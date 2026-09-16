@@ -13,7 +13,6 @@ from __future__ import annotations
 import hashlib
 import io
 import json
-import logging
 import re
 import sys
 import threading
@@ -107,6 +106,7 @@ def _patch_daemon_spawn(
                 server_url=None if mode == "local" else target,
                 log_path=spawned.log_path,
                 started_at=int(cli.time.time()),
+                host_id=cli._load_existing_host_id(),
                 config_sig=str(env[cli.DAEMON_CONFIG_SIG_ENV_VAR]),
             )
         )
@@ -300,6 +300,21 @@ def test_build_host_daemon_env_remote_strips_provider_credentials(
     assert "ANTHROPIC_API_KEY" not in env
     # Databricks auth is intentionally preserved for the daemon's server auth.
     assert env["DATABRICKS_TOKEN"] == "test-databricks-token"
+
+
+def test_build_host_daemon_env_remote_preserves_host_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Remote daemon spawns must retain the requested host identity."""
+    monkeypatch.setenv("OMNIGENT_HOST_ID", "d6d0ccebce7b4b706d21e23696bb462a")
+    monkeypatch.setenv("OMNIGENT_HOST_NAME", "isolated-host")
+    monkeypatch.setenv("OMNIGENT_HOST_TOKEN", "managed-token")
+
+    env = _build_host_daemon_env(server_url="https://example.databricksapps.com")
+
+    assert env["OMNIGENT_HOST_ID"] == "d6d0ccebce7b4b706d21e23696bb462a"
+    assert env["OMNIGENT_HOST_NAME"] == "isolated-host"
+    assert env["OMNIGENT_HOST_TOKEN"] == "managed-token"
 
 
 def test_build_host_daemon_env_remote_keeps_runner_env_passthrough(
@@ -652,6 +667,7 @@ def test_concurrent_ensure_host_daemon_elects_one_daemon(
                     server_url=target,
                     log_path=str(tmp_path / "host.log"),
                     started_at=int(cli.time.time()),
+                    host_id="host_abc",
                     config_sig="sig",
                 )
             )
@@ -682,12 +698,11 @@ def test_concurrent_ensure_host_daemon_elects_one_daemon(
     assert record.pid == 4242
 
 
-def test_ensure_host_daemon_warns_when_spawned_daemon_never_claims(
+def test_ensure_host_daemon_stops_spawned_daemon_that_never_claims(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
-    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A spawned daemon that never writes its record is surfaced, not silent."""
+    """A spawned daemon that never claims its record is stopped and surfaced."""
     monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
     monkeypatch.setattr(cli, "_build_host_daemon_env", lambda **_kw: {})
     monkeypatch.setattr(cli, "server_config_signature", lambda **_kw: "sig")
@@ -699,14 +714,56 @@ def test_ensure_host_daemon_warns_when_spawned_daemon_never_claims(
     )
     # The daemon crashes before claiming: no record ever appears.
     monkeypatch.setattr(cli, "_wait_for_daemon_claim", lambda *_a, **_kw: None)
+    stopped: list[int] = []
+    monkeypatch.setattr(
+        cli,
+        "_stop_spawned_host_daemon_process",
+        lambda spawned: stopped.append(spawned.pid),
+    )
 
-    with caplog.at_level(logging.WARNING, logger="omnigent.cli"):
+    with pytest.raises(click.ClickException) as excinfo:
         _ensure_host_daemon("https://server.example.com")
 
-    assert any(
-        "did not claim its registry record" in message and str(log_path) in message
-        for message in caplog.messages
+    assert "did not claim its registry record" in str(excinfo.value)
+    assert str(log_path) in str(excinfo.value)
+    assert stopped == [4242]
+
+
+def test_ensure_host_daemon_stops_spawned_daemon_on_identity_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A daemon claiming a different host identity fails before tunnel polling."""
+    monkeypatch.setattr(cli, "_HOST_PID_PATH", tmp_path / "host.pid")
+    monkeypatch.setattr(cli, "_build_host_daemon_env", lambda **_kw: {})
+    monkeypatch.setattr(cli, "_load_existing_host_id", lambda: "host_expected")
+    spawned = cli._SpawnedDaemonProcess(pid=4242, log_path=str(tmp_path / "host.log"))
+    monkeypatch.setattr(cli, "_spawn_host_daemon_process", lambda **_kw: spawned)
+    claimed = cli._HostDaemonRecord(
+        pid=spawned.pid,
+        target="https://server.example.com",
+        mode="server",
+        server_url="https://server.example.com",
+        log_path=spawned.log_path,
+        started_at=1_000_000,
+        host_id="host_actual",
     )
+    cli._write_daemon_record(claimed)
+    monkeypatch.setattr(cli, "_wait_for_daemon_claim", lambda *_a, **_kw: claimed)
+    stopped: list[int] = []
+    monkeypatch.setattr(
+        cli,
+        "_stop_spawned_host_daemon_process",
+        lambda child: stopped.append(child.pid),
+    )
+
+    with pytest.raises(click.ClickException) as excinfo:
+        _ensure_host_daemon("https://server.example.com")
+
+    assert "registered as 'host_actual'" in str(excinfo.value)
+    assert "requested 'host_expected'" in str(excinfo.value)
+    assert stopped == [spawned.pid]
+    assert cli._find_daemon_record("https://server.example.com") is None
 
 
 def _online_record() -> cli._HostDaemonRecord:
@@ -1136,6 +1193,32 @@ def test_host_reset_id_mints_fresh_id_when_no_daemon_runs(
     cfg = yaml.safe_load(config_path.read_text())
     assert cfg["host"]["host_id"] != "a" * 32
     assert cfg["host"]["name"] == "my-laptop"
+
+
+def test_host_reset_id_honors_config_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """`host reset-id` changes the identity the isolated daemon will load."""
+    import yaml
+
+    fallback_path = tmp_path / "fallback" / "config.yaml"
+    fallback_path.parent.mkdir(parents=True)
+    fallback_path.write_text(
+        yaml.safe_dump({"host": {"host_id": "a" * 32, "name": "fallback-host"}})
+    )
+    config_home = tmp_path / "isolated"
+    config_home.mkdir()
+    isolated_path = config_home / "config.yaml"
+    isolated_path.write_text(
+        yaml.safe_dump({"host": {"host_id": "b" * 32, "name": "isolated-host"}})
+    )
+    monkeypatch.setattr("omnigent.host.identity.CONFIG_PATH", fallback_path)
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+    monkeypatch.setattr(cli, "_list_daemon_records", lambda **_kw: [])
+
+    result = CliRunner().invoke(cli_group, ["host", "reset-id", "--yes"])
+
+    assert result.exit_code == 0, result.output
+    assert yaml.safe_load(isolated_path.read_text())["host"]["host_id"] != "b" * 32
+    assert yaml.safe_load(fallback_path.read_text())["host"]["host_id"] == "a" * 32
 
 
 def test_host_reset_id_refuses_while_a_daemon_is_running(

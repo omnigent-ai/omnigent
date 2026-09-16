@@ -64,6 +64,9 @@ class _HeartbeatStreamResponse:
         """
         del exc_type, exc, traceback
 
+    def raise_for_status(self) -> None:
+        """The scripted stream represents a successful HTTP response."""
+
     async def aiter_text(self) -> AsyncIterator[str]:
         """
         Yield a ready heartbeat, then finish after release.
@@ -200,6 +203,9 @@ class _ScriptedStreamResponse:
         :returns: None.
         """
         del exc_type, exc, traceback
+
+    def raise_for_status(self) -> None:
+        """The scripted stream represents a successful HTTP response."""
 
     async def aiter_text(self) -> AsyncIterator[str]:
         """
@@ -518,6 +524,9 @@ class _TunnelCloseStreamResponse:
     ) -> None:
         del exc_type, exc, traceback
 
+    def raise_for_status(self) -> None:
+        """The scripted stream represents a successful HTTP response."""
+
     async def aiter_text(self) -> AsyncIterator[str]:
         yield 'data: {"type": "session.heartbeat"}\n\n'
         await self._gate.wait()
@@ -548,6 +557,7 @@ class _TunnelCloseRunnerClient:
 @pytest.mark.asyncio
 async def test_relay_publishes_failed_status_on_tunnel_close(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
     A tunnel close mid-TURN publishes ``session.status`` "failed".
@@ -596,6 +606,14 @@ async def test_relay_publishes_failed_status_on_tunnel_close(
         assert event.get("type") == "session.status"
         assert event.get("status") == "failed"
         assert event["error"]["code"] == "runner_disconnected"
+        record = next(
+            r
+            for r in caplog.records
+            if getattr(r, "event_name", None) == "runner_stream_disconnected"
+        )
+        assert record.session_id == session_id
+        assert record.attributes == {"intentional_stop": False, "cached_session_status": "running"}
+        assert record.exc_info is not None
     finally:
         gate.set()
         if collector is not None:
@@ -793,7 +811,9 @@ async def test_runner_recovery_clears_persisted_disconnect_error_labels(
 
 
 @pytest.mark.asyncio
-async def test_relay_suppresses_disconnect_error_on_intentional_stop() -> None:
+async def test_relay_suppresses_disconnect_error_on_intentional_stop(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """
     A user-initiated Stop drops the tunnel quietly, not as a failure.
 
@@ -839,6 +859,13 @@ async def test_relay_suppresses_disconnect_error_on_intentional_stop() -> None:
 
         # The marker is one-shot: consumed by the disconnect handler.
         assert session_id not in sessions_module._intentional_stop_sessions
+        record = next(
+            r
+            for r in caplog.records
+            if getattr(r, "event_name", None) == "runner_stream_disconnected"
+        )
+        assert record.session_id == session_id
+        assert record.attributes == {"intentional_stop": True, "cached_session_status": None}
 
         # No durable runner_disconnected label persists, so snapshots and
         # child summaries stay clean.
@@ -887,6 +914,9 @@ class _ScriptedThenDropStreamResponse:
         traceback: TracebackType | None,
     ) -> None:
         del exc_type, exc, traceback
+
+    def raise_for_status(self) -> None:
+        """The scripted stream represents a successful HTTP response."""
 
     async def aiter_text(self) -> AsyncIterator[str]:
         # The heartbeat comes first so the caller's readiness wait resolves,
@@ -1007,6 +1037,7 @@ async def test_relay_running_edge_clears_stale_intentional_stop_marker(
 @pytest.mark.asyncio
 async def test_relay_stays_quiet_when_runner_leaves_an_idle_session(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
     A runner leaving an idle session is not an error.
@@ -1069,6 +1100,13 @@ async def test_relay_stays_quiet_when_runner_leaves_an_idle_session(
         # also proves no failure edge followed the scripted ones.
         assert sessions_module._session_status_cache.get(session_id) == "idle"
         assert sessions_module._last_task_error_from_labels(store.labels[session_id]) is None
+        record = next(
+            r
+            for r in caplog.records
+            if getattr(r, "event_name", None) == "runner_stream_disconnected"
+        )
+        assert record.session_id == session_id
+        assert record.attributes == {"intentional_stop": False, "cached_session_status": "idle"}
     finally:
         gate.set()
         if collector is not None:

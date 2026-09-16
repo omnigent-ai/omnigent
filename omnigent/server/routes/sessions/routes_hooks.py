@@ -79,6 +79,7 @@ from omnigent.server.routes._sessions.helpers import (
     _forward_session_change_to_runner,
     _get_runner_client,
     _native_ask_gate_lock,
+    _native_coding_agent_for_session,
     _publish_policy_denied,
     _structured_ask_user_question,
 )
@@ -97,6 +98,11 @@ from omnigent.spec.types import (
 )
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.permission_store import PermissionStore
+
+#: Policy-name vendor for a native agent key, where the two differ. Mirrors
+#: ``POLICY_NAME_VENDORS`` in ``web/src/lib/nativeCodingAgents.ts``, which resolves
+#: a card's glyph and name from the ``<vendor>_native_`` prefix.
+_NATIVE_POLICY_VENDORS: dict[str, str] = {"antigravity": "agy"}
 
 
 def _create_route_decision_id(
@@ -305,13 +311,35 @@ def register_hooks_routes(
         # binary-card fallback.
         if tool_name == "ExitPlanMode" and isinstance(tool_input, dict) and tool_input:
             extras["exit_plan_mode"] = tool_input
+        # This hook contract is Claude-Code-shaped and other native harnesses
+        # reuse it deliberately (devin's hooks carry the same fields), so the card
+        # has to name the harness that actually asked — a hardcoded "Claude" would
+        # mislabel every Devin approval. Emitting `<vendor>_native_permission` is
+        # what the other vendors do (`agy_native_permission`,
+        # `codex_native_command_approval`) and is what the web resolves the glyph
+        # from; claude resolves to the same string it always sent.
+        conv_for_vendor = await asyncio.to_thread(
+            conversation_store.get_conversation,
+            session_id,
+        )
+        asking_agent = (
+            _native_coding_agent_for_session(conv_for_vendor)
+            if conv_for_vendor is not None
+            else None
+        )
+        asking_name = asking_agent.display_name if asking_agent is not None else "Claude"
+        asking_vendor = (
+            _NATIVE_POLICY_VENDORS.get(asking_agent.key, asking_agent.key)
+            if asking_agent is not None
+            else "claude"
+        )
         params = ElicitationRequestParams(
             mode="form",
-            message=f"Claude wants to call **{tool_name}**",
+            message=f"{asking_name} wants to call **{tool_name}**",
             requestedSchema=None,
             url=None,
             phase="pre_tool_use",
-            policy_name="claude_native_permission",
+            policy_name=f"{asking_vendor}_native_permission",
             content_preview=f"{tool_name}({preview_str})",
             **extras,
         )
@@ -916,6 +944,7 @@ def register_hooks_routes(
                                 policy_phase=phase.value,
                                 policy_reason=decline_body["reason"],
                                 policy_gate="declined",
+                                policy_workspace_id=result.deciding_policy_workspace_id,
                             )
                             return Response(
                                 content=json.dumps(decline_body),
@@ -933,6 +962,7 @@ def register_hooks_routes(
                             policy_verdict=approval_body["result"],
                             policy_phase=phase.value,
                             policy_gate="ask",
+                            policy_workspace_id=result.deciding_policy_workspace_id,
                         )
                         if approval_body.get("reason"):
                             add_audit_attrs(policy_reason=approval_body["reason"])
@@ -956,15 +986,23 @@ def register_hooks_routes(
             resp_body["data"] = result.data
         # Tag the audit envelope with the decision so a DENY/ASK is debuggable
         # (a deny returns HTTP 200, so status alone can't tell you the verdict).
-        add_audit_attrs(policy_verdict=resp_body["result"], policy_phase=phase.value)
+        add_audit_attrs(
+            policy_verdict=resp_body["result"],
+            policy_phase=phase.value,
+            policy_workspace_id=result.deciding_policy_workspace_id,
+        )
         if result.reason:
             add_audit_attrs(policy_reason=result.reason)
         # Emit a structured log for non-ALLOW verdicts so operators can diagnose
-        # policy evaluation failures without needing audit-log access.
+        # policy evaluation failures without needing audit-log access. The
+        # workspace id is the deciding policy's owning workspace (None for a
+        # YAML / agent-spec policy that is not a workspace-scoped row).
         if result.action in (PolicyAction.DENY, PolicyAction.ASK):
             _logger.info(
-                "policy_eval_verdict: session=%s phase=%s action=%s policy=%s reason=%r tool=%s",
+                "policy_eval_verdict: session=%s policy_workspace=%s phase=%s "
+                "action=%s policy=%s reason=%r tool=%s",
                 session_id,
+                result.deciding_policy_workspace_id,
                 phase.value,
                 result.action.value,
                 result.deciding_policy,

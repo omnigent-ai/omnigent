@@ -584,6 +584,7 @@ export function TerminalView({
           !readOnly && activeRef.current,
           notifyClipboardRequest,
           focusOnConnectRef.current,
+          terminalId === "terminal_codex_main",
         );
         sessionRef.current = terminalSession;
         // Relay-connected with a direct URL on offer: negotiate the

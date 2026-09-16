@@ -16,6 +16,7 @@ import pytest
 from omnigent.onboarding.sandboxes import microsandbox as msmod
 from omnigent.onboarding.sandboxes.base import (
     DEFAULT_HOST_IMAGE,
+    SandboxGoneError,
     host_image_wheel_install_command,
 )
 from omnigent.onboarding.sandboxes.microsandbox import (
@@ -375,6 +376,7 @@ class _FakeMicrosandboxState:
     removed: list[str] = field(default_factory=list)
     remove_attempts: list[str] = field(default_factory=list)
     create_raises: Exception | None = None
+    start_raises: Exception | None = None
     remove_raises: Exception | None = None
     create_hangs: bool = False  # if True, create() sleeps (to exercise cancellation)
     cancelled: bool = False  # set when a hung create coroutine is cancelled
@@ -410,6 +412,8 @@ def _install_fake_microsandbox(monkeypatch: pytest.MonkeyPatch) -> _FakeMicrosan
 
         @staticmethod
         async def start(name: str, *, detached: bool = False) -> _FakeSandbox:
+            if state.start_raises is not None:
+                raise state.start_raises
             state.start_calls.append(name)
             sandbox = state.sandboxes[name]
             sandbox.status = _FakeSandboxStatus.RUNNING
@@ -1032,8 +1036,21 @@ def test_resume_running_sandbox_is_noop(fake_microsandbox: _FakeMicrosandboxStat
 
 def test_resume_missing_sandbox_fails(fake_microsandbox: _FakeMicrosandboxState) -> None:
     """Resume of a removed sandbox is an error (the wake path relaunches instead)."""
-    with pytest.raises(click.ClickException, match="ms-gone"):
+    with pytest.raises(SandboxGoneError, match="ms-gone"):
         MicrosandboxSandboxLauncher().resume("ms-gone")
+
+
+def test_resume_deleted_during_start_raises_gone(
+    fake_microsandbox: _FakeMicrosandboxState,
+) -> None:
+    """Deletion racing the restart is still classified as definitive loss."""
+    launcher = MicrosandboxSandboxLauncher()
+    sandbox_id = _provisioned(fake_microsandbox, launcher)
+    fake_microsandbox.sandboxes[sandbox_id].status = _FakeSandboxStatus.STOPPED
+    fake_microsandbox.start_raises = _FakeSandboxNotFoundError("gone during start")
+
+    with pytest.raises(SandboxGoneError, match=sandbox_id):
+        launcher.resume(sandbox_id)
 
 
 def test_is_running_reports_status(fake_microsandbox: _FakeMicrosandboxState) -> None:

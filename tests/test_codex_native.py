@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import contextlib
 import json
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -16,8 +19,10 @@ import httpx
 import pytest
 import tomllib
 import yaml
+from PIL import Image
 
 from omnigent._runner_startup import RunnerStartupProgress
+from omnigent.entities import CompactionData
 from omnigent.harnesses.codex_native import app_server as codex_native_app_server
 from omnigent.harnesses.codex_native import forwarder as codex_native_forwarder
 from omnigent.harnesses.codex_native import main as codex_native
@@ -1921,16 +1926,31 @@ def test_wait_for_thread_started_times_out_when_no_thread_event() -> None:
         )
 
 
-def test_supervise_forwarder_subscribes_existing_client_after_thread_discovery(
+def test_supervise_forwarder_subscribes_without_replaying_dead_letters(
     tmp_path: Path,
 ) -> None:
     """
     Fresh Codex sessions pass the listener used to discover
     ``thread/started``. Once the thread id is known, the forwarder
     subscribes that connection so TUI-originated turn/item events are
-    mirrored into the web session.
+    mirrored into the web session. Dead-letter recovery belongs to cold-resume
+    rollout reconstruction, so starting the live forwarder must not replay it
+    again after that snapshot has already been built.
     """
     fake_client = _FakeCodexAppServerClient()
+    codex_native_forwarder.append_dead_letter(
+        tmp_path,
+        session_id="conv_123",
+        event_type="external_conversation_item",
+        payload={"item_type": "message"},
+        reason="http 503",
+        http_status=503,
+    )
+    ap_requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        ap_requests.append(request)
+        return httpx.Response(200)
 
     async def run() -> None:
         """
@@ -1946,6 +1966,7 @@ def test_supervise_forwarder_subscribes_existing_client_after_thread_discovery(
             app_server_url=str(tmp_path / "app-server.sock"),
             thread_id="thread_123",
             client=fake_client,  # type: ignore[arg-type]
+            ap_transport=httpx.MockTransport(handler),
         )
 
     asyncio.run(run())
@@ -1954,6 +1975,8 @@ def test_supervise_forwarder_subscribes_existing_client_after_thread_discovery(
         ("thread/resume", {"threadId": "thread_123", "excludeTurns": True})
     ]
     assert fake_client.closed
+    assert ap_requests == []
+    assert (tmp_path / "dead_letter.jsonl").exists()
 
 
 def test_supervise_forwarder_resumes_when_it_opens_client(
@@ -8449,8 +8472,11 @@ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_resu
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("ensure_status", [200, 503])
 async def test_prepare_codex_terminal_via_daemon_creates_runner_and_ensures_terminal(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    ensure_status: int,
 ) -> None:
     """
     Daemon preparation owns session create, runner launch, and terminal ensure.
@@ -8464,6 +8490,9 @@ async def test_prepare_codex_terminal_via_daemon_creates_runner_and_ensures_term
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
     """
+    from omnigent import _startup_events as startup
+
+    caplog.set_level("INFO", logger="omnigent.startup")
     original_async_client = httpx.AsyncClient
     calls: list[tuple[str, str, object]] = []
 
@@ -8497,7 +8526,7 @@ async def test_prepare_codex_terminal_via_daemon_creates_runner_and_ensures_term
         if request.method == "GET" and path == "/v1/runners/runner_new/status":
             return httpx.Response(200, json={"online": True})
         if request.method == "POST" and path.endswith("/resources/terminals"):
-            return httpx.Response(200, json={"id": "terminal_codex_main"})
+            return httpx.Response(ensure_status, json={"id": "terminal_codex_main"})
         if request.method == "GET" and path.endswith("/resources/terminals/terminal_codex_main"):
             return httpx.Response(
                 200,
@@ -8527,17 +8556,27 @@ async def test_prepare_codex_terminal_via_daemon_creates_runner_and_ensures_term
     monkeypatch.setattr(codex_native.httpx, "AsyncClient", client_factory)
     progress_updates: list[str] = []
 
-    prepared = await codex_native._prepare_codex_terminal_via_daemon(
-        base_url="https://example.com",
-        headers={},
-        session_id=None,
-        session_bundle=b"bundle",
-        codex_args=("--config", "approval_policy=on-request"),
-        model="gpt-5.4-mini",
-        host_id="host_local",
-        workspace="/repo",
-        startup_progress=RunnerStartupProgress(update=progress_updates.append),
+    expected_error = (
+        pytest.raises(click.ClickException) if ensure_status != 200 else contextlib.nullcontext()
     )
+    with expected_error:
+        with startup.native_startup_attempt(harness="codex-native"):
+            prepared = await codex_native._prepare_codex_terminal_via_daemon(
+                base_url="https://example.com",
+                headers={},
+                session_id=None,
+                session_bundle=b"bundle",
+                codex_args=("--config", "approval_policy=on-request"),
+                model="gpt-5.4-mini",
+                host_id="host_local",
+                workspace="/repo",
+                startup_progress=RunnerStartupProgress(update=progress_updates.append),
+            )
+    if ensure_status != 200:
+        events = [r.attributes["event"] for r in caplog.records if r.name == "omnigent.startup"]
+        assert events[-1] == "launch_failed"
+        assert "terminal_available" not in events
+        return
 
     assert prepared.session_id == "conv_new"
     assert prepared.terminal_id == "terminal_codex_main"
@@ -8572,6 +8611,23 @@ async def test_prepare_codex_terminal_via_daemon_creates_runner_and_ensures_term
         "Starting Codex terminal...",
         "Codex terminal ready.",
     ]
+
+    events = [r.attributes for r in caplog.records if r.name == "omnigent.startup"]
+    assert [e["event"] for e in events] == [
+        "launch_started",
+        "session_resolved",
+        "runner_requested",
+        "runner_connected",
+        "session_runner_bound",
+        "terminal_available",
+        "launch_incomplete",
+    ]
+    assert len({e["attempt_id"] for e in events}) == 1
+    assert all(
+        r.session_id == "conv_new"
+        for r in caplog.records
+        if r.name == "omnigent.startup" and r.attributes["event"] != "launch_started"
+    )
 
 
 @pytest.mark.asyncio
@@ -10998,6 +11054,72 @@ def test_clone_codex_rollout_returns_none_for_unsafe_target_id(
 
 
 @pytest.mark.asyncio
+async def test_ensure_local_codex_resume_rollout_replays_before_history_fetch(
+    tmp_path: Path,
+) -> None:
+    """A successful dead-letter replay is included in the rebuilt snapshot."""
+    thread_id = "019e96aa-0be2-7343-8d3b-6f914d60936b"
+    codex_home = tmp_path / "codex-home"
+    replay_data = {
+        "item_type": "message",
+        "item_data": {
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "recovered reply"}],
+        },
+        "response_id": "turn_recovered",
+        "source_id": "codex:item:recovered",
+    }
+    codex_native_forwarder.append_dead_letter(
+        tmp_path,
+        session_id="conv_codex",
+        event_type="external_conversation_item",
+        payload=replay_data,
+        reason="http 503",
+        http_status=503,
+    )
+    request_order: list[str] = []
+    server_items: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        request_order.append(request.method)
+        if request.method == "POST":
+            body = json.loads(request.content)
+            assert body == {"type": "external_conversation_item", "data": replay_data}
+            server_items.append(
+                {
+                    "id": "msg_recovered",
+                    "response_id": replay_data["response_id"],
+                    "type": "message",
+                    **replay_data["item_data"],
+                }
+            )
+            return httpx.Response(200)
+        assert request.url.path == "/v1/sessions/conv_codex/items"
+        return httpx.Response(200, json={"data": server_items, "has_more": False})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://test"
+    ) as client:
+        rollout = await codex_native._ensure_local_codex_resume_rollout(
+            client,
+            session_id="conv_codex",
+            external_session_id=thread_id,
+            codex_home=codex_home,
+            workspace=tmp_path.resolve(),
+            model_provider="omnigent_databricks",
+            codex_path=None,
+        )
+
+    records = [json.loads(line) for line in rollout.read_text().splitlines()]
+    assert request_order == ["POST", "GET"]
+    assert not (tmp_path / "dead_letter.jsonl").exists()
+    assert any(
+        record["type"] == "response_item" and record["payload"].get("id") == "msg_recovered"
+        for record in records
+    )
+
+
+@pytest.mark.asyncio
 async def test_ensure_local_codex_resume_rollout_synthesizes_omnigent_history(
     tmp_path: Path,
 ) -> None:
@@ -11811,6 +11933,68 @@ def test_rollout_records_includes_compacted_entry_from_compaction_item() -> None
         and r["payload"].get("content") == [{"type": "input_text", "text": "after compaction"}]
     ]
     assert len(post_items) == 1
+
+
+def test_rollout_records_downgrade_image_stripped_by_compaction_storage() -> None:
+    """A stored Responses image marker cannot poison Codex replacement history."""
+    pixels = bytes(range(256)) * 3
+    png = BytesIO()
+    Image.frombytes("RGB", (16, 16), pixels).save(png, format="PNG")
+    data_uri = f"data:image/png;base64,{base64.b64encode(png.getvalue()).decode()}"
+    messages = [
+        {
+            "type": "message",
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "before"},
+                {"type": "input_image", "image_url": data_uri, "detail": "high"},
+                {"type": "input_image", "image_url": "https://example.com/kept.png"},
+                {"type": "input_image", "file_id": "file_kept"},
+                {"type": "input_text", "text": "after"},
+            ],
+        },
+        {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "answer"}],
+        },
+    ]
+    stored = CompactionData(
+        summary="summary",
+        last_item_id="msg_before",
+        token_count=1,
+        compacted_messages=messages,
+    )
+    assert stored.compacted_messages is not None
+    stored_content = stored.compacted_messages[0]["content"]
+    assert stored_content[1]["image_url"] == (
+        "[image/png content omitted from the compaction snapshot]"
+    )
+
+    records = codex_native._codex_rollout_records_from_session_items(
+        [{"id": "cmp_image", "type": "compaction", **stored.model_dump(exclude_none=True)}],
+        session_id="conv_test",
+        external_session_id="019f-thread",
+        cwd=Path("/tmp/test"),
+        model_provider="openai",
+        cli_version="0.140.0",
+    )
+
+    history = next(record for record in records if record["type"] == "compacted")["payload"][
+        "replacement_history"
+    ]
+    assert [message["role"] for message in history] == ["user", "assistant"]
+    replayed_content = history[0]["content"]
+    assert [block["type"] for block in replayed_content] == [
+        "input_text",
+        "input_text",
+        "input_image",
+        "input_image",
+        "input_text",
+    ]
+    assert "image/png" in replayed_content[1]["text"]
+    assert replayed_content[2:] == stored_content[2:]
+    assert messages[0]["content"][1]["image_url"] == data_uri
 
 
 def test_codex_event_msg_record_ignores_non_list_content() -> None:

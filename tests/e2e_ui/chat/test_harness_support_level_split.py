@@ -1,6 +1,6 @@
 """E2E: the prototype picker leads with Claude Code, Cursor, and Codex.
 
-Other harnesses stay in Other; its label identifies the selected harness.
+Other harnesses stay in Other unless selected; the current pick is promoted on reopen.
 All stubbed harnesses are ready, so grouping is independent of availability.
 """
 
@@ -198,7 +198,7 @@ async def _drive_recent(base_url: str) -> None:
 def test_picker_leads_with_primary_harnesses(
     seeded_session: tuple[str, str],
 ) -> None:
-    """Primary harnesses remain inline; Other identifies a selected Pi harness."""
+    """Primary harnesses lead; the selected secondary harness joins them on reopen."""
     base_url, session_id = seeded_session
     del session_id  # this flow never creates a session — only reads the picker
     _run_in_fresh_loop(_drive(base_url))
@@ -249,7 +249,7 @@ async def _drive(base_url: str) -> None:
                 "expected primary Cursor row to precede Pi in Other"
             )
 
-            # The trigger and Other label both identify the selected harness.
+            # Selecting Pi keeps its config reachable, then promotes it on reopen.
             await pi_row.click()
             await expect(page.get_by_test_id("new-chat-landing-agent-select")).to_have_attribute(
                 "aria-label", re.compile("Pi")
@@ -257,12 +257,8 @@ async def _drive(base_url: str) -> None:
             await page.keyboard.press("Escape")
             await expect(page.get_by_role("menu")).to_have_count(0)
             await _open_picker(page)
-            other = page.get_by_test_id("new-chat-landing-harness-more")
-            await expect(other).to_contain_text("Pi")
-            await expect(
-                page.get_by_test_id(f"new-chat-landing-agent-{_PI_AGENT_ID}")
-            ).to_have_count(0)
-            await other.click()
+            await expect(page.get_by_test_id("new-chat-landing-harness-more")).to_have_count(0)
+            await expect(pi_row).to_be_visible()
             await expect(
                 page.get_by_test_id(f"new-chat-landing-agent-{_PI_AGENT_ID}")
             ).to_have_attribute("data-active", "true")

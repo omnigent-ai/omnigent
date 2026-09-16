@@ -16,6 +16,7 @@ import { WebglAddon } from "@xterm/addon-webgl";
 import { type FontWeight, type ITheme, Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import { type CodeFont, codeFontFamilyForEditor, readCodeFont } from "@/lib/codeFontPreferences";
+import { CodexTerminalPalette, codexTerminalTheme } from "./CodexTerminalPalette";
 
 // Card background colors derived from the app's CSS palette.
 // Light: --card: oklch(1.000 0 0) = pure white.
@@ -188,18 +189,33 @@ export type TerminalInputListener = () => void;
 /** Kitty Keyboard Protocol / CSI-u encoding for Shift+Enter. */
 export const SHIFT_ENTER_CSI_U = "\x1b[13;2u";
 
+/** Readline line-editing bytes for the macOS Cmd key mappings below. */
+export const CMD_BACKSPACE_LINE_KILL = "\x15"; // Ctrl-U: kill to line start
+export const CMD_LEFT_LINE_START = "\x01"; // Ctrl-A: cursor to line start
+export const CMD_RIGHT_LINE_END = "\x05"; // Ctrl-E: cursor to line end
+
 /**
  * Return the terminal bytes to send for a browser key event.
  *
- * xterm.js does not currently emit Kitty Keyboard Protocol sequences for
- * Shift+Enter, so the browser attach path synthesizes the CSI-u sequence
- * for that one key combination. This mirrors native terminals that support
- * CSI-u while keeping plain Enter and modified Enter variants on xterm's
- * default path.
+ * Two key families need synthesized bytes because neither xterm.js nor the
+ * browser produces them:
+ *
+ * - **Shift+Enter** — xterm does not emit Kitty Keyboard Protocol sequences
+ *   for it, so the browser attach path synthesizes the CSI-u sequence,
+ *   mirroring native terminals that support CSI-u while keeping plain Enter
+ *   and modified Enter variants on xterm's default path.
+ * - **macOS Cmd+Backspace / Cmd+Left / Cmd+Right** — the standard
+ *   readline-style line shortcuts. The Option (Alt) equivalents work because
+ *   xterm encodes Alt-modified keys as ESC-prefixed sequences that
+ *   readline/zsh read as word operations; Cmd (metaKey) combos get no
+ *   encoding at all — the browser eats them and nothing reaches the PTY.
+ *   Each maps to the Ctrl control character a native terminal sends. Only
+ *   bare Cmd combos are mapped: Cmd+C/V/K/R and friends keep their
+ *   browser/xterm meaning (copy/paste/clear/reload).
  *
  * :param event: Browser keyboard event from xterm's custom key handler.
- * :returns: CSI-u bytes for Shift+Enter, or ``null`` to let xterm handle
- *     the event normally.
+ * :returns: Bytes to send instead of xterm's default handling, or ``null``
+ *     to let xterm handle the event normally.
  */
 export function terminalKeyEventPayload(event: KeyboardEvent): string | null {
   // An in-flight IME composition owns the keyboard: xterm consults this
@@ -217,6 +233,11 @@ export function terminalKeyEventPayload(event: KeyboardEvent): string | null {
     !event.metaKey
   ) {
     return SHIFT_ENTER_CSI_U;
+  }
+  if (event.metaKey && !event.altKey && !event.ctrlKey && !event.shiftKey) {
+    if (event.key === "Backspace") return CMD_BACKSPACE_LINE_KILL;
+    if (event.key === "ArrowLeft") return CMD_LEFT_LINE_START;
+    if (event.key === "ArrowRight") return CMD_RIGHT_LINE_END;
   }
   return null;
 }
@@ -478,6 +499,82 @@ export function wheelReportPayload(
 }
 
 /**
+ * Decide how one step of a one-finger vertical drag over the terminal
+ * becomes scrollback movement or SGR mouse-wheel reports, carrying the
+ * fractional-line remainder across steps.
+ *
+ * xterm has no built-in touch handling, so without this a finger drag on a
+ * phone leaves the view pinned to the live bottom — the scrollback is
+ * unreachable by touch even though wheel scrolling works. Dragging the
+ * finger *down* reveals older content (the native scroll gesture), which
+ * maps to negative lines: xterm's ``scrollLines`` scrolls up for negative
+ * amounts, and {@link sgrWheelReports} emits wheel-up (button 64) reports.
+ *
+ * When the pane program is tracking the mouse with SGR encoding (for
+ * example Claude Code on the control transport), the drag synthesizes
+ * wheel reports at the touched cell — mirroring {@link wheelReportPayload}
+ * — capped at {@link WHEEL_REPORTS_MAX_PER_EVENT} per step. Otherwise the
+ * drag moves xterm's own scrollback via ``lines``.
+ *
+ * Pure helper — exported for direct unit testing; production code calls it
+ * from the session's touch listeners.
+ *
+ * :param move: Finger positions — previous and current Y, and the X used
+ *     to place a report column.
+ * :param mouse: Current mouse tracking mode + SGR-encoding flag.
+ * :param screen: Character-grid geometry, or ``null`` when layout isn't
+ *     measurable yet (the drag is left to the browser).
+ * :param partial: Fractional lines carried over from previous steps.
+ * :returns: ``consume`` — whether the caller owns the gesture step
+ *     (prevent default so the browser doesn't pan); ``lines`` — whole
+ *     lines to feed ``term.scrollLines`` (0 when reports are emitted
+ *     instead); ``data`` — SGR reports to feed to the terminal ("" on the
+ *     scrollback path); ``partial`` — the new carry.
+ */
+/**
+ * Finger travel (CSS px) before a one-finger touch is treated as a scroll
+ * drag. Below this the gesture is left to the browser, so taps and the
+ * start of a long-press (text selection) aren't swallowed by jitter; at or
+ * beyond it the dominant axis decides — vertical locks into scrolling,
+ * horizontal abandons the gesture to the browser.
+ */
+export const TOUCH_SCROLL_SLOP_PX = 8;
+
+export function touchScrollPayload(
+  move: { previousY: number; currentY: number; clientX: number },
+  mouse: WheelMouseState,
+  screen: WheelScreenMetrics | null,
+  partial: number,
+): { consume: boolean; lines: number; data: string; partial: number } {
+  if (screen === null || screen.cellHeight <= 0) {
+    return { consume: false, lines: 0, data: "", partial };
+  }
+  const total = partial + (move.previousY - move.currentY) / screen.cellHeight;
+  const whole = Math.trunc(total);
+  if (mouse.mouseTrackingMode === "none" || !mouse.sgrEncoding) {
+    // Unlike the wheel path (which defers non-SGR tracking to xterm's
+    // native handler), touch has no native fallback — scroll the buffer,
+    // a harmless no-op on an alt-screen TUI with empty scrollback.
+    return { consume: true, lines: whole, data: "", partial: total - whole };
+  }
+  const capped = Math.max(
+    -WHEEL_REPORTS_MAX_PER_EVENT,
+    Math.min(WHEEL_REPORTS_MAX_PER_EVENT, whole),
+  );
+  const clamp = (v: number, max: number) => Math.min(Math.max(v, 1), max);
+  const col = clamp(Math.floor((move.clientX - screen.left) / screen.cellWidth) + 1, screen.cols);
+  const row = clamp(Math.floor((move.currentY - screen.top) / screen.cellHeight) + 1, screen.rows);
+  return {
+    consume: true,
+    lines: 0,
+    data: sgrWheelReports(capped, col, row),
+    // Discard the over-cap excess (like the wheel path) so a giant drag
+    // step can't keep scrolling long after the gesture.
+    partial: capped === whole ? total - whole : 0,
+  };
+}
+
+/**
  * One xterm ↔ tmux WebSocket bridge tied to a single DOM container.
  *
  * The constructor performs all the setup synchronously — open the
@@ -498,6 +595,7 @@ export class TerminalSession {
   private readonly resizeObserver: ResizeObserver;
   private readonly dataDispose: { dispose: () => void };
   private readonly osc52Dispose: { dispose: () => void };
+  private readonly codexPalette: CodexTerminalPalette | null;
   private readonly onClipboardRequest?: TerminalClipboardListener;
   /** Whether this visible, interactive attach may write the local clipboard. */
   private clipboardEnabled: boolean;
@@ -522,6 +620,14 @@ export class TerminalSession {
   private lastSentSize: { cols: number; rows: number } | null = null;
   /** Fractional wheel lines carried across events (see {@link wheelReportPayload}). */
   private wheelPartialLines = 0;
+  /** Start of the tracked one-finger touch, or ``null`` when none is active. */
+  private touchStart: { x: number; y: number } | null = null;
+  /** Whether the tracked touch passed the slop gate and owns scrolling. */
+  private touchScrolling = false;
+  /** Y of the last processed drag step (valid while {@link touchScrolling}). */
+  private touchLastY = 0;
+  /** Fractional touch lines carried across moves (see {@link touchScrollPayload}). */
+  private touchPartialLines = 0;
 
   /**
    * Construct, attach to the DOM, and open the WebSocket.
@@ -550,7 +656,9 @@ export class TerminalSession {
     clipboardEnabled = true,
     onClipboardRequest?: TerminalClipboardListener,
     focusOnConnect = true,
+    adaptCodexPalette = false,
   ) {
+    this.codexPalette = adaptCodexPalette ? new CodexTerminalPalette() : null;
     this.clipboardEnabled = clipboardEnabled;
     this.focusOnConnect = focusOnConnect;
     this.onClipboardRequest = onClipboardRequest;
@@ -562,12 +670,9 @@ export class TerminalSession {
       ...terminalFontOptions(readCodeFont()),
       scrollback: 20000,
       cursorBlink: true,
-      theme: terminalTheme(isDark),
-      // 256-color indices (e.g. Claude Code's 38;5;231 white) can't be
-      // remapped via ITheme (slots 0-15 only), so they vanish on the
-      // light theme's white card. This WCAG AA contrast floor nudges a
-      // cell's foreground luminance only when it lacks contrast against
-      // its actual background.
+      theme: this.theme(isDark),
+      // Keep fixed-color CLI text readable against each cell's background
+      // without replacing its syntax palette.
       minimumContrastRatio: 4.5,
       // Opt into xterm's proposed APIs, matching openui's terminal setup.
       allowProposedApi: true,
@@ -639,7 +744,7 @@ export class TerminalSession {
       (ev) => {
         if (ev.data instanceof ArrayBuffer) {
           const bytes = new Uint8Array(ev.data);
-          this.term.write(bytes);
+          this.term.write(this.codexPalette?.write(bytes) ?? bytes);
           const now = performance.now();
           if (now - lastActivityTs > 300) {
             lastActivityTs = now;
@@ -719,6 +824,77 @@ export class TerminalSession {
       return false;
     });
 
+    // xterm has no touch support, so on a phone a finger drag would
+    // otherwise leave the view pinned to the live bottom with the
+    // scrollback unreachable. Translate one-finger vertical drags into
+    // scrollback movement (or SGR wheel reports when the pane program is
+    // tracking the mouse), mirroring the wheel path above. Multi-touch
+    // (pinch) is left to the browser.
+    container.addEventListener(
+      "touchstart",
+      (e) => {
+        if (e.touches.length !== 1) {
+          this.touchStart = null;
+          this.touchScrolling = false;
+          return;
+        }
+        this.touchStart = { x: e.touches[0].clientX, y: e.touches[0].clientY };
+        this.touchScrolling = false;
+        this.touchPartialLines = 0;
+      },
+      { signal },
+    );
+    container.addEventListener(
+      "touchmove",
+      (e) => {
+        if (this.touchStart === null || e.touches.length !== 1) return;
+        const touch = e.touches[0];
+        if (!this.touchScrolling) {
+          // Slop gate: taps and long-press jitter stay with the browser.
+          // Past the slop, the dominant axis decides — a mostly-horizontal
+          // drag is abandoned so browser gestures/selection still work.
+          const dx = Math.abs(touch.clientX - this.touchStart.x);
+          const dy = Math.abs(touch.clientY - this.touchStart.y);
+          if (Math.max(dx, dy) < TOUCH_SCROLL_SLOP_PX) return;
+          if (dx > dy) {
+            this.touchStart = null;
+            return;
+          }
+          // Lock in: the pre-slop travel feeds the first step so the view
+          // doesn't visibly "jump the gate".
+          this.touchScrolling = true;
+          this.touchLastY = this.touchStart.y;
+        }
+        const result = touchScrollPayload(
+          { previousY: this.touchLastY, currentY: touch.clientY, clientX: touch.clientX },
+          {
+            mouseTrackingMode: this.term.modes.mouseTrackingMode,
+            sgrEncoding: this.sgrMouseEncodingActive(),
+          },
+          this.screenMetrics(),
+          this.touchPartialLines,
+        );
+        // Advance even on an unmeasurable (non-consumed) step so the next
+        // measurable one resumes from the current finger position.
+        this.touchLastY = touch.clientY;
+        this.touchPartialLines = result.partial;
+        if (!result.consume) return;
+        // The drag is ours — stop the browser from panning ancestors.
+        if (e.cancelable) e.preventDefault();
+        if (result.data) this.term.input(result.data, true);
+        if (result.lines !== 0) this.term.scrollLines(result.lines);
+      },
+      // Explicitly non-passive so preventDefault() above is honored.
+      { passive: false, signal },
+    );
+    const endTouch = () => {
+      this.touchStart = null;
+      this.touchScrolling = false;
+      this.touchPartialLines = 0;
+    };
+    container.addEventListener("touchend", endTouch, { signal });
+    container.addEventListener("touchcancel", endTouch, { signal });
+
     // ResizeObserver fires on any layout-affecting change (window
     // resize, font load, CSS class change). tmux deduplicates same-
     // size events server-side, so no throttle needed here.
@@ -731,7 +907,12 @@ export class TerminalSession {
    * Safe to call at any point after construction.
    */
   setTheme(isDark: boolean): void {
-    this.term.options.theme = terminalTheme(isDark);
+    this.term.options.theme = this.theme(isDark);
+  }
+
+  private theme(isDark: boolean): ITheme {
+    const theme = terminalTheme(isDark);
+    return this.codexPalette ? codexTerminalTheme(theme, isDark) : theme;
   }
 
   /** Enable clipboard bridging only for the visible, interactive surface. */

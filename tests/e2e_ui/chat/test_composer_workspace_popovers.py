@@ -117,7 +117,7 @@ def test_composer_workspace_labels_use_available_width(
     font_size: int,
     long_labels: bool,
 ) -> None:
-    """Names fit wide bars while long labels truncate without crowding the other control."""
+    """Names fit wide bars; when they can't, the bar collapses to icons, not ellipses."""
     base_url, session_id = seeded_session
     seed_committed_turn(session_id, prompt="Hello", reply="Inspect the workspace labels.")
     name = "new-composer-width" * (8 if long_labels else 1)
@@ -154,8 +154,19 @@ def test_composer_workspace_labels_use_available_width(
     controls = page.get_by_test_id("composer-workspace-controls")
     expect(controls).to_be_visible(timeout=30_000)
     expect(controls.get_by_role("button")).to_have_count(2)
-    expect(controls.locator("span.truncate")).to_have_text([name, name])
     controls.screenshot(path=tmp_path / f"labels-{viewport_width}-{font_size}.png")
+
+    # The bar shows the full names while they fit; once a name would have to
+    # truncate (long labels, or the narrow mobile bar) every chip drops to its
+    # icon instead of showing clipped text.
+    collapsed = long_labels or viewport_width == 390
+    if collapsed:
+        expect(controls).to_have_attribute("data-labels", "collapsed")
+        for label in controls.locator("span.truncate").all():
+            expect(label).to_be_hidden()
+    else:
+        expect(controls).not_to_have_attribute("data-labels", "collapsed")
+        expect(controls.locator("span.truncate")).to_have_text([name, name])
 
     dimensions = controls.evaluate(
         """bar => {
@@ -193,10 +204,11 @@ def test_composer_workspace_labels_use_available_width(
         assert button["left"] >= dimensions["left"]
         assert button["right"] <= dimensions["right"]
         assert button["bottom"] <= dimensions["bottom"]
-        assert button["labelWidth"] > 0
-        if long_labels or viewport_width == 390:
-            assert button["textWidth"] > button["labelWidth"]
+        if collapsed:
+            # Collapsed: the label is hidden, so only the icon remains.
+            assert button["labelWidth"] == 0
         else:
+            assert button["labelWidth"] > 0
             assert button["textWidth"] <= button["labelWidth"] + 1
         for icon in button["icons"]:
             assert icon["right"] - icon["left"] >= 12

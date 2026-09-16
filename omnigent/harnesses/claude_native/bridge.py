@@ -46,6 +46,7 @@ import threading
 import time
 import urllib.parse
 from collections.abc import Awaitable, Callable, Iterator, Mapping
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from http import HTTPStatus
@@ -78,6 +79,9 @@ from omnigent.tools.base import Tool, ToolContext
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS
 
 _logger = logging.getLogger(__name__)
+_INJECTION_CANCEL_EVENT: ContextVar[threading.Event | None] = ContextVar(
+    "claude_native_injection_cancel_event", default=None
+)
 
 BRIDGE_DIR_ENV_VAR = "HARNESS_CLAUDE_NATIVE_BRIDGE_DIR"
 REQUEST_SESSION_ID_ENV_VAR = "HARNESS_CLAUDE_NATIVE_REQUEST_SESSION_ID"
@@ -171,6 +175,9 @@ _MAX_CONCURRENT_MCP_REQUESTS = 64
 # ``tmux.json`` after the Claude terminal launches; the harness
 # tails it and shells out to tmux.
 _TMUX_READY_TIMEOUT_S = 30.0
+# Hard cap on waiting for a slow-booting terminal whose process is still
+# alive.
+_TMUX_READY_SLOW_BOOT_TIMEOUT_S = 180.0
 # Per-command tmux budget. 10s matches every other native bridge: a tmux
 # server starved by parallel worker boots on a large worktree can stall
 # past 5s while still healthy, and a shorter budget kills the delivery.
@@ -212,6 +219,7 @@ _MIN_TITLED_RULE_WIDTH = 20
 # input box has not mounted yet and no rule is on screen to anchor on.
 _PROMPT_SCAN_TAIL_LINES = 5
 _CLAUDE_READY_POLL_INTERVAL_S = 0.15
+_CLAUDE_LIVENESS_POLL_INTERVAL_S = 1.0
 _PASTE_SETTLE_S = 0.1  # let the TUI commit a paste before the separate submit Enter
 # How long to wait for the pasted draft to visibly land in Claude's
 # input box before sending the submit Enter. Claude Code coalesces
@@ -222,13 +230,29 @@ _PASTE_SETTLE_S = 0.1  # let the TUI commit a paste before the separate submit E
 _PASTE_COMMIT_TIMEOUT_S = 5.0
 # After the submit Enter, how long to keep checking that the draft
 # actually left the input box (re-sending Enter while it hasn't)
-# before failing loud.
-_SUBMIT_VERIFY_TIMEOUT_S = 10.0
+# before failing loud. Sized to out-wait a transiently unresponsive
+# TUI (e.g. CPU-starved at submit time): giving up after the old short
+# window failed the whole turn while the committed draft would have
+# delivered moments later. This doubles the old 10s ceiling as a
+# conservative interim value — the true recovery-time tail was never
+# measurable while that ceiling censored it (a submit that would land
+# at 20s was recorded as a 10s failure). The slow-accept log below now
+# records real recovery times, so tune this from that distribution.
+_SUBMIT_VERIFY_TIMEOUT_S = 20.0
+# How long the draft may verifiably sit unaccepted before a warning is
+# logged that the TUI is slow (delivery keeps retrying). Also the point
+# past which a recovery is logged with its elapsed time — the signal
+# used to tune _SUBMIT_VERIFY_TIMEOUT_S once the tail is observed.
+_SUBMIT_SLOW_ACCEPT_WARN_S = 10.0
 # Minimum spacing between repeated submit Enters during verification.
 # Long enough for the TUI to clear the box after a successful submit
 # (so a slow-but-successful first Enter isn't double-tapped), short
 # enough that a swallowed Enter is retried promptly.
 _SUBMIT_RETRY_INTERVAL_S = 1.0
+# Cap for the exponential backoff between repeated submit Enters. An
+# Enter sent into a stalled TUI queues in the pty and replays when it
+# recovers, so retries slow down instead of piling up there.
+_SUBMIT_RETRY_MAX_INTERVAL_S = 8.0
 # How long to watch for Claude Code's "Unknown command" rejection after a
 # message leading with an unrecognized slash command was submitted
 # unescaped. The rejection prints within ~1s of the swallowed submit and
@@ -422,6 +446,26 @@ class ClaudePromptTimeout(RuntimeError):
     """Claude Code's input box did not render before delivery timed out."""
 
 
+class ClaudeInjectionCancelled(RuntimeError):
+    """The caller cancelled delivery before the injection worker finished."""
+
+
+@contextlib.contextmanager
+def cancellable_injection(cancel_event: threading.Event) -> Iterator[None]:
+    """Bind a cancellation flag inherited by this delivery's ``asyncio.to_thread`` worker."""
+    token = _INJECTION_CANCEL_EVENT.set(cancel_event)
+    try:
+        yield
+    finally:
+        _INJECTION_CANCEL_EVENT.reset(token)
+
+
+def _check_injection_cancelled() -> None:
+    cancel_event = _INJECTION_CANCEL_EVENT.get()
+    if cancel_event is not None and cancel_event.is_set():
+        raise ClaudeInjectionCancelled("Claude Code message delivery was cancelled")
+
+
 class TmuxSessionNotAdvertised(RuntimeError):
     """The bridge's tmux target was not advertised before the deadline."""
 
@@ -490,6 +534,15 @@ def _trusted_parent_for_bridge_dir(target: Path) -> Path:
     cursor_root = _absolute_syntactic_path(cursor_bridge_root())
     if target.is_relative_to(cursor_root):
         return _absolute_syntactic_path(cursor_root.parent.parent)
+
+    from omnigent.harnesses.devin_native.bridge import bridge_root as devin_bridge_root
+
+    devin_root = _absolute_syntactic_path(devin_bridge_root())
+    if target.is_relative_to(devin_root):
+        # Same shape as cursor-native ($TMPDIR/omnigent-<uid>/devin-native): trust
+        # the uid-scoped temp dir's parent and validate/chmod the two
+        # bridge-owned directories below it.
+        return _absolute_syntactic_path(devin_root.parent.parent)
 
     from omnigent.harnesses.antigravity_native.bridge import bridge_root as antigravity_bridge_root
 
@@ -564,8 +617,8 @@ def _trusted_parent_for_bridge_dir(target: Path) -> Path:
     raise RuntimeError(
         f"bridge dir {target!s} is not under an allowed bridge root "
         f"({claude_root!s}, {codex_root!s}, {pi_root!s}, {cursor_root!s}, "
-        f"{antigravity_root!s}, {qwen_root!s}, {hermes_root!s}, {opencode_root!s}, "
-        f"{kiro_root!s}, {acp_root!s}, {router_root!s})"
+        f"{devin_root!s}, {antigravity_root!s}, {qwen_root!s}, {hermes_root!s}, "
+        f"{opencode_root!s}, {kiro_root!s}, {acp_root!s}, {router_root!s})"
     )
 
 
@@ -3634,6 +3687,10 @@ def inject_user_message(
     :param content: User text from the Omnigent web UI. Must be non-empty.
     :param timeout_s: Seconds to wait for each readiness gate
         (``tmux.json`` advertised, then prompt rendered), e.g. ``30.0``.
+        The prompt-rendered gate extends past this budget while the
+        terminal's process is verifiably alive but still booting (see
+        :func:`_wait_for_claude_prompt_ready`), so a slow host connect
+        delivers the message late instead of dropping it.
     :returns: None.
     :raises RuntimeError: If the tmux target is not advertised in time,
         if Claude's input prompt never renders, if a ``tmux send-keys``
@@ -3797,20 +3854,70 @@ def _paste_and_submit(
     # after the burst, so it submits). Each Enter only fires while the
     # draft is verifiably still present, so a retry can never hit an
     # empty prompt or a permission dialog of the started turn.
-    deadline = time.monotonic() + _SUBMIT_VERIFY_TIMEOUT_S
-    last_enter = time.monotonic()
-    while time.monotonic() < deadline:
-        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
-        pane = _capture_pane(socket_path, tmux_target)
-        if not _draft_in_input_box(pane, needle):
-            return
-        if time.monotonic() - last_enter >= _SUBMIT_RETRY_INTERVAL_S:
-            _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
-            last_enter = time.monotonic()
+    if _verify_submit_accepted(socket_path, tmux_target, needle=needle, what="submitted message"):
+        return
     raise RuntimeError(
         f"Claude Code did not accept the submitted message within {_SUBMIT_VERIFY_TIMEOUT_S}s "
         "(the draft is still in the input box). The message was not delivered."
     )
+
+
+def _verify_submit_accepted(
+    socket_path: str,
+    tmux_target: str,
+    *,
+    needle: str,
+    what: str,
+) -> bool:
+    """
+    Wait for a submitted draft to leave the input box, re-sending Enter.
+
+    A transiently unresponsive TUI (a CPU-starved host, a long paste
+    burst) can take tens of seconds to process the submit while the
+    committed draft sits visibly in the box. Failing at a short fixed
+    window turned that recoverable slowness into a failed turn with the
+    message dropped, so this wait out-lasts realistic starvation: a
+    warning is logged once at :data:`_SUBMIT_SLOW_ACCEPT_WARN_S`, the
+    Enter retries back off exponentially (each retry into a stalled TUI
+    queues in the pty and replays on recovery, so fewer is safer), and
+    only after :data:`_SUBMIT_VERIFY_TIMEOUT_S` does the caller fail.
+
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :param needle: Draft marker from :func:`_submit_needle`.
+    :param what: Label for log lines, e.g. ``"submitted message"``.
+    :returns: ``True`` when the draft left the input box (accepted),
+        ``False`` when it is still there after the full window.
+    """
+    start = time.monotonic()
+    last_enter = start
+    retry_interval = _SUBMIT_RETRY_INTERVAL_S
+    warned = False
+    while time.monotonic() - start < _SUBMIT_VERIFY_TIMEOUT_S:
+        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+        if not _draft_in_input_box(_capture_pane(socket_path, tmux_target), needle):
+            if warned:
+                _logger.info(
+                    "claude-native: %s accepted after %.1fs of an unresponsive TUI",
+                    what,
+                    time.monotonic() - start,
+                )
+            return True
+        now = time.monotonic()
+        if not warned and now - start >= _SUBMIT_SLOW_ACCEPT_WARN_S:
+            warned = True
+            _logger.warning(
+                "claude-native: %s not accepted after %.0fs (the draft is "
+                "still in the input box); retrying for up to %.0fs",
+                what,
+                _SUBMIT_SLOW_ACCEPT_WARN_S,
+                _SUBMIT_VERIFY_TIMEOUT_S,
+            )
+        if now - last_enter >= retry_interval:
+            _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+            last_enter = now
+            retry_interval = min(retry_interval * 2, _SUBMIT_RETRY_MAX_INTERVAL_S)
+    return False
 
 
 def _count_unknown_command_rejections(pane: str, needle: str) -> int:
@@ -4031,18 +4138,9 @@ def inject_slash_command(
         # or our own confirm dialog (the intended answer), never a foreign
         # surface. The command leaving the box is the submit signal; the
         # dialog replacing the composer counts, since submission pops it.
-        deadline = time.monotonic() + _SUBMIT_VERIFY_TIMEOUT_S
-        last_enter = time.monotonic()
-        submitted = False
-        while time.monotonic() < deadline:
-            time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
-            if not _draft_in_input_box(_capture_pane(socket_path, tmux_target), needle):
-                submitted = True
-                break
-            if time.monotonic() - last_enter >= _SUBMIT_RETRY_INTERVAL_S:
-                _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
-                last_enter = time.monotonic()
-        if not submitted:
+        if not _verify_submit_accepted(
+            socket_path, tmux_target, needle=needle, what="slash command"
+        ):
             raise RuntimeError(
                 f"Claude Code did not accept the slash command within "
                 f"{_SUBMIT_VERIFY_TIMEOUT_S}s (the command is still in the "
@@ -4627,6 +4725,7 @@ def _run_tmux(socket_path: str, *args: str) -> None:
     """
     import subprocess
 
+    _check_injection_cancelled()
     cmd = ["tmux", "-S", socket_path, *args]
     try:
         proc = subprocess.run(
@@ -4658,6 +4757,7 @@ def _capture_pane(socket_path: str, tmux_target: str) -> str:
     """
     import subprocess
 
+    _check_injection_cancelled()
     try:
         proc = subprocess.run(
             ["tmux", "-S", socket_path, "capture-pane", "-t", tmux_target, "-p"],
@@ -4669,6 +4769,46 @@ def _capture_pane(socket_path: str, tmux_target: str) -> str:
     except (subprocess.SubprocessError, OSError):
         return ""
     return proc.stdout if proc.returncode == 0 else ""
+
+
+def _claude_pane_alive(socket_path: str, tmux_target: str) -> bool | None:
+    """
+    Report whether the Claude pane's process is still running.
+
+    ``keep_alive_after_exit`` retains dead panes, so check ``#{pane_dead}``
+    rather than pane existence. An unanswered probe is inconclusive: a
+    busy tmux server must not prematurely end the slow-boot wait.
+
+    :param socket_path: Absolute path to the tmux socket, e.g.
+        ``"/tmp/.../tmux.sock"``.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :returns: ``True`` when tmux affirms the pane's process is alive,
+        ``False`` when tmux affirms it exited or rejects the query, and
+        ``None`` when the probe went unanswered.
+    """
+    import subprocess
+
+    _check_injection_cancelled()
+    try:
+        proc = subprocess.run(
+            [
+                "tmux",
+                "-S",
+                socket_path,
+                "display-message",
+                "-p",
+                "-t",
+                tmux_target,
+                "#{pane_dead}",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=_TMUX_SEND_TIMEOUT_S,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    return proc.returncode == 0 and proc.stdout.strip() == "0"
 
 
 def claude_pane_ready(bridge_dir: Path) -> bool:
@@ -5059,17 +5199,23 @@ def _wait_for_claude_prompt_ready(
     :param socket_path: Absolute path to the tmux socket, e.g.
         ``"/tmp/.../tmux.sock"``.
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
-    :param timeout_s: Seconds to wait for the prompt, e.g. ``30.0``.
+    :param timeout_s: Base readiness budget, e.g. ``30.0``. A live pane or
+        unanswered liveness probe extends the wait to
+        :data:`_TMUX_READY_SLOW_BOOT_TIMEOUT_S`; a dead pane or rejected
+        query ends the wait at the next liveness check.
     :returns: None.
-    :raises ClaudePromptTimeout: If the prompt never renders within
-        *timeout_s* (Claude failed to boot). The message carries a poll
+    :raises ClaudePromptTimeout: If the prompt never renders in time
+        (Claude failed to boot, or a slow boot outlasted even the hard
+        cap). The message carries the seconds actually waited, a poll
         count, how many of those polls saw an empty capture, and the tail
         of the last non-empty capture the loop actually observed (see
         :func:`_format_terminal_failure_tail`) so the true failure mode —
         a startup crash, a torn/empty capture under a mid-turn repaint, or
         a box that never appeared — is diagnosable from the error alone.
     """
-    deadline = time.monotonic() + timeout_s
+    started = time.monotonic()
+    next_liveness_probe = started + timeout_s
+    hard_deadline = started + max(timeout_s, _TMUX_READY_SLOW_BOOT_TIMEOUT_S)
     polls = 0
     empty_polls = 0
     # Keep the last non-empty capture the loop actually saw, not a fresh
@@ -5082,6 +5228,7 @@ def _wait_for_claude_prompt_ready(
     # Poll at least once even at timeout_s=0: a single readiness check is
     # still meaningful, and it guarantees a capture to attach on failure.
     while True:
+        _check_injection_cancelled()
         pane = _capture_pane(socket_path, tmux_target)
         polls += 1
         if pane.strip():
@@ -5090,16 +5237,22 @@ def _wait_for_claude_prompt_ready(
             empty_polls += 1
         if _claude_prompt_rendered(pane):
             return
-        if time.monotonic() >= deadline:
+        now = time.monotonic()
+        if now >= hard_deadline:
             break
+        if now >= next_liveness_probe:
+            if _claude_pane_alive(socket_path, tmux_target) is False:
+                break
+            next_liveness_probe = time.monotonic() + _CLAUDE_LIVENESS_POLL_INTERVAL_S
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
     # Timed out. The poll/empty-capture counts separate the failure modes:
     # mostly-empty captures point at a torn read under a busy repaint (the
     # session is alive but capture-pane came back blank); non-empty captures
     # with no box point at Claude never rendering the prompt (a boot crash,
     # e.g. a ``JSON Parse error``, whose text the tail then surfaces).
+    waited_s = time.monotonic() - started
     raise ClaudePromptTimeout(
-        f"Claude Code terminal did not become ready within {timeout_s}s "
+        f"Claude Code terminal did not become ready within {waited_s:.1f}s "
         f"(input prompt never rendered in {polls} polls, "
         f"{empty_polls} empty captures). The message was not delivered."
         + _format_terminal_failure_tail(last_nonempty)
@@ -5160,6 +5313,7 @@ def _wait_for_tmux_info(bridge_dir: Path, *, timeout_s: float) -> dict[str, str]
     deadline = time.monotonic() + timeout_s
     path = bridge_dir / _TMUX_FILE
     while time.monotonic() < deadline:
+        _check_injection_cancelled()
         payload = _read_json_file(path)
         socket_path = payload.get("socket_path") if isinstance(payload, dict) else None
         tmux_target = payload.get("tmux_target") if isinstance(payload, dict) else None

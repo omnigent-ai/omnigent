@@ -52,6 +52,8 @@ const CONVERSATION_STATE_KEY_MAP: Record<keyof ConversationState, true> = {
   gitBranch: true,
   todos: true,
   skills: true,
+  skillsStatus: true,
+  skillsEventVersion: true,
   codexModelOptions: true,
   terminalPending: true,
   viewers: true,
@@ -65,6 +67,7 @@ const CONVERSATION_STATE_KEY_MAP: Record<keyof ConversationState, true> = {
   pendingRetryStableId: true,
   sendLatchedAt: true,
   historyGeneration: true,
+  awaitingSideChatFor: true,
 };
 
 const CONVERSATION_STATE_KEYS = new Set<string>(Object.keys(CONVERSATION_STATE_KEY_MAP));
@@ -119,6 +122,8 @@ export function createInitialConversationState(): ConversationState {
     gitBranch: null,
     todos: [],
     skills: [],
+    skillsStatus: null,
+    skillsEventVersion: 0,
     codexModelOptions: [],
     terminalPending: false,
     viewers: [],
@@ -132,5 +137,6 @@ export function createInitialConversationState(): ConversationState {
     pendingRetryStableId: null,
     sendLatchedAt: null,
     historyGeneration: 0,
+    awaitingSideChatFor: null,
   };
 }

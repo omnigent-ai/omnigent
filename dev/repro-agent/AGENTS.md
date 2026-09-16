@@ -24,6 +24,22 @@ proving the fix with a before/after test transition — is a separate step; it
 consumes your session (the reconstructed journey, the e2e test, and your notes)
 as its input. You produce a live-confirmed reproduction + the test, and hand off.
 
+## Code comments
+
+Default to no added comments. Add one only to explain a non-obvious constraint
+or reason the code cannot express clearly. Use one short sentence, normally one
+line and at most two. Do not narrate setup, operations, or assertions; repeat
+test names; or duplicate nearby explanations. Keep investigation history in the
+handoff or PR description. Apply the same standard to test docstrings.
+
+Code changes rapidly. Omit comments likely to become misleading as the
+implementation evolves. Keep necessary comments next to the code they describe,
+and update or remove them in the same change whenever that code's behavior or
+assumptions change.
+
+Before handing off or committing, remove redundant or stale comments from the
+deliverable, including tests carried over from repro.
+
 ## Input contract
 
 You are invoked with **just the bug** — reproducing it is your job, so the
@@ -99,10 +115,13 @@ Your first turn is a fixed checklist — do all of it before Step 1:
    note that and carry on — it is not a reproduction failure. When `public` is
    absent or false (the default), skip this — do not call `sys_session_share`.
 2. **Confirm the workspace** (see above) and that you can reach the app and your
-   tooling with one `sys_os_shell` / tool check: the browser tools
-   (`browser_navigate` / `browser_snapshot` / `browser_click` / `browser_type`)
-   for UI journeys, and `sys_session_*` / HTTP for backend journeys. Confirm you
-   can read the report: `gh` is available for a GitHub issue, or a Linear key
+   tooling with one `sys_os_shell` / tool check: Playwright for headless web UI
+   journeys (including CI), and `sys_session_*` / HTTP for backend journeys.
+   The `browser_*` tools control the Omnigent desktop app's embedded browser;
+   their presence in your tool list does not mean a desktop is connected.
+   In headless CI, do not call them, including as a preflight probe. A missing
+   desktop renderer is expected and does not block the Playwright lane.
+   Confirm you can read the report: `gh` is available for a GitHub issue, or a Linear key
    (`LINEAR_API_KEY` or `DATABRICKS_LINEAR_API_KEY`) is set for a Linear ticket
    (if it isn't, stop and report an infrastructure/configuration failure without
    emitting a verdict handoff; the workflow must retry it). Also note — without failing —
@@ -261,17 +280,30 @@ Drive the running app through the journey and **observe the failure yourself**.
 Do this for **each** sub-symptom you enumerated in Step 1 — reproduce them
 independently, because a compound bug can be partly fixed:
 
-- **UI bugs** — use the browser tools to navigate the app, click/type through the
-  reconstructed steps, and `browser_snapshot` the state that shows the failure
-  (e.g. a missing picker, a wrong value, an error toast). The browser tools drive
-  the desktop app's embedded browser, so a UI-journey reproduction expects a
-  desktop / embedded-browser context; if you have no browser pane to drive, say
-  so and fall back to the backend path. If no valid lane is available, report an
-  operational failure without a verdict handoff so the workflow retries; missing
-  browser/tool access is not `needs_more_info`.
+- **UI bugs** — in headless runs, including CI, script and execute the user
+  journey with Playwright using `tests/e2e_ui/` fixtures. Navigate the real SPA,
+  click/type through the reported steps, and capture the visible failure with
+  assertions and screenshots. Follow the environment-fidelity rules above when
+  choosing fixtures; a desktop-only failure is not confirmed by a web stand-in.
+  For a local session with a connected Omnigent desktop browser, you may instead
+  use `browser_navigate`, `browser_snapshot`, `browser_click`, and `browser_type`.
+  If a call reports `no browser renderer is connected`, stop calling that tool
+  family and use Playwright; retrying cannot attach a desktop. Missing desktop
+  access alone is not a reason to replace a UI journey with a backend probe or
+  report an infrastructure failure. If no valid lane can reach the reported
+  surface, name the blocker and follow the verdict and environment-fidelity
+  rules above.
 - **Backend/behavioral bugs** — create a session and drive turns via
   `sys_session_*`, or exercise the server's HTTP API directly, and capture the
   bad response / traceback / exit.
+
+**Inspect screenshots as images.** Do not use `browser_navigate` with a
+`file://` URL to inspect CI artifacts: it targets the desktop browser, not the
+CI filesystem. Use an available image-capable tool to view the saved screenshot.
+If none is available, preserve the image for review, use Playwright DOM/layout
+assertions for what they can establish, and state that visual inspection was
+unavailable. Image dimensions, file metadata, and successful screenshot capture
+alone do not establish that the UI looks correct.
 
 Reach for the real trigger, not the internal function it flows into. If the
 journey depends on a precondition your environment lacks (an online host for a
@@ -401,7 +433,7 @@ leaked runner env), and the per-surface mechanics (`web` / `mobile` / `terminal`
 - a **`reproduced`** facet → **before-fix footage** (`kind: "before"`): use the
   authored test to drive and verify the failure, but film only the product surface
   and the user-visible bug (e.g. `recordings/1234/before-picker.webm`). Never film
-  pytest, assertion output, logs, or the test source.
+  pytest, assertion output, or the test source.
 - an **`already_fixed`** facet → **proof-it-works footage** (`kind: "fixed"`): use
   the same test to drive and verify the passing journey, while the video shows only
   the product behaving correctly (e.g. `recordings/1234/fixed-picker.webm`).
@@ -409,12 +441,18 @@ leaked runner env), and the per-surface mechanics (`web` / `mobile` / `terminal`
 `not_reproduced` and `needs_more_info` facets have nothing to film — skip them.
 Name the clip `<before|fixed>-<facet>.<ext>` when you move it to a stable path.
 
-A clip must show a **live action producing the outcome** — a command executing
-and printing, a screen changing — never static text on screen asserting the bug.
-When a facet's whole user-visible outcome is a static piece of text (an error
-line, a value) with nothing to watch, do **not** manufacture a video of it: keep
-`recordings: []` and state the observed text in your evidence, per
-`dev/recording-lanes.md`.
+Follow these rules for each clip:
+
+- Show the user action and the product's response.
+- For CLI or terminal output, record the real command and its output, even if
+  only an error message changes. For example, run `omnigent host` with an
+  expired login and capture the error it prints.
+- For internal/API-only results with no visible user interaction, written
+  evidence is enough. Set `recordings: []` and describe the result in `evidence`.
+- If recording is blocked by missing tools or an environment that cannot run
+  the journey, set `recordings: []` and name the specific blocker in
+  `recording_unavailable_reason`. Do not block the verdict because footage is
+  missing or rejected; explain the gap and continue.
 
 ## Output — the reproduction artifacts
 
@@ -548,13 +586,14 @@ Field meanings:
   of the surface-appropriate values in `dev/recording-lanes.md`. Keep an
   authored-but-unrendered VHS tape in the artifact, but do not declare it as a
   recording. Empty list when nothing valid was recorded.
-- `recording_unavailable_reason` — empty when every expected clip is present;
-  otherwise the concrete per-surface tooling or reachability blocker. For a bug
-  whose outcome is purely textual — an `api` facet, or a facet whose user-visible
-  result is just a static error line or value with nothing to watch — say the
-  evidence is textual and put the observed text in `evidence`; `recordings: []` is
-  correct and not a blocker. Never substitute a synthetic fallback or test-runner
-  video.
+- `recording_unavailable_reason` — leave empty when every expected clip is
+  present. Otherwise explain each missing clip:
+
+  - For internal/API-only results, say there is no visible user interaction
+    and put the written evidence in `evidence`.
+  - For a recording failure, name the missing tool or the environment problem.
+    Text-only CLI output is not a reason to skip recording.
+  - Do not substitute a video of test output or a made-up demonstration.
 
 Keep the prose before the block terse — the one exception is the full test
 source, which you paste in full. You produce the live-confirmed reproduction +
