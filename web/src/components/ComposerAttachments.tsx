@@ -6,10 +6,10 @@ import { ZoomableImage } from "@/components/ImageLightbox";
 import { cn } from "@/lib/utils";
 
 /**
- * Pending (pre-send) attachments shown under the composer textarea. Follows
- * Slack's pattern: images render as square thumbnails you can click to view
- * full-screen (via the shared lightbox), other files as a horizontal row with
- * name and type. Shared by the chat composer and the new-chat dialog.
+ * Pending (pre-send) attachments shown under the composer textarea. Images
+ * render as square thumbnails you can click to view full-screen (via the
+ * shared lightbox); other files render as a card showing the name with its
+ * type and size. Shared by the chat composer and the new-chat dialog.
  */
 export function ComposerAttachments({
   files,
@@ -22,12 +22,20 @@ export function ComposerAttachments({
 }) {
   if (files.length === 0) return null;
   return (
-    <div className={cn("flex flex-wrap items-start gap-1.5 px-4 pb-2", className)}>
+    <div className={cn("flex flex-wrap items-start gap-2 px-4 pb-2", className)}>
       {files.map((file, i) => (
         <AttachmentTile key={attachmentKey(file)} file={file} onRemove={() => onRemove(i)} />
       ))}
     </div>
   );
+}
+
+/** Human-readable file size, e.g. 6815744 -> "6.5 MB". */
+export function formatFileSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  const kb = bytes / 1024;
+  if (kb < 1024) return `${Math.round(kb)} KB`;
+  return `${(kb / 1024).toFixed(1)} MB`;
 }
 
 /** Blob URL for an image preview, created and revoked inside one effect so the
@@ -55,7 +63,7 @@ function AttachmentTile({ file, onRemove }: { file: File; onRemove: () => void }
 
   if (isImage) {
     return (
-      <div className="relative size-16 shrink-0 overflow-hidden rounded-md border border-border bg-muted">
+      <div className="relative size-16 shrink-0 overflow-hidden rounded-lg border border-border bg-muted">
         <ZoomableImage src={url} alt={name} className="size-16 object-cover" />
         <RemoveButton
           name={name}
@@ -66,16 +74,21 @@ function AttachmentTile({ file, onRemove }: { file: File; onRemove: () => void }
     );
   }
 
-  const ext = name.includes(".") ? name.slice(name.lastIndexOf(".") + 1).toUpperCase() : "";
+  const ext = name.includes(".") ? name.slice(name.lastIndexOf(".") + 1).toUpperCase() : "FILE";
+  const meta = `${ext} · ${formatFileSize(file.size)}`;
   return (
-    <span className="flex items-center gap-1.5 rounded-md border border-border bg-muted px-2 py-1 text-sm text-muted-foreground">
-      <FileTextIcon className="size-4 shrink-0" />
-      <span className="max-w-[160px] truncate">{name}</span>
-      {ext && <span className="shrink-0 text-xs opacity-70">{ext}</span>}
+    <span className="flex h-16 max-w-[18rem] items-center gap-2.5 rounded-lg border border-border bg-background px-2.5">
+      <span className="grid size-9 shrink-0 place-items-center rounded-md bg-muted text-muted-foreground">
+        <FileTextIcon className="size-4" />
+      </span>
+      <span className="flex min-w-0 flex-col">
+        <span className="truncate text-sm font-medium text-foreground">{name}</span>
+        <span className="text-xs text-muted-foreground">{meta}</span>
+      </span>
       <RemoveButton
         name={name}
         onRemove={onRemove}
-        className="ml-0.5 rounded-full hover:text-foreground"
+        className="ml-1 shrink-0 rounded-full text-muted-foreground hover:text-foreground"
       />
     </span>
   );

@@ -1,6 +1,6 @@
 // Pending composer attachments: images render as clickable thumbnails, other
-// files as a name+type row, and the blob URL backing an image thumbnail is
-// revoked on unmount.
+// files as a name/type/size card, and the blob URL backing an image thumbnail
+// is revoked on unmount.
 
 import { StrictMode } from "react";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
@@ -9,7 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 vi.mock("@/lib/host", () => ({ getEmbedRoot: () => null }));
 
 import { ImageLightboxProvider } from "./ImageLightbox";
-import { ComposerAttachments } from "./ComposerAttachments";
+import { ComposerAttachments, formatFileSize } from "./ComposerAttachments";
 
 const revoke = vi.fn();
 
@@ -43,10 +43,10 @@ describe("ComposerAttachments", () => {
     expect(img).toHaveAttribute("src", "blob:mock");
   });
 
-  it("shows a non-image file as a name + type row (no thumbnail)", () => {
+  it("shows a non-image file as a card with name, type, and size (no thumbnail)", () => {
     renderList([new File([new Uint8Array(4)], "notes.txt", { type: "text/plain" })]);
     expect(screen.getByText("notes.txt")).toBeInTheDocument();
-    expect(screen.getByText("TXT")).toBeInTheDocument();
+    expect(screen.getByText("TXT · 4 B")).toBeInTheDocument();
     expect(screen.queryByRole("img")).toBeNull();
   });
 
@@ -86,5 +86,13 @@ describe("ComposerAttachments", () => {
     // Creating the URL in an effect (not in render) keeps the committed <img>'s
     // URL from being revoked by StrictMode's mount → cleanup → remount cycle.
     expect(revoke).not.toHaveBeenCalledWith(src);
+  });
+});
+
+describe("formatFileSize", () => {
+  it("formats bytes, KB, and MB", () => {
+    expect(formatFileSize(512)).toBe("512 B");
+    expect(formatFileSize(2048)).toBe("2 KB");
+    expect(formatFileSize(6_815_744)).toBe("6.5 MB");
   });
 });
