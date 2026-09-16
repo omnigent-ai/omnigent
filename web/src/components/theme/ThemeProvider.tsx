@@ -5,13 +5,15 @@ import { setThemeSource } from "@/lib/nativeBridge";
 /**
  * Mirrors the in-app theme selection onto native shell chrome. Renders nothing.
  */
-function NativeThemeSync() {
-  const { theme } = useTheme();
+export function NativeThemeSync() {
+  const { theme, forcedTheme } = useTheme();
+  // Managed embeds follow the host's theme instead of the saved user preference.
+  const themeSource = forcedTheme ?? theme;
   useEffect(() => {
-    if (theme === "light" || theme === "dark" || theme === "system") {
-      setThemeSource(theme);
+    if (themeSource === "light" || themeSource === "dark" || themeSource === "system") {
+      setThemeSource(themeSource);
     }
-  }, [theme]);
+  }, [themeSource]);
   return null;
 }
 

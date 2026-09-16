@@ -2,11 +2,12 @@ import type { ReactNode } from "react";
 import { cleanup, render } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { ThemeProvider } from "./ThemeProvider";
+import { NativeThemeSync, ThemeProvider } from "./ThemeProvider";
 
 const themeState = vi.hoisted(() => ({
   setThemeSource: vi.fn(),
   theme: "system" as string | undefined,
+  forcedTheme: undefined as string | undefined,
 }));
 
 vi.mock("@/lib/nativeBridge", () => ({
@@ -15,12 +16,13 @@ vi.mock("@/lib/nativeBridge", () => ({
 
 vi.mock("next-themes", () => ({
   ThemeProvider: ({ children }: { children: ReactNode }) => children,
-  useTheme: () => ({ theme: themeState.theme }),
+  useTheme: () => ({ theme: themeState.theme, forcedTheme: themeState.forcedTheme }),
 }));
 
 beforeEach(() => {
   themeState.setThemeSource.mockClear();
   themeState.theme = "system";
+  themeState.forcedTheme = undefined;
 });
 
 afterEach(cleanup);
@@ -39,5 +41,27 @@ describe("ThemeProvider native theme sync", () => {
     rerender(<ThemeProvider>content</ThemeProvider>);
 
     expect(themeState.setThemeSource).toHaveBeenCalledWith("light");
+  });
+
+  it("uses the managed host's theme instead of the saved standalone preference", () => {
+    themeState.theme = "light";
+    themeState.forcedTheme = "dark";
+    const { rerender } = render(<NativeThemeSync />);
+
+    expect(themeState.setThemeSource).toHaveBeenLastCalledWith("dark");
+
+    themeState.theme = "dark";
+    themeState.forcedTheme = "light";
+    rerender(<NativeThemeSync />);
+
+    expect(themeState.setThemeSource).toHaveBeenLastCalledWith("light");
+  });
+
+  it("syncs the managed theme before the saved preference loads", () => {
+    themeState.theme = undefined;
+    themeState.forcedTheme = "dark";
+    render(<NativeThemeSync />);
+
+    expect(themeState.setThemeSource).toHaveBeenCalledWith("dark");
   });
 });

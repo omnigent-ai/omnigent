@@ -27,6 +27,7 @@ import { QueryClient, QueryClientProvider, useQueryClient } from "@tanstack/reac
 import { ThemeProvider as NextThemesProvider } from "next-themes";
 import { type ReactNode, useCallback, useEffect, useMemo, useState } from "react";
 import App from "./App";
+import { NativeThemeSync } from "./components/theme/ThemeProvider";
 import { TooltipProvider } from "./components/ui/tooltip";
 import { ImageLightboxProvider } from "./components/ImageLightbox";
 import { RunnerHealthProvider } from "./hooks/RunnerHealthProvider";
@@ -203,7 +204,7 @@ function OmnigentProviders({
       <div
         ref={scopeRef}
         className={isDarkMode ? "dark" : undefined}
-        style={{ height: "100%", width: "100%" }}
+        style={{ height: "100%", width: "100%", colorScheme: isDarkMode ? "dark" : "light" }}
       >
         <EmbeddedProvider>
           {/* next-themes is kept as the JS source of truth for `resolvedTheme`
@@ -217,6 +218,7 @@ function OmnigentProviders({
             enableColorScheme={false}
             disableTransitionOnChange
           >
+            <NativeThemeSync />
             <TooltipProvider>
               <ImageLightboxProvider>
                 <RoutingProvider value={routing}>
