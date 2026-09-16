@@ -102,3 +102,30 @@ def test_crash():
     assert records[0]["type"] == "plan"
     assert any(r.get("when") == "call" and r["outcome"] == "passed" for r in records)
     assert not any(r["type"] == "finish" for r in records)
+
+
+def test_parallel_pytest_is_rejected_before_touching_output(
+    pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _configure(pytester, monkeypatch)
+    pytester.makepyfile("def test_pass(): pass")
+    result = pytester.runpytest_subprocess(
+        "-q", "-p", "xdist.plugin", "-n2", f"--ui-timing-output={path}"
+    )
+    assert result.ret == pytest.ExitCode.USAGE_ERROR
+    result.stderr.fnmatch_lines(["*--ui-timing-output requires serial pytest within each shard*"])
+    assert not path.exists()
+
+
+def test_new_run_replaces_previous_timing_file(
+    pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _configure(pytester, monkeypatch)
+    path.parent.mkdir(parents=True)
+    path.write_text("stale records from an earlier run\n")
+    pytester.makepyfile("def test_pass(): pass")
+    result = pytester.runpytest_subprocess("-q", f"--ui-timing-output={path}")
+    result.assert_outcomes(passed=1)
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    assert [r["type"] for r in records] == ["plan", "phase", "phase", "phase", "finish"]
+    assert records[-1] == {"type": "finish", "exitstatus": 0}

@@ -13,10 +13,14 @@ Each file contains:
 - A `finish` record with pytest's exit status, when pytest finishes normally.
 
 Records are appended as tests run, and artifacts upload even on failure.
-Interrupted processes may leave partial records with no `finish`; inspect
-completion and coverage before treating a run as a full timing baseline.
+Interrupted processes may leave partial records with no `finish`, and the final
+JSON line may be incomplete. Inspect completion and coverage before treating a
+run as a full timing baseline.
 Reported phase durations exclude runner setup, queueing, and retry sleeps.
 Shared fixture setup/teardown is attributed to the test that triggers it.
+
+The initial `plan` record supplies the schema version for the whole file. Its
+`commit` field is `GITHUB_SHA`: on PR runs, this is the tested merge commit.
 
 Download all shard files for a specific run and attempt into a fresh directory:
 
