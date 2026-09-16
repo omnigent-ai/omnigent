@@ -464,7 +464,12 @@ jobs:
           {review_sections}
 
           Do NOT comment on code style, formatting, naming conventions, or other cosmetic issues — omit them entirely.
-          Be concise. Do not restate the diff. Focus on what matters.
+          Do not restate the diff. Focus on what matters.
+
+          **Writing style:**
+          - Keep sentences concise and to the point. Use plain words.
+          - Do not assume the reader has prior knowledge. Explain and provide context when needed.
+          - Format multiple sub-points as a list.
 
           Before labeling anything **blocking**, double-check: does this issue actually exist in the diff? Verify the problem is real and present in the changed code — not inferred, speculative, or already handled elsewhere. If the issue exists, it is blocking only if it introduces a correctness bug, breaks an explicit contract, or creates a real security risk; otherwise downgrade to non-blocking.
 
