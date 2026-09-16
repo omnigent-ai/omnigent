@@ -14,7 +14,7 @@ import math
 import os
 import time
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Literal, ParamSpec, TypeVar
@@ -25,6 +25,7 @@ _P = ParamSpec("_P")
 _R = TypeVar("_R")
 StartupEvent = Literal[
     "launch_started",
+    "host_state_observed",
     "session_resolved",
     "runner_requested",
     "runner_connected",
@@ -120,6 +121,7 @@ class _Attempt:
         *,
         session_id: str | None = None,
         exit_code: int | None = None,
+        details: Mapping[str, object] | None = None,
     ) -> None:
         if (self.attached and event != "terminal_attach_exited") or event in self.events:
             return
@@ -144,6 +146,10 @@ class _Attempt:
         }
         if exit_code is not None:
             attributes["exit_code"] = exit_code
+        if details is not None:
+            for key, value in details.items():
+                if key not in attributes:
+                    attributes[key] = value
         # This matches debug_logging's structured event seam without importing
         # its exporter on the launch path. Keep JSON for local diagnostics too.
         with contextlib.suppress(Exception):
@@ -162,12 +168,16 @@ _attempt: ContextVar[_Attempt | None] = ContextVar("startup_attempt", default=No
 
 
 def record_startup_event(
-    event: StartupEvent, *, session_id: str | None = None, exit_code: int | None = None
+    event: StartupEvent,
+    *,
+    session_id: str | None = None,
+    exit_code: int | None = None,
+    details: Mapping[str, object] | None = None,
 ) -> None:
     """Record a milestone only inside an instrumented CLI launch."""
     attempt = _attempt.get()
     if attempt is not None:
-        attempt.record(event, session_id=session_id, exit_code=exit_code)
+        attempt.record(event, session_id=session_id, exit_code=exit_code, details=details)
 
 
 @contextlib.contextmanager

@@ -17,6 +17,7 @@ from omnigent.harnesses.codex_native.bridge import (
     clear_bridge_state,
     codex_home_for_bridge_dir,
     codex_mcp_config_overrides,
+    codex_terminal_interactive,
     mcp_startup_waiting_detail,
     pending_mcp_servers,
     prepare_bridge_dir,
@@ -39,6 +40,30 @@ from omnigent.harnesses.codex_native.bridge import (
     write_codex_config_model,
     write_policy_hook_config,
 )
+
+
+def test_codex_terminal_interactive_requires_thread_and_enabled_composer(
+    bridge_dir: Path, tmp_path: Path
+) -> None:
+    """The KPI endpoint excludes pre-thread and disabled-composer frames."""
+    ready_pane = "Codex\n\n› Ask Codex to do anything\n  ? for shortcuts"
+
+    assert codex_terminal_interactive(bridge_dir, ready_pane) is False
+
+    write_bridge_state(
+        bridge_dir,
+        CodexNativeBridgeState(
+            session_id="conv_interactive",
+            socket_path="ws://127.0.0.1:1234",
+            thread_id="thread_interactive",
+            codex_home=str(tmp_path / "codex-home"),
+        ),
+    )
+
+    assert codex_terminal_interactive(bridge_dir, ready_pane) is True
+    assert codex_terminal_interactive(bridge_dir, "› Input disabled.") is False
+    assert codex_terminal_interactive(bridge_dir, "› Shutting down...") is False
+    assert codex_terminal_interactive(bridge_dir, "Codex is starting") is False
 
 
 def test_codex_mcp_config_overrides_isolate_the_bridge_interpreter(tmp_path: Path) -> None:

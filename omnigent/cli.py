@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import contextlib
+import contextvars
 import copy
 import json
 import logging
@@ -31,7 +32,7 @@ from rich.console import Console
 from rich.table import Table
 
 from omnigent._platform import IS_WINDOWS, resolve_repo_symlink
-from omnigent._startup_events import capture_cli_entry
+from omnigent._startup_events import capture_cli_entry, record_startup_event
 from omnigent.cli_common import (
     RESUME_PICKER_SENTINEL as _RESUME_PICKER_SENTINEL,
 )
@@ -3457,11 +3458,28 @@ def _ensure_host_daemon(server_url: str | None) -> bool:
         rather than continue this command mid-restart. ``False`` for a
         plain reuse, a transparent tunnel-health heal, or a first spawn.
     """
+    ensure_started_at = time.monotonic()
     target = _normalize_daemon_target(server_url)
+    existing_before = _find_daemon_record(target)
+    process_was_running = existing_before is not None and _daemon_owner_is_live(existing_before)
+
+    def _record_host_state(action: str, *, running_before: bool = process_was_running) -> None:
+        record_startup_event(
+            "host_state_observed",
+            details={
+                "host_mode": "remote" if server_url else "local",
+                "host_process_state_at_launch": "running" if running_before else "not_running",
+                "host_process_action": action,
+                "host_ensure_elapsed_ms": round((time.monotonic() - ensure_started_at) * 1000, 3),
+            },
+        )
+
     decision = _reuse_existing_daemon_record(target)
     if decision.reuse:
+        _record_host_state("reused")
         return False
     if not decision.config_changed and _local_daemon_serves_target(target, server_url):
+        _record_host_state("reused_local_daemon", running_before=True)
         return False
 
     _HOST_PID_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -3473,9 +3491,11 @@ def _ensure_host_daemon(server_url: str | None) -> bool:
     expected_host_id = _load_existing_host_id()
     spawned = _spawn_host_daemon_process(args=args, env=daemon_env)
     if spawned is None:
+        _record_host_state("start_failed")
         return False
     claimed = _wait_for_daemon_claim(target, spawned)
     if claimed is None:
+        _record_host_state("start_timeout")
         _stop_spawned_host_daemon_process(spawned)
         _delete_spawned_daemon_record(target, spawned)
         # The spawned daemon (or a concurrent winner) never wrote its record:
@@ -3487,6 +3507,7 @@ def _ensure_host_daemon(server_url: str | None) -> bool:
         )
     expected_host_id = expected_host_id or _load_existing_host_id()
     if expected_host_id is not None and claimed.host_id != expected_host_id:
+        _record_host_state("start_identity_mismatch")
         _stop_spawned_host_daemon_process(spawned)
         _delete_spawned_daemon_record(target, spawned)
         actual_host_id = claimed.host_id or "<missing>"
@@ -3496,6 +3517,13 @@ def _ensure_host_daemon(server_url: str | None) -> bool:
             "Check OMNIGENT_HOST_ID, OMNIGENT_HOST_NAME, and OMNIGENT_CONFIG_HOME. "
             f"See {spawned.log_path}."
         )
+    if claimed.pid != spawned.pid:
+        action = "started_concurrently_during_launch"
+    elif process_was_running:
+        action = "restarted_during_launch"
+    else:
+        action = "started_during_launch"
+    _record_host_state(action)
     return decision.config_changed
 
 
@@ -3752,7 +3780,8 @@ def _ensure_backend(server: str | None) -> str:
             concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool,
         ):
             auth_future = pool.submit(_ensure_databricks_server_auth, server)
-            daemon_future = pool.submit(_ensure_host_daemon, server)
+            daemon_context = contextvars.copy_context()
+            daemon_future = pool.submit(daemon_context.run, _ensure_host_daemon, server)
             # Raise auth errors before daemon errors: a login failure is
             # more actionable than a daemon-connect failure that would
             # have been caused by the same missing credentials.

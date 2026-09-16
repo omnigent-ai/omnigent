@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     from omnigent.harnesses.opencode_native.client import OpenCodeClient, OpenCodeSession
     from omnigent.harnesses.opencode_native.forwarder import OpenCodeNativeForwarder
     from omnigent.inner.datamodel import OSEnvSpec
+    from omnigent.inner.terminal import TerminalInstance
     from omnigent.runner.subagent_routing import SubagentRouter
     from omnigent.runner.turn_routing import TurnRouter
     from omnigent.spec.types import MCPServerConfig
@@ -46,7 +47,7 @@ import httpx
 from fastapi.responses import JSONResponse, Response
 
 from omnigent._platform import IS_WINDOWS, resolve_cli_binary
-from omnigent.debug_logging import runner_primary_session_id
+from omnigent.debug_logging import debug_event, runner_primary_session_id
 from omnigent.entities.session_resources import (
     SessionResourceView,
     session_resource_view_to_dict,
@@ -331,6 +332,12 @@ def _register_auto_forwarder_task(session_id: str, task: asyncio.Task[object]) -
 # they aren't garbage-collected before they run.
 _COST_POPUP_REPOP_TASKS: set[asyncio.Task[object]] = set()
 
+# One-shot readiness observers for runner-owned native terminals. Strong
+# references keep the tasks alive after session creation returns.
+_TERMINAL_INTERACTIVE_TASKS: set[asyncio.Task[None]] = set()
+_TERMINAL_INTERACTIVE_TIMEOUT_S = 180.0
+_TERMINAL_INTERACTIVE_POLL_INTERVAL_S = 0.15
+
 # Background Codex app-server instances for host-spawned codex-native
 # runners, kept referenced so they aren't garbage-collected mid-run.
 _AUTO_CODEX_APP_SERVERS: dict[str, CodexNativeAppServer] = {}
@@ -343,6 +350,109 @@ _AUTO_OPENCODE_SERVERS: dict[str, OpenCodeNativeServer] = {}
 # Bound repeated terminal GET miss logs from tight client poll loops.
 _TERMINAL_LOOKUP_MISS_LOG_INTERVAL_S = 10.0
 _terminal_lookup_miss_log_state: dict[tuple[str, str, str], float] = {}
+
+
+async def _observe_terminal_interactive(
+    *,
+    session_id: str,
+    terminal_id: str,
+    harness: str,
+    readiness_signal: str,
+    instance: TerminalInstance,
+    is_interactive: Callable[[str], bool],
+    timeout_s: float = _TERMINAL_INTERACTIVE_TIMEOUT_S,
+    poll_interval_s: float = _TERMINAL_INTERACTIVE_POLL_INTERVAL_S,
+) -> None:
+    """Emit one semantic event when a native TUI can accept a message."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_s
+    try:
+        while True:
+            result = await instance.read()
+            screen = result.get("screen")
+            if isinstance(screen, str) and is_interactive(screen):
+                _logger.info(
+                    "Native terminal became interactive: session=%s harness=%s terminal_id=%s",
+                    session_id,
+                    harness,
+                    terminal_id,
+                    extra=debug_event(
+                        "terminal_interactive",
+                        session_id=session_id,
+                        harness=harness,
+                        terminal_id=terminal_id,
+                        terminal_instance_id=instance.diagnostic_id,
+                        readiness_signal=readiness_signal,
+                    ),
+                )
+                return
+            if not instance.running:
+                raise RuntimeError("terminal stopped before becoming interactive")
+            if loop.time() >= deadline:
+                raise TimeoutError(f"terminal did not become interactive within {timeout_s:g}s")
+            await asyncio.sleep(poll_interval_s)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — observer failure must not fail session creation
+        _logger.warning(
+            "Native terminal interactivity was not observed: session=%s harness=%s "
+            "terminal_id=%s reason=%s",
+            session_id,
+            harness,
+            terminal_id,
+            str(exc),
+            extra=debug_event(
+                "terminal_interactive_unobserved",
+                session_id=session_id,
+                harness=harness,
+                terminal_id=terminal_id,
+                terminal_instance_id=instance.diagnostic_id,
+                readiness_signal=readiness_signal,
+                reason=type(exc).__name__,
+            ),
+        )
+
+
+def _schedule_terminal_interactive_observer(
+    *,
+    session_id: str,
+    resource_registry: SessionResourceRegistry,
+    terminal_name: str,
+    session_key: str,
+    harness: str,
+    readiness_signal: str,
+    is_interactive: Callable[[str], bool],
+) -> None:
+    """Start a non-blocking readiness observer for a registered terminal."""
+    terminal_registry = getattr(resource_registry, "terminal_registry", None)
+    if terminal_registry is None:
+        return
+    instance = terminal_registry.get(session_id, terminal_name, session_key)
+    if instance is None:
+        _logger.warning(
+            "Cannot observe native terminal interactivity: terminal is not registered; "
+            "session=%s harness=%s terminal=%s:%s",
+            session_id,
+            harness,
+            terminal_name,
+            session_key,
+            extra={"session_id": session_id},
+        )
+        return
+    terminal_id = terminal_resource_id(terminal_name, session_key)
+    task = asyncio.create_task(
+        _observe_terminal_interactive(
+            session_id=session_id,
+            terminal_id=terminal_id,
+            harness=harness,
+            readiness_signal=readiness_signal,
+            instance=instance,
+            is_interactive=is_interactive,
+        ),
+        name=f"terminal-interactive-{session_id}-{terminal_name}",
+    )
+    _TERMINAL_INTERACTIVE_TASKS.add(task)
+    task.add_done_callback(_TERMINAL_INTERACTIVE_TASKS.discard)
 
 
 def _terminal_lookup_miss_reason(
@@ -4965,6 +5075,17 @@ async def _auto_create_codex_terminal(
                 "resource": session_resource_view_to_dict(terminal_view),
             },
         )
+        from omnigent.harnesses.codex_native.bridge import codex_terminal_interactive
+
+        _schedule_terminal_interactive_observer(
+            session_id=session_id,
+            resource_registry=resource_registry,
+            terminal_name="codex",
+            session_key="main",
+            harness="codex-native",
+            readiness_signal="codex_composer",
+            is_interactive=lambda pane: codex_terminal_interactive(bridge_dir, pane),
+        )
     except BaseException:
         with contextlib.suppress(Exception):
             await event_client.close()
@@ -7900,6 +8021,17 @@ async def _auto_create_claude_terminal(
         bridge_id=bridge_id,
         terminal_name="claude",
         session_key="main",
+    )
+    from omnigent.harnesses.claude_native.bridge import _claude_prompt_rendered
+
+    _schedule_terminal_interactive_observer(
+        session_id=session_id,
+        resource_registry=resource_registry,
+        terminal_name="claude",
+        session_key="main",
+        harness="claude-native",
+        readiness_signal="claude_composer",
+        is_interactive=_claude_prompt_rendered,
     )
     _logger.info(
         "Claude terminal tmux target published: session=%s bridge_id=%s",
