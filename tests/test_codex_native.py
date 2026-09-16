@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import contextlib
 import json
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -16,8 +19,10 @@ import httpx
 import pytest
 import tomllib
 import yaml
+from PIL import Image
 
 from omnigent._runner_startup import RunnerStartupProgress
+from omnigent.entities import CompactionData
 from omnigent.harnesses.codex_native import app_server as codex_native_app_server
 from omnigent.harnesses.codex_native import forwarder as codex_native_forwarder
 from omnigent.harnesses.codex_native import main as codex_native
@@ -8467,8 +8472,11 @@ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_resu
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("ensure_status", [200, 503])
 async def test_prepare_codex_terminal_via_daemon_creates_runner_and_ensures_terminal(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    ensure_status: int,
 ) -> None:
     """
     Daemon preparation owns session create, runner launch, and terminal ensure.
@@ -8482,6 +8490,9 @@ async def test_prepare_codex_terminal_via_daemon_creates_runner_and_ensures_term
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
     """
+    from omnigent import _startup_events as startup
+
+    caplog.set_level("INFO", logger="omnigent.startup")
     original_async_client = httpx.AsyncClient
     calls: list[tuple[str, str, object]] = []
 
@@ -8515,7 +8526,7 @@ async def test_prepare_codex_terminal_via_daemon_creates_runner_and_ensures_term
         if request.method == "GET" and path == "/v1/runners/runner_new/status":
             return httpx.Response(200, json={"online": True})
         if request.method == "POST" and path.endswith("/resources/terminals"):
-            return httpx.Response(200, json={"id": "terminal_codex_main"})
+            return httpx.Response(ensure_status, json={"id": "terminal_codex_main"})
         if request.method == "GET" and path.endswith("/resources/terminals/terminal_codex_main"):
             return httpx.Response(
                 200,
@@ -8545,17 +8556,27 @@ async def test_prepare_codex_terminal_via_daemon_creates_runner_and_ensures_term
     monkeypatch.setattr(codex_native.httpx, "AsyncClient", client_factory)
     progress_updates: list[str] = []
 
-    prepared = await codex_native._prepare_codex_terminal_via_daemon(
-        base_url="https://example.com",
-        headers={},
-        session_id=None,
-        session_bundle=b"bundle",
-        codex_args=("--config", "approval_policy=on-request"),
-        model="gpt-5.4-mini",
-        host_id="host_local",
-        workspace="/repo",
-        startup_progress=RunnerStartupProgress(update=progress_updates.append),
+    expected_error = (
+        pytest.raises(click.ClickException) if ensure_status != 200 else contextlib.nullcontext()
     )
+    with expected_error:
+        with startup.native_startup_attempt(harness="codex-native"):
+            prepared = await codex_native._prepare_codex_terminal_via_daemon(
+                base_url="https://example.com",
+                headers={},
+                session_id=None,
+                session_bundle=b"bundle",
+                codex_args=("--config", "approval_policy=on-request"),
+                model="gpt-5.4-mini",
+                host_id="host_local",
+                workspace="/repo",
+                startup_progress=RunnerStartupProgress(update=progress_updates.append),
+            )
+    if ensure_status != 200:
+        events = [r.attributes["event"] for r in caplog.records if r.name == "omnigent.startup"]
+        assert events[-1] == "launch_failed"
+        assert "terminal_available" not in events
+        return
 
     assert prepared.session_id == "conv_new"
     assert prepared.terminal_id == "terminal_codex_main"
@@ -8590,6 +8611,23 @@ async def test_prepare_codex_terminal_via_daemon_creates_runner_and_ensures_term
         "Starting Codex terminal...",
         "Codex terminal ready.",
     ]
+
+    events = [r.attributes for r in caplog.records if r.name == "omnigent.startup"]
+    assert [e["event"] for e in events] == [
+        "launch_started",
+        "session_resolved",
+        "runner_requested",
+        "runner_connected",
+        "session_runner_bound",
+        "terminal_available",
+        "launch_incomplete",
+    ]
+    assert len({e["attempt_id"] for e in events}) == 1
+    assert all(
+        r.session_id == "conv_new"
+        for r in caplog.records
+        if r.name == "omnigent.startup" and r.attributes["event"] != "launch_started"
+    )
 
 
 @pytest.mark.asyncio
@@ -11895,6 +11933,68 @@ def test_rollout_records_includes_compacted_entry_from_compaction_item() -> None
         and r["payload"].get("content") == [{"type": "input_text", "text": "after compaction"}]
     ]
     assert len(post_items) == 1
+
+
+def test_rollout_records_downgrade_image_stripped_by_compaction_storage() -> None:
+    """A stored Responses image marker cannot poison Codex replacement history."""
+    pixels = bytes(range(256)) * 3
+    png = BytesIO()
+    Image.frombytes("RGB", (16, 16), pixels).save(png, format="PNG")
+    data_uri = f"data:image/png;base64,{base64.b64encode(png.getvalue()).decode()}"
+    messages = [
+        {
+            "type": "message",
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "before"},
+                {"type": "input_image", "image_url": data_uri, "detail": "high"},
+                {"type": "input_image", "image_url": "https://example.com/kept.png"},
+                {"type": "input_image", "file_id": "file_kept"},
+                {"type": "input_text", "text": "after"},
+            ],
+        },
+        {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "answer"}],
+        },
+    ]
+    stored = CompactionData(
+        summary="summary",
+        last_item_id="msg_before",
+        token_count=1,
+        compacted_messages=messages,
+    )
+    assert stored.compacted_messages is not None
+    stored_content = stored.compacted_messages[0]["content"]
+    assert stored_content[1]["image_url"] == (
+        "[image/png content omitted from the compaction snapshot]"
+    )
+
+    records = codex_native._codex_rollout_records_from_session_items(
+        [{"id": "cmp_image", "type": "compaction", **stored.model_dump(exclude_none=True)}],
+        session_id="conv_test",
+        external_session_id="019f-thread",
+        cwd=Path("/tmp/test"),
+        model_provider="openai",
+        cli_version="0.140.0",
+    )
+
+    history = next(record for record in records if record["type"] == "compacted")["payload"][
+        "replacement_history"
+    ]
+    assert [message["role"] for message in history] == ["user", "assistant"]
+    replayed_content = history[0]["content"]
+    assert [block["type"] for block in replayed_content] == [
+        "input_text",
+        "input_text",
+        "input_image",
+        "input_image",
+        "input_text",
+    ]
+    assert "image/png" in replayed_content[1]["text"]
+    assert replayed_content[2:] == stored_content[2:]
+    assert messages[0]["content"][1]["image_url"] == data_uri
 
 
 def test_codex_event_msg_record_ignores_non_list_content() -> None:

@@ -113,8 +113,14 @@ _ACP_RESOURCE_NOT_FOUND_CODE = -32002
 
 # ACP protocol constants (JSON-RPC 2.0 method names).
 _AGENT_METHOD_INITIALIZE = "initialize"
+_AGENT_METHOD_AUTHENTICATE = "authenticate"
 _AGENT_METHOD_SESSION_NEW = "session/new"
 _AGENT_METHOD_SESSION_PROMPT = "session/prompt"
+# Browser/device-login method ids that cannot complete on a headless sandbox.
+_ACP_INTERACTIVE_AUTH_METHODS = frozenset({"grok.com"})
+# ACP error code an agent returns when a request requires ``authenticate``
+# first (Grok Build's ``session/new`` uses it for "Authentication required").
+_ACP_AUTH_REQUIRED_CODE = -32000
 
 # Notification sent *from* the agent to the client (streaming progress).
 _CLIENT_NOTIFICATION_SESSION_UPDATE = "session/update"
@@ -137,6 +143,13 @@ _UPDATE_CONFIG_OPTION = "config_option_update"
 # not ``optionId``).
 _AGENT_METHOD_SET_CONFIG_OPTION = "session/set_config_option"
 _CONFIG_OPTION_MODEL = "model"
+
+# ACP ``session/set_model`` — the model-selection API an agent advertises by
+# returning a ``models`` object from ``session/new`` (``availableModels`` plus
+# ``currentModelId``) instead of exposing a ``model`` config option. Cline speaks
+# this shape and never sends ``config_option_update``, so an agent selected this
+# way is unreachable through ``session/set_config_option`` alone.
+_AGENT_METHOD_SET_MODEL = "session/set_model"
 
 # ACP tool-call lifecycle statuses (the terminal ones close a tool card).
 _TOOL_STATUS_COMPLETED = "completed"
@@ -178,9 +191,12 @@ class AcpAgentConfig:
         Split with :func:`shlex.split` into an argv and exec'd directly (never
         via a shell), so quoting works but ``$VAR`` / pipes / redirects do not.
     :param name: Human label for logs / elicitation cards (e.g. ``"Gemini CLI"``).
-    :param model: Optional model id. Only sent to the agent when
-        :attr:`send_model_in_session_new` is set; otherwise inert (the agent
-        takes its model from its own config or from flags in ``command``).
+    :param model: Optional model id, applied to the live session when a turn
+        carries no per-turn pick — via ``session/set_model`` for agents that
+        advertise a model catalog in ``session/new``, else via the ``model``
+        session config option. With :attr:`send_model_in_session_new` it is
+        also sent in ``session/new`` itself. Unset means the agent keeps the
+        model from its own config or from flags in ``command``.
     :param session_id_mode: ``"server"`` — the agent assigns the session id and
         we adopt it (Goose); ``"client"`` — we generate the id and send it
         (Qwen). Defaults to ``"server"``, the ACP-idiomatic shape.
@@ -297,6 +313,49 @@ def _parse_image_data_uri(data_uri: object) -> tuple[str, str] | None:
     return mime, payload
 
 
+def _is_auth_required_error(error: object) -> bool:
+    """True when a JSON-RPC error object says authentication is required.
+
+    Matches the ACP auth-required error code and, as a fallback for agents
+    that use a generic code, an "authentication required" message.
+    """
+    if not isinstance(error, dict):
+        return False
+    if error.get("code") == _ACP_AUTH_REQUIRED_CODE:
+        return True
+    message = error.get("message")
+    return isinstance(message, str) and "authentication required" in message.lower()
+
+
+def _unattended_auth_method_id(initialize_result: _AcpJsonObject) -> str | None:
+    """Pick a non-browser ACP auth method, or ``None`` if none is advertised.
+
+    Prefers ``_meta.defaultAuthMethodId`` (Grok sets this to ``cached_token``
+    when ``auth.json`` loaded) and otherwise the first method that is not a
+    known interactive login id. Entries without a string ``id`` are skipped.
+    """
+    methods = initialize_result.get("authMethods")
+    if not isinstance(methods, list) or not methods:
+        return None
+    ids = [
+        method.get("id")
+        for method in methods
+        if isinstance(method, dict) and isinstance(method.get("id"), str)
+    ]
+    meta = initialize_result.get("_meta")
+    default = meta.get("defaultAuthMethodId") if isinstance(meta, dict) else None
+    if (
+        isinstance(default, str)
+        and default in ids
+        and default not in _ACP_INTERACTIVE_AUTH_METHODS
+    ):
+        return default
+    for method_id in ids:
+        if method_id not in _ACP_INTERACTIVE_AUTH_METHODS:
+            return method_id
+    return None
+
+
 class AcpExecutor(Executor):
     """Executor that drives any ACP agent over JSON-RPC 2.0 on stdio."""
 
@@ -318,7 +377,7 @@ class AcpExecutor(Executor):
             sandbox (bwrap/seatbelt) at spawn — see :meth:`_sandbox_launch_path`.
         :param extension: Vendor behavior for the agent being driven, injected by
             that vendor's harness wrap (e.g.
-            :mod:`omnigent.inner.devin.harness`). The default is protocol-only,
+            a vendor wrap). The default is protocol-only,
             so the generic ``acp`` harness reads no vendor field.
         """
         self._config = config
@@ -365,7 +424,18 @@ class AcpExecutor(Executor):
         self._session_id: str | None = None
         self._initialized: bool = False
         self._image_supported: bool = False
+        # One-way latch per subprocess: set after a successful ACP
+        # ``authenticate``; reset on restart so a fresh process re-auths.
+        self._authenticated: bool = False
+        # ``initialize.result`` snapshot advertising auth (``authMethods`` +
+        # ``_meta.defaultAuthMethodId``); consumed only when ``session/new``
+        # actually reports that authentication is required.
+        self._auth_advertisement: _AcpJsonObject = {}
         self._system_prompt_sent: bool = False
+        # Model ids the agent listed in ``session/new.models.availableModels``.
+        # Non-empty means the agent selects models through ``session/set_model``
+        # rather than a ``model`` session config option.
+        self._session_model_ids: set[str] = set()
 
         # ACP toolCallId → tool name / rawInput from the originating tool_call, so
         # a later tool_call_update can close the right tool card, and a permission
@@ -411,6 +481,8 @@ class AcpExecutor(Executor):
         # subprocess died. ``_initialized`` is a one-way latch.
         self._initialized = False
         self._image_supported = False
+        self._authenticated = False
+        self._auth_advertisement = {}
         env = self._build_spawn_env()
         launch_path, argv = self._sandbox_launch(tuple(env.keys()))
         _STREAM_LIMIT = 16 * 1024 * 1024
@@ -681,11 +753,66 @@ class AcpExecutor(Executor):
             message = resp["error"].get("message", resp["error"])
             self._warn_initialize_failed(str(message))
             raise RuntimeError(f"ACP initialize failed: {message}")
+        result = resp.get("result") or {}
         prompt_caps = (
-            (resp.get("result") or {}).get("agentCapabilities", {}).get("promptCapabilities", {})
+            result.get("agentCapabilities", {}).get("promptCapabilities", {})
+            if isinstance(result, dict)
+            else {}
         )
         self._image_supported = bool(prompt_caps.get("image"))
+        # Stash the advertised auth methods but do NOT authenticate here:
+        # sending an unsolicited ``authenticate`` would change the handshake
+        # for every agent that advertises methods informationally (or is
+        # already authenticated via env/disk). ``_ensure_session`` reacts
+        # only when ``session/new`` actually demands authentication.
+        self._auth_advertisement = result if isinstance(result, dict) else {}
         self._initialized = True
+
+    async def _authenticate(self, method_id: str) -> None:
+        """Send ACP ``authenticate`` with *method_id* and latch success.
+
+        Called reactively from :meth:`_ensure_session` after ``session/new``
+        reports that authentication is required — never proactively, so agents
+        whose ``session/new`` already succeeds keep their handshake untouched.
+        """
+        auth_resp = await self._rpc(
+            _AGENT_METHOD_AUTHENTICATE,
+            {"methodId": method_id},
+            timeout=_INIT_TIMEOUT_SECONDS,
+        )
+        if "error" in auth_resp:
+            error = auth_resp["error"]
+            message = error.get("message", error) if isinstance(error, dict) else error
+            raise RuntimeError(f"ACP authenticate failed: {message}")
+        self._authenticated = True
+
+    async def _authenticate_and_retry_session_new(
+        self, resp: _AcpJsonObject, params: _AcpJsonObject
+    ) -> _AcpJsonObject:
+        """Authenticate with an advertised headless method and retry once.
+
+        Grok Build (``grok agent stdio``) rejects ``session/new`` with
+        ``Authentication required`` until the client sends ``authenticate``;
+        its ``_meta.defaultAuthMethodId`` (``cached_token`` when
+        ``~/.grok/auth.json`` holds a token) completes headlessly. If the
+        agent advertises only interactive/browser methods — or a malformed
+        list with no usable id — raise a clear diagnosis instead of attempting
+        a login that cannot succeed on a headless host. With no advertised
+        methods at all, return the original error untouched.
+        """
+        method_id = _unattended_auth_method_id(self._auth_advertisement)
+        if method_id is None:
+            if self._auth_advertisement.get("authMethods"):
+                error = resp["error"]
+                message = error.get("message", error) if isinstance(error, dict) else error
+                raise RuntimeError(
+                    "ACP session/new requires authentication, but the agent "
+                    "advertises no headless auth method (browser-only or "
+                    f"malformed authMethods): {message}"
+                )
+            return resp
+        await self._authenticate(method_id)
+        return await self._rpc(_AGENT_METHOD_SESSION_NEW, params, timeout=_INIT_TIMEOUT_SECONDS)
 
     async def _ensure_session(self) -> str:
         """Create (or reuse) an ACP session, returning the session id.
@@ -712,6 +839,8 @@ class AcpExecutor(Executor):
             params["model"] = self._config.model
 
         resp = await self._rpc(_AGENT_METHOD_SESSION_NEW, params, timeout=_INIT_TIMEOUT_SECONDS)
+        if "error" in resp and not self._authenticated and _is_auth_required_error(resp["error"]):
+            resp = await self._authenticate_and_retry_session_new(resp, params)
         if "error" in resp:
             raise RuntimeError(
                 f"ACP session/new failed: {resp['error'].get('message', resp['error'])}"
@@ -730,7 +859,33 @@ class AcpExecutor(Executor):
         # server unable to attribute per-model token usage for the turn.
         if isinstance(result, dict):
             self._note_config_options(result.get("configOptions"))
+            self._note_session_models(result.get("models"))
         return self._session_id
+
+    def _note_session_models(self, models: object) -> None:
+        """Record the model catalog an agent returns from ``session/new``.
+
+        Agents advertise model selection one of two ways: a ``model`` session
+        config option (see :meth:`_note_config_options`), or a ``models`` object
+        here carrying ``availableModels`` and ``currentModelId``. Agents using the
+        latter never emit ``config_option_update``, so without this their model
+        stays on the agent's own default and a ``/model`` pick is silently
+        dropped — which also leaves the agent billing whatever it defaulted to.
+
+        :param models: The ``models`` value from ``session/new``'s result.
+        """
+        if not isinstance(models, dict):
+            return
+        available = models.get("availableModels")
+        if isinstance(available, list):
+            for entry in available:
+                if isinstance(entry, dict):
+                    model_id = entry.get("modelId")
+                    if isinstance(model_id, str) and model_id:
+                        self._session_model_ids.add(model_id)
+        current = models.get("currentModelId")
+        if isinstance(current, str) and current:
+            self._active_model = current
 
     def _session_mcp_servers(self) -> list[_AcpJsonObject]:
         """Build ``session/new.mcpServers`` and snapshot the bridge aliases.
@@ -1414,7 +1569,18 @@ class AcpExecutor(Executor):
         :param session_id: The live ACP session to reconfigure.
         :param model: Requested model id, or ``None`` to leave it alone.
         """
+        # A turn carries a model only when the user picked one; fall back to the
+        # agent's configured ``model:`` so a configured id is actually applied
+        # instead of leaving the agent on its own default.
+        model = model or self._config.model
         if not model or model == self._active_model or not self._model_switch_supported:
+            return
+        # An agent that returned a model catalog from ``session/new`` selects
+        # models with ``session/set_model`` and never advertises a ``model``
+        # config option, so the config-option path below would bail out and leave
+        # it on its own default. Take the catalog route first when we have one.
+        if self._session_model_ids:
+            await self._set_model_via_catalog(session_id, model)
             return
         # Before the first ``config_option_update`` we don't know what's settable;
         # attempting is harmless because a rejection just latches the feature off.
@@ -1456,6 +1622,44 @@ class AcpExecutor(Executor):
             self._active_model = model
         logger.info(
             "acp[%s] model set to %s (transcript kept)", self._config.name, self._active_model
+        )
+
+    async def _set_model_via_catalog(self, session_id: str, model: str) -> None:
+        """Warm-switch the model with ``session/set_model``.
+
+        Used for agents that advertise a catalog in ``session/new`` rather than a
+        ``model`` config option. Like the config-option path this preserves the
+        transcript, never fails the turn, and latches the feature off on
+        rejection.
+
+        The requested id is *not* checked against ``availableModels``: that list
+        is what the agent offers interactively, and an id outside it can still be
+        valid — Cline accepts its subscription-scoped ``cline-pass/*`` ids, which
+        it does not enumerate. An unusable id comes back as an RPC error, which
+        is the authoritative answer.
+
+        :param session_id: The live ACP session to reconfigure.
+        :param model: Requested model id.
+        """
+        response = await self._rpc(
+            _AGENT_METHOD_SET_MODEL, {"sessionId": session_id, "modelId": model}
+        )
+        if "error" in response:
+            self._model_switch_supported = False
+            logger.warning(
+                "acp[%s] %s to %s rejected (%s); continuing on the current model",
+                self._config.name,
+                _AGENT_METHOD_SET_MODEL,
+                model,
+                response["error"].get("message", response["error"]),
+            )
+            return
+        self._active_model = model
+        logger.info(
+            "acp[%s] model set to %s via %s (transcript kept)",
+            self._config.name,
+            model,
+            _AGENT_METHOD_SET_MODEL,
         )
 
     async def run_turn(

@@ -6924,8 +6924,45 @@ async def test_parent_output_forwards_while_child_history_is_blocked(
             await task
 
 
+def _observe_subagent_scans(
+    monkeypatch: pytest.MonkeyPatch,
+    response_for: Callable[[dict[str, Any]], dict[str, Any]],
+) -> asyncio.Event:
+    """Record HTTP calls and signal completion of two real child-history scans."""
+    completed = asyncio.Event()
+    scans = 0
+    original = forwarder._forward_available_subagents
+
+    async def scan(**kwargs: Any) -> Any:
+        nonlocal scans
+        state = await original(**kwargs)
+        scans += 1
+        if scans >= 2:
+            completed.set()
+        return state
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content) if request.content else {}
+        response = (
+            [response_for(item) for item in body] if isinstance(body, list) else response_for(body)
+        )
+        return httpx.Response(202, json=response)
+
+    @contextlib.asynccontextmanager
+    async def open_mock_client(*_args: Any, **_kwargs: Any) -> Any:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), base_url="http://ap"
+        ) as client:
+            yield client
+
+    monkeypatch.setattr(forwarder, "_forward_available_subagents", scan)
+    monkeypatch.setattr("omnigent.cli_auth.open_server_client", open_mock_client)
+    return completed
+
+
 async def test_subagent_watcher_skips_subagents_already_in_state(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
     On forwarder restart, sub-agents already in
@@ -6985,10 +7022,10 @@ async def test_subagent_watcher_skips_subagents_already_in_state(
             return {"queued": False, "child_session_id": "conv_unexpected"}
         return {}
 
-    server, _thread, base_url = _start_recording_server_with_responses(response_for)
+    scanned = _observe_subagent_scans(monkeypatch, response_for)
     task = asyncio.create_task(
         forward_claude_transcript_to_session(
-            base_url=base_url,
+            base_url="http://ap",
             headers={},
             session_id="conv_parent",
             bridge_dir=bridge_dir,
@@ -6997,17 +7034,12 @@ async def test_subagent_watcher_skips_subagents_already_in_state(
             poll_interval_s=0.01,
         )
     )
-    # Let the forwarder run a few ticks. Long enough to scan the
-    # subagents dir at least twice; if it would re-register, we'd
-    # see the POST in ``starts`` within this window.
     try:
-        await asyncio.sleep(0.2)
+        await asyncio.wait_for(scanned.wait(), timeout=5.0)
     finally:
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
-        server.shutdown()
-        server.server_close()
 
     assert starts == [], (
         f"forwarder re-registered a sub-agent that was already in state: {starts!r}"
@@ -7016,6 +7048,7 @@ async def test_subagent_watcher_skips_subagents_already_in_state(
 
 async def test_subagent_watcher_preserves_parked_sentinel_across_restart(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
     A sub-agent that exhausted its permanent-failure budget is "parked"
@@ -7075,10 +7108,10 @@ async def test_subagent_watcher_preserves_parked_sentinel_across_restart(
             return {"queued": False, "child_session_id": "conv_should_not_be_used"}
         return {}
 
-    server, _thread, base_url = _start_recording_server_with_responses(response_for)
+    scanned = _observe_subagent_scans(monkeypatch, response_for)
     task = asyncio.create_task(
         forward_claude_transcript_to_session(
-            base_url=base_url,
+            base_url="http://ap",
             headers={},
             session_id="conv_parent",
             bridge_dir=bridge_dir,
@@ -7088,13 +7121,11 @@ async def test_subagent_watcher_preserves_parked_sentinel_across_restart(
         )
     )
     try:
-        await asyncio.sleep(0.2)
+        await asyncio.wait_for(scanned.wait(), timeout=5.0)
     finally:
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
-        server.shutdown()
-        server.server_close()
 
     assert starts == [], f"forwarder retried a parked sub-agent after restart: {starts!r}"
 
@@ -9449,7 +9480,10 @@ async def test_standalone_hook_persist_failure_holds_cursor_for_retry(
     assert after_ok.event_cursor > after_fail.event_cursor  # cursor advanced
 
 
-def test_forward_failures_escalate_to_degraded_once() -> None:
+@pytest.mark.parametrize("http_status", [None, 403, 503])
+def test_forward_failures_escalate_to_degraded_once(
+    http_status: int | None, caplog: pytest.LogCaptureFixture
+) -> None:
     """
     Sustained forward failures flip the degraded latch exactly once (#1120).
 
@@ -9458,22 +9492,45 @@ def test_forward_failures_escalate_to_degraded_once() -> None:
     re-fire per dropped item.
     """
     forwarder._reset_forward_health()
+    tracker = forwarder._PostRetryTracker()
+    request = httpx.Request("POST", "https://example.test/events?secret=private")
+    exc = (
+        httpx.ConnectError("private connection detail", request=request)
+        if http_status is None
+        else httpx.HTTPStatusError(
+            "private rejection detail",
+            request=request,
+            response=httpx.Response(http_status, request=request, text="private body"),
+        )
+    )
 
     for _ in range(forwarder._FORWARD_DEGRADED_THRESHOLD - 1):
-        forwarder._note_forward_failure("item:source-1")
+        tracker.record_failure("item:source-1", exc)
     # Below threshold: not yet degraded.
     assert forwarder._forward_health.degraded_logged is False
 
-    forwarder._note_forward_failure("item:source-1")  # crosses threshold
+    tracker.record_failure("item:source-1", exc)  # crosses threshold
     assert forwarder._forward_health.degraded_logged is True
     assert forwarder._forward_health.consecutive_failures == forwarder._FORWARD_DEGRADED_THRESHOLD
 
     # The latch holds — further failures keep counting but don't re-escalate.
-    forwarder._note_forward_failure("item:source-1")
+    tracker.record_failure("item:source-1", exc)
     assert forwarder._forward_health.degraded_logged is True
     assert (
         forwarder._forward_health.consecutive_failures == forwarder._FORWARD_DEGRADED_THRESHOLD + 1
     )
+    records = [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "claude_forward_sync_degraded"
+    ]
+    assert len(records) == 1
+    assert records[0].attributes == {
+        "exception_type": type(exc).__name__,
+        "http_status": http_status,
+    }
+    assert "private" not in records[0].getMessage()
+    assert records[0].exc_info is None
 
 
 def test_forward_success_resets_degraded_state() -> None:
@@ -9484,7 +9541,7 @@ def test_forward_success_resets_degraded_state() -> None:
     """
     forwarder._reset_forward_health()
     for _ in range(forwarder._FORWARD_DEGRADED_THRESHOLD):
-        forwarder._note_forward_failure("status:idle")
+        forwarder._note_forward_failure("status:idle", httpx.ConnectError("unreachable"))
     assert forwarder._forward_health.degraded_logged is True
 
     forwarder._note_forward_success()

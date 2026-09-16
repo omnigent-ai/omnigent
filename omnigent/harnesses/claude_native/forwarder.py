@@ -347,12 +347,13 @@ def _note_forward_success() -> None:
     _forward_health.degraded_logged = False
 
 
-def _note_forward_failure(retry_key: str) -> None:
+def _note_forward_failure(retry_key: str, exc: httpx.HTTPError) -> None:
     """
     Record a forward post failure; escalate once when sync degrades.
 
     :param retry_key: Stable retry key of the failed post, e.g.
         ``"item:source-1"``.
+    :param exc: The latest failed post's HTTP exception.
     :returns: None.
     """
     _forward_health.consecutive_failures += 1
@@ -366,6 +367,13 @@ def _note_forward_failure(retry_key: str) -> None:
             "(latest key=%s)",
             _forward_health.consecutive_failures,
             retry_key,
+            extra={
+                "event_name": "claude_forward_sync_degraded",
+                "attributes": {
+                    "exception_type": type(exc).__name__,
+                    "http_status": _http_status_for_log(exc),
+                },
+            },
         )
         _forward_health.degraded_logged = True
 
@@ -928,7 +936,7 @@ class _PostRetryTracker:
         """
         # Count every failed post (transient or permanent) so a sustained
         # outage escalates once to a degraded-sync signal (#1120).
-        _note_forward_failure(key)
+        _note_forward_failure(key, exc)
         entry = self._entries.get(key)
         if entry is None:
             entry = _PostRetryEntry()

@@ -638,6 +638,49 @@ async def test_list_session_resources_rejects_malformed_runner_response(
 
 
 @pytest.mark.asyncio
+async def test_list_session_resources_missing_session_agent_returns_typed_410(
+    client: httpx.AsyncClient,
+) -> None:
+    """A runner 410 ``session_agent_missing`` passes through typed, not as 502.
+
+    The session's bound agent was deleted or rebound — a session-lifecycle
+    condition the client resolves by recreating the agent or starting a new
+    session. The list proxy re-derives the typed 410 from the runner body's
+    error code instead of flattening the non-200 to a generic 502 gateway
+    failure, so the public contract matches the runner's classification.
+    """
+    fake_runner = _FakeRunnerClient(
+        responses={
+            "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources": (
+                410,
+                {
+                    "error": {
+                        "code": "session_agent_missing",
+                        "message": (
+                            "session spec resolver: agent 'ag_gone' for "
+                            "session 'conv_test' was not found"
+                        ),
+                    }
+                },
+            ),
+        },
+    )
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.get("/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources")
+
+    assert resp.status_code == 410
+    body = resp.json()
+    assert body["error"]["code"] == "session_agent_missing"
+    # The client-safe message must not leak the internal resolver text or
+    # the raw agent id — matching the native-terminal payload's hygiene.
+    message = body["error"]["message"]
+    assert "session spec resolver" not in message
+    assert "ag_gone" not in message
+    assert "no longer available" in message
+
+
+@pytest.mark.asyncio
 async def test_list_session_resources_local_fallback_lists_default(
     client: httpx.AsyncClient,
 ) -> None:
@@ -1224,6 +1267,49 @@ async def test_get_resource_by_id_404_from_runner(
 
     assert resp.status_code == 404
     assert resp.json()["error"]["code"] == "not_found"
+
+
+@pytest.mark.asyncio
+async def test_get_resource_by_id_missing_session_agent_returns_typed_410(
+    client: httpx.AsyncClient,
+) -> None:
+    """A runner 410 ``session_agent_missing`` passes through typed, not as 502.
+
+    The session's bound agent was deleted or rebound — a session-lifecycle
+    condition the client resolves by recreating the agent or starting a new
+    session. The GET proxy re-derives the typed 410 from the runner body's
+    error code instead of flattening the non-200 to a generic 502 gateway
+    failure, so the public contract matches the runner's classification.
+    """
+    fake_runner = _FakeRunnerClient(
+        responses={
+            "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/env_gone": (
+                410,
+                {
+                    "error": {
+                        "code": "session_agent_missing",
+                        "message": (
+                            "session spec resolver: agent 'ag_gone' for "
+                            "session 'conv_test' was not found"
+                        ),
+                    }
+                },
+            ),
+        },
+    )
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.get("/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/env_gone")
+
+    assert resp.status_code == 410
+    body = resp.json()
+    assert body["error"]["code"] == "session_agent_missing"
+    # The client-safe message must not leak the internal resolver text or
+    # the raw agent id — matching the native-terminal payload's hygiene.
+    message = body["error"]["message"]
+    assert "session spec resolver" not in message
+    assert "ag_gone" not in message
+    assert "no longer available" in message
 
 
 @pytest.mark.asyncio
@@ -3251,6 +3337,90 @@ async def test_filesystem_download_forwards_runner_errors(
 
     assert resp.status_code == runner_status
     assert resp.json()["error"] == {"code": code, "message": "nope"}
+
+
+@pytest.mark.asyncio
+async def test_filesystem_download_missing_session_agent_returns_typed_410(
+    client: httpx.AsyncClient,
+) -> None:
+    """A runner 410 ``session_agent_missing`` on download is typed and sanitized.
+
+    The session's bound agent was deleted or rebound — a session-lifecycle
+    condition. The download proxy re-derives the typed 410 with the fixed
+    client-safe message instead of forwarding the runner's raw resolver
+    text (which names the resolver and the raw agent id) verbatim.
+    """
+    runner = FastAPI()
+
+    @runner.get(_FS_ROUTE)
+    async def _serve(session_id: str, environment_id: str, relative_path: str) -> JSONResponse:
+        del session_id, environment_id, relative_path
+        return JSONResponse(
+            status_code=410,
+            content={
+                "error": {
+                    "code": "session_agent_missing",
+                    "message": (
+                        "session spec resolver: agent 'ag_gone' for "
+                        "session 'conv_test' was not found"
+                    ),
+                }
+            },
+        )
+
+    async with _runner_app_client(runner):
+        resp = await client.get(_DOWNLOAD_URL)
+
+    assert resp.status_code == 410
+    body = resp.json()
+    assert body["error"]["code"] == "session_agent_missing"
+    message = body["error"]["message"]
+    assert "session spec resolver" not in message
+    assert "ag_gone" not in message
+    assert "no longer available" in message
+
+
+@pytest.mark.asyncio
+async def test_filesystem_write_missing_session_agent_returns_typed_410(
+    client: httpx.AsyncClient,
+) -> None:
+    """A runner 410 ``session_agent_missing`` on a mutation is typed and sanitized.
+
+    Same lifecycle condition as the read/download paths: the mutation proxy
+    re-derives the typed 410 with the fixed client-safe message instead of
+    forwarding the runner's raw resolver text verbatim.
+    """
+    path = (
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default"
+        "/filesystem/new.txt"
+    )
+    fake_runner = _FakeRunnerClient(
+        responses={
+            path: (
+                410,
+                {
+                    "error": {
+                        "code": "session_agent_missing",
+                        "message": (
+                            "session spec resolver: agent 'ag_gone' for "
+                            "session 'conv_test' was not found"
+                        ),
+                    }
+                },
+            ),
+        },
+    )
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.put(path, json={"content": "hello", "encoding": "utf-8"})
+
+    assert resp.status_code == 410
+    body = resp.json()
+    assert body["error"]["code"] == "session_agent_missing"
+    message = body["error"]["message"]
+    assert "session spec resolver" not in message
+    assert "ag_gone" not in message
+    assert "no longer available" in message
 
 
 @pytest.mark.asyncio

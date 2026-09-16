@@ -77,7 +77,7 @@ export function ComposerConfigSections({
       )}
       {efforts && (
         <div data-testid={efforts.testId}>
-          <DropdownMenuSeparator />
+          {models && <DropdownMenuSeparator />}
           <PickerSectionHeader>{efforts.header}</PickerSectionHeader>
           {efforts.leading}
           <ConfigChoices choices={efforts.choices} />

@@ -5340,6 +5340,7 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
             created_at: 0,
             items: [],
             skills,
+            skills_status: "ready",
           });
         }
         return defaultFetchHandler(input, init);
@@ -5362,6 +5363,65 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
 
       expect(useChatStore.getState().skills).toEqual([
         { name: "grill-me", description: "Interview the user" },
+      ]);
+      expect(useChatStore.getState().skillsStatus).toBe("ready");
+    });
+
+    it.each([{ skills: [] }, { skills: [{ name: "review", description: "Review code" }] }])(
+      "settles skills before an older bind snapshot finishes: %j",
+      async ({ skills }) => {
+        const id = "conv_skills_race";
+        seedSession(id);
+        let resolveInitialSnapshot!: (response: Response) => void;
+        let snapshotCount = 0;
+        const snapshot = { id, agent_id: "agent_xyz", status: "idle", created_at: 0, items: [] };
+        fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+          const url = typeof input === "string" ? input : input.toString();
+          if (url.split("?")[0] === `/v1/sessions/${id}` && (init?.method ?? "GET") === "GET") {
+            snapshotCount += 1;
+            if (snapshotCount === 1) {
+              return new Promise<Response>((resolve) => {
+                resolveInitialSnapshot = resolve;
+              });
+            }
+            return mockResponse({ ...snapshot, skills, skills_status: "ready" });
+          }
+          return defaultFetchHandler(input, init);
+        });
+
+        const bind = useChatStore.getState().switchTo(id);
+        await tick();
+        handleSessionEvent({ type: "session_skills", conversationId: id });
+        await tick();
+        const statusBeforeBind = useChatStore.getState().skillsStatus;
+        resolveInitialSnapshot(mockResponse({ ...snapshot, skills: [], skills_status: "loading" }));
+        await bind;
+
+        expect(snapshotCount).toBe(2);
+        expect(statusBeforeBind).toBe("ready");
+        expect(useChatStore.getState().skillsStatus).toBe("ready");
+        expect(useChatStore.getState().skills).toEqual(skills);
+      },
+    );
+
+    it("ignores a skills response superseded by a newer notification", async () => {
+      useChatStore.setState({ conversationId: "conv_abc", skillsStatus: "loading", skills: [] });
+      let resolveOlder!: (response: Response) => void;
+      fetchMock.mockImplementationOnce(
+        () =>
+          new Promise<Response>((resolve) => {
+            resolveOlder = resolve;
+          }),
+      );
+      handleSessionEvent({ type: "session_skills", conversationId: "conv_abc" });
+      seedSnapshotSkills("conv_abc", [{ name: "newer", description: "Latest catalog" }]);
+      handleSessionEvent({ type: "session_skills", conversationId: "conv_abc" });
+      await tick();
+      resolveOlder(mockResponse({ id: "conv_abc", skills: [], skills_status: "error" }));
+      await tick();
+      expect(useChatStore.getState().skillsStatus).toBe("ready");
+      expect(useChatStore.getState().skills).toEqual([
+        { name: "newer", description: "Latest catalog" },
       ]);
     });
 
@@ -5410,8 +5470,10 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       expect(conversationRegistry.peek("conv_bg_skills")!.getState().skills).toEqual([
         { name: "late", description: "resolved in background" },
       ]);
+      expect(conversationRegistry.peek("conv_bg_skills")!.getState().skillsStatus).toBe("ready");
       // ...and the visible conversation was not touched.
       expect(useChatStore.getState().skills).toEqual([]);
+      expect(useChatStore.getState().skillsStatus).toBeNull();
     });
 
     it("leaves the existing skills in place when the refetch fails", async () => {
@@ -5438,6 +5500,17 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       expect(useChatStore.getState().skills).toEqual([
         { name: "kept", description: "survives the error" },
       ]);
+      expect(useChatStore.getState().skillsStatus).toBe("error");
+    });
+
+    it("retries failed discovery with a fresh runner snapshot", async () => {
+      useChatStore.setState({ conversationId: "conv_abc", skills: [], skillsStatus: "error" });
+      seedSnapshotSkills("conv_abc", []);
+      await useChatStore.getState().refreshSkills();
+      expect(fetchMock.mock.calls.some(([url]) => String(url).includes("refresh_state=true"))).toBe(
+        true,
+      );
+      expect(useChatStore.getState().skillsStatus).toBe("ready");
     });
   });
 
@@ -6565,8 +6638,104 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
     });
   });
 
+  describe("codex /side send", () => {
+    it("neither bubbles in the parent nor latches it into Working", async () => {
+      // The command is forked into a side chat, so this session runs nothing:
+      // a bubble would sit unanswered and a "streaming" latch would never clear.
+      seedSession("conv_codex_side", []);
+      await useChatStore.getState().switchTo("conv_codex_side");
+      useChatStore.setState({ sessionHarness: "codex-native", awaitingSideChatFor: null });
+
+      await useChatStore.getState().send("/side what was my last message?", "agent_xyz");
+
+      const after = useChatStore.getState();
+      expect(after.pendingUserMessages).toHaveLength(0);
+      expect(after.status).not.toBe("streaming");
+      // armed, so the fork's session.created moves the user into it
+      expect(after.awaitingSideChatFor).toBe("conv_codex_side");
+    });
+
+    it("still bubbles and latches for an ordinary message", async () => {
+      seedSession("conv_codex_plain", []);
+      await useChatStore.getState().switchTo("conv_codex_plain");
+      useChatStore.setState({ sessionHarness: "codex-native", awaitingSideChatFor: null });
+
+      await useChatStore.getState().send("hello", "agent_xyz");
+
+      const after = useChatStore.getState();
+      expect(after.pendingUserMessages).toHaveLength(1);
+      expect(after.awaitingSideChatFor).toBeNull();
+    });
+  });
+
   describe("session.created", () => {
+    it("opens the side chat the user asked for with /side", () => {
+      // `awaitingSideChatFor` is set when the command is sent; the fork's
+      // session.created then moves the user into it and reveals the rail.
+      useChatStore.setState({
+        conversationId: "conv_parent",
+        awaitingSideChatFor: "conv_parent",
+        redirectToConversationId: null,
+        sideChatRailRequest: null,
+      });
+
+      handleSessionEvent({
+        type: "session_created",
+        conversationId: "conv_parent",
+        childSessionId: "conv_side",
+        agentId: "ag_xyz",
+        parentSessionId: "conv_parent",
+      } as SessionCreatedEvent);
+
+      const after = useChatStore.getState();
+      expect(after.redirectToConversationId).toBe("conv_side");
+      expect(after.sideChatRailRequest).toBe("conv_side");
+      // one-shot: a later spawn must not move the user again
+      expect(after.awaitingSideChatFor).toBeNull();
+    });
+
+    it("does not move the user for an agent-spawned sub-agent", () => {
+      // awaitingSideChatFor is conversation-scoped, so bind a fresh conversation
+      // to start it clean; sideChatRailRequest + redirectToConversationId are
+      // app-global, so reset and read them globally.
+      bindConversationForTest("conv_agent_spawn", { awaitingSideChatFor: null });
+      useChatStore.setState({ redirectToConversationId: null, sideChatRailRequest: null });
+
+      handleSessionEvent({
+        type: "session_created",
+        conversationId: "conv_agent_spawn",
+        childSessionId: "conv_child",
+        agentId: "ag_xyz",
+        parentSessionId: "conv_agent_spawn",
+      } as SessionCreatedEvent);
+
+      expect(useChatStore.getState().redirectToConversationId).toBeNull();
+      expect(useChatStore.getState().sideChatRailRequest).toBeNull();
+    });
+
+    it("opens the awaited side chat on the /side latch", () => {
+      // The child arriving under the parent the user armed with /side is
+      // revealed and followed.
+      const parent = bindConversationForTest("conv_race", { awaitingSideChatFor: "conv_race" });
+      useChatStore.setState({ redirectToConversationId: null, sideChatRailRequest: null });
+
+      handleSessionEvent({
+        type: "session_created",
+        conversationId: "conv_race",
+        childSessionId: "conv_side",
+        agentId: "ag_xyz",
+        parentSessionId: "conv_race",
+      } as SessionCreatedEvent);
+
+      // redirect + rail request are app-global; awaitingSideChatFor is the
+      // conversation-scoped latch (read from the entry).
+      expect(useChatStore.getState().redirectToConversationId).toBe("conv_side");
+      expect(useChatStore.getState().sideChatRailRequest).toBe("conv_side");
+      expect(parent.get().awaitingSideChatFor).toBeNull();
+    });
+
     it("is a no-op (sub-agent rendering is future work — R8)", () => {
+      useChatStore.setState({ awaitingSideChatFor: null });
       const before = useChatStore.getState();
       const event: SessionCreatedEvent = {
         type: "session_created",
@@ -11052,6 +11221,33 @@ describe("pending initial prompt transport", () => {
     setPendingInitialPrompt("conv_blank", { text: "", skill: null });
     // Nothing was stored, so the consume reads null.
     expect(consumePendingInitialPrompt("conv_blank")).toBeNull();
+  });
+
+  it("queues an image-only draft (blank text, attached files) intact", () => {
+    // The server-first create path (pending custom agent) stashes the
+    // first message here instead of sending it optimistically. Blank
+    // text must NOT drop the prompt when files are attached — the
+    // landing composer's submit gate counts files as content, so the
+    // transport has to as well or the image silently vanishes and the
+    // session starts without its first message.
+    const file = new File(["x"], "screenshot.png", { type: "image/png" });
+    setPendingInitialPrompt("conv_img", { text: "", skill: null, files: [file] });
+    // The consume returns the exact File objects: they become the
+    // input_image blocks of the auto-sent first message.
+    expect(consumePendingInitialPrompt("conv_img")).toEqual({
+      text: "",
+      skill: null,
+      files: [file],
+    });
+    // Read-once still holds for the image-only shape.
+    expect(consumePendingInitialPrompt("conv_img")).toBeNull();
+  });
+
+  it("still ignores a blank prompt with an explicitly empty files array", () => {
+    // files: [] is "no attachments", not content — the blank guard must
+    // treat it exactly like an absent files field.
+    setPendingInitialPrompt("conv_blank_files", { text: "", skill: null, files: [] });
+    expect(consumePendingInitialPrompt("conv_blank_files")).toBeNull();
   });
 
   it("keys prompts by conversation id so they don't cross sessions", () => {

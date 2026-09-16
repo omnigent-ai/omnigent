@@ -170,7 +170,7 @@ def create_app(extension: AcpExtension = NO_ACP_EXTENSION) -> FastAPI:
 
     :param extension: Vendor behavior for the agent this process drives. A
         vendor's own wrap calls this with its extension (see
-        :mod:`omnigent.inner.devin.harness`); the runner calls it with no
+        a vendor wrap); the runner calls it with no
         argument for ``harness: acp`` and for a builtin ACP CLI row that declares
         no vendor behavior.
     :returns: The app the runner serves.
