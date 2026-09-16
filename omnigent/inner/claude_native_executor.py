@@ -13,6 +13,7 @@ from pathlib import Path
 
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_DIR_ENV_VAR,
+    CLAUDE_FRAMEWORK_CONTEXT_FILE,
     REQUEST_SESSION_ID_ENV_VAR,
     SWITCH_MODEL_DIALOG_HINT,
     ClaudePromptTimeout,
@@ -39,7 +40,6 @@ from omnigent.inner.executor import (
     describe_exception,
 )
 from omnigent.inner.native_attachments import (
-    CLAUDE_FRAMEWORK_CONTEXT_FILE,
     FRAMEWORK_NOTICE_BLOCK_TYPE,
     attachment_reference_line,
     framework_notices,

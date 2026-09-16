@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
+    CLAUDE_FRAMEWORK_CONTEXT_FILE,
     approval_wait_marker_path,
     hold_approval_wait_marker,
     read_active_session_id,
@@ -30,7 +31,6 @@ from omnigent.harnesses.claude_native.bridge import (
     url_component,
     write_active_session_id,
 )
-from omnigent.inner.native_attachments import CLAUDE_FRAMEWORK_CONTEXT_FILE
 
 # The observer path (the default, most frequent invocation — Claude blocks
 # on it per Stop/UserPromptSubmit/TaskCreated/...) must not pay the

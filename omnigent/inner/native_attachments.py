@@ -33,7 +33,6 @@ _logger = logging.getLogger(__name__)
 # seeding): brackets end the match early, newlines break the line shape.
 _MARKER_UNSAFE = re.compile(r"[\[\]\r\n]")
 FRAMEWORK_NOTICE_BLOCK_TYPE = "_omnigent_framework_notice"
-CLAUDE_FRAMEWORK_CONTEXT_FILE = "pending_framework_context.txt"
 _RESIZE_NOTICE_DIMS = re.compile(r"downscaled from (\d+)×(\d+) px")
 
 # Maps a data-URI MIME type to the file extension used when no filename
