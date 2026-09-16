@@ -761,7 +761,8 @@ def reap_orphaned_terminals() -> int:
         if _process_alive(pid):
             continue
         socket_path = entry / "tmux.sock"
-        if socket_path.exists():
+        had_socket = socket_path.exists()
+        if had_socket:
             with contextlib.suppress(OSError, subprocess.TimeoutExpired):
                 subprocess.run(
                     ["tmux", "-S", str(socket_path), "kill-server"],
@@ -772,6 +773,19 @@ def reap_orphaned_terminals() -> int:
                     timeout=_REAP_KILL_TIMEOUT_S,
                 )
         shutil.rmtree(entry, ignore_errors=True)
+        # Record what the sweep destroyed. The socket path is the join key
+        # against the owning session's "no server running on <socket>" exit,
+        # so a killed terminal ties to that session, not a mystery loss. A
+        # missing socket is called out explicitly so the line never implies
+        # a tmux server was killed when none existed.
+        logger.warning(
+            "orphan sweep reaped terminal instance dir %s "
+            "(tmux server socket %s%s, owner pid %s no longer running)",
+            entry.name,
+            socket_path,
+            "" if had_socket else " was already gone",
+            pid,
+        )
         reaped += 1
     return reaped
 

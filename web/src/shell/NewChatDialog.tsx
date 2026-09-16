@@ -42,7 +42,6 @@ import {
   LockIcon,
   FileTextIcon,
   FolderIcon,
-  ImageIcon,
   PlusIcon,
   ShuffleIcon,
   WandSparklesIcon,
@@ -98,7 +97,8 @@ import { backgroundSessionTitlesRequestHeaders } from "@/lib/backgroundSessionTi
 import { fetchGithubBranches, fetchGithubRepos, type GithubRepo } from "@/lib/githubIntegration";
 import { randomUUID } from "@/lib/randomUUID";
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
-import { attachmentKey, validateAttachments } from "@/lib/attachments";
+import { validateAttachments } from "@/lib/attachments";
+import { ComposerAttachments } from "@/components/ComposerAttachments";
 import {
   describeImagePreparationFailure,
   isHeicImageFile,
@@ -235,6 +235,8 @@ import {
   CODEX_NATIVE_DEFAULT_APPROVAL_MODE,
   CURSOR_NATIVE_DEFAULT_EXEC_MODE,
   CURSOR_NATIVE_EXEC_MODES,
+  DEVIN_NATIVE_DEFAULT_PERMISSION_MODE,
+  DEVIN_NATIVE_PERMISSION_MODES,
 } from "@/lib/nativeHarnessModes";
 import { fetchHosts, useHostModelOptions, useHosts, type Host } from "@/hooks/useHosts";
 import { readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
@@ -321,6 +323,7 @@ function createdHarnessOptions({
   supportsApprovalMode,
   supportsCursorMode,
   supportsAgySkipPermissions,
+  supportsDevinMode,
   supportsModelPicker,
   supportsEffortPicker,
   permissionMode,
@@ -328,6 +331,7 @@ function createdHarnessOptions({
   bypassSandbox,
   cursorExecMode,
   agySkipMode,
+  devinPermissionMode,
   pickedModel,
   pickedEffort,
   smartRoutingEligible,
@@ -338,6 +342,7 @@ function createdHarnessOptions({
   supportsApprovalMode: boolean;
   supportsCursorMode: boolean;
   supportsAgySkipPermissions: boolean;
+  supportsDevinMode: boolean;
   supportsModelPicker: boolean;
   supportsEffortPicker: boolean;
   permissionMode: string;
@@ -345,6 +350,7 @@ function createdHarnessOptions({
   bypassSandbox: boolean;
   cursorExecMode: string;
   agySkipMode: string;
+  devinPermissionMode: string;
   pickedModel: string;
   pickedEffort: string;
   smartRoutingEligible: boolean;
@@ -364,6 +370,12 @@ function createdHarnessOptions({
     options.mode = cursorExecMode;
   } else if (supportsAgySkipPermissions) {
     options.mode = agySkipMode;
+  } else if (supportsDevinMode) {
+    // Devin's permission mode rides `terminal_launch_args`, not the gated
+    // `permission_mode` field, so it is remembered like any other mode knob.
+    options.mode = devinPermissionMode;
+    options.model = pickedModel;
+    options.effort = pickedEffort;
   }
 
   if (smartRoutingEligible) {
@@ -1278,6 +1290,8 @@ const EMPTY_HARNESS_TRIGGER_DETAILS: readonly { label: string; value: string }[]
 function agentHasModelSettings(agent: AvailableAgent | undefined): boolean {
   return (
     nativeAgentHasCapability(agent, "modelPicker") ||
+    // devinMode owns Devin's own Model + Effort rows (see nativeCodingAgents).
+    nativeAgentHasCapability(agent, "devinMode") ||
     nativeCodingAgentForAvailableAgent(agent)?.harness === "codex-native"
   );
 }
@@ -1292,7 +1306,8 @@ function agentHasAdvancedSettings(
     !nativeAgentHasCapability(agent, "permissionMode") &&
     !nativeAgentHasCapability(agent, "approvalMode") &&
     !nativeAgentHasCapability(agent, "cursorMode") &&
-    !nativeAgentHasCapability(agent, "skipPermissions")
+    !nativeAgentHasCapability(agent, "skipPermissions") &&
+    !nativeAgentHasCapability(agent, "devinPermission")
   );
 }
 
@@ -2081,6 +2096,7 @@ interface LandingDraft {
   bypassSandbox: boolean;
   cursorExecMode: string;
   agySkipMode: string;
+  devinPermissionMode: string;
   pickedHarness: string | null;
   pickedModel: string;
   pickedEffort: string;
@@ -2455,6 +2471,11 @@ export function NewChatLandingScreen() {
     "pi-native",
     hostSelected,
   );
+  const {
+    data: hostDevinModelOptions,
+    isLoading: hostDevinModelsLoading,
+    error: hostDevinModelsError,
+  } = useHostModelOptions(selectedHostId, "devin-native", !sandboxSelected);
   // Only bridge this host's first fetch. Empty/error responses and host changes
   // must never inherit another catalog or keep retired choices alive.
   const cachedHostModels =
@@ -2496,6 +2517,14 @@ export function NewChatLandingScreen() {
   const codexModelOptions = useMemo(
     () => (sandboxSelected ? [] : (availableCodexModels ?? [])),
     [availableCodexModels, sandboxSelected],
+  );
+  // Devin model *families* (claude-opus-5, swe-2, …). Effort is a separate
+  // axis Omnigent carries as reasoning_effort and the runner recombines onto
+  // the id at launch (resolve_devin_launch_model), so the list stays short
+  // instead of enumerating every effort variant.
+  const devinModelOptions = useMemo(
+    () => (sandboxSelected ? [] : (hostDevinModelOptions ?? [])),
+    [hostDevinModelOptions, sandboxSelected],
   );
   const piModelOptions = useMemo(
     () =>
@@ -2660,6 +2689,10 @@ export function NewChatLandingScreen() {
   const [agySkipMode, setAgySkipMode] = useState<string>(
     () => restoredDraft?.agySkipMode ?? AGY_NATIVE_DEFAULT_SKIP_MODE,
   );
+  // Devin's `--permission-mode`. Only meaningful for the devin-native wrapper.
+  const [devinPermissionMode, setDevinPermissionMode] = useState<string>(
+    () => restoredDraft?.devinPermissionMode ?? DEVIN_NATIVE_DEFAULT_PERMISSION_MODE,
+  );
   // Per-session brain-harness override for bundle agents (polly / debby).
   // null = the agent spec's declared harness (no override sent). On agent
   // switch, seeded from the user's last stored pick for that agent.
@@ -2752,6 +2785,7 @@ export function NewChatLandingScreen() {
     bypassSandbox,
     cursorExecMode,
     agySkipMode,
+    devinPermissionMode,
     pickedHarness,
     pickedModel,
     pickedEffort,
@@ -3151,8 +3185,10 @@ export function NewChatLandingScreen() {
   );
   const selectedNativeHarness = nativeCodingAgentForAvailableAgent(selectedAgent)?.harness ?? null;
   const supportsPermissionMode = nativeAgentHasCapability(selectedAgent, "permissionMode");
+  const supportsDevinMode = nativeAgentHasCapability(selectedAgent, "devinMode");
   const supportsApprovalMode = nativeAgentHasCapability(selectedAgent, "approvalMode");
   const supportsCursorMode = nativeAgentHasCapability(selectedAgent, "cursorMode");
+  const supportsDevinPermission = nativeAgentHasCapability(selectedAgent, "devinPermission");
   const supportsAgySkipPermissions = nativeAgentHasCapability(selectedAgent, "skipPermissions");
   const supportsModelPicker = nativeAgentHasCapability(selectedAgent, "modelPicker");
   const hideUnconfiguredHarnesses = useMemo(() => readHideUnconfiguredHarnesses(), []);
@@ -3303,6 +3339,12 @@ export function NewChatLandingScreen() {
         AGY_NATIVE_SKIP_MODES.find((m) => m.value === agySkipMode)?.label ?? agySkipMode;
       return [{ label: "Permission mode", value: skipValue }, ...routingRow];
     }
+    if (supportsDevinPermission) {
+      const devinValue =
+        DEVIN_NATIVE_PERMISSION_MODES.find((m) => m.value === devinPermissionMode)?.label ??
+        devinPermissionMode;
+      return [{ label: "Permission mode", value: devinValue }, ...routingRow];
+    }
     if (selectedAgent?.harness != null && selectedAgent.harness in brainHarnessLabelsAll) {
       const active = pickedHarness ?? selectedAgent.harness;
       return [
@@ -3317,6 +3359,8 @@ export function NewChatLandingScreen() {
     supportsApprovalMode,
     supportsCursorMode,
     supportsAgySkipPermissions,
+    supportsDevinPermission,
+    devinPermissionMode,
     supportsModelPicker,
     selectedAgent,
     brainHarnessLabelsAll,
@@ -3342,11 +3386,13 @@ export function NewChatLandingScreen() {
   );
   const pickerModelOptions: readonly NativeModelOption[] = supportsPermissionMode
     ? claudeModelOptions
-    : selectedNativeHarness === "pi-native"
-      ? piModelOptions
-      : selectedNativeHarness === "codex-native"
-        ? codexModelOptions
-        : [];
+    : selectedNativeHarness === "devin-native"
+      ? devinModelOptions
+      : selectedNativeHarness === "pi-native"
+        ? piModelOptions
+        : selectedNativeHarness === "codex-native"
+          ? codexModelOptions
+          : [];
   const [pickerModelSearch, setPickerModelSearch] = useState("");
   const pickerModelsLoading =
     !sandboxSelected &&
@@ -3357,13 +3403,17 @@ export function NewChatLandingScreen() {
         ? hostCodexModelsLoading
         : selectedNativeHarness === "pi-native"
           ? hostPiModelsLoading
-          : false);
+          : selectedNativeHarness === "devin-native"
+            ? hostDevinModelsLoading
+            : false);
   const pickerModelsError =
     selectedNativeHarness === "claude-native"
       ? hostClaudeModelsError
       : selectedNativeHarness === "codex-native"
         ? hostCodexModelsError
-        : null;
+        : selectedNativeHarness === "devin-native"
+          ? hostDevinModelsError
+          : null;
   const pickerDataLoading =
     agentsLoading ||
     (cachedPickerOptions !== null && (hostsLoading || info === "loading")) ||
@@ -3459,14 +3509,23 @@ export function NewChatLandingScreen() {
   useEffect(() => setPickerModelSearch(""), [selectedNativeHarness]);
   const pickerEffortOptions = supportsPermissionMode
     ? CLAUDE_NATIVE_EFFORTS
-    : selectedNativeHarness === "pi-native"
-      ? PI_NATIVE_EFFORTS
-      : selectedNativeHarness === "codex-native"
-        ? codexEffortLevelsForModel(
-            codexModelOptions,
-            pickedModel || codexModelOptions.find((option) => option.isDefault)?.id,
-          ).map((value) => ({ value, label: normalizeEffortLabel(value) }))
-        : [];
+    : selectedNativeHarness === "devin-native"
+      ? // Devin encodes effort as a model-variant suffix, and the rung set is
+        // PER MODEL (swe-2 exposes only medium/high/max; `swe-2-low` is a
+        // different Fusion model), so derive it from the selected model's catalog
+        // entry rather than offering a fixed ladder the model can't honor.
+        codexEffortLevelsForModel(
+          devinModelOptions,
+          pickedModel || devinModelOptions.find((option) => option.isDefault)?.id,
+        ).map((value) => ({ value, label: normalizeEffortLabel(value) }))
+      : selectedNativeHarness === "pi-native"
+        ? PI_NATIVE_EFFORTS
+        : selectedNativeHarness === "codex-native"
+          ? codexEffortLevelsForModel(
+              codexModelOptions,
+              pickedModel || codexModelOptions.find((option) => option.isDefault)?.id,
+            ).map((value) => ({ value, label: normalizeEffortLabel(value) }))
+          : [];
   const rememberPickerOptions = (harness: string, options: HarnessOptions) => {
     const previous = pickerEdits;
     setPickerEdits({
@@ -3532,6 +3591,7 @@ export function NewChatLandingScreen() {
           models={
             supportsModelPicker ||
             supportsPermissionMode ||
+            supportsDevinMode ||
             selectedNativeHarness === "codex-native"
               ? {
                   testId: "new-chat-landing-agent-models",
@@ -3649,7 +3709,9 @@ export function NewChatLandingScreen() {
             ? codexModelOptions
             : native.iconKind === "pi"
               ? piModelOptions
-              : [];
+              : native.iconKind === "devin"
+                ? devinModelOptions
+                : [];
       const model = catalog.find((option) => option.id === saved.model);
       const label = visibleModelLabel(model ? nativeModelLabel(model) : defaultModelLabel(catalog));
       const efforts = native.iconKind === "pi" ? PI_NATIVE_EFFORTS : CLAUDE_NATIVE_EFFORTS;
@@ -3672,7 +3734,9 @@ export function NewChatLandingScreen() {
           ? CURSOR_NATIVE_EXEC_MODES
           : supportsAgySkipPermissions
             ? AGY_NATIVE_SKIP_MODES
-            : [];
+            : supportsDevinPermission
+              ? DEVIN_NATIVE_PERMISSION_MODES
+              : [];
   const selectDirectMode = (mode: string) => {
     if (!selectedNativeHarness) return;
     if (supportsPermissionMode) setPermissionMode(mode);
@@ -3691,6 +3755,7 @@ export function NewChatLandingScreen() {
       setBypassSandbox(false);
     } else if (supportsCursorMode) setCursorExecMode(mode);
     else if (supportsAgySkipPermissions) setAgySkipMode(mode);
+    else if (supportsDevinPermission) setDevinPermissionMode(mode);
     rememberPickerOptions(selectedNativeHarness, { mode });
   };
   // Reset per-agent-instance run-config that must not carry across an agent
@@ -3739,9 +3804,11 @@ export function NewChatLandingScreen() {
       ? piModelOptions
       : selectedNativeHarness === "claude-native"
         ? claudeModelOptions
-        : selectedNativeHarness === "codex-native"
-          ? codexModelOptions
-          : [];
+        : selectedNativeHarness === "devin-native"
+          ? devinModelOptions
+          : selectedNativeHarness === "codex-native"
+            ? codexModelOptions
+            : [];
   const projectDefaultModelValid =
     projectDefaultModel != null && projectModelVocab.some((m) => m.id === projectDefaultModel)
       ? projectDefaultModel
@@ -3862,6 +3929,10 @@ export function NewChatLandingScreen() {
       setCursorExecMode(resolve(CURSOR_NATIVE_EXEC_MODES, CURSOR_NATIVE_DEFAULT_EXEC_MODE));
     } else if (supportsAgySkipPermissions) {
       setAgySkipMode(resolve(AGY_NATIVE_SKIP_MODES, AGY_NATIVE_DEFAULT_SKIP_MODE));
+    } else if (supportsDevinPermission) {
+      setDevinPermissionMode(
+        resolve(DEVIN_NATIVE_PERMISSION_MODES, DEVIN_NATIVE_DEFAULT_PERMISSION_MODE),
+      );
     }
     // Reseed on harness changes, when the selected host's catalog resolves,
     // and when the project's configured default model settles (its config
@@ -4895,6 +4966,7 @@ export function NewChatLandingScreen() {
       const agentSupportsApprovalMode = nativeAgentHasCapability(agent, "approvalMode");
       const agentSupportsCursorMode = nativeAgentHasCapability(agent, "cursorMode");
       const agentSupportsAgySkip = nativeAgentHasCapability(agent, "skipPermissions");
+      const agentSupportsDevinPermission = nativeAgentHasCapability(agent, "devinPermission");
       const agentSupportsModelPicker = nativeAgentHasCapability(agent, "modelPicker");
       // Smart Routing — server-side. The fully-auto harness always routes
       // (harness + model), so send "on" to keep the persisted state consistent
@@ -4929,7 +5001,13 @@ export function NewChatLandingScreen() {
       const normalizedModelOverride =
         !smartRoutingHarnessSelected &&
         !routingOwnsModel &&
-        (agentSupportsModelPicker || nativeAgent?.harness === "codex-native") &&
+        // devin's Model+Effort live under its own `devinMode` capability (not
+        // `modelPicker`), so — like codex-native — pin the pick by harness or
+        // the New-Chat selection never reaches `_auto_create_devin_terminal`
+        // and Devin launches on its own config default.
+        (agentSupportsModelPicker ||
+          nativeAgent?.harness === "codex-native" ||
+          nativeAgent?.harness === "devin-native") &&
         pickedModel
           ? pickedModel
           : null;
@@ -4938,7 +5016,8 @@ export function NewChatLandingScreen() {
         !routingOwnsModel &&
         (agentSupportsPermissionMode ||
           selectedNativeHarness === "pi-native" ||
-          nativeAgent?.harness === "codex-native") &&
+          nativeAgent?.harness === "codex-native" ||
+          nativeAgent?.harness === "devin-native") &&
         pickedEffort
           ? pickedEffort
           : null;
@@ -5152,7 +5231,12 @@ export function NewChatLandingScreen() {
                     ? (CURSOR_NATIVE_EXEC_MODES.find((m) => m.value === cursorExecMode)?.args ?? [])
                     : agentSupportsAgySkip && agySkipMode !== AGY_NATIVE_DEFAULT_SKIP_MODE
                       ? (AGY_NATIVE_SKIP_MODES.find((m) => m.value === agySkipMode)?.args ?? [])
-                      : undefined,
+                      : agentSupportsDevinPermission &&
+                          devinPermissionMode !== DEVIN_NATIVE_DEFAULT_PERMISSION_MODE
+                        ? (DEVIN_NATIVE_PERMISSION_MODES.find(
+                            (m) => m.value === devinPermissionMode,
+                          )?.args ?? [])
+                        : undefined,
             // Model + reasoning effort, persisted on the session row before
             // the runner launches. Claude, Codex, and Pi read model_override at
             // terminal launch; an unselected ("") knob is omitted so the
@@ -5225,6 +5309,7 @@ export function NewChatLandingScreen() {
         const launchedOptions = createdHarnessOptions({
           harness: selectedNativeHarness,
           supportsPermissionMode: agentSupportsPermissionMode,
+          supportsDevinMode,
           supportsApprovalMode: agentSupportsApprovalMode,
           supportsCursorMode: agentSupportsCursorMode,
           supportsAgySkipPermissions: agentSupportsAgySkip,
@@ -5236,6 +5321,7 @@ export function NewChatLandingScreen() {
           bypassSandbox,
           cursorExecMode,
           agySkipMode,
+          devinPermissionMode,
           pickedModel,
           pickedEffort,
           smartRoutingEligible: effectiveAgentId !== PENDING_AGENT_ID && smartRoutingEligible,
@@ -5897,34 +5983,8 @@ export function NewChatLandingScreen() {
                         ))}
                       </div>
                     )}
-                    {/* File chips — shown below the textarea when files are attached. */}
-                    {files.length > 0 && (
-                      <div className="flex flex-wrap gap-1.5 px-4 pb-2">
-                        {files.map((file, i) => (
-                          <span
-                            key={attachmentKey(file)}
-                            className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground"
-                          >
-                            {file.type.startsWith("image/") ? (
-                              <ImageIcon className="size-3 shrink-0" />
-                            ) : (
-                              <FileTextIcon className="size-3 shrink-0" />
-                            )}
-                            <span className="max-w-[140px] truncate">
-                              {file.name || "image.png"}
-                            </span>
-                            <button
-                              type="button"
-                              onClick={() => removeFile(i)}
-                              className="ml-0.5 rounded-full hover:text-foreground"
-                              aria-label={`Remove ${file.name || "image.png"}`}
-                            >
-                              <XIcon className="size-3" />
-                            </button>
-                          </span>
-                        ))}
-                      </div>
-                    )}
+                    {/* Pending attachments — image thumbnails (click to view) + file rows. */}
+                    <ComposerAttachments files={files} onRemove={removeFile} />
                     {/* Rejected-attachment feedback: unsupported type or too large */}
                     {attachmentError !== null && (
                       <div

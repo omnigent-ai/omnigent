@@ -105,6 +105,7 @@ from omnigent.server.routes._sessions.common import (
     _CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY,
     _CODEX_NATIVE_COLLABORATION_MODES,
     _CODEX_NATIVE_WRAPPER_LABEL_VALUE,
+    _DEVIN_NATIVE_WRAPPER_LABEL_VALUE,
     _logger,
     _managed_launch_tasks,
     get_server_runner_router,
@@ -2112,16 +2113,11 @@ def register_core_routes(
                 )
             requested_codex_collaboration_mode = body.collaboration_mode
         permission_mode_requested = "permission_mode" in body.model_fields_set
-        requested_claude_permission_mode: str | None = None
+        requested_permission_mode: str | None = None
         if permission_mode_requested:
             if body.permission_mode is None:
                 raise OmnigentError(
                     "permission_mode must be a non-empty string",
-                    code=ErrorCode.INVALID_INPUT,
-                )
-            if body.permission_mode not in _CLAUDE_NATIVE_PERMISSION_MODES:
-                raise OmnigentError(
-                    f"permission_mode must be one of {sorted(_CLAUDE_NATIVE_PERMISSION_MODES)}",
                     code=ErrorCode.INVALID_INPUT,
                 )
             conv_for_permission_mode = await asyncio.to_thread(
@@ -2130,15 +2126,30 @@ def register_core_routes(
             )
             if conv_for_permission_mode is None:
                 raise _session_not_found()
-            if (
-                conv_for_permission_mode.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
-                != _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE
-            ):
+            # The mode lives in the harness's own TUI, so both the eligible wrapper
+            # and the vocabulary are per harness — Devin's rungs are not Claude's,
+            # and validating one against the other would reject a valid switch.
+            wrapper_for_permission_mode = conv_for_permission_mode.labels.get(
+                _CLAUDE_NATIVE_WRAPPER_LABEL_KEY
+            )
+            if wrapper_for_permission_mode == _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE:
+                allowed_permission_modes: tuple[str, ...] = tuple(_CLAUDE_NATIVE_PERMISSION_MODES)
+            elif wrapper_for_permission_mode == _DEVIN_NATIVE_WRAPPER_LABEL_VALUE:
+                from omnigent.harnesses.devin_native.bridge import DEVIN_PERMISSION_MODES
+
+                allowed_permission_modes = DEVIN_PERMISSION_MODES
+            else:
                 raise OmnigentError(
-                    "permission_mode is only supported for claude-native sessions",
+                    "permission_mode is only supported for claude-native and "
+                    "devin-native sessions",
                     code=ErrorCode.INVALID_INPUT,
                 )
-            requested_claude_permission_mode = body.permission_mode
+            if body.permission_mode not in allowed_permission_modes:
+                raise OmnigentError(
+                    f"permission_mode must be one of {sorted(allowed_permission_modes)}",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            requested_permission_mode = body.permission_mode
         approval_mode_requested = "approval_mode" in body.model_fields_set
         requested_codex_approval_mode: str | None = None
         if approval_mode_requested:
@@ -2448,20 +2459,20 @@ def register_core_routes(
                 _codex_plan_enabled,
                 _runner_result,
             )
-        if requested_claude_permission_mode is not None and live_forward:
+        if requested_permission_mode is not None and live_forward:
             _mode_result = await _forward_session_change_to_runner(
                 session_id,
                 runner_router,
                 {
                     "type": "permission_mode_change",
-                    "permission_mode": requested_claude_permission_mode,
+                    "permission_mode": requested_permission_mode,
                 },
             )
             # Raises unless the runner confirms the switch, so the label can
             # never claim a mode Claude isn't in. Stores the mode it reached.
             _confirmed_permission_mode = _require_permission_mode_forward(
                 session_id,
-                requested_claude_permission_mode,
+                requested_permission_mode,
                 _mode_result,
             )
             labels_to_set[_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY] = _confirmed_permission_mode

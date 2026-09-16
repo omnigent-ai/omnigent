@@ -3252,8 +3252,8 @@ describe("Composer file-attachment focus", () => {
     const file = new File([new Uint8Array(10)], "shot.png", { type: "image/png" });
     fireEvent.drop(transcript, { dataTransfer: { types: ["Files"], files: [file] } });
 
-    // getAllBy: the chip pairs the visible name with a hover title.
-    expect((await screen.findAllByText("shot.png")).length).toBeGreaterThan(0);
+    // An image attaches as a thumbnail; its filename is the img alt text.
+    expect(await screen.findByAltText("shot.png")).toBeTruthy();
     expect(screen.queryByTestId("file-drop-overlay")).toBeNull();
   });
 

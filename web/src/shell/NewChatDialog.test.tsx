@@ -307,6 +307,35 @@ const CLAUDE_MODEL_OPTIONS_RESULT = {
     { id: "haiku", model: "system.ai.claude-haiku-4-5", displayName: "Haiku 4.5" },
   ],
 };
+// Devin's catalog carries per-model effort rungs, which the effort picker derives
+// from: swe-2 exposes only medium/high/max (`swe-2-low` is a different Fusion
+// model), while claude-opus-5 exposes the full ladder.
+const DEVIN_MODEL_OPTIONS_RESULT = {
+  ...SUCCESS_QUERY_STATE,
+  data: [
+    {
+      id: "swe-2",
+      displayName: "SWE-2",
+      isDefault: true,
+      supportedReasoningEfforts: [
+        { reasoningEffort: "medium" },
+        { reasoningEffort: "high" },
+        { reasoningEffort: "max" },
+      ],
+    },
+    {
+      id: "claude-opus-5",
+      displayName: "Claude Opus 5",
+      supportedReasoningEfforts: [
+        { reasoningEffort: "low" },
+        { reasoningEffort: "medium" },
+        { reasoningEffort: "high" },
+        { reasoningEffort: "xhigh" },
+        { reasoningEffort: "max" },
+      ],
+    },
+  ],
+};
 const CODEX_MODEL_OPTIONS_RESULT = {
   ...SUCCESS_QUERY_STATE,
   data: [
@@ -1152,7 +1181,11 @@ function setupLandingMocks() {
   } as unknown as ReturnType<typeof useHostWorktrees>);
   mockHosts([host("online")]);
   mockModelQueries((harness) =>
-    harness === "codex-native" ? CODEX_MODEL_OPTIONS_RESULT : CLAUDE_MODEL_OPTIONS_RESULT,
+    harness === "codex-native"
+      ? CODEX_MODEL_OPTIONS_RESULT
+      : harness === "devin-native"
+        ? DEVIN_MODEL_OPTIONS_RESULT
+        : CLAUDE_MODEL_OPTIONS_RESULT,
   );
   mockAgents(DEFAULT_LANDING_AGENTS);
 }
@@ -3194,7 +3227,7 @@ describe("NewChatLandingScreen", () => {
         fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
       }
 
-      if (["claude", "codex", "pi"].includes(native.key)) {
+      if (["claude", "codex", "pi", "devin"].includes(native.key)) {
         fireEvent.click(screen.getByTestId(`new-chat-landing-agent-config-${agentId}`));
         expect(screen.getByTestId("new-chat-landing-agent-models")).toBeVisible();
         expect(screen.getByTestId("new-chat-landing-agent-efforts")).toBeVisible();
@@ -3327,6 +3360,53 @@ describe("NewChatLandingScreen", () => {
     expect(screen.queryByTestId("new-chat-landing-agent-effort-value")).toBeNull();
     const { body } = await submitAndReadBody();
     expect(body.reasoning_effort).toBeUndefined();
+  });
+
+  it("renders Devin's own model families and only the selected model's effort rungs", () => {
+    // Devin declares only `devinMode` (not modelPicker/permissionMode). Both the
+    // config-content gate and the models-section gate must honour that flag, or a
+    // Devin chat opens with no way to pick a model or effort at launch.
+    mockAgents([
+      {
+        id: "a1",
+        name: "claude-native-ui",
+        display_name: "Claude Code",
+        description: null,
+        harness: "claude-native",
+        skills: [],
+      },
+      {
+        id: "a3",
+        name: "devin-native-ui",
+        display_name: "Devin",
+        description: null,
+        harness: "devin-native",
+        skills: [],
+      },
+    ]);
+    mockHosts([{ ...host("online"), configured_harnesses: { "devin-native": true } } as Host]);
+    useHostModelOptionsMock.mockImplementation(
+      (_hostId, harness) =>
+        (harness === "devin-native"
+          ? DEVIN_MODEL_OPTIONS_RESULT
+          : CLAUDE_MODEL_OPTIONS_RESULT) as unknown as ReturnType<typeof useHostModelOptions>,
+    );
+    renderLanding();
+    openAgentModels("a3");
+
+    const models = screen.getByTestId("new-chat-landing-agent-models");
+    expect(models).toHaveTextContent("SWE-2");
+    expect(screen.getByTestId("new-chat-landing-agent-model-claude-opus-5")).toBeTruthy();
+
+    // Effort is a model-variant suffix and the rungs are PER MODEL: swe-2 (the
+    // default here) has only medium/high/max, so offering "low" would compose an
+    // id that is a different model and silently fall back to the bare family.
+    for (const rung of ["medium", "high", "max"]) {
+      expect(screen.getByTestId(`new-chat-landing-agent-effort-${rung}`)).toBeTruthy();
+    }
+    for (const rung of ["low", "xhigh"]) {
+      expect(screen.queryByTestId(`new-chat-landing-agent-effort-${rung}`)).toBeNull();
+    }
   });
 
   it("hides adjacent Codex effort options when the model has no effort metadata", () => {
@@ -3792,15 +3872,15 @@ describe("NewChatLandingScreen", () => {
     fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
       target: { files: [file] },
     });
-    expect(await screen.findByText("diagram.png")).toBeTruthy();
+    expect(await screen.findByAltText("diagram.png")).toBeTruthy();
     first.unmount();
 
     renderLanding();
     expect((screen.getByTestId("new-chat-landing-input") as HTMLTextAreaElement).value).toBe(
       "half-typed thought",
     );
-    // The attachment chip re-renders from the restored draft.
-    expect(screen.getByText("diagram.png")).toBeTruthy();
+    // The attachment thumbnail re-renders from the restored draft.
+    expect(screen.getByAltText("diagram.png")).toBeTruthy();
   });
 
   it("hands the draft back when a create the user walked away from is rejected", async () => {
@@ -6196,8 +6276,8 @@ describe("NewChatLandingScreen attachments", () => {
       target: { files: [original] },
     });
 
-    await waitFor(() => expect(screen.getByText("photo.jpg")).toBeTruthy());
-    expect(screen.queryByText("photo.heic")).toBeNull();
+    await waitFor(() => expect(screen.getByAltText("photo.jpg")).toBeTruthy());
+    expect(screen.queryByAltText("photo.heic")).toBeNull();
   });
 
   it("keeps a newer rejection visible while an image is preparing", async () => {
@@ -6222,7 +6302,7 @@ describe("NewChatLandingScreen attachments", () => {
     );
 
     resolveImage?.({ ok: true, file: image, converted: false });
-    await waitFor(() => expect(screen.getByText("photo.heic")).toBeTruthy());
+    await waitFor(() => expect(screen.getByAltText("photo.heic")).toBeTruthy());
     expect(screen.getByTestId("new-chat-landing-attachment-error").textContent).toContain(
       "only images, PDF, and text/code files are supported",
     );
@@ -6252,7 +6332,7 @@ describe("NewChatLandingScreen attachments", () => {
     expect(screen.getByText("Drop files here")).toBeTruthy();
     const file = new File(["hello"], "shot.png", { type: "image/png" });
     fireEvent.drop(surface, { dataTransfer: fileDrag([file]) });
-    expect(await screen.findByText("shot.png")).toBeTruthy();
+    expect(await screen.findByAltText("shot.png")).toBeTruthy();
     expect(screen.queryByText("Drop files here")).toBeNull();
   });
 
