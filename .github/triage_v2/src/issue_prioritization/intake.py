@@ -104,7 +104,7 @@ def _choose_assignee(
 ) -> str | None:
     if current_assignees:
         return None
-    paused = {login.casefold() for login in areas.issue_assignment_paused}
+    paused = {login.casefold() for login in areas.assignment_paused}
     maintainers_by_key = {
         login.casefold(): login for login in maintainers if login.casefold() not in paused
     }

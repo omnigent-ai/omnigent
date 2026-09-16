@@ -16,6 +16,7 @@
 //     their latest `assigned` event. Breach -> re-ping + add one second assignee
 //     from the owners of the area(s) whose comp:* label the issue carries.
 //
+// `assignment_paused` excludes logins from every new automatic assignment.
 // Ownership comes from .github/areas.json -- the single source of truth shared
 // with auto-assign-reviewer.js and issue-triage.yml (it replaced the old
 // .github/reviewers + .github/ISSUE_ASSIGNEES files). `owners_paused` is ignored.
@@ -123,12 +124,14 @@ function breachedTargets({ targets, clockStartByUser, openedAt, now, comments, r
 //   labelOwners - Map "comp:x" -> Set of owners, for routing an issue by its label
 // `owners_paused` is intentionally ignored. `text` is injectable for tests.
 function parseAreas(text) {
-  const areas = JSON.parse(text).areas || [];
+  const config = JSON.parse(text);
+  const paused = new Set((config.assignment_paused || []).map((u) => u.toLowerCase()));
+  const areas = config.areas || [];
   const rules = [];
   const pool = new Map();
   const labelOwners = new Map();
   for (const area of areas) {
-    const owners = area.owners || [];
+    const owners = (area.owners || []).filter((u) => !paused.has(u.toLowerCase()));
     owners.forEach((o) => pool.set(o.toLowerCase(), o));
     for (const p of area.paths || []) rules.push({ prefix: p.replace(/^\//, ""), owners });
     if (area.label) {

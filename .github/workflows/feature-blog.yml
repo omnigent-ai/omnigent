@@ -684,6 +684,11 @@ jobs:
             git -C "$SITE" push --force "$PUSH_URL" "$branch"
 
             reviewer="$(cat "/tmp/reviewer_${idx}.txt" 2>/dev/null || true)"
+            if ! jq -e --arg login "$reviewer" \
+              '[(.assignment_paused // [])[] | ascii_downcase] | index($login | ascii_downcase) == null' \
+              .github/areas.json > /dev/null; then
+              reviewer=""
+            fi
             mention=""
             [ -n "$reviewer" ] && mention=" · most context @${reviewer}"
 

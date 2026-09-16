@@ -134,7 +134,7 @@ jobs:
 
           config = json.loads(pathlib.Path(".github/areas.json").read_text())
           areas = config["areas"]
-          paused = {login.casefold() for login in config.get("issue_assignment_paused", [])}
+          paused = {login.casefold() for login in config.get("assignment_paused", [])}
 
           owners, components, lines = [], set(), []
           for a in areas:
@@ -661,8 +661,8 @@ jobs:
 
           # Refresh state after labeling/commenting so closure and assignment do
           # not rely on the earlier read.
-          issue_state=$(gh issue view "$ISSUE_NUMBER" --repo "$REPO" \
-            --json state --jq '.state')
+          issue_status=$(gh issue view "$ISSUE_NUMBER" --repo "$REPO" --json state,assignees)
+          issue_state=$(jq -r '.state' <<<"$issue_status")
           if [ "$issue_state" != "OPEN" ]; then
             exit 0
           fi
@@ -681,25 +681,25 @@ jobs:
 
           # Assign maintainer authors directly unless their issue assignments are paused.
           author=$(jq -r '.author.login // empty' /tmp/issue.json)
-          maintainer_assigned=false
-          if [ -n "$author" ] && grep -qxF "$author" .github/MAINTAINER && \
+          owner_assigned=$(jq -r '.assignees | length > 0' <<<"$issue_status")
+          if [ "$owner_assigned" = "false" ] && [ -n "$author" ] && grep -qxF "$author" .github/MAINTAINER && \
             jq -e --arg author "$author" \
-              '[(.issue_assignment_paused // [])[] | ascii_downcase] | index($author | ascii_downcase) == null' \
+              '[(.assignment_paused // [])[] | ascii_downcase] | index($author | ascii_downcase) == null' \
               .github/areas.json > /dev/null; then
             echo "Issue filed by maintainer $author — assigning to author"
             gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --add-assignee "$author"
-            maintainer_assigned=true
+            owner_assigned=true
           fi
 
           # Otherwise, assign an owner: the least-loaded area owner, with LLM
           # rank as a tiebreaker (load primary, rank secondary). Symmetric with
-          # the PR reviewer path. Skipped if the maintainer-author was already
-          # assigned above. Every triaged issue gets an owner — duplicates
+          # the PR reviewer path. Skipped if the issue already has an owner.
+          # Every triaged issue gets an owner — duplicates
           # included, even ones about to be closed below — so the only issues
           # left unassigned are needs_info ones (too vague to route until the
           # reporter adds detail).
           needs_info=$(jq -r '.needs_info // false' /tmp/triage_result.json)
-          if [ "$maintainer_assigned" = "false" ] && [ "$needs_info" != "true" ]; then
+          if [ "$owner_assigned" = "false" ] && [ "$needs_info" != "true" ]; then
             # Open-issue load per candidate (fewest assigned open issues wins ties).
             # One trusted query; the LLM never sees GH_TOKEN.
             gh issue list --repo "$REPO" --state open --limit 500 \

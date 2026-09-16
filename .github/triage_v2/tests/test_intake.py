@@ -16,7 +16,7 @@ def test_paused_assignments_cover_area_fallback_and_maintainer_authors(tmp_path)
     config.write_text(
         json.dumps(
             {
-                "issue_assignment_paused": ["Paused"],
+                "assignment_paused": ["Paused"],
                 "areas": [
                     {
                         "key": "runner",

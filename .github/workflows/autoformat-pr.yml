@@ -33,7 +33,7 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           ref: ${{ github.event.repository.default_branch }}
-          sparse-checkout: .github/scripts/pr-template
+          sparse-checkout: .github
           persist-credentials: false
 
       - name: Set up Python
@@ -55,10 +55,16 @@ jobs:
           new_body_file=$(mktemp)
           jq -r '.body // ""' <<<"$pr_json" > "$body_file"
 
-          gh api \
-            --method POST \
-            "/repos/${REPO}/issues/${PR_NUMBER}/assignees" \
-            -f "assignees[]=${author}"
+          assignment_note="Automatic assignment is paused for the author."
+          if jq -e --arg login "$author" \
+            '[(.assignment_paused // [])[] | ascii_downcase] | index($login | ascii_downcase) == null' \
+            .github/areas.json > /dev/null; then
+            gh api \
+              --method POST \
+              "/repos/${REPO}/issues/${PR_NUMBER}/assignees" \
+              -f "assignees[]=${author}"
+            assignment_note="Assigned @${author}."
+          fi
 
           .github/scripts/pr-template/format_body.py "$body_file" "$new_body_file"
 
@@ -69,7 +75,7 @@ jobs:
           fi
 
           if [ "$changed" = true ]; then
-            gh pr comment "$PR_NUMBER" --repo "$REPO" --body "Autoformatted PR body and assigned @${author}."
+            gh pr comment "$PR_NUMBER" --repo "$REPO" --body "Autoformatted PR body. ${assignment_note}"
           else
-            gh pr comment "$PR_NUMBER" --repo "$REPO" --body "Assigned @${author}. PR body already had the expected template sections."
+            gh pr comment "$PR_NUMBER" --repo "$REPO" --body "${assignment_note} PR body already had the expected template sections."
           fi

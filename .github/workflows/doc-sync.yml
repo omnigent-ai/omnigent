@@ -667,6 +667,11 @@ jobs:
         run: |
           set -euo pipefail
           BRANCH="auto/docs/pr-${PR_NUMBER}"
+          if ! jq -e --arg login "$REVIEWER" \
+            '[(.assignment_paused // [])[] | ascii_downcase] | index($login | ascii_downcase) == null' \
+            "$GITHUB_WORKSPACE/.github/areas.json" > /dev/null; then
+            REVIEWER=""
+          fi
           # Descriptive PR/commit title from the sitepr step (drafter's DOC_PR_TITLE,
           # else the source PR title, else "docs: document #N"). The PR number lives
           # in the body, so it's kept out of the title.
