@@ -453,6 +453,7 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # The daemon and runner resolve OS-keyring credentials in the user's session.
         "DBUS_SESSION_BUS_ADDRESS",
         "XDG_RUNTIME_DIR",
+        "PYTHON_KEYRING_BACKEND",
         "TZ",
         "TERM",
         "TERMINFO",

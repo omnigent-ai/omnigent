@@ -206,6 +206,10 @@ jobs:
           # sysmon: the default C-trace coverage backend pushed the heaviest
           # shard past its timeout; only line coverage is collected.
           COVERAGE_CORE: sysmon
+          # Multiplies the tests' hang-guard waits (tests.budgets.budget).
+          # A shared runner under -n 4+ can stall an event loop past a 1s
+          # budget; local runs keep the unscaled default and fail fast.
+          OMNIGENT_TEST_TIMEOUT_SCALE: "4"
         run: |
           mkdir -p artifacts artifacts/progress "$(dirname "$COVERAGE_FILE")"
           # matrix.paths is unquoted on purpose: it word-splits into pytest args.

@@ -74,6 +74,7 @@ import {
   type SessionItemsPage,
   updateSession,
 } from "@/lib/sessionsApi";
+import { isStaleCursorError } from "@/lib/staleCursor";
 import type {
   McpServerStartup,
   SessionInputConsumedEvent,
@@ -2962,6 +2963,10 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     } catch {
       // A stale failure must not disable scroll-up on the NEW window.
       if (stale()) return;
+      // A `stale_cursor` 400 lands here too: the oldest loaded item was
+      // deleted, so this window's back-cursor is unrecoverable without
+      // re-hydrating. Stopping scroll-up matches the pre-existing behaviour
+      // for any page failure; a reconnect or revisit rebuilds the window.
       // Disable further fetches on error — a persistent server failure
       // would otherwise re-trigger the scroll listener on every scroll event.
       pageSet({ loadingMoreHistory: false, hasMoreHistory: false });
@@ -4598,7 +4603,11 @@ async function reconcileOnReconnect(
     let older: SessionItemsPage;
     try {
       older = await fetchSessionItemsPage(id, { olderThan: cursor });
-    } catch {
+    } catch (error) {
+      // A cursor whose item was deleted can never be paged past. Stop the
+      // backfill with the gap still uncovered so the full rehydrate below
+      // runs, instead of leaving items no path can fetch.
+      if (isStaleCursorError(error)) break;
       return;
     }
     if (stale()) return;

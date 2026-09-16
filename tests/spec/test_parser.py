@@ -4156,7 +4156,7 @@ def test_parse_credential_proxy_databricks_cli_rejected_on_macos(tmp_path: Path)
                     "source": {"env": "X", "file": "/tmp/s"},
                 }
             ],
-            r"exactly one of 'env', 'file', or 'command'",
+            r"exactly one of 'env', 'file', 'command', or 'unix_socket'",
         ),
         # Malformed ``env`` injection-shim name.
         (

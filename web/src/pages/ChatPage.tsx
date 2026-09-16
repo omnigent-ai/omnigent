@@ -3429,6 +3429,18 @@ function ComposerImpl(
     ) {
       const ta = e.currentTarget;
       if (e.key === "ArrowUp" && ta.selectionStart === 0) {
+        // Empty-composer recall takes the last queued row before browsing history.
+        if (fullText.trim() === "" && files.length === 0 && mentionedItems.length === 0) {
+          const target = queuedMessages.findLast((m) => m.conversationId === conversationId);
+          if (target !== undefined) {
+            e.preventDefault();
+            resetCursor();
+            setFiles(target.files ?? []);
+            dequeueMessage(target.queueId);
+            applyRecall(ta, target);
+            return;
+          }
+        }
         const recalled = recallPrevious(fullText, storedReplyDraft);
         if (recalled !== null) {
           e.preventDefault();

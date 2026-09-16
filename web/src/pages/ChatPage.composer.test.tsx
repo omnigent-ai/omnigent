@@ -117,6 +117,7 @@ import type { ElicitationBlock } from "@/lib/blocks";
 import { getGoal } from "@/lib/goalApi";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { Composer, shouldQueueSend } from "./ChatPage";
+import { appendPromptHistoryEntry } from "@/hooks/usePromptHistory";
 import {
   BUILTIN_SLASH_COMMANDS,
   rankedSlashCommandNames,
@@ -3499,6 +3500,212 @@ describe("Composer — queued-message flush gating", () => {
     await waitFor(() => expect(sendSpy).toHaveBeenCalledTimes(1));
     expect(sendSpy.mock.calls[0]!.slice(0, 2)).toEqual(["held", "agent_xyz"]);
     expect(useChatStore.getState().queuedMessages).toHaveLength(0);
+  });
+});
+
+describe("Composer — ArrowUp edit of a queued message", () => {
+  const CONV = "conv_uparrow_edit";
+  const QUEUED_TEXT = "queued follow-up recalled for editing";
+
+  beforeEach(() => {
+    clearSessionDrafts();
+    // A running turn keeps the flush effect from draining the queue while
+    // the test drives the recall-edit journey.
+    useChatStore.setState({
+      conversationId: CONV,
+      boundAgentId: "agent_xyz",
+      status: "idle",
+      sessionStatus: "running",
+      queuedMessages: [{ queueId: "q_1", text: QUEUED_TEXT, conversationId: CONV }],
+    });
+  });
+
+  afterEach(() => {
+    cleanup();
+    useChatStore.setState({ queuedMessages: [] });
+    // Drop the prompt-history keys these tests seeded.
+    for (let i = window.localStorage.length - 1; i >= 0; i--) {
+      const key = window.localStorage.key(i);
+      if (key?.startsWith("omnigent:prompt-history")) window.localStorage.removeItem(key);
+    }
+  });
+
+  it("dequeues the recalled message so re-sending can't duplicate it", async () => {
+    appendPromptHistoryEntry(QUEUED_TEXT, CONV);
+    const props = composerProps({ onSend: useChatStore.getState().enqueueMessage });
+    renderWithTooltips(<Composer {...props} />);
+
+    fireEvent.keyDown(textarea(), { key: "ArrowUp" });
+
+    await waitFor(() => expect(textarea().value).toBe(QUEUED_TEXT));
+    expect(useChatStore.getState().queuedMessages).toHaveLength(0);
+    fireEvent.change(textarea(), { target: { value: `${QUEUED_TEXT} edited` } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(useChatStore.getState().queuedMessages).toEqual([
+      expect.objectContaining({ text: `${QUEUED_TEXT} edited`, conversationId: CONV }),
+    ]);
+  });
+
+  it.each([true, false])(
+    "recalls the remaining queue after clearing the first recall (history present: %s)",
+    (withHistory) => {
+      useChatStore.setState({
+        queuedMessages: [
+          { queueId: "q_first", text: "First follow-up", conversationId: CONV },
+          { queueId: "q_last", text: QUEUED_TEXT, conversationId: CONV },
+          { queueId: "q_other", text: "Other chat", conversationId: "conv_other" },
+        ],
+      });
+      if (withHistory) {
+        appendPromptHistoryEntry("First follow-up", CONV);
+        appendPromptHistoryEntry(QUEUED_TEXT, CONV);
+      }
+      renderWithTooltips(<Composer {...composerProps()} />);
+
+      fireEvent.keyDown(textarea(), { key: "ArrowUp" });
+      expect(textarea()).toHaveValue(QUEUED_TEXT);
+      expect(useChatStore.getState().queuedMessages.map((message) => message.queueId)).toEqual([
+        "q_first",
+        "q_other",
+      ]);
+
+      fireEvent.change(textarea(), { target: { value: "" } });
+      fireEvent.keyDown(textarea(), { key: "ArrowUp" });
+
+      expect(textarea()).toHaveValue("First follow-up");
+      expect(useChatStore.getState().queuedMessages.map((message) => message.queueId)).toEqual([
+        "q_other",
+      ]);
+    },
+  );
+
+  it("adopts the queued row's attachments so re-sending keeps them", async () => {
+    const file = new File(["notes"], "notes.txt", { type: "text/plain" });
+    useChatStore.setState({
+      queuedMessages: [{ queueId: "q_1", text: QUEUED_TEXT, conversationId: CONV, files: [file] }],
+    });
+    appendPromptHistoryEntry(QUEUED_TEXT, CONV);
+    renderWithTooltips(<Composer {...composerProps()} />);
+
+    fireEvent.keyDown(textarea(), { key: "ArrowUp" });
+
+    await waitFor(() => expect(textarea().value).toBe(QUEUED_TEXT));
+    expect(screen.getByText("notes.txt")).toBeTruthy();
+    expect(useChatStore.getState().queuedMessages).toHaveLength(0);
+  });
+
+  it("preserves a queued quoted reply and its attachments on re-send", () => {
+    const replyDraft: StoredReplyDraft = {
+      version: 1,
+      quotes: [{ before: "", text: "Quoted answer" }],
+      text: "Follow-up",
+    };
+    const text = serializeReplyDraft(replyDraft);
+    const file = new File(["notes"], "notes.txt", { type: "text/plain" });
+    useChatStore.setState({
+      queuedMessages: [
+        { queueId: "q_reply", text, replyDraft, files: [file], conversationId: CONV },
+      ],
+    });
+    appendPromptHistoryEntry(text, CONV, replyDraft);
+    const props = composerProps();
+    renderWithTooltips(<Composer {...props} />);
+
+    fireEvent.keyDown(textarea(), { key: "ArrowUp" });
+
+    expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent("Quoted answer");
+    expect(textarea()).toHaveValue("Follow-up");
+    expect(useChatStore.getState().queuedMessages).toHaveLength(0);
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(props.onSend).toHaveBeenCalledWith(text, [file], replyDraft);
+  });
+
+  it.each([false, true])("recalls queued path mentions with quotes: %s", (quoted) => {
+    useChatStore.setState({ queuedMessages: [], sessionHarness: "codex-native" });
+    const props = composerProps({ onSend: useChatStore.getState().enqueueMessage });
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    renderWithTooltips(<Composer {...props} ref={ref} />);
+    act(() =>
+      useChatStore.setState({
+        pendingComposerAttachments: [{ path: "src/example.ts", isDir: false }],
+      }),
+    );
+    if (quoted) act(() => ref.current?.appendReplyQuote("Quoted answer"));
+    fireEvent.change(textarea(), { target: { value: QUEUED_TEXT } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    const original = useChatStore.getState().queuedMessages[0]!;
+    expect(original.text).toContain("[Attached file: src/example.ts]");
+
+    fireEvent.keyDown(textarea(), { key: "ArrowUp" });
+
+    expect(useChatStore.getState().queuedMessages).toHaveLength(0);
+    expect(screen.queryAllByTestId("composer-reply-quote")).toHaveLength(quoted ? 1 : 0);
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(useChatStore.getState().queuedMessages).toEqual([
+      expect.objectContaining({ text: original.text }),
+    ]);
+    expect(useChatStore.getState().queuedMessages[0]?.replyDraft).toEqual(original.replyDraft);
+  });
+
+  it("restores the queued quote metadata even when history has only plain text", () => {
+    const replyDraft: StoredReplyDraft = {
+      version: 1,
+      quotes: [{ before: "", text: "Quoted answer" }],
+      text: "Follow-up",
+    };
+    const text = serializeReplyDraft(replyDraft);
+    useChatStore.setState({
+      queuedMessages: [{ queueId: "q_reply", text, replyDraft, conversationId: CONV }],
+    });
+    appendPromptHistoryEntry(text, CONV);
+    renderWithTooltips(<Composer {...composerProps()} />);
+
+    fireEvent.keyDown(textarea(), { key: "ArrowUp" });
+
+    expect(textarea()).toHaveValue("Follow-up");
+    expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent("Quoted answer");
+    expect(useChatStore.getState().queuedMessages).toHaveLength(0);
+  });
+
+  it("keeps an attachment-only draft when browsing history", () => {
+    const file = new File(["draft"], "draft.txt", { type: "text/plain" });
+    setSessionDraft(CONV, { text: "", files: [file] });
+    appendPromptHistoryEntry(QUEUED_TEXT, CONV);
+    const props = composerProps();
+    renderWithTooltips(<Composer {...props} />);
+
+    fireEvent.keyDown(textarea(), { key: "ArrowUp" });
+
+    expect(textarea()).toHaveValue(QUEUED_TEXT);
+    expect(useChatStore.getState().queuedMessages).toHaveLength(1);
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(props.onSend).toHaveBeenCalledWith(QUEUED_TEXT, [file]);
+  });
+
+  it("browsing history over a non-empty draft leaves the queued row alone", async () => {
+    appendPromptHistoryEntry(QUEUED_TEXT, CONV);
+    renderWithTooltips(<Composer {...composerProps()} />);
+
+    const ta = textarea();
+    fireEvent.change(ta, { target: { value: "half-typed draft" } });
+    ta.setSelectionRange(0, 0);
+    fireEvent.keyDown(ta, { key: "ArrowUp" });
+
+    await waitFor(() => expect(textarea().value).toBe(QUEUED_TEXT));
+    expect(useChatStore.getState().queuedMessages).toHaveLength(1);
+  });
+
+  it("leaves another conversation's identically-worded queued row alone", async () => {
+    useChatStore.setState({
+      queuedMessages: [{ queueId: "q_other", text: QUEUED_TEXT, conversationId: "conv_other" }],
+    });
+    appendPromptHistoryEntry(QUEUED_TEXT, CONV);
+    renderWithTooltips(<Composer {...composerProps()} />);
+
+    fireEvent.keyDown(textarea(), { key: "ArrowUp" });
+
+    await waitFor(() => expect(textarea().value).toBe(QUEUED_TEXT));
+    expect(useChatStore.getState().queuedMessages).toHaveLength(1);
   });
 });
 

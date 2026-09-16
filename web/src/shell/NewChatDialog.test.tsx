@@ -6872,6 +6872,7 @@ describe("NewChatLandingScreen custom-agent sandbox gating", () => {
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
     // The item is omitted entirely on a sandbox target.
     expect(screen.queryByTestId("new-chat-landing-create-agent")).toBeNull();
+    expect(screen.queryByTestId("new-chat-landing-custom-agents")).toBeNull();
   });
 
   it("shows 'Create custom agent' on a host and opens the dialog", async () => {
@@ -6890,14 +6891,35 @@ describe("NewChatLandingScreen custom-agent sandbox gating", () => {
         screen.getByTestId("new-chat-landing-host-chip").getAttribute("aria-label"),
       ).not.toContain("Sandbox"),
     );
-    // With no custom agents yet, the create item is a top-level row (no
-    // "Custom agents" submenu to hide it behind) and opens the dialog.
+    // Open the create dialog through the custom-agents submenu.
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
-    // No custom agents → no "Custom agents" submenu; create must be top-level.
     fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
     const createItem = screen.getByTestId("new-chat-landing-create-agent");
     fireEvent.click(createItem);
-    await waitFor(() => expect(screen.getByTestId("create-agent-dialog")).toBeTruthy());
+    await waitFor(() => expect(screen.getByTestId("create-agent-dialog")).toBeVisible());
+    for (const field of ["name", "description", "harness", "model", "instructions", "add-mcp"]) {
+      expect(screen.getByTestId(`create-agent-${field}`)).toBeVisible();
+    }
+  });
+
+  it("cancels a custom agent without replacing the selected agent", async () => {
+    renderLanding();
+    const agentPicker = screen.getByTestId("new-chat-landing-agent-select");
+    expect(agentPicker).toHaveAccessibleName(/Claude Code/);
+    fireEvent.pointerDown(agentPicker, { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
+    fireEvent.click(screen.getByTestId("new-chat-landing-create-agent"));
+
+    const dialog = await screen.findByTestId("create-agent-dialog");
+    fireEvent.change(screen.getByTestId("create-agent-name"), {
+      target: { value: "should-not-persist" },
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+
+    await waitFor(() => expect(screen.queryByTestId("create-agent-dialog")).toBeNull());
+    expect(agentPicker).toHaveAccessibleName(/Claude Code/);
+    fireEvent.pointerDown(agentPicker, { button: 0 });
+    expect(screen.queryByTestId("new-chat-landing-agent-pending")).toBeNull();
   });
 
   // Switch the target to the connected host, then create + submit a pending

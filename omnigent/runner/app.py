@@ -188,6 +188,9 @@ from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger(__name__)
 
+# Allow process termination and forwarder cleanup to finish before DELETE proceeds.
+_SESSION_INIT_CANCEL_TIMEOUT_S = 20.0
+
 # Claude-native session model listing: how long one request waits inline for
 # the probe before answering 503-pending, and how long the probe may stay
 # pending before the configured rows are served instead. Module-level so
@@ -4575,6 +4578,32 @@ def create_runner_app(
 
     @app.delete("/v1/sessions/{session_id}")
     async def delete_session(session_id: str) -> JSONResponse:
+        # Stop initialization before it can recreate resources during teardown.
+        init_tasks = [
+            task
+            for key, task in list(_session_init_tasks.items())
+            if key[0] == session_id and not task.done()
+        ]
+        for init_task in init_tasks:
+            init_task.cancel()
+        if init_tasks:
+            # Bound cleanup time; log init failures so resource teardown still runs.
+            _finished, pending = await asyncio.wait(
+                set(init_tasks), timeout=_SESSION_INIT_CANCEL_TIMEOUT_S
+            )
+            if pending:
+                _logger.warning(
+                    "Cancelled session init for %s did not finish within %.0fs",
+                    session_id,
+                    _SESSION_INIT_CANCEL_TIMEOUT_S,
+                )
+            for done_task in _finished:
+                if not done_task.cancelled() and done_task.exception() is not None:
+                    _logger.warning(
+                        "Session init for %s failed while being cancelled: %r",
+                        session_id,
+                        done_task.exception(),
+                    )
         turn_task = _active_turns.pop(session_id, None)
         if turn_task is not None and isinstance(turn_task, asyncio.Task):
             turn_task.cancel()
@@ -4604,6 +4633,8 @@ def create_runner_app(
         _repl_terminal_ensure_locks.pop(session_id, None)
         _interrupted_sessions.discard(session_id)
         await _cancel_auto_forwarder_task(session_id)
+        # Close any OpenCode server that no forwarder adopted.
+        await _native_runtime.teardown_opencode_native_server(session_id)
 
         if process_manager is not None:
             await process_manager.forward_cancel(session_id)
