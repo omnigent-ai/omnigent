@@ -69,7 +69,7 @@ def test_review_output_preserves_final_review(tmp_path: Path, raw: str, expected
         assert result.returncode != 0
         assert "Polly produced no publishable review" in result.stderr
         assert not github_output.exists()
-        assert not output.read_text().strip()
+        assert output.read_text() == raw
         return
     assert result.returncode == 0, result.stdout + result.stderr
     assert output.read_text() == expected
@@ -77,3 +77,46 @@ def test_review_output_preserves_final_review(tmp_path: Path, raw: str, expected
     assert header.startswith("review_text<<")
     delimiter = header.removeprefix("review_text<<")
     assert payload == f"{expected}{delimiter}\n"
+
+
+def test_failure_diagnostics_preserves_logs_without_gateway_secrets(tmp_path: Path) -> None:
+    workflow = yaml.safe_load(_WORKFLOW.read_text())
+    step = next(
+        s
+        for s in workflow["jobs"]["review"]["steps"]
+        if s.get("name") == "Prepare Polly failure diagnostics"
+    )
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "runner.log").write_text("request failed: test-api-secret at https://gateway.test")
+    (logs / "config.yaml").write_text("not a process log")
+    (tmp_path / "polly-stderr.log").write_text("stderr: test-api-secret")
+    output = tmp_path / "polly_output.txt"
+    output.write_text("Waiting for results. https://gateway.test")
+    destination = tmp_path / "diagnostics"
+    script = step["run"].replace("/tmp/polly_output.txt", str(output))
+    script = script.replace("/tmp/polly-diagnostics", str(destination))
+    script = script.replace(
+        "pathlib.Path.home() / '.omnigent' / 'logs'", f"pathlib.Path({str(logs)!r})"
+    )
+    (tmp_path / "python3").symlink_to(sys.executable)
+    result = subprocess.run(
+        ["bash", "-e", "-c", script],
+        cwd=tmp_path,
+        env={
+            "PATH": f"{tmp_path}{os.pathsep}{os.defpath}",
+            "LLM_API_KEY": "test-api-secret",
+            "GATEWAY_BASE_URL": "https://gateway.test",
+        },
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (destination / "polly-stderr.log").read_text() == "stderr: [REDACTED]"
+    assert (destination / "polly-output.txt").read_text() == "Waiting for results. [REDACTED]"
+    assert (destination / "process-logs/runner.log").read_text() == (
+        "request failed: [REDACTED] at [REDACTED]"
+    )
+    assert not (destination / "process-logs/config.yaml").exists()
