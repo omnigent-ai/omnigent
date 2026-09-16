@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useReducer, useRef, useState } from "react";
+import { findNativeModelOption } from "@/lib/codexNativeModels";
 import { formatStatusModelLabel, nativeModelLabel } from "@/lib/composerModelLabel";
 import { getCurrentUserId, resolveIdentity } from "@/lib/identity";
 import {
@@ -52,7 +53,9 @@ export function useSessionModelLabel(
 
   // Host names are a display fallback only; the session cache stays session-owned.
   const hostOption =
-    hostOptions.find((row) => row.id === raw) ?? hostOptions.find((row) => row.model === raw);
+    scope.harness === "codex-native" || scope.harness === "codex"
+      ? findNativeModelOption(hostOptions, raw)
+      : (hostOptions.find((row) => row.id === raw) ?? hostOptions.find((row) => row.model === raw));
   const fallbackLabel = cached ?? (hostOption ? nativeModelLabel(hostOption) : null);
   const waiting = expectsCatalog && raw !== null && !catalogReady && fallbackLabel === null;
   // Finishing identity bootstrap must not restart an in-flight metadata wait.
