@@ -932,6 +932,20 @@ class ErrorDetail(BaseModel):
     remediation: str | None = None
 
 
+class ErrorResponse(BaseModel):
+    """
+    The body every failed request carries: a single ``error`` object.
+
+    Mirrors what the FastAPI exception handler emits for an
+    :class:`~omnigent.errors.OmnigentError`, so documented error responses
+    and the runtime envelope stay the same shape.
+
+    :param error: Machine-readable detail about the failure.
+    """
+
+    error: ErrorDetail
+
+
 class IncompleteDetails(BaseModel):
     """
     Details explaining why a response is incomplete.

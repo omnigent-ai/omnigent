@@ -92,6 +92,9 @@ from omnigent.server.routes._auth_helpers import (
 from omnigent.server.routes._content_type import (
     require_json_or_multipart_content_type,
 )
+from omnigent.server.routes._errors import (
+    STALE_CURSOR_RESPONSE,
+)
 from omnigent.server.routes._errors import session_not_found as _session_not_found
 from omnigent.server.routes._origin import require_trusted_origin
 from omnigent.server.routes._sessions.common import (
@@ -1118,7 +1121,7 @@ def register_core_routes(
     @router.get(
         "/sessions",
         response_model=None,
-        responses={200: {"model": SessionList}},
+        responses={200: {"model": SessionList}, **STALE_CURSOR_RESPONSE},
     )
     async def list_sessions(
         request: Request,

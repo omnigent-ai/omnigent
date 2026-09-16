@@ -1793,7 +1793,6 @@
                 "type": "null"
               }
             ],
-            "default": null,
             "description": "Optional one/two-sentence explanation of why it failed. Paired with `title`.",
             "title": "Cause"
           },
@@ -1816,7 +1815,6 @@
                 "type": "null"
               }
             ],
-            "default": null,
             "description": "Optional concrete next step to fix it, e.g. a command to run. `None` when there is no single clear fix.",
             "title": "Remediation"
           },
@@ -1829,7 +1827,6 @@
                 "type": "null"
               }
             ],
-            "default": null,
             "description": "Optional short headline naming what went wrong, e.g. `\"Claude Code can't run as root\"`. Present when the runner recognized the failure (see `omnigent.runner.launch_failure`); lets the UI show a clear card title instead of the raw `code`.",
             "title": "Title"
           }
@@ -1898,6 +1895,20 @@
           "error"
         ],
         "title": "ErrorEvent",
+        "type": "object"
+      },
+      "ErrorResponse": {
+        "description": "The body every failed request carries: a single `error` object.\n\nMirrors what the FastAPI exception handler emits for an\n`~omnigent.errors.OmnigentError`, so documented error responses\nand the runtime envelope stay the same shape.",
+        "properties": {
+          "error": {
+            "$ref": "#/components/schemas/ErrorDetail",
+            "description": "Machine-readable detail about the failure."
+          }
+        },
+        "required": [
+          "error"
+        ],
+        "title": "ErrorResponse",
         "type": "object"
       },
       "ExtensionAssetErrorResponse": {
@@ -11008,6 +11019,16 @@
             },
             "description": "Successful Response"
           },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The `after`/`before` cursor names an item that no longer exists (it was deleted, or archived out of the filtered set) so the keyset bound cannot be resolved. The `error.code` is `stale_cursor`. Enumeration cannot continue from this cursor: restart from the first page, without a cursor."
+          },
           "422": {
             "content": {
               "application/json": {
@@ -11817,6 +11838,16 @@
             },
             "description": "Successful Response"
           },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The `after`/`before` cursor names an item that no longer exists (it was deleted, or archived out of the filtered set) so the keyset bound cannot be resolved. The `error.code` is `stale_cursor`. Enumeration cannot continue from this cursor: restart from the first page, without a cursor."
+          },
           "422": {
             "content": {
               "application/json": {
@@ -12407,6 +12438,16 @@
               }
             },
             "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The `after`/`before` cursor names an item that no longer exists (it was deleted, or archived out of the filtered set) so the keyset bound cannot be resolved. The `error.code` is `stale_cursor`. Enumeration cannot continue from this cursor: restart from the first page, without a cursor."
           },
           "422": {
             "content": {

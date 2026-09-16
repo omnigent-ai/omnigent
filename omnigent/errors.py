@@ -12,9 +12,10 @@ New code should prefer OmnigentError for consistency.
 from __future__ import annotations
 
 import functools
+import inspect
 from collections.abc import Callable
 from enum import Enum
-from typing import ParamSpec, TypeVar
+from typing import Any, ParamSpec, TypeVar, cast
 
 _P = ParamSpec("_P")
 _T = TypeVar("_T")
@@ -519,9 +520,25 @@ def restart_on_stale_cursor(fn: Callable[_P, _T]) -> Callable[_P, _T]:
     after :data:`_STALE_CURSOR_ATTEMPTS` attempts (rows are being deleted
     faster than the walk can finish).
 
+    Works on coroutine functions too: an ``async def`` walk is awaited
+    inside the retry loop, so decorating one restarts it rather than
+    handing back a coroutine the loop never gets to see fail.
+
     :param fn: A function that runs one complete enumeration per call.
     :returns: The wrapped function.
     """
+    if inspect.iscoroutinefunction(fn):
+
+        @functools.wraps(fn)
+        async def async_wrapper(*args: _P.args, **kwargs: _P.kwargs) -> Any:
+            for _ in range(_STALE_CURSOR_ATTEMPTS - 1):
+                try:
+                    return await fn(*args, **kwargs)
+                except StaleCursorError:
+                    continue
+            return await fn(*args, **kwargs)
+
+        return cast(Callable[_P, _T], async_wrapper)
 
     @functools.wraps(fn)
     def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _T:

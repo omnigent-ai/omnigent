@@ -3,7 +3,8 @@ import { useQueries, useQueryClient } from "@tanstack/react-query";
 import type { Conversation } from "./useConversations";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
 import { latestActivityIsError } from "@/lib/sessionError";
-import { fetchSessionItemsPage } from "@/lib/sessionsApi";
+import { fetchSessionItemsPage, type SessionItemsPage } from "@/lib/sessionsApi";
+import { isStaleCursorError } from "@/lib/staleCursor";
 import { isTempConvId } from "@/lib/tempConversationId";
 import { conversationRegistry } from "@/store/conversationRegistry";
 
@@ -32,11 +33,20 @@ async function fetchLatestError(id: string, signal: AbortSignal): Promise<boolea
     if (error !== undefined || !page.hasMore) return error ?? false;
     // A hidden metadata item may trail the last visible message. Bound the
     // fallback instead of hydrating a whole transcript just for its badge.
-    const older = await fetchSessionItemsPage(id, {
-      olderThan: page.items[0]?.id,
-      limit: 8,
-      signal,
-    });
+    let older: SessionItemsPage;
+    try {
+      older = await fetchSessionItemsPage(id, {
+        olderThan: page.items[0]?.id,
+        limit: 8,
+        signal,
+      });
+    } catch (err) {
+      // The item this badge read anchored on was deleted between the two
+      // requests. The tail is unknowable now; fall back to the first read
+      // rather than failing the whole badge.
+      if (isStaleCursorError(err)) return false;
+      throw err;
+    }
     return latestActivityIsError(itemsToBlocks(older.items)) ?? false;
   } finally {
     const next = waitingReads.shift();

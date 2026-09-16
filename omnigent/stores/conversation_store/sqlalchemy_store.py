@@ -3102,9 +3102,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         )
         cursor_row_values = tuple_(literal(sort_val, sort_col.type), cursor_tiebreaker)
         descending_scan = is_desc if forward else not is_desc
-        return stmt.where(
-            row < cursor_row_values if descending_scan else row > cursor_row_values
-        )
+        return stmt.where(row < cursor_row_values if descending_scan else row > cursor_row_values)
 
     def update_conversation(
         self,

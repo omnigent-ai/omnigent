@@ -461,3 +461,37 @@ def test_restart_on_stale_cursor_passes_other_errors_through() -> None:
     with pytest.raises(ValueError):
         walk()
     assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_restart_on_stale_cursor_restarts_an_async_walk() -> None:
+    """An ``async def`` walk is awaited inside the retry loop, not returned
+    as a coroutine the loop never sees fail."""
+    calls = 0
+
+    @restart_on_stale_cursor
+    async def walk() -> str:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise StaleCursorError("conv_gone")
+        return "complete"
+
+    assert await walk() == "complete"
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_restart_on_stale_cursor_reraises_from_an_async_walk() -> None:
+    """A persistently dead cursor surfaces from an async walk too."""
+    calls = 0
+
+    @restart_on_stale_cursor
+    async def walk() -> None:
+        nonlocal calls
+        calls += 1
+        raise StaleCursorError("conv_gone")
+
+    with pytest.raises(StaleCursorError):
+        await walk()
+    assert calls == _STALE_CURSOR_ATTEMPTS

@@ -7309,7 +7309,12 @@ def test_seeded_acl_pushdown_cursor_plans_and_deep_pagination(
                 # Then the emitted spelling, as a description of what produced
                 # that plan. ``after`` in a descending scan compares "<";
                 # every other combination flips one of the two.
-                listing = next((c for c in clauses if sort_by in str(c)), clauses[0])
+                # Skip the cursor point lookup, which also mentions ``sort_by``:
+                # only the paged listing carries an ORDER BY.
+                listing = next(
+                    (c for c in clauses if sort_by in str(c) and "ORDER BY" in str(c)),
+                    clauses[0],
+                )
                 descending_scan = (order == "desc") if direction == "after" else (order == "asc")
                 comparison = "<" if descending_scan else ">"
                 assert f"(conversations.{sort_by}, {tiebreaker}) {comparison}" in " ".join(

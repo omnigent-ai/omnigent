@@ -32,7 +32,12 @@ from omnigent.entities import (
     ConversationItem,
     NewConversationItem,
 )
-from omnigent.errors import ErrorCode, OmnigentError, restart_on_stale_cursor
+from omnigent.errors import (
+    ErrorCode,
+    OmnigentError,
+    StaleCursorError,
+    restart_on_stale_cursor,
+)
 from omnigent.llms import Client as LLMClient
 from omnigent.models.model_catalog import resolve_catalog_model
 from omnigent.models.model_resolver import ModelResolutionError
@@ -2515,6 +2520,12 @@ def fetch_all_items(
     the walk (via :func:`restart_on_stale_cursor`) instead of
     silently dropping the remaining items.
 
+    The restart only recovers a cursor this function derived
+    itself. A caller-supplied ``after`` that is already gone
+    would be re-issued unchanged by every attempt, so it
+    raises — the caller decides what a missing anchor means
+    for its own read.
+
     :param conv_store: The ConversationStore to query.
     :param conversation_id: The conversation to fetch items
         from, e.g. ``"conv_abc123"``.
@@ -2522,6 +2533,8 @@ def fetch_all_items(
         to fetch from the beginning.
     :returns: All items in chronological order after the
         cursor.
+    :raises StaleCursorError: If ``after`` names an item that
+        no longer exists.
     """
     all_items: list[ConversationItem] = []
     cursor = after
@@ -2741,11 +2754,28 @@ def _load_initial_history(
     # The compaction item may be appended after additional output
     # items that the summary does not cover — using last_item_id
     # ensures those post-summary items are included.
-    recent_items = fetch_all_items(
-        conv_store,
-        conversation_id,
-        after=compaction_item.data.last_item_id,
-    )
+    try:
+        recent_items = fetch_all_items(
+            conv_store,
+            conversation_id,
+            after=compaction_item.data.last_item_id,
+        )
+    except StaleCursorError:
+        # The anchor was deleted, so "everything after it" is unrecoverable.
+        # Reload the whole conversation, as a structurally broken compaction
+        # item does above: a superset beats a prompt starved of history.
+        _logger.warning(
+            "Compaction anchor %r for %s no longer exists; loading full history",
+            last_id,
+            conversation_id,
+        )
+        return _LoadedHistory(
+            items=[
+                item
+                for item in fetch_all_items(conv_store, conversation_id)
+                if item.type not in NON_CONTENT_ITEM_TYPES
+            ]
+        )
     # Filter metadata items — they are not conversation content the
     # LLM should receive verbatim.
     content_items = [i for i in recent_items if i.type not in NON_CONTENT_ITEM_TYPES]
