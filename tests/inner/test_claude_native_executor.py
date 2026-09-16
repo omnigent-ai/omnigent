@@ -675,6 +675,14 @@ async def test_failed_injection_clears_framework_context(
     ]
     assert isinstance(events[0], ExecutorError)
     assert not (tmp_path / "pending_framework_context.txt").exists()
+    assert not await executor.enqueue_session_message(
+        "session-key",
+        [
+            {"type": "input_text", "text": "inspect this"},
+            framework_notice_block({"width": 6000, "height": 4000}),
+        ],
+    )
+    assert not (tmp_path / "pending_framework_context.txt").exists()
 
 
 @pytest.mark.asyncio
@@ -875,6 +883,10 @@ async def test_enqueue_session_message_materializes_image(
     Steering messages with multimodal content blocks also materialize
     attachments (same path as ``run_turn``).
     """
+    from omnigent.harnesses.claude_native.bridge import CLAUDE_FRAMEWORK_CONTEXT_FILE
+    from omnigent.inner.native_attachments import framework_notice_block, resize_notice
+
+    dimensions = {"width": 6000, "height": 4000}
     sent: list[dict[str, Any]] = []
     monkeypatch.setattr(
         claude_native_executor,
@@ -891,6 +903,7 @@ async def test_enqueue_session_message_materializes_image(
                 "image_url": _TINY_PNG_DATA_URI,
                 "filename": "steering_img.png",
             },
+            framework_notice_block(dimensions),
             {"type": "input_text", "text": "look at this"},
         ],
     )
@@ -900,10 +913,14 @@ async def test_enqueue_session_message_materializes_image(
     injected = sent[0]["content"]
     assert "steering_img.png" in injected
     assert "look at this" in injected
+    assert "downscaled" not in injected
+    assert (tmp_path / CLAUDE_FRAMEWORK_CONTEXT_FILE).read_text() == resize_notice(dimensions)
     # File was written to the bridge directory.
     written = list((tmp_path / "uploads").iterdir())
     assert len(written) == 1
     assert written[0].name == "steering_img.png"
+    assert await executor.enqueue_session_message("session-key", "follow-up")
+    assert not (tmp_path / CLAUDE_FRAMEWORK_CONTEXT_FILE).exists()
 
 
 @pytest.mark.asyncio

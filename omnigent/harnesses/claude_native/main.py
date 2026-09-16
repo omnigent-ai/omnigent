@@ -5795,6 +5795,8 @@ def _claude_user_content_from_api_blocks(
     unresolved ones surface as a visible could-not-load marker — never a
     silent drop.
 
+    Historical resize notices are not replayed; live submissions supply hook context.
+
     :param content: Omnigent ``content`` value, e.g.
         ``[{"type": "input_text", "text": "hello"}]``.
     :param bridge_dir: Session bridge directory for re-materializing

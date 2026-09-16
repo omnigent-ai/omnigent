@@ -119,10 +119,22 @@ class ClaudeNativeExecutor(Executor):
             return False
         try:
             async with self._inject_lock:
-                await self._inject(partial(inject_user_message, self._bridge_dir, content=text))
+                await self._inject_prompt(text, framework_notices(content))
         except RuntimeError:
             return False
         return True
+
+    async def _inject_prompt(self, text: str, notices: list[str]) -> None:
+        """Inject user text with one-shot context while holding the injection lock."""
+        context_path = self._bridge_dir / CLAUDE_FRAMEWORK_CONTEXT_FILE
+        context_path.unlink(missing_ok=True)
+        if notices:
+            context_path.write_text("\n\n".join(notices), encoding="utf-8")
+        try:
+            await self._inject(partial(inject_user_message, self._bridge_dir, content=text))
+        except BaseException:
+            context_path.unlink(missing_ok=True)
+            raise
 
     async def run_turn(
         self,
@@ -229,15 +241,7 @@ class ClaudeNativeExecutor(Executor):
                         # Track the routed id, not the alias: the next turn's
                         # comparison is against what routing asked for.
                         self._applied_model = wanted_model
-                    if notices:
-                        context_path.write_text("\n\n".join(notices), encoding="utf-8")
-                    try:
-                        await self._inject(
-                            partial(inject_user_message, self._bridge_dir, content=text)
-                        )
-                    except BaseException:
-                        context_path.unlink(missing_ok=True)
-                        raise
+                    await self._inject_prompt(text, notices)
         except ClaudePromptTimeout as exc:
             _logger.exception(
                 "claude-native: prompt delivery to harness timed out",
