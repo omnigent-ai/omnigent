@@ -56,6 +56,9 @@ final class ConnectionErrorTests: XCTestCase {
       requestSwitchServer: { _ in }, openServerSetup: {})
     let coordinator = view.makeCoordinator()
     let webView = NoNetworkWebView()
+    // Mirror makeUIView: failure callbacks act only for the attached, model-held view.
+    view.model.webView = webView
+    coordinator.attach(webView)
     coordinator.load(url, in: webView)
     defer { coordinator.detach() }
 

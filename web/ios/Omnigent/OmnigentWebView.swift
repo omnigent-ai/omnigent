@@ -47,6 +47,7 @@ struct OmnigentWebView: UIViewRepresentable {
     let configuration = WKWebViewConfiguration()
     configuration.userContentController = contentController
     configuration.allowsInlineMediaPlayback = true
+    configuration.websiteDataStore = context.coordinator.websiteDataStore
 
     let webView = AccessoryFreeWebView(frame: .zero, configuration: configuration)
     webView.navigationDelegate = context.coordinator
@@ -362,7 +363,8 @@ struct OmnigentWebView: UIViewRepresentable {
     private(set) var pinnedURL: URL?
     /// Derived, never stored: a cached copy would be one more thing to keep in sync
     /// with `pinnedURL`.
-    private var pinnedOrigin: String? { pinnedURL?.omnigentOrigin }
+    private var effectiveOrigin: String?
+    private var pinnedOrigin: String? { effectiveOrigin }
     private var pinnedAuthentication: ServerAuthentication {
       ServerAuthentication(origin: pinnedOrigin)
     }
@@ -371,10 +373,35 @@ struct OmnigentWebView: UIViewRepresentable {
     private var rootBounces = 0
     private static let maxRootBounces = 1
     private var urlObservation: NSKeyValueObservation?
-    private let oidcLoginManager = OidcLoginManager()
+    private var oidcLoginManager = OidcLoginManager()
+    let websiteDataStore: WKWebsiteDataStore
+    private let contextResult: Result<DatabricksWebContext?, Error>
+    private let webStore: DatabricksWebStore?
+    private let workspaceBootstrap: DatabricksWorkspaceBootstrap
+    private var workspaceSession: DatabricksWebSession?
+    private var authenticationTask: Task<Void, Never>?
+    private var navigationID = UUID()
 
-    init(_ parent: OmnigentWebView) {
+    init(
+      _ parent: OmnigentWebView, context: DatabricksWebContext? = nil,
+      bootstrap: DatabricksWorkspaceBootstrap? = nil
+    ) {
       self.parent = parent
+      let result = Result { try context ?? DatabricksWebContext.resolve(parent.initialURL) }
+      contextResult = result
+      workspaceBootstrap = bootstrap ?? DatabricksWorkspaceBootstrap()
+      switch result {
+      case .success(let context?):
+        let store = DatabricksWebStore(identifier: context.storeIdentifier)
+        webStore = store
+        websiteDataStore = store.websiteDataStore
+      case .success(nil):
+        webStore = nil
+        websiteDataStore = .default()
+      case .failure:
+        webStore = nil
+        websiteDataStore = .nonPersistent()
+      }
     }
 
     func attach(_ webView: WKWebView) {
@@ -386,13 +413,30 @@ struct OmnigentWebView: UIViewRepresentable {
       urlObservation = webView.observe(\.url) { [weak self] _, _ in
         Task { @MainActor in
           guard let self, let webView = self.webView else { return }
+          if let session = self.workspaceSession, let url = webView.url,
+            session.navigationURL(for: url) == nil
+          {
+            self.showWorkspaceFailure(DatabricksSessionError.workspaceChanged)
+            return
+          }
           self.bounceIfWorkspaceRoot(webView)
         }
       }
     }
 
     func detach() {
-      parent.model.cancelServerSwitcherWatchdog()
+      navigationID = UUID()
+      authenticationTask?.cancel()
+      workspaceBootstrap.cancel()
+      (webView as? AccessoryFreeWebView)?.onWindowAvailable = nil
+      webView?.stopLoading()
+      webView?.navigationDelegate = nil
+      webView?.uiDelegate = nil
+      if parent.model.webView === webView {
+        parent.model.cancelServerSwitcherWatchdog()
+        parent.model.cancelAuthentication = nil
+        parent.model.isAuthenticating = false
+      }
       urlObservation = nil
       oidcLoginManager.cancel()
       webView = nil
@@ -469,15 +513,105 @@ struct OmnigentWebView: UIViewRepresentable {
     }
 
     func load(_ url: URL, in webView: WKWebView) {
+      navigationID = UUID()
+      authenticationTask?.cancel()
+      authenticationTask = nil
+      workspaceBootstrap.cancel()
+      oidcLoginManager.cancel()
+      oidcLoginManager = OidcLoginManager()
+      (webView as? AccessoryFreeWebView)?.onWindowAvailable = nil
+      webView.stopLoading()
       pinnedURL = url
-      // A new pin is a new server: the previous one's exhausted bounce budget must
-      // not suppress the first bounce here.
+      effectiveOrigin = nil
+      workspaceSession = nil
       rootBounces = 0
-      publishModelChanges { model in
-        model.currentURL = url
-        model.serverSwitcherHidden = true
+      publishModelChanges { [weak self] model in
+        model.currentURL = self?.workspaceSession?.pageURL ?? url
+        model.isAuthenticating = self?.webStore != nil && self?.workspaceSession == nil
+        model.serverSwitcherHidden = !model.isAuthenticating
+        model.isLoading = true
+        model.bottomBarVisible = false
+        if model.isAuthenticating {
+          model.cancelAuthentication = {
+            self?.showWorkspaceFailure(DatabricksSessionError.cancelled)
+          }
+        } else {
+          model.cancelAuthentication = nil
+        }
       }
-      webView.load(URLRequest(url: url))
+      switch contextResult {
+      case .success(nil):
+        effectiveOrigin = url.omnigentOrigin
+        webView.load(URLRequest(url: url))
+      case .failure(let error):
+        showWorkspaceFailure(error)
+      case .success(let context?):
+        guard
+          let current = try? DatabricksWebContext(url: url, configuration: context.configuration),
+          current.storeIdentifier == context.storeIdentifier
+        else {
+          showWorkspaceFailure(DatabricksSessionError.workspaceChanged)
+          return
+        }
+        if let window = webView.window {
+          startWorkspace(current, in: webView, window: window)
+        } else if let hosted = webView as? AccessoryFreeWebView {
+          hosted.onWindowAvailable = { [weak self, weak webView] window in
+            guard let self, let webView else { return }
+            self.startWorkspace(current, in: webView, window: window)
+          }
+        } else {
+          showWorkspaceFailure(DatabricksSessionError.presentationUnavailable)
+        }
+      }
+    }
+
+    private func startWorkspace(
+      _ context: DatabricksWebContext, in webView: WKWebView, window: UIWindow
+    ) {
+      guard let webStore, authenticationTask == nil else { return }
+      let id = navigationID
+      authenticationTask = Task { [weak self, weak webView] in
+        guard let self, let webView else { return }
+        defer { if navigationID == id { authenticationTask = nil } }
+        do {
+          let session = try await workspaceBootstrap.prepare(
+            context: context, store: webStore, anchor: window)
+          try Task.checkCancellation()
+          guard navigationID == id, self.webView === webView, parent.model.webView === webView
+          else { return }
+          workspaceSession = session
+          effectiveOrigin = session.pageURL.omnigentOrigin
+          parent.model.isAuthenticating = false
+          parent.model.cancelAuthentication = nil
+          parent.model.currentURL = session.pageURL
+          webView.load(URLRequest(url: session.pageURL))
+        } catch {
+          guard navigationID == id, self.webView === webView else { return }
+          showWorkspaceFailure(
+            error is CancellationError ? DatabricksSessionError.cancelled : error)
+        }
+      }
+    }
+
+    private func showWorkspaceFailure(_ error: Error) {
+      navigationID = UUID()
+      effectiveOrigin = nil
+      workspaceSession = nil
+      let id = navigationID
+      authenticationTask?.cancel()
+      authenticationTask = nil
+      workspaceBootstrap.cancel()
+      (webView as? AccessoryFreeWebView)?.onWindowAvailable = nil
+      webView?.stopLoading()
+      Task { @MainActor [weak self] in
+        guard let self, navigationID == id, webView != nil else { return }
+        parent.model.isAuthenticating = false
+        parent.model.cancelAuthentication = nil
+        parent.model.isLoading = false
+        parent.model.cancelServerSwitcherWatchdog()
+        parent.loadFailed(parent.initialURL, error.localizedDescription)
+      }
     }
 
     func userContentController(
@@ -534,10 +668,12 @@ struct OmnigentWebView: UIViewRepresentable {
     }
 
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+      guard isCurrent(webView), webStore == nil || workspaceSession != nil else { return }
       if let url = webView.url,
         ["http", "https"].contains(url.scheme?.lowercased() ?? ""),
         url.omnigentOrigin != pinnedOrigin,
-        !pinnedAuthentication.usesInWebViewAuth
+        pinnedAuthentication == .oidc,
+        webStore == nil
       {
         webView.stopLoading()
         startLogin(in: webView)
@@ -555,6 +691,12 @@ struct OmnigentWebView: UIViewRepresentable {
     }
 
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+      guard isCurrent(webView), webStore == nil || workspaceSession != nil else { return }
+      if let session = workspaceSession, let url = webView.url,
+        session.navigationURL(for: url) != nil
+      {
+        effectiveOrigin = url.omnigentOrigin
+      }
       parent.model.currentURL = webView.url ?? parent.model.currentURL
       // Workspace roots are caught here too, not only in decidePolicyFor: that
       // callback is skipped for loads the shell starts itself, and the Databricks
@@ -564,6 +706,7 @@ struct OmnigentWebView: UIViewRepresentable {
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+      guard isCurrent(webView), webStore == nil || workspaceSession != nil else { return }
       parent.model.isLoading = false
       parent.model.currentURL = webView.url ?? parent.model.currentURL
       // A page other than the bare root finished loading, so the last bounce (if
@@ -600,6 +743,7 @@ struct OmnigentWebView: UIViewRepresentable {
     }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+      guard isCurrent(webView) else { return }
       webView.reload()
     }
 
@@ -608,6 +752,10 @@ struct OmnigentWebView: UIViewRepresentable {
       decidePolicyFor navigationAction: WKNavigationAction,
       decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
     ) {
+      guard isCurrent(webView) else {
+        decisionHandler(.cancel)
+        return
+      }
       guard let url = navigationAction.request.url,
         let scheme = url.scheme?.lowercased()
       else {
@@ -618,6 +766,29 @@ struct OmnigentWebView: UIViewRepresentable {
       if navigationAction.targetFrame == nil {
         openExternal(url)
         decisionHandler(.cancel)
+        return
+      }
+
+      if webStore != nil, navigationAction.targetFrame?.isMainFrame == true,
+        ["http", "https"].contains(scheme)
+      {
+        guard let session = workspaceSession, let destination = session.navigationURL(for: url)
+        else {
+          decisionHandler(.cancel)
+          if navigationAction.navigationType == .linkActivated {
+            openExternal(url)
+          } else {
+            showWorkspaceFailure(DatabricksSessionError.workspaceChanged)
+          }
+          return
+        }
+        if destination != url {
+          decisionHandler(.cancel)
+          bounce(webView, to: destination)
+          return
+        }
+        // Native bootstrap already established this workspace's allowed page origins.
+        decisionHandler(.allow)
         return
       }
 
@@ -636,9 +807,7 @@ struct OmnigentWebView: UIViewRepresentable {
         url.omnigentOrigin != pinnedOrigin
       {
         if pinnedAuthentication.usesInWebViewAuth {
-          // Databricks authentication sets its session cookies through the
-          // WebView redirect chain. Keep IdP interactions inline, but preserve
-          // normal external-link behavior for links tapped on the app page.
+          // Apps still use inline platform SSO; links tapped on the app page remain external.
           if webView.url?.omnigentOrigin == pinnedOrigin,
             navigationAction.navigationType == .linkActivated
           {
@@ -680,6 +849,7 @@ struct OmnigentWebView: UIViewRepresentable {
       for navigationAction: WKNavigationAction,
       windowFeatures: WKWindowFeatures
     ) -> WKWebView? {
+      guard isCurrent(webView) else { return nil }
       if navigationAction.targetFrame == nil, let url = navigationAction.request.url {
         openExternal(url)
       }
@@ -693,7 +863,7 @@ struct OmnigentWebView: UIViewRepresentable {
       type: WKMediaCaptureType,
       decisionHandler: @escaping (WKPermissionDecision) -> Void
     ) {
-      guard Self.isAllowedMediaCaptureType(type),
+      guard isCurrent(webView), Self.isAllowedMediaCaptureType(type),
         origin.omnigentOrigin == pinnedOrigin,
         webView.url?.omnigentOrigin == pinnedOrigin
       else {
@@ -716,6 +886,11 @@ struct OmnigentWebView: UIViewRepresentable {
       guard let pinnedOrigin else { return false }
       guard message.frameInfo.securityOrigin.omnigentOrigin == pinnedOrigin else { return false }
       guard webView?.url?.omnigentOrigin == pinnedOrigin else { return false }
+      if let session = workspaceSession, let url = webView?.url,
+        session.navigationURL(for: url) == nil
+      {
+        return false
+      }
       return message.frameInfo.isMainFrame
     }
 
@@ -771,9 +946,18 @@ struct OmnigentWebView: UIViewRepresentable {
       topViewController()?.present(alert, animated: true)
     }
 
+    private func isCurrent(_ webView: WKWebView) -> Bool {
+      self.webView === webView && parent.model.webView === webView
+    }
+
     private func handleLoadFailure(_ webView: WKWebView, error: Error) {
+      guard isCurrent(webView) else { return }
       let nsError = error as NSError
       guard nsError.code != NSURLErrorCancelled else { return }
+      if webStore != nil {
+        showWorkspaceFailure(DatabricksSessionError.networkUnavailable)
+        return
+      }
       parent.model.isLoading = false
       parent.model.cancelServerSwitcherWatchdog()
 
@@ -788,7 +972,9 @@ struct OmnigentWebView: UIViewRepresentable {
 
     private func publishModelChanges(_ update: @escaping @MainActor (WebViewModel) -> Void) {
       let model = parent.model
-      Task { @MainActor in
+      let id = navigationID
+      Task { @MainActor [weak self] in
+        guard let self, navigationID == id, let webView, model.webView === webView else { return }
         update(model)
       }
     }
@@ -811,6 +997,16 @@ struct OmnigentWebView: UIViewRepresentable {
 }
 
 private final class AccessoryFreeWebView: WKWebView {
+  var onWindowAvailable: ((UIWindow) -> Void)?
+
+  override func didMoveToWindow() {
+    super.didMoveToWindow()
+    if let window, let callback = onWindowAvailable {
+      onWindowAvailable = nil
+      callback(window)
+    }
+  }
+
   override var inputAccessoryView: UIView? {
     nil
   }

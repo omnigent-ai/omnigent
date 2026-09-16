@@ -32,10 +32,20 @@ struct WebShellView: View {
           requestSwitchServer: switchServerIfListed,
           openServerSetup: connectToNewServer
         )
+        .id(DatabricksWebContext.viewIdentity(for: initialURL))
         .ignoresSafeArea()
 
+        if model.isAuthenticating {
+          VStack(spacing: 16) {
+            ProgressView("Connecting to workspace…")
+            Button("Cancel") { model.cancelAuthentication?() }
+          }
+          .frame(maxWidth: .infinity, maxHeight: .infinity)
+          .background(DesignTokens.background(colorScheme))
+        }
+
         ServerSwitcher(
-          currentURL: model.currentURL ?? initialURL,
+          currentURL: initialURL,
           recents: ManagedServers.merged(
             managed: managedConfiguration.serverURLs, recents: settings.recentServers),
           isLoading: model.isLoading,
@@ -157,12 +167,17 @@ private struct ServerSwitcher: View {
     Menu {
       Button {
       } label: {
-        Label(currentURL.omnigentHostLabel, systemImage: "checkmark")
+        Label(DatabricksWebContext.serverLabel(for: currentURL), systemImage: "checkmark")
       }
       .disabled(true)
 
       let otherServers = recents.filter {
-        URL(string: $0)?.omnigentOrigin != currentURL.omnigentOrigin
+        guard let url = URL(string: $0) else { return false }
+        if ServerAuthentication(origin: currentURL.omnigentOrigin) == .databricksWorkspace {
+          return DatabricksWebContext.contextIdentity(for: url)
+            != DatabricksWebContext.contextIdentity(for: currentURL)
+        }
+        return url.omnigentOrigin != currentURL.omnigentOrigin
       }
       if !otherServers.isEmpty {
         Divider()
@@ -170,7 +185,7 @@ private struct ServerSwitcher: View {
           Button {
             switchServer(recent)
           } label: {
-            Text(URL(string: recent)?.omnigentHostLabel ?? recent)
+            Text(URL(string: recent).map { DatabricksWebContext.serverLabel(for: $0) } ?? recent)
           }
         }
       }
@@ -188,7 +203,7 @@ private struct ServerSwitcher: View {
       }
     } label: {
       HStack(spacing: 6) {
-        Text(currentURL.omnigentHostLabel)
+        Text(DatabricksWebContext.serverLabel(for: currentURL))
           .fontWeight(.medium)
           .lineLimit(1)
           .truncationMode(.middle)

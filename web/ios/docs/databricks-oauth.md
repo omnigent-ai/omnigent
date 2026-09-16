@@ -1,11 +1,14 @@
 # Databricks OAuth on iOS
 
-The native OAuth layer is available for workspace-hosted Omnigent, but is **not
-connected to WebView loading yet**. Workspace and Databricks Apps sign-in still
-run inline; generic OIDC is unchanged. Native token persistence and on-demand
-refresh, workspace query context, and issuer discovery are implemented. Platform
-session-cookie bootstrap, isolated per-workspace WebKit data stores, and WebView
-activation remain separate integration steps.
+Workspace-hosted Omnigent uses native OAuth, Keychain credentials, and session-cookie
+bootstrap before loading its WebView. Each workspace context has an isolated,
+persistent WebKit data store. Databricks Apps keep inline platform sign-in, and
+generic OIDC is unchanged.
+
+A workspace connection requires the build configuration and HTTPS callback
+association below. Missing configuration returns to setup with an error; it does
+not fall back to inline workspace login. Automatic mid-session recovery and the
+complete sign-out workflow remain separate lifecycle work.
 
 ## Build configuration
 
@@ -160,6 +163,58 @@ are likewise retried before any saved token can be returned. These pending chang
 are process-local: an app exit or a lost refresh response can still require a new
 sign-in, because server-side rotation and local persistence cannot be atomic.
 
+## Session-cookie bootstrap and web-data isolation
+
+`DatabricksWorkspaceBootstrap` first obtains a saved/refreshed grant, or requests
+native sign-in. When new sign-in is required, it clears the selected context's web
+data **before** a replacement grant can be saved. This avoids pairing new credentials
+with old account data if later session creation fails or is canceled.
+
+The session client issues a native `GET /auth/session/create` with a relative
+`next_url` containing the intended app path and query. A workspace issuer supplies
+the initial exchange origin; account/legacy grants use the entered workspace origin.
+An account-issued grant without an explicit workspace ID is rejected rather than
+letting an unspecified default workspace share the same persistent store. Enter a
+workspace-specific URL instead; no picker or workspace discovery is performed.
+The bearer is sent on the first request only, not forwarded through redirects.
+
+Redirects are handled explicitly, with a limit of eight hops. They must stay on
+HTTPS Databricks workspace-domain families, with no userinfo, nondefault ports, or
+conflicting workspace IDs. A per-operation cookie jar applies the returned cookies
+to subsequent requests according to their domain, path, and expiry; it never imports
+an existing browser or global URLSession cookie jar. The final app URL retains the
+requested conversation/query, not authentication parameters from intermediate URLs.
+
+The client requires a nonempty, unexpired `DBAUTH` cookie valid for the final page.
+Live session cookies must have Secure and HttpOnly attributes. Cookie domains must
+be valid for the response that set them; domains are never broadened to bridge
+hosts. Attributes, companion cookies, and explicit deletions are passed to WebKit.
+Unsupported redirects, cookie scopes, login-page landings, and HTTP failures return
+to setup rather than loading a different workspace or silently retrying sign-in.
+These are client validation rules; verify the deployment's actual cookie-setting
+redirect chain during integration.
+
+`DatabricksWebStore` uses a stable, named `WKWebsiteDataStore` for the credential
+context: entered origin, optional `o`, and client ID. Different contexts have separate
+cookies and other web storage. New native navigation URLs recreate the WebView while
+retaining that context's store. Supported canonical/alias redirects stay inside the
+same logical store; the native bridge trusts only its active approved page origin.
+No old shared-default-store cookies are copied into a workspace store. Other server
+authentication modes retain their existing store behavior.
+
+Cookie updates are serialized per store, even across canceled/recreated WebViews.
+Before applying a new session, conflicting old cookie names are removed. The caller
+waits for writes and reads back the session cookie before loading the page, and checks
+that the grant is still current. Canceled/stale startup work cannot load another
+context's WebView. The connecting screen offers cancellation and the native server
+menu distinguishes workspace IDs on a shared host.
+
+Reconnecting or relaunching runs bootstrap again and reuses a valid grant without
+another browser prompt. A detected login/context change while browsing currently
+returns to setup for reconnect; bounded automatic cookie-expiry recovery and full
+logout cleanup are not implemented yet. WebKit clearing is local to the app and
+must not be described as ending provider/browser SSO.
+
 ## Verification
 
 Run these focused suites in Xcode's Test navigator:
@@ -171,15 +226,36 @@ Run these focused suites in Xcode's Test navigator:
 - `DatabricksLoginManagerTests`
 - `DatabricksCredentialStoreTests`
 - `DatabricksTokenManagerTests`
+- `DatabricksSessionClientTests`
+- `DatabricksWebContextTests`
+- `DatabricksWorkspaceBootstrapTests`
 - `DeepLinkTests` (conversation paths preserve existing workspace queries)
 
 They use synthetic tokens and fake browser sessions; they never log in to a live
 workspace. Credential-store tests use real Keychain APIs under unique test-only
 service names and delete only their own scoped items. Other tests inject an
-in-memory store and never touch the default Keychain service. The redirect-transport
-test uses a local HTTP server without real credentials. Also inspect Debug and Release processed Info.plists using build
-overrides, and the app's signing entitlements. Live browser/AASA verification is
-still required when cookie bootstrap connects this layer to workspace login.
+in-memory credential store and never touch the default Keychain service. WebKit
+isolation tests use uniquely named stores with synthetic cookies and clear their
+own data. Network fixtures prevent requests from falling through to real services;
+the redirect-transport test uses a local HTTP server without real credentials.
+
+For a live test, use a disposable simulator/device profile and two workspaces you
+are authorized to access:
+
+1. Build with a registered public client ID; verify the processed Info.plist and
+   associated-domain provisioning for the exact bundle ID.
+2. Connect to a workspace URL, including `o` where required. Complete the system
+   auth sheet and confirm the intended Omnigent page and API access work.
+3. Relaunch and verify it reconnects without another browser prompt while the
+   grant remains valid.
+4. Connect to a second workspace (including a different `o` on the same host).
+   Switch back and verify sessions and web storage do not mix.
+5. Cancel sign-in, then retry; the original workspace URL/query should remain in
+   the setup form. Open a conversation link and verify its path/context survive.
+6. Check a Databricks Apps URL and a generic OIDC server for unchanged behavior.
+
+Do not put private hosts, IDs, tokens, cookies, callback URLs, or unredacted network
+captures in issues, PRs, screenshots, or maintained examples.
 
 References: [Databricks U2M OAuth](https://docs.databricks.com/aws/en/dev-tools/auth/oauth-u2m),
 [Apple HTTPS callbacks](<https://developer.apple.com/documentation/authenticationservices/aswebauthenticationsession/callback/https(host:path:)>),

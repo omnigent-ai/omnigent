@@ -61,6 +61,14 @@ actor DatabricksTokenManager {
     try flushPendingWrite(for: scope)
   }
 
+  func isCurrent(_ tokens: DatabricksOAuthTokens, for scope: DatabricksCredentialScope) throws
+    -> Bool
+  {
+    try Task.checkCancellation()
+    guard pendingWrites[scope] == nil else { return false }
+    return try store.load(for: scope) == tokens
+  }
+
   /// Nil means no reusable grant. Network, configuration, and Keychain failures remain errors.
   func tokens(for scope: DatabricksCredentialScope) async throws -> DatabricksOAuthTokens? {
     try Task.checkCancellation()

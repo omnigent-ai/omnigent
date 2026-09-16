@@ -57,6 +57,12 @@
 		B2000000000000000000000E /* DatabricksTokenManagerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000000E /* DatabricksTokenManagerTests.swift */; };
 		B10000000000000000000020 /* DatabricksOAuthIssuer.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000020 /* DatabricksOAuthIssuer.swift */; };
 		B2000000000000000000000F /* DatabricksOAuthIssuerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000000F /* DatabricksOAuthIssuerTests.swift */; };
+		B10000000000000000000021 /* DatabricksWebContext.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000021 /* DatabricksWebContext.swift */; };
+		B10000000000000000000022 /* DatabricksSessionClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000022 /* DatabricksSessionClient.swift */; };
+		B10000000000000000000023 /* DatabricksWorkspaceBootstrap.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000023 /* DatabricksWorkspaceBootstrap.swift */; };
+		B20000000000000000000010 /* DatabricksWebContextTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000010 /* DatabricksWebContextTests.swift */; };
+		B20000000000000000000011 /* DatabricksSessionClientTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000011 /* DatabricksSessionClientTests.swift */; };
+		B20000000000000000000012 /* DatabricksWorkspaceBootstrapTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000012 /* DatabricksWorkspaceBootstrapTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -132,6 +138,12 @@
 		A2000000000000000000000E /* DatabricksTokenManagerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DatabricksTokenManagerTests.swift; sourceTree = "<group>"; };
 		A10000000000000000000020 /* DatabricksOAuthIssuer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DatabricksOAuthIssuer.swift; sourceTree = "<group>"; };
 		A2000000000000000000000F /* DatabricksOAuthIssuerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DatabricksOAuthIssuerTests.swift; sourceTree = "<group>"; };
+		A10000000000000000000021 /* DatabricksWebContext.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DatabricksWebContext.swift; sourceTree = "<group>"; };
+		A10000000000000000000022 /* DatabricksSessionClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DatabricksSessionClient.swift; sourceTree = "<group>"; };
+		A10000000000000000000023 /* DatabricksWorkspaceBootstrap.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DatabricksWorkspaceBootstrap.swift; sourceTree = "<group>"; };
+		A20000000000000000000010 /* DatabricksWebContextTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DatabricksWebContextTests.swift; sourceTree = "<group>"; };
+		A20000000000000000000011 /* DatabricksSessionClientTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DatabricksSessionClientTests.swift; sourceTree = "<group>"; };
+		A20000000000000000000012 /* DatabricksWorkspaceBootstrapTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DatabricksWorkspaceBootstrapTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -209,6 +221,9 @@
 				A1000000000000000000001E /* DatabricksCredentialStore.swift */,
 				A1000000000000000000001F /* DatabricksTokenManager.swift */,
 				A10000000000000000000020 /* DatabricksOAuthIssuer.swift */,
+				A10000000000000000000021 /* DatabricksWebContext.swift */,
+				A10000000000000000000022 /* DatabricksSessionClient.swift */,
+				A10000000000000000000023 /* DatabricksWorkspaceBootstrap.swift */,
 				A1000000000000000000001D /* Omnigent.entitlements */,
 				A1000000000000000000000D /* Assets.xcassets */,
 				A10000000000000000000013 /* PrivacyInfo.xcprivacy */,
@@ -237,6 +252,9 @@
 				A2000000000000000000000D /* DatabricksCredentialStoreTests.swift */,
 				A2000000000000000000000E /* DatabricksTokenManagerTests.swift */,
 				A2000000000000000000000F /* DatabricksOAuthIssuerTests.swift */,
+				A20000000000000000000010 /* DatabricksWebContextTests.swift */,
+				A20000000000000000000011 /* DatabricksSessionClientTests.swift */,
+				A20000000000000000000012 /* DatabricksWorkspaceBootstrapTests.swift */,
 			);
 			path = OmnigentTests;
 			sourceTree = "<group>";
@@ -417,6 +435,9 @@
 				B1000000000000000000001E /* DatabricksCredentialStore.swift in Sources */,
 				B1000000000000000000001F /* DatabricksTokenManager.swift in Sources */,
 				B10000000000000000000020 /* DatabricksOAuthIssuer.swift in Sources */,
+				B10000000000000000000021 /* DatabricksWebContext.swift in Sources */,
+				B10000000000000000000022 /* DatabricksSessionClient.swift in Sources */,
+				B10000000000000000000023 /* DatabricksWorkspaceBootstrap.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -440,6 +461,9 @@
 				B2000000000000000000000D /* DatabricksCredentialStoreTests.swift in Sources */,
 				B2000000000000000000000E /* DatabricksTokenManagerTests.swift in Sources */,
 				B2000000000000000000000F /* DatabricksOAuthIssuerTests.swift in Sources */,
+				B20000000000000000000010 /* DatabricksWebContextTests.swift in Sources */,
+				B20000000000000000000011 /* DatabricksSessionClientTests.swift in Sources */,
+				B20000000000000000000012 /* DatabricksWorkspaceBootstrapTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

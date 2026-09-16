@@ -216,6 +216,7 @@ final class OAuthTestServer {
     var status = 200
     var data = Data()
     var url: URL?
+    var headers: [String: String] = [:]
   }
   typealias Handler = (URLRequest) throws -> Response?
   static let tokenData = Data(
@@ -284,7 +285,9 @@ private final class OAuthURLProtocol: URLProtocol {
       guard let result = try handler(request) else { return }
       let response = HTTPURLResponse(
         url: result.url ?? request.url!, statusCode: result.status,
-        httpVersion: nil, headerFields: ["Content-Type": "application/json"])!
+        httpVersion: nil,
+        headerFields: ["Content-Type": "application/json"].merging(result.headers) { _, new in new }
+      )!
       client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
       client?.urlProtocol(self, didLoad: result.data)
       client?.urlProtocolDidFinishLoading(self)

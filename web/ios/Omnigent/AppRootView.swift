@@ -37,7 +37,7 @@ struct AppRootView: View {
           },
           loadFailed: { failedURL, message in
             mode = .setup(
-              prefill: failedURL.omnigentOrigin ?? failedURL.absoluteString, error: message)
+              prefill: serverURL.absoluteString, error: message)
           },
           // Record the CLEAN server URL (no /c/<id>) — the conversation path
           // lives only in the load URL, never in recents, so a later deep link
