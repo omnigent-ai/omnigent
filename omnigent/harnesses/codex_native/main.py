@@ -30,6 +30,7 @@ from omnigent._wrapper_labels import (
 )
 from omnigent._wrapper_labels import WRAPPER_LABEL_KEY as _WRAPPER_LABEL_KEY
 from omnigent.conversation_browser import conversation_url, open_conversation_link_if_enabled
+from omnigent.debug_logging import debug_event
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.harness_availability import (
     HARNESS_BINARY_MISSING,
@@ -2086,12 +2087,24 @@ class _CodexResumeHistoryUnavailableError(click.ClickException):
     """Server history is temporarily unavailable for Codex cold resume."""
 
 
+_CODEX_RESUME_HISTORY_FETCH_ATTEMPTS = 3
+_CODEX_RESUME_HISTORY_RETRYABLE_STATUS = frozenset({500, 502, 503, 504})
+
+
+async def _codex_resume_history_retry_sleep(delay: float) -> None:
+    """Yield between history reads without delaying cancellation."""
+    await asyncio.sleep(delay)
+
+
 async def _fetch_all_session_items_for_codex_resume(
     client: httpx.AsyncClient,
     session_id: str,
 ) -> list[_JsonObject]:
     """
     Fetch committed Omnigent session items in chronological order.
+
+    Retry transient failures on the same page up to three times, using the
+    client's request timeout. Exhaustion preserves the local-rollout fallback.
 
     :param client: HTTP client pointed at the Omnigent server.
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
@@ -2104,19 +2117,56 @@ async def _fetch_all_session_items_for_codex_resume(
     """
     items: list[_JsonObject] = []
     after: str | None = None
+    retries = 0
+    pages = 0
     while True:
         params: dict[str, str | int] = {"limit": 1000, "order": "asc"}
         if after is not None:
             params["after"] = after
-        try:
-            resp = await client.get(
-                f"/v1/sessions/{url_component(session_id)}/items",
-                params=params,
+        resp: httpx.Response | None = None
+        for attempt in range(1, _CODEX_RESUME_HISTORY_FETCH_ATTEMPTS + 1):
+            last_attempt = attempt == _CODEX_RESUME_HISTORY_FETCH_ATTEMPTS
+            try:
+                resp = await client.get(
+                    f"/v1/sessions/{url_component(session_id)}/items",
+                    params=params,
+                )
+            except httpx.TransportError as exc:
+                if last_attempt or not isinstance(
+                    exc,
+                    (
+                        httpx.TimeoutException,
+                        httpx.ConnectError,
+                        httpx.ReadError,
+                        httpx.WriteError,
+                        httpx.RemoteProtocolError,
+                    ),
+                ):
+                    raise _CodexResumeHistoryUnavailableError(
+                        f"Failed to fetch history for {session_id!r}: {exc}"
+                    ) from exc
+                reason = type(exc).__name__
+            else:
+                if last_attempt or resp.status_code not in _CODEX_RESUME_HISTORY_RETRYABLE_STATUS:
+                    break
+                reason = f"http_{resp.status_code}"
+            retries += 1
+            _logger.warning(
+                "Retrying Codex resume history page: session=%s page=%d attempt=%d reason=%s",
+                session_id,
+                pages + 1,
+                attempt,
+                reason,
+                extra=debug_event(
+                    "codex_resume_history_retry",
+                    session_id=session_id,
+                    page=pages + 1,
+                    attempt=attempt,
+                    reason=reason,
+                ),
             )
-        except httpx.TransportError as exc:
-            raise _CodexResumeHistoryUnavailableError(
-                f"Failed to fetch history for {session_id!r}: {exc}"
-            ) from exc
+            await _codex_resume_history_retry_sleep(0.5 * 2 ** (attempt - 1))
+        assert resp is not None
         if resp.status_code >= 500:
             raise _CodexResumeHistoryUnavailableError(
                 f"Failed to fetch history for {session_id!r} "
@@ -2145,7 +2195,23 @@ async def _fetch_all_session_items_for_codex_resume(
                     f"item at index {index}."
                 )
             items.append(item)
+        pages += 1
         if not payload.get("has_more"):
+            if retries:
+                _logger.info(
+                    "Recovered Codex resume history: session=%s retries=%d pages=%d items=%d",
+                    session_id,
+                    retries,
+                    pages,
+                    len(items),
+                    extra=debug_event(
+                        "codex_resume_history_recovered",
+                        session_id=session_id,
+                        retries=retries,
+                        pages=pages,
+                        items=len(items),
+                    ),
+                )
             return items
         last_id = payload.get("last_id")
         if not isinstance(last_id, str) or not last_id:
