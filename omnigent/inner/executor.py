@@ -15,6 +15,8 @@ from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass, field
 from typing import Any, Protocol, TypeAlias, runtime_checkable
 
+from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
+
 # ---------------------------------------------------------------------------
 # Type aliases for JSON-shaped executor boundaries
 # ---------------------------------------------------------------------------
@@ -539,6 +541,17 @@ def classify_tool_result(
             return ToolResultClassification(
                 status=ToolCallStatus.BLOCKED,
                 error=str(result.get("reason", "BLOCKED")),
+            )
+        image_result = decode_mcp_image_result(result)
+        if image_result is not None:
+            if not image_result.is_error:
+                return ToolResultClassification(status=ToolCallStatus.SUCCESS, error="")
+            text = "\n".join(
+                str(block["text"]) for block in image_result.content if block["type"] == "text"
+            )
+            return ToolResultClassification(
+                status=ToolCallStatus.ERROR,
+                error=text or "MCP tool returned an error",
             )
         for key in ("content", "result", "output", "text"):
             if key in result:

@@ -49,6 +49,7 @@ import httpx
 
 from omnigent.debug_logging import runner_primary_session_id
 from omnigent.harness_aliases import canonicalize_harness
+from omnigent.inner.executor import ToolCallStatus, classify_tool_result
 from omnigent.models.model_override import (
     harness_supports_model_override,
     model_family_mismatch,
@@ -57,6 +58,7 @@ from omnigent.models.model_override import (
 )
 from omnigent.native.native_coding_agents import public_agent_name
 from omnigent.runtime import pending_elicitations
+from omnigent.runtime.mcp_tool_result import encode_mcp_image_result, native_image_payload
 from omnigent.tools import ToolManager
 from omnigent.tools.base import Tool, ToolContext
 from omnigent.tools.builtins._arguments import parse_json_object_arguments
@@ -4163,7 +4165,8 @@ async def _execute_browser_tool(
     embedded browser: POST ``/v1/sessions/{conversation_id}/browser/
     action_request`` with ``{action, args}`` (where ``action`` is the
     tool name minus the ``browser_`` prefix) and return the server's JSON
-    response verbatim as the tool output. The server parks a Future,
+    response as the tool output, preserving screenshots as native images.
+    The server parks a Future,
     publishes ``browser.action_request`` on the session stream, and
     resolves the Future when the winning renderer POSTs the action
     result — so this POST stays open until the action completes or the
@@ -4206,7 +4209,41 @@ async def _execute_browser_tool(
         return json.dumps({"error": f"{tool_name} failed: {type(exc).__name__}: {exc}"})
     if resp.status_code >= 400:
         return json.dumps({"error": f"{tool_name} returned {resp.status_code}: {resp.text[:200]}"})
+    if tool_name == "browser_screenshot":
+        return _browser_screenshot_output(resp.text)
     return resp.text
+
+
+def _browser_screenshot_output(output: str) -> str:
+    """Carry a successful browser data URL through the shared image transport."""
+    try:
+        result = json.loads(output)
+    except ValueError:
+        return output
+    if (
+        not isinstance(result, dict)
+        or result.get("ok") is not True
+        or classify_tool_result(result).status != ToolCallStatus.SUCCESS
+    ):
+        return output
+    data_url = result.get("data_url")
+    if not isinstance(data_url, str):
+        return output
+    match = re.fullmatch(r"data:(image/[a-zA-Z0-9.+-]+);base64,([\s\S]+)", data_url)
+    if match is None:
+        return output
+    media_type, data = match.groups()
+    canonical = native_image_payload(data, media_type)
+    if canonical is None:
+        return output
+    metadata = {key: value for key, value in result.items() if key != "data_url"}
+    return encode_mcp_image_result(
+        [
+            {"type": "text", "text": json.dumps(metadata)},
+            {"type": "image", "mimeType": media_type, "data": canonical},
+        ],
+        is_error=False,
+    )
 
 
 async def _execute_policy_tool(

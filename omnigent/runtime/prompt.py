@@ -14,7 +14,11 @@ from omnigent.entities import (
     MessageData,
     NativeToolData,
 )
-from omnigent.runtime.tool_result_replay import image_omitted_placeholder
+from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
+from omnigent.runtime.tool_result_replay import (
+    image_omitted_placeholder,
+    strip_unparseable_image_output,
+)
 from omnigent.spec import AgentSpec
 
 # Shape of the wake notice the runner posts into a parent session when a
@@ -249,10 +253,8 @@ def _strip_output_annotations(
 def _strip_output_image_data(value: Any) -> Any:
     """Rewrite inline base64 image blocks to a text placeholder.
 
-    Walks a tool result's decoded content and replaces any Anthropic
-    ``{"type": "image", "source": {"type": "base64", ...}}`` block with a
-    short text block, dropping the base64 ``data``. Non-image content is
-    returned unchanged.
+    Walks decoded content and replaces Anthropic image blocks or images in a
+    recognized MCP envelope with text placeholders. Other content is retained.
 
     :param value: Decoded ``function_call_output`` content (list, dict, or
         scalar).
@@ -261,6 +263,20 @@ def _strip_output_image_data(value: Any) -> Any:
     if isinstance(value, list):
         return [_strip_output_image_data(item) for item in value]
     if isinstance(value, dict):
+        image_result = decode_mcp_image_result(value)
+        if image_result is not None:
+            blocks = [
+                {
+                    "type": "text",
+                    "text": image_omitted_placeholder(str(block["mimeType"])),
+                }
+                if block["type"] == "image"
+                else block
+                for block in image_result.content
+            ]
+            if image_result.is_error:
+                blocks.insert(0, {"type": "text", "text": "Error:"})
+            return blocks
         source = value.get("source")
         if value.get("type") == "image" and isinstance(source, dict):
             return {
@@ -298,10 +314,9 @@ def _dedupe_tool_output_images(output: str) -> str:
     resume cleanly without a store migration. Plain-text outputs (the common
     case) are returned unchanged.
 
-    Two forms are handled: well-formed JSON (parsed, walked, reserialized) and
-    JSON that was truncated at the conversation-store byte cap — the exact shape
-    that wedges resume — which no longer parses, so a regex fallback rewrites the
-    ``{"type":"image","source":{...base64...}}`` block in place.
+    Well-formed JSON is parsed, walked, and reserialized. Store-clipped MCP
+    envelopes recover their complete blocks; other clipped Anthropic image
+    sources use the regex fallback.
 
     :param output: The persisted ``function_call_output.output`` string.
     :returns: The output with any inline base64 image data replaced by a
@@ -315,6 +330,10 @@ def _dedupe_tool_output_images(output: str) -> str:
     try:
         decoded = json.loads(output)
     except (ValueError, TypeError):
+        normalized = strip_unparseable_image_output(output)
+        if normalized != output:
+            return _dedupe_tool_output_images(normalized)
+
         # Truncated/invalid JSON (e.g. clipped at the store byte cap): fall back
         # to an in-place regex rewrite of any image source block.
         def _replace(match: re.Match[str]) -> str:

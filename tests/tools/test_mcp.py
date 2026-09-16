@@ -730,18 +730,56 @@ def test_format_call_result_error_prefix() -> None:
 
 def test_format_call_result_non_text_content() -> None:
     """
-    Non-text content (e.g. images) is serialized as JSON via
-    ``model_dump()``.
+    Image content uses the tagged transport envelope.
     """
-    block = ImageContent(type="image", data="base64data", mimeType="image/png")
+    from tests._image_fixtures import _TINY_PNG_BASE64
+
+    block = ImageContent(type="image", data=_TINY_PNG_BASE64, mimeType="image/png")
     result = MagicMock()
     result.content = [block]
     result.isError = False
 
     formatted = _format_call_result(result)
     parsed = json.loads(formatted)
-    assert parsed["type"] == "image"
-    assert parsed["data"] == "base64data"
+    assert parsed["__omnigent_mcp_image_result__"] == 1
+    assert parsed["content"][0]["type"] == "image"
+    assert parsed["content"][0]["data"] == _TINY_PNG_BASE64
+
+
+@pytest.mark.parametrize("is_error", [False, True])
+@pytest.mark.parametrize(
+    ("data", "mime_type"),
+    [("", "image/png"), ("abcd", "application/octet-stream")],
+)
+def test_format_call_result_malformed_image_keeps_valid_neighbor(
+    data: str, mime_type: str, is_error: bool
+) -> None:
+    from omnigent.runtime.mcp_tool_result import (
+        decode_mcp_image_result,
+        mcp_response_from_tool_result,
+    )
+    from tests._image_fixtures import _TINY_PNG_BASE64
+
+    valid = ImageContent(type="image", data=_TINY_PNG_BASE64, mimeType="image/png")
+    malformed = ImageContent(type="image", data=data, mimeType=mime_type)
+    trailing = "Required trailing detail: blue."
+    output = _format_call_result(
+        CallToolResult(
+            content=[valid, malformed, TextContent(type="text", text=trailing)],
+            isError=is_error,
+        )
+    )
+
+    parsed = json.loads(output)
+    assert decode_mcp_image_result(parsed) is not None
+    assert mcp_response_from_tool_result(parsed) == {
+        "content": [
+            valid.model_dump(mode="json"),
+            {"type": "text", "text": json.dumps(malformed.model_dump())},
+            {"type": "text", "text": trailing},
+        ],
+        "isError": is_error,
+    }
 
 
 def test_format_call_result_empty_content() -> None:

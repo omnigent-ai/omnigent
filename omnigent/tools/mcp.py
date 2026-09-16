@@ -49,11 +49,13 @@ from mcp.types import (
     ContentBlock,
     ElicitRequestParams,
     ElicitResult,
+    ImageContent,
     TextContent,
 )
 from mcp.types import Tool as McpToolDef
 
 from omnigent.runner.identity import strip_runner_auth_secrets
+from omnigent.runtime.mcp_tool_result import encode_mcp_image_result, native_image_payload
 from omnigent.spec.types import MCPServerConfig, RetryPolicy
 
 _T = TypeVar("_T")
@@ -625,8 +627,7 @@ class McpServerConnection:
         :param session_id: Omnigent session id, e.g. ``"conv_abc123"``.
             Forwarded to ``_invoke_tool`` for inline elicitation
             context. ``None`` when no session is available.
-        :returns: The tool result as a string. For multi-content
-            results, text blocks are joined with newlines.
+        :returns: A tagged image result or the legacy newline-joined text.
         :raises RuntimeError: If ``connect()`` has not been called.
         :raises McpServerDisabledError: If the circuit breaker is
             tripped.
@@ -1711,8 +1712,9 @@ def _format_call_result(result: CallToolResult) -> str:
     """
     Convert an MCP ``CallToolResult`` to a plain string.
 
-    Extracts text content blocks and joins them. If the result
-    indicates an error, prefixes the output with ``"Error: "``.
+    Image results use a tagged envelope so terminal adapters can restore
+    native image blocks. Other results retain the joined text format and
+    the ``"Error: "`` prefix on failure.
 
     :param result: The ``CallToolResult`` from
         ``session.call_tool()``.
@@ -1720,10 +1722,31 @@ def _format_call_result(result: CallToolResult) -> str:
         Returns ``"(empty response)"`` when the server sends no
         content blocks.
     """
-    parts: list[str] = []
+    content = []
+    legacy_parts: list[str] = []
+    has_image = False
     for block in result.content:
-        parts.append(_format_content_block(block))
-    joined = "\n".join(parts)
+        canonical = (
+            native_image_payload(block.data, block.mimeType)
+            if isinstance(block, ImageContent)
+            else None
+        )
+        if canonical is not None:
+            content.append({**block.model_dump(mode="json"), "data": canonical})
+            has_image = True
+        else:
+            text = _format_content_block(block)
+            legacy_parts.append(text)
+            content.append(
+                block.model_dump(mode="json")
+                if isinstance(block, ImageContent)
+                and block.data
+                and block.mimeType.startswith("image/")
+                else {"type": "text", "text": text}
+            )
+    if has_image:
+        return encode_mcp_image_result(content, is_error=bool(result.isError))
+    joined = "\n".join(legacy_parts)
     if not joined:
         joined = "(empty response)"
     if result.isError:

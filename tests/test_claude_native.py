@@ -9204,7 +9204,10 @@ def test_tool_use_result_redacts_inline_data_uris() -> None:
 
 
 @pytest.mark.parametrize("is_error", [False, True], ids=["ok", "error"])
-def test_mcp_single_image_result_replays_as_one_structured_image(is_error: bool) -> None:
+@pytest.mark.parametrize("spelling", ["legacy", "envelope"])
+def test_mcp_single_image_result_replays_as_one_structured_image(
+    is_error: bool, spelling: str
+) -> None:
     """
     A lone MCP ``ImageContent`` replays as a real image block, once.
 
@@ -9226,7 +9229,13 @@ def test_mcp_single_image_result_replays_as_one_structured_image(is_error: bool)
     output = _mcp_call_output(
         ImageContent(type="image", data=b64, mimeType="image/png"), is_error=is_error
     )
-    assert output.startswith("Error: ") is is_error
+    if spelling == "legacy":
+        output = ("Error: " if is_error else "") + json.dumps(
+            {"type": "image", "data": b64, "mimeType": "image/png"}
+        )
+        assert output.startswith("Error: ") is is_error
+    else:
+        assert json.loads(output)["isError"] is is_error
     records = _image_output_records(output)
     assert len(records) == 1
     record = records[0]
@@ -9306,7 +9315,10 @@ def test_mcp_errored_non_image_result_representation_is_unchanged() -> None:
 
 
 @pytest.mark.parametrize("is_error", [False, True], ids=["ok", "error"])
-def test_mcp_mixed_text_and_image_result_replays_as_block_list(is_error: bool) -> None:
+@pytest.mark.parametrize("spelling", ["legacy", "envelope"])
+def test_mcp_mixed_text_and_image_result_replays_as_block_list(
+    is_error: bool, spelling: str
+) -> None:
     """
     Text-plus-screenshot MCP output replays as a structured block list.
 
@@ -9329,23 +9341,35 @@ def test_mcp_mixed_text_and_image_result_replays_as_block_list(is_error: bool) -
         ImageContent(type="image", data=b64, mimeType="image/png"),
         is_error=is_error,
     )
-    # The persisted form is genuinely not one JSON document.
-    with pytest.raises(json.JSONDecodeError):
-        json.loads(output)
-    expected_text = "Error: took a screenshot" if is_error else "took a screenshot"
+    if spelling == "legacy":
+        output = (
+            ("Error: " if is_error else "")
+            + "took a screenshot\n"
+            + json.dumps({"type": "image", "data": b64, "mimeType": "image/png"})
+        )
+        with pytest.raises(json.JSONDecodeError):
+            json.loads(output)
+    else:
+        assert json.loads(output)["isError"] is is_error
+    expected_text = (
+        "Error: took a screenshot" if is_error and spelling == "legacy" else "took a screenshot"
+    )
     records = _image_output_records(output)
     assert len(records) == 1
     record = records[0]
     content = record["message"]["content"][0]["content"]
-    assert content == [
+    expected = [
         {"type": "text", "text": expected_text},
         {
             "type": "image",
             "source": {"type": "base64", "media_type": "image/png", "data": b64},
         },
     ]
+    if is_error and spelling == "envelope":
+        expected.insert(0, {"type": "text", "text": "Error:"})
+    assert content == expected
     tool_use_result = json.loads(record["toolUseResult"])
-    assert tool_use_result[0] == {"type": "text", "text": expected_text}
+    assert tool_use_result[0] == expected[0]
     assert b64 not in json.dumps(tool_use_result)
     assert json.dumps(record).count(b64) == 1
 
@@ -9955,35 +9979,29 @@ def test_store_capped_mcp_image_result_does_not_leak_base64(
 
 
 def test_store_capped_multi_image_result_keeps_the_intact_image() -> None:
-    """A clipped trailing image is collapsed without discarding earlier ones.
-
-    The newline-joined form is several JSON documents, so a whole-body parse
-    failure says nothing about the intact lines; only the clipped line is stood
-    down to a placeholder.
-    """
+    """Capping removes an oversized image payload while preserving a valid one."""
     from mcp.types import CallToolResult, ImageContent
 
     from omnigent.runtime.tool_output import cap_tool_output
     from omnigent.tools.mcp import _format_call_result
 
     clipped = base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"\xa5" * 900_000).decode()
-    capped = cap_tool_output(
-        _format_call_result(
-            CallToolResult(
-                content=[
-                    ImageContent(type="image", data=_TINY_PNG_BASE64, mimeType="image/png"),
-                    ImageContent(type="image", data=clipped, mimeType="image/png"),
-                ],
-                isError=False,
-            )
+    output = _format_call_result(
+        CallToolResult(
+            content=[
+                ImageContent(type="image", data=_TINY_PNG_BASE64, mimeType="image/png"),
+                ImageContent(type="image", data=clipped, mimeType="image/png"),
+            ],
+            isError=False,
         )
     )
+    capped = cap_tool_output(output)
 
     records = _image_output_records(capped)
     blob = json.dumps(records[0])
     assert blob.count(_TINY_PNG_BASE64) == 1, "the intact image must survive"
     assert blob.count(clipped[:64]) == 0, "the clipped payload must not"
-    assert len(blob) < len(capped) // 100
+    assert len(blob) < len(output) // 100
     content = records[0]["message"]["content"][0]["content"]
     assert content[0]["source"]["data"] == _TINY_PNG_BASE64
     assert "omitted from history" in json.dumps(content[1:])
@@ -10002,13 +10020,11 @@ def test_errored_truncated_image_result_does_not_leak_base64() -> None:
     model-visible ``tool_result`` text and again in ``toolUseResult``.
     The error must survive as compact text, the payload in neither place.
     """
-    from mcp.types import ImageContent
+    from mcp.types import TextContent
 
     b64 = "iVBORw0KGgo" + "A" * 100_000
-    # Real prefix from the real formatter, then the store's real clipping.
-    errored = _mcp_call_output(
-        ImageContent(type="image", data=b64, mimeType="image/png"), is_error=True
-    )
+    # The legacy text error prefix remains valid for previously stored images.
+    errored = _mcp_call_output(TextContent(type="text", text="tool failed"), is_error=True)
     assert errored.startswith(trc._MCP_ERROR_PREFIX)
     truncated = _store_truncated(
         trc._MCP_ERROR_PREFIX + '[{"type":"image","source":{"type":"base64","data":"' + b64

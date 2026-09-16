@@ -46,6 +46,7 @@ from omnigent.models.codex_model_vocabulary import (
 )
 from omnigent.models.model_fallbacks import CODEX_CATALOG_CLONE_SOURCE_SLUG, CODEX_DEFAULT_MODEL
 from omnigent.native import _native_forwarder_health as native_forwarder_health
+from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
 from omnigent.spec.types import RetryPolicy
 from omnigent.util.reasoning_effort import CODEX_EFFORTS, EFFORT_ALIASES, validate_effort
 
@@ -2044,17 +2045,62 @@ def _build_initial_prompt(
     """
     Build the initial prompt for a fresh Codex thread.
 
-    For single-message or single-user-message inputs, returns
-    the latest user content directly (may be multimodal). For
-    multi-turn history, serializes prior turns as text and
-    returns a plain string.
+    Replays prior turns with role labels, keeping attachments as native
+    content blocks. Text-only history retains its plain-string format.
 
     :param messages: Conversation history.
     :returns: A string prompt or a list of content block dicts.
     """
     user_messages = [msg for msg in messages if msg.get("role") == "user"]
-    if len(messages) <= 1 or len(user_messages) <= 1:
+    has_tool_history = any(msg.get("role") == "tool" for msg in messages)
+    if len(messages) <= 1 or (len(user_messages) <= 1 and not has_tool_history):
         return _extract_latest_user_content(messages)
+
+    has_attachments = any(
+        isinstance(msg.get("content"), list)
+        and any(
+            isinstance(block, dict) and block.get("type") in ("input_image", "input_file")
+            for block in msg["content"]
+        )
+        for msg in messages
+    )
+    if has_attachments:
+        blocks: list[CodexParams] = [{"type": "input_text", "text": "Conversation so far:"}]
+        for msg in messages:
+            role = str(msg.get("role", "user")).replace("_", " ")
+            blocks.append({"type": "input_text", "text": f"{role}:"})
+            content = msg.get("content")
+            if isinstance(content, str):
+                blocks.append({"type": "input_text", "text": content})
+            elif isinstance(content, list):
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    kind = block.get("type")
+                    if kind in ("input_text", "output_text", "text"):
+                        text = block.get("text")
+                        if isinstance(text, str):
+                            blocks.append({"type": "input_text", "text": text})
+                    elif kind == "input_image" and isinstance(block.get("image_url"), str):
+                        blocks.append({"type": "input_image", "image_url": block["image_url"]})
+                    elif kind == "input_file" and isinstance(block.get("file_data"), str):
+                        blocks.append(block)
+                    else:
+                        blocks.append(
+                            {
+                                "type": "input_text",
+                                "text": f"[Unavailable history content: {kind}]",
+                            }
+                        )
+        blocks.append(
+            {
+                "type": "input_text",
+                "text": (
+                    "Respond to the latest user message, using the conversation above as context."
+                ),
+            }
+        )
+        return blocks
 
     lines = ["Conversation so far:"]
     for msg in messages:
@@ -2333,6 +2379,20 @@ def _codex_builtin_tool_completion(item: CodexParams) -> ToolCallComplete | None
 
 def _dynamic_tool_result_payload(result: CodexToolResult) -> CodexParams:
     classification = classify_tool_result(result)
+    image_result = decode_mcp_image_result(result)
+    if image_result is not None:
+        items: list[CodexParams] = []
+        for block in image_result.native_content():
+            if block["type"] == "image":
+                items.append(
+                    {
+                        "type": "inputImage",
+                        "imageUrl": f"data:{block['mimeType']};base64,{block['data']}",
+                    }
+                )
+            else:
+                items.append({"type": "inputText", "text": block["text"]})
+        return {"success": not image_result.is_error, "contentItems": items}
     return {
         "success": classification.status == ToolCallStatus.SUCCESS,
         "contentItems": [
@@ -2432,6 +2492,7 @@ class _CodexAppServerSession:
         # Serialize concurrent writes to the subprocess stdin so that parallel
         # tool-call responses don't interleave bytes on the pipe.
         self._stdin_lock = asyncio.Lock()
+        self._supports_direct_tool_namespaces = False
 
     async def start(self) -> None:
         if self._started:
@@ -2527,7 +2588,7 @@ class _CodexAppServerSession:
             )
             self._reader_task = asyncio.create_task(self._reader_loop())
             self._stderr_task = asyncio.create_task(self._stderr_loop())
-            await self._request(
+            initialized = await self._request(
                 "initialize",
                 {
                     "clientInfo": {
@@ -2539,6 +2600,15 @@ class _CodexAppServerSession:
                     },
                 },
             )
+            user_agent = initialized.get("result", {}).get("userAgent")
+            version = (
+                re.match(r"^[^/\s]+/(\d+)\.(\d+)\.(\d+)", user_agent)
+                if isinstance(user_agent, str)
+                else None
+            )
+            self._supports_direct_tool_namespaces = version is not None and tuple(
+                int(part) for part in version.groups()
+            ) >= (0, 142, 0)
             self._started = True
             if router_bridge_dir is not None:
                 # App-server threads run persisted-trusted hooks only, so the
@@ -2746,10 +2816,15 @@ class _CodexAppServerSession:
                 params["developerInstructions"] = system_prompt
             if tools:
                 params["dynamicTools"] = _dynamic_tool_specs(tools)
-                features: CodexParams = {"unified_exec": False}
+                tool_config: CodexParams = {
+                    "features.unified_exec": False,
+                }
+                if self._supports_direct_tool_namespaces:
+                    # Code Mode flattens dynamic image results into strings.
+                    tool_config["features.code_mode.direct_only_tool_namespaces"] = ["functions"]
                 if self._disable_native_tools:
-                    features["shell_tool"] = False
-                params["config"] = {"features": features}
+                    tool_config["features.shell_tool"] = False
+                params["config"] = tool_config
             response = await self._request("thread/start", params)
             thread = response.get("result", {}).get("thread", {})
             raw_thread_id = thread.get("id")

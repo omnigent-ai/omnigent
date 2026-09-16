@@ -8,6 +8,7 @@ import pytest
 
 from omnigent.entities import ConversationItem, FunctionCallOutputData
 from omnigent.runner.app import _format_subagent_wake_notice
+from omnigent.runtime.mcp_tool_result import encode_mcp_image_result
 from omnigent.runtime.prompt import (
     EMBEDDED_BROWSER_PRIORITY_INSTRUCTION,
     SUBAGENT_WAKE_NOTICE_INSTRUCTION,
@@ -19,6 +20,7 @@ from omnigent.runtime.prompt import (
     raw_author_instructions,
 )
 from omnigent.spec import AgentSpec
+from tests._image_fixtures import _TINY_PNG_BASE64
 
 _SAMPLE_FRAMEWORK_INSTRUCTION = "Framework instruction for testing build_instructions_nullable."
 
@@ -125,6 +127,46 @@ def test_history_replay_leaves_non_image_json_output_unchanged() -> None:
     stored = json.dumps([{"type": "text", "text": "hello"}], separators=(",", ":"))
     result = history_to_input_items([_output_item(stored)])
     assert result[0]["output"] == stored
+
+
+@pytest.mark.parametrize("is_error", [False, True])
+def test_text_history_replay_omits_envelope_images_but_preserves_text(is_error: bool) -> None:
+    stored = encode_mcp_image_result(
+        [
+            {"type": "text", "text": "before"},
+            {"type": "image", "mimeType": "image/png", "data": _TINY_PNG_BASE64},
+            {"type": "text", "text": "Required trailing fact: blue."},
+            {"type": "image", "mimeType": "image/png", "data": _TINY_PNG_BASE64},
+        ],
+        is_error=is_error,
+    )
+    output = history_to_input_items([_output_item(stored)])[0]["output"]
+    assert _TINY_PNG_BASE64 not in output
+    blocks = json.loads(output)
+    if is_error:
+        assert blocks.pop(0) == {"type": "text", "text": "Error:"}
+    assert blocks[0] == {"type": "text", "text": "before"}
+    assert "omitted from history" in blocks[1]["text"]
+    assert blocks[2] == {"type": "text", "text": "Required trailing fact: blue."}
+    assert "omitted from history" in blocks[3]["text"]
+
+
+def test_text_history_replay_recovers_old_clipped_envelope() -> None:
+    stored = encode_mcp_image_result(
+        [
+            {"type": "text", "text": "before"},
+            {"type": "image", "mimeType": "image/png", "data": _TINY_PNG_BASE64},
+            {"type": "image", "mimeType": "image/png", "data": _TINY_PNG_BASE64},
+        ],
+        is_error=True,
+    )
+    clipped = stored[: stored.rindex(_TINY_PNG_BASE64) + 12] + "[truncated]"
+    output = history_to_input_items([_output_item(clipped)])[0]["output"]
+    assert _TINY_PNG_BASE64 not in output
+    assert _TINY_PNG_BASE64[:12] not in output
+    assert "before" in output
+    assert "Error:" in output
+    assert "omitted from history" in output
 
 
 def test_framework_instructions_append_after_custom_prompts() -> None:
