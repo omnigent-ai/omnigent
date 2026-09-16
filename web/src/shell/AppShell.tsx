@@ -9,8 +9,8 @@ import {
 } from "@/hooks/useConversations";
 import { conversationDisplayLabel, UNTITLED_CONVERSATION_LABEL } from "./sidebarNav";
 import { useSessionAgent } from "@/hooks/useAgents";
-import { useApproveHotkey } from "@/hooks/useApproveHotkey";
 import { useNewShellHotkey } from "@/hooks/useNewShellHotkey";
+import { useApprovalAction } from "@/hooks/useApprovalAction";
 import { AgentInfoContent, agentHasInfo } from "@/components/AgentInfo";
 import { useIdleNotifications } from "@/hooks/useIdleNotifications";
 import { useSeedReadState } from "@/hooks/useUnseenConversations";
@@ -182,9 +182,7 @@ function resolveTerminalViewKey(stored: string | null, agentKey: string): string
 
 export function AppShell() {
   const navigate = useNavigate();
-  // Cmd/Ctrl+Enter accepts the pending harness approval prompt. Bound once
-  // here so it works on every chat route, regardless of where focus sits.
-  useApproveHotkey();
+  useApprovalAction();
 
   // Lock the iOS shell to the visual viewport so the soft keyboard can't pan
   // the whole document (which would hide the header and break the layout).

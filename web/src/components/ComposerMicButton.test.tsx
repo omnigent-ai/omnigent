@@ -18,6 +18,7 @@
 
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
+import { ActionsProvider, KeybindingDispatcher } from "@/actions";
 import { CapabilitiesContext } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
 import type { DictationSessionEvents } from "@/lib/dictation";
@@ -133,6 +134,92 @@ afterEach(() => {
 });
 
 describe("ComposerMicButton", () => {
+  it("toggles through the centralized physical-key action", () => {
+    render(
+      <ActionsProvider>
+        <KeybindingDispatcher />
+        <ComposerMicButton onTranscript={vi.fn()} enableHotkey />
+      </ActionsProvider>,
+    );
+    const event = new KeyboardEvent("keydown", {
+      key: "√",
+      code: "KeyV",
+      ctrlKey: true,
+      altKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    screen.getByRole("button", { name: "Voice dictation" }).dispatchEvent(event);
+    expect(startSpy).toHaveBeenCalledOnce();
+    expect(event.defaultPrevented).toBe(true);
+  });
+
+  it("leaves dictation shortcuts to focused terminal surfaces", () => {
+    render(
+      <ActionsProvider>
+        <KeybindingDispatcher />
+        <div className="xterm">
+          <input aria-label="terminal input" />
+        </div>
+        <ComposerMicButton onTranscript={vi.fn()} enableHotkey />
+      </ActionsProvider>,
+    );
+    screen.getByRole("textbox", { name: "terminal input" }).focus();
+    screen.getByRole("textbox", { name: "terminal input" }).dispatchEvent(
+      new KeyboardEvent("keydown", {
+        code: "KeyV",
+        ctrlKey: true,
+        altKey: true,
+        bubbles: true,
+        cancelable: true,
+      }),
+    );
+    expect(startSpy).not.toHaveBeenCalled();
+  });
+
+  it("does not bind dictation when enableHotkey is false", () => {
+    render(
+      <ActionsProvider>
+        <KeybindingDispatcher />
+        <ComposerMicButton onTranscript={vi.fn()} />
+      </ActionsProvider>,
+    );
+    const event = new KeyboardEvent("keydown", {
+      code: "KeyV",
+      ctrlKey: true,
+      altKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    screen.getByRole("button", { name: "Voice dictation" }).dispatchEvent(event);
+    expect(startSpy).not.toHaveBeenCalled();
+    expect(event.defaultPrevented).toBe(false);
+  });
+
+  it("leaves dictation shortcuts to focused Monaco surfaces", () => {
+    render(
+      <ActionsProvider>
+        <KeybindingDispatcher />
+        <div className="monaco-editor">
+          <input aria-label="editor input" />
+        </div>
+        <ComposerMicButton onTranscript={vi.fn()} enableHotkey />
+      </ActionsProvider>,
+    );
+    const input = screen.getByRole("textbox", { name: "editor input" });
+    input.focus();
+    input.dispatchEvent(
+      new KeyboardEvent("keydown", {
+        code: "KeyV",
+        ctrlKey: true,
+        altKey: true,
+        bubbles: true,
+        cancelable: true,
+      }),
+    );
+    expect(startSpy).not.toHaveBeenCalled();
+  });
+
   it("renders nothing when the browser has no SpeechRecognition support", () => {
     vi.stubGlobal("SpeechRecognition", undefined);
     vi.stubGlobal("webkitSpeechRecognition", undefined);

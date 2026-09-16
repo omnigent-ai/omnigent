@@ -4,6 +4,8 @@
 // bare Enter, Alt/Shift-modified Enter, and a chord landing in a text field
 // that holds a draft (a send intent, not a verdict).
 
+import type { ReactNode } from "react";
+import { ActionsProvider, KeybindingDispatcher } from "@/actions";
 import { renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -13,7 +15,19 @@ vi.mock("@/store/chatStore", () => ({
   useChatStore: { getState: () => ({ blocks, submitApproval }) },
 }));
 
-import { useApproveHotkey } from "./useApproveHotkey";
+import { useApprovalAction } from "./useApprovalAction";
+
+function renderApproval(isMac: boolean) {
+  vi.spyOn(navigator, "platform", "get").mockReturnValue(isMac ? "MacIntel" : "Linux x86_64");
+  return renderHook(() => useApprovalAction(), {
+    wrapper: ({ children }: { children: ReactNode }) => (
+      <ActionsProvider>
+        <KeybindingDispatcher />
+        {children}
+      </ActionsProvider>
+    ),
+  });
+}
 
 /** Dispatch a keydown that reaches window from body (default: Cmd+Enter). */
 function press(
@@ -32,10 +46,11 @@ beforeEach(() => {
   blocks = [];
 });
 afterEach(() => {
+  vi.restoreAllMocks();
   blocks = [];
 });
 
-describe("useApproveHotkey", () => {
+describe("useApprovalAction", () => {
   const pending = { type: "elicitation", elicitationId: "e1", status: "pending" };
 
   const FIELD_SCHEMA = {
@@ -49,7 +64,7 @@ describe("useApproveHotkey", () => {
     // keystroke that accepts anyway walks around that gate and sends the
     // server none of what it asked for.
     blocks = [{ ...pending, requestedSchema: FIELD_SCHEMA }];
-    renderHook(() => useApproveHotkey(true));
+    renderApproval(true);
     press();
     expect(submitApproval).not.toHaveBeenCalled();
   });
@@ -61,35 +76,35 @@ describe("useApproveHotkey", () => {
       { type: "elicitation", elicitationId: "old", status: "pending" },
       { ...pending, elicitationId: "form", requestedSchema: FIELD_SCHEMA },
     ];
-    renderHook(() => useApproveHotkey(true));
+    renderApproval(true);
     press();
     expect(submitApproval).not.toHaveBeenCalled();
   });
 
   it("still accepts a bare consent prompt that names no fields", () => {
     blocks = [{ ...pending, requestedSchema: { type: "object" } }];
-    renderHook(() => useApproveHotkey(true));
+    renderApproval(true);
     press();
     expect(submitApproval).toHaveBeenCalledWith("e1", "accept");
   });
 
   it("Cmd+Enter accepts the pending approval (macOS)", () => {
     blocks = [pending];
-    renderHook(() => useApproveHotkey(true));
+    renderApproval(true);
     press();
     expect(submitApproval).toHaveBeenCalledWith("e1", "accept");
   });
 
   it("Ctrl+Enter accepts on Windows/Linux", () => {
     blocks = [pending];
-    renderHook(() => useApproveHotkey(false));
+    renderApproval(false);
     press({ ctrlKey: true });
     expect(submitApproval).toHaveBeenCalledWith("e1", "accept");
   });
 
   it("ignores Ctrl+Enter on macOS (only ⌘↵ fires there)", () => {
     blocks = [pending];
-    renderHook(() => useApproveHotkey(true));
+    renderApproval(true);
     press({ ctrlKey: true });
     expect(submitApproval).not.toHaveBeenCalled();
   });
@@ -100,28 +115,28 @@ describe("useApproveHotkey", () => {
       { type: "text" },
       { type: "elicitation", elicitationId: "new", status: "pending" },
     ];
-    renderHook(() => useApproveHotkey(true));
+    renderApproval(true);
     press();
     expect(submitApproval).toHaveBeenCalledWith("new", "accept");
   });
 
   it("ignores already-responded prompts", () => {
     blocks = [{ type: "elicitation", elicitationId: "e1", status: "responded" }];
-    renderHook(() => useApproveHotkey(true));
+    renderApproval(true);
     press();
     expect(submitApproval).not.toHaveBeenCalled();
   });
 
   it("skips AskUserQuestion (needs an explicit choice)", () => {
     blocks = [{ type: "elicitation", elicitationId: "q1", status: "pending", askUserQuestion: {} }];
-    renderHook(() => useApproveHotkey(true));
+    renderApproval(true);
     press();
     expect(submitApproval).not.toHaveBeenCalled();
   });
 
   it("ignores bare Enter and Alt/Shift-modified Enter", () => {
     blocks = [pending];
-    renderHook(() => useApproveHotkey(true));
+    renderApproval(true);
     press({}); // bare Enter
     press({ metaKey: true, shiftKey: true });
     press({ metaKey: true, altKey: true });
@@ -133,7 +148,7 @@ describe("useApproveHotkey", () => {
     // send chord (the ONLY one under the Mod+Enter preference); it must
     // never resolve a prompt that mounted moments earlier.
     blocks = [pending];
-    renderHook(() => useApproveHotkey(false));
+    renderApproval(false);
     const ta = document.createElement("textarea");
     ta.value = "deploying the fix, hold on";
     document.body.appendChild(ta);
@@ -157,7 +172,7 @@ describe("useApproveHotkey", () => {
     // composer sendable with an empty value, and it advertises that via
     // data-has-draft. The chord is still a send intent there, not a verdict.
     blocks = [pending];
-    renderHook(() => useApproveHotkey(false));
+    renderApproval(false);
     const ta = document.createElement("textarea");
     ta.dataset.hasDraft = "true";
     document.body.appendChild(ta);
@@ -181,7 +196,7 @@ describe("useApproveHotkey", () => {
     // chord from there is a verdict, not a send intent, and must not be
     // suppressed by the drafting guard.
     blocks = [pending];
-    renderHook(() => useApproveHotkey(false));
+    renderApproval(false);
     const box = document.createElement("input");
     box.type = "checkbox";
     document.body.appendChild(box);
@@ -204,7 +219,7 @@ describe("useApproveHotkey", () => {
     // Post-send, focus can legitimately sit in the cleared composer; an
     // empty field carries no draft, so the chord keeps meaning "approve".
     blocks = [pending];
-    renderHook(() => useApproveHotkey(false));
+    renderApproval(false);
     const ta = document.createElement("textarea");
     document.body.appendChild(ta);
     try {
