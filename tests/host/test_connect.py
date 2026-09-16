@@ -5809,10 +5809,19 @@ async def test_handle_import_local_reports_unreadable_sessions_as_failed(
     session_frames = [f for f in frames if isinstance(f, HostImportLocalSessionFrame)]
     done_frames = [f for f in frames if isinstance(f, HostImportLocalDoneFrame)]
 
-    # Only the readable session got a frame; the corrupt one is counted, not sent.
+    # Only the readable session got a frame; the corrupt one is counted, not
+    # sent, and carries a reason so the UI can explain it rather than show a bare
+    # "1 failed".
     assert [f.session.external_session_id for f in session_frames] == ["good"]
     assert len(done_frames) == 1
     assert done_frames[0].status == "ok" and done_frames[0].failed == 1
+    assert done_frames[0].failures == [
+        {
+            "external_session_id": "corrupt",
+            "source": "claude",
+            "reason": "This session's transcript could not be read.",
+        }
+    ]
 
 
 async def test_handle_import_local_unexpected_error_skips_only_that_session(
@@ -5874,10 +5883,18 @@ async def test_handle_import_local_unexpected_error_skips_only_that_session(
     done_frames = [f for f in frames if isinstance(f, HostImportLocalDoneFrame)]
 
     # The batch runs (oldest first): both good sessions streamed, the bad one
-    # counted, and the stream closed cleanly rather than status="failed".
+    # counted with a reason, and the stream closed cleanly rather than
+    # status="failed".
     assert [f.session.external_session_id for f in session_frames] == ["after", "before"]
     assert len(done_frames) == 1
     assert done_frames[0].status == "ok" and done_frames[0].failed == 1
+    assert done_frames[0].failures == [
+        {
+            "external_session_id": "bad",
+            "source": "claude",
+            "reason": "This session could not be read.",
+        }
+    ]
 
 
 async def test_handle_import_local_send_failure_skips_only_that_session(

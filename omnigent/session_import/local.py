@@ -200,6 +200,51 @@ def _qwen_session_locator(path: Path) -> str:
     return f"{project_digest}:{sha256(session_id.encode()).hexdigest()}"
 
 
+# Codex records the session's origin in ``session_meta.source``. Its own resume
+# picker lists only interactive sources (Cli, VSCode); ``exec`` runs, ``mcp``
+# sessions, and sub-agent / internal threads are automation the user never
+# opened interactively. Match that so recent-import doesn't flood the sidebar
+# with headless ``codex exec`` runs, whose first message is an injected
+# instruction, which is what produced the "many instruction-like titles" report.
+_CODEX_INTERACTIVE_SOURCES = frozenset({"cli", "vscode"})
+
+
+def _codex_rollout_source(path: Path) -> object | None:
+    """Return a Codex rollout's recorded ``session_meta.source``, if present.
+
+    ``session_meta`` is the first record in a rollout, so only the first line is
+    read. Returns the raw value (a string like ``"cli"`` / ``"exec"`` for
+    top-level sources, or a dict for sub-agent / internal ones), or ``None`` when
+    the file is unreadable or predates the ``source`` field.
+    """
+    try:
+        with path.open(encoding="utf-8") as handle:
+            first = handle.readline()
+    except OSError:
+        return None
+    try:
+        record = json.loads(first)
+    except ValueError:
+        return None
+    if not isinstance(record, dict) or record.get("type") != "session_meta":
+        return None
+    payload = record.get("payload")
+    return payload.get("source") if isinstance(payload, dict) else None
+
+
+def _codex_source_is_interactive(source: object) -> bool:
+    """Whether a Codex session source is one the interactive picker shows.
+
+    Mirrors Codex's resume picker (interactive = ``Cli`` / ``VSCode``). A missing
+    source (very old rollouts predating the field) defaults to interactive so
+    genuine history isn't dropped; any recorded non-interactive value (``exec``,
+    ``mcp``, or a sub-agent / internal object) is excluded.
+    """
+    if source is None:
+        return True
+    return isinstance(source, str) and source.lower() in _CODEX_INTERACTIVE_SOURCES
+
+
 def _recent_local_sessions_with_recency(
     source: ImportSource,
     *,
@@ -302,8 +347,13 @@ def _recent_local_sessions_with_recency(
         candidates = []
         for path in rollouts:
             session_id = path.stem[-36:]
-            if _CODEX_THREAD_ID_RE.fullmatch(session_id):
-                candidates.append((path, session_id))
+            if not _CODEX_THREAD_ID_RE.fullmatch(session_id):
+                continue
+            # Read the rollout's source (one line) and skip non-interactive
+            # runs (exec / mcp / sub-agent / internal) that Codex itself hides.
+            if not _codex_source_is_interactive(_codex_rollout_source(path)):
+                continue
+            candidates.append((path, session_id))
         return _recent_unique_sessions_with_recency(candidates, limit=limit)
 
     raise ValueError(f"Unsupported import source: {source}")
@@ -415,6 +465,21 @@ def _items_from_last_compaction(
     return items if last is None else items[last:]
 
 
+def _claude_import_item_data(item: ClaudeTranscriptItem) -> dict[str, object]:
+    """Return an item's data, flagging a compaction summary as meta.
+
+    Claude writes a continuation summary after compacting its own context; a
+    large transcript is trimmed to start there, so the summary would otherwise
+    become the sidebar title ("This session is being continued…"). It is durable
+    context replayed to the agent, not a user turn; flag it ``is_meta`` so the
+    title falls through to a real user message (matching Pi's branch summaries).
+    """
+    data = item.data
+    if item.is_compact_summary and isinstance(data, dict) and not data.get("is_meta"):
+        return {**data, "is_meta": True}
+    return data
+
+
 def load_claude_session(
     session_id: str,
     *,
@@ -444,7 +509,7 @@ def load_claude_session(
         NewConversationItem(
             type=item.item_type,
             response_id=item.response_id,
-            data=parse_item_data(item.item_type, item.data),
+            data=parse_item_data(item.item_type, _claude_import_item_data(item)),
         )
         for item in source_items
     )

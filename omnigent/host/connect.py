@@ -2341,27 +2341,39 @@ class HostProcess:
                 return [], str(exc)
             return [(source, sid) for sid in ids], None
 
-        def _load(source: str, session_id: str) -> HostImportedLocalSession | None:
+        def _load(
+            source: str, session_id: str
+        ) -> tuple[HostImportedLocalSession | None, str | None]:
             from omnigent.session_import.local import load_local_session
             from omnigent.session_import.models import ImportSource, SessionImportNotFoundError
 
             try:
                 local = load_local_session(cast(ImportSource, source), session_id)
-            except (SessionImportNotFoundError, OSError, ValueError, TypeError):
-                return None
-            return HostImportedLocalSession(
-                external_session_id=local.external_session_id,
-                workspace=local.workspace,
-                items=[
-                    {
-                        "type": item.type,
-                        "response_id": item.response_id,
-                        "data": item.data.model_dump(mode="json", exclude_none=True),
-                    }
-                    for item in local.items
-                ],
-                title=local.title,
-                source=local.source,
+            except SessionImportNotFoundError as exc:
+                # Designed to be surfaced (e.g. "…has no importable history"),
+                # so pass it through as the per-session failure reason.
+                return None, str(exc)
+            except (OSError, ValueError, TypeError):
+                _logger.exception(
+                    "import_local: could not read session source=%r id=%r", source, session_id
+                )
+                return None, "This session's transcript could not be read."
+            return (
+                HostImportedLocalSession(
+                    external_session_id=local.external_session_id,
+                    workspace=local.workspace,
+                    items=[
+                        {
+                            "type": item.type,
+                            "response_id": item.response_id,
+                            "data": item.data.model_dump(mode="json", exclude_none=True),
+                        }
+                        for item in local.items
+                    ],
+                    title=local.title,
+                    source=local.source,
+                ),
+                None,
             )
 
         try:
@@ -2379,14 +2391,21 @@ class HostProcess:
             # Oldest first so the server imports newest last → newest sits atop the sidebar.
             ordered = list(reversed(targets))
             total = len(ordered)
-            load_failed = 0
+            failures: list[dict[str, object]] = []
             for source, session_id in ordered:
                 try:
-                    session = await asyncio.to_thread(_load, source, session_id)
+                    session, reason = await asyncio.to_thread(_load, source, session_id)
                     if session is None:
                         # Unreadable/corrupt transcript: no frame to send, but
-                        # report it on the done frame so the counts stay honest.
-                        load_failed += 1
+                        # report it (with a reason) on the done frame so the
+                        # server's counts stay honest and the UI can explain it.
+                        failures.append(
+                            {
+                                "external_session_id": session_id,
+                                "source": source,
+                                "reason": reason or "This session could not be read.",
+                            }
+                        )
                         continue
                     await ws.send(
                         encode_host_frame(
@@ -2406,12 +2425,21 @@ class HostProcess:
                     _logger.exception(
                         "import_local: skipping session source=%r id=%r", source, session_id
                     )
-                    load_failed += 1
+                    failures.append(
+                        {
+                            "external_session_id": session_id,
+                            "source": source,
+                            "reason": "This session could not be read.",
+                        }
+                    )
                     continue
             await ws.send(
                 encode_host_frame(
                     HostImportLocalDoneFrame(
-                        request_id=frame.request_id, status="ok", failed=load_failed
+                        request_id=frame.request_id,
+                        status="ok",
+                        failed=len(failures),
+                        failures=failures,
                     )
                 )
             )
