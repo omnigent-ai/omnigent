@@ -196,7 +196,7 @@ class _ZeroBusCapture:
         rows, lock = self._rows, self._lock
 
         class _Handler(http.server.BaseHTTPRequestHandler):
-            def do_POST(self) -> None:  # noqa: N802 - http.server API
+            def do_POST(self) -> None:
                 body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
                 if self.path.endswith("/oidc/v1/token"):
                     payload = json.dumps({"access_token": "e2e-token", "expires_in": 3600})

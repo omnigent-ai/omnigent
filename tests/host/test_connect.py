@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import errno
+import json
 import logging
 import subprocess
 import sys
@@ -51,6 +52,8 @@ from omnigent.host.frames import (
     HostRunnerExitedFrame,
     HostRunnerStatusFrame,
     HostRunnerStatusResultFrame,
+    HostSkillsFrame,
+    HostSkillsResultFrame,
     HostStatFrame,
     HostStatResultFrame,
     HostStopRunnerFrame,
@@ -107,6 +110,149 @@ def _no_real_zygote(monkeypatch: pytest.MonkeyPatch) -> None:
     from omnigent.runner._zygote import ZYGOTE_ENABLED_ENV_VAR
 
     monkeypatch.setenv(ZYGOTE_ENABLED_ENV_VAR, "0")
+
+
+def _write_discovery_skill(root: Path, name: str, *, visible: bool = True) -> None:
+    skill_dir = root / name
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        f"---\nname: {name}\ndescription: {name} description\n"
+        f"user-invocable: {str(visible).lower()}\n---\nprivate skill body\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "harness,expected",
+    [
+        ("claude-native", {"project", "user", "toolkit:review"}),
+        ("codex-native", {"codex-user"}),
+    ],
+)
+async def test_host_discovers_harness_skills_without_a_runner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, harness: str, expected: set[str]
+) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "project with spaces"
+    home.mkdir()
+    (home / "project with spaces").symlink_to(workspace, target_is_directory=True)
+    monkeypatch.setattr(Path, "home", lambda: home)
+    monkeypatch.setenv("HOME", str(home))
+    config = tmp_path / "claude-config"
+    codex_home = tmp_path / "codex-config"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _write_discovery_skill(workspace / ".claude" / "skills", "project")
+    _write_discovery_skill(workspace / ".claude" / "skills", "hidden", visible=False)
+    _write_discovery_skill(workspace / ".agents" / "skills", "agents")
+    _write_discovery_skill(config / "skills", "user")
+    _write_discovery_skill(config / "skills", "project")
+    _write_discovery_skill(codex_home / "skills", "codex-user")
+    _write_discovery_skill(home / ".claude" / "skills", "wrong-config-home")
+    plugin = config / "plugins" / "cache" / "market" / "toolkit" / "1.0"
+    _write_discovery_skill(plugin / "skills", "review")
+    (config / "settings.json").write_text(json.dumps({"enabledPlugins": {"toolkit@market": True}}))
+    (config / "plugins" / "installed_plugins.json").write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "plugins": {"toolkit@market": [{"scope": "user", "installPath": str(plugin)}]},
+            }
+        )
+    )
+
+    host = _make_host_process()
+    result = host._handle_skills(
+        HostSkillsFrame(request_id="r", harness=harness, path="~/project with spaces")
+    )
+    assert result.status == "ok", result.error
+    assert {skill["name"] for skill in result.skills} == expected
+    assert len(result.skills) == len(expected)
+    assert all(set(skill) == {"name", "description"} for skill in result.skills)
+    assert "private skill body" not in encode_host_frame(result)
+    assert host._alive_runner_ids() == []
+
+
+@pytest.mark.parametrize(
+    "path,error_code",
+    [
+        ("", "invalid_path"),
+        ("relative/path", "invalid_path"),
+        ("bad\x00path", "invalid_path"),
+        ("missing", "not_directory"),
+        ("file", "not_directory"),
+    ],
+)
+async def test_host_skills_rejects_invalid_directory(
+    tmp_path: Path, path: str, error_code: str
+) -> None:
+    (tmp_path / "file").write_text("not a directory")
+    if path in {"missing", "file"}:
+        path = str(tmp_path / path)
+    result = _make_host_process()._handle_skills(
+        HostSkillsFrame(request_id="r", harness="claude-native", path=path)
+    )
+    assert result.status == "failed"
+    assert result.error_code == error_code
+
+
+async def test_host_skills_distinguishes_empty_and_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.host import skills as skill_sources
+
+    host = _make_host_process()
+    frame = HostSkillsFrame(request_id="r", harness="claude-native", path=str(tmp_path))
+    monkeypatch.setattr(skill_sources, "resolve_harness_skills", lambda *_: [])
+    assert host._handle_skills(frame) == HostSkillsResultFrame(request_id="r", status="ok")
+
+    def fail(*_args: object) -> None:
+        raise OSError("unreadable skill directory")
+
+    monkeypatch.setattr(skill_sources, "resolve_harness_skills", fail)
+    host = _make_host_process()
+    result = host._handle_skills(frame)
+    assert result.status == "failed"
+    assert result.error_code == "discovery_failed"
+
+
+async def test_host_skills_does_not_block_tunnel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.host import skills as skill_sources
+
+    host = _make_host_process()
+    ws = _RecordingWS()
+    started = asyncio.Event()
+    release = threading.Event()
+    loop = asyncio.get_running_loop()
+
+    def slow_discovery(*_args: object) -> list[object]:
+        loop.call_soon_threadsafe(started.set)
+        assert release.wait(timeout=5)
+        return []
+
+    monkeypatch.setattr(skill_sources, "resolve_harness_skills", slow_discovery)
+    host._start_frame_task(
+        ws,  # type: ignore[arg-type] — duck-typed WebSocket
+        encode_host_frame(
+            HostSkillsFrame(request_id="skills", harness="claude-native", path=str(tmp_path))
+        ),
+    )
+    try:
+        await asyncio.wait_for(started.wait(), timeout=2)
+        await host._handle_raw_message(
+            ws,  # type: ignore[arg-type] — duck-typed WebSocket
+            encode_host_frame(HostStatFrame(request_id="stat", path=str(tmp_path))),
+        )
+        reply = decode_host_frame(ws.sent[0])
+        assert isinstance(reply, HostStatResultFrame)
+        assert reply.request_id == "stat"
+    finally:
+        release.set()
+        await _drain_frame_tasks(host)
+    assert decode_host_frame(ws.sent[-1]) == HostSkillsResultFrame(
+        request_id="skills", status="ok"
+    )
 
 
 async def test_handle_model_options_serves_the_claude_catalog(

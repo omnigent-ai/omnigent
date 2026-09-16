@@ -41,6 +41,7 @@ from omnigent.harnesses.kimi_native.forwarder import (
     read_kimi_wire_items,
     read_new_kimi_wire_items,
 )
+from tests.budgets import budget
 
 _FIXTURES = Path(__file__).parent / "fixtures" / "kimi_wire"
 
@@ -2931,7 +2932,7 @@ async def _drive_loop(
         )
     )
     try:
-        async with asyncio.timeout(timeout_s):
+        async with asyncio.timeout(budget(timeout_s)):
             while not until():
                 await asyncio.sleep(0.05)
     finally:

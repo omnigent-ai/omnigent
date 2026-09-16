@@ -465,9 +465,15 @@ def _stamp_error_dimensions(attrs: dict[str, str], record: logging.LogRecord) ->
     Any record carrying ``exc_info`` gains ``error_category`` / ``error_impact``
     derived from the exception (see :func:`omnigent.errors.classify_exception`),
     so every ``_logger.exception`` / ``exc_info=…`` site across the codebase is
-    covered without per-site edits. Explicit callsite values always win.
+    covered without per-site edits. Exception and explicit cause types make
+    generic wrapper errors groupable without their messages. Explicit callsite
+    values always win.
     """
     exc = record.exc_info[1] if isinstance(record.exc_info, tuple) else None
+    if isinstance(exc, BaseException):
+        attrs.setdefault("exception_type", type(exc).__name__)
+        if exc.__cause__ is not None:
+            attrs.setdefault("exception_cause_type", type(exc.__cause__).__name__)
     if isinstance(exc, BaseException) and not (
         "error_category" in attrs and "error_impact" in attrs
     ):

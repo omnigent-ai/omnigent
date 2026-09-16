@@ -34,6 +34,7 @@ from omnigent.runner.identity import strip_runner_auth_secrets
 from omnigent.util.tmux_compat import MIN_TMUX_VERSION, MIN_TMUX_VERSION_HINT, tmux_version
 
 from . import _proc
+from .agent_env import strip_desktop_session_env
 from .datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 from .egress import EgressProxyHandle, apply_egress_env, start_egress_proxy
 from .os_env import (
@@ -1269,14 +1270,7 @@ class TerminalInstance:
         env.pop("OMNIGENT_TMUX_SOCK", None)
         # Apply per-terminal env overrides (takes precedence over inherited env).
         env.update(self.env)
-        # Strip vars the caller asked us not to leak into the terminal —
-        # ambient values like ``DATABRICKS_CONFIG_PROFILE`` would otherwise
-        # propagate to the terminal's children (including MCP servers),
-        # whose own auth resolution then picks up the parent's profile
-        # instead of the credentials they were explicitly configured with.
-        # Applied AFTER ``env.update`` so the strip wins even if the
-        # same key was set in ``self.env`` — ``env_unset`` is a
-        # leak-prevention boundary, not a soft default.
+        # Apply exclusions last so overrides cannot leak credentials to MCP servers.
         for key in self.env_unset:
             env.pop(key, None)
         # Strip the runner-auth secret: native agents run their shell in
@@ -1309,6 +1303,7 @@ class TerminalInstance:
         # env vars so its outbound traffic is filtered.
         sandbox_for_launcher: SandboxPolicy | None = self.sandbox_policy
         if sandbox_for_launcher is not None and sandbox_for_launcher.active:
+            env = strip_desktop_session_env(env)
             if self.egress_rules:
                 sandbox_for_launcher = self._bootstrap_egress_proxy(sandbox_for_launcher, env)
             cli_path = shutil.which(self.command) or self.command

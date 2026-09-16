@@ -1,12 +1,16 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { useSkills } from "@/hooks/useSkills";
+
+vi.mock("@/hooks/useSkills", () => ({ useSkills: vi.fn() }));
 import type * as IdentityModule from "@/lib/identity";
 import type * as UseConversationsModule from "@/hooks/useConversations";
+import type * as UseSkillsModule from "@/hooks/useSkills";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 import type * as ChatStoreModule from "@/store/chatStore";
 import type * as NativeBridgeModule from "@/lib/nativeBridge";
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Profiler, type ProfilerOnRenderCallback } from "react";
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -1131,6 +1135,18 @@ function setupLandingMocks() {
   useProjectConfigMock.mockReset();
   useProjectConfigMock.mockReturnValue(DISABLED_QUERY_RESULT);
   useHostModelOptionsMock.mockReset();
+  vi.mocked(useSkills).mockReset();
+  vi.mocked(useSkills).mockImplementation(
+    ({ target, enabled = true, starting = false }) =>
+      ({
+        skills:
+          useAvailableAgentsMock().data?.find(
+            (agent: AvailableAgent) => agent.id === target?.agentId,
+          )?.skills ?? [],
+        skillsStatus: target && enabled ? "ready" : starting ? "loading" : "unavailable",
+        refetch: vi.fn(),
+      }) as ReturnType<typeof useSkills>,
+  );
   useAvailableAgentsMock.mockReset();
   useHostFilesystemMock.mockReset();
   useHostWorktreesMock.mockReset();
@@ -1194,6 +1210,7 @@ function renderLanding(
   infoOverrides: Partial<ServerInfo> = {},
   route = "/",
   onRender?: ProfilerOnRenderCallback,
+  strictMode = false,
 ) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
@@ -1238,6 +1255,7 @@ function renderLanding(
         </TooltipProvider>
       </CapabilitiesProvider>
     </QueryClientProvider>,
+    { reactStrictMode: strictMode },
   );
 }
 
@@ -2874,7 +2892,7 @@ describe("NewChatLandingScreen", () => {
       "rounded-t-2xl",
       "border",
       "border-b-0",
-      "bg-muted/70",
+      "composer-workspace-surface",
       "px-2",
       "py-1.5",
     );
@@ -5955,12 +5973,12 @@ describe("NewChatLandingScreen", () => {
   });
 });
 
-// The landing composer's "/" skills menu: bundled skills of the chosen
-// agent surface as suggestions before any session exists, so a skill can
-// be invoked from the very first message. Native terminal agents are
-// excluded — their CLI owns slash commands.
+// Bundled and host skills can be selected before a session exists.
 describe("NewChatLandingScreen skills menu", () => {
-  beforeEach(setupLandingMocks);
+  beforeEach(() => {
+    setupLandingMocks();
+    setPendingInitialPromptMock.mockReset();
+  });
   afterEach(() => {
     cleanup();
     localStorage.clear();
@@ -5982,18 +6000,165 @@ describe("NewChatLandingScreen skills menu", () => {
   }
 
   function typeMessage(text: string) {
+    fireEvent.focus(screen.getByTestId("new-chat-landing-input"));
     fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
       target: { value: text },
     });
   }
+
+  function mockSkills(state: Partial<ReturnType<typeof useSkills>>) {
+    vi.mocked(useSkills).mockImplementation(
+      ({ target, enabled = true, starting = false }) =>
+        ({
+          skills: [],
+          skillsStatus: "ready",
+          refetch: vi.fn(),
+          ...state,
+          ...(!target || !enabled
+            ? { skills: [], skillsStatus: starting ? "loading" : "unavailable" }
+            : {}),
+        }) as ReturnType<typeof useSkills>,
+    );
+  }
+
+  it("updates and selects arriving skills under StrictMode without retyping", async () => {
+    const { useSkills: realHook } =
+      await vi.importActual<typeof UseSkillsModule>("@/hooks/useSkills");
+    vi.mocked(useSkills).mockImplementation(realHook);
+    let resolveSkills!: (response: Response) => void;
+    authenticatedFetchMock.mockReturnValue(
+      new Promise<Response>((resolve) => {
+        resolveSkills = resolve;
+      }),
+    );
+    renderLanding({}, "/", undefined, true);
+    typeMessage("/review");
+    expect(screen.getByText("Loading skills…")).toBeInTheDocument();
+    const input = screen.getByTestId("new-chat-landing-input");
+    fireEvent.keyDown(input, { key: "Enter" });
+    fireEvent.keyDown(input, { key: "Tab" });
+    expect(input).toHaveValue("/review");
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+    expect(authenticatedFetchMock).toHaveBeenCalledTimes(1);
+    expect(authenticatedFetchMock.mock.calls[0]![0]).toContain(
+      "/v1/skills?host_id=host_1&harness=claude-native&path=%2FUsers%2Fcorey%2Frepo",
+    );
+    await act(async () =>
+      resolveSkills({
+        ok: true,
+        json: async () => ({ skills: [{ name: "review-host", description: "Review from host" }] }),
+      } as Response),
+    );
+    expect(await screen.findByTestId("slash-menu-item-review-host")).toBeInTheDocument();
+    expect(screen.getByTestId("slash-menu-item-review-host")).toHaveAttribute(
+      "data-active",
+      "true",
+    );
+    expect(screen.queryByText("Loading skills…")).not.toBeInTheDocument();
+    fireEvent.keyDown(input, { key: "Tab" });
+    expect(input).toHaveValue("/review-host ");
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled();
+    expect(authenticatedFetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows bundled skills while loading, then uses the server's effective catalog", () => {
+    mockAgents([skilledAgent()]);
+    mockSkills({ skillsStatus: "loading" });
+    renderLanding();
+    typeMessage("/");
+    expect(screen.getByText("Loading skills…")).toBeInTheDocument();
+    expect(screen.getByTestId("slash-menu-item-review-pr")).toBeInTheDocument();
+    mockSkills({
+      skills: [
+        { name: "review-pr", description: "Current bundled description" },
+        { name: "host-review", description: "Host-only skill" },
+      ],
+    });
+    typeMessage("/review");
+    expect(screen.getAllByTestId("slash-menu-item-review-pr")).toHaveLength(1);
+    expect(screen.getByTestId("slash-menu-item-host-review")).toBeInTheDocument();
+    expect(screen.getByText("Current bundled description")).toBeInTheDocument();
+    expect(screen.queryByText("Review a pull request")).not.toBeInTheDocument();
+    typeMessage("/");
+    expect(screen.queryByTestId("slash-menu-item-cross-review")).not.toBeInTheDocument();
+  });
+
+  it("shows Retry for discovery failures and an empty state after successful retry", () => {
+    const retry = vi.fn();
+    mockSkills({ skillsStatus: "error", refetch: retry });
+    renderLanding();
+    typeMessage("/");
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(retry).toHaveBeenCalledOnce();
+    mockSkills({ skills: [] });
+    typeMessage("/missing");
+    expect(screen.getByText("No matching skills")).toBeInTheDocument();
+    typeMessage("/");
+    expect(screen.getByText("No skills available")).toBeInTheDocument();
+  });
+
+  it("dismisses a loading-only menu with Escape", () => {
+    mockSkills({ skillsStatus: "loading" });
+    renderLanding();
+    typeMessage("/");
+    fireEvent.keyDown(screen.getByTestId("new-chat-landing-input"), { key: "Escape" });
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("");
+    expect(screen.queryByText("Loading skills…")).not.toBeInTheDocument();
+  });
+
+  it("hides the cached host catalog when the host disconnects", () => {
+    mockAgents([skilledAgent()]);
+    mockSkills({ skills: [{ name: "host-only", description: "Host-only skill" }] });
+    renderLanding();
+    typeMessage("/");
+    expect(screen.getByTestId("slash-menu-item-host-only")).toBeInTheDocument();
+    mockHosts([host("offline")]);
+    typeMessage("/host");
+    expect(screen.getByText("Skills unavailable while the host is offline.")).toBeInTheDocument();
+    expect(screen.queryByTestId("slash-menu-item-host-only")).not.toBeInTheDocument();
+    expect(useSkills).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        target: {
+          hostId: "host_1",
+          harness: "claude-sdk",
+          path: "/Users/corey/repo",
+          agentId: "ag_skilled",
+        },
+        enabled: false,
+      }),
+    );
+    typeMessage("/");
+    expect(screen.getByTestId("slash-menu-item-review-pr")).toBeInTheDocument();
+  });
+
+  it.each([true, false])(
+    "delivers a host skill as the first message (native: %s)",
+    async (native) => {
+      if (!native) mockAgents([skilledAgent()]);
+      mockSkills({ skills: [{ name: "host-review", description: "Review on host" }] });
+      authenticatedFetchMock.mockResolvedValue({
+        ok: true,
+        json: async () => ({ id: "conv_new" }),
+      } as Response);
+      renderLanding();
+      typeMessage("/host");
+      fireEvent.click(screen.getByTestId("slash-menu-item-host-review"));
+      typeMessage("/host-review check these changes");
+      fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+      await waitFor(() => expect(setPendingInitialPromptMock).toHaveBeenCalled());
+      expect(setPendingInitialPromptMock.mock.calls[0]![1]).toMatchObject({
+        text: "/host-review check these changes",
+        skill: native ? null : { name: "host-review", args: "check these changes" },
+      });
+    },
+  );
 
   it("lists the chosen agent's bundled skills when the draft starts with /", () => {
     mockAgents([skilledAgent()]);
     renderLanding();
     typeMessage("/");
     // Both bundled skills render as rows under the "Skills" section header
-    // — proving the menu reads skills off GET /v1/agents (the only source
-    // here; there is no session snapshot yet). Row testids, not text: the
+    // — proving bundled skills stay available before discovery. Row testids, not text: the
     // active entry's name also renders in the detail card.
     expect(screen.getByText("Skills")).toBeTruthy();
     expect(screen.getByTestId("slash-menu-item-review-pr")).toBeTruthy();
@@ -6077,10 +6242,7 @@ describe("NewChatLandingScreen skills menu", () => {
     expect(screen.queryByText("Review a pull request")).toBeNull();
   });
 
-  it("shows no menu for native terminal agents even if skills are listed", () => {
-    // A native agent with (hypothetical) bundled skills: the gate is the
-    // agent kind, not an empty skill list — the vendor CLI interprets
-    // slash commands itself, so the web menu must stay out of the way.
+  it("offers skills for native terminal agents", () => {
     mockAgents([
       {
         id: "a1",
@@ -6093,7 +6255,7 @@ describe("NewChatLandingScreen skills menu", () => {
     ]);
     renderLanding();
     typeMessage("/");
-    expect(screen.queryByTestId("slash-menu-item-review-pr")).toBeNull();
+    expect(screen.getByTestId("slash-menu-item-review-pr")).toBeInTheDocument();
   });
 });
 
@@ -6710,6 +6872,7 @@ describe("NewChatLandingScreen custom-agent sandbox gating", () => {
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
     // The item is omitted entirely on a sandbox target.
     expect(screen.queryByTestId("new-chat-landing-create-agent")).toBeNull();
+    expect(screen.queryByTestId("new-chat-landing-custom-agents")).toBeNull();
   });
 
   it("shows 'Create custom agent' on a host and opens the dialog", async () => {
@@ -6728,14 +6891,35 @@ describe("NewChatLandingScreen custom-agent sandbox gating", () => {
         screen.getByTestId("new-chat-landing-host-chip").getAttribute("aria-label"),
       ).not.toContain("Sandbox"),
     );
-    // With no custom agents yet, the create item is a top-level row (no
-    // "Custom agents" submenu to hide it behind) and opens the dialog.
+    // Open the create dialog through the custom-agents submenu.
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
-    // No custom agents → no "Custom agents" submenu; create must be top-level.
     fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
     const createItem = screen.getByTestId("new-chat-landing-create-agent");
     fireEvent.click(createItem);
-    await waitFor(() => expect(screen.getByTestId("create-agent-dialog")).toBeTruthy());
+    await waitFor(() => expect(screen.getByTestId("create-agent-dialog")).toBeVisible());
+    for (const field of ["name", "description", "harness", "model", "instructions", "add-mcp"]) {
+      expect(screen.getByTestId(`create-agent-${field}`)).toBeVisible();
+    }
+  });
+
+  it("cancels a custom agent without replacing the selected agent", async () => {
+    renderLanding();
+    const agentPicker = screen.getByTestId("new-chat-landing-agent-select");
+    expect(agentPicker).toHaveAccessibleName(/Claude Code/);
+    fireEvent.pointerDown(agentPicker, { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
+    fireEvent.click(screen.getByTestId("new-chat-landing-create-agent"));
+
+    const dialog = await screen.findByTestId("create-agent-dialog");
+    fireEvent.change(screen.getByTestId("create-agent-name"), {
+      target: { value: "should-not-persist" },
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+
+    await waitFor(() => expect(screen.queryByTestId("create-agent-dialog")).toBeNull());
+    expect(agentPicker).toHaveAccessibleName(/Claude Code/);
+    fireEvent.pointerDown(agentPicker, { button: 0 });
+    expect(screen.queryByTestId("new-chat-landing-agent-pending")).toBeNull();
   });
 
   // Switch the target to the connected host, then create + submit a pending

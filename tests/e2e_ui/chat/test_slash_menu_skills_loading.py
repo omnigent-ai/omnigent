@@ -1,9 +1,9 @@
-"""The open slash menu settles skill discovery through the real SSE consumer."""
+"""The open slash menu settles directly from a host discovery response."""
 
 from __future__ import annotations
 
 import time
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 from playwright.sync_api import Page, Route, expect
@@ -37,7 +37,7 @@ def _mock_starting_runner(page: Page, session_id: str) -> None:
 
 @pytest.mark.parametrize("empty", [False, True], ids=["skills-found", "no-skills"])
 @pytest.mark.parametrize("phase", ["discovery", "runner-starting", "sandbox-starting"])
-def test_open_slash_menu_resolves_skills_on_sse(
+def test_open_slash_menu_resolves_skills_from_host(
     page: Page,
     seeded_session: tuple[str, str],
     empty: bool,
@@ -47,34 +47,26 @@ def test_open_slash_menu_resolves_skills_on_sse(
     base_url, session_id = seeded_session
     session_path = f"/v1/sessions/{session_id}"
     resolved = False
-    snapshot_reads = 0
+    skill_requests: list[Route] = []
     if phase != "discovery":
         _mock_starting_runner(page, session_id)
 
     def snapshot(route: Route) -> None:
-        nonlocal snapshot_reads
         if urlparse(route.request.url).path != session_path or route.request.method != "GET":
-            route.continue_()
+            route.fallback()
             return
         response = route.fetch()
         body = response.json()
-        snapshot_reads += 1
-        body["skills_status"] = (
-            "ready" if resolved else "loading" if phase == "discovery" else "unavailable"
-        )
+        body.update(host_id="menu-host", workspace="/workspace")
         if phase != "discovery":
             body["created_at"] = time.time()
             body["runner_online"] = False
         if phase == "sandbox-starting":
             body["sandbox_status"] = None if resolved else {"stage": "provisioning"}
-        body["skills"] = (
-            [{"name": "code-review", "description": "Review the current change"}]
-            if resolved and not empty
-            else []
-        )
         route.fulfill(response=response, json=body)
 
     page.route(f"**{session_path}*", snapshot)
+    page.route(f"**/v1/skills?session_id={session_id}", lambda route: skill_requests.append(route))
     _install_stream_controller(page, session_id)
     page.goto(f"{base_url}/c/{session_id}")
     composer = page.get_by_label("Message the agent")
@@ -89,13 +81,16 @@ def test_open_slash_menu_resolves_skills_on_sse(
     # Filter out built-ins: the loading subsection must keep the menu open.
     composer.fill("/review")
     expect(page.get_by_text("Loading skills…", exact=True)).to_be_visible()
-    reads_before_event = snapshot_reads
+    assert len(skill_requests) == 1
     resolved = True
-    _push_sse(page, "session.skills", {"type": "session.skills", "conversation_id": session_id})
-
-    # The fallback read waits five seconds; this must settle directly from SSE.
+    skill_requests[0].fulfill(
+        json={
+            "skills": []
+            if empty
+            else [{"name": "code-review", "description": "Review the current change"}]
+        }
+    )
     expect(page.get_by_text("Loading skills…", exact=True)).not_to_be_visible(timeout=3_000)
-    assert snapshot_reads > reads_before_event
     expect(composer).to_have_value("/review")
     if empty:
         expect(page.get_by_text("No matching skills", exact=True)).to_be_visible()
@@ -124,8 +119,8 @@ def test_codex_skill_menu_completes_and_sends_native_skill(
         body = response.json()
         body.update(
             harness="codex-native",
-            skills_status="ready",
-            skills=[{"name": "code-review", "description": "Review the current change"}],
+            host_id="menu-host",
+            workspace="/workspace",
         )
         route.fulfill(response=response, json=body)
 
@@ -138,6 +133,12 @@ def test_codex_skill_menu_completes_and_sends_native_skill(
 
     page.route(f"**{session_path}*", snapshot)
     page.route(f"**{session_path}/events", capture_event)
+    page.route(
+        "**/v1/skills?*",
+        lambda route: route.fulfill(
+            json={"skills": [{"name": "code-review", "description": "Review the current change"}]}
+        ),
+    )
     _install_stream_controller(page, session_id)
     page.goto(f"{base_url}/c/{session_id}")
     composer = page.get_by_label("Message the agent")
@@ -169,6 +170,136 @@ def test_codex_skill_menu_completes_and_sends_native_skill(
     ]
 
 
+def test_read_only_composer_skips_discovery_until_edit_access(
+    page: Page, seeded_session: tuple[str, str]
+) -> None:
+    """Only an editable composer requests the session's skill catalog."""
+    base_url, session_id = seeded_session
+    session_path = f"/v1/sessions/{session_id}"
+    read_only = True
+    skill_requests: list[str] = []
+
+    def snapshot(route: Route) -> None:
+        if urlparse(route.request.url).path != session_path or route.request.method != "GET":
+            route.fallback()
+            return
+        response = route.fetch()
+        body = response.json()
+        body.update(
+            host_id="menu-host",
+            workspace="/workspace",
+            permission_level=1 if read_only else 2,
+        )
+        route.fulfill(response=response, json=body)
+
+    def skills(route: Route) -> None:
+        skill_requests.append(route.request.url)
+        route.fulfill(json={"skills": [{"name": "review", "description": "Review changes"}]})
+
+    page.route(f"**{session_path}*", snapshot)
+    page.route("**/v1/skills?*", skills)
+    page.goto(f"{base_url}/c/{session_id}")
+    composer = page.get_by_label("Message the agent")
+    expect(composer).to_be_disabled()
+    assert skill_requests == []
+
+    read_only = False
+    page.reload()
+    expect(composer).to_be_enabled()
+    composer.fill("/")
+    expect(page.get_by_test_id("slash-menu-item-review")).to_be_visible()
+
+
+@pytest.mark.parametrize("harness,prefix", [("claude-sdk", "/"), ("codex-native", "$")])
+def test_new_session_menu_uses_the_selected_agents_effective_catalog(
+    page: Page, seeded_session: tuple[str, str], harness: str, prefix: str
+) -> None:
+    """The host request includes the agent, and its result replaces cached suggestions."""
+    base_url, session_id = seeded_session
+    pending: list[Route] = []
+
+    def session_agents(route: Route) -> None:
+        # Session-scoped agents must not replace the fixture's selected agent.
+        if parse_qs(urlparse(route.request.url).query).get("kind") == ["any"]:
+            route.fulfill(json={"data": [], "has_more": False})
+        else:
+            route.fallback()
+
+    page.route("**/v1/sessions?*", session_agents)
+    page.route(
+        "**/v1/hosts",
+        lambda route: route.fulfill(
+            json={
+                "hosts": [
+                    {
+                        "host_id": "preview-host",
+                        "name": "Preview host",
+                        "owner": "local",
+                        "status": "online",
+                    }
+                ]
+            }
+        ),
+    )
+    page.route(
+        "**/v1/agents",
+        lambda route: route.fulfill(
+            json={
+                "data": [
+                    {
+                        "id": "preview-agent",
+                        "name": "preview-agent",
+                        "harness": harness,
+                        "skills": [{"name": "obsolete", "description": "Old bundled suggestion"}],
+                    }
+                ],
+                "has_more": False,
+            }
+        ),
+    )
+    page.route(
+        "**/v1/hosts/preview-host/harnesses/*/model-options*",
+        lambda route: route.fulfill(json={"models": []}),
+    )
+
+    def discover(route: Route) -> None:
+        if "host_id" in parse_qs(urlparse(route.request.url).query):
+            pending.append(route)
+        else:
+            route.fallback()
+
+    page.route("**/v1/skills?*", discover)
+    page.goto(f"{base_url}/c/{session_id}")
+    expect(page.get_by_label("Message the agent")).to_be_visible(timeout=30_000)
+    page.evaluate("""() => localStorage.setItem(
+        'omnigent:recent-workspaces', JSON.stringify({'preview-host': ['/tmp']})
+    )""")
+    page.get_by_test_id("new-chat-button").click()
+    composer = page.get_by_test_id("new-chat-landing-input")
+    composer.fill("Hello")
+    expect(page.get_by_test_id("new-chat-landing-submit")).to_be_enabled()
+    composer.fill("/allow")
+    expect(page.get_by_text("Loading skills…", exact=True)).to_be_visible()
+    expect(page.get_by_test_id("new-chat-landing-submit")).to_be_disabled()
+    composer.press("Tab")
+    expect(composer).to_have_value("/allow")
+    assert len(pending) == 1
+    assert parse_qs(urlparse(pending[0].request.url).query) == {
+        "host_id": ["preview-host"],
+        "harness": [harness],
+        "path": ["/tmp"],
+        "agent_id": ["preview-agent"],
+    }
+    pending[0].fulfill(json={"skills": [{"name": "allowed", "description": "Permitted skill"}]})
+    expect(page.get_by_test_id("slash-menu-item-allowed")).to_have_text(f"{prefix}allowed")
+    composer.fill("/")
+    expect(page.get_by_test_id("slash-menu-item-obsolete")).not_to_be_visible()
+    composer.fill("/allow")
+    composer.press("Tab")
+    expect(composer).to_have_value(f"{prefix}allowed ")
+    expect(page.get_by_test_id("new-chat-landing-submit")).to_be_enabled()
+
+
 def test_slash_menu_stops_loading_when_sandbox_launch_fails(
     page: Page,
     seeded_session: tuple[str, str],
@@ -180,14 +311,14 @@ def test_slash_menu_stops_loading_when_sandbox_launch_fails(
 
     def snapshot(route: Route) -> None:
         if urlparse(route.request.url).path != session_path or route.request.method != "GET":
-            route.continue_()
+            route.fallback()
             return
         response = route.fetch()
         body = response.json()
         body.update(
             created_at=time.time(),
-            skills=[],
-            skills_status="unavailable",
+            host_id=None,
+            workspace=None,
             sandbox_status={"stage": "provisioning"},
         )
         route.fulfill(response=response, json=body)
