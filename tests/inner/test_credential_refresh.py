@@ -3,9 +3,13 @@ from __future__ import annotations
 import base64
 import http.server
 import socketserver
+import subprocess
+import sys
 import threading
+import time
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from functools import partial
 from pathlib import Path
 from unittest.mock import Mock
@@ -17,9 +21,15 @@ from omnigent.inner.credential_proxy import (
     RefreshingSecretProvider,
     prepare_credential_proxy_runtime,
 )
-from omnigent.inner.datamodel import CredentialSourceSpec
+from omnigent.inner.datamodel import (
+    CredentialProxyEntry,
+    CredentialProxySpec,
+    CredentialSourceSpec,
+    OSEnvSandboxSpec,
+    OSEnvSpec,
+)
 from omnigent.inner.egress.proxy import EgressProxy
-from omnigent.inner.sandbox import SandboxPolicy
+from omnigent.inner.sandbox import SandboxPolicy, resolve_sandbox
 from omnigent.spec.parser import _parse_credential_proxy
 
 
@@ -268,6 +278,7 @@ def test_refresh_requires_a_policy_and_revalidates_rotation(
         (200, b"token\nheader"),
         (200, b"x" * 65537),
     ],
+    ids=["rotated", "error", "redirect", "empty", "multiline", "oversize"],
 )
 def test_private_socket_renewal_and_failed_refresh(
     broker: tuple[Path, dict[str, object]], sandbox: SandboxPolicy, status: int, payload: bytes
@@ -299,3 +310,254 @@ def test_refresh_remains_opt_in(tmp_path: Path) -> None:
     runtime = prepare_credential_proxy_runtime(spec, parent_env={})
     token_file.write_text("replacement")
     assert {rule.resolve_secret() for rule in runtime.rewrites} == {"initial"}
+
+
+@pytest.mark.parametrize("mode", ["direct", "source-alias", "root-alias", "readonly-cwd"])
+def test_rejects_sandbox_readable_refresh_sources(
+    tmp_path: Path, sandbox: SandboxPolicy, mode: str
+) -> None:
+    readable = tmp_path / "readable"
+    readable.mkdir()
+    token = readable / "token"
+    token.write_text("secret")
+    candidate = token
+    cwd = sandbox.write_roots[0]
+    if mode == "source-alias":
+        candidate = tmp_path / "alias"
+        candidate.symlink_to(token)
+    elif mode == "root-alias":
+        alias = tmp_path / "alias"
+        alias.symlink_to(readable, target_is_directory=True)
+        sandbox.read_roots = [alias]
+    elif mode == "readonly-cwd":
+        cwd = readable
+    if mode not in ("root-alias", "readonly-cwd"):
+        sandbox.read_roots = [readable]
+    with pytest.raises(ValueError, match="sandbox-readable"):
+        RefreshingSecretProvider(
+            CredentialSourceSpec(kind="file", path=str(candidate), refresh_interval_seconds=60),
+            parent_env={},
+            sandbox=sandbox,
+            cwd=cwd,
+        )
+
+
+@pytest.mark.parametrize("refresh", [None, 60])
+def test_readonly_broker_is_rejected_before_contact(
+    broker: tuple[Path, dict[str, object]], sandbox: SandboxPolicy, refresh: int | None
+) -> None:
+    path, state = broker
+    sandbox.read_roots = [path.parent]
+    source = {"unix_socket": str(path), "refresh_interval_seconds": refresh}
+    spec = _parse_credential_proxy([{"type": "gh_basic", "source": source}])
+    with pytest.raises(ValueError, match="sandbox-readable"):
+        prepare_credential_proxy_runtime(spec, parent_env={}, sandbox=sandbox)
+    assert state["calls"] == 0
+
+
+def test_hardlinked_broker_is_rejected_before_contact(
+    broker: tuple[Path, dict[str, object]], sandbox: SandboxPolicy
+) -> None:
+    path, state = broker
+    alias = path.parent / "broker-alias.sock"
+    alias.hardlink_to(path)
+    spec = _parse_credential_proxy([{"type": "gh_basic", "source": {"unix_socket": str(path)}}])
+    with pytest.raises(ValueError, match="hard-linked"):
+        prepare_credential_proxy_runtime(spec, parent_env={}, sandbox=sandbox)
+    assert state["calls"] == 0
+
+
+def test_refresh_rejects_changed_private_symlink_target(
+    tmp_path: Path, sandbox: SandboxPolicy
+) -> None:
+    original = tmp_path / "original"
+    original.write_text("initial")
+    target = tmp_path / "replacement"
+    target.write_text("replacement")
+    alias = tmp_path / "alias"
+    alias.symlink_to(original)
+    clock = Mock(return_value=0.0)
+    provider = RefreshingSecretProvider(
+        CredentialSourceSpec(kind="file", path=str(alias), refresh_interval_seconds=60),
+        parent_env={},
+        sandbox=sandbox,
+        clock=clock,
+    )
+    assert provider.resolve() == "initial"
+    assert sandbox.credential_source_paths == [original.resolve()]
+    alias.unlink()
+    alias.symlink_to(target)
+    clock.return_value = 60.0
+    with pytest.raises(ValueError, match="symlink target changed"):
+        provider.resolve()
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        CredentialSourceSpec(kind="env", env="TOKEN", refresh_interval_seconds=60),
+        CredentialSourceSpec(kind="command", command="echo secret", refresh_interval_seconds=60),
+    ],
+)
+def test_runtime_rejects_nonrenewable_sources(
+    source: CredentialSourceSpec, sandbox: SandboxPolicy
+) -> None:
+    spec = CredentialProxySpec(
+        entries=[
+            CredentialProxyEntry(host="example.com", scheme="bearer", source=source),
+        ]
+    )
+    with pytest.raises(ValueError, match="requires a file or unix_socket"):
+        prepare_credential_proxy_runtime(spec, parent_env={"TOKEN": "secret"}, sandbox=sandbox)
+
+
+@pytest.mark.parametrize("refresh", [None, 60])
+def test_missing_broker_fails_at_startup(
+    tmp_path: Path, sandbox: SandboxPolicy, refresh: int | None
+) -> None:
+    spec = _parse_credential_proxy(
+        [
+            {
+                "type": "gh_basic",
+                "source": {
+                    "unix_socket": str(tmp_path / "missing.sock"),
+                    "refresh_interval_seconds": refresh,
+                },
+            }
+        ]
+    )
+    with pytest.raises(ValueError, match="credential broker is unavailable"):
+        prepare_credential_proxy_runtime(spec, parent_env={}, sandbox=sandbox)
+
+
+def test_socket_without_interval_remains_startup_only(
+    broker: tuple[Path, dict[str, object]], sandbox: SandboxPolicy
+) -> None:
+    path, state = broker
+    spec = _parse_credential_proxy([{"type": "gh_basic", "source": {"unix_socket": str(path)}}])
+    runtime = prepare_credential_proxy_runtime(spec, parent_env={}, sandbox=sandbox)
+    calls = state["calls"]
+    state["body"] = b"replacement"
+    assert {rule.resolve_secret() for rule in runtime.rewrites} == {"initial"}
+    assert state["calls"] == calls
+    assert sandbox.credential_source_paths == [path.resolve()]
+
+
+@pytest.mark.parametrize(
+    "kind,refresh", [("file", 60), ("unix_socket", 60), ("unix_socket", None)]
+)
+def test_native_sandbox_resolution_protects_sources_before_proxy_startup(
+    tmp_path: Path,
+    sandbox: SandboxPolicy,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+    refresh: int | None,
+) -> None:
+    path = tmp_path / "private-source"
+    sandbox.credential_proxy = _parse_credential_proxy(
+        [
+            {
+                "type": "gh_basic",
+                "source": {kind: str(path), "refresh_interval_seconds": refresh},
+            }
+        ]
+    )
+    backend = Mock(resolve=Mock(return_value=sandbox))
+    monkeypatch.setattr("omnigent.inner.sandbox._get_backend", lambda name: backend)
+    spec = OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap"))
+    policy = resolve_sandbox(spec, sandbox.write_roots[0])
+    assert policy.credential_source_paths == [path.resolve()]
+    sandbox.read_roots = [path.parent]
+    with pytest.raises(ValueError, match="sandbox-readable"):
+        resolve_sandbox(spec, sandbox.write_roots[0])
+
+
+@pytest.mark.parametrize("phase", ["headers", "body"])
+def test_socket_deadline_bounds_dribbling_response(
+    short_tmp_parent: Path, sandbox: SandboxPolicy, monkeypatch: pytest.MonkeyPatch, phase: str
+) -> None:
+    stopped = threading.Event()
+
+    class Handler(socketserver.BaseRequestHandler):
+        def handle(self) -> None:
+            self.request.recv(4096)
+            headers = b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n"
+            try:
+                if phase == "body":
+                    self.request.sendall(headers)
+                payload = b"x" * 100 if phase == "body" else headers
+                for byte in payload:
+                    if stopped.wait(0.03):
+                        return
+                    self.request.sendall(bytes([byte]))
+            except OSError:
+                pass
+
+    path = short_tmp_parent / "slow.sock"
+    monkeypatch.setattr("omnigent.inner.credential_proxy._BROKER_SOURCE_TIMEOUT_SECONDS", 0.3)
+    with socketserver.UnixStreamServer(str(path), Handler) as server:
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            started = time.monotonic()
+            provider = RefreshingSecretProvider(
+                CredentialSourceSpec(
+                    kind="unix_socket", path=str(path), refresh_interval_seconds=60
+                ),
+                parent_env={},
+                sandbox=sandbox,
+            )
+            with pytest.raises(ValueError, match="credential broker is unavailable"):
+                provider.resolve()
+            assert time.monotonic() - started < 1.5
+        finally:
+            stopped.set()
+            server.shutdown()
+            thread.join()
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="requires macOS sandbox-exec")
+@pytest.mark.parametrize("kind", ["file", "unix_socket"])
+def test_seatbelt_denies_sources_despite_implicit_read_grant(
+    broker: tuple[Path, dict[str, object]], sandbox: SandboxPolicy, kind: str
+) -> None:
+    from omnigent.inner.seatbelt_sandbox import _build_profile
+
+    path, _ = broker
+    path = path.resolve()
+    sandbox.backend_type = "darwin_seatbelt"
+    sandbox.allow_network = True
+    command = [
+        "/usr/bin/curl",
+        "--silent",
+        "--max-time",
+        "2",
+        "--unix-socket",
+        str(path),
+        "http://localhost/token",
+    ]
+    if kind == "file":
+        path = path.parent / "private-token"
+        path.write_text("initial")
+        command = ["/bin/cat", str(path)]
+    spec = _parse_credential_proxy(
+        [
+            {"type": "gh_basic", "source": {kind: str(path), "refresh_interval_seconds": 60}},
+        ]
+    )
+    prepare_credential_proxy_runtime(spec, parent_env={}, sandbox=sandbox)
+    for protected in (False, True):
+        policy = sandbox if protected else replace(sandbox, credential_source_paths=None)
+        profile = _build_profile(policy, sandbox.write_roots[0], extra_read_paths=[path.parent])
+        result = subprocess.run(
+            ["/usr/bin/sandbox-exec", "-p", profile, *command],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if protected:
+            assert result.returncode != 0
+            assert "initial" not in result.stdout
+        else:
+            assert result.returncode == 0, result.stderr
+            assert result.stdout == "initial"

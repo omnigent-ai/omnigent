@@ -629,6 +629,16 @@ class BwrapSandboxBackend(SandboxBackend):
             str(chdir_target),
             "--",
         ]
+        if policy.credential_source_paths:
+            bind_flags = {"--bind", "--bind-try", "--ro-bind", "--ro-bind-try"}
+            for index, argument in enumerate(bwrap_args[:-2]):
+                if argument not in bind_flags:
+                    continue
+                mounted_source = Path(bwrap_args[index + 1]).resolve()
+                if any(
+                    path.is_relative_to(mounted_source) for path in policy.credential_source_paths
+                ):
+                    raise ValueError("credential source must stay outside sandbox-visible mounts")
         bwrap_args.extend(argv)
         return bwrap_args
 

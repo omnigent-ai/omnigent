@@ -298,19 +298,34 @@ credential_proxy:
 The parent makes an HTTP `GET /token` directly over the Unix socket. The broker
 must return HTTP 200 with a non-empty, single-line token (at most 64 KiB).
 Redirects are not followed, no shell or external executable is involved, and
-the connection uses a 30-second socket timeout. Host bindings from one source
-declaration share a single cache and refresh lock.
+one five-second deadline covers connection setup, headers, and the response
+body, including responses that trickle in slowly. Host bindings from one source
+declaration share a cache and one in-flight refresh. Concurrent proxy requests
+await the same result or failure without occupying additional worker threads;
+cancelling one request does not cancel the refresh for other requests.
 
 Keep the broker socket and its private key outside sandbox read/write paths.
-Refresh sources require absolute paths and an active sandbox policy. The runtime
-rejects sources whose paths, symlink targets, or parent directories are sandbox
-writable; hard-linked token files are also rejected. These checks run before
-startup resolution and every refresh. The trusted broker must keep its own code,
+Refresh sources require absolute paths and an active Linux bubblewrap or macOS
+Seatbelt policy. The runtime rejects sources whose paths, symlink targets, or
+parent directories fall inside sandbox read/write grants or the workspace, even
+when the workspace is read-only. Hard-linked files and sockets are rejected.
+Canonical source paths stay protected through launcher serialization: Linux
+rejects mounts that expose them, including implicit toolchain mounts; macOS
+denies file access and Unix-socket connections even under implicit read grants.
+These protections also apply to startup-only Unix socket sources. Existing
+startup-only file, environment, and command sources are unchanged.
+
+Source checks run before startup resolution and every refresh. A symlink source
+must retain its original canonical target for the session; replacing the file
+atomically at the same canonical path remains supported. The trusted broker must keep its own code,
 configuration, and dependencies outside sandbox-writable paths too.
 Choose an interval shorter than the minimum remaining lifetime of tokens
 returned by the source. A failed refresh fails the request; it does not reuse
 an old credential. Proxy requests receive a sanitized HTTP 502 on source failure,
-and the next request retries. Without this setting, sources resolve once at startup.
+and a later request retries after the shared attempt finishes. The broker must
+be ready before the helper starts: a source failure during startup prevents
+launch, rather than producing a recoverable request-time 502. Without a refresh
+interval, sources resolve once at startup.
 Environment sources cannot refresh because a running process inherits a fixed
 environment. Shell command sources remain startup-only: a sandbox might otherwise
 replace a script or dependency before the trusted parent executes it again. Use

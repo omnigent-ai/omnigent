@@ -588,6 +588,47 @@ def test_wrap_launcher_argv_nested_write_mount_follows_read_parent(
     assert read_index < write_index
 
 
+@pytest.mark.parametrize("exposure", ["cwd", "read-root", "root-alias", "implicit", "system"])
+def test_launcher_rejects_visible_credential_sources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, exposure: str
+) -> None:
+    cwd = (tmp_path / "workspace").resolve()
+    cwd.mkdir()
+    private = (tmp_path / "private").resolve()
+    private.mkdir()
+    policy = _make_policy(cwd)
+    source = private / "token"
+    source.write_text("secret")
+    if exposure == "cwd":
+        source = cwd / "token"
+    elif exposure == "read-root":
+        policy.read_roots = [private]
+    elif exposure == "root-alias":
+        alias = tmp_path / "alias"
+        alias.symlink_to(private, target_is_directory=True)
+        policy.read_roots = [alias]
+    elif exposure == "implicit":
+        monkeypatch.setattr(
+            bwrap_sandbox,
+            "_ensure_executable_visible",
+            lambda argv, cwd: ["--ro-bind", str(private), "/runtime"],
+        )
+    else:
+        source = Path("/usr/lib/private-token")
+    policy.credential_source_paths = [source]
+    with pytest.raises(ValueError, match="sandbox-visible mounts"):
+        _make_backend().wrap_launcher_argv(["/bin/sh", "-c", "true"], policy, cwd)
+
+
+def test_launcher_accepts_private_credential_source(tmp_path: Path) -> None:
+    cwd = (tmp_path / "workspace").resolve()
+    cwd.mkdir()
+    policy = _make_policy(cwd)
+    policy.credential_source_paths = [(tmp_path / "private-token").resolve()]
+    argv = _make_backend().wrap_launcher_argv(["/bin/sh", "-c", "true"], policy, cwd)
+    assert argv[-3:] == ["/bin/sh", "-c", "true"]
+
+
 def test_wrap_launcher_argv_masks_denied_unix_socket_after_write_root(
     tmp_path: Path,
 ) -> None:

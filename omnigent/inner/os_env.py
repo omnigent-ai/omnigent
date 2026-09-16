@@ -482,6 +482,7 @@ class _HelperProcessClient:
                     sandbox.credential_proxy,
                     parent_env=credential_parent_env,
                     sandbox=sandbox,
+                    cwd=self.cwd,
                 )
                 env.update(credential_runtime.helper_env_updates)
                 # Materialize placeholder-only config files (e.g. a
