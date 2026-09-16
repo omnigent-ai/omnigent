@@ -16,6 +16,9 @@ credential-free). The Claude side drives a scripted CLI double whose
 interactive picker disables ``fable`` (offering Sonnet/Opus/Haiku) while its
 help output advertises ``fable`` — the exact mismatch the report reproduces.
 The browser drives the real SPA's New Chat landing screen.
+
+A second configuration rejects Claude control initialization and omits Codex's
+custom catalog, exercising legacy /model discovery and bundled model choices.
 """
 
 from __future__ import annotations
@@ -45,7 +48,6 @@ _PICKER_WARMUP_TIMEOUT_S = 120.0
 _CODEX_CUSTOM_VISIBLE = ("acme-large", "acme-small", "acme-turbo", "acme-nano")
 _CODEX_HIDDEN_SLUG = "acme-secret"
 _CODEX_CONFIGURED_DEFAULT = "acme-large"
-_CODEX_CONFIGURED_DEFAULT_LABEL = "Acme Large"
 
 _CLAUDE_PICKER_ALIASES = ("sonnet", "opus", "haiku")
 _CLAUDE_EXTRA_ALIAS = "fable"
@@ -62,6 +64,7 @@ import json
 import sys
 
 ARGS = sys.argv[1:]
+LEGACY = False
 
 RESOLUTIONS = {
     "sonnet": ("claude-sonnet-4-5-20250929", "Sonnet 4.5"),
@@ -71,6 +74,8 @@ RESOLUTIONS = {
     "default": ("claude-sonnet-4-5-20250929", "Sonnet 4.5"),
 }
 HELP_ALIASES = "sonnet, opus, haiku, fable, default, or a full model ID"
+if LEGACY:
+    HELP_ALIASES = "sonnet, opus, haiku, default, or a full model ID"
 
 # What the CLI's own interactive /model picker offers: fable is present but
 # disabled for this account.
@@ -125,6 +130,9 @@ if ARGS[:2] == ["auth", "status"]:
     raise SystemExit(0)
 
 if "-p" in ARGS and opt("--input-format") == "stream-json":
+    if LEGACY:
+        print("unsupported initialize request", file=sys.stderr)
+        raise SystemExit(2)
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -207,10 +215,12 @@ def _sanitized_env() -> dict[str, str]:
     return env
 
 
-def _build_codex_source_home(root: Path, home: Path) -> list[str]:
-    """Write the user's ``~/.codex`` shape from the report: catalog + default.
+def _build_codex_source_home(
+    root: Path, home: Path, *, custom_catalog: bool
+) -> tuple[list[str], str]:
+    """Configure the isolated CLI with a default and an optional custom catalog.
 
-    :returns: The visible slugs the CLI's own ``/model`` picker offers.
+    :returns: The visible slugs and configured default from the CLI's catalog.
     """
     codex = shutil.which("codex")
     assert codex is not None
@@ -221,7 +231,7 @@ def _build_codex_source_home(root: Path, home: Path) -> list[str]:
     env["CODEX_HOME"] = str(bundled_home)
     bundled = json.loads(
         subprocess.run(
-            [codex, "debug", "models"],
+            [codex, "debug", "models", "--bundled"],
             capture_output=True,
             text=True,
             timeout=60,
@@ -255,13 +265,17 @@ def _build_codex_source_home(root: Path, home: Path) -> list[str]:
     codex_home = home / ".codex"
     codex_home.mkdir(parents=True, exist_ok=True)
     catalog_path = codex_home / "model-catalog.json"
-    catalog_path.write_text(json.dumps(catalog))
+    default_model = _CODEX_CONFIGURED_DEFAULT if custom_catalog else visible[-1]["slug"]
+    catalog_setting = ""
+    if custom_catalog:
+        catalog_path.write_text(json.dumps(catalog))
+        catalog_setting = f'model_catalog_json = "{catalog_path}"\n'
     # The custom provider table keeps codex-native "ready" without a codex
     # login; the minimal probe copy preserves provider tables, so it cannot
     # mask the dropped catalog/default this test reproduces.
     (codex_home / "config.toml").write_text(
-        f'model = "{_CODEX_CONFIGURED_DEFAULT}"\n'
-        f'model_catalog_json = "{catalog_path}"\n'
+        f'model = "{default_model}"\n'
+        f"{catalog_setting}"
         'model_provider = "acme"\n'
         "\n"
         "[model_providers.acme]\n"
@@ -269,7 +283,8 @@ def _build_codex_source_home(root: Path, home: Path) -> list[str]:
         'base_url = "http://127.0.0.1:1/v1"\n'
         'wire_api = "responses"\n'
     )
-    return [m["slug"] for m in catalog["models"] if m.get("visibility") == "list"]
+    picker_models = catalog["models"] if custom_catalog else models
+    return [m["slug"] for m in picker_models if m.get("visibility") == "list"], default_model
 
 
 @dataclass
@@ -279,6 +294,7 @@ class PickerRig:
     base_url: str
     host_id: str
     codex_visible_slugs: list[str]
+    codex_default: str
     server_log: Path
     host_log: Path
 
@@ -290,8 +306,10 @@ class PickerRig:
         return "\n".join(parts)
 
 
-@pytest.fixture(scope="module")
-def picker_rig(tmp_path_factory: pytest.TempPathFactory) -> Iterator[PickerRig]:
+@pytest.fixture(scope="module", params=["structured-custom", "legacy-bundled"])
+def picker_rig(
+    tmp_path_factory: pytest.TempPathFactory, request: pytest.FixtureRequest
+) -> Iterator[PickerRig]:
     if shutil.which("codex") is None:
         pytest.skip("the 'codex' CLI is required to probe the real catalog behaviour")
 
@@ -301,9 +319,10 @@ def picker_rig(tmp_path_factory: pytest.TempPathFactory) -> Iterator[PickerRig]:
     stub_bin = root / "stub-bin"
     stub_bin.mkdir()
     stub = stub_bin / "claude"
-    stub.write_text(_CLAUDE_STUB)
+    legacy = request.param == "legacy-bundled"
+    stub.write_text(_CLAUDE_STUB.replace("LEGACY = False", f"LEGACY = {legacy}"))
     stub.chmod(0o755)
-    codex_visible = _build_codex_source_home(root, home)
+    codex_visible, codex_default = _build_codex_source_home(root, home, custom_catalog=not legacy)
 
     port = _free_port()
     base_url = f"http://127.0.0.1:{port}"
@@ -401,6 +420,7 @@ def picker_rig(tmp_path_factory: pytest.TempPathFactory) -> Iterator[PickerRig]:
             base_url=base_url,
             host_id=str(host_id),
             codex_visible_slugs=codex_visible,
+            codex_default=codex_default,
             server_log=server_log,
             host_log=host_log,
         )
@@ -470,16 +490,10 @@ def _model_rows(page: Page, rig: PickerRig) -> list[dict[str, str]]:
     )
 
 
-def test_codex_picker_offers_the_clis_configured_catalog_and_default(
+def test_codex_picker_offers_the_clis_catalog_and_default(
     page: Page, picker_rig: PickerRig
 ) -> None:
-    """The New Chat Codex picker mirrors ``model_catalog_json`` + ``model``.
-
-    The CLI's own ``/model`` picker under this ``config.toml`` offers exactly
-    the configured catalog's visible entries with ``acme-large`` as the
-    effective default (verified live: ``model/list`` against the same home).
-    The Omnigent picker must offer the same choices and name the same default.
-    """
+    """The Codex picker preserves configured or bundled choices and a new selection."""
     page.goto(picker_rig.base_url)
     expect(page.get_by_test_id("new-chat-landing-input")).to_be_visible(timeout=30_000)
     _pick_agent(page, "Codex")
@@ -503,11 +517,15 @@ def test_codex_picker_offers_the_clis_configured_catalog_and_default(
     assert not hidden, f"hidden catalog entries must stay absent from the picker: {hidden}"
 
     checked = [row["id"] for row in rows if row["checked"] == "true"]
-    assert checked == [_CODEX_CONFIGURED_DEFAULT], (
+    assert checked == [picker_rig.codex_default], (
         f"the picker marks {checked} as the default choice; the CLI's effective default under "
-        f"this config.toml is model = {_CODEX_CONFIGURED_DEFAULT!r} "
-        f"({_CODEX_CONFIGURED_DEFAULT_LABEL})"
+        f"this config.toml is model = {picker_rig.codex_default!r}"
     )
+
+    selected = next(row_id for row_id in row_ids if row_id != picker_rig.codex_default)
+    page.get_by_test_id(f"{_MODEL_ROW_PREFIX}{selected}").click()
+    selected_rows = _model_rows(page, picker_rig)
+    assert [row["id"] for row in selected_rows if row["checked"] == "true"] == [selected]
 
 
 def test_claude_picker_omits_aliases_the_cli_picker_does_not_offer(
@@ -542,3 +560,7 @@ def test_claude_picker_omits_aliases_the_cli_picker_does_not_offer(
         f"not offer fable — it is advertised only by the headless usage line, which must not "
         f"drive the picker"
     )
+
+    page.get_by_test_id(f"{_MODEL_ROW_PREFIX}opus").click()
+    selected_rows = _model_rows(page, picker_rig)
+    assert [row["id"] for row in selected_rows if row["checked"] == "true"] == ["opus"]

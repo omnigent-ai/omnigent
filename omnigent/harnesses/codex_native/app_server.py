@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import hashlib
 import json
 import logging
 import os
@@ -1029,64 +1028,26 @@ async def _wait_for_discovery_listener(
     raise TimeoutError("Timed out waiting for Codex model discovery app-server")
 
 
-def _codex_picker_config(source_home: Path) -> dict[str, str]:
-    """Read the CLI settings needed to reproduce its model picker."""
+def _codex_config_identity(source_home: Path) -> tuple[object, ...]:
+    """Invalidate cached CLI answers when configuration or its catalog changes."""
+    from omnigent.models.model_catalog_store import binary_identity
+
+    config_path = source_home / "config.toml"
+    catalog_path: str | None = None
     try:
-        config = tomlkit.parse((source_home / "config.toml").read_text(encoding="utf-8"))
+        config = tomlkit.parse(config_path.read_text(encoding="utf-8"))
+        catalog = config.get("model_catalog_json")
+        if isinstance(catalog, str) and catalog:
+            path = Path(catalog).expanduser()
+            catalog_path = str(path if path.is_absolute() else source_home / path)
     except (OSError, ValueError):
-        return {}
-    picker = {
-        key: str(value)
-        for key in ("model", "model_catalog_json")
-        if isinstance(value := config.get(key), str) and value
-    }
-    if catalog := picker.get("model_catalog_json"):
-        path = Path(catalog).expanduser()
-        picker["model_catalog_json"] = str(
-            path if path.is_absolute() else (source_home / path).resolve()
-        )
-    return picker
-
-
-def _probe_codex_home(config_overrides: Sequence[str]) -> Path:
-    """
-    Persistent probe ``CODEX_HOME`` for one provider configuration.
-
-    Persistent (unlike the hermetic discovery's temp dir) so Codex's own
-    ``models_cache.json`` ETag handling makes repeat probes cheap; keyed by
-    the override set so a provider change never replays another provider's
-    cache.
-
-    Materialized by the same bridge a session launch uses, in its minimal
-    shape. Both halves matter: the credential decides which models the
-    account's catalog lists (login-gated entries, the account default), and
-    the provider tables decide whether Codex loads its config at all, since
-    an override naming a ``model_provider`` the home does not define fails
-    config load outright. Minimal keeps the probe from starting the user's
-    MCPs, hooks and plugins.
-
-    :param config_overrides: The probe's ``-c`` overrides.
-    :returns: The created ``CODEX_HOME`` directory.
-    """
-    key = hashlib.sha256("\n".join(config_overrides).encode("utf-8")).hexdigest()[:12]
-    home = Path.home() / ".omnigent" / "cache" / "codex-model-probe" / key
-    home.mkdir(mode=0o700, parents=True, exist_ok=True)
-    # The bridge skips files that already exist, and config.toml is copied
-    # (not symlinked), so drop the copy to re-read an edited source config.
-    with contextlib.suppress(OSError):
-        (home / "config.toml").unlink(missing_ok=True)
-    source_home = _codex_home_config_source_from_env()
-    _populate_codex_home_config(home, source_home, minimal_config=True)
-    # A custom catalog replaces Codex's built-in choices, including visibility.
-    picker_config = _codex_picker_config(source_home)
-    if picker_config:
-        config_path = home / "config.toml"
-        document = (
-            tomlkit.parse(config_path.read_text()) if config_path.exists() else tomlkit.document()
-        )
-        document.update(picker_config)
-        config_path.write_text(tomlkit.dumps(document), encoding="utf-8")
-    return home
+        pass
+    return (
+        str(source_home.resolve()),
+        binary_identity(str(config_path)),
+        binary_identity(catalog_path),
+        binary_identity(str(source_home / "auth.json")),
+    )
 
 
 def mark_launch_default(rows: list[_JsonObject], pinned_model: str | None) -> list[_JsonObject]:
@@ -1132,17 +1093,10 @@ async def probe_codex_model_options(
     """
     Ask a session-configured Codex app-server for its own model list.
 
-    The harness is the source of truth for what a session's ``/model``
-    picker would offer, so the probe boots ``codex app-server`` with the
-    SAME materialization a session launch gets — for every launch shape.
-    A Databricks profile contributes its provider overrides (gateway base
-    URL + minted auth + model pin) and ``DATABRICKS_HOST``; other provider
-    shapes carry their resolved ``-c`` overrides verbatim; the plain
-    Codex-login shape probes bare, which yields the ACCOUNT's visible
-    catalog: the probe home is isolated (never the user's real
-    ``~/.codex``) but links the real ``auth.json`` in the way a session
-    launch does, so login-gated entries and the account default match what
-    a live session will offer.
+    Read-only RPCs run against the configured source ``CODEX_HOME`` with
+    the session's provider overrides. Codex resolves its own config layers,
+    profiles, credentials and model cache; no picker config is reconstructed.
+    No thread is started and no configuration write RPC is issued.
 
     :param codex_path: Optional Codex executable override.
     :param launch: An already-resolved ``model=None`` launch shape. When
@@ -1171,7 +1125,8 @@ async def probe_codex_model_options(
         config_overrides.extend(databricks.config_overrides)
         env["DATABRICKS_HOST"] = databricks.host
         pinned_model = databricks.model
-    codex_home = await asyncio.to_thread(_probe_codex_home, config_overrides)
+    codex_home = _codex_home_config_source_from_env().resolve()
+    await asyncio.to_thread(codex_home.mkdir, mode=0o700, parents=True, exist_ok=True)
     env["CODEX_HOME"] = str(codex_home)
     port = _allocate_loopback_port()
     listen_url = f"ws://127.0.0.1:{port}"
@@ -1192,7 +1147,7 @@ async def probe_codex_model_options(
         await client.connect()
         rows = await list_codex_model_options(client)
         if pinned_model is None:
-            pinned_model = await _read_codex_probe_default(client, codex_home)
+            pinned_model = await _read_codex_probe_default(client)
     finally:
         if client is not None:
             with contextlib.suppress(Exception):
@@ -1201,8 +1156,8 @@ async def probe_codex_model_options(
     return mark_launch_default(rows, pinned_model)
 
 
-async def _read_codex_probe_default(client: CodexAppServerClient, codex_home: Path) -> str | None:
-    """Prefer effective config, then the probe's config or the CLI's default row."""
+async def _read_codex_probe_default(client: CodexAppServerClient) -> str | None:
+    """Read Codex's effective default; older servers retain their model/list default."""
     try:
         try:
             response = await client.request("config/read", {"includeLayers": False})
@@ -1215,8 +1170,8 @@ async def _read_codex_probe_default(client: CodexAppServerClient, codex_home: Pa
             exc.code == -32600 and "unknown variant `config/read`" in (exc.message or "")
         ):
             raise
-        _logger.info("Codex config/read unavailable; keeping the configured or model/list default")
-        return _codex_picker_config(codex_home).get("model")
+        _logger.info("Codex config/read unavailable; keeping the model/list default")
+        return None
     result = response.get("result")
     config = result.get("config") if isinstance(result, dict) else None
     model = config.get("model") if isinstance(config, dict) else None
@@ -1245,12 +1200,10 @@ def codex_catalog_fingerprint(launch: NativeCodexLaunch, *, codex_path: str | No
     from omnigent.models.model_catalog_store import binary_identity, fingerprint_of
 
     profile_host = _read_databrickscfg_host(launch.profile) if launch.profile is not None else None
-    picker_config = _codex_picker_config(_codex_home_config_source_from_env())
     return fingerprint_of(
         "codex-native",
-        "configured-picker-v1",
-        tuple(sorted(picker_config.items())),
-        binary_identity(picker_config.get("model_catalog_json")),
+        "source-home-picker-v2",
+        _codex_config_identity(_codex_home_config_source_from_env()),
         (launch.profile, (profile_host or "").rstrip("/")) if launch.profile is not None else None,
         launch.model,
         tuple(launch.config_overrides),

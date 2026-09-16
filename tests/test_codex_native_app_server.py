@@ -2731,7 +2731,7 @@ async def test_probe_codex_model_options_uses_launch_config_and_marks_default(
     Harness truth: the probe's rows are Codex's own ``model/list`` output
     under the same Databricks routing a session launch gets — provider
     overrides passed as ``-c`` args, ``DATABRICKS_HOST`` in env, a
-    persistent probe home — reduced to a single default marker naming the
+    configured source home — reduced to a single default marker naming the
     launch-pinned model.
     """
     from omnigent.harnesses.codex_native import app_server as codex_native_app_server
@@ -2845,8 +2845,7 @@ async def test_probe_codex_model_options_uses_launch_config_and_marks_default(
     env = captured["env"]
     assert isinstance(env, dict)
     assert env["DATABRICKS_HOST"] == "https://ws.example"
-    # Persistent probe home under the omnigent cache, not a fresh temp dir.
-    assert str(tmp_path / ".omnigent" / "cache" / "codex-model-probe") in env["CODEX_HOME"]
+    assert env["CODEX_HOME"] == str(tmp_path / ".codex")
     assert Path(env["CODEX_HOME"]).is_dir()
 
 
@@ -3195,56 +3194,6 @@ def test_resolve_databricks_codex_model_matches_servable_ids() -> None:
         )
 
 
-def test_probe_codex_home_bridges_provider_tables_and_credential(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """The probe home carries the provider tables its overrides name.
-
-    A launch shape resolved off the user's ``config.toml`` pins only a
-    provider *name* (``-c model_provider="Databricks"``). Codex refuses to
-    load a config that names an undefined provider, exiting before it binds
-    the listener, so a probe home holding only a credential yields no
-    catalog at all. Minimal keeps the user's MCP/hook/plugin config out.
-    """
-    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
-
-    source = tmp_path / ".codex"
-    source.mkdir()
-    (source / "config.toml").write_text(
-        'model_provider = "Databricks"\n'
-        "\n"
-        "[model_providers.Databricks]\n"
-        'base_url = "https://ws.example/serving-endpoints"\n'
-        "\n"
-        "[mcp_servers.slow]\n"
-        'command = "sleep"\n'
-    )
-    (source / ".credentials.json").write_text("{}")
-    (source / "hooks.json").write_text("{}")
-    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
-    monkeypatch.delenv("CODEX_HOME", raising=False)
-
-    home = codex_native_app_server._probe_codex_home(['model_provider="Databricks"'])
-
-    config = (home / "config.toml").read_text()
-    assert "[model_providers.Databricks]" in config
-    assert "https://ws.example/serving-endpoints" in config
-    # The credential the account's catalog is gated on, in either spelling.
-    assert (home / ".credentials.json").is_symlink()
-    # Minimal: no MCPs to boot and no hooks to fire during a probe.
-    assert "mcp_servers" not in config
-    assert not (home / "hooks.json").exists()
-
-    # A persistent home must re-read an edited source config, not pin the
-    # tables copied on first use.
-    (source / "config.toml").write_text(
-        'model_provider = "Other"\n\n[model_providers.Other]\nbase_url = "https://two.example"\n'
-    )
-    home = codex_native_app_server._probe_codex_home(['model_provider="Databricks"'])
-    assert "https://two.example" in (home / "config.toml").read_text()
-
-
 async def test_discovery_stderr_tail_is_bounded_and_redacted() -> None:
     """The probe retains one safe diagnostic without persisting raw stderr."""
     from omnigent.harnesses.codex_native import app_server as codex_native_app_server
@@ -3345,35 +3294,74 @@ async def test_discovery_early_exit_without_stderr_keeps_plain_error() -> None:
         await codex_native_app_server._wait_for_discovery_listener(discovery, port=1)
 
 
-@pytest.mark.parametrize("relative", [False, True], ids=["absolute", "relative"])
-def test_codex_probe_home_preserves_configured_catalog(
+@pytest.mark.parametrize("relative", [False, True], ids=["absolute-home", "relative-home"])
+async def test_codex_probe_reads_source_home_without_reconstructing_config(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, relative: bool
 ) -> None:
     from omnigent.harnesses.codex_native import app_server
 
     source = tmp_path / "source"
     source.mkdir()
-    catalog = source / "models.json"
-    catalog.write_text('{"models": []}')
-    catalog_setting = catalog.name if relative else str(catalog)
-    (source / "config.toml").write_text(
-        f'model = "gateway-model"\nmodel_catalog_json = {json.dumps(catalog_setting)}\n'
-        'model_provider = "gateway"\n'
-        '[model_providers.gateway]\nname = "Gateway"\n'
-        '[mcp_servers.unrelated]\ncommand = "must-not-start"\n'
-    )
+    files = {
+        "config.toml": (
+            'model = "stale-root-default"\nprofile = "work"\n'
+            'model_catalog_json = "models.json"\n'
+            '[profiles.work]\nmodel = "profile-default"\n'
+            '[mcp_servers.unrelated]\ncommand = "must-not-start"\n'
+        ),
+        "models.json": '{"models": []}',
+        "models_cache.json": '{"models": [{"slug": "cached-model"}]}',
+        "auth.json": "{}",
+    }
+    for name, content in files.items():
+        (source / name).write_text(content)
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    monkeypatch.setattr(app_server, "_codex_home_config_source_from_env", lambda: source)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        app_server,
+        "_codex_home_config_source_from_env",
+        lambda: Path("source") if relative else source,
+    )
+    client = AsyncMock(spec=CodexAppServerClient)
+    requests = []
 
-    home = app_server._probe_codex_home([])
-    config = tomllib.loads((home / "config.toml").read_text())
-    assert config["model_catalog_json"] == str(catalog)
-    assert config["model"] == "gateway-model"
-    assert config["model_provider"] == "gateway"
-    assert "mcp_servers" not in config
+    async def request(method: str, params: object) -> dict[str, object]:
+        requests.append(method)
+        if method == "config/read":
+            return {"result": {"config": {"model": "profile-default"}}}
+        assert method == "model/list"
+        return {
+            "result": {
+                "data": [{"id": "cli-default", "isDefault": True}, {"id": "profile-default"}]
+            }
+        }
+
+    client.request.side_effect = request
+    monkeypatch.setattr(app_server, "CodexAppServerClient", lambda **kwargs: client)
+    start = AsyncMock()
+    monkeypatch.setattr(app_server, "_start_codex_model_discovery_process", start)
+    monkeypatch.setattr(app_server, "_wait_for_discovery_listener", AsyncMock())
+    stop = AsyncMock()
+    monkeypatch.setattr(app_server, "_stop_codex_model_discovery_process", stop)
+
+    rows = await app_server.probe_codex_model_options(
+        codex_path="/test/codex", launch=NativeCodexLaunch([], None, None)
+    )
+
+    assert rows == [{"id": "cli-default"}, {"id": "profile-default", "isDefault": True}]
+    assert start.call_args.kwargs["env"]["CODEX_HOME"] == str(source)
+    assert start.call_args.kwargs["cwd"] == source
+    assert start.call_args.kwargs["config_overrides"] == []
+    assert requests == ["model/list", "config/read"]
+    assert {p.name: p.read_text() for p in source.iterdir()} == files
+    client.close.assert_awaited_once()
+    stop.assert_awaited_once()
 
 
-@pytest.mark.parametrize("change", ["catalog-content", "catalog-path", "default-model"])
+@pytest.mark.parametrize(
+    "change",
+    ["catalog-content", "catalog-path", "default-model", "profile", "auth", "source-home"],
+)
 def test_codex_catalog_fingerprint_tracks_configured_catalog(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: str
 ) -> None:
@@ -3391,8 +3379,18 @@ def test_codex_catalog_fingerprint_tracks_configured_catalog(
         catalog.write_text('{"models": [{"slug": "newly-available"}]}')
     elif change == "catalog-path":
         config.write_text('model = "first"\nmodel_catalog_json = "another.json"\n')
-    else:
+    elif change == "default-model":
         config.write_text('model = "second"\nmodel_catalog_json = "models.json"\n')
+    elif change == "profile":
+        config.write_text(
+            config.read_text() + 'profile = "work"\n[profiles.work]\nmodel = "profile-model"\n'
+        )
+    elif change == "auth":
+        (tmp_path / "auth.json").write_text("{}")
+    else:
+        monkeypatch.setattr(
+            app_server, "_codex_home_config_source_from_env", lambda: tmp_path / "other"
+        )
 
     assert app_server.codex_catalog_fingerprint(launch, codex_path=sys.executable) != before
 
@@ -3468,10 +3466,9 @@ async def test_codex_without_custom_catalog_keeps_models_and_default(
         codex_path="/test/codex", launch=NativeCodexLaunch([], None, None)
     )
     expected = [{"id": "first"}, {"id": "second"}]
-    expected[1 if config_text else 0]["isDefault"] = True
+    expected[0]["isDefault"] = True
     assert rows == expected
-    probe_home = app_server._probe_codex_home([])
-    config_path = probe_home / "config.toml"
+    config_path = source / "config.toml"
     config = tomllib.loads(config_path.read_text()) if config_path.exists() else {}
     assert "model_catalog_json" not in config
     client.close.assert_awaited_once()
@@ -3479,7 +3476,7 @@ async def test_codex_without_custom_catalog_keeps_models_and_default(
 
 
 @pytest.mark.parametrize("code", [-32600, -32602])
-async def test_codex_config_read_retries_legacy_params(tmp_path: Path, code: int) -> None:
+async def test_codex_config_read_retries_legacy_params(code: int) -> None:
     from omnigent.harnesses.codex_native import app_server
 
     client = AsyncMock(spec=CodexAppServerClient)
@@ -3487,18 +3484,18 @@ async def test_codex_config_read_retries_legacy_params(tmp_path: Path, code: int
         CodexAppServerResponseError({"code": code, "message": "unknown field `includeLayers`"}),
         {"result": {"config": {"model": "configured"}}},
     ]
-    assert await app_server._read_codex_probe_default(client, tmp_path) == "configured"
+    assert await app_server._read_codex_probe_default(client) == "configured"
     assert [call.args for call in client.request.await_args_list] == [
         ("config/read", {"includeLayers": False}),
         ("config/read", {}),
     ]
 
 
-async def test_codex_config_read_preserves_unrelated_errors(tmp_path: Path) -> None:
+async def test_codex_config_read_preserves_unrelated_errors() -> None:
     from omnigent.harnesses.codex_native import app_server
 
     client = AsyncMock(spec=CodexAppServerClient)
     client.request.side_effect = CodexAppServerResponseError({"code": -32603})
     with pytest.raises(CodexAppServerResponseError):
-        await app_server._read_codex_probe_default(client, tmp_path)
+        await app_server._read_codex_probe_default(client)
     client.request.assert_awaited_once()
