@@ -104,6 +104,8 @@ interface SlashCommandMenuProps {
   commands: Record<string, string>;
   /** Absent for menus without asynchronous skill discovery. */
   skillsStatus?: SkillsStatus | null;
+  /** Context-specific guidance when discovery cannot run yet. */
+  skillsUnavailableMessage?: string;
   onRetrySkills?: () => void;
 }
 
@@ -177,6 +179,7 @@ export function SlashCommandMenu({
   onSelect,
   commands,
   skillsStatus,
+  skillsUnavailableMessage = "Skills unavailable while disconnected.",
   onRetrySkills,
 }: SlashCommandMenuProps) {
   const matchedNames = rankedSlashCommandNames(commands, query);
@@ -248,7 +251,7 @@ export function SlashCommandMenu({
           )}
           {skillsStatus === "unavailable" && (
             <div role="status" className="px-1.5 py-1 text-ui text-muted-foreground">
-              Skills unavailable while disconnected.
+              {skillsUnavailableMessage}
             </div>
           )}
           {skillsStatus === "ready" && skillRows.length === 0 && (

@@ -381,6 +381,36 @@ tools:
 
 For client-provided tools, use `runtime: client` and do not set `callable`.
 
+### Linux desktop keyrings
+
+The host and runner inherit `DBUS_SESSION_BUS_ADDRESS` and `XDG_RUNTIME_DIR`
+to resolve credentials stored by `omnigent setup`. Restart the host from the
+desktop session after changing these values. The keyring must be available
+and unlocked.
+
+Headless harnesses do not inherit these desktop variables by default. For a
+trusted harness that performs its own keyring lookup, such as Goose configured
+with `goose configure`, explicitly opt out of the sandbox and request them:
+
+```yaml
+os_env:
+  type: caller_process
+  sandbox:
+    type: none
+    env_passthrough: [DBUS_SESSION_BUS_ADDRESS, XDG_RUNTIME_DIR]
+```
+
+Unsandboxed terminals retain their declared/inherited desktop environment.
+Active sandboxes remove the host bus address even when it appears in
+`env_passthrough`, and supply a private, writable `XDG_RUNTIME_DIR` instead of
+the desktop directory. Configure authentication separately for sandboxed
+harnesses; the desktop keyring is not an available credential source there.
+
+Environment filtering alone does not isolate the keyring. Desktop addresses
+can be discovered without these variables; socket/filesystem access and process
+isolation must enforce the boundary. Do not grant host desktop runtime paths to
+untrusted sandboxes. `sandbox.type: none` deliberately provides no OS isolation.
+
 ### Tool sandbox containers
 
 Local Python tools can run inside a container image by declaring a sandbox image.

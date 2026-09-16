@@ -77,6 +77,8 @@ async def test_fork_sends_ephemeral_fork_rpc_and_returns_child_id() -> None:
     assert method == "thread/fork"
     assert params["threadId"] == "thread_parent"
     assert params["ephemeral"] is True
+    # Required by codex >= 0.154.0 for an ephemeral fork.
+    assert params["excludeTurns"] is True
     assert "side conversation" in params["developerInstructions"]
 
 

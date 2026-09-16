@@ -136,7 +136,15 @@ async def fork_ephemeral_side_thread(
     :returns: The new child Codex thread id, or ``None`` if the response carried
         no thread id.
     """
-    params: _JsonObject = {"threadId": parent_thread_id, "ephemeral": True}
+    # excludeTurns is required on an ephemeral fork from codex 0.154.0 on
+    # (rejected otherwise: "ephemeral paginated thread/fork requires
+    # excludeTurns: true"); it only omits the parent's turns from this response,
+    # not from the fork's inherited reference context. Matches thread/resume.
+    params: _JsonObject = {
+        "threadId": parent_thread_id,
+        "ephemeral": True,
+        "excludeTurns": True,
+    }
     if developer_instructions is not None:
         params["developerInstructions"] = developer_instructions
     response = await codex_client.request("thread/fork", params)

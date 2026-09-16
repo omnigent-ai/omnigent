@@ -370,15 +370,18 @@ class CodexNativeExecutor(Executor):
                         },
                     )
                 except CodexAppServerResponseError as error:
-                    # The recorded turn already ended or was replaced by a newer
-                    # one, so there is nothing left to interrupt — not a failure.
-                    # The local cancel map was already flipped above.
+                    # The recorded turn already ended or was replaced by a
+                    # newer one, so there is nothing left to interrupt — not a
+                    # failure. The local cancel map was already flipped above.
                     if not _is_stale_active_turn(error):
                         raise
+                    # Drop the stale record unless a newer turn/started already
+                    # replaced it.
+                    clear_active_turn_id_if_matches(self._bridge_dir, state.active_turn_id)
                     _logger.info(
-                        "Codex native interrupt: recorded turn already advanced; "
-                        "nothing to interrupt (turn_id=%s)",
+                        "Codex native interrupt skipped: recorded turn %s already superseded (%s)",
                         state.active_turn_id,
+                        error.message,
                     )
         finally:
             await client.close()

@@ -27,6 +27,7 @@ from omnigent.runner.identity import (
 )
 from omnigent.util.json_types import JsonValue
 
+from .agent_env import strip_desktop_session_env
 from .async_utils import run_sync_on_thread
 from .credential_proxy import (
     CredentialProxyRuntime,
@@ -44,7 +45,7 @@ from .sandbox import (
     get_backend,
     reachable_roots,
     resolve_sandbox,
-    set_temp_env,
+    set_sandbox_env,
     with_additional_write_roots,
 )
 
@@ -113,7 +114,7 @@ class _PopenKwargs(TypedDict, total=False):
 #   include the project root; passing through the parent's value would
 #   let any ambient ``PYTHONPATH`` shadow our setting.
 # - ``TMPDIR`` / ``TMP`` / ``TEMP`` / ``TEMPDIR``: set explicitly by
-#   :func:`set_temp_env` to point at the per-helper scratch tmpdir.
+#   :func:`set_sandbox_env` to point at the per-helper scratch tmpdir.
 # - All credential families: ``AWS_*``, ``GITHUB_TOKEN``,
 #   ``OPENAI_API_KEY``, ``ANTHROPIC_API_KEY``, ``DATABRICKS_TOKEN``,
 #   ``GOOGLE_APPLICATION_CREDENTIALS``, ``VAULT_TOKEN``, ``KUBECONFIG``,
@@ -202,6 +203,8 @@ def build_helper_env(
     behavior can pass ``sandbox.type: none`` (which opts out of every
     sandboxing protection, env filtering included).
 
+    Active sandboxes also exclude host desktop-session variables, even when
+    declared in passthrough; launch supplies a private ``XDG_RUNTIME_DIR``.
     Both branches always strip the runner-auth secret
     (:data:`~omnigent.runner.identity.RUNNER_AUTH_SECRET_ENV_VARS`): the
     helper runs the agent's tool payload, which must never see the tunnel
@@ -217,7 +220,7 @@ def build_helper_env(
     :returns: A fresh dict containing only the allowed env vars (minus
         runner-auth secrets), ready to hand to ``subprocess.Popen``'s
         ``env=`` argument. Callers typically follow up with
-        ``set_temp_env`` and an explicit ``PYTHONPATH`` write so those
+        ``set_sandbox_env`` and an explicit ``PYTHONPATH`` write so those
         values take precedence over anything the parent might have set.
     """
     if not sandbox.active:
@@ -232,7 +235,7 @@ def build_helper_env(
     prefixes = _DEFAULT_ENV_PASSTHROUGH_PREFIXES
 
     env: dict[str, str] = {}
-    for name, value in parent_env.items():
+    for name, value in strip_desktop_session_env(parent_env).items():
         if name in allowed or any(name.startswith(prefix) for prefix in prefixes):
             env[name] = value
     # The default allowlist already excludes the runner-auth secrets,
@@ -462,7 +465,7 @@ class _HelperProcessClient:
         if sandbox.active:
             self._tmpdir = create_private_tmpdir()
             sandbox = with_additional_write_roots(sandbox, [self._tmpdir])
-            set_temp_env(env, self._tmpdir)
+            set_sandbox_env(env, self._tmpdir)
             if self.start_in_scratch:
                 helper_cwd = self._tmpdir
                 env["PWD"] = str(self._tmpdir)
@@ -503,6 +506,9 @@ class _HelperProcessClient:
                     credential_runtime.rewrites if credential_runtime is not None else None
                 ),
             )
+
+        if self._tmpdir is not None:
+            set_sandbox_env(env, self._tmpdir)
 
         config: dict[str, JsonValue] = {
             "cwd": str(helper_cwd),

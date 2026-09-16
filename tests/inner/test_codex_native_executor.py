@@ -1617,3 +1617,54 @@ def test_interrupt_tolerates_stale_active_turn_mismatch(
     assert _MismatchInterruptClient.requests == [
         ("turn/interrupt", {"threadId": "thread_123", "turnId": "turn_gone"}),
     ]
+    state = read_bridge_state(tmp_path)
+    assert state is not None and state.active_turn_id is None, (
+        f"the authoritatively superseded turn record must be cleared; bridge={state!r}"
+    )
+
+
+class _RefusedInterruptClient(_FakeCodexNativeClient):
+    """Reject a recorded-turn interrupt with an unrelated app-server error."""
+
+    async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        """
+        Reject a non-empty ``turn/interrupt``; defer to the base fake otherwise.
+
+        :param method: JSON-RPC method, e.g. ``"turn/interrupt"``.
+        :param params: JSON-RPC params.
+        :returns: Codex-shaped response payload.
+        """
+        if method == "turn/interrupt" and params.get("turnId"):
+            type(self).requests.append((method, params))
+            raise CodexAppServerResponseError({"code": -32600, "message": "thread not found"})
+        return await super().request(method, params)
+
+
+def test_interrupt_reraises_unrelated_rejections(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    Only the superseded-turn mismatch is tolerated; other rejections raise.
+
+    A genuinely failed interrupt (any error other than "the recorded turn
+    is no longer the active one") must keep propagating so callers can
+    log and bound it — the tolerance must not become blanket swallowing.
+    """
+    _RefusedInterruptClient.requests = []
+    _RefusedInterruptClient.created = []
+    _RefusedInterruptClient.next_turn = 1
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _RefusedInterruptClient,
+    )
+    _seed_bridge(tmp_path, active_turn_id="turn_active")
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    with pytest.raises(CodexAppServerResponseError, match="thread not found"):
+        asyncio.run(executor.interrupt_session("key"))
+
+    state = read_bridge_state(tmp_path)
+    assert state is not None and state.active_turn_id == "turn_active", (
+        f"an unexplained rejection must not clear the recorded turn; bridge={state!r}"
+    )
