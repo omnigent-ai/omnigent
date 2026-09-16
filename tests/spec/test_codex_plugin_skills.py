@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
@@ -27,15 +29,31 @@ def _plugin(codex_home: Path, name: str = "toolkit", version: str = "1.0.0") -> 
     return root
 
 
-def _config(codex_home: Path, **plugins: bool | None) -> None:
-    codex_home.mkdir(parents=True, exist_ok=True)
-    (codex_home / "config.toml").write_text(
-        "\n".join(
-            f'[plugins."{name}@market"]\n'
-            + (f"enabled = {str(enabled).lower()}\n" if enabled is not None else "")
-            for name, enabled in plugins.items()
-        )
+def _entry(
+    name: str = "toolkit", version: str = "1.0.0", **overrides: object
+) -> dict[str, object]:
+    return {
+        "marketplaceName": "market",
+        "name": name,
+        "version": version,
+        "enabled": True,
+        **overrides,
+    }
+
+
+def _inventory(cli: Mock, *entries: dict[str, object]) -> None:
+    cli.return_value = subprocess.CompletedProcess(
+        [], 0, stdout=json.dumps({"installed": entries, "available": [_entry("uninstalled")]})
     )
+
+
+@pytest.fixture(autouse=True)
+def codex_cli(monkeypatch: pytest.MonkeyPatch) -> Mock:
+    monkeypatch.setattr("omnigent.inner.codex_executor._find_codex_cli", lambda: "/test/codex")
+    cli = Mock()
+    _inventory(cli, _entry())
+    monkeypatch.setattr("omnigent.spec.codex_plugin_skills.subprocess.run", cli)
+    return cli
 
 
 def _discover(
@@ -50,14 +68,18 @@ def _discover(
     return {s.name: s.skill_dir for s in resolve_harness_skills(ctx, "codex-native")}
 
 
-def test_enabled_plugin_skills_keep_namespaces_and_standalone_skills(tmp_path: Path) -> None:
+def test_enabled_plugin_skills_keep_namespaces_and_standalone_skills(
+    tmp_path: Path, codex_cli: Mock
+) -> None:
     codex_home = tmp_path / ".codex"
     standalone = _skill(codex_home / "skills")
     first = _skill(_plugin(codex_home) / "skills")
     second = _skill(_plugin(codex_home, "other") / "skills")
     _skill(_plugin(codex_home, "disabled") / "skills")
     _skill(_plugin(codex_home, "uninstalled") / "skills")
-    _config(codex_home, toolkit=True, other=None, disabled=False, missing=True)
+    _inventory(
+        codex_cli, _entry(), _entry("other"), _entry("disabled", enabled=False), _entry("missing")
+    )
 
     assert _discover(tmp_path) == {
         "review": standalone,
@@ -66,32 +88,16 @@ def test_enabled_plugin_skills_keep_namespaces_and_standalone_skills(tmp_path: P
     }
 
 
-@pytest.mark.parametrize(
-    "versions,active",
-    [
-        (["1.9.0", "1.10.0"], "1.10.0"),
-        (["2.0.0", "local"], "local"),
-        (["1.0.0-rc.9", "1.0.0-rc.10"], "1.0.0-rc.10"),
-        (["1.0.0-rc.1", "1.0.0"], "1.0.0"),
-        (["1.0.0+build.9", "1.0.0+build.10"], "1.0.0+build.10"),
-        (["aaa", "bbb"], "bbb"),
-    ],
-)
-def test_only_active_plugin_version_is_discovered(
-    tmp_path: Path, versions: list[str], active: str
-) -> None:
+def test_plugin_updates_follow_the_inventory_version(tmp_path: Path, codex_cli: Mock) -> None:
     codex_home = tmp_path / ".codex"
-    for version in versions:
-        _skill(_plugin(codex_home, version=version) / "skills", version)
-    _config(codex_home, toolkit=True)
+    old = _skill(_plugin(codex_home, version="1.9.0") / "skills")
+    new = _skill(_plugin(codex_home, version="1.10.0") / "skills")
+    _skill(_plugin(codex_home, version="99.0.0") / "skills", "unused")
 
-    assert _discover(tmp_path) == {
-        f"toolkit:{active}": codex_home
-        / "plugins/cache/market/toolkit"
-        / active
-        / "skills"
-        / active
-    }
+    _inventory(codex_cli, _entry(version="1.9.0"))
+    assert _discover(tmp_path) == {"toolkit:review": old}
+    _inventory(codex_cli, _entry(version="1.10.0"))
+    assert _discover(tmp_path) == {"toolkit:review": new}
 
 
 @pytest.mark.parametrize(
@@ -106,15 +112,16 @@ def test_only_active_plugin_version_is_discovered(
     ],
 )
 def test_plugin_skill_filters(
-    tmp_path: Path, skills_filter: str | list[str], expected: set[str]
+    tmp_path: Path, codex_cli: Mock, skills_filter: str | list[str], expected: set[str]
 ) -> None:
     codex_home = tmp_path / ".codex"
     root = _plugin(codex_home)
     _skill(root / "skills")
     _skill(root / "skills", "hidden", hidden=True)
-    _config(codex_home, toolkit=True)
 
     assert set(_discover(tmp_path, skills_filter)) == expected
+    if skills_filter == "none" or skills_filter == []:
+        codex_cli.assert_not_called()
 
 
 @pytest.mark.parametrize("paths", ["./custom", ["./custom", "./extra"], []])
@@ -128,7 +135,6 @@ def test_plugin_manifest_skill_paths(tmp_path: Path, paths: str | list[str]) -> 
     _skill(root / "custom", "custom")
     _skill(root / "extra", "extra")
     _skill(root / ".codex-plugin/migrated-command-skills", "command")
-    _config(codex_home, toolkit=True)
 
     expected = {"toolkit:command"}
     if paths:
@@ -144,7 +150,6 @@ def test_plugin_skill_uses_frontmatter_name(tmp_path: Path) -> None:
     codex_home = tmp_path / ".codex"
     directory = _skill(_plugin(codex_home) / "skills")
     directory.rename(directory.with_name("directory-name"))
-    _config(codex_home, toolkit=True)
 
     assert _discover(tmp_path) == {"toolkit:review": directory.with_name("directory-name")}
 
@@ -156,7 +161,6 @@ def test_plugin_manifest_can_point_to_a_single_skill(tmp_path: Path) -> None:
     (root / ".codex-plugin/plugin.json").write_text(
         json.dumps({"name": "toolkit", "skills": "./skills/review"})
     )
-    _config(codex_home, toolkit=True)
 
     assert _discover(tmp_path) == {"toolkit:review": skill}
 
@@ -164,31 +168,64 @@ def test_plugin_manifest_can_point_to_a_single_skill(tmp_path: Path) -> None:
     assert _discover(tmp_path) == {}
 
 
-def test_plugin_discovery_honors_custom_codex_home(tmp_path: Path) -> None:
-    for codex_home, name in [(tmp_path / ".codex", "default"), (tmp_path / "custom", "custom")]:
-        _skill(_plugin(codex_home, name) / "skills")
-        _config(codex_home, **{name: True})
+def test_plugin_inventory_uses_session_home_and_workspace(tmp_path: Path, codex_cli: Mock) -> None:
+    codex_home = tmp_path / "custom"
+    skill = _skill(_plugin(codex_home) / "skills")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    ctx = SkillSourceContext(
+        roots=(workspace,),
+        home=tmp_path,
+        skills_filter="all",
+        bundle_dir=None,
+        codex_home=codex_home,
+    )
 
-    assert set(_discover(tmp_path, codex_home=tmp_path / "custom")) == {"custom:review"}
+    assert {s.name: s.skill_dir for s in resolve_harness_skills(ctx, "codex-native")} == {
+        "toolkit:review": skill
+    }
+    args, kwargs = codex_cli.call_args
+    assert args == (["/test/codex", "plugin", "list", "--json"],)
+    assert kwargs["env"]["CODEX_HOME"] == str(codex_home)
+    assert kwargs["cwd"] == workspace
+    assert kwargs["timeout"] == 5
 
 
-@pytest.mark.parametrize("config", ["invalid = [", 'plugins = "invalid"'])
-def test_bad_plugin_config_keeps_standalone_skills(tmp_path: Path, config: str) -> None:
+@pytest.mark.parametrize(
+    "failure",
+    [
+        FileNotFoundError(),
+        subprocess.TimeoutExpired("codex", 5),
+        subprocess.CalledProcessError(2, "codex"),
+    ],
+)
+def test_unavailable_plugin_inventory_keeps_standalone_skills(
+    tmp_path: Path, codex_cli: Mock, failure: Exception
+) -> None:
     codex_home = tmp_path / ".codex"
     standalone = _skill(codex_home / "skills")
     _skill(_plugin(codex_home) / "skills")
-    (codex_home / "config.toml").write_text(config)
+    codex_cli.side_effect = failure
 
     assert _discover(tmp_path) == {"review": standalone}
 
 
+@pytest.mark.parametrize("output", ["{", "[]", '{"installed": {}}', '{"installed": [null, {}]}'])
+def test_malformed_plugin_inventory(tmp_path: Path, codex_cli: Mock, output: str) -> None:
+    _skill(_plugin(tmp_path / ".codex") / "skills")
+    codex_cli.return_value = subprocess.CompletedProcess([], 0, stdout=output)
+    assert _discover(tmp_path) == {}
+
+
 @pytest.mark.parametrize("manifest", ["{", "[]", "{}", '{"name": 42}'])
-def test_bad_plugin_manifest_does_not_hide_other_plugins(tmp_path: Path, manifest: str) -> None:
+def test_bad_plugin_manifest_does_not_hide_other_plugins(
+    tmp_path: Path, codex_cli: Mock, manifest: str
+) -> None:
     codex_home = tmp_path / ".codex"
     root = _plugin(codex_home)
     _skill(root / "skills")
     (root / ".codex-plugin/plugin.json").write_text(manifest)
     _skill(_plugin(codex_home, "healthy") / "skills")
-    _config(codex_home, toolkit=True, healthy=True)
+    _inventory(codex_cli, _entry(), _entry("healthy"))
 
     assert set(_discover(tmp_path)) == {"healthy:review"}

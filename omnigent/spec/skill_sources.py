@@ -496,8 +496,8 @@ def codex_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
     ``omnigent.spec``'s module-load path.
 
     Plugins are loaded directly by Codex from its cache, outside the symlinked
-    standalone sources. Discover their active versions separately so plugin
-    namespaces survive and disabled or stale cached skills stay hidden.
+    standalone sources. Ask the CLI for installed versions and enabled state
+    so plugin namespaces survive and stale cached skills stay hidden.
     """
     from omnigent.inner.codex_executor import codex_skill_sources, select_codex_skill_dirs
     from omnigent.spec.codex_plugin_skills import discover_codex_plugin_skills
@@ -512,7 +512,8 @@ def codex_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
             continue
         out.append(replace(spec, name=name))
     codex_home = host_override if host_override is not None else ctx.home / ".codex"
-    out.extend(discover_codex_plugin_skills(codex_home, ctx.skills_filter))
+    cwd = ctx.roots[0] if ctx.roots else None
+    out.extend(discover_codex_plugin_skills(codex_home, ctx.skills_filter, cwd=cwd))
     return out
 
 
