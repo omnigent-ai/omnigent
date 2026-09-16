@@ -1,6 +1,6 @@
 """Tests for the post-hoc Antigravity (agy) policy-audit helpers.
 
-Pure unit tests for :mod:`omnigent.antigravity_native_audit` — the
+Pure unit tests for :mod:`omnigent.harnesses.antigravity_native.audit` — the
 classification/rendering layer of the audit-only governance path. No I/O; the
 async POST + interrupt (in the forwarder) are covered separately.
 """
@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from omnigent.antigravity_native_audit import (
+from omnigent.harnesses.antigravity_native.audit import (
     DEGRADE_NOTICE_TEXT,
     HARNESS_NAME,
     audit_verdict_is_violation,

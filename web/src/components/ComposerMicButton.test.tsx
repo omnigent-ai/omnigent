@@ -146,6 +146,21 @@ describe("ComposerMicButton", () => {
     expect(button).toHaveAttribute("aria-pressed", "false");
   });
 
+  it("allows a caller to override sizing without changing dictation state classes", () => {
+    render(<ComposerMicButton className="size-8 md:size-7" onTranscript={vi.fn()} />);
+    const button = screen.getByRole("button", { name: "Voice dictation" });
+
+    expect(button).toHaveClass("size-8", "md:size-7");
+    expect(button).not.toHaveClass("size-9", "md:size-8");
+    expect(button).toHaveAttribute("aria-pressed", "false");
+
+    fireEvent.click(button);
+    act(() => handlers.start?.({}));
+
+    expect(button).toHaveAttribute("aria-pressed", "true");
+    expect(button).toHaveClass("bg-muted/60", "focus-visible:text-destructive");
+  });
+
   it("defaults Web Speech to the browser language", () => {
     Object.defineProperty(navigator, "language", { configurable: true, value: "ja-JP" });
 

@@ -23,9 +23,11 @@ from omnigent_slack.notifications import (
 from omnigent_slack.omnigent import (
     AuthRequiredError,
     HarnessNotConfiguredError,
+    HostType,
     HostUnavailableError,
     OmnigentClient,
     OmnigentClientPool,
+    RunnerUnavailableError,
     ServerUnreachableError,
     StreamInterruptedError,
     extract_assistant_text,
@@ -84,6 +86,26 @@ _STREAM_INTERRUPTED_TEXT = (
     "still arrive here — send another message if it doesn't."
 )
 
+# Shown when a MANAGED session has no runner: usually the server is still
+# provisioning its sandbox (tens of seconds on a first message), but the server
+# raises the SAME 503 ``runner_unavailable`` when the sandbox launch failed
+# outright, and the client discards the discriminating server message (it may
+# carry internal detail). The wording is therefore cause-neutral: it names the
+# not-ready sandbox and asks for a retry without promising the wait will
+# resolve, and escalates to the operator when it keeps happening (the
+# failed-launch subcase).
+_MANAGED_SANDBOX_NOT_READY_TEXT = (
+    ":warning: Your managed sandbox isn't ready yet. Try again in a moment; if it "
+    "keeps happening, contact your Omnigent operator."
+)
+
+# The same "no runner" report on an EXTERNAL host: no runner is bound, and the
+# mid-turn relaunch-and-retry — where it runs — did not recover one. Waiting is
+# the ask; a host the server knows to be offline raises HostUnavailableError.
+_RUNNER_UNAVAILABLE_TEXT = (
+    ":warning: No runner is available for this session yet. Try again in a moment."
+)
+
 
 class _TurnAborted(Exception):
     """A turn can't proceed; ``text`` is the public user-facing reason to deliver."""
@@ -118,7 +140,9 @@ class _StreamState:
     elicitations: ElicitationTurnState = field(default_factory=ElicitationTurnState)
 
 
-def _classify_turn_error(exc: BaseException, server_url: str) -> str | None:
+def _classify_turn_error(
+    exc: BaseException, server_url: str, *, host_type: HostType
+) -> str | None:
     """Map a known startup/turn error to its public user-facing text.
 
     Single source of truth shared by the session-creation and mid-turn error
@@ -126,6 +150,11 @@ def _classify_turn_error(exc: BaseException, server_url: str) -> str | None:
     thread and are delivered publicly. Returns ``None`` for an unrecognized error
     (the caller falls back to the generic failure). Auth errors do NOT flow
     through here — the caller intercepts them for a DM re-login prompt.
+
+    Pass the turn's ``host_type``: a missing runner reads differently on a managed
+    session (the server's sandbox is still coming up) than on the user's own host.
+    It is required rather than defaulted so a new call site can't silently tell an
+    external-host user their sandbox is starting.
     """
     if isinstance(exc, StreamInterruptedError):
         # A mid-stream drop with reconnect exhausted — the server stayed
@@ -139,6 +168,14 @@ def _classify_turn_error(exc: BaseException, server_url: str) -> str | None:
         # The server's message is curated, actionable guidance for this code —
         # surface it so the user knows to run `omnigent setup` on the host.
         return f":warning: {exc}"
+    if isinstance(exc, RunnerUnavailableError):
+        # No runner is serving the session. Usually recoverable by waiting, but
+        # the managed 503 also covers a failed sandbox launch and the class does
+        # not discriminate — so name the not-ready state instead of the generic
+        # failure, without promising that waiting will resolve it.
+        if host_type == "managed":
+            return _MANAGED_SANDBOX_NOT_READY_TEXT
+        return _RUNNER_UNAVAILABLE_TEXT
     return None
 
 
@@ -461,6 +498,10 @@ class SlackOmnigentService:
                         owner_user_id=record.owner_user_id or requester,
                         workspace=record.workspace,
                         host_id=record.host_id,
+                        # From the SESSION, not the user's current config: a
+                        # thread keeps running where it was created even if the
+                        # user re-runs setup and switches host type.
+                        host_type=record.host_type,
                     )
                 )
                 spawned = True
@@ -494,6 +535,7 @@ class SlackOmnigentService:
                     owner_user_id=requester,
                     workspace=config.workspace,
                     host_id=config.host_id,
+                    host_type=config.host_type,
                 )
             )
             spawned = True
@@ -628,6 +670,23 @@ class SlackOmnigentService:
         except Exception:
             self._logger.warning("Failed to deliver re-login prompt thread=%s", turn.key.display())
 
+    async def _discard_unlaunched_session(
+        self, omnigent: OmnigentClient, session_id: str, turn: SlackTurn
+    ) -> None:
+        """Best-effort delete of a session whose runner launch failed.
+
+        A delete failure is logged and swallowed: the user's launch-failure
+        message must still be delivered.
+        """
+        try:
+            await omnigent.delete_session(session_id)
+        except Exception:
+            self._logger.warning(
+                "Failed to delete unlaunched session session_id=%s thread=%s",
+                session_id,
+                turn.key.display(),
+            )
+
     async def _ensure_session(self, turn: SlackTurn, omnigent: OmnigentClient) -> str | None:
         """Return the session id for this turn, creating one if needed.
 
@@ -651,10 +710,31 @@ class SlackOmnigentService:
             return None
 
         try:
-            session_id = await omnigent.create_session(turn.agent_id, turn.title)
-            runner_id = await omnigent.launch_runner(
-                session_id, workspace=turn.workspace or "", host_id=turn.host_id
+            session_id = await omnigent.create_session(
+                turn.agent_id, turn.title, host_type=turn.host_type
             )
+            runner_id: str | None = None
+            if turn.host_type == "managed":
+                # The server provisions this session's sandbox in the background,
+                # so there is no host to launch a runner on — and none is needed:
+                # the server holds the first message until the launch settles.
+                self._logger.info(
+                    "Managed session; the server provisions its host thread=%s session_id=%s",
+                    turn.key.display(),
+                    session_id,
+                )
+            else:
+                try:
+                    runner_id = await omnigent.launch_runner(
+                        session_id, workspace=turn.workspace or "", host_id=turn.host_id
+                    )
+                except Exception:
+                    # The binding write below never runs when the launch fails,
+                    # so nothing could find this session again — delete it
+                    # rather than strand it on the server (a retry creates a
+                    # fresh one).
+                    await self._discard_unlaunched_session(omnigent, session_id, turn)
+                    raise
         except AuthRequiredError as exc:
             # Expired/lost token: DM a re-login button rather than a plain notice.
             self._logger.info(
@@ -665,12 +745,14 @@ class SlackOmnigentService:
             ServerUnreachableError,
             HostUnavailableError,
             HarnessNotConfiguredError,
+            RunnerUnavailableError,
         ) as exc:
             self._logger.info("Session startup failed thread=%s: %s", turn.key.display(), exc)
             # These are curated bot-composed messages; fall back to the generic
             # failure rather than str(exc) so no server detail can leak.
             raise _TurnAborted(
-                _classify_turn_error(exc, self._server_url) or GENERIC_FAILURE_TEXT
+                _classify_turn_error(exc, self._server_url, host_type=turn.host_type)
+                or GENERIC_FAILURE_TEXT
             ) from exc
         except Exception as exc:
             # Any other startup failure (e.g. a 500 surfaced as OmnigentError)
@@ -693,6 +775,7 @@ class SlackOmnigentService:
             owner_user_id=turn.owner_user_id,
             host_id=turn.host_id,
             workspace=turn.workspace,
+            host_type=turn.host_type,
         )
         self._logger.info(
             "Mapped Slack thread to new Omnigent session thread=%s session_id=%s runner_id=%s",
@@ -749,7 +832,11 @@ class SlackOmnigentService:
             # idle windows (a timeout must NOT cancel it — that would end the
             # generator); we re-await it next window.
             events = omnigent.run_turn(
-                session_id, turn.text, workspace=turn.workspace, host_id=turn.host_id
+                session_id,
+                turn.text,
+                workspace=turn.workspace,
+                host_id=turn.host_id,
+                host_type=turn.host_type,
             ).__aiter__()
             pending: asyncio.Task[dict[str, Any]] | None = None
             try:
@@ -788,12 +875,14 @@ class SlackOmnigentService:
             StreamInterruptedError,
             HostUnavailableError,
             HarnessNotConfiguredError,
+            RunnerUnavailableError,
         ) as exc:
             self._logger.info("Turn error mid-stream thread=%s: %s", turn.key.display(), exc)
             # Curated bot-composed messages; fall back to the generic failure
             # rather than str(exc) so no server detail can leak.
             await reply.stop_with(
-                _classify_turn_error(exc, self._server_url) or GENERIC_FAILURE_TEXT
+                _classify_turn_error(exc, self._server_url, host_type=turn.host_type)
+                or GENERIC_FAILURE_TEXT
             )
             state.aborted = True
         except Exception:
@@ -885,6 +974,10 @@ class SlackOmnigentService:
 
         item_text = extract_assistant_text(event)
         if item_text:
+            # ``response.output_item.done`` for an assistant message: it committed.
+            # For an id-less harness (claude-sdk) that is the only signal the
+            # message ended, so the next delta gets a break instead of running on.
+            reply.mark_message_end()
             reply.set_final(item_text)
 
         event_error = extract_error_text(event)

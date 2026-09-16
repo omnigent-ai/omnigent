@@ -55,10 +55,10 @@ from omnigent.errors import OmnigentError
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.inner import _proc
 from omnigent.inner.databricks_executor import _DatabricksBearerAuth, _read_databrickscfg
-from omnigent.model_catalog import resolve_catalog_model
-from omnigent.model_resolver import ModelResolutionError
-from omnigent.native_coding_agents import native_coding_agent_for_wrapper_label
-from omnigent.native_dispatch import resolve_hook_for_key
+from omnigent.models.model_catalog import resolve_catalog_model
+from omnigent.models.model_resolver import ModelResolutionError
+from omnigent.native.native_coding_agents import native_coding_agent_for_wrapper_label
+from omnigent.native.native_dispatch import resolve_hook_for_key
 from omnigent.process_logging import (
     PROCESS_LOG_FILE_ENV_VAR,
     child_logging_popen_kwargs,
@@ -593,7 +593,7 @@ def run_attach(
     # snapshot gives the agent name + harness for an honest banner.
     info = _attach_session_info(base_url=base_url, conversation_id=conversation_id)
     if not info.runner_online:
-        from omnigent.server_url import display_server_url
+        from omnigent.util.server_url import display_server_url
 
         raise click.ClickException(
             f"Session {conversation_id} has no online runner on "
@@ -686,6 +686,7 @@ def _remote_headers(
     server_url: str | None = None,
     *,
     host_id: str | None,
+    org_id: str | None = None,
 ) -> dict[str, str]:
     """
     Build headers for remote AP-server requests.
@@ -711,6 +712,8 @@ def _remote_headers(
         request that keys off the runner-env host_id). Required-keyword with
         no default so every call site consciously decides — pass the request
         path's host when it has one rather than silently defaulting to unkeyed.
+    :param org_id: Workspace selector captured from the current server URL, or
+        ``None`` to fall back to the stored login record.
     :returns: Headers to pass to httpx / OmnigentClient.
     """
     # Resolve the bearer in the documented precedence order (one credential
@@ -746,7 +749,7 @@ def _remote_headers(
     if server_url:
         from omnigent.cli_auth import databricks_request_headers
 
-        headers.update(databricks_request_headers(server_url, host_id=host_id))
+        headers.update(databricks_request_headers(server_url, host_id=host_id, org_id=org_id))
     return headers
 
 
@@ -1600,7 +1603,7 @@ def _unreachable_server_message(base_url: str) -> str:
             f"It may have stopped — run `{cli_invocation()} stop`, then try again. "
             f"Server logs are under {process_log_dir_reference('server')}."
         )
-    from omnigent.server_url import display_server_url
+    from omnigent.util.server_url import display_server_url
 
     return (
         f"Could not connect to the Omnigent server at {display_server_url(base_url)}. "
@@ -1693,7 +1696,7 @@ async def _prepare_chat_session_via_daemon(
         wait_for_host_online,
         wait_for_runner_online,
     )
-    from omnigent.native_terminal import bind_session_runner
+    from omnigent.native.native_terminal import bind_session_runner
 
     async def resolve_session() -> tuple[str, bool]:
         """Fork, resume, or create the session to bind, and say if it is fresh.
@@ -1769,6 +1772,25 @@ async def _prepare_chat_session_via_daemon(
         # needs its own guard.
         raise _unparseable_proxy_env_error(base_url, exc) from exc
     return _DaemonChatSession(session_id=session_id, runner_id=runner_id)
+
+
+def _stop_headless_session(*, base_url: str, session_id: str) -> None:
+    """Stop a finished one-shot session's daemon-owned runner, best-effort.
+
+    A ``-p`` run is complete when it returns and nothing reattaches to it, but
+    the daemon only tears a runner down on an explicit stop; otherwise it lives
+    until the runner's own idle self-exit, holding its harness subtree open.
+
+    :param base_url: Omnigent server base URL.
+    :param session_id: The finished session's id, e.g. ``"conv_abc123"``.
+    """
+    from omnigent.cli import _stop_session_on_server
+
+    # Teardown must never turn a completed run into a failed one.
+    try:
+        _stop_session_on_server(base_url=base_url, session_id=session_id)
+    except Exception:  # noqa: BLE001 — best-effort cleanup
+        logger.debug("could not stop session %s after one-shot run", session_id, exc_info=True)
 
 
 def _chat_via_daemon(
@@ -1903,24 +1925,30 @@ def _chat_via_daemon(
             # client refreshes its own auth per request. ``progress`` is handed
             # off so ``_chat_with_server`` clears the spinner the instant before
             # the REPL paints (or before it redirects to a native wrapper).
-            _chat_with_server(
-                base_url,
-                tool_handler,
-                initial_message=initial_message,
-                resume_conversation_id=prepared.session_id,
-                fork_session_id=None,
-                agent_name=agent_name,
-                runner_id=prepared.runner_id,
-                runner_recover=None,
-                log=log,
-                agent_yaml=spec_path,
-                session_bundle=bundle_bytes,
-                debug_events=debug_events,
-                resume_parts=resume_parts,
-                skills=all_skills or None,
-                auto_open_conversation=auto_open_conversation,
-                progress=progress,
-            )
+            try:
+                _chat_with_server(
+                    base_url,
+                    tool_handler,
+                    initial_message=initial_message,
+                    resume_conversation_id=prepared.session_id,
+                    fork_session_id=None,
+                    agent_name=agent_name,
+                    runner_id=prepared.runner_id,
+                    runner_recover=None,
+                    log=log,
+                    agent_yaml=spec_path,
+                    session_bundle=bundle_bytes,
+                    debug_events=debug_events,
+                    resume_parts=resume_parts,
+                    skills=all_skills or None,
+                    auto_open_conversation=auto_open_conversation,
+                    progress=progress,
+                )
+            finally:
+                # One-shot only: an interactive REPL session stays online for
+                # the next turn, so it must not be torn down here.
+                if initial_message is not None:
+                    _stop_headless_session(base_url=base_url, session_id=prepared.session_id)
     finally:
         _cleanup_materialized_override_bundle(spec_path)
 

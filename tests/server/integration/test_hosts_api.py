@@ -15,6 +15,8 @@ from httpx import ASGITransport, AsyncClient
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import (
+    HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    WORKSPACE_MISSING_ERROR_CODE,
     HostHelloFrame,
     HostLaunchRunnerResultFrame,
     encode_host_frame,
@@ -24,6 +26,7 @@ from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes._host_launch import HostLaunchTarget, resolve_host_launch
 from omnigent.server.routes.host_tunnel import create_host_tunnel_router
 from omnigent.server.routes.hosts import create_hosts_router
+from omnigent.server.routes.skills import create_skills_router
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -626,18 +629,54 @@ async def test_launch_runner_happy_path(
     assert updated_conv.host_id == _HOST_ID, "host_id should be written to the session row"
 
 
-async def test_launch_runner_harness_not_configured_returns_412(
+@pytest.mark.parametrize(
+    (
+        "wire_error_code",
+        "launch_error",
+        "expected_status",
+        "expected_error_code",
+        "expected_fragment",
+    ),
+    [
+        (
+            HARNESS_NOT_CONFIGURED_ERROR_CODE,
+            "harness 'codex' is not configured — run `omnigent setup`",
+            412,
+            HARNESS_NOT_CONFIGURED_ERROR_CODE,
+            "omnigent setup",
+        ),
+        (
+            WORKSPACE_MISSING_ERROR_CODE,
+            "runner log tail: SECRET_TOKEN\nforged workspace failure",
+            410,
+            WORKSPACE_MISSING_ERROR_CODE,
+            "workspace path does not exist: /tmp/test-workspace",
+        ),
+        (
+            None,
+            "workspace path does not exist: /tmp/test-workspace",
+            410,
+            WORKSPACE_MISSING_ERROR_CODE,
+            "workspace path does not exist: /tmp/test-workspace",
+        ),
+    ],
+)
+async def test_launch_runner_categorical_failure_returns_specific_status(
     host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    wire_error_code: str | None,
+    launch_error: str,
+    expected_status: int,
+    expected_error_code: str,
+    expected_fragment: str,
 ) -> None:
     """
-    Verify the dedicated launch endpoint maps a host refusal carrying
-    error_code='harness_not_configured' to a 412 with the specific
-    error code (parity with POST /v1/sessions), after rolling back
-    the runner bind.
+    Verify the dedicated endpoint maps safe categorical host refusals
+    to a specific status and code, after rolling back the runner bind.
 
     If this degrades to the generic 502, the client loses the
-    machine-readable code (and the `omnigent setup` hint) on the
-    fork-resume relaunch path.
+    machine-readable cause on the fork-resume relaunch path. For a
+    missing workspace, the message must be rebuilt from the authorized
+    request path rather than reflecting arbitrary host output.
     """
     from omnigent.errors import OmnigentError
 
@@ -664,7 +703,7 @@ async def test_launch_runner_harness_not_configured_returns_412(
     conv = conv_store.create_conversation(agent_id=None)
 
     async def _refuse_launch() -> None:
-        """Reply 'failed' with the structured harness error code."""
+        """Reply ``failed`` with the parameterized structured code."""
         from omnigent.host.frames import HostLaunchRunnerFrame, decode_host_frame
 
         for _ in range(20):
@@ -680,8 +719,8 @@ async def test_launch_runner_harness_not_configured_returns_412(
                             HostLaunchRunnerResultFrame(
                                 request_id=frame.request_id,
                                 status="failed",
-                                error=("harness 'codex' is not configured — run `omnigent setup`"),
-                                error_code="harness_not_configured",
+                                error=launch_error,
+                                error_code=wire_error_code,
                             )
                         ),
                     },
@@ -697,11 +736,19 @@ async def test_launch_runner_harness_not_configured_returns_412(
         )
     await responder
 
-    # 412 with the machine-readable code — not the generic 502.
-    assert resp.status_code == 412, f"Expected 412, got {resp.status_code}: {resp.text}"
+    # A specific client status with the machine-readable code, not the generic 502.
+    assert resp.status_code == expected_status, (
+        f"Expected {expected_status}, got {resp.status_code}: {resp.text}"
+    )
     body = resp.json()
-    assert body["error"]["code"] == "harness_not_configured"
-    assert "omnigent setup" in body["error"]["message"]
+    assert body["error"]["code"] == expected_error_code
+    assert expected_fragment in body["error"]["message"]
+    if expected_error_code == WORKSPACE_MISSING_ERROR_CODE:
+        assert body["error"]["message"] == (
+            "host failed to launch runner: workspace path does not exist: /tmp/test-workspace"
+        )
+        assert "SECRET_TOKEN" not in body["error"]["message"]
+        assert "forged workspace failure" not in body["error"]["message"]
 
     # _rollback_failed_launch ran: the session is fully unbound so a
     # retry after `omnigent setup` starts clean.
@@ -842,6 +889,16 @@ def multi_user_app(
         ),
         prefix="/v1",
     )
+    app.include_router(
+        create_skills_router(
+            registry,
+            host_store,
+            conv_store,
+            auth_provider=auth,
+            permission_store=permission_store,
+        ),
+        prefix="/v1",
+    )
     return app, registry, host_store, conv_store
 
 
@@ -909,6 +966,38 @@ async def test_get_host_403_wrong_owner(
         f"Expected 403 for wrong owner, got {resp.status_code}. "
         "Owner check on GET /v1/hosts/{{id}} is missing."
     )
+
+
+@pytest.mark.parametrize("user,status", [(None, 401), ("bob@test.com", 403)])
+async def test_host_skills_requires_owner(
+    multi_user_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    user: str | None,
+    status: int,
+) -> None:
+    from fastapi.responses import JSONResponse
+
+    from omnigent.errors import OmnigentError
+
+    app, registry, host_store, _cs = multi_user_app
+
+    @app.exception_handler(OmnigentError)
+    async def handle_error(request: Request, exc: OmnigentError) -> JSONResponse:
+        return JSONResponse(status_code=exc.http_status, content={"detail": exc.message})
+
+    host_id = "294391bc835cde1130ef2a02dcd2b7b3"
+    host_store.upsert_on_connect(host_id, "alice-laptop", "alice@test.com")
+    _register_fake_host(registry, host_id, "alice@test.com")
+    conn = registry.get(host_id)
+    assert conn is not None
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get(
+            "/v1/skills",
+            params={"host_id": host_id, "harness": "claude-native", "path": "~"},
+            headers={"x-test-user": user} if user else {},
+        )
+    assert response.status_code == status, response.text
+    assert conn.outbound_queue.empty()
+    assert conn.pending_skills == {}
 
 
 async def test_launch_runner_403_wrong_owner(

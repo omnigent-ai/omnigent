@@ -38,6 +38,7 @@ _QUEUED_STRIP = '[data-testid="composer-queued-strip"]'
 _PILL = '[data-testid="background-task-pill"]'
 _COMPOSER_PLACEHOLDER_IDLE = "Send a message…"
 
+
 _SEND_MSG = "sentinel-bg-send-2a9c sent while a background task runs"
 _RELOAD_SEND_MSG = "sentinel-bg-send-7f31 sent after reopening the session"
 
@@ -101,9 +102,7 @@ def test_message_sends_directly_while_background_task_runs(
     page.goto(f"{base_url}/c/{session_id}")
     expect(composer).to_be_visible()
 
-    # The turn ended but a background shell outlives it: the Stop hook posts
-    # `waiting` with the ended turn's response_id and a positive count. The
-    # composer's pill names the shell ("1 background task").
+    # Background shells outlive the turn, but their unfinished composer control stays hidden.
     _publish_status(
         base_url,
         session_id,
@@ -111,7 +110,7 @@ def test_message_sends_directly_while_background_task_runs(
         response_id="resp_bg_1",
         background_task_count=1,
     )
-    expect(page.locator(_PILL)).to_contain_text("1 background task", timeout=15_000)
+    expect(page.locator(_PILL)).to_have_count(0)
 
     # The composer must be free to send — NOT stuck on the queued follow-up
     # placeholder. This is the exact regression: `waiting`+response_id used
@@ -156,9 +155,8 @@ def test_message_sends_directly_after_reopening_with_background_task(
     page.goto(f"{base_url}/c/{session_id}")
     composer = page.get_by_label("Message the agent")
     expect(composer).to_be_visible()
-    # The shells are still reported (the tally rides the snapshot) …
-    expect(page.locator(_PILL)).to_contain_text("1 background task", timeout=15_000)
-    # … but the turn is over, so the composer is free.
+    expect(page.locator(_PILL)).to_have_count(0)
+    # The turn is over, so the composer is free.
     expect(composer).to_have_attribute("placeholder", _COMPOSER_PLACEHOLDER_IDLE, timeout=15_000)
 
     composer.fill(_RELOAD_SEND_MSG)

@@ -101,4 +101,40 @@ describe("ImportSessionsPanel", () => {
     // A null title renders the placeholder rather than crashing.
     expect(screen.getByTestId("import-result-link-c2")).toHaveTextContent("Untitled session");
   });
+
+  it("imports one session by harness and ID without listing sessions", async () => {
+    useHostsMock.mockReturnValue({
+      data: [{ host_id: "host_1", name: "mac-laptop", owner: "alice", status: "online" }],
+    } as unknown as ReturnType<typeof useHosts>);
+    importLocalSessionsMock.mockImplementation(async (_host, _source, _limit, onSession) => {
+      onSession?.({ id: "c1", title: "Exact session" });
+      return {
+        imported: 1,
+        alreadyImported: 0,
+        failed: 0,
+        sessions: [{ id: "c1", title: "Exact session" }],
+      };
+    });
+
+    renderPanel();
+    fireEvent.change(screen.getAllByRole("combobox")[1], {
+      target: { value: "session" },
+    });
+
+    expect(screen.queryByTestId("import-limit-select")).toBeNull();
+    const idInput = screen.getByTestId("import-session-id");
+    expect(screen.getByTestId("import-submit")).toBeDisabled();
+    fireEvent.change(idInput, { target: { value: "  session-exact  " } });
+    fireEvent.click(screen.getByTestId("import-submit"));
+
+    await waitFor(() =>
+      expect(importLocalSessionsMock).toHaveBeenCalledWith(
+        "host_1",
+        "claude",
+        25,
+        expect.any(Function),
+        "session-exact",
+      ),
+    );
+  });
 });

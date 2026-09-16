@@ -13,6 +13,20 @@ Omnigent identity against it.
 
 ## Setup
 
+**The quick path — create the app from the manifest.** At
+[api.slack.com/apps](https://api.slack.com/apps) → **Create New App** → **From
+an app manifest** → pick the workspace → paste
+[`deploy/slack-app-manifest.yaml`](deploy/slack-app-manifest.yaml). That sets
+Socket Mode, Interactivity, the default scopes and events below, and the
+`/omnigent` command in one step. For Databricks web-auth, uncomment
+`users:read` and `users:read.email` in the manifest before pasting it. A
+manifest cannot mint tokens, so finish with the two steps from the manifest
+header — generate a `connections:write` app-level token (**Basic Information →
+App-Level Tokens**) and **Install to Workspace** for the bot token — then
+continue from step 5.
+
+Doing it by hand instead:
+
 1. Create a Slack app with Socket Mode **and** Interactivity enabled (Socket
   Mode delivers the interactive button/modal payloads — no request URL needed).
 2. Add the OAuth scopes and event subscriptions listed under **Required scopes**
@@ -30,7 +44,9 @@ Omnigent identity against it.
 
 ## Required scopes
 
-The bot uses two tokens, each carrying different scopes.
+The bot uses two tokens, each carrying different scopes. These are mirrored in
+[`deploy/slack-app-manifest.yaml`](deploy/slack-app-manifest.yaml) — change both
+together.
 
 ### Bot token scopes (`OMNIGENT_SLACK_BOT_TOKEN`, `xoxb-…`)
 

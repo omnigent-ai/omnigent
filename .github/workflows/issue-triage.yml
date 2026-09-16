@@ -124,7 +124,7 @@ jobs:
         run: |
           # Derive everything downstream needs from the single source of truth,
           # .github/areas.json:
-          #   /tmp/owners.json   -- flat allowlist of every area owner (the ONLY
+          #   /tmp/owners.json   -- flat allowlist of active area owners (the ONLY
           #                         logins the assignment step may ever pick).
           #   /tmp/components.json -- the set of comp:* labels the validator allows.
           #   /tmp/areas_prompt.txt -- the AREAS block injected into the triage
@@ -132,16 +132,19 @@ jobs:
           python3 <<'PYEOF'
           import json, pathlib
 
-          areas = json.loads(pathlib.Path(".github/areas.json").read_text())["areas"]
+          config = json.loads(pathlib.Path(".github/areas.json").read_text())
+          areas = config["areas"]
+          paused = {login.casefold() for login in config.get("assignment_paused", [])}
 
           owners, components, lines = [], set(), []
           for a in areas:
-              for o in a.get("owners", []):
+              active_owners = [o for o in a.get("owners", []) if o.casefold() not in paused]
+              for o in active_owners:
                   if o not in owners:
                       owners.append(o)
               components.add(a["label"])
               lines.append(
-                  f"- {a['key']}: {a['definition']} Owners: {', '.join(a.get('owners', []))}."
+                  f"- {a['key']}: {a['definition']} Owners: {', '.join(active_owners)}."
               )
 
           pathlib.Path("/tmp/owners.json").write_text(json.dumps(owners))
@@ -658,8 +661,8 @@ jobs:
 
           # Refresh state after labeling/commenting so closure and assignment do
           # not rely on the earlier read.
-          issue_state=$(gh issue view "$ISSUE_NUMBER" --repo "$REPO" \
-            --json state --jq '.state')
+          issue_status=$(gh issue view "$ISSUE_NUMBER" --repo "$REPO" --json state,assignees)
+          issue_state=$(jq -r '.state' <<<"$issue_status")
           if [ "$issue_state" != "OPEN" ]; then
             exit 0
           fi
@@ -676,24 +679,27 @@ jobs:
           # issue is later reopened — triage only fires on `opened`, so a
           # reopened issue would otherwise come back unassigned.
 
-          # If the issue was filed by a maintainer, assign it to them directly.
+          # Assign maintainer authors directly unless their issue assignments are paused.
           author=$(jq -r '.author.login // empty' /tmp/issue.json)
-          maintainer_assigned=false
-          if [ -n "$author" ] && grep -qxF "$author" .github/MAINTAINER; then
+          owner_assigned=$(jq -r '.assignees | length > 0' <<<"$issue_status")
+          if [ "$owner_assigned" = "false" ] && [ -n "$author" ] && grep -qxF "$author" .github/MAINTAINER && \
+            jq -e --arg author "$author" \
+              '[(.assignment_paused // [])[] | ascii_downcase] | index($author | ascii_downcase) == null' \
+              .github/areas.json > /dev/null; then
             echo "Issue filed by maintainer $author — assigning to author"
             gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --add-assignee "$author"
-            maintainer_assigned=true
+            owner_assigned=true
           fi
 
           # Otherwise, assign an owner: the least-loaded area owner, with LLM
           # rank as a tiebreaker (load primary, rank secondary). Symmetric with
-          # the PR reviewer path. Skipped if the maintainer-author was already
-          # assigned above. Every triaged issue gets an owner — duplicates
+          # the PR reviewer path. Skipped if the issue already has an owner.
+          # Every triaged issue gets an owner — duplicates
           # included, even ones about to be closed below — so the only issues
           # left unassigned are needs_info ones (too vague to route until the
           # reporter adds detail).
           needs_info=$(jq -r '.needs_info // false' /tmp/triage_result.json)
-          if [ "$maintainer_assigned" = "false" ] && [ "$needs_info" != "true" ]; then
+          if [ "$owner_assigned" = "false" ] && [ "$needs_info" != "true" ]; then
             # Open-issue load per candidate (fewest assigned open issues wins ties).
             # One trusted query; the LLM never sees GH_TOKEN.
             gh issue list --repo "$REPO" --state open --limit 500 \
@@ -792,9 +798,9 @@ jobs:
       )
     uses: ./.github/workflows/issue-prioritization-v2.yml
     with:
-      issue_number: ${{ github.event.issue.number || inputs.issue_number }}
+      issue_number: ${{ fromJSON(format('{0}', github.event.issue.number || inputs.issue_number)) }}
       intake: ${{ github.event_name == 'workflow_dispatch' || github.event.action == 'opened' }}
       apply: ${{ github.event_name != 'workflow_dispatch' || inputs.apply_labels }}
       manual_dispatch: ${{ github.event_name == 'workflow_dispatch' }}
-      post_duplicate_comments: ${{ inputs.post_comment }}
+      post_duplicate_comments: ${{ github.event_name == 'workflow_dispatch' && inputs.post_comment }}
     secrets: inherit

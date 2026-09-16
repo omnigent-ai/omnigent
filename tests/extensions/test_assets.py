@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import importlib.resources
+import importlib.util
 import sys
 from pathlib import Path
 
@@ -14,6 +16,7 @@ from omnigent.extensions.assets import (
     ASSET_STYLES,
     ExtensionAssetError,
     build_asset_index,
+    parse_dev_bundle_overrides,
     resolve_bundle,
 )
 
@@ -121,6 +124,27 @@ def test_rejects_namespace_package_root(tmp_path: Path, monkeypatch: pytest.Monk
 
     with pytest.raises(ExtensionAssetError, match="regular package"):
         resolve_bundle(_manifest(css=None), package=package)
+
+
+def test_parses_only_existing_absolute_development_roots(tmp_path: Path) -> None:
+    assert parse_dev_bundle_overrides(f'{{"acme.assets": "{tmp_path}"}}') == {
+        "acme.assets": tmp_path
+    }
+    with pytest.raises(ExtensionAssetError, match="valid JSON"):
+        parse_dev_bundle_overrides("not-json")
+    with pytest.raises(ExtensionAssetError, match="existing absolute directory"):
+        parse_dev_bundle_overrides('{"acme.assets": "relative"}')
+
+
+def test_rejects_unsupported_traversable_loader(monkeypatch: pytest.MonkeyPatch) -> None:
+    class Spec:
+        origin = "/virtual/package.py"
+
+    monkeypatch.setattr(importlib.util, "find_spec", lambda _package: Spec())
+    monkeypatch.setattr(importlib.resources, "files", lambda _package: object())
+
+    with pytest.raises(ExtensionAssetError, match="unsupported package loader"):
+        resolve_bundle(_manifest(css=None), package="virtual_package")
 
 
 def test_asset_index_isolates_broken_extension(tmp_path: Path) -> None:

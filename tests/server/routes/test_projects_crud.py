@@ -16,6 +16,9 @@ Two auth setups are exercised:
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import time
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -24,6 +27,7 @@ import pytest
 import pytest_asyncio
 from fastapi import FastAPI
 
+from omnigent.runtime import user_session_stream
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.auth import UnifiedAuthProvider
@@ -271,7 +275,7 @@ def multi_user_app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
             cache_dir=tmp_path / "cache",
         ),
         project_store=SqlAlchemyProjectStore(db_uri),
-        auth_provider=UnifiedAuthProvider(source="header"),
+        auth_provider=UnifiedAuthProvider(source="header", local_single_user=False),
         permission_store=SqlAlchemyPermissionStore(db_uri),
     )
 
@@ -363,3 +367,230 @@ async def test_cannot_delete_another_users_project(
     assert (
         await multi_user_client.get(f"/v1/projects/{created['id']}", headers=_as_user(BOB))
     ).status_code == 200
+
+
+# ── Live broadcast of project changes ────────────────────────────────────────
+#
+# Project mutations must announce on the owner's session-updates discovery
+# channel (``user_session_stream``): that push is the only thing that lets the
+# owner's OTHER connected clients (another tab, the mobile app) refresh their
+# projects cache, so a rename made here shows up there without a reload.
+
+
+@contextlib.asynccontextmanager
+async def _collect_discovery_events(user_key: str) -> AsyncIterator[list[dict]]:
+    """Collect every event published on ``user_key``'s discovery channel."""
+    events: list[dict] = []
+
+    async def _drain() -> None:
+        async for evt in user_session_stream.subscribe(user_key):
+            events.append(evt)
+
+    task = asyncio.create_task(_drain())
+    # Let the subscriber register before the caller mutates anything.
+    await asyncio.sleep(0)
+    try:
+        yield events
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
+async def _wait_for_events(events: list[dict], count: int, *, timeout: float = 2.0) -> None:
+    """Wait until ``events`` holds ``count`` items (publish is a queued hop)."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if len(events) >= count:
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"expected {count} events, saw {events}")
+
+
+async def test_project_mutations_announce_projects_changed_to_owner(
+    multi_user_client: httpx.AsyncClient,
+) -> None:
+    """Create, rename, and delete each push ``projects_changed`` to the owner
+    — and never to another user's channel (projects are owner-private)."""
+    async with (
+        _collect_discovery_events(ALICE) as alice_events,
+        _collect_discovery_events(BOB) as bob_events,
+    ):
+        created = await multi_user_client.post(
+            "/v1/projects", json={"name": "Live folder"}, headers=_as_user(ALICE)
+        )
+        assert created.status_code == 200
+        await _wait_for_events(alice_events, 1)
+
+        renamed = await multi_user_client.patch(
+            f"/v1/projects/{created.json()['id']}",
+            json={"name": "Live folder renamed"},
+            headers=_as_user(ALICE),
+        )
+        assert renamed.status_code == 200
+        await _wait_for_events(alice_events, 2)
+
+        deleted = await multi_user_client.delete(
+            f"/v1/projects/{created.json()['id']}", headers=_as_user(ALICE)
+        )
+        assert deleted.status_code == 200
+        await _wait_for_events(alice_events, 3)
+
+        assert alice_events == [{"type": "projects_changed"}] * 3
+        # Give any mis-keyed publish a chance to land before asserting silence.
+        await asyncio.sleep(0.05)
+        assert bob_events == []
+
+
+async def test_rejected_project_mutation_announces_nothing(
+    multi_user_client: httpx.AsyncClient,
+) -> None:
+    """A 404'd cross-user rename/delete pushes no event on either channel."""
+    created = await multi_user_client.post(
+        "/v1/projects", json={"name": "Bob private"}, headers=_as_user(BOB)
+    )
+    assert created.status_code == 200
+    async with (
+        _collect_discovery_events(ALICE) as alice_events,
+        _collect_discovery_events(BOB) as bob_events,
+    ):
+        rename = await multi_user_client.patch(
+            f"/v1/projects/{created.json()['id']}",
+            json={"name": "Hijacked"},
+            headers=_as_user(ALICE),
+        )
+        assert rename.status_code == 404
+        delete = await multi_user_client.delete(
+            f"/v1/projects/{created.json()['id']}", headers=_as_user(ALICE)
+        )
+        assert delete.status_code == 404
+        await asyncio.sleep(0.05)
+        assert alice_events == []
+        assert bob_events == []
+
+
+async def test_project_order_round_trip(project_client: httpx.AsyncClient) -> None:
+    """Custom order affects both discovery APIs and survives rename/delete/reset."""
+
+    async def names(path: str) -> list[str]:
+        response = await project_client.get(path)
+        response.raise_for_status()
+        data = response.json()
+        return [p["name"] for p in (data if isinstance(data, list) else data["data"])]
+
+    ids = []
+    for name in ["BUG", "DOC", "WORK"]:
+        response = await project_client.post("/v1/projects", json={"name": name})
+        ids.append(response.json()["id"])
+    assert (await project_client.get("/v1/projects/order")).json() == {
+        "ordered_project_ids": None,
+        "sort_mode": "alphabetical",
+    }
+    ordered = [ids[2], ids[0], ids[1]]
+    response = await project_client.put(
+        "/v1/projects/order", json={"ordered_project_ids": ordered}
+    )
+    assert response.status_code == 200
+    assert response.json() == {"ordered_project_ids": ordered, "sort_mode": "manual"}
+    for path in ["/v1/projects", "/v1/sessions/projects"]:
+        assert await names(path) == ["WORK", "BUG", "DOC"]
+    await project_client.patch(f"/v1/projects/{ids[2]}", json={"name": "ZZZ"})
+    await project_client.post("/v1/projects", json={"name": "AAA"})
+    assert await names("/v1/sessions/projects") == ["ZZZ", "BUG", "DOC", "AAA"]
+    await project_client.delete(f"/v1/projects/{ids[0]}")
+    assert await names("/v1/sessions/projects") == ["ZZZ", "DOC", "AAA"]
+    response = await project_client.put("/v1/projects/order", json={"ordered_project_ids": None})
+    assert response.status_code == 200
+    assert await names("/v1/sessions/projects") == ["AAA", "DOC", "ZZZ"]
+    assert response.json() == {"ordered_project_ids": ordered, "sort_mode": "alphabetical"}
+    assert (await project_client.get("/v1/projects/order")).json() == response.json()
+
+
+async def test_project_order_rejects_invalid_payload(project_client: httpx.AsyncClient) -> None:
+    """Malformed/duplicate/unknown IDs never overwrite a saved preference."""
+    project = (await project_client.post("/v1/projects", json={"name": "A"})).json()
+    for ids in [[project["id"], project["id"]], ["missing"], "invalid"]:
+        response = await project_client.put(
+            "/v1/projects/order", json={"ordered_project_ids": ids}
+        )
+        assert response.status_code in (400, 422)
+    assert (await project_client.put("/v1/projects/order", json={})).status_code == 422
+    assert (await project_client.get("/v1/projects/order")).json() == {
+        "ordered_project_ids": None,
+        "sort_mode": "alphabetical",
+    }
+
+
+@pytest.mark.parametrize("ids", [["a" * 33], ["g" * 32], ["a" * 32] * 10001])
+async def test_project_order_rejects_oversized_or_malformed_ids(
+    project_client: httpx.AsyncClient, ids: list[str]
+) -> None:
+    response = await project_client.put("/v1/projects/order", json={"ordered_project_ids": ids})
+    assert response.status_code == 422
+
+
+async def test_corrupt_order_does_not_break_project_discovery(
+    project_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    from sqlalchemy import text
+
+    from omnigent.db.utils import get_or_create_engine
+
+    for name in ("Z", "A"):
+        (await project_client.post("/v1/projects", json={"name": name})).raise_for_status()
+    (
+        await project_client.put("/v1/projects/order", json={"ordered_project_ids": []})
+    ).raise_for_status()
+    with get_or_create_engine(db_uri).begin() as connection:
+        connection.execute(
+            text("UPDATE users SET project_order=:raw WHERE workspace_id=0 AND id='local'"),
+            {"raw": b"\x00\x01broken compression"},
+        )
+    preference = await project_client.get("/v1/projects/order")
+    assert preference.status_code == 200
+    assert preference.json() == {"sort_mode": "alphabetical", "ordered_project_ids": None}
+    for path in ("/v1/projects", "/v1/sessions/projects"):
+        response = await project_client.get(path)
+        assert response.status_code == 200
+        body = response.json()
+        assert [p["name"] for p in (body if isinstance(body, list) else body["data"])] == [
+            "A",
+            "Z",
+        ]
+
+
+async def test_order_endpoints_enforce_owner_and_announce_changes(
+    multi_user_client: httpx.AsyncClient,
+) -> None:
+    client = multi_user_client
+    created = await client.post("/v1/projects", headers=_as_user(ALICE), json={"name": "A"})
+    project_id = created.json()["id"]
+    assert (await client.get("/v1/projects/order")).status_code == 401
+    assert (
+        await client.put("/v1/projects/order", json={"ordered_project_ids": None})
+    ).status_code == 401
+    async with (
+        _collect_discovery_events(ALICE) as alice_events,
+        _collect_discovery_events(BOB) as bob_events,
+    ):
+        rejected = await client.put(
+            "/v1/projects/order",
+            headers=_as_user(BOB),
+            json={"ordered_project_ids": [project_id]},
+        )
+        assert rejected.status_code == 400
+        assert (await client.get("/v1/projects/order", headers=_as_user(BOB))).json() == {
+            "sort_mode": "alphabetical",
+            "ordered_project_ids": None,
+        }
+        for ids in ([project_id], None):
+            response = await client.put(
+                "/v1/projects/order",
+                headers=_as_user(ALICE),
+                json={"ordered_project_ids": ids},
+            )
+            assert response.status_code == 200
+        await _wait_for_events(alice_events, 2)
+        assert alice_events == [{"type": "projects_changed"}] * 2
+        await asyncio.sleep(0.05)
+        assert bob_events == []

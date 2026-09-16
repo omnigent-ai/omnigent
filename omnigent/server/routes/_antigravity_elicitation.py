@@ -6,7 +6,7 @@ the endpoint (Task 9) handle all network interaction.
 Two functions are exported:
 
 * :func:`to_elicitation_params` — converts a :class:`PendingInteraction`
-  dict (produced by :func:`omnigent.antigravity_native_steps.pending_interaction`)
+  dict (produced by :func:`omnigent.harnesses.antigravity_native.steps.pending_interaction`)
   into an :class:`~omnigent.server.schemas.ElicitationRequestParams` that
   the web UI can render.
 
@@ -353,7 +353,7 @@ def to_tui_selection_keys(
     prompt open, stranding the terminal (and folding the next typed turn into the
     stale prompt's buffer — #1200). So the bridge ALSO types the selection into
     the pane via
-    :func:`omnigent.antigravity_native_bridge.send_interaction_keys_via_tui`,
+    :func:`omnigent.harnesses.antigravity_native.bridge.send_interaction_keys_via_tui`,
     mirroring cursor-native. This is the pure shape-mapper for those keys.
 
     * **permission** — Approve → option ``"1"`` ("Yes"), Reject → option ``"4"``

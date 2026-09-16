@@ -62,7 +62,7 @@ def test_about_dialog_update_flow(page: Page) -> None:
     expect(page.get_by_text("0.13.0", exact=True)).to_be_visible()
     expect(page.get_by_text("0.13.0.dev0", exact=True)).to_be_visible()
     expect(page.get_by_text("/Users/alice/.local/bin/omnigent", exact=True)).to_be_visible()
-    expect(page.get_by_text("omni update", exact=True)).to_be_visible()
+    expect(page.get_by_text("omni upgrade", exact=True)).to_be_visible()
 
     update_now = page.get_by_role("button", name="Update now")
     expect(update_now).to_be_visible()

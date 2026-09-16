@@ -30,7 +30,8 @@ from omnigent.entities import (
 )
 from omnigent.entities.session_resources import session_resource_view_to_dict
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.native_coding_agents import (
+from omnigent.native.native_coding_agents import (
+    native_coding_agent_for_agent_name,
     native_coding_agent_for_terminal_name,
 )
 from omnigent.runner.routing import RunnerRouter
@@ -65,6 +66,7 @@ from omnigent.server.routes._origin import require_trusted_origin
 from omnigent.server.routes._sessions.common import (
     _logger,
     get_server_runner_router,
+    host_interactive_shells_for_request,
     set_server_runner_router,
 )
 from omnigent.server.routes._sessions.helpers import (
@@ -78,6 +80,8 @@ from omnigent.server.routes._sessions.helpers import (
     _proxy_get_session_resources_to_runner,
     _publish_and_persist_resource_event,
     _publish_changed_files_invalidated,
+    _raise_if_runner_session_agent_missing,
+    _raise_if_session_agent_missing_payload,
     _read_upload_capped,
     _stored_file_to_resource,
 )
@@ -118,6 +122,25 @@ class _RunnerStreamResponse(StreamingResponse):
             await super().__call__(scope, receive, send)
         finally:
             await self._upstream.aclose()
+
+
+# Admission gate bounding how many image uploads hold their raw bytes in memory
+# and decode/re-encode at once. Created lazily on first use so it binds to the
+# running server loop (not import time) and picks up the configured size. The
+# raw upload is already spooled to disk by the multipart parser before the
+# handler runs, so waiting here serializes only the in-memory materialize +
+# decode — the memory-heavy work — never the network transfer.
+_image_compression_gate: asyncio.Semaphore | None = None
+
+
+def _get_image_compression_gate() -> asyncio.Semaphore:
+    """Return the process-wide image-compression admission semaphore."""
+    global _image_compression_gate
+    if _image_compression_gate is None:
+        from omnigent.server.server_config import image_compression_concurrency
+
+        _image_compression_gate = asyncio.Semaphore(image_compression_concurrency())
+    return _image_compression_gate
 
 
 def register_resources_routes(
@@ -351,6 +374,10 @@ def register_resources_routes(
             payload = None
         if not isinstance(payload, dict) or not isinstance(payload.get("error"), dict):
             raise HTTPException(status_code=502, detail="runner download failed")
+        # Re-derive the typed session-lifecycle 410 (agent deleted or
+        # rebound) with its client-safe message instead of forwarding the
+        # runner's raw resolver text verbatim.
+        _raise_if_session_agent_missing_payload(payload)
         return JSONResponse(status_code=resp.status_code, content=payload)
 
     async def _proxy_get_to_runner(
@@ -367,7 +394,9 @@ def register_resources_routes(
         :param params: Optional query params forwarded to the runner,
             e.g. ``{"order": "asc"}``. ``None`` sends no query string.
         :returns: Parsed JSON response body.
-        :raises HTTPException: 502 on runner failure.
+        :raises OmnigentError: Typed ``not_found`` (404) or
+            ``session_agent_missing`` (410) re-derived from the runner body.
+        :raises HTTPException: 502 on any other runner failure.
         """
         runner_client = await _get_runner_client_for_resource_access(
             session_id,
@@ -402,6 +431,9 @@ def register_resources_routes(
                 code=ErrorCode.NOT_FOUND,
             )
         if resp.status_code != 200:
+            # Re-derive the typed session-lifecycle 410 (agent deleted or
+            # rebound) instead of flattening it to a generic 502.
+            _raise_if_runner_session_agent_missing(resp)
             if isinstance(response_payload, dict):
                 error = response_payload.get("error", {})
                 msg = error.get("message") or "runner resource endpoint failed"
@@ -596,6 +628,70 @@ def register_resources_routes(
         """
         return LEVEL_OWNER if ntpath.isabs(client_path) else within_workspace
 
+    async def _authorize_browse_read(
+        session_id: str,
+        request: Request | None,
+        client_path: str = "",
+    ) -> Conversation:
+        """Authorize a workspace *content* read and return the conversation.
+
+        The read surfaces (file read/list, directory listing, changed files,
+        diffs, search, and the GitHub diff views) all serve the workspace's
+        own bytes or paths. An ABSOLUTE ``client_path`` is the owner's own
+        machine — owner-only, exactly as :func:`_browse_level` decides for a
+        mutation. A workspace-relative read needs ``LEVEL_EDIT`` *unless* the
+        session owner opted into ``share_workspace_files``, which lowers the
+        bar to ``LEVEL_READ``.
+
+        Fail-closed by default: a plain read grant shares the *conversation*,
+        not the raw filesystem — workspace files routinely hold secrets
+        (``.env`` / key files), so a read-only viewer sees nothing there until
+        the owner turns sharing on. The opt-in never widens absolute-path
+        browsing; that stays owner-only.
+
+        One :func:`require_access_and_level` round-trip resolves both the
+        caller's level and (via the conversation it returns) the session flag,
+        so the hot file-panel path pays no extra query in the common case.
+
+        :param session_id: Session/conversation identifier.
+        :param request: Incoming request; ``None`` for internal (no-auth)
+            calls, which are admitted at read level like ``_validate_session``.
+        :param client_path: Client-supplied path (``""`` for the whole-
+            workspace surfaces such as ``/changes``). A leading ``/`` — on any
+            platform — marks it absolute and forces the owner gate.
+        :returns: The authorized conversation.
+        :raises OmnigentError: 401/403/404 on auth failure.
+        """
+        if ntpath.isabs(client_path):
+            return await _validate_session(session_id, request, LEVEL_OWNER)
+        if request is None:
+            return await _validate_session(session_id, request, LEVEL_READ)
+        user_id = _get_user_id(request, auth_provider)
+        access = await _require_access_and_level(
+            user_id,
+            session_id,
+            LEVEL_READ,
+            permission_store,
+            conversation_store,
+        )
+        conv = access.conversation
+        if conv is None:
+            # Admin caller or permissions disabled: no conversation was fetched
+            # during authorization, so read it here (matching _validate_session).
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if conv is None:
+                raise _session_not_found()
+        # ``level is None`` means permissions are disabled (single-user); admins
+        # resolve to owner. Edit collaborators keep the workspace unconditionally;
+        # a view-only grant reaches it only once the owner shares its files.
+        if access.level is None or access.level >= LEVEL_EDIT or conv.share_workspace_files:
+            return conv
+        raise OmnigentError(
+            f"{user_id!r} needs edit access to browse the workspace of session "
+            f"{session_id!r}, or the owner must enable file sharing",
+            code=ErrorCode.FORBIDDEN,
+        )
+
     def _resolve_browse_path(request: Request, client_path: str) -> tuple[bool, str]:
         """Resolve a filesystem request path against its declared base.
 
@@ -706,6 +802,53 @@ def register_resources_routes(
                 raise HTTPException(status_code=400, detail=exc.message) from exc
             # Any other host FS failure (e.g. git_status_failed 500) mirrors the
             # runner proxy, which wraps non-200/404 responses as a 502.
+            raise HTTPException(status_code=502, detail=exc.message) from exc
+
+    async def _write_workspace_via_host(
+        session_id: str,
+        conversation: Conversation,
+        op: str,
+        host_params: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Serve a workspace-mutating op over the session's host tunnel.
+
+        The write counterpart of :func:`_read_workspace_via_host`, for when the
+        runner is offline but the host holding the workspace is connected.
+
+        :param op: Host-side write op — currently ``"github_set_preference"``.
+        :param host_params: Op-specific args for the host writer.
+        :returns: The refreshed payload, or ``None`` when no host is bound /
+            connected / reachable (caller re-raises the runner-offline error).
+        :raises HTTPException: On host-reported failures, reproducing the runner's
+            status.
+        """
+        from omnigent.server.routes._host_filesystem import (
+            HostFsError,
+            HostFsUnavailableError,
+            write_workspace_from_host,
+        )
+
+        if host_registry is None:
+            return None
+        if not conversation.host_id or not conversation.workspace:
+            return None
+        host_conn = host_registry.get(conversation.host_id)
+        if host_conn is None:
+            return None
+        try:
+            return await write_workspace_from_host(
+                host_registry=host_registry,
+                host_conn=host_conn,
+                op=op,
+                workspace=conversation.workspace,
+                session_id=session_id,
+                params=host_params,
+            )
+        except HostFsUnavailableError:
+            return None
+        except HostFsError as exc:
+            if exc.status == 400:
+                raise HTTPException(status_code=400, detail=exc.message) from exc
             raise HTTPException(status_code=502, detail=exc.message) from exc
 
     async def _proxy_post_to_runner(
@@ -1116,6 +1259,19 @@ def register_resources_routes(
         if not is_native_bootstrap:
             spec = await asyncio.to_thread(_load_agent_spec_for_session, conv, agent_store)
             declared = list(spec.terminals or {}) if spec is not None else []
+            if (
+                spec is not None
+                and conv.host_id is not None
+                and host_registry is not None
+                and native_coding_agent_for_agent_name(spec.name) is not None
+            ):
+                reported = host_interactive_shells_for_request(
+                    conv.host_id,
+                    host_registry=host_registry,
+                    runner_router=runner_router or get_server_runner_router(),
+                )
+                if reported:
+                    declared = reported
             if body.get("terminal") not in declared:
                 raise OmnigentError(
                     (
@@ -1411,10 +1567,15 @@ def register_resources_routes(
                 code=ErrorCode.INVALID_INPUT,
             )
         from omnigent.runtime.content_resolver import (
+            _COMPRESSIBLE_IMAGE_MIMES,
             MAX_ATTACHMENT_UPLOAD_BYTES,
+            ImageCompressionError,
             _resolve_content_type,
             attachment_text_type_for_extension,
             attachment_upload_limit,
+            compress_image_attachment,
+            image_filename_for_content_type,
+            image_needs_compression,
         )
 
         # Resolve the type from the declared MIME + filename BEFORE reading
@@ -1445,13 +1606,38 @@ def register_resources_routes(
                     "PDF, and text/code files can be attached."
                 ),
             )
-        content = await _read_upload_capped(
-            file,
-            min(type_limit, MAX_ATTACHMENT_UPLOAD_BYTES),
-        )
+        read_limit = min(type_limit, MAX_ATTACHMENT_UPLOAD_BYTES)
+        filename = file.filename
+        if content_type in _COMPRESSIBLE_IMAGE_MIMES:
+            # Compressible images carry the large cap and the decode, so they are
+            # the server's peak upload memory. The body is already spooled to
+            # disk by the multipart parser, so gate the in-memory read + the
+            # decode/re-encode behind the admission semaphore: a burst of
+            # concurrent uploads waits (each holding only a disk-backed temp
+            # file), instead of every one buffering the full image in RAM and
+            # decoding at once. This bounds peak memory to the gate size × the
+            # per-upload cost, without serializing the network transfer.
+            async with _get_image_compression_gate():
+                content = await _read_upload_capped(file, read_limit)
+                if image_needs_compression(len(content), content_type):
+                    try:
+                        compressed, resolved_type = await asyncio.to_thread(
+                            compress_image_attachment, content, content_type
+                        )
+                    except ImageCompressionError as exc:
+                        raise HTTPException(status_code=413, detail=str(exc)) from exc
+                    # A re-encode (e.g. PNG → JPEG) changes the type; realign the
+                    # filename extension so name, bytes, and MIME stay consistent.
+                    if resolved_type != content_type:
+                        filename = image_filename_for_content_type(file.filename, resolved_type)
+                    content, content_type = compressed, resolved_type
+        else:
+            # PDF/text/SVG and other non-compressed types use their smaller
+            # per-type caps and aren't decoded, so they read outside the gate.
+            content = await _read_upload_capped(file, read_limit)
         stored = file_store.create(
             session_id=session_id,
-            filename=file.filename,
+            filename=filename,
             bytes=len(content),
             content_type=content_type,
         )
@@ -1837,6 +2023,10 @@ def register_resources_routes(
             raise HTTPException(status_code=405)
 
         if status >= 400:
+            # Re-derive the typed session-lifecycle 410 (agent deleted or
+            # rebound) with its client-safe message instead of forwarding
+            # the runner's raw resolver text verbatim.
+            _raise_if_session_agent_missing_payload(payload)
             error = payload.get("error", {})
             message = error.get("message", "filesystem operation failed")
             if status == 404:
@@ -1924,7 +2114,7 @@ def register_resources_routes(
             params["before"] = before
         qs = urllib.parse.urlencode(params)
         path = f"/v1/sessions/{session_id}/resources/environments/{environment_id}/filesystem?{qs}"
-        conv = await _validate_session(session_id, request, LEVEL_READ)
+        conv = await _authorize_browse_read(session_id, request)
         return _skip_gzip_for_binary(
             request,
             await _fs_get_with_host_fallback(
@@ -2049,9 +2239,7 @@ def register_resources_routes(
             params["exclude"] = exclude
 
         absolute, path = _resolve_browse_path(request, path)
-        conv = await _validate_session(
-            session_id, request, _browse_level(path, within_workspace=LEVEL_READ)
-        )
+        conv = await _authorize_browse_read(session_id, request, path)
 
         qs = urllib.parse.urlencode(params)
         suffix = ""
@@ -2099,7 +2287,7 @@ def register_resources_routes(
         :returns: Flat list of changed filesystem entries with ``status``.
         """
         path = f"/v1/sessions/{session_id}/resources/environments/{environment_id}/changes"
-        conv = await _validate_session(session_id, request, LEVEL_READ)
+        conv = await _authorize_browse_read(session_id, request)
         return await _fs_get_with_host_fallback(
             session_id,
             conv,
@@ -2137,7 +2325,7 @@ def register_resources_routes(
             f"/v1/sessions/{session_id}/resources/environments"
             f"/{environment_id}/diff/{relative_path}"
         )
-        conv = await _validate_session(session_id, request, LEVEL_READ)
+        conv = await _authorize_browse_read(session_id, request, relative_path)
         return await _fs_get_with_host_fallback(
             session_id,
             conv,
@@ -2155,6 +2343,7 @@ def register_resources_routes(
     async def read_github_pr_diff(
         request: Request,
         session_id: str,
+        pr_url: str | None = None,
     ) -> Any:
         """
         Return the whole PR as one unified diff patch.
@@ -2167,12 +2356,13 @@ def register_resources_routes(
         :param session_id: Session/conversation identifier.
         :returns: JSON with the ``patch`` text.
         """
-        conv = await _validate_session(session_id, request, LEVEL_READ)
+        conv = await _authorize_browse_read(session_id, request)
         return await _fs_get_with_host_fallback(
             session_id,
             conv,
             op="github_pr_diff",
-            host_params={},
+            host_params={"pr_url": pr_url} if pr_url else {},
+            runner_params={"pr_url": pr_url} if pr_url else None,
             runner_path=f"/v1/sessions/{session_id}/resources/github/diff",
         )
 
@@ -2187,13 +2377,16 @@ def register_resources_routes(
         session_id: str,
         relative_path: str,
         base: str | None = Query(default=None),
+        pr_url: str | None = None,
+        previous_path: str | None = None,
+        head_sha: str | None = None,
+        base_sha: str | None = None,
     ) -> Any:
         """
-        Return before/after content for a file in the branch-vs-base diff.
+        Return before/after content for a file in the selected PR.
 
-        Reads the file at HEAD and at the base branch's merge-base via
-        ``git show``. Falls back to the host tunnel when the runner is offline,
-        so the diff stays viewable from the workspace on disk.
+        Tracked PRs read GitHub revisions; legacy requests use the workspace.
+        Falls back to the host tunnel when the runner is offline.
 
         :param request: The incoming FastAPI request (for auth).
         :param session_id: Session/conversation identifier.
@@ -2201,14 +2394,25 @@ def register_resources_routes(
         :param base: Base branch name; the default is derived when omitted.
         :returns: JSON with ``before`` and ``after`` content strings.
         """
-        conv = await _validate_session(session_id, request, LEVEL_READ)
+        conv = await _authorize_browse_read(session_id, request, relative_path)
+        params = {
+            key: value
+            for key, value in {
+                "base": base,
+                "pr_url": pr_url,
+                "previous_path": previous_path,
+                "head_sha": head_sha,
+                "base_sha": base_sha,
+            }.items()
+            if value is not None
+        }
         return await _fs_get_with_host_fallback(
             session_id,
             conv,
             op="github_diff",
-            host_params={"base": base, "path": relative_path},
+            host_params={"base": base, "path": relative_path, **params},
             runner_path=f"/v1/sessions/{session_id}/resources/github/diff/{relative_path}",
-            runner_params={"base": base} if base else None,
+            runner_params=params or None,
         )
 
     @file_read_router.get(
@@ -2271,9 +2475,7 @@ def register_resources_routes(
         # `_mutating_level` for why anything weaker would make this route a
         # way around the owner-scoped host filesystem endpoint.
         absolute, relative_path = _resolve_browse_path(request, relative_path)
-        conv = await _validate_session(
-            session_id, request, _browse_level(relative_path, within_workspace=LEVEL_READ)
-        )
+        conv = await _authorize_browse_read(session_id, request, relative_path)
 
         qs = urllib.parse.urlencode(params)
         runner_rel = _runner_path_segment(relative_path, absolute=absolute)
@@ -2462,6 +2664,7 @@ def register_resources_routes(
     async def get_session_github(
         request: Request,
         session_id: str,
+        pr_url: str | None = None,
     ) -> dict[str, Any]:
         """
         Return GitHub context (repo, branch, base ref, PR) for a session.
@@ -2479,7 +2682,8 @@ def register_resources_routes(
             session_id,
             conv,
             op="github_info",
-            host_params={},
+            host_params={"pr_url": pr_url} if pr_url else {},
+            runner_params={"pr_url": pr_url} if pr_url else None,
             runner_path=f"/v1/sessions/{session_id}/resources/github",
         )
 
@@ -2490,6 +2694,7 @@ def register_resources_routes(
     async def list_session_github_changes(
         request: Request,
         session_id: str,
+        pr_url: str | None = None,
     ) -> dict[str, Any]:
         """
         List the PR's changed files (empty when the branch has no PR).
@@ -2498,14 +2703,100 @@ def register_resources_routes(
         :param session_id: Session/conversation identifier.
         :returns: Flat list of changed files with ``status`` and line counts.
         """
-        conv = await _validate_session(session_id, request, LEVEL_READ)
+        conv = await _authorize_browse_read(session_id, request)
         return await _fs_get_with_host_fallback(
             session_id,
             conv,
             op="github_changes",
-            host_params={},
+            host_params={"pr_url": pr_url} if pr_url else {},
+            runner_params={"pr_url": pr_url} if pr_url else None,
             runner_path=f"/v1/sessions/{session_id}/resources/github/changes",
         )
+
+    @router.post("/sessions/{session_id}/resources/github/prs", response_model=None)
+    async def update_session_github_pr(request: Request, session_id: str) -> dict[str, Any]:
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        body = await request.json()
+        if not isinstance(body, dict) or not isinstance(body.get("url"), str):
+            raise HTTPException(status_code=400, detail="Expected a pull request URL")
+        params = {
+            "url": body["url"],
+            "action": body.get("action", "attach"),
+            "session_id": session_id,
+        }
+        try:
+            status, result = await _proxy_post_to_runner(
+                session_id,
+                f"/v1/sessions/{session_id}/resources/github/prs",
+                params,
+                conv,
+            )
+        except OmnigentError as exc:
+            if exc.code != ErrorCode.RUNNER_UNAVAILABLE:
+                raise
+            payload = await _write_workspace_via_host(
+                session_id, conv, op="github_prs_update", host_params=params
+            )
+            if payload is None:
+                raise
+            return payload
+        if status >= 400:
+            raise HTTPException(
+                status_code=status, detail=result.get("detail", "Cannot update pull requests")
+            )
+        return result
+
+    @router.post(
+        "/sessions/{session_id}/resources/github/preferences",
+        response_model=None,
+    )
+    async def set_session_github_preference(
+        request: Request,
+        session_id: str,
+    ) -> dict[str, Any]:
+        """
+        Apply the GitHub panel's account (and optional base) selection.
+
+        Persists the choice — a per-workspace account preference in the user
+        config, and ``gh repo set-default`` when a base is given — then returns the
+        refreshed ``session.github.info``. Served by the runner when it's online,
+        else by the host over its tunnel (both run the same
+        :func:`github_resource.set_github_preference` against the local config +
+        workspace), so a preference change works with the runner asleep.
+
+        :param request: The incoming FastAPI request (JSON body + auth).
+        :param session_id: Session/conversation identifier.
+        :returns: The refreshed ``session.github.info`` object.
+        """
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        body = await request.json()
+        params = {"account": body.get("account"), "remote": body.get("remote")}
+        if body.get("pr_url"):
+            params.update(pr_url=body["pr_url"], session_id=session_id)
+        try:
+            status, result = await _proxy_post_to_runner(
+                session_id,
+                f"/v1/sessions/{session_id}/resources/github/preferences",
+                params,
+                conv,
+            )
+        except OmnigentError as exc:
+            # Runner asleep — serve the write from the host if it's connected.
+            if exc.code != ErrorCode.RUNNER_UNAVAILABLE:
+                raise
+            payload = await _write_workspace_via_host(
+                session_id, conv, op="github_set_preference", host_params=params
+            )
+            if payload is None:
+                raise
+            return payload
+        if status >= 400:
+            error = result.get("error", {})
+            raise OmnigentError(
+                error.get("message", f"GitHub preference update failed (HTTP {status})"),
+                code=error.get("code", ErrorCode.INTERNAL_ERROR),
+            )
+        return result
 
     # Generic single-resource lookup — registered AFTER typed
     # collections so "environments", "terminals", "files" are not

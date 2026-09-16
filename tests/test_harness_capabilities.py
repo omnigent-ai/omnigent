@@ -30,8 +30,7 @@ from omnigent.harness_plugins import (
     native_agents,
     valid_harnesses,
 )
-from omnigent.inner.devin import DEVIN_ACP_EXTENSION
-from omnigent.model_override import (
+from omnigent.models.model_override import (
     _ANTIGRAVITY_FAMILY_HARNESSES,
     _CLAUDE_FAMILY_HARNESSES,
 )
@@ -78,19 +77,16 @@ def test_subagents_matches_its_implementing_mechanism() -> None:
 
     1. A **native** agent with a ``subagent_wrapper_label``: Omnigent intercepts
        the vendor's own spawn and mints the child session.
-    2. An **ACP vendor extension** carrying a sub-agent dialect
-       (:mod:`omnigent.inner.devin`): the agent reports its sub-agent lifecycle in
-       its own ``_meta``, and the runner mints the child from that. No native
-       wrapper label is involved — deliberately, since the child inherits its
-       parent's harness identity rather than claiming a vendor's.
+    2. An **ACP vendor extension** carrying a sub-agent dialect: the agent
+       reports its sub-agent lifecycle in its own ``_meta`` and the runner mints
+       the child from that. No built-in row uses this today — the mechanism
+       stays for a community ACP plugin — so nothing is added below.
 
     Keeping the derivation here means a harness cannot publish a ``subagents``
     capability on ``/v1/harnesses`` that nothing implements, or implement one it
     does not publish.
     """
     subagent_capable = {agent.harness for agent in native_agents() if agent.subagent_wrapper_label}
-    if DEVIN_ACP_EXTENSION.surfaces_subagents:
-        subagent_capable.add("devin")
     for harness, capability in harness_capabilities().items():
         expected = harness in subagent_capable
         assert capability.subagents == expected, harness
@@ -115,7 +111,7 @@ def test_p0_bench_harnesses_declare_interrupt_and_streaming() -> None:
 
 def test_pi_harnesses_declare_the_pi_effort_family() -> None:
     """Both pi harnesses advertise pi's 7-level ladder, not "no effort knob"."""
-    from omnigent.reasoning_effort import EFFORT_VALUES, PI_EFFORTS
+    from omnigent.util.reasoning_effort import EFFORT_VALUES, PI_EFFORTS
 
     caps = harness_capabilities()
     for harness in ("pi", "pi-native"):
@@ -225,7 +221,7 @@ def test_hermes_picker_row_has_spawn_env_plumbing() -> None:
     (via ``_SDK_MODEL_OVERRIDE_HARNESSES``) makes the server accept the override
     instead of rejecting it up front."""
     from omnigent.harness_plugins import model_env_keys
-    from omnigent.model_override import harness_supports_model_override
+    from omnigent.models.model_override import harness_supports_model_override
 
     assert model_env_keys()["hermes"] == "HARNESS_HERMES_MODEL"
     assert harness_supports_model_override("hermes")

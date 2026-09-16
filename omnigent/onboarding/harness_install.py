@@ -52,11 +52,11 @@ from omnigent._platform import resolve_cli_binary
 from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
 from omnigent.cli_invocation import cli_invocation
 from omnigent.harness_install_spec import HarnessInstallSpec, SetupStep
-from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, GEMINI_FAMILY, OPENAI_FAMILY
-from omnigent.opencode_native_client import (
+from omnigent.harnesses.opencode_native.client import (
     OPENCODE_MAX_VERSION_EXCLUSIVE,
     OPENCODE_MIN_VERSION,
 )
+from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, GEMINI_FAMILY, OPENAI_FAMILY
 
 # Pi is not a configure-menu family (the menu is Claude + Codex), but the
 # first-run ``run`` flow falls back to it, so it has install metadata too.
@@ -153,6 +153,15 @@ COPILOT_KEY = "copilot"
 HERMES_KEY = "hermes"
 
 _HERMES_INSTALL_HINT = "curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash"
+
+# Devin (Cognition) ships via a curl installer rather than npm and authenticates
+# through its own ``devin auth login``, which writes a credential file it reads
+# back at spawn — Omnigent stores no Devin credential. ``devin auth status``
+# exits 0 only while logged in, giving the same revocation-aware status probe
+# Codex gets from ``codex login status``.
+DEVIN_KEY = "devin"
+
+_DEVIN_INSTALL_HINT = "curl -fsSL https://cli.devin.ai/install.sh | bash"
 
 # Anthropic recommends its native installer over ``npm install -g``: it writes
 # to a user-writable ``~/.local/bin`` and self-updates, so it sidesteps the
@@ -312,6 +321,16 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         install_command=("bash", "-c", _HERMES_INSTALL_HINT),
         min_version=_HERMES_MIN_VERSION,
     ),
+    DEVIN_KEY: HarnessInstallSpec(
+        "Devin",
+        "devin",
+        package=None,
+        login_args=("auth", "login"),
+        status_args=("auth", "status"),
+        install_hint=_DEVIN_INSTALL_HINT,
+        install_command=("bash", "-c", _DEVIN_INSTALL_HINT),
+        auth_hint="run `devin auth login` (Omnigent stores no Devin credential)",
+    ),
 }
 
 
@@ -377,6 +396,12 @@ _HARNESS_NAME_TO_KEY: dict[str, str] = {
     # gates on the same binary.
     "hermes-native": HERMES_KEY,
     "native-hermes": HERMES_KEY,
+    # Native Devin TUI (``devin-native``, via ``omni devin``) wraps the ``devin``
+    # CLI; ``native-devin`` gates on the same binary. The bare ``devin`` spelling
+    # canonicalizes to ``devin-native``, so it lands here too, and the ACP row
+    # gates on the same binary through the catalog.
+    "devin-native": DEVIN_KEY,
+    "native-devin": DEVIN_KEY,
 }
 
 
@@ -737,7 +762,7 @@ def _parse_harness_cli_version(text: str) -> str | None:
     """Extract a semver-ish string from ``<binary> --version`` output.
 
     Mirrors the OpenCode-specific parser in
-    :func:`omnigent.opencode_native_app_server.parse_opencode_version` but is
+    :func:`omnigent.harnesses.opencode_native.app_server.parse_opencode_version` but is
     kept generic so any harness can declare a version range in its install spec.
     Date-shaped versions (e.g. Cursor's ``2026.06.22`` or
     ``2026.06.19-20-24-33-653a7fb``) are normalized to ``YYYY.MM.DD``.

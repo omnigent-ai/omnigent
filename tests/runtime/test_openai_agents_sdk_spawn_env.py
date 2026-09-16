@@ -37,11 +37,19 @@ def _isolate_global_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> N
     this file so tests that don't explicitly set up a global config are
     not affected by the developer's real ``~/.omnigent/config.yaml``.
 
+    Also redirect ``$HOME`` (and ``$USERPROFILE`` on Windows) to that temp
+    dir: ambient provider detection reads ``~/.codex/config.toml`` and
+    ``~/.databrickscfg``, which live under HOME, not OMNIGENT_CONFIG_HOME. On
+    a Databricks developer machine those otherwise pin a provider and break
+    these tests (issue #4279).
+
     Tests that need a specific global config write their own config.yaml
     into a separate temp dir and set OMNIGENT_CONFIG_HOME themselves —
     that setenv call wins because monkeypatch applies in call order.
     """
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
 
 
 def _make_spec(

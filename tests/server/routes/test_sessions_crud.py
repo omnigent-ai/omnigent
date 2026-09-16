@@ -614,6 +614,29 @@ async def test_patch_rejects_client_supplied_sandbox_labels(
         assert key not in conv.labels
 
 
+async def test_patch_rejects_client_supplied_side_chat_thread_id_label(
+    client: httpx.AsyncClient,
+    session_id: str,
+    db_uri: str,
+) -> None:
+    """``omnigent.codex_native.subagent_thread_id`` records the Codex thread a
+    ``/side`` child forwards follow-up turns onto. The server writes it and later
+    re-reads the child's own copy to drive ``turn/start``, so a client seed would
+    redirect another session's follow-up into an attacker-chosen thread. It must
+    be rejected and nothing persisted."""
+    conv_store = SqlAlchemyConversationStore(db_uri)
+
+    resp = await client.patch(
+        f"/v1/sessions/{session_id}",
+        json={"labels": {"omnigent.codex_native.subagent_thread_id": "thread_evil"}},
+        headers={"Content-Type": "application/json"},
+    )
+    assert resp.status_code == 400
+    conv = conv_store.get_conversation(session_id)
+    assert conv is not None
+    assert "omnigent.codex_native.subagent_thread_id" not in conv.labels
+
+
 async def test_patch_rejects_client_supplied_archived_at_label(
     client: httpx.AsyncClient,
     session_id: str,

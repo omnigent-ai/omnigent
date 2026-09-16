@@ -9,12 +9,10 @@
 //   the "Working…" indicator.
 
 import {
-  AlertCircleIcon,
   BrainCircuitIcon,
   CheckIcon,
   ChevronRightIcon,
   CopyIcon,
-  InfoIcon,
   Loader2Icon,
   RotateCcwIcon,
   RotateCwIcon,
@@ -52,7 +50,7 @@ interface ErrorBannerProps {
   remediation?: string;
   /** `"info"` renders a neutral notice (no failure tone) instead of a destructive error. */
   level?: "error" | "info";
-  /** Reconnect the existing session without replaying or duplicating user input. */
+  /** Recover the existing session or continue after a retryable turn failure. */
   onRetry?: () => Promise<void>;
 }
 
@@ -75,6 +73,9 @@ const FAILURE_CODE_DESCRIPTIONS: Record<string, string> = {
   workspace_missing: "The session workspace no longer exists on the host.",
   codex_thread_reset:
     "Codex hit an error reloading the earlier transcript, so it started a fresh thread.",
+  codex_turn_error: "Codex ran into an error during this turn.",
+  native_turn_error: "The agent ran into an error during this turn.",
+  rate_limit_exceeded: "The model's rate limit was reached. You can retry this turn.",
 };
 
 const RETRYABLE_ERROR_CODES = new Set([
@@ -83,6 +84,7 @@ const RETRYABLE_ERROR_CODES = new Set([
   "runner_disconnected",
   "runner_failed_to_start",
   "runner_unavailable",
+  "rate_limit_exceeded",
 ]);
 
 interface ParsedErrorMessage {
@@ -156,7 +158,6 @@ export function ErrorBanner({
 }: ErrorBannerProps) {
   const notice = level === "info";
   const tone = notice ? "var(--muted-foreground)" : "var(--destructive)";
-  const StatusIcon = notice ? InfoIcon : AlertCircleIcon;
   const headline =
     title || FAILURE_CODE_DESCRIPTIONS[code] || (notice ? "Notice" : "Something went wrong");
   const parsed = useMemo(() => parseErrorMessage(message), [message]);
@@ -185,16 +186,12 @@ export function ErrorBanner({
   const [retrying, setRetrying] = useState(false);
   const [retryError, setRetryError] = useState<string | null>(null);
   const [dismissed, setDismissed] = useState(false);
-  const [headerHovered, setHeaderHovered] = useState(false);
-  const [headerFocusVisible, setHeaderFocusVisible] = useState(false);
   const copyResetRef = useRef<number>(0);
   const retryInFlightRef = useRef(false);
-  const headerPointerDownRef = useRef(false);
   const dismissButtonRef = useRef<HTMLButtonElement>(null);
   const messageId = useId();
   const diagnosticsId = useId();
   const retryable = onRetry !== undefined && RETRYABLE_ERROR_CODES.has(code);
-  const showDisclosureIcon = expanded || headerHovered || headerFocusVisible;
 
   useEffect(() => () => window.clearTimeout(copyResetRef.current), []);
   useEffect(() => {
@@ -229,7 +226,7 @@ export function ErrorBanner({
           className="relative z-10 h-auto rounded-xl border-border bg-background px-4 py-2 text-sm font-normal text-muted-foreground shadow-xs"
         >
           <Loader2Icon aria-hidden="true" className="animate-spin" />
-          Reconnecting
+          {code === "rate_limit_exceeded" ? "Retrying" : "Reconnecting"}
         </Badge>
       </div>
     );
@@ -270,18 +267,6 @@ export function ErrorBanner({
         data-testid="error-pill"
         data-level={notice ? "info" : "error"}
         onClick={() => setExpanded((value) => !value)}
-        onMouseEnter={() => setHeaderHovered(true)}
-        onMouseLeave={() => setHeaderHovered(false)}
-        onPointerDown={() => {
-          headerPointerDownRef.current = true;
-          setHeaderFocusVisible(false);
-        }}
-        onPointerUp={() => {
-          headerPointerDownRef.current = false;
-        }}
-        onPointerCancel={() => {
-          headerPointerDownRef.current = false;
-        }}
         className="group/error relative z-10 w-[560px] max-w-full cursor-pointer rounded-[12px] p-[8px] text-foreground"
         style={{
           background: `color-mix(in srgb, ${tone} 4%, var(--app-shell-bg, var(--background)))`,
@@ -297,53 +282,37 @@ export function ErrorBanner({
               event.stopPropagation();
               setExpanded((value) => !value);
             }}
-            onKeyDown={(event) => {
-              setHeaderFocusVisible(event.currentTarget.matches(":focus-visible"));
-            }}
-            onFocus={(event) => {
-              setHeaderFocusVisible(
-                !headerPointerDownRef.current && event.currentTarget.matches(":focus-visible"),
-              );
-            }}
-            onBlur={() => {
-              headerPointerDownRef.current = false;
-              setHeaderFocusVisible(false);
-            }}
             className="flex min-w-0 flex-1 cursor-pointer items-start rounded-lg bg-transparent text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
           >
             <span
               data-testid="error-leading-slot"
               className="mt-[4px] mr-[4px] flex h-[18px] w-[18px] shrink-0 items-center justify-center"
             >
-              {showDisclosureIcon ? (
-                <ChevronRightIcon
-                  data-testid="error-disclosure-icon"
-                  className={cn(
-                    "size-4 text-muted-foreground transition-transform duration-150 animate-in fade-in group-hover/error:text-foreground",
-                    expanded && "rotate-90",
-                  )}
-                  aria-hidden="true"
-                />
-              ) : (
-                <StatusIcon
-                  data-testid="error-status-icon"
-                  className={cn(
-                    "size-[18px] duration-150 animate-in fade-in",
-                    notice ? "text-muted-foreground" : "text-destructive",
-                  )}
-                  aria-hidden="true"
-                />
-              )}
+              <ChevronRightIcon
+                data-testid="error-disclosure-icon"
+                className={cn(
+                  "size-4 text-muted-foreground transition-transform duration-150 group-hover/error:text-foreground",
+                  expanded && "rotate-90",
+                )}
+                aria-hidden="true"
+              />
             </span>
-            <span
-              data-testid="error-headline"
-              title={headline}
-              className={cn(
-                "mr-[4px] min-w-0 flex-1 truncate whitespace-nowrap leading-6",
-                notice ? "text-foreground" : "text-destructive",
+            <span className="mr-[4px] flex min-w-0 flex-1 flex-col">
+              <span
+                data-testid="error-headline"
+                title={headline}
+                className={cn(
+                  "min-w-0 truncate whitespace-nowrap leading-6",
+                  notice ? "text-foreground" : "text-destructive",
+                )}
+              >
+                {headline}
+              </span>
+              {!expanded && (
+                <span className="text-[11px] leading-4 text-muted-foreground/70">
+                  Expand for details
+                </span>
               )}
-            >
-              {headline}
             </span>
           </button>
           {retryable ? (

@@ -846,3 +846,53 @@ async def test_control_bridge_read_only_drops_input() -> None:
     assert ws.sent_text == []
 
     await _kill_and_join(sock, task)
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.asyncio
+async def test_control_attach_pins_client_term_over_inherited_dumb(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The control client reports a real TERM even when the runner env is ``dumb``.
+
+    A pane TUI (e.g. Codex) reads the attached client's ``#{client_termname}``
+    over its own $TERM and refuses to start when it sees ``dumb``. A runner
+    launched non-interactively can inherit ``TERM=dumb``, so the bridge must pin
+    a real terminal type on the attach regardless of the inherited value.
+    """
+    tmux = shutil.which("tmux")
+    assert tmux
+    # Simulate a runner whose environment carries a non-interactive ``dumb``.
+    monkeypatch.setenv("TERM", "dumb")
+
+    sock, target = await _new_private_tmux("sleep 30")
+    ws = _FakeWebSocket(inbound=[])
+    task = asyncio.create_task(
+        bridge_tmux_control_to_websocket(
+            ws, socket_path=str(sock), tmux_target=target, read_only=False
+        )
+    )
+    try:
+        termname = ""
+        for _ in range(50):
+            proc = await asyncio.create_subprocess_exec(
+                tmux,
+                "-S",
+                str(sock),
+                "list-clients",
+                "-F",
+                "#{client_termname}",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            out, _ = await proc.communicate()
+            termname = out.decode().strip()
+            if termname:
+                break
+            await asyncio.sleep(0.1)
+        assert termname == "xterm-256color", (
+            f"attached control client reported TERM {termname!r}; a leaked "
+            "'dumb' makes a pane TUI (Codex) refuse to start"
+        )
+    finally:
+        await _kill_and_join(sock, task)

@@ -19,7 +19,7 @@ import pytest
 from fastapi import FastAPI, Request
 from PIL import Image
 
-from omnigent.native_coding_agents import (
+from omnigent.native.native_coding_agents import (
     ANTIGRAVITY_NATIVE_AGENT_NAME,
     QWEN_NATIVE_AGENT_NAME,
 )
@@ -829,6 +829,52 @@ async def test_health_unbound_fork_of_coding_session_reads_offline(
     assert sessions[chat_fork.id]["runner_online"] is True
 
 
+def test_generic_credentials_route_does_not_shadow_detected(
+    db_uri: str,
+    tmp_path: Path,
+) -> None:
+    """The generic ``/hosts/{id}/credentials/{provider}`` route must not shadow
+    the literal ``/hosts/{id}/credentials/detected`` owned by ``create_hosts_router``.
+
+    Regression guard for the mount order: the credentials router carries a
+    ``{provider}`` path param, and Starlette matches routes in registration order
+    with no literal-over-parameter priority. If the credentials router is
+    registered before the hosts router, ``…/credentials/detected`` resolves to the
+    generic handler and the credential-adoption endpoint breaks.
+    """
+    from starlette.routing import Match
+
+    from omnigent.server.app import create_app
+    from omnigent.stores.conversation_store.sqlalchemy_store import (
+        SqlAlchemyConversationStore,
+    )
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+    from omnigent.stores.host_store import HostStore
+
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    app = create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=SqlAlchemyConversationStore(db_uri),
+        artifact_store=artifact_store,
+        host_store=HostStore(db_uri),
+        agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
+    )
+
+    def endpoint_for(path: str) -> str | None:
+        scope = {"type": "http", "method": "GET", "path": path}
+        for route in app.router.routes:
+            match, _ = route.matches(scope)
+            if match == Match.FULL:
+                return getattr(getattr(route, "endpoint", None), "__name__", None)
+        return None
+
+    # The literal wins over the generic {provider} param, and github still routes
+    # to the generic broker handler.
+    assert endpoint_for("/v1/hosts/h1/credentials/detected") == "detect_host_credentials"
+    assert endpoint_for("/v1/hosts/h1/credentials/github") == "host_credential"
+
+
 @pytest.mark.asyncio
 async def test_health_unbound_imported_session_reads_offline(
     db_uri: str,
@@ -1049,7 +1095,7 @@ def test_ensure_default_native_agents_seeds_every_native_agent(
     the loop — or seeded under the wrong name/id — is caught here.
     """
     from omnigent.db.utils import builtin_agent_id
-    from omnigent.native_coding_agents import NATIVE_CODING_AGENTS
+    from omnigent.native.native_coding_agents import NATIVE_CODING_AGENTS
 
     server_app._ensure_default_native_agents(
         seed_stores.agent_store,
@@ -1982,3 +2028,64 @@ async def test_offline_runner_is_logged_as_state_while_real_faults_stay_errors(
     assert "Internal error" not in unavailable.getMessage()
     assert internal.levelno == logging.ERROR
     assert internal.exc_info is not None
+
+
+@pytest.mark.asyncio
+async def test_peer_cancelled_rpc_is_booked_upstream_while_real_faults_stay_unhandled(
+    app: FastAPI,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    A peer-cancelled backing RPC books a coded WARN 499; real faults keep 500.
+
+    Both arms are asserted together because the point is the contrast: the
+    upstream cancelling an in-flight call (a teardown/restart burst) is an
+    expected, retryable condition that must not read as an ERROR-level
+    ``Unhandled exception``, while a genuinely uncoded fault must keep
+    exactly that booking. The cancelled RPC is a structural stand-in (an
+    exception class literally named ``RpcError`` with a ``code()`` status
+    accessor) because the deployed build vendors grpc — the handler must
+    match shape, not class identity.
+
+    :param app: The real application, for its registered handlers.
+    :param caplog: Pytest log capture fixture.
+    :returns: None.
+    """
+    import json
+
+    class _Status:
+        name = "CANCELLED"
+
+    class RpcError(Exception):
+        def code(self) -> object:
+            return _Status()
+
+    handler = app.exception_handlers[Exception]
+    request = Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/v1/mas/workspace-tree/children",
+            "raw_path": b"/v1/mas/workspace-tree/children",
+            "query_string": b"",
+            "headers": [],
+        }
+    )
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.server.app"):
+        cancelled = await handler(request, RpcError("RPC terminated with CANCELLED"))
+        fault = await handler(request, RuntimeError("boom"))
+
+    # The cancellation answers the coded, retryable 499; the fault keeps 500.
+    assert cancelled.status_code == 499
+    assert json.loads(cancelled.body)["error"]["code"] == "upstream_cancelled"
+    assert fault.status_code == 500
+    assert json.loads(fault.body)["error"]["code"] == "internal_error"
+
+    records = [r for r in caplog.records if r.name == "omnigent.server.app"]
+    assert len(records) == 2, f"expected one record per exception, got {records}"
+    upstream, unhandled = records
+    assert upstream.levelno == logging.WARNING
+    assert not upstream.getMessage().startswith("Unhandled exception:")
+    assert unhandled.levelno == logging.ERROR
+    assert unhandled.getMessage().startswith("Unhandled exception:")

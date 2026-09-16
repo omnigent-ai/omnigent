@@ -47,6 +47,7 @@ function loadNavigationHarness({
   const listeners = new Map();
   const calls = { loadFile: [], loadURL: [] };
   const bannerCalls = { show: [], hide: 0 };
+  const browserRegistryCalls = { setActive: [], closeAll: [] };
   let currentUrl = serverUrl;
   const appEvents = new Map();
   const webContents = {
@@ -166,7 +167,10 @@ function loadNavigationHarness({
       }),
     },
     "./browserViewRegistry": {
-      createBrowserViewRegistry: () => ({ closeAll: () => {} }),
+      createBrowserViewRegistry: () => ({
+        closeAll: (reason) => browserRegistryCalls.closeAll.push(reason),
+        setActive: (conversationId) => browserRegistryCalls.setActive.push(conversationId),
+      }),
     },
     "./browserViewBounds": {
       createBrowserViewBoundsController: () => ({ attach: () => {}, detach: () => {} }),
@@ -239,6 +243,7 @@ function loadNavigationHarness({
     api,
     calls,
     bannerCalls,
+    browserRegistryCalls,
     emit: (eventName, ...args) => webContents.emit(eventName, ...args),
     hasListener: (eventName) => listeners.has(eventName),
     setUrl: (url) => {
@@ -535,6 +540,45 @@ describe("navigation fallback wiring (src/main.js)", () => {
     assert.equal(harness.hasListener("did-navigate"), true);
     assert.equal(harness.calls.loadFile.length, 1);
     assert.equal(harness.calls.loadFile[0][0], harness.api.SETUP_PAGE);
+    harness.cleanup();
+  });
+});
+
+describe("browser view detach on main-frame navigation (src/main.js)", () => {
+  it("detaches the embedded browser view when the shell commits a new document", () => {
+    // Regression: the session-expiry watcher reloads the window onto the
+    // workspace sign-in page. That navigation tears down the SPA renderer
+    // WITHOUT BrowserPane's unmount detach, so nothing detached the native
+    // WebContentsView — it kept painting over the sign-in page, and over the
+    // SPA after signing back in.
+    const harness = loadNavigationHarness({ registerFallbacks: false });
+    harness.api.createWindow("https://host.example/ml/omnigents");
+
+    harness.setUrl("https://host.example/login.html?next_url=%2Fml%2Fomnigents");
+    harness.emit(
+      "did-navigate",
+      "https://host.example/login.html?next_url=%2Fml%2Fomnigents",
+      200,
+      "OK",
+    );
+
+    assert.deepEqual(harness.browserRegistryCalls.setActive, [null]);
+    harness.cleanup();
+  });
+
+  it("detaches again when the user signs back in (each committed document)", () => {
+    const harness = loadNavigationHarness({ registerFallbacks: false });
+    harness.api.createWindow("https://host.example/ml/omnigents");
+
+    harness.setUrl("https://host.example/login.html");
+    harness.emit("did-navigate", "https://host.example/login.html", 200, "OK");
+    harness.setUrl("https://host.example/ml/omnigents");
+    harness.emit("did-navigate", "https://host.example/ml/omnigents", 200, "OK");
+
+    // One detach per committed main-frame document: the login page and the
+    // re-signed-in SPA. A re-mounted BrowserPane re-attaches via
+    // browser-set-active, so detaching on the SPA commit is safe.
+    assert.deepEqual(harness.browserRegistryCalls.setActive, [null, null]);
     harness.cleanup();
   });
 });
