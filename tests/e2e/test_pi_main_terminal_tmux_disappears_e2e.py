@@ -133,8 +133,8 @@ def _find_pi_process(marker: str) -> tuple[int, list[str]] | None:
     ``--extension`` is not a standalone token there) and the ``python -m
     omnigent.runner...`` runner that spawned it.
 
-    Match only the process where ``--extension`` is its own argv token and
-    ``argv[0]`` is not tmux -- that is the real pi CLI.
+    Before Pi sets its process title, match its standalone ``--extension``
+    argument. Afterward, match the ``pi`` title plus its inherited bridge dir.
 
     :param marker: The ``pi-native/<hash>`` bridge segment.
     :returns: ``(pid, argv)`` of the pi process, or ``None`` if not found yet.
@@ -147,13 +147,26 @@ def _find_pi_process(marker: str) -> tuple[int, list[str]] | None:
             raw = (pid_dir / "cmdline").read_bytes()
         except OSError:
             continue
-        if needle not in raw:
-            continue
         argv = [chunk.decode(errors="replace") for chunk in raw.split(b"\x00") if chunk]
         if not argv:
             continue
-        if "--extension" in argv and not os.path.basename(argv[0]).startswith("tmux"):
+        if (
+            needle in raw
+            and "--extension" in argv
+            and not os.path.basename(argv[0]).startswith("tmux")
+        ):
             return int(pid_dir.name), argv
+        if argv[0] == "pi":
+            try:
+                env = (pid_dir / "environ").read_bytes().split(b"\x00")
+            except OSError:
+                continue
+            if any(
+                entry.startswith(b"OMNIGENT_PI_NATIVE_BRIDGE_DIR=")
+                and entry.endswith(b"/" + needle)
+                for entry in env
+            ):
+                return int(pid_dir.name), argv
     return None
 
 
@@ -230,19 +243,21 @@ def _kill_pi_processes(marker: str) -> None:
                 os.kill(int(pid_dir.name), signal.SIGKILL)
 
 
-def _scan_home_logs_for(home: Path, pattern: re.Pattern[str]) -> str | None:
-    """Return the first log line under *home* matching *pattern*, else ``None``.
+def _scan_home_logs_for(home: Path, session_id: str, pattern: re.Pattern[str]) -> str | None:
+    """Find a failure in this session's runner logs, excluding previous retries.
 
     The "tmux unavailable ... pi:main" signature is emitted by the RUNNER
     process (the idle-watcher daemon thread), whose process log lands under
-    ``<home>/.omnigent/logs/runner/``. Scanning every ``*.log`` under the
-    daemon HOME finds it wherever the runner routed it.
+    ``<home>/.omnigent/logs/runner/runner-<session_id>-*.log``.
 
     :param home: The daemon HOME whose ``.omnigent/logs`` tree holds the logs.
+    :param session_id: The current session, excluding prior attempts on this host.
     :param pattern: The compiled signature regex.
     :returns: The matching line, or ``None``.
     """
-    for log_path in home.rglob("*.log"):
+    paths = list((home / ".omnigent" / "logs" / "runner").glob(f"runner-{session_id}-*.log"))
+    assert paths, f"No runner logs found for session {session_id}; the log check is inconclusive"
+    for log_path in paths:
         try:
             text = log_path.read_text(errors="replace")
         except OSError:
@@ -546,7 +561,7 @@ def test_pi_main_terminal_survives_pi_exit_without_tmux_unavailable(
         terminal_gone = False
         scan_deadline = time.monotonic() + 25.0
         while time.monotonic() < scan_deadline:
-            hit = _scan_home_logs_for(host.home, _TMUX_UNAVAILABLE_RE)
+            hit = _scan_home_logs_for(host.home, session_id, _TMUX_UNAVAILABLE_RE)
             if hit is not None:
                 signature_line = hit
                 break
@@ -566,8 +581,8 @@ def test_pi_main_terminal_survives_pi_exit_without_tmux_unavailable(
 
         # The reproduction / regression assertion.
         assert signature_line is None, (
-            "Bug reproduced: killing the pi CLI vaporized the pi:main "
-            "tmux server (launched without keep_alive_after_exit), and the idle "
+            "Bug reproduced: killing the pi CLI left pi:main unavailable "
+            "to tmux, and the idle "
             "watcher logged the generic tmux-unavailable signature instead of a "
             f"diagnosable pane-dead exit:\n    {signature_line}"
         )
