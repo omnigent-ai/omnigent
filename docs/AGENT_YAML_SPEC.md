@@ -282,7 +282,7 @@ works; the sandbox holds only `oa_cred_*` placeholders, never a live token.
 
 ### Refreshing proxy credentials
 
-File and command credential sources can opt into renewal with
+File and Unix socket credential sources can opt into renewal with
 `refresh_interval_seconds`. The trusted parent re-reads the source on the first
 request after that interval; sandbox placeholders stay the same. For example,
 a local token broker can mint replacement GitHub App tokens before they expire:
@@ -291,16 +291,30 @@ a local token broker can mint replacement GitHub App tokens before they expire:
 credential_proxy:
   - type: gh_basic
     source:
-      command: "curl --fail --silent --max-time 20 --unix-socket /private/broker.sock http://localhost/token"
+      unix_socket: /private/broker.sock
       refresh_interval_seconds: 60
 ```
 
+The parent makes an HTTP `GET /token` directly over the Unix socket. The broker
+must return HTTP 200 with a non-empty, single-line token (at most 64 KiB).
+Redirects are not followed, no shell or external executable is involved, and
+the connection uses a 30-second socket timeout. Host bindings from one source
+declaration share a single cache and refresh lock.
+
 Keep the broker socket and its private key outside sandbox read/write paths.
+Refresh sources require absolute paths and an active sandbox policy. The runtime
+rejects sources whose paths, symlink targets, or parent directories are sandbox
+writable; hard-linked token files are also rejected. These checks run before
+startup resolution and every refresh. The trusted broker must keep its own code,
+configuration, and dependencies outside sandbox-writable paths too.
 Choose an interval shorter than the minimum remaining lifetime of tokens
 returned by the source. A failed refresh fails the request; it does not reuse
-an old credential. Without this setting, sources resolve once at startup.
+an old credential. Proxy requests receive a sanitized HTTP 502 on source failure,
+and the next request retries. Without this setting, sources resolve once at startup.
 Environment sources cannot refresh because a running process inherits a fixed
-environment.
+environment. Shell command sources remain startup-only: a sandbox might otherwise
+replace a script or dependency before the trusted parent executes it again. Use
+a private broker for renewable credentials instead.
 
 ## Tools
 

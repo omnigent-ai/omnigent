@@ -44,6 +44,7 @@ from urllib.parse import urlparse
 from omnigent.inner.credential_proxy import (
     SYNTHETIC_CREDENTIAL_PREFIX,
     CredentialRewriteRule,
+    CredentialSourceUnavailable,
 )
 from omnigent.inner.egress.certs import HostCertCache
 from omnigent.inner.egress.rules import (
@@ -115,12 +116,14 @@ class _AuthRewriteResult:
         when a synthetic placeholder matched, otherwise the input bytes
         unchanged.
     :param error: A human-readable reason to reject the request with
-        ``403`` (a placeholder was sent to the wrong host or is unknown),
+        ``403`` (placeholder misuse) or ``502`` (credential source failure),
         or ``None`` when the request may proceed.
+    :param status_code: HTTP error status when ``error`` is set.
     """
 
     headers: bytes
     error: str | None
+    status_code: int = 403
 
 
 # S2 (security): CSP-internal endpoints that present as globally
@@ -807,6 +810,9 @@ class EgressProxy:
             method=method, host=host, headers_raw=headers_raw
         )
         if rewrite.error is not None:
+            if rewrite.status_code == 502:
+                await self._send_bad_gateway(client_writer, rewrite.error)
+                return
             logger.warning(
                 "BLOCKED-CREDENTIAL %s https://%s%s — %s", method, host, path, rewrite.error
             )
@@ -962,6 +968,9 @@ class EgressProxy:
             method=method, host=host, headers_raw=headers_raw
         )
         if rewrite.error is not None:
+            if rewrite.status_code == 502:
+                await self._send_bad_gateway(writer, rewrite.error)
+                return
             logger.warning(
                 "BLOCKED-CREDENTIAL %s http://%s%s — %s", method, host, path, rewrite.error
             )
@@ -1249,12 +1258,18 @@ class EgressProxy:
         if not self._cred_by_host:
             return _AuthRewriteResult(headers=headers_raw, error=None)
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            None,
-            functools.partial(
-                self._rewrite_authorization, method=method, host=host, headers_raw=headers_raw
-            ),
-        )
+        try:
+            return await loop.run_in_executor(
+                None,
+                functools.partial(
+                    self._rewrite_authorization, method=method, host=host, headers_raw=headers_raw
+                ),
+            )
+        except CredentialSourceUnavailable:
+            logger.warning("CREDENTIAL-REFRESH-FAILED %s %s", method, host)
+            return _AuthRewriteResult(
+                headers=b"", error="Credential source unavailable", status_code=502
+            )
 
     def _rewrite_authorization(
         self, *, method: str, host: str, headers_raw: bytes

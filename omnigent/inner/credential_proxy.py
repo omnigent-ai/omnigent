@@ -27,8 +27,11 @@ This module owns two pieces:
 
 from __future__ import annotations
 
+import http.client
 import os
 import secrets
+import socket
+import stat
 import subprocess
 import threading
 import time
@@ -43,6 +46,7 @@ from omnigent.inner.datamodel import (
     CredentialSourceSpec,
     DatabricksProxySpec,
 )
+from omnigent.inner.sandbox import SandboxPolicy
 
 # Prefix on every minted placeholder. The proxy uses it to recognise a
 # value as one of *its* synthetic credentials (so it can reject a
@@ -52,6 +56,11 @@ from omnigent.inner.datamodel import (
 SYNTHETIC_CREDENTIAL_PREFIX = "oa_cred_"
 # Timeout for a ``command:`` source subprocess, in seconds.
 _COMMAND_SOURCE_TIMEOUT_SECONDS = 30
+_MAX_BROKER_TOKEN_BYTES = 65536
+
+
+class CredentialSourceUnavailable(ValueError):
+    """A credential source could not supply the requested token."""
 
 
 @dataclass
@@ -109,7 +118,10 @@ class CredentialRewriteRule:
             configured (a malformed rule).
         """
         if self.secret_provider is not None:
-            return self.secret_provider()
+            try:
+                return self.secret_provider()
+            except Exception as error:
+                raise CredentialSourceUnavailable("Credential source unavailable") from error
         if self.real_secret is not None:
             return self.real_secret
         raise ValueError(
@@ -167,6 +179,7 @@ def prepare_credential_proxy_runtime(
     spec: CredentialProxySpec | None,
     *,
     parent_env: dict[str, str],
+    sandbox: SandboxPolicy | None = None,
 ) -> CredentialProxyRuntime:
     """
     Resolve secrets, mint placeholders, and build the proxy rewrite rules.
@@ -182,6 +195,7 @@ def prepare_credential_proxy_runtime(
     :param parent_env: Parent process environment used to resolve
         ``env`` / ``command`` sources. ``file`` sources read the
         filesystem directly.
+    :param sandbox: Effective sandbox policy, required for renewable and socket sources.
     :returns: A :class:`CredentialProxyRuntime` with helper env updates
         (only for ``inject_env`` entries) and the proxy rewrite rules.
     :raises ValueError: If any configured source cannot be resolved to a
@@ -195,11 +209,20 @@ def prepare_credential_proxy_runtime(
         _prepare_databricks_runtime(spec.databricks, runtime)
 
     synthetic_by_env: dict[str, str] = {}
+    providers: dict[int, RefreshingSecretProvider] = {}
     for entry in spec.entries:
         secret_provider: Callable[[], str] | None = None
+        if entry.source.kind == "unix_socket":
+            _validate_refresh_source(entry.source, sandbox)
         if entry.source.refresh_interval_seconds is not None:
-            provider = RefreshingSecretProvider(entry.source, parent_env=parent_env)
-            provider.resolve()
+            source_id = id(entry.source)
+            provider = providers.get(source_id)
+            if provider is None:
+                provider = RefreshingSecretProvider(
+                    entry.source, parent_env=parent_env, sandbox=sandbox
+                )
+                provider.resolve()
+                providers[source_id] = provider
             secret_provider = provider.resolve
             real_secret = None
         else:
@@ -238,26 +261,47 @@ def prepare_credential_proxy_runtime(
     return runtime
 
 
+def _validate_refresh_source(source: CredentialSourceSpec, sandbox: SandboxPolicy | None) -> None:
+    if sandbox is None or not sandbox.active:
+        raise ValueError("credential refresh requires an active sandbox policy")
+    if source.kind not in ("file", "unix_socket") or not source.path:
+        raise ValueError("credential refresh requires a file or unix_socket source")
+    path = Path(source.path).expanduser()
+    if not path.is_absolute():
+        raise ValueError("refresh source must use an absolute path")
+    roots = tuple(root.resolve() for root in sandbox.write_roots)
+    files = tuple(allowed.resolve() for allowed in sandbox.write_files)
+    for component in (path, *path.parents):
+        for candidate in (component.absolute(), component.resolve()):
+            if any(candidate.is_relative_to(root) for root in roots) or candidate in files:
+                raise ValueError("refresh source must stay outside sandbox-writable paths")
+    if source.kind == "file" and path.exists() and path.stat().st_nlink != 1:
+        raise ValueError("refresh source must not be a hard-linked file")
+
+
 class RefreshingSecretProvider:
-    """Cache a parent-side file or command secret until its next refresh."""
+    """Cache a trusted file or private broker secret until its next refresh."""
 
     def __init__(
         self,
         source: CredentialSourceSpec,
         *,
         parent_env: dict[str, str],
+        sandbox: SandboxPolicy | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         interval = source.refresh_interval_seconds
         if (
-            source.kind not in ("file", "command")
+            source.kind not in ("file", "unix_socket")
             or interval is None
             or not 0 < interval < float("inf")
         ):
             raise ValueError(
-                "credential refresh requires a file or command and a finite positive interval"
+                "credential refresh requires a file or unix_socket and a finite positive interval"
             )
+        _validate_refresh_source(source, sandbox)
         self._source = source
+        self._sandbox = sandbox
         self._parent_env = dict(parent_env)
         self._interval = interval
         self._clock = clock
@@ -269,6 +313,7 @@ class RefreshingSecretProvider:
         """Refresh on access; a failed refresh never falls back to an old token."""
         with self._lock:
             if self._secret is None or self._clock() >= self._next_refresh:
+                _validate_refresh_source(self._source, self._sandbox)
                 self._secret = _resolve_secret(self._source, parent_env=self._parent_env)
                 self._next_refresh = self._clock() + self._interval
             return self._secret
@@ -285,6 +330,29 @@ def _resolve_secret(source: CredentialSourceSpec, *, parent_env: dict[str, str])
     :raises ValueError: If the source is misconfigured, missing, empty,
         or (for ``command``) exits non-zero.
     """
+    if source.kind == "unix_socket":
+        if not source.path:
+            raise ValueError("credential_proxy unix_socket source requires a path")
+        path = Path(source.path).expanduser()
+        if not stat.S_ISSOCK(path.stat().st_mode):
+            raise ValueError("credential broker path is not a Unix socket")
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+            connection.settimeout(_COMMAND_SOURCE_TIMEOUT_SECONDS)
+            connection.connect(str(path))
+            connection.sendall(
+                b"GET /token HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+            )
+            with http.client.HTTPResponse(connection) as response:
+                response.begin()
+                if response.status != 200:
+                    raise ValueError("credential broker returned an unsuccessful response")
+                payload = response.read(_MAX_BROKER_TOKEN_BYTES + 1)
+        if len(payload) > _MAX_BROKER_TOKEN_BYTES:
+            raise ValueError("credential broker response is too large")
+        token = payload.decode("utf-8").strip()
+        if not token or "\r" in token or "\n" in token:
+            raise ValueError("credential broker returned an invalid token")
+        return token
     if source.kind == "env":
         if not source.env:
             raise ValueError("credential_proxy env source requires an 'env' name")
@@ -543,7 +611,9 @@ __all__ = [
     "SYNTHETIC_CREDENTIAL_PREFIX",
     "CredentialProxyRuntime",
     "CredentialRewriteRule",
+    "CredentialSourceUnavailable",
     "DatabricksProfileTokenProvider",
     "MaterializedFile",
+    "RefreshingSecretProvider",
     "prepare_credential_proxy_runtime",
 ]
