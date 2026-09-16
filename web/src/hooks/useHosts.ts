@@ -92,11 +92,19 @@ async function fetchHostModelOptions(
   const res = await authenticatedFetch(
     `/v1/hosts/${encodeURIComponent(hostId)}/harnesses/${encodeURIComponent(harness)}/model-options`,
   );
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  if (!res.ok) {
+    let detail = `${res.status} ${res.statusText}`;
+    try {
+      const body = (await res.json()) as { detail?: unknown };
+      if (typeof body.detail === "string" && body.detail) detail = body.detail;
+    } catch {
+      // Non-JSON error body — keep the status-line detail.
+    }
+    throw new Error(detail);
+  }
   const body = (await res.json()) as { models?: NativeModelOption[]; error?: string };
   const models = body.models ?? [];
-  // An honest empty answer names its reason (the host's probe failed);
-  // surface it as the query error so the picker can say WHY it is empty.
+  // Backward compatibility with servers that encoded probe failure in a 200.
   if (models.length === 0 && body.error) throw new Error(body.error);
   return models;
 }
@@ -112,12 +120,12 @@ export function useHostModelOptions(hostId: string | null, harness: string, enab
     // the host's current catalog, which it re-resolves on every request.
     staleTime: 15_000,
     refetchInterval: enabled && hostId !== null ? 15_000 : false,
-    // A request racing the host's boot probe gets an honest empty answer
-    // with an error string; the probe itself completes shortly after
+    // A request racing the host's boot probe gets a structured failure;
+    // the probe itself completes shortly after
     // (single-flight in the host's catalog store). Retry with backoff so a
     // picker opened during that warm-up window fills in instead of pinning
     // the transient error until reopen. A genuinely failing probe still
-    // surfaces its error once the retries exhaust (~45 s).
+    // surfaces its error once the retries exhaust (~22 s).
     retry: 6,
     retryDelay: (attempt) => Math.min(5_000, 1_000 * 2 ** attempt),
   });

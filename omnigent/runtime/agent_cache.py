@@ -48,6 +48,26 @@ class AgentCache:
         self._cache_dir = cache_dir
         self._specs: dict[str, AgentSpec] = {}
 
+    def _cache_path(self, agent_id: str, *, suffix: str = "") -> Path:
+        """Return a direct child of the cache root for an agent id."""
+        component = os.path.basename(agent_id)
+        if (
+            not component
+            or component in {".", ".."}
+            or component != agent_id
+            or "\\" in component
+            or "\x00" in component
+        ):
+            raise ValueError(f"unsafe agent id for cache path: {agent_id!r}")
+        cache_root = self._cache_dir.resolve(strict=False)
+        normalized_path = os.path.normpath(cache_root / f"{component}{suffix}")
+        if not normalized_path.startswith(os.path.join(cache_root, "")):
+            raise ValueError(f"unsafe agent id for cache path: {agent_id!r}")
+        path = Path(normalized_path)
+        if path.parent != cache_root or path.resolve(strict=False) != path:
+            raise ValueError(f"unsafe agent id for cache path: {agent_id!r}")
+        return path
+
     def load(
         self,
         agent_id: str,
@@ -79,7 +99,7 @@ class AgentCache:
         :returns: A LoadedAgent with the parsed spec and the
             on-disk working directory.
         """
-        workdir = self._cache_dir / agent_id
+        workdir = self._cache_path(agent_id)
 
         # Tier 1: in-memory spec. The cached spec was parsed with the
         # *expand_env* value of whichever caller populated it first.
@@ -130,8 +150,8 @@ class AgentCache:
         :returns: A LoadedAgent with the new spec and working
             directory.
         """
-        workdir = self._cache_dir / agent_id
-        staging_dir = self._cache_dir / f"{agent_id}_staging"
+        workdir = self._cache_path(agent_id)
+        staging_dir = self._cache_path(agent_id, suffix="_staging")
 
         # Extract new bundle to staging directory
         tmp_fd, tmp_name = tempfile.mkstemp(suffix=".tar.gz")
@@ -166,8 +186,8 @@ class AgentCache:
         :param agent_id: Unique agent identifier,
             e.g. ``"ag_abc123"``.
         """
+        workdir = self._cache_path(agent_id)
         self._specs.pop(agent_id, None)
-        workdir = self._cache_dir / agent_id
         if workdir.is_dir():
             shutil.rmtree(workdir)
 

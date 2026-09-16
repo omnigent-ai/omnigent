@@ -244,7 +244,7 @@ describe("About window", () => {
     assert.match(html, /id="desktop-update-now"[^>]*>Update now<\/button>/);
     assert.match(html, /aria-label="Update download progress"/);
     assert.match(html, /id="desktop-restart"[^>]*>Restart to update<\/button>/);
-    assert.match(html, /Run <code>omni update<\/code> to update\./);
+    assert.match(html, /Run <code>omni upgrade<\/code> to update\./);
     assert.match(html, /id="close"[^>]*>Close<\/button>/);
     assert.match(script, /info\.appIconDataUrl\.startsWith\("data:image\/"\)/);
     assert.match(script, /desktopHeading\.textContent = `Omnigent \$\{platformName\} app`/);

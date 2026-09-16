@@ -1,29 +1,33 @@
-"""iOS shell: the Chat/Terminal switcher must live in the header, not below the composer.
+"""Mobile: the Chat/Terminal switcher folds into the header kebab, not below the composer.
 
-The Chat/Terminal switcher for terminal-first sessions lives in the top-right
-header controls (``ViewModeToggle`` in ``web/src/shell/ViewModeToggle.tsx``) on
-every shell, iOS included. The iOS shell used to get a different placement: the
-SPA suppressed the header toggle under ``isIOSShell()`` and instead commanded
-the shell's bottom pill (``web/ios/Omnigent/ChatTerminalBar.swift``) visible
-below the composer via the ``setViewMode`` bridge call — leaving web and iPhone
-with two inconsistent navigation patterns.
+On a desktop-width viewport the Chat/Terminal switcher for terminal-first
+sessions is a segmented track in the top-right header controls
+(``ViewModeToggle`` in ``web/src/shell/ViewModeToggle.tsx``). On a mobile-width
+viewport the narrow header can't carry that track beside the "…" menu, so the
+track is dropped and the switch folds into the header kebab instead
+(``ViewModeMenuItems`` in the same file, surfaced by ``ChatHeader``). iOS is a
+mobile-width shell, so it takes the same kebab placement as the mobile web
+header — not the retired native bottom pill below the composer
+(``web/ios/Omnigent/ChatTerminalBar.swift``), which the SPA must never float.
 
-The SPA owns both halves of that placement decision (render the header toggle;
-keep the bottom bar hidden), so the contract is fully observable in a browser:
-inject a minimal ``window.omnigentNative = {kind: "ios", ...}`` bridge before
-any app script runs (the same feature-detection stubbing
-``test_android_shell.py`` uses) and record every ``setViewMode`` push.
+The SPA owns the whole placement decision (drop the header track on mobile,
+put the switch in the kebab, keep the native bottom bar hidden), so the
+contract is fully observable in a browser: inject a minimal
+``window.omnigentNative = {kind: "ios", ...}`` bridge before any app script
+runs (the same feature-detection stubbing ``test_android_shell.py`` uses) and
+record every ``setViewMode`` push.
 
-Parity expectation encoded here (fails if the iOS placement regresses):
+Parity expectation encoded here (fails if the mobile placement regresses):
 
-1. under the iOS bridge, the header ``view-mode-toggle`` renders like it does
-   on the mobile web header; and
-2. the shell is never told to float the bottom pill (``setViewMode`` never
-   pushes ``visible: true``).
+1. on a phone viewport the segmented header ``view-mode-toggle`` does NOT
+   render, and the Chat/Terminal switch is reachable inside the header kebab
+   (``view-mode-menu-chat`` / ``view-mode-menu-terminal``); and
+2. under the iOS bridge the shell is never told to float the bottom pill
+   (``setViewMode`` never pushes ``visible: true``).
 
 A companion control test proves the same journey in a plain mobile browser
-also shows the header switcher, so the iOS-bridge case can only fail on an
-iOS-specific gate, not a missing control or mobile-layout difference.
+also folds the switch into the kebab, so the iOS-bridge case can only fail on
+an iOS-specific gate, not a missing control or mobile-layout difference.
 """
 
 from __future__ import annotations
@@ -147,21 +151,39 @@ def _open_terminal_first_session(page: Page, seeded_session: tuple[str, str]) ->
     expect(composer).to_be_visible(timeout=60_000)
 
 
-def test_ios_shell_shows_switcher_in_header_not_below_composer(
+def _open_header_kebab(page: Page) -> None:
+    """Open the mobile header's single "…" menu.
+
+    On a phone the header carries one kebab: the owner-managed session menu
+    (``header-conversation-actions``) when the session is owned, otherwise the
+    fallback session-actions menu (``session-actions-menu``). Either one holds
+    the folded Chat/Terminal switch, so open whichever is present.
+
+    :param page: Playwright page (mobile viewport, session open).
+    """
+    trigger = page.get_by_test_id("header-conversation-actions").or_(
+        page.get_by_test_id("session-actions-menu")
+    )
+    expect(trigger).to_be_visible(timeout=8_000)
+    trigger.click()
+
+
+def test_ios_shell_folds_switcher_into_kebab_not_below_composer(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """Under the iOS bridge the switcher must match the web header placement.
+    """Under the iOS bridge the switcher folds into the kebab, like mobile web.
 
     Drives the journey — open a terminal-first Omnigent session in the iOS
     app, view the chat with the composer visible, look below the composer —
-    and asserts the parity contract: the Chat/Terminal switcher renders in the
-    header (like the mobile web header) and the native bottom pill is never
+    and asserts the parity contract: the segmented header switcher is gone on
+    the phone viewport, the Chat/Terminal switch lives inside the header kebab
+    (matching the mobile web header), and the native bottom pill is never
     commanded visible below the composer.
 
-    Regression shape this guards: ``ViewModeToggle`` gating itself off under
-    ``isIOSShell()`` while the SPA pushes ``setViewMode({visible: true, ...})``,
-    floating the retired pill below the composer.
+    Regression shape this guards: the SPA pushing ``setViewMode({visible: true,
+    ...})`` to float the retired pill below the composer, or the mobile header
+    keeping the segmented track beside the "…" menu.
 
     :param page: Playwright page fixture (fresh context per test).
     :param seeded_session: ``(base_url, session_id)`` of a runner-bound session.
@@ -181,10 +203,12 @@ def test_ios_shell_shows_switcher_in_header_not_below_composer(
     print(f"[ios-switcher] header view-mode-toggle count: {toggle_count}")
     print(f"[ios-switcher] native setViewMode pushes: {calls}")
 
-    # Expected parity half 1: the switcher lives in the header on iOS too.
-    # The composer wait above already settled hydration, so the toggle renders
-    # (or never will) well within this window.
-    expect(page.get_by_test_id("view-mode-toggle")).to_be_visible(timeout=8_000)
+    # Expected parity half 1: the segmented header track is dropped on mobile,
+    # and the switch is reachable inside the header kebab instead.
+    expect(page.get_by_test_id("view-mode-toggle")).to_have_count(0)
+    _open_header_kebab(page)
+    expect(page.get_by_test_id("view-mode-menu-chat")).to_be_visible(timeout=8_000)
+    expect(page.get_by_test_id("view-mode-menu-terminal")).to_be_visible()
 
     # Expected parity half 2: the obsolete pill below the composer is gone —
     # the SPA never tells the shell to float the native Chat/Terminal bar.
@@ -193,17 +217,18 @@ def test_ios_shell_shows_switcher_in_header_not_below_composer(
     assert not shown, (
         "iOS shell was told to float the Chat/Terminal pill below the composer "
         f"(setViewMode pushes with visible=true: {shown}); expected the header "
-        "switcher instead, matching the web UI."
+        "kebab switch instead, matching the web UI."
     )
 
 
-def test_mobile_web_browser_shows_switcher_in_header(
+def test_mobile_web_browser_folds_switcher_into_kebab(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """Control: the same journey in a plain mobile browser has the header switcher.
+    """Control: the same journey in a plain mobile browser folds into the kebab.
 
-    Proves the header ``view-mode-toggle`` exists at the phone viewport when no
+    Proves the segmented header ``view-mode-toggle`` is absent at the phone
+    viewport and the Chat/Terminal switch lives inside the header kebab when no
     iOS bridge is injected — so the sibling test's failure is the iOS gate, not
     a missing control or a mobile-layout difference.
 
@@ -213,4 +238,7 @@ def test_mobile_web_browser_shows_switcher_in_header(
     page.set_viewport_size(_MOBILE_VIEWPORT)
     _open_terminal_first_session(page, seeded_session)
 
-    expect(page.get_by_test_id("view-mode-toggle")).to_be_visible(timeout=8_000)
+    expect(page.get_by_test_id("view-mode-toggle")).to_have_count(0)
+    _open_header_kebab(page)
+    expect(page.get_by_test_id("view-mode-menu-chat")).to_be_visible(timeout=8_000)
+    expect(page.get_by_test_id("view-mode-menu-terminal")).to_be_visible()

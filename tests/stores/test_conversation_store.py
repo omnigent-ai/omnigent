@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from pathlib import Path
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
 from sqlalchemy import event, text
+from sqlalchemy.exc import DBAPIError
+from sqlalchemy.orm import Session
 
 from omnigent.db.utils import get_or_create_engine
 from omnigent.entities import (
@@ -33,6 +39,33 @@ from omnigent.stores.host_store import HostStore
 # ── CRUD ──────────────────────────────────────────────
 
 
+class _CommitSerializationFailure(Exception):
+    """Synthetic CockroachDB serialization failure."""
+
+    sqlstate = "40001"
+
+
+class _RetryOnceMaker:
+    """Wrap a real maker and inject one failure before its first commit."""
+
+    def __init__(self, delegate: Any) -> None:
+        """Create a CockroachDB-shaped maker around a real test session."""
+        self.engine = MagicMock()
+        self.engine.dialect.name = "cockroachdb"
+        self.query_name_prefix = delegate.query_name_prefix
+        self._delegate = delegate
+        self.attempts = 0
+
+    @contextmanager
+    def __call__(self, query_name: str) -> Iterator[Session]:
+        """Roll back the first attempt, then allow the second to commit."""
+        with self._delegate(query_name) as session:
+            yield session
+            self.attempts += 1
+            if self.attempts == 1:
+                raise DBAPIError("commit", {}, _CommitSerializationFailure(), False)
+
+
 def test_fork_drops_import_provenance_labels(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
@@ -46,12 +79,62 @@ def test_fork_drops_import_provenance_labels(
             "kept": "yes",
         },
     )
+    conversation_store.set_session_todos(
+        source.id, [{"content": "fork", "status": "pending", "activeForm": "forking"}]
+    )
 
     fork = conversation_store.fork_conversation(source.id)
 
     assert fork.labels["kept"] == "yes"
     assert IMPORT_SOURCE_LABEL_KEY not in fork.labels
     assert IMPORT_EXTERNAL_SESSION_ID_LABEL_KEY not in fork.labels
+
+
+def test_fork_drops_sandbox_repo_label(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A fork must not inherit the repository the source's sandbox was built
+    from: the label is what a sandbox RELAUNCH re-clones, so a clone that
+    asked for an empty sandbox would get the source's repo re-cloned into it
+    on the first relaunch. The fork's own launch re-stamps whatever it
+    resolves."""
+    from omnigent.server.managed_hosts import MANAGED_REPO_LABEL_KEY
+
+    source = conversation_store.create_conversation()
+    conversation_store.set_labels(
+        source.id,
+        {MANAGED_REPO_LABEL_KEY: "https://github.com/org/repo#main", "kept": "yes"},
+    )
+
+    fork = conversation_store.fork_conversation(source.id)
+
+    assert fork.labels["kept"] == "yes"
+    assert MANAGED_REPO_LABEL_KEY not in fork.labels
+
+
+def test_fork_drops_per_repo_sandbox_labels(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """The per-repo family (``omnigent.sandbox.repo.<index>``) is dropped by
+    prefix on a fork, for the same reason as the legacy single label: the fork's
+    own launch re-stamps whatever it resolves, so inheriting the source's would
+    re-clone them even into a fork that asked for an empty sandbox."""
+    from omnigent.server.managed_hosts import MANAGED_REPO_LABEL_KEY
+
+    source = conversation_store.create_conversation()
+    conversation_store.set_labels(
+        source.id,
+        {
+            f"{MANAGED_REPO_LABEL_KEY}.0": "https://github.com/org/api#main",
+            f"{MANAGED_REPO_LABEL_KEY}.1": "https://github.com/org/web",
+            "kept": "yes",
+        },
+    )
+
+    fork = conversation_store.fork_conversation(source.id)
+
+    assert fork.labels["kept"] == "yes"
+    assert not any(k.startswith(f"{MANAGED_REPO_LABEL_KEY}.") for k in fork.labels)
 
 
 def test_fork_drops_per_user_pin_labels(
@@ -100,6 +183,32 @@ def test_create_with_existing_caller_supplied_id_raises(db_uri: str) -> None:
     assert created.id == conversation_id
     with pytest.raises(ConversationAlreadyExistsError):
         second_store.create_conversation(conversation_id=conversation_id)
+
+
+def test_create_retries_metadata_phase_after_conversation_commit(tmp_path: Path) -> None:
+    """A metadata 40001 replays only that phase after the AP row commits."""
+    from omnigent.db.db_models import SqlConversation, SqlConversationMetadata
+
+    conversation_id = "b" * 32
+    metadata_uri = f"sqlite:///{tmp_path / 'metadata.db'}"
+    conversation_uri = f"sqlite:///{tmp_path / 'conversations.db'}"
+    store = SqlAlchemyConversationStore(metadata_uri, conversation_uri)
+    retrying_metadata_maker = _RetryOnceMaker(store._session_immediate)
+    store._session_immediate = retrying_metadata_maker
+
+    created = store.create_conversation(
+        conversation_id=conversation_id,
+        title="retry metadata",
+        terminal_launch_args=["--safe"],
+    )
+
+    assert retrying_metadata_maker.attempts == 2
+    assert created.id == conversation_id
+    assert created.terminal_launch_args == ["--safe"]
+    with store._conv_session("test_select_conversation") as session:
+        assert session.query(SqlConversation).filter_by(id=conversation_id).count() == 1
+    with store._session("test_select_metadata") as session:
+        assert session.query(SqlConversationMetadata).filter_by(id=conversation_id).count() == 1
 
 
 def test_get_nonexistent(conversation_store: SqlAlchemyConversationStore) -> None:
@@ -594,6 +703,101 @@ def test_append_encodes_item_data_in_one_batch_call(db_uri: str) -> None:
     assert [item.data.content[0]["text"] for item in persisted] == texts
     read_back = store.list_items(conv.id).data
     assert [item.data.content[0]["text"] for item in read_back] == texts
+
+
+def test_append_retry_reuses_prepared_id_and_encoded_payload(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A serialization replay repeats SQL, not ID generation or encoding."""
+    from contextlib import contextmanager
+    from unittest.mock import MagicMock
+
+    from sqlalchemy.exc import DBAPIError
+
+    class SerializationFailure(Exception):
+        sqlstate = "40001"
+
+    class RecordingStore(SqlAlchemyConversationStore):
+        def __init__(self, uri: str) -> None:
+            super().__init__(uri)
+            self.encode_calls = 0
+
+        def _encode_item_data_batch(self, data_jsons: list[str]) -> list[str]:
+            self.encode_calls += 1
+            return super()._encode_item_data_batch(data_jsons)
+
+    class RetryOnceMaker:
+        def __init__(self, delegate: Any) -> None:
+            self.engine = MagicMock()
+            self.engine.dialect.name = "cockroachdb"
+            self.query_name_prefix = delegate.query_name_prefix
+            self._delegate = delegate
+            self.attempts = 0
+
+        @contextmanager
+        def __call__(self, query_name: str) -> Iterator[Session]:
+            with self._delegate(query_name) as session:
+                yield session
+                self.attempts += 1
+                if self.attempts == 1:
+                    raise DBAPIError("commit", {}, SerializationFailure(), False)
+
+    item_id = "1" * 32
+    id_calls = 0
+
+    def generate_id(_item_type: str) -> str:
+        nonlocal id_calls
+        id_calls += 1
+        return item_id
+
+    monkeypatch.setattr(
+        "omnigent.stores.conversation_store.sqlalchemy_store.generate_item_id",
+        generate_id,
+    )
+    store = RecordingStore(db_uri)
+    conv = store.create_conversation()
+    retrying_maker = RetryOnceMaker(store._conv_session_immediate)
+    store._conv_session_immediate = retrying_maker
+    statements: list[str] = []
+
+    def capture_statement(
+        _connection: object,
+        _cursor: object,
+        statement: str,
+        _parameters: object,
+        _context: object,
+        _executemany: bool,
+    ) -> None:
+        statements.append(statement.strip().upper())
+
+    event.listen(store._conv_engine, "before_cursor_execute", capture_statement)
+    try:
+        [persisted] = store.append(
+            conv.id,
+            [
+                NewConversationItem(
+                    type="message",
+                    response_id="resp_retry",
+                    data=MessageData(
+                        role="user",
+                        content=[{"type": "input_text", "text": "retry once"}],
+                    ),
+                )
+            ],
+        )
+    finally:
+        event.remove(store._conv_engine, "before_cursor_execute", capture_statement)
+
+    assert retrying_maker.attempts == 2
+    if store._conv_engine.dialect.name == "sqlite":
+        assert statements.count("BEGIN IMMEDIATE") == 2
+    else:
+        assert sum(statement.endswith("FOR UPDATE") for statement in statements) == 2
+    assert id_calls == 1
+    assert store.encode_calls == 1
+    assert persisted.id == item_id
+    assert [item.id for item in store.list_items(conv.id).data] == [item_id]
 
 
 def test_append_function_call_items(
@@ -1851,6 +2055,9 @@ async def test_delete_conversation(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
     conv = conversation_store.create_conversation()
+    conversation_store.set_session_todos(
+        conv.id, [{"content": "late", "status": "pending", "activeForm": "waiting"}]
+    )
     conversation_store.append(
         conv.id,
         [
@@ -1864,6 +2071,7 @@ async def test_delete_conversation(
     assert await conversation_store.delete_conversation(conv.id) is True
     assert conversation_store.get_conversation(conv.id) is None
     assert conversation_store.list_items(conv.id).data == []
+    assert not conversation_store.set_session_todos(conv.id, [])
     assert await conversation_store.delete_conversation(conv.id) is False
 
 
@@ -3484,6 +3692,44 @@ def test_update_conversation_terminal_launch_args_empty_list_distinct_from_none(
     assert updated.terminal_launch_args == []
 
 
+def test_update_conversation_share_workspace_files_round_trips(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """The share-workspace-files opt-in persists as a two-state flag.
+
+    ``True`` stores the share, ``False`` clears it back to the edit-only
+    default, and ``None`` (the default arg) leaves whatever was stored
+    untouched — the same "None = unchanged" contract as the other
+    per-session overrides. A fresh session starts unshared.
+    """
+    created = conversation_store.create_session_with_agent(
+        agent_id="c0ffee00c0ffee00c0ffee00c0ffee00",
+        agent_name="share-agent",
+        agent_bundle_location="c0ffee00c0ffee00c0ffee00c0ffee00/bundle1",
+        agent_description=None,
+    )
+    conv_id = created.conversation.id
+    # Default: unshared.
+    assert created.conversation.share_workspace_files is False
+
+    shared = conversation_store.update_conversation(conv_id, share_workspace_files=True)
+    assert shared is not None
+    assert shared.share_workspace_files is True
+    # Survives a reload (decoded from the persisted override blob).
+    assert conversation_store.get_conversation(conv_id).share_workspace_files is True
+
+    # None leaves it on.
+    untouched = conversation_store.update_conversation(conv_id, title="renamed")
+    assert untouched is not None
+    assert untouched.share_workspace_files is True
+
+    # False clears it back to edit-only.
+    cleared = conversation_store.update_conversation(conv_id, share_workspace_files=False)
+    assert cleared is not None
+    assert cleared.share_workspace_files is False
+    assert conversation_store.get_conversation(conv_id).share_workspace_files is False
+
+
 def test_set_host_id_no_workspace_fails_when_row_has_none(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
@@ -3634,6 +3880,44 @@ def test_set_external_session_id_same_value_is_idempotent(
     assert fetched.external_session_id == "sid-1"
 
 
+def test_find_conversation_by_external_session_id_matches_column_without_labels(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """The lookup keys off the metadata column, so a native run (no import
+    labels) is found — this is what lets an import dedupe against it."""
+    conv = conversation_store.create_conversation(title="native run")
+    conversation_store.set_external_session_id(conv.id, "sid-native")
+
+    found = conversation_store.find_conversation_by_external_session_id("sid-native")
+    assert found is not None
+    assert found.id == conv.id
+    assert conversation_store.find_conversation_by_external_session_id("sid-absent") is None
+
+
+def test_find_conversation_by_external_session_id_returns_earliest(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When duplicates already exist for one id, the earliest-created wins.
+
+    ``created_at`` is integer seconds, so the two rows would otherwise tie and
+    fall back to the (random) id order; pin distinct stamps to assert the
+    created_at ordering itself.
+    """
+    import omnigent.stores.conversation_store.sqlalchemy_store as store_mod
+
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 1000)
+    first = conversation_store.create_conversation(title="first")
+    conversation_store.set_external_session_id(first.id, "sid-dupe")
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 2000)
+    second = conversation_store.create_conversation(title="second")
+    conversation_store.set_external_session_id(second.id, "sid-dupe")
+
+    found = conversation_store.find_conversation_by_external_session_id("sid-dupe")
+    assert found is not None
+    assert found.id == first.id
+
+
 def test_set_external_session_id_rejects_overwrite_with_different_value(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
@@ -3752,6 +4036,115 @@ def test_fork_conversation_copies_items(
         assert fork_item.data == src_item.data
 
 
+@pytest.mark.parametrize("item_count", [0, 1, 129])
+@pytest.mark.parametrize("workspace_id", [0, 42])
+def test_fork_batches_item_inserts(
+    conversation_store: SqlAlchemyConversationStore,
+    item_count: int,
+    workspace_id: int,
+) -> None:
+    """Copied rows must have complete primary keys so the ORM can batch inserts."""
+    from omnigent.db.db_models import workspace_scope
+
+    with workspace_scope(workspace_id):
+        source = conversation_store.create_conversation()
+        source_items = conversation_store.append(
+            source.id,
+            [
+                NewConversationItem(
+                    type="message",
+                    response_id=f"response-{index}",
+                    data=MessageData(
+                        role="user", content=[{"type": "input_text", "text": f"item {index}"}]
+                    ),
+                )
+                for index in range(item_count)
+            ],
+        )
+        insert_calls: list[bool] = []
+
+        def record_insert(conn, cursor, statement, parameters, context, executemany):
+            if context.isinsert and context.compiled.statement.table.name == "conversation_items":
+                insert_calls.append(executemany)
+
+        event.listen(conversation_store._conv_engine, "before_cursor_execute", record_insert)
+        try:
+            fork = conversation_store.fork_conversation(source.id)
+        finally:
+            event.remove(conversation_store._conv_engine, "before_cursor_execute", record_insert)
+
+        assert insert_calls == ([] if item_count == 0 else [item_count > 1])
+        copied = conversation_store.list_items(fork.id, limit=1000).data
+        assert [item.data for item in copied] == [item.data for item in source_items]
+        assert [item.response_id for item in copied] == [item.response_id for item in source_items]
+        assert len({item.id for item in copied}) == item_count
+        assert not {item.id for item in copied}.intersection(item.id for item in source_items)
+        assert conversation_store.list_items(source.id, limit=1000).data == source_items
+
+    with workspace_scope(workspace_id + 1):
+        assert conversation_store.list_items(fork.id).data == []
+
+
+@pytest.mark.parametrize("up_to_response_id", [None, "resp_001", "resp_002"])
+def test_fork_conversation_preserves_item_timestamps(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+    up_to_response_id: str | None,
+) -> None:
+    """Copied history keeps its timing; the fork and new items use the current time."""
+    import omnigent.stores.conversation_store.sqlalchemy_store as store_mod
+
+    current_time = 1000
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: current_time)
+    source = conversation_store.create_conversation()
+    for index, created_at in enumerate((1010, 1116, 1210, 1252)):
+        current_time = created_at
+        conversation_store.append(
+            source.id,
+            [
+                NewConversationItem(
+                    type="message",
+                    response_id=f"resp_00{index // 2 + 1}",
+                    data=MessageData(
+                        role="assistant",
+                        content=[{"type": "output_text", "text": f"Step {index}"}],
+                        agent="test-agent",
+                    ),
+                )
+            ],
+        )
+
+    source_items = conversation_store.list_items(source.id).data
+    expected_count = 2 if up_to_response_id == "resp_001" else 4
+    expected_timestamps = [item.created_at for item in source_items[:expected_count]]
+    parent_id = source.id
+    for fork_time in (2000, 3000):
+        current_time = fork_time
+        fork = conversation_store.fork_conversation(parent_id, up_to_response_id=up_to_response_id)
+        assert fork.created_at == fork_time
+        assert fork.updated_at == fork_time
+        fork_items = conversation_store.list_items(fork.id).data
+        assert [item.created_at for item in fork_items] == expected_timestamps
+        assert fork_items[1].created_at - fork_items[0].created_at == 106
+        parent_id = fork.id
+
+    current_time = 4000
+    [new_item] = conversation_store.append(
+        parent_id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_new",
+                data=MessageData(
+                    role="user", content=[{"type": "input_text", "text": "Continue"}]
+                ),
+            )
+        ],
+    )
+    assert new_item.created_at == current_time
+    assert conversation_store.list_items(source.id).data == source_items
+
+
 def test_fork_remaps_compaction_boundary_to_copied_item(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
@@ -3797,6 +4190,153 @@ def test_fork_remaps_compaction_boundary_to_copied_item(
     fork_compaction = next(item for item in fork_items if item.type == "compaction")
     assert isinstance(fork_compaction.data, CompactionData)
     assert fork_compaction.data.last_item_id != boundary.id
+    assert fork_compaction.data.last_item_id == fork_items[0].id
+
+
+def _count_encode_hooks(
+    store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> dict[str, int]:
+    """Replace *store*'s payload-transform hooks with counting identities.
+
+    Models a deployment-shaped store where every hook call (per-item or
+    batch) is one round-trip, so a test can pin how many round-trips an
+    operation pays.
+
+    :param store: The store instance to instrument.
+    :param monkeypatch: Pytest monkeypatch for test-scoped patching.
+    :returns: Mutable counters keyed ``"item"``/``"batch"``/``"decode_batch"``.
+    """
+    calls = {"item": 0, "batch": 0, "decode_batch": 0}
+
+    def per_item_encode(data_json: str) -> str:
+        calls["item"] += 1
+        return data_json
+
+    def batch_encode(data_jsons: list[str]) -> list[str]:
+        calls["batch"] += 1
+        return list(data_jsons)
+
+    def batch_decode(stored: list[str]) -> list[str]:
+        calls["decode_batch"] += 1
+        return list(stored)
+
+    monkeypatch.setattr(store, "_encode_item_data", per_item_encode)
+    monkeypatch.setattr(store, "_encode_item_data_batch", batch_encode)
+    monkeypatch.setattr(store, "_decode_item_data_batch", batch_decode)
+    return calls
+
+
+def test_fork_reuses_encoded_payloads_without_per_item_encode(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Forking must not pay one encode round-trip per copied item.
+
+    On a store whose payload encode is a per-call RPC (the documented
+    batch-hook deployment), a per-item fan-out multiplies the user's
+    blocked fork request by the item count. Non-compaction payloads never
+    change on copy, so the fork must reuse the stored encoding verbatim:
+    zero encode calls of either kind for a compaction-free source.
+    """
+    source = conversation_store.create_conversation()
+    conversation_store.append(
+        source.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id=f"resp_{index:03d}",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": f"turn {index}"}],
+                ),
+            )
+            for index in range(5)
+        ],
+    )
+    calls = _count_encode_hooks(conversation_store, monkeypatch)
+
+    fork = conversation_store.fork_conversation(source.id)
+
+    assert calls["item"] == 0, (
+        f"fork paid {calls['item']} per-item encode round-trips; copied "
+        f"payloads must reuse the source's stored encoding"
+    )
+    assert calls["batch"] == 0, (
+        f"fork paid {calls['batch']} batch encode calls for a source with "
+        f"no compaction items; nothing needed re-encoding"
+    )
+    assert calls["decode_batch"] == 0, (
+        f"fork paid {calls['decode_batch']} batch decode calls for a source "
+        f"with no compaction items; nothing needed decoding"
+    )
+    fork_items = conversation_store.list_items(fork.id).data
+    source_items = conversation_store.list_items(source.id).data
+    assert [item.data for item in fork_items] == [item.data for item in source_items]
+
+
+def test_fork_reencodes_only_compaction_payloads_in_one_batch(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only compaction payloads (whose cursor is remapped) pay a re-encode,
+    and they pay it as ONE batch decode + ONE batch encode — never one call
+    per copied item."""
+    source = conversation_store.create_conversation()
+    [boundary] = conversation_store.append(
+        source.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_001",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": "old"}]),
+            )
+        ],
+    )
+    conversation_store.append(
+        source.id,
+        [
+            NewConversationItem(
+                type="compaction",
+                response_id="compact_001",
+                data=CompactionData(
+                    summary="The user said old.",
+                    last_item_id=boundary.id,
+                    token_count=6,
+                ),
+            )
+        ]
+        + [
+            NewConversationItem(
+                type="message",
+                response_id=f"resp_{index:03d}",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": f"turn {index}"}],
+                ),
+            )
+            for index in range(2, 6)
+        ],
+    )
+    calls = _count_encode_hooks(conversation_store, monkeypatch)
+
+    fork = conversation_store.fork_conversation(source.id)
+
+    assert calls["item"] == 0, (
+        f"fork paid {calls['item']} per-item encode round-trips; compaction "
+        f"re-encoding must go through the batch hook"
+    )
+    assert calls["batch"] == 1, (
+        f"fork paid {calls['batch']} batch encode calls; the remapped "
+        f"compaction payloads must be re-encoded in one batch"
+    )
+    assert calls["decode_batch"] == 1, (
+        f"fork paid {calls['decode_batch']} batch decode calls; only the "
+        f"compaction payloads need decoding, in one batch"
+    )
+    fork_items = conversation_store.list_items(fork.id).data
+    fork_compaction = next(item for item in fork_items if item.type == "compaction")
+    assert isinstance(fork_compaction.data, CompactionData)
     assert fork_compaction.data.last_item_id == fork_items[0].id
 
 
@@ -4138,6 +4678,7 @@ def test_fork_conversation_drops_instance_scoped_labels(
     assert fork.labels == {"omnigent.wrapper": "claude-code-native-ui"}, (
         f"Fork must drop instance-scoped labels, kept {fork.labels!r}"
     )
+    assert fork.session_todos == []
 
 
 def test_fork_extra_labels_rearm_bypass_over_the_always_drop(
@@ -4532,14 +5073,33 @@ def test_instance_scoped_label_keys_match_harness_constants() -> None:
     forks would re-inherit the source's bridge. Importing the real
     constants here makes that rename fail loudly at test time.
     """
-    from omnigent.claude_native_bridge import BRIDGE_ID_LABEL_KEY
-    from omnigent.codex_native_bridge import CODEX_NATIVE_BRIDGE_ID_LABEL_KEY
+    from omnigent.harnesses.claude_native.bridge import BRIDGE_ID_LABEL_KEY
+    from omnigent.harnesses.codex_native.bridge import CODEX_NATIVE_BRIDGE_ID_LABEL_KEY
     from omnigent.stores.conversation_store import _INSTANCE_SCOPED_LABEL_KEYS
 
     # Each harness's canonical bridge-id key must be in the denylist; a
     # miss means a rename slipped past the store's hard-coded literal.
     assert BRIDGE_ID_LABEL_KEY in _INSTANCE_SCOPED_LABEL_KEYS
     assert CODEX_NATIVE_BRIDGE_ID_LABEL_KEY in _INSTANCE_SCOPED_LABEL_KEYS
+
+
+def test_fork_only_dropped_label_keys_match_sandbox_repo_constant() -> None:
+    """
+    The store's fork-only denylist matches the server's sandbox-repo key.
+
+    The store hard-codes the repository literal (to avoid importing the
+    server into the persistence layer). If the server renames
+    ``MANAGED_REPO_LABEL_KEY``, the literal in
+    :data:`_FORK_ONLY_DROPPED_LABEL_KEYS` would silently stop matching and
+    a fork would re-inherit the source's repository — a clone that asked
+    for an empty sandbox would get the source's repo re-cloned into it on
+    the first relaunch. Importing the real constant here makes that rename
+    fail loudly at test time.
+    """
+    from omnigent.server.managed_hosts import MANAGED_REPO_LABEL_KEY
+    from omnigent.stores.conversation_store import _FORK_ONLY_DROPPED_LABEL_KEYS
+
+    assert MANAGED_REPO_LABEL_KEY in _FORK_ONLY_DROPPED_LABEL_KEYS
 
 
 def test_fork_conversation_copies_reasoning_effort(
@@ -4735,6 +5295,9 @@ def test_switch_conversation_agent_cross_family_resets_and_relabels(
         conv_id, model_override="claude-opus-4-7", reasoning_effort="high"
     )
     conversation_store.set_external_session_id(conv_id, "old-native-uuid")
+    conversation_store.set_session_todos(
+        conv_id, [{"content": "switch", "status": "pending", "activeForm": "switching"}]
+    )
     conversation_store.set_labels(
         conv_id,
         {
@@ -4790,6 +5353,7 @@ def test_switch_conversation_agent_cross_family_resets_and_relabels(
     # Native runtime state belongs to the old harness → cleared so the next
     # turn cold-starts and rebuilds from items.
     assert updated.external_session_id is None
+    assert updated.session_todos == []
     # Labels: target ui/wrapper applied, carry-history + previous-builtin
     # stamped, and the old instance-scoped stopped marker dropped.
     assert updated.labels[UI_MODE_LABEL_KEY] == UI_MODE_TERMINAL_VALUE
@@ -5165,12 +5729,18 @@ def test_set_session_state_overwrites(
 ) -> None:
     """set_session_state replaces the entire state dict."""
     conv = conversation_store.create_conversation()
+    todos = [{"content": "keep", "status": "pending", "activeForm": "keeping"}]
+    conversation_store.set_session_todos(conv.id, todos)
     conversation_store.set_session_state(conv.id, {"v": 1})
-    conversation_store.set_session_state(conv.id, {"v": 2, "new_key": True})
+    conversation_store.set_session_state(
+        conv.id,
+        {"v": 2, "new_key": True, "_omnigent_native_plan_snapshot_v1": [{"forged": 1}]},
+    )
 
     fetched = conversation_store.get_conversation(conv.id)
     assert fetched is not None
     assert fetched.session_state == {"v": 2, "new_key": True}
+    assert fetched.session_todos == todos
 
 
 def test_set_session_state_empty_dict(
@@ -5394,6 +5964,61 @@ def test_fork_seeds_next_position_from_copied_items(
     assert _stored_next_position(conversation_store, fork.id) == 3
     conversation_store.append(fork.id, [_user_message("after")])
     assert _stored_positions(conversation_store, fork.id) == [0, 1, 2, 3]
+
+
+def test_fork_retry_reuses_prepared_ids_and_encoded_payloads(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fork retries replay inserts without repeating preparation hooks."""
+
+    class RecordingStore(SqlAlchemyConversationStore):
+        def __init__(self, uri: str) -> None:
+            super().__init__(uri)
+            self.decode_calls = 0
+            self.encode_calls = 0
+
+        def _decode_item_data_batch(self, stored: list[str]) -> list[str]:
+            self.decode_calls += 1
+            return super()._decode_item_data_batch(stored)
+
+        def _encode_item_data(self, data_json: str) -> str:
+            self.encode_calls += 1
+            return super()._encode_item_data(data_json)
+
+    store = RecordingStore(db_uri)
+    source = store.create_conversation()
+    store.append(
+        source.id,
+        [_user_message("first", "resp_1"), _user_message("second", "resp_1")],
+    )
+    store.decode_calls = 0
+    store.encode_calls = 0
+    item_ids = iter(["1" * 32, "2" * 32])
+    generated_ids: list[str] = []
+
+    def generate_id(_item_type: str) -> str:
+        item_id = next(item_ids)
+        generated_ids.append(item_id)
+        return item_id
+
+    monkeypatch.setattr(
+        "omnigent.stores.conversation_store.sqlalchemy_store.generate_item_id",
+        generate_id,
+    )
+    retrying_ap_maker = _RetryOnceMaker(store._conv_session_immediate)
+    store._conv_session_immediate = retrying_ap_maker
+
+    fork = store.fork_conversation(source.id)
+
+    assert retrying_ap_maker.attempts == 2
+    # Copied payloads reuse the source's stored encoding verbatim (only
+    # compaction payloads re-encode, and this source has none), so a retry
+    # replays SQL alone: zero decode/encode hook calls on either attempt.
+    assert store.decode_calls == 0
+    assert store.encode_calls == 0
+    assert generated_ids == ["1" * 32, "2" * 32]
+    assert [item.id for item in store.list_items(fork.id).data] == generated_ids
 
 
 def test_truncated_fork_seeds_next_position_from_copied_items(
@@ -5773,6 +6398,79 @@ def test_list_conversations_owned_by_excludes_shared_sessions(
     assert ids == {mine.id}
 
 
+def test_list_conversations_shared_only_returns_accessible_but_not_owned(
+    conversation_store: SqlAlchemyConversationStore,
+    db_uri: str,
+) -> None:
+    """``shared_only=True`` returns sessions Alice can access but does NOT own —
+    i.e. sessions shared with her by another user. Her own sessions are excluded."""
+    from omnigent.stores.permission_store.sqlalchemy_store import (
+        SqlAlchemyPermissionStore,
+    )
+
+    mine = conversation_store.create_conversation()
+    shared_by_bob = conversation_store.create_conversation()
+    shared_by_carol = conversation_store.create_conversation()
+
+    perms = SqlAlchemyPermissionStore(db_uri)
+    for user in ("alice@example.com", "bob@example.com", "carol@example.com"):
+        perms.ensure_user(user)
+    # Alice owns "mine"
+    perms.grant("alice@example.com", mine.id, 4)
+    # Bob owns shared_by_bob and shares it with Alice (read)
+    perms.grant("bob@example.com", shared_by_bob.id, 4)
+    perms.grant("alice@example.com", shared_by_bob.id, 1)
+    # Carol owns shared_by_carol and shares it with Alice (edit)
+    perms.grant("carol@example.com", shared_by_carol.id, 4)
+    perms.grant("alice@example.com", shared_by_carol.id, 2)
+
+    ids = {
+        c.id
+        for c in conversation_store.list_conversations(
+            accessible_by="alice@example.com",
+            shared_only=True,
+        ).data
+    }
+    assert ids == {shared_by_bob.id, shared_by_carol.id}
+    assert mine.id not in ids
+
+
+def test_list_conversations_shared_only_empty_when_no_shared_sessions(
+    conversation_store: SqlAlchemyConversationStore,
+    db_uri: str,
+) -> None:
+    """``shared_only=True`` returns an empty list when the user owns everything
+    accessible to them (single-user / no sharing scenario)."""
+    from omnigent.stores.permission_store.sqlalchemy_store import (
+        SqlAlchemyPermissionStore,
+    )
+
+    mine = conversation_store.create_conversation()
+    perms = SqlAlchemyPermissionStore(db_uri)
+    perms.ensure_user("alice@example.com")
+    perms.grant("alice@example.com", mine.id, 4)
+
+    result = conversation_store.list_conversations(
+        accessible_by="alice@example.com",
+        shared_only=True,
+    )
+    assert result.data == []
+
+
+def test_list_conversations_archived_only_returns_only_archived(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """``archived_only=True`` returns only archived sessions; active ones are excluded."""
+    active = conversation_store.create_conversation()
+    archived = conversation_store.create_conversation()
+    conversation_store.update_conversation(archived.id, archived=True)
+
+    result = conversation_store.list_conversations(archived_only=True, include_archived=True)
+    ids = {c.id for c in result.data}
+    assert archived.id in ids
+    assert active.id not in ids
+
+
 def test_live_state_columns_round_trip_without_bumping_updated_at(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
@@ -6034,6 +6732,753 @@ def test_item_search_text_seam_redirects_persisted_value(db_uri: str) -> None:
             ).scalars()
         )
     assert stored == ["custom-search-text"]
+
+
+def _acl_perms(db_uri: str):
+    from omnigent.stores.permission_store.sqlalchemy_store import (
+        SqlAlchemyPermissionStore,
+    )
+
+    perms = SqlAlchemyPermissionStore(db_uri)
+    for user in ("alice@example.com", "bob@example.com"):
+        perms.ensure_user(user)
+    return perms
+
+
+def _spread_created_at(store: SqlAlchemyConversationStore, ids: list[str]) -> None:
+    """Give *ids* strictly decreasing ``created_at`` values, newest first.
+
+    Conversations created in the same second tie on ``created_at``, and the
+    tiebreaker differs by dialect (SQLite ``rowid`` = insertion order,
+    PostgreSQL the random uuid ``id``), so any order-sensitive assertion
+    must not depend on creation order. Spreading the timestamps makes the
+    expected order identical on every dialect.
+    """
+    from sqlalchemy import update as sa_update
+
+    from omnigent.db.db_models import SqlConversation as _Conv
+
+    base = 2_000_000_000
+    with store._conv_session("test_setup") as session:
+        for offset, conv_id in enumerate(ids):
+            session.execute(
+                sa_update(_Conv)
+                .where(_Conv.id == conv_id)
+                .values(created_at=base - offset, updated_at=base - offset)
+            )
+
+
+@contextlib.contextmanager
+def _capture_conversation_selects(store: SqlAlchemyConversationStore):
+    """Capture the SELECT statements the store emits against conversations.
+
+    Yields a list that receives the actual SQLAlchemy clause elements, so a
+    plan test can re-compile the STORE'S OWN statement with literal binds
+    instead of hand-writing SQL that may omit predicates the planner sees.
+    """
+    from sqlalchemy import event as sa_event
+
+    captured: list[object] = []
+
+    def _on_before_execute(conn, clauseelement, multiparams, params, execution_options):
+        text = str(clauseelement)
+        if text.lstrip().upper().startswith("SELECT") and "FROM conversations" in text:
+            captured.append(clauseelement)
+
+    sa_event.listen(store._conv_engine, "before_execute", _on_before_execute)
+    try:
+        yield captured
+    finally:
+        sa_event.remove(store._conv_engine, "before_execute", _on_before_execute)
+
+
+@contextlib.contextmanager
+def _capture_driver_sql(store: SqlAlchemyConversationStore):
+    """Capture (statement, parameters) as the DBAPI sees them.
+
+    Plan tests need the driver-level form: the cursor binds a 16-byte
+    identifier, which cannot be rendered as a SQL literal, and re-binding raw
+    Python values to a ``text()`` EXPLAIN skips the type decorator — the exact
+    trap that made the first row-values attempt fail only on PostgreSQL.
+    Capturing the adapted parameters lets EXPLAIN run the real statement.
+    """
+    from sqlalchemy import event as sa_event
+
+    captured: list[tuple[str, object]] = []
+
+    def _on(conn, cursor, statement, parameters, context, executemany):
+        if statement.lstrip().upper().startswith("SELECT") and "FROM conversations" in statement:
+            captured.append((statement, parameters))
+
+    sa_event.listen(store._conv_engine, "before_cursor_execute", _on)
+    try:
+        yield captured
+    finally:
+        sa_event.remove(store._conv_engine, "before_cursor_execute", _on)
+
+
+def _explain_driver(store: SqlAlchemyConversationStore, statement: str, parameters: object) -> str:
+    """``EXPLAIN`` the exact statement+parameters the store executed.
+
+    Returns the plan as one string: PostgreSQL JSON, or SQLite's
+    ``EXPLAIN QUERY PLAN`` rows joined.
+    """
+    dialect = store._conv_engine.dialect.name
+    with store._conv_session("test_setup") as session:
+        conn = session.connection()
+        if dialect == "postgresql":
+            conn.exec_driver_sql("ANALYZE conversations")
+            conn.exec_driver_sql("ANALYZE session_permissions")
+            raw = conn.exec_driver_sql(
+                "EXPLAIN (ANALYZE, FORMAT JSON) " + statement, parameters
+            ).scalar_one()
+            return json.dumps(raw if isinstance(raw, (list, dict)) else json.loads(raw))
+        rows = conn.exec_driver_sql("EXPLAIN QUERY PLAN " + statement, parameters).all()
+    return " | ".join(str(row) for row in rows)
+
+
+def _explain_json(store: SqlAlchemyConversationStore, sql: str, analyze: bool = False) -> str:
+    """Return a PostgreSQL plan for *sql* as a JSON string (ANALYZE first)."""
+    from sqlalchemy import text as sql_text
+
+    with store._conv_session("test_setup") as session:
+        session.execute(sql_text("ANALYZE conversations"))
+        session.execute(sql_text("ANALYZE session_permissions"))
+        prefix = "EXPLAIN (ANALYZE, FORMAT JSON) " if analyze else "EXPLAIN (FORMAT JSON) "
+        raw = session.execute(sql_text(prefix + sql)).scalar_one()
+    return json.dumps(raw if isinstance(raw, (list, dict)) else json.loads(raw))
+
+
+def _bulk_seed_conversations_and_grants(
+    store: SqlAlchemyConversationStore,
+    user_id: str,
+    *,
+    count: int,
+    granted_ratio: float,
+    tie_size: int = 1,
+) -> None:
+    """Insert *count* conversations (and grants for a fraction of them).
+
+    Core bulk inserts, not per-row store calls, so a plan test can reach a
+    realistic row count without a slow fixture.
+
+    :param tie_size: How many rows share one ``created_at`` value. The
+        default of 1 gives every row a distinct timestamp; a larger value
+        creates ties, which is what makes the cursor's tiebreaker term
+        load-bearing (without ties, dropping it changes nothing).
+    """
+    import uuid as _uuid
+
+    from sqlalchemy import insert as sa_insert
+
+    from omnigent.db.db_models import SqlConversation as _Conv
+    from omnigent.db.db_models import SqlSessionPermission as _Perm
+
+    base = 1_900_000_000
+    conv_rows = []
+    perm_rows = []
+    for i in range(count):
+        cid = _uuid.uuid4().hex
+        stamp = base + i // tie_size
+        conv_rows.append(
+            {
+                "workspace_id": 0,
+                "id": cid,
+                "created_at": stamp,
+                "updated_at": stamp,
+                "title": f"seed-{i}",
+                "parent_conversation_id": None,
+                "root_conversation_id": cid,
+                "next_position": 0,
+                # The endpoint filters has_agent_id=True, so an all-NULL
+                # agent_id seed would exclude every row and the plan under
+                # test would never be the plan production runs.
+                "agent_id": _uuid.uuid4().hex,
+                "archived": i % 5 == 0,
+            }
+        )
+        if i < int(count * granted_ratio):
+            perm_rows.append(
+                {
+                    "workspace_id": 0,
+                    "user_id": user_id,
+                    "conversation_id": cid,
+                    "level": 4,
+                }
+            )
+    with store._conv_session("test_setup") as session:
+        session.execute(sa_insert(_Conv), conv_rows)
+    with store._session("test_setup") as session:
+        session.execute(sa_insert(_Perm), perm_rows)
+
+
+def test_list_conversations_accessible_and_owned_intersect(
+    conversation_store: SqlAlchemyConversationStore, db_uri: str
+) -> None:
+    """
+    ``accessible_by`` + ``owned_by`` intersect, with different users.
+
+    Passing the same user for both operands makes ownership imply
+    accessibility, so the intersection equals ``owned_by`` alone and dropping
+    either operand goes unnoticed. Alice can read the row Bob owns; nothing
+    else satisfies both.
+    """
+    owned_by_alice = conversation_store.create_conversation(title="owned-by-alice")
+    owned_by_bob = conversation_store.create_conversation(title="owned-by-bob")
+    alice_reads_bob_owns = conversation_store.create_conversation(title="alice-reads-bob-owns")
+    # Both can read it and NEITHER owns it: it satisfies the intersection only
+    # if owned_by stops requiring owner level.
+    both_read_neither_owns = conversation_store.create_conversation(title="both-read")
+    perms = _acl_perms(db_uri)
+    perms.grant("alice@example.com", owned_by_alice.id, 4)
+    perms.grant("bob@example.com", owned_by_bob.id, 4)
+    perms.grant("alice@example.com", alice_reads_bob_owns.id, 1)
+    perms.grant("bob@example.com", alice_reads_bob_owns.id, 4)
+    perms.grant("alice@example.com", both_read_neither_owns.id, 1)
+    perms.grant("bob@example.com", both_read_neither_owns.id, 1)
+
+    ids = {
+        c.id
+        for c in conversation_store.list_conversations(
+            accessible_by="alice@example.com", owned_by="bob@example.com"
+        ).data
+    }
+    assert ids == {alice_reads_bob_owns.id}
+
+
+def test_single_db_acl_uses_exists_pushdown_not_prefetch(
+    conversation_store: SqlAlchemyConversationStore, db_uri: str
+) -> None:
+    """
+    Single-DB mode pushes the ACL into the conversations query as a
+    correlated EXISTS: no standalone session_permissions prefetch runs,
+    and the ids never round-trip through Python.
+    """
+    from sqlalchemy import event
+
+    assert conversation_store._conv_engine is conversation_store._engine
+
+    conv = conversation_store.create_conversation(title="mine")
+    perms = _acl_perms(db_uri)
+    perms.grant("alice@example.com", conv.id, 4)
+
+    statements: list[str] = []
+
+    def _capture(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    event.listen(conversation_store._engine, "before_cursor_execute", _capture)
+    try:
+        result = conversation_store.list_conversations(
+            accessible_by="alice@example.com", owned_by="alice@example.com"
+        )
+    finally:
+        event.remove(conversation_store._engine, "before_cursor_execute", _capture)
+
+    assert {c.id for c in result.data} == {conv.id}
+    perm_stmts = [s for s in statements if "session_permissions" in s]
+    # The permission table appears only inside the conversations query
+    # (as EXISTS subqueries) — never as its own prefetch SELECT.
+    assert perm_stmts, "expected the list query to reference session_permissions"
+    for stmt in perm_stmts:
+        assert "FROM conversations" in stmt
+        assert "EXISTS" in stmt
+
+
+def test_list_conversations_acl_with_cursor_pagination(
+    conversation_store: SqlAlchemyConversationStore, db_uri: str
+) -> None:
+    """Cursor pagination composes with the ACL filter: walking every page
+    yields exactly the granted rows (no leak, no overlap, none lost), and a
+    NON-granted conversation used as the cursor still returns the granted
+    rows that follow it — an empty page would not satisfy this.
+
+    Owns the ACL-vs-cursor COMPOSITION: removing the filter (``needs_meta_filter
+    = False``) fails here, because the ungranted rows appear. It deliberately
+    does NOT own the pushdown — disabling it falls back to the id prefetch,
+    which must return identical rows on split binds, so this test passing
+    under that mutation is the contract working. The pushdown is pinned by
+    the statement-shape and plan guards below.
+    """
+    convs = [conversation_store.create_conversation(title=f"c{i}") for i in range(6)]
+    # Newest first: c0, c1, ... c5. Deterministic on every dialect.
+    _spread_created_at(conversation_store, [c.id for c in convs])
+    granted = {c.id for c in (convs[0], convs[1], convs[4], convs[5])}
+    perms = _acl_perms(db_uri)
+    for conv_id in granted:
+        perms.grant("alice@example.com", conv_id, 4)
+
+    # Full walk in pages of 2 must reproduce exactly the granted set.
+    seen: list[str] = []
+    cursor: str | None = None
+    for _ in range(10):  # bounded; 4 rows / 2 per page = 2 pages
+        page = conversation_store.list_conversations(
+            accessible_by="alice@example.com", limit=2, after=cursor
+        )
+        seen.extend(c.id for c in page.data)
+        if not page.has_more:
+            break
+        cursor = page.last_id
+    assert len(seen) == len(set(seen)), f"pages overlap: {seen}"
+    assert set(seen) == granted
+    assert seen == [convs[0].id, convs[1].id, convs[4].id, convs[5].id]
+
+    # A non-granted conversation (c2, positioned between granted rows) as
+    # the cursor: position filter only, ACL still applied — so the result is
+    # exactly the granted rows after it, not an empty page.
+    page3 = conversation_store.list_conversations(
+        accessible_by="alice@example.com", limit=10, after=convs[2].id
+    )
+    assert [c.id for c in page3.data] == [convs[4].id, convs[5].id]
+
+
+def test_list_projects_single_db_uses_exists_pushdown(
+    conversation_store: SqlAlchemyConversationStore, db_uri: str
+) -> None:
+    """Single-DB list_projects pushes ACL as EXISTS — no standalone
+    session_permissions prefetch — and still scopes correctly."""
+    from sqlalchemy import event
+
+    assert conversation_store._conv_engine is conversation_store._engine
+    mine = conversation_store.create_conversation(title="mine")
+    other = conversation_store.create_conversation(title="other")
+    conversation_store.set_labels(mine.id, {"omni_project": "Mine"})
+    conversation_store.set_labels(other.id, {"omni_project": "Other"})
+    perms = _acl_perms(db_uri)
+    perms.grant("alice@example.com", mine.id, 4)
+    perms.grant("bob@example.com", other.id, 4)
+
+    statements: list[str] = []
+
+    def _capture(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    event.listen(conversation_store._engine, "before_cursor_execute", _capture)
+    try:
+        projects = conversation_store.list_projects(accessible_by="alice@example.com")
+    finally:
+        event.remove(conversation_store._engine, "before_cursor_execute", _capture)
+
+    assert projects == ["Mine"]
+    perm_stmts = [s for s in statements if "session_permissions" in s]
+    assert perm_stmts, "expected the labels query to reference session_permissions"
+    for stmt in perm_stmts:
+        assert "conversation_labels" in stmt
+        assert "EXISTS" in stmt
+
+
+_PLAN_SEED_ROWS = 5_000
+"""Rows seeded for the plan tests.
+
+At a few hundred rows PostgreSQL correctly prefers a sequential scan, so a
+plan assertion there measures the planner's choice for a toy table rather than
+the production one. The index/range behaviour under test only appears once the
+table is large enough for an index plan to be the rational choice.
+"""
+
+
+def test_seeded_acl_pushdown_cursor_plans_and_deep_pagination(
+    conversation_store: SqlAlchemyConversationStore, db_uri: str
+) -> None:
+    """
+    ACL and cursor contracts against a realistically sized table.
+
+    Two contracts share one seed because seeding is the expensive part:
+
+    1. The default listing pushes the ACL into a correlated EXISTS, with no id
+       round-trip through Python.
+    2. The cursor predicate is emitted as a row-values comparison, which
+       PostgreSQL can use as an index RANGE condition when the sort has a
+       compatible index. The equivalent
+       ``ts < :ts OR (ts = :ts AND id < :id)`` form is left as a residual
+       filter, so a deep cursor reads and discards every row above it, at a
+       cost that grows with cursor depth.
+
+    The SQL shape is asserted for both sort columns. The PLAN assertion is
+    limited to ``updated_at``, which has an existing compatible index; a
+    ``created_at`` plan may rationally sort or hash-join without one. EXPLAIN
+    uses the driver form because the cursor binds a 16-byte identifier that
+    cannot be written as a SQL literal, and re-binding raw values to a
+    ``text()`` EXPLAIN skips the type decorator — the exact trap that made the
+    first row-values attempt fail only on PostgreSQL.
+
+    Plan assertions are dialect-specific by nature (PostgreSQL EXPLAIN JSON,
+    SQLite EXPLAIN QUERY PLAN); other dialects keep the behavioural coverage
+    from the cursor-walk and row-set tests, which run everywhere.
+    """
+    if conversation_store._conv_engine.dialect.name not in ("postgresql", "sqlite"):
+        pytest.skip("plan-shape assertions are written for PostgreSQL and SQLite EXPLAIN output")
+    _acl_perms(db_uri)
+    # Tied timestamps: with one row per timestamp the cursor's tiebreaker term
+    # is decorative and dropping it loses nothing, so the walk below could not
+    # tell a correct cursor from a broken one.
+    _bulk_seed_conversations_and_grants(
+        conversation_store,
+        "alice@example.com",
+        count=_PLAN_SEED_ROWS,
+        # Half the workspace granted: a selective ACL is what production
+        # looks like, and an all-granted table lets the planner ignore the
+        # permission side entirely.
+        granted_ratio=0.5,
+        tie_size=4,
+    )
+    dialect = conversation_store._conv_engine.dialect.name
+
+    def _plan_of(driver_captured: list[tuple[str, object]], sort_by: str) -> str:
+        order_by = f"order by conversations.{sort_by}"
+        statement, parameters = next(
+            (st, pr)
+            for st, pr in driver_captured
+            if order_by in st.lower() and "limit" in st.lower()
+        )
+        return _explain_driver(conversation_store, statement, parameters)
+
+    def _index_conds_and_filtered(plan: str) -> tuple[list[str], list[int]]:
+        flat: list[dict[str, object]] = []
+
+        def _walk(node: dict[str, object]) -> None:
+            flat.append(node)
+            for child in node.get("Plans", []) or []:
+                _walk(child)
+
+        for entry in json.loads(plan):
+            _walk(entry["Plan"])
+        return (
+            [str(n.get("Index Cond", "")) for n in flat if "Index Cond" in n],
+            [int(n.get("Rows Removed by Filter", 0) or 0) for n in flat],
+        )
+
+    # ── 1. default listing: ACL pushdown ────────────────────────────────
+    with _capture_conversation_selects(conversation_store) as clauses:
+        page = conversation_store.list_conversations(
+            limit=20,
+            accessible_by="alice@example.com",
+            has_agent_id=True,
+            kind="default",
+            sort_by="created_at",
+            order="desc",
+        )
+    assert page.data, "seed must produce visible rows or the plan is not the real one"
+    # On the uncompiled statement: without the pushdown the ACL becomes a
+    # materialized list of binary ids, and anything that renders it dies before
+    # reaching this assertion.
+    assert "EXISTS" in str(clauses[0]).upper(), str(clauses[0])
+
+    # ── 2. deep cursor: row values and indexed updated_at range ─────────
+    # A DEEP cursor with a NORMAL page size — the shape that distinguishes an
+    # index range condition from a residual filter. Asking for half the table
+    # in one page makes a sequential scan the planner's rational choice, and
+    # the plan would then say nothing about the predicate.
+    #
+    # ALL FOUR branches are explained, not just descending ``after``. The
+    # rewrite changed both directions and both orders, and the four produce
+    # different predicates; pinning one of them let the residual OR form be
+    # restored for the other three with every test still green. Behavioural
+    # equality cannot see this — the OR form returns the same rows, just by
+    # reading and discarding everything above the cursor.
+    baseline = conversation_store.list_conversations(
+        accessible_by="alice@example.com",
+        limit=_PLAN_SEED_ROWS * 2,
+        has_agent_id=True,
+        kind="default",
+        sort_by="created_at",
+        order="desc",
+    )
+    assert not baseline.has_more, "baseline must be a single complete page"
+    expected_ids = [c.id for c in baseline.data]
+    deep = int(len(expected_ids) * 0.7)
+
+    tiebreaker_col = conversation_store._tiebreaker_col
+    # The tiebreaker column is dialect-chosen (SQLite rowid = insertion order,
+    # otherwise the uuid id) — assert against the store's own choice rather
+    # than hard-coding one dialect's spelling.
+    tiebreaker = str(getattr(tiebreaker_col, "expression", tiebreaker_col))
+
+    first = None
+    second = None
+    for sort_by in ("created_at", "updated_at"):
+        for order in ("desc", "asc"):
+            for direction in ("after", "before"):
+                page = conversation_store.list_conversations(
+                    accessible_by="alice@example.com",
+                    limit=deep,
+                    has_agent_id=True,
+                    kind="default",
+                    sort_by=sort_by,
+                    order=order,
+                )
+                assert page.has_more, "seed must be deeper than one page"
+                cursor_id = page.data[-1].id
+                with _capture_conversation_selects(conversation_store) as clauses:
+                    with _capture_driver_sql(conversation_store) as driver_captured:
+                        cursor_page = conversation_store.list_conversations(
+                            accessible_by="alice@example.com",
+                            limit=20,
+                            has_agent_id=True,
+                            kind="default",
+                            sort_by=sort_by,
+                            order=order,
+                            **{direction: cursor_id},
+                        )
+                where = f"{sort_by}/{order}/{direction}"
+                if sort_by == "updated_at":
+                    # With the existing compatible index, the row value must
+                    # become a range condition rather than a residual filter.
+                    cursor_plan = _plan_of(driver_captured, sort_by)
+                    if dialect == "postgresql":
+                        index_conds, rows_filtered = _index_conds_and_filtered(cursor_plan)
+                        assert any(sort_by in c and "id" in c for c in index_conds), (
+                            where,
+                            cursor_plan,
+                        )
+                        assert all(r == 0 for r in rows_filtered), (where, cursor_plan)
+                    else:
+                        assert "USING INDEX" in cursor_plan, (where, cursor_plan)
+                        assert "SCAN conversations" not in cursor_plan, (where, cursor_plan)
+
+                # Then the emitted spelling, as a description of what produced
+                # that plan. ``after`` in a descending scan compares "<";
+                # every other combination flips one of the two.
+                listing = next((c for c in clauses if sort_by in str(c)), clauses[0])
+                descending_scan = (order == "desc") if direction == "after" else (order == "asc")
+                comparison = "<" if descending_scan else ">"
+                assert f"(conversations.{sort_by}, {tiebreaker}) {comparison}" in " ".join(
+                    str(listing).split()
+                ), (where, tiebreaker, str(listing))
+
+                # Keep the descending created_at/after pages for the walk below.
+                if sort_by == "created_at" and order == "desc" and direction == "after":
+                    first, second = page, cursor_page
+
+    assert first is not None and second is not None
+
+    # ── 3. behaviour: deep pagination loses and duplicates nothing ──────
+    first_ids = [c.id for c in first.data]
+    second_ids = [c.id for c in second.data]
+    assert not set(first_ids) & set(second_ids), "cursor pages overlap"
+    # Non-overlap alone only proves no DUPLICATES. A cursor that skips rows —
+    # the failure mode of a wrong tiebreaker or a strict-vs-inclusive boundary
+    # slip — also produces non-overlapping pages, so compare the paged walk to
+    # the single-shot result.
+    walked: list[str] = []
+    after: str | None = None
+    while True:
+        walk_page = conversation_store.list_conversations(
+            accessible_by="alice@example.com",
+            limit=500,
+            after=after,
+            has_agent_id=True,
+            kind="default",
+            sort_by="created_at",
+            order="desc",
+        )
+        walked.extend(c.id for c in walk_page.data)
+        if not walk_page.has_more or walk_page.last_id is None:
+            break
+        after = walk_page.last_id
+    assert len(walked) == len(set(walked)), "paged walk returned a row twice"
+    assert walked == expected_ids, (
+        f"paged walk lost or reordered rows: {len(walked)} of {len(expected_ids)}"
+    )
+
+
+@pytest.mark.parametrize("order", ["desc", "asc"])
+@pytest.mark.parametrize("sort_by", ["created_at", "updated_at"])
+def test_cursor_pages_forward_and_backward_in_both_orders(
+    conversation_store: SqlAlchemyConversationStore, db_uri: str, sort_by: str, order: str
+) -> None:
+    """
+    ``before`` is the same rewritten predicate as ``after``, in reverse.
+
+    The row-values rewrite changed both directions and both sort columns, but
+    coverage only ever exercised descending ``after``. Tied timestamps are
+    seeded so the tiebreaker term decides page boundaries, which is where a
+    direction mix-up shows up: paging forward and then back must return the
+    same rows, in the same order.
+    """
+    _acl_perms(db_uri)
+    _bulk_seed_conversations_and_grants(
+        conversation_store, "alice@example.com", count=40, granted_ratio=1.0, tie_size=4
+    )
+
+    def _page(**kwargs: object) -> list[str]:
+        return [
+            c.id
+            for c in conversation_store.list_conversations(
+                accessible_by="alice@example.com",
+                has_agent_id=True,
+                kind="default",
+                sort_by=sort_by,
+                order=order,
+                **kwargs,  # type: ignore[arg-type]
+            ).data
+        ]
+
+    full = _page(limit=100)
+    assert len(full) > 12, "seed must cover several pages"
+
+    # Forward from a mid-list cursor.
+    forward = _page(limit=6, after=full[5])
+    assert forward == full[6:12], (forward, full[:14])
+
+    # ``before`` narrows to the rows preceding the cursor while keeping the
+    # same ORDER BY, so the whole prefix comes back in listing order and LIMIT
+    # takes it from the start — not the rows nearest the cursor. Both halves
+    # are asserted: the full prefix pins the boundary (exclusive, correct
+    # direction), the limited page pins which end LIMIT cuts.
+    assert _page(limit=100, before=full[12]) == full[:12], full[:14]
+    assert _page(limit=6, before=full[12]) == full[:6], full[:14]
+
+
+# ── Idempotent append (stable_id) ─────────────────────
+
+
+def test_append_with_stable_id_is_idempotent(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A re-append under the same stable id returns the stored item once.
+
+    The retry contract for at-least-once producers (transcript
+    forwarders): a timed-out POST's disposition is unknown, so the same
+    item may arrive again — and concurrent forwarders tailing one
+    transcript derive the same stable id for the same record.
+    """
+    conv = conversation_store.create_conversation()
+    stable = "ab" * 16
+    item = NewConversationItem(
+        type="message",
+        response_id="resp_x",
+        data=MessageData(role="user", content=[{"type": "input_text", "text": "hi"}]),
+        stable_id=stable,
+    )
+    [first] = conversation_store.append(conv.id, [item])
+    assert first.id == stable
+    assert first.deduplicated is False
+
+    [second] = conversation_store.append(conv.id, [item])
+    assert second.id == stable
+    assert second.deduplicated is True
+
+    page = conversation_store.list_items(conv.id)
+    assert [i.id for i in page.data if i.id == stable] == [stable]
+
+
+def test_append_without_stable_id_still_duplicates(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """No stable id keeps the legacy contract: every append inserts."""
+    conv = conversation_store.create_conversation()
+    item = NewConversationItem(
+        type="message",
+        response_id="resp_x",
+        data=MessageData(role="user", content=[{"type": "input_text", "text": "hi"}]),
+    )
+    [a] = conversation_store.append(conv.id, [item])
+    [b] = conversation_store.append(conv.id, [item])
+    assert a.id != b.id
+    assert b.deduplicated is False
+
+
+def test_append_dedupe_does_not_burn_a_position(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A dedupe hit allocates no position: later items stay contiguous."""
+    conv = conversation_store.create_conversation()
+    stable = "cd" * 16
+    dup = NewConversationItem(
+        type="message",
+        response_id="resp_x",
+        data=MessageData(role="user", content=[{"type": "input_text", "text": "one"}]),
+        stable_id=stable,
+    )
+    conversation_store.append(conv.id, [dup])
+    # duplicate + a genuinely new item in one batch
+    fresh = NewConversationItem(
+        type="message",
+        response_id="resp_x",
+        data=MessageData(
+            role="assistant",
+            content=[{"type": "output_text", "text": "two"}],
+            agent="worker",
+        ),
+    )
+    [got_dup, got_fresh] = conversation_store.append(conv.id, [dup, fresh])
+    assert got_dup.deduplicated is True
+    assert got_fresh.deduplicated is False
+    page = conversation_store.list_items(conv.id)
+    assert len(page.data) == 2
+
+
+def test_pure_dedupe_append_leaves_conversation_metadata_alone(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A duplicate-only re-post must not make the conversation look active."""
+    conv = conversation_store.create_conversation()
+    item = NewConversationItem(
+        type="message",
+        response_id="resp_x",
+        data=MessageData(role="user", content=[{"type": "input_text", "text": "hi"}]),
+        stable_id="ef" * 16,
+    )
+    conversation_store.append(conv.id, [item])
+    before = conversation_store.get_conversation(conv.id)
+    assert before is not None
+
+    conversation_store.append(conv.id, [item])
+    after = conversation_store.get_conversation(conv.id)
+    assert after is not None
+    assert after.updated_at == before.updated_at
+
+
+def test_same_stable_id_twice_in_one_batch_inserts_once(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """In-batch twins collapse instead of colliding on the primary key."""
+    conv = conversation_store.create_conversation()
+    item = NewConversationItem(
+        type="message",
+        response_id="resp_x",
+        data=MessageData(role="user", content=[{"type": "input_text", "text": "hi"}]),
+        stable_id="0a" * 16,
+    )
+    [a, b] = conversation_store.append(conv.id, [item, item])
+    assert a.id == b.id
+    assert a.deduplicated is False
+    assert b.deduplicated is True
+    assert len(conversation_store.list_items(conv.id).data) == 1
+
+
+def test_repeated_persisted_twin_batch_leaves_conversation_metadata_alone(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A retry batch repeating one already-persisted stable id is a pure duplicate.
+
+    Concurrent forwarders can deliver the same record twice in one batch
+    after it already persisted: every item resolves to the stored row, so
+    nothing inserts and the conversation must not look active.
+    """
+    import omnigent.stores.conversation_store.sqlalchemy_store as store_mod
+
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 1000)
+    conv = conversation_store.create_conversation()
+    item = NewConversationItem(
+        type="message",
+        response_id="resp_x",
+        data=MessageData(role="user", content=[{"type": "input_text", "text": "hi"}]),
+        stable_id="1b" * 16,
+    )
+    conversation_store.append(conv.id, [item])
+
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 2000)
+    [a, b] = conversation_store.append(conv.id, [item, item])
+    assert a.deduplicated is True
+    assert b.deduplicated is True
+    assert a.id == b.id
+    after = conversation_store.get_conversation(conv.id)
+    assert after is not None
+    assert after.updated_at == 1000
+    assert len(conversation_store.list_items(conv.id).data) == 1
 
 
 # ── Connection-checkout budget ─────────────────────────

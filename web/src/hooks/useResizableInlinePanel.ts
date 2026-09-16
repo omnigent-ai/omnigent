@@ -5,7 +5,15 @@
 // ExecutionLogsPanel / FilesPanelDrawer — those open at ~50 % by default
 // while the inline panel starts at a compact sidebar width.
 
-import { useCallback, useEffect, useReducer, useRef, useState, useSyncExternalStore } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useReducer,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 
 const MIN_WIDTH_PX = 240;
@@ -310,9 +318,10 @@ export function useResizableInlinePanel(
     };
   }, [isDragging, removeDragOverlay]);
 
-  return {
-    panelWidth: resolvedWidth,
-    handleProps: {
+  // Stable identity so consumers memoized on this prop (WorkspacePanel) don't
+  // re-render on every parent render — the object only changes when its inputs do.
+  const handleProps = useMemo(
+    () => ({
       onMouseDown,
       onKeyDown,
       role: "separator" as const,
@@ -320,6 +329,9 @@ export function useResizableInlinePanel(
       "aria-label": "Resize panel",
       "aria-disabled": !persistEnabled,
       tabIndex: persistEnabled ? 0 : -1,
-    },
-  };
+    }),
+    [onMouseDown, onKeyDown, persistEnabled],
+  );
+
+  return { panelWidth: resolvedWidth, handleProps };
 }

@@ -17,16 +17,17 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { WorkspacePicker, isNavigablePath } from "./WorkspacePicker";
+import {
+  WorkspacePicker,
+  isNavigablePath,
+  resolveWorkspacePath,
+  useResolvedHostHome,
+} from "./WorkspacePicker";
 import { WorkspacePathField } from "./WorkspacePathField";
 import { CliCommandBlock } from "./CliCommandBlock";
 import { HostLabel } from "./HostLabel";
 import { buildReconnectCommand } from "./ReconnectSessionDialog";
-import {
-  isValidWorkspace,
-  normalizeWorkspacePath,
-  sessionsSharingDirectory,
-} from "./NewChatDialog";
+import { normalizeWorkspacePath, sessionsSharingDirectory } from "./NewChatDialog";
 import { useHosts } from "@/hooks/useHosts";
 import { useDirectorySessions } from "@/hooks/useDirectorySessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
@@ -62,6 +63,8 @@ import { getSessionSlim, launchRunner } from "@/lib/sessionsApi";
  *   host/workspace/branch). Ignored when ``sourceSessionId`` is set.
  * @param serverUrl - Origin for the CLI fallback command.
  * @param wrapper - The session's ``omnigent.wrapper`` label (CLI fallback).
+ * @param harness - The session's canonical harness; the CLI fallback uses it
+ *   to pick the native resume verb when no wrapper label is present.
  * @param onBound - Called after a successful bind so the caller can
  *   replay the message the user was trying to send.
  */
@@ -73,6 +76,7 @@ export function ResumeWithDirectoryDialog({
   prefill,
   serverUrl,
   wrapper,
+  harness,
   onBound,
 }: {
   open: boolean;
@@ -82,6 +86,7 @@ export function ResumeWithDirectoryDialog({
   prefill?: { hostId?: string | null; workspace?: string | null; gitBranch?: string | null };
   serverUrl: string;
   wrapper?: string | null;
+  harness?: string | null;
   onBound?: () => void;
 }) {
   const queryClient = useQueryClient();
@@ -167,8 +172,14 @@ export function ResumeWithDirectoryDialog({
     onOpenChange(next);
   }
 
-  const workspaceTrimmed = normalizeWorkspacePath(workspace) ?? "";
-  const workspaceValid = isValidWorkspace(workspace);
+  // Resolve a typed "~/…" path to its absolute form against the host's home,
+  // so it's directly submittable without opening the tree browser (the server
+  // never expands ~). Already-absolute values pass through normalized; a
+  // tilde path stays unresolved until the home listing arrives.
+  const resolvedHome = useResolvedHostHome(selectedHostId);
+  const resolvedWorkspace = resolveWorkspacePath(workspace, resolvedHome);
+  const workspaceTrimmed = resolvedWorkspace ?? normalizeWorkspacePath(workspace) ?? "";
+  const workspaceValid = resolvedWorkspace !== null;
 
   // Conflict hint: other *connected* sessions already working in the
   // picked directory on this host (same wiring as NewChatDialog).
@@ -287,6 +298,7 @@ export function ResumeWithDirectoryDialog({
                 conversationId: sessionId,
                 serverUrl,
                 wrapper,
+                harness,
                 // The source's host is offline here. With a host binding the
                 // owner re-registers the host (`omnigent host`); without one
                 // the runner is relaunched directly via the wrapper's resume

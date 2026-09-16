@@ -42,23 +42,24 @@ from dataclasses import dataclass
 from types import ModuleType
 from typing import Any, NamedTuple, Protocol, TypeAlias, cast
 
-from omnigent import model_catalog
 from omnigent._platform import resolve_cli_binary, stable_user_id
-from omnigent.claude_model_vocabulary import (
-    ALIAS_MODEL_ENV_VARS,
-    served_alias_pins,
-    served_canonical_overrides,
-)
 from omnigent.cli_invocation import cli_invocation
 from omnigent.databricks_ai_gateway import is_databricks_ai_gateway_url
 from omnigent.inner import _proc
 from omnigent.inner.bundle_skills import ensure_bundle_plugin_manifest
 from omnigent.inner.hook_scripts import subagent_router
-from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.llms.adapters._content import parse_data_uri as _parse_replay_data_uri
-from omnigent.reasoning_effort import CLAUDE_EFFORTS, validate_effort
+from omnigent.models import model_catalog
+from omnigent.models.claude_model_vocabulary import (
+    ALIAS_MODEL_ENV_VARS,
+    served_alias_pins,
+    served_canonical_overrides,
+)
+from omnigent.models.model_metadata import concrete_reported_model
 from omnigent.spec.types import RetryPolicy
+from omnigent.util.json_types import JsonObject as _JsonObject
+from omnigent.util.reasoning_effort import CLAUDE_EFFORTS, validate_effort
 
 from ._subprocess_lifecycle import close_anyio_subprocess_transport
 from .async_utils import run_sync_on_thread
@@ -1002,7 +1003,7 @@ def _resolve_databricks_claude_model(profile: str | None) -> str:
     :returns: The model id to launch on.
     """
     try:
-        from omnigent.databricks_model_discovery import discover_databricks_claude_catalog
+        from omnigent.models.databricks_model_discovery import discover_databricks_claude_catalog
         from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
 
         creds = resolve_databricks_workspace(profile)
@@ -1126,11 +1127,13 @@ def _resolve_gateway_env(
     command + a refresh TTL. When the gateway base URL and auth command are
     supplied directly (the generic-provider producer, or ucode), they are
     used verbatim. When only a Databricks profile is supplied (no override
-    values), the Databricks-specific fallback derives both from
-    ``~/.databrickscfg``:
-      1. ~/.databrickscfg profile credentials
-      2. ~/.databrickscfg (explicit profile, DEFAULT, or first valid section)
-    Returns an empty dict if no credentials are available.
+    values), the Databricks-specific fallback derives both from the profile's
+    workspace **host** (see
+    :func:`~omnigent.inner.databricks_executor._databricks_gateway_host`).
+    Only the host is needed: the bearer token is minted at request time by
+    the generated auth command, so OAuth U2M profiles (``auth_type =
+    databricks-cli``, no static ``token`` field) resolve too. Returns an
+    empty dict if no workspace host can be resolved.
 
     The bearer token itself is not returned. Claude Code receives an
     invocation-local ``apiKeyHelper`` setting and refresh TTL instead, so
@@ -1170,16 +1173,22 @@ def _resolve_gateway_env(
             _CLAUDE_API_KEY_HELPER_ENV_KEY: auth_command_override,
         }
     if host is None:
+        # Only the workspace host is needed here: the auth command mints the
+        # bearer at request time. Resolving the host (rather than a static
+        # ``(host, token)`` credential pair) keeps OAuth U2M profiles working
+        # — they carry a ``host`` but no ``token`` field, so a token-requiring
+        # lookup would fail even though ``databricks auth token`` succeeds.
+        # Same derivation the codex gateway path uses.
         try:
-            from .databricks_executor import _read_databrickscfg
+            from .databricks_executor import _databricks_gateway_host
 
-            creds = _read_databrickscfg(profile)
+            host = _databricks_gateway_host(profile)
         except ImportError:
-            creds = None
+            host = None
 
-        if creds is None:
+        if not host:
             return {}
-        host = creds.host.rstrip("/")
+        host = host.rstrip("/")
         base_url = (
             base_url_override if base_url_override is not None else f"{host}/ai-gateway/anthropic"
         )
@@ -2958,8 +2967,8 @@ class ClaudeSDKExecutor(Executor):
                         assistant_msg = cast(_AssistantMessageObj, message)
                         # Capture the concrete model the SDK used (the resolved
                         # config ``model`` is None when the spec pins none).
-                        _am_model = getattr(assistant_msg, "model", None)
-                        if isinstance(_am_model, str) and _am_model:
+                        _am_model = concrete_reported_model(getattr(assistant_msg, "model", None))
+                        if _am_model is not None:
                             observed_model = _am_model
                         if got_stream_events:
                             # StreamEvents already emitted text. Emit the

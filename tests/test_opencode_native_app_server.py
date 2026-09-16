@@ -6,8 +6,8 @@ from pathlib import Path
 
 import pytest
 
-from omnigent import opencode_native_app_server as appsrv
-from omnigent.opencode_native_app_server import (
+from omnigent.harnesses.opencode_native import app_server as appsrv
+from omnigent.harnesses.opencode_native.app_server import (
     OpenCodeCliNotFoundError,
     OpenCodeNativeServer,
     OpenCodeVersionError,

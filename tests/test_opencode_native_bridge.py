@@ -8,8 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from omnigent import opencode_native_bridge as bridge
-from omnigent.opencode_native_bridge import (
+from omnigent.harnesses.opencode_native import bridge
+from omnigent.harnesses.opencode_native.bridge import (
     OpenCodeNativeBridgeState,
     auth_headers_for_secret,
     bridge_dir_for_bridge_id,

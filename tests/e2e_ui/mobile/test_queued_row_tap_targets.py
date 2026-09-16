@@ -86,6 +86,13 @@ def test_queued_row_controls_meet_mobile_tap_target(
         composer.fill(_MSG1)
         send.click()
 
+        # Exercise the second send after the background terminal mounts;
+        # its scrollbar must not intercept the composer while hidden.
+        warm_terminal = page.get_by_test_id("main-terminal-view")
+        expect(warm_terminal).to_have_attribute("data-visible", "false", timeout=15_000)
+        expect(warm_terminal.locator(".xterm")).to_be_attached(timeout=15_000)
+        expect(warm_terminal).to_have_attribute("inert", "")
+
         # msg2 -> typed while busy -> held in the client-side queue and shown
         # in the docked strip above the composer.
         composer.fill(_MSG2)

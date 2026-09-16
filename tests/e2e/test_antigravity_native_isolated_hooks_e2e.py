@@ -14,12 +14,12 @@ from pathlib import Path
 import pexpect
 import pytest
 
-from omnigent.antigravity_native_bridge import (
+from omnigent.harnesses.antigravity_native.bridge import (
     agy_gemini_dir,
     seed_isolated_agy_home,
     write_mcp_config,
 )
-from omnigent.antigravity_native_launch import agy_binary_path
+from omnigent.harnesses.antigravity_native.launch import agy_binary_path
 
 try:
     _AGY_BIN: str | None = agy_binary_path()

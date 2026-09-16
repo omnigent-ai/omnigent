@@ -167,11 +167,17 @@ def _build_usage_report(
         for conv in page.data:
             if conv.agent_id is None:
                 continue
-            usage = load_session_usage(conv.id, conversation_store)
+            # The list page already holds each row, so pass its root to skip
+            # re-reading the same conversation once per listed session.
+            usage = load_session_usage(
+                conv.id,
+                conversation_store,
+                root_conversation_id=conv.root_conversation_id,
+            )
             primary_harness = _resolve_session_harness(conv) if include_page_details else None
             other_harnesses = None
             if include_page_details:
-                tree = load_session_tree(conv.id, conversation_store)
+                tree = load_session_tree(conv.id, conversation_store, conv.root_conversation_id)
                 other_harnesses = _collect_other_harnesses(primary_harness, tree, conv.id)
             sessions.append(
                 SessionUsage(

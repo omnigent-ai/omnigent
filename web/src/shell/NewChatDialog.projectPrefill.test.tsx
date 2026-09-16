@@ -1,10 +1,14 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("@/hooks/useSkills", () => ({
+  useSkills: () => ({ skills: [], skillsStatus: "ready", refetch: vi.fn() }),
+}));
 import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { authenticatedFetch } from "@/lib/identity";
 import type { Host } from "@/hooks/useHosts";
@@ -41,7 +45,11 @@ vi.mock("@/store/chatStore", () => ({
   setPendingInitialPrompt: vi.fn(),
 }));
 
-vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
+vi.mock("@/lib/identity", () => ({
+  authenticatedFetch: vi.fn(),
+  getCurrentUserId: vi.fn(() => null),
+  resolveIdentity: vi.fn(async () => null),
+}));
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: vi.fn(),
   useHostModelOptions: vi.fn(() => ({ data: [] })),
@@ -134,9 +142,32 @@ function setRepoIsGit(): void {
 }
 
 function renderLanding(): { rerender: (ui: ReactNode) => void; unmount: () => void } {
+  const info: ServerInfo = {
+    accounts_enabled: false,
+    single_user: false,
+    login_url: null,
+    needs_setup: false,
+    databricks_features: false,
+    enabled_connections: [],
+    managed_sandboxes_enabled: false,
+    sandbox_provider: null,
+    sharing_mode: "on",
+    public_sharing_enabled: true,
+    server_version: null,
+    smart_routing_enabled: false,
+    smart_routing_sources: { external: false, oss: false },
+    features: { harness_install: false },
+    harness_install_enabled: false,
+    installable_harnesses: [],
+    dictation_available: false,
+  };
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   function Wrapper({ children }: { children: ReactNode }) {
-    return <QueryClientProvider client={client}>{children}</QueryClientProvider>;
+    return (
+      <QueryClientProvider client={client}>
+        <CapabilitiesProvider info={info}>{children}</CapabilitiesProvider>
+      </QueryClientProvider>
+    );
   }
   const { rerender, unmount } = render(<NewChatLandingScreen />, { wrapper: Wrapper });
   return { rerender, unmount };
@@ -175,10 +206,7 @@ function renderSandboxLanding(): { rerender: (ui: ReactNode) => void } {
   return { rerender };
 }
 
-/** Render with Smart Routing enabled server-side, so a routing-eligible
- *  native agent can actually turn routing on (the plain renderLanding has no
- *  CapabilitiesProvider, so its server info stays "loading" and routing is
- *  never eligible). Returns rerender so a test can re-drive the same mount. */
+/** Render with Smart Routing enabled so a routing-eligible native agent can turn it on. */
 function renderRoutingLanding(): { rerender: (ui: ReactNode) => void; unmount: () => void } {
   const info: ServerInfo = {
     accounts_enabled: false,
@@ -222,6 +250,8 @@ function selectAgent(agentId: string): void {
     fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
   }
   fireEvent.click(screen.getByTestId(`new-chat-landing-agent-${agentId}`));
+  const selectedRow = screen.queryByTestId(`new-chat-landing-agent-${agentId}`);
+  if (selectedRow) fireEvent.keyDown(selectedRow, { key: "Escape" });
 }
 
 async function submitAndReadBody(): Promise<Record<string, unknown>> {
@@ -518,27 +548,25 @@ describe("NewChatLandingScreen project prefill", () => {
     fireEvent.change(screen.getByTestId("new-chat-landing-repo-input"), {
       target: { value: "https://github.com/org/alpha-repo" },
     });
-    fireEvent.change(screen.getByTestId("new-chat-landing-repo-branch-input"), {
-      target: { value: "alpha-main" },
-    });
-    expect(screen.getByTestId("new-chat-landing-repo-chip").textContent).toContain(
-      "alpha-repo#alpha-main",
-    );
+    fireEvent.click(screen.getByTestId("new-chat-landing-repo-add"));
+    await screen.findByTestId("new-chat-landing-repo-row");
+    expect(screen.getByTestId("new-chat-landing-repo-chip").textContent).toContain("alpha-repo");
 
     // Click project Beta's pencil: the param changes in place.
     searchParams = new URLSearchParams("project=Beta");
     rerender(<NewChatLandingScreen />);
 
     // The sticky host pick re-selects the sandbox, but Alpha's staged repo
-    // inputs are gone.
+    // is gone.
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-repo-chip").textContent).toContain("Repository"),
     );
     const body = await submitAndReadBody();
     expect(body.host_type).toBe("managed");
-    // Blank repo inputs pin workspace to explicit null under Beta's
-    // project_id (a managed create rejects a default-filled path) — not
-    // Alpha's repo#branch.
+    // No repos carried over → an empty workspaces list; workspace stays pinned
+    // to explicit null under Beta's project_id (a managed create rejects a
+    // default-filled path) — not Alpha's repo.
+    expect(body.workspaces).toEqual([]);
     expect(body.workspace).toBeNull();
   });
 
@@ -638,11 +666,12 @@ describe("NewChatLandingScreen project prefill", () => {
     setProjectConfig({ host_id: "host_1" });
     renderLanding();
 
-    await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain(
-        "feature-x",
-      ),
-    );
+    const workspaceTrigger = screen.getByTestId("new-chat-landing-workspace-chip");
+    const worktreeTrigger = screen.getByTestId("new-chat-landing-branch-chip");
+    await waitFor(() => expect(workspaceTrigger).toHaveAttribute("title", LINKED_WORKTREE));
+    expect(workspaceTrigger).toHaveTextContent("gamma");
+    expect(worktreeTrigger).toHaveTextContent("feature/x");
+    expect(worktreeTrigger).toHaveAttribute("title", "Existing worktree branch: feature/x");
     const body = await submitAndReadBody();
     // Bound straight to the worktree dir; the worktree's branch rides along and
     // no base branch is set (it's a bind, not a fork).
@@ -737,8 +766,8 @@ describe("NewChatLandingScreen project prefill", () => {
     renderLanding();
 
     await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain(
-        "Claude Code",
+      expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(
+        /Claude Code/,
       ),
     );
     const body = await submitAndReadBody();
@@ -758,8 +787,8 @@ describe("NewChatLandingScreen project prefill", () => {
     renderLanding();
 
     await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain(
-        "Claude Code",
+      expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(
+        /Claude Code/,
       ),
     );
     const body = await submitAndReadBody();
@@ -778,8 +807,8 @@ describe("NewChatLandingScreen project prefill", () => {
     renderLanding();
 
     await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain(
-        "Claude Code",
+      expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(
+        /Claude Code/,
       ),
     );
     const body = await submitAndReadBody();
@@ -794,17 +823,17 @@ describe("NewChatLandingScreen project prefill", () => {
     setProjectConfig({ host_id: "host_1", agent_id: CLAUDE_AGENT_ID });
     const { rerender } = renderLanding();
     await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain(
-        "Claude Code",
+      expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(
+        /Claude Code/,
       ),
     );
 
     // Commit "Sonnet" through the agent-config modal (the user's explicit pick).
-    fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-config-model"), { button: 0 });
-    fireEvent.click(screen.getByTestId("new-chat-landing-config-model"));
-    fireEvent.click(screen.getByRole("option", { name: "Sonnet" }));
-    fireEvent.click(screen.getByTestId("new-chat-landing-config-save"));
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-select"));
+    fireEvent.click(screen.getByTestId(`new-chat-landing-agent-config-${CLAUDE_AGENT_ID}`));
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Sonnet" }));
+    fireEvent.keyDown(screen.getByTestId("new-chat-landing-agent-models"), { key: "Escape" });
 
     // The project default (Opus) lands afterwards — it must not reseed.
     setProjectConfig({ host_id: "host_1", agent_id: CLAUDE_AGENT_ID, model: "opus" });
@@ -824,18 +853,18 @@ describe("NewChatLandingScreen project prefill", () => {
     setProjectConfig({ host_id: "host_1", agent_id: CLAUDE_AGENT_ID });
     const { unmount } = renderRoutingLanding();
     await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain(
-        "Claude Code",
+      expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(
+        /Claude Code/,
       ),
     );
 
     // Turn Smart Routing on via the config modal, then park the draft by
     // unmounting (submittedRef stays false → landingDraft keeps routing "on").
-    fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-config-model"), { button: 0 });
-    fireEvent.click(screen.getByTestId("new-chat-landing-config-model"));
-    fireEvent.click(screen.getByRole("option", { name: "Smart Routing" }));
-    fireEvent.click(screen.getByTestId("new-chat-landing-config-save"));
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-select"));
+    fireEvent.click(screen.getByTestId(`new-chat-landing-agent-config-${CLAUDE_AGENT_ID}`));
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Smart Routing" }));
+    fireEvent.keyDown(screen.getByTestId("new-chat-landing-agent-models"), { key: "Escape" });
     unmount();
 
     // Remount for the SAME project, now with a stored model default. The
@@ -843,8 +872,8 @@ describe("NewChatLandingScreen project prefill", () => {
     setProjectConfig({ host_id: "host_1", agent_id: CLAUDE_AGENT_ID, model: "opus" });
     renderRoutingLanding();
     await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain(
-        "Claude Code",
+      expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(
+        /Claude Code/,
       ),
     );
 
@@ -887,9 +916,8 @@ describe("NewChatLandingScreen project prefill", () => {
 const ALWAYS_WORKTREE_KEY = "omnigent:always-use-worktree";
 
 describe("NewChatLandingScreen global always-use-worktree default", () => {
-  // The branch chip's label reflects the branch field ("Worktree" when empty),
-  // so it lets a test observe the seeded/retracted branch without opening the
-  // popover the actual input lives in.
+  // The compact header exposes the visible branch/request label separately
+  // from its state-specific accessible description.
   function branchLabel(): string {
     return screen.getByTestId("new-chat-landing-branch-chip").textContent ?? "";
   }
@@ -996,11 +1024,7 @@ describe("NewChatLandingScreen global always-use-worktree default", () => {
     localStorage.setItem(RECENT_KEY, JSON.stringify({ host_1: [REPO] }));
     localStorage.setItem(ALWAYS_WORKTREE_KEY, "true");
 
-    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    function Wrapper({ children }: { children: ReactNode }) {
-      return <QueryClientProvider client={client}>{children}</QueryClientProvider>;
-    }
-    const first = render(<NewChatLandingScreen />, { wrapper: Wrapper });
+    const first = renderLanding();
     await waitFor(() => expect(branchLabel()).toMatch(/^worktree-[0-9a-f]{8}$/));
 
     // Leave the composer (draft preserved), turn the global default off, come
@@ -1008,9 +1032,9 @@ describe("NewChatLandingScreen global always-use-worktree default", () => {
     // retraction effect must clear it now that the default is off.
     first.unmount();
     localStorage.removeItem(ALWAYS_WORKTREE_KEY);
-    render(<NewChatLandingScreen />, { wrapper: Wrapper });
+    renderLanding();
 
-    await waitFor(() => expect(branchLabel()).toContain("Worktree"));
+    await waitFor(() => expect(branchLabel()).toBe("New worktree"));
     const body = await submitAndReadBody();
     expect(body.workspace).toBe(REPO);
     expect(body.git).toBeUndefined();

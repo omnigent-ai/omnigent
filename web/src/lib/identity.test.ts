@@ -209,6 +209,45 @@ describe("authenticatedFetch", () => {
   });
 
   describe("slice-key routing (host sharding)", () => {
+    it.each([
+      {
+        query: "host_id=host_target&harness=claude-native&path=%2Frepo",
+        mode: "host",
+        expected: "host_target",
+      },
+      { query: "session_id=session-a", mode: "known", expected: "host_target" },
+      { query: "session_id=session-a", mode: "resolve", expected: "host_target" },
+      { query: "session_id=session-a", mode: "unknown", expected: null },
+    ])(
+      "routes unified skill discovery to its own host ($mode)",
+      async ({ query, mode, expected }) => {
+        vi.doUnmock("./sessionHost");
+        const { setSessionHost } = await import("./sessionHost");
+        setSessionHost("other-a", "host_modal");
+        setSessionHost("other-b", "host_modal");
+        if (mode === "known") setSessionHost("session-a", "host_target");
+        vi.doMock("./host", () => ({
+          getOmnigentHostConfig: vi.fn(() => ({ fetcher: () => fetch })),
+          hostFetch: fetchMock,
+          isDatabricksWorkspace: vi.fn(() => true),
+        }));
+        const { authenticatedFetch, setSessionHostResolver } = await import("./identity");
+        const resolve = vi.fn(async (sessionId: string) => {
+          if (mode === "resolve") setSessionHost(sessionId, "host_target");
+        });
+        setSessionHostResolver(resolve);
+        fetchMock.mockResolvedValueOnce(mockJsonResponse({ skills: [] }));
+        await authenticatedFetch(`/api/2.0/omnigent/v1/skills?${query}`);
+        const headers = new Headers((fetchMock.mock.calls[0][1] as RequestInit).headers);
+        expect(headers.get("X-Databricks-Omnigent-Slice-Key")).toBe(expected);
+        if (mode === "resolve" || mode === "unknown") {
+          expect(resolve).toHaveBeenCalledExactlyOnceWith("session-a");
+        } else {
+          expect(resolve).not.toHaveBeenCalled();
+        }
+      },
+    );
+
     it("stamps X-Databricks-Omnigent-Slice-Key on host-scoped URLs", async () => {
       // Mock sessionHost module before importing identity
       vi.doMock("./sessionHost", () => ({
@@ -312,6 +351,40 @@ describe("authenticatedFetch", () => {
       const secondHeaders = new Headers(secondInit.headers);
       expect(secondHeaders.get("X-Databricks-Omnigent-Slice-Key")).toBeNull();
       expect(response.status).toBe(200);
+    });
+
+    it("keys /v1/imports/local by its body host_id, not the modal host", async () => {
+      // The import reads the CHOSEN host's transcripts over that host's tunnel,
+      // so it must route to the replica keyed by the body host_id — never the
+      // importing user's modal host (a different host, or null for a fresh user),
+      // which would land off-replica and 409 "host is not connected".
+      vi.doMock("./sessionHost", () => ({
+        getSessionHost: vi.fn(() => null),
+        setSessionHost: vi.fn(),
+        isHostKeyless: vi.fn(() => false),
+        markHostKeyless: vi.fn(),
+        clearHostKeyless: vi.fn(),
+        modalHostId: vi.fn(() => "host_modal"),
+        resolveModalHost: vi.fn(),
+        isModalHostResolved: vi.fn(() => true),
+      }));
+      vi.doMock("./host", () => ({
+        getOmnigentHostConfig: vi.fn(() => ({ fetcher: () => fetch })),
+        hostFetch: fetchMock,
+        isDatabricksWorkspace: vi.fn(() => true),
+      }));
+
+      fetchMock.mockResolvedValueOnce(mockJsonResponse({}));
+      const { authenticatedFetch } = await import("./identity");
+
+      await authenticatedFetch("/v1/imports/local/stream", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ host_id: "host_target", source: "all", limit: 5 }),
+      });
+
+      const headers = new Headers((fetchMock.mock.calls[0][1] as RequestInit).headers);
+      expect(headers.get("X-Databricks-Omnigent-Slice-Key")).toBe("host_target");
     });
   });
 });

@@ -69,6 +69,11 @@ describe("KeyboardShortcutsList composer rows", () => {
 });
 
 describe("KeyboardShortcutsDialog", () => {
+  it("advertises the session-search chord without taking the Print shortcut", () => {
+    render(<KeyboardShortcutsList />);
+    expect(keysFor("Find a session by name")).toEqual(["Ctrl", "Alt", "S"]);
+  });
+
   it("renders nothing until opened", () => {
     render(<KeyboardShortcutsDialog />);
     expect(screen.queryByText("Send message")).toBeNull();
@@ -84,8 +89,11 @@ describe("KeyboardShortcutsDialog", () => {
     expect(screen.getByText("Open command palette")).toBeTruthy();
     expect(screen.getByText("Show keyboard shortcuts")).toBeTruthy();
     expect(screen.getByText("Send message")).toBeTruthy();
+    expect(keysFor("Open model picker")).toEqual(["Ctrl", "⇧", "M"]);
     expect(screen.getByText("Recall previous prompt")).toBeTruthy();
     expect(screen.getByText("Previous session")).toBeTruthy();
+    expect(keysFor("Previous session")).toEqual(["Ctrl", "["]);
+    expect(keysFor("Next session")).toEqual(["Ctrl", "]"]);
     expect(screen.getByText("Toggle conversations sidebar")).toBeTruthy();
     expect(screen.getByText("Open a new shell")).toBeTruthy();
     expect(screen.getByText("Navigate suggestions")).toBeTruthy();

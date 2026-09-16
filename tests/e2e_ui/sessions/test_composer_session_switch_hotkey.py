@@ -1,24 +1,21 @@
-"""E2E: Cmd/Ctrl+Arrow switches sessions, composer focus included.
+"""E2E: Cmd/Ctrl+bracket switches sessions, composer focus included.
 
 ``useSessionSwitchHotkey`` (window keydown) steps the sidebar's ordered
-sessions on Cmd/Ctrl+Up/Down. It used to bail whenever the keydown target sat
-in an editable field, which killed the chord in the composer — the one place
-users spend their time, and the exact case the hotkey was meant to serve (the
-composer already declines modified arrows so this window hook can have them).
-It now yields on ``defaultPrevented`` instead, so a widget that genuinely
-claimed the chord for its own list navigation still wins.
+sessions on Cmd/Ctrl+[ and Cmd/Ctrl+]. Brackets carry no composer caret
+behavior, so the global shortcut can work while a draft is focused. Terminals
+and Monaco remain excluded because they own these chords.
 
 This exercises the contract through the real chain the unit tests mock out:
 live session list -> sidebar render order -> window keydown handler ->
 client-side navigation to ``/c/{id}``.
 
-- ``test_ctrl_arrow_switches_session_from_focused_composer``: focus the
-  composer, leave a draft, press Ctrl+Down, and assert the route moved, the
+- ``test_command_bracket_switches_session_from_focused_composer``: focus the
+  composer, leave a draft, press Command/Ctrl+], and assert the route moved, the
   inactive row gains its draft indicator, and the draft survives the round
   trip. A regression that restored the editable-field guard would stay put
   here.
-- ``test_ctrl_arrow_still_switches_session_from_body_focus``: blur the
-  composer so the keydown targets the body, press Ctrl+Down, and assert the
+- ``test_command_bracket_still_switches_session_from_body_focus``: blur the
+  composer so the keydown targets the body, press Command/Ctrl+], and assert the
   route leaves the current session.
 
 No LLM turn is needed — pure client-side keyboard + routing — so this skips the
@@ -28,6 +25,8 @@ sidebar's "Sessions" group, so both are in the hotkey's ordered list.
 """
 
 from __future__ import annotations
+
+import sys
 
 import httpx
 from playwright.sync_api import Page, expect
@@ -45,11 +44,11 @@ def _set_title(base_url: str, session_id: str, title: str) -> None:
     resp.raise_for_status()
 
 
-def test_ctrl_arrow_switches_session_from_focused_composer(
+def test_command_bracket_switches_session_from_focused_composer(
     page: Page,
     seeded_session_pair: tuple[str, str, str],
 ) -> None:
-    """Typing in the composer, then Ctrl+↓, still moves to another session."""
+    """Typing in the composer, then Command/Ctrl+], moves to another session."""
     base_url, session_a, session_b = seeded_session_pair
     _set_title(base_url, session_a, "e2e-switch-a")
     _set_title(base_url, session_b, "e2e-switch-b")
@@ -72,9 +71,17 @@ def test_ctrl_arrow_switches_session_from_focused_composer(
     # row does not need a redundant draft marker.
     expect(draft_indicator).to_have_count(0)
 
+    # The non-platform modifier must not navigate (Control on macOS, Meta
+    # elsewhere), and holding both modifiers must not bypass that exclusivity.
+    wrong_modifier = "Control" if sys.platform == "darwin" else "Meta"
+    page.keyboard.press(f"{wrong_modifier}+BracketRight")
+    assert page.url == f"{base_url}/c/{session_a}"
+    page.keyboard.press("Meta+Control+BracketRight")
+    assert page.url == f"{base_url}/c/{session_a}"
+
     # ControlOrMeta maps to the real platform modifier (Cmd on macOS, Ctrl
-    # elsewhere); CI runs Linux chromium, so this is Ctrl+Down.
-    page.keyboard.press("ControlOrMeta+ArrowDown")
+    # elsewhere); CI runs Linux chromium, so this is Ctrl+].
+    page.keyboard.press("ControlOrMeta+BracketRight")
 
     # Assert "switched away" rather than a hard-coded target: the suite shares
     # one server, so the sidebar may hold sessions beyond this pair.
@@ -88,7 +95,7 @@ def test_ctrl_arrow_switches_session_from_focused_composer(
     # Drafts are per-session, so the composer we landed on is a different one;
     # stepping back restores the draft, proving the chord navigated rather than
     # clobbering composer state.
-    page.keyboard.press("ControlOrMeta+ArrowUp")
+    page.keyboard.press("ControlOrMeta+BracketLeft")
     expect(page).to_have_url(f"{base_url}/c/{session_a}", timeout=10_000)
     expect(page.get_by_placeholder(_COMPOSER)).to_have_value(
         "an unsent draft that must survive the switch"
@@ -96,11 +103,11 @@ def test_ctrl_arrow_switches_session_from_focused_composer(
     expect(draft_indicator).to_have_count(0)
 
 
-def test_ctrl_arrow_still_switches_session_from_body_focus(
+def test_command_bracket_still_switches_session_from_body_focus(
     page: Page,
     seeded_session_pair: tuple[str, str, str],
 ) -> None:
-    """With focus outside the composer, Ctrl+↓ still steps to a neighbor."""
+    """With focus outside the composer, Command/Ctrl+] steps to a neighbor."""
     base_url, session_a, session_b = seeded_session_pair
     _set_title(base_url, session_a, "e2e-switch-a")
     _set_title(base_url, session_b, "e2e-switch-b")
@@ -119,7 +126,7 @@ def test_ctrl_arrow_still_switches_session_from_body_focus(
 
     # Dispatch the chord at the body; the keydown bubbles to the window hook
     # and we navigate to a neighbor.
-    page.locator("body").press("ControlOrMeta+ArrowDown")
+    page.locator("body").press("ControlOrMeta+BracketRight")
 
     # Assert we left session_a for another /c/ route. We check "switched away"
     # rather than a hard-coded target id: the suite shares one server across

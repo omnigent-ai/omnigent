@@ -327,6 +327,16 @@ def test_configured_harness_map_covers_all_spellings(
         # Native Kiro (``omni kiro``) — gates on the kiro-cli binary.
         "kiro-native",
         "native-kiro",
+        # Native Devin (``omni devin``) — gates on the devin binary. The bare
+        # ``devin`` spelling canonicalizes onto ``devin-native``, so it is
+        # covered too; Devin's ACP row is keyed ``devin-acp`` and gates on the
+        # same binary through the catalog.
+        "devin",
+        "devin-native",
+        # The retired builtin ACP id still resolves (aliased onto the native
+        # wrap), so a consumer holding it must get a real answer, not "unknown".
+        "devin-acp",
+        "native-devin",
         # Goose — native TUI (``omni goose``) + headless ACP harness; both gate
         # on the goose CLI.
         "goose",
@@ -480,7 +490,7 @@ def test_configured_harness_map_all_true_with_clis(
 
     _all_clis_installed(monkeypatch)
     monkeypatch.setattr(
-        "omnigent.codex_native._codex_auth_unavailable_reason",
+        "omnigent.harnesses.codex_native.main._codex_auth_unavailable_reason",
         lambda: None,
     )
     monkeypatch.setenv("CURSOR_API_KEY", "crsr_ready")
@@ -513,7 +523,7 @@ def test_configured_harness_map_probes_codex_readiness_once(
         return "needs-auth"
 
     monkeypatch.setattr(
-        "omnigent.codex_native._codex_auth_unavailable_reason",
+        "omnigent.harnesses.codex_native.main._codex_auth_unavailable_reason",
         _codex_reason,
     )
 

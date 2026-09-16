@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 from pathlib import Path
 
 import pytest
 
-from omnigent import codex_native_bridge
-from omnigent.codex_native_bridge import (
+from omnigent.harnesses.codex_native import bridge as codex_native_bridge
+from omnigent.harnesses.codex_native.bridge import (
     CodexNativeBridgeState,
     cancel_pending_mcp_startup,
     clear_active_turn_id_if_matches,
@@ -21,7 +22,9 @@ from omnigent.codex_native_bridge import (
     prepare_bridge_dir,
     read_bridge_startup_error,
     read_bridge_state,
+    read_codex_config_effort,
     read_codex_config_model,
+    read_codex_home_config_effort,
     read_codex_home_config_model,
     read_mcp_startup,
     read_policy_hook_config,
@@ -30,6 +33,7 @@ from omnigent.codex_native_bridge import (
     update_mcp_server_startup,
     write_bridge_startup_error,
     write_bridge_state,
+    write_codex_config_effort,
     write_codex_config_model,
     write_policy_hook_config,
 )
@@ -48,7 +52,12 @@ def test_codex_mcp_config_overrides_isolate_the_bridge_interpreter(tmp_path: Pat
 
     prefix = "mcp_servers.omnigent.args="
     raw = next(o[len(prefix) :] for o in overrides if o.startswith(prefix))
-    assert json.loads(raw)[:4] == ["-I", "-m", "omnigent.claude_native_bridge", "serve-mcp"]
+    assert json.loads(raw)[:4] == [
+        "-I",
+        "-m",
+        "omnigent.harnesses.claude_native.bridge",
+        "serve-mcp",
+    ]
 
 
 def _seed_active_turn(bridge_dir: Path, active_turn_id: str | None) -> None:
@@ -97,7 +106,9 @@ def bridge_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     :param monkeypatch: pytest monkeypatch fixture.
     :returns: Prepared bridge directory.
     """
-    monkeypatch.setattr("omnigent.codex_native_bridge._BRIDGE_ROOT", tmp_path / "codex-native")
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", tmp_path / "codex-native"
+    )
     return prepare_bridge_dir("bridge_test")
 
 
@@ -156,6 +167,43 @@ def test_read_codex_config_model_none_when_unparsable(bridge_dir: Path) -> None:
     assert read_codex_config_model(bridge_dir) is None
 
 
+def test_read_codex_config_effort_returns_top_level_effort(bridge_dir: Path) -> None:
+    """The top-level ``model_reasoning_effort`` key (what /model writes) is returned.
+
+    This is the forwarder's source of truth for the effort the terminal runs
+    at; if it returned the wrong key or ``None``, an in-TUI effort change
+    would never mirror to the chat composer.
+    """
+    _write_config(bridge_dir, 'model = "gpt-5.4"\nmodel_reasoning_effort = "high"\n')
+
+    assert read_codex_config_effort(bridge_dir) == "high"
+
+
+def test_read_codex_home_config_effort_reads_a_codex_home_directly(bridge_dir: Path) -> None:
+    """A ``CODEX_HOME`` path yields the same effort as the bridge-dir reader."""
+    _write_config(bridge_dir, 'model_reasoning_effort = "low"\n')
+
+    assert read_codex_home_config_effort(codex_home_for_bridge_dir(bridge_dir)) == "low"
+
+
+def test_read_codex_config_effort_none_when_missing_or_absent(bridge_dir: Path) -> None:
+    """No file, no key, or a non-string value → ``None`` (no invented effort)."""
+    assert read_codex_config_effort(bridge_dir) is None
+
+    _write_config(bridge_dir, 'model = "gpt-5.4"\n')
+    assert read_codex_config_effort(bridge_dir) is None
+
+    _write_config(bridge_dir, "model_reasoning_effort = 3\n")
+    assert read_codex_config_effort(bridge_dir) is None
+
+
+def test_read_codex_config_effort_none_when_unparsable(bridge_dir: Path) -> None:
+    """Malformed TOML → ``None``, not a crash (guards a partial write)."""
+    _write_config(bridge_dir, 'model_reasoning_effort = "high\n[broken')
+
+    assert read_codex_config_effort(bridge_dir) is None
+
+
 def test_write_codex_config_model_replaces_top_level_key(bridge_dir: Path) -> None:
     """The existing top-level ``model`` line is replaced, sections untouched.
 
@@ -190,6 +238,145 @@ def test_write_codex_config_model_creates_missing_file(bridge_dir: Path) -> None
     """No codex-home/config.toml yet → the writer creates it (best-effort)."""
     assert write_codex_config_model(bridge_dir, "gpt-5.6-luna") is True
     assert read_codex_config_model(bridge_dir) == "gpt-5.6-luna"
+
+
+def test_write_codex_config_effort_replaces_top_level_key(bridge_dir: Path) -> None:
+    """The existing top-level ``model_reasoning_effort`` line is replaced.
+
+    An Omnigent-initiated effort change (web composer gear) must land on the
+    same key an in-TUI ``/model`` writes, or a fresh forwarder state (thread
+    resume / reconnect) re-reads the stale launch effort and mirrors it back,
+    silently reverting the composer's pick.
+    """
+    _write_config(
+        bridge_dir,
+        'model = "gpt-5.5"\n'
+        'model_reasoning_effort = "medium"\n'
+        "[model_providers.databricks]\n"
+        'model_reasoning_effort = "section-effort-not-touched"\n',
+    )
+
+    assert write_codex_config_effort(bridge_dir, "high") is True
+    assert read_codex_config_effort(bridge_dir) == "high"
+    body = (codex_home_for_bridge_dir(bridge_dir) / "config.toml").read_text()
+    assert 'model_reasoning_effort = "section-effort-not-touched"' in body
+    assert 'model = "gpt-5.5"' in body
+
+
+def test_write_codex_config_effort_inserts_when_absent(bridge_dir: Path) -> None:
+    """A config with no top-level effort key gains one at the top."""
+    _write_config(bridge_dir, 'model = "gpt-5.5"\n')
+
+    assert write_codex_config_effort(bridge_dir, "low") is True
+    assert read_codex_config_effort(bridge_dir) == "low"
+    assert read_codex_config_model(bridge_dir) == "gpt-5.5"
+
+
+def test_write_codex_config_effort_creates_missing_file(bridge_dir: Path) -> None:
+    """No codex-home/config.toml yet → the writer creates it (best-effort)."""
+    assert write_codex_config_effort(bridge_dir, "high") is True
+    assert read_codex_config_effort(bridge_dir) == "high"
+
+
+def test_write_codex_config_effort_replaces_key_after_multiline_array(bridge_dir: Path) -> None:
+    """A top-level multiline array must not end the top-level scan early.
+
+    Its continuation lines can begin with ``[`` (nested arrays); mistaking one
+    for a table header would miss the existing effort key below the array and
+    insert a duplicate at the top — invalid TOML that ``tomllib`` (and codex
+    itself) reject, corrupting the mirror rather than just staling it.
+    """
+    # The continuation line sits at column 0 — valid TOML, and the shape a
+    # naive ``startswith("[")`` break mistakes for a table header.
+    _write_config(
+        bridge_dir,
+        "notify = [\n"
+        '["notify-send", "Codex"],\n'
+        "]\n"
+        'model = "gpt-5.5"\n'
+        'model_reasoning_effort = "medium"\n',
+    )
+
+    assert write_codex_config_effort(bridge_dir, "high") is True
+    assert read_codex_config_effort(bridge_dir) == "high"
+    body = (codex_home_for_bridge_dir(bridge_dir) / "config.toml").read_text()
+    assert body.count("model_reasoning_effort") == 1
+
+
+def test_write_codex_config_model_replaces_key_after_multiline_array(bridge_dir: Path) -> None:
+    """The model writer shares the array-aware scan (same duplicate-key hazard)."""
+    _write_config(
+        bridge_dir,
+        'notify = [\n["notify-send", "Codex"],\n]\nmodel = "databricks-gpt-5-5"\n',
+    )
+
+    assert write_codex_config_model(bridge_dir, "gpt-5.6-luna") is True
+    assert read_codex_config_model(bridge_dir) == "gpt-5.6-luna"
+    body = (codex_home_for_bridge_dir(bridge_dir) / "config.toml").read_text()
+    assert len([line for line in body.splitlines() if line.startswith("model =")]) == 1
+
+
+def test_write_codex_config_effort_replaces_key_after_bracket_in_string(bridge_dir: Path) -> None:
+    """Brackets inside string values/comments must not derail the upsert.
+
+    A line-scanning heuristic that counts brackets sees the lone ``[`` in
+    ``notify = ["["]`` as an unclosed array and skips every following key,
+    inserting a duplicate — invalid TOML. The tomlkit-based upsert parses the
+    document, so string/comment content cannot be mistaken for structure.
+    """
+    _write_config(
+        bridge_dir,
+        'notify = ["["]\n'
+        'model = "gpt-5.5"  # experimental [beta\n'
+        'model_reasoning_effort = "medium"\n',
+    )
+
+    assert write_codex_config_effort(bridge_dir, "high") is True
+    assert read_codex_config_effort(bridge_dir) == "high"
+    body = (codex_home_for_bridge_dir(bridge_dir) / "config.toml").read_text()
+    assert body.count("model_reasoning_effort") == 1
+    # The style-preserving rewrite keeps unrelated lines (and comments) intact.
+    assert 'notify = ["["]' in body
+    assert "# experimental [beta" in body
+
+
+def test_write_codex_config_model_clamps_stale_effort_for_capped_model(bridge_dir: Path) -> None:
+    """Switching onto a capped model clamps a too-high stale effort line.
+
+    The switched-to thread inherits config.toml's effort; one above the new
+    model's ladder would 400 the next turn, so the model write clamps it.
+    """
+    _write_config(bridge_dir, 'model = "gpt-5.5"\nmodel_reasoning_effort = "xhigh"\n')
+
+    assert write_codex_config_model(bridge_dir, "databricks-glm-5-2") is True
+    assert read_codex_config_model(bridge_dir) == "databricks-glm-5-2"
+    assert read_codex_config_effort(bridge_dir) == "medium"
+
+
+def test_write_codex_config_model_replaces_quoted_key(bridge_dir: Path) -> None:
+    """A quoted top-level ``"model"`` key is the same key — replaced, not duplicated."""
+    _write_config(bridge_dir, '"model" = "databricks-gpt-5-5"\n')
+
+    assert write_codex_config_model(bridge_dir, "gpt-5.6-luna") is True
+    assert read_codex_config_model(bridge_dir) == "gpt-5.6-luna"
+
+
+def test_write_codex_config_effort_false_on_undecodable_or_malformed_file(
+    bridge_dir: Path,
+) -> None:
+    """Undecodable or malformed files → ``False`` (best-effort), never made worse."""
+    home = codex_home_for_bridge_dir(bridge_dir)
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.toml").write_bytes(b"\xff\xfe\x00broken")
+
+    assert write_codex_config_effort(bridge_dir, "high") is False
+    assert write_codex_config_model(bridge_dir, "gpt-5.6-luna") is False
+
+    # Malformed TOML (e.g. a torn partial write) is refused rather than
+    # rewritten into something even a lenient reader cannot recover.
+    (home / "config.toml").write_text('model_reasoning_effort = "high\n[broken')
+    assert write_codex_config_effort(bridge_dir, "high") is False
+    assert write_codex_config_model(bridge_dir, "gpt-5.6-luna") is False
 
 
 def test_policy_hook_config_round_trips(bridge_dir: Path) -> None:
@@ -476,46 +663,204 @@ def test_prepare_bridge_dir_writes_owner_pid_marker(
     prune the dir only when its owner is provably dead."""
     import os
 
-    from omnigent.codex_native_bridge import prepare_bridge_dir
+    from omnigent.harnesses.codex_native.bridge import prepare_bridge_dir
 
-    monkeypatch.setattr("omnigent.codex_native_bridge._BRIDGE_ROOT", tmp_path / "codex-native")
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", tmp_path / "codex-native"
+    )
 
     bridge_dir = prepare_bridge_dir("bridge_owner")
 
     assert (bridge_dir / "owner.pid").read_text(encoding="utf-8").strip() == str(os.getpid())
 
 
-def test_prune_orphaned_bridge_dirs_only_removes_dead_owners(
+def test_prune_orphaned_bridge_dirs_retains_recent_dead_owner_bridge(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Prune removes only provably-dead-owner dirs; live and unmarked survive."""
-    import os
-    import subprocess
-    import sys
-
-    from omnigent.codex_native_bridge import prune_orphaned_bridge_dirs
-
+    """Recent dead-owner bridges remain fully intact during the grace period."""
     root = tmp_path / "codex-native"
     root.mkdir(parents=True)
-    monkeypatch.setattr("omnigent.codex_native_bridge._BRIDGE_ROOT", root)
+    monkeypatch.setattr("omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", root)
+    monkeypatch.setattr("omnigent.inner.terminal._process_alive", lambda _pid: False)
+    now = 2_000_000_000.0
+    monkeypatch.setattr(codex_native_bridge.time, "time", lambda: now)
 
-    dead = subprocess.Popen([sys.executable, "-c", "pass"])
-    dead.wait()
     dead_dir = root / "deadowner"
     dead_dir.mkdir()
-    (dead_dir / "owner.pid").write_text(str(dead.pid), encoding="utf-8")
+    owner_marker = dead_dir / "owner.pid"
+    owner_marker.write_text("999999", encoding="utf-8")
+    rollout = (
+        dead_dir
+        / "codex-home"
+        / "sessions"
+        / "2026"
+        / "09"
+        / "09"
+        / "rollout-2026-09-09T00-00-00-thread.jsonl"
+    )
+    rollout.parent.mkdir(parents=True)
+    rollout.write_text('{"type":"session_meta"}\n', encoding="utf-8")
+    bridge_config = dead_dir / "bridge.json"
+    bridge_config.write_text("secret", encoding="utf-8")
+    policy_config = dead_dir / "policy_hook.json"
+    policy_config.write_text("secret", encoding="utf-8")
+    ephemeral_dir = dead_dir / "mcp-runtime"
+    ephemeral_dir.mkdir()
+    runtime_token = ephemeral_dir / "token"
+    runtime_token.write_text("secret", encoding="utf-8")
+    os.utime(owner_marker, (now - 60, now - 60))
+
+    def _unexpected_walk(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("recent owner activity should skip rollout scanning")
+
+    monkeypatch.setattr(codex_native_bridge.os, "walk", _unexpected_walk)
+
+    assert codex_native_bridge.prune_orphaned_bridge_dirs() == 0
+    assert owner_marker.read_text(encoding="utf-8") == "999999"
+    assert rollout.read_text(encoding="utf-8") == '{"type":"session_meta"}\n'
+    assert bridge_config.read_text(encoding="utf-8") == "secret"
+    assert policy_config.read_text(encoding="utf-8") == "secret"
+    assert runtime_token.read_text(encoding="utf-8") == "secret"
+
+
+def test_prune_orphaned_bridge_dirs_removes_expired_bridge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dead-owner bridge inactive for 7 days is removed wholesale."""
+    root = tmp_path / "codex-native"
+    root.mkdir(parents=True)
+    monkeypatch.setattr("omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", root)
+    monkeypatch.setattr("omnigent.inner.terminal._process_alive", lambda _pid: False)
+    now = 2_000_000_000.0
+    monkeypatch.setattr(codex_native_bridge.time, "time", lambda: now)
+
+    dead_dir = root / "deadowner"
+    rollout = (
+        dead_dir
+        / "codex-home"
+        / "sessions"
+        / "2026"
+        / "09"
+        / "09"
+        / "rollout-2026-09-09T00-00-00-thread.jsonl"
+    )
+    rollout.parent.mkdir(parents=True)
+    rollout.write_text('{"type":"session_meta"}\n', encoding="utf-8")
+    unrelated_jsonl = rollout.parent / "metadata.jsonl"
+    unrelated_jsonl.write_text('{"recent":true}\n', encoding="utf-8")
+    owner_marker = dead_dir / "owner.pid"
+    owner_marker.write_text("999999", encoding="utf-8")
+    (dead_dir / "bridge.json").write_text("secret", encoding="utf-8")
+    expired_at = now - codex_native_bridge._ORPHAN_RETENTION_SECONDS
+    for activity_path in (owner_marker, rollout):
+        os.utime(activity_path, (expired_at, expired_at))
+    os.utime(unrelated_jsonl, (now - 60, now - 60))
+
+    assert codex_native_bridge.prune_orphaned_bridge_dirs() == 1
+    assert not dead_dir.exists()
+
+
+def test_prune_orphaned_bridge_dirs_uses_latest_rollout_activity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A recent rollout keeps a bridge whose launch and owner marker are old."""
+    root = tmp_path / "codex-native"
+    root.mkdir(parents=True)
+    monkeypatch.setattr("omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", root)
+    monkeypatch.setattr("omnigent.inner.terminal._process_alive", lambda _pid: False)
+    now = 2_000_000_000.0
+    monkeypatch.setattr(codex_native_bridge.time, "time", lambda: now)
+
+    dead_dir = root / "deadowner"
+    rollout = (
+        dead_dir
+        / "codex-home"
+        / "sessions"
+        / "2026"
+        / "09"
+        / "09"
+        / "rollout-2026-09-09T00-00-00-thread.jsonl"
+    )
+    rollout.parent.mkdir(parents=True)
+    rollout.write_text('{"type":"session_meta"}\n', encoding="utf-8")
+    owner_marker = dead_dir / "owner.pid"
+    owner_marker.write_text("999999", encoding="utf-8")
+    expired_at = now - codex_native_bridge._ORPHAN_RETENTION_SECONDS - 1
+    os.utime(owner_marker, (expired_at, expired_at))
+    os.utime(rollout, (now - 60, now - 60))
+
+    assert codex_native_bridge.prune_orphaned_bridge_dirs() == 0
+    assert dead_dir.exists()
+    assert rollout.exists()
+
+
+def test_prune_orphaned_bridge_dirs_retains_bridge_when_rollout_scan_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An incomplete rollout scan fails closed instead of deleting the bridge."""
+    root = tmp_path / "codex-native"
+    root.mkdir(parents=True)
+    monkeypatch.setattr("omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", root)
+    monkeypatch.setattr("omnigent.inner.terminal._process_alive", lambda _pid: False)
+    now = 2_000_000_000.0
+    monkeypatch.setattr(codex_native_bridge.time, "time", lambda: now)
+
+    dead_dir = root / "deadowner"
+    sessions_dir = dead_dir / "codex-home" / "sessions"
+    sessions_dir.mkdir(parents=True)
+    owner_marker = dead_dir / "owner.pid"
+    owner_marker.write_text("999999", encoding="utf-8")
+    expired_at = now - codex_native_bridge._ORPHAN_RETENTION_SECONDS - 1
+    os.utime(owner_marker, (expired_at, expired_at))
+
+    def _failed_walk(
+        _root: Path,
+        *,
+        onerror: object,
+    ) -> list[tuple[str, list[str], list[str]]]:
+        assert callable(onerror)
+        onerror(PermissionError("rollout directory unreadable"))
+        return []
+
+    monkeypatch.setattr(codex_native_bridge.os, "walk", _failed_walk)
+
+    assert codex_native_bridge.prune_orphaned_bridge_dirs() == 0
+    assert dead_dir.exists()
+
+
+def test_prune_orphaned_bridge_dirs_keeps_live_and_unmarked_bridges(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Live-owner and unmarked bridges remain even when old."""
+    root = tmp_path / "codex-native"
+    root.mkdir(parents=True)
+    monkeypatch.setattr("omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", root)
+    monkeypatch.setattr("omnigent.inner.terminal._process_alive", lambda pid: pid == os.getpid())
+    now = 2_000_000_000.0
+    monkeypatch.setattr(codex_native_bridge.time, "time", lambda: now)
+    expired_at = now - codex_native_bridge._ORPHAN_RETENTION_SECONDS - 1
+
+    dead_dir = root / "deadowner"
+    dead_dir.mkdir()
+    dead_marker = dead_dir / "owner.pid"
+    dead_marker.write_text("999999", encoding="utf-8")
+    os.utime(dead_marker, (expired_at, expired_at))
 
     live_dir = root / "liveowner"
     live_dir.mkdir()
-    (live_dir / "owner.pid").write_text(str(os.getpid()), encoding="utf-8")
+    live_marker = live_dir / "owner.pid"
+    live_marker.write_text(str(os.getpid()), encoding="utf-8")
+    os.utime(live_marker, (expired_at, expired_at))
 
     unmarked_dir = root / "unmarked"
     unmarked_dir.mkdir()
 
-    pruned = prune_orphaned_bridge_dirs()
-
-    assert pruned == 1
+    assert codex_native_bridge.prune_orphaned_bridge_dirs() == 1
     assert not dead_dir.exists()
     assert live_dir.exists()
     assert unmarked_dir.exists()

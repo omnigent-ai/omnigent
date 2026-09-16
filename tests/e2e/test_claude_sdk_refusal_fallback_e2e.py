@@ -34,6 +34,7 @@ Usage::
 
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import tarfile
@@ -121,7 +122,7 @@ def _register_claude_sdk_agent(
 def test_claude_sdk_refusal_fallback_routes_to_served_model(
     http_client: httpx.Client,
     live_runner_id: str,
-    mock_llm_server_url: str,
+    isolated_mock_llm_server_url: str,
 ) -> None:
     """A safeguard refusal on claude-sdk falls back to the served Opus id.
 
@@ -133,62 +134,69 @@ def test_claude_sdk_refusal_fallback_routes_to_served_model(
     turn re-issues on a served model and completes instead of dying on a
     canonical id the gateway rejects.
     """
-    reset_mock_llm(mock_llm_server_url)
+    reset_mock_llm(isolated_mock_llm_server_url)
     # What the gateway serves: the executor lists this once per session and
     # pins each family alias to it.
-    set_mock_served_models(mock_llm_server_url, _SERVED_MODELS)
+    set_mock_served_models(isolated_mock_llm_server_url, _SERVED_MODELS)
     agent_name = _register_claude_sdk_agent(
         http_client,
         name=f"refusal-fb-{uuid.uuid4().hex[:6]}",
         model=_LAUNCH_MODEL,
-        mock_llm_base_url=mock_llm_server_url,
+        mock_llm_base_url=isolated_mock_llm_server_url,
     )
     # The Fable turn is refused (cyber). The Opus re-issue and any preflight
     # calls fall through to the queue default (a plain text answer), so the
     # turn can complete once the fallback lands on a served model.
     configure_mock_llm(
-        mock_llm_server_url,
+        isolated_mock_llm_server_url,
         [{"refusal_category": "cyber"}],
         key=_LAUNCH_MODEL,
     )
     session_id = create_runner_bound_session(
         http_client, agent_name=agent_name, runner_id=live_runner_id
     )
-    response_id = send_user_message_to_session(
-        http_client,
-        session_id=session_id,
-        content="Please greet me.",
-    )
-    body = poll_session_until_terminal(
-        http_client, session_id=session_id, response_id=response_id, timeout=180
-    )
+    try:
+        response_id = send_user_message_to_session(
+            http_client,
+            session_id=session_id,
+            content="Please greet me.",
+        )
+        body = poll_session_until_terminal(
+            http_client, session_id=session_id, response_id=response_id, timeout=180
+        )
 
-    reqs = get_mock_requests(mock_llm_server_url)
-    wire_models = [req.get("model") for req in reqs]
+        reqs = get_mock_requests(isolated_mock_llm_server_url)
+        wire_models = [req.get("model") for req in reqs]
 
-    # The launch turn ran on Fable and was refused — the precondition.
-    assert _LAUNCH_MODEL in wire_models, (
-        f"the launch model {_LAUNCH_MODEL!r} never reached the wire; models seen: {wire_models}"
-    )
-    # The refusal-fallback re-issued on the gateway's spelling of the older
-    # Opus its route table names. Without the canonical rewrites the CLI sends
-    # the bare canonical id, the gateway rejects it, and no such request lands.
-    assert _SERVED_FALLBACK_MODEL in wire_models, (
-        f"the refusal-fallback did not re-issue on the served Opus id "
-        f"{_SERVED_FALLBACK_MODEL!r} — the canonical id Claude Code names was "
-        f"not rewritten to this gateway's spelling, so the fallback request "
-        f"named a model the gateway rejects. Models seen: {wire_models}"
-    )
-    # No canonical spelling ever reached the wire: the rewrite happened before
-    # the request, rather than the gateway happening to tolerate a vendor id.
-    canonical_leaks = [
-        model for model in wire_models if isinstance(model, str) and model.startswith("claude-")
-    ]
-    assert not canonical_leaks, (
-        f"canonical vendor ids reached the gateway unrewritten: {canonical_leaks}"
-    )
-    # And the turn completed rather than dying with the model_not_found error.
-    assert body["status"] == "completed", (
-        f"the turn did not complete after the refusal-fallback: "
-        f"status={body['status']!r} error={body.get('error')!r}"
-    )
+        # The launch turn ran on Fable and was refused — the precondition.
+        assert _LAUNCH_MODEL in wire_models, (
+            f"the launch model {_LAUNCH_MODEL!r} never reached the wire; "
+            f"models seen: {wire_models}"
+        )
+        # The refusal-fallback re-issued on the gateway's spelling of the older
+        # Opus its route table names. Without the canonical rewrites the CLI sends
+        # the bare canonical id, the gateway rejects it, and no such request lands.
+        assert _SERVED_FALLBACK_MODEL in wire_models, (
+            f"the refusal-fallback did not re-issue on the served Opus id "
+            f"{_SERVED_FALLBACK_MODEL!r} — the canonical id Claude Code names was "
+            f"not rewritten to this gateway's spelling, so the fallback request "
+            f"named a model the gateway rejects. Models seen: {wire_models}"
+        )
+        # No canonical spelling ever reached the wire: the rewrite happened before
+        # the request, rather than the gateway happening to tolerate a vendor id.
+        canonical_leaks = [
+            model
+            for model in wire_models
+            if isinstance(model, str) and model.startswith("claude-")
+        ]
+        assert not canonical_leaks, (
+            f"canonical vendor ids reached the gateway unrewritten: {canonical_leaks}"
+        )
+        # And the turn completed rather than dying with the model_not_found error.
+        assert body["status"] == "completed", (
+            f"the turn did not complete after the refusal-fallback: "
+            f"status={body['status']!r} error={body.get('error')!r}"
+        )
+    finally:
+        with contextlib.suppress(httpx.HTTPError):
+            http_client.delete(f"/v1/sessions/{session_id}", timeout=30.0)

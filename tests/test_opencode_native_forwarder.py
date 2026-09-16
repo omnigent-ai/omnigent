@@ -8,8 +8,8 @@ from typing import Any
 
 import httpx
 
-import omnigent.opencode_native_forwarder as fwd_mod
-from omnigent.opencode_native_client import OpenCodeEvent
+import omnigent.harnesses.opencode_native.forwarder as fwd_mod
+from omnigent.harnesses.opencode_native.client import OpenCodeEvent
 
 _SESSION = "ses_1"
 
