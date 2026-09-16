@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import io
 import tarfile
+import threading
 from pathlib import Path
 
 import pytest
 import yaml
 
+import omnigent.runtime.agent_cache as agent_cache_module
 from omnigent.errors import OmnigentError
 from omnigent.runtime.agent_cache import AgentCache
+from omnigent.spec import AgentSpec
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 
 # Minimal valid config.yaml for a spec_version=1 agent
@@ -68,6 +72,47 @@ def _store_bundle(
     data = _make_bundle_bytes(files)
     artifact_store.put(bundle_location, data)
     return data
+
+
+def _pause_next_extraction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[threading.Event, threading.Event]:
+    """Pause the next archive extraction until the test releases it."""
+    real_load_spec = agent_cache_module.load_spec
+    extraction_started = threading.Event()
+    release_extraction = threading.Event()
+    pause_lock = threading.Lock()
+    extraction_paused = False
+
+    def gated_load_spec(
+        source: Path | bytes,
+        *,
+        dest: Path | None = None,
+        expand_env: bool = True,
+        enforce_handler_allowlist: bool = False,
+        prune_invalid_sub_agents: bool = False,
+    ) -> AgentSpec:
+        nonlocal extraction_paused
+        with pause_lock:
+            should_pause = dest is not None and not extraction_paused
+            if should_pause:
+                extraction_paused = True
+        if should_pause:
+            assert dest is not None
+            dest.mkdir(parents=True, exist_ok=True)
+            (dest / "config.yaml").write_text("", encoding="utf-8")
+            extraction_started.set()
+            assert release_extraction.wait(timeout=10)
+        return real_load_spec(
+            source,
+            dest=dest,
+            expand_env=expand_env,
+            enforce_handler_allowlist=enforce_handler_allowlist,
+            prune_invalid_sub_agents=prune_invalid_sub_agents,
+        )
+
+    monkeypatch.setattr(agent_cache_module, "load_spec", gated_load_spec)
+    return extraction_started, release_extraction
 
 
 def test_load_cache_miss_downloads_and_extracts(
@@ -301,14 +346,14 @@ def test_cache_operations_reject_symlink_redirect(
 
 
 @pytest.mark.parametrize("target_name", ["outside", "cache-sibling", "cache/other-agent"])
-def test_replace_rejects_staging_symlink_redirect(
+def test_replace_does_not_follow_legacy_staging_symlink(
     agent_cache: AgentCache,
     artifact_store: LocalArtifactStore,
     cache_dir: Path,
     tmp_path: Path,
     target_name: str,
 ) -> None:
-    """Reject redirected staging before changing either cache tier."""
+    """Replacement scratch space never follows a predictable cache path."""
     bundle_location = "agent-1/abc123"
     bundle_bytes = _store_bundle(artifact_store, bundle_location)
     loaded = agent_cache.load("agent-1", bundle_location)
@@ -321,13 +366,12 @@ def test_replace_rejects_staging_symlink_redirect(
     except OSError:
         pytest.skip("directory symlinks are unavailable")
 
-    with pytest.raises(ValueError, match="unsafe agent id"):
-        agent_cache.replace("agent-1", bundle_location, bundle_bytes)
+    replaced = agent_cache.replace("agent-1", bundle_location, bundle_bytes)
 
     assert marker.read_text(encoding="utf-8") == "keep"
     assert (cache_dir / "agent-1_staging").is_symlink()
-    assert (loaded.workdir / "config.yaml").read_text(encoding="utf-8") == _MINIMAL_CONFIG
-    assert agent_cache.load("agent-1", bundle_location).spec is loaded.spec
+    assert replaced.workdir == loaded.workdir
+    assert agent_cache.load("agent-1", bundle_location).spec is replaced.spec
 
 
 # ── env-var expansion is gated on provenance ──────────
@@ -493,3 +537,95 @@ def test_replace_swaps_spec(
     # Subsequent load() returns the new spec from memory cache
     loaded_again = agent_cache.load("agent-5", loc_v2)
     assert loaded_again.spec is loaded_v2.spec
+
+
+@pytest.mark.parametrize("separate_instances", [False, True])
+def test_concurrent_cold_loads_never_read_an_unpublished_directory(
+    artifact_store: LocalArtifactStore,
+    cache_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    separate_instances: bool,
+) -> None:
+    """Both loaders see complete bundles, including with separate caches."""
+    bundle_location = "agent-shared/abc123"
+    _store_bundle(artifact_store, bundle_location)
+    winner_location = "agent-shared/def456"
+    _store_bundle(
+        artifact_store,
+        winner_location,
+        {"config.yaml": _MINIMAL_CONFIG.replace("test-agent", "winner")},
+    )
+    first_cache = AgentCache(artifact_store=artifact_store, cache_dir=cache_dir)
+    second_cache = (
+        AgentCache(artifact_store=artifact_store, cache_dir=cache_dir)
+        if separate_instances
+        else first_cache
+    )
+    extraction_started, release_extraction = _pause_next_extraction(monkeypatch)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(first_cache.load, "agent-shared", bundle_location)
+        assert extraction_started.wait(timeout=5)
+        second = pool.submit(second_cache.load, "agent-shared", winner_location)
+        try:
+            second_loaded = second.result(timeout=5)
+        finally:
+            release_extraction.set()
+        first_loaded = first.result()
+
+    assert first_loaded.spec.name == second_loaded.spec.name == "winner"
+    assert first_loaded.workdir == second_loaded.workdir == cache_dir / "agent-shared"
+    assert yaml.safe_load((first_loaded.workdir / "config.yaml").read_text())["name"] == "winner"
+    assert not list(cache_dir.parent.glob(f".{cache_dir.name}-staging-*"))
+
+
+def test_load_failure_cleans_unpublished_extraction(
+    artifact_store: LocalArtifactStore,
+    cache_dir: Path,
+) -> None:
+    """An invalid bundle raises normally without poisoning the disk tier."""
+    bundle_location = "invalid-agent/abc123"
+    _store_bundle(artifact_store, bundle_location, {"config.yaml": "[]"})
+    cache = AgentCache(artifact_store=artifact_store, cache_dir=cache_dir)
+
+    with pytest.raises(OmnigentError, match=r"config\.yaml must be a YAML mapping"):
+        cache.load("invalid-agent", bundle_location)
+
+    assert not (cache_dir / "invalid-agent").exists()
+    assert not any(cache_dir.iterdir())
+    assert not list(cache_dir.parent.glob(f".{cache_dir.name}-staging-*"))
+
+    _store_bundle(artifact_store, bundle_location)
+    assert cache.load("invalid-agent", bundle_location).spec.name == "test-agent"
+
+
+def test_replace_staging_does_not_collide_with_another_agent_id(
+    artifact_store: LocalArtifactStore,
+    cache_dir: Path,
+) -> None:
+    """Replacement scratch space cannot consume another agent's live cache."""
+    neighbor_location = "agent-1_staging/v1"
+    neighbor_config = yaml.dump(
+        {
+            "spec_version": 1,
+            "name": "neighbor",
+            "executor": {"type": "omnigent", "config": {"harness": "claude-sdk"}},
+        }
+    )
+    _store_bundle(
+        artifact_store,
+        neighbor_location,
+        {"config.yaml": neighbor_config},
+    )
+    cache = AgentCache(artifact_store=artifact_store, cache_dir=cache_dir)
+    cache.load("agent-1_staging", neighbor_location)
+    artifact_store.delete(neighbor_location)
+
+    agent_location = "agent-1/v1"
+    agent_bytes = _store_bundle(artifact_store, agent_location)
+    cache.load("agent-1", agent_location)
+    cache.replace("agent-1", "agent-1/v2", agent_bytes)
+
+    disk_cache = AgentCache(artifact_store=artifact_store, cache_dir=cache_dir)
+    neighbor = disk_cache.load("agent-1_staging", neighbor_location)
+    assert neighbor.spec.name == "neighbor"
