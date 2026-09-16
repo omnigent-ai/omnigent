@@ -75,7 +75,7 @@ describe("useSessionModelLabel", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it.each(["codex-native", "codex"])(
+  it.each(["codex-native", "codex", "native-codex"])(
     "names an offline %s session's Unity Catalog model from the host catalog",
     (harness) => {
       const codexScope = { ...scope, harness };

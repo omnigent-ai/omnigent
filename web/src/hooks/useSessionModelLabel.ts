@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { findNativeModelOption } from "@/lib/codexNativeModels";
 import { formatStatusModelLabel, nativeModelLabel } from "@/lib/composerModelLabel";
+import { isCodexHarness } from "@/lib/harnessSetup";
 import { getCurrentUserId, resolveIdentity } from "@/lib/identity";
 import {
   getSessionModelLabelCacheKey,
@@ -53,7 +54,7 @@ export function useSessionModelLabel(
 
   // Host names are a display fallback only; the session cache stays session-owned.
   const hostOption =
-    scope.harness === "codex-native" || scope.harness === "codex"
+    scope.harness != null && isCodexHarness(scope.harness)
       ? findNativeModelOption(hostOptions, raw)
       : (hostOptions.find((row) => row.id === raw) ?? hostOptions.find((row) => row.model === raw));
   const fallbackLabel = cached ?? (hostOption ? nativeModelLabel(hostOption) : null);
