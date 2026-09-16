@@ -62,8 +62,9 @@ _ROOT = Path(__file__).resolve().parents[3]
 
 @pytest.fixture
 def antigravity_model(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, built_spa: None
 ) -> Iterator[list[str] | None]:
+    """Build with the caller's HOME before isolating agy credentials."""
     if os.environ.get("OMNIGENT_E2E_ANTIGRAVITY") != "mock":
         assert gemini_auth_has_credential(), "set GEMINI_API_KEY or sign in with `agy`, then rerun"
         yield None
@@ -336,7 +337,6 @@ def antigravity_session(
 ) -> Iterator[AntigravitySession]:
     assert not request.config.getoption("--ui-base-url"), "this test requires its own server"
     assert shutil.which("agy"), "install agy before running this test"
-    request.getfixturevalue("built_spa")
     with _antigravity_stack(tmp_path) as session:
         yield session
 
