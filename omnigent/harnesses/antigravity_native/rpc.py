@@ -54,6 +54,7 @@ them without real subprocesses or sockets.
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import json
 import logging
@@ -194,6 +195,35 @@ def _rpc_url(port: int, method: str) -> str:
     :returns: Full ``https://127.0.0.1:<port>/<service>/<method>`` URL.
     """
     return f"https://{_LOOPBACK}:{port}/{_LS_SERVICE}/{method}"
+
+
+def _csrf_token_for_port(port: int) -> str | None:
+    """Read the token only from the live agy process owning this loopback port."""
+    for pid in _list_agy_pids():
+        try:
+            process = psutil.Process(pid)
+            args = process.cmdline()
+            if not args or Path(args[0]).name != "agy":
+                continue
+            token = None
+            for index, arg in enumerate(args[1:], start=1):
+                if arg.startswith("--csrf_token="):
+                    token = arg.partition("=")[2]
+                elif arg == "--csrf_token" and index + 1 < len(args):
+                    token = args[index + 1]
+            if token and port in _pid_listen_ports(pid) and process.is_running():
+                return token
+        except (psutil.Error, OSError):
+            continue
+    return None
+
+
+def _rpc_headers(port: int, content_type: str = "application/json") -> dict[str, str]:
+    headers = {"Content-Type": content_type}
+    token = _csrf_token_for_port(port)
+    if token:
+        headers["x-codeium-csrf-token"] = token
+    return headers
 
 
 # httpx transport seam. ``None`` (production) lets httpx use its real loopback
@@ -425,7 +455,7 @@ def _heartbeat_ok(port: int) -> bool:
         with _sync_client(_PROBE_TIMEOUT_S) as client:
             response = client.post(
                 url,
-                headers={"Content-Type": "application/json"},
+                headers=_rpc_headers(port),
                 content=b"{}",
             )
     except httpx.HTTPError:
@@ -463,7 +493,7 @@ def _conversation_matches(port: int, conversation_id: str) -> bool:
         with _sync_client(_PROBE_TIMEOUT_S) as client:
             response = client.post(
                 url,
-                headers={"Content-Type": "application/json"},
+                headers=_rpc_headers(port),
                 content=json.dumps({"conversationId": conversation_id}).encode("utf-8"),
             )
     except httpx.HTTPError:
@@ -506,7 +536,7 @@ def get_trajectory_steps(port: int, cascade_id: str) -> list[dict[str, object]]:
     with _sync_client(_RPC_CALL_TIMEOUT_S) as client:
         response = client.post(
             url,
-            headers={"Content-Type": "application/json"},
+            headers=_rpc_headers(port),
             content=json.dumps({"cascadeId": cascade_id}).encode("utf-8"),
         )
     # Raises httpx.HTTPStatusError (subclass of httpx.HTTPError) on non-2xx so
@@ -537,7 +567,7 @@ def cancel_cascade_steps(port: int, cascade_id: str) -> bool:
         with _sync_client(_RPC_CALL_TIMEOUT_S) as client:
             response = client.post(
                 url,
-                headers={"Content-Type": "application/json"},
+                headers=_rpc_headers(port),
                 content=json.dumps({"cascadeId": cascade_id}).encode("utf-8"),
             )
     except Exception:  # deliberate fail-open: ssl.SSLError etc. outside httpx hierarchy
@@ -584,7 +614,7 @@ def _post_rpc_raising(port: int, method: str, body: dict[str, object]) -> None:
         with _sync_client(_RPC_CALL_TIMEOUT_S) as client:
             response = client.post(
                 url,
-                headers={"Content-Type": "application/json"},
+                headers=_rpc_headers(port),
                 content=json.dumps(body).encode("utf-8"),
             )
     except httpx.HTTPError as e:
@@ -783,7 +813,7 @@ def get_available_models(port: int) -> dict[str, object]:
     with _sync_client(_RPC_CALL_TIMEOUT_S) as client:
         response = client.post(
             url,
-            headers={"Content-Type": "application/json"},
+            headers=_rpc_headers(port),
             content=b"{}",
         )
     # Raises httpx.HTTPStatusError (subclass of httpx.HTTPError) on non-2xx so
@@ -856,7 +886,7 @@ def get_all_cascade_trajectories(port: int) -> dict[str, object]:
     with _sync_client(_RPC_CALL_TIMEOUT_S) as client:
         response = client.post(
             url,
-            headers={"Content-Type": "application/json"},
+            headers=_rpc_headers(port),
             content=b"{}",
         )
     # Raises httpx.HTTPStatusError (subclass of httpx.HTTPError) on non-2xx so
@@ -974,12 +1004,13 @@ async def stream_agent_state_updates(
     url = _rpc_url(port, _METHOD_STREAM_AGENT_STATE_UPDATES)
     _assert_loopback_url(url)
     body = _encode_connect_envelope({"conversationId": conversation_id})
+    headers = await asyncio.to_thread(_rpc_headers, port, "application/connect+json")
     async with (
         _async_client(_STREAM_TIMEOUT) as client,
         client.stream(
             "POST",
             url,
-            headers={"Content-Type": "application/connect+json"},
+            headers=headers,
             content=body,
         ) as response,
     ):

@@ -38,6 +38,7 @@ Key design points:
 from __future__ import annotations
 
 import logging
+import secrets
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -202,6 +203,9 @@ def build_agy_launch(
 ) -> tuple[list[str], dict[str, str]]:
     """Build the argv and environment overrides for an agy launch.
 
+    Each launch receives a fresh CSRF token for its local RPC server unless
+    the caller supplies one in ``extra_args``.
+
     Two launch modes are supported:
 
     * **Fresh session** (``resume=False``) — nothing is set for identity. agy
@@ -256,6 +260,8 @@ def build_agy_launch(
         or empty (agy needs a real id to resume).
     """
     argv: list[str] = [agy_binary_path()]
+    if not any(arg == "--csrf_token" or arg.startswith("--csrf_token=") for arg in extra_args):
+        argv.append(f"--csrf_token={secrets.token_urlsafe(32)}")
     if resume:
         if not conversation_id:
             raise ValueError("Resuming an agy conversation requires a conversation id.")

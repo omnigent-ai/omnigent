@@ -12,6 +12,7 @@ import struct
 import subprocess
 from collections.abc import AsyncIterator
 from pathlib import Path
+from unittest.mock import Mock
 
 import httpx
 import pytest
@@ -28,6 +29,82 @@ _LSOF_TWO_PORTS = (
 )
 
 _CONVERSATION_ID = "90468e33-38c3-4e48-ae9f-03c843196227"
+
+
+@pytest.fixture
+def authenticated_agy(monkeypatch: pytest.MonkeyPatch) -> dict[int, Mock]:
+    processes = {
+        101: Mock(cmdline=lambda: ["/bin/agy", "--csrf_token=first"], is_running=lambda: True),
+        102: Mock(cmdline=lambda: ["/bin/agy", "--csrf_token", "second"], is_running=lambda: True),
+    }
+    monkeypatch.setattr(rpc, "_list_agy_pids", lambda: list(processes))
+    monkeypatch.setattr(rpc.psutil, "Process", lambda pid: processes[pid])
+    monkeypatch.setattr(rpc, "_pid_listen_ports", lambda pid: {101: [52548], 102: [52550]}[pid])
+    return processes
+
+
+def test_csrf_token_is_scoped_to_live_port_owner(authenticated_agy: dict[int, Mock]) -> None:
+    assert rpc._csrf_token_for_port(52548) == "first"
+    assert rpc._csrf_token_for_port(52550) == "second"
+    assert rpc._csrf_token_for_port(52549) is None
+    authenticated_agy[101].is_running = lambda: False
+    assert rpc._csrf_token_for_port(52548) is None
+
+
+@pytest.mark.parametrize("error", [rpc.psutil.AccessDenied(101), rpc.psutil.NoSuchProcess(101)])
+def test_unreadable_process_does_not_leak_another_token(
+    authenticated_agy: dict[int, Mock], error: Exception
+) -> None:
+    authenticated_agy[101].cmdline = Mock(side_effect=error)
+    assert "x-codeium-csrf-token" not in rpc._rpc_headers(52548)
+
+
+@pytest.mark.parametrize("args", [["/bin/agy"], ["/bin/other", "/bin/agy", "--csrf_token=wrong"]])
+def test_legacy_or_unrelated_process_has_no_token(
+    authenticated_agy: dict[int, Mock], args: list[str]
+) -> None:
+    authenticated_agy[101].cmdline = lambda: args
+    assert "x-codeium-csrf-token" not in rpc._rpc_headers(52548)
+
+
+def test_all_sync_rpcs_authenticate(
+    monkeypatch: pytest.MonkeyPatch, authenticated_agy: dict[int, Mock]
+) -> None:
+    methods = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        if request.headers.get("x-codeium-csrf-token") != "first":
+            return httpx.Response(401, json={"message": "missing CSRF token"})
+        methods.append(request.url.path.rsplit("/", 1)[-1])
+        return httpx.Response(200, json={"metadata": {"rootConversationId": _CONVERSATION_ID}})
+
+    monkeypatch.setattr(rpc, "_HTTP_TRANSPORT", httpx.MockTransport(respond))
+    assert rpc.discover_language_server_port(101) == 52548
+    assert rpc._conversation_matches(52548, _CONVERSATION_ID)
+    rpc.get_trajectory_steps(52548, _CONVERSATION_ID)
+    assert rpc.cancel_cascade_steps(52548, _CONVERSATION_ID)
+    rpc.start_cascade(52548, _CONVERSATION_ID)
+    rpc.send_user_cascade_message(52548, _CONVERSATION_ID, text="hello", plan_model="gemini")
+    rpc.get_available_models(52548)
+    rpc.get_all_cascade_trajectories(52548)
+    assert len(set(methods)) == 8
+
+
+@pytest.mark.asyncio
+async def test_stream_authenticates_to_its_own_process(
+    monkeypatch: pytest.MonkeyPatch, authenticated_agy: dict[int, Mock]
+) -> None:
+    def respond(request: httpx.Request) -> httpx.Response:
+        if request.headers.get("x-codeium-csrf-token") != "second":
+            return httpx.Response(401)
+        assert request.headers["content-type"] == "application/connect+json"
+        return httpx.Response(
+            200, content=rpc._encode_connect_envelope({"update": {"done": True}})
+        )
+
+    monkeypatch.setattr(rpc, "_ASYNC_HTTP_TRANSPORT", httpx.MockTransport(respond))
+    updates = [update async for update in rpc.stream_agent_state_updates(52550, _CONVERSATION_ID)]
+    assert updates == [{"done": True}]
 
 
 # ---------------------------------------------------------------------------
