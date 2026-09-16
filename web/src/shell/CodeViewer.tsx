@@ -36,6 +36,7 @@ import { useChatStore } from "@/store/chatStore";
 import { nativeCodingAgentForHarness } from "@/lib/nativeCodingAgents";
 import type { BundledLanguage, ThemedToken } from "shiki";
 import { highlightCode } from "@/components/ai-elements/code-block";
+import { normalizeExplicitMathDelimiters } from "@/components/ai-elements/mathMarkdown";
 import ReactMarkdown, { type Components, type Options } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkEmoji from "remark-emoji";
@@ -43,6 +44,7 @@ import rehypeRaw from "rehype-raw";
 import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
 import { rehypeGithubAlerts } from "rehype-github-alerts";
 import rehypeSlug from "rehype-slug";
+import { createMathPlugin } from "@streamdown/math";
 import { MermaidPreview } from "./MermaidPreview";
 import type { Comment } from "@/hooks/useComments";
 import {
@@ -101,10 +103,16 @@ const ModelViewer = lazy(() => import("./ModelViewer").then((m) => ({ default: m
 const GUTTER_WIDTH = 48;
 const EMPTY_COMMENTS: Comment[] = [];
 
+// Same TeX math config as chat (see streamdown-security.ts): only `$$…$$` opens
+// math so a lone `$` stays prose. Wraps remark-math + rehype-katex, whose plugin
+// tuples slot straight into react-markdown, so the preview renders formulas the
+// way the chat surface already does.
+const MATH_PLUGIN = createMathPlugin({ singleDollarTextMath: false });
+
 // GFM covers tables, task lists, strikethrough, and autolinks; remark-emoji
 // renders GitHub-style `:shortcode:` emoji as their unicode glyphs so docs read
-// the same here as on GitHub.
-const MARKDOWN_REMARK_PLUGINS = [remarkGfm, remarkEmoji];
+// the same here as on GitHub. remark-math parses `$$…$$` into math nodes.
+const MARKDOWN_REMARK_PLUGINS = [remarkGfm, remarkEmoji, MATH_PLUGIN.remarkPlugin];
 
 // rehype-github-alerts turns `> [!NOTE]` blockquotes into GitHub's
 // `<div class="markdown-alert markdown-alert-note">…` callout markup (GFM
@@ -140,12 +148,17 @@ const MARKDOWN_SANITIZE_SCHEMA = {
 // that HTML; rehype-sanitize then strips anything unsafe (<script>, event
 // handlers, javascript: URLs) so this stays safe to render inline without an
 // iframe. Order matters: alerts transform before sanitize, slug adds IDs to
-// headings, and sanitize runs last, after raw parsing and GFM.
+// headings, and sanitize runs after raw parsing and GFM — only KaTeX comes
+// later, rendering math from the already-sanitized tree.
 const MARKDOWN_REHYPE_PLUGINS: Options["rehypePlugins"] = [
   rehypeRaw,
   rehypeSlug,
   rehypeGithubAlerts,
   [rehypeSanitize, MARKDOWN_SANITIZE_SCHEMA],
+  // After sanitize: sanitize neutralises the untrusted markdown/HTML, leaving the
+  // `language-math` code nodes as plain text; KaTeX then renders that trusted
+  // output. Running KaTeX before sanitize would strip its MathML/spans as unknown.
+  MATH_PLUGIN.rehypePlugin,
 ];
 
 // Tailwind Preflight applies `img { height: auto }`, which overrides the HTML
@@ -192,6 +205,10 @@ function MarkdownPreview({
   tocOpen: boolean;
   onTocOpenChange: (open: boolean) => void;
 }) {
+  // Rewrite explicit TeX delimiters (`\(…\)`, `\[…\]`) to `$$…$$` before
+  // rendering, the same as chat, so agent-authored formulas render here too;
+  // remark-math only honours `$` delimiters. Safe outside code/existing math.
+  const rendered = useMemo(() => normalizeExplicitMathDelimiters(content), [content]);
   return (
     <div className="flex h-full">
       <div
@@ -205,7 +222,7 @@ function MarkdownPreview({
           rehypePlugins={MARKDOWN_REHYPE_PLUGINS}
           components={MARKDOWN_COMPONENTS}
         >
-          {content}
+          {rendered}
         </ReactMarkdown>
       </div>
       {tocOpen && (

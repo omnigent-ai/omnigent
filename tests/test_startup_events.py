@@ -44,9 +44,13 @@ def context(**changes: object) -> str:
     )
 
 
+@pytest.mark.parametrize("harness", ["claude-native", "codex-native"])
 @pytest.mark.parametrize("boundary", [None, "wrapper_entry", "python_entry", "launcher_entry"])
 def test_exec_handoff_includes_wrapper_and_import_time(
-    boundary: str | None, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    harness: startup.NativeHarness,
+    boundary: str | None,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     caplog.set_level(logging.INFO, logger="omnigent.startup")
     monkeypatch.setenv(
@@ -56,7 +60,7 @@ def test_exec_handoff_includes_wrapper_and_import_time(
     @startup.capture_cli_entry
     def main() -> None:
         assert startup.STARTUP_CONTEXT_ENV not in os.environ
-        with startup.codex_startup_attempt():
+        with startup.native_startup_attempt(harness=harness):
             startup.record_startup_event("session_resolved", session_id="conv_synthetic")
             monkeypatch.setattr(startup.time, "monotonic_ns", lambda: 11_000_000_000)
             monkeypatch.setattr(startup.time, "time_ns", lambda: 1)  # wall clock jumps
@@ -68,6 +72,7 @@ def test_exec_handoff_includes_wrapper_and_import_time(
     assert [e["elapsed_ms"] for e in events] == [3500, 3500, 4500, 4500]
     assert {e["attempt_id"] for e in events} == {"00000000-0000-4000-8000-000000000001"}
     assert {e["start_boundary"] for e in events} == {boundary or "wrapper_entry"}
+    assert {e["harness"] for e in events} == {harness}
     assert {e["started_at_unix_ms"] for e in events} == {16000}
     assert [r.session_id for r in caplog.records] == [
         None,
@@ -105,7 +110,7 @@ def test_invalid_or_cross_process_handoff_is_discarded(
 ) -> None:
     caplog.set_level(logging.INFO, logger="omnigent.startup")
     monkeypatch.setenv(startup.STARTUP_CONTEXT_ENV, value)
-    with startup.codex_startup_attempt():
+    with startup.native_startup_attempt(harness="codex-native"):
         pass
     assert startup.STARTUP_CONTEXT_ENV not in os.environ
     assert records(caplog)[0]["start_boundary"] == "omnigent_cli_entry"
@@ -127,7 +132,7 @@ def test_unsuccessful_attempt_retained_without_content(
 ) -> None:
     caplog.set_level(logging.INFO, logger="omnigent.startup")
     with pytest.raises(type(error)):
-        with startup.codex_startup_attempt():
+        with startup.native_startup_attempt(harness="codex-native"):
             raise error
     assert [e["event"] for e in records(caplog)] == ["launch_started", event]
     assert "private details" not in caplog.text
@@ -137,7 +142,7 @@ def test_unsuccessful_attempt_retained_without_content(
 def test_runtime_failure_does_not_reclassify_startup(caplog: pytest.LogCaptureFixture) -> None:
     caplog.set_level(logging.INFO, logger="omnigent.startup")
     with pytest.raises(RuntimeError):
-        with startup.codex_startup_attempt():
+        with startup.native_startup_attempt(harness="codex-native"):
             startup.record_startup_event("terminal_available")
             startup.record_startup_event("terminal_available")
             startup.record_startup_event("terminal_attach_started")
@@ -158,7 +163,7 @@ def test_uploader_and_logger_failure_do_not_break_launch(monkeypatch: pytest.Mon
 
     monkeypatch.setattr(debug_logging, "attach_debug_log_sink", broken)
     monkeypatch.setattr(startup._logger, "info", broken)
-    with startup.codex_startup_attempt():
+    with startup.native_startup_attempt(harness="codex-native"):
         startup.record_startup_event("terminal_available")
 
 
@@ -174,7 +179,7 @@ def test_structured_rows_reach_existing_debug_sink(monkeypatch: pytest.MonkeyPat
 
     monkeypatch.setattr(debug_logging, "attach_debug_log_sink", attach)
     try:
-        with startup.codex_startup_attempt():
+        with startup.native_startup_attempt(harness="codex-native"):
             startup.record_startup_event("session_resolved", session_id="conv_synthetic")
             startup.record_startup_event("terminal_available")
     finally:
@@ -213,7 +218,7 @@ def test_warning_cli_level_does_not_drop_uploaded_events(
     cli_log = cli_diagnostics.setup_cli_logging(["codex"])
     try:
         assert startup._logger.getEffectiveLevel() == logging.WARNING
-        with startup.codex_startup_attempt():
+        with startup.native_startup_attempt(harness="codex-native"):
             startup.record_startup_event("terminal_available", session_id="conv_synthetic")
         assert [row["attributes"]["event"] for row in uploaded] == [
             "launch_started",
@@ -247,16 +252,24 @@ async def test_attach_subprocess_spawn_is_distinct_from_availability(
         return SimpleNamespace(wait=wait)
 
     monkeypatch.setattr(native, "asyncio", SimpleNamespace(create_subprocess_exec=spawn))
-    with startup.codex_startup_attempt():
+    with startup.native_startup_attempt(harness="codex-native"):
         startup.record_startup_event("terminal_available")
         await native._attach_direct_tmux(Path("/tmp/synthetic.sock"), "synthetic:main")
     assert records(caplog)[-1]["event"] == "terminal_attach_exited"
     assert records(caplog)[-1]["exit_code"] == 1
 
 
+@pytest.mark.parametrize(
+    ("command", "harness"),
+    [("claude", "claude-native"), ("codex", "codex-native")],
+)
 @pytest.mark.parametrize("args", [[], ["--resume", "conv_synthetic"]])
-def test_codex_callback_tracks_backend_failure_before_native_launch(
-    args: list[str], monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+def test_native_callback_tracks_backend_failure_before_launch(
+    command: str,
+    harness: startup.NativeHarness,
+    args: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     from click.testing import CliRunner
 
@@ -270,8 +283,9 @@ def test_codex_callback_tracks_backend_failure_before_native_launch(
         raise RuntimeError("synthetic backend failure")
 
     monkeypatch.setattr(cli_module, "_ensure_backend", fail_backend)
-    result = CliRunner().invoke(cli_module.cli, ["codex", *args])
+    result = CliRunner().invoke(cli_module.cli, [command, *args])
     assert result.exit_code != 0
     assert isinstance(result.exception, RuntimeError)
     assert [e["event"] for e in records(caplog)] == ["launch_started", "launch_failed"]
+    assert {e["harness"] for e in records(caplog)} == {harness}
     assert {e["launch_kind"] for e in records(caplog)} == {"resume" if args else "create"}

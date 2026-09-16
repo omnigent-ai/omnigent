@@ -30,6 +30,7 @@ interface Props {
   options: readonly NativeModelOption[];
   expectsCatalog: boolean;
   confirmed: boolean;
+  hostOptions?: readonly NativeModelOption[];
 }
 const defaults: Props = { scope, model, options: [], expectsCatalog: true, confirmed: true };
 const loading = { label: null, loading: true, unavailable: false };
@@ -44,6 +45,7 @@ function renderLabel(overrides: Partial<Props> = {}) {
         props.options,
         props.expectsCatalog,
         props.confirmed,
+        props.hostOptions,
       ),
     { initialProps: { ...defaults, ...overrides } },
   );
@@ -67,6 +69,59 @@ afterEach(() => {
 });
 
 describe("useSessionModelLabel", () => {
+  it.each(["alias-a", model])("uses an exact host id or wire-model match: %s", (reported) => {
+    const { result } = renderLabel({ model: reported, hostOptions: catalog });
+    expect(result.current).toEqual(named);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("does not retain a host name after the model changes or the host catalog disappears", () => {
+    const { result, rerender } = renderLabel({ hostOptions: catalog });
+    expect(result.current).toEqual(named);
+    rerender({ ...defaults, model: "another-model", hostOptions: catalog });
+    expect(result.current).toEqual(loading);
+    rerender({ ...defaults, hostOptions: catalog });
+    expect(result.current).toEqual(named);
+    rerender(defaults);
+    expect(result.current).toEqual(loading);
+    act(() => vi.advanceTimersByTime(SESSION_MODEL_LABEL_WAIT_MS));
+    expect(result.current).toEqual({ label: null, loading: false, unavailable: true });
+    expect(readSessionModelLabelCache(cacheKey())).toBeNull();
+  });
+
+  it("uses a host entry's wire model when it has no display name", () => {
+    const { result } = renderLabel({
+      model: "alias-a",
+      hostOptions: [{ id: "alias-a", model }],
+    });
+    expect(result.current).toEqual({ label: model, loading: false, unavailable: false });
+  });
+
+  it("recovers from timeout with a host name without caching it, then prefers the session catalog", () => {
+    const { result, rerender } = renderLabel();
+    act(() => vi.advanceTimersByTime(SESSION_MODEL_LABEL_WAIT_MS));
+    expect(result.current.unavailable).toBe(true);
+    const hostOptions = [{ ...catalog[0], displayName: "Host name" }];
+    rerender({ ...defaults, hostOptions });
+    expect(result.current).toEqual({ label: "Host name", loading: false, unavailable: false });
+    expect(readSessionModelLabelCache(cacheKey())).toBeNull();
+    rerender({ ...defaults, hostOptions, options: catalog });
+    expect(result.current).toEqual(named);
+    expect(readSessionModelLabelCache(cacheKey())).toBe(named.label);
+    rerender({ ...defaults, hostOptions });
+    expect(result.current).toEqual(named);
+  });
+
+  it("does not borrow a host name for a different model or override a populated session catalog", () => {
+    const hostOptions = [{ ...catalog[0], displayName: "Host name" }];
+    const { result, rerender } = renderLabel({ model: `${model}[1m]`, hostOptions });
+    expect(result.current).toEqual(loading);
+    act(() => vi.advanceTimersByTime(SESSION_MODEL_LABEL_WAIT_MS));
+    expect(result.current.unavailable).toBe(true);
+    rerender({ ...defaults, hostOptions, options: [{ id: "another-model" }] });
+    expect(result.current).toEqual({ label: model, loading: false, unavailable: false });
+  });
+
   it("waits on a cold catalog, then renders and caches its exact display name", () => {
     const { result, rerender } = renderLabel();
     expect(result.current).toEqual(loading);

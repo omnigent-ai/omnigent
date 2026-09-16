@@ -230,13 +230,29 @@ _PASTE_SETTLE_S = 0.1  # let the TUI commit a paste before the separate submit E
 _PASTE_COMMIT_TIMEOUT_S = 5.0
 # After the submit Enter, how long to keep checking that the draft
 # actually left the input box (re-sending Enter while it hasn't)
-# before failing loud.
-_SUBMIT_VERIFY_TIMEOUT_S = 10.0
+# before failing loud. Sized to out-wait a transiently unresponsive
+# TUI (e.g. CPU-starved at submit time): giving up after the old short
+# window failed the whole turn while the committed draft would have
+# delivered moments later. This doubles the old 10s ceiling as a
+# conservative interim value — the true recovery-time tail was never
+# measurable while that ceiling censored it (a submit that would land
+# at 20s was recorded as a 10s failure). The slow-accept log below now
+# records real recovery times, so tune this from that distribution.
+_SUBMIT_VERIFY_TIMEOUT_S = 20.0
+# How long the draft may verifiably sit unaccepted before a warning is
+# logged that the TUI is slow (delivery keeps retrying). Also the point
+# past which a recovery is logged with its elapsed time — the signal
+# used to tune _SUBMIT_VERIFY_TIMEOUT_S once the tail is observed.
+_SUBMIT_SLOW_ACCEPT_WARN_S = 10.0
 # Minimum spacing between repeated submit Enters during verification.
 # Long enough for the TUI to clear the box after a successful submit
 # (so a slow-but-successful first Enter isn't double-tapped), short
 # enough that a swallowed Enter is retried promptly.
 _SUBMIT_RETRY_INTERVAL_S = 1.0
+# Cap for the exponential backoff between repeated submit Enters. An
+# Enter sent into a stalled TUI queues in the pty and replays when it
+# recovers, so retries slow down instead of piling up there.
+_SUBMIT_RETRY_MAX_INTERVAL_S = 8.0
 # How long to watch for Claude Code's "Unknown command" rejection after a
 # message leading with an unrecognized slash command was submitted
 # unescaped. The rejection prints within ~1s of the swallowed submit and
@@ -519,6 +535,15 @@ def _trusted_parent_for_bridge_dir(target: Path) -> Path:
     if target.is_relative_to(cursor_root):
         return _absolute_syntactic_path(cursor_root.parent.parent)
 
+    from omnigent.harnesses.devin_native.bridge import bridge_root as devin_bridge_root
+
+    devin_root = _absolute_syntactic_path(devin_bridge_root())
+    if target.is_relative_to(devin_root):
+        # Same shape as cursor-native ($TMPDIR/omnigent-<uid>/devin-native): trust
+        # the uid-scoped temp dir's parent and validate/chmod the two
+        # bridge-owned directories below it.
+        return _absolute_syntactic_path(devin_root.parent.parent)
+
     from omnigent.harnesses.antigravity_native.bridge import bridge_root as antigravity_bridge_root
 
     # antigravity-native keeps its bridge files below ``~/.omnigent/antigravity-native``,
@@ -592,8 +617,8 @@ def _trusted_parent_for_bridge_dir(target: Path) -> Path:
     raise RuntimeError(
         f"bridge dir {target!s} is not under an allowed bridge root "
         f"({claude_root!s}, {codex_root!s}, {pi_root!s}, {cursor_root!s}, "
-        f"{antigravity_root!s}, {qwen_root!s}, {hermes_root!s}, {opencode_root!s}, "
-        f"{kiro_root!s}, {acp_root!s}, {router_root!s})"
+        f"{devin_root!s}, {antigravity_root!s}, {qwen_root!s}, {hermes_root!s}, "
+        f"{opencode_root!s}, {kiro_root!s}, {acp_root!s}, {router_root!s})"
     )
 
 
@@ -3829,20 +3854,70 @@ def _paste_and_submit(
     # after the burst, so it submits). Each Enter only fires while the
     # draft is verifiably still present, so a retry can never hit an
     # empty prompt or a permission dialog of the started turn.
-    deadline = time.monotonic() + _SUBMIT_VERIFY_TIMEOUT_S
-    last_enter = time.monotonic()
-    while time.monotonic() < deadline:
-        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
-        pane = _capture_pane(socket_path, tmux_target)
-        if not _draft_in_input_box(pane, needle):
-            return
-        if time.monotonic() - last_enter >= _SUBMIT_RETRY_INTERVAL_S:
-            _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
-            last_enter = time.monotonic()
+    if _verify_submit_accepted(socket_path, tmux_target, needle=needle, what="submitted message"):
+        return
     raise RuntimeError(
         f"Claude Code did not accept the submitted message within {_SUBMIT_VERIFY_TIMEOUT_S}s "
         "(the draft is still in the input box). The message was not delivered."
     )
+
+
+def _verify_submit_accepted(
+    socket_path: str,
+    tmux_target: str,
+    *,
+    needle: str,
+    what: str,
+) -> bool:
+    """
+    Wait for a submitted draft to leave the input box, re-sending Enter.
+
+    A transiently unresponsive TUI (a CPU-starved host, a long paste
+    burst) can take tens of seconds to process the submit while the
+    committed draft sits visibly in the box. Failing at a short fixed
+    window turned that recoverable slowness into a failed turn with the
+    message dropped, so this wait out-lasts realistic starvation: a
+    warning is logged once at :data:`_SUBMIT_SLOW_ACCEPT_WARN_S`, the
+    Enter retries back off exponentially (each retry into a stalled TUI
+    queues in the pty and replays on recovery, so fewer is safer), and
+    only after :data:`_SUBMIT_VERIFY_TIMEOUT_S` does the caller fail.
+
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :param needle: Draft marker from :func:`_submit_needle`.
+    :param what: Label for log lines, e.g. ``"submitted message"``.
+    :returns: ``True`` when the draft left the input box (accepted),
+        ``False`` when it is still there after the full window.
+    """
+    start = time.monotonic()
+    last_enter = start
+    retry_interval = _SUBMIT_RETRY_INTERVAL_S
+    warned = False
+    while time.monotonic() - start < _SUBMIT_VERIFY_TIMEOUT_S:
+        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+        if not _draft_in_input_box(_capture_pane(socket_path, tmux_target), needle):
+            if warned:
+                _logger.info(
+                    "claude-native: %s accepted after %.1fs of an unresponsive TUI",
+                    what,
+                    time.monotonic() - start,
+                )
+            return True
+        now = time.monotonic()
+        if not warned and now - start >= _SUBMIT_SLOW_ACCEPT_WARN_S:
+            warned = True
+            _logger.warning(
+                "claude-native: %s not accepted after %.0fs (the draft is "
+                "still in the input box); retrying for up to %.0fs",
+                what,
+                _SUBMIT_SLOW_ACCEPT_WARN_S,
+                _SUBMIT_VERIFY_TIMEOUT_S,
+            )
+        if now - last_enter >= retry_interval:
+            _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+            last_enter = now
+            retry_interval = min(retry_interval * 2, _SUBMIT_RETRY_MAX_INTERVAL_S)
+    return False
 
 
 def _count_unknown_command_rejections(pane: str, needle: str) -> int:
@@ -4063,18 +4138,9 @@ def inject_slash_command(
         # or our own confirm dialog (the intended answer), never a foreign
         # surface. The command leaving the box is the submit signal; the
         # dialog replacing the composer counts, since submission pops it.
-        deadline = time.monotonic() + _SUBMIT_VERIFY_TIMEOUT_S
-        last_enter = time.monotonic()
-        submitted = False
-        while time.monotonic() < deadline:
-            time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
-            if not _draft_in_input_box(_capture_pane(socket_path, tmux_target), needle):
-                submitted = True
-                break
-            if time.monotonic() - last_enter >= _SUBMIT_RETRY_INTERVAL_S:
-                _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
-                last_enter = time.monotonic()
-        if not submitted:
+        if not _verify_submit_accepted(
+            socket_path, tmux_target, needle=needle, what="slash command"
+        ):
             raise RuntimeError(
                 f"Claude Code did not accept the slash command within "
                 f"{_SUBMIT_VERIFY_TIMEOUT_S}s (the command is still in the "

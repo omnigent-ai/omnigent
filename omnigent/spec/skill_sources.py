@@ -14,7 +14,8 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Callable
+import subprocess
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import cast
@@ -25,7 +26,7 @@ from omnigent.spec.types import SkillSpec
 
 _log = logging.getLogger(__name__)
 
-_SKILL_FAMILIES = frozenset({"claude", "codex", "cursor", "pi", "antigravity"})
+_SKILL_FAMILIES = frozenset({"claude", "codex", "cursor", "pi", "antigravity", "devin"})
 
 # The bare ``antigravity`` harness is the in-process Gemini SDK executor, NOT the
 # agy CLI. It never launches agy, so ~/.gemini plugin/builtin skills are not its
@@ -642,6 +643,68 @@ def pi_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
     return []
 
 
+def devin_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
+    """Devin skills: whatever ``devin skills list`` reports as user-invocable.
+
+    Devin loads slash-command skills from its own dirs (``~/.config/devin/skills``,
+    ``~/.agents/skills``, ``.devin/skills``, …) *and* from Claude Code's
+    ``.claude/skills`` for compatibility, with its own precedence — more than any
+    single dir walk here would faithfully reproduce. So the menu is sourced
+    authoritatively from the CLI itself, matching exactly the ``/`` commands the
+    Devin terminal offers.
+
+    Native only (the wrap types ``/name`` into the real Devin TUI). Best-effort:
+    a missing CLI, a non-zero exit, a timeout, or unparseable output yields no
+    host skills rather than raising — the bundled skills still show.
+
+    :param ctx: Session discovery context; the first root is the CLI's cwd.
+    :returns: One :class:`SkillSpec` per user-invocable Devin skill.
+    """
+    if not ctx.is_native:
+        return []
+    root = ctx.roots[0] if ctx.roots else ctx.home
+    try:
+        proc = subprocess.run(
+            ["devin", "skills", "list", "--json", "--trigger", "user"],
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:  # best-effort discovery
+        _log.debug("devin skills list failed to run: %s", exc)
+        return []
+    if proc.returncode != 0:
+        _log.debug("devin skills list exited %d: %s", proc.returncode, proc.stderr[:200])
+        return []
+    try:
+        entries = json.loads(proc.stdout)
+    except (ValueError, TypeError):
+        return []
+    if not isinstance(entries, list):
+        return []
+    out: list[SkillSpec] = []
+    for entry in entries:
+        if not isinstance(entry, Mapping):
+            continue
+        name = entry.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        description = entry.get("description")
+        base_dir = entry.get("base_dir")
+        out.append(
+            SkillSpec(
+                name=name,
+                description=description if isinstance(description, str) else "",
+                content="",
+                skill_dir=Path(base_dir) if isinstance(base_dir, str) and base_dir else None,
+                user_invocable=True,
+            )
+        )
+    return out
+
+
 # Keyed by harness family (see _harness_family). A harness with no entry
 # (qwen, openai-agents, the in-process antigravity SDK, …) falls through to
 # _generic_host_skills in resolve_harness_skills — the ~/.claude/skills walk,
@@ -662,6 +725,7 @@ _SKILL_SOURCES: dict[str | None, SkillSource] = {
     "claude": claude_host_skills,
     "codex": codex_host_skills,
     "cursor": cursor_host_skills,
+    "devin": devin_host_skills,
     "pi": pi_host_skills,
     "antigravity": antigravity_host_skills,
 }

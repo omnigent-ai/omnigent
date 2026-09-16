@@ -1808,7 +1808,7 @@ async def test_pre_resolved_elicitation_tombstone_expires_before_hook_registrati
             "conv_123",
             "elicit_expired",
         )
-        assert _harness_pre_resolved_elicitations == {}
+        assert _harness_pre_resolved_elicitations.all_values() == []
     finally:
         _harness_pre_resolved_elicitations.clear()
 

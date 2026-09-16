@@ -30,6 +30,7 @@ import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
+import { writeWorkspacePanelDefault } from "@/lib/workspacePanelPreferences";
 
 // Match the AppShell.test.tsx mocks except DO NOT mock SubagentsPanel —
 // we want the real one so its <Link> renders.
@@ -121,6 +122,7 @@ beforeEach(() => {
   // The rail's open-state persists per session in localStorage; clear it so
   // state written by one test (e.g. a collapse) can't leak into the next.
   localStorage.clear();
+  writeWorkspacePanelDefault("open");
   vi.mocked(useConversations).mockReset();
   vi.mocked(useConversations).mockReturnValue({
     data: {
