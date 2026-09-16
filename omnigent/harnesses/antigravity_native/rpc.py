@@ -304,7 +304,9 @@ def _csrf_token_for_port(port: int) -> str | None:
     if owner is not None:
         token = _csrf_token_from_process(port, owner)
         if token:
-            _remember_rpc_port_owner(port, owner)
+            with _RPC_PORT_OWNERS_LOCK:
+                if _RPC_PORT_OWNERS.get(port) is owner:
+                    _RPC_PORT_OWNERS.move_to_end(port)
             return token
         with _RPC_PORT_OWNERS_LOCK:
             if _RPC_PORT_OWNERS.get(port) is owner:

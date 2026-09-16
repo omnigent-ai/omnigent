@@ -11,6 +11,7 @@ import json
 import os
 import struct
 import subprocess
+import threading
 from collections import OrderedDict
 from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
@@ -186,6 +187,75 @@ def test_repeated_rpcs_only_revalidate_their_owner(
         )
     scans.assert_not_called()
     assert lookups.call_count == len(ports_to_read)
+
+
+def test_cache_hit_does_not_replace_a_newer_owner(
+    monkeypatch: pytest.MonkeyPatch, authenticated_agy: dict[int, Mock]
+) -> None:
+    assert rpc._csrf_token_for_port(52548) == "first"
+    validated = threading.Barrier(2, timeout=5)
+    resume = threading.Event()
+    read_token = rpc._csrf_token_from_process
+
+    def pause_after_validation(port: int, process: rpc.psutil.Process) -> str | None:
+        token = read_token(port, process)
+        if token == "first":
+            validated.wait()
+            assert resume.wait(timeout=5)
+        return token
+
+    monkeypatch.setattr(rpc, "_csrf_token_from_process", pause_after_validation)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        pending = executor.submit(rpc._csrf_token_for_port, 52548)
+        try:
+            validated.wait()
+            monkeypatch.setattr(
+                rpc, "_pid_listen_ports", lambda pid: {101: [52552], 102: [52548]}[pid]
+            )
+            assert rpc._csrf_token_for_port(52548) == "second"
+        finally:
+            resume.set()
+        assert pending.result(timeout=5) == "first"
+
+    scans = Mock(return_value=list(authenticated_agy))
+    monkeypatch.setattr(rpc, "_list_agy_pids", scans)
+    assert rpc._csrf_token_for_port(52548) == "second"
+    scans.assert_not_called()
+
+
+@pytest.mark.parametrize("refresh_oldest", [False, True])
+def test_rpc_owner_cache_evicts_least_recently_used_at_128_entries(
+    monkeypatch: pytest.MonkeyPatch, refresh_oldest: bool
+) -> None:
+    processes = {
+        pid: Mock(
+            pid=pid, cmdline=lambda: ["/bin/agy", "--csrf_token=test"], is_running=lambda: True
+        )
+        for pid in range(1000, 1129)
+    }
+    scans = Mock()
+    monkeypatch.setattr(rpc, "_list_agy_pids", scans)
+    monkeypatch.setattr(rpc.psutil, "Process", lambda pid: processes[pid])
+    monkeypatch.setattr(rpc, "_pid_listen_ports", lambda pid: [pid + 50000])
+    for pid in range(1000, 1128):
+        scans.return_value = [pid]
+        assert rpc._csrf_token_for_port(pid + 50000) == "test"
+
+    if refresh_oldest:
+        assert rpc._csrf_token_for_port(51000) == "test"
+    scans.return_value = [1128]
+    assert rpc._csrf_token_for_port(51128) == "test"
+
+    evicted = 51001 if refresh_oldest else 51000
+    assert len(rpc._RPC_PORT_OWNERS) == 128
+    assert set(rpc._RPC_PORT_OWNERS) == set(range(51000, 51129)) - {evicted}
+    scans.reset_mock()
+    assert rpc._csrf_token_for_port(51128) == "test"
+    scans.assert_not_called()
+    scans.return_value = [evicted - 50000]
+    assert rpc._csrf_token_for_port(evicted) == "test"
+    scans.assert_called_once_with()
+    assert len(rpc._RPC_PORT_OWNERS) == 128
 
 
 def test_cached_owner_revalidates_port_before_sending_token(
