@@ -1493,6 +1493,7 @@ class TestCodexExecutor(unittest.TestCase):
                     "input_tokens": 100,
                     "output_tokens": 25,
                     "total_tokens": 125,
+                    "context_tokens": 125,
                     "model": "gpt-5.4-mini",
                 },
             )
@@ -1520,8 +1521,10 @@ class TestCodexExecutor(unittest.TestCase):
 
         ``tokenUsage.last`` covers only the newest model request, so a turn
         spanning model -> tool -> model would be accounted as just its final
-        request. The turn's usage must instead be the growth of the
-        cumulative ``tokenUsage.total`` counters across the whole turn.
+        request. The turn's billing usage must instead be the growth of the
+        cumulative ``tokenUsage.total`` counters across the whole turn, while
+        ``context_tokens`` (window fill) stays the latest ``last`` snapshot
+        (1350 here) — not the billed total (2450).
         """
 
         async def _t():
@@ -1602,6 +1605,7 @@ class TestCodexExecutor(unittest.TestCase):
                     "output_tokens": 250,
                     "total_tokens": 2450,
                     "cache_read_input_tokens": 1800,
+                    "context_tokens": 1350,
                     "model": "gpt-5.4-mini",
                 },
             )
@@ -1612,8 +1616,10 @@ class TestCodexExecutor(unittest.TestCase):
         """A later turn on the same thread reports only its own token growth.
 
         ``tokenUsage.total`` is cumulative across the whole thread, so the
-        second turn's usage must be diffed against the counters consumed at
-        the first turn's boundary — not reported as the thread total.
+        second turn's billing usage must be diffed against the counters
+        consumed at the first turn's boundary — not reported as the thread
+        total. ``context_tokens`` (window fill) is the opposite: it stays the
+        latest cumulative snapshot (2450), so the two diverge on turn two.
         """
 
         async def _t():
@@ -1673,6 +1679,7 @@ class TestCodexExecutor(unittest.TestCase):
                     "output_tokens": 100,
                     "total_tokens": 1100,
                     "cache_read_input_tokens": 800,
+                    "context_tokens": 1100,
                     "model": "gpt-5.4-mini",
                 },
             )
@@ -1692,6 +1699,7 @@ class TestCodexExecutor(unittest.TestCase):
                     "output_tokens": 150,
                     "total_tokens": 1350,
                     "cache_read_input_tokens": 1000,
+                    "context_tokens": 2450,
                     "model": "gpt-5.4-mini",
                 },
             )
@@ -1760,6 +1768,7 @@ class TestCodexExecutor(unittest.TestCase):
                     "input_tokens": 100,
                     "output_tokens": 25,
                     "total_tokens": 125,
+                    "context_tokens": 125,
                     "model": "gpt-5.4-mini",
                 },
             )
@@ -2967,6 +2976,54 @@ def test_codex_turn_usage_from_totals_clamps_counter_resets() -> None:
         "total_tokens": 0,
         "model": "gpt-5.4-mini",
     }
+
+
+def test_extract_codex_context_tokens_reads_last_total() -> None:
+    """context_tokens is the latest ``last`` total (window fill), inclusive
+    of cached tokens, independent of the cumulative ``total`` breakdown."""
+    from omnigent.inner.codex_executor import _extract_codex_context_tokens
+
+    params = {
+        "tokenUsage": {
+            "last": {
+                "inputTokens": 1200,
+                "cachedInputTokens": 1000,
+                "outputTokens": 150,
+                "totalTokens": 1350,
+            },
+            "total": {"inputTokens": 2200, "outputTokens": 250, "totalTokens": 2450},
+        }
+    }
+    # The window-fill snapshot is the last request's raw total, NOT the
+    # cumulative thread total and NOT the non-cached input split.
+    assert _extract_codex_context_tokens(params) == 1350
+
+
+def test_extract_codex_context_tokens_recomputes_when_total_absent() -> None:
+    """With no ``last.totalTokens``, fill recomputes from input + output
+    (input already includes cached, which occupies the window)."""
+    from omnigent.inner.codex_executor import _extract_codex_context_tokens
+
+    params = {"tokenUsage": {"last": {"inputTokens": 100, "outputTokens": 25}}}
+    assert _extract_codex_context_tokens(params) == 125
+
+
+def test_extract_codex_context_tokens_rejects_missing_or_malformed() -> None:
+    """No usable ``last`` breakdown yields None (meter keeps its prior value)."""
+    from omnigent.inner.codex_executor import _extract_codex_context_tokens
+
+    assert _extract_codex_context_tokens(None) is None
+    assert _extract_codex_context_tokens("not a dict") is None
+    assert _extract_codex_context_tokens({}) is None
+    assert _extract_codex_context_tokens({"tokenUsage": None}) is None
+    assert _extract_codex_context_tokens({"tokenUsage": {"total": {"totalTokens": 9}}}) is None
+    # An all-zero ``last`` carries no fill signal.
+    assert (
+        _extract_codex_context_tokens(
+            {"tokenUsage": {"last": {"inputTokens": 0, "outputTokens": 0}}}
+        )
+        is None
+    )
 
 
 def _make_skill_dir(root: Path, name: str) -> Path:

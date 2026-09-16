@@ -349,6 +349,39 @@ def _codex_turn_usage_from_totals(
     return usage
 
 
+def _extract_codex_context_tokens(params: object) -> int | None:
+    """Window-fill snapshot from a ``thread/tokenUsage/updated`` payload's
+    ``last`` breakdown: the size of the latest model request, the proxy for
+    how full the context window is going into the next one.
+
+    Reported as ``context_tokens`` — a per-update snapshot the occupancy
+    meter reads (server-side it pairs with the model's catalog window to
+    size the ring). It is never summed across a turn and is distinct from
+    the billing ``total_tokens``, which on the cumulative-delta path is a
+    turn total, not window fill. ``last.totalTokens`` already covers input
+    (inclusive of cached, which still occupies the window) plus output;
+    recompute from components when the provider omits it. Mirrors
+    ``pi_executor``'s last-call context split.
+
+    :param params: Codex ``thread/tokenUsage/updated`` params.
+    :returns: The window-fill token count, or ``None`` when the payload has
+        no usable ``last`` breakdown.
+    """
+    if not isinstance(params, dict):
+        return None
+    token_usage = params.get("tokenUsage")
+    if not isinstance(token_usage, dict):
+        return None
+    last = token_usage.get("last")
+    if not isinstance(last, dict):
+        return None
+    total = int(last.get("totalTokens") or 0)
+    if total > 0:
+        return total
+    recomputed = int(last.get("inputTokens") or 0) + int(last.get("outputTokens") or 0)
+    return recomputed or None
+
+
 def _format_codex_error_params(params: object) -> str:
     """
     Format a Codex App Server JSON-RPC error frame's ``params`` dict
@@ -2385,11 +2418,12 @@ class _CodexAppServerSession:
         self._process_cwd: Path | None = None
         # Private CODEX_HOME so the subprocess never writes to the user's ~/.codex/.
         self._codex_home_dir: Path | None = None
-        # In-flight turn's usage, mapped to the wire shape: the delta of the
-        # thread's cumulative ``tokenUsage.total`` counters since the last
-        # turn boundary (``last`` covers only the latest model request, so a
-        # multi-request turn would under-report). Consumed (and cleared) on
-        # the next ``turn/completed``.
+        # In-flight turn's usage, mapped to the wire shape: billing figures
+        # are the delta of the thread's cumulative ``tokenUsage.total``
+        # counters since the last turn boundary (``last`` covers only the
+        # latest model request, so a multi-request turn would under-report),
+        # plus a ``context_tokens`` window-fill snapshot from ``last``.
+        # Consumed (and cleared) on the next ``turn/completed``.
         self._last_turn_usage: dict[str, object] | None = None
         # Raw cumulative ``tokenUsage.total`` counters: the newest observed
         # values, and the snapshot consumed at the last turn boundary.
@@ -3127,6 +3161,14 @@ class _CodexAppServerSession:
                         # No cumulative breakdown — fall back to the newest
                         # request's ``last`` (under-reports multi-request turns).
                         self._last_turn_usage = _extract_codex_last_turn_usage(params, model)
+                    # context_tokens is window fill: a snapshot of the latest
+                    # request from ``last``, carried alongside the billing
+                    # figures so the occupancy meter reads it rather than the
+                    # summable ``total_tokens``.
+                    if self._last_turn_usage is not None:
+                        context_tokens = _extract_codex_context_tokens(params)
+                        if context_tokens is not None:
+                            self._last_turn_usage["context_tokens"] = context_tokens
                     continue
 
                 if method == "turn/completed":
