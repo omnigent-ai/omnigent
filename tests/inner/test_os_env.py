@@ -124,6 +124,20 @@ def test_build_helper_env_active_passes_omnigent_session_marker() -> None:
     assert env[OMNIGENT_SESSION_ENV_VAR] == OMNIGENT_SESSION_ENV_VALUE
 
 
+def test_build_helper_env_active_excludes_desktop_session() -> None:
+    parent = {
+        "PATH": "/usr/bin",
+        "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus",
+        "XDG_RUNTIME_DIR": "/run/user/1000",
+    }
+
+    env = build_helper_env(parent, _active_policy())
+
+    assert env["PATH"] == "/usr/bin"
+    assert "DBUS_SESSION_BUS_ADDRESS" not in env
+    assert "XDG_RUNTIME_DIR" not in env
+
+
 # ---------------------------------------------------------------------------
 # _shell_impl — timeout result shape
 # ---------------------------------------------------------------------------

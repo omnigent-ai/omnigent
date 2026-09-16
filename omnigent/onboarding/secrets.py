@@ -39,6 +39,8 @@ import os
 import keyring
 import keyring.errors
 
+from omnigent.errors import ErrorCode, OmnigentError
+
 # The subset of keyring exceptions that mean "this backend can't serve the
 # request" (locked / headless / no backend) — we fall back to the file
 # backend rather than crash.
@@ -192,19 +194,30 @@ def load_secret(name: str) -> str | None:
     """Return the secret stored under *name*, or ``None`` if absent.
 
     Tries the OS keychain when enabled; on a :class:`keyring.errors.KeyringError`
-    it falls back to the file backend. A missing secret (in either backend)
-    returns ``None`` so callers can fail loud with a name-specific message.
+    it falls back to the file backend. If no file secret exists, it reports
+    the keyring access failure instead of treating the secret as absent.
 
     :param name: The stable secret name, e.g. ``"anthropic"``.
     :returns: The stored secret value, e.g. ``"sk-ant-..."``, or ``None``
-        when no secret is stored under *name*.
+        when the selected backend is accessible but has no secret under *name*.
+    :raises OmnigentError: If the keyring is inaccessible and no file secret exists.
     """
     if _use_keyring():
         try:
             stored: str | None = keyring.get_password(_KEYRING_SERVICE, name)
             return stored
-        except _KEYRING_ERRORS:
-            pass
+        except _KEYRING_ERRORS as exc:
+            stored = _read_secrets_file().get(name)
+            if stored is not None:
+                return stored
+            raise OmnigentError(
+                f"could not read secret {name!r} from the OS keyring "
+                f"({type(exc).__name__}); no file-backed secret is available. "
+                "Check that a keyring backend is available and unlocked, then restart "
+                "the Omnigent host from the same desktop session. On Linux, check "
+                "DBUS_SESSION_BUS_ADDRESS and XDG_RUNTIME_DIR.",
+                code=ErrorCode.INVALID_INPUT,
+            ) from None
     return _read_secrets_file().get(name)
 
 
