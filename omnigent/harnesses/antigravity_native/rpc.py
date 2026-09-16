@@ -66,6 +66,8 @@ import re
 import stat
 import struct
 import subprocess
+import threading
+from collections import OrderedDict
 from collections.abc import AsyncIterator, Iterable
 from pathlib import Path
 from typing import NamedTuple
@@ -164,6 +166,11 @@ _MAX_FALLBACK_PROBE_PORTS = 32
 # in ``conversation_id_owned_by_pid`` so a pathological candidate set cannot blow
 # up a log line.
 _MAX_LOGGED_AMBIGUOUS_IDS = 10
+
+# Cache process identities only; tokens and port ownership are checked on every call.
+_RPC_PORT_OWNERS: OrderedDict[int, psutil.Process] = OrderedDict()
+_RPC_PORT_OWNERS_LOCK = threading.Lock()
+_MAX_RPC_PORT_OWNERS = 128
 
 
 def _assert_loopback_url(url: str) -> None:
@@ -266,19 +273,51 @@ def _pid_rpc_ports(pid: int) -> list[int]:
     return _pid_listen_ports(pid) or _logged_rpc_ports(pid)
 
 
+def _csrf_token_from_process(port: int, process: psutil.Process) -> str | None:
+    try:
+        # is_running checks the process start time as well as its PID.
+        if not process.is_running():
+            return None
+        args = process.cmdline()
+        if not args or Path(args[0]).name != "agy":
+            return None
+        token = _flag_value(args, "--csrf_token")
+        if token and port in _pid_rpc_ports(process.pid) and process.is_running():
+            return token
+    except (psutil.Error, OSError):
+        pass
+    return None
+
+
+def _remember_rpc_port_owner(port: int, process: psutil.Process) -> None:
+    with _RPC_PORT_OWNERS_LOCK:
+        _RPC_PORT_OWNERS[port] = process
+        _RPC_PORT_OWNERS.move_to_end(port)
+        if len(_RPC_PORT_OWNERS) > _MAX_RPC_PORT_OWNERS:
+            _RPC_PORT_OWNERS.popitem(last=False)
+
+
 def _csrf_token_for_port(port: int) -> str | None:
     """Read the token only from the live agy process owning this loopback port."""
+    with _RPC_PORT_OWNERS_LOCK:
+        owner = _RPC_PORT_OWNERS.get(port)
+    if owner is not None:
+        token = _csrf_token_from_process(port, owner)
+        if token:
+            _remember_rpc_port_owner(port, owner)
+            return token
+        with _RPC_PORT_OWNERS_LOCK:
+            if _RPC_PORT_OWNERS.get(port) is owner:
+                del _RPC_PORT_OWNERS[port]
     for pid in _list_agy_pids():
         try:
             process = psutil.Process(pid)
-            args = process.cmdline()
-            if not args or Path(args[0]).name != "agy":
-                continue
-            token = _flag_value(args, "--csrf_token")
-            if token and port in _pid_rpc_ports(pid) and process.is_running():
-                return token
         except (psutil.Error, OSError):
             continue
+        token = _csrf_token_from_process(port, process)
+        if token:
+            _remember_rpc_port_owner(port, process)
+            return token
     return None
 
 
