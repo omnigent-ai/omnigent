@@ -918,17 +918,25 @@ def _claude_model_probe_invocation(
     """
     from omnigent.claude_launcher import resolve_claude_launch
 
-    args = [
-        "-p",
-        *(["--input-format", "stream-json"] if stream_input else ["/model"]),
-        # The probe asks one client-side question; the MCP fleet, session
-        # persistence, and background chatter are irrelevant startup weight.
-        "--strict-mcp-config",
-        "--mcp-config",
-        '{"mcpServers":{}}',
-        "--no-session-persistence",
-        *extra_args,
-    ]
+    args = ["-p"]
+    if stream_input:
+        args.extend(("--input-format", "stream-json"))
+    else:
+        args.append("/model")
+    args.extend(
+        [
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            # The probe asks one client-side question; the MCP fleet, session
+            # persistence, and background chatter are irrelevant startup weight.
+            "--strict-mcp-config",
+            "--mcp-config",
+            '{"mcpServers":{}}',
+            "--no-session-persistence",
+            *extra_args,
+        ]
+    )
     if claude_config is not None and claude_config.api_key_helper:
         args.extend(("--settings", json.dumps({"apiKeyHelper": claude_config.api_key_helper})))
     command, launch_args = resolve_claude_launch("claude", args)
@@ -969,7 +977,7 @@ async def _resolve_claude_model_alias(
     """
     command, launch_args, env = _claude_model_probe_invocation(
         claude_config,
-        ("--model", alias, "--output-format", "stream-json", "--verbose"),
+        ("--model", alias),
     )
     try:
         process = await asyncio.create_subprocess_exec(
@@ -1120,7 +1128,7 @@ async def _run_claude_model_probe(
 ) -> str | None:
     """Run a bounded client-side probe, with or without control initialization."""
     command, launch_args, env = _claude_model_probe_invocation(
-        claude_config, ("--output-format", "stream-json", "--verbose"), stream_input=stream_input
+        claude_config, stream_input=stream_input
     )
     requests = [
         {
