@@ -18,6 +18,7 @@ from omnigent.db.utils import generate_agent_id
 from omnigent.entities import USER_SESSION_TITLE_MAX_CHARS
 from omnigent.server.routes import sessions as sessions_module
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -297,6 +298,38 @@ async def test_delete_session_calls_full_runner_teardown(
     assert deleted_paths == [f"/v1/sessions/{session_id}"], (
         f"server-side delete should call full runner teardown, got: {deleted_paths}"
     )
+
+
+async def test_delete_session_survives_blob_delete_failure(
+    client: httpx.AsyncClient,
+    session_id: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Delete succeeds even when artifact-store blob cleanup fails.
+
+    File metadata rows are destroyed before blob deletes run, so a
+    store-backend failure raised out of the blob-cleanup loop would
+    surface as an unhandled 500 and strand the session half-deleted
+    (file rows gone, conversation retained, every retry failing).
+    Blob cleanup must be best-effort like the other cleanup steps.
+    """
+    upload = await client.post(
+        f"/v1/sessions/{session_id}/resources/files",
+        files={"file": ("notes.txt", b"attachment", "text/plain")},
+    )
+    assert upload.status_code == 201
+
+    def _failing_delete(self: LocalArtifactStore, key: str) -> None:
+        raise RuntimeError("artifact backend unavailable")
+
+    monkeypatch.setattr(LocalArtifactStore, "delete", _failing_delete)
+
+    resp = await client.delete(f"/v1/sessions/{session_id}")
+
+    assert resp.status_code == 200
+    assert resp.json()["deleted"] is True
+    get_resp = await client.get(f"/v1/sessions/{session_id}")
+    assert get_resp.status_code == 404
 
 
 # ── PATCH /v1/sessions/{id} ─────────────────────────────────────────
