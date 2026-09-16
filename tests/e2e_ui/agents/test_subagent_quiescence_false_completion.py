@@ -406,14 +406,12 @@ def test_midtask_lull_must_not_deliver_false_completion(
         # with the live evidence. The promised "result" does not exist: the
         # child transcript still holds only its first intermediate message.
         with __import__("contextlib").suppress(AssertionError):
-            expect(
-                page.get_by_text(_FALSE_NOTICE_MARKER, exact=False).first
-            ).to_be_visible(timeout=45_000)
+            expect(page.get_by_text(_FALSE_NOTICE_MARKER, exact=False).first).to_be_visible(
+                timeout=45_000
+            )
             page.wait_for_timeout(3_000)
         child_texts = [_item_text(item) for item in _session_items(base_url, child_id)]
-        has_only_intermediate = any(
-            _INTERMEDIATE_TEXT in text for text in child_texts
-        )
+        has_only_intermediate = any(_INTERMEDIATE_TEXT in text for text in child_texts)
         raise AssertionError(
             "A bare mid-task transcript lull (sub-agent still running, no "
             "done record) was promoted to a terminal 'completed' delivery: "
