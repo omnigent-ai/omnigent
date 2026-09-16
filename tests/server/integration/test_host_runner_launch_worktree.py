@@ -481,6 +481,37 @@ async def test_launch_runner_cancellation_during_host_bind_rolls_back(
     assert conv.git_branch is None
 
 
+async def test_launch_runner_post_commit_host_bind_failure_rolls_back(
+    register_host: RegisterHost,
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failure after the host binding commits still clears the full binding."""
+    original_set_host_id = SqlAlchemyConversationStore.set_host_id
+
+    def _commit_then_fail(*args: Any, **kwargs: Any) -> Any:
+        original_set_host_id(*args, **kwargs)
+        raise RuntimeError("read-back failed")
+
+    monkeypatch.setattr(SqlAlchemyConversationStore, "set_host_id", _commit_then_fail)
+    cap = register_host()
+    session_id = await _bare_session(client, "wt-bind-read-failure-agent")
+
+    with pytest.raises(RuntimeError, match="read-back failed"):
+        await _launch(client, session_id, git={"branch_name": "feature/b"})
+
+    assert len(cap.create) == 1
+    assert len(cap.remove) == 1
+    assert cap.launch == []
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert conv is not None
+    assert conv.runner_id is None
+    assert conv.host_id is None
+    assert conv.workspace is None
+    assert conv.git_branch is None
+
+
 async def test_launch_runner_with_existing_worktree_persists_without_creating(
     register_host: RegisterHost,
     client: httpx.AsyncClient,

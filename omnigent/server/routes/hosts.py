@@ -938,7 +938,14 @@ def create_hosts_router(
 
         async def _rollback_failed_launch() -> None:
             """Clear the binding and worktree after a failed runner launch."""
-            await asyncio.to_thread(conversation_store.clear_host_binding, body.session_id)
+            try:
+                await asyncio.to_thread(conversation_store.clear_host_binding, body.session_id)
+            except ConversationNotFoundError:
+                _logger.warning(
+                    "Failed to clear host binding for session %s",
+                    body.session_id,
+                    exc_info=True,
+                )
             await _rollback_worktree()
 
         request_id = secrets.token_hex(8)
@@ -970,22 +977,14 @@ def create_hosts_router(
             async def _rollback_persist_failure() -> None:
                 with contextlib.suppress(BaseException):
                     await persist_task
-                persisted = (
-                    persist_task.done()
-                    and not persist_task.cancelled()
-                    and persist_task.exception() is None
-                )
-                if persisted:
-                    await asyncio.to_thread(conversation_store.clear_host_binding, body.session_id)
-                else:
-                    await _rollback_runner_claim()
-                await _rollback_worktree()
+                await _rollback_failed_launch()
 
             cleanup_task = asyncio.create_task(_rollback_persist_failure())
             if isinstance(exc, asyncio.CancelledError):
                 _track_runner_launch_cleanup(cleanup_task)
             else:
-                await cleanup_task
+                with contextlib.suppress(BaseException):
+                    await cleanup_task
             raise
 
         try:
