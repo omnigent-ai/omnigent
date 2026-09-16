@@ -3420,25 +3420,6 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         return run_write_transaction(self._session_immediate, "set_runner_id", write)
 
-    def clear_runner_id_if_matches(self, conversation_id: str, runner_id: str) -> bool:
-        """Clear a runner reservation only if the caller still owns it."""
-        from sqlalchemy import update
-
-        def write(session: Session) -> bool:
-            stmt = (
-                update(SqlConversationMetadata)
-                .where(
-                    SqlConversationMetadata.workspace_id == current_workspace_id(),
-                    SqlConversationMetadata.id == conversation_id,
-                    SqlConversationMetadata.runner_id == runner_id,
-                )
-                .values(runner_id=None)
-            )
-            result = cast(_RowCountResult, session.execute(stmt))
-            return result.rowcount == 1
-
-        return run_write_transaction(self._session_immediate, "clear_runner_id_if_matches", write)
-
     def touch_runner_liveness(self, runner_ids: list[str], now: int) -> None:
         """
         Stamp ``runner_last_seen`` for sessions bound to live runners.

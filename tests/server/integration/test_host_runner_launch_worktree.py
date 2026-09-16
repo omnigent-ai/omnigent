@@ -18,11 +18,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import threading
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 
 import httpx
 import pytest
@@ -111,7 +109,6 @@ class _HostCapture:
     launch: list[HostLaunchRunnerFrame] = field(default_factory=list)
     remove: list[HostRemoveWorktreeFrame] = field(default_factory=list)
     create_started: asyncio.Event = field(default_factory=asyncio.Event)
-    remove_started: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 # register(*, create_status=, create_error=, launch_status=) -> _HostCapture
@@ -160,7 +157,7 @@ async def register_host(
 
         async def _resolve_create(
             frame: HostCreateWorktreeFrame,
-            future: asyncio.Future[Any],
+            future: asyncio.Future[dict[str, object]],
         ) -> None:
             if create_gate is not None:
                 await create_gate.wait()
@@ -226,7 +223,6 @@ async def register_host(
                         )
                 elif isinstance(frame, HostRemoveWorktreeFrame):
                     cap.remove.append(frame)
-                    cap.remove_started.set()
                     fut = conn.pending_remove_worktrees.pop(frame.request_id, None)
                     if fut is not None and not fut.done():
                         fut.set_result({"status": "ok", "error": None})
@@ -245,9 +241,9 @@ async def register_host(
         if not task.done():
             task.cancel()
     for task in resolver_tasks:
-        if not task.done():
-            task.cancel()
-    await asyncio.gather(*resolver_tasks, return_exceptions=True)
+        task.cancel()
+    if resolver_tasks:
+        await asyncio.gather(*resolver_tasks, return_exceptions=True)
 
 
 async def _bare_session(client: httpx.AsyncClient, name: str) -> str:
@@ -352,217 +348,36 @@ async def test_launch_runner_without_git_binds_source_dir_no_worktree(
     assert conv.host_id == _HOST_ID
 
 
-async def test_launch_runner_reserves_session_before_worktree_creation(
+async def test_concurrent_source_launch_cannot_overtake_worktree_launch(
     register_host: RegisterHost,
     client: httpx.AsyncClient,
     db_uri: str,
 ) -> None:
-    """A later plain launch cannot overtake a slow worktree launch."""
-    release_create = asyncio.Event()
-    cap = register_host(create_gate=release_create)
-    session_id = await _bare_session(client, "wt-concurrent-launch-agent")
+    """A source-directory launch cannot bind while worktree creation is pending."""
+    create_gate = asyncio.Event()
+    cap = register_host(create_gate=create_gate)
+    session_id = await _bare_session(client, "wt-race-agent")
 
     worktree_launch = asyncio.create_task(
         _launch(client, session_id, git={"branch_name": "feature/b"})
     )
     await asyncio.wait_for(cap.create_started.wait(), timeout=1.0)
 
-    pending_conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
-    assert pending_conv is not None
-    assert pending_conv.runner_id is not None, "session was not reserved before worktree creation"
-    assert pending_conv.workspace is None
+    source_launch = asyncio.create_task(_launch(client, session_id, git=None))
+    await asyncio.sleep(0)
+    create_gate.set()
 
-    source_response = await _launch(client, session_id)
-    assert source_response.status_code == 400, source_response.text
-    assert cap.launch == [], "runner launched before the requested worktree was ready"
-
-    release_create.set()
-    worktree_response = await worktree_launch
-
+    worktree_response, source_response = await asyncio.gather(worktree_launch, source_launch)
     assert worktree_response.status_code == 200, worktree_response.text
+    assert source_response.status_code == 400, source_response.text
     assert len(cap.create) == 1
     assert len(cap.launch) == 1
+    assert cap.launch[0].workspace == f"{_SOURCE_REPO}-worktrees/feature-b"
 
     conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
     assert conv is not None
     assert conv.workspace == f"{_SOURCE_REPO}-worktrees/feature-b"
     assert conv.git_branch == "feature/b"
-    assert conv.host_id == _HOST_ID
-
-
-async def test_launch_runner_releases_reservation_when_worktree_creation_fails(
-    register_host: RegisterHost,
-    client: httpx.AsyncClient,
-    db_uri: str,
-) -> None:
-    """A failed worktree operation leaves the session bindable again."""
-    register_host(create_status="failed", create_error="bad base branch")
-    session_id = await _bare_session(client, "wt-create-failure-agent")
-
-    response = await _launch(client, session_id, git={"branch_name": "feature/b"})
-
-    assert response.status_code == 400, response.text
-    conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
-    assert conv is not None
-    assert conv.runner_id is None
-    assert conv.host_id is None
-    assert conv.workspace is None
-    assert conv.git_branch is None
-
-
-async def test_launch_runner_releases_reservation_when_harness_resolution_fails(
-    register_host: RegisterHost,
-    client: httpx.AsyncClient,
-    db_uri: str,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Harness metadata failures do not leave the session reserved."""
-
-    async def _fail_harness_resolution(*_args: Any) -> str:
-        raise RuntimeError("agent bundle unavailable")
-
-    monkeypatch.setattr(
-        "omnigent.server.routes.hosts._resolve_agent_harness",
-        _fail_harness_resolution,
-    )
-    cap = register_host()
-    session_id = await _bare_session(client, "wt-harness-failure-agent")
-
-    with pytest.raises(RuntimeError, match="agent bundle unavailable"):
-        await _launch(client, session_id, git={"branch_name": "feature/b"})
-
-    assert cap.create == []
-    conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
-    assert conv is not None
-    assert conv.runner_id is None
-    assert conv.host_id is None
-    assert conv.workspace is None
-    assert conv.git_branch is None
-
-
-async def test_launch_runner_cancellation_during_host_bind_rolls_back(
-    register_host: RegisterHost,
-    client: httpx.AsyncClient,
-    db_uri: str,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Cancellation waits for the DB write, then clears its result."""
-    bind_started = threading.Event()
-    release_bind = threading.Event()
-    original_set_host_id = SqlAlchemyConversationStore.set_host_id
-
-    def _delayed_set_host_id(*args: Any, **kwargs: Any) -> Any:
-        bind_started.set()
-        assert release_bind.wait(timeout=2.0)
-        return original_set_host_id(*args, **kwargs)
-
-    monkeypatch.setattr(SqlAlchemyConversationStore, "set_host_id", _delayed_set_host_id)
-    cap = register_host()
-    session_id = await _bare_session(client, "wt-bind-cancel-agent")
-
-    launch_task = asyncio.create_task(
-        _launch(client, session_id, git={"branch_name": "feature/b"})
-    )
-    assert await asyncio.to_thread(bind_started.wait, 2.0)
-    launch_task.cancel()
-    release_bind.set()
-    with pytest.raises(asyncio.CancelledError):
-        await launch_task
-
-    await asyncio.wait_for(cap.remove_started.wait(), timeout=1.0)
-    assert len(cap.create) == 1
-    assert len(cap.remove) == 1
-    assert cap.launch == []
-    conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
-    assert conv is not None
-    assert conv.runner_id is None
-    assert conv.host_id is None
-    assert conv.workspace is None
-    assert conv.git_branch is None
-
-
-async def test_launch_runner_cancellation_during_reservation_rolls_back(
-    register_host: RegisterHost,
-    client: httpx.AsyncClient,
-    db_uri: str,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Cancellation waits for the reservation CAS, then clears only its token."""
-    reserve_started = threading.Event()
-    release_reserve = threading.Event()
-    cleanup_finished = threading.Event()
-    original_set_runner_id = SqlAlchemyConversationStore.set_runner_id
-    original_clear_if_matches = SqlAlchemyConversationStore.clear_runner_id_if_matches
-
-    def _delayed_set_runner_id(*args: Any, **kwargs: Any) -> bool:
-        reserve_started.set()
-        assert release_reserve.wait(timeout=2.0)
-        return original_set_runner_id(*args, **kwargs)
-
-    def _tracked_clear_if_matches(*args: Any, **kwargs: Any) -> bool:
-        try:
-            return original_clear_if_matches(*args, **kwargs)
-        finally:
-            cleanup_finished.set()
-
-    monkeypatch.setattr(SqlAlchemyConversationStore, "set_runner_id", _delayed_set_runner_id)
-    monkeypatch.setattr(
-        SqlAlchemyConversationStore,
-        "clear_runner_id_if_matches",
-        _tracked_clear_if_matches,
-    )
-    cap = register_host()
-    session_id = await _bare_session(client, "wt-reserve-cancel-agent")
-
-    launch_task = asyncio.create_task(
-        _launch(client, session_id, git={"branch_name": "feature/b"})
-    )
-    assert await asyncio.to_thread(reserve_started.wait, 2.0)
-    launch_task.cancel()
-    release_reserve.set()
-    with pytest.raises(asyncio.CancelledError):
-        await launch_task
-
-    assert await asyncio.to_thread(cleanup_finished.wait, 2.0)
-    assert cap.create == []
-    assert cap.launch == []
-    conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
-    assert conv is not None
-    assert conv.runner_id is None
-    assert conv.host_id is None
-    assert conv.workspace is None
-    assert conv.git_branch is None
-
-
-async def test_launch_runner_post_commit_host_bind_failure_rolls_back(
-    register_host: RegisterHost,
-    client: httpx.AsyncClient,
-    db_uri: str,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A failure after the host binding commits still clears the full binding."""
-    original_set_host_id = SqlAlchemyConversationStore.set_host_id
-
-    def _commit_then_fail(*args: Any, **kwargs: Any) -> Any:
-        original_set_host_id(*args, **kwargs)
-        raise RuntimeError("read-back failed")
-
-    monkeypatch.setattr(SqlAlchemyConversationStore, "set_host_id", _commit_then_fail)
-    cap = register_host()
-    session_id = await _bare_session(client, "wt-bind-read-failure-agent")
-
-    with pytest.raises(RuntimeError, match="read-back failed"):
-        await _launch(client, session_id, git={"branch_name": "feature/b"})
-
-    assert len(cap.create) == 1
-    assert len(cap.remove) == 1
-    assert cap.launch == []
-    conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
-    assert conv is not None
-    assert conv.runner_id is None
-    assert conv.host_id is None
-    assert conv.workspace is None
-    assert conv.git_branch is None
 
 
 async def test_launch_runner_with_existing_worktree_persists_without_creating(

@@ -17,9 +17,9 @@ from the DB so a host connected to replica B reads back as
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 import secrets
+import weakref
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -62,33 +62,17 @@ from omnigent.server.routes._workspace_validation import (
 )
 from omnigent.server.schemas import SessionGitOptions
 from omnigent.stores import AgentStore, ConversationStore
-from omnigent.stores.conversation_store import ConversationNotFoundError
 from omnigent.stores.host_store import HostStore, host_is_live
 from omnigent.stores.permission_store import PermissionStore
 
 _logger = logging.getLogger(__name__)
 
-# custom-lint: disable-next=workspace-scoped-cache -- set of Task objects
-_runner_launch_cleanup_tasks: set[asyncio.Task[None]] = set()
-
-
-def _track_runner_launch_cleanup(task: asyncio.Task[None]) -> None:
-    """Keep detached launch cleanup alive and report failures."""
-    _runner_launch_cleanup_tasks.add(task)
-
-    def _done(completed: asyncio.Task[None]) -> None:
-        _runner_launch_cleanup_tasks.discard(completed)
-        if completed.cancelled():
-            return
-        error = completed.exception()
-        if error is not None:
-            _logger.warning(
-                "Detached runner launch cleanup failed",
-                exc_info=(type(error), error, error.__traceback__),
-            )
-
-    task.add_done_callback(_done)
-
+# Host-scoped requests are routed to one replica, so this closes the local
+# create-worktree-before-bind race while the database CAS remains the fallback.
+# custom-lint: disable-next=workspace-scoped-cache -- lock; collision only serializes
+_runner_launch_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+    weakref.WeakValueDictionary()
+)
 
 _LAUNCH_RESULT_TIMEOUT_S = 30.0
 # Per-call timeout for host.list_dir round-trips. Listing is a single
@@ -829,110 +813,23 @@ def create_hosts_router(
             )
 
         if body.git is not None:
-            from omnigent.host.git_worktree import (
-                WorktreeError,
-                validate_branch_name,
-            )
+            from omnigent.host.git_worktree import WorktreeError, validate_branch_name
 
             try:
                 validate_branch_name(body.git.branch_name)
             except WorktreeError as exc:
                 raise HTTPException(status_code=400, detail=exc.message) from exc
 
-        # Atomically reserve the session before creating the worktree.
-        # Later launch requests fail instead of binding it elsewhere.
-        binding_token = secrets.token_urlsafe(32)
-        runner_id = token_bound_runner_id(binding_token)
-
-        async def _rollback_runner_claim() -> None:
-            await asyncio.to_thread(
-                conversation_store.clear_runner_id_if_matches,
-                body.session_id,
-                runner_id,
-            )
-
-        reserve_task = asyncio.create_task(
-            asyncio.to_thread(
-                conversation_store.set_runner_id,
-                body.session_id,
-                runner_id,
-            )
-        )
-        try:
-            bound = await asyncio.shield(reserve_task)
-        except BaseException as exc:
-
-            async def _rollback_reservation() -> None:
-                with contextlib.suppress(BaseException):
-                    await reserve_task
-                await _rollback_runner_claim()
-
-            cleanup_task = asyncio.create_task(_rollback_reservation())
-            if isinstance(exc, asyncio.CancelledError):
-                _track_runner_launch_cleanup(cleanup_task)
-            else:
-                with contextlib.suppress(BaseException):
-                    await cleanup_task
-            raise
-
-        if not bound:
-            raise HTTPException(
-                status_code=400,
-                detail="session already has a runner bound",
-            )
-
-        # Resolve the harness while only the runner reservation is held.
+        # Resolve the harness before creating host-side state.
         harness: str | None = None
         if agent_store is not None and agent_cache is not None:
-            try:
-                harness = await _resolve_agent_harness(target.conv, agent_store, agent_cache)
-            except BaseException:
-                await _rollback_runner_claim()
-                raise
+            harness = await _resolve_agent_harness(target.conv, agent_store, agent_cache)
 
-        # Create the requested worktree before storing the final workspace.
         git_branch: str | None = None
-        # Set only for worktrees created by this request.
         worktree = None
-        if body.git is not None:
-            if body.git.existing_worktree:
-                # Record the branch without creating or owning the worktree.
-                git_branch = body.git.branch_name
-            else:
-                from omnigent.server.routes._host_worktree import (
-                    WorktreeHostUnavailableError,
-                    WorktreeProxyError,
-                    create_worktree_on_host,
-                )
-
-                try:
-                    worktree = await create_worktree_on_host(
-                        host_registry=host_registry,
-                        host_conn=conn,
-                        repo_path=workspace,
-                        branch_name=body.git.branch_name,
-                        base_branch=body.git.base_branch,
-                        existing_branch=body.git.existing_branch,
-                    )
-                except WorktreeHostUnavailableError as exc:
-                    await _rollback_runner_claim()
-                    raise HTTPException(status_code=409, detail=exc.message) from exc
-                except WorktreeProxyError as exc:
-                    await _rollback_runner_claim()
-                    raise HTTPException(status_code=400, detail=exc.message) from exc
-                except BaseException:
-                    await _rollback_runner_claim()
-                    raise
-                workspace = worktree.worktree_path
-                git_branch = worktree.branch
 
         async def _rollback_worktree() -> None:
-            """
-            Remove a worktree created by this request.
-
-            Cleanup is best-effort. Recreated branches are preserved because
-            they existed before this request.
-            """
+            """Remove a worktree created by this request."""
             if worktree is None:
                 return
             from omnigent.server.routes._host_worktree import (
@@ -957,20 +854,78 @@ def create_hosts_router(
                 )
 
         async def _rollback_failed_launch() -> None:
-            """Clear the binding and worktree after a failed runner launch."""
-            try:
-                await asyncio.to_thread(conversation_store.clear_host_binding, body.session_id)
-            except ConversationNotFoundError:
-                _logger.warning(
-                    "Failed to clear host binding for session %s",
-                    body.session_id,
-                    exc_info=True,
+            """Clear state created by a failed runner launch."""
+            await asyncio.to_thread(conversation_store.clear_host_binding, body.session_id)
+            await _rollback_worktree()
+
+        binding_token = secrets.token_urlsafe(32)
+        runner_id = token_bound_runner_id(binding_token)
+
+        launch_lock = _runner_launch_locks.setdefault(body.session_id, asyncio.Lock())
+        async with launch_lock:
+            current = await asyncio.to_thread(
+                conversation_store.get_conversation,
+                body.session_id,
+            )
+            if current is None or current.runner_id is not None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="session already has a runner bound",
                 )
-            finally:
+
+            if body.git is not None:
+                if body.git.existing_worktree:
+                    git_branch = body.git.branch_name
+                else:
+                    from omnigent.server.routes._host_worktree import (
+                        WorktreeHostUnavailableError,
+                        WorktreeProxyError,
+                        create_worktree_on_host,
+                    )
+
+                    try:
+                        worktree = await create_worktree_on_host(
+                            host_registry=host_registry,
+                            host_conn=conn,
+                            repo_path=workspace,
+                            branch_name=body.git.branch_name,
+                            base_branch=body.git.base_branch,
+                            existing_branch=body.git.existing_branch,
+                        )
+                    except WorktreeHostUnavailableError as exc:
+                        raise HTTPException(status_code=409, detail=exc.message) from exc
+                    except WorktreeProxyError as exc:
+                        raise HTTPException(status_code=400, detail=exc.message) from exc
+                    workspace = worktree.worktree_path
+                    git_branch = worktree.branch
+
+            bound = await asyncio.to_thread(
+                conversation_store.set_runner_id,
+                body.session_id,
+                runner_id,
+            )
+            if not bound:
                 await _rollback_worktree()
+                raise HTTPException(
+                    status_code=400,
+                    detail="session already has a runner bound",
+                )
+            try:
+                await asyncio.to_thread(
+                    conversation_store.set_host_id,
+                    body.session_id,
+                    host_id,
+                    workspace,
+                    git_branch,
+                )
+            except BaseException:
+                await _rollback_failed_launch()
+                raise
 
         request_id = secrets.token_hex(8)
         future: asyncio.Future[dict[str, str | None]] = asyncio.get_running_loop().create_future()
+        conn.pending_launches[request_id] = future
+
         launch_frame = encode_host_frame(
             HostLaunchRunnerFrame(
                 request_id=request_id,
@@ -980,36 +935,7 @@ def create_hosts_router(
                 harness=harness,
             )
         )
-
-        # Store the final host, workspace, and optional branch together.
-        persist_task = asyncio.create_task(
-            asyncio.to_thread(
-                conversation_store.set_host_id,
-                body.session_id,
-                host_id,
-                workspace,
-                git_branch,
-            )
-        )
         try:
-            await asyncio.shield(persist_task)
-        except BaseException as exc:
-
-            async def _rollback_persist_failure() -> None:
-                with contextlib.suppress(BaseException):
-                    await persist_task
-                await _rollback_failed_launch()
-
-            cleanup_task = asyncio.create_task(_rollback_persist_failure())
-            if isinstance(exc, asyncio.CancelledError):
-                _track_runner_launch_cleanup(cleanup_task)
-            else:
-                with contextlib.suppress(BaseException):
-                    await cleanup_task
-            raise
-
-        try:
-            conn.pending_launches[request_id] = future
             host_registry.send_text(conn, launch_frame)
         except ConnectionError:
             conn.pending_launches.pop(request_id, None)
@@ -1018,10 +944,6 @@ def create_hosts_router(
                 status_code=409,
                 detail="host connection was replaced",
             ) from None
-        except BaseException:
-            conn.pending_launches.pop(request_id, None)
-            await _rollback_failed_launch()
-            raise
 
         try:
             result = await asyncio.wait_for(

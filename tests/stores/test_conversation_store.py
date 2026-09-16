@@ -2477,13 +2477,7 @@ def test_update_title_bumps_updated_at(
 
 @pytest.mark.parametrize(
     "rebind",
-    [
-        "replace_runner_id",
-        "clear_runner_id",
-        "clear_runner_id_if_matches",
-        "clear_host_binding",
-        "set_host_id",
-    ],
+    ["replace_runner_id", "clear_runner_id", "clear_host_binding", "set_host_id"],
 )
 def test_runner_host_rebind_does_not_bump_updated_at(
     conversation_store: SqlAlchemyConversationStore,
@@ -2514,9 +2508,6 @@ def test_runner_host_rebind_does_not_bump_updated_at(
         conversation_store.replace_runner_id(conv.id, "runner_abc123")
     elif rebind == "clear_runner_id":
         conversation_store.clear_runner_id(conv.id)
-    elif rebind == "clear_runner_id_if_matches":
-        conversation_store.set_runner_id(conv.id, "runner_abc123")
-        conversation_store.clear_runner_id_if_matches(conv.id, "runner_abc123")
     elif rebind == "clear_host_binding":
         conversation_store.clear_host_binding(conv.id)
     else:
@@ -3337,24 +3328,6 @@ def test_clear_host_binding_nulls_all_binding_fields(
     assert refetched.runner_id is None
     # And the session can be re-bound (the CAS sees runner_id IS NULL).
     assert conversation_store.set_runner_id(conv.id, "runner_token_retry") is True
-
-
-def test_clear_runner_id_if_matches_preserves_replacement(
-    conversation_store: SqlAlchemyConversationStore,
-) -> None:
-    """A stale cleanup cannot clear another caller's runner binding."""
-    conv = conversation_store.create_conversation()
-    assert conversation_store.set_runner_id(conv.id, "runner_current") is True
-
-    assert conversation_store.clear_runner_id_if_matches(conv.id, "runner_stale") is False
-    unchanged = conversation_store.get_conversation(conv.id)
-    assert unchanged is not None
-    assert unchanged.runner_id == "runner_current"
-
-    assert conversation_store.clear_runner_id_if_matches(conv.id, "runner_current") is True
-    cleared = conversation_store.get_conversation(conv.id)
-    assert cleared is not None
-    assert cleared.runner_id is None
 
 
 def test_clear_host_binding_missing_conversation_raises(
