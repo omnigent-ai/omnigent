@@ -1,28 +1,23 @@
-"""E2E: a runner attached to a remote routing-capable server offers sys_advise_models.
+"""E2E: ``sys_advise_models`` must be offered on a runner attached to a routing server.
 
-The server is the only process that can answer "can this deployment route?"
-(its ``/v1/info`` computes ``smart_routing_enabled`` from the routing backends
-constructed in the server process). A runner attached to that server over a
-host daemon holds no routing backends of its own, so the tool-registration
-gate must not be answered from the runner's local caps — otherwise
-``sys_advise_models`` is hidden from every session on that runner even though
-the server would happily serve the call.
+Journey: run an omnigent server with
+smart routing configured (the ``live_server`` fixture's server-level ``llm:``
+block gives it the built-in OSS judge, so ``GET /v1/info`` reports
+``smart_routing_enabled: true``) -> attach a runner process that does not share
+the server's process (an ``omnigent host`` daemon, and the tunneled sibling
+runner every local deployment spawns) -> start a session on that runner and run
+one turn -> inspect the tool surface offered to the model.
 
-The journey is the real remote-attachment path, driven end to end:
+Expected: ``sys_advise_models`` is advertised alongside ``sys_list_models``,
+because the attached server can answer the call. The guarded regression: the
+runner-process gate evaluates ``routing_available(get_caps())`` against its own
+empty caps (the routing backends live only in the server process), so the
+advisor is hidden from every session on such a runner unless the server's
+session-init envelope carries its routing answer.
 
-1. the shared e2e server (mock mode configures a server ``llm:`` block, so
-   the built-in judge makes ``smart_routing_enabled: true``),
-2. a real ``omnigent host`` daemon registered against it,
-3. a session launched on that host's runner,
-4. one turn against the mock LLM — whose captured request body carries the
-   exact tool surface the model was offered.
+Usage::
 
-The assertion is on that captured tool surface: ``sys_list_models`` present
-(the sub-agent tool block registered and the capture worked) and
-``sys_advise_models`` present alongside it (the routing-gated tool was not
-hidden). All against the mock LLM server — no real credentials needed::
-
-    .venv/bin/python -m pytest tests/e2e/test_advise_models_remote_runner.py -v
+    pytest tests/e2e/test_advise_models_remote_runner.py -v
 """
 
 from __future__ import annotations
@@ -32,265 +27,237 @@ import signal
 import subprocess
 import time
 import uuid
+from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
-import yaml
 
-from omnigent.process_logging import PROCESS_LOG_FILE_ENV_VAR
+from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_executable
 from tests.e2e.conftest import (
-    POLL_INTERVAL_S,
     configure_mock_llm,
+    create_runner_bound_session,
+    get_mock_requests,
     lookup_agent_id,
     poll_session_until_terminal,
     register_inline_agent,
+    reset_mock_llm,
     send_user_message_to_session,
 )
+from tests.e2e.helpers import POLL_INTERVAL_S
 
-#: Seconds to wait for the host daemon to register online.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
 _HOST_ONLINE_TIMEOUT_S = 60.0
-
-#: Seconds to wait for the host-launched runner to come online.
-_RUNNER_ONLINE_TIMEOUT_S = 45.0
+_TURN_TIMEOUT_S = 180.0
 
 
-def _spawn_host_daemon(
-    *,
-    tmp_path: Path,
-    live_server: str,
-) -> tuple[subprocess.Popen[bytes], str, Path]:
-    """Spawn an isolated ``omnigent host`` daemon against *live_server*.
-
-    The daemon gets a private ``HOME`` plus explicit ``OMNIGENT_CONFIG_HOME``
-    / ``OMNIGENT_DATA_DIR`` under *tmp_path*, so an ambient config home (e.g.
-    one whose provider block references env vars this machine doesn't have)
-    can never leak into the runner it launches. The host identity is
-    pre-seeded at ``$HOME/.omnigent/config.yaml`` — the path the daemon's
-    identity loader actually reads — and ``OMNIGENT_CONFIG_HOME`` points at
-    the same directory so config reads agree with it.
-
-    :param tmp_path: Per-test temp dir used as the daemon's ``HOME``.
-    :param live_server: Server URL the daemon registers with.
-    :returns: ``(proc, host_id, daemon_log)``.
-    """
-    config_home = tmp_path / ".omnigent"
-    config_home.mkdir(parents=True, exist_ok=True)
-    host_id = uuid.uuid4().hex
-    host_name = f"e2e-advise-{uuid.uuid4().hex[:12]}"
-    (config_home / "config.yaml").write_text(
-        yaml.safe_dump(
-            {"host": {"host_id": host_id, "name": host_name}},
-            default_flow_style=False,
-            sort_keys=True,
-        )
+def _assert_server_routes(client: httpx.Client) -> None:
+    """Journey precondition: the server itself must report routing on."""
+    resp = client.get("/v1/info")
+    resp.raise_for_status()
+    info = resp.json()
+    assert info.get("smart_routing_enabled") is True, (
+        "precondition failed: the test server does not report "
+        f"smart_routing_enabled=true (got {info.get('smart_routing_enabled')!r}, "
+        f"sources={info.get('smart_routing_sources')!r}); the live_server "
+        "fixture's server-level llm: block should configure the OSS judge"
     )
-    daemon_log = tmp_path / "host-daemon.log"
-    # Pin the daemon (and the runner it launches) to this worktree's omnigent:
-    # the assertion is about RUNNER-side tool registration, so an ambient
-    # PYTHONPATH naming another omnigent checkout would silently test that
-    # other build. apply_runner_env drops the variable again in compat mode,
-    # where the pinned old install must resolve instead.
-    repo_root = Path(__file__).resolve().parents[2]
-    ambient_pythonpath = os.environ.get("PYTHONPATH", "")
-    env = {
-        **os.environ,
-        "HOME": str(tmp_path),
-        "OMNIGENT_CONFIG_HOME": str(config_home),
-        "OMNIGENT_DATA_DIR": str(tmp_path / "omnigent-data"),
-        "PYTHONPATH": f"{repo_root}{os.pathsep}{ambient_pythonpath}",
-        PROCESS_LOG_FILE_ENV_VAR: str(daemon_log),
-    }
-    with open(daemon_log, "w") as log_fh:
+
+
+def _register_spawn_agent(
+    client: httpx.Client, mock_llm_server_url: str, *, model: str, label: str
+) -> str:
+    """Register an openai-agents agent whose ``spawn: true`` grant registers the
+    sub-agent tool block (``sys_list_models`` + the gated ``sys_advise_models``)."""
+    return register_inline_agent(
+        client,
+        name=f"advise-{label}-{uuid.uuid4().hex[:6]}",
+        harness="openai-agents",
+        model=model,
+        profile="",
+        prompt="You are a helpful assistant.",
+        mock_llm_base_url=f"{mock_llm_server_url}/v1",
+        extra_config={"spawn": True},
+    )
+
+
+def _advertised_tool_names(reqs: list[dict[str, Any]]) -> set[str]:
+    """Collect tool names offered to the model, normalizing MCP-style prefixes."""
+    names: set[str] = set()
+    for req in reqs:
+        for tool in req.get("tools", []) or []:
+            raw = tool.get("name") or (tool.get("function") or {}).get("name")
+            if raw:
+                names.add(str(raw).split("__")[-1])
+    return names
+
+
+def _run_turn_and_collect_tools(
+    client: httpx.Client,
+    mock_llm_server_url: str,
+    *,
+    session_id: str,
+    model: str,
+) -> set[str]:
+    """Send one scripted turn and return the tool names its LLM request carried."""
+    # A host-bound session's runner spawns asynchronously after create; the
+    # events endpoint 503s until it tunnels in, so retry like the web UI does.
+    deadline = time.monotonic() + _HOST_ONLINE_TIMEOUT_S
+    while True:
+        try:
+            response_id = send_user_message_to_session(
+                client,
+                session_id=session_id,
+                content="Which model should I use for this task?",
+            )
+            break
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code != 503 or time.monotonic() > deadline:
+                raise
+            time.sleep(POLL_INTERVAL_S)
+    body = poll_session_until_terminal(
+        client, session_id=session_id, response_id=response_id, timeout=_TURN_TIMEOUT_S
+    )
+    assert body["status"] == "completed", (
+        f"turn did not complete: status={body['status']!r} error={body.get('error')!r}"
+    )
+    reqs = get_mock_requests(mock_llm_server_url, key=model)
+    assert reqs, f"mock LLM captured no requests for model {model!r}"
+    return _advertised_tool_names(reqs)
+
+
+def _assert_advisor_offered(tool_names: set[str], *, topology: str) -> None:
+    assert "sys_list_models" in tool_names, (
+        f"control failed on the {topology}: sys_list_models missing, so the "
+        f"sub-agent tool block never registered at all. Advertised: {sorted(tool_names)}"
+    )
+    assert "sys_advise_models" in tool_names, (
+        f"sys_advise_models is hidden from a session on the {topology} even "
+        "though the attached server reports smart_routing_enabled=true "
+        f"(the runner-side routing_available(get_caps()) gate). "
+        f"Advertised: {sorted(tool_names)}"
+    )
+
+
+@pytest.fixture
+def attached_host(live_server: str, http_client: httpx.Client, tmp_path: Path) -> Iterator[str]:
+    """Attach a real ``omnigent host`` daemon to the live server; yield its host id."""
+    home_dir = tmp_path / "host-home"
+    home_dir.mkdir()
+    log_path = tmp_path / "host-daemon.log"
+    env = os.environ.copy()
+    env["HOME"] = str(home_dir)
+    env["OMNIGENT_CONFIG_HOME"] = str(home_dir / "config")
+    env["OMNIGENT_DATA_DIR"] = str(home_dir / "data")
+    # Absolute paths only: the host-spawned runner's cwd is the session
+    # workspace, where relative PYTHONPATH entries stop resolving.
+    env["PYTHONPATH"] = os.pathsep.join(
+        [
+            str(_REPO_ROOT),
+            str(_REPO_ROOT / "sdks" / "python-client"),
+            str(_REPO_ROOT / "sdks" / "ui"),
+        ]
+        + [e for e in env.get("PYTHONPATH", "").split(os.pathsep) if os.path.isabs(e)]
+    )
+    env.pop("CLAUDECODE", None)
+    with open(log_path, "w") as log_fh:
         proc = subprocess.Popen(
             [runner_executable(), "-m", "omnigent.host._daemon_entry", "--server", live_server],
             env=apply_runner_env(env),
             cwd=compat_runner_cwd(),
-            stdout=subprocess.DEVNULL,
-            stderr=log_fh,
+            stdout=log_fh,
+            stderr=subprocess.STDOUT,
         )
-    return proc, host_id, daemon_log
-
-
-def _wait_for_host_online(client: httpx.Client, host_id: str, timeout: float) -> None:
-    """Poll ``GET /v1/hosts`` until *host_id* shows online.
-
-    :param client: HTTP client pointed at the server.
-    :param host_id: Host id to wait for.
-    :param timeout: Max seconds to wait.
-    :raises AssertionError: When the host never registers.
-    """
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        try:
-            resp = client.get("/v1/hosts")
+    try:
+        deadline = time.monotonic() + _HOST_ONLINE_TIMEOUT_S
+        host_id: str | None = None
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                raise AssertionError(
+                    f"host daemon exited with {proc.returncode}:\n"
+                    f"{log_path.read_text(errors='replace')[-3000:]}"
+                )
+            resp = http_client.get("/v1/hosts")
             if resp.status_code == 200:
-                for host in resp.json().get("hosts", []):
-                    if host["host_id"] == host_id and host["status"] == "online":
-                        return
-        except httpx.ConnectError:
-            pass
-        time.sleep(POLL_INTERVAL_S)
-    raise AssertionError(f"Host {host_id!r} did not appear online within {timeout}s")
+                online = [h for h in resp.json().get("hosts", []) if h["status"] == "online"]
+                if online:
+                    host_id = str(online[0]["host_id"])
+                    break
+            time.sleep(POLL_INTERVAL_S)
+        if host_id is None:
+            raise AssertionError(
+                f"no host came online within {_HOST_ONLINE_TIMEOUT_S}s:\n"
+                f"{log_path.read_text(errors='replace')[-3000:]}"
+            )
+        yield host_id
+    finally:
+        if proc.poll() is None:
+            proc.send_signal(signal.SIGTERM)
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
 
 
-def _offered_tool_names(mock_llm_server_url: str, model: str) -> set[str]:
-    """Return every tool name the mock LLM saw for requests to *model*.
-
-    The mock server captures each request body verbatim; the ``tools`` array
-    is exactly the tool surface the runner's ToolManager advertised for the
-    turn. Handles both Responses-style (top-level ``name``) and
-    chat-completions-style (``function.name``) tool entries.
-
-    :param mock_llm_server_url: Base URL of the mock LLM server.
-    :param model: The model key the agent's requests carry.
-    :returns: The union of tool names across the captured requests.
-    """
-    resp = httpx.get(f"{mock_llm_server_url}/mock/requests", params={"key": model}, timeout=10)
-    resp.raise_for_status()
-    names: set[str] = set()
-    for request in resp.json().get("requests", []):
-        for tool in request.get("tools") or []:
-            if not isinstance(tool, dict):
-                continue
-            name = tool.get("name") or (tool.get("function") or {}).get("name")
-            if isinstance(name, str):
-                names.add(name)
-    return names
-
-
-def test_advise_models_offered_on_runner_attached_to_routing_server(
+def test_advise_models_offered_on_host_attached_runner(
     live_server: str,
     http_client: httpx.Client,
-    tmp_path: Path,
     mock_llm_server_url: str,
+    attached_host: str,
+    tmp_path: Path,
 ) -> None:
-    """A session on a host-attached runner is offered ``sys_advise_models``.
+    """The reported journey: routing server -> ``omnigent host --server`` ->
+    session on that host's runner -> the model must be offered ``sys_advise_models``."""
+    _assert_server_routes(http_client)
+    model = f"mock-advise-host-{uuid.uuid4().hex[:6]}"
+    reset_mock_llm(mock_llm_server_url)
+    agent_name = _register_spawn_agent(http_client, mock_llm_server_url, model=model, label="host")
+    configure_mock_llm(mock_llm_server_url, [{"text": "Acknowledged."}], key=model)
 
-    Preconditions asserted, not assumed: the server itself reports
-    ``smart_routing_enabled: true`` on ``/v1/info`` (in mock mode the e2e
-    server carries an ``llm:`` block, which builds the built-in judge). When
-    the deployment cannot route the journey's premise is absent, so skip.
-
-    **What breaks if wrong:** the ``sys_advise_models`` registration gate is
-    evaluated against the runner process's local caps — which never carry a
-    routing backend on a remote-server attachment — so the tool is hidden
-    from every session on the runner while the same server advertises
-    ``smart_routing_enabled: true`` and would have answered the call.
-    """
-    info_resp = http_client.get("/v1/info")
-    info_resp.raise_for_status()
-    info = info_resp.json()
-    if not info.get("smart_routing_enabled"):
-        pytest.skip(
-            "this server deployment cannot route (smart_routing_enabled is "
-            "false), so the advisor is correctly hidden and the journey's "
-            "premise is absent"
-        )
-
-    # A unique model key claims a private request log slice on the mock
-    # server, so a stray request from another test can't pollute the capture.
-    model = f"mock-advise-remote-{uuid.uuid4().hex[:6]}"
-    configure_mock_llm(
-        mock_llm_server_url,
-        [{"text": "OK"}] * 3,
-        key=model,
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    resp = http_client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": lookup_agent_id(http_client, agent_name),
+            "host_id": attached_host,
+            "workspace": str(workspace),
+        },
+        headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
     )
-    # spawn: true grants the sub-agent tool block, where sys_list_models is
-    # unconditional and sys_advise_models is routing-gated — the pair under test.
-    agent_name = register_inline_agent(
-        http_client,
-        name=f"advise-remote-{uuid.uuid4().hex[:6]}",
-        harness="openai-agents",
-        model=model,
-        profile="",
-        prompt="You are a terse smoke-test assistant. Follow instructions exactly.",
-        mock_llm_base_url=f"{mock_llm_server_url}/v1",
-        extra_config={"spawn": True},
+    resp.raise_for_status()
+    session_id = str(resp.json()["id"])
+
+    tool_names = _run_turn_and_collect_tools(
+        http_client, mock_llm_server_url, session_id=session_id, model=model
     )
-    agent_id = lookup_agent_id(http_client, agent_name)
+    _assert_advisor_offered(tool_names, topology="host-attached runner")
 
-    daemon_proc, host_id, daemon_log = _spawn_host_daemon(
-        tmp_path=tmp_path,
-        live_server=live_server,
+
+def test_advise_models_offered_on_tunneled_sibling_runner(
+    live_server: str,
+    http_client: httpx.Client,
+    mock_llm_server_url: str,
+    live_runner_id: str,
+) -> None:
+    """The wider scope from the issue thread: the default local topology's
+    tunneled sibling runner must also be offered ``sys_advise_models``."""
+    _assert_server_routes(http_client)
+    model = f"mock-advise-sibling-{uuid.uuid4().hex[:6]}"
+    reset_mock_llm(mock_llm_server_url)
+    agent_name = _register_spawn_agent(
+        http_client, mock_llm_server_url, model=model, label="sibling"
     )
-    try:
-        _wait_for_host_online(http_client, host_id, timeout=_HOST_ONLINE_TIMEOUT_S)
+    configure_mock_llm(mock_llm_server_url, [{"text": "Acknowledged."}], key=model)
 
-        # The remote-attachment path: create the session, then launch a
-        # runner for it on the host and bind it — the same flow the UI's
-        # host picker drives.
-        create_resp = http_client.post("/v1/sessions", json={"agent_id": agent_id})
-        create_resp.raise_for_status()
-        session_id = create_resp.json()["id"]
-
-        workspace = tmp_path / "ws"
-        workspace.mkdir()
-        launch_resp = http_client.post(
-            f"/v1/hosts/{host_id}/runners",
-            json={"session_id": session_id, "workspace": str(workspace)},
-            timeout=90.0,
-        )
-        assert launch_resp.status_code == 200, (
-            f"Runner launch failed: {launch_resp.status_code} {launch_resp.text}"
-        )
-        runner_id = launch_resp.json()["runner_id"]
-
-        deadline = time.monotonic() + _RUNNER_ONLINE_TIMEOUT_S
-        while time.monotonic() < deadline:
-            status_resp = http_client.get(f"/v1/runners/{runner_id}/status")
-            if status_resp.status_code == 200 and status_resp.json().get("online") is True:
-                break
-            time.sleep(POLL_INTERVAL_S)
-        else:
-            daemon_tail = daemon_log.read_text(errors="replace")[-3000:]
-            raise AssertionError(
-                f"Runner {runner_id} never came online after launch.\n"
-                f"host daemon log tail:\n{daemon_tail}"
-            )
-        http_client.patch(
-            f"/v1/sessions/{session_id}",
-            json={"runner_id": runner_id},
-        ).raise_for_status()
-
-        # One turn is enough: the request the harness sends to the (mock)
-        # model carries the full tool surface for the session.
-        response_id = send_user_message_to_session(
-            http_client,
-            session_id=session_id,
-            content="Reply with exactly OK and nothing else. Do not call tools.",
-        )
-        body = poll_session_until_terminal(
-            http_client,
-            session_id=session_id,
-            response_id=response_id,
-            timeout=120,
-        )
-        assert body["status"] == "completed", (
-            f"Turn on the host-attached runner failed: {body.get('error')}"
-        )
-
-        offered = _offered_tool_names(mock_llm_server_url, model)
-        # Control first: the unconditional sibling tool from the same
-        # registration block proves the capture observed the real surface.
-        assert any(name.endswith("sys_list_models") for name in offered), (
-            f"sys_list_models missing from the offered tools — the capture "
-            f"did not observe the sub-agent tool block at all. Offered: "
-            f"{sorted(offered)}"
-        )
-        assert any(name.endswith("sys_advise_models") for name in offered), (
-            f"The server reports smart_routing_enabled: true, but the "
-            f"session on the host-attached runner was not offered "
-            f"sys_advise_models. The registration gate is being answered "
-            f"from the runner's local caps (which carry no routing backend "
-            f"on a remote-server attachment) instead of the server's "
-            f"routing capability. Offered tools: {sorted(offered)}"
-        )
-    finally:
-        daemon_proc.send_signal(signal.SIGTERM)
-        try:
-            daemon_proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            daemon_proc.kill()
-            daemon_proc.wait(timeout=5)
+    session_id = create_runner_bound_session(
+        http_client, agent_name=agent_name, runner_id=live_runner_id
+    )
+    tool_names = _run_turn_and_collect_tools(
+        http_client, mock_llm_server_url, session_id=session_id, model=model
+    )
+    _assert_advisor_offered(tool_names, topology="tunneled sibling runner")

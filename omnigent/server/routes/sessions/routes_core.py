@@ -51,6 +51,7 @@ from omnigent.runner.identity import (
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runner.session_init_protocol import build_runner_session_init_payload
 from omnigent.runtime import (
+    get_caps,
     pending_elicitations,
     user_session_stream,
 )
@@ -165,6 +166,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _run_managed_launch,
     _spawn_archive_stop,
 )
+from omnigent.server.routing_backend import routing_available
 from omnigent.server.schemas import (
     AutomaticSessionRenameRequest,
     AutomaticSessionRenameResponse,
@@ -470,7 +472,11 @@ def register_core_routes(
             }
             if conv.agent_id is not None:
                 try:
-                    init_body = build_runner_session_init_payload(conv, server_version=VERSION)
+                    init_body = build_runner_session_init_payload(
+                        conv,
+                        server_version=VERSION,
+                        smart_routing_available=routing_available(get_caps()),
+                    )
                 except Exception:
                     # Must not fail the create, but the degradation loses the
                     # seeded override — surface it instead of silently
@@ -1884,14 +1890,35 @@ def register_core_routes(
                     session_id,
                 )
                 if _runner_client is not None and conv is not None:
+                    # Send the full session-init envelope for the same reason
+                    # the create path does: the id-only body takes the
+                    # runner's legacy init path, which never learns the
+                    # server's routing capability (or the persisted session
+                    # snapshot). Same fallback: a session without an agent
+                    # keeps the id-only body the envelope builder rejects.
+                    bind_init_body: dict[str, Any] = {
+                        "session_id": session_id,
+                        "agent_id": conv.agent_id,
+                        "sub_agent_name": conv.sub_agent_name,
+                    }
+                    if conv.agent_id is not None:
+                        try:
+                            bind_init_body = build_runner_session_init_payload(
+                                conv,
+                                server_version=VERSION,
+                                smart_routing_available=routing_available(get_caps()),
+                            )
+                        except Exception:
+                            _logger.warning(
+                                "session-init envelope build failed for %s on runner "
+                                "bind; falling back to the id-only body",
+                                session_id,
+                                exc_info=True,
+                            )
                     try:
                         runner_init_resp = await _runner_client.post(
                             "/v1/sessions",
-                            json={
-                                "session_id": session_id,
-                                "agent_id": conv.agent_id,
-                                "sub_agent_name": conv.sub_agent_name,
-                            },
+                            json=bind_init_body,
                             timeout=10.0,
                         )
                         if runner_init_resp.status_code < 400:

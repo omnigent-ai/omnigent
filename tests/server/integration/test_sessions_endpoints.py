@@ -30,6 +30,7 @@ from omnigent.entities import (
     NewConversationItem,
 )
 from omnigent.llms.context_window import ModelPricing
+from omnigent.runner.session_init_protocol import parse_runner_session_init_envelope
 from omnigent.runtime.tool_output import MAX_TOOL_OUTPUT_BYTES
 from omnigent.server.background_session_titles import BackgroundTitleRequest
 from omnigent.server.routes._sessions.helpers import (
@@ -4122,19 +4123,90 @@ async def test_patch_runner_rebind_clears_stale_failed_status(
         sessions_module._session_status_cache.pop(sid, None)
 
     assert resp.status_code == 200, resp.text
-    assert runner_client.posts == [
-        {
-            "url": "/v1/sessions",
-            "json": {
-                "session_id": sid,
-                "agent_id": agent["id"],
-                "sub_agent_name": None,
-            },
-            "timeout": 10.0,
-        }
-    ]
+    (init_post,) = runner_client.posts
+    assert init_post["url"] == "/v1/sessions"
+    assert init_post["timeout"] == 10.0
+    # The bind notify speaks the full envelope; the legacy id fields stay on
+    # top for older runners.
+    assert init_post["json"]["session_id"] == sid
+    assert init_post["json"]["agent_id"] == agent["id"]
+    assert init_post["json"]["sub_agent_name"] is None
+    assert parse_runner_session_init_envelope(init_post["json"]) is not None
     assert [event["status"] for event in published] == ["failed", "idle"]
     assert cache_after == "idle"
+
+
+@pytest.mark.parametrize("server_routes", [True, False])
+async def test_create_and_bind_notifies_carry_the_servers_routing_answer(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    server_routes: bool,
+) -> None:
+    """Both runner notifies must stamp the server's routing answer.
+
+    The routing backends live in the server process, so the runner learns
+    whether ``sys_advise_models`` is answerable only from
+    ``smart_routing_available`` on the session-init envelope. A notify that
+    omits the stamp (or sends the legacy id-only body, which takes the
+    runner's envelope-less init path) leaves the runner reading routing as
+    off and hiding the advisor from every session bound through it.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes.sessions import routes_core as routes_core_module
+
+    class _RecordingRunnerClient:
+        def __init__(self) -> None:
+            self.posts: list[dict[str, Any]] = []
+
+        async def post(
+            self,
+            url: str,
+            *,
+            json: dict[str, Any],
+            timeout: float,
+        ) -> httpx.Response:
+            self.posts.append({"url": url, "json": json})
+            return httpx.Response(200, request=httpx.Request("POST", url))
+
+    runner_client = _RecordingRunnerClient()
+
+    async def _get_runner_client(_session_id: str, _runner_router: Any) -> _RecordingRunnerClient:
+        return runner_client
+
+    async def _ensure_runner_relay_ready(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _get_runner_client)
+    monkeypatch.setattr(sessions_module, "_ensure_runner_relay_ready", _ensure_runner_relay_ready)
+    monkeypatch.setattr(
+        sessions_module, "_registered_runner_id", lambda _router, raw, *, user_id=None: raw
+    )
+    monkeypatch.setattr(routes_core_module, "routing_available", lambda _caps: server_routes)
+
+    def _init_envelopes() -> list[Any]:
+        return [
+            parse_runner_session_init_envelope(post["json"])
+            for post in runner_client.posts
+            if post["url"] == "/v1/sessions"
+        ]
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    sid = session["id"]
+
+    create_envelopes = _init_envelopes()
+    assert create_envelopes, "session create never notified the runner"
+    assert all(env is not None for env in create_envelopes)
+    assert all(env.smart_routing_available is server_routes for env in create_envelopes)
+
+    runner_client.posts.clear()
+    resp = await client.patch(f"/v1/sessions/{sid}", json={"runner_id": "runner_bound"})
+    assert resp.status_code == 200, resp.text
+
+    bind_envelopes = _init_envelopes()
+    assert bind_envelopes, "runner bind never notified the runner"
+    assert all(env is not None for env in bind_envelopes)
+    assert all(env.smart_routing_available is server_routes for env in bind_envelopes)
 
 
 async def test_post_external_session_status_idle_forwards_persisted_assistant_output(
