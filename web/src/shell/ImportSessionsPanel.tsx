@@ -25,6 +25,7 @@ const SOURCES: { value: ImportSourceSelector; label: string }[] = [
   { value: "all", label: "All harnesses" },
   { value: "claude", label: "Claude Code" },
   { value: "codex", label: "Codex" },
+  { value: "hermes", label: "Hermes" },
   { value: "opencode", label: "OpenCode" },
   { value: "pi", label: "Pi" },
   { value: "qwen", label: "Qwen" },
