@@ -862,16 +862,18 @@ def create_hosts_router(
         runner_id = token_bound_runner_id(binding_token)
 
         launch_lock = _runner_launch_locks.setdefault(body.session_id, asyncio.Lock())
+        waited_for_launch = launch_lock.locked()
         async with launch_lock:
-            current = await asyncio.to_thread(
-                conversation_store.get_conversation,
-                body.session_id,
-            )
-            if current is None or current.runner_id is not None:
-                raise HTTPException(
-                    status_code=400,
-                    detail="session already has a runner bound",
+            if waited_for_launch:
+                current = await asyncio.to_thread(
+                    conversation_store.get_conversation,
+                    body.session_id,
                 )
+                if current is None or current.runner_id is not None:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="session already has a runner bound",
+                    )
 
             if body.git is not None:
                 if body.git.existing_worktree:
