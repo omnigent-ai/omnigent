@@ -2452,7 +2452,11 @@ async def _persist_external_conversation_item(
         e.g. ``"conv_abc123"``.
     :param conv: Conversation row for title seeding.
     :param body: External item event body.
-    :param conversation_store: Store used to append the item.
+    :param conversation_store: Store used to append the item. An optional async
+        ``run_in_thread_with_background_lease(method_name, *args, **kwargs)``
+        hook owns dispatch and resource lifetime for the append. It must acquire
+        resources before submission and release them after the worker exits,
+        even if its awaiter is cancelled. Hook failures propagate to the caller.
     :param created_by: Authenticated identity of the actor whose
         request triggered the forwarder POST, e.g.
         ``"alice@example.com"``. Used to attribute user messages typed
@@ -2545,7 +2549,13 @@ async def _persist_external_conversation_item(
         event=SessionEventInput(type=item.type, data=item.data.model_dump()),
         enabled=enabled and (drained is None or drained.background_titles_enabled),
     )
-    persisted_items = await asyncio.to_thread(conversation_store.append, session_id, batch)
+    # A store with request-scoped resources must retain them until the worker
+    # finishes, including when the awaiting request is cancelled.
+    run_in_thread = getattr(conversation_store, "run_in_thread_with_background_lease", None)
+    if run_in_thread is not None:
+        persisted_items = await run_in_thread("append", session_id, batch)
+    else:
+        persisted_items = await asyncio.to_thread(conversation_store.append, session_id, batch)
     persisted = persisted_items[-1]
     if persisted.deduplicated:
         # A re-post of an already-committed item: nothing new to render or
