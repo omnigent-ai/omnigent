@@ -492,6 +492,17 @@ class TestBuildModelsJson(unittest.TestCase):
         self.assertIn("databricks-anthropic", providers)
         self.assertIn("databricks-completions", providers)
 
+    def test_anthropic_provider_forces_adaptive_thinking(self):
+        # Claude 4+/5 reject the legacy ``thinking.type.enabled`` payload and
+        # require ``thinking.type.adaptive`` + ``output_config.effort``. Pi sends
+        # adaptive only when ``forceAdaptiveThinking`` is set in the provider
+        # compat block; without it an unpinned pi agent (default model resolves
+        # to a Databricks Claude model) 400s on its first turn. The pi-native
+        # path already sets this in ``harnesses/pi_native/credentials.py``.
+        result = _build_models_json("https://host.example.com", "tok123")
+        compat = result["providers"]["databricks-anthropic"].get("compat", {})
+        self.assertIs(compat.get("forceAdaptiveThinking"), True)
+
     def test_dynamic_model_declared_image_capable(self):
         # #515: a dynamically-registered model must advertise image input, or
         # Pi's transformMessages strips every image block ("model does not
