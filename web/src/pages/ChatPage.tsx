@@ -4645,7 +4645,8 @@ function SessionHarnessPicker({
     });
   // Devin Fusion: the composed `fusion-…` id is the model; the lead effort is
   // baked in, so it carries no separate reasoning effort.
-  const composerFusion = fusionOption(modelOptions)?.fusion;
+  const composerFusionOption = fusionOption(modelOptions);
+  const composerFusion = composerFusionOption?.fusion;
   const fusionSelected = composerFusion !== undefined && isFusionModelUid(pickerSelectedModel);
   const selectFusionModel = (modelUid: string) =>
     void apply(async () => {
@@ -4697,14 +4698,14 @@ function SessionHarnessPicker({
                     label: nativeModelLabel(model),
                     checked:
                       !routingOn &&
-                      (model.fusion !== undefined
+                      (composerFusion !== undefined && model.id === composerFusionOption?.id
                         ? isFusionModelUid(pickerSelectedModel)
                         : model.id === pickerSelectedModel ||
                           (pickerSelectedModel === null && model.isDefault === true)),
                     disabled: busy || pendingModelChange !== null,
                     onSelect: () =>
-                      model.fusion !== undefined
-                        ? selectFusionModel(model.fusion.default)
+                      composerFusion !== undefined && model.id === composerFusionOption?.id
+                        ? selectFusionModel(composerFusion.default)
                         : selectModel(model.isDefault ? null : model.id),
                     testId: `composer-agent-model-${model.id}`,
                     className: "whitespace-normal break-words",
