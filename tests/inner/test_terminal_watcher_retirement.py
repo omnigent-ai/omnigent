@@ -12,7 +12,7 @@ import omnigent.inner.terminal as terminal_mod
 from omnigent.inner.terminal import TerminalInstance
 
 
-@pytest.mark.parametrize("blocked_probe", ["capture", "session", "pane"])
+@pytest.mark.parametrize("blocked_probe", ["capture", "session", "pane", "detach"])
 def test_replaced_watcher_discards_in_flight_probe(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -26,6 +26,7 @@ def test_replaced_watcher_discards_in_flight_probe(
         socket_path=tmp_path / "tmux.sock",
         private_dir=tmp_path,
         running=True,
+        keep_alive_after_exit=blocked_probe == "detach",
     )
     entered = threading.Event()
     release = threading.Event()
@@ -59,14 +60,23 @@ def test_replaced_watcher_discards_in_flight_probe(
         return False
 
     def pane_dead() -> bool:
-        if threading.current_thread() is origin and blocked_probe == "pane":
-            pause()
-            return True
+        if threading.current_thread() is origin:
+            if blocked_probe == "pane":
+                pause()
+                return True
+            if blocked_probe == "detach":
+                return True
         return False
+
+    def detach(*args: str) -> str:
+        assert args == ("detach-client", "-s", instance.tmux_target)
+        pause()
+        return ""
 
     monkeypatch.setattr(instance, "_capture_pane_for_idle_or_none", capture)
     monkeypatch.setattr(instance, "_tmux_session_exists_sync", session_exists)
     monkeypatch.setattr(instance, "_pane_is_dead", pane_dead)
+    monkeypatch.setattr(instance, "_tmux_output_sync", detach)
     monkeypatch.setattr(terminal_mod, "_IDLE_WATCHER_JOIN_TIMEOUT_S", 0.01)
     instance.start_idle_watcher_thread(
         on_exit=old_exited.set, on_tick=old_ticked.set, poll_interval_s=0.001

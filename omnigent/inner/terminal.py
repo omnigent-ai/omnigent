@@ -1914,6 +1914,8 @@ class TerminalInstance:
                 if self.keep_alive_after_exit:
                     with contextlib.suppress(Exception):
                         self._tmux_output_sync("detach-client", "-s", self.tmux_target)
+                    if stop_event.is_set() or not self.running:
+                        return
                 self.running = False
                 if on_exit is not None:
                     self._fire_watch_callback(on_exit, "exit")
@@ -2084,10 +2086,9 @@ class TerminalInstance:
 
         Symmetrical to :meth:`_stop_idle_watcher` for the asyncio
         variant. Bounded by :data:`_IDLE_WATCHER_JOIN_TIMEOUT_S` so
-        a wedged ``subprocess.run`` (rare — the only one in the loop
-        body) doesn't block the close path indefinitely. After the
-        timeout an in-flight probe may still be running. The stopped
-        watcher discards its result when it returns.
+        a blocked tmux command doesn't hold up the close path indefinitely.
+        After the timeout an in-flight command may still be running. The
+        stopped watcher discards its result when it returns.
         """
         thread = self._idle_thread
         stop_event = self._idle_stop_event
