@@ -3427,13 +3427,10 @@ describe("Composer sub-agent tray", () => {
     expect(tray()?.parentElement).toBe(bar?.parentElement);
   });
 
-  it("squares the workspace bar's top so the tray reads as one shelf, not two tabs", () => {
-    // With the tray showing, the bar drops its own rounded top and the tray
-    // owns the single rounded top — otherwise the two rounded tops overlap and
-    // look like two mismatched tabs.
+  it("keeps the workspace bar's rounded top below the sub-agent tray", () => {
     render(<Composer {...composerProps({ subAgentLabel: "check-account-eligibility" })} />);
     const bar = document.querySelector('[data-testid="composer-workspace-controls"]');
-    expect(bar?.className).toContain("rounded-t-none");
+    expect(bar?.className).toContain("rounded-t-2xl");
   });
 
   it("keeps the workspace bar's rounded top on a top-level session (no tray)", () => {

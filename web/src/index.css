@@ -456,6 +456,25 @@
   background-color: rgba(255, 255, 255, 0.05);
 }
 
+/* Composite tray tints over an opaque base so stacked surfaces cannot bleed through. */
+.composer-workspace-surface {
+  background:
+    linear-gradient(
+      color-mix(in oklab, var(--muted) 70%, transparent),
+      color-mix(in oklab, var(--muted) 70%, transparent)
+    ),
+    var(--background);
+}
+
+.composer-subagent-surface {
+  background:
+    linear-gradient(
+      color-mix(in oklab, var(--brand-accent) 10%, transparent),
+      color-mix(in oklab, var(--brand-accent) 10%, transparent)
+    ),
+    var(--background);
+}
+
 /* Fixed default icon geometry: a 14px glyph centered in a 16px SVG box. */
 .ui-icon {
   box-sizing: border-box;

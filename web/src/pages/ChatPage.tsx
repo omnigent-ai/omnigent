@@ -2282,25 +2282,15 @@ export function subAgentComposerLabel(
 }
 
 /**
- * Shelf tray sitting flush on the composer's workspace bar while the active
- * session is a sub-agent (child) — names the sub-agent the message is going
- * to, so the composer reads as "messaging the sub-agent", not the
- * orchestrator. Rendered inside the composer column wrapper sharing the bar's
- * ``mx-3`` inset; ``-mb-px`` collapses the seam so the tray sits directly on
- * the bar. The tray owns the stack's rounded top, so the bar squares its own
- * top (``rounded-t-none``, applied at the call site while a sub-agent shows) —
- * this hides the tray's square bottom behind the bar, reading as one shelf
- * rather than two overlapping rounded tabs. Brand pink (``brand-accent``)
- * marks this as a sub-agent context cue, not a status.
- *
- * @param label - The sub-agent instance name, e.g.
- *   ``"check-account-eligibility"`` (from ``subAgentComposerLabel``).
+ * Sub-agent shelf tucked behind the workspace bar's rounded top.
+ * Bottom padding keeps the label above the overlap; opaque surfaces prevent
+ * the pink tint from bleeding through the bar.
  */
 function SubagentComposerTray({ label }: { label: string }) {
   return (
     <div
       data-testid="composer-subagent-tray"
-      className="-mb-px mx-3 flex items-center gap-1.5 rounded-t-2xl bg-brand-accent/10 px-4 py-1.5 text-sm text-brand-accent"
+      className="composer-subagent-surface mx-3 -mb-4 flex items-center gap-1.5 rounded-t-2xl px-4 pb-5.5 pt-1.5 text-sm text-brand-accent"
     >
       <BotIcon className="size-3.5 shrink-0" aria-hidden="true" />
       {/* truncate so a long sub-agent name never wraps the tray to two rows */}
@@ -3545,10 +3535,7 @@ function ComposerImpl(
             SubagentComposerTray). Truthy (not just non-null) so an empty
             label never peeks a nameless tray. */}
         {subAgentLabel ? <SubagentComposerTray label={subAgentLabel} /> : null}
-        <ComposerWorkspaceBar
-          data-testid="composer-workspace-controls"
-          className={subAgentLabel ? "rounded-t-none" : undefined}
-        >
+        <ComposerWorkspaceBar data-testid="composer-workspace-controls">
           <ComposerWorkspaceStatus
             workspacePath={composerWorkspace ?? null}
             worktreePath={composerGit.worktreePath}
