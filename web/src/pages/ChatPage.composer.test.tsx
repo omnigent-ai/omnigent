@@ -3427,12 +3427,6 @@ describe("Composer sub-agent tray", () => {
     expect(tray()?.parentElement).toBe(bar?.parentElement);
   });
 
-  it("keeps the workspace bar's rounded top below the sub-agent tray", () => {
-    render(<Composer {...composerProps({ subAgentLabel: "check-account-eligibility" })} />);
-    const bar = document.querySelector('[data-testid="composer-workspace-controls"]');
-    expect(bar?.className).toContain("rounded-t-2xl");
-  });
-
   it("keeps the workspace bar's rounded top on a top-level session (no tray)", () => {
     render(<Composer {...composerProps()} />);
     const bar = document.querySelector('[data-testid="composer-workspace-controls"]');

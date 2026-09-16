@@ -456,12 +456,12 @@
   background-color: rgba(255, 255, 255, 0.05);
 }
 
-/* Composite tray tints over an opaque base so stacked surfaces cannot bleed through. */
+/* --background is the opaque palette canvas; flatten tints over it to mask the stack. */
 .composer-workspace-surface {
   background:
     linear-gradient(
-      color-mix(in oklab, var(--muted) 70%, transparent),
-      color-mix(in oklab, var(--muted) 70%, transparent)
+      color-mix(in oklch, var(--muted) 70%, transparent),
+      color-mix(in oklch, var(--muted) 70%, transparent)
     ),
     var(--background);
 }
@@ -469,8 +469,8 @@
 .composer-subagent-surface {
   background:
     linear-gradient(
-      color-mix(in oklab, var(--brand-accent) 10%, transparent),
-      color-mix(in oklab, var(--brand-accent) 10%, transparent)
+      color-mix(in oklch, var(--brand-accent) 10%, transparent),
+      color-mix(in oklch, var(--brand-accent) 10%, transparent)
     ),
     var(--background);
 }
