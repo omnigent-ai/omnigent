@@ -194,6 +194,7 @@ class AgentCache:
                             restore_error.add_note(
                                 f"Previous cached bundle retained at {backup_dir / 'previous'}"
                             )
+                            # Surface failed recovery, preserving the publish error as its cause.
                             raise restore_error from publish_error
                     raise
                 published = True
