@@ -1816,13 +1816,6 @@ def test_seed_isolated_agy_home_tolerates_absent_plugins(
 def test_seed_isolated_agy_home_seeds_user_global_hooks(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The user's global config/hooks.json is seeded into --gemini_dir.
-
-    agy loads its global lifecycle hooks from ``<gemini_dir>/config/hooks.json``,
-    so without the seed a dispatched session silently drops the user's
-    hook-based policy gates (e.g. a PreToolUse deny of ``git commit
-    --no-verify``) that fire in every interactive agy.
-    """
     fake_home = tmp_path / "real-home"
     real_config = fake_home / ".gemini" / "config"
     real_config.mkdir(parents=True)
@@ -1838,14 +1831,12 @@ def test_seed_isolated_agy_home_seeds_user_global_hooks(
 
     iso_hooks = agy_gemini_dir(bridge_dir) / "config" / "hooks.json"
     assert json.loads(iso_hooks.read_text(encoding="utf-8")) == json.loads(hooks_payload)
-    # The real file is copied, never moved or modified.
     assert (real_config / "hooks.json").read_text(encoding="utf-8") == hooks_payload
 
 
 def test_seed_isolated_agy_home_reseed_refreshes_hooks(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Re-seeding picks up the freshest real-home hooks, so policy edits win."""
     fake_home = tmp_path / "real-home"
     real_hooks = fake_home / ".gemini" / "config" / "hooks.json"
     real_hooks.parent.mkdir(parents=True)
@@ -1865,8 +1856,6 @@ def test_seed_isolated_agy_home_reseed_refreshes_hooks(
 def test_seed_isolated_agy_home_hooks_are_copied_not_linked(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Hooks are copied, not linked: agy can write hooks.json, and an edit made
-    inside a dispatched session must never mutate the user's real ~/.gemini."""
     fake_home = tmp_path / "real-home"
     real_hooks = fake_home / ".gemini" / "config" / "hooks.json"
     real_hooks.parent.mkdir(parents=True)
@@ -1886,7 +1875,6 @@ def test_seed_isolated_agy_home_hooks_are_copied_not_linked(
 def test_seed_isolated_agy_home_tolerates_absent_hooks(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A user with no global hooks seeds cleanly — no file, no failed launch."""
     fake_home = tmp_path / "real-home"
     (fake_home / ".gemini").mkdir(parents=True)
     monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
@@ -1897,7 +1885,6 @@ def test_seed_isolated_agy_home_tolerates_absent_hooks(
 
     iso_config = agy_gemini_dir(bridge_dir) / "config"
     assert not (iso_config / "hooks.json").exists()
-    # The rest of the seed still landed.
     assert (iso_config / ".migrated").is_file()
 
 

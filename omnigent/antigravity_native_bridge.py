@@ -376,10 +376,6 @@ _AGY_PLUGINS_DIR = "plugins"
 _AGY_IMPORT_MANIFEST = "import_manifest.json"
 
 
-# agy loads its global lifecycle hooks from ``<gemini_dir>/config/hooks.json``.
-# Hooks are how users install local policy gates (deny ``git commit
-# --no-verify``, force-pushes, ...), so an isolated dir without the file
-# silently drops every gate a dispatched session was supposed to enforce.
 _AGY_HOOKS_FILE = "hooks.json"
 
 
@@ -696,22 +692,7 @@ def _seed_isolated_agy_skills(real_home: Path, iso_gemini: Path) -> None:
 
 
 def _seed_isolated_agy_hooks(real_home: Path, iso_gemini: Path) -> None:
-    """Seed the user's global lifecycle hooks into the isolated Gemini dir.
-
-    agy loads its global hooks from ``<gemini_dir>/config/hooks.json``, so a
-    dispatched session launched under a bridge-owned ``--gemini_dir`` starts
-    with none of the user's hooks unless the file is seeded — silently dropping
-    hook-based policy gates that fire in every interactive ``agy``. Re-written
-    on every seed so the freshest real-home policy always wins, and copied
-    rather than linked so hook edits made inside a dispatched session (agy can
-    write ``hooks.json``) never mutate the user's real ``~/.gemini``.
-
-    Best-effort, like the plugin seed: a user with no global hooks simply gets
-    a session without them rather than a failed launch.
-
-    :param real_home: The user's real home directory.
-    :param iso_gemini: The bridge-owned ``--gemini_dir`` being seeded.
-    """
+    """Refresh a separate copy of global hooks on each seed; ignore copy failures."""
     real_hooks = real_home / ".gemini" / _MCP_CONFIG_DIR / _AGY_HOOKS_FILE
     if not real_hooks.is_file():
         return
