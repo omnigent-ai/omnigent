@@ -548,7 +548,9 @@ jobs:
           import re, pathlib
           raw = pathlib.Path('/tmp/polly_output.txt').read_text()
           sentinel = '<!-- POLLY_REVIEW_START -->'
-          idx = raw.find(sentinel)
+          # Headless output can include earlier drafts before the final review.
+          # Keep only the last marked review.
+          idx = raw.rfind(sentinel)
           if idx >= 0:
               cleaned = raw[idx + len(sentinel):].lstrip('\n')
           else:
