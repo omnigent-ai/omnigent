@@ -14,7 +14,7 @@ import { CliCommandBlock } from "./CliCommandBlock";
 import { ForkSessionForm } from "./ForkSessionDialog";
 import { SwitchHostDialog } from "./SwitchHostDialog";
 
-import { nativeCodingAgentForWrapper } from "@/lib/nativeCodingAgents";
+import { nativeCodingAgentForHarness, nativeCodingAgentForWrapper } from "@/lib/nativeCodingAgents";
 
 const HOST_OWNER_DESCRIPTION =
   "This session's host is offline. Run the command below from the host machine to reconnect.";
@@ -53,6 +53,11 @@ export type ReconnectState = "host_offline" | "local_stranded";
  *    --resume <id>`; everything else uses the generic `omnigent run
  *    path/to/agent.yaml --resume <id>`.
  *
+ * The native wrapper is resolved from the `omnigent.wrapper` label, then
+ * the canonical `harness` — a pre-native session (e.g. a legacy `devin-acp`
+ * row) can carry no wrapper label yet still be a native harness, and the
+ * generic `omnigent run` form cannot resume it.
+ *
  * The Databricks profile stays a placeholder in every form — it's
  * per-deployment and not knowable from the browser.
  */
@@ -60,11 +65,13 @@ export function buildReconnectCommand({
   conversationId,
   serverUrl,
   wrapper,
+  harness,
   state,
 }: {
   conversationId: string;
   serverUrl: string;
   wrapper?: string | null;
+  harness?: string | null;
   state: ReconnectState;
 }): string {
   // Backslash-continued so the command stays readable inside a narrow
@@ -76,8 +83,9 @@ export function buildReconnectCommand({
   // Every native TUI wrapper resumes through its own verb (`omnigent devin
   // --resume …`), and the verb is the registry key — the generic
   // `omnigent run <agent.yaml>` below cannot resume one at all, so it was wrong
-  // for every native harness except claude.
-  const nativeAgent = nativeCodingAgentForWrapper(wrapper);
+  // for every native harness except claude. Fall back to the canonical harness
+  // when there's no wrapper label (a label-less pre-native session).
+  const nativeAgent = nativeCodingAgentForWrapper(wrapper) ?? nativeCodingAgentForHarness(harness);
   if (nativeAgent !== undefined) {
     return [
       `omnigent ${nativeAgent.key} \\`,
@@ -114,6 +122,8 @@ export function buildReconnectCommand({
  * @param wrapper - The conversation's `omnigent.wrapper` label
  *   (`"claude-code-native-ui"` for `omnigent claude` sessions). Picks
  *   the `local_stranded` command form.
+ * @param harness - The conversation's canonical harness, used to pick the
+ *   `local_stranded` command form when no wrapper label is present.
  * @param state - Which unreachable state we're reconnecting from.
  * @param isOwner - Whether the viewer owns the session. Gates the
  *   reconnect command for `host_offline`.
@@ -130,6 +140,7 @@ export function ReconnectSessionDialog({
   conversationId,
   serverUrl,
   wrapper,
+  harness,
   state,
   isOwner,
   sourceTitle,
@@ -142,6 +153,7 @@ export function ReconnectSessionDialog({
   conversationId: string;
   serverUrl: string;
   wrapper?: string | null;
+  harness?: string | null;
   state: ReconnectState;
   isOwner: boolean;
   sourceTitle?: string | null;
@@ -155,7 +167,7 @@ export function ReconnectSessionDialog({
   // CLI command is useless to them. Owners of both states, and anyone
   // on a local_stranded session, get a command.
   const showCommand = isOwner || !isHostReconnect;
-  const command = buildReconnectCommand({ conversationId, serverUrl, wrapper, state });
+  const command = buildReconnectCommand({ conversationId, serverUrl, wrapper, harness, state });
   // Titles mirror the unreachable banner's wording ("Host is offline —
   // click to reconnect" / "Agent disconnected — click to reconnect").
   const title = isHostReconnect ? "Host is offline" : "Agent disconnected";

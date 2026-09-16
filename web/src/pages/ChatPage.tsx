@@ -1166,6 +1166,7 @@ export function ChatPage() {
         conversationId={urlConvId}
         serverUrl={getCliServerUrl()}
         wrapper={activeConv?.labels?.["omnigent.wrapper"]}
+        harness={activeSession?.harness}
         state={reconnectState}
         isOwner={reconnectIsOwner}
         // Source prefill for the Clone tab's fork form. Mirrors AppShell's
@@ -1191,6 +1192,7 @@ export function ChatPage() {
           }}
           serverUrl={getCliServerUrl()}
           wrapper={activeConv?.labels?.["omnigent.wrapper"]}
+          harness={activeSession?.harness}
         />
       )}
     </SessionSharedContext.Provider>
