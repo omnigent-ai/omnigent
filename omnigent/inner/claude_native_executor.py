@@ -210,10 +210,7 @@ class ClaudeNativeExecutor(Executor):
             with telemetry.span("claude_native.inject"):
                 async with self._inject_lock:
                     context_path = self._bridge_dir / CLAUDE_FRAMEWORK_CONTEXT_FILE
-                    if notices:
-                        context_path.write_text("\n\n".join(notices), encoding="utf-8")
-                    else:
-                        context_path.unlink(missing_ok=True)
+                    context_path.unlink(missing_ok=True)
                     if wanted_model_arg is not None:
                         # Accepted trade-off: ``/model <id>`` also saves the
                         # pick as the person's global default for new Claude
@@ -232,9 +229,15 @@ class ClaudeNativeExecutor(Executor):
                         # Track the routed id, not the alias: the next turn's
                         # comparison is against what routing asked for.
                         self._applied_model = wanted_model
-                    await self._inject(
-                        partial(inject_user_message, self._bridge_dir, content=text)
-                    )
+                    if notices:
+                        context_path.write_text("\n\n".join(notices), encoding="utf-8")
+                    try:
+                        await self._inject(
+                            partial(inject_user_message, self._bridge_dir, content=text)
+                        )
+                    except BaseException:
+                        context_path.unlink(missing_ok=True)
+                        raise
         except ClaudePromptTimeout as exc:
             _logger.exception(
                 "claude-native: prompt delivery to harness timed out",
@@ -492,29 +495,7 @@ def _content_to_text(content: EnqueuedContent, bridge_dir: Path) -> str:
 
 def _latest_framework_notices(messages: list[Message]) -> list[str]:
     """Return framework context attached to the latest user turn."""
-    latest_user = next(
-        (
-            index
-            for index in range(len(messages) - 1, -1, -1)
-            if messages[index].get("role") == "user"
-        ),
-        None,
-    )
-    if latest_user is None:
-        return []
-    notices = framework_notices(messages[latest_user].get("content"))
-    for message in messages[latest_user + 1 :]:
-        if message.get("role") not in {"developer", "system"}:
-            continue
-        content = message.get("content")
-        if isinstance(content, str) and content:
-            notices.append(content)
-        elif isinstance(content, list):
-            notices.extend(
-                text
-                for block in content
-                if isinstance(block, dict)
-                and isinstance((text := block.get("text")), str)
-                and text
-            )
-    return notices
+    for message in reversed(messages):
+        if message.get("role") == "user":
+            return framework_notices(message.get("content"))
+    return []

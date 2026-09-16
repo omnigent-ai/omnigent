@@ -18,6 +18,7 @@ import binascii
 import hashlib
 import logging
 import re
+import shutil
 import urllib.parse
 import uuid
 from collections.abc import Mapping
@@ -33,7 +34,6 @@ _logger = logging.getLogger(__name__)
 # seeding): brackets end the match early, newlines break the line shape.
 _MARKER_UNSAFE = re.compile(r"[\[\]\r\n]")
 FRAMEWORK_NOTICE_BLOCK_TYPE = "_omnigent_framework_notice"
-_RESIZE_NOTICE_DIMS = re.compile(r"downscaled from (\d+)×(\d+) px")
 
 # Maps a data-URI MIME type to the file extension used when no filename
 # is supplied, e.g. ``"image/png"`` -> ``".png"``.
@@ -229,12 +229,10 @@ def resize_notice(source_metadata: Mapping[str, object] | None) -> str | None:
     :returns: The notice text when the image was downscaled, else ``None``
         (passthrough images, non-images, or absent metadata).
     """
-    if not source_metadata:
+    dimensions = resize_dimensions(source_metadata)
+    if dimensions is None:
         return None
-    width = source_metadata.get("width")
-    height = source_metadata.get("height")
-    if not width or not height:
-        return None
+    width, height = dimensions["width"], dimensions["height"]
     return (
         f"Note: the attached image was downscaled from {width}×{height} px to fit "
         "size limits, so you are viewing a lower-resolution version. Ask the user "
@@ -243,9 +241,32 @@ def resize_notice(source_metadata: Mapping[str, object] | None) -> str | None:
     )
 
 
-def framework_notice_block(text: str) -> dict[str, object]:
+def resize_dimensions(source_metadata: object) -> dict[str, int] | None:
+    """Return positive integer image dimensions from stored metadata."""
+    if not isinstance(source_metadata, Mapping):
+        return None
+    width, height = source_metadata.get("width"), source_metadata.get("height")
+    if type(width) is not int or type(height) is not int or width <= 0 or height <= 0:
+        return None
+    return {"width": width, "height": height}
+
+
+def reject_authored_framework_notices(content: object) -> object:
+    """Reject reserved context blocks in authored message content."""
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict):
+                if block.get("type") == FRAMEWORK_NOTICE_BLOCK_TYPE:
+                    raise ValueError(
+                        "Framework notice blocks are reserved for attachment resolution"
+                    )
+                reject_authored_framework_notices(block.get("content"))
+    return content
+
+
+def framework_notice_block(source_metadata: Mapping[str, object]) -> dict[str, object]:
     """Build transient model context that must not become user text."""
-    return {"type": FRAMEWORK_NOTICE_BLOCK_TYPE, "text": text}
+    return {"type": FRAMEWORK_NOTICE_BLOCK_TYPE, "source_metadata": dict(source_metadata)}
 
 
 def framework_notices(content: object) -> list[str]:
@@ -256,24 +277,26 @@ def framework_notices(content: object) -> list[str]:
     for block in content:
         if not isinstance(block, dict) or block.get("type") != FRAMEWORK_NOTICE_BLOCK_TYPE:
             continue
-        text = block.get("text")
-        if isinstance(text, str) and text:
+        text = resize_notice(resize_dimensions(block.get("source_metadata")))
+        if text:
             notices.append(text)
     return notices
 
 
-def codex_resize_metadata_path(path: Path, notice: str) -> Path:
+def codex_resize_metadata_path(path: Path, source_metadata: object) -> Path:
     """Encode resize metadata in Codex's model-visible image path."""
-    match = _RESIZE_NOTICE_DIMS.search(notice)
-    if match is None:
+    dimensions = resize_dimensions(source_metadata)
+    if dimensions is None:
         return path
-    width, height = match.groups()
-    alias = path.with_name(
-        f"{path.stem}__omnigent-downscaled-from-{width}x{height}"
-        f"-request-crop-for-fine-detail{path.suffix}"
-    )
+    width, height = dimensions["width"], dimensions["height"]
     try:
-        path.replace(alias)
+        alias = path.with_name(
+            f"{path.stem[:80]}_{hashlib.sha256(path.read_bytes()).hexdigest()[:12]}"
+            f"__omnigent-downscaled-from-{width}x{height}"
+            f"-request-crop-for-fine-detail{path.suffix}"
+        )
+        if not alias.exists():
+            shutil.copyfile(path, alias)
     except OSError:
         _logger.warning("Failed to add resize metadata to Codex image path", exc_info=True)
         return path
@@ -285,7 +308,7 @@ async def resolve_file_id_block(
     *,
     session_id: str,
     client: httpx.AsyncClient,
-) -> tuple[dict[str, object], str | None] | None:
+) -> tuple[dict[str, object], dict[str, int] | None] | None:
     """
     Fetch a ``file_id`` attachment's bytes and inline them as a data URI.
 
@@ -300,8 +323,7 @@ async def resolve_file_id_block(
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
     :param client: HTTP client pointed at the Omnigent server.
     :returns: ``(rebuilt_block, notice)`` — the block without ``file_id``,
-        and a resize notice (see :func:`resize_notice`) to emit as a
-        sibling text block when the image was downscaled, else ``None``.
+        and source dimensions for a sibling framework block, or ``None``.
         Returns ``None`` (not a tuple) when the fetch failed, so callers
         keep the original block and a visible marker can surface downstream.
     """
@@ -345,12 +367,12 @@ async def resolve_file_id_block(
     content_type = content_type.split(";", 1)[0]
     encoded = base64.b64encode(content_resp.content).decode("ascii")
     new_block = {k: v for k, v in block.items() if k != "file_id"}
-    notice: str | None = None
+    notice: dict[str, int] | None = None
     if block.get("type") == "input_image":
         new_block["image_url"] = f"data:{content_type};base64,{encoded}"
-        source_metadata = meta.get("source_metadata")
-        if isinstance(source_metadata, Mapping):
-            notice = resize_notice(source_metadata)
+        resource_metadata = meta.get("metadata")
+        if isinstance(resource_metadata, Mapping):
+            notice = resize_dimensions(resource_metadata.get("source_metadata"))
     else:
         new_block["file_data"] = f"data:{content_type};base64,{encoded}"
     return new_block, notice

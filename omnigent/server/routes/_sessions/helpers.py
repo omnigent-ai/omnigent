@@ -787,6 +787,7 @@ def _stored_file_to_resource(
             "filename": stored.filename,
             "bytes": stored.bytes,
             "created_at": stored.created_at,
+            "source_metadata": stored.source_metadata,
         },
     }
 

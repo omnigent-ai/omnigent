@@ -143,7 +143,7 @@ def _chat_to_anthropic(
     payload: dict[str, Any] = {"model": model}
 
     # Extract system messages
-    system_parts = [m["content"] for m in messages if m["role"] == "system"]
+    system_parts = [m["content"] for m in messages if m["role"] in {"system", "developer"}]
     if system_parts:
         payload["system"] = "\n".join(system_parts)
 
@@ -151,7 +151,7 @@ def _chat_to_anthropic(
     converted: list[dict[str, Any]] = []
     for m in messages:
         role = m["role"]
-        if role == "system":
+        if role in {"system", "developer"}:
             continue
         if role == "assistant":
             converted.append(_convert_assistant_message(m))

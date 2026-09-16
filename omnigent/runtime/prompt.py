@@ -14,7 +14,7 @@ from omnigent.entities import (
     MessageData,
     NativeToolData,
 )
-from omnigent.inner.native_attachments import FRAMEWORK_NOTICE_BLOCK_TYPE
+from omnigent.inner.native_attachments import FRAMEWORK_NOTICE_BLOCK_TYPE, framework_notices
 from omnigent.runtime.tool_result_replay import image_omitted_placeholder
 from omnigent.spec import AgentSpec
 
@@ -331,6 +331,8 @@ def _dedupe_tool_output_images(output: str) -> str:
 
 def history_to_input_items(
     items: list[ConversationItem],
+    *,
+    preserve_framework_notices: bool = False,
 ) -> list[dict[str, Any]]:
     """
     Convert persisted ConversationItems into Responses API input items.
@@ -342,6 +344,7 @@ def history_to_input_items(
     kept as separate items rather than embedded in assistant messages.
 
     :param items: Persisted conversation items in chronological order.
+    :param preserve_framework_notices: Keep structured notices for native transports.
     :returns: A list of Responses API input item dicts suitable for
         ``client.responses.create(input=...)``.
     """
@@ -356,12 +359,10 @@ def history_to_input_items(
             # the LLM. The text description survives and gives
             # the LLM context about files it previously produced.
             content = _strip_output_annotations(item.data.content)
-            notices = [
-                block["text"]
-                for block in content
-                if block.get("type") == FRAMEWORK_NOTICE_BLOCK_TYPE
-                and isinstance(block.get("text"), str)
-            ]
+            if preserve_framework_notices:
+                result.append({"role": item.data.role, "content": content})
+                continue
+            notices = framework_notices(content)
             visible_content = [
                 block for block in content if block.get("type") != FRAMEWORK_NOTICE_BLOCK_TYPE
             ]

@@ -614,6 +614,9 @@ async def test_resize_notice_uses_hidden_hook_context(
     tmp_path: Path,
 ) -> None:
     """Claude terminal input excludes the framework notice."""
+    from omnigent.inner.native_attachments import framework_notice_block, resize_notice
+
+    dimensions = {"width": 6000, "height": 4000}
     sent: list[dict[str, Any]] = []
     monkeypatch.setattr(claude_native_executor, "inject_user_message", _stub_inject(sent))
     executor = ClaudeNativeExecutor(tmp_path)
@@ -622,9 +625,12 @@ async def test_resize_notice_uses_hidden_hook_context(
         [
             {
                 "role": "user",
-                "content": [{"type": "input_text", "text": "inspect this"}],
+                "content": [
+                    {"type": "input_text", "text": "inspect this"},
+                    framework_notice_block(dimensions),
+                ],
             },
-            {"role": "developer", "content": "downscaled"},
+            {"role": "developer", "content": "unrelated context"},
         ],
         [],
         "",
@@ -632,7 +638,43 @@ async def test_resize_notice_uses_hidden_hook_context(
         pass
 
     assert sent[0]["content"] == "inspect this"
-    assert (tmp_path / "pending_framework_context.txt").read_text() == "downscaled"
+    assert (tmp_path / "pending_framework_context.txt").read_text() == resize_notice(dimensions)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error", [RuntimeError("injection failed"), ClaudePromptTimeout("timeout")]
+)
+async def test_failed_injection_clears_framework_context(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, error: Exception
+) -> None:
+    from omnigent.inner.native_attachments import framework_notice_block
+
+    def fail_inject(*args: Any, **kwargs: Any) -> None:
+        assert (tmp_path / "pending_framework_context.txt").exists()
+        raise error
+
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", fail_inject)
+    monkeypatch.setattr(claude_native_executor, "kill_session", lambda *args, **kwargs: None)
+    executor = ClaudeNativeExecutor(tmp_path)
+    events = [
+        event
+        async for event in executor.run_turn(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "inspect this"},
+                        framework_notice_block({"width": 6000, "height": 4000}),
+                    ],
+                }
+            ],
+            [],
+            "",
+        )
+    ]
+    assert isinstance(events[0], ExecutorError)
+    assert not (tmp_path / "pending_framework_context.txt").exists()
 
 
 @pytest.mark.asyncio

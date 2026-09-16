@@ -1287,6 +1287,31 @@ def test_compress_image_reports_source_dims_on_downscale() -> None:
     assert none_dims is None
 
 
+@pytest.mark.parametrize("orientation", [5, 6, 7, 8])
+def test_resize_dimensions_follow_exif_orientation(
+    monkeypatch: pytest.MonkeyPatch, orientation: int
+) -> None:
+    from io import BytesIO
+
+    from PIL import Image
+
+    from omnigent.runtime import content_resolver
+
+    monkeypatch.setattr(content_resolver, "IMAGE_MODEL_BUDGET_BYTES", 1024)
+    monkeypatch.setattr(content_resolver, "IMAGE_MAX_EDGE_PX", 64)
+    image = Image.new("RGB", (300, 200), "red")
+    exif = image.getexif()
+    exif[274] = orientation
+    original = BytesIO()
+    image.save(original, format="PNG", compress_level=0, exif=exif)
+    result, _, source_dims = content_resolver.compress_image_attachment(
+        original.getvalue(), "image/png"
+    )
+    assert source_dims == (200, 300)
+    with Image.open(BytesIO(result)) as resized:
+        assert resized.height > resized.width
+
+
 def test_resize_notice_injected_for_downscaled_image(
     artifact_store: FakeArtifactStore,
 ) -> None:
@@ -1313,7 +1338,7 @@ def test_resize_notice_injected_for_downscaled_image(
     blocks = result[0].data.content
     assert blocks[0]["type"] == "input_image"
     assert blocks[1]["type"] == "_omnigent_framework_notice"
-    assert "downscaled from 6000×4000" in blocks[1]["text"]
+    assert blocks[1]["source_metadata"] == {"width": 6000, "height": 4000}
 
 
 def test_no_resize_notice_when_not_downscaled(
@@ -1339,7 +1364,7 @@ def test_no_resize_notice_when_not_downscaled(
 
     assert isinstance(result[0].data, MessageData)
     blocks = result[0].data.content
-    assert all(b.get("type") != "input_text" for b in blocks)
+    assert all(b.get("type") != "_omnigent_framework_notice" for b in blocks)
 
 
 def test_compress_image_skips_non_raster_type() -> None:

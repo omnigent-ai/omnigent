@@ -16,7 +16,7 @@ import logging
 from typing import Any
 
 from omnigent.entities import ConversationItem, MessageData
-from omnigent.inner.native_attachments import framework_notice_block, resize_notice
+from omnigent.inner.native_attachments import framework_notice_block, resize_dimensions
 from omnigent.stores import ArtifactStore, FileStore
 
 _logger = logging.getLogger(__name__)
@@ -385,6 +385,8 @@ def compress_image_attachment(
             probe_format = probe.format
             # Capture dimensions before draft scaling and transpose.
             source_size = (probe.width, probe.height)
+            if probe.getexif().get(274) in {5, 6, 7, 8}:
+                source_size = (probe.height, probe.width)
             max_source_px = (
                 IMAGE_MAX_SOURCE_PIXELS
                 if probe_format in _DRAFTABLE_IMAGE_FORMATS
@@ -832,7 +834,7 @@ def _resolve_file_id_block(
     cache: dict[str, str] | None = None,
     *,
     session_id: str | None = None,
-) -> tuple[dict[str, Any], str | None]:
+) -> tuple[dict[str, Any], dict[str, int] | None]:
     """
     Resolve a single content block's ``file_id`` to inline content.
 
@@ -854,7 +856,7 @@ def _resolve_file_id_block(
         session-scoped file ownership, e.g. ``"conv_abc123"``.
     :returns: ``(block, notice)`` — a new dict with ``file_id`` replaced by
         inline content (all other fields preserved), and an optional resize
-        notice string to emit alongside a downscaled image (``None`` otherwise).
+        source dimensions to emit alongside a downscaled image (``None`` otherwise).
     :raises ValueError: If ``file_id`` is not found in the file
         store — the file was deleted between request validation
         and agent loop execution.
@@ -885,10 +887,10 @@ def _resolve_file_id_block(
     content_type = _resolve_content_type(file_meta.content_type, file_meta.filename)
 
     block_type = block.get("type")
-    notice: str | None = None
+    notice: dict[str, int] | None = None
     if block_type == "input_image":
         resolved["image_url"] = f"data:{content_type};base64,{encoded}"
-        notice = resize_notice(file_meta.source_metadata)
+        notice = resize_dimensions(file_meta.source_metadata)
     else:
         # input_file and any future type: inline as file_data.
         # Uses a data: URI so providers (OpenAI, etc.) can parse

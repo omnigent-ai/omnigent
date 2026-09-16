@@ -478,12 +478,12 @@ def test_resize_notice_is_encoded_in_model_visible_image_path(
                     "role": "user",
                     "content": [
                         {"type": "input_image", "image_url": _PNG_DATA_URI},
+                        {
+                            "type": "_omnigent_framework_notice",
+                            "source_metadata": {"width": 4600, "height": 3400},
+                        },
                         {"type": "input_text", "text": "inspect this"},
                     ],
-                },
-                {
-                    "role": "developer",
-                    "content": "Note: the attached image was downscaled from 4600×3400 px.",
                 },
             ],
             [],
@@ -501,6 +501,39 @@ def test_resize_notice_is_encoded_in_model_visible_image_path(
     assert "downscaled-from-4600x3400" in image["path"]
     assert start["input"][1] == {"type": "text", "text": "inspect this"}
     assert len(start["input"]) == 2
+
+
+def test_resize_paths_preserve_multiple_images_and_cached_originals(tmp_path: Path) -> None:
+    from omnigent.inner.codex_native_executor import _content_to_input_items
+    from omnigent.inner.native_attachments import framework_notice_block
+
+    content = []
+    for image_bytes, dimensions in [
+        (b"first image", {"width": 6000, "height": 4000}),
+        (b"second image", {"width": 6000, "height": 4000}),
+        (b"third image", {"width": 8000, "height": 5000}),
+    ]:
+        content.extend(
+            [
+                {
+                    "type": "input_image",
+                    "filename": "same.png",
+                    "image_url": "data:image/png;base64," + base64.b64encode(image_bytes).decode(),
+                },
+                framework_notice_block(dimensions),
+            ]
+        )
+    items = _content_to_input_items(content, tmp_path)
+    paths = [Path(item["path"]) for item in items]
+    assert len(set(paths)) == 3
+    assert [path.read_bytes() for path in paths] == [
+        b"first image",
+        b"second image",
+        b"third image",
+    ]
+    assert "downscaled-from-8000x5000" in paths[2].name
+    assert (tmp_path / "uploads" / "same.png").read_bytes() == b"first image"
+    assert _content_to_input_items(content, tmp_path) == items
 
 
 def test_input_file_text_is_inlined_as_a_text_item(
