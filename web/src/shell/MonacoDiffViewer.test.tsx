@@ -512,7 +512,7 @@ describe("diff file position navigation", () => {
   }
 
   it.each(["split", "unified"] as const)(
-    "centers repeated citations on the current-file side in %s mode",
+    "centers repeated citations and stops after a handled wheel event in %s mode",
     async (layout) => {
       const editors = navigationEditors();
       const props = { before: "old", after: "new", layout, position: { line: 40, column: 7 } };
@@ -546,10 +546,21 @@ describe("diff file position navigation", () => {
       expect(editors.modified.revealPositionInCenter).toHaveBeenCalledTimes(3);
       act(editors.resize);
       expect(editors.modified.revealPositionInCenter).toHaveBeenCalledTimes(4);
-      editors.container.dispatchEvent(new Event("wheel"));
-      act(editors.resize);
-      act(editors.finishDiff);
-      expect(editors.modified.revealPositionInCenter).toHaveBeenCalledTimes(4);
+      const childEditor = document.createElement("div");
+      editors.container.append(childEditor);
+      // Monaco consumes handled wheel events inside the child editor.
+      childEditor.addEventListener("wheel", (event) => event.stopPropagation());
+      vi.useFakeTimers();
+      try {
+        act(editors.finishDiff);
+        childEditor.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: 100 }));
+        act(editors.resize);
+        act(editors.finishDiff);
+        act(() => vi.advanceTimersToNextFrame());
+        expect(editors.modified.revealPositionInCenter).toHaveBeenCalledTimes(4);
+      } finally {
+        vi.useRealTimers();
+      }
       unmount();
     },
   );

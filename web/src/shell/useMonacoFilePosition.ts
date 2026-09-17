@@ -46,9 +46,11 @@ export function useMonacoFilePosition({
       layout.dispose();
       diffUpdate?.dispose();
       if (frame !== undefined) cancelAnimationFrame(frame);
-      for (const event of events) dom?.removeEventListener(event, stop);
+      for (const event of events) dom?.removeEventListener(event, stop, { capture: true });
     };
-    for (const event of events) dom?.addEventListener(event, stop, { passive: true });
+    // Capture interaction before Monaco consumes events in its child editors.
+    for (const event of events)
+      dom?.addEventListener(event, stop, { passive: true, capture: true });
     center();
     return stop;
   }, [editorRef, mounted, position, cancelScrollRestoreRef, diffEditorRef]);
