@@ -94,6 +94,24 @@ _PERMISSION_PENDING: dict[str, object] = {
     },
 }
 
+# A permission prompt whose spec advertises agy's always-allow persist choice
+# (the shape a live agy WAITING run_command step carries — see
+# ``tests/fixtures/antigravity/steps/run_command_waiting.json``).
+_PERSISTABLE_PERMISSION_PENDING: dict[str, object] = {
+    "kind": "permission",
+    "trajectory_id": "traj-xyz",
+    "step_index": 6,
+    "spec": {
+        "resource": {
+            "action": "command",
+            "target": "pwd",
+        },
+        "persistSuggestionType": "PERSIST_SUGGESTION_TYPE_SUGGESTED",
+        "suggestedPersistPattern": "pwd",
+        "actionDescription": "Running pwd command",
+    },
+}
+
 
 # ── to_elicitation_params: ask_question ─────────────────────────────
 
@@ -253,6 +271,43 @@ class TestToElicitationParamsPermission:
         extra = params.model_extra or {}
         assert extra.get("trajectory_id") == "traj-xyz"
 
+    def test_action_description_surfaced(self) -> None:
+        """agy's actionDescription must reach the card, not be dropped."""
+        params = to_elicitation_params(_PERMISSION_PENDING)
+        extra = params.model_extra or {}
+        assert extra.get("action_description") == "Running pwd command"
+
+    def test_action_description_absent_when_spec_has_none(self) -> None:
+        pending = dict(_PERMISSION_PENDING)
+        pending["spec"] = {"resource": {"action": "command", "target": "pwd"}}
+        params = to_elicitation_params(pending)
+        extra = params.model_extra or {}
+        assert "action_description" not in extra
+
+    def test_always_allow_pattern_surfaced_when_advertised(self) -> None:
+        """A suggested persist pattern must surface as the always-allow choice."""
+        params = to_elicitation_params(_PERSISTABLE_PERMISSION_PENDING)
+        extra = params.model_extra or {}
+        assert extra.get("always_allow_pattern") == "pwd"
+
+    def test_always_allow_pattern_absent_without_suggestion(self) -> None:
+        """No persist suggestion → the card must not offer always-allow."""
+        params = to_elicitation_params(_PERMISSION_PENDING)
+        extra = params.model_extra or {}
+        assert "always_allow_pattern" not in extra
+
+    def test_always_allow_pattern_absent_without_pattern(self) -> None:
+        """A suggestion type with no concrete pattern offers nothing to persist."""
+        pending = dict(_PERSISTABLE_PERMISSION_PENDING)
+        spec_obj = _PERSISTABLE_PERMISSION_PENDING["spec"]
+        assert isinstance(spec_obj, dict)
+        spec = dict(spec_obj)
+        del spec["suggestedPersistPattern"]
+        pending["spec"] = spec
+        params = to_elicitation_params(pending)
+        extra = params.model_extra or {}
+        assert "always_allow_pattern" not in extra
+
 
 # ── to_interaction_payload: ask_question ────────────────────────────
 
@@ -387,6 +442,16 @@ class TestToInteractionPayloadPermission:
         payload = to_interaction_payload("permission", result, self._spec())
         assert payload == {"permission": {"allow": False}}
 
+    def test_always_allow_accept_keeps_rpc_payload_allow_only(self) -> None:
+        """The persist choice rides the TUI channel; the RPC stays allow-only."""
+        result = ElicitationResult.model_validate(
+            {"action": "accept", "_meta": {"persist": "always"}}
+        )
+        spec = _PERSISTABLE_PERMISSION_PENDING["spec"]
+        assert isinstance(spec, dict)
+        payload = to_interaction_payload("permission", result, spec)
+        assert payload == {"permission": {"allow": True}}
+
 
 # ── to_tui_selection_keys: web verdict → agy TUI keystrokes (#1200) ──
 
@@ -413,6 +478,45 @@ class TestToTuiSelectionKeysPermission:
         """Cancel maps to the reject option, like the RPC ``allow: False`` path."""
         result = ElicitationResult(action="cancel")
         assert to_tui_selection_keys("permission", result, self._spec()) == ["4", "Enter"]
+
+    def _persistable_spec(self) -> dict[str, object]:
+        spec = _PERSISTABLE_PERMISSION_PENDING["spec"]
+        assert isinstance(spec, dict)
+        return spec
+
+    def test_always_allow_accept_types_option_2_then_enter(self) -> None:
+        """An always-allow accept selects agy's own persist menu entry."""
+        result = ElicitationResult.model_validate(
+            {"action": "accept", "_meta": {"persist": "always"}}
+        )
+        keys = to_tui_selection_keys("permission", result, self._persistable_spec())
+        assert keys == ["2", "Enter"]
+
+    def test_unadvertised_persist_falls_back_to_plain_approve(self) -> None:
+        """A persist verdict against a non-persistable prompt must type "Yes".
+
+        The always-allow menu entry only exists when the spec advertised a
+        persist pattern; falling back keeps a stale or crafted verdict from
+        selecting a different menu entry.
+        """
+        result = ElicitationResult.model_validate(
+            {"action": "accept", "_meta": {"persist": "always"}}
+        )
+        assert to_tui_selection_keys("permission", result, self._spec()) == ["1", "Enter"]
+
+    def test_plain_accept_on_persistable_prompt_types_option_1(self) -> None:
+        """Approve without a persist choice stays the bare "Yes" (option 1)."""
+        result = ElicitationResult(action="accept")
+        keys = to_tui_selection_keys("permission", result, self._persistable_spec())
+        assert keys == ["1", "Enter"]
+
+    def test_persist_decline_still_types_option_4(self) -> None:
+        """A decline can never ride the persist path into an approve option."""
+        result = ElicitationResult.model_validate(
+            {"action": "decline", "_meta": {"persist": "always"}}
+        )
+        keys = to_tui_selection_keys("permission", result, self._persistable_spec())
+        assert keys == ["4", "Enter"]
 
 
 class TestToTuiSelectionKeysAskQuestion:
