@@ -476,7 +476,9 @@ testpaths = ["tests"]
 # credentials and/or extra setup (Databricks profile; npm build +
 # Playwright browsers for the UI suite; a deployed Databricks App URL
 # for the live suite). Opt-in via explicit pytest invocation.
-addopts = "--ignore=tests/e2e --ignore=tests/e2e_ui --ignore=tests/e2e_live --ignore=tests/integration"
+# structlog-config's pytest plugin clobbers unittest's private item._excinfo.
+# Disable it until the plugin stops writing to that attribute.
+addopts = "-p no:structlog_config --ignore=tests/e2e --ignore=tests/e2e_ui --ignore=tests/e2e_live --ignore=tests/integration"
 # Default per-test wallclock cap. Catches infinite hangs in any
 # suite (unit, inner, integration, e2e) without bothering tests
 # that actually finish. The longest legitimate integration tests

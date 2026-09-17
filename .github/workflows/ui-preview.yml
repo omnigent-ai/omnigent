@@ -279,7 +279,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - name: Download app files
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
@@ -294,6 +294,7 @@ jobs:
 
       - name: Create or update app
         id: app
+        timeout-minutes: 40
         env:
           DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
           DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID }}
@@ -302,31 +303,126 @@ jobs:
           APP_NAME: ${{ github.event_name == 'push' && 'omnigent-ui-preview-dev' || format('omnigent-ui-preview-pr-{0}', github.event.pull_request.number) }}
           APP_DESCRIPTION: ${{ github.event.pull_request.html_url || format('{0}/{1}', github.server_url, github.repository) }}
         run: |
-          if databricks apps get "$APP_NAME" > /dev/null 2>&1; then
-            echo "App already exists"
-          else
-            echo "Creating app..."
-            databricks apps create \
-              --json "{\"name\": \"$APP_NAME\", \"description\": \"$APP_DESCRIPTION\"}" \
-              --no-wait
-            for i in $(seq 1 40); do
-              STATE=$(databricks apps get "$APP_NAME" -o json | jq -r '.compute_status.state')
-              echo "Compute state: $STATE"
-              if [ "$STATE" = "ACTIVE" ]; then
+          refresh_app() {
+            APP_JSON=$(databricks apps get "$APP_NAME" -o json)
+            if ! jq -e --arg id "$APP_ID" --arg name "$APP_NAME" \
+              '.id == $id and .name == $name' <<< "$APP_JSON" > /dev/null; then
+              echo "::error::App identity changed while provisioning; refusing to continue"
+              exit 1
+            fi
+            APP_STATE=$(jq -er '.compute_status.state' <<< "$APP_JSON")
+            jq -r '"Compute state: \(.compute_status.state): \(.compute_status.message // "no details")"' \
+              <<< "$APP_JSON"
+          }
+
+          # A failed lookup must not turn an auth/API error into a create attempt.
+          APP_JSON=$(databricks apps list -o json | jq -c --arg name "$APP_NAME" \
+            '.[] | select(.name == $name)')
+          if [ -n "$APP_JSON" ]; then
+            APP_JSON=$(databricks apps get "$APP_NAME" -o json)
+          fi
+
+          for attempt in $(seq 1 3); do
+            echo "Provisioning attempt $attempt/3"
+            if [ -z "$APP_JSON" ]; then
+              APP_JSON=$(databricks apps create \
+                --json "$(jq -cn --arg name "$APP_NAME" --arg description "$APP_DESCRIPTION" \
+                  '{name: $name, description: $description}')" --no-wait -o json)
+            fi
+            APP_ID=$(jq -er '.id | select(type == "string" and length > 0)' <<< "$APP_JSON")
+
+            # Existing deployments retain their app identity, permissions, and URL.
+            if jq -e '.active_deployment != null or .pending_deployment != null
+              or (.default_source_code_path // "") != ""' <<< "$APP_JSON" > /dev/null; then
+              echo "App already has a deployment; reusing without recreation"
+              break
+            fi
+
+            for poll in $(seq 1 40); do
+              refresh_app
+              if [ "$APP_STATE" = "ACTIVE" ]; then
                 break
-              elif [ "$STATE" = "ERROR" ] || [ "$STATE" = "STOPPED" ]; then
-                echo "::error::Compute entered $STATE state"
-                exit 1
+              elif [ "$APP_STATE" = "ERROR" ] || [ "$APP_STATE" = "STOPPED" ]; then
+                break
               fi
               sleep 15
             done
-            if [ "$STATE" != "ACTIVE" ]; then
-              echo "::error::Timed out waiting for compute to become ACTIVE (last state: $STATE)"
+
+            # Provisioning may have finished during the last polling interval.
+            if [ "$APP_STATE" != "ACTIVE" ]; then
+              refresh_app
+            fi
+            if [ "$APP_STATE" = "ACTIVE" ]; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "::error::Compute did not become ACTIVE after 3 attempts (last state: $APP_STATE)"
               exit 1
             fi
-          fi
 
-          URL=$(databricks apps get "$APP_NAME" -o json | jq -r '.url')
+            # Only an undeployed preview owned by this workflow is disposable.
+            if ! jq -e --arg creator "$DATABRICKS_CLIENT_ID" --arg description "$APP_DESCRIPTION" \
+              '.creator == $creator and .description == $description
+              and .active_deployment == null and .pending_deployment == null
+              and .pending_update == null
+              and (.default_source_code_path // "") == ""
+              and ((.resources // []) | length == 0)
+              and (.compute_status.state | IN("STARTING", "ERROR", "STOPPED"))' \
+              <<< "$APP_JSON" > /dev/null; then
+              echo "::error::App is not an unchanged, undeployed preview; refusing to recreate"
+              exit 1
+            fi
+
+            echo "::warning::Compute did not become ACTIVE (last state: $APP_STATE); recreating $APP_NAME"
+            databricks apps delete "$APP_NAME" --auto-approve
+            for poll in $(seq 1 20); do
+              APP_JSON=$(databricks apps list -o json | jq -c --arg name "$APP_NAME" \
+                '.[] | select(.name == $name)')
+              if [ -z "$APP_JSON" ]; then
+                break
+              fi
+              if ! jq -e --arg id "$APP_ID" '.id == $id' <<< "$APP_JSON" > /dev/null; then
+                echo "::error::App identity changed during deletion; refusing to continue"
+                exit 1
+              fi
+              sleep 3
+            done
+            if [ -n "$APP_JSON" ]; then
+              echo "::error::App still exists after deletion; refusing to create another app"
+              exit 1
+            fi
+            sleep "$((attempt * 15))"
+          done
+
+          if ! URL=$(python3 -c '
+          import json
+          import sys
+          from urllib.parse import urlsplit
+
+          url = json.load(sys.stdin).get("url")
+          if not isinstance(url, str) or any(
+              char.isspace() or ord(char) < 32 or ord(char) == 127 or char == "\\"
+              for char in url
+          ):
+              sys.exit(1)
+          try:
+              parsed = urlsplit(url)
+              valid = (
+                  parsed.scheme == "https"
+                  and bool(parsed.hostname)
+                  and parsed.username is None
+                  and parsed.password is None
+                  and (parsed.port is None or parsed.port > 0)
+              )
+          except ValueError:
+              sys.exit(1)
+          if not valid:
+              sys.exit(1)
+          print(url)
+          ' <<< "$APP_JSON"); then
+            echo "::error::App has no usable preview URL"
+            exit 1
+          fi
           echo "url=$URL" >> "$GITHUB_OUTPUT"
 
       - name: Upload files and deploy

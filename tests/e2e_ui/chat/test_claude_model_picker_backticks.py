@@ -171,8 +171,7 @@ def _open_model_picker(page: Page, base_url: str, session_id: str) -> None:
     gear = page.get_by_test_id("composer-config-gear")
     expect(gear).to_be_visible(timeout=15_000)
     gear.click()
-    page.get_by_test_id("composer-advanced-settings").click()
-    page.get_by_test_id("composer-config-model").click()
+    page.get_by_test_id("composer-agent-edit").click()
 
 
 def test_claude_native_picker_shows_plain_model_names(
@@ -199,7 +198,7 @@ def test_claude_native_picker_shows_plain_model_names(
 
     _open_model_picker(page, base_url, session_id)
 
-    rows = page.locator('[role="option"][data-model-id]')
+    rows = page.locator('[role="menuitemcheckbox"][data-model-id]')
     expect(rows).to_have_count(len(_EXPECTED_LABELS))
     for index, (model_id, label) in enumerate(_EXPECTED_LABELS):
         row = rows.nth(index)
@@ -209,7 +208,7 @@ def test_claude_native_picker_shows_plain_model_names(
 
     # The "Default (…)" sentinel row names the default via the same label, so
     # the backticks must not leak into it either.
-    default_row = page.get_by_role("option", name=re.compile(r"^Default \("))
+    default_row = page.locator('[role="menuitemcheckbox"][data-model-id]').first
     expect(default_row).not_to_contain_text("`")
 
 
@@ -237,7 +236,7 @@ def test_claude_native_picker_1m_context_rows_read_alike(
 
     _open_model_picker(page, base_url, session_id)
 
-    rows = page.locator('[role="option"][data-model-id]')
+    rows = page.locator('[role="menuitemcheckbox"][data-model-id]')
     expect(rows).to_have_count(len(_EXPECTED_LABELS))
     one_m_texts = [
         rows.nth(index).inner_text().strip()

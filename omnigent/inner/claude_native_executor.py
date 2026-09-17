@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
-from collections.abc import AsyncIterator
+import threading
+from collections.abc import AsyncIterator, Callable
+from functools import partial
 from pathlib import Path
 
 from omnigent.harnesses.claude_native.bridge import (
@@ -14,6 +17,7 @@ from omnigent.harnesses.claude_native.bridge import (
     SWITCH_MODEL_DIALOG_HINT,
     ClaudePromptTimeout,
     TmuxSessionNotAdvertised,
+    cancellable_injection,
     inject_slash_command,
     inject_user_message,
     is_auth_slash_command,
@@ -110,11 +114,7 @@ class ClaudeNativeExecutor(Executor):
             return False
         try:
             async with self._inject_lock:
-                await asyncio.to_thread(
-                    inject_user_message,
-                    self._bridge_dir,
-                    content=text,
-                )
+                await self._inject(partial(inject_user_message, self._bridge_dir, content=text))
         except RuntimeError:
             return False
         return True
@@ -209,20 +209,20 @@ class ClaudeNativeExecutor(Executor):
                         # sessions. Runs to completion before the message
                         # inject below (same lock), so its confirm Enter can't
                         # race the message.
-                        await asyncio.to_thread(
-                            inject_slash_command,
-                            self._bridge_dir,
-                            command=f"/model {wanted_model_arg}",
-                            auto_confirm=True,
-                            confirm_hint=SWITCH_MODEL_DIALOG_HINT,
+                        await self._inject(
+                            partial(
+                                inject_slash_command,
+                                self._bridge_dir,
+                                command=f"/model {wanted_model_arg}",
+                                auto_confirm=True,
+                                confirm_hint=SWITCH_MODEL_DIALOG_HINT,
+                            )
                         )
                         # Track the routed id, not the alias: the next turn's
                         # comparison is against what routing asked for.
                         self._applied_model = wanted_model
-                    await asyncio.to_thread(
-                        inject_user_message,
-                        self._bridge_dir,
-                        content=text,
+                    await self._inject(
+                        partial(inject_user_message, self._bridge_dir, content=text)
                     )
         except ClaudePromptTimeout as exc:
             _logger.exception(
@@ -243,6 +243,23 @@ class ClaudeNativeExecutor(Executor):
             yield ExecutorError(message=describe_exception(exc))
             return
         yield TurnComplete(response=None)
+
+    async def _inject(self, operation: Callable[[], None]) -> None:
+        """Drain cancelled delivery workers before releasing the pane's injection lock."""
+        cancelled = threading.Event()
+        with cancellable_injection(cancelled):
+            worker = asyncio.create_task(asyncio.to_thread(operation))
+        try:
+            await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            cancelled.set()
+            while not worker.done():
+                with contextlib.suppress(Exception, asyncio.CancelledError):
+                    await asyncio.shield(worker)
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                worker.result()
+            self._reap_failed_turn()
+            raise
 
     def _reap_failed_turn(self) -> str | None:
         """Kill the Claude pane before a delivery timeout becomes ``failed``."""

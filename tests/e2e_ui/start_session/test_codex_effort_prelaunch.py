@@ -26,11 +26,11 @@ from playwright.async_api import Route, async_playwright, expect
 
 from tests.e2e_ui.start_session.test_start_session import (
     _HOST_ID,
+    _close_entry_models,
     _codex_native_agents_body,
-    _open_entry_config,
+    _open_entry_models,
     _register_common_routes,
     _run_in_fresh_loop,
-    _save_config,
     _wait_until,
 )
 
@@ -135,41 +135,17 @@ async def _drive_codex_effort_prelaunch(base_url: str, session_id: str) -> None:
             await page.get_by_test_id("new-chat-landing-input").wait_for(
                 state="visible", timeout=30_000
             )
-            await _open_entry_config(page, "ag_codex_e2e")
+            await _open_entry_models(page, "ag_codex_e2e")
 
-            modal = page.get_by_test_id("new-chat-landing-config-modal")
-            await expect(modal).to_be_visible()
-            # Sanity: the Codex branch resolved the host catalog — the Model
-            # row names the catalog default — so the effort metadata riding
-            # the same response was available to the modal too.
-            await expect(page.get_by_test_id("new-chat-landing-config-model")).to_contain_text(
-                "Default (GPT Live Default)"
+            await expect(page.get_by_test_id("new-chat-landing-agent-models")).to_contain_text(
+                "GPT Live Default"
             )
-
-            # THE BUG: no reasoning-effort control exists in the Codex
-            # new-session modal. Locate it the way a user finds it — an
-            # effort/thinking select inside the modal — plus the sibling
-            # rows' testid, so any reasonable fix (reusing the Claude row's
-            # testid or adding a codex-specific one) turns this green.
-            effort = (
-                modal.get_by_role(
-                    "combobox",
-                    name=re.compile(r"(reasoning\s+)?effort|thinking level", re.IGNORECASE),
-                )
-                .or_(modal.get_by_test_id("new-chat-landing-config-effort"))
-                .first
-            )
+            effort = page.get_by_test_id("new-chat-landing-agent-effort-high")
             await expect(effort).to_be_visible()
-            await expect(effort).to_be_enabled()
-
-            # The catalog's ladder must actually be selectable: pick "high"
-            # (advertised by the default model's supportedReasoningEfforts).
+            await expect(effort).not_to_have_attribute("data-disabled", "")
             await effort.click()
-            option = page.get_by_role("option", name=re.compile(r"^high$", re.IGNORECASE))
-            await expect(option).to_be_visible()
-            await option.click()
-            await expect(effort).to_contain_text(re.compile(r"high", re.IGNORECASE))
-            await _save_config(page)
+            await expect(effort).to_have_attribute("aria-checked", "true")
+            await _close_entry_models(page)
 
             # The pick must take effect: it rides the create call as
             # ``reasoning_effort``, exactly like the Claude Code landing row

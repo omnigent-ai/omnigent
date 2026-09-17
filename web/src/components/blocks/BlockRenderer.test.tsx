@@ -298,6 +298,33 @@ describe("BlockRenderer dispatch", () => {
     expect(screen.queryByText("Thinking...")).toBeNull();
   });
 
+  it("renders settled assistant text in static markdown mode", () => {
+    const { container } = renderMarkdownText("*settled");
+
+    expect(screen.getByText("*settled")).toBeInTheDocument();
+    expect(container.querySelector("em")).toBeNull();
+  });
+
+  it("uses streaming markdown mode only for the live trailing text item", () => {
+    const items: RenderItem[] = [
+      { kind: "text", itemId: "t1", text: "*settled", final: true },
+      { kind: "text", itemId: "t2", text: "*streaming", final: false },
+    ];
+    const { container } = render(
+      <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+        <BlockRenderer items={items} sessionStatus="running" />
+      </FileViewerContext.Provider>,
+    );
+
+    const sections = container.querySelectorAll<HTMLElement>(
+      '[data-testid="assistant-text-section"]',
+    );
+    expect(sections).toHaveLength(2);
+    expect(sections[0]).toHaveTextContent("*settled");
+    expect(sections[0]!.querySelector("em")).toBeNull();
+    expect(sections[1]!.querySelector("em")).toHaveTextContent("streaming");
+  });
+
   it("adds subtle separation between adjacent assistant text items", async () => {
     const items: RenderItem[] = [
       { kind: "text", itemId: "t1", text: "First message.", final: true },

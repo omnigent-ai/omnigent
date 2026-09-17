@@ -172,7 +172,7 @@
       },
       "AutomaticSessionRenameRequest": {
         "additionalProperties": false,
-        "description": "Request body for the current-agent automatic rename endpoint.",
+        "description": "Proposed title for a framework or agent-initiated rename.",
         "properties": {
           "title": {
             "maxLength": 100,
@@ -196,7 +196,8 @@
                 "enum": [
                   "not_top_level",
                   "no_seed",
-                  "title_changed"
+                  "title_changed",
+                  "generation_failed"
                 ],
                 "type": "string"
               },
@@ -3172,6 +3173,18 @@
             ],
             "title": "Role",
             "type": "string"
+          },
+          "stream_message_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Native live-preview stream finalized by this assistant message. Persisted so reconnect snapshots can suppress delayed preview chunks after the authoritative item.",
+            "title": "Stream Message Id"
           }
         },
         "required": [
@@ -4550,6 +4563,17 @@
             ],
             "title": "Sandbox Provider"
           },
+          "sandbox_provider_capabilities": {
+            "additionalProperties": {
+              "additionalProperties": {
+                "type": "boolean"
+              },
+              "type": "object"
+            },
+            "default": {},
+            "title": "Sandbox Provider Capabilities",
+            "type": "object"
+          },
           "sandbox_providers": {
             "items": {
               "type": "string"
@@ -4636,6 +4660,7 @@
             "response.reasoning_text.delta": "#/components/schemas/ReasoningTextDeltaEvent",
             "response.retry": "#/components/schemas/RetryEvent",
             "session.agent_changed": "#/components/schemas/SessionAgentChangedEvent",
+            "session.btw_sidechat": "#/components/schemas/SessionBtwSidechatEvent",
             "session.changed_files.invalidated": "#/components/schemas/SessionChangedFilesInvalidatedEvent",
             "session.child_session.updated": "#/components/schemas/SessionChildSessionUpdatedEvent",
             "session.codex_approval_mode": "#/components/schemas/SessionCodexApprovalModeEvent",
@@ -4725,6 +4750,9 @@
           },
           {
             "$ref": "#/components/schemas/SessionSupersededEvent"
+          },
+          {
+            "$ref": "#/components/schemas/SessionBtwSidechatEvent"
           },
           {
             "$ref": "#/components/schemas/SessionPresenceEvent"
@@ -4881,6 +4909,59 @@
           "agent_name"
         ],
         "title": "SessionAgentChangedEvent",
+        "type": "object"
+      },
+      "SessionBtwSidechatEvent": {
+        "description": "A Claude Code `/btw` side-chat exchange to show transiently.\n\n`/btw` opens an ephemeral side conversation whose answer Claude Code\nkeeps only in its in-TUI overlay \u2014 it is never written to the session\ntranscript. The claude-native forwarder scrapes the settled overlay\nfrom the pane and emits this event so the managed web UI can show the\nsame ephemeral overlay (dismissed with Escape), WITHOUT adding a\npersisted side-chat turn to the main conversation.\n\nCategory: **transient** (SSE-only), live-only by design. Nothing is\npersisted and there is no SSE replay, so a reload drops the overlay \u2014\nmatching the terminal, where Escape closes it and leaves no history.\n\nThe wire shape is FLAT (not enveloped):\n`{\"type\": \"session.btw_sidechat\", \"conversation_id\": <id>, \"question\": <str>, \"answer\": <str>, \"truncated\": <bool>}`.",
+        "properties": {
+          "answer": {
+            "description": "The side-chat answer text.",
+            "title": "Answer",
+            "type": "string"
+          },
+          "conversation_id": {
+            "description": "The conversation whose stream this rides.",
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "question": {
+            "description": "The `/btw` request line as typed, e.g. `\"/btw is this backward compatible?\"`.",
+            "title": "Question",
+            "type": "string"
+          },
+          "sequence_number": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence Number"
+          },
+          "truncated": {
+            "default": false,
+            "description": "True when the pane clipped a longer answer; the web overlay notes it and points at the terminal for the full text.",
+            "title": "Truncated",
+            "type": "boolean"
+          },
+          "type": {
+            "const": "session.btw_sidechat",
+            "description": "Always `\"session.btw_sidechat\"`.",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "conversation_id",
+          "question",
+          "answer"
+        ],
+        "title": "SessionBtwSidechatEvent",
         "type": "object"
       },
       "SessionChangedFilesInvalidatedEvent": {
@@ -6709,6 +6790,18 @@
             "title": "Skills",
             "type": "array"
           },
+          "skills_status": {
+            "default": "unavailable",
+            "description": "Skill discovery state. A ready catalog may be empty; errors and disconnected runners must not leave clients loading.",
+            "enum": [
+              "loading",
+              "ready",
+              "error",
+              "unavailable"
+            ],
+            "title": "Skills Status",
+            "type": "string"
+          },
           "status": {
             "description": "Session lifecycle status. One of `\"idle\"` (no loop running), `\"running\"` (loop executing), `\"waiting\"` (loop parked on background work / sub-agents), or `\"failed\"` (terminal failure). Current read paths collapse `\"waiting\"` -> `\"running\"` before building this snapshot; the literal stays a superset of what the runtime can produce so a server that forwards the raw status never 500s on serialization.",
             "enum": [
@@ -6912,7 +7005,7 @@
         "type": "object"
       },
       "SessionSkillsEvent": {
-        "description": "Signal that a session's runner-owned skills have resolved.\n\nSkills are discovered against the bound runner's filesystem and\nfetched off the session-snapshot hot path: the snapshot kicks a\nsingle background fetch (`_load_runner_skills` in\n`omnigent/server/routes/sessions.py`) and serves `[]` until\nit lands. This event fires the moment that background fetch\npopulates the per-session skills cache, so a connected web client\ncan re-read the snapshot and fill its slash-command menu instead\nof waiting for the next bind.\n\nCarries no payload beyond the conversation id \u2014 it is a \"skills\nare ready, re-read the snapshot\" nudge, mirroring the\ninvalidate-then-refetch shape used by\n`SessionChangedFilesInvalidatedEvent`. The snapshot's\n`skills` field (now cache-backed) stays the source of truth.",
+        "description": "Signal that a session's runner-owned skill discovery has settled.\n\nSkills are discovered against the bound runner's filesystem and\nfetched off the session-snapshot hot path: the snapshot kicks a\nsingle background fetch (`_load_runner_skills` in\n`omnigent/server/routes/sessions.py`) and serves `[]` until\nit lands. This event fires the moment that background fetch\npopulates the per-session skills cache or first fails, so a connected web client\ncan re-read the snapshot and fill its slash-command menu instead\nof waiting for the next bind.\n\nCarries no payload beyond the conversation id \u2014 it is a \"skills\nare ready, re-read the snapshot\" nudge, mirroring the\ninvalidate-then-refetch shape used by\n`SessionChangedFilesInvalidatedEvent`. The snapshot's\n`skills` and `skills_status` fields stay the source of truth.",
         "properties": {
           "conversation_id": {
             "description": "Session identifier, e.g. `\"conv_abc123\"`. Category: **transient** (SSE-only). On reconnect, clients seed the menu from the session snapshot's `skills` field, which is populated by the runner-skills cache at snapshot build time.",
@@ -11126,6 +11219,59 @@
           }
         },
         "summary": "Update Session Agent",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/agent-title": {
+      "post": {
+        "description": "Apply title requirements to an agent proposal before a guarded rename.",
+        "operationId": "rename_session_from_agent_v1_sessions__session_id__agent_title_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AutomaticSessionRenameRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AutomaticSessionRenameResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Rename Session From Agent",
         "tags": [
           "sessions"
         ]

@@ -185,13 +185,19 @@ _INSTANCE_SCOPED_LABEL_KEYS = frozenset(
 # repository records what THIS session's sandbox was built from and a relaunch
 # re-clones from it, so a fork that asked for an empty sandbox would otherwise
 # have the source's repo re-cloned into it on the first relaunch; the fork's own
-# managed launch re-stamps whatever repository it resolves. The repo literal
-# mirrors the server's ``MANAGED_REPO_LABEL_KEY``; a store test cross-checks it
-# so a rename there fails loudly here. Unlike runtime instance labels, these
-# survive an in-place agent switch but never a fork.
+# managed launch re-stamps whatever repository it resolves. Unlike runtime
+# instance labels, these survive an in-place agent switch but never a fork.
+#
+# Recorded one label PER repo (``omnigent.sandbox.repo.<index>``), a
+# dynamic-suffix family like the per-user pins, so a fork drops the whole family
+# by prefix in ``fork_conversation`` (this bare base key still covers any legacy
+# single-label session). The literal mirrors the server's
+# ``MANAGED_REPO_LABEL_KEY``; a store test cross-checks it so a rename there
+# fails loudly here.
+_SANDBOX_REPO_LABEL_KEY = "omnigent.sandbox.repo"
 _FORK_ONLY_DROPPED_LABEL_KEYS = IMPORT_PROVENANCE_LABEL_KEYS | {
     ARCHIVED_AT_LABEL_KEY,
-    "omnigent.sandbox.repo",
+    _SANDBOX_REPO_LABEL_KEY,
 }
 
 

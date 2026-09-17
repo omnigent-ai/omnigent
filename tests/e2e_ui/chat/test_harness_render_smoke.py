@@ -235,12 +235,12 @@ def test_harness_session_renders_without_crashing(
     # Opening the gear renders the model control, folding every row (the exact
     # path the null-``model`` cursor crash took).
     page.get_by_test_id("composer-config-gear").click()
-    page.get_by_test_id("composer-advanced-settings").click()
-    expect(page.get_by_test_id("composer-config-modal")).to_be_visible(timeout=10_000)
-    expect(page.get_by_test_id("composer-config-model")).to_be_visible()
-    page.get_by_test_id("composer-config-model").click()
+    page.get_by_test_id("composer-agent-edit").click()
+    expect(page.get_by_test_id("composer-agent-config-menu")).to_be_visible(timeout=10_000)
+    expect(page.get_by_test_id("composer-agent-models")).to_be_visible()
+
     # The option list renders without throwing (rows folded into the picker).
-    expect(page.locator('[role="option"]').first).to_be_visible(timeout=10_000)
+    expect(page.locator('[role="menuitemcheckbox"]').first).to_be_visible(timeout=10_000)
 
     crash = [e for e in errors if any(m in e for m in _CRASH_MARKERS)]
     assert not crash, f"{harness}: render crashed with {crash!r} (all errors: {errors!r})"

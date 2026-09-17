@@ -254,11 +254,8 @@ async def _drive(base_url: str) -> None:
             await expect(page.get_by_test_id("new-chat-landing-agent-select")).to_have_attribute(
                 "aria-label", re.compile("Pi")
             )
-            # Committing closes the menu; wait for it to unmount before
-            # reopening, else the click lands mid-close and never reopens.
-            await page.get_by_test_id("new-chat-landing-harness-more").wait_for(
-                state="detached", timeout=10_000
-            )
+            await page.keyboard.press("Escape")
+            await expect(page.get_by_role("menu")).to_have_count(0)
             await _open_picker(page)
             other = page.get_by_test_id("new-chat-landing-harness-more")
             await expect(other).to_contain_text("Pi")

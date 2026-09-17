@@ -25,6 +25,7 @@ from typing import ParamSpec, TypeVar
 
 import click
 
+from omnigent._startup_events import observe_codex_startup
 from omnigent._startup_profile import StartupProfiler
 from omnigent.cli_common import (
     CLAUDE_STARTUP_PROFILE_ENV_VAR as _CLAUDE_STARTUP_PROFILE_ENV_VAR,
@@ -357,6 +358,7 @@ def register_native_commands(cli: click.Group) -> None:
         ),
     )
     @click.argument("codex_args", nargs=-1, type=click.UNPROCESSED)
+    @observe_codex_startup
     def codex(
         server: str | None,
         resume: str | None,

@@ -46,6 +46,7 @@ import threading
 import time
 import urllib.parse
 from collections.abc import Awaitable, Callable, Iterator, Mapping
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from http import HTTPStatus
@@ -78,6 +79,9 @@ from omnigent.tools.base import Tool, ToolContext
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS
 
 _logger = logging.getLogger(__name__)
+_INJECTION_CANCEL_EVENT: ContextVar[threading.Event | None] = ContextVar(
+    "claude_native_injection_cancel_event", default=None
+)
 
 BRIDGE_DIR_ENV_VAR = "HARNESS_CLAUDE_NATIVE_BRIDGE_DIR"
 REQUEST_SESSION_ID_ENV_VAR = "HARNESS_CLAUDE_NATIVE_REQUEST_SESSION_ID"
@@ -171,6 +175,9 @@ _MAX_CONCURRENT_MCP_REQUESTS = 64
 # ``tmux.json`` after the Claude terminal launches; the harness
 # tails it and shells out to tmux.
 _TMUX_READY_TIMEOUT_S = 30.0
+# Hard cap on waiting for a slow-booting terminal whose process is still
+# alive.
+_TMUX_READY_SLOW_BOOT_TIMEOUT_S = 180.0
 # Per-command tmux budget. 10s matches every other native bridge: a tmux
 # server starved by parallel worker boots on a large worktree can stall
 # past 5s while still healthy, and a shorter budget kills the delivery.
@@ -212,6 +219,7 @@ _MIN_TITLED_RULE_WIDTH = 20
 # input box has not mounted yet and no rule is on screen to anchor on.
 _PROMPT_SCAN_TAIL_LINES = 5
 _CLAUDE_READY_POLL_INTERVAL_S = 0.15
+_CLAUDE_LIVENESS_POLL_INTERVAL_S = 1.0
 _PASTE_SETTLE_S = 0.1  # let the TUI commit a paste before the separate submit Enter
 # How long to wait for the pasted draft to visibly land in Claude's
 # input box before sending the submit Enter. Claude Code coalesces
@@ -256,11 +264,14 @@ _PERMISSION_MODE_FOOTERS: dict[str, str] = {
     "acceptEdits": "accept edits on",
     "plan": "plan mode on",
     "auto": "auto mode on",
+    # Launch-only, but readable: a pane launched into bypass must report
+    # its own mode so the cycler has a starting point to leave it from.
+    "bypassPermissions": "bypass permissions on",
 }
-# Modes shift+tab can reach. ``dontAsk`` is never in the cycle and
-# ``bypassPermissions`` only joins it when launched into, so both are
-# rejected up front.
-CYCLEABLE_PERMISSION_MODES = frozenset(_PERMISSION_MODE_FOOTERS)
+# Modes shift+tab can reach from any session. ``dontAsk`` is never in the
+# cycle and ``bypassPermissions`` only joins it when launched into, so
+# neither is a switch target.
+CYCLEABLE_PERMISSION_MODES = frozenset(_PERMISSION_MODE_FOOTERS) - {"bypassPermissions"}
 # Cap on shift+tab presses. The cycle is 3-5 modes wide depending on which
 # optional modes are enabled, so a full lap plus slack proves the target is
 # unreachable rather than slow.
@@ -417,6 +428,26 @@ def validate_claude_hook_interpreter_compatibility(
 
 class ClaudePromptTimeout(RuntimeError):
     """Claude Code's input box did not render before delivery timed out."""
+
+
+class ClaudeInjectionCancelled(RuntimeError):
+    """The caller cancelled delivery before the injection worker finished."""
+
+
+@contextlib.contextmanager
+def cancellable_injection(cancel_event: threading.Event) -> Iterator[None]:
+    """Bind a cancellation flag inherited by this delivery's ``asyncio.to_thread`` worker."""
+    token = _INJECTION_CANCEL_EVENT.set(cancel_event)
+    try:
+        yield
+    finally:
+        _INJECTION_CANCEL_EVENT.reset(token)
+
+
+def _check_injection_cancelled() -> None:
+    cancel_event = _INJECTION_CANCEL_EVENT.get()
+    if cancel_event is not None and cancel_event.is_set():
+        raise ClaudeInjectionCancelled("Claude Code message delivery was cancelled")
 
 
 class TmuxSessionNotAdvertised(RuntimeError):
@@ -1224,9 +1255,9 @@ def approval_wait_marker_path(session_id: str, *, bridge_dir: Path | None = None
     """
     Return the marker path a parked permission hook keeps fresh.
 
-    One marker per hook process: concurrent prompts on one session (a
-    permission request and an AskUserQuestion, or parallel tool calls) each
-    own a file, so the first to finish never clears another's evidence.
+    One marker per hook process: concurrent prompts on one session (parallel
+    tool calls each raising a permission request) own separate files, so the
+    first to finish never clears another's evidence.
 
     :param session_id: Omnigent session id whose verdict a hook is waiting
         on, e.g. ``"conv_abc123"``.
@@ -2051,36 +2082,11 @@ def build_hook_settings(
             "command": evaluate_policy_command,
         }
 
-        # In bypassPermissions mode PermissionRequest never fires, so
-        # AskUserQuestion needs its own PreToolUse hook to surface the
-        # form. It's a no-op in other modes to avoid double-surfacing.
-        ask_uq_command_parts = [
-            python,
-            "-I",
-            "-m",
-            "omnigent.harnesses.claude_native.hook",
-            "ask-user-question",
-            "--bridge-dir",
-            str(bridge_dir),
-        ]
-        ask_uq_hook: _JsonObject = {
-            "type": "command",
-            "command": shlex.join(ask_uq_command_parts),
-            # Short timeout: if the web-UI elicitation isn't answered
-            # within 10s, the hook returns empty output so Claude falls
-            # through to its TUI picker in bypassPermissions mode. In
-            # default mode this hook exits immediately (no-op), so the
-            # timeout is irrelevant there.
-            "timeout": 10,
-        }
-        # The ``AskUserQuestion`` matcher only fires if that tool is actually
-        # callable. A session launched with ``--disallowedTools AskUserQuestion``
-        # (e.g. the exit-plan-mode e2e fixture) can never trigger this hook, so
-        # the registration is dormant there — harmless, just never reached.
-        hooks["PreToolUse"] = [
-            {"matcher": "AskUserQuestion", "hooks": [ask_uq_hook]},
-            {"hooks": [evaluate_policy_hook]},
-        ]
+        # AskUserQuestion needs no PreToolUse forwarder: Claude Code raises its
+        # permission prompt for the question in every mode, bypass included, so
+        # the PermissionRequest hook above carries it. A second forwarder here
+        # parked a duplicate elicitation and the web showed two identical cards.
+        hooks["PreToolUse"] = [{"hooks": [evaluate_policy_hook]}]
         # PostToolUse already has TodoWrite and TaskUpdate matchers
         # for the transcript forwarder (the observer ``hook``). Append
         # a catch-all policy evaluation entry so TOOL_RESULT policies
@@ -2216,12 +2222,10 @@ def url_component(value: str) -> str:
 # Claude falls back to plain assistant text + a normal user reply,
 # which already round-trips through the existing chat-input pipeline.
 #
-# Currently empty: ``AskUserQuestion`` routes through a dedicated
-# ``PreToolUse`` hook (registered in ``build_hook_settings``) that
-# surfaces the question + options to the web UI as an elicitation
-# form and injects the user's answer via ``updatedInput``, and
-# ``ExitPlanMode`` surfaces through the standard ``PermissionRequest``
-# hook as an approve/reject elicitation card.
+# Currently empty: ``AskUserQuestion`` and ``ExitPlanMode`` both surface
+# through the standard ``PermissionRequest`` hook — the question as an
+# elicitation form whose answers come back via ``updatedInput``, the plan
+# as an approve/reject card.
 _OMNIGENT_DISALLOWED_TOOLS: tuple[str, ...] = ()
 
 
@@ -3658,6 +3662,10 @@ def inject_user_message(
     :param content: User text from the Omnigent web UI. Must be non-empty.
     :param timeout_s: Seconds to wait for each readiness gate
         (``tmux.json`` advertised, then prompt rendered), e.g. ``30.0``.
+        The prompt-rendered gate extends past this budget while the
+        terminal's process is verifiably alive but still booting (see
+        :func:`_wait_for_claude_prompt_ready`), so a slow host connect
+        delivers the message late instead of dropping it.
     :returns: None.
     :raises RuntimeError: If the tmux target is not advertised in time,
         if Claude's input prompt never renders, if a ``tmux send-keys``
@@ -4164,6 +4172,180 @@ def _permission_mode_from_pane(pane: str) -> str | None:
     return None
 
 
+# ── /btw side-chat overlay ─────────────────────────────────────────
+# Claude Code's ``/btw`` ("by the way") opens an in-TUI overlay that
+# answers a side question without ever persisting it — not to the
+# transcript JSONL, the message-deltas file, or any hook. The rendered
+# pane is the only place the answer exists, so the forwarder scrapes it
+# from there (read-only) to mirror the exchange into the managed web UI.
+#
+# The overlay draws a ``▔`` top border, the ``/btw <question>`` line(s)
+# (4-space indent; prior side turns stack above the current one), a
+# blank, the answer (6-space indent), a blank, and a footer pinned to the
+# pane's bottom. The answer is rendered atomically once generation
+# finishes — it does not stream chunk-by-chunk into the pane.
+_BTW_OVERLAY_BORDER_GLYPH = "▔"
+_BTW_FOOTER_CLOSE_HINT = "Esc to close"
+# A settled overlay's footer offers copy + fork; while the answer is
+# still generating the footer carries neither and a ``✻ Answering…`` line
+# shows in the region. Both conditions gate "the exchange is complete".
+_BTW_FOOTER_COMPLETE_HINTS = ("c to copy", "f to fork")
+_BTW_ANSWERING_HINT = "Answering"
+_BTW_QUESTION_PREFIX = "/btw"
+# Read-only capture cannot tell a complete tall answer from one the pane
+# clipped (both end in a blank + footer), so an overlay whose border→footer
+# span reaches this many rows is flagged possibly-truncated. This
+# over-flags long *complete* answers, which is acceptable for the
+# best-effort relay (the note points the reader at the terminal).
+_BTW_TRUNCATION_MIN_SPAN_ROWS = 12
+
+
+@dataclass(frozen=True)
+class BtwOverlay:
+    """
+    A completed Claude Code ``/btw`` side-chat exchange scraped from the pane.
+
+    :param question: The ``/btw <question>`` line as typed, e.g.
+        ``"/btw is this backward compatible?"``, or ``None`` when the
+        question scrolled out of the visible overlay (a long answer).
+    :param answer: The visible answer text, dedented and stripped.
+    :param truncated: True when the overlay likely clipped a longer
+        answer (best-effort heuristic; see
+        :data:`_BTW_TRUNCATION_MIN_SPAN_ROWS`).
+    """
+
+    question: str | None
+    answer: str
+    truncated: bool
+
+
+@dataclass(frozen=True)
+class PaneSignals:
+    """
+    The poll-time signals scraped from a single Claude pane capture.
+
+    Bundled so the forwarder reads the pane ONCE per poll and parses every
+    footer-derived signal from that one ``capture-pane`` subprocess, instead
+    of spawning a separate capture per signal.
+
+    :param permission_mode: The ``--permission-mode`` footer value, e.g.
+        ``"auto"``, or ``None`` when no mode footer is visible.
+    :param btw_overlay: A settled ``/btw`` side-chat overlay, or ``None``
+        when none is shown / it is still generating.
+    """
+
+    permission_mode: str | None = None
+    btw_overlay: BtwOverlay | None = None
+
+
+def _btw_overlay_from_pane(pane: str) -> BtwOverlay | None:
+    """
+    Parse a *completed* ``/btw`` side-chat overlay from a captured pane.
+
+    Returns ``None`` when no overlay is visible, the answer is still
+    generating (completion gate unmet), or no answer text is present — so
+    a caller only ever relays a settled exchange.
+
+    :param pane: Captured pane text from :func:`_capture_pane`.
+    :returns: The parsed overlay, or ``None``.
+    """
+    lines = pane.splitlines()
+    footer_idx = next(
+        (i for i in range(len(lines) - 1, -1, -1) if _BTW_FOOTER_CLOSE_HINT in lines[i]),
+        None,
+    )
+    if footer_idx is None:
+        return None
+    footer = lines[footer_idx]
+    if not all(hint in footer for hint in _BTW_FOOTER_COMPLETE_HINTS):
+        return None
+    border_idx = next(
+        (i for i in range(footer_idx - 1, -1, -1) if _BTW_OVERLAY_BORDER_GLYPH in lines[i]),
+        None,
+    )
+    if border_idx is None:
+        return None
+    region = lines[border_idx + 1 : footer_idx]
+    # A ``✻ Answering…`` line means the (current) exchange is still in
+    # flight even though a completed footer is on screen — bail.
+    if any(_BTW_ANSWERING_HINT in line for line in region):
+        return None
+    # The current turn's question is the LAST ``/btw`` line; earlier side
+    # turns stack above it. Its answer is everything after it.
+    question_idx = next(
+        (
+            i
+            for i in range(len(region) - 1, -1, -1)
+            if region[i].lstrip().startswith(_BTW_QUESTION_PREFIX)
+        ),
+        None,
+    )
+    if question_idx is None:
+        question = None
+        answer_lines = region
+    else:
+        question = region[question_idx].strip()
+        answer_lines = region[question_idx + 1 :]
+    answer = _dedent_overlay_lines(answer_lines)
+    if not answer:
+        return None
+    truncated = (footer_idx - border_idx) >= _BTW_TRUNCATION_MIN_SPAN_ROWS
+    return BtwOverlay(question=question, answer=answer, truncated=truncated)
+
+
+def _btw_overlay_present(pane: str) -> bool:
+    """
+    Report whether a ``/btw`` overlay is currently on screen.
+
+    Broader than :func:`_btw_overlay_from_pane` (which only matches a
+    *settled* exchange): this also matches a multi-turn overlay and one
+    still generating, since dismissing should work in any of those states.
+    It is deliberately specific to the ``/btw`` footer so
+    :func:`dismiss_btw_overlay` never spends an Escape on a bare composer
+    (where Escape would cancel an in-flight turn).
+
+    :param pane: Captured pane text from :func:`_capture_pane`.
+    :returns: True when the ``/btw`` overlay is visible.
+    """
+    lines = pane.splitlines()
+    footer_idx = next(
+        (i for i in range(len(lines) - 1, -1, -1) if _BTW_FOOTER_CLOSE_HINT in lines[i]),
+        None,
+    )
+    if footer_idx is None:
+        return False
+    if not any(_BTW_OVERLAY_BORDER_GLYPH in line for line in lines[:footer_idx]):
+        return False
+    footer = lines[footer_idx]
+    # The /btw footer offers copy+fork (single, settled), switch (multi-turn),
+    # or the region shows the answering spinner (still generating). Requiring
+    # one of these keeps a model picker / confirm dialog (other "Esc to close"
+    # surfaces) from matching.
+    if all(hint in footer for hint in _BTW_FOOTER_COMPLETE_HINTS):
+        return True
+    if "to switch" in footer:
+        return True
+    return any(_BTW_ANSWERING_HINT in line for line in lines[:footer_idx])
+
+
+def _dedent_overlay_lines(overlay_lines: list[str]) -> str:
+    """
+    Strip the common leading indent from captured overlay lines.
+
+    Mirrors :func:`textwrap.dedent` without the import, preserving the
+    answer's relative indentation (nested lists, code) while removing the
+    overlay's fixed left margin and any trailing pad from ``capture-pane``.
+
+    :param overlay_lines: Raw pane lines of the answer region.
+    :returns: The dedented, stripped text.
+    """
+    non_blank = [line for line in overlay_lines if line.strip()]
+    indent = min((len(line) - len(line.lstrip(" ")) for line in non_blank), default=0)
+    return "\n".join(
+        line[indent:].rstrip() if line.strip() else "" for line in overlay_lines
+    ).strip()
+
+
 def _read_settled_permission_mode(
     socket_path: str,
     tmux_target: str,
@@ -4477,6 +4659,7 @@ def _run_tmux(socket_path: str, *args: str) -> None:
     """
     import subprocess
 
+    _check_injection_cancelled()
     cmd = ["tmux", "-S", socket_path, *args]
     try:
         proc = subprocess.run(
@@ -4508,6 +4691,7 @@ def _capture_pane(socket_path: str, tmux_target: str) -> str:
     """
     import subprocess
 
+    _check_injection_cancelled()
     try:
         proc = subprocess.run(
             ["tmux", "-S", socket_path, "capture-pane", "-t", tmux_target, "-p"],
@@ -4519,6 +4703,46 @@ def _capture_pane(socket_path: str, tmux_target: str) -> str:
     except (subprocess.SubprocessError, OSError):
         return ""
     return proc.stdout if proc.returncode == 0 else ""
+
+
+def _claude_pane_alive(socket_path: str, tmux_target: str) -> bool | None:
+    """
+    Report whether the Claude pane's process is still running.
+
+    ``keep_alive_after_exit`` retains dead panes, so check ``#{pane_dead}``
+    rather than pane existence. An unanswered probe is inconclusive: a
+    busy tmux server must not prematurely end the slow-boot wait.
+
+    :param socket_path: Absolute path to the tmux socket, e.g.
+        ``"/tmp/.../tmux.sock"``.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :returns: ``True`` when tmux affirms the pane's process is alive,
+        ``False`` when tmux affirms it exited or rejects the query, and
+        ``None`` when the probe went unanswered.
+    """
+    import subprocess
+
+    _check_injection_cancelled()
+    try:
+        proc = subprocess.run(
+            [
+                "tmux",
+                "-S",
+                socket_path,
+                "display-message",
+                "-p",
+                "-t",
+                tmux_target,
+                "#{pane_dead}",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=_TMUX_SEND_TIMEOUT_S,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    return proc.returncode == 0 and proc.stdout.strip() == "0"
 
 
 def claude_pane_ready(bridge_dir: Path) -> bool:
@@ -4909,17 +5133,23 @@ def _wait_for_claude_prompt_ready(
     :param socket_path: Absolute path to the tmux socket, e.g.
         ``"/tmp/.../tmux.sock"``.
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
-    :param timeout_s: Seconds to wait for the prompt, e.g. ``30.0``.
+    :param timeout_s: Base readiness budget, e.g. ``30.0``. A live pane or
+        unanswered liveness probe extends the wait to
+        :data:`_TMUX_READY_SLOW_BOOT_TIMEOUT_S`; a dead pane or rejected
+        query ends the wait at the next liveness check.
     :returns: None.
-    :raises ClaudePromptTimeout: If the prompt never renders within
-        *timeout_s* (Claude failed to boot). The message carries a poll
+    :raises ClaudePromptTimeout: If the prompt never renders in time
+        (Claude failed to boot, or a slow boot outlasted even the hard
+        cap). The message carries the seconds actually waited, a poll
         count, how many of those polls saw an empty capture, and the tail
         of the last non-empty capture the loop actually observed (see
         :func:`_format_terminal_failure_tail`) so the true failure mode —
         a startup crash, a torn/empty capture under a mid-turn repaint, or
         a box that never appeared — is diagnosable from the error alone.
     """
-    deadline = time.monotonic() + timeout_s
+    started = time.monotonic()
+    next_liveness_probe = started + timeout_s
+    hard_deadline = started + max(timeout_s, _TMUX_READY_SLOW_BOOT_TIMEOUT_S)
     polls = 0
     empty_polls = 0
     # Keep the last non-empty capture the loop actually saw, not a fresh
@@ -4932,6 +5162,7 @@ def _wait_for_claude_prompt_ready(
     # Poll at least once even at timeout_s=0: a single readiness check is
     # still meaningful, and it guarantees a capture to attach on failure.
     while True:
+        _check_injection_cancelled()
         pane = _capture_pane(socket_path, tmux_target)
         polls += 1
         if pane.strip():
@@ -4940,16 +5171,22 @@ def _wait_for_claude_prompt_ready(
             empty_polls += 1
         if _claude_prompt_rendered(pane):
             return
-        if time.monotonic() >= deadline:
+        now = time.monotonic()
+        if now >= hard_deadline:
             break
+        if now >= next_liveness_probe:
+            if _claude_pane_alive(socket_path, tmux_target) is False:
+                break
+            next_liveness_probe = time.monotonic() + _CLAUDE_LIVENESS_POLL_INTERVAL_S
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
     # Timed out. The poll/empty-capture counts separate the failure modes:
     # mostly-empty captures point at a torn read under a busy repaint (the
     # session is alive but capture-pane came back blank); non-empty captures
     # with no box point at Claude never rendering the prompt (a boot crash,
     # e.g. a ``JSON Parse error``, whose text the tail then surfaces).
+    waited_s = time.monotonic() - started
     raise ClaudePromptTimeout(
-        f"Claude Code terminal did not become ready within {timeout_s}s "
+        f"Claude Code terminal did not become ready within {waited_s:.1f}s "
         f"(input prompt never rendered in {polls} polls, "
         f"{empty_polls} empty captures). The message was not delivered."
         + _format_terminal_failure_tail(last_nonempty)
@@ -5010,6 +5247,7 @@ def _wait_for_tmux_info(bridge_dir: Path, *, timeout_s: float) -> dict[str, str]
     deadline = time.monotonic() + timeout_s
     path = bridge_dir / _TMUX_FILE
     while time.monotonic() < deadline:
+        _check_injection_cancelled()
         payload = _read_json_file(path)
         socket_path = payload.get("socket_path") if isinstance(payload, dict) else None
         tmux_target = payload.get("tmux_target") if isinstance(payload, dict) else None
@@ -6319,6 +6557,87 @@ def read_permission_mode(bridge_dir: Path) -> str | None:
     if not isinstance(socket_path, str) or not isinstance(tmux_target, str):
         return None
     return _permission_mode_from_pane(_capture_pane(socket_path, tmux_target))
+
+
+def read_btw_overlay(bridge_dir: Path) -> BtwOverlay | None:
+    """
+    Read a completed ``/btw`` side-chat overlay from the Claude pane.
+
+    Non-blocking, best-effort, and strictly read-only — it captures the
+    pane but never sends keystrokes, so it cannot race the executor's
+    message injections (the forwarder and executor run in separate
+    processes with no shared pane-write lock). Returns ``None`` when the
+    terminal isn't up, no settled overlay is shown, or nothing parses.
+
+    :param bridge_dir: Bridge directory path, e.g.
+        ``/tmp/omnigent/claude-native/<digest>``.
+    :returns: The parsed overlay, or ``None``.
+    """
+    payload = _read_json_file(bridge_dir / _TMUX_FILE)
+    if not isinstance(payload, dict):
+        return None
+    socket_path = payload.get("socket_path")
+    tmux_target = payload.get("tmux_target")
+    if not isinstance(socket_path, str) or not isinstance(tmux_target, str):
+        return None
+    return _btw_overlay_from_pane(_capture_pane(socket_path, tmux_target))
+
+
+def read_pane_signals(bridge_dir: Path) -> PaneSignals:
+    """
+    Read every poll-time footer signal from ONE Claude pane capture.
+
+    Non-blocking, best-effort, read-only. Captures the pane a single time
+    and parses both the permission-mode footer and any settled ``/btw``
+    overlay from it, so the forwarder spawns one ``capture-pane``
+    subprocess per poll rather than one per signal. Returns an empty
+    :class:`PaneSignals` when the terminal isn't up.
+
+    :param bridge_dir: Bridge directory path, e.g.
+        ``/tmp/omnigent/claude-native/<digest>``.
+    :returns: The parsed pane signals (fields ``None`` when absent).
+    """
+    payload = _read_json_file(bridge_dir / _TMUX_FILE)
+    if not isinstance(payload, dict):
+        return PaneSignals()
+    socket_path = payload.get("socket_path")
+    tmux_target = payload.get("tmux_target")
+    if not isinstance(socket_path, str) or not isinstance(tmux_target, str):
+        return PaneSignals()
+    pane = _capture_pane(socket_path, tmux_target)
+    return PaneSignals(
+        permission_mode=_permission_mode_from_pane(pane),
+        btw_overlay=_btw_overlay_from_pane(pane),
+    )
+
+
+def dismiss_btw_overlay(bridge_dir: Path) -> bool:
+    """
+    Close a visible ``/btw`` overlay in the pane by sending Escape.
+
+    Called from the runner when the reader dismisses the web-side overlay,
+    so the two views close in lockstep. Escape is sent ONLY when the
+    ``/btw`` overlay is verifiably on screen (:func:`_btw_overlay_present`)
+    — a blind Escape on the bare composer would cancel an in-flight turn.
+    Runs in the runner (the pane's writer), so it does not race the
+    executor's injections. Best-effort: a no-op when the overlay is not
+    shown, since the next injected message dismisses it anyway.
+
+    :param bridge_dir: Bridge directory path, e.g.
+        ``/tmp/omnigent/claude-native/<digest>``.
+    :returns: True when an Escape was sent, False when no overlay was shown.
+    """
+    payload = _read_json_file(bridge_dir / _TMUX_FILE)
+    if not isinstance(payload, dict):
+        return False
+    socket_path = payload.get("socket_path")
+    tmux_target = payload.get("tmux_target")
+    if not isinstance(socket_path, str) or not isinstance(tmux_target, str):
+        return False
+    if not _btw_overlay_present(_capture_pane(socket_path, tmux_target)):
+        return False
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Escape")
+    return True
 
 
 def read_claude_status_model(bridge_dir: Path) -> str | None:

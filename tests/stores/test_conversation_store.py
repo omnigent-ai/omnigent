@@ -108,6 +108,31 @@ def test_fork_drops_sandbox_repo_label(
     assert MANAGED_REPO_LABEL_KEY not in fork.labels
 
 
+def test_fork_drops_per_repo_sandbox_labels(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """The per-repo family (``omnigent.sandbox.repo.<index>``) is dropped by
+    prefix on a fork, for the same reason as the legacy single label: the fork's
+    own launch re-stamps whatever it resolves, so inheriting the source's would
+    re-clone them even into a fork that asked for an empty sandbox."""
+    from omnigent.server.managed_hosts import MANAGED_REPO_LABEL_KEY
+
+    source = conversation_store.create_conversation()
+    conversation_store.set_labels(
+        source.id,
+        {
+            f"{MANAGED_REPO_LABEL_KEY}.0": "https://github.com/org/api#main",
+            f"{MANAGED_REPO_LABEL_KEY}.1": "https://github.com/org/web",
+            "kept": "yes",
+        },
+    )
+
+    fork = conversation_store.fork_conversation(source.id)
+
+    assert fork.labels["kept"] == "yes"
+    assert not any(k.startswith(f"{MANAGED_REPO_LABEL_KEY}.") for k in fork.labels)
+
+
 def test_fork_drops_per_user_pin_labels(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
@@ -4001,6 +4026,55 @@ def test_fork_conversation_copies_items(
         assert fork_item.response_id == src_item.response_id
         # Data content is identical.
         assert fork_item.data == src_item.data
+
+
+@pytest.mark.parametrize("item_count", [0, 1, 129])
+@pytest.mark.parametrize("workspace_id", [0, 42])
+def test_fork_batches_item_inserts(
+    conversation_store: SqlAlchemyConversationStore,
+    item_count: int,
+    workspace_id: int,
+) -> None:
+    """Copied rows must have complete primary keys so the ORM can batch inserts."""
+    from omnigent.db.db_models import workspace_scope
+
+    with workspace_scope(workspace_id):
+        source = conversation_store.create_conversation()
+        source_items = conversation_store.append(
+            source.id,
+            [
+                NewConversationItem(
+                    type="message",
+                    response_id=f"response-{index}",
+                    data=MessageData(
+                        role="user", content=[{"type": "input_text", "text": f"item {index}"}]
+                    ),
+                )
+                for index in range(item_count)
+            ],
+        )
+        insert_calls: list[bool] = []
+
+        def record_insert(conn, cursor, statement, parameters, context, executemany):
+            if context.isinsert and context.compiled.statement.table.name == "conversation_items":
+                insert_calls.append(executemany)
+
+        event.listen(conversation_store._conv_engine, "before_cursor_execute", record_insert)
+        try:
+            fork = conversation_store.fork_conversation(source.id)
+        finally:
+            event.remove(conversation_store._conv_engine, "before_cursor_execute", record_insert)
+
+        assert insert_calls == ([] if item_count == 0 else [item_count > 1])
+        copied = conversation_store.list_items(fork.id, limit=1000).data
+        assert [item.data for item in copied] == [item.data for item in source_items]
+        assert [item.response_id for item in copied] == [item.response_id for item in source_items]
+        assert len({item.id for item in copied}) == item_count
+        assert not {item.id for item in copied}.intersection(item.id for item in source_items)
+        assert conversation_store.list_items(source.id, limit=1000).data == source_items
+
+    with workspace_scope(workspace_id + 1):
+        assert conversation_store.list_items(fork.id).data == []
 
 
 @pytest.mark.parametrize("up_to_response_id", [None, "resp_001", "resp_002"])

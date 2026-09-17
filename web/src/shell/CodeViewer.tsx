@@ -43,9 +43,7 @@ import rehypeRaw from "rehype-raw";
 import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
 import { rehypeGithubAlerts } from "rehype-github-alerts";
 import rehypeSlug from "rehype-slug";
-import { mermaid } from "@streamdown/mermaid";
-import { MarkdownErrorBoundary } from "@/components/ai-elements/MarkdownErrorBoundary";
-import { Streamdown } from "streamdown";
+import { MermaidPreview } from "./MermaidPreview";
 import type { Comment } from "@/hooks/useComments";
 import {
   type FileContentResponse,
@@ -150,20 +148,6 @@ const MARKDOWN_REHYPE_PLUGINS: Options["rehypePlugins"] = [
   [rehypeSanitize, MARKDOWN_SANITIZE_SCHEMA],
 ];
 
-const MERMAID_STREAMDOWN_PLUGINS = { mermaid };
-
-function MermaidPreview({ source }: { source: string }) {
-  return (
-    <div data-testid="mermaid-preview" className="not-prose my-4 overflow-auto">
-      <MarkdownErrorBoundary source={source}>
-        <Streamdown plugins={MERMAID_STREAMDOWN_PLUGINS}>
-          {`\`\`\`mermaid\n${source.replace(/\n$/, "")}\n\`\`\``}
-        </Streamdown>
-      </MarkdownErrorBoundary>
-    </div>
-  );
-}
-
 // Tailwind Preflight applies `img { height: auto }`, which overrides the HTML
 // `width`/`height` *attributes* (presentational hints lose to any author CSS).
 // GitHub honors explicit dimensions, so mirror them onto an inline style —
@@ -175,7 +159,9 @@ const MARKDOWN_COMPONENTS: Components = {
     const child = isValidElement(children) ? children : null;
     if (
       isValidElement<{ className?: string; children?: ReactNode }>(child) &&
-      child.props.className?.split(/\s+/).includes("language-mermaid")
+      // Match case-insensitively so a cased fence (```Mermaid) renders a diagram
+      // in the read-only preview too, matching the editor's detection.
+      child.props.className?.split(/\s+/).some((c) => c.toLowerCase() === "language-mermaid")
     ) {
       return <MermaidPreview source={String(child.props.children ?? "")} />;
     }

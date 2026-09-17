@@ -33,6 +33,7 @@ import type {
   ResponseInProgress,
   ResponseQueued,
   RetryEvent,
+  SessionBtwSidechatEvent,
   SessionChangedFilesInvalidatedEvent,
   SessionChildSessionUpdatedEvent,
   SessionModelOptionsEvent,
@@ -874,6 +875,23 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       reason: "clear",
     } satisfies SessionSupersededEvent;
   }
+  if (eventType === "session.btw_sidechat") {
+    const conversationId = data.conversation_id;
+    const question = data.question;
+    const answer = data.answer;
+    const truncated = data.truncated;
+    if (typeof conversationId !== "string" || !conversationId) return null;
+    if (typeof question !== "string") return null;
+    if (typeof answer !== "string") return null;
+    if (typeof truncated !== "boolean") return null;
+    return {
+      type: "session_btw_sidechat",
+      conversationId,
+      question,
+      answer,
+      truncated,
+    } satisfies SessionBtwSidechatEvent;
+  }
   if (eventType === "session.resource.created") {
     const resource = parseSessionResource(data.resource);
     if (resource === null) return null;
@@ -1161,6 +1179,7 @@ function parseOutputItem(data: Record<string, unknown>): StreamEvent | null {
   const itemType = String(rec.type ?? "");
   const itemId = String(rec.id ?? "");
   const responseId = String(rec.response_id ?? "");
+  const messageId = typeof data.message_id === "string" ? data.message_id : undefined;
 
   if (itemType === "function_call") {
     const argsStr = String(rec.arguments ?? "{}");
@@ -1200,6 +1219,7 @@ function parseOutputItem(data: Record<string, unknown>): StreamEvent | null {
       content: Array.isArray(content) ? (content as Record<string, unknown>[]) : [],
       itemId,
       responseId,
+      ...(messageId !== undefined ? { messageId } : {}),
     } satisfies MessageDone;
   }
 
