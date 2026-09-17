@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import subprocess
@@ -117,6 +118,9 @@ def test_supervisor_uses_installed_packages_from_workspace(tmp_path: Path, shado
     config_file = tmp_path / "databrickscfg"
     env["DATABRICKS_CONFIG_FILE"] = str(config_file)
     env["NO_PROXY"] = "127.0.0.1,localhost"
+    env["DATABRICKS_TOKEN"] = "ambient-wrong-token"
+    env["DATABRICKS_HOST"] = "http://127.0.0.1:1"
+    env["DATABRICKS_CONFIG_PROFILE"] = "wrong-profile"
     argv = wrap_agy_gateway_launch(
         [sys.executable, str(child), str(workspace)],
         {"OMNIGENT_AGY_DATABRICKS_PROFILE": "supervisor-test"},
@@ -139,23 +143,152 @@ def test_supervisor_uses_installed_packages_from_workspace(tmp_path: Path, shado
     assert result.returncode == 23, result.stderr
 
 
-def test_selected_databricks_profile_owns_the_host(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    from databricks.sdk.oauth import HostMetadata
+@pytest.fixture
+def profile_workspace(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """Real SDK auth against a local metadata / OAuth server, with fake credentials."""
+    minted: list[str] = []
+
+    class AuthHandler(BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: object) -> None:
+            pass
+
+        def reply(self, payload: dict) -> None:
+            body = json.dumps(payload).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self) -> None:
+            if self.path == "/.well-known/databricks-config":
+                self.reply({})
+            elif self.path == "/oidc/.well-known/oauth-authorization-server":
+                self.reply({"token_endpoint": f"http://127.0.0.1:{self.server.server_port}/token"})
+            else:
+                self.send_error(404)
+
+        def do_POST(self) -> None:
+            expected = base64.b64encode(b"profile-client:profile-secret").decode()
+            if self.path != "/token" or self.headers.get("Authorization") != f"Basic {expected}":
+                self.send_error(403)
+                return
+            self.rfile.read(int(self.headers["Content-Length"]))
+            token = f"profile-oauth-token-{len(minted)}"
+            minted.append(token)
+            self.reply({"access_token": token, "token_type": "Bearer", "expires_in": 3600})
 
     cfg = tmp_path / "databrickscfg"
-    cfg.write_text("[selected]\nhost = https://selected.example\ntoken = selected-token\n")
     monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg))
-    monkeypatch.setenv("DATABRICKS_HOST", "https://ambient.example")
-    monkeypatch.delenv("DATABRICKS_TOKEN", raising=False)
-    monkeypatch.setattr(
-        "databricks.sdk.config.get_host_metadata",
-        lambda _: HostMetadata.from_dict({}),
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
+    with ThreadingHTTPServer(("127.0.0.1", 0), AuthHandler) as upstream:
+        thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+        thread.start()
+        try:
+            yield cfg, f"http://127.0.0.1:{upstream.server_port}", minted
+        finally:
+            upstream.shutdown()
+            thread.join(timeout=5)
+
+
+@pytest.mark.parametrize("auth_type", ["pat", "oauth-m2m"])
+@pytest.mark.parametrize("ambient_auth", ["pat", "oauth-m2m"])
+def test_selected_databricks_profile_owns_host_and_identity(
+    monkeypatch: pytest.MonkeyPatch, profile_workspace, auth_type: str, ambient_auth: str
+) -> None:
+    cfg, host, minted = profile_workspace
+    credentials = (
+        "token = selected-token\n"
+        if auth_type == "pat"
+        else "client_id = profile-client\nclient_secret = profile-secret\n"
     )
+    cfg.write_text(
+        f"[selected]\nhost = {host}\nauth_type = {auth_type}\n{credentials}"
+        f"discovery_url = {host}/oidc/.well-known/oauth-authorization-server\n"
+    )
+    monkeypatch.setenv("DATABRICKS_HOST", "http://127.0.0.1:1")
+    monkeypatch.setenv("DATABRICKS_CONFIG_PROFILE", "wrong-profile")
+    monkeypatch.setenv("DATABRICKS_AUTH_TYPE", ambient_auth)
+    monkeypatch.setenv("DATABRICKS_TOKEN", "ambient-token")
+    monkeypatch.setenv("DATABRICKS_CLIENT_ID", "ambient-client")
+    monkeypatch.setenv("DATABRICKS_CLIENT_SECRET", "ambient-secret")
+    monkeypatch.setenv("DATABRICKS_DISCOVERY_URL", f"{host}/wrong-discovery")
+    before = dict(os.environ)
     source = databricks_token_source("selected")
-    assert source.workspace_url == "https://selected.example"
-    assert source.resolve() == "selected-token"
+    now = [0.0]
+    source._clock = lambda: now[0]
+    assert source.workspace_url == host
+    assert source.resolve() == (
+        "selected-token" if auth_type == "pat" else "profile-oauth-token-0"
+    )
+    cfg.write_text(cfg.read_text().replace("selected-token", "refreshed-token"))
+    assert source.resolve() == (
+        "selected-token" if auth_type == "pat" else "profile-oauth-token-0"
+    )
+    now[0] = 61.0
+    assert source.resolve() == (
+        "refreshed-token" if auth_type == "pat" else "profile-oauth-token-1"
+    )
+    assert minted == (
+        [] if auth_type == "pat" else ["profile-oauth-token-0", "profile-oauth-token-1"]
+    )
+    assert dict(os.environ) == before
+
+
+def test_selected_cli_oauth_profile_reaches_cli_with_isolated_environment(
+    monkeypatch: pytest.MonkeyPatch, profile_workspace, tmp_path: Path
+) -> None:
+    cfg, host, _ = profile_workspace
+    cli = tmp_path / "databricks"
+    cli.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, sys\n"
+        "if sys.argv[1] == 'version':\n"
+        "    print(json.dumps({'Major': 0, 'Minor': 296, 'Patch': 0}))\n"
+        "else:\n"
+        "    assert sys.argv[1:3] == ['auth', 'token']\n"
+        "    assert sys.argv[sys.argv.index('--profile') + 1] == 'selected'\n"
+        "    assert not any(key in os.environ for key in [\n"
+        "        'DATABRICKS_TOKEN', 'DATABRICKS_CLIENT_ID', 'DATABRICKS_CLIENT_SECRET',\n"
+        "        'DATABRICKS_HOST', 'DATABRICKS_CONFIG_PROFILE', 'DATABRICKS_AUTH_TYPE'])\n"
+        "    assert os.environ['DATABRICKS_CONFIG_FILE'] == sys.argv[0] + 'cfg'\n"
+        "    print(json.dumps({'access_token': 'cli-profile-token',\n"
+        "                      'token_type': 'Bearer', 'expiry': '2100-01-01T00:00:00Z'}))\n"
+    )
+    cli.chmod(0o755)
+    cfg.write_text(
+        f"[selected]\nhost = {host}\nauth_type = databricks-cli\ndatabricks_cli_path = {cli}\n"
+    )
+    monkeypatch.setenv("DATABRICKS_HOST", "http://127.0.0.1:1")
+    monkeypatch.setenv("DATABRICKS_TOKEN", "ambient-token")
+    monkeypatch.setenv("DATABRICKS_AUTH_TYPE", "pat")
+    monkeypatch.setenv("DATABRICKS_CONFIG_PROFILE", "wrong-profile")
+    before = dict(os.environ)
+    assert databricks_token_source("selected").resolve() == "cli-profile-token"
+    assert dict(os.environ) == before
+
+
+@pytest.mark.parametrize("invalid", ["missing", "hostless", "tokenless", "changed-host"])
+def test_selected_databricks_profile_never_falls_back(
+    monkeypatch: pytest.MonkeyPatch, profile_workspace, invalid: str
+) -> None:
+    from omnigent.errors import OmnigentError
+
+    cfg, host, _ = profile_workspace
+    monkeypatch.setenv("DATABRICKS_HOST", host)
+    monkeypatch.setenv("DATABRICKS_TOKEN", "ambient-token")
+    monkeypatch.setenv("DATABRICKS_AUTH_TYPE", "pat")
+    section = "other" if invalid == "missing" else "selected"
+    cfg.write_text(
+        f"[{section}]\nauth_type = pat\n"
+        + (f"host = {host}\n" if invalid != "hostless" else "")
+        + ("token = selected-token\n" if invalid != "tokenless" else "")
+    )
+    with pytest.raises(OmnigentError):
+        source = databricks_token_source("selected")
+        if invalid == "changed-host":
+            cfg.write_text(cfg.read_text().replace(host, host + "/other-workspace"))
+        source.resolve()
 
 
 @pytest.mark.asyncio

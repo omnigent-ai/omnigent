@@ -25,7 +25,8 @@ if TYPE_CHECKING:
 
 
 def databricks_token_source(profile: str) -> "DatabricksProfileTokenProvider":
-    """Bind SDK authentication to the selected profile's host, like native Codex."""
+    """Bind the workspace and refreshed identity to the selected profile."""
+    from omnigent.harnesses.antigravity_native.databricks_auth import ProfileAuthConfig
     from omnigent.inner.credential_proxy import DatabricksProfileTokenProvider
     from omnigent.inner.databricks_executor import _read_databrickscfg_host
 
@@ -37,14 +38,14 @@ def databricks_token_source(profile: str) -> "DatabricksProfileTokenProvider":
             f"Databricks profile {profile!r} has no workspace host.", code=ErrorCode.INVALID_INPUT
         )
     try:
-        from databricks.sdk.config import Config
+        import databricks.sdk.config  # noqa: F401 - check the optional dependency at setup.
     except ImportError:
         raise OmnigentError(
             "Native agy Databricks routing requires `pip install 'omnigent[databricks]'`.",
             code=ErrorCode.INVALID_INPUT,
         ) from None
     return DatabricksProfileTokenProvider(
-        profile, config_factory=lambda name: Config(profile=name, host=host)
+        profile, config_factory=lambda name: ProfileAuthConfig(name, host)
     )
 
 

@@ -194,7 +194,17 @@ def test_setup_gateway_reaches_real_agy_through_fresh_local_daemon(
                     "token = gateway-test-key\nauth_type = pat\n"
                 )
                 profile_file.chmod(0o600)
-                env["DATABRICKS_CONFIG_FILE"] = str(profile_file)
+                env.update(
+                    {
+                        "DATABRICKS_CONFIG_FILE": str(profile_file),
+                        "DATABRICKS_HOST": f"http://127.0.0.1:{gateway.server_port}/ambient",
+                        "DATABRICKS_TOKEN": "ambient-wrong-token",
+                        "DATABRICKS_CLIENT_ID": "ambient-client",
+                        "DATABRICKS_CLIENT_SECRET": "ambient-secret",
+                        "DATABRICKS_AUTH_TYPE": "oauth-m2m",
+                        "DATABRICKS_CONFIG_PROFILE": "wrong-profile",
+                    }
+                )
             result = cli(
                 "setup",
                 "--no-internal-beta",
@@ -232,7 +242,7 @@ def test_setup_gateway_reaches_real_agy_through_fresh_local_daemon(
                 ].default_families == {"gemini"}
             else:
                 assert config["providers"]["test-gemini"]["gemini"]["base_url"] == endpoint
-            # No ambient credentials: the new daemon must read what setup saved.
+            # The new daemon must read the Gemini credentials saved by setup.
             assert "GEMINI_API_KEY" not in env and "GOOGLE_GEMINI_BASE_URL" not in env
             result = cli("host", "--background", "--non-interactive")
             assert result.returncode == 0, result.stdout + result.stderr

@@ -110,6 +110,11 @@ for it, for example `pip install 'omnigent[databricks]'`. PAT and service-princi
 credentials belong in the Databricks profile configuration; they do not require
 an interactive OAuth login.
 
+The selected profile owns both the workspace and identity. Ambient
+`DATABRICKS_HOST`, `DATABRICKS_TOKEN`, and OAuth client settings cannot override
+it, including during token refresh. `DATABRICKS_CONFIG_FILE` can select a custom
+profile file. An invalid profile fails instead of using ambient credentials.
+
 Omnigent starts a local adapter with each agy process. It supplies the profile's
 Bearer token, refreshes access tokens through the profile's authentication
 provider, and maps agy's model names to the corresponding Databricks model
