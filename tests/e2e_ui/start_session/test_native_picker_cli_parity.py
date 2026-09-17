@@ -310,7 +310,7 @@ class PickerRig:
 
 @pytest.fixture(scope="module", params=["structured-custom", "legacy-bundled"])
 def picker_rig(
-    tmp_path_factory: pytest.TempPathFactory, request: pytest.FixtureRequest
+    built_spa: None, tmp_path_factory: pytest.TempPathFactory, request: pytest.FixtureRequest
 ) -> Iterator[PickerRig]:
     if shutil.which("codex") is None:
         pytest.skip("the 'codex' CLI is required to probe the real catalog behaviour")

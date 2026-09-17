@@ -132,12 +132,22 @@ def _find_pi_process(marker: str) -> tuple[int, list[str]] | None:
     ``--extension`` is not a standalone token there) and the ``python -m
     omnigent.runner...`` runner that spawned it.
 
-    Match only the process where ``--extension`` is its own argv token and
-    ``argv[0]`` is not tmux -- that is the real pi CLI.
+    After Pi sets its process title, argv contains only ``pi``. Its bridge
+    environment variable still identifies the session in that case.
 
     :param marker: The ``pi-native/<hash>`` bridge segment.
     :returns: ``(pid, argv)`` of the pi process, or ``None`` if not found yet.
     """
+    for pid, argv in _iter_session_processes(marker):
+        if argv == ["pi"] or (
+            "--extension" in argv and not os.path.basename(argv[0]).startswith("tmux")
+        ):
+            return pid, argv
+    return None
+
+
+def _iter_session_processes(marker: str) -> Iterator[tuple[int, list[str]]]:
+    """Yield processes tied to the test session by argv or Pi's launch environment."""
     needle = marker.encode()
     for pid_dir in Path("/proc").iterdir():
         if not pid_dir.name.isdigit():
@@ -146,14 +156,22 @@ def _find_pi_process(marker: str) -> tuple[int, list[str]] | None:
             raw = (pid_dir / "cmdline").read_bytes()
         except OSError:
             continue
-        if needle not in raw:
-            continue
         argv = [chunk.decode(errors="replace") for chunk in raw.split(b"\x00") if chunk]
         if not argv:
             continue
-        if "--extension" in argv and not os.path.basename(argv[0]).startswith("tmux"):
-            return int(pid_dir.name), argv
-    return None
+        if needle in raw:
+            yield int(pid_dir.name), argv
+        elif argv == ["pi"]:
+            try:
+                environ = (pid_dir / "environ").read_bytes().split(b"\x00")
+            except OSError:
+                continue
+            if any(
+                entry.startswith(b"OMNIGENT_PI_NATIVE_BRIDGE_DIR=")
+                and entry.endswith(b"/" + needle)
+                for entry in environ
+            ):
+                yield int(pid_dir.name), argv
 
 
 def _kill_pi_processes(marker: str) -> None:
@@ -162,17 +180,9 @@ def _kill_pi_processes(marker: str) -> None:
     :param marker: The bridge segment; kills the pi CLI and any child that
         inherited it so the test leaves no orphaned tmux/pi tree.
     """
-    needle = marker.encode()
-    for pid_dir in Path("/proc").iterdir():
-        if not pid_dir.name.isdigit():
-            continue
-        try:
-            raw = (pid_dir / "cmdline").read_bytes()
-        except OSError:
-            continue
-        if needle in raw:
-            with contextlib.suppress(ProcessLookupError, PermissionError):
-                os.kill(int(pid_dir.name), signal.SIGKILL)
+    for pid, _ in _iter_session_processes(marker):
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.kill(pid, signal.SIGKILL)
 
 
 def _scan_home_logs_for(home: Path, pattern: re.Pattern[str]) -> str | None:
