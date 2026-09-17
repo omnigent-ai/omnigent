@@ -1038,12 +1038,16 @@ async def test_codex_reprobed_launch_catalog_cancels_timed_out_probe_and_preserv
 
 
 @pytest.mark.parametrize("failed", [False, True], ids=["empty", "failed"])
-async def test_codex_reprobed_launch_catalog_distinguishes_empty_from_failed(
+async def test_codex_reprobed_launch_catalog_preserves_prior_cache_on_no_rows(
     _catalog_launch: NativeCodexLaunch,
     monkeypatch: pytest.MonkeyPatch,
     failed: bool,
 ) -> None:
-    """Empty successful catalogs replace stale rows; failed probes preserve them."""
+    """An empty or failed refresh cannot erase a previously useful answer.
+
+    Codex always offers models, so an empty ``model/list`` is a degraded
+    probe — unlike Claude, whose disabled-only picker can be honestly empty.
+    """
     from omnigent.harnesses.codex_native import app_server as codex_native_app_server
     from omnigent.models import model_catalog_store
 
@@ -1066,16 +1070,10 @@ async def test_codex_reprobed_launch_catalog_distinguishes_empty_from_failed(
     monkeypatch.setattr(codex_native_app_server, "probe_codex_model_options", _probe)
     result = await codex_native_app_server.codex_reprobed_launch_catalog(launch=_catalog_launch)
 
-    assert result == (None if failed else [])
-    if failed:
-        assert (path.read_bytes(), path.stat().st_mtime_ns) == before
-    assert model_catalog_store.read_catalog("codex-native", fingerprint) == (
-        stale if failed else []
-    )
-    assert (
-        await codex_native_app_server.codex_launch_catalog_is_stale(launch=_catalog_launch)
-        is failed
-    )
+    assert result is None
+    assert (path.read_bytes(), path.stat().st_mtime_ns) == before
+    assert model_catalog_store.read_catalog("codex-native", fingerprint) == stale
+    assert await codex_native_app_server.codex_launch_catalog_is_stale(launch=_catalog_launch)
 
 
 @pytest.mark.parametrize("reprobe", [False, True])

@@ -1278,7 +1278,7 @@ async def _codex_launch_catalog(
 
     async def _probe() -> list[_JsonObject] | None:
         try:
-            return await asyncio.wait_for(
+            rows = await asyncio.wait_for(
                 probe_codex_model_options(codex_path=codex_path, launch=launch),
                 timeout=_MODEL_CATALOG_PROBE_TIMEOUT_SECONDS,
             )
@@ -1287,6 +1287,12 @@ async def _codex_launch_catalog(
             # persistently failing probe doesn't flood the logs.
             log_once(_logger, logging.WARNING, "codex catalog probe failed", exc_info=True)
             return None
+        # Codex always offers models, so an empty model/list is a degraded
+        # probe rather than a real catalog. Reporting "no catalog" keeps a
+        # previously useful stored answer serving instead of erasing it
+        # (the shared store persists empty rows for harnesses like Claude,
+        # where a disabled-only picker legitimately yields none).
+        return rows or None
 
     read = model_catalog_store.reprobe_catalog if reprobe else model_catalog_store.ensure_catalog
     return await read("codex-native", fingerprint, _probe)
@@ -1316,7 +1322,7 @@ async def codex_reprobed_launch_catalog(
     """
     Await a fresh catalog for one launch shape, joining an in-flight probe.
 
-    Failed probes leave the stored catalog untouched; stale rows
+    Failed or empty probes leave the stored catalog untouched; stale rows
     are never returned as the result of the refresh.
 
     :param codex_path: Optional Codex executable override.
