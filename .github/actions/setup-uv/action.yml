@@ -22,8 +22,8 @@ runs:
       if: inputs.version == '0.12.15' && runner.arch == 'X64' && (runner.os == 'Linux' || runner.os == 'Windows')
       uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
       with:
-        path: ${{ runner.tool_cache }}/uv
-        key: uv-tool-v2-${{ runner.os }}-${{ runner.arch }}-${{ inputs.version }}
+        path: ${{ runner.tool_cache }}/uv/${{ inputs.version }}
+        key: uv-tool-v3-${{ runner.os }}-${{ runner.arch }}-${{ inputs.version }}
 
     - name: Authenticate restored uv binary
       if: steps.restore-uv.outputs.cache-hit == 'true'
@@ -92,5 +92,5 @@ runs:
       if: inputs.version == '0.12.15' && runner.arch == 'X64' && (runner.os == 'Linux' || runner.os == 'Windows') && steps.restore-uv.outputs.cache-hit != 'true'
       uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
       with:
-        path: ${{ runner.tool_cache }}/uv
-        key: uv-tool-v2-${{ runner.os }}-${{ runner.arch }}-${{ inputs.version }}
+        path: ${{ runner.tool_cache }}/uv/${{ inputs.version }}
+        key: uv-tool-v3-${{ runner.os }}-${{ runner.arch }}-${{ inputs.version }}
