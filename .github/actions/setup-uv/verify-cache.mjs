@@ -48,7 +48,7 @@ async function authenticate() {
     if (name.endsWith(".complete")) {
       continue;
     }
-    if (!(name in expected)) {
+    if (!Object.hasOwn(expected, name)) {
       throw new Error(`Cached uv tool contains an unexpected file: ${file}`);
     }
     if (binaries.has(name)) {
@@ -87,4 +87,9 @@ try {
   }
   console.warn(`Rejected cached uv binaries for ${platform}; installing a fresh copy`);
   console.warn(error.message);
+  if (process.env.UV_CACHE_KEY && process.env.GITHUB_REPOSITORY) {
+    console.warn(
+      `Evict the immutable entry with: gh cache delete "${process.env.UV_CACHE_KEY}" --repo "${process.env.GITHUB_REPOSITORY}"`,
+    );
+  }
 }

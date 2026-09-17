@@ -32,6 +32,7 @@ runs:
       env:
         UV_TOOL_CACHE_ROOT: ${{ runner.tool_cache }}/uv/${{ inputs.version }}
         UV_CACHE_PLATFORM: ${{ runner.os }}-${{ runner.arch }}
+        UV_CACHE_KEY: uv-tool-v3-${{ runner.os }}-${{ runner.arch }}-${{ inputs.version }}
         UV_CACHE_RECOVER_ON_FAILURE: "true"
       run: node "$GITHUB_ACTION_PATH/verify-cache.mjs"
 
