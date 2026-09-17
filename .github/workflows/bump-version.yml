@@ -61,7 +61,7 @@ jobs:
           python-version-file: ".python-version"
 
       - name: Install uv
-        uses: ./.github/actions/setup-uv
+        uses: omnigent-ai/omnigent/.github/actions/setup-uv@3328cea9954e995f65532ea61aa71f02f27556c7 # self-contained setup
         with:
           enable-cache: true
 
