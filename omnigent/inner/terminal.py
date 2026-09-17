@@ -809,7 +809,7 @@ def reap_orphaned_terminals() -> int:
     whose whole process group is torn down by a test harness — leaks
     them forever, one per session now that runner-bound SDK sessions
     auto-create the embedded REPL terminal. Each instance dir records
-    its owner pid at creation; this sweep (run at runner startup) kills
+    its owner pid at creation; the global maintenance sweep kills
     the tmux server of every instance whose owner no longer exists and
     removes the instance dir. Dirs without an owner-pid marker are left
     untouched — they are either from an older version or not ours.

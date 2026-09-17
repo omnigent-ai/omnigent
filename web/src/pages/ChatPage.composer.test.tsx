@@ -2407,8 +2407,8 @@ describe("SlashCommandMenu", () => {
 
   it("filters rows by the typed query", () => {
     render(<SlashCommandMenu query="be" activeIndex={0} onSelect={vi.fn()} commands={COMMANDS} />);
-    // Row testids (not text) — the active entry's name also appears in the
-    // detail card beside the panel, so a text query would double-match.
+    // Row testids (not text): each row renders its description inline too, so a
+    // text query could match a description as well as a name.
     expect(screen.getByTestId("slash-menu-item-beta")).toBeDefined();
     expect(screen.queryByTestId("slash-menu-item-alpha")).toBeNull();
     expect(screen.queryByTestId("slash-menu-item-gamma")).toBeNull();
@@ -2421,16 +2421,14 @@ describe("SlashCommandMenu", () => {
     expect(onSelect).toHaveBeenCalledWith("/gamma");
   });
 
-  it("shows the highlighted entry's description in the detail card", () => {
+  it("shows each entry's description inline on its row", () => {
     render(<SlashCommandMenu query="" activeIndex={1} onSelect={vi.fn()} commands={COMMANDS} />);
-    // Descriptions moved off the rows into the Cursor-style detail card:
-    // only the active entry's blurb renders, next to the panel. If the
-    // card regressed (or showed the wrong entry), users would lose the
-    // only place a skill's description is visible.
-    const detail = screen.getByTestId("slash-menu-detail");
-    expect(detail.textContent).toContain("/beta");
-    expect(detail.textContent).toContain("Second");
-    expect(detail.textContent).not.toContain("First");
+    // Descriptions render inline on each row (grouped "+"-tray style), so a
+    // skill's blurb is always visible — not hidden behind a highlight in a
+    // separate detail card.
+    const beta = screen.getByTestId("slash-menu-item-beta");
+    expect(beta.textContent).toContain("/beta");
+    expect(beta.textContent).toContain("Second");
   });
 
   it("surfaces a namespaced skill by its leaf name", () => {
@@ -3201,8 +3199,11 @@ describe("Composer startSideChat (text-select → Ask in side chat)", () => {
     expect(textarea()).toHaveValue("");
   });
 
-  it("falls back to a normal reply when the harness has no side chat", () => {
-    useChatStore.setState({ sessionHarness: "claude-native" });
+  it("falls back to a normal reply when the session has no side-chat harness", () => {
+    // Side chat is generic now (every harness supports it), so the only
+    // no-side-chat case is a session with no bound harness — then a quoted
+    // "Ask in side chat" degrades to an ordinary reply.
+    useChatStore.setState({ sessionHarness: "" });
     const props = composerProps();
     const ref = createRef<ComponentRef<typeof Composer>>();
     render(<Composer {...props} ref={ref} />);
@@ -3211,7 +3212,7 @@ describe("Composer startSideChat (text-select → Ask in side chat)", () => {
     fireEvent.change(textarea(), { target: { value: "a question" } });
     fireEvent.keyDown(textarea(), { key: "Enter" });
 
-    // No /side prefix; sends as an ordinary quoted reply with its snapshot.
+    // No /side prefix, no fork; sends as an ordinary quoted reply with its snapshot.
     expect(props.onSend).toHaveBeenCalledWith("> some selection\n\na question", undefined, {
       version: 1,
       quotes: [{ before: "", text: "some selection" }],

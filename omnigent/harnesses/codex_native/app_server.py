@@ -69,6 +69,7 @@ from omnigent.inner.databricks_executor import (
 )
 from omnigent.models.codex_model_vocabulary import codex_reachable_model_slug, codex_spawn_model
 from omnigent.process_logging import log_info_once, log_once, redact_log_text
+from omnigent.util.reasoning_effort import CODEX_NATIVE_EFFORTS
 
 _logger = logging.getLogger(__name__)
 
@@ -1085,7 +1086,14 @@ def _probe_codex_home(config_overrides: Sequence[str]) -> Path:
     # (not symlinked), so drop the copy to re-read an edited source config.
     with contextlib.suppress(OSError):
         (home / "config.toml").unlink(missing_ok=True)
-    _populate_codex_home_config(home, _codex_home_config_source_from_env(), minimal_config=True)
+    # The probe drives the same native codex binary as a session launch, so
+    # keep the full native effort ladder instead of clamping max/ultra.
+    _populate_codex_home_config(
+        home,
+        _codex_home_config_source_from_env(),
+        minimal_config=True,
+        supported_efforts=CODEX_NATIVE_EFFORTS,
+    )
     return home
 
 
@@ -1409,6 +1417,9 @@ class CodexNativeAppServer:
         surfaces it to Omnigent (which posts a single durable banner). Prevents
         re-posting the same notice on every subsequent ensure. Not a
         constructor input.
+    :param reconcile_process_registry: Whether startup synchronously performs
+        host-global crash registry maintenance. Runner-owned launches delegate
+        it to the host janitor; standalone callers keep the safe default.
     """
 
     codex_path: str
@@ -1437,6 +1448,7 @@ class CodexNativeAppServer:
     trust_project: bool = False
     trust_all_hooks: bool = False
     router_hooks_registered: bool = False
+    reconcile_process_registry: bool = True
 
     async def start(self) -> None:
         """
@@ -1507,6 +1519,7 @@ class CodexNativeAppServer:
             config_source,
             inject_hooks=self.router_hooks_registered,
             extend_model_catalog=codex_extended_catalog_requested(self.env),
+            supported_efforts=CODEX_NATIVE_EFFORTS,
         )
         if self.trust_project:
             _trust_codex_project(self.codex_home, self.cwd)
@@ -1569,7 +1582,8 @@ class CodexNativeAppServer:
                     ap_server_url=self.ap_server_url,
                     ap_auth_headers=self.ap_auth_headers or {},
                 )
-        reconcile_codex_native_process_registry()
+        if self.reconcile_process_registry:
+            reconcile_codex_native_process_registry()
         resolved_listen = self.listen_url or f"unix://{self.socket_path}"
         self.process_registry_tag = f"codex-native-{uuid.uuid4().hex}"
         tagged_argv0 = (
@@ -2567,6 +2581,7 @@ def build_codex_native_server(
     trust_all_hooks: bool = False,
     reasoning_effort: str | None = None,
     model_catalog_rows: list[_JsonObject] | None = None,
+    reconcile_process_registry: bool = True,
 ) -> CodexNativeAppServer:
     """
     Build a configured native Codex app-server process wrapper.
@@ -2617,6 +2632,10 @@ def build_codex_native_server(
         the copied config's value.
     :param model_catalog_rows: Fresh rows from the shared launch-shaped
         ``model/list`` catalog, used to avoid a redundant migration probe.
+    :param reconcile_process_registry: Whether startup performs the global
+        crash registry sweep. Runner-owned launches disable this because the
+        host janitor owns it; standalone callers keep the
+        synchronous safety default.
     :returns: Configured app-server process wrapper.
     :raises ImportError: If no Codex CLI is available.
     :raises OSError: If Databricks routing was requested but no
@@ -2684,6 +2703,7 @@ def build_codex_native_server(
         model_catalog_rows=model_catalog_rows,
         trust_project=trust_project,
         trust_all_hooks=trust_all_hooks,
+        reconcile_process_registry=reconcile_process_registry,
     )
 
 

@@ -161,7 +161,9 @@ async def _register_routing_routes(
     await page.route("**/v1/agents", handle_agents)
     await page.route("**/v1/sessions/*/events", handle_events)
     await page.route(_SESSIONS_RE, handle_sessions)
-    await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+    await page.route(
+        re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
+    )
     # The landing needs a working directory before Send enables, and the
     # stubbed host has no browsable filesystem.
     await page.add_init_script(

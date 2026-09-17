@@ -6,7 +6,7 @@ report:
 * Agent A exists as a user-registered template (``builtin: false`` in
   ``GET /v1/agents``) — e.g. created via ``omnigent server --agent``.
 * A newer ``omnigent run`` minted a session-scoped Agent A with a DISTINCT
-  agent_id (discovered via ``GET /v1/sessions?kind=any``), created after the
+  agent_id (discovered via ``GET /v1/sessions?visibility=mine``), created after the
   template.
 
 The picker must offer (and bind) the newest — the upload — not the stale
@@ -150,7 +150,7 @@ async def _register_routes(page, *, created_session_id: str, create_requests: li
                 body=json.dumps({"id": created_session_id, "session_id": created_session_id}),
             )
         else:
-            # The picker's sessions scan (?kind=any).
+            # The picker's sessions scan (?visibility=mine).
             await route.fulfill(status=200, content_type="application/json", body=_scan_body())
 
     async def handle_events(route: Route) -> None:

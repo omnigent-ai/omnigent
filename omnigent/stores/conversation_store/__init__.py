@@ -107,6 +107,12 @@ PROJECT_LABEL_KEY = "omni_project"
 # mirrors the canonical key as ``PINNED_LABEL_KEY``.
 PINNED_LABEL_KEY = "omnigent.pinned"
 
+# Marks a top-level fork created as a side chat. A side chat surfaces only as a
+# Workspace-rail tab, so a conversation carrying this label is hidden from the
+# left sidebar (the ``GET /v1/sessions`` list filters it out). The fork
+# otherwise behaves like any other session (its own runner, transcript).
+SIDE_CHAT_LABEL_KEY = "omnigent.side_chat"
+
 # Single-user / no-auth sentinel for the per-user pin key suffix, mirroring the
 # reserved ``"local"`` identity used elsewhere (see ``RESERVED_USER_LOCAL``).
 _PINNED_LABEL_LOCAL_USER = "local"

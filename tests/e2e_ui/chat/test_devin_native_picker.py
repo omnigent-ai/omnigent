@@ -162,7 +162,9 @@ async def _drive(base_url: str, session_id: str) -> None:
                 f"**/v1/hosts/{_HOST_ID}/harnesses/devin-native/model-options",
                 handle_devin_models,
             )
-            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+            await page.route(
+                re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
+            )
 
             # A real (non-sandbox) host workspace so the devin-native catalog is
             # probed (`useHostModelOptions(hostId, "devin-native", !sandbox)`).

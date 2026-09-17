@@ -1,3 +1,10 @@
+import { filterSessionScope } from "@/lib/sessionVisibility";
+import { getCurrentUserId } from "@/lib/identity";
+import { PinCapacityContext, SidebarConfigContext } from "@/lib/sidebarConfig";
+import { useSidebarDisplayPagination } from "@/hooks/useSidebarDisplayPagination";
+import { useSidebarData, useSidebarView, type SidebarListQuery } from "@/hooks/useSidebarData";
+import { useArchivedSessions } from "@/hooks/useScopeCache";
+import { InfiniteScrollSentinel, type AutoLoadBudget } from "@/components/InfiniteScrollSentinel";
 import {
   type ComponentType,
   type CSSProperties,
@@ -131,7 +138,6 @@ import {
   useBulkMoveToProject,
   useProjects,
   useProjectSessions,
-  useConversations,
   useLeaveSession,
   useMoveToProject,
   useDeleteProject,
@@ -140,7 +146,6 @@ import {
   useUpdateProjectConfig,
   PROJECT_LABEL_KEY,
   PINNED_CONVERSATIONS_KEY,
-  usePinnedConversations,
   useTogglePinnedConversation,
   setConversationPinned,
   useRenameConversation,
@@ -163,8 +168,6 @@ import { EmojiPicker } from "@/components/ProjectIconPicker";
 import { SessionStateBadge } from "@/components/SessionStateBadge";
 import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useActiveRootSessionId } from "@/hooks/useSession";
-import { useCommentInbox } from "@/hooks/useCommentInbox";
-import { sumPendingApprovals } from "@/lib/inbox";
 import { isSessionStoppable } from "@/lib/sessionStop";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { useHasSessionDraft } from "@/lib/sessionDrafts";
@@ -517,26 +520,27 @@ export function useMigrateLocalPinsToServer(
   serverPinnedIds: Set<string>,
   pinnedLoaded: boolean,
   filterHonored: boolean,
+  ownedIds?: ReadonlySet<string>,
 ): void {
   const queryClient = useQueryClient();
-  const migratedRef = useRef(false);
+  const attempted = useRef(new Set<string>());
   useEffect(() => {
     // Don't migrate until the query settled AND the server proved it honors the
     // pinned filter — an old server ignores it, and migrating there wipes local
-    // pins. Leave `migratedRef` false so a later load (post server upgrade)
-    // still runs the migration.
-    if (!pinnedLoaded || !filterHonored || migratedRef.current) return;
-    migratedRef.current = true;
+    // pins. A later load can retry after the server upgrade.
+    if (!pinnedLoaded || !filterHonored) return;
     const legacyIds = readPinnedConversationIds();
-    const toMigrate = legacyIds.filter((id) => !serverPinnedIds.has(id));
+    const remaining = legacyIds.filter((id) => !serverPinnedIds.has(id));
+    const toMigrate = remaining.filter(
+      (id) => !attempted.current.has(id) && (!ownedIds || ownedIds.has(id)),
+    );
     // Ids the server already owns can be dropped from the legacy key right away;
     // ids still to migrate stay until their write succeeds (below), so a failed
     // or offline write retries next load instead of losing the pin.
-    if (toMigrate.length === 0) {
-      clearLegacyPinnedConversationIds();
-      return;
-    }
-    writeLegacyPinnedConversationIds(toMigrate);
+    if (remaining.length === 0) clearLegacyPinnedConversationIds();
+    else writeLegacyPinnedConversationIds(remaining);
+    if (toMigrate.length === 0) return;
+    toMigrate.forEach((id) => attempted.current.add(id));
     void (async () => {
       // Legacy localStorage kept pins most-recently-pinned-first, so preserve
       // that order by synthesizing descending pin timestamps: the oldest pin
@@ -552,8 +556,10 @@ export function useMigrateLocalPinsToServer(
       );
       // Keep only the ids whose write failed in the legacy key, so the next
       // load retries them; drop the succeeded ones (now server-owned).
-      const failedIds = results.filter((r) => r.conv === null).map((r) => r.id);
-      writeLegacyPinnedConversationIds(failedIds);
+      const succeeded = new Set(results.filter((r) => r.conv !== null).map((r) => r.id));
+      writeLegacyPinnedConversationIds(
+        readPinnedConversationIds().filter((id) => !succeeded.has(id)),
+      );
       // Patch the pinned-list cache with the confirmed rows rather than
       // invalidating — the `?pinned=true` index lags these writes, so a refetch
       // here would momentarily drop the just-migrated pins.
@@ -569,10 +575,9 @@ export function useMigrateLocalPinsToServer(
         });
       }
     })();
-    // Re-run when the query settles or the filter starts being honored (post
-    // server upgrade); the ref guard prevents re-entry once it actually runs.
+    // Retry newly loaded owned IDs; failed writes wait until the next mount.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pinnedLoaded, filterHonored]);
+  }, [pinnedLoaded, filterHonored, ownedIds]);
 }
 
 function SidebarImpl({
@@ -583,6 +588,7 @@ function SidebarImpl({
   onOpenSearch,
   peek,
 }: SidebarProps) {
+  const sidebarData = useSidebarData();
   const branding = useBranding();
   const serverInfo = useServerInfo();
   const usagePageEnabled = isFeatureEnabled(serverInfo, "usage_page");
@@ -596,7 +602,7 @@ function SidebarImpl({
   // A loopback-only server has one user, so "Shared" is meaningless there —
   // the filter menu drops that option. Mirrors AppShell's `shareDisabled`.
   // Read before the filter state, which validates a stored "shared" against it.
-  const multiUser = !isCurrentServerLocal();
+  const multiUser = !isCurrentServerLocal() && sidebarData.sharedAvailable;
   // Active filter from the Sessions heading's menu, seeded from the persisted
   // preference so a reload keeps the slice the viewer was last on.
   const [activeTab, setActiveTab] = useState<SidebarTab>(() => readSessionFilter(multiUser));
@@ -661,73 +667,19 @@ function SidebarImpl({
     [selectionMode, exitSelectionMode],
   );
 
-  // All-sessions query — fetches every accessible session (owned + shared)
-  // including archived ones. Used for inbox badge counts and WS reconciliation
-  // so approvals and comment notifications from shared sessions are never missed.
-  const conversationsQuery = useConversations("", true, {
-    reconcileWhileConnected: true,
-    // Re-render only on fields the sidebar/ConversationList read, so the
-    // live-updates merge's per-frame result-object churn doesn't re-render the
-    // whole row list. Keep in sync with `conversationsQuery.*` reads.
-    notifyOnChangeProps: [
-      "data",
-      "error",
-      "hasNextPage",
-      "isError",
-      "isFetching",
-      "isFetchingNextPage",
-      "isLoading",
-      "fetchNextPage",
-    ],
-  });
-
-  // Tab-scoped query — server-filtered for "mine", "shared", or "archived",
-  // disabled on the "all" tab. Paginates only the sessions relevant to the
-  // active tab so the sidebar never churns through hundreds of irrelevant pages
-  // while the user looks at a small filtered set (OMNI-6002).
-  const tabVisibility =
-    activeTab === "mine"
-      ? "mine"
-      : activeTab === "shared"
-        ? "shared"
-        : activeTab === "archived"
-          ? "archived"
-          : undefined;
-  const filteredConversationsQuery = useConversations(
-    "",
-    false,
-    { enabled: tabVisibility !== undefined },
-    undefined,
-    tabVisibility,
-  );
-  // "all" tab reuses the all-sessions query for display; every other tab uses
-  // the server-filtered query so the sentinel only paginates matching sessions.
-  const displayQuery = tabVisibility ? filteredConversationsQuery : conversationsQuery;
-
-  // Bounded background pagination for conversationsQuery (inbox badge / WS
-  // watch-set). On filtered tabs the display sentinel never drives
-  // conversationsQuery, so the badge would stay capped at its initial 30
-  // sessions. We fetch up to BADGE_EXTRA_PAGES extra pages (one at a time,
-  // gated on a ref so we stop and never spam) as soon as the tab mounts.
-  const BADGE_EXTRA_PAGES = 3;
-  const badgeExtraFetched = useRef(0);
-  const lastBadgeTab = useRef<typeof tabVisibility>(undefined);
-  const {
-    hasNextPage: allHasNextPage,
-    isFetchingNextPage: allIsFetching,
-    fetchNextPage: allFetchNextPage,
-  } = conversationsQuery;
-  useEffect(() => {
-    if (!tabVisibility) return;
-    if (lastBadgeTab.current !== tabVisibility) {
-      lastBadgeTab.current = tabVisibility;
-      badgeExtraFetched.current = 0;
-    }
-    if (badgeExtraFetched.current >= BADGE_EXTRA_PAGES) return;
-    if (!allHasNextPage || allIsFetching) return;
-    badgeExtraFetched.current += 1;
-    allFetchNextPage();
-  }, [tabVisibility, allHasNextPage, allIsFetching, allFetchNextPage]);
+  useSidebarView(activeTab);
+  const archivedQuery = useArchivedSessions(activeTab === "archived");
+  const displayQuery: SidebarListQuery =
+    activeTab === "archived"
+      ? archivedQuery
+      : activeTab === "mine"
+        ? sidebarData.mine
+        : activeTab === "shared"
+          ? sidebarData.sharedAvailable
+            ? sidebarData.shared
+            : { ...sidebarData.all, data: undefined, isLoading: false, hasNextPage: false }
+          : sidebarData.all;
+  const inboxCount = sidebarData.inboxCount;
 
   // The scrollable list container — used as the IntersectionObserver root for
   // infinite scroll (auto-loading the next page as the sentinel nears view).
@@ -746,29 +698,6 @@ function SidebarImpl({
     scrollContainerRef.current = node;
     setHasScrolled((node?.scrollTop ?? 0) > 0);
   }, []);
-
-  // Inbox badge — total approval prompts across loaded rows. We read from both
-  // conversationsQuery (all-sessions, page 1 coverage) AND filteredConversationsQuery
-  // (tab-scoped, grows as the user scrolls) so that scrolling any filtered tab
-  // extends badge coverage — the two caches overlap and dedup handles it.
-  const loadedRows = useMemo(() => {
-    const rows = [
-      ...(conversationsQuery.data?.pages ?? []).flatMap((p) => p.data),
-      ...(filteredConversationsQuery.data?.pages ?? []).flatMap((p) => p.data),
-    ];
-    const seen = new Set<string>();
-    return rows.filter((c) => {
-      if (seen.has(c.id)) return false;
-      seen.add(c.id);
-      return true;
-    });
-  }, [conversationsQuery.data, filteredConversationsQuery.data]);
-  const pendingApprovals = useMemo(() => sumPendingApprovals(loadedRows), [loadedRows]);
-  // Plus unseen file comments — the badge counts everything the Inbox
-  // page lists. Comment queries are shared with the page/FileViewer
-  // (same ["comments", id] keys), so this adds no duplicate fetches.
-  const unseenComments = useCommentInbox(loadedRows).items.length;
-  const inboxCount = pendingApprovals + unseenComments;
 
   // Row-Link click handler. The Link navigates natively (so modifier/middle
   // clicks open tabs); we only close the drawer on a plain primary click on
@@ -804,7 +733,7 @@ function SidebarImpl({
   // they follow the user across devices. `usePinnedConversations` is the
   // authoritative pinned set (independent of the paginated window); the toggle
   // mutation flips the label and refreshes that query.
-  const { data: pinnedData, isSuccess: pinnedLoaded } = usePinnedConversations();
+  const { data: pinnedData, isSuccess: pinnedLoaded } = sidebarData.pinned;
   // Stable empty fallback so downstream memos don't re-fire on every render
   // while the query is still loading (`pinnedData` undefined).
   const pinnedConversations = useMemo(
@@ -825,15 +754,27 @@ function SidebarImpl({
   // not render a row until it's loaded. This is window-scoped and transient —
   // against a new server the migration promotes the id to a real server pinned
   // row (which carries its own row) on the same or next load.
+  const ownedPinIds = useMemo(
+    () =>
+      sidebarData.pinsIncludeShared
+        ? undefined
+        : new Set(
+            filterSessionScope(sidebarData.loadedRows, "mine", getCurrentUserId()).map(
+              (row) => row.id,
+            ),
+          ),
+    [sidebarData.pinsIncludeShared, sidebarData.loadedRows],
+  );
   const pinnedConversationIds = useMemo(() => {
     const ids = pinnedConversations.map((c) => c.id);
     const seen = new Set(ids);
-    for (const id of readPinnedConversationIds()) if (!seen.has(id)) ids.push(id);
+    for (const id of readPinnedConversationIds())
+      if (!seen.has(id) && (!ownedPinIds || ownedPinIds.has(id))) ids.push(id);
     return ids;
     // `pinnedLoaded` isn't read but is a dep on purpose: it re-reads the legacy
     // key after the migration (gated on the query settling) mutates it.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pinnedConversations, pinnedLoaded]);
+  }, [pinnedConversations, pinnedLoaded, ownedPinIds]);
   const togglePinnedMutation = useTogglePinnedConversation();
   const pinnedIdSet = useMemo(() => new Set(pinnedConversationIds), [pinnedConversationIds]);
   // The migration compares the legacy key against what the SERVER already owns
@@ -854,7 +795,7 @@ function SidebarImpl({
   // still-local pins up to the server (as the `omnigent.pinned` label) the
   // first time this build runs, so no one loses their existing pins, then
   // clear the legacy key so this runs at most once.
-  useMigrateLocalPinsToServer(serverPinnedIdSet, pinnedLoaded, pinnedFilterHonored);
+  useMigrateLocalPinsToServer(serverPinnedIdSet, pinnedLoaded, pinnedFilterHonored, ownedPinIds);
 
   // Desktop-only drag-to-resize, mirroring the right rail. The width is
   // exposed as a CSS variable consumed by the ``md:w-[var(--sidebar-width)]``
@@ -1333,59 +1274,6 @@ export const Sidebar = memo(SidebarImpl);
  * no-IntersectionObserver fallback. Renders nothing once there's no more to
  * load. Shared by the global list and each project folder.
  */
-function InfiniteScrollSentinel({
-  hasMore,
-  isFetching,
-  fetchMore,
-  scrollRoot,
-  indent,
-}: {
-  hasMore: boolean;
-  isFetching: boolean;
-  fetchMore: () => void;
-  scrollRoot: RefObject<HTMLElement | null>;
-  indent?: boolean;
-}) {
-  const ref = useRef<HTMLButtonElement>(null);
-  useEffect(() => {
-    const sentinel = ref.current;
-    if (!sentinel || !hasMore) return;
-    const observer = new IntersectionObserver(
-      (entries) => {
-        if (entries[0]?.isIntersecting && !isFetching) fetchMore();
-      },
-      { root: scrollRoot.current, rootMargin: "200px" },
-    );
-    observer.observe(sentinel);
-    return () => observer.disconnect();
-  }, [hasMore, isFetching, fetchMore, scrollRoot]);
-
-  if (!hasMore) return null;
-  return (
-    <button
-      ref={ref}
-      type="button"
-      disabled={isFetching}
-      onClick={() => {
-        if (hasMore) fetchMore();
-      }}
-      className={cn(
-        "flex w-full cursor-pointer items-center justify-center gap-1.5 rounded-md px-2 py-1.5 text-muted-foreground text-sm hover:bg-muted disabled:pointer-events-none disabled:opacity-50",
-        indent && "pl-5",
-      )}
-    >
-      {isFetching ? (
-        <>
-          <Loader2Icon className="size-3 animate-spin" />
-          Loading…
-        </>
-      ) : (
-        "Load more"
-      )}
-    </button>
-  );
-}
-
 const projectDragId = (name: string) => `project-order:${name}`;
 type ProjectHeaderDrag = ReturnType<typeof useSortable>;
 
@@ -1463,6 +1351,15 @@ function ProjectFolder({
   onConversationsLoaded?: (name: string, conversations: Conversation[]) => void;
 }) {
   const query = useProjectSessions(name, expanded);
+  const { registerFolder } = useSidebarData();
+  const watchedRows = useMemo(
+    () => query.data?.pages.flatMap((page) => page.data) ?? [],
+    [query.data],
+  );
+  useEffect(() => {
+    if (expanded) registerFolder(name, watchedRows);
+  }, [expanded, name, watchedRows, registerFolder]);
+  useEffect(() => () => registerFolder(name, null), [expanded, name, registerFolder]);
   const pinnedSet = useMemo(() => new Set(pinnedConversationIds), [pinnedConversationIds]);
   const conversations = useMemo(() => {
     // Union the folder's own pages with its members from the globally-loaded
@@ -1617,6 +1514,7 @@ function ProjectFolder({
               isFetching={query.isFetchingNextPage}
               fetchMore={query.fetchNextPage}
               scrollRoot={scrollRoot}
+              scopeKey={name}
               indent
             />
           )
@@ -1628,7 +1526,7 @@ function ProjectFolder({
 }
 
 interface ConversationListProps {
-  conversationsQuery: ReturnType<typeof useConversations>;
+  conversationsQuery: SidebarListQuery;
   // The scrollable ancestor, used as the infinite-scroll observer root.
   scrollContainerRef: RefObject<HTMLElement | null>;
   onRowClick: (e: MouseEvent<HTMLAnchorElement>) => void;
@@ -1792,7 +1690,7 @@ function ConversationList({
   // sessions render in their own group at the bottom (below "Shared with
   // me"); a pinned-then-archived session shows under Archived, not Pinned.
   const pinnedSet = useMemo(() => new Set(pinnedConversationIds), [pinnedConversationIds]);
-  const sections = useMemo(() => {
+  const loadedSections = useMemo(() => {
     // Merge the server pinned set in, so a pinned session outside the loaded
     // paginated window still renders. Dedupe by id: a pinned session is usually
     // also present in the paginated list, and merging both would render it twice.
@@ -1875,6 +1773,21 @@ function ConversationList({
     activeTab,
     viewerId,
   ]);
+
+  const config = useContext(SidebarConfigContext);
+  const displayPagination = useSidebarDisplayPagination(
+    loadedSections.sessions,
+    JSON.stringify([activeTab, searchQuery]),
+    activeTab === "shared"
+      ? (config.sharedDisplayPageSize ?? config.displayPageSize)
+      : config.displayPageSize,
+    conversationsQuery.hasNextPage,
+    conversationsQuery.fetchNextPage,
+  );
+  const sections = useMemo(
+    () => ({ ...loadedSections, sessions: displayPagination.rows }),
+    [loadedSections, displayPagination.rows],
+  );
 
   // Scope-active flags: which section owns the current selection UI (checkboxes
   // + bulk-action bar). Only one is ever true at a time.
@@ -2216,20 +2129,25 @@ function ConversationList({
   // so there's no client-side list to normalize against the loaded window —
   // the pinned query returns exactly the pinned sessions, unpinning removes the
   // label, and a deleted session drops out of the query on the server.
-  const hasMorePages = conversationsQuery.hasNextPage;
-  const { fetchNextPage, isFetchingNextPage } = conversationsQuery;
+  const autoLoadBudget = useRef<AutoLoadBudget>({ scope: activeTab, count: 0 });
+  const hasMorePages = displayPagination.hasMore;
+  const fetchNextPage = displayPagination.loadMore;
+  const { isFetchingNextPage } = conversationsQuery;
 
-  if (conversationsQuery.isLoading) {
-    return <p className="px-2 py-1 text-muted-foreground text-sm">Loading…</p>;
-  }
-  if (conversationsQuery.isError) {
-    const err = conversationsQuery.error;
-    return (
-      <p className="px-2 py-1 text-destructive text-ui">
-        Failed to load: {err instanceof Error ? err.message : String(err)}
-      </p>
-    );
-  }
+  const sessionStatus = conversationsQuery.isError ? (
+    <p role="status" className="px-2 py-1 text-destructive text-ui">
+      {allConversations.length === 0
+        ? `Failed to load: ${conversationsQuery.error instanceof Error ? conversationsQuery.error.message : String(conversationsQuery.error)}`
+        : "Some sessions could not be loaded."}{" "}
+      <button type="button" onClick={() => void conversationsQuery.refetch?.()}>
+        Retry
+      </button>
+    </p>
+  ) : conversationsQuery.isLoading ? (
+    <p role="status" className="px-2 py-1 text-muted-foreground text-sm">
+      Loading…
+    </p>
+  ) : undefined;
   const showShared = activeTab === "shared";
   const emptyMessage = searchQuery ? "No matching conversations" : "No sessions";
 
@@ -2320,7 +2238,7 @@ function ConversationList({
             {!showShared && activeDrag?.project != null && sections.sessions.length === 0 && (
               <UngroupDropZone />
             )}
-            {totalVisible === 0 && searchQuery ? (
+            {totalVisible === 0 && searchQuery && !sessionStatus ? (
               <>
                 <p className="px-2 py-1 text-ui text-muted-foreground">{emptyMessage}</p>
                 {/* The list is one paginated stream ordered by updated_at across
@@ -2330,6 +2248,9 @@ function ConversationList({
               user on a false "empty" state. */}
                 {hasMorePages && (
                   <InfiniteScrollSentinel
+                    scopeKey={activeTab}
+                    budgetRef={autoLoadBudget}
+                    maxAutoLoads={displayPagination.maxAutoLoads}
                     hasMore={hasMorePages}
                     isFetching={isFetchingNextPage}
                     fetchMore={fetchNextPage}
@@ -2481,7 +2402,8 @@ function ConversationList({
                       title="Sessions"
                       conversations={sections.sessions}
                       activeConversationId={displayedActiveId}
-                      emptyMessage={SIDEBAR_FILTER_EMPTY[activeTab]}
+                      emptyMessage={sessionStatus ? undefined : SIDEBAR_FILTER_EMPTY[activeTab]}
+                      footer={sessionStatus}
                       pinnedConversationIds={pinnedConversationIds}
                       collapsed={effectiveCollapsedSections.includes("Chats")}
                       onToggleCollapsed={() => effectiveToggleSectionCollapsed("Chats")}
@@ -2548,6 +2470,9 @@ function ConversationList({
               under a collapsed group reads orphaned. */}
                 {!effectiveCollapsedSections.includes("Chats") && (
                   <InfiniteScrollSentinel
+                    scopeKey={activeTab}
+                    budgetRef={autoLoadBudget}
+                    maxAutoLoads={displayPagination.maxAutoLoads}
                     hasMore={hasMorePages}
                     isFetching={isFetchingNextPage}
                     fetchMore={fetchNextPage}
@@ -3410,6 +3335,7 @@ function ConversationMenuItems({
   setMenuOpen: (open: boolean) => void;
   runArchive: () => void;
 }) {
+  const atPinCap = useContext(PinCapacityContext);
   // Mobile lacks the horizontal room for a side-opening submenu, so the
   // project picker replaces the menu body in place instead of flying out
   // to the side. `view` swaps between the main actions and that sub-view;
@@ -3474,6 +3400,7 @@ function ConversationMenuItems({
       {!isArchived && (
         <C.Item
           data-testid="pin-conversation"
+          disabled={!isPinned && atPinCap}
           className="md:hidden"
           onSelect={() => onTogglePinned(conversation.id)}
         >
@@ -3790,6 +3717,7 @@ function ConversationRowImpl({
   onToggleSelected: (conversationId: string, shiftKey?: boolean) => void;
   onProjectAssigned?: (projectName: string) => void;
 }) {
+  const atPinCap = useContext(PinCapacityContext);
   const hostsById = useContext(HostsByIdContext);
   const navigate = useNavigate();
   // A client-only `temp:` row (navigate-first create window): no server session
@@ -4398,6 +4326,8 @@ function ConversationRowImpl({
               size="icon-xs"
               aria-label={isPinned ? "Unpin conversation" : "Pin conversation"}
               data-testid="quick-pin-conversation"
+              aria-disabled={!isPinned && atPinCap}
+              title={!isPinned && atPinCap ? "Unpin a session first" : undefined}
               className={cn(
                 // Desktop-only quick affordance: hidden on mobile (the kebab's
                 // Pin item below covers that), hover/focus-revealed from `md`

@@ -8,6 +8,7 @@ import { SwitchHostDialog } from "./SwitchHostDialog";
 import { useHosts } from "@/hooks/useHosts";
 import { useHostFilesystem } from "@/hooks/useHostFilesystem";
 import { launchRunner, updateSession } from "@/lib/sessionsApi";
+import { terminalsQueryKey, type TerminalInfo } from "@/lib/terminals";
 
 // Heavy children have their own suites; stub them so this one stays on the
 // dialog's two-call move and its recovery from a half-finished switch.
@@ -160,6 +161,29 @@ describe("SwitchHostDialog", () => {
       launchRunnerMock.mock.invocationCallOrder[0],
     );
     expect(invalidate).toHaveBeenCalledWith({ queryKey: ["session-agent", "conv_1"] });
+  });
+
+  it("resets the terminals cache so the strip re-attaches to the new host", async () => {
+    const client = renderDialog();
+    // Stale entry: the origin host's shell. The terminals query never goes
+    // stale on its own (staleTime: Infinity) and its queryFn unions with the
+    // cache, so only an explicit clear can drop a dead entry.
+    client.setQueryData<TerminalInfo[]>(terminalsQueryKey("conv_1"), [
+      { id: "terminal_shellA_s1", name: "shellA", session: "s1", running: true },
+    ]);
+    const invalidate = vi.spyOn(client, "invalidateQueries");
+
+    const button = await screen.findByTestId("switch-host-button");
+    await waitFor(() => expect((button as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(button);
+
+    await waitFor(() => expect(launchRunnerMock).toHaveBeenCalledTimes(1));
+    // The old host's shell is dropped synchronously…
+    await waitFor(() =>
+      expect(client.getQueryData<TerminalInfo[]>(terminalsQueryKey("conv_1"))).toEqual([]),
+    );
+    // …and the list is refetched so the new host's shells replace it.
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: terminalsQueryKey("conv_1") });
   });
 
   it("offers the origin host again when the launch fails after the release", async () => {

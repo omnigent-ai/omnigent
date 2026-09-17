@@ -22,7 +22,7 @@ import time
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, Protocol, SupportsIndex, SupportsInt, cast
+from typing import Literal, Protocol, SupportsIndex, SupportsInt, cast
 
 import httpx
 import websockets.asyncio.client
@@ -102,6 +102,7 @@ from omnigent.host.git_worktree import (
     remove_worktree,
 )
 from omnigent.host.identity import HostIdentity, load_or_create_host_identity
+from omnigent.host.maintenance import HostMaintenanceJanitor
 from omnigent.host.runner_zygote import ZygoteManager, ZygoteRunnerProc, ZygoteUnavailable
 from omnigent.inner import _proc
 from omnigent.onboarding.harness_auth import (
@@ -134,6 +135,7 @@ from omnigent.process_logging import (
 from omnigent.runner._zygote import ZYGOTE_ENABLED_ENV_VAR
 from omnigent.runner.identity import (
     RUNNER_DELEGATED_AUTH_ENV_VAR,
+    RUNNER_HOST_OWNS_GLOBAL_CLEANUP_ENV_VAR,
     RUNNER_ID_ENV_VAR,
     RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR,
     RUNNER_INTERACTIVE_SHELLS_ENV_VAR,
@@ -149,6 +151,11 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     PongFrame,
     decode_frame,
     encode_frame,
+)
+from omnigent.runtime.harnesses.paths import (
+    HARNESS_TMP_PARENT_ENV_VAR,
+    absolute_harness_tmp_parent,
+    resolve_harness_tmp_parent,
 )
 from omnigent.runtime.websocket_metrics import (
     record_websocket_connected,
@@ -775,6 +782,8 @@ def _build_runner_env(
     host_id: str | None = None,
     harness: str | None = None,
     interactive_shells: list[str] | None = None,
+    host_owns_global_cleanup: bool = False,
+    harness_tmp_parent: Path | None = None,
 ) -> dict[str, str]:
     """
     Build the environment for a spawned runner subprocess.
@@ -804,6 +813,10 @@ def _build_runner_env(
     :param harness: Canonical harness of the launching session, e.g.
         ``"claude-native"``; lets the runner start harness-specific prewarms
         at boot. ``None`` (unknown / older server) omits the stamp.
+    :param host_owns_global_cleanup: Whether an active host janitor owns the
+        machine-global cleanup that standalone runners perform synchronously.
+    :param harness_tmp_parent: Absolute harness socket root shared with the
+        host janitor. ``None`` preserves the standalone runner default.
     :returns: The runner subprocess environment.
     """
     extra_names = {
@@ -844,6 +857,10 @@ def _build_runner_env(
         env[RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR] = initial_auth_token
     env[RUNNER_WORKSPACE_ENV_VAR] = workspace
     env[RUNNER_PARENT_PID_ENV_VAR] = str(parent_pid)
+    if host_owns_global_cleanup:
+        env[RUNNER_HOST_OWNS_GLOBAL_CLEANUP_ENV_VAR] = "1"
+    if harness_tmp_parent is not None:
+        env[HARNESS_TMP_PARENT_ENV_VAR] = str(absolute_harness_tmp_parent(harness_tmp_parent))
     # Bound glibc allocator RSS in the runner (no-op off Linux). Injected
     # explicitly because the allowlist above would otherwise drop an inherited
     # MALLOC_ARENA_MAX. setdefault so an operator override still wins.
@@ -1018,6 +1035,7 @@ class HostProcess:
         )
         if not self._interactive_shells:
             self._interactive_shells = ["bash"]
+        self._harness_tmp_parent = resolve_harness_tmp_parent()
         self._runners: dict[str, _RunnerHandle] = {}
         from omnigent.host.skills import HostSkillDiscovery
 
@@ -1093,14 +1111,14 @@ class HostProcess:
         # Strong refs to per-runner watcher tasks; asyncio only keeps
         # weak refs, so an unreferenced task can be GC'd mid-flight.
         self._watcher_tasks: set[asyncio.Task[None]] = set()
-        # Strong refs to detached superseded-runner stops (see
-        # _spawn_superseded_stop), for the same GC reason.
-        self._supersede_stop_tasks: set[asyncio.Task[None]] = set()
+        # Strong refs to detached runner stops (supersede / abandoned spawn),
+        # for the same GC reason.
+        self._runner_stop_tasks: set[asyncio.Task[None]] = set()
         # Strong ref to the orphan-reaper task (see :meth:`_orphan_reaper_loop`).
         self._reaper_task: asyncio.Task[None] | None = None
-        # Background sweep of native bridge dirs orphaned by prior runs; kept
-        # off the startup path so it never delays registration (see run()).
-        self._bridge_sweep_task: asyncio.Task[None] | None = None
+        # Host-owned machine-global cleanup. Runner exits trigger background
+        # passes; runner startup never waits for them.
+        self._maintenance_janitor: HostMaintenanceJanitor | None = None
         # Number of host-owned ``subprocess`` operations (e.g. the git worktree
         # commands in :mod:`omnigent.host.git_worktree`) currently in flight.
         # The orphan reaper skips its sweep while this is >0 so it never
@@ -1373,6 +1391,8 @@ class HostProcess:
         dead = [rid for rid, handle in self._runners.items() if handle.proc.poll() is not None]
         for rid in dead:
             self._runners.pop(rid)
+        if dead:
+            self._trigger_maintenance("runner_exited_during_reconnect")
         return list(self._runners.keys())
 
     def _tunnel_url(self) -> str:
@@ -1784,6 +1804,8 @@ class HostProcess:
             host_id=self._identity.host_id,
             harness=frame.harness,
             interactive_shells=self._interactive_shells,
+            host_owns_global_cleanup=self._maintenance_janitor is not None,
+            harness_tmp_parent=self._harness_tmp_parent,
         )
         # The runner serves one primary session (plus any co-located subagents);
         # pass it so runner-level log records can be attributed to that session.
@@ -1822,7 +1844,12 @@ class HostProcess:
         try:
             proc, log_path = await asyncio.shield(spawn)
         except asyncio.CancelledError:
-            spawn.add_done_callback(self._discard_abandoned_spawn)
+            task = asyncio.create_task(
+                self._stop_abandoned_spawn(spawn),
+                name="host-stop-abandoned-runner-spawn",
+            )
+            self._runner_stop_tasks.add(task)
+            task.add_done_callback(self._runner_stop_tasks.discard)
             raise
         except OSError as exc:
             return self._launch_failed(
@@ -1835,6 +1862,7 @@ class HostProcess:
             # is in the captured log, so ship the tail with the result
             # instead of making the user go find the file on the host.
             error = _runner_exit_error(proc.returncode, log_path)
+            self._trigger_maintenance("runner_launch_failed")
             # The returned result retains the diagnostic tail, while
             # _launch_failed limits the host lifecycle line to its first line.
             return self._launch_failed(frame, error)
@@ -2014,7 +2042,10 @@ class HostProcess:
         finally:
             log_fh.close()
 
-    def _discard_abandoned_spawn(self, spawn: asyncio.Future[Any]) -> None:
+    async def _stop_abandoned_spawn(
+        self,
+        spawn: asyncio.Future[tuple[subprocess.Popen[bytes] | ZygoteRunnerProc, Path]],
+    ) -> None:
         """Tear down a runner whose launch was cancelled before registration.
 
         ``_handle_launch`` shields the spawn, so a cancellation still lets the
@@ -2023,21 +2054,25 @@ class HostProcess:
         status forever). Kill it off the loop, since for a zygote-forked runner
         the terminate/wait round-trips are blocking control-socket exchanges.
 
-        :param spawn: The completed spawn future.
+        :param spawn: The retained spawn future.
         """
-        if spawn.cancelled():
+        try:
+            proc, _log_path = await asyncio.shield(spawn)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — a failed spawn created nothing to stop
             return
-        if spawn.exception() is not None:
-            return  # spawn failed; nothing was created
-        proc, _log_path = spawn.result()
         _logger.warning(
             "Launch cancelled after runner spawn (pid=%s); terminating the orphan",
             proc.pid,
         )
-        with contextlib.suppress(RuntimeError):
-            # No running loop during interpreter shutdown — best effort.
-            asyncio.get_running_loop().run_in_executor(
-                None, functools.partial(self._stop_runner_proc, proc)
+        try:
+            await self._stop_runner_and_trigger(proc, "runner_spawn_abandoned")
+        except Exception:  # noqa: BLE001 — detached cleanup must be observed
+            _logger.warning(
+                "Failed to stop abandoned runner pid=%s",
+                proc.pid,
+                exc_info=True,
             )
 
     async def _handle_stop(
@@ -2062,7 +2097,7 @@ class HostProcess:
         # direct-Popen runner, but blocking control-socket exchanges for a
         # zygote-forked one — run them off the loop so a wedged zygote can't
         # freeze the daemon's control handler.
-        await asyncio.to_thread(self._stop_runner_proc, handle.proc)
+        await self._stop_runner_and_trigger(handle.proc, "runner_stopped")
         _logger.info("Stopped runner %s", frame.runner_id)
         print(
             f"  ↓ Runner stopped: {frame.runner_id}",
@@ -2093,7 +2128,7 @@ class HostProcess:
 
         async def _stop_and_log() -> None:
             try:
-                await asyncio.to_thread(self._stop_runner_proc, handle.proc)
+                await self._stop_runner_and_trigger(handle.proc, "runner_superseded")
                 _logger.info(
                     "Stopped superseded runner %s for session %s",
                     runner_id,
@@ -2109,8 +2144,25 @@ class HostProcess:
                 )
 
         task = asyncio.create_task(_stop_and_log())
-        self._supersede_stop_tasks.add(task)
-        task.add_done_callback(self._supersede_stop_tasks.discard)
+        self._runner_stop_tasks.add(task)
+        task.add_done_callback(self._runner_stop_tasks.discard)
+
+    async def _stop_runner_and_trigger(
+        self,
+        proc: subprocess.Popen[bytes] | ZygoteRunnerProc,
+        reason: str,
+    ) -> None:
+        """Finish runner termination before triggering host maintenance."""
+        stop_task = asyncio.create_task(asyncio.to_thread(self._stop_runner_proc, proc))
+        try:
+            await asyncio.shield(stop_task)
+        except asyncio.CancelledError:
+            with contextlib.suppress(Exception):
+                await stop_task
+            raise
+        finally:
+            if stop_task.done():
+                self._trigger_maintenance(reason)
 
     @staticmethod
     def _stop_runner_proc(proc: subprocess.Popen[bytes] | ZygoteRunnerProc) -> None:
@@ -2201,6 +2253,7 @@ class HostProcess:
             # _handle_stop (or _cleanup_runners) removed it first —
             # an intentional termination, not a crash to report.
             return
+        self._trigger_maintenance("runner_exited")
         if handle.proc.returncode == 0:
             # A clean exit (code 0) is a graceful shutdown, not a crash — the
             # idle reaper shutting an inactive runner down, or any orderly
@@ -2227,6 +2280,12 @@ class HostProcess:
             ),
         )
         await self._report_runner_exit(runner_id, error)
+
+    def _trigger_maintenance(self, reason: str) -> None:
+        """Request host-owned cleanup without joining the session path."""
+        janitor = self._maintenance_janitor
+        if janitor is not None:
+            janitor.trigger(reason)
 
     async def _report_runner_exit(self, runner_id: str, error: str) -> None:
         """Send a ``host.runner_exited`` report, queueing on failure.
@@ -3564,17 +3623,6 @@ class HostProcess:
             except OSError:
                 _logger.debug("lifecycle tunnel abort raised", exc_info=True)
 
-    async def _sweep_orphaned_bridge_dirs(self) -> None:
-        """Reclaim native bridge dirs orphaned by prior runs (best-effort)."""
-        from omnigent.native.native_bridge_common import reap_orphaned_native_bridge_dirs
-
-        try:
-            reaped = await asyncio.to_thread(reap_orphaned_native_bridge_dirs)
-            if reaped:
-                _logger.info("Reaped %d orphaned native bridge dir(s) from prior runs", reaped)
-        except Exception:  # noqa: BLE001 — housekeeping must never break the host
-            _logger.debug("native bridge-dir orphan sweep failed", exc_info=True)
-
     async def run(self) -> None:
         """Run the host process with reconnection.
 
@@ -3596,29 +3644,29 @@ class HostProcess:
         self._reaper_task = asyncio.create_task(
             self._orphan_reaper_loop(), name="host-orphan-reaper"
         )
-        # Reap per-session native-harness bridge dirs orphaned by a runner
-        # that died uncleanly (crash / SIGKILL / host restart mid-run). The
-        # runner performs the same sweep at its own startup, but after a
-        # crash no new runner may ever launch on this machine, so the host
-        # (re)start is the reliable moment to reclaim them. Runs as a
-        # background task: a slow sweep (many stale dirs) must not sit on the
-        # critical path of the connect loop below, which registers the host.
-        self._bridge_sweep_task = asyncio.create_task(
-            self._sweep_orphaned_bridge_dirs(), name="host-bridge-dir-sweep"
-        )
+        # Bind this daemon's lifetime to its registry record before starting
+        # host-owned cleanup. The previous daemon holds this lock until its
+        # runners have been terminated, so the delayed startup pass cannot
+        # classify a still-shutting-down runner as live and miss it forever.
+        if self._lifecycle_lock is not None:
+            self._lifecycle_lock.acquire()
+            self._lifecycle_task = asyncio.create_task(
+                self._lifecycle_monitor_loop(), name="host-lifecycle-monitor"
+            )
+        try:
+            self._maintenance_janitor = HostMaintenanceJanitor.for_host(
+                harness_tmp_parent=self._harness_tmp_parent
+            )
+            self._maintenance_janitor.start()
+        except Exception:
+            self._maintenance_janitor = None
+            _logger.exception("Failed to start host maintenance janitor")
         # Detect wake from system suspend (laptop sleep) and force-drop the
         # then-dead tunnel so the reconnect loop reattaches within seconds
         # instead of waiting out the ~90s keepalive ping timeout.
         self._suspend_task = asyncio.create_task(
             watch_for_resume(self._on_resume_from_suspend), name="host-suspend-watch"
         )
-        # Bind this daemon's lifetime to its registry record: hold the target's
-        # flock and watch the record so a stale daemon retires itself.
-        if self._lifecycle_lock is not None:
-            self._lifecycle_lock.acquire()
-            self._lifecycle_task = asyncio.create_task(
-                self._lifecycle_monitor_loop(), name="host-lifecycle-monitor"
-            )
         # Warm the runner zygote now: start() blocks on its one-time import
         # of the runner graph (~1-2s), which otherwise lands inside the first
         # session launch of the daemon's life. Best-effort — a failure
@@ -3796,18 +3844,20 @@ class HostProcess:
         except (KeyboardInterrupt, asyncio.CancelledError):
             pass
         finally:
-            # Await the cancellations: a bare cancel() leaves the tasks
-            # pending at loop close ("Task was destroyed but it is pending!").
+            # Stop accepting lifecycle work before draining teardown tasks.
+            # Cancelling an in-flight launch retains its shielded spawn in
+            # _runner_stop_tasks, so quiescing frame handlers first closes the
+            # race where shutdown took an incomplete snapshot of those tasks.
+            await self._quiesce_frame_tasks()
+            await self._drain_runner_stop_tasks()
+            if self._maintenance_janitor is not None:
+                await self._maintenance_janitor.shutdown()
+                self._maintenance_janitor = None
             if self._reaper_task is not None:
                 self._reaper_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await self._reaper_task
                 self._reaper_task = None
-            if self._bridge_sweep_task is not None:
-                self._bridge_sweep_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await self._bridge_sweep_task
-                self._bridge_sweep_task = None
             if self._suspend_task is not None:
                 self._suspend_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -3818,10 +3868,6 @@ class HostProcess:
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await self._lifecycle_task
                 self._lifecycle_task = None
-            # Release the flock but leave the record deletion to the CLI stop /
-            # takeover paths that own it (this daemon may have been superseded).
-            if self._lifecycle_lock is not None:
-                self._lifecycle_lock.release()
             if self._capability_init_task is not None:
                 self._capability_init_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -3848,6 +3894,11 @@ class HostProcess:
                 with contextlib.suppress(Exception):
                     self._zygote.stop()
                 self._zygote = None
+            # Release ownership only after runner termination. A replacement
+            # daemon starts its cleanup after acquiring this lock, making the
+            # old-host/new-host handoff a deterministic startup-sweep barrier.
+            if self._lifecycle_lock is not None:
+                self._lifecycle_lock.release()
 
     def _on_resume_from_suspend(self, gap_s: float) -> None:
         """Force-drop the tunnel after a detected wake from system suspend.
@@ -4258,6 +4309,26 @@ class HostProcess:
         task = asyncio.create_task(self._run_frame_handler(ws, raw), name="host-frame")
         self._frame_tasks.add(task)
         task.add_done_callback(self._frame_tasks.discard)
+
+    async def _quiesce_frame_tasks(self) -> None:
+        """Cancel and await every in-flight host frame handler."""
+        tasks = list(self._frame_tasks)
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+
+    async def _drain_runner_stop_tasks(self) -> None:
+        """Await retained runner teardown tasks until no producer remains."""
+        while self._runner_stop_tasks:
+            tasks = list(self._runner_stop_tasks)
+            for task in tasks:
+                try:
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await task
+                finally:
+                    self._runner_stop_tasks.discard(task)
 
     async def _run_frame_handler(
         self, ws: websockets.asyncio.client.ClientConnection, raw: str

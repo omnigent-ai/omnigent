@@ -544,8 +544,11 @@ jobs:
           # Keep raw stdout for failures, including secret-scan and posting errors.
           # Write publishable content separately using a review marker or heading.
           # Missing review content fails the step so diagnostic logs are saved.
+          # A model-capacity/overload failure still fails (red check + diagnostics
+          # upload) but is flagged via model_at_capacity so a later step tells the
+          # author it's a transient gateway issue, not their code.
           python3 -c "
-          import re, pathlib
+          import os, re, pathlib
           raw = pathlib.Path('/tmp/polly_output.txt').read_text()
           sentinel = '<!-- POLLY_REVIEW_START -->'
           # Headless output can include earlier drafts before the final review.
@@ -557,6 +560,14 @@ jobs:
               m = re.search(r'^#{1,6} ', raw, re.MULTILINE)
               cleaned = raw[m.start():] if m else ''
           if not cleaned.strip():
+              stderr_log = pathlib.Path('polly-stderr.log')
+              log = stderr_log.read_text(errors='replace') if stderr_log.is_file() else ''
+              if re.search(r'at capacity|serverOverloaded|overloaded_error|\"type\": *\"overloaded', log, re.IGNORECASE):
+                  gh_output = os.environ.get('GITHUB_OUTPUT')
+                  if gh_output:
+                      with open(gh_output, 'a') as fh:
+                          fh.write('model_at_capacity=true\n')
+                  raise SystemExit('::error::Polly review failed — the review model was at capacity.')
               raise SystemExit('::error::Polly produced no publishable review; see the diagnostics artifact.')
           pathlib.Path('/tmp/polly_review.txt').write_text(cleaned)
           "
@@ -568,6 +579,34 @@ jobs:
           # Cap at 60 KB — GitHub comment body limit is ~65 KB.
           head -c 61440 /tmp/polly_review.txt >> "$GITHUB_OUTPUT"
           echo "${delim}" >> "$GITHUB_OUTPUT"
+
+      # Runs even though "Run Polly review" failed (hence !cancelled()), but
+      # only for a capacity/overload failure — a genuine failure gets no note.
+      - name: Note model-capacity failure
+        if: ${{ !cancelled() && steps.polly.outputs.model_at_capacity == 'true' }}
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
+          RUN_URL: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        run: |
+          set -euo pipefail
+          # Distinct marker (not polly-reviewed-sha / polly-skipped-sha) so a
+          # later `/review` still triggers a fresh review instead of being
+          # suppressed by the "already reviewed this SHA" dedupe step.
+          {
+            echo "<!-- polly-capacity-notice -->"
+            echo "## <img src=\"https://raw.githubusercontent.com/omnigent-ai/omnigent/main/docs/images/omnigent-logo.svg\" alt=\"\" height=\"20\" valign=\"middle\" /> Polly AI Review couldn't run — model busy"
+            echo ""
+            echo "This check failed because the review model was at capacity, so Polly couldn't generate a review this run. It's a transient gateway condition, **not a problem with your PR**."
+            echo ""
+            echo "Comment \`/review\` to try again in a few minutes."
+            echo ""
+            echo "---"
+            echo "<sub>Automated by Polly · [workflow run](${RUN_URL})</sub>"
+          } > /tmp/capacity_comment.md
+          gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file /tmp/capacity_comment.md \
+            || echo "::notice::Could not post the capacity note (read-only token)."
 
       - name: Scan review output for secrets before posting
         if: steps.creds.outputs.available == 'true'

@@ -146,9 +146,11 @@ async def _register_routes(
     await page.route("**/v1/agents", handle_agents)
     await page.route("**/v1/sessions/*/events", handle_events)
     await page.route(_SESSIONS_RE, handle_sessions)
-    # Registered after the broad sessions glob so it wins the kind=any discovery
+    # Registered after the broad sessions glob so it wins the visibility=mine discovery
     # scan; the bare conversation-list GET still falls through to handle_sessions.
-    await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+    await page.route(
+        re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
+    )
 
 
 async def _seed_workspace(page) -> None:
