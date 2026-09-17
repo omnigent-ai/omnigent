@@ -231,29 +231,15 @@ jobs:
 
       - name: Install Claude Code CLI
         if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
-        env:
-          NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
-        run: |
-          # Install outside the checked-out tree: a repo-root package.json would
-          # otherwise capture this bare `npm install` and hoist it there, leaving
-          # this dir's node_modules empty.
-          CC_CLI_DIR="${RUNNER_TEMP}/omnigent-cc-cli"
-          mkdir -p "$CC_CLI_DIR" && cd "$CC_CLI_DIR"
-          npm install --ignore-scripts --no-audit --no-fund @anthropic-ai/claude-code@2.1.266
-          node node_modules/@anthropic-ai/claude-code/install.cjs
-          echo "$CC_CLI_DIR/node_modules/.bin" >> "$GITHUB_PATH"
+        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@967f64351f07abc994e7944e25fbc6782efe190c
+        with:
+          harness: claude
 
       - name: Install Codex CLI
         if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
-        env:
-          NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
-        run: |
-          # Install outside the checked-out tree so a repo-root package.json
-          # can't capture this bare `npm install` and hoist it away from here.
-          CODEX_CLI_DIR="${RUNNER_TEMP}/omnigent-codex-cli"
-          mkdir -p "$CODEX_CLI_DIR" && cd "$CODEX_CLI_DIR"
-          npm install --ignore-scripts --no-audit --no-fund @openai/codex@0.139.0
-          echo "$CODEX_CLI_DIR/node_modules/.bin" >> "$GITHUB_PATH"
+        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@967f64351f07abc994e7944e25fbc6782efe190c
+        with:
+          harness: codex
 
       - name: Set LLM credentials
         if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'

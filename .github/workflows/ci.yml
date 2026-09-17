@@ -434,11 +434,9 @@ jobs:
         uses: ./.github/actions/setup-pnpm
 
       - name: Install codex CLI
-        env:
-          NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
-        run: |
-          pnpm install --frozen-lockfile --ignore-scripts --filter e2e-ci-deps
-          echo "${GITHUB_WORKSPACE}/.github/ci-deps/node_modules/.bin" >> "$GITHUB_PATH"
+        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@967f64351f07abc994e7944e25fbc6782efe190c
+        with:
+          harness: codex
 
       - name: Cache virtualenv
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v4

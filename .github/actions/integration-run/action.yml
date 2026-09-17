@@ -75,20 +75,29 @@ runs:
       shell: bash
       run: uv sync --locked --extra all --group test
 
-    - name: Install binary dependencies
-      # Mirrors e2e.yml. --ignore-scripts blocks npm postinstall hooks; we run
-      # claude-code's install.cjs explicitly (audited, no network). bubblewrap
-      # backs the linux_bwrap sandbox in tests/inner/*.
-      working-directory: .github/ci-deps
+    - name: Install system dependencies
+      # bubblewrap backs the linux_bwrap sandbox in tests/inner/*.
       shell: bash
       run: |
         set -euo pipefail
         sudo apt-get update
         sudo apt-get install -y tmux ripgrep bubblewrap
         sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-        npm install --ignore-scripts
-        node node_modules/@anthropic-ai/claude-code/install.cjs
-        echo "${GITHUB_WORKSPACE}/.github/ci-deps/node_modules/.bin" >> "$GITHUB_PATH"
+
+    - name: Install Claude Code CLI
+      uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@967f64351f07abc994e7944e25fbc6782efe190c
+      with:
+        harness: claude
+
+    - name: Install Codex CLI
+      uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@967f64351f07abc994e7944e25fbc6782efe190c
+      with:
+        harness: codex
+
+    - name: Install Pi CLI
+      uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@967f64351f07abc994e7944e25fbc6782efe190c
+      with:
+        harness: pi
 
     - name: Build pinned old server (backwards-compat only)
       # See e2e-run for the full rationale. Requires fetch-depth 0 in the caller.
