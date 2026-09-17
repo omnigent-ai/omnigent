@@ -80,6 +80,10 @@ _LOG_SETTLE_S = 5.0
 
 # The user text sent alongside the image, echoed in the forked chat.
 _USER_PROMPT = "What is in this image?"
+# Settled assistant reply seeded alongside the image so a forked transcript
+# renders a complete exchange (user image → agent answer), describing the
+# checked-in test image (a red square with a blue center).
+_AGENT_REPLY = "It's a red square with a smaller blue square centered inside it."
 _ATTACHMENT_FILENAME = "fork-carry.png"
 
 
@@ -107,7 +111,7 @@ def _upload_image(base_url: str, session_id: str) -> str:
     return str(resp.json()["id"])
 
 
-def _seed_image_message(session_id: str, file_id: str) -> None:
+def _seed_image_message(session_id: str, file_id: str, reply: str | None = None) -> None:
     """Persist a user message with an ``input_image`` block straight into the store.
 
     Seeds the pre-resolution item directly (no ``POST /events``) so no runner
@@ -115,23 +119,37 @@ def _seed_image_message(session_id: str, file_id: str) -> None:
     left running would keep that runner busy when the fork binds and launches
     Claude Code. The journey only needs the raw ``file_id`` block persisted —
     which is exactly what a real send would leave behind before resolution.
+
+    :param reply: When set, also seed a settled assistant reply so the forked
+        transcript renders a complete exchange (user image → agent answer),
+        not just the unanswered attachment.
     """
-    seed_committed_items(
-        session_id,
-        [
+    items = [
+        NewConversationItem(
+            type="message",
+            response_id="resp_attach",
+            data=MessageData(
+                role="user",
+                content=[
+                    {"type": "input_text", "text": _USER_PROMPT},
+                    {"type": "input_image", "file_id": file_id},
+                ],
+            ),
+        )
+    ]
+    if reply is not None:
+        items.append(
             NewConversationItem(
                 type="message",
                 response_id="resp_attach",
                 data=MessageData(
-                    role="user",
-                    content=[
-                        {"type": "input_text", "text": _USER_PROMPT},
-                        {"type": "input_image", "file_id": file_id},
-                    ],
+                    role="assistant",
+                    content=[{"type": "output_text", "text": reply}],
+                    agent="hello_world",
                 ),
             )
-        ],
-    )
+        )
+    seed_committed_items(session_id, items)
 
 
 def _wait_persisted_file_id_block(base_url: str, session_id: str, file_id: str) -> None:
@@ -376,9 +394,10 @@ def test_fork_shared_attachment_renders_in_forked_chat(
     base_url, source_id = seeded_session
     runner_id = str(_server_state["runner_id"])
 
-    # 1) Upload an image and persist the user message (seeded, no turn).
+    # 1) Upload an image and persist a settled exchange (user image + the
+    #    agent's answer) straight into the store — no turn dispatched.
     source_file_id = _upload_image(base_url, source_id)
-    _seed_image_message(source_id, source_file_id)
+    _seed_image_message(source_id, source_file_id, reply=_AGENT_REPLY)
     _wait_persisted_file_id_block(base_url, source_id, source_file_id)
     image_bytes = _TEST_IMAGE_PATH.read_bytes()
 
@@ -403,12 +422,14 @@ def test_fork_shared_attachment_renders_in_forked_chat(
     )
     assert fork_content.content == image_bytes
 
-    # 3) Open the forked chat — the attachment renders (survived the fork).
+    # 3) Open the forked chat — the attachment AND the agent's answer render
+    #    (the whole exchange survived the fork).
     _bind_session_runner(base_url, fork_id, runner_id)
     page.goto(f"{base_url}/c/{fork_id}")
     expect(page.get_by_text(_USER_PROMPT).first).to_be_visible(timeout=60_000)
     _wait_attachment_loaded(page, fork_file_id)
-    page.wait_for_timeout(2500)  # hold on the rendered attachment (recording)
+    expect(page.get_by_text(_AGENT_REPLY).first).to_be_visible(timeout=60_000)
+    page.wait_for_timeout(2500)  # hold on the rendered exchange (recording)
 
     # 4) Delete the SOURCE, reload the fork — the attachment STILL renders
     #    (reference-counted blob deletion kept the shared bytes alive).
@@ -417,4 +438,5 @@ def test_fork_shared_attachment_renders_in_forked_chat(
     page.reload()
     expect(page.get_by_text(_USER_PROMPT).first).to_be_visible(timeout=60_000)
     _wait_attachment_loaded(page, fork_file_id)
-    page.wait_for_timeout(3000)  # hold on the surviving attachment (recording)
+    expect(page.get_by_text(_AGENT_REPLY).first).to_be_visible(timeout=60_000)
+    page.wait_for_timeout(3000)  # hold on the surviving exchange (recording)
