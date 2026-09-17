@@ -546,9 +546,10 @@ def configured_harness_map() -> dict[str, HarnessAvailability]:
 
     Built so the server/web UI can do a plain dict lookup with whatever
     spelling it holds — canonical ids, executor-type spellings, the
-    ``claude`` alias, and ``pi``. SDK and unknown harnesses map to
-    ``True`` (never gated); CLI-wrapping harnesses map to whether their
-    binary is on ``PATH``. Codex entries use a structured string reason when
+    ``claude`` alias, ``pi``, and the ``acp:<slug>`` id of every configured
+    generic-ACP agent. SDK and unknown harnesses map to ``True`` (never
+    gated); CLI-wrapping harnesses map to whether their binary is on
+    ``PATH``. Codex entries use a structured string reason when
     unavailable: ``"binary-missing"`` or ``"needs-auth"``.
 
     :returns: Mapping of harness spelling to readiness, e.g.
@@ -574,6 +575,16 @@ def configured_harness_map() -> dict[str, HarnessAvailability]:
     spellings.add(GOOSE_KEY)  # headless Goose (``goose acp``) gates on the goose binary
     spellings.add(HERMES_KEY)  # Hermes Agent wraps the ``hermes`` CLI
     spellings.add(COPILOT_KEY)
+    # Each configured generic-ACP agent is addressed as ``acp:<slug>``, and the
+    # picker treats a key missing from a non-empty map as unconfigured — so
+    # enumerate the configured slugs; canonicalization folds each onto the
+    # generic ``acp`` availability. A malformed block emits no slug keys.
+    try:
+        from omnigent.onboarding.acp_auth import acp_agents
+
+        spellings.update(f"acp:{agent.slug}" for agent in acp_agents())
+    except Exception:
+        _logger.debug("readiness: acp agent slug enumeration failed", exc_info=True)
     availability_cache: dict[tuple[str, ...], HarnessAvailability] = {}
     result: dict[str, HarnessAvailability] = {}
     for spelling in spellings:

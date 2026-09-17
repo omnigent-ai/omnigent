@@ -376,7 +376,8 @@ def test_configured_harness_map_covers_all_spellings(
         "hermes-native",
         "native-hermes",
         # Generic ACP harness — config-gated (≥1 agent in the acp: block), no CLI
-        # binary of its own; the acp:<slug> picks are config-derived, not keyed here.
+        # binary of its own. Per-slug ``acp:<slug>`` keys are config-derived, so
+        # none appear here (the fixture's config home is empty).
         "acp",
         # Builtin ACP CLI harnesses: every catalog row + alias, derived so a new
         # row never needs to touch this list.
@@ -505,10 +506,71 @@ def test_configured_harness_map_all_true_with_clis(
         "omnigent.onboarding.harness_readiness._family_provider_configured", lambda _h: True
     )
     # The generic ACP harness is config-gated (≥1 registered agent), not
-    # CLI-gated — satisfy it so it isn't the lone unconfigured entry here.
-    monkeypatch.setattr("omnigent.onboarding.acp_auth.acp_agents", lambda config=None: [object()])
+    # CLI-gated — satisfy it so it isn't the lone unconfigured entry here. A
+    # real entry (not a bare object) so the map's per-slug enumeration also
+    # runs, adding an all-true ``acp:<slug>`` key.
+    from omnigent.onboarding.acp_auth import AcpAgentEntry
+
+    monkeypatch.setattr(
+        "omnigent.onboarding.acp_auth.acp_agents",
+        lambda config=None: [AcpAgentEntry(slug="traex", name="TraeX", command="traex acp serve")],
+    )
     result = configured_harness_map()
     assert all(result.values())
+
+
+def test_configured_harness_map_enumerates_configured_acp_slugs(
+    tmp_path: Path,
+) -> None:
+    """Every configured ``acp:<slug>`` agent gets its own available map key.
+
+    The picker seeds one row per configured generic-ACP agent and filters it
+    against this map, where a missing key on a non-empty map reads as
+    unconfigured — so a map without the slug keys badges a launchable agent
+    "needs setup" (the false negative this pins). Colliding names keep their
+    ``-2`` suffix so every row's key matches the slug the agent registers under.
+    """
+    (tmp_path / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "acp": {
+                    "agents": [
+                        {"name": "TraeX", "command": "traex acp serve"},
+                        {"name": "Gemini CLI", "command": "gemini --experimental-acp"},
+                        {"name": "gemini cli", "command": "gemini2 --experimental-acp"},
+                    ]
+                }
+            }
+        )
+    )
+    result = configured_harness_map()
+    assert result["acp"] is True
+    assert result["acp:traex"] is True
+    assert result["acp:gemini-cli"] is True
+    assert result["acp:gemini-cli-2"] is True
+
+
+def test_configured_harness_map_omits_acp_slugs_without_configured_agents(
+    tmp_path: Path,
+) -> None:
+    """No ``acp:`` block → no slug keys, and a malformed block never raises.
+
+    An empty config must not invent slug keys, and a block that makes
+    ``acp_agents()`` raise degrades to the generic ``acp`` entry reading
+    not-configured — readiness feeds the daemon's hello frame and must never
+    crash the refresh.
+    """
+    result = configured_harness_map()
+    assert not [key for key in result if key.startswith("acp:")]
+
+    (tmp_path / "config.yaml").write_text(
+        yaml.safe_dump(
+            {"acp": {"agents": [{"name": "X", "command": "y", "omnigent_mcp": "nope"}]}}
+        )
+    )
+    result = configured_harness_map()
+    assert not [key for key in result if key.startswith("acp:")]
+    assert result["acp"] is False
 
 
 def test_configured_harness_map_probes_codex_readiness_once(
