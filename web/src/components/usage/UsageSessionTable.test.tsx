@@ -24,6 +24,8 @@ function session(overrides: Partial<SessionUsage> = {}): SessionUsage {
     otherHarnesses: null,
     llmModel: null,
     agentName: null,
+    projectId: null,
+    projectName: null,
     ...overrides,
   };
 }
