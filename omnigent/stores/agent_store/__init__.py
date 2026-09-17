@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import builtins
 from abc import ABC, abstractmethod
-from typing import Literal
 
 from omnigent.entities import Agent, PagedList
 
@@ -83,12 +82,9 @@ class AgentStore(ABC):
         after: str | None = None,
         before: str | None = None,
         order: str = "desc",
-        *,
-        kind: Literal["template", "session"] = "template",
-        accessible_by: str | None = None,
     ) -> PagedList[Agent]:
         """
-        List agents of one kind with cursor-based pagination.
+        List registered template agents with cursor-based pagination.
 
         ``order`` controls the sort direction on ``created_at``
         (``"desc"`` = newest-first, ``"asc"`` = oldest-first).
@@ -100,8 +96,6 @@ class AgentStore(ABC):
         :param before: Cursor agent ID; only return agents appearing
             *before* this agent in the sort order.
         :param order: Sort direction, ``"desc"`` or ``"asc"``.
-        :param kind: Template catalog or session-bound agents.
-        :param accessible_by: Restrict session agents to the caller's grants.
         :returns: A :class:`PagedList` of :class:`Agent` objects.
         """
         ...

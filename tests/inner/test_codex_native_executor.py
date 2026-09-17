@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import logging
 from pathlib import Path
 from typing import Any
@@ -755,6 +756,7 @@ def test_steer_does_not_retry_ambiguous_or_unrelated_errors(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     error: Exception,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Only Codex's explicit idle semantic is safe to retry."""
 
@@ -784,6 +786,25 @@ def test_steer_does_not_retry_ambiguous_or_unrelated_errors(
     state = read_bridge_state(tmp_path)
     assert state is not None
     assert state.active_turn_id == "turn_maybe_active"
+
+    from omnigent.debug_logging import record_to_row
+
+    record = next(
+        record
+        for record in caplog.records
+        if record.getMessage() == "Codex native turn injection failed"
+    )
+    row = record_to_row(record, source="runner")
+    assert row["session_id"] == state.session_id
+    assert row["event_name"] == "codex_turn_injection_failed"
+    attrs = row["attributes"]
+    assert row["turn_id"] == "turn_maybe_active"
+    assert attrs["thread_id"] == state.thread_id
+    if isinstance(error, CodexAppServerResponseError):
+        assert attrs["rpc_error_code"] == "-32600"
+    else:
+        assert "rpc_error_code" not in attrs
+    assert "do not duplicate" not in json.dumps(attrs)
 
 
 def test_stale_steer_recovery_preserves_and_steers_concurrent_new_turn(
@@ -1676,6 +1697,7 @@ def test_turn_start_is_not_gated_on_pending_mcp_startup(
 def test_turn_error_names_pending_mcp_servers(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
     A turn failure during MCP startup names the still-pending servers.
@@ -1716,6 +1738,23 @@ def test_turn_error_names_pending_mcp_servers(
 
     assert [type(event) for event in events] == [ExecutorError]
     assert "MCP startup still waiting on storage-console" in events[0].message
+
+    from omnigent.debug_logging import record_to_row
+
+    records = [
+        record
+        for record in caplog.records
+        if record.getMessage() == "Codex native turn injection failed"
+    ]
+    assert len(records) == 1
+    row = record_to_row(records[0], source="runner")
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert row["session_id"] == state.session_id
+    assert row["event_name"] == "codex_turn_injection_failed"
+    assert row["attributes"]["thread_id"] == state.thread_id
+    assert row["attributes"]["exception_type"] == "RuntimeError"
+    assert str(tmp_path) not in json.dumps(row["attributes"])
 
 
 def test_interrupt_with_active_turn_and_pending_mcp_stops_both(

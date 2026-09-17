@@ -22,7 +22,7 @@ from typing import Any
 
 from playwright.async_api import Route, async_playwright, expect
 
-from tests.e2e_ui.start_session.helpers import select_landing_agent
+from tests.e2e_ui.start_session.helpers import select_landing_agent, stub_empty_host_picker_data
 
 _HOST_ID = "host_e2e"
 # The stub host reports codex installed-but-not-configured; the credential POST
@@ -178,7 +178,7 @@ async def _register_routes(page, *, credential_requests: list[dict[str, Any]]) -
         )
 
     async def handle_agent_scan(route: Route) -> None:
-        # The picker also scans GET /v1/sessions?kind=any for registered agents.
+        # The picker also scans GET /v1/sessions?visibility=mine for registered agents.
         # The seeded_session fixture creates real sessions in the DB, so without
         # this stub those leak in and the picker auto-selects the built-in Claude
         # Code (ready) instead of our unconfigured Codex — no "Set up" notice
@@ -189,8 +189,11 @@ async def _register_routes(page, *, credential_requests: list[dict[str, Any]]) -
 
     await page.route("**/v1/info", handle_info)
     await page.route("**/v1/hosts", handle_hosts)
+    await stub_empty_host_picker_data(page, _HOST_ID)
     await page.route("**/v1/agents", handle_agents)
-    await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+    await page.route(
+        re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
+    )
     await page.route("**/v1/harnesses", handle_harnesses)
     await page.route("**/v1/hosts/*/credentials/detected", handle_detect)
     await page.route(f"**/v1/hosts/*/harnesses/{_HARNESS}/credential", handle_credential)

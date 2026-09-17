@@ -90,7 +90,9 @@ async def _register_routes(page, *, configured_harnesses: dict[str, Any]) -> Non
 
     await page.route("**/v1/hosts", handle_hosts)
     await page.route("**/v1/agents", handle_agents)
-    await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+    await page.route(
+        re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
+    )
 
 
 def test_version_too_low_warns_with_outdated_cli_copy(

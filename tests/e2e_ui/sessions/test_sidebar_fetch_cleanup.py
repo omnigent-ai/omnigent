@@ -143,3 +143,69 @@ def test_mine_filters_a_mixed_visibility_response(
     page.get_by_test_id("session-filter-all").click()
     expect(page.get_by_text("Owned from mixed response", exact=True)).to_be_visible()
     expect(page.get_by_text("Shared from mixed response", exact=True)).to_be_visible()
+
+
+def test_templates_load_before_mine_and_discovery_reuses_its_request(
+    page: Page, request: pytest.FixtureRequest
+) -> None:
+    base_url = request.config.getoption("--ui-base-url") or request.getfixturevalue("live_server")
+    held_mine: list[Route] = []
+    agent_requests: list[str] = []
+
+    def sessions(route: Route) -> None:
+        params = parse_qs(urlparse(route.request.url).query)
+        if params.get("visibility") == ["mine"] and "pinned" not in params:
+            held_mine.append(route)
+        else:
+            route.fulfill(json={"data": [], "has_more": False})
+
+    def agents(route: Route) -> None:
+        agent_requests.append(route.request.url)
+        route.fulfill(
+            json={
+                "data": [
+                    {
+                        "id": "ag_immediate",
+                        "name": "immediate-template",
+                        "builtin": False,
+                        "created_at": 1,
+                    }
+                ],
+                "has_more": False,
+            }
+        )
+
+    page.route_web_socket("**/v1/sessions/updates*", lambda _socket: None)
+    page.route("**/v1/sessions?*", sessions)
+    page.route("**/v1/agents", agents)
+    page.route("**/v1/agents?*", agents)
+    page.goto(base_url, wait_until="domcontentloaded")
+    picker = page.get_by_test_id("new-chat-landing-agent-select")
+    expect(picker).to_contain_text("Immediate-template")
+    expect(picker).to_be_enabled()
+    assert len(held_mine) == 1
+    held_mine[0].fulfill(
+        json={
+            "data": [
+                {
+                    "id": "recent_mine",
+                    "agent_id": "ag_recent",
+                    "agent_name": "recent-custom",
+                    "title": "Recent owned session",
+                    "created_at": 2,
+                    "updated_at": 2,
+                    "permission_level": 4,
+                    "labels": {},
+                }
+            ],
+            "has_more": False,
+        }
+    )
+    page.wait_for_load_state("networkidle")
+    picker.click()
+    page.get_by_test_id("new-chat-landing-custom-agents").click()
+    expect(page.get_by_test_id("new-chat-landing-agent-ag_recent")).to_be_visible()
+    expect(page.get_by_test_id("new-chat-landing-agent-ag_immediate")).to_be_visible()
+    assert len(held_mine) == 1
+    assert len(agent_requests) == 1
+    assert not urlparse(agent_requests[0]).query

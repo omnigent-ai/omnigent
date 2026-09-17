@@ -1,3 +1,4 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   useConversations as useTestConversations,
   useConversations,
@@ -7,7 +8,6 @@ vi.mock("@/hooks/useSidebarData", () => ({ useLoadedConversations: () => useTest
 import { cleanup, render, screen } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { MemoryRouter } from "react-router-dom";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { RunnerHealthInput, SessionLiveness } from "@/hooks/useRunnerHealth";
 

@@ -1,5 +1,6 @@
 import { useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
 import { useMemo } from "react";
+import { useSidebarData } from "./useSidebarData";
 import { authenticatedFetch } from "@/lib/identity";
 import { agentRootName } from "@/lib/forkHarness";
 import { capitalizeAgentName, useAcpHarnessIds, useHarnessLabels } from "@/lib/agentLabels";
@@ -113,19 +114,13 @@ interface BuiltinAgentsListWire {
  * Fetch the built-in agents from the read-only list `GET /v1/agents`
  * (see designs/BUILTIN_AGENTS.md).
  */
-export async function fetchAgentCatalog(
-  kind: "template" | "session" = "template",
-): Promise<AvailableAgent[]> {
+export async function fetchAgentCatalog(): Promise<AvailableAgent[]> {
   const rows: BuiltinAgentWire[] = [];
   let after: string | null = null;
   // Each page provides the cursor for the next request.
   /* oxlint-disable no-await-in-loop */
   do {
     const params = new URLSearchParams();
-    if (kind === "session") {
-      params.set("kind", kind);
-      params.set("limit", "100");
-    }
     if (after !== null) params.set("after", after);
     const url = params.size ? `/v1/agents?${params}` : "/v1/agents";
     const res = await authenticatedFetch(url);
@@ -158,15 +153,28 @@ interface DiscoveredSessionAgent {
   agent: AvailableAgent;
 }
 
-export const SESSION_AGENTS_QUERY_KEY = ["session-agents"] as const;
-
+/** Discover agents from the first 30 owned sessions already loaded by the sidebar. */
 export function useSessionAgents(enabled = true) {
-  return useQuery({
-    queryKey: SESSION_AGENTS_QUERY_KEY,
-    queryFn: () => fetchAgentCatalog("session"),
-    staleTime: 30_000,
-    enabled,
-  });
+  const { mine } = useSidebarData();
+  const data = useMemo(() => {
+    if (!enabled || !mine.data) return undefined;
+    const agents = new Map<string, AvailableAgent>();
+    for (const row of mine.data.pages.flatMap((page) => page.data).slice(0, 30)) {
+      if (!row.agent_id || !row.agent_name || agents.has(row.agent_id)) continue;
+      agents.set(row.agent_id, {
+        id: row.agent_id,
+        name: row.agent_name,
+        display_name: displayNameForAgent(row.agent_name),
+        description: null,
+        harness: null,
+        skills: [],
+        sessionId: row.id,
+        created_at: row.created_at,
+      });
+    }
+    return [...agents.values()];
+  }, [enabled, mine.data]);
+  return { ...mine, data };
 }
 
 /** Wire shape of `GET /v1/sessions/{id}/agent` (AgentObject). */
@@ -233,25 +241,17 @@ export async function prefetchAvailableAgentDetails(
   }
 }
 
-/** Merge both catalogs without letting name deduplication rebind a pinned agent id. */
+/** Keep configured agent ids through name deduplication within the available sources. */
 async function fetchAvailableAgents(
   pinnedAgentIds: string[],
   queryClient: QueryClient,
+  sessionAgents: AvailableAgent[],
 ): Promise<AvailableAgent[]> {
-  const [catalog, sessionAgents] = await Promise.all([
-    queryClient.fetchQuery({
-      queryKey: AGENT_CATALOG_QUERY_KEY,
-      queryFn: () => fetchAgentCatalog(),
-      staleTime: AVAILABLE_AGENTS_STALE_MS,
-    }),
-    queryClient
-      .fetchQuery({
-        queryKey: SESSION_AGENTS_QUERY_KEY,
-        queryFn: () => fetchAgentCatalog("session"),
-        staleTime: AVAILABLE_AGENTS_STALE_MS,
-      })
-      .catch(() => [] as AvailableAgent[]),
-  ]);
+  const catalog = await queryClient.fetchQuery({
+    queryKey: AGENT_CATALOG_QUERY_KEY,
+    queryFn: fetchAgentCatalog,
+    staleTime: AVAILABLE_AGENTS_STALE_MS,
+  });
   const discovered = sessionAgents.map((agent) => ({
     agentId: agent.id,
     agentName: agent.name,
@@ -384,6 +384,7 @@ function applyAcpHarnessCatalog(
 
 export function useAvailableAgents(options: UseAvailableAgentsOptions = {}) {
   const enabled = options.enabled ?? true;
+  const sessionAgents = useSessionAgents(enabled);
   // Normalized, order-stable pin key so equivalent pin sets share one cache
   // entry and a caller's fresh array literal doesn't churn the query. Agent
   // ids never contain "," so the join is unambiguous.
@@ -407,7 +408,7 @@ export function useAvailableAgents(options: UseAvailableAgentsOptions = {}) {
   );
   const queryClient = useQueryClient();
   // The harness/built-in rows come entirely from GET /v1/agents, so they must
-  // not wait for a slow sessions discovery discovery (managed deployments with
+  // not wait for a slow Mine session load (managed deployments with
   // large session tables). This catalog query resolves fast and feeds the
   // merged query's placeholder below; same enabled gate as the merged query.
   const { data: catalog } = useQuery({
@@ -421,31 +422,22 @@ export function useAvailableAgents(options: UseAvailableAgentsOptions = {}) {
   // the discovery lands. Consumers that must not resolve stored ids against a
   // partial list read isPlaceholderData to tell this state apart.
   //
-  // Only PROTECTED rows (`builtin !== false`: seeded built-ins plus older
-  // servers that omit the flag) feed the placeholder. A user-registered
-  // template (`builtin === false`) competes newest-wins with same-named
-  // session-discovered agents in the resolved merge (#3234), so surfacing it
-  // as launchable before the discovery lands could bind a stale template id that
-  // the merge would have superseded. The harness rows this placeholder exists
-  // to deliver are all protected, so nothing user-visible is delayed.
   const placeholderData = useMemo(
-    () =>
-      catalog === undefined
-        ? undefined
-        : mergeAvailableAgents(
-            catalog.filter((agent) => agent.builtin !== false),
-            [],
-          ),
+    () => (catalog === undefined ? undefined : mergeAvailableAgents(catalog, [])),
     [catalog],
   );
   return useQuery({
-    // Unpinned consumers keep the historical bare key; pinned variants get
-    // their own entry (prefetch patches both via a prefix match).
-    queryKey: pinnedKey === "" ? ["available-agents"] : ["available-agents", pinnedKey],
+    // Recompute when the first 30 Mine sessions change; hover patches match the prefix.
+    queryKey: ["available-agents", pinnedKey, sessionAgents.data ?? null],
     // fetchQuery dedupes with the catalog query's in-flight fetch, so the
     // merged fetch reuses (not repeats) the catalog request.
-    queryFn: () => fetchAvailableAgents(pinnedKey === "" ? [] : pinnedKey.split(","), queryClient),
-    enabled,
+    queryFn: () =>
+      fetchAvailableAgents(
+        pinnedKey === "" ? [] : pinnedKey.split(","),
+        queryClient,
+        sessionAgents.data ?? [],
+      ),
+    enabled: enabled && (sessionAgents.data !== undefined || sessionAgents.isError),
     staleTime: AVAILABLE_AGENTS_STALE_MS,
     placeholderData,
     select,

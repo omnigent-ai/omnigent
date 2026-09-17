@@ -21,6 +21,8 @@ from typing import Any
 
 from playwright.async_api import Route, async_playwright, expect
 
+from tests.e2e_ui.start_session.helpers import stub_empty_host_picker_data
+
 _HOST_ID = "host_e2e"
 # The stub host reports Claude ready and Codex missing. Claude remains the
 # selected inline default, so Codex exercises the picker's More submenu before
@@ -167,7 +169,7 @@ async def _register_routes(page, *, install_requests: list[str]) -> None:
         await route.fulfill(status=200, content_type="application/json", body=_harnesses_body())
 
     async def handle_agent_scan(route: Route) -> None:
-        # The picker ALSO scans GET /v1/sessions?kind=any for registered agents.
+        # The picker ALSO scans GET /v1/sessions?visibility=mine for registered agents.
         # The seeded_session fixture creates real sessions in the DB, so without
         # this stub those leak in as agents and the picker auto-selects the
         # built-in Claude Code (ready) instead of our unconfigured Codex —
@@ -193,8 +195,11 @@ async def _register_routes(page, *, install_requests: list[str]) -> None:
 
     await page.route("**/v1/info", handle_info)
     await page.route("**/v1/hosts", handle_hosts)
+    await stub_empty_host_picker_data(page, _HOST_ID)
     await page.route("**/v1/agents", handle_agents)
-    await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+    await page.route(
+        re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
+    )
     await page.route("**/v1/harnesses", handle_harnesses)
     await page.route(f"**/v1/hosts/*/harnesses/{_HARNESS}/install", handle_install)
 

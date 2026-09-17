@@ -213,6 +213,10 @@ VITE_MINE_REFRESH_MS=120000 VITE_SHARED_REFRESH_MS=300000 pnpm --dir web dev
 Each refresh requests the loaded window, capped by `sidebar.maxRefreshSessions`
 (default 200). Up to that cap, the response replaces the window. Beyond it, the
 newest 200 rows replace the refreshed portion and older loaded rows remain.
+Agent discovery reads the first 30 Mine sessions from that cache, adding no
+session-list requests. Agents found only in older or shared sessions are not
+discovered; the built-in `/v1/agents` catalog is still loaded separately.
+
 Pagination still adds 30 rows per request. Mine and Shared results are checked
 against the viewer's ownership metadata in the frontend as well.
 

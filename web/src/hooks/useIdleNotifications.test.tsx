@@ -1,3 +1,4 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   useConversations as useTestConversations,
   useConversations,
@@ -5,7 +6,6 @@ import {
 
 vi.mock("@/hooks/useSidebarData", () => ({ useLoadedConversations: () => useTestConversations() }));
 import { cleanup, renderHook, act } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const navigateMock = vi.fn();
 // The hook consumes `useNavigate` from the routing IoC seam (@/lib/routing),

@@ -2196,13 +2196,8 @@ export function NewChatLandingScreen() {
     storedProjectConfig,
   ]);
 
-  // Pin the configured project agent into discovery so the recency-bounded
-  // session scan (or its same-name dedup) can't drop or id-swap it out of
-  // the picker — the config must seed the agent the project actually pinned.
-  // agentsArePlaceholder: catalog-only rows served while the sessions
-  // discovery scan is still in flight — render them (harnesses must not wait
-  // for a slow scan), but never resolve a stored agent id against them: a
-  // scan-discovered agent may still be on its way.
+  // Preserve a configured agent through name deduplication when it is in the
+  // catalog or first 30 Mine sessions. Templates render while Mine is loading.
   const {
     data: agents,
     isLoading: agentsLoading,
@@ -3104,11 +3099,8 @@ export function NewChatLandingScreen() {
   // bundled agent. So a pending pick made before switching to a sandbox is
   // dropped there, falling back to a real agent; off the sandbox it's kept.
   const pendingAgentAllowedOnTarget = !sandboxSelected;
-  // The project's configured agent could not be resolved: the catalog, the
-  // session scan, AND the pinned direct lookup all came up empty (deleted
-  // agent, or one the caller can't read). Never substitute another agent for
-  // it — the composer surfaces this state ("Agent unavailable" chip, blocked
-  // submit) until the user explicitly picks an agent instead.
+  // A configured agent absent from templates and the first 30 Mine sessions
+  // stays unavailable until the user explicitly chooses another agent.
   const configuredAgentUnavailable =
     projectParam !== "" &&
     prefillConfig?.agentId != null &&

@@ -1,11 +1,15 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, renderHook, waitFor } from "@testing-library/react";
+import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { SidebarDataProvider } from "./useSidebarData";
+import { useAgents } from "./useAgents";
+import { refreshScopeWindow } from "@/lib/sidebarData";
+import type { Conversation } from "./useConversations";
 import { useAvailableAgents, prefetchAvailableAgentDetails } from "./useAvailableAgents";
 
-// Template and session catalogs load in parallel through authenticatedFetch.
+// The template catalog and sidebar Mine cache load through authenticatedFetch.
 // URL-keyed stubs exercise the real fetch and mapping path.
 function mockResponse(body: unknown, init?: { ok?: boolean; status?: number }): Response {
   return {
@@ -19,7 +23,7 @@ function mockResponse(body: unknown, init?: { ok?: boolean; status?: number }): 
 const fetchMock = vi.fn();
 
 const BUILTINS_URL = "/v1/agents";
-const SESSION_AGENTS_URL = "/v1/agents?kind=session&limit=100";
+const MINE_URL = "/v1/sessions?order=desc&sort_by=updated_at&limit=30&visibility=mine";
 const HARNESSES_URL = "/v1/harnesses";
 
 /**
@@ -29,7 +33,7 @@ const HARNESSES_URL = "/v1/harnesses";
  */
 function routeFetch(routes: Record<string, Response>) {
   fetchMock.mockImplementation((url: string) => {
-    const route = routes[url];
+    const route = routes[url] ?? (url.includes("pinned=true") ? EMPTY_MINE : undefined);
     if (!route) {
       return Promise.reject(new Error(`unrouted fetch in test: ${url}`));
     }
@@ -43,7 +47,11 @@ function wrapper({ children }: { children: ReactNode }) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
-  return <QueryClientProvider client={client}>{children}</QueryClientProvider>;
+  return (
+    <QueryClientProvider client={client}>
+      <SidebarDataProvider sharedEnabled={false}>{children}</SidebarDataProvider>
+    </QueryClientProvider>
+  );
 }
 
 beforeEach(() => {
@@ -56,33 +64,132 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-const EMPTY_SESSION_AGENTS = mockResponse({ object: "list", data: [], has_more: false });
+/** Build owned sessions around the agent metadata under test. */
+function sessionResponse(
+  body: { data?: { id: string; name: string; created_at?: number }[]; [key: string]: unknown },
+  init?: { ok?: boolean; status?: number },
+): Response {
+  return mockResponse(
+    {
+      ...body,
+      data: body.data?.map((agent, index) => ({
+        id: `session_${index}`,
+        agent_id: agent.id,
+        agent_name: agent.name,
+        created_at: agent.created_at ?? 1,
+        updated_at: 1000 - index,
+        permission_level: 4,
+      })),
+    },
+    init,
+  );
+}
+
+const EMPTY_MINE = mockResponse({ object: "list", data: [], has_more: false });
 
 describe("useAvailableAgents", () => {
   it("does not fetch while disabled", async () => {
     const { result } = renderHook(() => useAvailableAgents({ enabled: false }), { wrapper });
     await Promise.resolve();
 
-    expect(fetchMock).not.toHaveBeenCalled();
+    expect(fetchMock.mock.calls.some(([url]) => String(url).startsWith("/v1/agents"))).toBe(false);
     expect(result.current.fetchStatus).toBe("idle");
   });
 
-  it("fetches template and session agents through separate cached catalogs", async () => {
+  it("reuses the sidebar Mine request for both agent readers", async () => {
     routeFetch({
       [BUILTINS_URL]: mockResponse({ object: "list", data: [], has_more: false }),
-      [SESSION_AGENTS_URL]: EMPTY_SESSION_AGENTS,
+      [MINE_URL]: EMPTY_MINE,
     });
 
-    const { result } = renderHook(() => useAvailableAgents(), { wrapper });
-    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    const { result } = renderHook(
+      () => {
+        useAgents();
+        return { ...useAvailableAgents() };
+      },
+      { wrapper },
+    );
+    await waitFor(() => {
+      expect(result.current.isSuccess).toBe(true);
+      expect(result.current.isPlaceholderData).toBe(false);
+    });
 
-    // Pins both source endpoints. /v1/agents drifting back to the
-    // retired /api/agents route would break against current servers;
-    // the scan dropping kind=any would silently stop discovering
-    // agents bound only to sub-agent sessions.
     const urls = fetchMock.mock.calls.map((c) => c[0] as string);
     expect(urls).toContain(BUILTINS_URL);
-    expect(urls).toContain(SESSION_AGENTS_URL);
+    expect(urls.filter((url) => url === MINE_URL)).toHaveLength(1);
+    expect(urls.some((url) => url.includes("kind=session"))).toBe(false);
+  });
+
+  it("limits discovery to 30 Mine sessions and updates when that cache refreshes", async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const mineKey = ["conversations", "", false, null, "mine"];
+    const rows: Conversation[] = Array.from({ length: 60 }, (_, index) => ({
+      id: `mine_${index}`,
+      object: "conversation",
+      title: null,
+      labels: {},
+      agent_id: `ag_${index}`,
+      agent_name: `custom-${index}`,
+      created_at: 100 - index,
+      updated_at: 100 - index,
+      permission_level: 4,
+    }));
+    const cache = (data: Conversation[]) =>
+      refreshScopeWindow(
+        undefined,
+        {
+          data,
+          has_more: false,
+          first_id: data[0]?.id ?? null,
+          last_id: data.at(-1)?.id ?? null,
+        },
+        60,
+      );
+    client.setQueryData(mineKey, cache(rows));
+    routeFetch({
+      [BUILTINS_URL]: mockResponse({ data: [], has_more: false }),
+      "/v1/sessions?order=desc&sort_by=updated_at&limit=30&visibility=shared": mockResponse({
+        data: [{ ...rows[0], id: "shared", agent_id: "ag_shared", permission_level: 1 }],
+        has_more: false,
+      }),
+    });
+    const { result } = renderHook(
+      () => ({
+        picker: { ...useAvailableAgents() },
+        agents: useAgents().data,
+      }),
+      {
+        wrapper: ({ children }: { children: ReactNode }) => (
+          <QueryClientProvider client={client}>
+            <SidebarDataProvider>{children}</SidebarDataProvider>
+          </QueryClientProvider>
+        ),
+      },
+    );
+    await waitFor(() => expect(result.current.picker.isPlaceholderData).toBe(false));
+    await waitFor(() => expect(result.current.picker.data).toHaveLength(30));
+    expect(result.current.agents?.map((agent) => agent.id)).toEqual(
+      rows.slice(0, 30).map((row) => row.agent_id),
+    );
+    expect(
+      result.current.picker.data?.some((agent) => agent.id === "ag_30" || agent.id === "ag_shared"),
+    ).toBe(false);
+    act(() =>
+      client.setQueryData(
+        mineKey,
+        cache([
+          { ...rows[0], id: "new_session", agent_id: "ag_new", agent_name: "new-custom" },
+          ...rows.slice(1),
+        ]),
+      ),
+    );
+    await waitFor(() =>
+      expect(result.current.picker.data?.some((agent) => agent.id === "ag_new")).toBe(true),
+    );
+    expect(result.current.agents?.[0]?.id).toBe("ag_new");
+    expect(fetchMock.mock.calls.filter(([url]) => url === MINE_URL)).toHaveLength(0);
+    expect(fetchMock.mock.calls.filter(([url]) => url === BUILTINS_URL)).toHaveLength(1);
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes("kind=session"))).toBe(false);
   });
 
   it("labels and flags generic-ACP agents from the server harness catalog", async () => {
@@ -99,7 +206,7 @@ describe("useAvailableAgents", () => {
         ],
         has_more: false,
       }),
-      [SESSION_AGENTS_URL]: EMPTY_SESSION_AGENTS,
+      [MINE_URL]: EMPTY_MINE,
       [HARNESSES_URL]: mockResponse({
         data: [
           { id: "grok", label: "Grok Build", capabilities: { integration_mode: "acp-subprocess" } },
@@ -112,7 +219,7 @@ describe("useAvailableAgents", () => {
       }),
     });
 
-    const { result } = renderHook(() => useAvailableAgents(), { wrapper });
+    const { result } = renderHook(() => ({ ...useAvailableAgents() }), { wrapper });
     // The catalog is a second query, so wait for the enrichment specifically.
     await waitFor(() =>
       expect(result.current.data?.find((a) => a.name === "grok")?.acpHarness).toBe(true),
@@ -141,11 +248,14 @@ describe("useAvailableAgents", () => {
         data: [{ id: "ag_codex", name: "codex-native-ui", harness: "codex-native" }],
         has_more: false,
       }),
-      [SESSION_AGENTS_URL]: EMPTY_SESSION_AGENTS,
+      [MINE_URL]: EMPTY_MINE,
     });
 
-    const { result } = renderHook(() => useAvailableAgents(), { wrapper });
-    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    const { result } = renderHook(() => ({ ...useAvailableAgents() }), { wrapper });
+    await waitFor(() => {
+      expect(result.current.isSuccess).toBe(true);
+      expect(result.current.isPlaceholderData).toBe(false);
+    });
 
     expect(result.current.data).toEqual([
       {
@@ -219,11 +329,14 @@ describe("useAvailableAgents", () => {
         ],
         has_more: false,
       }),
-      [SESSION_AGENTS_URL]: EMPTY_SESSION_AGENTS,
+      [MINE_URL]: EMPTY_MINE,
     });
 
-    const { result } = renderHook(() => useAvailableAgents(), { wrapper });
-    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    const { result } = renderHook(() => ({ ...useAvailableAgents() }), { wrapper });
+    await waitFor(() => {
+      expect(result.current.isSuccess).toBe(true);
+      expect(result.current.isPlaceholderData).toBe(false);
+    });
 
     // Native terminal wrappers show product names ("Claude Code" / "Pi").
     // nessie's and debby's lowercase slugs are
@@ -313,11 +426,14 @@ describe("useAvailableAgents", () => {
         data: [{ id: "ag_x", name: "x" }],
         has_more: false,
       }),
-      [SESSION_AGENTS_URL]: EMPTY_SESSION_AGENTS,
+      [MINE_URL]: EMPTY_MINE,
     });
 
-    const { result } = renderHook(() => useAvailableAgents(), { wrapper });
-    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    const { result } = renderHook(() => ({ ...useAvailableAgents() }), { wrapper });
+    await waitFor(() => {
+      expect(result.current.isSuccess).toBe(true);
+      expect(result.current.isPlaceholderData).toBe(false);
+    });
 
     expect(result.current.data?.[0].harness).toBeNull();
   });
@@ -332,11 +448,14 @@ describe("useAvailableAgents", () => {
         data: [{ id: "ag_x", name: "x" }],
         has_more: false,
       }),
-      [SESSION_AGENTS_URL]: EMPTY_SESSION_AGENTS,
+      [MINE_URL]: EMPTY_MINE,
     });
 
-    const { result } = renderHook(() => useAvailableAgents(), { wrapper });
-    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    const { result } = renderHook(() => ({ ...useAvailableAgents() }), { wrapper });
+    await waitFor(() => {
+      expect(result.current.isSuccess).toBe(true);
+      expect(result.current.isPlaceholderData).toBe(false);
+    });
 
     expect(result.current.data?.[0].description).toBeNull();
   });
@@ -344,10 +463,10 @@ describe("useAvailableAgents", () => {
   it("surfaces an error when the built-in request fails", async () => {
     routeFetch({
       [BUILTINS_URL]: mockResponse({ detail: "nope" }, { ok: false, status: 500 }),
-      [SESSION_AGENTS_URL]: EMPTY_SESSION_AGENTS,
+      [MINE_URL]: EMPTY_MINE,
     });
 
-    const { result } = renderHook(() => useAvailableAgents(), { wrapper });
+    const { result } = renderHook(() => ({ ...useAvailableAgents() }), { wrapper });
     await waitFor(() => expect(result.current.isError).toBe(true));
 
     expect(result.current.error).toBeInstanceOf(Error);
@@ -361,7 +480,7 @@ describe("useAvailableAgents", () => {
         data: [{ id: "ag_native", name: "claude-native-ui", harness: "claude-native" }],
         has_more: false,
       }),
-      [SESSION_AGENTS_URL]: mockResponse({
+      [MINE_URL]: sessionResponse({
         object: "list",
         data: [
           // Binds the built-in's own agent row — dropped by id.
@@ -394,13 +513,16 @@ describe("useAvailableAgents", () => {
       }),
     });
 
-    const { result } = renderHook(() => useAvailableAgents(), { wrapper });
-    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    const { result } = renderHook(() => ({ ...useAvailableAgents() }), { wrapper });
+    await waitFor(() => {
+      expect(result.current.isSuccess).toBe(true);
+      expect(result.current.isPlaceholderData).toBe(false);
+    });
 
     // One built-in + one custom. A second "Claude Code" row (from
     // ag_clone/ag_clone2 leaking) means shadow-dropping regressed —
     // ag_clone2 specifically guards the nested fork-of-fork case that
-    // surfaces as a duplicate built-in; ag_doc missing means kind=any
+    // surfaces as a duplicate built-in; ag_doc missing means Mine
     // discovery broke; two ag_doc rows mean the by-id dedup broke.
     // description/harness are null on initial load — enriched on hover
     // via prefetchAvailableAgentDetails.
@@ -420,6 +542,8 @@ describe("useAvailableAgents", () => {
         description: null,
         harness: null,
         skills: [],
+        sessionId: expect.any(String),
+        created_at: 1,
       },
     ]);
     // No enrich fetches on initial load — enrichment is deferred to hover.
@@ -449,7 +573,7 @@ describe("useAvailableAgents", () => {
         ],
         has_more: false,
       }),
-      [SESSION_AGENTS_URL]: mockResponse({
+      [MINE_URL]: sessionResponse({
         object: "list",
         data: [
           // Session-bound id with a non-canonical kiro name (server typo).
@@ -465,8 +589,11 @@ describe("useAvailableAgents", () => {
       }),
     });
 
-    const { result } = renderHook(() => useAvailableAgents(), { wrapper });
-    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    const { result } = renderHook(() => ({ ...useAvailableAgents() }), { wrapper });
+    await waitFor(() => {
+      expect(result.current.isSuccess).toBe(true);
+      expect(result.current.isPlaceholderData).toBe(false);
+    });
 
     // ag_session_kiro appears on initial load with harness: null because
     // enrichment is deferred. prefetchAvailableAgentDetails (called on picker
@@ -504,6 +631,8 @@ describe("useAvailableAgents", () => {
         description: null,
         harness: null,
         skills: [],
+        sessionId: "session_0",
+        created_at: 1,
       },
     ]);
   });
@@ -511,7 +640,7 @@ describe("useAvailableAgents", () => {
   it("collapses same-named custom agents with distinct agent_ids to the newest agent row", async () => {
     routeFetch({
       [BUILTINS_URL]: mockResponse({ object: "list", data: [], has_more: false }),
-      [SESSION_AGENTS_URL]: mockResponse({
+      [MINE_URL]: sessionResponse({
         object: "list",
         data: [
           // Three sessions of the same custom agent, each with its own
@@ -533,8 +662,11 @@ describe("useAvailableAgents", () => {
       }),
     });
 
-    const { result } = renderHook(() => useAvailableAgents(), { wrapper });
-    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    const { result } = renderHook(() => ({ ...useAvailableAgents() }), { wrapper });
+    await waitFor(() => {
+      expect(result.current.isSuccess).toBe(true);
+      expect(result.current.isPlaceholderData).toBe(false);
+    });
 
     // Exactly one elise row (the newest mint, ag_run3) plus doc-writer.
     // Three elise rows would mean the by-name collapse regressed to
@@ -548,6 +680,8 @@ describe("useAvailableAgents", () => {
         description: null,
         harness: null,
         skills: [],
+        sessionId: "session_0",
+        created_at: 1,
       },
       {
         id: "ag_doc",
@@ -556,6 +690,8 @@ describe("useAvailableAgents", () => {
         description: null,
         harness: null,
         skills: [],
+        sessionId: expect.any(String),
+        created_at: 1,
       },
     ]);
   });
@@ -582,7 +718,7 @@ describe("useAvailableAgents", () => {
         ],
         has_more: false,
       }),
-      [SESSION_AGENTS_URL]: mockResponse({
+      [MINE_URL]: sessionResponse({
         object: "list",
         data: [
           // A session that bound the template directly — dropped by id (the
@@ -596,8 +732,11 @@ describe("useAvailableAgents", () => {
       }),
     });
 
-    const { result } = renderHook(() => useAvailableAgents(), { wrapper });
-    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    const { result } = renderHook(() => ({ ...useAvailableAgents() }), { wrapper });
+    await waitFor(() => {
+      expect(result.current.isSuccess).toBe(true);
+      expect(result.current.isPlaceholderData).toBe(false);
+    });
 
     // Exactly one "agent-a", bound to the newer upload (ag_upload_v2). The
     // seeded debby is untouched. ag_template winning would mean the stale
@@ -630,15 +769,18 @@ describe("useAvailableAgents", () => {
         ],
         has_more: false,
       }),
-      [SESSION_AGENTS_URL]: mockResponse({
+      [MINE_URL]: sessionResponse({
         object: "list",
         data: [{ id: "ag_template", name: "agent-a", created_at: 250 }],
         has_more: false,
       }),
     });
 
-    const { result } = renderHook(() => useAvailableAgents(), { wrapper });
-    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    const { result } = renderHook(() => ({ ...useAvailableAgents() }), { wrapper });
+    await waitFor(() => {
+      expect(result.current.isSuccess).toBe(true);
+      expect(result.current.isPlaceholderData).toBe(false);
+    });
 
     // One agent-a (the template), carried with its full catalog info. No
     // enrich fetch — the only session bound the template directly.
@@ -662,7 +804,7 @@ describe("useAvailableAgents", () => {
         ],
         has_more: false,
       }),
-      [SESSION_AGENTS_URL]: mockResponse({
+      [MINE_URL]: sessionResponse({
         object: "list",
         data: [
           // A newer upload named "debby" — must be dropped, not surfaced.
@@ -672,8 +814,11 @@ describe("useAvailableAgents", () => {
       }),
     });
 
-    const { result } = renderHook(() => useAvailableAgents(), { wrapper });
-    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    const { result } = renderHook(() => ({ ...useAvailableAgents() }), { wrapper });
+    await waitFor(() => {
+      expect(result.current.isSuccess).toBe(true);
+      expect(result.current.isPlaceholderData).toBe(false);
+    });
 
     // Only the seeded debby; the same-named upload is shadowed (Option 1) and
     // never enriched, even though it is newer than the built-in.
@@ -693,11 +838,14 @@ describe("useAvailableAgents", () => {
       }),
       // Transient 5xx on the scan — built-in availability must not be
       // hostage to the discovery extension, so the hook still succeeds.
-      [SESSION_AGENTS_URL]: mockResponse({ detail: "boom" }, { ok: false, status: 503 }),
+      [MINE_URL]: sessionResponse({ detail: "boom" }, { ok: false, status: 503 }),
     });
 
-    const { result } = renderHook(() => useAvailableAgents(), { wrapper });
-    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    const { result } = renderHook(() => ({ ...useAvailableAgents() }), { wrapper });
+    await waitFor(() => {
+      expect(result.current.isSuccess).toBe(true);
+      expect(result.current.isPlaceholderData).toBe(false);
+    });
 
     expect(result.current.data?.map((a) => a.id)).toEqual(["ag_native"]);
   });
@@ -705,17 +853,20 @@ describe("useAvailableAgents", () => {
   it("lists a custom agent with stored fields when optional metadata is absent", async () => {
     routeFetch({
       [BUILTINS_URL]: mockResponse({ object: "list", data: [], has_more: false }),
-      [SESSION_AGENTS_URL]: mockResponse({
+      [MINE_URL]: sessionResponse({
         object: "list",
         data: [{ id: "ag_doc", name: "doc-writer" }],
         has_more: false,
       }),
     });
 
-    const { result } = renderHook(() => useAvailableAgents(), { wrapper });
-    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    const { result } = renderHook(() => ({ ...useAvailableAgents() }), { wrapper });
+    await waitFor(() => {
+      expect(result.current.isSuccess).toBe(true);
+      expect(result.current.isPlaceholderData).toBe(false);
+    });
 
-    // Agent is listed with the fields returned by the catalog, without per-agent requests.
+    // Session metadata supplies the name; full details are deferred until hover.
     expect(result.current.data).toEqual([
       {
         id: "ag_doc",
@@ -724,6 +875,8 @@ describe("useAvailableAgents", () => {
         description: null,
         harness: null,
         skills: [],
+        sessionId: expect.any(String),
+        created_at: 1,
       },
     ]);
   });
@@ -785,7 +938,7 @@ describe("prefetchAvailableAgentDetails", () => {
 
     await prefetchAvailableAgentDetails(agent, queryClient);
 
-    expect(fetchMock).not.toHaveBeenCalled();
+    expect(fetchMock.mock.calls.some(([url]) => String(url).startsWith("/v1/agents"))).toBe(false);
     expect(queryClient.getQueryData(["available-agents"])).toEqual([agent]);
   });
 
@@ -803,7 +956,7 @@ describe("prefetchAvailableAgentDetails", () => {
 
     await prefetchAvailableAgentDetails(agent, queryClient);
 
-    expect(fetchMock).not.toHaveBeenCalled();
+    expect(fetchMock.mock.calls.some(([url]) => String(url).startsWith("/v1/agents"))).toBe(false);
   });
 
   it("leaves the agent name-only when the enrich fetch fails", async () => {
@@ -873,42 +1026,12 @@ describe("prefetchAvailableAgentDetails", () => {
 // the recency-bounded scan can miss them and the same-name collapse could
 // otherwise drop or id-swap them, silently rebinding the project.
 describe("useAvailableAgents pinned agents", () => {
-  const PINNED_LOOKUP_URL = "/v1/agents?kind=session&limit=100&after=ag_first";
-
-  it("resolves pinned agents from later catalog pages", async () => {
-    routeFetch({
-      [BUILTINS_URL]: mockResponse({ object: "list", data: [], has_more: false }),
-      [SESSION_AGENTS_URL]: mockResponse({
-        data: [{ id: "ag_first", name: "other" }],
-        has_more: true,
-        last_id: "ag_first",
-      }),
-      [PINNED_LOOKUP_URL]: mockResponse({
-        object: "list",
-        data: [{ id: "ag_pinned", name: "deploy-bot", created_at: 100 }],
-        has_more: false,
-      }),
-    });
-
-    const { result } = renderHook(() => useAvailableAgents({ pinnedAgentIds: ["ag_pinned"] }), {
-      wrapper,
-    });
-    await waitFor(() => expect(result.current.isSuccess).toBe(true));
-
-    const pinned = result.current.data?.find((a) => a.id === "ag_pinned");
-    expect(pinned?.name).toBe("deploy-bot");
-    expect(fetchMock.mock.calls.map(([url]) => url)).toContain(PINNED_LOOKUP_URL);
-    expect(fetchMock.mock.calls.some(([url]) => String(url).startsWith("/v1/sessions"))).toBe(
-      false,
-    );
-  });
-
   it("keeps a pinned agent's id through the same-name newest-wins collapse", async () => {
     // A newer same-named upload wins the name bucket — without pinning, that
     // id swap would silently rebind the project to the newer upload.
     routeFetch({
       [BUILTINS_URL]: mockResponse({ object: "list", data: [], has_more: false }),
-      [SESSION_AGENTS_URL]: mockResponse({
+      [MINE_URL]: sessionResponse({
         object: "list",
         data: [
           { id: "ag_new", name: "deploy-bot", created_at: 200 },
@@ -918,10 +1041,16 @@ describe("useAvailableAgents pinned agents", () => {
       }),
     });
 
-    const { result } = renderHook(() => useAvailableAgents({ pinnedAgentIds: ["ag_pinned"] }), {
-      wrapper,
+    const { result } = renderHook(
+      () => ({ ...useAvailableAgents({ pinnedAgentIds: ["ag_pinned"] }) }),
+      {
+        wrapper,
+      },
+    );
+    await waitFor(() => {
+      expect(result.current.isSuccess).toBe(true);
+      expect(result.current.isPlaceholderData).toBe(false);
     });
-    await waitFor(() => expect(result.current.isSuccess).toBe(true));
 
     const ids = (result.current.data ?? []).map((a) => a.id);
     expect(ids).toContain("ag_pinned");
@@ -948,7 +1077,7 @@ describe("useAvailableAgents pinned agents", () => {
         ],
         has_more: false,
       }),
-      [SESSION_AGENTS_URL]: mockResponse({
+      [MINE_URL]: sessionResponse({
         object: "list",
         data: [
           // Newer same-named upload — wins the bucket, evicting the template.
@@ -958,10 +1087,16 @@ describe("useAvailableAgents pinned agents", () => {
       }),
     });
 
-    const { result } = renderHook(() => useAvailableAgents({ pinnedAgentIds: ["ag_pinned"] }), {
-      wrapper,
+    const { result } = renderHook(
+      () => ({ ...useAvailableAgents({ pinnedAgentIds: ["ag_pinned"] }) }),
+      {
+        wrapper,
+      },
+    );
+    await waitFor(() => {
+      expect(result.current.isSuccess).toBe(true);
+      expect(result.current.isPlaceholderData).toBe(false);
     });
-    await waitFor(() => expect(result.current.isSuccess).toBe(true));
 
     const ids = (result.current.data ?? []).map((a) => a.id);
     expect(ids).toContain("ag_pinned");
@@ -980,13 +1115,19 @@ describe("useAvailableAgents pinned agents", () => {
         data: [{ id: "ag_polly", name: "polly", builtin: true }],
         has_more: false,
       }),
-      [SESSION_AGENTS_URL]: EMPTY_SESSION_AGENTS,
+      [MINE_URL]: EMPTY_MINE,
     });
 
-    const { result } = renderHook(() => useAvailableAgents({ pinnedAgentIds: ["ag_gone"] }), {
-      wrapper,
+    const { result } = renderHook(
+      () => ({ ...useAvailableAgents({ pinnedAgentIds: ["ag_gone"] }) }),
+      {
+        wrapper,
+      },
+    );
+    await waitFor(() => {
+      expect(result.current.isSuccess).toBe(true);
+      expect(result.current.isPlaceholderData).toBe(false);
     });
-    await waitFor(() => expect(result.current.isSuccess).toBe(true));
 
     expect(result.current.data?.map((a) => a.id)).toEqual(["ag_polly"]);
   });
@@ -1014,11 +1155,11 @@ describe("useAvailableAgents slow discovery scan", () => {
     });
     fetchMock.mockImplementation((url: string) => {
       if (url === BUILTINS_URL) return Promise.resolve(catalogResponse());
-      if (url === SESSION_AGENTS_URL) return scanGate;
+      if (url === MINE_URL) return scanGate;
       return Promise.reject(new Error(`unrouted fetch in test: ${url}`));
     });
 
-    const { result } = renderHook(() => useAvailableAgents(), { wrapper });
+    const { result } = renderHook(() => ({ ...useAvailableAgents() }), { wrapper });
 
     // Catalog rows appear while the scan is still pending…
     await waitFor(() =>
@@ -1029,7 +1170,7 @@ describe("useAvailableAgents slow discovery scan", () => {
     // …and upgrade in place — placeholder flag cleared, scan-discovered
     // agents merged in — once the scan finally lands.
     releaseScan(
-      mockResponse({
+      sessionResponse({
         object: "list",
         data: [{ id: "ag_custom", name: "my-agent", created_at: 1 }],
         has_more: false,
@@ -1039,13 +1180,7 @@ describe("useAvailableAgents slow discovery scan", () => {
     expect(result.current.data?.map((a) => a.id)).toEqual(["ag_claude", "ag_codex", "ag_custom"]);
   });
 
-  it("keeps supersedable templates (builtin: false) out of the placeholder rows", async () => {
-    // A user-registered template competes newest-wins with same-named
-    // session-discovered agents in the resolved merge (#3234). Surfacing it
-    // as launchable while the scan is still pending could bind a stale
-    // template id the merge would have superseded — so the placeholder
-    // carries protected rows only, and the template joins once the scan
-    // settles the race.
+  it("shows user-registered templates immediately while Mine is pending", async () => {
     let releaseScan: (r: Response) => void = () => {};
     const scanGate = new Promise<Response>((resolve) => {
       releaseScan = resolve;
@@ -1074,21 +1209,24 @@ describe("useAvailableAgents slow discovery scan", () => {
             has_more: false,
           }),
         );
-      if (url === SESSION_AGENTS_URL) return scanGate;
+      if (url === MINE_URL) return scanGate;
       return Promise.reject(new Error(`unrouted fetch in test: ${url}`));
     });
 
-    const { result } = renderHook(() => useAvailableAgents(), { wrapper });
+    const { result } = renderHook(() => ({ ...useAvailableAgents() }), { wrapper });
 
-    // Placeholder rows: the protected harnesses, never the template.
+    // All templates are available while the Mine request is still pending.
     await waitFor(() =>
-      expect(result.current.data?.map((a) => a.id)).toEqual(["ag_claude", "ag_codex"]),
+      expect(result.current.data?.map((a) => a.id)).toEqual([
+        "ag_claude",
+        "ag_codex",
+        "ag_template",
+      ]),
     );
     expect(result.current.isPlaceholderData).toBe(true);
 
-    // Once the scan lands (empty: nothing supersedes it), the template is
-    // merged in — deferred until the race is settled, not dropped.
-    releaseScan(mockResponse({ object: "list", data: [], has_more: false }));
+    // Mine settling clears the placeholder flag without another catalog request.
+    releaseScan(sessionResponse({ object: "list", data: [], has_more: false }));
     await waitFor(() => expect(result.current.isPlaceholderData).toBe(false));
     expect(result.current.data?.map((a) => a.id)).toEqual(["ag_claude", "ag_codex", "ag_template"]);
   });
@@ -1096,11 +1234,14 @@ describe("useAvailableAgents slow discovery scan", () => {
   it("fetches the catalog once per mount (placeholder and merge share it)", async () => {
     routeFetch({
       [BUILTINS_URL]: catalogResponse(),
-      [SESSION_AGENTS_URL]: EMPTY_SESSION_AGENTS,
+      [MINE_URL]: EMPTY_MINE,
     });
 
-    const { result } = renderHook(() => useAvailableAgents(), { wrapper });
-    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    const { result } = renderHook(() => ({ ...useAvailableAgents() }), { wrapper });
+    await waitFor(() => {
+      expect(result.current.isSuccess).toBe(true);
+      expect(result.current.isPlaceholderData).toBe(false);
+    });
     await waitFor(() => expect(result.current.isPlaceholderData).toBe(false));
 
     // The placeholder's catalog query and the merged queryFn share one

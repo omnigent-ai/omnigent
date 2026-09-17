@@ -43,6 +43,7 @@ import {
   LayoutDashboardIcon,
   Loader2Icon,
   MailIcon,
+  MailOpenIcon,
   MessageCircleDashedIcon,
   Maximize2Icon,
   Minimize2Icon,
@@ -173,8 +174,11 @@ import { useSessionErrors } from "@/hooks/useSessionErrors";
 import { useChatStore } from "@/store/chatStore";
 import {
   isConversationUnseen,
+  isExplicitlyUnread,
+  markConversationRead,
   markConversationUnread,
   useConversationReadState,
+  useUnseenTick,
 } from "@/hooks/useUnseenConversations";
 import { cn } from "@/lib/utils";
 import { useOmnigentAnalytics } from "@/lib/analytics";
@@ -3256,6 +3260,7 @@ function ConversationMenuItems({
   currentProject,
   onTogglePinned,
   onMarkUnread,
+  onMarkRead,
   onProjectAssigned,
   moveToProject,
   stopSession,
@@ -3286,6 +3291,7 @@ function ConversationMenuItems({
   currentProject: string | null;
   onTogglePinned: (conversationId: string) => void;
   onMarkUnread: () => void;
+  onMarkRead: () => void;
   onProjectAssigned?: (projectName: string) => void;
   moveToProject: ReturnType<typeof useMoveToProject>;
   stopSession: ReturnType<typeof useStopSession>;
@@ -3430,10 +3436,11 @@ function ConversationMenuItems({
           </TooltipContent>
         </Tooltip>
       )}
-      {/* Mark as unread — re-lights the row's pink dot so a session can
-          be flagged to revisit, including the one you're currently
-          viewing. Hidden only when the row already shows the dot. */}
-      {canMarkUnread && (
+      {/* Every row offers one read-state action: "Mark as unread" re-lights
+          the pink dot so a session can be flagged to revisit (including the
+          one you're currently viewing); a row already showing the dot offers
+          the reverse, "Mark as read", which clears it. */}
+      {canMarkUnread ? (
         <C.Item
           data-testid="mark-unread-conversation"
           onSelect={() => {
@@ -3443,6 +3450,17 @@ function ConversationMenuItems({
         >
           <MailIcon className="size-3.5" />
           Mark as unread
+        </C.Item>
+      ) : (
+        <C.Item
+          data-testid="mark-read-conversation"
+          onSelect={() => {
+            onMarkRead();
+            setMenuOpen(false);
+          }}
+        >
+          <MailOpenIcon className="size-3.5" />
+          Mark as read
         </C.Item>
       )}
       {/* Projects are a My-sessions-only tool, so filing is owner-only — a
@@ -4002,6 +4020,7 @@ function ConversationRowImpl({
     currentProject,
     onTogglePinned,
     onMarkUnread: () => markConversationUnread(conversation.id, conversation.updated_at),
+    onMarkRead: () => markConversationRead(conversation.id, conversation.updated_at),
     onProjectAssigned,
     moveToProject,
     stopSession,
@@ -5386,6 +5405,18 @@ function BulkActionBar({
     [allConversations, selectedIds],
   );
 
+  // Subscribed so the read-state action below flips read↔unread the moment
+  // the mirror is written (e.g. a background turn lighting a selected row's
+  // dot while the bar is open). Computed per render — the selection is small.
+  useUnseenTick();
+  // Mirrors the row dot's condition (active-row suppression included), so the
+  // offered direction always matches the dots the user sees.
+  const unreadSelected = selectedConversations.filter(
+    (c) =>
+      isConversationUnseen(c.id, c.updated_at, c.status) &&
+      (c.id !== activeId || isExplicitlyUnread(c.id)),
+  );
+
   const ownedSelected = useMemo(
     () => selectedConversations.filter((c) => isOwnedByViewer(c, viewerId)),
     [selectedConversations, viewerId],
@@ -5468,6 +5499,20 @@ function BulkActionBar({
     );
   }
 
+  // Read state is per-viewer (not ownership-gated, matching the row menu),
+  // so both actions apply to every selected row. The store writes are
+  // synchronous with a fire-and-forget server sync, so the bar can exit
+  // immediately, matching the other bulk actions.
+  function handleMarkRead() {
+    for (const c of unreadSelected) markConversationRead(c.id, c.updated_at);
+    onExit();
+  }
+
+  function handleMarkUnread() {
+    for (const c of selectedConversations) markConversationUnread(c.id, c.updated_at);
+    onExit();
+  }
+
   function handleArchive() {
     if (nonArchivedSelected.length === 0) return;
     // The rows leave the sidebar optimistically (useBulkArchiveConversations
@@ -5531,6 +5576,43 @@ function BulkActionBar({
           </span>
 
           <div className="ml-auto flex items-center gap-0.5">
+            {unreadSelected.length > 0 ? (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon-xs"
+                    className="shrink-0"
+                    disabled={isBusy}
+                    onClick={handleMarkRead}
+                    aria-label="Mark selected as read"
+                    data-testid="bulk-mark-read"
+                  >
+                    <MailOpenIcon className="size-3.5" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="bottom">Mark as read</TooltipContent>
+              </Tooltip>
+            ) : (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon-xs"
+                    className="shrink-0"
+                    disabled={isBusy || count === 0}
+                    onClick={handleMarkUnread}
+                    aria-label="Mark selected as unread"
+                    data-testid="bulk-mark-unread"
+                  >
+                    <MailIcon className="size-3.5" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="bottom">Mark as unread</TooltipContent>
+              </Tooltip>
+            )}
             {!(allSelectedSameArchiveGroup && archivedSelected.length > 0) && (
               <Tooltip>
                 <TooltipTrigger asChild>

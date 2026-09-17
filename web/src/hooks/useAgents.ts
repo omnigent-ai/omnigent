@@ -59,7 +59,7 @@ export interface Agent {
   terminals?: string[];
 }
 
-/** Session-agent catalog shared with the new-session picker. */
+/** Agents discovered in the first 30 cached Mine sessions, shared with the picker. */
 export function useAgents({ enabled = true }: { enabled?: boolean } = {}) {
   return useSessionAgents(enabled);
 }

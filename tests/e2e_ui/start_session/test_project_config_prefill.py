@@ -192,7 +192,9 @@ async def _drive_prefill(base_url: str, session_id: str) -> None:
             await page.route(_PROJECT_CFG_RE, handle_project_config)
             await page.route("**/v1/sessions/*/events", handle_events)
             await page.route(_SESSIONS_RE, handle_sessions)
-            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+            await page.route(
+                re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
+            )
 
             await page.goto(f"{base_url}/?project={_PROJECT_NAME}")
             await page.get_by_test_id("new-chat-landing-input").wait_for(
@@ -330,7 +332,9 @@ async def _drive_sandbox_prefill(base_url: str, session_id: str) -> None:
             await page.route(_PROJECT_CFG_RE, handle_project_config)
             await page.route("**/v1/sessions/*/events", handle_events)
             await page.route(_SESSIONS_RE, handle_sessions)
-            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+            await page.route(
+                re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
+            )
 
             await page.goto(f"{base_url}/?project={_PROJECT_NAME}")
             await page.get_by_test_id("new-chat-landing-input").wait_for(
@@ -429,7 +433,9 @@ async def _drive_born_filed(base_url: str, session_id: str) -> None:
             await page.route(_PROJECT_CFG_RE, handle_project_config)
             await page.route("**/v1/sessions/*/events", handle_events)
             await page.route(_SESSIONS_RE, handle_sessions)
-            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+            await page.route(
+                re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
+            )
 
             # The per-project pencil destination: the composer lands pre-scoped
             # to this project (no interaction needed to file into it).

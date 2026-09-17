@@ -203,7 +203,7 @@ async def _drive_mobile_enter_newline(base_url: str, session_id: str) -> None:
                 else:
                     await route.continue_()
 
-            # Suppress the agent-discovery scan (kind=any) so only the stubbed
+            # Suppress the agent-discovery scan (visibility=mine) so only the stubbed
             # polly agent feeds the picker — same guard as test_start_session.py.
             async def handle_agent_scan(route: Route) -> None:
                 await route.fulfill(
@@ -216,7 +216,9 @@ async def _drive_mobile_enter_newline(base_url: str, session_id: str) -> None:
             await page.route("**/v1/agents", handle_agents)
             await page.route("**/v1/sessions/*/events", handle_events)
             await page.route(_SESSIONS_RE, handle_sessions)
-            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+            await page.route(
+                re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
+            )
 
             # Seed a recent workspace so the host chip auto-fills and the Send
             # button can become enabled.

@@ -13,6 +13,7 @@ from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
 from typing import cast
 
+from omnigent.debug_logging import debug_event
 from omnigent.harnesses.codex_native import side_chat
 from omnigent.harnesses.codex_native.app_server import (
     CodexAppServerClient,
@@ -570,7 +571,20 @@ class CodexNativeExecutor(Executor):
                                 settings_overrides=settings_overrides,
                             )
                     except Exception as exc:
-                        _logger.exception("Codex native turn injection failed")
+                        _logger.exception(
+                            "Codex native turn injection failed",
+                            extra=debug_event(
+                                "codex_turn_injection_failed",
+                                session_id=state.session_id,
+                                turn_id=state.active_turn_id,
+                                thread_id=state.thread_id,
+                                rpc_error_code=(
+                                    exc.code
+                                    if isinstance(exc, CodexAppServerResponseError)
+                                    else None
+                                ),
+                            ),
+                        )
                         error_msg = f"Codex native executor error: {exc}"
                         # Name the servers a still-unsettled MCP startup is
                         # blocked on — the most common cause of an injection

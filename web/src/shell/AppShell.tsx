@@ -426,9 +426,7 @@ export function AppShell() {
   const agentTerminal = useMemo(() => findAgentTerminal(terminals), [terminals]);
 
   const debugMode = useDebugMode();
-  // Restrict the observer to the fields AppShell actually reads: the 30s
-  // refetchInterval otherwise re-renders this whole shell on every background
-  // `isFetching`/`dataUpdatedAt` flap even when the list is unchanged.
+  // Reuse sidebar rows; the active-session snapshot covers sessions outside its cache.
   const { data: conversationsData, isLoading: conversationsLoading } = useLoadedConversations();
   const optimisticConversationTitle = useOptimisticTitle(conversationId ?? "");
   // Surface sessions needing attention as OS notifications + a dock badge.
@@ -545,7 +543,7 @@ export function AppShell() {
     (isTempConvId(conversationId)
       ? (optimisticConversationTitle ?? UNTITLED_CONVERSATION_LABEL)
       : null) ||
-    (isChildSession ? UNTITLED_CONVERSATION_LABEL : null);
+    (isChildSession || activeSession?.id === conversationId ? UNTITLED_CONVERSATION_LABEL : null);
   const headerProjectSummary =
     breadcrumbConv?.project_id != null
       ? projectSummaries?.find((p) => p.id === breadcrumbConv.project_id)

@@ -1168,6 +1168,52 @@ export async function fetchSessionItemsPage(
 }
 
 /**
+ * Build a portable JSONL export of a session's transcript.
+ *
+ * Same format as `omnigent session export` (see `session_export` in
+ * `omnigent/cli.py`): the first line is the session metadata
+ * (`record_type: "session_meta"`), every following line is one committed
+ * item (`record_type: "item"`) in chronological order, so the file
+ * round-trips through `omnigent session import`. Records keep the raw
+ * wire shape rather than the SPA's parsed types for that parity.
+ */
+export async function exportSessionTranscript(sessionId: string): Promise<string> {
+  const metaParams = new URLSearchParams({
+    include_items: "false",
+    include_liveness: "false",
+  });
+  const metaRes = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(sessionId)}?${metaParams}`,
+  );
+  const meta = await readJsonOrThrow<Record<string, unknown>>(metaRes);
+  const lines = [JSON.stringify({ record_type: "session_meta", ...meta })];
+
+  // Pages are a cursor chain (each request needs the previous last_id),
+  // so the fetches cannot run in parallel.
+  /* oxlint-disable no-await-in-loop */
+  let after: string | null = null;
+  for (;;) {
+    const params = new URLSearchParams({ limit: "500", order: "asc" });
+    if (after) params.set("after", after);
+    const res = await authenticatedFetch(
+      `/v1/sessions/${encodeURIComponent(sessionId)}/items?${params}`,
+    );
+    const page = await readJsonOrThrow<{
+      data: Record<string, unknown>[];
+      has_more?: boolean;
+      last_id?: string | null;
+    }>(res);
+    for (const item of page.data) {
+      lines.push(JSON.stringify({ record_type: "item", ...item }));
+    }
+    if (!page.has_more || page.last_id == null) break;
+    after = page.last_id;
+  }
+  /* oxlint-enable no-await-in-loop */
+  return lines.join("\n") + "\n";
+}
+
+/**
  * Items the initial window requests, in one round trip.
  *
  * Opening a session must not keep fetching afterwards: growing the window

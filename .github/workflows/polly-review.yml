@@ -538,7 +538,8 @@ jobs:
             | tee /tmp/polly_output.txt \
             || { echo "::warning::Polly review exited non-zero"; cat polly-stderr.log; }
 
-          # Strip coordination text using a review marker or markdown heading.
+          # Keep raw stdout for failures, including secret-scan and posting errors.
+          # Write publishable content separately using a review marker or heading.
           # Missing review content fails the step so diagnostic logs are saved.
           python3 -c "
           import re, pathlib
@@ -552,9 +553,9 @@ jobs:
           else:
               m = re.search(r'^#{1,6} ', raw, re.MULTILINE)
               cleaned = raw[m.start():] if m else ''
-          pathlib.Path('/tmp/polly_output.txt').write_text(cleaned)
           if not cleaned.strip():
               raise SystemExit('::error::Polly produced no publishable review; see the failure logs artifact.')
+          pathlib.Path('/tmp/polly_review.txt').write_text(cleaned)
           "
 
           # Use a collision-resistant random delimiter so model output
@@ -562,7 +563,7 @@ jobs:
           delim="REVIEW_$(openssl rand -hex 8)"
           echo "review_text<<${delim}" >> "$GITHUB_OUTPUT"
           # Cap at 60 KB — GitHub comment body limit is ~65 KB.
-          head -c 61440 /tmp/polly_output.txt >> "$GITHUB_OUTPUT"
+          head -c 61440 /tmp/polly_review.txt >> "$GITHUB_OUTPUT"
           echo "${delim}" >> "$GITHUB_OUTPUT"
 
       - name: Scan review output for secrets before posting
@@ -574,7 +575,7 @@ jobs:
           # Abort if Polly's output contains the literal LLM API key — this
           # catches prompt-injection attacks that trick Polly into echoing the
           # secret into the PR comment.
-          if [ -n "$LLM_API_KEY" ] && grep -qF "$LLM_API_KEY" /tmp/polly_output.txt 2>/dev/null; then
+          if [ -n "$LLM_API_KEY" ] && grep -qF "$LLM_API_KEY" /tmp/polly_review.txt 2>/dev/null; then
             echo "::error::Review output contains LLM_API_KEY — aborting post to prevent secret exfiltration."
             exit 1
           fi
@@ -610,13 +611,42 @@ jobs:
           gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file /tmp/comment.md
           echo "Created new comment"
 
+      - name: Prepare Polly failure diagnostics
+        if: failure()
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          GATEWAY_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
+        run: |
+          python3 <<'PY'
+          import os, pathlib
+          destination = pathlib.Path('/tmp/polly-diagnostics')
+          destination.mkdir(parents=True, exist_ok=True)
+          sources = {
+              'polly-stderr.log': pathlib.Path('polly-stderr.log'),
+              'polly-output.txt': pathlib.Path('/tmp/polly_output.txt'),
+              'polly-review.txt': pathlib.Path('/tmp/polly_review.txt'),
+          }
+          logs = pathlib.Path.home() / '.omnigent' / 'logs'
+          for source in logs.rglob('*.log'):
+              sources['process-logs/' + str(source.relative_to(logs))] = source
+          for name, source in sources.items():
+              if not source.is_file():
+                  continue
+              text = source.read_text(errors='replace')
+              for key in ('LLM_API_KEY', 'GATEWAY_BASE_URL'):
+                  value = os.environ.get(key)
+                  if value:
+                      text = text.replace(value, '[REDACTED]')
+              target = destination / name
+              target.parent.mkdir(parents=True, exist_ok=True)
+              target.write_text(text)
+          PY
+
       - name: Upload logs on failure
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: polly-review-logs-${{ github.run_id }}
-          path: |
-            polly-stderr.log
-            /tmp/polly_output.txt
+          path: /tmp/polly-diagnostics/
           retention-days: 7
           if-no-files-found: ignore

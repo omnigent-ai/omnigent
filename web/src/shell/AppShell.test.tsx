@@ -1,3 +1,5 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
 import { SidebarDataProvider } from "@/hooks/useSidebarData";
 import type * as UseTerminalsModule from "@/hooks/useTerminals";
@@ -16,7 +18,6 @@ import {
   useNavigate,
   useSearchParams,
 } from "react-router-dom";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ServerInfo } from "@/lib/capabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
@@ -623,33 +624,45 @@ describe("AppShell header", () => {
     expect(screen.queryByTestId("file-viewer-inline")).toBeNull();
   });
 
-  it("shows owner actions for a top-level session omitted from conversation pages", () => {
-    mockConversations([]);
-    useSessionMock.mockReturnValue({
-      session: {
-        id: "conv_off_window",
-        agentId: "ag_owner",
-        agentName: "developer",
-        runnerId: null,
-        status: "idle",
-        createdAt: 1_700_000_000,
-        title: "Off-window owner session",
-        labels: {},
-        items: [],
-        pendingElicitations: [],
-        permissionLevel: 4,
-        parentSessionId: null,
-        subAgentName: null,
-        kind: "default",
-      },
-      isLoading: false,
-      error: null,
-    });
+  it.each([
+    { title: "Off-window owner session", archived: false },
+    { title: null, archived: true },
+  ])(
+    "shows owner actions for an off-window session ($title, archived=$archived)",
+    ({ title, archived }) => {
+      mockConversations([]);
+      useSessionMock.mockReturnValue({
+        session: {
+          id: "conv_off_window",
+          agentId: "ag_owner",
+          agentName: "developer",
+          runnerId: null,
+          status: "idle",
+          createdAt: 1_700_000_000,
+          title,
+          archived,
+          labels: {},
+          items: [],
+          pendingElicitations: [],
+          permissionLevel: 4,
+          parentSessionId: null,
+          subAgentName: null,
+          kind: "default",
+        },
+        isLoading: false,
+        error: null,
+      });
 
-    renderShell("/c/conv_off_window");
+      renderShell("/c/conv_off_window");
 
-    expect(screen.getByRole("button", { name: "Conversation actions" })).toBeInTheDocument();
-  });
+      const actions = screen.getByRole("button", { name: "Conversation actions" });
+      expect(actions).toBeInTheDocument();
+      fireEvent.pointerDown(actions, { button: 0, ctrlKey: false });
+      expect(
+        screen.getByRole("menuitem", { name: archived ? "Unarchive" : "Archive", exact: true }),
+      ).toBeInTheDocument();
+    },
+  );
 
   it("keeps owner actions hidden for an off-window sub-agent", () => {
     mockConversations([]);

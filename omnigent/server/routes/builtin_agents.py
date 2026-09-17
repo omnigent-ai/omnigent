@@ -1,9 +1,17 @@
 """Read-only route for discovering built-in agents (``GET /v1/agents``).
 
-The default catalog contains seeded and user-registered templates.
-``kind=session`` lists session-bound agents accessible through the caller's
-root-session grants. The picker uses both catalogs to select an ``agent_id``
-for session creation. See ``designs/BUILTIN_AGENTS.md``.
+Built-in agents are the long-lived, shared agents the server provides
+out of the box — the seeded ``claude-native-ui`` agent plus anything
+registered at startup with ``omnigent server --agent``. They are the
+``session_id IS NULL`` rows in ``agent_store``; ``agent_store.list()``
+already filters to exactly these. Session-scoped agents (created via
+multipart ``POST /v1/sessions``) belong to one conversation and are read
+through ``GET /v1/sessions/{id}/agent`` — never here.
+
+The Web UI's new-session picker calls this to discover bindable
+built-ins, then creates a session with
+``POST /v1/sessions {agent_id, host_id, workspace}``. See
+``designs/BUILTIN_AGENTS.md``.
 
 This is the read-only successor to the removed ``GET /api/agents`` list:
 there is intentionally no create/update/delete — agent writes happen
@@ -12,9 +20,7 @@ through session creation.
 
 from __future__ import annotations
 
-import asyncio
 import logging
-from typing import Literal
 
 from fastapi import APIRouter, Query, Request
 
@@ -141,11 +147,11 @@ def create_builtin_agents_router(
         after: str | None = Query(default=None),
         before: str | None = Query(default=None),
         order: str = Query(default="desc", pattern="^(asc|desc)$"),
-        kind: Literal["template", "session"] = Query(default="template"),
     ) -> PaginatedList:
         """List built-in agents with cursor-based pagination.
 
-        Templates are the default; session agents require access to their owning root.
+        Returns only built-in agents — ``agent_store.list()`` filters
+        ``session_id IS NULL`` — so session-scoped agents never appear.
 
         :param request: The incoming FastAPI request (for auth).
         :param limit: Maximum number of agents to return (1-1000).
@@ -154,16 +160,8 @@ def create_builtin_agents_router(
         :param order: Sort order, ``"asc"`` or ``"desc"``.
         :returns: A :class:`PaginatedList` of built-in agents.
         """
-        user_id = _require_user(request, auth_provider)
-        page = await asyncio.to_thread(
-            agent_store.list,
-            limit=limit,
-            after=after,
-            before=before,
-            order=order,
-            kind=kind,
-            accessible_by=user_id,
-        )
+        _require_user(request, auth_provider)
+        page = agent_store.list(limit=limit, after=after, before=before, order=order)
         return PaginatedList(
             data=[_to_agent_object(a, agent_cache) for a in page.data],
             first_id=page.first_id,
