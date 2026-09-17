@@ -163,6 +163,12 @@ _PROVIDER_RESOLUTION_HARNESS: dict[str, _ProviderHarness] = {
 # harness as having "no model-provider resolution".
 _CURSOR_HARNESSES: frozenset[str] = frozenset({"cursor", "cursor-native", "native-cursor"})
 
+# devin authenticates through its own ``devin auth login`` (Omnigent stores no
+# Devin credential), so — like cursor-agent — the CLI is the authority on which
+# models the account may use and the listing is a live CLI probe, not a
+# provider-config lookup.
+_DEVIN_HARNESSES: frozenset[str] = frozenset({"devin-native", "native-devin"})
+
 # Preferred inline family per single-family harness (pi consumes both).
 _KEY_AUTH_FAMILY: dict[str, str] = {
     "claude-sdk": ANTHROPIC_FAMILY,
@@ -605,6 +611,8 @@ def _resolve_model_provider_unsafe(spec: object, harness: str | None) -> Resolve
         return ResolvedModelProvider(
             kind=SUBSCRIPTION_KIND, cli="cursor-agent", detail="cursor-agent CLI login"
         )
+    if (harness or "") in _DEVIN_HARNESSES:
+        return ResolvedModelProvider(kind=SUBSCRIPTION_KIND, cli="devin", detail="devin CLI login")
 
     harness_type = _PROVIDER_RESOLUTION_HARNESS.get(harness or "")
     if harness_type is None:
@@ -1065,7 +1073,7 @@ def _listing_for_provider(
                 "this worker cannot run here"
             ),
         )
-    if provider.kind == SUBSCRIPTION_KIND and provider.cli != "cursor-agent":
+    if provider.kind == SUBSCRIPTION_KIND and provider.cli not in ("cursor-agent", "devin"):
         return _static_subscription_listing(provider)
     if provider.kind == CLI_CONFIG_KIND:
         return _static_cli_config_listing(provider)
@@ -1077,7 +1085,11 @@ def _listing_for_provider(
         return cached
     try:
         if provider.kind == SUBSCRIPTION_KIND:
-            listing = _fetch_cursor_cli_listing(provider)
+            listing = (
+                _fetch_devin_cli_listing(provider)
+                if provider.cli == "devin"
+                else _fetch_cursor_cli_listing(provider)
+            )
         elif provider.kind == DATABRICKS_KIND:
             listing = _fetch_databricks_listing(provider, transport=transport)
         elif provider.kind == KEY_KIND and provider.family == ANTHROPIC_FAMILY:
@@ -1137,6 +1149,28 @@ def _fetch_cursor_cli_listing(provider: ResolvedModelProvider) -> ModelListing:
             for option in options
         ),
         note=f"live models advertised by the {provider.cli or 'cursor-agent'} CLI",
+    )
+
+
+def _fetch_devin_cli_listing(provider: ResolvedModelProvider) -> ModelListing:
+    """Build a live listing from the installed Devin CLI.
+
+    Lists Devin model *families* (``claude-opus-5``, ``swe-2``, …) rather than
+    the ~400 raw variants: a variant id encodes the reasoning effort as a
+    suffix, and Omnigent carries effort as its own axis which
+    ``resolve_devin_launch_model`` recombines at launch.
+    """
+    from omnigent.harnesses.devin_native.main import list_devin_cli_model_options
+
+    options = list_devin_cli_model_options()
+    return ModelListing(
+        source="cli",
+        verified=True,
+        models=tuple(
+            ModelEntry(id=str(option["id"]), family=model_family_token(str(option["id"])))
+            for option in options
+        ),
+        note=f"live models advertised by the {provider.cli or 'devin'} CLI",
     )
 
 

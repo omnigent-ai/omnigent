@@ -6,7 +6,7 @@
 // and assert exactly which ids reach `setWatched`.
 
 import { act, cleanup, render, renderHook, waitFor } from "@testing-library/react";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { QueryClient, QueryClientProvider, QueryObserver } from "@tanstack/react-query";
 import { MemoryRouter, useNavigate } from "react-router-dom";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -35,6 +35,8 @@ vi.mock("@/lib/sessionUpdatesSocket", () => ({
 }));
 
 import { SessionUpdatesProvider } from "./SessionUpdatesProvider";
+import { useSaveProjectOrder } from "./useProjectOrder";
+import * as projectsApi from "@/lib/projectsApi";
 
 function conv(id: string): Conversation {
   return {
@@ -477,6 +479,124 @@ describe("SessionUpdatesProvider projects_changed frames", () => {
     expect(frameListener).toBeTypeOf("function");
     act(() => frameListener({ type: "projects_changed" }));
     expect(invalidate).toHaveBeenCalledWith({ queryKey: ["projects"] });
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ["project-order"] });
     expect(invalidate).toHaveBeenCalledWith({ queryKey: ["project-config"] });
+  });
+
+  it("refreshes both caches when a change arrives during the save's settlement refetch", async () => {
+    const client = new QueryClient();
+    const oldProjects = [{ id: "a", name: "A" }];
+    const newProjects = [{ id: "b", name: "B" }, ...oldProjects];
+    const oldOrder = { sort_mode: "manual" as const, ordered_project_ids: ["a"] };
+    const newOrder = { sort_mode: "manual" as const, ordered_project_ids: ["b", "a"] };
+    let finishProjects!: (value: typeof oldProjects) => void;
+    let finishOrder!: (value: typeof oldOrder) => void;
+    const fetchProjects = vi
+      .fn()
+      .mockReturnValueOnce(
+        new Promise<typeof oldProjects>((resolve) => {
+          finishProjects = resolve;
+        }),
+      )
+      .mockResolvedValue(newProjects);
+    const fetchOrder = vi
+      .fn()
+      .mockReturnValueOnce(
+        new Promise<typeof oldOrder>((resolve) => {
+          finishOrder = resolve;
+        }),
+      )
+      .mockResolvedValue(newOrder);
+    const stopProjects = new QueryObserver(client, {
+      queryKey: ["projects"],
+      queryFn: fetchProjects,
+      initialData: oldProjects,
+      staleTime: Infinity,
+    }).subscribe(() => {});
+    const stopOrder = new QueryObserver(client, {
+      queryKey: ["project-order"],
+      queryFn: fetchOrder,
+      initialData: oldOrder,
+      staleTime: Infinity,
+    }).subscribe(() => {});
+    const save = vi.spyOn(projectsApi, "saveProjectOrder").mockResolvedValue(oldOrder);
+    renderProvider(client, ["/"]);
+    const { result } = renderHook(() => useSaveProjectOrder(), {
+      wrapper: ({ children }: { children: ReactNode }) => (
+        <QueryClientProvider client={client}>{children}</QueryClientProvider>
+      ),
+    });
+    try {
+      act(() => result.current.mutate(oldProjects));
+      await waitFor(() => expect(fetchOrder).toHaveBeenCalledTimes(1));
+      expect(fetchProjects).toHaveBeenCalledTimes(1);
+      expect(client.isMutating({ mutationKey: ["project-order"] })).toBe(1);
+      const frameListener = subscribe.mock.calls.at(-1)?.[0] as unknown as (frame: unknown) => void;
+      act(() => frameListener({ type: "projects_changed" }));
+      expect(fetchProjects).toHaveBeenCalledTimes(1);
+      expect(fetchOrder).toHaveBeenCalledTimes(1);
+
+      // The in-flight reads captured the snapshot before the other tab's change.
+      await act(async () => {
+        finishProjects(oldProjects);
+        finishOrder(oldOrder);
+      });
+      await waitFor(() => {
+        expect(result.current.isSuccess).toBe(true);
+        expect(client.getQueryData(["projects"])).toEqual(newProjects);
+        expect(client.getQueryData(["project-order"])).toEqual(newOrder);
+      });
+      expect(fetchProjects).toHaveBeenCalledTimes(2);
+      expect(fetchOrder).toHaveBeenCalledTimes(2);
+    } finally {
+      stopProjects();
+      stopOrder();
+      save.mockRestore();
+    }
+  });
+
+  it("coalesces changes until all order saves finish, including a failed save", async () => {
+    const client = new QueryClient();
+    renderProvider(client, ["/"]);
+    let finish!: () => void;
+    let fail!: (error: Error) => void;
+    const first = client.getMutationCache().build(client, {
+      mutationKey: ["project-order"],
+      mutationFn: () =>
+        new Promise<void>((resolve) => {
+          finish = resolve;
+        }),
+    });
+    const second = client.getMutationCache().build(client, {
+      mutationKey: ["project-order"],
+      mutationFn: () =>
+        new Promise<void>((_resolve, reject) => {
+          fail = reject;
+        }),
+    });
+    const firstSave = first.execute(undefined);
+    const secondSave = second.execute(undefined).catch(() => {});
+    await waitFor(() => expect(fail).toBeTypeOf("function"));
+    const invalidate = vi.spyOn(client, "invalidateQueries");
+    const frameListener = subscribe.mock.calls.at(-1)?.[0] as unknown as (frame: unknown) => void;
+    act(() => {
+      frameListener({ type: "projects_changed" });
+      frameListener({ type: "projects_changed" });
+    });
+    await act(async () => {
+      finish();
+      await firstSave;
+    });
+    expect(invalidate).not.toHaveBeenCalledWith({ queryKey: ["projects"] });
+    expect(invalidate).not.toHaveBeenCalledWith({ queryKey: ["project-order"] });
+    invalidate.mockClear();
+    await act(async () => {
+      fail(new Error("offline"));
+      await secondSave;
+    });
+    expect(invalidate.mock.calls).toEqual([
+      [{ queryKey: ["projects"] }],
+      [{ queryKey: ["project-order"] }],
+    ]);
   });
 });

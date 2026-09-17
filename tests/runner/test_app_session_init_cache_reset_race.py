@@ -128,10 +128,12 @@ async def test_session_init_memoizes_spec_when_no_reset_intervenes() -> None:
             json={"session_id": _SESSION_ID, "agent_id": _AGENT_ID},
         )
         assert init_resp.status_code == 201, init_resp.text
-        skills_resp = await client.get(f"/v1/sessions/{_SESSION_ID}/skills")
+        skills_resp = await client.post(
+            f"/v1/sessions/{_SESSION_ID}/skills/resolve", json={"name": "missing-skill"}
+        )
 
-    assert skills_resp.status_code == 200, skills_resp.text
-    names = {skill["name"] for skill in skills_resp.json()["skills"]}
+    assert skills_resp.status_code == 404, skills_resp.text
+    names = set(skills_resp.json()["available"])
     assert resolver_calls == 1, (
         f"spec read after an uninterrupted init re-consulted the resolver "
         f"({resolver_calls} calls): init's memoization was wrongly suppressed"
@@ -196,10 +198,12 @@ async def test_session_init_does_not_reinstate_spec_superseded_by_reset() -> Non
         init_resp = await asyncio.wait_for(init_task, timeout=30)
         assert init_resp.status_code == 201, init_resp.text
 
-        skills_resp = await client.get(f"/v1/sessions/{_SESSION_ID}/skills")
+        skills_resp = await client.post(
+            f"/v1/sessions/{_SESSION_ID}/skills/resolve", json={"name": "missing-skill"}
+        )
 
-    assert skills_resp.status_code == 200, skills_resp.text
-    names = {skill["name"] for skill in skills_resp.json()["skills"]}
+    assert skills_resp.status_code == 404, skills_resp.text
+    names = set(skills_resp.json()["available"])
 
     # The acknowledged reset retired the v1 entry: the next spec read must
     # consult the resolver again rather than be served init's stale write.
@@ -536,10 +540,12 @@ async def test_session_init_fences_reset_during_legacy_context_load(
             f"(released: {process_manager.released})"
         )
 
-        skills_resp = await client.get(f"/v1/sessions/{session_id}/skills")
+        skills_resp = await client.post(
+            f"/v1/sessions/{session_id}/skills/resolve", json={"name": "missing-skill"}
+        )
 
-    assert skills_resp.status_code == 200, skills_resp.text
-    names = {skill["name"] for skill in skills_resp.json()["skills"]}
+    assert skills_resp.status_code == 404, skills_resp.text
+    names = set(skills_resp.json()["available"])
     assert resolver_calls == 2, (
         "spec read after a reset acknowledged during the legacy context load "
         "was served from the session spec cache: the generation was captured "
@@ -640,10 +646,12 @@ async def test_session_init_fences_reset_during_harness_spawn() -> None:
         get_resp = await client.get(f"/v1/sessions/{session_id}")
         assert get_resp.status_code == 200, get_resp.text
 
-        skills_resp = await client.get(f"/v1/sessions/{session_id}/skills")
+        skills_resp = await client.post(
+            f"/v1/sessions/{session_id}/skills/resolve", json={"name": "missing-skill"}
+        )
 
-    assert skills_resp.status_code == 200, skills_resp.text
-    names = {skill["name"] for skill in skills_resp.json()["skills"]}
+    assert skills_resp.status_code == 404, skills_resp.text
+    names = set(skills_resp.json()["available"])
     # The reset popped the spec entry init memoized just before the spawn:
     # the next spec read must consult the resolver again.
     assert resolver_calls == 2, (

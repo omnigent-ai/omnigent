@@ -1012,6 +1012,15 @@ def _resolve_databricks_claude_model(profile: str | None) -> str:
         for tier in ("opus", "sonnet", "haiku", "fable"):
             servable = families.get(tier)
             if servable:
+                logger.warning(
+                    "claude-sdk: no model pinned for this session; resolved %r "
+                    "from the %r workspace catalog (%s precedence). Pin a model "
+                    "in the agent spec or dispatch to control which endpoint "
+                    "is billed.",
+                    servable,
+                    profile or "DEFAULT",
+                    " > ".join(("opus", "sonnet", "haiku", "fable")),
+                )
                 return servable
     except Exception:  # noqa: BLE001 — the bundled catalog is the last resort
         logger.warning(
@@ -1020,7 +1029,14 @@ def _resolve_databricks_claude_model(profile: str | None) -> str:
             profile,
             exc_info=True,
         )
-    return model_catalog.resolve_catalog_model("databricks", family="claude").model_id
+    resolved = model_catalog.resolve_catalog_model("databricks", family="claude").model_id
+    logger.warning(
+        "claude-sdk: no model pinned for this session; resolved %r from the "
+        "bundled catalog. Pin a model in the agent spec or dispatch to "
+        "control which endpoint is billed.",
+        resolved,
+    )
+    return resolved
 
 
 class _GatewayModelVocabulary(NamedTuple):
@@ -1127,11 +1143,13 @@ def _resolve_gateway_env(
     command + a refresh TTL. When the gateway base URL and auth command are
     supplied directly (the generic-provider producer, or ucode), they are
     used verbatim. When only a Databricks profile is supplied (no override
-    values), the Databricks-specific fallback derives both from
-    ``~/.databrickscfg``:
-      1. ~/.databrickscfg profile credentials
-      2. ~/.databrickscfg (explicit profile, DEFAULT, or first valid section)
-    Returns an empty dict if no credentials are available.
+    values), the Databricks-specific fallback derives both from the profile's
+    workspace **host** (see
+    :func:`~omnigent.inner.databricks_executor._databricks_gateway_host`).
+    Only the host is needed: the bearer token is minted at request time by
+    the generated auth command, so OAuth U2M profiles (``auth_type =
+    databricks-cli``, no static ``token`` field) resolve too. Returns an
+    empty dict if no workspace host can be resolved.
 
     The bearer token itself is not returned. Claude Code receives an
     invocation-local ``apiKeyHelper`` setting and refresh TTL instead, so
@@ -1171,16 +1189,22 @@ def _resolve_gateway_env(
             _CLAUDE_API_KEY_HELPER_ENV_KEY: auth_command_override,
         }
     if host is None:
+        # Only the workspace host is needed here: the auth command mints the
+        # bearer at request time. Resolving the host (rather than a static
+        # ``(host, token)`` credential pair) keeps OAuth U2M profiles working
+        # — they carry a ``host`` but no ``token`` field, so a token-requiring
+        # lookup would fail even though ``databricks auth token`` succeeds.
+        # Same derivation the codex gateway path uses.
         try:
-            from .databricks_executor import _read_databrickscfg
+            from .databricks_executor import _databricks_gateway_host
 
-            creds = _read_databrickscfg(profile)
+            host = _databricks_gateway_host(profile)
         except ImportError:
-            creds = None
+            host = None
 
-        if creds is None:
+        if not host:
             return {}
-        host = creds.host.rstrip("/")
+        host = host.rstrip("/")
         base_url = (
             base_url_override if base_url_override is not None else f"{host}/ai-gateway/anthropic"
         )
@@ -1724,6 +1748,7 @@ class ClaudeSDKExecutor(Executor):
         self._gateway_uses_databricks_profile = bool(
             gateway and self._gateway_host is None and base_url_override is None
         )
+        self._resolved_default_model: str | None = None
 
         # Lazily-started local proxy that restores request fields the
         # Claude CLI strips on the gateway path (thinking.display).
@@ -2497,9 +2522,11 @@ class ClaudeSDKExecutor(Executor):
         # spawning, so no ``databricks-*`` default is injected there.
         model = cfg.model or self._model_override
         if model is None and self._gateway_uses_databricks_profile:
-            model = await run_sync_on_thread(
-                _resolve_databricks_claude_model, self._databricks_profile
-            )
+            if self._resolved_default_model is None:
+                self._resolved_default_model = await run_sync_on_thread(
+                    _resolve_databricks_claude_model, self._databricks_profile
+                )
+            model = self._resolved_default_model
 
         # Build env: Databricks gateway settings derived from profile-backed
         # creds. CLAUDECODE removal happens around the subprocess spawn in

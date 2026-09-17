@@ -198,6 +198,8 @@ def test_record_to_row_captures_stack_trace() -> None:
         )
     row = dl.record_to_row(record, source="server")
     assert "ValueError: boom" in (row["stack_trace"] or "")
+    assert row["attributes"]["exception_type"] == "ValueError"
+    assert "exception_cause_type" not in row["attributes"]
 
 
 def test_record_to_row_auto_attributes_logged_exception() -> None:
@@ -210,13 +212,21 @@ def test_record_to_row_auto_attributes_logged_exception() -> None:
     import sys
 
     try:
-        raise ValueError("boom")
-    except ValueError:
+        try:
+            raise TimeoutError("private upstream URL")
+        except TimeoutError as cause:
+            raise RuntimeError("private launch configuration") from cause
+    except RuntimeError:
         record = logging.LogRecord(
             "omnigent", logging.ERROR, __file__, 1, "failed", (), sys.exc_info()
         )
     attrs = dl.record_to_row(record, source="server")["attributes"]
-    assert attrs == {"error_category": "unknown", "error_impact": "unknown"}
+    assert attrs == {
+        "error_category": "unknown",
+        "error_impact": "unknown",
+        "exception_type": "RuntimeError",
+        "exception_cause_type": "TimeoutError",
+    }
 
 
 def test_record_to_row_auto_attributes_omnigent_error_from_its_axes() -> None:
@@ -248,9 +258,14 @@ def test_record_to_row_explicit_attributes_win_over_derived() -> None:
         record = logging.LogRecord(
             "omnigent", logging.ERROR, __file__, 1, "failed", (), sys.exc_info()
         )
-    record.attributes = {"error_category": "server", "error_impact": "blocking"}
+    record.attributes = {
+        "error_category": "server",
+        "error_impact": "blocking",
+        "exception_type": "ExplicitFailure",
+        "exception_cause_type": "ExplicitCause",
+    }
     attrs = dl.record_to_row(record, source="server")["attributes"]
-    assert attrs == {"error_category": "server", "error_impact": "blocking"}
+    assert attrs == record.attributes
 
 
 def test_phase_scope_stamps_error_phase_on_logged_exception() -> None:

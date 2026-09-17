@@ -608,6 +608,11 @@ class ConversationStore(ABC):
             means return all types.
         :returns: A :class:`PagedList` of
             :class:`ConversationItem` objects.
+        :raises omnigent.errors.StaleCursorError: If the ``after``/``before``
+            item no longer exists in this conversation (e.g. deleted
+            between two page fetches) — its position is unknowable, and an
+            empty page would be indistinguishable from a completed
+            enumeration.
         """
         ...
 
@@ -759,10 +764,11 @@ class ConversationStore(ABC):
             does. Powers the sidebar's session search on
             ``GET /v1/sessions?search_query=...``.
         :param accessible_by: When set, filter to sessions the
-            user has access to via ``session_permissions``. Uses
-            a UNION subquery: sessions the user has a direct
-            grant on, plus sessions with a ``"__public__"`` grant.
-            ``None`` disables the filter (returns all sessions).
+            user has a direct grant on in ``session_permissions``.
+            Public (``"__public__"``) grants are deliberately NOT
+            included — a public-only session does not appear in the
+            user's own list. ``None`` disables the filter (returns
+            all sessions).
         :param owned_by: When set, filter to sessions the user
             *owns* (an ``owner``-level grant), a stricter form of
             ``accessible_by`` that excludes sessions merely shared
@@ -796,6 +802,10 @@ class ConversationStore(ABC):
             in a single indexed query instead of fetching all children.
         :returns: A :class:`PagedList` of :class:`Conversation`
             objects.
+        :raises omnigent.errors.StaleCursorError: If the ``after``/``before``
+            conversation no longer exists (e.g. deleted between two page
+            fetches) — its sort position is unknowable, and an empty page
+            would be indistinguishable from a completed enumeration.
         """
         ...
 
@@ -1055,8 +1065,8 @@ class ConversationStore(ABC):
         """
         Persist the full session-state snapshot for a conversation.
 
-        Overwrites the existing ``session_state`` JSON column with
-        the serialized *state* dict. Called by
+        Replaces policy-visible state while preserving the internal Plan key
+        in the existing conversation metadata JSON. Called by
         :meth:`PolicyEngine.apply_state_updates` after applying
         structured :class:`StateUpdate` operations to the hot
         cache.
@@ -1090,6 +1100,14 @@ class ConversationStore(ABC):
             sub-dict (per-model token/cost buckets), hence ``Any``.
         """
         ...
+
+    def set_session_todos(
+        self,
+        conversation_id: str,
+        todos: list[dict[str, Any]],
+    ) -> bool:
+        """Persist the native Plan snapshot; empty clears, missing metadata returns false."""
+        raise NotImplementedError
 
     @abstractmethod
     def set_conversation_project(

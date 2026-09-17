@@ -28,8 +28,6 @@ import type {
   SessionEventInput,
   SessionItem,
   SessionStatus,
-  SkillsStatus,
-  SkillSummary,
 } from "./types";
 
 /** Returns the client surface label for the X-Omnigent-Client telemetry header. */
@@ -240,13 +238,6 @@ interface SessionResponseWire {
     status: "pending" | "in_progress" | "completed";
     activeForm: string;
   }[];
-  /**
-   * Skills the bound agent can invoke — bundled + host-discovered
-   * (subject to the spec's ``skills_filter``). Just name + one-line
-   * description. Surfaced in the web composer's slash-command menu.
-   */
-  skills?: SkillSummary[];
-  skills_status?: SkillsStatus;
   /** Runner-owned model picker rows for native sessions. */
   model_options?: NativeModelOption[];
   /**
@@ -359,8 +350,6 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     subAgentName: wire.sub_agent_name ?? null,
     kind: wire.kind === "sub_agent" ? "sub_agent" : "default",
     todos: wire.todos ?? [],
-    skills: wire.skills ?? [],
-    skillsStatus: wire.skills_status,
     codexModelOptions: wire.model_options ?? [],
     terminalPending: wire.terminal_pending ?? false,
     sandboxStatus: wire.sandbox_status ?? null,
@@ -1176,6 +1165,52 @@ export async function fetchSessionItemsPage(
   const page = await readJsonOrThrow<SessionItemsResponseWire>(res);
   // Server returns newest-first; reverse to chronological for rendering.
   return { items: [...page.data].reverse(), hasMore: page.has_more };
+}
+
+/**
+ * Build a portable JSONL export of a session's transcript.
+ *
+ * Same format as `omnigent session export` (see `session_export` in
+ * `omnigent/cli.py`): the first line is the session metadata
+ * (`record_type: "session_meta"`), every following line is one committed
+ * item (`record_type: "item"`) in chronological order, so the file
+ * round-trips through `omnigent session import`. Records keep the raw
+ * wire shape rather than the SPA's parsed types for that parity.
+ */
+export async function exportSessionTranscript(sessionId: string): Promise<string> {
+  const metaParams = new URLSearchParams({
+    include_items: "false",
+    include_liveness: "false",
+  });
+  const metaRes = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(sessionId)}?${metaParams}`,
+  );
+  const meta = await readJsonOrThrow<Record<string, unknown>>(metaRes);
+  const lines = [JSON.stringify({ record_type: "session_meta", ...meta })];
+
+  // Pages are a cursor chain (each request needs the previous last_id),
+  // so the fetches cannot run in parallel.
+  /* oxlint-disable no-await-in-loop */
+  let after: string | null = null;
+  for (;;) {
+    const params = new URLSearchParams({ limit: "500", order: "asc" });
+    if (after) params.set("after", after);
+    const res = await authenticatedFetch(
+      `/v1/sessions/${encodeURIComponent(sessionId)}/items?${params}`,
+    );
+    const page = await readJsonOrThrow<{
+      data: Record<string, unknown>[];
+      has_more?: boolean;
+      last_id?: string | null;
+    }>(res);
+    for (const item of page.data) {
+      lines.push(JSON.stringify({ record_type: "item", ...item }));
+    }
+    if (!page.has_more || page.last_id == null) break;
+    after = page.last_id;
+  }
+  /* oxlint-enable no-await-in-loop */
+  return lines.join("\n") + "\n";
 }
 
 /**

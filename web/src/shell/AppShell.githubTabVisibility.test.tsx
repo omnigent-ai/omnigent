@@ -14,6 +14,7 @@ import { Link, MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
+import { writeWorkspacePanelDefault } from "@/lib/workspacePanelPreferences";
 
 vi.mock("@/hooks/useConversations", async (importOriginal) => ({
   ...(await importOriginal<typeof UseConversationsModule>()),
@@ -94,6 +95,7 @@ beforeEach(() => {
   // The rail persists per-session state (selected tab, width) in
   // localStorage; clear it so one test's writes can't leak into another.
   localStorage.clear();
+  writeWorkspacePanelDefault("open");
   sessionStorage.clear();
   vi.mocked(isMobileViewport).mockReturnValue(false);
   useGithubInfoMock.mockReset();

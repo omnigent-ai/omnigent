@@ -37,6 +37,7 @@ StartupEvent = Literal[
     "launch_cancelled",
     "launch_incomplete",
 ]
+NativeHarness = Literal["claude-native", "codex-native"]
 
 
 @dataclass(frozen=True)
@@ -107,6 +108,7 @@ def capture_cli_entry(function: Callable[_P, _R]) -> Callable[_P, _R]:
 @dataclass
 class _Attempt:
     entry: _Entry
+    harness: NativeHarness
     launch_kind: Literal["create", "resume"]
     session_id: str | None = None
     events: set[str] = field(default_factory=set)
@@ -130,7 +132,7 @@ class _Attempt:
             "schema_version": 1,
             "event": event,
             "attempt_id": self.entry.attempt_id,
-            "harness": "codex-native",
+            "harness": self.harness,
             "launch_kind": self.launch_kind,
             "start_boundary": self.entry.start_boundary,
             "started_at_unix_ms": self.entry.started_at_unix_ms,
@@ -169,11 +171,13 @@ def record_startup_event(
 
 
 @contextlib.contextmanager
-def codex_startup_attempt(
-    *, launch_kind: Literal["create", "resume"] = "create"
+def native_startup_attempt(
+    *,
+    harness: NativeHarness,
+    launch_kind: Literal["create", "resume"] = "create",
 ) -> Iterator[None]:
     """Track one launch through attachment, retaining unsuccessful attempts."""
-    attempt = _Attempt(_entry.get() or _capture_entry(), launch_kind)
+    attempt = _Attempt(_entry.get() or _capture_entry(), harness, launch_kind)
     token = _attempt.set(attempt)
     # Fleet telemetry must survive a quieter CLI. Local file/stderr handlers
     # still apply their own configured level.
@@ -203,17 +207,22 @@ def codex_startup_attempt(
         _attempt.reset(token)
 
 
-def observe_codex_startup(function: Callable[_P, _R]) -> Callable[_P, _R]:
-    """Instrument the command callback, including validation and backend setup."""
+def observe_native_startup(
+    harness: NativeHarness,
+) -> Callable[[Callable[_P, _R]], Callable[_P, _R]]:
+    """Instrument a native command, including validation and backend setup."""
 
-    @functools.wraps(function)
-    def wrapped(*args: _P.args, **kwargs: _P.kwargs) -> _R:
-        launch_kind = (
-            "resume"
-            if kwargs.get("resume") is not None or kwargs.get("session_id") is not None
-            else "create"
-        )
-        with codex_startup_attempt(launch_kind=launch_kind):
-            return function(*args, **kwargs)
+    def decorate(function: Callable[_P, _R]) -> Callable[_P, _R]:
+        @functools.wraps(function)
+        def wrapped(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+            launch_kind = (
+                "resume"
+                if kwargs.get("resume") is not None or kwargs.get("session_id") is not None
+                else "create"
+            )
+            with native_startup_attempt(harness=harness, launch_kind=launch_kind):
+                return function(*args, **kwargs)
 
-    return wrapped
+        return wrapped
+
+    return decorate

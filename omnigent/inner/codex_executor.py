@@ -276,6 +276,112 @@ def _extract_codex_last_turn_usage(params: object, model: str | None) -> dict[st
     return usage
 
 
+def _extract_codex_thread_total_usage(params: object) -> dict[str, int] | None:
+    """Extract the raw cumulative counters from a ``thread/tokenUsage/updated``
+    payload's ``total`` breakdown.
+
+    Codex's ``tokenUsage.total`` is cumulative across the whole thread (the
+    CLI subtracts prior totals to recover per-turn deltas), unlike ``last``,
+    which covers only the latest model request. Returns the raw counters so
+    the session can diff them against the previous turn boundary.
+
+    :param params: Codex ``thread/tokenUsage/updated`` params.
+    :returns: The raw cumulative counters, or ``None`` when the payload has
+        no usable ``total`` breakdown (caller falls back to ``last``).
+    """
+    if not isinstance(params, dict):
+        return None
+    token_usage = params.get("tokenUsage")
+    if not isinstance(token_usage, dict):
+        return None
+    total = token_usage.get("total")
+    if not isinstance(total, dict):
+        return None
+    if not any(
+        isinstance(total.get(key), int) for key in ("inputTokens", "outputTokens", "totalTokens")
+    ):
+        return None
+    return {
+        "inputTokens": int(total.get("inputTokens") or 0),
+        "cachedInputTokens": int(total.get("cachedInputTokens") or 0),
+        "outputTokens": int(total.get("outputTokens") or 0),
+        "totalTokens": int(total.get("totalTokens") or 0),
+    }
+
+
+def _codex_turn_usage_from_totals(
+    latest: dict[str, int],
+    baseline: dict[str, int] | None,
+    model: str | None,
+) -> dict[str, object]:
+    """Map the growth of the thread's cumulative counters since the last turn
+    boundary onto the wire shape that :class:`TurnComplete` consumes.
+
+    A turn that spans several model requests (model -> tool -> model -> final)
+    emits one ``thread/tokenUsage/updated`` per request, and ``last`` covers
+    only the newest request — so the turn's usage is the delta of the
+    cumulative ``total`` counters instead. Deltas clamp at zero so a counter
+    reset can never report negative usage. Cached tokens split out of
+    ``input_tokens`` exactly as in :func:`_extract_codex_last_turn_usage`.
+
+    :param latest: Raw cumulative counters from the newest usage update.
+    :param baseline: Raw cumulative counters consumed at the previous turn
+        boundary, or ``None`` for the thread's first turn.
+    :param model: The resolved model, stamped as ``"model"`` (see
+        :func:`_extract_codex_last_turn_usage`).
+    """
+
+    def _delta(key: str) -> int:
+        prior = baseline.get(key, 0) if baseline else 0
+        return max(latest.get(key, 0) - prior, 0)
+
+    input_total = _delta("inputTokens")
+    cached = min(_delta("cachedInputTokens"), input_total)
+    usage: dict[str, object] = {
+        "input_tokens": input_total - cached,
+        "output_tokens": _delta("outputTokens"),
+        "total_tokens": _delta("totalTokens"),
+    }
+    if cached:
+        usage["cache_read_input_tokens"] = cached
+    if model:
+        usage["model"] = model
+    return usage
+
+
+def _extract_codex_context_tokens(params: object) -> int | None:
+    """Window-fill snapshot from a ``thread/tokenUsage/updated`` payload's
+    ``last`` breakdown: the size of the latest model request, the proxy for
+    how full the context window is going into the next one.
+
+    Reported as ``context_tokens`` — a per-update snapshot the occupancy
+    meter reads (server-side it pairs with the model's catalog window to
+    size the ring). It is never summed across a turn and is distinct from
+    the billing ``total_tokens``, which on the cumulative-delta path is a
+    turn total, not window fill. ``last.totalTokens`` already covers input
+    (inclusive of cached, which still occupies the window) plus output;
+    recompute from components when the provider omits it. Mirrors
+    ``pi_executor``'s last-call context split.
+
+    :param params: Codex ``thread/tokenUsage/updated`` params.
+    :returns: The window-fill token count, or ``None`` when the payload has
+        no usable ``last`` breakdown.
+    """
+    if not isinstance(params, dict):
+        return None
+    token_usage = params.get("tokenUsage")
+    if not isinstance(token_usage, dict):
+        return None
+    last = token_usage.get("last")
+    if not isinstance(last, dict):
+        return None
+    total = int(last.get("totalTokens") or 0)
+    if total > 0:
+        return total
+    recomputed = int(last.get("inputTokens") or 0) + int(last.get("outputTokens") or 0)
+    return recomputed or None
+
+
 def _format_codex_error_params(params: object) -> str:
     """
     Format a Codex App Server JSON-RPC error frame's ``params`` dict
@@ -2312,11 +2418,17 @@ class _CodexAppServerSession:
         self._process_cwd: Path | None = None
         # Private CODEX_HOME so the subprocess never writes to the user's ~/.codex/.
         self._codex_home_dir: Path | None = None
-        # Most recent ``thread/tokenUsage/updated`` payload's ``last``
-        # turn breakdown, mapped to the wire shape. Consumed (and cleared)
-        # on the next ``turn/completed`` so each TurnComplete carries the
-        # usage for the turn that just finished.
+        # In-flight turn's usage, mapped to the wire shape: billing figures
+        # are the delta of the thread's cumulative ``tokenUsage.total``
+        # counters since the last turn boundary (``last`` covers only the
+        # latest model request, so a multi-request turn would under-report),
+        # plus a ``context_tokens`` window-fill snapshot from ``last``.
+        # Consumed (and cleared) on the next ``turn/completed``.
         self._last_turn_usage: dict[str, object] | None = None
+        # Raw cumulative ``tokenUsage.total`` counters: the newest observed
+        # values, and the snapshot consumed at the last turn boundary.
+        self._thread_usage_total_raw: dict[str, int] | None = None
+        self._thread_usage_baseline_raw: dict[str, int] | None = None
         # Serialize concurrent writes to the subprocess stdin so that parallel
         # tool-call responses don't interleave bytes on the pipe.
         self._stdin_lock = asyncio.Lock()
@@ -2508,6 +2620,15 @@ class _CodexAppServerSession:
         if len(self._recent_events) > 20:
             self._recent_events.pop(0)
 
+    def _consume_turn_usage(self) -> dict[str, object] | None:
+        """Return the finished turn's usage and advance the thread baseline
+        so the next turn's delta excludes everything reported so far."""
+        usage = self._last_turn_usage
+        self._last_turn_usage = None
+        if self._thread_usage_total_raw is not None:
+            self._thread_usage_baseline_raw = self._thread_usage_total_raw
+        return usage
+
     def _format_recent_events(self) -> list[CodexParams]:
         formatted: list[CodexParams] = []
         for message in self._recent_events[-8:]:
@@ -2640,6 +2761,10 @@ class _CodexAppServerSession:
             # Fresh thread: forget the prior thread's applied effort so the
             # settings update below re-sends it for this thread.
             self._applied_effort = None
+            # Fresh thread: cumulative usage counters restart at zero.
+            self._thread_usage_total_raw = None
+            self._thread_usage_baseline_raw = None
+            self._last_turn_usage = None
 
         assert self.thread_id is not None
         latest_user_content = _extract_latest_user_content(messages)
@@ -3013,8 +3138,7 @@ class _CodexAppServerSession:
                                 active_turn_id,
                                 final_response[:120],
                             )
-                            turn_usage = self._last_turn_usage
-                            self._last_turn_usage = None
+                            turn_usage = self._consume_turn_usage()
                             _notify_usage_from_dict(model=model, usage=turn_usage)
                             yield TurnComplete(response=final_response, usage=turn_usage)
                             return
@@ -3027,7 +3151,24 @@ class _CodexAppServerSession:
                         continue
 
                 if method == "thread/tokenUsage/updated":
-                    self._last_turn_usage = _extract_codex_last_turn_usage(params, model)
+                    total_raw = _extract_codex_thread_total_usage(params)
+                    if total_raw is not None:
+                        self._thread_usage_total_raw = total_raw
+                        self._last_turn_usage = _codex_turn_usage_from_totals(
+                            total_raw, self._thread_usage_baseline_raw, model
+                        )
+                    else:
+                        # No cumulative breakdown — fall back to the newest
+                        # request's ``last`` (under-reports multi-request turns).
+                        self._last_turn_usage = _extract_codex_last_turn_usage(params, model)
+                    # context_tokens is window fill: a snapshot of the latest
+                    # request from ``last``, carried alongside the billing
+                    # figures so the occupancy meter reads it rather than the
+                    # summable ``total_tokens``.
+                    if self._last_turn_usage is not None:
+                        context_tokens = _extract_codex_context_tokens(params)
+                        if context_tokens is not None:
+                            self._last_turn_usage["context_tokens"] = context_tokens
                     continue
 
                 if method == "turn/completed":
@@ -3054,8 +3195,7 @@ class _CodexAppServerSession:
                             message_buffers=message_buffers,
                             final_response=final_response,
                         )
-                    turn_usage = self._last_turn_usage
-                    self._last_turn_usage = None
+                    turn_usage = self._consume_turn_usage()
                     _notify_usage_from_dict(model=model, usage=turn_usage)
                     yield TurnComplete(response=final_response, usage=turn_usage)
                     return

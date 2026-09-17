@@ -21,6 +21,7 @@ from fastapi.routing import APIRoute
 from starlette.datastructures import Headers
 from starlette.types import Message, Receive, Scope, Send
 
+from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.debug_logging import add_audit_attrs, mark_request_audit_suppressed
 from omnigent.entities import (
     ErrorData,
@@ -101,6 +102,7 @@ from omnigent.server.routes._sessions.common import (
     _EXTERNAL_COMPACTION_STATUS_TYPE,
     _EXTERNAL_COMPACTION_STATUS_VALUES,
     _EXTERNAL_CONVERSATION_ITEM_TYPE,
+    _EXTERNAL_DEVIN_SUBAGENT_START_TYPE,
     _EXTERNAL_ELICITATION_RESOLVED_TYPE,
     _EXTERNAL_MCP_STARTUP_STATUS_VALUES,
     _EXTERNAL_MCP_STARTUP_TYPE,
@@ -150,6 +152,7 @@ from omnigent.server.routes._sessions.helpers import (
     _get_runner_client_for_resource_access,
     _handle_external_session_todos,
     _is_codex_native_subagent,
+    _is_devin_native_subagent,
     _launch_runner_on_host,
     _parse_background_tasks,
     _persist_external_acp_subagent_start,
@@ -207,6 +210,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _persist_external_antigravity_subagent_start,
     _persist_external_codex_subagent_start,
     _persist_external_conversation_item,
+    _persist_external_devin_subagent_start,
     _persist_external_session_usage,
     _persist_host_launch_failure_turn,
     _persist_native_terminal_failure,
@@ -243,10 +247,13 @@ from omnigent.util.session_lifecycle import (
     is_session_closed,
 )
 
+# custom-lint: disable-next=workspace-scoped-cache -- lock; collision only serializes
 _retry_recovery_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
     weakref.WeakValueDictionary()
 )
-_retry_recovery_tasks: dict[str, asyncio.Task[dict[str, bool | str]]] = {}
+_retry_recovery_tasks: WorkspaceScopedCache[str, asyncio.Task[dict[str, bool | str]]] = (
+    WorkspaceScopedCache()
+)
 
 # POST /events types that arrive per streamed chunk — the harness echoing its
 # own live output back. Their per-call audit row is pure noise (the content is
@@ -692,6 +699,7 @@ def register_events_routes(
             _EXTERNAL_ACP_SUBAGENT_START_TYPE,
             _EXTERNAL_CODEX_SUBAGENT_START_TYPE,
             _EXTERNAL_ANTIGRAVITY_SUBAGENT_START_TYPE,
+            _EXTERNAL_DEVIN_SUBAGENT_START_TYPE,
             _EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE,
             _EXTERNAL_CODEX_APPROVAL_MODE_CHANGE_TYPE,
         ):
@@ -1418,6 +1426,22 @@ def register_events_routes(
             if effective_status != status:
                 status = effective_status
                 body.data["status"] = status
+            if status == "quiesced":
+                # The claude-native sub-agent transcript-quiescence badge: a
+                # UI signal only. Publish it as an idle badge, but never
+                # forward it to the runner — the runner's terminal-delivery
+                # branch consumes "idle"/"failed" as authoritative
+                # completions, and a >5s transcript gap is not one.
+                _publish_status(
+                    session_id,
+                    "idle",
+                    None,
+                    response_id=response_id,
+                    background_task_count=bg_count,
+                    background_tasks=bg_tasks,
+                    blocked_on=blocked_on,
+                )
+                return {"queued": False}
             # Terminal edges carry the harness's own persisted text: the
             # child's result on ``idle``, and on ``failed`` — when the
             # forwarder attached no detail — its error report (claude-native's
@@ -1488,10 +1512,13 @@ def register_events_routes(
                 conv.kind == "sub_agent"
                 and status in {"idle", "failed"}
                 and not _is_codex_native_subagent(conv)
+                and not _is_devin_native_subagent(conv)
             ):
-                # Codex-internal children are tracked inside the same
-                # app-server thread tree; they have no runner inbox entry
-                # to forward terminal status to.
+                # Codex-internal and devin-native children are mirrors with no
+                # runner inbox work entry to forward terminal status to: codex
+                # collab threads live in the app-server thread tree, and a
+                # devin sub-agent is a reconstructed chain of the parent
+                # session, never an omnigent-dispatched runner sub-agent.
                 if runner_result is None:
                     # The child's pinned runner_id is stale — its runner was
                     # relaunched under a new id and only the parent was
@@ -1641,7 +1668,7 @@ def register_events_routes(
             )
             return {"queued": False}
         if body.type == _EXTERNAL_SESSION_TODOS_TYPE:
-            _handle_external_session_todos(session_id, body)
+            await _handle_external_session_todos(session_id, body, conversation_store)
             return {"queued": False}
         if body.type == _EXTERNAL_SUBAGENT_START_TYPE:
             child_id = await _persist_external_subagent_start(
@@ -1671,6 +1698,16 @@ def register_events_routes(
                 body,
                 conversation_store,
             )
+            return {"queued": False, "child_session_id": child_id}
+        if body.type == _EXTERNAL_DEVIN_SUBAGENT_START_TYPE:
+            child_id = await _persist_external_devin_subagent_start(
+                session_id,
+                conv,
+                body,
+                conversation_store,
+            )
+            # Returned to the devin-native forwarder so it can post the
+            # reconstructed sub-agent transcript into the child id.
             return {"queued": False, "child_session_id": child_id}
         if body.type == _EXTERNAL_ACP_SUBAGENT_START_TYPE:
             child_id = await _persist_external_acp_subagent_start(
@@ -2421,9 +2458,10 @@ def register_events_routes(
             )
         if runner_client is not None:
             try:
+                # Allow initialization, forwarder, and resource cleanup to finish.
                 await runner_client.delete(
                     f"/v1/sessions/{session_id}",
-                    timeout=10.0,
+                    timeout=60.0,
                 )
             except (httpx.HTTPError, ConnectionError):
                 _logger.warning(

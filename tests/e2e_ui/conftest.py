@@ -62,6 +62,7 @@ from tests.codex_parity.sidecar_harness import (
     build_sidecar_bin,
     start_codex_responses_sidecar,
 )
+from tests.e2e_ui import timings
 from tests.e2e_ui.url_safety import DEV_PORTS, unsafe_ui_base_url_reason
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -302,6 +303,7 @@ def pytest_addoption(parser: pytest.Parser) -> None:
             "instead of rebuilding. Fails if no build is present."
         ),
     )
+    timings.pytest_addoption(parser)
     # Round-robin shard split for the e2e-ui CI matrix. We roll our own
     # (rather than pull in pytest-shard / pytest-split) so the partition
     # is a dependency-free strided slice -- see pytest_collection_modifyitems
@@ -325,6 +327,7 @@ def pytest_configure(config: pytest.Config) -> None:
 
     :param config: Pytest config with repo and pytest-playwright options.
     """
+    timings.pytest_configure(config)
     base_url = config.getoption("--ui-base-url")
     if base_url:
         _validate_ui_base_url(base_url)
@@ -909,6 +912,7 @@ def _spawn_runner_against_external_server(
     # that depend on ``server_pid`` (only valid when this fixture spawns
     # the server too) will KeyError, which is the right failure shape.
     _server_state["runner_id"] = runner_id
+    _server_state["runner_pid"] = proc.pid
     # Exposed so a test whose predecessor killed the shared runner (e.g.
     # test_stale_stream) can respawn one via :func:`_ensure_runner_online`.
     _server_state["binding_token"] = binding_token
@@ -2227,6 +2231,17 @@ def _ui_defaults() -> None:
     for streaming-text assertions without masking real hangs.
     """
     expect.set_options(timeout=15_000)
+
+
+@pytest.fixture(autouse=True)
+def _workspace_panel_test_baseline(request: pytest.FixtureRequest) -> None:
+    """Keep unrelated UI tests explicit about requiring an open Workspace panel."""
+    if request.node.get_closest_marker("workspace_panel_product_default") is not None:
+        return
+    if "page" not in request.fixturenames:
+        return
+    page = request.getfixturevalue("page")
+    page.add_init_script("window.localStorage.setItem('omnigent:default-workspace-panel', 'open')")
 
 
 @pytest.fixture(autouse=True)

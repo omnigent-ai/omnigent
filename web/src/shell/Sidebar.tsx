@@ -39,6 +39,7 @@ import {
   LayoutDashboardIcon,
   Loader2Icon,
   MailIcon,
+  MailOpenIcon,
   MessageCircleDashedIcon,
   Maximize2Icon,
   Minimize2Icon,
@@ -61,6 +62,8 @@ import {
 } from "lucide-react";
 import {
   DndContext,
+  closestCenter,
+  KeyboardSensor,
   DragOverlay,
   type DragEndEvent,
   type DragStartEvent,
@@ -73,6 +76,14 @@ import {
   useSensor,
   useSensors,
 } from "@dnd-kit/core";
+import {
+  arrayMove,
+  SortableContext,
+  sortableKeyboardCoordinates,
+  verticalListSortingStrategy,
+  useSortable,
+} from "@dnd-kit/sortable";
+import { useProjectOrder, useSaveProjectOrder } from "@/hooks/useProjectOrder";
 import { useQueryClient } from "@tanstack/react-query";
 import { Link, useLocation, useNavigate, useParams } from "@/lib/routing";
 import { SidebarHeaderActions, SidebarSettingsButton } from "./SidebarHeaderActions";
@@ -163,8 +174,11 @@ import { useSessionErrors } from "@/hooks/useSessionErrors";
 import { useChatStore } from "@/store/chatStore";
 import {
   isConversationUnseen,
+  isExplicitlyUnread,
+  markConversationRead,
   markConversationUnread,
   useConversationReadState,
+  useUnseenTick,
 } from "@/hooks/useUnseenConversations";
 import { cn } from "@/lib/utils";
 import { useOmnigentAnalytics } from "@/lib/analytics";
@@ -1372,6 +1386,9 @@ function InfiniteScrollSentinel({
   );
 }
 
+const projectDragId = (name: string) => `project-order:${name}`;
+type ProjectHeaderDrag = ReturnType<typeof useSortable>;
+
 /**
  * One project folder. Fetches its own sessions server-side (`?project=`) so it
  * shows ALL its members regardless of how far the global sidebar list has been
@@ -1400,7 +1417,15 @@ function ProjectFolder({
   onToggleSelected,
   onProjectAssigned,
   onConversationsLoaded,
+  ordering,
 }: {
+  ordering: {
+    disabled: boolean;
+    insertion?: "before" | "after";
+    move: (destination: "up" | "down" | "top" | "bottom") => void;
+    first: boolean;
+    last: boolean;
+  };
   name: string;
   /** First-class project id, or null for a label-only folder. */
   projectId: string | null;
@@ -1486,16 +1511,31 @@ function ProjectFolder({
     icon,
   );
 
+  const headerDrag = useSortable({
+    id: projectDragId(name),
+    data: { type: "project-order", name },
+    disabled: ordering.disabled,
+  });
+  const orderedMenuActions = { ...menuActions, ordering };
+
   return (
     <div
       ref={setNodeRef}
       className={cn(
-        "rounded-[var(--radius-otto-sm)] transition-colors duration-200 ease-[var(--ease-otto)]",
+        "relative rounded-[var(--radius-otto-sm)] transition-colors duration-200 ease-[var(--ease-otto)]",
         // Subtle background tint on drag-over — no border, no shadow.
         isOver && DROP_TARGET_HIGHLIGHT,
       )}
     >
+      {ordering.insertion && (
+        <span
+          data-testid="project-order-insertion"
+          className="pointer-events-none absolute inset-x-0 z-10 h-0.5 bg-primary"
+          style={ordering.insertion === "before" ? { top: 0 } : { bottom: 0 }}
+        />
+      )}
       <ConversationSection
+        headerDrag={headerDrag}
         title={name}
         icon={
           icon ? (
@@ -1550,7 +1590,11 @@ function ProjectFolder({
         }
         indentRows
         headerAction={
-          <ProjectFolderActions projectName={name} onNavigate={onRowClick} actions={menuActions} />
+          <ProjectFolderActions
+            projectName={name}
+            onNavigate={onRowClick}
+            actions={orderedMenuActions}
+          />
         }
         // Touch exposes these actions through the header's long-press menu.
         actionHoverOnly
@@ -1560,7 +1604,7 @@ function ProjectFolder({
               components={contextBundle}
               projectName={name}
               onNavigate={onRowClick}
-              actions={menuActions}
+              actions={orderedMenuActions}
             />
           </ContextMenuContent>
         }
@@ -1653,6 +1697,25 @@ function ConversationList({
   // Project folders ({ id, name }) for grouping sessions — first-class id
   // and/or the legacy omni_project label, unioned server-side.
   const { data: projects = [] } = useProjects();
+  const projectOrder = useProjectOrder();
+  const saveOrder = useSaveProjectOrder();
+  const [draggedProject, setDraggedProject] = useState<string | null>(null);
+  const dragOrigin = useRef<{ left: number; top: number; width: number } | undefined>(undefined);
+  const [overProject, setOverProject] = useState<string | null>(null);
+  const moveProject = (name: string, destination: "up" | "down" | "top" | "bottom") => {
+    if (saveOrder.isPending) return;
+    const from = projects.findIndex((p) => p.name === name);
+    const to =
+      destination === "top"
+        ? 0
+        : destination === "bottom"
+          ? projects.length - 1
+          : destination === "up"
+            ? from - 1
+            : from + 1;
+    if (from < 0 || to < 0 || to >= projects.length || from === to) return;
+    saveOrder.mutate(arrayMove(projects, from, to));
+  };
 
   // id → name for the rows' project_id lookup, built once here and shared via
   // context so a row doesn't subscribe to useProjects() itself.
@@ -1908,8 +1971,7 @@ function ConversationList({
   // "Chats" list / a fallback strip (unfile it), or onto "Pinned" (pin it, which
   // floats it out of its project). "Shared with me" is deliberately not a drop
   // target — you can't file sessions there. The kebab "Move session" menu + the
-  // pin button remain the keyboard-accessible paths; DnD is a pointer
-  // enhancement on top of them, so the sensors are pointer-only.
+  // pin button remain the keyboard-accessible session actions.
   const moveToProject = useMoveToProject();
   // The session currently being dragged (id + source project + pinned state), or
   // null. Set on drag start, cleared on end/cancel; drives the DragOverlay
@@ -1923,12 +1985,31 @@ function ConversationList({
   } | null>(null);
   // Mouse: a small drag threshold so a plain click still navigates / opens the
   // kebab. Touch: a press-and-hold delay so scrolling the list isn't hijacked
-  // into a drag. Keyboard users use the kebab menu instead (no KeyboardSensor).
+  // into a drag. Project headers also support keyboard sorting.
   const sensors = useSensors(
+    useSensor(KeyboardSensor, {
+      coordinateGetter: sortableKeyboardCoordinates,
+      keyboardCodes: { start: ["Space"], cancel: ["Escape"], end: ["Space"] },
+    }),
     useSensor(MouseSensor, { activationConstraint: { distance: 5 } }),
     useSensor(TouchSensor, { activationConstraint: { delay: 250, tolerance: 8 } }),
   );
   const handleDragStart = useCallback((event: DragStartEvent) => {
+    const isProject = event.active.data.current?.type === "project-order";
+    // New drop zones can shift the source row; preserve its position before rendering them.
+    const target = event.activatorEvent.target;
+    const rect =
+      ("clientX" in event.activatorEvent || "touches" in event.activatorEvent) &&
+      target instanceof Element
+        ? target
+            .closest(isProject ? "[data-project-order-name]" : "[data-sidebar-session-id]")
+            ?.getBoundingClientRect()
+        : undefined;
+    dragOrigin.current = rect ? { left: rect.left, top: rect.top, width: rect.width } : undefined;
+    if (event.active.data.current?.type === "project-order") {
+      setDraggedProject(event.active.data.current.name as string);
+      return;
+    }
     const data = event.active.data.current as
       { label?: string; project?: string | null; isPinned?: boolean } | undefined;
     setActiveDrag({
@@ -1940,6 +2021,15 @@ function ConversationList({
   }, []);
   const handleDragEnd = useCallback(
     (event: DragEndEvent) => {
+      if (event.active.data.current?.type === "project-order") {
+        setDraggedProject(null);
+        setOverProject(null);
+        if (event.over?.data.current?.type !== "project-order" || saveOrder.isPending) return;
+        const from = projects.findIndex((p) => p.name === event.active.data.current?.name);
+        const to = projects.findIndex((p) => p.name === event.over?.data.current?.name);
+        if (from >= 0 && to >= 0 && from !== to) saveOrder.mutate(arrayMove(projects, from, to));
+        return;
+      }
       const dragged = activeDrag;
       setActiveDrag(null);
       if (!dragged) return;
@@ -1971,7 +2061,7 @@ function ConversationList({
         if (action.unpin) onTogglePinned(dragged.id);
       }
     },
-    [activeDrag, moveToProject, expandProject, onTogglePinned],
+    [activeDrag, moveToProject, expandProject, onTogglePinned, projects, saveOrder],
   );
 
   const expandAllProjects = useCallback((allNames: string[]) => {
@@ -2170,13 +2260,47 @@ function ConversationList({
     >
       <DndContext
         sensors={sensors}
-        collisionDetection={pointerWithin}
+        collisionDetection={(args) => {
+          const ordering = args.active.data.current?.type === "project-order";
+          const droppableContainers = args.droppableContainers.filter(
+            (container) => (container.data.current?.type === "project-order") === ordering,
+          );
+          if (!ordering) return pointerWithin({ ...args, droppableContainers });
+          // Restrict project drops to the project list inside the sidebar.
+          if (args.pointerCoordinates) {
+            const rects = droppableContainers
+              .map((c) => args.droppableRects.get(c.id))
+              .filter((r) => r != null);
+            const y = args.pointerCoordinates.y;
+            const x = args.pointerCoordinates.x;
+            const sidebar = scrollContainerRef.current?.getBoundingClientRect();
+            if (sidebar && (x < sidebar.left || x > sidebar.right)) return [];
+            if (
+              !rects.length ||
+              y < Math.min(...rects.map((r) => r.top)) - 10 ||
+              y > Math.max(...rects.map((r) => r.bottom)) + 10
+            )
+              return [];
+          }
+          return closestCenter({ ...args, droppableContainers });
+        }}
         // Always-measure so the transient "remove from project" zone (mounted at
         // drag start) is registered as a drop target without a stale layout cache.
         measuring={{ droppable: { strategy: MeasuringStrategy.Always } }}
         onDragStart={handleDragStart}
         onDragEnd={handleDragEnd}
-        onDragCancel={() => setActiveDrag(null)}
+        onDragOver={(event) =>
+          setOverProject(
+            event.over?.data.current?.type === "project-order"
+              ? (event.over.data.current.name as string)
+              : null,
+          )
+        }
+        onDragCancel={() => {
+          setActiveDrag(null);
+          setDraggedProject(null);
+          setOverProject(null);
+        }}
       >
         <RowEditHoldContext.Provider value={reportRowEditing}>
           <div
@@ -2261,6 +2385,19 @@ function ConversationList({
                   headerAction={
                     !selectionMode ? (
                       <ProjectHeaderActions
+                        onOrderChange={(manual) => {
+                          const ranks = new Map(
+                            projectOrder.data?.ordered_project_ids?.map((id, index) => [id, index]),
+                          );
+                          const restored = [...projects].sort(
+                            (a, b) =>
+                              (ranks.get(a.id ?? "") ?? Infinity) -
+                              (ranks.get(b.id ?? "") ?? Infinity),
+                          );
+                          saveOrder.mutate(manual ? restored : null);
+                        }}
+                        manualOrder={projectOrder.data?.sort_mode === "manual"}
+                        orderDisabled={saveOrder.isPending || !projectOrder.data}
                         projectNames={sections.projectGroups.map((group) => group.name)}
                         collapsed={effectiveCollapsedSections.includes("Projects")}
                         expandedProjects={expandedProjects}
@@ -2275,30 +2412,53 @@ function ConversationList({
                     ) : undefined
                   }
                 >
-                  {sections.projectGroups.map((group) => (
-                    <ProjectFolder
-                      key={group.name}
-                      name={group.name}
-                      projectId={group.id}
-                      icon={group.icon}
-                      windowConversations={group.conversations}
-                      activeConversationId={displayedActiveId}
-                      expanded={expandedProjects.includes(group.name)}
-                      active={newSessionProjectName === group.name}
-                      onToggleCollapsed={() => toggleProjectExpanded(group.name)}
-                      pinnedConversationIds={pinnedConversationIds}
-                      activeOverride={activeOverride}
-                      frozenSortKeys={frozenKeys}
-                      scrollRoot={scrollContainerRef}
-                      onRowClick={onRowClick}
-                      onTogglePinned={onTogglePinned}
-                      selectionMode={projectsSelecting}
-                      selectedIds={selectedIds}
-                      onToggleSelected={onToggleSelected}
-                      onProjectAssigned={expandProject}
-                      onConversationsLoaded={handleFolderConversationsLoaded}
-                    />
-                  ))}
+                  <SortableContext
+                    items={projects.map((p) => projectDragId(p.name))}
+                    strategy={verticalListSortingStrategy}
+                  >
+                    {sections.projectGroups.map((group, index) => (
+                      <ProjectFolder
+                        key={group.name}
+                        ordering={{
+                          disabled:
+                            !projectOrder.data ||
+                            saveOrder.isPending ||
+                            selectionMode ||
+                            editingIds.size > 0,
+                          first: index === 0,
+                          last: index === projects.length - 1,
+                          move: (destination) => moveProject(group.name, destination),
+                          insertion:
+                            overProject === group.name &&
+                            draggedProject !== group.name &&
+                            draggedProject !== null
+                              ? projects.findIndex((p) => p.name === draggedProject) < index
+                                ? "after"
+                                : "before"
+                              : undefined,
+                        }}
+                        name={group.name}
+                        projectId={group.id}
+                        icon={group.icon}
+                        windowConversations={group.conversations}
+                        activeConversationId={displayedActiveId}
+                        expanded={expandedProjects.includes(group.name)}
+                        active={newSessionProjectName === group.name}
+                        onToggleCollapsed={() => toggleProjectExpanded(group.name)}
+                        pinnedConversationIds={pinnedConversationIds}
+                        activeOverride={activeOverride}
+                        frozenSortKeys={frozenKeys}
+                        scrollRoot={scrollContainerRef}
+                        onRowClick={onRowClick}
+                        onTogglePinned={onTogglePinned}
+                        selectionMode={projectsSelecting}
+                        selectedIds={selectedIds}
+                        onToggleSelected={onToggleSelected}
+                        onProjectAssigned={expandProject}
+                        onConversationsLoaded={handleFolderConversationsLoaded}
+                      />
+                    ))}
+                  </SortableContext>
                   {sections.projectGroups.length === 0 &&
                     !effectiveCollapsedSections.includes("Projects") && (
                       <p className="px-2 py-1 text-ui text-muted-foreground">No projects</p>
@@ -2405,10 +2565,17 @@ function ConversationList({
           coordinates against the aside's box and drift off the cursor whenever
           the aside sits away from (0,0) — e.g. the floating peek card. */}
         {createPortal(
-          <DragOverlay dropAnimation={null}>
-            {activeDrag ? (
-              <div className="pointer-events-none max-w-[16rem] truncate rounded-md border bg-card-solid px-3 py-2 text-ui shadow-tooltip">
-                {activeDrag.label}
+          <DragOverlay
+            dropAnimation={null}
+            className="pointer-events-none"
+            style={dragOrigin.current}
+          >
+            {activeDrag || draggedProject ? (
+              <div
+                className="pointer-events-none max-w-[16rem] truncate rounded-md border bg-card-solid px-3 py-2 text-ui shadow-tooltip"
+                style={dragOrigin.current ? { maxWidth: "none" } : undefined}
+              >
+                {draggedProject ?? activeDrag?.label}
               </div>
             ) : null}
           </DragOverlay>,
@@ -2531,6 +2698,7 @@ function projectMarkerState(
 // group, so they all align and animate identically (icon · title ·
 // hover-chevron · collapsed marker).
 function SectionHeader({
+  headerDrag,
   title,
   icon,
   marker,
@@ -2544,6 +2712,7 @@ function SectionHeader({
   contextMenu,
   contextMenuDisabled,
 }: {
+  headerDrag?: ProjectHeaderDrag;
   title: string;
   icon?: ReactNode;
   marker?: SessionState | null;
@@ -2613,6 +2782,20 @@ function SectionHeader({
       : "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]:focus-within]/header:opacity-0";
   const button = (
     <button
+      ref={
+        headerDrag
+          ? (node) => {
+              headerDrag.setNodeRef(node);
+              headerDrag.setActivatorNodeRef(node);
+            }
+          : undefined
+      }
+      {...headerDrag?.attributes}
+      aria-disabled={undefined}
+      // Touch retains scrolling and long-press menus, which include move actions.
+      onMouseDown={(event) => headerDrag?.listeners?.onMouseDown?.(event)}
+      onKeyDown={(event) => headerDrag?.listeners?.onKeyDown?.(event)}
+      data-project-order-name={headerDrag ? title : undefined}
       type="button"
       aria-expanded={!collapsed}
       aria-current={active ? "page" : undefined}
@@ -2624,6 +2807,10 @@ function SectionHeader({
         onToggleCollapsed();
       }}
       className={cn(
+        headerDrag &&
+          !headerDrag.attributes["aria-disabled"] &&
+          "cursor-grab active:cursor-grabbing",
+        headerDrag?.isDragging && "opacity-40",
         contextMenu && "select-none [-webkit-touch-callout:none]",
         icon
           ? cn(
@@ -2762,6 +2949,9 @@ function SessionFilterMenu({
 }
 
 function ProjectHeaderActions({
+  onOrderChange,
+  manualOrder,
+  orderDisabled,
   projectNames,
   collapsed,
   expandedProjects,
@@ -2771,6 +2961,9 @@ function ProjectHeaderActions({
   onProjectCreated,
   onEnterSelectionMode,
 }: {
+  onOrderChange: (manual: boolean) => void;
+  manualOrder: boolean;
+  orderDisabled: boolean;
   projectNames: string[];
   collapsed: boolean;
   expandedProjects: string[];
@@ -2786,9 +2979,8 @@ function ProjectHeaderActions({
   const allExpanded =
     projectNames.length > 0 && projectNames.every((name) => expandedProjects.includes(name));
   const anyExpanded = projectNames.some((name) => expandedProjects.includes(name));
-  // The kebab only carries the expand/collapse and "Select sessions" items; with
-  // neither applicable (e.g. no projects yet) it would open empty, so hide it.
-  const showMenu = showExpandControls || hasProjectSessions;
+  // Hide the menu when there are no projects or sessions to organize.
+  const showMenu = showExpandControls || hasProjectSessions || projectNames.length > 0;
 
   return (
     <div className="flex items-center gap-0.5">
@@ -2809,6 +3001,20 @@ function ProjectHeaderActions({
             </Button>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end" className="min-w-40">
+            <DropdownMenuSub>
+              <DropdownMenuSubTrigger disabled={orderDisabled}>
+                Sort projects by
+              </DropdownMenuSubTrigger>
+              <DropdownMenuSubContent className="min-w-40">
+                <DropdownMenuRadioGroup
+                  value={manualOrder ? "manual" : "alphabetical"}
+                  onValueChange={(value) => onOrderChange(value === "manual")}
+                >
+                  <DropdownMenuRadioItem value="alphabetical">Alphabetically</DropdownMenuRadioItem>
+                  <DropdownMenuRadioItem value="manual">Manual order</DropdownMenuRadioItem>
+                </DropdownMenuRadioGroup>
+              </DropdownMenuSubContent>
+            </DropdownMenuSub>
             {/* Gated independently: each hides only when it would be a no-op, so
                 a mixed set offers both. */}
             {showExpandControls && !allExpanded && (
@@ -2900,6 +3106,7 @@ function SectionGroup({
 }
 
 function ConversationSection({
+  headerDrag,
   title,
   icon,
   marker,
@@ -2924,6 +3131,7 @@ function ConversationSection({
   footer,
   onProjectAssigned,
 }: {
+  headerDrag?: ProjectHeaderDrag;
   title?: string;
   /** Optional icon rendered before the title (e.g. project folder icon). */
   icon?: ReactNode;
@@ -2987,6 +3195,7 @@ function ConversationSection({
             hasPersistentAction={persistentHeaderAction != null}
             collapsed={isCollapsed}
             onToggleCollapsed={onToggleCollapsed}
+            headerDrag={headerDrag}
             contextMenu={headerContextMenu}
             contextMenuDisabled={selectionMode}
           />
@@ -3155,6 +3364,7 @@ function ConversationMenuItems({
   currentProject,
   onTogglePinned,
   onMarkUnread,
+  onMarkRead,
   onProjectAssigned,
   moveToProject,
   stopSession,
@@ -3185,6 +3395,7 @@ function ConversationMenuItems({
   currentProject: string | null;
   onTogglePinned: (conversationId: string) => void;
   onMarkUnread: () => void;
+  onMarkRead: () => void;
   onProjectAssigned?: (projectName: string) => void;
   moveToProject: ReturnType<typeof useMoveToProject>;
   stopSession: ReturnType<typeof useStopSession>;
@@ -3327,10 +3538,11 @@ function ConversationMenuItems({
           </TooltipContent>
         </Tooltip>
       )}
-      {/* Mark as unread — re-lights the row's pink dot so a session can
-          be flagged to revisit, including the one you're currently
-          viewing. Hidden only when the row already shows the dot. */}
-      {canMarkUnread && (
+      {/* Every row offers one read-state action: "Mark as unread" re-lights
+          the pink dot so a session can be flagged to revisit (including the
+          one you're currently viewing); a row already showing the dot offers
+          the reverse, "Mark as read", which clears it. */}
+      {canMarkUnread ? (
         <C.Item
           data-testid="mark-unread-conversation"
           onSelect={() => {
@@ -3340,6 +3552,17 @@ function ConversationMenuItems({
         >
           <MailIcon className="size-3.5" />
           Mark as unread
+        </C.Item>
+      ) : (
+        <C.Item
+          data-testid="mark-read-conversation"
+          onSelect={() => {
+            onMarkRead();
+            setMenuOpen(false);
+          }}
+        >
+          <MailOpenIcon className="size-3.5" />
+          Mark as read
         </C.Item>
       )}
       {/* Projects are a My-sessions-only tool, so filing is owner-only — a
@@ -3898,6 +4121,7 @@ function ConversationRowImpl({
     currentProject,
     onTogglePinned,
     onMarkUnread: () => markConversationUnread(conversation.id, conversation.updated_at),
+    onMarkRead: () => markConversationRead(conversation.id, conversation.updated_at),
     onProjectAssigned,
     moveToProject,
     stopSession,
@@ -4017,7 +4241,9 @@ function ConversationRowImpl({
     // it. `setRowRef` merges the drag node ref with the scroll-into-view ref.
     <li
       ref={setRowRef}
-      {...dragListeners}
+      data-sidebar-session-id={conversation.id}
+      onMouseDown={(event) => dragListeners?.onMouseDown?.(event)}
+      onTouchStart={(event) => dragListeners?.onTouchStart?.(event)}
       className={cn("group relative", isDragging && "opacity-40")}
     >
       {/* Right-click anywhere on the row opens the same actions as the kebab.
@@ -4636,11 +4862,11 @@ function ProjectFolderMenuItems({
   onNavigate: (e: MouseEvent<HTMLAnchorElement>) => void;
   actions: ProjectFolderMenuActions;
 }) {
+  const { onMenuOpen, onMenuClose } = actions;
   useEffect(() => {
-    // Config loading follows the Radix content lifecycle; do not force-mount it.
-    actions.onMenuOpen();
-    return actions.onMenuClose;
-  }, [actions]);
+    onMenuOpen();
+    return onMenuClose;
+  }, [onMenuOpen, onMenuClose]);
 
   return (
     <>
@@ -4664,6 +4890,28 @@ function ProjectFolderMenuItems({
         <Settings2Icon className="size-3.5" />
         Project settings
       </C.Item>
+      {actions.ordering && (
+        <>
+          <C.Separator />
+          {(["up", "down", "top", "bottom"] as const).map((destination) => (
+            <C.Item
+              key={destination}
+              disabled={
+                actions.ordering!.disabled ||
+                (destination === "up" || destination === "top"
+                  ? actions.ordering!.first
+                  : actions.ordering!.last)
+              }
+              onSelect={() => actions.ordering!.move(destination)}
+            >
+              {destination === "top" || destination === "bottom"
+                ? `Move to ${destination}`
+                : `Move ${destination}`}
+            </C.Item>
+          ))}
+          <C.Separator />
+        </>
+      )}
       <C.Item data-testid="delete-project" variant="destructive" onSelect={actions.openDelete}>
         <Trash2Icon className="size-3.5" />
         Delete project
@@ -4673,6 +4921,12 @@ function ProjectFolderMenuItems({
 }
 
 interface ProjectFolderMenuActions {
+  ordering?: {
+    disabled: boolean;
+    first: boolean;
+    last: boolean;
+    move: (destination: "up" | "down" | "top" | "bottom") => void;
+  };
   openRename: () => void;
   openSettings: () => void;
   openDelete: () => void;
@@ -5250,6 +5504,18 @@ function BulkActionBar({
     [allConversations, selectedIds],
   );
 
+  // Subscribed so the read-state action below flips read↔unread the moment
+  // the mirror is written (e.g. a background turn lighting a selected row's
+  // dot while the bar is open). Computed per render — the selection is small.
+  useUnseenTick();
+  // Mirrors the row dot's condition (active-row suppression included), so the
+  // offered direction always matches the dots the user sees.
+  const unreadSelected = selectedConversations.filter(
+    (c) =>
+      isConversationUnseen(c.id, c.updated_at, c.status) &&
+      (c.id !== activeId || isExplicitlyUnread(c.id)),
+  );
+
   const ownedSelected = useMemo(
     () => selectedConversations.filter((c) => isOwnedByViewer(c, viewerId)),
     [selectedConversations, viewerId],
@@ -5332,6 +5598,20 @@ function BulkActionBar({
     );
   }
 
+  // Read state is per-viewer (not ownership-gated, matching the row menu),
+  // so both actions apply to every selected row. The store writes are
+  // synchronous with a fire-and-forget server sync, so the bar can exit
+  // immediately, matching the other bulk actions.
+  function handleMarkRead() {
+    for (const c of unreadSelected) markConversationRead(c.id, c.updated_at);
+    onExit();
+  }
+
+  function handleMarkUnread() {
+    for (const c of selectedConversations) markConversationUnread(c.id, c.updated_at);
+    onExit();
+  }
+
   function handleArchive() {
     if (nonArchivedSelected.length === 0) return;
     // The rows leave the sidebar optimistically (useBulkArchiveConversations
@@ -5395,6 +5675,43 @@ function BulkActionBar({
           </span>
 
           <div className="ml-auto flex items-center gap-0.5">
+            {unreadSelected.length > 0 ? (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon-xs"
+                    className="shrink-0"
+                    disabled={isBusy}
+                    onClick={handleMarkRead}
+                    aria-label="Mark selected as read"
+                    data-testid="bulk-mark-read"
+                  >
+                    <MailOpenIcon className="size-3.5" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="bottom">Mark as read</TooltipContent>
+              </Tooltip>
+            ) : (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon-xs"
+                    className="shrink-0"
+                    disabled={isBusy || count === 0}
+                    onClick={handleMarkUnread}
+                    aria-label="Mark selected as unread"
+                    data-testid="bulk-mark-unread"
+                  >
+                    <MailIcon className="size-3.5" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="bottom">Mark as unread</TooltipContent>
+              </Tooltip>
+            )}
             {!(allSelectedSameArchiveGroup && archivedSelected.length > 0) && (
               <Tooltip>
                 <TooltipTrigger asChild>

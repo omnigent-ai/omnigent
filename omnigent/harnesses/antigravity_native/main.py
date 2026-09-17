@@ -995,6 +995,7 @@ async def _launch_and_record(
         permission_mode=permission_mode,
         headless=headless,
         extra_args=antigravity_args,
+        log_dir=bridge_dir,
     )
     # Scope agy to a per-session isolated Gemini dir, exactly as the runner-owned
     # launch does. agy has no --mcp-config flag and ignores every ANTIGRAVITY_* env

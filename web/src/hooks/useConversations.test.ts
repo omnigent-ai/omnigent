@@ -7,6 +7,7 @@ import { createElement, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ConversationsInfiniteData } from "@/lib/sessionListCache";
 import type { Session } from "@/lib/types";
+import { ApiError } from "@/lib/sessionsApi";
 import { useSessionUpdatesConnected } from "./useSessionUpdatesConnected";
 import {
   deleteConversation,
@@ -314,6 +315,65 @@ describe("useConversations search timeout", () => {
     // A genuine server/network error still retries (up to the default cap).
     expect(retry(0, new Error("500 Internal Server Error"))).toBe(true);
     expect(retry(3, new Error("500 Internal Server Error"))).toBe(false);
+  });
+});
+
+describe("useConversations stale cursor", () => {
+  function page(body: unknown) {
+    return mockResponse(body);
+  }
+
+  it("restarts the walk from page 1 when a page cursor goes stale", async () => {
+    // Page 1, then a session deleted mid-scroll kills the page-2 cursor. The
+    // sidebar must reload from the top, not render the raw 400.
+    fetchMock
+      .mockResolvedValueOnce(
+        page({ data: [{ id: "a" }], first_id: "a", last_id: "a", has_more: true }),
+      )
+      .mockResolvedValueOnce(
+        mockResponse(
+          { error: { code: "stale_cursor", message: "cursor 'a' no longer exists" } },
+          { ok: false, status: 400 },
+        ),
+      )
+      .mockResolvedValue(
+        page({ data: [{ id: "b" }], first_id: "b", last_id: "b", has_more: false }),
+      );
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+
+    const { result } = renderHook(() => useConversations("", false), { wrapper });
+    await waitFor(() => expect(result.current.data?.pages.length).toBe(1));
+    await act(async () => {
+      await result.current.fetchNextPage();
+    });
+
+    // The reset drops the stale page set and re-walks from no cursor.
+    await waitFor(() => expect(result.current.error).toBeNull());
+    await waitFor(() => expect(result.current.data?.pages.length).toBe(1));
+    const lastUrl = fetchMock.mock.calls.at(-1)![0] as string;
+    expect(lastUrl).not.toContain("after=");
+  });
+
+  it("does not retry a stale cursor in place", () => {
+    fetchMock.mockResolvedValue(
+      mockResponse({ data: [], first_id: null, last_id: null, has_more: false }),
+    );
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    renderHook(() => useConversations("", false), { wrapper });
+
+    const query = queryClient.getQueryCache().find({ queryKey: ["conversations", "", false] });
+    const retry = (query?.options as { retry?: unknown } | undefined)?.retry as (
+      failureCount: number,
+      error: unknown,
+    ) => boolean;
+    // Reissuing the same dead cursor fails identically, so the restart owns
+    // the recovery instead.
+    expect(retry(0, new ApiError("gone", 400, "stale_cursor"))).toBe(false);
+    expect(retry(0, new ApiError("bad", 400, "invalid_input"))).toBe(true);
   });
 });
 

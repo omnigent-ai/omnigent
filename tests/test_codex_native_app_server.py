@@ -1198,6 +1198,39 @@ def test_codex_catalog_fingerprint_survives_a_missing_binary(tmp_path: Path) -> 
     assert isinstance(fingerprint, str) and fingerprint
 
 
+def test_fresh_codex_launch_catalog_rejects_stale_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only a fresh gateway-aware snapshot may replace the migration probe."""
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+    from omnigent.models import model_catalog_store
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    codex = tmp_path / "codex"
+    codex.write_text("build", encoding="utf-8")
+    launch = _default_codex_launch()
+    fingerprint = codex_native_app_server.codex_catalog_fingerprint(launch, codex_path=str(codex))
+    rows = [{"id": "gpt-5.4", "model": "gpt-5.4", "isDefault": True}]
+
+    assert (
+        codex_native_app_server.fresh_codex_launch_catalog(launch=launch, codex_path=str(codex))
+        is None
+    )
+    model_catalog_store.write_catalog("codex-native", fingerprint, rows)
+    assert (
+        codex_native_app_server.fresh_codex_launch_catalog(launch=launch, codex_path=str(codex))
+        == rows
+    )
+
+    path = model_catalog_store.catalog_path("codex-native", fingerprint)
+    old = path.stat().st_mtime - model_catalog_store.CATALOG_STALE_AFTER_S - 60
+    os.utime(path, (old, old))
+    assert (
+        codex_native_app_server.fresh_codex_launch_catalog(launch=launch, codex_path=str(codex))
+        is None
+    )
+
+
 def _test_app_server(
     tmp_path: Path,
     codex_home: Path,
@@ -2553,6 +2586,79 @@ def test_codex_model_upgrade_target_reads_catalog_migration() -> None:
     assert _codex_model_upgrade_target(catalog, "gpt-5.4") == "gpt-5.6-terra"
     assert _codex_model_upgrade_target(catalog, "current") is None
     assert _codex_model_upgrade_target(catalog, "missing") is None
+
+
+def test_codex_model_upgrade_target_reads_gateway_model_list_migration() -> None:
+    """Gateway-aware ``model/list`` rows carry the same migration target."""
+    from omnigent.harnesses.codex_native.app_server import _codex_model_upgrade_target
+
+    rows = [
+        {
+            "id": "databricks-gpt-5-4",
+            "model": "gpt-5.4",
+            "upgrade": "gpt-5.6-terra",
+            "upgradeInfo": {"model": "gpt-5.6-terra"},
+        }
+    ]
+
+    assert _codex_model_upgrade_target(rows, "gpt-5.4") == "gpt-5.6-terra"
+
+
+@pytest.mark.parametrize("gateway_rows", ["matching", "missing", "malformed", "current", None])
+async def test_start_uses_fresh_gateway_catalog_before_debug_models(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    gateway_rows: str | None,
+) -> None:
+    """Only complete matching gateway rows replace the migration subprocess."""
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+
+    source_home = tmp_path / "source-codex-home"
+    source_home.mkdir()
+    (source_home / "config.toml").write_text("", encoding="utf-8")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    _disable_codex_startup_rpc(monkeypatch)
+    probes: list[str] = []
+
+    def _debug_catalog(codex_path: str, source: Path, *, timeout: float) -> dict[str, object]:
+        del source, timeout
+        probes.append(codex_path)
+        return {"models": [{"slug": "gpt-5.4", "upgrade": {"model": "gpt-5.6-terra"}}]}
+
+    monkeypatch.setattr(codex_native_app_server, "read_codex_model_catalog", _debug_catalog)
+    server = _test_app_server(
+        tmp_path,
+        tmp_path / "codex-home",
+        tmp_path / "bridge",
+        workspace,
+    )
+    server.trust_project = True
+    server.pinned_model = "gpt-5.4"
+    if gateway_rows is not None:
+        row: dict[str, object] = {
+            "id": "gpt-5.4" if gateway_rows != "missing" else "gpt-5.6-terra",
+            "model": "gpt-5.4" if gateway_rows != "missing" else "gpt-5.6-terra",
+        }
+        if gateway_rows == "malformed":
+            row["upgradeInfo"] = {}
+        elif gateway_rows == "current":
+            row["upgrade"] = None
+            row["upgradeInfo"] = None
+        else:
+            row["upgrade"] = "gpt-5.6-terra"
+        server.model_catalog_rows = [row]
+
+    await server.start()
+    await server.close()
+
+    assert probes == ([] if gateway_rows in {"matching", "current"} else [sys.executable])
+    config = tomllib.loads((server.codex_home / "config.toml").read_text(encoding="utf-8"))
+    if gateway_rows == "current":
+        assert "model_migrations" not in config.get("notice", {})
+    else:
+        assert config["notice"]["model_migrations"] == {"gpt-5.4": "gpt-5.6-terra"}
 
 
 def test_acknowledge_codex_model_migration_updates_private_config(tmp_path: Path) -> None:

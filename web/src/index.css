@@ -386,9 +386,50 @@
   line-height: 20px;
 }
 
-.composer-agent-menu [role="menuitem"].composer-agent-row {
-  gap: 4px;
-  padding: 0 12px 0 0;
+.composer-agent-menu [role^="menuitem"] {
+  background-color: transparent;
+}
+
+.composer-agent-menu [role^="menuitem"]:not([data-disabled]) {
+  cursor: pointer;
+}
+
+/* Show the selection initially; interaction takes over until the menu reopens. */
+.composer-agent-menu[data-initial-selection="true"]
+  :is(
+    .composer-agent-row,
+    [role="menuitem"]:not(.composer-agent-select, .composer-agent-edit)
+  )[data-active="true"],
+.composer-agent-menu[data-input-method="pointer"]:not([data-initial-selection="true"])
+  :is(
+    [role^="menuitem"]:not(.composer-agent-select, .composer-agent-edit),
+    .composer-agent-row
+  ):not([data-disabled]):hover,
+.composer-agent-menu[data-input-method="keyboard"]
+  [role^="menuitem"]:not(.composer-agent-select, .composer-agent-edit):focus,
+.composer-agent-menu[data-input-method="keyboard"] .composer-agent-row:focus-within,
+.composer-agent-menu
+  [role="menuitem"][aria-haspopup="menu"][data-state="open"]:not(
+    .composer-agent-select,
+    .composer-agent-edit
+  ),
+.composer-agent-menu .composer-agent-row:has(> [aria-haspopup="menu"][data-state="open"]) {
+  background-color: var(--muted);
+}
+
+.composer-agent-menu .composer-agent-row > [role="menuitem"] {
+  gap: 0;
+  padding: 0;
+}
+
+.composer-agent-menu .composer-agent-edit {
+  padding: 0 12px 0 4px;
+}
+
+.composer-agent-menu
+  .composer-agent-select:not(:has(> .composer-agent-edit))
+  .composer-agent-choice {
+  padding-right: 12px;
 }
 
 .composer-agent-menu [role="menuitemcheckbox"] {
@@ -413,6 +454,25 @@
   border-width: 0.5px;
   border-color: color(srgb 0.960784 0.960784 0.956863 / 0.04);
   background-color: rgba(255, 255, 255, 0.05);
+}
+
+/* --background is the opaque palette canvas; flatten tints over it to mask the stack. */
+.composer-workspace-surface {
+  background:
+    linear-gradient(
+      color-mix(in oklch, var(--muted) 70%, transparent),
+      color-mix(in oklch, var(--muted) 70%, transparent)
+    ),
+    var(--background);
+}
+
+.composer-subagent-surface {
+  background:
+    linear-gradient(
+      color-mix(in oklch, var(--brand-accent) 10%, transparent),
+      color-mix(in oklch, var(--brand-accent) 10%, transparent)
+    ),
+    var(--background);
 }
 
 /* Fixed default icon geometry: a 14px glyph centered in a 16px SVG box. */
