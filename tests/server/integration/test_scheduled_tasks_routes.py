@@ -146,7 +146,9 @@ async def test_create_lists_and_gets(auth_client: httpx.AsyncClient, db_uri: str
     assert created["workspace"] == "/repo"
     assert created["host_id"] == "4b653f6031f35d168cc0b37caa1306d1"
     assert "base_branch" not in created
-    assert "execution_target" not in created
+    # execution_target is now surfaced (defaults to connected_host); base_branch
+    # stays an internal legacy column.
+    assert created["execution_target"] == "connected_host"
     task_id = created["id"]
 
     listed = await auth_client.get("/v1/scheduled-tasks", headers=_headers())
@@ -189,6 +191,29 @@ async def test_create_rejects_workspace_without_host(
     _make_user(db_uri)
     body = _create_body()
     del body["host_id"]
+    resp = await auth_client.post("/v1/scheduled-tasks", json=body, headers=_headers())
+    assert resp.status_code == 400, resp.text
+
+
+async def test_create_managed_sandbox_rejects_pinned_host(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """A managed_sandbox task runs in a fresh sandbox; a pinned host/workspace is a 422."""
+    _make_user(db_uri)
+    # _create_body pins host_id + workspace by default — invalid with a sandbox.
+    body = _create_body(execution_target="managed_sandbox")
+    resp = await auth_client.post("/v1/scheduled-tasks", json=body, headers=_headers())
+    assert resp.status_code == 422, resp.text
+
+
+async def test_create_managed_sandbox_requires_configured_sandboxes(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """managed_sandbox is rejected (400) when the server has no sandbox config."""
+    _make_user(db_uri)
+    body = _create_body(execution_target="managed_sandbox")
+    del body["host_id"]
+    del body["workspace"]
     resp = await auth_client.post("/v1/scheduled-tasks", json=body, headers=_headers())
     assert resp.status_code == 400, resp.text
 

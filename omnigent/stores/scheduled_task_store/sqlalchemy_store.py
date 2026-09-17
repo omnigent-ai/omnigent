@@ -142,6 +142,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         max_cost_usd: float | None = None,
         workspace: str | None = None,
         host_id: str | None = None,
+        execution_target: str = "connected_host",
         state: str = "active",
     ) -> ScheduledTask:
         """Insert a new scheduled task with a required recurring ``rrule``."""
@@ -164,7 +165,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 max_cost_usd=max_cost_usd,
                 workspace=workspace,
                 base_branch=None,
-                execution_target=encode_scheduled_task_execution_target("connected_host"),
+                execution_target=encode_scheduled_task_execution_target(execution_target),
                 host_id=host_id,
                 state=encode_scheduled_task_state(state),
                 last_run_at=None,
@@ -272,6 +273,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         max_cost_usd: float | None = _UNSET,
         workspace: str | None = None,
         host_id: str | None = _UNSET,
+        execution_target: str | None = None,
         state: str | None = None,
         last_run_at: int | None = None,
         last_run_conversation_id: str | None = _UNSET,
@@ -331,6 +333,11 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             if host_id is not _UNSET and row.host_id != host_id:
                 row.host_id = host_id
                 changed = True
+            if execution_target is not None:
+                encoded_target = encode_scheduled_task_execution_target(execution_target)
+                if row.execution_target != encoded_target:
+                    row.execution_target = encoded_target
+                    changed = True
             if state is not None:
                 encoded_state = encode_scheduled_task_state(state)
                 if row.state != encoded_state:

@@ -211,6 +211,16 @@ class _FakeHost:
     host_id: str
     user_id: str
     account_generation: str | None = None
+    # Non-None marks a server-managed sandbox host; the unpinned connected-host
+    # resolver skips these so an automation never reuses an existing sandbox.
+    sandbox_provider: str | None = None
+
+
+class _FakeSandboxConfig:
+    """Minimal stand-in for ManagedSandboxDeployment in fire tests."""
+
+    def __init__(self, *, managed_launch_supported: bool = True) -> None:
+        self.managed_launch_supported = managed_launch_supported
 
 
 class FakeHostStore:
@@ -283,6 +293,8 @@ def _deps(sched_store: FakeScheduledTaskStore, **overrides: Any) -> FireDeps:
         tunnel_registry=overrides.get("tunnel_registry"),
         file_store=overrides.get("file_store"),
         artifact_store=overrides.get("artifact_store"),
+        sandbox_config=overrides.get("sandbox_config"),
+        managed_launches=overrides.get("managed_launches"),
     )
 
 
@@ -1375,21 +1387,83 @@ async def test_offline_connected_host_records_failed_without_session() -> None:
 
 
 @pytest.mark.asyncio
-async def test_managed_sandbox_is_skipped_and_recorded() -> None:
-    """Managed-sandbox targets are recorded as skipped and do not launch."""
+async def test_managed_sandbox_without_config_records_failed() -> None:
+    """A managed-sandbox task on a server with no sandbox config fails cleanly."""
     store = FakeScheduledTaskStore(rows={"task_1": _task(execution_target="managed_sandbox")})
     launched: list[Any] = []
 
     async def _launch(conv: Any, task: Any) -> None:
         launched.append(conv)
 
+    # No sandbox_config on deps → managed launch is unavailable.
     on_fire = build_on_fire(_deps(store), launch_dispatch=_launch)
     await on_fire(0, "task_1")
     await _drain()
 
     assert launched == []
     assert len(store.runs) == 1
-    assert store.runs[0]["status"] == "skipped"
+    assert store.runs[0]["status"] == "failed"
+    assert store.runs[0]["error_code"] == "managed_sandbox_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_managed_sandbox_fires_hostless_via_managed_dispatch() -> None:
+    """A managed-sandbox task creates a HOSTLESS session and runs the managed seam."""
+    conv_store = FakeConversationStore()
+    perm = FakePermissionStore()
+    # A managed task carries no host/workspace; even a stale pair is dropped.
+    store = FakeScheduledTaskStore(
+        rows={
+            "task_1": _task(
+                execution_target="managed_sandbox", host_id="stale_host", workspace="/stale"
+            )
+        }
+    )
+    launched: list[Any] = []
+
+    async def _launch(conv: Any, task: Any) -> None:
+        launched.append((conv, task))
+
+    on_fire = build_on_fire(
+        _deps(
+            store,
+            conversation_store=conv_store,
+            permission_store=perm,
+            sandbox_config=_FakeSandboxConfig(managed_launch_supported=True),
+        ),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    # Session created hostless (the launch binds a fresh sandbox), not on the
+    # stale pinned host/workspace.
+    assert len(conv_store.created) == 1
+    assert conv_store.created[0]["host_id"] is None
+    assert conv_store.created[0]["workspace"] is None
+    assert len(launched) == 1
+    assert perm.grants and perm.grants[0][2] == LEVEL_OWNER
+    assert store.runs[0]["status"] == "running"
+
+
+@pytest.mark.asyncio
+async def test_resolve_owner_host_skips_sandbox_hosts() -> None:
+    """An unpinned connected-host fire never resolves onto an existing sandbox host."""
+    # Owner's most-recently-active online host is a managed sandbox; the next one
+    # is a real connected host. The resolver must skip the sandbox and pick the
+    # connected host rather than reusing the sandbox.
+    hosts = {
+        "sandbox_1": _FakeHost("sandbox_1", "alice@example.com", sandbox_provider="modal"),
+        "host_2": _FakeHost("host_2", "alice@example.com"),
+    }
+    deps = _deps(
+        FakeScheduledTaskStore(rows={}),
+        host_store=FakeHostStore(hosts),
+        host_registry=FakeHostRegistry(online={"sandbox_1", "host_2"}),
+    )
+    task = _task(user_id="alice@example.com", host_id=None)
+    resolved = await fire_mod._resolve_owner_host(deps, task)
+    assert resolved == "host_2"
 
 
 # ── build_run_now (manual "run now" trigger) ─────────────────────────────────

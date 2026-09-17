@@ -54,6 +54,7 @@ class ScheduledTaskStore(ABC):
         max_cost_usd: float | None = None,
         workspace: str | None = None,
         host_id: str | None = None,
+        execution_target: str = "connected_host",
         state: str = "active",
     ) -> ScheduledTask:
         """
@@ -75,6 +76,8 @@ class ScheduledTaskStore(ABC):
         :param max_cost_usd: Optional per-firing cost budget in USD.
         :param workspace: Runner start path (source repo / working dir).
         :param host_id: The connected host to pin the run to.
+        :param execution_target: ``"connected_host"`` (default) or
+            ``"managed_sandbox"`` (a fresh server-provisioned sandbox per fire).
         :param state: Lifecycle state — ``active``/``paused``/``deleted``.
             Defaults to ``"active"``.
         :returns: The newly created :class:`ScheduledTask`.
@@ -141,6 +144,7 @@ class ScheduledTaskStore(ABC):
         max_cost_usd: float | None = _UNSET,
         workspace: str | None = None,
         host_id: str | None = _UNSET,
+        execution_target: str | None = None,
         state: str | None = None,
         last_run_at: int | None = None,
         last_run_conversation_id: str | None = _UNSET,

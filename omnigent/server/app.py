@@ -1498,6 +1498,11 @@ def create_app(
                 tunnel_registry=tunnel_registry,
                 file_store=file_store,
                 artifact_store=artifact_store,
+                # Managed-sandbox execution target: provision a fresh sandbox per
+                # fire. ``managed_launches`` is created during app construction
+                # (before this lifespan runs), so it is already on state here.
+                sandbox_config=sandbox_config,
+                managed_launches=app_inst.state.managed_launches,
             )
             on_fire = build_on_fire(fire_deps)
             # The manual "run now" trigger reuses the same fire path (dispatch /

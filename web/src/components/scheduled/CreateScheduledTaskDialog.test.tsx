@@ -20,6 +20,8 @@ import * as agentsHook from "@/hooks/useAvailableAgents";
 import * as hostsHook from "@/hooks/useHosts";
 import * as scheduledHooks from "@/hooks/useScheduledTasks";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
 
 vi.mock("@/hooks/useAvailableAgents", () => ({ useAvailableAgents: vi.fn() }));
 // useHostModelOptions is consumed by the ModelEffortFields sub-form (model
@@ -173,6 +175,17 @@ function renderDialog(onOpenChange: (open: boolean) => void = vi.fn()) {
   return render(<CreateScheduledTaskDialog open onOpenChange={onOpenChange} />);
 }
 
+/** Render inside a CapabilitiesProvider that advertises managed sandboxes. */
+function renderWithSandboxes(onOpenChange: (open: boolean) => void = vi.fn()) {
+  return render(
+    <CapabilitiesProvider
+      info={{ ...SERVER_INFO_OFFLINE_FALLBACK, managed_sandboxes_enabled: true }}
+    >
+      <CreateScheduledTaskDialog open onOpenChange={onOpenChange} />
+    </CapabilitiesProvider>,
+  );
+}
+
 function scheduledTask(overrides: Partial<ScheduledTasksApiModule.ScheduledTask> = {}) {
   return {
     id: "st_1",
@@ -189,6 +202,7 @@ function scheduledTask(overrides: Partial<ScheduledTasksApiModule.ScheduledTask>
     permissionMode: null,
     workspace: null,
     hostId: null,
+    executionTarget: "connected_host",
     state: "active",
     lastRunAt: null,
     lastRunStatus: null,
@@ -440,6 +454,49 @@ describe("CreateScheduledTaskDialog edit mode", () => {
     );
     expect(screen.getByRole("alert")).toHaveTextContent("This schedule can't be edited");
     expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+  });
+});
+
+describe("CreateScheduledTaskDialog sandbox mode", () => {
+  // Open the Host <Select> the Radix-in-jsdom way (see ForkSessionDialog.test).
+  function openHostSelect() {
+    const trigger = screen.getByTestId("task-host-trigger");
+    fireEvent.pointerDown(trigger, new MouseEvent("pointerdown", { bubbles: true, button: 0 }));
+    fireEvent.click(trigger);
+  }
+
+  it("offers no sandbox host option when the server does not advertise managed sandboxes", () => {
+    renderDialog();
+    openHostSelect();
+    expect(screen.queryByTestId("task-host-sandbox-option")).not.toBeInTheDocument();
+  });
+
+  it("offers a sandbox option in the host picker when enabled; choosing it enters sandbox mode", () => {
+    renderWithSandboxes();
+    openHostSelect();
+    fireEvent.click(screen.getByTestId("task-host-sandbox-option"));
+    // Sandbox mode swaps the helper text to the fresh-sandbox copy (no separate
+    // checkbox), and the connected-host workspace picker never appears.
+    expect(screen.getByText(/Provisions a fresh sandbox for each run/i)).toBeInTheDocument();
+    expect(screen.queryByText("pick-workspace")).not.toBeInTheDocument();
+  });
+
+  it("submits execution_target=managed_sandbox with no host/workspace when the sandbox option is chosen", async () => {
+    renderWithSandboxes();
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Nightly" } });
+    fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "Do it" } });
+    openHostSelect();
+    fireEvent.click(screen.getByTestId("task-host-sandbox-option"));
+
+    const submit = screen.getByTestId("create-scheduled-task-submit");
+    await waitFor(() => expect(submit).toBeEnabled());
+    fireEvent.click(submit);
+
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    const arg = mutateAsync.mock.calls[0][0];
+    expect(arg).toMatchObject({ executionTarget: "managed_sandbox" });
+    expect(arg).not.toHaveProperty("hostId");
+    expect(arg).not.toHaveProperty("workspace");
   });
 });
 

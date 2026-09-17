@@ -129,6 +129,17 @@ class SysScheduledTaskCreateTool(Tool):
                                 "is online."
                             ),
                         },
+                        "execution_target": {
+                            "type": "string",
+                            "enum": ["connected_host", "managed_sandbox"],
+                            "description": (
+                                "Where each firing runs. 'connected_host' (default) uses a "
+                                "pinned/resolved connected host. 'managed_sandbox' provisions "
+                                "a FRESH server-managed sandbox per firing and tears it down "
+                                "when the run completes — do not set host_id or workspace with "
+                                "it. Requires the server to have managed sandboxes configured."
+                            ),
+                        },
                     },
                     "required": ["name", "prompt", "rrule", "agent_id"],
                     "additionalProperties": False,
@@ -239,6 +250,15 @@ class SysScheduledTaskUpdateTool(Tool):
                         "host_id": {
                             "type": "string",
                             "description": "New connected host to run on.",
+                        },
+                        "execution_target": {
+                            "type": "string",
+                            "enum": ["connected_host", "managed_sandbox"],
+                            "description": (
+                                "Switch where firings run. 'managed_sandbox' provisions a "
+                                "fresh server-managed sandbox per firing (clears any pinned "
+                                "host; do not also set host_id or workspace)."
+                            ),
                         },
                         "state": {
                             "type": "string",
