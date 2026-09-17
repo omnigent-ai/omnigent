@@ -26,11 +26,13 @@ runs:
         key: uv-tool-v3-${{ runner.os }}-${{ runner.arch }}-${{ inputs.version }}
 
     - name: Authenticate restored uv binary
+      id: authenticate-restored-uv
       if: steps.restore-uv.outputs.cache-hit == 'true'
       shell: bash
       env:
         UV_TOOL_CACHE_ROOT: ${{ runner.tool_cache }}/uv/${{ inputs.version }}
         UV_CACHE_PLATFORM: ${{ runner.os }}-${{ runner.arch }}
+        UV_CACHE_RECOVER_ON_FAILURE: "true"
       run: node "$GITHUB_ACTION_PATH/verify-cache.mjs"
 
     - name: Install uv (attempt 1/3)
@@ -68,7 +70,7 @@ runs:
         enable-cache: ${{ inputs.enable-cache }}
 
     - name: Authenticate installed uv binary
-      if: inputs.version == '0.12.15' && runner.arch == 'X64' && (runner.os == 'Linux' || runner.os == 'Windows') && steps.restore-uv.outputs.cache-hit != 'true'
+      if: inputs.version == '0.12.15' && runner.arch == 'X64' && (runner.os == 'Linux' || runner.os == 'Windows') && steps.authenticate-restored-uv.outputs.valid != 'true'
       shell: bash
       env:
         UV_TOOL_CACHE_ROOT: ${{ runner.tool_cache }}/uv/${{ inputs.version }}

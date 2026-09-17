@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { lstat, readdir, readFile } from "node:fs/promises";
+import { appendFile, lstat, readdir, readFile, rm } from "node:fs/promises";
 import path from "node:path";
 
 // Extracted from uv 0.12.15 archives verified against upstream release hashes.
@@ -40,33 +40,51 @@ if (!cacheRoot || !expected) {
   throw new Error(`Unsupported uv binary cache platform: ${platform ?? "unset"}`);
 }
 
-const files = await collectFiles(cacheRoot);
-const binaries = new Map();
-for (const file of files) {
-  const name = path.basename(file);
-  if (name.endsWith(".complete")) {
-    continue;
+async function authenticate() {
+  const files = await collectFiles(cacheRoot);
+  const binaries = new Map();
+  for (const file of files) {
+    const name = path.basename(file);
+    if (name.endsWith(".complete")) {
+      continue;
+    }
+    if (!(name in expected)) {
+      throw new Error(`Cached uv tool contains an unexpected file: ${file}`);
+    }
+    if (binaries.has(name)) {
+      throw new Error(`Cached uv tool contains more than one ${name}`);
+    }
+    binaries.set(name, file);
   }
-  if (!(name in expected)) {
-    throw new Error(`Cached uv tool contains an unexpected file: ${file}`);
+
+  for (const [name, expectedChecksum] of Object.entries(expected)) {
+    const file = binaries.get(name);
+    if (!file) {
+      throw new Error(`Cached uv tool is missing ${name}`);
+    }
+    const actualChecksum = createHash("sha256")
+      .update(await readFile(file))
+      .digest("hex");
+    if (actualChecksum !== expectedChecksum) {
+      throw new Error(`Cached uv tool failed checksum verification: ${name}`);
+    }
   }
-  if (binaries.has(name)) {
-    throw new Error(`Cached uv tool contains more than one ${name}`);
-  }
-  binaries.set(name, file);
 }
 
-for (const [name, expectedChecksum] of Object.entries(expected)) {
-  const file = binaries.get(name);
-  if (!file) {
-    throw new Error(`Cached uv tool is missing ${name}`);
+try {
+  await authenticate();
+  if (process.env.GITHUB_OUTPUT) {
+    await appendFile(process.env.GITHUB_OUTPUT, "valid=true\n");
   }
-  const actualChecksum = createHash("sha256")
-    .update(await readFile(file))
-    .digest("hex");
-  if (actualChecksum !== expectedChecksum) {
-    throw new Error(`Cached uv tool failed checksum verification: ${name}`);
+  console.log(`Authenticated cached uv binaries for ${platform}`);
+} catch (error) {
+  if (process.env.UV_CACHE_RECOVER_ON_FAILURE !== "true") {
+    throw error;
   }
+  await rm(cacheRoot, { recursive: true, force: true });
+  if (process.env.GITHUB_OUTPUT) {
+    await appendFile(process.env.GITHUB_OUTPUT, "valid=false\n");
+  }
+  console.warn(`Rejected cached uv binaries for ${platform}; installing a fresh copy`);
+  console.warn(error.message);
 }
-
-console.log(`Authenticated cached uv binaries for ${platform}`);
