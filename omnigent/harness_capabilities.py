@@ -55,6 +55,10 @@ class EffortFamily(str, Enum):
     NONE = "none"
     ANTHROPIC = "anthropic"
     OPENAI = "openai"
+    # codex-native drives the real codex process, which advertises its own
+    # per-model reasoning levels (up to ``ultra``) — wider than the Responses
+    # wire ladder (``OPENAI``, capped at ``xhigh``). See CODEX_NATIVE_EFFORTS.
+    CODEX_NATIVE = "codex-native"
     GEMINI = "gemini"
     COPILOT = "copilot"
     PI = "pi"
