@@ -762,6 +762,7 @@ function FileViewerBody({
         ? "preview"
         : previewableViewMode
     : "source";
+  // Local state triggers rendering; the WeakSet preserves dismissal across remounts.
   const [dismissedPosition, setDismissedPosition] = useState<FilePosition>();
   const [appliedNavigation, setAppliedNavigation] = useState({ conversationId, path, position });
   const lastNavigationRef = useRef(appliedNavigation);

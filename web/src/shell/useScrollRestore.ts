@@ -123,24 +123,24 @@ export function useScrollRestore(
 ): (event: UIEvent<HTMLElement>) => void {
   const pendingRef = useRef<{ target: number; deadline: number } | null>(null);
   const keyRef = useRef<string | null>(null);
-  if (key !== keyRef.current) {
-    keyRef.current = key;
-    // The deadline belongs to the pending entry, not to an effect run, so
-    // re-renders during the restore can't keep extending the window.
-    pendingRef.current = key
-      ? {
-          target: scrollTopCache.get(key) ?? 0,
-          deadline: performance.now() + SCROLL_RESTORE_BUDGET_MS,
-        }
-      : null;
-  }
-
-  if (!restore) pendingRef.current = null;
 
   // Arm a restore once per content identity / readiness change — NOT every
   // render. A virtualized tree re-renders on every scroll frame; re-running the
   // restore then would fight the user and re-read layout each frame.
   useLayoutEffect(() => {
+    // Only committed navigation may replace or cancel the active restore.
+    if (key !== keyRef.current) {
+      keyRef.current = key;
+      // Keep the deadline stable across readiness changes and StrictMode replay.
+      pendingRef.current = key
+        ? {
+            target: scrollTopCache.get(key) ?? 0,
+            deadline: performance.now() + SCROLL_RESTORE_BUDGET_MS,
+          }
+        : null;
+    }
+    if (!restore) pendingRef.current = null;
+
     const el = ref.current;
     const pending = pendingRef.current;
     if (!el || !pending || !ready) return;

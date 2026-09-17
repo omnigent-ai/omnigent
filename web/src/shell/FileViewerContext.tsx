@@ -5,9 +5,8 @@
 import { createContext, useContext } from "react";
 
 /**
- * How the viewer should land after opening a file. `line` is the 1-based line
- * a chat or terminal citation (`path:line`) pointed at; the viewer reveals it
- * instead of parking at the top.
+ * A 1-based citation target. Object identity is the navigation request key:
+ * preserve it when forwarding or remounting; create a fresh object for each click.
  */
 export interface FilePosition {
   line: number;

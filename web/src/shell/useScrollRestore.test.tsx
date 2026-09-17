@@ -11,7 +11,7 @@
 //   6. Saving resumes once the restore settles.
 //   7. A null key disables persistence entirely.
 
-import { StrictMode, useRef } from "react";
+import { startTransition, StrictMode, Suspense, useRef } from "react";
 import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
@@ -253,3 +253,44 @@ it("saves new DOM scroll positions when explicit navigation overrides restoratio
   expect(el.scrollTop).toBe(900);
   expect(getSavedScrollTop(key)).toBe(900);
 });
+
+it.each(["same file", "another file"])(
+  "keeps the committed scroll restore when navigation to %s suspends",
+  async (destination) => {
+    const key = `suspended-navigation:${destination}`;
+    saveScrollTop(key, 500);
+    const pending = new Promise<void>(() => {});
+    const attempted = vi.fn();
+    function Suspend({ blocked }: { blocked: boolean }) {
+      if (blocked) {
+        attempted();
+        throw pending;
+      }
+      return null;
+    }
+    const tree = (scrollKey: string, restore: boolean) => (
+      <Suspense fallback={<div>Loading navigation</div>}>
+        <Scroller scrollKey={scrollKey} ready restore={restore} />
+        <Suspend blocked={!restore} />
+      </Suspense>
+    );
+    const view = render(tree(key, true));
+    const el = view.getByTestId("scroller");
+
+    act(() => {
+      startTransition(() => {
+        view.rerender(tree(destination === "same file" ? key : `${key}:next`, false));
+      });
+    });
+    expect(attempted).toHaveBeenCalled();
+    expect(view.queryByText("Loading navigation")).toBeNull();
+    expect(view.getByTestId("scroller")).toBe(el);
+
+    el.scrollTop = 0;
+    fireEvent.scroll(el);
+    await nextFrame();
+    expect(el.scrollTop).toBe(500);
+    expect(getSavedScrollTop(key)).toBe(500);
+    view.rerender(tree(key, true));
+  },
+);
