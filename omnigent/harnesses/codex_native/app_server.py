@@ -1295,7 +1295,7 @@ async def _codex_launch_catalog(
         return None
     fingerprint = codex_catalog_fingerprint(launch, codex_path=codex_path)
 
-    async def _probe() -> list[_JsonObject] | None:
+    async def _probe(*, allow_empty: bool) -> list[_JsonObject] | None:
         try:
             rows = await asyncio.wait_for(
                 probe_codex_model_options(codex_path=codex_path, launch=launch),
@@ -1306,15 +1306,21 @@ async def _codex_launch_catalog(
             # persistently failing probe doesn't flood the logs.
             log_once(_logger, logging.WARNING, "codex catalog probe failed", exc_info=True)
             return None
-        # Codex always offers models, so an empty model/list is a degraded
-        # probe rather than a real catalog. Reporting "no catalog" keeps a
-        # previously useful stored answer serving instead of erasing it
-        # (the shared store persists empty rows for harnesses like Claude,
-        # where a disabled-only picker legitimately yields none).
-        return rows or None
+        if rows or allow_empty:
+            return rows
+        # The probe answered empty while the store already holds a useful
+        # answer. A hidden-only custom catalog is a real (empty, cacheable)
+        # answer on cold discovery, but an empty refresh must not erase a
+        # previously useful stored answer — the runner treats it as a failed
+        # re-probe and keeps serving the stored rows.
+        return None
 
+    # Empty answers are cacheable only for true cold discovery: any refresh
+    # of an existing entry (stale-hit background refresh or an awaited
+    # re-probe) must leave a previously useful answer in place.
+    allow_empty = model_catalog_store.read_catalog("codex-native", fingerprint) is None
     read = model_catalog_store.reprobe_catalog if reprobe else model_catalog_store.ensure_catalog
-    return await read("codex-native", fingerprint, _probe)
+    return await read("codex-native", fingerprint, lambda: _probe(allow_empty=allow_empty))
 
 
 async def codex_launch_catalog(
@@ -1325,7 +1331,8 @@ async def codex_launch_catalog(
 
     Reads the on-disk catalog for the ``model=None`` launch shape; a miss
     pays one session-shaped probe (real auth linked in) and persists the
-    answer for every later consumer.
+    answer — including a hidden-only catalog's honest empty answer — for
+    every later consumer.
 
     :param codex_path: Optional Codex executable override.
     :param launch: An already-resolved ``model=None`` launch shape. When
