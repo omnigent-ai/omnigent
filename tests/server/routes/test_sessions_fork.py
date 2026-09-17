@@ -433,14 +433,16 @@ class _ArtifactStore:
         :param blobs: Map from file ID to blob bytes.
         """
         self.blobs: dict[str, bytes] = dict(blobs or {})
+        self.exists_calls = 0
 
     def exists(self, artifact_id: str) -> bool:
         """
-        Whether a blob exists.
+        Whether a blob exists (counts calls so tests can assert no probing).
 
         :param artifact_id: Blob key (the file id).
         :returns: True when the blob is present.
         """
+        self.exists_calls += 1
         return artifact_id in self.blobs
 
     def get(self, artifact_id: str) -> bytes:
@@ -754,12 +756,13 @@ async def test_fork_session_shares_source_file_blob_without_copying_bytes() -> N
 
 
 @pytest.mark.asyncio
-async def test_fork_session_skips_files_with_missing_blobs() -> None:
-    """A source file whose blob is gone is left out of the copy map.
+async def test_fork_copies_all_file_rows_without_probing_blobs() -> None:
+    """The fork carries every source file row as pure metadata — no per-file
+    artifact-store probe (an S3 HEAD / Volumes stat is real per-fork latency).
 
-    Its references keep the source id and degrade exactly as they
-    already do in the source session, instead of pointing at a copy
-    that could never serve content.
+    A source file whose blob is already gone still gets a fork row; it 404s on
+    read exactly as the source already does, so probing would only trade
+    latency for the same outcome. Forking never fails on a deleted file.
     """
     source_id = "e9f8f58523cec9a57d3bdf93be543e8c"
     live_file_id = "aa11bb22cc33dd44ee55ff6677889900"
@@ -786,6 +789,7 @@ async def test_fork_session_skips_files_with_missing_blobs() -> None:
             ),
         }
     )
+    # Only the live file has a blob; the fork must not probe either way.
     artifact_store = _ArtifactStore(blobs={live_file_id: b"\x89PNG"})
     client = TestClient(
         _build_app(conv_store, file_store=file_store, artifact_store=artifact_store)
@@ -794,12 +798,15 @@ async def test_fork_session_skips_files_with_missing_blobs() -> None:
     resp = client.post(f"/v1/sessions/{source_id}/fork", json={})
 
     assert resp.status_code == 201, resp.text
+    # Both source files are mapped and copied — no probe-driven skipping.
     file_id_map = conv_store.fork_calls[0]["file_id_map"]
-    assert set(file_id_map) == {live_file_id}
-    # No copy row was minted for the blob-less file.
+    assert set(file_id_map) == {live_file_id, gone_file_id}
     fork_id = resp.json()["id"]
-    fork_owned = [f for f in file_store.files.values() if f.session_id == fork_id]
-    assert [f.filename for f in fork_owned] == ["kept.png"]
+    fork_owned = sorted(f.filename for f in file_store.files.values() if f.session_id == fork_id)
+    assert fork_owned == ["kept.png", "lost.png"]
+    # The fork touched the artifact store zero times (no bytes moved, no HEADs).
+    assert artifact_store.exists_calls == 0
+    assert set(artifact_store.blobs) == {live_file_id}
 
 
 @pytest.mark.asyncio

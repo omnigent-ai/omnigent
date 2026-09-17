@@ -2971,12 +2971,18 @@ def register_core_routes(
         # pre-resolution), but a fork owns none of those rows — its own file
         # endpoints would 404, so the web transcript shows broken
         # attachments and a native transcript rebuild receives the file_id
-        # unresolved. Pre-allocate a fork-owned id per copyable source file;
-        # the store rewrites the copied items to those ids, and a fork-owned
-        # row per id is created right after the fork commits. The row points
-        # at the SOURCE's blob (blob_key), so the fork shares the bytes and
-        # copies nothing — reference-counted deletion keeps that blob alive
-        # until every referencing row is gone.
+        # unresolved. Pre-allocate a fork-owned id per source file; the store
+        # rewrites the copied items to those ids, and a fork-owned row per id
+        # is created right after the fork commits. Each row points at the
+        # SOURCE's blob (blob_key), so the fork shares the bytes and copies
+        # nothing — reference-counted deletion keeps that blob alive until
+        # every referencing row is gone.
+        #
+        # This is pure metadata: we deliberately do NOT probe the artifact
+        # store for each blob (an S3 HEAD / Volumes stat per file is real
+        # per-fork latency). A file whose blob happens to be gone yields a
+        # fork row that 404s on read — exactly how the source itself already
+        # degrades — so a probe would only trade latency for the same outcome.
         fork_file_id_map: dict[str, str] = {}
         fork_source_files: list[StoredFile] = []
         if file_store is not None and artifact_store is not None:
@@ -2990,13 +2996,8 @@ def register_core_routes(
                     order="asc",
                 )
                 for stored_file in files_page.data:
-                    # A file whose blob is already gone can't be shared;
-                    # leaving its references on the source id degrades the
-                    # same way the source session already does.
-                    blob_key = stored_file.blob_key or stored_file.id
-                    if await asyncio.to_thread(artifact_store.exists, blob_key):
-                        fork_source_files.append(stored_file)
-                        fork_file_id_map[stored_file.id] = generate_file_id()
+                    fork_source_files.append(stored_file)
+                    fork_file_id_map[stored_file.id] = generate_file_id()
                 if not files_page.has_more or not files_page.data:
                     break
                 files_after = files_page.last_id
@@ -3057,11 +3058,11 @@ def register_core_routes(
         # resolve the same content independently, and the source's
         # source_metadata (e.g. an image's pre-downscale dimensions) is
         # carried so the fork's copy is not left less descriptive than the
-        # original. Every step is best-effort: a source file whose blob has
-        # since vanished (deleted between the scan above and here) is skipped,
-        # and a failed row create is logged and skipped — nothing to roll back
-        # since no blob was written, and that one attachment degrades exactly
-        # as a missing file does. So forking never fails on a deleted file.
+        # original. Row creation is best-effort and touches no artifact store:
+        # a failed create is logged and skipped — nothing to roll back since
+        # no blob was written — so forking never fails on a deleted file, and
+        # a source file whose blob is already gone just yields a row that
+        # 404s on read, exactly as the source already does.
         #
         # Accepted residual race (not closed here): a source-file/session
         # delete that runs fully concurrently with this fork can pass its
@@ -3074,11 +3075,6 @@ def register_core_routes(
         if file_store is not None and artifact_store is not None:
             for stored_file in fork_source_files:
                 copied_file_id = fork_file_id_map[stored_file.id]
-                source_blob_key = stored_file.blob_key or stored_file.id
-                # Re-check right before the insert so a blob deleted mid-fork
-                # is skipped instead of minting a row that points at nothing.
-                if not await asyncio.to_thread(artifact_store.exists, source_blob_key):
-                    continue
                 try:
                     await asyncio.to_thread(
                         file_store.create,
@@ -3087,7 +3083,7 @@ def register_core_routes(
                         content_type=stored_file.content_type,
                         session_id=new_conv.id,
                         file_id=copied_file_id,
-                        blob_key=source_blob_key,
+                        blob_key=stored_file.blob_key or stored_file.id,
                         source_metadata=stored_file.source_metadata,
                     )
                 except Exception:
