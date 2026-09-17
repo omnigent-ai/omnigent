@@ -19,7 +19,7 @@ runs:
     # avoid both the manifest request and binary download.
     - name: Restore uv binary
       id: restore-uv
-      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
       with:
         path: ${{ runner.tool_cache }}/uv
         key: uv-tool-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.version }}
@@ -73,7 +73,7 @@ runs:
     # the files that populate this shared cache.
     - name: Save uv binary
       if: steps.restore-uv.outputs.cache-hit != 'true'
-      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
       with:
         path: ${{ runner.tool_cache }}/uv
         key: uv-tool-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.version }}
