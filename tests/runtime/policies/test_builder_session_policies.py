@@ -22,6 +22,7 @@ from omnigent.runtime.policies.builder import (
     _load_default_policy_specs,
     _load_session_policy_specs,
     _stored_policy_to_spec,
+    any_policies_apply,
     build_policy_engine,
     invalidate_default_policy_specs_cache,
     invalidate_session_policy_specs_cache,
@@ -31,6 +32,7 @@ from omnigent.spec.types import (
     FunctionPolicySpec,
     FunctionRef,
     GuardrailsSpec,
+    Phase,
 )
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
@@ -403,6 +405,62 @@ def test_subagent_inherits_root_session_policies(db_uri: str) -> None:
     assert "root_guard" in names, f"root session policy not inherited by sub-agent; got {names}"
     # Root policy should come before the ask_on_add_policy sentinel.
     assert names.index("root_guard") < names.index("__ask_on_add_policy")
+
+
+def test_any_policies_apply_sees_root_session_policies(db_uri: str) -> None:
+    """A policy-free sub-agent must not fast-path past its root's session policies.
+
+    ``POST /policies/evaluate`` skips the engine build when
+    ``any_policies_apply`` is False. The engine inherits the ROOT
+    conversation's session policies into every descendant, so a child
+    carrying no policies of its own must still report True when its root
+    does — pre-fix the guard checked only the child's own session policies
+    and the child's tool calls ran ungated.
+
+    :param db_uri: Per-test SQLite URI.
+    """
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    root_conv = conv_store.create_conversation()
+    child_conv = conv_store.create_conversation(
+        parent_conversation_id=root_conv.id,
+        kind="sub_agent",
+    )
+
+    policy_store = SqlAlchemyPolicyStore(db_uri)
+    policy_store.create(
+        policy_id="ad0be1fc9b224c34a1580ce4a1a7c3d8",
+        session_id=root_conv.id,
+        name="root_guard",
+        type="python",
+        handler="tests.resources.examples._shared.tool_functions.block_long_sleep",
+    )
+
+    assert any_policies_apply(
+        spec=_make_minimal_spec(),
+        conversation_id=child_conv.id,
+        default_policies=None,
+        policy_store=policy_store,
+        phase=Phase.TOOL_CALL,
+        tool_name="Bash",
+        conversation=child_conv,
+    ), "root session policies must defeat the child's no-policy fast path"
+
+    # A tree with no policies anywhere still fast-paths: the root check must
+    # not defeat the guard for genuinely ungoverned children.
+    bare_root = conv_store.create_conversation()
+    bare_child = conv_store.create_conversation(
+        parent_conversation_id=bare_root.id,
+        kind="sub_agent",
+    )
+    assert not any_policies_apply(
+        spec=_make_minimal_spec(),
+        conversation_id=bare_child.id,
+        default_policies=None,
+        policy_store=policy_store,
+        phase=Phase.TOOL_CALL,
+        tool_name="Bash",
+        conversation=bare_child,
+    )
 
 
 def test_subagent_exact_duplicate_keeps_root_policy_order(db_uri: str) -> None:
