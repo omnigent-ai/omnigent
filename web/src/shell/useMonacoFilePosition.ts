@@ -1,6 +1,7 @@
 import { useEffect, type RefObject } from "react";
 import type { DiffOnMount } from "@monaco-editor/react";
 import type { FilePosition } from "./FileViewerContext";
+import { isFilePositionPending, stopFilePosition } from "./filePositionState";
 import type { CodeEditorInstance } from "./useMonacoCommentLayer";
 
 /** Center a citation after layout/diff calculation, until the reader takes over. */
@@ -19,7 +20,7 @@ export function useMonacoFilePosition({
 }) {
   useEffect(() => {
     const editor = editorRef.current;
-    if (!mounted || !editor || !position) return;
+    if (!mounted || !editor || !position || !isFilePositionPending(position)) return;
     cancelScrollRestoreRef.current?.();
     const diff = diffEditorRef?.current;
     const center = () => {
@@ -42,7 +43,8 @@ export function useMonacoFilePosition({
     });
     const dom = diff?.getContainerDomNode() ?? editor.getDomNode();
     const events = ["wheel", "touchstart", "pointerdown", "keydown"] as const;
-    const stop = () => {
+    const stop = (interaction?: Event) => {
+      if (interaction) stopFilePosition(position);
       layout.dispose();
       diffUpdate?.dispose();
       if (frame !== undefined) cancelAnimationFrame(frame);

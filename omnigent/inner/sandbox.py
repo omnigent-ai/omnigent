@@ -21,7 +21,7 @@ from omnigent.runner.identity import RUNNER_AUTH_SECRET_ENV_VARS
 from omnigent.util.json_types import JsonValue
 
 from .agent_env import DESKTOP_SESSION_ENV_VARS
-from .datamodel import CredentialProxySpec, OSEnvSandboxSpec, OSEnvSpec
+from .datamodel import CredentialProxySpec, CredentialSourceSpec, OSEnvSandboxSpec, OSEnvSpec
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +75,9 @@ class SandboxPolicy:
     :param write_files: Per-file write grants for non-directory paths
         that can't live in :attr:`write_roots` (bwrap treats these as
         additional ``--bind-try`` mounts).
+    :param credential_source_paths: Canonical private credential paths that
+        must remain unreadable and unreachable, including through implicit
+        runtime mounts. Carried through launcher serialization and policy clones.
     :param allow_network: ``True`` to share the host network namespace,
         ``False`` to isolate (bwrap adds ``--unshare-net``).
     :param cwd_allow_hidden: List of dotfile / dotdir basenames that
@@ -175,6 +178,7 @@ class SandboxPolicy:
     egress_relay_port: int | None = None
     egress_socket_path: str | None = None
     deny_unix_socket_paths: list[Path] | None = None
+    credential_source_paths: list[Path] | None = None
     # Parent-side only: the resolved credential-proxy policy. Read in
     # ``_HelperProcessClient._start_locked`` (parent) to mint synthetic
     # placeholders and proxy rewrite rules. Intentionally NOT carried in
@@ -234,6 +238,11 @@ class SandboxPolicy:
                 if self.deny_unix_socket_paths is not None
                 else None
             ),
+            "credential_source_paths": (
+                _json_string_list(self.credential_source_paths)
+                if self.credential_source_paths is not None
+                else None
+            ),
         }
         return result
 
@@ -288,6 +297,12 @@ class SandboxPolicy:
         deny_unix_socket_paths: list[Path] | None = None
         if isinstance(deny_unix_socket_paths_data, list):
             deny_unix_socket_paths = [Path(str(path)) for path in deny_unix_socket_paths_data]
+        credential_source_paths_data = data.get("credential_source_paths")
+        credential_source_paths = (
+            [Path(str(path)) for path in credential_source_paths_data]
+            if isinstance(credential_source_paths_data, list)
+            else None
+        )
         return cls(
             backend_type=str(data.get("backend_type", "none")),
             active=bool(data.get("active", False)),
@@ -305,6 +320,7 @@ class SandboxPolicy:
             egress_relay_port=egress_relay_port,
             egress_socket_path=egress_socket_path,
             deny_unix_socket_paths=deny_unix_socket_paths,
+            credential_source_paths=credential_source_paths,
         )
 
 
@@ -488,7 +504,50 @@ def resolve_sandbox(spec: OSEnvSpec, cwd: Path) -> SandboxPolicy:
             write_files=write_files,
             allow_network=True,
         )
-    return _get_backend(sandbox_spec.type).resolve(spec, cwd)
+    policy = _get_backend(sandbox_spec.type).resolve(spec, cwd)
+    if policy.credential_proxy is not None:
+        for entry in policy.credential_proxy.entries:
+            if (
+                entry.source.kind == "unix_socket"
+                or entry.source.refresh_interval_seconds is not None
+            ):
+                protect_credential_source(entry.source, policy, cwd=cwd)
+    return policy
+
+
+def protect_credential_source(
+    source: CredentialSourceSpec, sandbox: SandboxPolicy | None, *, cwd: Path | None = None
+) -> Path:
+    """Validate private source placement and carry its canonical path into every launcher."""
+    if sandbox is None or not sandbox.active:
+        raise ValueError("credential refresh requires an active sandbox policy")
+    if source.kind not in ("file", "unix_socket") or not source.path:
+        raise ValueError("credential refresh requires a file or unix_socket source")
+    if sandbox.backend_type not in _SPAWN_WRAP_BACKENDS:
+        raise ValueError("credential refresh requires a filesystem-confined sandbox")
+    path = Path(source.path).expanduser()
+    if not path.is_absolute():
+        raise ValueError("refresh source must use an absolute path")
+    roots = tuple(root.resolve() for root in sandbox.write_roots)
+    files = tuple(allowed.resolve() for allowed in sandbox.write_files)
+    read_roots = (
+        *(root.resolve() for root in (sandbox.read_roots or [])),
+        (cwd or Path.cwd()).resolve(),
+    )
+    for component in (path, *path.parents):
+        for candidate in (component.absolute(), component.resolve()):
+            if any(candidate.is_relative_to(root) for root in roots) or candidate in files:
+                raise ValueError("refresh source must stay outside sandbox-writable paths")
+            if any(candidate.is_relative_to(root) for root in read_roots):
+                raise ValueError("refresh source must stay outside sandbox-readable paths")
+    if path.exists() and path.stat().st_nlink != 1:
+        raise ValueError("refresh source must not be hard-linked")
+    canonical = path.resolve()
+    if sandbox.credential_source_paths is None:
+        sandbox.credential_source_paths = []
+    if canonical not in sandbox.credential_source_paths:
+        sandbox.credential_source_paths.append(canonical)
+    return canonical
 
 
 def containment_prefix(root: str | Path) -> str:
@@ -726,6 +785,11 @@ def _clone_policy_with(
         deny_unix_socket_paths=(
             list(policy.deny_unix_socket_paths)
             if policy.deny_unix_socket_paths is not None
+            else None
+        ),
+        credential_source_paths=(
+            list(policy.credential_source_paths)
+            if policy.credential_source_paths is not None
             else None
         ),
         # Preserve the credential-proxy policy across clones: the

@@ -5,7 +5,7 @@ Switch under Settings → Git. Turning it on writes
 ``localStorage["omnigent:always-use-worktree"] = "true"``; turning it off
 removes the key (absence = off). The composer reads this when it settles a git
 workspace and, when on, seeds a fresh worktree branch — see the composer-side
-behavior in ``start_session/test_project_config_prefill.py``.
+behavior in ``web/src/shell/NewChatDialog.projectPrefill.test.tsx``.
 
 This file covers just the control: default off, persists on, clears on off, and
 survives a reload. No LLM turn is needed.
@@ -32,10 +32,10 @@ def _open_git_settings(page: Page, base_url: str) -> None:
 
 
 def test_always_use_worktree_defaults_off_persists_and_clears(
-    page: Page, seeded_session: tuple[str, str]
+    page: Page, live_server: str
 ) -> None:
     """Off by default; toggling on persists and toggling off clears the key."""
-    base_url, _session_id = seeded_session
+    base_url = live_server
     _open_git_settings(page, base_url)
     toggle = page.get_by_test_id("settings-always-use-worktree-toggle")
 

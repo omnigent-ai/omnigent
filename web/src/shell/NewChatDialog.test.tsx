@@ -2892,7 +2892,7 @@ describe("NewChatLandingScreen", () => {
       "rounded-t-2xl",
       "border",
       "border-b-0",
-      "bg-muted/70",
+      "composer-workspace-surface",
       "px-2",
       "py-1.5",
     );
@@ -3411,6 +3411,78 @@ describe("NewChatLandingScreen", () => {
     for (const rung of ["low", "xhigh"]) {
       expect(screen.queryByTestId(`new-chat-landing-agent-effort-${rung}`)).toBeNull();
     }
+  });
+
+  it("shows Fusion's Lead/Sidekick selectors and sends the composed variant id", async () => {
+    // Fusion decomposes into Lead / Effort / Sidekick; picking a sidekick must
+    // compose the exact `fusion-…` variant and send it as the model override,
+    // with no separate reasoning effort (the lead effort is baked into the id).
+    const fusionCombo = (over: Record<string, unknown>) => ({
+      lead: "claude-fable-5.1",
+      leadLabel: "Claude Fable 5.1",
+      effort: "medium",
+      fast: false,
+      sidekick: "swe-2-medium",
+      sidekickLabel: "SWE-2 Medium",
+      priority: false,
+      ...over,
+    });
+    const devinWithFusion = {
+      ...SUCCESS_QUERY_STATE,
+      data: [
+        { id: "swe-2", displayName: "SWE-2", isDefault: true },
+        {
+          id: "fusion",
+          displayName: "Fusion",
+          fusion: {
+            default: "fusion-fable-medium-swe2medium",
+            combos: [
+              fusionCombo({ modelUid: "fusion-fable-medium-swe2medium" }),
+              fusionCombo({
+                modelUid: "fusion-fable-medium-swe2high",
+                sidekick: "swe-2-high",
+                sidekickLabel: "SWE-2 High",
+              }),
+            ],
+          },
+        },
+      ],
+    };
+    mockAgents([
+      {
+        id: "a3",
+        name: "devin-native-ui",
+        display_name: "Devin",
+        description: null,
+        harness: "devin-native",
+        skills: [],
+      },
+    ]);
+    mockHosts([{ ...host("online"), configured_harnesses: { "devin-native": true } } as Host]);
+    useHostModelOptionsMock.mockImplementation(
+      (_hostId, harness) =>
+        (harness === "devin-native"
+          ? devinWithFusion
+          : CLAUDE_MODEL_OPTIONS_RESULT) as unknown as ReturnType<typeof useHostModelOptions>,
+    );
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding();
+    openAgentModels("a3");
+
+    // Selecting Fusion reveals the Lead / Effort / Sidekick sections.
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-model-fusion"));
+    expect(screen.getByTestId("new-chat-landing-agent-fusion-leads")).toBeTruthy();
+    expect(screen.getByTestId("new-chat-landing-agent-fusion-sidekicks")).toBeTruthy();
+    expect(screen.getByTestId("new-chat-landing-agent-fusion-lead-claude-fable-5.1")).toBeTruthy();
+
+    // Switch the sidekick; the composed variant flows to the create body.
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-fusion-sidekick-swe-2-high"));
+    const { body } = await submitAndReadBody();
+    expect(body.model_override).toBe("fusion-fable-medium-swe2high");
+    expect(body.reasoning_effort).toBeUndefined();
   });
 
   it("hides adjacent Codex effort options when the model has no effort metadata", () => {
@@ -6872,6 +6944,7 @@ describe("NewChatLandingScreen custom-agent sandbox gating", () => {
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
     // The item is omitted entirely on a sandbox target.
     expect(screen.queryByTestId("new-chat-landing-create-agent")).toBeNull();
+    expect(screen.queryByTestId("new-chat-landing-custom-agents")).toBeNull();
   });
 
   it("shows 'Create custom agent' on a host and opens the dialog", async () => {
@@ -6890,14 +6963,35 @@ describe("NewChatLandingScreen custom-agent sandbox gating", () => {
         screen.getByTestId("new-chat-landing-host-chip").getAttribute("aria-label"),
       ).not.toContain("Sandbox"),
     );
-    // With no custom agents yet, the create item is a top-level row (no
-    // "Custom agents" submenu to hide it behind) and opens the dialog.
+    // Open the create dialog through the custom-agents submenu.
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
-    // No custom agents → no "Custom agents" submenu; create must be top-level.
     fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
     const createItem = screen.getByTestId("new-chat-landing-create-agent");
     fireEvent.click(createItem);
-    await waitFor(() => expect(screen.getByTestId("create-agent-dialog")).toBeTruthy());
+    await waitFor(() => expect(screen.getByTestId("create-agent-dialog")).toBeVisible());
+    for (const field of ["name", "description", "harness", "model", "instructions", "add-mcp"]) {
+      expect(screen.getByTestId(`create-agent-${field}`)).toBeVisible();
+    }
+  });
+
+  it("cancels a custom agent without replacing the selected agent", async () => {
+    renderLanding();
+    const agentPicker = screen.getByTestId("new-chat-landing-agent-select");
+    expect(agentPicker).toHaveAccessibleName(/Claude Code/);
+    fireEvent.pointerDown(agentPicker, { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
+    fireEvent.click(screen.getByTestId("new-chat-landing-create-agent"));
+
+    const dialog = await screen.findByTestId("create-agent-dialog");
+    fireEvent.change(screen.getByTestId("create-agent-name"), {
+      target: { value: "should-not-persist" },
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+
+    await waitFor(() => expect(screen.queryByTestId("create-agent-dialog")).toBeNull());
+    expect(agentPicker).toHaveAccessibleName(/Claude Code/);
+    fireEvent.pointerDown(agentPicker, { button: 0 });
+    expect(screen.queryByTestId("new-chat-landing-agent-pending")).toBeNull();
   });
 
   // Switch the target to the connected host, then create + submit a pending

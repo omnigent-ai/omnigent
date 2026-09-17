@@ -4,13 +4,20 @@
 
 import { createContext, useContext } from "react";
 
+/**
+ * How the viewer should land after opening a file. `line` is the 1-based line
+ * a chat or terminal citation (`path:line`) pointed at; the viewer reveals it
+ * instead of parking at the top.
+ */
 export interface FilePosition {
   line: number;
   column?: number;
 }
 
+export type OpenFileOptions = Partial<FilePosition>;
+
 interface FileViewerContextType {
-  openFile: (path: string, position?: FilePosition) => void;
+  openFile: (path: string, options?: OpenFileOptions) => void;
   /** Open GitHub in the workspace rail or mobile drawer. */
   openGithubTab: () => void;
   /**
@@ -45,7 +52,7 @@ export const FileViewerContext = createContext<FileViewerContextType | null>(nul
  * Returns the `openFile` callback when rendered inside AppShell, or
  * `null` when used outside of it (tests, Storybook, etc.).
  */
-export function useFileViewer(): FileViewerContextType["openFile"] | null {
+export function useFileViewer(): ((path: string, options?: OpenFileOptions) => void) | null {
   return useContext(FileViewerContext)?.openFile ?? null;
 }
 

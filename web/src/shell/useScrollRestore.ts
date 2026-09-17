@@ -56,14 +56,16 @@ interface ScrollableEditor {
  * @param editor The editor to restore (the modified side, for a diff).
  * @param getKey Reads the current cache key (files can switch under one editor).
  * @param isCurrent False once the editor has been replaced or torn down.
+ * @param restoreSaved Whether to restore a saved offset on attachment.
  * @returns Cancels a pending restore when explicit navigation takes priority.
  */
 export function attachEditorScrollRestore(
   editor: ScrollableEditor,
   getKey: () => string,
   isCurrent: () => boolean,
+  restoreSaved = true,
 ): () => void {
-  const saved = getSavedScrollTop(getKey());
+  const saved = restoreSaved ? getSavedScrollTop(getKey()) : undefined;
   let pending =
     saved !== undefined && saved > 0
       ? { target: saved, deadline: performance.now() + SCROLL_RESTORE_BUDGET_MS }

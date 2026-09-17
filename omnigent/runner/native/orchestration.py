@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     from omnigent.harnesses.opencode_native.client import OpenCodeClient, OpenCodeSession
     from omnigent.harnesses.opencode_native.forwarder import OpenCodeNativeForwarder
     from omnigent.inner.datamodel import OSEnvSpec
+    from omnigent.inner.terminal import TerminalInstance
     from omnigent.runner.subagent_routing import SubagentRouter
     from omnigent.runner.turn_routing import TurnRouter
     from omnigent.spec.types import MCPServerConfig
@@ -46,7 +47,7 @@ import httpx
 from fastapi.responses import JSONResponse, Response
 
 from omnigent._platform import IS_WINDOWS, resolve_cli_binary
-from omnigent.debug_logging import runner_primary_session_id
+from omnigent.debug_logging import debug_event, runner_primary_session_id
 from omnigent.entities.session_resources import (
     SessionResourceView,
     session_resource_view_to_dict,
@@ -162,8 +163,8 @@ def _publish_tmux_target_for_bridge(
 # forwarder on terminal re-create (else both mirror, double-posting items).
 _AUTO_FORWARDER_TASKS: dict[str, asyncio.Task[object]] = {}
 
-# Bound how long terminal (re)creation waits for a cancelled forwarder.
-_AUTO_FORWARDER_CANCEL_TIMEOUT_S = 10.0
+# Include the child's 10-second termination grace and forced-exit cleanup.
+_AUTO_FORWARDER_CANCEL_TIMEOUT_S = 15.0
 
 # Delegated runner bearers last 30 minutes and refresh five minutes before
 # expiry. A one-minute cadence allows several retries without giving the child
@@ -256,6 +257,24 @@ async def teardown_all_codex_native_app_servers() -> None:
             await teardown_codex_native_app_server(session_id)
 
 
+async def teardown_opencode_native_server(session_id: str) -> None:
+    """Cancel the forwarder and close any remaining server for this session."""
+    if session_id not in _AUTO_OPENCODE_SERVERS:
+        return
+    await _cancel_auto_forwarder_task(session_id)
+    leftover_server = _AUTO_OPENCODE_SERVERS.pop(session_id, None)
+    if leftover_server is not None:
+        with contextlib.suppress(Exception):
+            await leftover_server.close()
+
+
+async def teardown_all_opencode_native_servers() -> None:
+    """Close all registered OpenCode servers during runner shutdown, best effort."""
+    for session_id in list(_AUTO_OPENCODE_SERVERS):
+        with contextlib.suppress(Exception):
+            await teardown_opencode_native_server(session_id)
+
+
 def _register_auto_forwarder_task(session_id: str, task: asyncio.Task[object]) -> None:
     """
     Register a session's transcript-forwarder task in the keyed registry.
@@ -313,6 +332,12 @@ def _register_auto_forwarder_task(session_id: str, task: asyncio.Task[object]) -
 # they aren't garbage-collected before they run.
 _COST_POPUP_REPOP_TASKS: set[asyncio.Task[object]] = set()
 
+# One-shot readiness observers for runner-owned native terminals. Strong
+# references keep the tasks alive after session creation returns.
+_TERMINAL_INTERACTIVE_TASKS: set[asyncio.Task[None]] = set()
+_TERMINAL_INTERACTIVE_TIMEOUT_S = 180.0
+_TERMINAL_INTERACTIVE_POLL_INTERVAL_S = 0.15
+
 # Background Codex app-server instances for host-spawned codex-native
 # runners, kept referenced so they aren't garbage-collected mid-run.
 _AUTO_CODEX_APP_SERVERS: dict[str, CodexNativeAppServer] = {}
@@ -325,6 +350,109 @@ _AUTO_OPENCODE_SERVERS: dict[str, OpenCodeNativeServer] = {}
 # Bound repeated terminal GET miss logs from tight client poll loops.
 _TERMINAL_LOOKUP_MISS_LOG_INTERVAL_S = 10.0
 _terminal_lookup_miss_log_state: dict[tuple[str, str, str], float] = {}
+
+
+async def _observe_terminal_interactive(
+    *,
+    session_id: str,
+    terminal_id: str,
+    harness: str,
+    readiness_signal: str,
+    instance: TerminalInstance,
+    is_interactive: Callable[[str], bool],
+    timeout_s: float = _TERMINAL_INTERACTIVE_TIMEOUT_S,
+    poll_interval_s: float = _TERMINAL_INTERACTIVE_POLL_INTERVAL_S,
+) -> None:
+    """Emit one semantic event when a native TUI can accept a message."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_s
+    try:
+        while True:
+            result = await instance.read()
+            screen = result.get("screen")
+            if isinstance(screen, str) and is_interactive(screen):
+                _logger.info(
+                    "Native terminal became interactive: session=%s harness=%s terminal_id=%s",
+                    session_id,
+                    harness,
+                    terminal_id,
+                    extra=debug_event(
+                        "terminal_interactive",
+                        session_id=session_id,
+                        harness=harness,
+                        terminal_id=terminal_id,
+                        terminal_instance_id=instance.diagnostic_id,
+                        readiness_signal=readiness_signal,
+                    ),
+                )
+                return
+            if not instance.running:
+                raise RuntimeError("terminal stopped before becoming interactive")
+            if loop.time() >= deadline:
+                raise TimeoutError(f"terminal did not become interactive within {timeout_s:g}s")
+            await asyncio.sleep(poll_interval_s)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — observer failure must not fail session creation
+        _logger.warning(
+            "Native terminal interactivity was not observed: session=%s harness=%s "
+            "terminal_id=%s reason=%s",
+            session_id,
+            harness,
+            terminal_id,
+            str(exc),
+            extra=debug_event(
+                "terminal_interactive_unobserved",
+                session_id=session_id,
+                harness=harness,
+                terminal_id=terminal_id,
+                terminal_instance_id=instance.diagnostic_id,
+                readiness_signal=readiness_signal,
+                reason=type(exc).__name__,
+            ),
+        )
+
+
+def _schedule_terminal_interactive_observer(
+    *,
+    session_id: str,
+    resource_registry: SessionResourceRegistry,
+    terminal_name: str,
+    session_key: str,
+    harness: str,
+    readiness_signal: str,
+    is_interactive: Callable[[str], bool],
+) -> None:
+    """Start a non-blocking readiness observer for a registered terminal."""
+    terminal_registry = getattr(resource_registry, "terminal_registry", None)
+    if terminal_registry is None:
+        return
+    instance = terminal_registry.get(session_id, terminal_name, session_key)
+    if instance is None:
+        _logger.warning(
+            "Cannot observe native terminal interactivity: terminal is not registered; "
+            "session=%s harness=%s terminal=%s:%s",
+            session_id,
+            harness,
+            terminal_name,
+            session_key,
+            extra={"session_id": session_id},
+        )
+        return
+    terminal_id = terminal_resource_id(terminal_name, session_key)
+    task = asyncio.create_task(
+        _observe_terminal_interactive(
+            session_id=session_id,
+            terminal_id=terminal_id,
+            harness=harness,
+            readiness_signal=readiness_signal,
+            instance=instance,
+            is_interactive=is_interactive,
+        ),
+        name=f"terminal-interactive-{session_id}-{terminal_name}",
+    )
+    _TERMINAL_INTERACTIVE_TASKS.add(task)
+    task.add_done_callback(_TERMINAL_INTERACTIVE_TASKS.discard)
 
 
 def _terminal_lookup_miss_reason(
@@ -1551,9 +1679,12 @@ async def _auto_create_opencode_terminal(
                 workspace=workspace,
             ),
         )
-    except Exception:
-        await server.close()
+    except BaseException:
+        # Include cancellation; remove ownership before closing so a close failure
+        # cannot leave a stale entry or replace the startup error.
         _AUTO_OPENCODE_SERVERS.pop(session_id, None)
+        with contextlib.suppress(Exception):
+            await server.close()
         raise
 
     # Start the SSE forwarder in the background so session creation never
@@ -1620,10 +1751,12 @@ async def _auto_create_opencode_terminal(
                 "resource": session_resource_view_to_dict(terminal_view),
             },
         )
-    except Exception:
+    except BaseException:
+        # Terminal startup failure or cancellation must also release the server.
         await _cancel_auto_forwarder_task(session_id)
-        await server.close()
         _AUTO_OPENCODE_SERVERS.pop(session_id, None)
+        with contextlib.suppress(Exception):
+            await server.close()
         raise
 
     _logger.info(
@@ -4222,6 +4355,7 @@ async def _auto_create_codex_terminal(
         codex_remote_resume_omits_permission_args,
         codex_session_meta_model_provider,
         codex_terminal_env,
+        fresh_codex_launch_catalog,
         is_unreadable_thread_error,
         preload_codex_thread_for_resume,
         resolve_native_codex_launch,
@@ -4261,6 +4395,23 @@ async def _auto_create_codex_terminal(
     from omnigent.inner.codex_executor import _find_codex_cli
 
     _codex_cli_path = _find_codex_cli()
+    _catalog_launch = None
+    _fresh_codex_catalog: list[_JsonObject] | None = None
+    try:
+        _catalog_launch = await asyncio.to_thread(
+            resolve_native_codex_launch, model=None, spec=_launch_spec
+        )
+        _fresh_codex_catalog = fresh_codex_launch_catalog(
+            codex_path=_codex_cli_path,
+            launch=_catalog_launch,
+        )
+    except Exception:  # noqa: BLE001 — startup falls back to codex's migration probe
+        _logger.debug(
+            "fresh codex launch catalog unavailable for session=%s",
+            session_id,
+            exc_info=True,
+            extra={"session_id": session_id},
+        )
     pick_to_reset: str | None = None
     # Explicit launches (model-flows design §4): validate an explicit request
     # against the shared catalog, and give a Default launch on codex's own
@@ -4271,8 +4422,6 @@ async def _auto_create_codex_terminal(
     if launch_config.model_override or (
         _codex_launch.model is None and _codex_launch.profile is None
     ):
-        from dataclasses import replace as _dataclass_replace
-
         from omnigent.harnesses.codex_native.app_server import (
             codex_launch_catalog,
             codex_launch_catalog_is_stale,
@@ -4283,11 +4432,11 @@ async def _auto_create_codex_terminal(
 
         _codex_catalog: list[_JsonObject] | None = None
         _codex_catalog_was_stale = False
-        _catalog_launch = None
         try:
-            _catalog_launch = await asyncio.to_thread(
-                resolve_native_codex_launch, model=None, spec=_launch_spec
-            )
+            if _catalog_launch is None:
+                _catalog_launch = await asyncio.to_thread(
+                    resolve_native_codex_launch, model=None, spec=_launch_spec
+                )
             # Read staleness before the fetch can start a background probe.
             # The fingerprint and probe must use this session's provider.
             _codex_catalog_was_stale = await codex_launch_catalog_is_stale(
@@ -4356,7 +4505,9 @@ async def _auto_create_codex_terminal(
                     else None
                 )
                 if _default_id:
-                    _codex_launch = _dataclass_replace(_codex_launch, model=_default_id)
+                    _codex_launch = dataclasses.replace(_codex_launch, model=_default_id)
+        if _codex_catalog and not _codex_catalog_was_stale:
+            _fresh_codex_catalog = _codex_catalog
     _session_meta_provider = codex_session_meta_model_provider(_codex_launch)
     # Cancel any surviving forwarder first so its teardown closes the OLD app-server,
     # not the one registered below — and so it can't mirror alongside the new one.
@@ -4633,6 +4784,7 @@ async def _auto_create_codex_terminal(
         bypass_sandbox=launch_config.bypass_sandbox,
         developer_instructions=_codex_developer_instructions,
         reasoning_effort=launch_config.reasoning_effort,
+        model_catalog_rows=_fresh_codex_catalog,
         # Codex can show project-trust and legacy-model migration prompts before
         # creating a thread. This TUI runs detached for the web UI, so persist
         # the runner-owned acknowledgements in the private session config.
@@ -4833,6 +4985,10 @@ async def _auto_create_codex_terminal(
             resolve_harness_args,
             resolve_harness_config,
         )
+        from omnigent.harnesses.codex_native.bridge import (  # noqa: FlagLocalImports
+            CODEX_NATIVE_CONFIGURED_COMMAND_STARTUP_TIMEOUT_SECONDS,
+            write_bridge_startup_timeout,
+        )
 
         _codex_harness_cfg = load_effective_config()
         # Config-only command resolve: the managed host provisions
@@ -4842,11 +4998,41 @@ async def _auto_create_codex_terminal(
         # overrides are deliberately not consulted on this managed-host path.
         _, _codex_overrides = resolve_harness_config(_codex_harness_cfg)
         _codex_cmd_override = (_codex_overrides.get("codex-native") or {}).get("command")
-        codex_command = (
+        configured_codex_command = (
             _codex_cmd_override.strip()
             if isinstance(_codex_cmd_override, str) and _codex_cmd_override.strip()
-            else app_server.codex_path
+            else None
         )
+        codex_command = configured_codex_command or app_server.codex_path
+        thread_start_timeout_seconds = (
+            CODEX_NATIVE_CONFIGURED_COMMAND_STARTUP_TIMEOUT_SECONDS
+            if configured_codex_command is not None and not _codex_launch.login_required
+            else None
+        )
+        if configured_codex_command is not None:
+            if launch_config.external_session_id is not None:
+                _logger.info(
+                    "Codex resume: bridge state is preloaded before configured "
+                    "command %r starts; no bridge-state wait extension is needed "
+                    "(session %s)",
+                    configured_codex_command,
+                    session_id,
+                )
+            elif _codex_launch.login_required:
+                _logger.info(
+                    "Codex startup: configured command %r requires interactive "
+                    "login; preserving the unbounded sign-in wait (session %s)",
+                    configured_codex_command,
+                    session_id,
+                )
+            elif thread_start_timeout_seconds is not None:
+                _logger.info(
+                    "Codex startup: configured command %r gets a %.0fs "
+                    "thread-start budget (session %s)",
+                    configured_codex_command,
+                    thread_start_timeout_seconds,
+                    session_id,
+                )
         codex_launch_args = resolve_harness_args(
             "codex-native", tuple(codex_remote_args), cfg=_codex_harness_cfg
         )
@@ -4889,6 +5075,17 @@ async def _auto_create_codex_terminal(
                 "resource": session_resource_view_to_dict(terminal_view),
             },
         )
+        from omnigent.harnesses.codex_native.bridge import codex_terminal_interactive
+
+        _schedule_terminal_interactive_observer(
+            session_id=session_id,
+            resource_registry=resource_registry,
+            terminal_name="codex",
+            session_key="main",
+            harness="codex-native",
+            readiness_signal="codex_composer",
+            is_interactive=lambda pane: codex_terminal_interactive(bridge_dir, pane),
+        )
     except BaseException:
         with contextlib.suppress(Exception):
             await event_client.close()
@@ -4896,6 +5093,27 @@ async def _auto_create_codex_terminal(
             await app_server.close()
         _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
         raise
+
+    # Known-thread resumes publish bridge state before the terminal starts;
+    # only fresh discovery needs to extend the executor's state wait.
+    if launch_config.external_session_id is None and thread_start_timeout_seconds is not None:
+        try:
+            write_bridge_startup_timeout(bridge_dir, thread_start_timeout_seconds)
+        except OSError:
+            # The marker only extends the executor's legacy wait. A write
+            # failure must not strand the terminal before its forwarder owns
+            # it, and the forwarder must not keep waiting past the executor's
+            # legacy deadline that the marker can no longer extend: fall both
+            # sides back to the legacy timeout so the forwarder's precise
+            # startup error lands while the executor is still reporting.
+            thread_start_timeout_seconds = None
+            _logger.warning(
+                "Could not publish Codex startup timeout for session %s; "
+                "falling back to the legacy startup timeout for the executor "
+                "and the forwarder",
+                session_id,
+                exc_info=True,
+            )
 
     # Adopt the thread the fresh TUI creates and run the forwarder in the
     # background, so session creation never blocks on TUI startup.
@@ -4910,6 +5128,7 @@ async def _auto_create_codex_terminal(
                 event_client=event_client,
                 routing_summary=_codex_launch.summary,
                 login_required=_codex_launch.login_required,
+                thread_start_timeout_seconds=thread_start_timeout_seconds,
                 subagent_router=_codex_router,
                 turn_router=_codex_turn_router,
             )
@@ -4969,6 +5188,7 @@ async def _codex_discover_thread_and_forward(
     event_client: CodexAppServerClient,
     routing_summary: str,
     login_required: bool = False,
+    thread_start_timeout_seconds: float | None = None,
     subagent_router: SubagentRouter | None = None,
     turn_router: TurnRouter | None = None,
 ) -> None:
@@ -5005,6 +5225,9 @@ async def _codex_discover_thread_and_forward(
         the thread-start timeout), while thread discovery keeps listening
         so an interactive sign-in from the terminal still recovers the
         session.
+    :param thread_start_timeout_seconds: Configured-command thread-start
+        allowance. ``None`` preserves the forwarder's ordinary 30-second
+        default.
     :param subagent_router: Router this terminal launch started, torn down
         in the ``finally``. Passed so a late teardown cannot close the
         endpoint a re-created terminal has since installed.
@@ -5012,6 +5235,7 @@ async def _codex_discover_thread_and_forward(
         started, torn down alongside the subagent one.
     """
     from omnigent.harnesses.codex_native.bridge import (
+        CODEX_NATIVE_DIRECT_THREAD_START_TIMEOUT_SECONDS,
         CodexNativeBridgeState,
         clear_bridge_startup_error,
         write_bridge_startup_error,
@@ -5056,6 +5280,11 @@ async def _codex_discover_thread_and_forward(
                 # No deadline: the turn-facing failure is already recorded,
                 # so this wait only serves a possible interactive sign-in.
                 thread_id = await wait_for_thread_started(event_client, timeout=None)
+            elif thread_start_timeout_seconds is not None:
+                thread_id = await wait_for_thread_started(
+                    event_client,
+                    timeout=thread_start_timeout_seconds,
+                )
             else:
                 thread_id = await wait_for_thread_started(event_client)
         except (TimeoutError, RuntimeError) as exc:
@@ -5068,11 +5297,15 @@ async def _codex_discover_thread_and_forward(
                 session_id,
             )
             # Bridge state is never written here; leave the real cause for the executor (#59).
-            cause = (
-                "startup timed out"
-                if isinstance(exc, TimeoutError)
-                else "event stream ended before a thread was created"
-            )
+            if isinstance(exc, TimeoutError):
+                timeout_seconds = (
+                    thread_start_timeout_seconds
+                    if thread_start_timeout_seconds is not None
+                    else CODEX_NATIVE_DIRECT_THREAD_START_TIMEOUT_SECONDS
+                )
+                cause = f"startup timed out after {timeout_seconds:g}s"
+            else:
+                cause = "event stream ended before a thread was created"
             write_bridge_startup_error(
                 bridge_dir,
                 f"Codex app-server never started a thread ({cause}: "
@@ -5434,6 +5667,7 @@ async def _auto_create_antigravity_terminal(
         permission_mode=None,
         headless=False,
         extra_args=terminal_launch_args,
+        log_dir=bridge_dir,
     )
 
     # Wire the Omnigent MCP relay so the wrapped agy gets the sys_* tools
@@ -7788,6 +8022,17 @@ async def _auto_create_claude_terminal(
         terminal_name="claude",
         session_key="main",
     )
+    from omnigent.harnesses.claude_native.bridge import _claude_prompt_rendered
+
+    _schedule_terminal_interactive_observer(
+        session_id=session_id,
+        resource_registry=resource_registry,
+        terminal_name="claude",
+        session_key="main",
+        harness="claude-native",
+        readiness_signal="claude_composer",
+        is_interactive=_claude_prompt_rendered,
+    )
     _logger.info(
         "Claude terminal tmux target published: session=%s bridge_id=%s",
         session_id,
@@ -8167,8 +8412,8 @@ async def _resolve_native_spawn_env(
     :param harness_name: Harness id, e.g. ``"codex-native"``.
     :param session_id: Omnigent conversation id.
     :param server_client: Runner's client to the Omnigent server, for label reads.
-    :param optional_labels: Envelope labels already in hand (claude prefers these
-        over a fresh fetch), or ``None``.
+    :param optional_labels: Envelope labels already in hand, preferred over a
+        fresh fetch for every label-backed native provider, or ``None``.
     :returns: The spawn env mapping, or ``None`` when *harness_name* is not a
         native harness with a registered spawn-env builder (caller keeps its
         existing ``spawn_env``).
@@ -8202,9 +8447,13 @@ async def _resolve_native_spawn_env(
         return _typed_spawn_env(builder(session_id))
 
     if provider.bridge_id_label_key is not None:
-        labels = await _session_labels_for_runner_spawn(
-            server_client=server_client,
-            session_id=session_id,
+        labels = (
+            optional_labels
+            if optional_labels is not None
+            else await _session_labels_for_runner_spawn(
+                server_client=server_client,
+                session_id=session_id,
+            )
         )
         return _typed_spawn_env(
             builder(session_id, bridge_id=labels.get(provider.bridge_id_label_key))
@@ -8800,6 +9049,7 @@ async def _codex_native_terminal_arrives_via_transfer(
     server_client: httpx.AsyncClient | None,
     session_id: str,
     resource_registry: SessionResourceRegistry,
+    session_labels: Mapping[str, str] | None = None,
 ) -> bool:
     """
     Return whether a live Codex terminal will be transferred into a session.
@@ -8821,11 +9071,13 @@ async def _codex_native_terminal_arrives_via_transfer(
     :param session_id: Newly-bound session id, e.g. ``"conv_new"``.
     :param resource_registry: Registry probed for the original session's
         live ``codex:main`` terminal.
+    :param session_labels: Labels supplied by the initialization envelope.
+        ``None`` selects the legacy labels callback.
     :returns: ``True`` when a different session on the same bridge owns a
         live ``codex:main`` terminal (transfer inbound), else ``False``.
     """
     terminal_registry = resource_registry.terminal_registry
-    if terminal_registry is None or server_client is None:
+    if terminal_registry is None:
         return False
     # Lazy import keeps codex-native out of the generic runner import graph.
     from omnigent.harnesses.codex_native.bridge import (
@@ -8838,10 +9090,15 @@ async def _codex_native_terminal_arrives_via_transfer(
         read_bridge_state as read_codex_bridge_state,
     )
 
-    labels = await _session_labels_for_runner_spawn(
-        server_client=server_client,
-        session_id=session_id,
-    )
+    if session_labels is not None:
+        labels = session_labels
+    elif server_client is not None:
+        labels = await _session_labels_for_runner_spawn(
+            server_client=server_client,
+            session_id=session_id,
+        )
+    else:
+        return False
     bridge_id = labels.get(CODEX_NATIVE_BRIDGE_ID_LABEL_KEY) or session_id
     state = read_codex_bridge_state(codex_bridge_dir_for_bridge_id(bridge_id))
     # Fresh bridge, or the new session is already active — nothing transfers in.

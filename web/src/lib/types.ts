@@ -570,6 +570,42 @@ export interface ModelConfigurationSource {
   host?: string;
 }
 
+/**
+ * One resolved Devin Fusion pairing. Both halves are real catalog models:
+ * a `lead` (with an `effort` rung and an optional `fast` serving modifier) and
+ * a `sidekick` (with an optional `priority` modifier). `modelUid` is the exact
+ * `--model` id to launch.
+ */
+export interface FusionCombo {
+  /** Full Devin variant id, e.g. `fusion-claude-fable-5-1-medium-sidekick-swe-2-medium`. */
+  modelUid: string;
+  /** Lead family key (a standalone model id), e.g. `claude-fable-5.1`. */
+  lead: string;
+  /** Lead family label, e.g. `Claude Fable 5.1`. */
+  leadLabel: string;
+  /** Lead reasoning effort rung, e.g. `medium`. */
+  effort: string;
+  /** Whether this pairing uses the lead's `-fast` serving variant. */
+  fast: boolean;
+  /** Sidekick key with any `-priority` modifier stripped, e.g. `swe-2-medium`. */
+  sidekick: string;
+  /** Sidekick label, e.g. `SWE-2 Medium`. */
+  sidekickLabel: string;
+  /** Whether this pairing uses the sidekick's `-priority` variant. */
+  priority: boolean;
+}
+
+/**
+ * Structured Fusion picker payload: the full set of real lead/sidekick combos
+ * plus the default. The web builds dependent Lead / Effort / Sidekick selectors
+ * from `combos` and only offers combinations that exist.
+ */
+export interface FusionDescriptor {
+  combos: FusionCombo[];
+  /** `modelUid` of the default combo. */
+  default: string;
+}
+
 /** One runner-owned native model-picker row. */
 export interface NativeModelOption {
   /** Native picker id (a Claude alias or Codex model id). */
@@ -586,4 +622,6 @@ export interface NativeModelOption {
   isDefault?: boolean;
   /** Configuration that supplies this model; never includes credentials. */
   source?: ModelConfigurationSource;
+  /** Present only on Devin's Fusion option: its lead/sidekick combo table. */
+  fusion?: FusionDescriptor;
 }

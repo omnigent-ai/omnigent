@@ -159,7 +159,7 @@ def test_reject_unsupported_type(
 
 
 def test_landing_rejects_unsupported_type_and_keeps_message(
-    page: Page, seeded_session: tuple[str, str], tmp_path: Path
+    page: Page, live_server: str, tmp_path: Path
 ) -> None:
     """The new-chat landing composer rejects a zip without losing the typed message.
 
@@ -179,7 +179,7 @@ def test_landing_rejects_unsupported_type_and_keeps_message(
        never attached, so there is no chip to remove and nothing else would
        ever clear it; left sticky it reads as a hard blocker.
     """
-    base_url, _session_id = seeded_session
+    base_url = live_server
     sample = tmp_path / _ZIP_NAME
     sample.write_bytes(b"PK\x03\x04 not a real zip, just an unsupported binary")
 

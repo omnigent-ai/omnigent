@@ -165,7 +165,7 @@ jobs:
           python-version-file: ".python-version"
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v3
+        uses: ./.github/actions/setup-uv
         with:
           enable-cache: true
 
@@ -206,6 +206,10 @@ jobs:
           # sysmon: the default C-trace coverage backend pushed the heaviest
           # shard past its timeout; only line coverage is collected.
           COVERAGE_CORE: sysmon
+          # Multiplies the tests' hang-guard waits (tests.budgets.budget).
+          # A shared runner under -n 4+ can stall an event loop past a 1s
+          # budget; local runs keep the unscaled default and fail fast.
+          OMNIGENT_TEST_TIMEOUT_SCALE: "4"
         run: |
           mkdir -p artifacts artifacts/progress "$(dirname "$COVERAGE_FILE")"
           # matrix.paths is unquoted on purpose: it word-splits into pytest args.
@@ -265,7 +269,7 @@ jobs:
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
         with:
           python-version-file: ".python-version"
-      - uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a
+      - uses: ./.github/actions/setup-uv
         with:
           enable-cache: true
       - name: Install dependencies
@@ -307,7 +311,7 @@ jobs:
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
         with:
           python-version-file: ".python-version"
-      - uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a
+      - uses: ./.github/actions/setup-uv
         with:
           enable-cache: true
       - name: Start CockroachDB
@@ -362,7 +366,7 @@ jobs:
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
         with:
           python-version-file: ".python-version"
-      - uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a
+      - uses: ./.github/actions/setup-uv
         with:
           enable-cache: true
       - name: Install system MySQL client library
@@ -402,7 +406,7 @@ jobs:
           python-version-file: ".python-version"
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v3
+        uses: ./.github/actions/setup-uv
         with:
           enable-cache: true
 

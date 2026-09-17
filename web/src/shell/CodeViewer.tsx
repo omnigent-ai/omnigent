@@ -11,6 +11,7 @@
 //   highlighted range navigates to that comment in CommentsPanel.
 
 import type { FilePosition } from "./FileViewerContext";
+import { isFilePositionPending } from "./filePositionState";
 import { createPortal } from "react-dom";
 import {
   isValidElement,
@@ -515,7 +516,14 @@ export function CodeViewer({
 
   const revealedPositionRef = useRef<FilePosition | undefined>(undefined);
   useEffect(() => {
-    if (!position || showMonaco || viewMode !== "source" || !fileQuery.isSuccess) return;
+    if (
+      !position ||
+      !isFilePositionPending(position) ||
+      showMonaco ||
+      viewMode !== "source" ||
+      !fileQuery.isSuccess
+    )
+      return;
     if (revealedPositionRef.current === position) return;
     const index = Math.min(Math.max(1, position.line), rawLines.length) - 1;
     const line = matchLineRefs.current.get(index);

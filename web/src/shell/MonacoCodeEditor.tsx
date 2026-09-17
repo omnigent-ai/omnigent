@@ -16,6 +16,7 @@
 // (offsets must match the saved server content).
 
 import type { FilePosition } from "./FileViewerContext";
+import { isFilePositionPending } from "./filePositionState";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Editor, type EditorProps, type OnChange, type OnMount } from "@monaco-editor/react";
 import { AlertTriangleIcon, MessageSquareOffIcon } from "lucide-react";
@@ -302,6 +303,8 @@ function MonacoCodeEditorInner({
   // Monaco scrolls internally, so its offset is cached per conversation + file
   // rather than via the DOM scroll-restore hook. Held in a ref so the mount-time
   // onDidScrollChange subscription always writes the current file's key.
+  const positionRef = useRef(position);
+  positionRef.current = position;
   const scrollKeyRef = useRef("");
   scrollKeyRef.current = `viewer:${conversationId}:${path}`;
 
@@ -351,6 +354,7 @@ function MonacoCodeEditorInner({
         editor,
         () => scrollKeyRef.current,
         () => editorInstanceRef.current === editor,
+        !isFilePositionPending(positionRef.current),
       );
       setMounted(true);
     },

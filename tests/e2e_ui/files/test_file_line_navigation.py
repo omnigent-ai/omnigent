@@ -175,6 +175,40 @@ def test_source_citation_centers_last_loaded_line(
         )
         expect(viewer.locator(".monaco-diff-editor")).to_have_count(0)
 
+    # Reader interaction consumes the request even when the workspace remounts.
+    viewer.locator(".view-lines").click()
+    page.keyboard.press("Home")
+    page.keyboard.press("ArrowUp")
+    page.keyboard.press("PageUp")
+    page.keyboard.press("PageUp")
+    page.wait_for_function(
+        f"arg => !({_CENTERED_LINE})(arg)",
+        arg={"text": _AFTER_LINES[-1], "diff": False},
+    )
+    # Remember the nearest rendered line to the viewport center.
+    centered_text = viewer.locator(".monaco-editor").evaluate("""editor => {
+      const rect = editor.getBoundingClientRect();
+      const center = (rect.top + rect.bottom) / 2;
+      return [...editor.querySelectorAll('.view-line')].sort((a, b) =>
+        Math.abs(a.getBoundingClientRect().top - center) -
+        Math.abs(b.getBoundingClientRect().top - center)
+      )[0].textContent.replace(/\u00a0/g, ' ');
+    }""")
+    page.get_by_role("button", name="Collapse right panel").click()
+    expect(viewer).to_have_count(0)
+    page.get_by_role("button", name="Expand right panel").click()
+    page.wait_for_function(
+        _CENTERED_LINE, arg={"text": centered_text, "diff": False}, timeout=30_000
+    )
+    page.get_by_role("button", name="Beyond file", exact=True).click()
+    page.wait_for_function(
+        _CENTERED_LINE, arg={"text": _AFTER_LINES[-1], "diff": False}, timeout=10_000
+    )
+    page.reload()
+    page.wait_for_function(
+        _CENTERED_LINE, arg={"text": _AFTER_LINES[-1], "diff": False}, timeout=30_000
+    )
+
 
 def test_citation_preserves_offline_markdown_draft_with_diff_preference(
     page: Page, seeded_session: tuple[str, str]
@@ -250,3 +284,79 @@ def test_citation_preserves_offline_markdown_draft_with_diff_preference(
     expect(editor).to_be_visible()
     expect(editor).to_have_text("Unsaved offline Markdown draft")
     expect(viewer.locator(".monaco-editor")).to_have_count(0)
+
+
+def test_plain_markdown_open_restores_scroll_after_citing_another_file(
+    page: Page, seeded_session: tuple[str, str]
+) -> None:
+    """A citation must not suppress another file's first-render scroll restore."""
+    _seed_citation_file(page, seeded_session)
+    base_url, session_id = seeded_session
+    path = "src/saved.md"
+    content = "\n".join(f"Markdown source line {line}" for line in range(1, 501))
+    environment_url = f"{base_url}/v1/sessions/{session_id}/resources/environments/default"
+    page.route(
+        environment_url,
+        lambda route: route.fulfill(json={"metadata": {"root": "/workspace"}}),
+    )
+    page.route(
+        f"{environment_url}/filesystem/src?*",
+        lambda route: route.fulfill(
+            json={
+                "object": "list",
+                "has_more": False,
+                "data": [
+                    {"path": path, "name": "saved.md", "type": "file", "bytes": len(content)}
+                ],
+            }
+        ),
+    )
+    page.route(
+        f"{environment_url}/filesystem/{path}",
+        lambda route: route.fulfill(
+            json={
+                "object": "session.environment.filesystem.file_content",
+                "path": path,
+                "content": content,
+                "encoding": "utf-8",
+                "content_type": "text/markdown",
+                "bytes": len(content),
+            }
+        ),
+    )
+    response = httpx.post(
+        f"{base_url}/v1/sessions/{session_id}/events",
+        json={
+            "type": "external_assistant_message",
+            "data": {
+                "agent": "hello_world",
+                "text": f"[Open Markdown]({path})",
+            },
+        },
+        timeout=10,
+    )
+    response.raise_for_status()
+    page.set_viewport_size({"width": 1600, "height": 1000})
+    preferences = json.dumps({"diffActive": False, "previewableViewMode": "source"})
+    page.add_init_script(
+        f"localStorage.setItem('omnigent:file-view-preferences', {json.dumps(preferences)});"
+    )
+    page.goto(f"{base_url}/c/{session_id}?file={path}")
+    viewer = page.locator('[data-testid="file-viewer"]:visible')
+    target = viewer.locator('[data-line="200"]')
+    expect(target).to_be_attached(timeout=30_000)
+    target.evaluate("el => el.scrollIntoView({block: 'center'})")
+    expect(target).to_be_in_viewport()
+    original_top = target.evaluate("el => el.getBoundingClientRect().top")
+    page.get_by_role("button", name="Line 100", exact=True).click()
+    page.wait_for_function(
+        _CENTERED_LINE, arg={"text": _AFTER_LINES[99], "diff": False}, timeout=30_000
+    )
+    page.get_by_role("button", name="Open Markdown", exact=True).click()
+    expect(target).to_be_in_viewport(timeout=30_000)
+    page.wait_for_function(
+        """top => Math.abs(
+          document.querySelector('[data-line="200"]').getBoundingClientRect().top - top
+        ) < 25""",
+        arg=original_top,
+    )

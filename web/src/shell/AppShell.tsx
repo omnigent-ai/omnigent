@@ -95,7 +95,7 @@ import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { ChatHeader } from "./ChatHeader";
 import { ExecutionLogsPanel } from "./ExecutionLogsPanel";
 import { FileViewer } from "./FileViewer";
-import { FileViewerContext, type FilePosition } from "./FileViewerContext";
+import { FileViewerContext, type FilePosition, type OpenFileOptions } from "./FileViewerContext";
 import { FilesPanelDrawer } from "./FilesPanelDrawer";
 import type { ChangedSort } from "./FlatFileList";
 import { GithubPanel } from "./GithubPanel";
@@ -330,9 +330,31 @@ export function AppShell() {
   const [selectedFilePath, setSelectedFilePath] = useState<string | null>(() =>
     conversationId ? (readSessionWorkspaceState(conversationId).selectedFilePath ?? null) : null,
   );
-  const [fileNavigation, setFileNavigation] = useState<{ path: string; position: FilePosition }>();
+  const [fileNavigation, setFileNavigation] = useState<{
+    conversationId: string | undefined;
+    path: string;
+    position: FilePosition;
+  }>();
+  const citationPath = searchParams.get("file");
+  const citationLine = searchParams.get("line");
+  const citationColumn = searchParams.get("column");
+  // Keep URL requests stable across viewer remounts, just like citation clicks.
+  const urlNavigation = useMemo(() => {
+    const line = Number(citationLine);
+    const column = Number(citationColumn);
+    if (!citationPath || !Number.isSafeInteger(line) || line < 1) return undefined;
+    return {
+      conversationId,
+      path: citationPath,
+      position: { line, ...(Number.isSafeInteger(column) && column > 0 ? { column } : {}) },
+    };
+  }, [conversationId, citationPath, citationLine, citationColumn]);
   const filePosition =
-    fileNavigation?.path === selectedFilePath ? fileNavigation.position : undefined;
+    fileNavigation?.conversationId === conversationId && fileNavigation?.path === selectedFilePath
+      ? fileNavigation.position
+      : urlNavigation?.path === selectedFilePath
+        ? urlNavigation.position
+        : undefined;
   // Ordered list of open file tabs. ``selectedFilePath`` is the active tab
   // (null = a scope view, Changed/All, is active). Tabs persist when the user
   // switches to a scope view or another rail tab; only ``closeFile`` removes
@@ -1164,9 +1186,10 @@ export function AppShell() {
   }, []);
 
   const openFileViewer = useCallback(
-    (path: string, position?: FilePosition) => {
+    (path: string, options?: OpenFileOptions) => {
+      const position = options?.line ? { line: options.line, column: options.column } : undefined;
       setSelectedFilePath(path);
-      setFileNavigation(position ? { path, position: { ...position } } : undefined);
+      setFileNavigation(position ? { conversationId, path, position: { ...position } } : undefined);
       // A file and a shell tab can't both own the rail's content slot —
       // opening a file deselects any active shell tab (its tab stays in the
       // strip).
@@ -1206,6 +1229,12 @@ export function AppShell() {
           const next = new URLSearchParams(prev);
           next.set("file", path);
           next.delete("comment"); // stale comment belongs to the previous file
+          // A citation's cited line rides along so the viewer can land on it;
+          // a plain open clears any previous citation's line.
+          if (options?.line != null) next.set("line", String(options.line));
+          else next.delete("line");
+          if (options?.column != null) next.set("column", String(options.column));
+          else next.delete("column");
           return next;
         },
         { replace: true },
@@ -1225,6 +1254,8 @@ export function AppShell() {
         next.delete("file");
         next.delete("diff");
         next.delete("comment");
+        next.delete("line");
+        next.delete("column");
         return next;
       },
       { replace: true },
@@ -1506,6 +1537,7 @@ export function AppShell() {
               const params = new URLSearchParams(sp);
               params.set("file", neighbor);
               params.delete("comment");
+              params.delete("line"); // stale citation belongs to the closed file
               return params;
             },
             { replace: true },

@@ -16,7 +16,10 @@ import { defaultRemarkPlugins } from "streamdown";
 import remarkBreaks from "remark-breaks";
 import { normalizeExplicitMathDelimiters } from "@/components/ai-elements/mathMarkdown";
 import { MessageResponse } from "@/components/ai-elements/message";
-import { WORKSPACE_FILE_LINK_ATTR } from "@/components/ai-elements/streamdown-security";
+import {
+  splitWorkspaceFileCitation,
+  WORKSPACE_FILE_LINK_ATTR,
+} from "@/components/ai-elements/streamdown-security";
 import { ZoomableImage } from "@/components/ImageLightbox";
 import { useThrottledValue } from "@/hooks/useThrottledValue";
 import { isNativeShell } from "@/lib/nativeBridge";
@@ -35,9 +38,6 @@ import { showToast } from "@/components/ui/toast";
 // they destructure `node` away first. Left in, it renders as a literal
 // node="[object Object]" attribute.
 type WithHastNode<T> = T & { node?: unknown };
-
-// Trailing `:line` / `:line:col` on a cited path, e.g. `src/app.ts:42:7`.
-const POSITION_SUFFIX = /:(\d+)(?::(\d+))?$|#L(\d+)(?:C(\d+))?$/;
 
 /** What the chat renderers know about a cited path's openability. */
 interface WorkspaceFileOpener {
@@ -71,15 +71,14 @@ function useWorkspaceFileOpener(text: string): WorkspaceFileOpener {
   const conversationId = useFileViewerConversationId();
   const { root, home } = useWorkspacePaths();
 
-  // Resolve the filename separately from the cited source position.
-  const suffix = text.match(POSITION_SUFFIX);
-  const cited = text.replace(POSITION_SUFFIX, "");
-  const line = Number(suffix?.[1] ?? suffix?.[3]);
-  const column = Number(suffix?.[2] ?? suffix?.[4]);
-  const position =
-    Number.isSafeInteger(line) && line > 0
-      ? { line, ...(Number.isSafeInteger(column) && column > 0 ? { column } : {}) }
-      : undefined;
+  // Agents cite a file with the position they mean, `docs/notes.md:12` or
+  // `:12:7`. The position is not part of the filename, so no such path is ever
+  // in the changed-files list or on disk; drop it before resolving, but keep
+  // the line so the viewer can land on the cited change. The span still
+  // displays the citation the agent wrote.
+  const citation = splitWorkspaceFileCitation(text);
+  const cited = citation.path;
+  const citedLine = citation.line;
   // Collapse absolute / "~"-relative forms onto a workspace-relative path
   // (matching the changed-files list and relative filesystem routes), or keep
   // an outside-workspace path host-absolute — the FileViewer opens both.
@@ -115,7 +114,13 @@ function useWorkspaceFileOpener(text: string): WorkspaceFileOpener {
     };
   }
   return {
-    open: () => (position ? openFile(linkPath, position) : openFile(linkPath)),
+    open: () =>
+      citedLine === null
+        ? openFile(linkPath)
+        : openFile(linkPath, {
+            line: citedLine,
+            ...(citation.column ? { column: citation.column } : {}),
+          }),
     unopenable: false,
     resolvedPath: linkPath,
   };

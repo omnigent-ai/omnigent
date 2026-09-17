@@ -210,6 +210,8 @@ import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
 import { nativeModelLabel } from "@/components/HarnessConfigControls";
 import { PickerSectionHeader } from "@/components/composer/HarnessMenuRow";
 import { ComposerConfigSections } from "@/components/composer/ComposerConfigSections";
+import { buildFusionSections } from "@/components/composer/fusionSections";
+import { fusionOption, isFusionModelUid } from "@/lib/devinFusion";
 import { ComposerWorkspaceStatus } from "@/components/composer/ComposerWorkspaceStatus";
 import { ComposerPrLink } from "@/components/composer/ComposerPrLink";
 import { ComposerContextRing } from "@/components/composer/ComposerContextRing";
@@ -2282,25 +2284,15 @@ export function subAgentComposerLabel(
 }
 
 /**
- * Shelf tray sitting flush on the composer's workspace bar while the active
- * session is a sub-agent (child) — names the sub-agent the message is going
- * to, so the composer reads as "messaging the sub-agent", not the
- * orchestrator. Rendered inside the composer column wrapper sharing the bar's
- * ``mx-3`` inset; ``-mb-px`` collapses the seam so the tray sits directly on
- * the bar. The tray owns the stack's rounded top, so the bar squares its own
- * top (``rounded-t-none``, applied at the call site while a sub-agent shows) —
- * this hides the tray's square bottom behind the bar, reading as one shelf
- * rather than two overlapping rounded tabs. Brand pink (``brand-accent``)
- * marks this as a sub-agent context cue, not a status.
- *
- * @param label - The sub-agent instance name, e.g.
- *   ``"check-account-eligibility"`` (from ``subAgentComposerLabel``).
+ * Sub-agent shelf tucked behind the workspace bar's rounded top.
+ * Bottom padding keeps the label above the overlap; opaque surfaces prevent
+ * the pink tint from bleeding through the bar.
  */
 function SubagentComposerTray({ label }: { label: string }) {
   return (
     <div
       data-testid="composer-subagent-tray"
-      className="-mb-px mx-3 flex items-center gap-1.5 rounded-t-2xl bg-brand-accent/10 px-4 py-1.5 text-sm text-brand-accent"
+      className="composer-subagent-surface mx-3 -mb-4 flex items-center gap-1.5 rounded-t-2xl px-4 pb-5.5 pt-1.5 text-sm text-brand-accent"
     >
       <BotIcon className="size-3.5 shrink-0" aria-hidden="true" />
       {/* truncate so a long sub-agent name never wraps the tray to two rows */}
@@ -3439,6 +3431,18 @@ function ComposerImpl(
     ) {
       const ta = e.currentTarget;
       if (e.key === "ArrowUp" && ta.selectionStart === 0) {
+        // Empty-composer recall takes the last queued row before browsing history.
+        if (fullText.trim() === "" && files.length === 0 && mentionedItems.length === 0) {
+          const target = queuedMessages.findLast((m) => m.conversationId === conversationId);
+          if (target !== undefined) {
+            e.preventDefault();
+            resetCursor();
+            setFiles(target.files ?? []);
+            dequeueMessage(target.queueId);
+            applyRecall(ta, target);
+            return;
+          }
+        }
         const recalled = recallPrevious(fullText, storedReplyDraft);
         if (recalled !== null) {
           e.preventDefault();
@@ -3553,10 +3557,7 @@ function ComposerImpl(
             SubagentComposerTray). Truthy (not just non-null) so an empty
             label never peeks a nameless tray. */}
         {subAgentLabel ? <SubagentComposerTray label={subAgentLabel} /> : null}
-        <ComposerWorkspaceBar
-          data-testid="composer-workspace-controls"
-          className={subAgentLabel ? "rounded-t-none" : undefined}
-        >
+        <ComposerWorkspaceBar data-testid="composer-workspace-controls">
           <ComposerWorkspaceStatus
             workspacePath={composerWorkspace ?? null}
             worktreePath={composerGit.worktreePath}
@@ -4642,6 +4643,19 @@ function SessionHarnessPicker({
       )
         await store.setCostControlMode("off");
     });
+  // Devin Fusion: the composed `fusion-…` id is the model; the lead effort is
+  // baked in, so it carries no separate reasoning effort.
+  const composerFusionOption = fusionOption(modelOptions);
+  const composerFusion = composerFusionOption?.fusion;
+  const fusionSelected = composerFusion !== undefined && isFusionModelUid(pickerSelectedModel);
+  const selectFusionModel = (modelUid: string) =>
+    void apply(async () => {
+      const store = useChatStore.getState();
+      const sourceSessionId = store.conversationId;
+      await store.setModel(modelUid, { expectConfirmation: false });
+      if (useChatStore.getState().conversationId !== sourceSessionId) return;
+      if (selectedEffort !== null) await store.setEffort(null);
+    });
   const modelContent = (
     <>
       {costRoutingEligible && showModels && (
@@ -4684,15 +4698,21 @@ function SessionHarnessPicker({
                     label: nativeModelLabel(model),
                     checked:
                       !routingOn &&
-                      (model.id === pickerSelectedModel ||
-                        (pickerSelectedModel === null && model.isDefault === true)),
+                      (composerFusion !== undefined && model.id === composerFusionOption?.id
+                        ? isFusionModelUid(pickerSelectedModel)
+                        : model.id === pickerSelectedModel ||
+                          (pickerSelectedModel === null && model.isDefault === true)),
                     disabled: busy || pendingModelChange !== null,
-                    onSelect: () => selectModel(model.isDefault ? null : model.id),
+                    onSelect: () =>
+                      composerFusion !== undefined && model.id === composerFusionOption?.id
+                        ? selectFusionModel(composerFusion.default)
+                        : selectModel(model.isDefault ? null : model.id),
                     testId: `composer-agent-model-${model.id}`,
                     className: "whitespace-normal break-words",
                     data: { "data-model-id": model.id },
                   })),
                   ...(pickerSelectedModel &&
+                  !isFusionModelUid(pickerSelectedModel) &&
                   !modelOptions.some((model) => model.id === pickerSelectedModel)
                     ? [
                         {
@@ -4707,6 +4727,17 @@ function SessionHarnessPicker({
                     : []),
                 ],
               }
+            : undefined
+        }
+        extra={
+          composerFusion !== undefined && fusionSelected && !routingOn
+            ? buildFusionSections({
+                descriptor: composerFusion,
+                modelUid: pickerSelectedModel ?? composerFusion.default,
+                testIdPrefix: "composer-agent",
+                onChange: selectFusionModel,
+                disabled: busy || pendingModelChange !== null,
+              })
             : undefined
         }
       />

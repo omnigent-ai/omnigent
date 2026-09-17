@@ -475,20 +475,34 @@ def _batchwrite_calls(client: _FakeCodexClient) -> list[_Req]:
     return [r for r in client.requests if r.method == "config/batchWrite"]
 
 
-async def _fake_wait_until_ready(self: CodexNativeAppServer) -> None:
+@dataclass
+class _FakeStartupClient:
+    """Minimal initialized client returned by startup unit-test probes."""
+
+    close_calls: int = 0
+
+    async def close(self) -> None:
+        self.close_calls += 1
+
+
+async def _fake_wait_until_ready(self: CodexNativeAppServer) -> _FakeStartupClient:
     """
     Skip app-server socket probing in startup unit tests.
 
     :param self: The app-server wrapper under test.
-    :returns: None.
+    :returns: Initialized fake client owned by the startup flow.
     """
+    return _FakeStartupClient()
 
 
-async def _fake_trust_policy_hooks(self: CodexNativeAppServer) -> None:
+async def _fake_trust_policy_hooks(
+    self: CodexNativeAppServer, *, client: CodexAppServerClient | None = None
+) -> None:
     """
     Skip Codex ``hooks/list`` RPCs in startup unit tests.
 
     :param self: The app-server wrapper under test.
+    :param client: Reused initialized startup client.
     :returns: None.
     """
 
@@ -1198,6 +1212,39 @@ def test_codex_catalog_fingerprint_survives_a_missing_binary(tmp_path: Path) -> 
     assert isinstance(fingerprint, str) and fingerprint
 
 
+def test_fresh_codex_launch_catalog_rejects_stale_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only a fresh gateway-aware snapshot may replace the migration probe."""
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+    from omnigent.models import model_catalog_store
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    codex = tmp_path / "codex"
+    codex.write_text("build", encoding="utf-8")
+    launch = _default_codex_launch()
+    fingerprint = codex_native_app_server.codex_catalog_fingerprint(launch, codex_path=str(codex))
+    rows = [{"id": "gpt-5.4", "model": "gpt-5.4", "isDefault": True}]
+
+    assert (
+        codex_native_app_server.fresh_codex_launch_catalog(launch=launch, codex_path=str(codex))
+        is None
+    )
+    model_catalog_store.write_catalog("codex-native", fingerprint, rows)
+    assert (
+        codex_native_app_server.fresh_codex_launch_catalog(launch=launch, codex_path=str(codex))
+        == rows
+    )
+
+    path = model_catalog_store.catalog_path("codex-native", fingerprint)
+    old = path.stat().st_mtime - model_catalog_store.CATALOG_STALE_AFTER_S - 60
+    os.utime(path, (old, old))
+    assert (
+        codex_native_app_server.fresh_codex_launch_catalog(launch=launch, codex_path=str(codex))
+        is None
+    )
+
+
 def _test_app_server(
     tmp_path: Path,
     codex_home: Path,
@@ -1226,6 +1273,231 @@ def _test_app_server(
         bridge_dir=bridge_dir,
         python_executable="/new/python",
     )
+
+
+async def test_start_reuses_initialized_readiness_client_for_hook_trust(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Startup trusts hooks over the readiness connection, then closes it."""
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+
+    source_home = tmp_path / "source-codex-home"
+    source_home.mkdir()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+
+    async def _supported_version(_codex_path: str) -> tuple[int, int, int]:
+        return (0, 147, 0)
+
+    startup_client = _FakeStartupClient()
+    trusted_with: list[object] = []
+
+    async def _ready(_self: CodexNativeAppServer) -> _FakeStartupClient:
+        return startup_client
+
+    async def _trust(
+        _self: CodexNativeAppServer, *, client: CodexAppServerClient | None = None
+    ) -> None:
+        trusted_with.append(client)
+
+    monkeypatch.setattr(codex_native_app_server, "_codex_cli_version", _supported_version)
+    monkeypatch.setattr(CodexNativeAppServer, "_wait_until_ready", _ready)
+    monkeypatch.setattr(CodexNativeAppServer, "_trust_policy_hooks", _trust)
+    server = _test_app_server(
+        tmp_path,
+        tmp_path / "codex-home",
+        tmp_path / "bridge",
+        workspace,
+    )
+
+    await server.start()
+    try:
+        assert trusted_with == [startup_client]
+        assert startup_client.close_calls == 1
+    finally:
+        await server.close()
+
+
+async def test_start_cancellation_closes_reused_client_and_app_server(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cancellation during hook trust closes both startup resources."""
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+
+    source_home = tmp_path / "source-codex-home"
+    source_home.mkdir()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+
+    async def _supported_version(_codex_path: str) -> tuple[int, int, int]:
+        return (0, 147, 0)
+
+    startup_client = _FakeStartupClient()
+    trust_started = asyncio.Event()
+
+    async def _ready(_self: CodexNativeAppServer) -> _FakeStartupClient:
+        return startup_client
+
+    async def _trust(
+        _self: CodexNativeAppServer, *, client: CodexAppServerClient | None = None
+    ) -> None:
+        assert client is startup_client
+        trust_started.set()
+        await asyncio.Future()
+
+    monkeypatch.setattr(codex_native_app_server, "_codex_cli_version", _supported_version)
+    monkeypatch.setattr(CodexNativeAppServer, "_wait_until_ready", _ready)
+    monkeypatch.setattr(CodexNativeAppServer, "_trust_policy_hooks", _trust)
+    server = _test_app_server(
+        tmp_path,
+        tmp_path / "codex-home",
+        tmp_path / "bridge",
+        workspace,
+    )
+
+    task = asyncio.create_task(server.start())
+    await trust_started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert startup_client.close_calls == 1
+    assert server.proc is None
+    assert server.stderr_task is None
+
+
+async def test_wait_until_ready_closes_failed_client_before_reconnect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A refused readiness attempt is closed before returning its retry."""
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+
+    @dataclass
+    class _ProbeClient:
+        fail_connect: bool
+        connect_calls: int = 0
+        close_calls: int = 0
+
+        async def connect(self) -> None:
+            self.connect_calls += 1
+            if self.fail_connect:
+                raise OSError("listener not ready")
+
+        async def close(self) -> None:
+            self.close_calls += 1
+
+    first = _ProbeClient(fail_connect=True)
+    second = _ProbeClient(fail_connect=False)
+    attempts = [first, second]
+
+    def _client(*_args: object, **_kwargs: object) -> _ProbeClient:
+        return attempts.pop(0)
+
+    async def _no_sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr(codex_native_app_server, "CodexAppServerClient", _client)
+    monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    server = _test_app_server(
+        tmp_path,
+        tmp_path / "codex-home",
+        tmp_path / "bridge",
+        workspace,
+    )
+    server.proc = Mock(returncode=None)
+
+    connected = await server._wait_until_ready()
+
+    assert connected is second
+    assert first.connect_calls == 1
+    assert first.close_calls == 1
+    assert second.connect_calls == 1
+    assert second.close_calls == 0
+
+
+async def test_wait_until_ready_cancellation_closes_connecting_client(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cancellation during initialize closes the half-open startup client."""
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+
+    connect_started = asyncio.Event()
+
+    @dataclass
+    class _ConnectingClient:
+        close_calls: int = 0
+
+        async def connect(self) -> None:
+            connect_started.set()
+            await asyncio.Future()
+
+        async def close(self) -> None:
+            self.close_calls += 1
+
+    client = _ConnectingClient()
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "CodexAppServerClient",
+        lambda *_args, **_kwargs: client,
+    )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    server = _test_app_server(
+        tmp_path,
+        tmp_path / "codex-home",
+        tmp_path / "bridge",
+        workspace,
+    )
+    server.proc = Mock(returncode=None)
+
+    task = asyncio.create_task(server._wait_until_ready())
+    await connect_started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert client.close_calls == 1
+
+
+async def test_standalone_hook_trust_closes_client_when_connect_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed standalone trust handshake closes its partially-open client."""
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+
+    @dataclass
+    class _FailingClient:
+        close_calls: int = 0
+
+        async def connect(self) -> None:
+            raise RuntimeError("initialize failed")
+
+        async def close(self) -> None:
+            self.close_calls += 1
+
+    client = _FailingClient()
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "CodexAppServerClient",
+        lambda *_args, **_kwargs: client,
+    )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    server = _test_app_server(
+        tmp_path,
+        tmp_path / "codex-home",
+        tmp_path / "bridge",
+        workspace,
+    )
+
+    with pytest.raises(RuntimeError, match="initialize failed"):
+        await server._trust_policy_hooks()
+
+    assert client.close_calls == 1
 
 
 async def test_start_upserts_mcp_server_config_across_relaunches(
@@ -2105,7 +2377,10 @@ async def test_trust_failure_is_fail_open_with_reason(
     monkeypatch.setattr(CodexNativeAppServer, "_wait_until_ready", _fake_wait_until_ready)
     _set_codex_version(monkeypatch, (0, 136, 0))
 
-    async def _raise_trust(_self: CodexNativeAppServer) -> None:
+    async def _raise_trust(
+        _self: CodexNativeAppServer, *, client: CodexAppServerClient | None = None
+    ) -> None:
+        del client
         raise RuntimeError("Omnigent policy hook was not discovered for cwd ...")
 
     monkeypatch.setattr(CodexNativeAppServer, "_trust_policy_hooks", _raise_trust)
@@ -2553,6 +2828,79 @@ def test_codex_model_upgrade_target_reads_catalog_migration() -> None:
     assert _codex_model_upgrade_target(catalog, "gpt-5.4") == "gpt-5.6-terra"
     assert _codex_model_upgrade_target(catalog, "current") is None
     assert _codex_model_upgrade_target(catalog, "missing") is None
+
+
+def test_codex_model_upgrade_target_reads_gateway_model_list_migration() -> None:
+    """Gateway-aware ``model/list`` rows carry the same migration target."""
+    from omnigent.harnesses.codex_native.app_server import _codex_model_upgrade_target
+
+    rows = [
+        {
+            "id": "databricks-gpt-5-4",
+            "model": "gpt-5.4",
+            "upgrade": "gpt-5.6-terra",
+            "upgradeInfo": {"model": "gpt-5.6-terra"},
+        }
+    ]
+
+    assert _codex_model_upgrade_target(rows, "gpt-5.4") == "gpt-5.6-terra"
+
+
+@pytest.mark.parametrize("gateway_rows", ["matching", "missing", "malformed", "current", None])
+async def test_start_uses_fresh_gateway_catalog_before_debug_models(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    gateway_rows: str | None,
+) -> None:
+    """Only complete matching gateway rows replace the migration subprocess."""
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+
+    source_home = tmp_path / "source-codex-home"
+    source_home.mkdir()
+    (source_home / "config.toml").write_text("", encoding="utf-8")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    _disable_codex_startup_rpc(monkeypatch)
+    probes: list[str] = []
+
+    def _debug_catalog(codex_path: str, source: Path, *, timeout: float) -> dict[str, object]:
+        del source, timeout
+        probes.append(codex_path)
+        return {"models": [{"slug": "gpt-5.4", "upgrade": {"model": "gpt-5.6-terra"}}]}
+
+    monkeypatch.setattr(codex_native_app_server, "read_codex_model_catalog", _debug_catalog)
+    server = _test_app_server(
+        tmp_path,
+        tmp_path / "codex-home",
+        tmp_path / "bridge",
+        workspace,
+    )
+    server.trust_project = True
+    server.pinned_model = "gpt-5.4"
+    if gateway_rows is not None:
+        row: dict[str, object] = {
+            "id": "gpt-5.4" if gateway_rows != "missing" else "gpt-5.6-terra",
+            "model": "gpt-5.4" if gateway_rows != "missing" else "gpt-5.6-terra",
+        }
+        if gateway_rows == "malformed":
+            row["upgradeInfo"] = {}
+        elif gateway_rows == "current":
+            row["upgrade"] = None
+            row["upgradeInfo"] = None
+        else:
+            row["upgrade"] = "gpt-5.6-terra"
+        server.model_catalog_rows = [row]
+
+    await server.start()
+    await server.close()
+
+    assert probes == ([] if gateway_rows in {"matching", "current"} else [sys.executable])
+    config = tomllib.loads((server.codex_home / "config.toml").read_text(encoding="utf-8"))
+    if gateway_rows == "current":
+        assert "model_migrations" not in config.get("notice", {})
+    else:
+        assert config["notice"]["model_migrations"] == {"gpt-5.4": "gpt-5.6-terra"}
 
 
 def test_acknowledge_codex_model_migration_updates_private_config(tmp_path: Path) -> None:

@@ -66,17 +66,16 @@ describe("markWorkspaceFileLinks", () => {
     expectHandedOver(markHref("notes.md:12:7"), "notes.md:12:7");
   });
 
-  it.each(["docs/page.md#L12", "src/app.ts#L12C7"])(
-    "hands over a source position in %s",
-    (path) => {
-      expectHandedOver(markHref(path), path);
-    },
-  );
+  it.each([
+    "docs/notes.md#L12",
+    "docs/notes.md#L12C7",
+    "docs/notes.md#L12-L18",
+    "docs/notes.md#L12C7-L18C2",
+  ])("hands over a path with a source-style line fragment: %s", (path) => {
+    expectHandedOver(markHref(path), path);
+  });
 
   it.each([
-    ["https://example.com/docs.md#L12", "external line anchor"],
-    ["#L12", "in-page line anchor"],
-    ["docs/page.md#heading#L12", "multiple fragments"],
     ["https://example.com/docs.md", "external URL"],
     ["http://localhost:3000/x.md", "plain http URL"],
     ["//cdn.example.com/x.md", "protocol-relative URL"],
@@ -85,6 +84,7 @@ describe("markWorkspaceFileLinks", () => {
     ["javascript:alert(1)", "script scheme"],
     ["docs/page.md?raw=1", "path carrying a query"],
     ["docs/page.md#heading", "path carrying a fragment"],
+    ["docs/page.md#Lx", "malformed line fragment"],
   ])("leaves %s untouched (%s)", (href) => {
     expect(markHref(href)).toEqual({ href });
   });

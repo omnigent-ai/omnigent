@@ -630,6 +630,9 @@ class SessionsNamespace:
             sessions are omitted. When ``True``, archived sessions are
             returned alongside active ones.
         :returns: List of :class:`SessionListItem`.
+        :raises StaleCursorError: If ``after``/``before`` names a session
+            that has since been deleted. The walk cannot continue from
+            that cursor — restart it from the first page with no cursor.
         :raises OmnigentError: On non-2xx status.
         """
         params: dict[str, str | int] = {"limit": limit, "order": order, "sort_by": sort_by}
@@ -872,6 +875,9 @@ class SessionsNamespace:
         :param order: Sort order, ``"asc"`` (chronological) or
             ``"desc"``.
         :returns: List of conversation item dicts.
+        :raises StaleCursorError: If ``after`` names an item that has since
+            been deleted. The walk cannot continue from that cursor —
+            restart it from the first page with no cursor.
         :raises OmnigentError: On non-2xx status (404 when the
             session does not exist).
         """

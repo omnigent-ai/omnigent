@@ -205,7 +205,7 @@ async def _open_entry_config(page, agent_id: str) -> None:
 
 
 def test_codex_needs_auth_warns_and_clears_when_available(
-    seeded_session: tuple[str, str],
+    live_server: str,
 ) -> None:
     """A needs-auth Codex host warns to run ``codex login``; an available host doesn't.
 
@@ -219,8 +219,7 @@ def test_codex_needs_auth_warns_and_clears_when_available(
     2. **available** — when the same host omits the reason (Codex ready), the
        warning is absent. Proves the warning is reason-driven, not always-on.
     """
-    base_url, session_id = seeded_session
-    del session_id  # this flow never creates a session — only reads the picker
+    base_url = live_server
     _run_in_fresh_loop(_drive_codex_needs_auth(base_url))
 
 
@@ -292,7 +291,7 @@ async def _drive_codex_needs_auth(base_url: str) -> None:
 
 
 def test_codex_needs_auth_badge_in_harness_menu(
-    seeded_session: tuple[str, str],
+    live_server: str,
 ) -> None:
     """A bundle agent's harness picker badges the Codex row "needs auth".
 
@@ -302,8 +301,7 @@ def test_codex_needs_auth_badge_in_harness_menu(
     (``new-chat-landing-harness-warning-codex``) reading "needs auth" — the
     per-row counterpart to the under-composer message.
     """
-    base_url, session_id = seeded_session
-    del session_id
+    base_url = live_server
     _run_in_fresh_loop(_drive_codex_badge(base_url))
 
 

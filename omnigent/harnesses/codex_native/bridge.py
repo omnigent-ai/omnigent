@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import math
 import os
 import secrets
 import stat
@@ -24,9 +25,33 @@ CODEX_NATIVE_BRIDGE_ID_LABEL_KEY = "omnigent.codex_native.bridge_id"
 CODEX_NATIVE_BRIDGE_DIR_ENV_VAR = "HARNESS_CODEX_NATIVE_BRIDGE_DIR"
 CODEX_NATIVE_REQUEST_SESSION_ID_ENV_VAR = "HARNESS_CODEX_NATIVE_REQUEST_SESSION_ID"
 
+# Maximum time for a fresh TUI to emit ``thread/started``. Deliberately
+# generous because a host-spawned TUI cold-starts over the runner.
+CODEX_NATIVE_DIRECT_THREAD_START_TIMEOUT_SECONDS = 30.0
+# A configured command (for example ``codex-wrapper``) may do bounded setup
+# before it execs Codex. Direct launches retain the watchdog above; this
+# allowance is advertised only for an explicit command override.
+CODEX_NATIVE_CONFIGURED_COMMAND_STARTUP_TIMEOUT_SECONDS = 120.0
+# Give the runner time to publish bridge state or its startup error at the end
+# of the configured-command watchdog before the executor reports a generic miss.
+CODEX_NATIVE_STARTUP_PUBLICATION_GRACE_SECONDS = 5.0
+
+_CODEX_COMPOSER_GLYPH = "›"
+_CODEX_DISABLED_COMPOSER_TEXT = frozenset(
+    {
+        "Input disabled.",
+        "Shutting down...",
+        "Answer the questions to continue.",
+        "Respond to the tool suggestion to continue.",
+        "Respond to the MCP server request to continue.",
+    }
+)
+
 _STATE_FILE = "state.json"
 _STATE_LOCK_FILE = "state.lock"
 _STARTUP_ERROR_FILE = "startup_error.json"
+_STARTUP_TIMEOUT_FILE = "startup_timeout.json"
+_STARTUP_TIMEOUT_MAX_BYTES = 256
 # Per-MCP-server startup state mirrored from Codex's
 # ``mcpServer/startupStatus/updated`` notifications. Written by the
 # forwarder (and by ``wait_for_thread_started`` while it drains startup
@@ -54,6 +79,40 @@ _MCP_CONFIG_FILE = "bridge.json"
 _POLICY_HOOK_FILE = "policy_hook.json"
 _BRIDGE_ROOT = Path.home() / ".omnigent" / "codex-native"
 _ORPHAN_RETENTION_SECONDS = 7 * 24 * 60 * 60
+
+
+def _codex_composer_interactive(pane: str) -> bool:
+    """Return whether Codex's message composer is accepting input.
+
+    Codex renders its live composer as the last pane row whose trimmed text
+    starts with ``›``. The same glyph is dimmed while input is disabled, so
+    reject the disabled placeholder text that accompanies those states.
+
+    :param pane: ANSI-stripped tmux pane text.
+    :returns: ``True`` when the Codex message composer is mounted and enabled.
+    """
+    for line in reversed(pane.splitlines()):
+        row = line.lstrip()
+        if not row.startswith(_CODEX_COMPOSER_GLYPH):
+            continue
+        composer_text = row[len(_CODEX_COMPOSER_GLYPH) :].strip()
+        return composer_text not in _CODEX_DISABLED_COMPOSER_TEXT
+    return False
+
+
+def codex_terminal_interactive(bridge_dir: Path, pane: str) -> bool:
+    """Return whether Codex has a live thread and accepts terminal input.
+
+    A fresh TUI renders before its app-server thread exists, while a resume
+    preloads bridge state before launching the TUI. Requiring both bridge state
+    and the enabled composer gives the same semantic endpoint for both paths
+    without waiting for MCP servers to finish starting.
+
+    :param bridge_dir: Per-session Codex bridge directory.
+    :param pane: ANSI-stripped tmux pane text.
+    :returns: ``True`` when a message typed now can enter the Codex thread.
+    """
+    return read_bridge_state(bridge_dir) is not None and _codex_composer_interactive(pane)
 
 
 def bridge_root() -> Path:
@@ -822,6 +881,64 @@ def write_bridge_state(bridge_dir: Path, state: CodexNativeBridgeState) -> None:
         _write_bridge_state_unlocked(bridge_dir, state)
 
 
+def _validated_startup_timeout(value: object) -> float | None:
+    """Return a bounded configured-command timeout, or ``None`` if invalid."""
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or value <= 0
+        or value > CODEX_NATIVE_CONFIGURED_COMMAND_STARTUP_TIMEOUT_SECONDS
+        or not math.isfinite(value)
+    ):
+        return None
+    return float(value)
+
+
+def write_bridge_startup_timeout(bridge_dir: Path, timeout_seconds: float) -> None:
+    """Advertise a bounded configured-command startup wait to the executor.
+
+    This is launch policy, not a completion claim. It remains beside successful
+    state or a startup error until :func:`clear_bridge_state` starts the next
+    launch, so a retiring forwarder cannot erase a successor's newer marker.
+    """
+    timeout = _validated_startup_timeout(timeout_seconds)
+    if timeout is None:
+        raise ValueError(
+            "timeout_seconds must be finite, positive, and no greater than "
+            f"{CODEX_NATIVE_CONFIGURED_COMMAND_STARTUP_TIMEOUT_SECONDS:g}"
+        )
+    with _bridge_state_lock(bridge_dir):
+        path = bridge_dir / _STARTUP_TIMEOUT_FILE
+        fd, tmp_name = tempfile.mkstemp(prefix=f"{_STARTUP_TIMEOUT_FILE}.", dir=str(bridge_dir))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump({"timeout_seconds": timeout}, handle, allow_nan=False, sort_keys=True)
+                handle.write("\n")
+            os.replace(tmp_name, path)
+        finally:
+            if os.path.exists(tmp_name):
+                os.unlink(tmp_name)
+
+
+def read_bridge_startup_timeout(bridge_dir: Path) -> float | None:
+    """Read the configured-command startup wait, ignoring malformed input."""
+    path = bridge_dir / _STARTUP_TIMEOUT_FILE
+    try:
+        with path.open("rb") as handle:
+            payload = handle.read(_STARTUP_TIMEOUT_MAX_BYTES + 1)
+    except OSError:
+        return None
+    if len(payload) > _STARTUP_TIMEOUT_MAX_BYTES:
+        return None
+    try:
+        raw = json.loads(payload.decode("utf-8"))
+    except (UnicodeError, ValueError, RecursionError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    return _validated_startup_timeout(raw.get("timeout_seconds"))
+
+
 def clear_bridge_state(bridge_dir: Path) -> None:
     """
     Remove stale native Codex runtime state for a bridge directory.
@@ -840,6 +957,7 @@ def clear_bridge_state(bridge_dir: Path) -> None:
         for name in (
             _STATE_FILE,
             _STARTUP_ERROR_FILE,
+            _STARTUP_TIMEOUT_FILE,
             _MCP_STARTUP_FILE,
         ):
             try:

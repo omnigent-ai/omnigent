@@ -20,6 +20,8 @@ import { MemoryRouter, useSearchParams } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Comment } from "@/hooks/useComments";
 
+const codeViewerRenders = vi.hoisted(() => vi.fn());
+
 // ── Mock heavy child components ───────────────────────────────────────────────
 
 vi.mock("./CodeViewer", () => ({
@@ -28,25 +30,32 @@ vi.mock("./CodeViewer", () => ({
   // The "make dirty" button lets a test drive the editor's unsaved-edits signal
   // (onDirtyChange) so the mode-switch / navigation guard can be exercised.
   CodeViewer: ({
+    path,
+    position,
     viewMode,
     searchOpen,
     onDirtyChange,
   }: {
+    path: string;
+    position?: { line: number };
     viewMode: string;
     searchOpen?: boolean;
     onDirtyChange?: (dirty: boolean) => void;
-  }) => (
-    <div
-      data-testid="code-viewer"
-      data-view-mode={viewMode}
-      data-search-open={String(!!searchOpen)}
-    >
-      <button type="button" aria-label="make dirty" onClick={() => onDirtyChange?.(true)} />
-      {viewMode === "editor" && (
-        <textarea aria-label="Draft text" onChange={() => onDirtyChange?.(true)} />
-      )}
-    </div>
-  ),
+  }) => {
+    codeViewerRenders({ path, position });
+    return (
+      <div
+        data-testid="code-viewer"
+        data-view-mode={viewMode}
+        data-search-open={String(!!searchOpen)}
+      >
+        <button type="button" aria-label="make dirty" onClick={() => onDirtyChange?.(true)} />
+        {viewMode === "editor" && (
+          <textarea aria-label="Draft text" onChange={() => onDirtyChange?.(true)} />
+        )}
+      </div>
+    );
+  },
 }));
 
 vi.mock("./CommentsPanel", () => ({
@@ -1820,6 +1829,33 @@ describe("file position navigation", () => {
   beforeEach(() => {
     useCommentsMock.mockReturnValue(makeCommentsQuery([]));
   });
+  it("never passes the previous file's citation into the next file's first render", () => {
+    writeFileViewPreferences({
+      diffActive: false,
+      diffLayout: "unified",
+      previewableViewMode: "source",
+      hideWhitespace: false,
+      wrapLines: false,
+    });
+    const { rerender } = renderViewer({ open: true, path: "file1.md", position: { line: 12 } });
+    codeViewerRenders.mockClear();
+    rerender(viewerTree({ open: true, path: "file2.md" }));
+    expect(codeViewerRenders).toHaveBeenCalled();
+    for (const [props] of codeViewerRenders.mock.calls) {
+      expect(props).toEqual({ path: "file2.md", position: undefined });
+    }
+  });
+
+  it("keeps a manually selected preview when the viewer remounts with the old citation", () => {
+    const props = { open: true, path: "file1.md", position: { line: 12 } };
+    const { unmount } = renderViewer(props);
+    fireEvent.pointerDown(screen.getByRole("button", { name: /^View mode/ }), { button: 0 });
+    fireEvent.click(screen.getByRole("menuitem", { name: /Preview/ }));
+    unmount();
+    renderViewer(props);
+    expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-view-mode", "preview");
+  });
+
   it("opens source instead of a preferred Markdown preview and allows switching back", () => {
     writeFileViewPreferences({
       diffActive: false,

@@ -219,7 +219,7 @@ jobs:
         uses: ./.github/actions/setup-pnpm
 
       - name: Install uv
-        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39  # v8.2.0
+        uses: omnigent-ai/omnigent/.github/actions/setup-uv@25521b2eb074b11ebe51fe5e3eaeb494e20101eb # self-contained setup
         with:
           enable-cache: true
 
@@ -284,7 +284,7 @@ jobs:
         run: |
           CC_CLI_DIR="${RUNNER_TEMP}/omnigent-cc-cli"
           mkdir -p "$CC_CLI_DIR" && cd "$CC_CLI_DIR"
-          npm install --no-audit --no-fund @anthropic-ai/claude-code@2.1.236
+          npm install --no-audit --no-fund @anthropic-ai/claude-code@2.1.266
           echo "$CC_CLI_DIR/node_modules/.bin" >> "$GITHUB_PATH"
 
       - name: Install Codex CLI
@@ -298,6 +298,9 @@ jobs:
           npm install --ignore-scripts --no-audit --no-fund @openai/codex@0.139.0
           echo "$CODEX_CLI_DIR/node_modules/.bin" >> "$GITHUB_PATH"
 
+      - name: Install Antigravity CLI
+        uses: ./.github/actions/setup-agy
+
       - name: Run pytest target
         # Inputs validated by prep. Word-splitting on $TEST_TARGET / $EXTRA_ARGS
         # is intentional (multi-token); bound via env (not ``${{ }}``) to avoid
@@ -309,6 +312,7 @@ jobs:
         env:
           TEST_TARGET: ${{ github.event.inputs.test_target }}
           EXTRA_ARGS: ${{ github.event.inputs.extra_pytest_args }}
+          OMNIGENT_E2E_ANTIGRAVITY: mock
           # Prebuilt sidecar from build-sidecar; the codex goal-mode fixture uses
           # this instead of running cargo build. Absolute path: the fixture
           # resolves it as-is, and pytest may run from a different cwd.

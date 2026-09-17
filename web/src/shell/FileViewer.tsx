@@ -10,6 +10,12 @@
 //   └──────────────────────────────────┴──────────────────┘
 
 import type { FilePosition } from "./FileViewerContext";
+import {
+  dismissFilePosition,
+  isFilePositionDismissed,
+  isFilePositionPending,
+  stopFilePosition,
+} from "./filePositionState";
 import { toast } from "sonner";
 import {
   lazy,
@@ -748,25 +754,46 @@ function FileViewerBody({
         : previewableViewMode
     : "source";
   const [dismissedPosition, setDismissedPosition] = useState<FilePosition>();
-  const [appliedPosition, setAppliedPosition] = useState(position);
-  const lastPositionRef = useRef(position);
-  const filePosition = appliedPosition !== dismissedPosition ? appliedPosition : undefined;
+  const [appliedNavigation, setAppliedNavigation] = useState({ conversationId, path, position });
+  const lastNavigationRef = useRef(appliedNavigation);
+  const appliedPosition =
+    appliedNavigation.conversationId === conversationId && appliedNavigation.path === path
+      ? appliedNavigation.position
+      : undefined;
+  const filePosition =
+    appliedPosition !== dismissedPosition && !isFilePositionDismissed(appliedPosition)
+      ? appliedPosition
+      : undefined;
   // Citations preserve diff mode; previewable files need source to expose line numbers.
   const viewMode: "editor" | "preview" | "source" | "diff" =
     diffActive && isDiffAvailable ? "diff" : filePosition ? "source" : fileViewMode;
   const diffViewActive = viewMode === "diff";
 
   useEffect(() => {
-    if (lastPositionRef.current === position) return;
-    lastPositionRef.current = position;
-    const apply = () => setAppliedPosition(position);
+    const last = lastNavigationRef.current;
+    if (last.position === position && last.path === path && last.conversationId === conversationId)
+      return;
+    const next = { conversationId, path, position };
+    lastNavigationRef.current = next;
+    const apply = () => setAppliedNavigation(next);
     // Switching out of the rich-text editor must preserve its unsaved-edit guard.
     if (position && viewMode === "editor") {
       guardDirty(apply);
     } else {
       apply();
     }
-  }, [position, viewMode, guardDirty]);
+  }, [position, path, conversationId, viewMode, guardDirty]);
+
+  useEffect(() => {
+    const el = contentAreaRef.current;
+    if (!el || !filePosition) return;
+    const stop = () => stopFilePosition(filePosition);
+    const events = ["wheel", "touchstart", "pointerdown", "keydown"] as const;
+    for (const event of events) el.addEventListener(event, stop, { passive: true, capture: true });
+    return () => {
+      for (const event of events) el.removeEventListener(event, stop, { capture: true });
+    };
+  }, [filePosition]);
 
   // Cmd/Ctrl+F opens find-in-file on the Monaco-backed surfaces (code
   // source/editor and the diff view). Those surfaces would otherwise rely on
@@ -847,7 +874,7 @@ function FileViewerBody({
     contentAreaRef,
     contentScrollKey,
     fileQuery.data !== undefined,
-    !filePosition,
+    !isFilePositionPending(filePosition),
   );
   // Measure the content area so the split toggle can hide when there isn't
   // enough room for side-by-side. Only observe while the diff is shown — the
@@ -957,6 +984,7 @@ function FileViewerBody({
       // cancels leaves both the bias and the editor intact.
       const apply = () => {
         setDeepLinkBiasPath(null);
+        dismissFilePosition(position);
         setDismissedPosition(position);
         setPreviewableViewMode(mode);
       };
@@ -1019,6 +1047,7 @@ function FileViewerBody({
       // "editor" would no-op the first click. Keying on viewMode makes one click
       // always reach the other surface.
       onSelect: () => {
+        dismissFilePosition(position);
         setDismissedPosition(position);
         setPreviewableViewMode(viewMode === "preview" ? "source" : "preview");
       },
@@ -1064,6 +1093,7 @@ function FileViewerBody({
       active: viewMode === "diff",
       onSelect: () =>
         guardDirty(() => {
+          dismissFilePosition(position);
           setDismissedPosition(position);
           setDiffActive(viewMode !== "diff");
         }),

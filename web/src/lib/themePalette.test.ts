@@ -173,11 +173,24 @@ describe("themePalette", () => {
     }
   });
 
+  it.each(PALETTES)("keeps $label canvas opaque for composited surfaces", (palette) => {
+    for (const mode of ["light", "dark"] as const) {
+      expect(parseColor(palette.tokens[mode].background).alpha, mode).toBe(1);
+    }
+  });
+
   it("uses the canonical Solarized backgrounds", () => {
     const solarized = PALETTES.find((palette) => palette.id === "solarized");
     expect(solarized?.tokens.light.background).toBe("#fdf6e3");
     expect(solarized?.tokens.dark.background).toBe("#002b36");
     expect(solarized?.tokens.dark.shellBackground).toBe("#002b36");
+  });
+
+  it("keeps Solarized menu highlights distinct from popover surfaces", () => {
+    const solarized = PALETTES.find((palette) => palette.id === "solarized")!;
+
+    expect(solarized.tokens.light.muted).not.toBe(solarized.tokens.light.popover);
+    expect(solarized.tokens.dark.muted).not.toBe(solarized.tokens.dark.popover);
   });
 
   it("keeps Omnigent's text selection on the brand tint, not the neutral primary", () => {

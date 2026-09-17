@@ -42,14 +42,14 @@ def _open_appearance(page: Page, base_url: str) -> None:
     expect(page.get_by_role("group", name=GROUP_NAME, exact=True)).to_be_visible(timeout=30_000)
 
 
-def test_ui_font_size_scales_and_persists(page: Page, seeded_session: tuple[str, str]) -> None:
+def test_ui_font_size_scales_and_persists(page: Page, live_server: str) -> None:
     """Stepping the size updates the token + value live and survives a reload.
 
     A fresh context has no stored preference → default 13px. Increasing the
     size updates ``--desktop-ui-font-size`` and persists the px value; a page
     reload restores it (no reset, no flash back to the default).
     """
-    base_url, _session_id = seeded_session
+    base_url = live_server
     _open_appearance(page, base_url)
 
     value = page.get_by_test_id("ui-font-size-input")
@@ -74,11 +74,9 @@ def test_ui_font_size_scales_and_persists(page: Page, seeded_session: tuple[str,
     assert _desktop_ui_font_size(page) == "18px", "font size was not restored after reload"
 
 
-def test_ui_font_size_steppers_clamp_at_bounds(
-    page: Page, seeded_session: tuple[str, str]
-) -> None:
+def test_ui_font_size_steppers_clamp_at_bounds(page: Page, live_server: str) -> None:
     """The ``−``/``+`` buttons disable at the 11px min and 18px max."""
-    base_url, _session_id = seeded_session
+    base_url = live_server
 
     # Seed the max before the app boots so the "+" button renders disabled.
     page.goto(base_url)

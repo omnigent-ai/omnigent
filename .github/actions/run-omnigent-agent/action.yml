@@ -39,13 +39,14 @@ inputs:
   claude-code-version:
     description: "@anthropic-ai/claude-code npm version to install."
     required: false
-    default: 2.1.236
+    default: 2.1.266
 
 runs:
   using: composite
   steps:
     - name: Set up uv
-      uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+      # This action also runs from repositories checked out below the workspace root.
+      uses: omnigent-ai/omnigent/.github/actions/setup-uv@25521b2eb074b11ebe51fe5e3eaeb494e20101eb # self-contained setup
       with:
         enable-cache: true
 
