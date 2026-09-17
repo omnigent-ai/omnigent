@@ -61,19 +61,40 @@ export function useScopeCache(
     enabled,
   });
   const pagination = useMutation({
-    mutationFn: async ({ after, controller }: { after: string; controller: AbortController }) => {
-      const page = await fetchConversationsPage({
-        after,
-        searchQuery: "",
-        includeArchived: false,
-        visibility,
-        queryClient: client,
-        signal: controller.signal,
-      });
+    mutationFn: async ({ controller }: { controller: AbortController }) => {
+      let refreshing = client.getQueryCache().find({ queryKey, exact: true });
+      while (refreshing?.state.fetchStatus === "fetching" && refreshing.promise) {
+        // A replacement refresh can start while the previous one is being cancelled.
+        // oxlint-disable-next-line no-await-in-loop
+        await refreshing.promise.catch(() => {});
+        if (controller.signal.aborted) return;
+        refreshing = client.getQueryCache().find({ queryKey, exact: true });
+      }
       if (controller.signal.aborted) return;
-      client.setQueryData<ScopeCacheData>(queryKey, (current) =>
-        current ? appendScopePage(current, page) : current,
-      );
+      const tail = client.getQueryData<ScopeCacheData>(queryKey)?.pages.at(-1);
+      if (!tail?.has_more || !tail.last_id) return;
+      const after = tail.last_id;
+      const pending = (async () => {
+        const page = await fetchConversationsPage({
+          after,
+          searchQuery: "",
+          includeArchived: false,
+          visibility,
+          queryClient: client,
+          signal: controller.signal,
+        });
+        if (controller.signal.aborted) return;
+        client.setQueryData<ScopeCacheData>(queryKey, (current) =>
+          current ? appendScopePage(current, page) : current,
+        );
+      })();
+      // Refresh waits only for a page request, never for a click queued behind it.
+      pendingResult.current = pending;
+      try {
+        await pending;
+      } finally {
+        if (pendingResult.current === pending) pendingResult.current = null;
+      }
     },
     onError: (error, { controller }) => {
       if (!controller.signal.aborted && isStaleCursorError(error)) {
@@ -92,24 +113,14 @@ export function useScopeCache(
   const { mutateAsync } = pagination;
   const fetchNextPage = useCallback(async () => {
     const tail = client.getQueryData<ScopeCacheData>(queryKey)?.pages.at(-1);
-    if (
-      !enabled ||
-      pendingPage.current ||
-      client.getQueryState(queryKey)?.fetchStatus === "fetching" ||
-      !tail?.has_more ||
-      !tail.last_id
-    )
-      return;
+    if (!enabled || pendingPage.current || !tail?.has_more || !tail.last_id) return;
     const controller = new AbortController();
     pendingPage.current = controller;
     try {
-      const pending = mutateAsync({ after: tail.last_id, controller });
-      pendingResult.current = pending;
-      await pending;
+      await mutateAsync({ controller });
     } finally {
       if (pendingPage.current === controller) {
         pendingPage.current = null;
-        pendingResult.current = null;
       }
     }
   }, [client, queryKey, enabled, mutateAsync]);
@@ -136,5 +147,14 @@ export function useScopeCache(
 }
 
 export function useArchivedSessions(enabled: boolean) {
-  return useConversations("", false, { enabled, snapshot: true }, undefined, "archived");
+  const query = useConversations("", false, { enabled, snapshot: true }, undefined, "archived");
+  const wasEnabled = useRef(false);
+  const { data, refetch } = query;
+  useEffect(() => {
+    const opening = enabled && !wasEnabled.current;
+    wasEnabled.current = enabled;
+    // The initial load is automatic; later entries refresh the retained snapshot.
+    if (opening && data) void refetch({ cancelRefetch: false });
+  }, [enabled, data, refetch]);
+  return query;
 }

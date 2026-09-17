@@ -411,12 +411,13 @@ export function useAvailableAgents(options: UseAvailableAgentsOptions = {}) {
   // not wait for a slow Mine session load (managed deployments with
   // large session tables). This catalog query resolves fast and feeds the
   // merged query's placeholder below; same enabled gate as the merged query.
-  const { data: catalog } = useQuery({
+  const catalogQuery = useQuery({
     queryKey: AGENT_CATALOG_QUERY_KEY,
     queryFn: () => fetchAgentCatalog(),
     enabled,
     staleTime: AVAILABLE_AGENTS_STALE_MS,
   });
+  const { data: catalog } = catalogQuery;
   // Catalog merged with an empty discovery — the same rows a failing discovery degrades
   // to — shown while the merged fetch is in flight and upgraded in place when
   // the discovery lands. Consumers that must not resolve stored ids against a
@@ -426,7 +427,7 @@ export function useAvailableAgents(options: UseAvailableAgentsOptions = {}) {
     () => (catalog === undefined ? undefined : mergeAvailableAgents(catalog, [])),
     [catalog],
   );
-  return useQuery({
+  const query = useQuery({
     // Recompute when the first 30 Mine sessions change; hover patches match the prefix.
     queryKey: ["available-agents", pinnedKey, sessionAgents.data ?? null],
     // fetchQuery dedupes with the catalog query's in-flight fetch, so the
@@ -442,4 +443,8 @@ export function useAvailableAgents(options: UseAvailableAgentsOptions = {}) {
     placeholderData,
     select,
   });
+  return {
+    ...query,
+    isLoading: query.isLoading || (enabled && query.isPending && catalogQuery.isPending),
+  };
 }

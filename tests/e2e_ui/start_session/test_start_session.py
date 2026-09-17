@@ -1027,13 +1027,26 @@ async def _drive_no_redirect_after_navigating_away(
             await page.route("**/v1/sessions/*/events", handle_events)
             await page.route(_SESSIONS_RE, handle_sessions)
 
-            # Keep the agent-discovery scan empty so only the stubbed Claude
-            # agent feeds the picker (see _drive_permission_mode for why).
+            # Retain the navigation target in Mine without introducing another agent.
             async def handle_agent_scan(route: Route) -> None:
                 await route.fulfill(
                     status=200,
                     content_type="application/json",
-                    body=json.dumps({"data": []}),
+                    body=json.dumps(
+                        {
+                            "data": [
+                                {
+                                    "id": session_b,
+                                    "title": "Existing session",
+                                    "created_at": 1,
+                                    "updated_at": 1,
+                                    "permission_level": 4,
+                                    "labels": {},
+                                }
+                            ],
+                            "has_more": False,
+                        }
+                    ),
                 )
 
             await page.route(
@@ -1161,13 +1174,26 @@ async def _drive_landing_clears_after_navigating_away(
             await page.route("**/v1/sessions/*/events", handle_events)
             await page.route(_SESSIONS_RE, handle_sessions)
 
-            # Keep the agent-discovery scan empty so only the stubbed Claude
-            # agent feeds the picker (see _drive_permission_mode for why).
+            # Retain the navigation target in Mine without introducing another agent.
             async def handle_agent_scan(route: Route) -> None:
                 await route.fulfill(
                     status=200,
                     content_type="application/json",
-                    body=json.dumps({"data": []}),
+                    body=json.dumps(
+                        {
+                            "data": [
+                                {
+                                    "id": session_b,
+                                    "title": "Existing session",
+                                    "created_at": 1,
+                                    "updated_at": 1,
+                                    "permission_level": 4,
+                                    "labels": {},
+                                }
+                            ],
+                            "has_more": False,
+                        }
+                    ),
                 )
 
             await page.route(

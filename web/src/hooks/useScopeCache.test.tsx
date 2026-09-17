@@ -222,6 +222,93 @@ it("deduplicates load-more clicks and discards a pending page when disabled", as
   expect(cached().pages[0].data).toHaveLength(30);
 });
 
+it.each(["mine", "shared"] as const)(
+  "queues one %s page behind refresh and uses the refreshed cursor",
+  async (scope) => {
+    const { result } = renderHook(() => ({ ...useScopeCache(scope, 60_000) }), { wrapper });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    let finish!: (page: ConversationsPage) => void;
+    fetchPage.mockClear().mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    );
+    let refresh!: Promise<unknown>;
+    act(() => {
+      refresh = result.current.refetch();
+    });
+    await waitFor(() => expect(finish).toBeDefined());
+    expect(result.current.isFetchingNextPage).toBe(false);
+    let next!: Promise<unknown>;
+    act(() => {
+      next = result.current.fetchNextPage();
+      void result.current.fetchNextPage();
+    });
+    await waitFor(() => expect(result.current.isFetchingNextPage).toBe(true));
+    expect(fetchPage).toHaveBeenCalledTimes(1);
+    const replacement = rows(2, 30, scope === "shared");
+    await act(async () => {
+      finish(sessionRowsPage(replacement, true));
+      await refresh;
+      await next;
+    });
+    expect(fetchPage).toHaveBeenCalledTimes(2);
+    expect(fetchPage.mock.calls[1][0]).toMatchObject({ after: "s31", visibility: scope });
+    await waitFor(() =>
+      expect(result.current.data?.pages[0].data).toEqual([
+        ...replacement,
+        ...rows(32, 30, scope === "shared"),
+      ]),
+    );
+  },
+);
+
+it.each(["disabled", "exhausted", "failed", "replaced"])(
+  "handles a %s refresh while load more is queued",
+  async (scenario) => {
+    let enabled = true;
+    const { result, rerender } = renderHook(() => ({ ...useScopeCache("mine", 60_000, enabled) }), {
+      wrapper,
+    });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    let finish!: (page: ConversationsPage) => void;
+    let fail!: (error: Error) => void;
+    fetchPage.mockClear().mockImplementationOnce(
+      () =>
+        new Promise((resolve, reject) => {
+          finish = resolve;
+          fail = reject;
+        }),
+    );
+    let refresh!: Promise<unknown>;
+    let next!: Promise<unknown>;
+    act(() => {
+      refresh = result.current.refetch();
+    });
+    await waitFor(() => expect(finish).toBeDefined());
+    act(() => {
+      next = result.current.fetchNextPage();
+    });
+    await waitFor(() => expect(result.current.isFetchingNextPage).toBe(true));
+    if (scenario === "disabled") {
+      enabled = false;
+      rerender();
+    }
+    await act(async () => {
+      if (scenario === "replaced") await result.current.refetch();
+      if (scenario === "failed") fail(new Error("offline"));
+      else finish(sessionRowsPage(rows(2, 30), scenario !== "exhausted"));
+      await refresh;
+      await next;
+    });
+    const shouldAppend = scenario === "failed" || scenario === "replaced";
+    expect(fetchPage).toHaveBeenCalledTimes(scenario === "replaced" ? 3 : shouldAppend ? 2 : 1);
+    expect(cached().pages[0].data).toHaveLength(shouldAppend ? 60 : 30);
+    if (shouldAppend) expect(fetchPage.mock.calls.at(-1)?.[0].after).toBe("s30");
+  },
+);
+
 it("preserves loaded rows after a failed refresh and recovers on retry", async () => {
   const { result } = renderHook(() => useScopeCache("mine", 60_000), { wrapper });
   await waitFor(() => expect(result.current.isSuccess).toBe(true));

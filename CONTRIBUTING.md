@@ -219,6 +219,9 @@ discovered; the built-in `/v1/agents` catalog is still loaded separately.
 
 Pagination still adds 30 rows per request. Mine and Shared results are checked
 against the viewer's ownership metadata in the frontend as well.
+If Load more is clicked during a refresh, the click waits for that refresh,
+then fetches the next 30 using the updated cursor and appends them to the cache.
+Archived refreshes each time it is opened, without scheduled polling.
 
 ### Manual three-terminal fallback
 

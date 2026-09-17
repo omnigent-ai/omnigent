@@ -1153,19 +1153,27 @@ describe("useAvailableAgents slow discovery scan", () => {
     const scanGate = new Promise<Response>((resolve) => {
       releaseScan = resolve;
     });
+    let releaseCatalog!: (r: Response) => void;
+    const catalogGate = new Promise<Response>((resolve) => {
+      releaseCatalog = resolve;
+    });
     fetchMock.mockImplementation((url: string) => {
-      if (url === BUILTINS_URL) return Promise.resolve(catalogResponse());
+      if (url === BUILTINS_URL) return catalogGate;
       if (url === MINE_URL) return scanGate;
       return Promise.reject(new Error(`unrouted fetch in test: ${url}`));
     });
 
     const { result } = renderHook(() => ({ ...useAvailableAgents() }), { wrapper });
 
+    expect(result.current.isLoading).toBe(true);
+    releaseCatalog(catalogResponse());
+
     // Catalog rows appear while the scan is still pending…
     await waitFor(() =>
       expect(result.current.data?.map((a) => a.id)).toEqual(["ag_claude", "ag_codex"]),
     );
     expect(result.current.isPlaceholderData).toBe(true);
+    expect(result.current.isLoading).toBe(false);
 
     // …and upgrade in place — placeholder flag cleared, scan-discovered
     // agents merged in — once the scan finally lands.

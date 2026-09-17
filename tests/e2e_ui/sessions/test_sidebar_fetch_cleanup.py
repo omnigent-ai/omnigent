@@ -14,10 +14,24 @@ def test_scope_requests_and_bounded_automatic_pagination(
 ) -> None:
     base_url = request.config.getoption("--ui-base-url") or request.getfixturevalue("live_server")
     requests: list[dict[str, list[str]]] = []
+    hold_refresh = False
+    held_refreshes: list[Route] = []
 
     def sessions(route: Route) -> None:
         params = parse_qs(urlparse(route.request.url).query)
         requests.append(params)
+        if (
+            hold_refresh
+            and params.get("visibility") == ["mine"]
+            and "pinned" not in params
+            and "after" not in params
+        ):
+            held_refreshes.append(route)
+            return
+        respond(route)
+
+    def respond(route: Route) -> None:
+        params = parse_qs(urlparse(route.request.url).query)
         rows = []
         has_more = params.get("visibility") == ["mine"] and "pinned" not in params
         if has_more:
@@ -95,6 +109,35 @@ def test_scope_requests_and_bounded_automatic_pagination(
     load_more.click()
     page.wait_for_load_state("networkidle")
     assert mine()[-1]["after"] == [f"{240:032x}"]
+
+    # A manual click during refresh queues one page without consuming another click.
+    hold_refresh = True
+    start_count = len(mine())
+    page.clock.run_for(100)
+    with page.expect_request(
+        lambda req: (
+            "/v1/sessions?" in req.url
+            and parse_qs(urlparse(req.url).query).get("visibility") == ["mine"]
+            and "after" not in parse_qs(urlparse(req.url).query)
+        )
+    ):
+        page.clock.fast_forward(60_000)
+    expect(load_more).to_be_visible()
+    expect(load_more).to_be_enabled()
+    assert len(held_refreshes) == 1
+    load_more.click()
+    page.clock.run_for(100)
+    expect(page.get_by_role("button", name="Loading…", exact=True)).to_be_visible()
+    assert len(mine()) == start_count + 1
+    hold_refresh = False
+    respond(held_refreshes.pop())
+    page.wait_for_load_state("networkidle")
+    page.clock.run_for(100)
+    assert len(mine()) == start_count + 2
+    assert mine()[-1]["after"] == [f"{270:032x}"]
+    assert mine()[-1]["limit"] == ["30"]
+    page.clock.resume()
+    expect(load_more).to_be_visible()
 
 
 def test_mine_filters_a_mixed_visibility_response(
@@ -179,6 +222,12 @@ def test_templates_load_before_mine_and_discovery_reuses_its_request(
     page.route("**/v1/sessions?*", sessions)
     page.route("**/v1/agents", agents)
     page.route("**/v1/agents?*", agents)
+    page.route(
+        "**/v1/hosts",
+        lambda route: route.fulfill(
+            json={"hosts": [{"host_id": "test-host", "name": "Test host", "status": "online"}]}
+        ),
+    )
     page.goto(base_url, wait_until="domcontentloaded")
     picker = page.get_by_test_id("new-chat-landing-agent-select")
     expect(picker).to_contain_text("Immediate-template")
@@ -209,3 +258,58 @@ def test_templates_load_before_mine_and_discovery_reuses_its_request(
     assert len(held_mine) == 1
     assert len(agent_requests) == 1
     assert not urlparse(agent_requests[0]).query
+
+
+def test_archived_refreshes_on_entry_without_polling(
+    page: Page, request: pytest.FixtureRequest
+) -> None:
+    base_url = request.config.getoption("--ui-base-url") or request.getfixturevalue("live_server")
+    archived_requests = 0
+    title = "Original archived title"
+
+    def sessions(route: Route) -> None:
+        nonlocal archived_requests
+        params = parse_qs(urlparse(route.request.url).query)
+        data = []
+        if params.get("visibility") == ["archived"]:
+            archived_requests += 1
+            data = [
+                {
+                    "id": "archived-row",
+                    "title": title,
+                    "created_at": 1,
+                    "updated_at": 1,
+                    "archived": True,
+                    "labels": {},
+                    "permission_level": 4,
+                }
+            ]
+        route.fulfill(json={"data": data, "has_more": False})
+
+    def select(scope: str) -> None:
+        page.get_by_test_id("session-filter").click()
+        page.get_by_test_id(f"session-filter-{scope}").click()
+        page.wait_for_load_state("networkidle")
+        page.clock.run_for(100)
+
+    page.route_web_socket("**/v1/sessions/updates*", lambda _socket: None)
+    page.route("**/v1/sessions?*", sessions)
+    page.clock.install()
+    page.goto(base_url)
+    page.wait_for_load_state("networkidle")
+    assert archived_requests == 0
+    select("archived")
+    expect(page.get_by_text(title, exact=True)).to_be_visible()
+    assert archived_requests == 1
+    page.clock.pause_at(datetime.now(timezone.utc) + timedelta(seconds=5))
+    page.clock.fast_forward(180_000)
+    page.wait_for_load_state("networkidle")
+    assert archived_requests == 1
+    select("mine")
+    title = "Archived title changed remotely"
+    select("archived")
+    expect(page.get_by_text(title, exact=True)).to_be_visible()
+    assert archived_requests == 2
+    page.clock.fast_forward(180_000)
+    page.wait_for_load_state("networkidle")
+    assert archived_requests == 2
