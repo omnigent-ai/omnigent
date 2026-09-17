@@ -34,13 +34,19 @@ opaque headline. Reproduces today (cause discarded); the fix flips it.
 Facet 2 (``test_stream_failure_omits_live_terminal_pane``): with a live native
 terminal sitting at ``Trust this folder?``, the failure event must surface that
 pane snapshot. Reproduces today (pane omitted); the fix flips it.
+
+Facet 3 (``test_stream_severed_by_required_terminal_exit_reports_the_exit``): the
+pane dies while the runner is still delivering the message, so the runner's own
+required-terminal exit handling releases the harness and severs the stream it is
+reading. The failure must report that exit, not a connection error.
 """
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
@@ -67,6 +73,10 @@ _LIVE_PANE = "Trust this folder?\n1. Yes, proceed\n2. No, exit\n> "
 _CONV_ID = "9217a860245985f541fd686eb2a32b73"
 _AGENT_ID = "965906f5d9fb596610dda599a80faaee"
 
+# What a claude-native pane shows when it dies before ever reaching a ready
+# prompt -- the sub-agent dispatch failure behind OMNI-5626 / #5558.
+_BOOTING_PANE = "Loading MCP servers... (3/7)\nWaiting for the API key helper\n"
+
 
 class _StreamErrorHarnessClient(_ScriptedHarnessClient):
     """Harness client that emits its scripted frames, then drops mid-stream.
@@ -77,9 +87,16 @@ class _StreamErrorHarnessClient(_ScriptedHarnessClient):
     in its ``(httpx.HTTPError, RuntimeError)`` arm.
     """
 
-    def __init__(self, sse_frames: list[str], *, cause: str) -> None:
+    def __init__(
+        self,
+        sse_frames: list[str],
+        *,
+        cause: str,
+        sever: Callable[[], Awaitable[None]] | None = None,
+    ) -> None:
         super().__init__(sse_frames)
         self._cause = cause
+        self._sever = sever
 
     def stream(self, method: str, url: str, *, json: dict[str, Any], timeout: Any) -> Any:
         """Return a context manager whose stream errors after the frames."""
@@ -87,12 +104,13 @@ class _StreamErrorHarnessClient(_ScriptedHarnessClient):
         self.posted_bodies.append(json)
         frames = self._sse_frames
         cause = self._cause
+        sever = self._sever
 
         class _ErrCtx:
             status_code = 200
 
             async def __aenter__(self) -> _StreamErrorHarnessClient._ErrHandle:
-                return _StreamErrorHarnessClient._ErrHandle(frames, cause)
+                return _StreamErrorHarnessClient._ErrHandle(frames, cause, sever)
 
             async def __aexit__(self, *_: Any) -> None:
                 return None
@@ -104,13 +122,23 @@ class _StreamErrorHarnessClient(_ScriptedHarnessClient):
 
         status_code = 200
 
-        def __init__(self, frames: list[str], cause: str) -> None:
+        def __init__(
+            self,
+            frames: list[str],
+            cause: str,
+            sever: Callable[[], Awaitable[None]] | None,
+        ) -> None:
             self._frames = frames
             self._cause = cause
+            self._sever = sever
 
         async def aiter_text(self) -> AsyncIterator[str]:
             for frame in self._frames:
                 yield frame
+            # Whatever kills the channel (e.g. the runner releasing the harness
+            # subprocess) happens while the runner is parked on this read.
+            if self._sever is not None:
+                await self._sever()
             raise httpx.ReadError(self._cause)
 
 
@@ -286,3 +314,143 @@ async def test_stream_failure_omits_live_terminal_pane(tmp_path: Path) -> None:
         "no 'Last captured terminal output' diagnostics block was attached to "
         f"the stream-failure event. Full event: {failed}"
     )
+
+
+def _failed_statuses(conv_id: str) -> list[dict[str, Any]]:
+    """Drain the ``session.status: failed`` events the runner published for *conv_id*."""
+    from omnigent.runner.app import _session_event_queues_ref
+
+    queue = _session_event_queues_ref.get(conv_id)
+    statuses: list[dict[str, Any]] = []
+    while queue is not None and not queue.empty():
+        item = queue.get_nowait()
+        if (
+            isinstance(item, dict)
+            and item.get("type") == "session.status"
+            and item.get("status") == "failed"
+        ):
+            statuses.append(item)
+    return statuses
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pane_status_before_exit", [None, "idle"])
+async def test_stream_severed_by_required_terminal_exit_reports_the_exit(
+    tmp_path: Path, pane_status_before_exit: str | None
+) -> None:
+    """Facet 3: a stream severed by the runner's own harness release names the exit.
+
+    A claude-native sub-agent's pane dies while the runner is still delivering the
+    first message (Claude Code never shows a ready prompt, or exits while booting).
+    The tmux watcher reports the exit, the resource registry evicts the terminal,
+    and the runner's exit handler releases the harness subprocess -- which closes
+    the client ``proxy_stream`` is reading, surfacing there as ``ReadError``.
+    That used to be reported as an opaque connection error. For a pane that
+    never ran a turn (``idle`` at exit) the exit handler publishes nothing
+    itself, so that connection error was the *only* failure the user ever saw
+    (OMNI-5626 / #5558). The turn must instead fail as ``required_terminal_exited``
+    carrying the pane's last output, and it must fail exactly once.
+    """
+    from omnigent.runner.app import _session_event_queues_ref
+
+    conv_id = "5626dead245985f541fd686eb2a32b73"
+    terminal_registry = TerminalRegistry()
+    instance = make_test_terminal_instance("claude", "main", tmp_path)
+    instance.command = "claude"
+    instance.launch_cwd = str(tmp_path)
+    instance._remember_pane_snapshot(_BOOTING_PANE)
+    terminal_registry._by_conversation.setdefault(conv_id, {})[("claude", "main")] = instance
+    callbacks: dict[str, Any] = {}
+
+    def _capture_watcher(
+        on_idle: object | None = None,
+        *,
+        on_activity: object | None = None,
+        on_exit: object | None = None,
+        on_tick: object | None = None,
+        idle_threshold_s: float | None = None,
+        poll_interval_s: float | None = None,
+        replace: bool = False,
+    ) -> None:
+        del on_idle, on_activity, on_tick, idle_threshold_s, poll_interval_s, replace
+        callbacks["on_exit"] = on_exit
+
+    instance.start_idle_watcher_thread = _capture_watcher  # type: ignore[method-assign]
+
+    native_spec = AgentSpec(
+        spec_version=1,
+        name="claude-agent",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return native_spec
+
+    state: dict[str, Any] = {}
+
+    async def _pane_dies_under_the_stream() -> None:
+        """The pane exits mid-delivery; the runner tears the harness down under its own read."""
+        if pane_status_before_exit is not None:
+            # The PTY watcher's last reading before the pane vanished.
+            state["resource_registry"]._last_session_status[conv_id] = pane_status_before_exit
+        callbacks["on_exit"]()
+        await state["resource_registry"].wait_for_terminal_exit_cleanup()
+        for _ in range(500):
+            if state["pm"].released == [conv_id]:
+                return
+            await asyncio.sleep(0)
+        raise AssertionError("the required-terminal exit never released the harness")
+
+    harness_client = _StreamErrorHarnessClient(
+        [_sse({"type": "response.created", "response": {"id": "resp_claude"}})],
+        cause="ReadError(ClosedResourceError())",
+        sever=_pane_dies_under_the_stream,
+    )
+    pm = _FakeProcessManager(harness_client)
+    state["pm"] = pm
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        terminal_registry=terminal_registry,
+    )
+    resource_registry = app.state.session_resource_registry
+    state["resource_registry"] = resource_registry
+    _session_event_queues_ref.pop(conv_id, None)
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://runner") as client:
+            create_resp = await client.post(
+                "/v1/sessions",
+                json={"session_id": conv_id, "agent_id": _AGENT_ID},
+            )
+            assert create_resp.status_code == 201, create_resp.text
+        await resource_registry.observe_required_terminal(conv_id, "claude", "main", instance)
+        assert callable(callbacks.get("on_exit"))
+
+        events = await _drive_failing_turn(
+            app, conv_id, harness="claude-native", model="claude-agent"
+        )
+        statuses = _failed_statuses(conv_id)
+    finally:
+        _session_event_queues_ref.pop(conv_id, None)
+
+    failed = _failed_event(events)
+    error = failed.get("error", {})
+    event_blob = json.dumps(failed)
+    assert error.get("code") == "required_terminal_exited", failed
+    assert "Harness stream connection error" not in event_blob, failed
+    assert "Required terminal exited unexpectedly" in event_blob, failed
+    assert "Waiting for the API key helper" in event_blob, failed
+    assert "last captured terminal output" in event_blob.lower(), failed
+    # The registry evicted the dead pane and the runner released its harness.
+    assert terminal_registry.get(conv_id, "claude", "main") is None
+    assert pm.released == [conv_id]
+    # Every failure the session surfaced is the exit -- never the transport symptom.
+    assert statuses, "the turn must surface as failed"
+    assert {s["error"]["code"] for s in statuses} == {"required_terminal_exited"}, statuses
+    if pane_status_before_exit == "idle":
+        # The exit handler itself stays quiet for an idle pane; the stream's
+        # failure is the one and only failure the user sees.
+        assert len(statuses) == 1, statuses
