@@ -3793,16 +3793,9 @@ export function NewChatLandingScreen() {
     else if (supportsDevinPermission) setDevinPermissionMode(mode);
     rememberPickerOptions(selectedNativeHarness, { mode });
   };
-  // Reset per-agent-instance run-config that must not carry across an agent
-  // change. The DANGEROUS Codex bypass re-opts-in per context (matching the
-  // store's fork / agent-switch behavior; CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY
-  // is instance-scoped). Clear routing too so a non-routable agent cannot inherit it.
-  //
-  // Only reset on an ACTUAL agent change — not the initial resolution (null →
-  // first id, or a persisted/draft pick resolving on mount), which would wipe a
-  // costControlMode/bypass restored from the landing draft.
+  // Clear shared state on agent changes; the harness seed restores its own
+  // saved options. Initial agent resolution must preserve the landing draft.
   const prevAgentIdRef = useRef<string | null | undefined>(undefined);
-  const suppressBypassSeedRef = useRef(false);
   // Tracks an explicit model pick the user committed in this composer visit
   // (via the model picker). Once set, an async project-config arrival or
   // cache refresh must not reseed the project default over the user's choice;
@@ -3811,9 +3804,7 @@ export function NewChatLandingScreen() {
   useEffect(() => {
     const prev = prevAgentIdRef.current;
     prevAgentIdRef.current = effectiveAgentId;
-    suppressBypassSeedRef.current =
-      prev !== undefined && prev !== null && prev !== effectiveAgentId;
-    if (!suppressBypassSeedRef.current) return;
+    if (prev === undefined || prev === null || prev === effectiveAgentId) return;
     userPickedModelRef.current = false;
     setBypassSandbox(false);
     setCostControlMode(null);
@@ -3927,9 +3918,7 @@ export function NewChatLandingScreen() {
       );
     } else if (supportsApprovalMode) {
       setBypassSandbox(
-        (!suppressBypassSeedRef.current ||
-          editedOptions.mode === CODEX_NATIVE_BYPASS_APPROVAL_VALUE) &&
-          selectedNativeHarness === "codex-native" &&
+        selectedNativeHarness === "codex-native" &&
           stored.mode === CODEX_NATIVE_BYPASS_APPROVAL_VALUE,
       );
       setApprovalMode(resolve(CODEX_NATIVE_APPROVAL_MODES, CODEX_NATIVE_DEFAULT_APPROVAL_MODE));
