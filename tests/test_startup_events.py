@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -82,6 +83,74 @@ def test_exec_handoff_includes_wrapper_and_import_time(
     ]
     assert startup._entry.get() is None
     assert startup._attempt.get() is None
+
+
+def test_host_state_event_carries_deterministic_process_classification(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A native launch records whether the host process predated the command."""
+    from omnigent import cli
+
+    caplog.set_level(logging.INFO, logger="omnigent.startup")
+    record = SimpleNamespace(pid=1234)
+    monkeypatch.setattr(cli, "_find_daemon_record", lambda _target: record)
+    monkeypatch.setattr(cli, "_daemon_owner_is_live", lambda _record: True)
+    monkeypatch.setattr(
+        cli,
+        "_reuse_existing_daemon_record",
+        lambda _target: cli._DaemonReuseDecision(reuse=True, config_changed=False),
+    )
+
+    with startup.native_startup_attempt(harness="claude-native"):
+        assert cli._ensure_host_daemon("https://example.test") is False
+
+    host_event = next(
+        event for event in records(caplog) if event["event"] == "host_state_observed"
+    )
+    assert host_event["host_mode"] == "remote"
+    assert host_event["host_process_state_at_launch"] == "running"
+    assert host_event["host_process_action"] == "reused"
+    assert host_event["host_ensure_elapsed_ms"] >= 0
+
+
+def test_remote_backend_preserves_startup_context_in_host_thread(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Remote CLI launches retain startup telemetry in the daemon worker."""
+    from omnigent import _runner_startup, cli
+
+    caplog.set_level(logging.INFO, logger="omnigent.startup")
+    monkeypatch.setattr(
+        cli,
+        "_resolve_server_url",
+        lambda server: SimpleNamespace(api_base=server.rstrip("/")),
+    )
+    monkeypatch.setattr(cli, "_ensure_databricks_server_auth", lambda _server: None)
+    monkeypatch.setattr(
+        _runner_startup,
+        "runner_startup_progress",
+        lambda **_kwargs: contextlib.nullcontext(),
+    )
+
+    def ensure_host(server: str) -> None:
+        startup.record_startup_event(
+            "host_state_observed",
+            details={
+                "host_mode": "remote",
+                "host_process_state_at_launch": "running",
+                "host_process_action": "reused",
+                "host_ensure_elapsed_ms": 1.0,
+            },
+        )
+
+    monkeypatch.setattr(cli, "_ensure_host_daemon", ensure_host)
+
+    with startup.native_startup_attempt(harness="claude-native"):
+        assert cli._ensure_backend("https://example.test/") == "https://example.test"
+
+    assert any(event["event"] == "host_state_observed" for event in records(caplog))
 
 
 @pytest.mark.parametrize(

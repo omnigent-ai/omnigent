@@ -30,6 +30,7 @@ from typing import Any
 
 from playwright.async_api import Route, async_playwright, expect
 
+from tests.e2e_ui.start_session.helpers import stub_empty_host_picker_data
 from tests.e2e_ui.start_session.test_start_session import (
     _HOST_ID,
     _SESSIONS_RE,
@@ -156,6 +157,7 @@ async def _register_routing_routes(
 
     await page.route("**/v1/info", handle_info)
     await page.route("**/v1/hosts", handle_hosts)
+    await stub_empty_host_picker_data(page, _HOST_ID)
     await page.route("**/v1/agents", handle_agents)
     await page.route("**/v1/sessions/*/events", handle_events)
     await page.route(_SESSIONS_RE, handle_sessions)

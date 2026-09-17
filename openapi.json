@@ -2659,6 +2659,42 @@
         "title": "HostModelOptionsResponse",
         "type": "object"
       },
+      "ImportFailureRef": {
+        "description": "One session that could not be imported, with a user-facing reason.\n\n`external_session_id` / `source` name the source session when known (a\nhost that reports only a count leaves them `None`); `reason` explains the\nfailure so the UI can show it instead of an anonymous \"N failed\". Also the\nshape of each `{\"event\": \"failed\", ...}` line on the stream endpoint.",
+        "properties": {
+          "external_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "External Session Id"
+          },
+          "reason": {
+            "title": "Reason",
+            "type": "string"
+          },
+          "source": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source"
+          }
+        },
+        "required": [
+          "reason"
+        ],
+        "title": "ImportFailureRef",
+        "type": "object"
+      },
       "ImportItemInput": {
         "description": "One normalized existing Omnigent item received from the CLI.",
         "properties": {
@@ -3012,6 +3048,13 @@
             "format": "int64",
             "title": "Failed",
             "type": "integer"
+          },
+          "failures": {
+            "items": {
+              "$ref": "#/components/schemas/ImportFailureRef"
+            },
+            "title": "Failures",
+            "type": "array"
           },
           "imported": {
             "format": "int64",
@@ -10049,7 +10092,7 @@
     },
     "/v1/imports/local/stream": {
       "post": {
-        "description": "Stream local transcripts from a chosen host.\n\nSame import as the buffered `POST /v1/imports/local`, but responds with\nNDJSON: one `{\"event\": \"session\", ...}` line per newly imported session\nas its frame lands, so the caller lists sessions as they arrive rather\nthan waiting out the whole batch; a terminal `{\"event\": \"done\", ...}`\ncarries the tally. A mid-stream host failure emits `{\"event\": \"error\", ...}` before `done` \u2014 the sessions read so far are already committed\nand a retry is idempotent. Request validation still fails ahead of the\nstream with the usual HTTP error.",
+        "description": "Stream local transcripts from a chosen host.\n\nSame import as the buffered `POST /v1/imports/local`, but responds with\nNDJSON: one `{\"event\": \"session\", ...}` line per newly imported session\nas its frame lands, so the caller lists sessions as they arrive rather\nthan waiting out the whole batch. Each session that could not be imported\nemits one `{\"event\": \"failed\", \"external_session_id\", \"source\", \"reason\"}` line (after the successes), and a terminal\n`{\"event\": \"done\", ...}` carries the tally plus the full `failures`\nlist. A mid-stream host read failure emits `{\"event\": \"error\", ...}`\nbefore `done` (the sessions read so far are already committed and a\nretry is idempotent). Request validation still fails ahead of the stream\nwith the usual HTTP error.",
         "operationId": "import_local_sessions_stream_v1_imports_local_stream_post",
         "requestBody": {
           "content": {

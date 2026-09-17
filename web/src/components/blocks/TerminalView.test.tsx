@@ -9,9 +9,10 @@
 import type * as TerminalSessionModule from "./TerminalSession";
 
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { act } from "react";
+import { act, useMemo } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Toaster } from "@/components/ui/sonner";
+import { FileViewerContext, type OpenFileOptions } from "@/shell/FileViewerContext";
 import { toast } from "sonner";
 import type { ConnectionState } from "./TerminalSession";
 import {
@@ -27,6 +28,29 @@ const clipboardMock = vi.hoisted(() => ({
 
 vi.mock("@/lib/clipboard", () => ({ copyText: clipboardMock.copyText }));
 
+function FileViewerHarness({
+  openFile,
+}: {
+  openFile: (path: string, options?: OpenFileOptions) => void;
+}) {
+  const value = useMemo(
+    () => ({
+      openFile,
+      openGithubTab: () => {},
+      isChangedPath: () => false,
+      conversationId: "conv_abc",
+      workspaceRoot: "/home/u/ws",
+      workspaceHome: "/home/u",
+    }),
+    [openFile],
+  );
+  return (
+    <FileViewerContext.Provider value={value}>
+      <TerminalView sessionId="conv_abc" terminalId="terminal_codex_main" />
+    </FileViewerContext.Provider>
+  );
+}
+
 const terminalSessionMock = vi.hoisted(() => ({
   instances: [] as {
     url: string;
@@ -34,6 +58,7 @@ const terminalSessionMock = vi.hoisted(() => ({
     clipboardEnabled: boolean;
     adaptCodexPalette: boolean;
     onClipboardRequest?: (text: string) => void;
+    onFileLink?: (uri: string) => boolean;
     onState: (state: ConnectionState) => void;
     dispose: ReturnType<typeof vi.fn>;
     setTheme: ReturnType<typeof vi.fn>;
@@ -63,6 +88,7 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
       onClipboardRequest?: (text: string) => void,
       _focusOnConnect = true,
       adaptCodexPalette = false,
+      onFileLink?: (uri: string) => boolean,
     ) {
       terminalSessionMock.instances.push({
         url,
@@ -70,6 +96,7 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
         clipboardEnabled,
         adaptCodexPalette,
         onClipboardRequest,
+        onFileLink,
         onState,
         dispose: this.dispose,
         setTheme: this.setTheme,
@@ -171,6 +198,17 @@ describe("control-mode terminal", () => {
     render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
     await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
     expect(screen.queryByTestId("terminal-selection-hint")).toBeNull();
+  });
+
+  it("opens an OSC 8 workspace file citation in the FileViewer", async () => {
+    const openFile = vi.fn();
+    render(<FileViewerHarness openFile={openFile} />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+
+    expect(
+      terminalSessionMock.instances[0].onFileLink?.("file:///home/u/ws/src/app.ts#L42-L50"),
+    ).toBe(true);
+    expect(openFile).toHaveBeenCalledWith("src/app.ts", { line: 42 });
   });
 });
 

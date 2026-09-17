@@ -1,16 +1,16 @@
-// Recovering the desktop window when its outer auth session expires.
+// Recovering the desktop window when its outer auth session expires — the
+// HTTP-redirect path.
 //
-// A workspace-hosted Omnigent sits behind the Databricks SSO gate. When that
-// session's cookie lapses, the gate answers the SPA's API calls with a 303
-// redirect to its own ``login.html`` instead of the expected JSON. The SPA
-// can't parse the login page as data and dies on a "Failed to load: Fetch
-// request failed due to expired user session" error — and a desktop user has
-// no address bar to force a refresh out of it.
+// A workspace-hosted Omnigent sits behind the Databricks SSO gate. Some
+// deployments answer an expired session with a 3xx redirect to a login page
+// (``/login``, ``/login/sso``, or ``/login.html``); this watches for that raw
+// redirect and reloads the window so the gate can re-challenge.
 //
-// The shell sees the raw redirect (independent of whichever server bundle is
-// loaded), so it recovers here: on a login-page redirect for a connected
-// server, reload the window. That re-issues the top-level navigation the SSO
-// gate inspects, so it can re-challenge and re-mint the session.
+// NOTE: a managed Databricks workspace bounces an expired session via a
+// CLIENT-SIDE navigation, which webRequest never surfaces — so this seam does
+// not fire there. That case is handled by the away-watch's navigation
+// detection (see silentReauthManaged in main.js), which is the primary recovery
+// path. This HTTP-redirect seam remains for deployments that do emit a 3xx.
 //
 // Kept Electron-free at its core (isLoginRedirect) so the matching logic is
 // unit-testable (test/session-expiry.test.js) without booting the app.
@@ -35,7 +35,14 @@ function isLoginRedirect(details) {
   } catch {
     return false;
   }
-  return pathname.endsWith("/login.html") || pathname === "login.html";
+  // A managed workspace bounces an expired session to its login gate — observed
+  // as `/login/sso` (and `/login`); some deployments use `/login.html`. Match
+  // all of these. Scoped to the login path prefix so ordinary API redirects
+  // (e.g. /ajax-api/…) are left alone.
+  const p = pathname.toLowerCase();
+  return (
+    p === "/login" || p.startsWith("/login/") || p.endsWith("/login.html") || p === "login.html"
+  );
 }
 
 /**

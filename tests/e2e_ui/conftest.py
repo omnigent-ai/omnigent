@@ -1221,6 +1221,30 @@ def live_server(
         log_handle.close()
 
 
+@pytest.fixture(scope="session")
+def _recover_shared_runner(
+    live_server: str, tmp_path_factory: pytest.TempPathFactory
+) -> Iterator[Callable[[], None]]:
+    """Keep a recovered runner alive until the shared server is torn down."""
+    recovered: list[subprocess.Popen[bytes]] = []
+
+    def recover() -> None:
+        runner = _ensure_runner_online(live_server, tmp_path_factory)
+        if runner is not None:
+            recovered.append(runner)
+
+    try:
+        yield recover
+    finally:
+        for runner in recovered:
+            runner.terminate()
+            try:
+                runner.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                runner.kill()
+                runner.wait(timeout=5)
+
+
 @pytest.fixture
 def seeded_session(
     live_server: str,
@@ -2344,11 +2368,11 @@ def server_pid(live_server: str) -> int:
 # The native codex render-parity suite drives it.
 # ---------------------------------------------------------------------------
 
-# A precise-echo agent on the openai-agents harness (same provider family as
-# hello_world, so it authenticates against the same gateway in CI). spec_version
-# 1 + executor.config.harness routes through the strict parser; arcname
-# config.yaml keeps it on that path.
+# A precise-echo agent for mock-backed render-parity tests. Use the strict
+# config.yaml parser with spec_version: 1 and executor.config.harness.
 _CUSTOM_AGENT_NAME = "echo_probe"
+# A separate mock model keeps the empty parity fallback away from other tests.
+_CUSTOM_AGENT_MODEL = "render-parity-probe"
 _CLAUDE_MOCK_MODEL = "claude-sonnet-4-20250514"
 _CODEX_MOCK_MODEL = "gpt-4o"
 _CUSTOM_AGENT_YAML = f"""\
@@ -2360,7 +2384,7 @@ prompt: |
   and nothing else — no preamble, no quotes, no trailing punctuation.
 
 executor:
-  model: gpt-4o-mini
+  model: {_CUSTOM_AGENT_MODEL}
   config:
     harness: openai-agents
 """

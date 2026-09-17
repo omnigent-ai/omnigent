@@ -22,6 +22,8 @@ from typing import Any
 
 from playwright.async_api import Route, async_playwright, expect
 
+from tests.e2e_ui.start_session.helpers import stub_empty_host_picker_data
+
 # Stubbed host the composer auto-selects.
 _HOST_ID = "host_e2e"
 # Bare create endpoint — intercepts POST but lets GET through.
@@ -140,6 +142,7 @@ async def _register_routes(
         )
 
     await page.route("**/v1/hosts", handle_hosts)
+    await stub_empty_host_picker_data(page, _HOST_ID)
     await page.route("**/v1/agents", handle_agents)
     await page.route("**/v1/sessions/*/events", handle_events)
     await page.route(_SESSIONS_RE, handle_sessions)

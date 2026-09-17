@@ -45,6 +45,8 @@ from typing import Any
 
 from playwright.async_api import Route, async_playwright, expect
 
+from tests.e2e_ui.start_session.helpers import stub_empty_host_picker_data
+
 # ---------------------------------------------------------------------------
 # Constants copied from test_start_session.py (same server/stub shape)
 # ---------------------------------------------------------------------------
@@ -213,6 +215,7 @@ async def _drive_mobile_enter_newline(base_url: str, session_id: str) -> None:
                 )
 
             await page.route("**/v1/hosts", handle_hosts)
+            await stub_empty_host_picker_data(page, _HOST_ID)
             await page.route("**/v1/agents", handle_agents)
             await page.route("**/v1/sessions/*/events", handle_events)
             await page.route(_SESSIONS_RE, handle_sessions)

@@ -165,7 +165,7 @@ jobs:
           python-version-file: ".python-version"
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v3
+        uses: ./.github/actions/setup-uv
         with:
           enable-cache: true
 
@@ -269,7 +269,7 @@ jobs:
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
         with:
           python-version-file: ".python-version"
-      - uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a
+      - uses: ./.github/actions/setup-uv
         with:
           enable-cache: true
       - name: Install dependencies
@@ -311,7 +311,7 @@ jobs:
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
         with:
           python-version-file: ".python-version"
-      - uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a
+      - uses: ./.github/actions/setup-uv
         with:
           enable-cache: true
       - name: Start CockroachDB
@@ -366,7 +366,7 @@ jobs:
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
         with:
           python-version-file: ".python-version"
-      - uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a
+      - uses: ./.github/actions/setup-uv
         with:
           enable-cache: true
       - name: Install system MySQL client library
@@ -406,7 +406,7 @@ jobs:
           python-version-file: ".python-version"
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v3
+        uses: ./.github/actions/setup-uv
         with:
           enable-cache: true
 

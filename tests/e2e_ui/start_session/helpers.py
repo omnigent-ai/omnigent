@@ -5,6 +5,18 @@ from __future__ import annotations
 from playwright.async_api import Page, expect
 
 
+async def stub_empty_host_picker_data(page: Page, host_id: str) -> None:
+    """Answer auxiliary requests for a fake host with no catalog or worktrees."""
+    await page.route(
+        f"**/v1/hosts/{host_id}/harnesses/*/model-options",
+        lambda route: route.fulfill(json={"models": []}),
+    )
+    await page.route(
+        f"**/v1/hosts/{host_id}/worktrees?*",
+        lambda route: route.fulfill(json={"data": []}),
+    )
+
+
 async def open_landing_workspace_picker(page: Page) -> None:
     """Open the second-stage filesystem picker from the workspace recents menu."""
     await page.get_by_test_id("new-chat-landing-workspace-chip").click()

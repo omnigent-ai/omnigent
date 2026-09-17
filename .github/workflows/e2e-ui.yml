@@ -165,7 +165,7 @@ jobs:
         uses: ./.github/actions/setup-pnpm
 
       - name: Install uv
-        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39  # v8.2.0
+        uses: ./.github/actions/setup-uv
         with:
           enable-cache: true
 
@@ -296,10 +296,11 @@ jobs:
           # goes and rebalance; the 1s floor keeps trivial phases out.
           # Retry every otherwise-unmarked failure once for transient CI races;
           # per-test @pytest.mark.flaky settings still take precedence.
+          # Keep the failed attempt's traceback even when its retry passes.
           uv run pytest tests/e2e_ui \
             -v --tb=long --showlocals --log-level=INFO -r a \
             --durations=25 --durations-min=1.0 \
-            --reruns=1 --reruns-delay=5 \
+            --reruns=1 --reruns-delay=5 --rerun-show-tracebacks \
             --ui-skip-build \
             --ui-timing-output=artifacts/ui-timings.jsonl \
             --splits="$NUM_SHARDS" \
