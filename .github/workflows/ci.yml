@@ -169,7 +169,7 @@ jobs:
         with:
           enable-cache: true
 
-      - name: Install ripgrep + bubblewrap + tmux
+      - name: Install test system dependencies
         # ripgrep: the Grep tool prefers it. bubblewrap: the linux_bwrap sandbox
         # needs it. tmux: the integration-mock shard spawns harness terminals.
         # apparmor sysctl: Ubuntu 24.04 blocks unprivileged user namespaces
@@ -177,6 +177,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y ripgrep bubblewrap tmux
+          if [ "${{ matrix.group }}" = "inner-rest" ]; then
+            sudo apt-get install -y --no-install-recommends dbus-daemon gnome-keyring
+          fi
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
       - name: Cache virtualenv
@@ -203,6 +206,10 @@ jobs:
           # sysmon: the default C-trace coverage backend pushed the heaviest
           # shard past its timeout; only line coverage is collected.
           COVERAGE_CORE: sysmon
+          # Multiplies the tests' hang-guard waits (tests.budgets.budget).
+          # A shared runner under -n 4+ can stall an event loop past a 1s
+          # budget; local runs keep the unscaled default and fail fast.
+          OMNIGENT_TEST_TIMEOUT_SCALE: "4"
         run: |
           mkdir -p artifacts artifacts/progress "$(dirname "$COVERAGE_FILE")"
           # matrix.paths is unquoted on purpose: it word-splits into pytest args.

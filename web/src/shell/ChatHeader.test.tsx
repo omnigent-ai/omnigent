@@ -821,6 +821,7 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
         .map((item) => (item.textContent ?? "").replace(svgTitleText(item), "").trim()),
     ).toEqual([
       "Pin",
+      "Export",
       "Rename",
       "Mark as unread",
       "Add to project",

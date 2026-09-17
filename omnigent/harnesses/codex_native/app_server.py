@@ -469,24 +469,70 @@ def _sync_codex_developer_instructions(
     config_path.write_text(tomlkit.dumps(document), encoding="utf-8")
 
 
-def _codex_model_upgrade_target(catalog: object, model: str) -> str | None:
-    """Return Codex's replacement for *model*, when the catalog declares one."""
-    if not isinstance(catalog, dict):
-        return None
-    models = catalog.get("models")
+def _codex_model_catalog_entry(catalog: object, model: str) -> dict[str, object] | None:
+    """Return the catalog entry naming *model*, across both Codex schemas."""
+    if isinstance(catalog, dict):
+        models = catalog.get("models")
+    else:
+        models = catalog
     if not isinstance(models, list):
         return None
+    from omnigent.models.codex_model_vocabulary import comparable_model_id
+
+    model_key = comparable_model_id(model)
     for entry in models:
-        if not isinstance(entry, dict) or entry.get("slug") != model:
+        if not isinstance(entry, dict):
             continue
-        upgrade = entry.get("upgrade")
-        if not isinstance(upgrade, dict):
-            return None
-        target = upgrade.get("model") or upgrade.get("id")
-        if isinstance(target, str) and target and target != model:
-            return target
-        return None
+        names = (entry.get("slug"), entry.get("id"), entry.get("model"))
+        if not any(
+            isinstance(name, str) and comparable_model_id(name) == model_key for name in names
+        ):
+            continue
+        return entry
     return None
+
+
+def _codex_model_upgrade_target(catalog: object, model: str) -> str | None:
+    """Return Codex's replacement for *model*, when the catalog declares one."""
+    entry = _codex_model_catalog_entry(catalog, model)
+    if entry is None:
+        return None
+    upgrade_info = entry.get("upgradeInfo")
+    if isinstance(upgrade_info, dict):
+        target = upgrade_info.get("model") or upgrade_info.get("id")
+    else:
+        upgrade = entry.get("upgrade")
+        if isinstance(upgrade, dict):
+            target = upgrade.get("model") or upgrade.get("id")
+        else:
+            target = upgrade
+    if not isinstance(target, str):
+        return None
+    from omnigent.models.codex_model_vocabulary import comparable_model_id
+
+    if target and comparable_model_id(target) != comparable_model_id(model):
+        return target
+    return None
+
+
+def _codex_model_upgrade_metadata_is_malformed(entry: dict[str, object]) -> bool:
+    """Return whether declared migration metadata lacks a usable target."""
+    upgrade_info = entry.get("upgradeInfo")
+    if upgrade_info is not None:
+        if not isinstance(upgrade_info, dict):
+            return True
+        target = upgrade_info.get("model") or upgrade_info.get("id")
+        return not isinstance(target, str) or not target
+
+    upgrade = entry.get("upgrade")
+    if upgrade is None:
+        return False
+    if isinstance(upgrade, str):
+        return not upgrade
+    if isinstance(upgrade, dict):
+        target = upgrade.get("model") or upgrade.get("id")
+        return not isinstance(target, str) or not target
+    return True
 
 
 def _acknowledge_codex_model_migration(codex_home: Path, model: str, target: str) -> None:
@@ -1184,6 +1230,19 @@ def codex_catalog_fingerprint(launch: NativeCodexLaunch, *, codex_path: str | No
     )
 
 
+def fresh_codex_launch_catalog(
+    *, codex_path: str | None = None, launch: NativeCodexLaunch
+) -> list[_JsonObject] | None:
+    """Return a fresh persisted catalog for one launch shape, without probing."""
+    from omnigent.models import model_catalog_store
+
+    fingerprint = codex_catalog_fingerprint(launch, codex_path=codex_path)
+    rows = model_catalog_store.read_catalog("codex-native", fingerprint)
+    if rows is None or model_catalog_store.catalog_is_stale("codex-native", fingerprint):
+        return None
+    return rows
+
+
 async def _codex_launch_catalog(
     *, codex_path: str | None, launch: NativeCodexLaunch | None, reprobe: bool
 ) -> list[_JsonObject] | None:
@@ -1330,6 +1389,9 @@ class CodexNativeAppServer:
     :param pinned_effort: Session-persisted reasoning effort written as
         ``model_reasoning_effort`` into the per-session ``config.toml`` at
         start, or ``None`` to keep the copied config's value.
+    :param model_catalog_rows: Fresh rows from the shared, launch-shaped
+        ``model/list`` catalog. When present, startup derives migration
+        acknowledgements locally instead of spawning ``codex debug models``.
     :param trust_project: Whether to trust :attr:`cwd` in the private
         session config before startup. Runner-owned headless sessions set
         this because nobody can answer Codex's project-trust TUI prompt.
@@ -1368,6 +1430,7 @@ class CodexNativeAppServer:
     policy_notice_pending: bool = False
     pinned_model: str | None = None
     pinned_effort: str | None = None
+    model_catalog_rows: list[_JsonObject] | None = None
     process_registry_tag: str | None = None
     process_owner_lock: CodexNativeProcessOwnerLock | None = None
     codex_cli_version: tuple[int, int, int] | None = None
@@ -1421,12 +1484,18 @@ class CodexNativeAppServer:
         config_source = _codex_home_config_source_from_env()
         model_migration_target: str | None = None
         if self.trust_project and self.pinned_model:
-            catalog = await asyncio.to_thread(
-                read_codex_model_catalog,
-                self.codex_path,
-                config_source,
-                timeout=_MODEL_MIGRATION_CATALOG_TIMEOUT_SECONDS,
-            )
+            catalog: object = self.model_catalog_rows
+            catalog_entry = _codex_model_catalog_entry(catalog, self.pinned_model)
+            # ``model/list`` excludes hidden rows. A selected legacy model may
+            # therefore be absent even from a fresh snapshot. A present row
+            # with malformed migration metadata is also unsafe to trust.
+            if catalog_entry is None or _codex_model_upgrade_metadata_is_malformed(catalog_entry):
+                catalog = await asyncio.to_thread(
+                    read_codex_model_catalog,
+                    self.codex_path,
+                    config_source,
+                    timeout=_MODEL_MIGRATION_CATALOG_TIMEOUT_SECONDS,
+                )
             model_migration_target = _codex_model_upgrade_target(catalog, self.pinned_model)
         # Off the loop: this copies/symlinks a home AND (on a Smart Routing
         # session) shells out to ``codex debug models`` with a 10s timeout. Run
@@ -2479,6 +2548,7 @@ def build_codex_native_server(
     trust_project: bool = False,
     trust_all_hooks: bool = False,
     reasoning_effort: str | None = None,
+    model_catalog_rows: list[_JsonObject] | None = None,
 ) -> CodexNativeAppServer:
     """
     Build a configured native Codex app-server process wrapper.
@@ -2527,6 +2597,8 @@ def build_codex_native_server(
         the private ``config.toml`` at start (see
         :func:`_pin_codex_config_effort`), e.g. ``"ultra"``. ``None`` keeps
         the copied config's value.
+    :param model_catalog_rows: Fresh rows from the shared launch-shaped
+        ``model/list`` catalog, used to avoid a redundant migration probe.
     :returns: Configured app-server process wrapper.
     :raises ImportError: If no Codex CLI is available.
     :raises OSError: If Databricks routing was requested but no
@@ -2591,6 +2663,7 @@ def build_codex_native_server(
         python_executable=python_executable,
         pinned_model=pinned_model,
         pinned_effort=reasoning_effort,
+        model_catalog_rows=model_catalog_rows,
         trust_project=trust_project,
         trust_all_hooks=trust_all_hooks,
     )

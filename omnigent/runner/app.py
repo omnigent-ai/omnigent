@@ -46,7 +46,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from omnigent._platform import normalize_interactive_shells
 from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
-from omnigent.debug_logging import phase_scope, runner_primary_session_id
+from omnigent.debug_logging import debug_event, phase_scope, runner_primary_session_id
 from omnigent.entities.session_resources import (
     DEFAULT_ENVIRONMENT_ID,
     SessionResourceView,
@@ -176,7 +176,7 @@ from omnigent.server.schemas import (
     BackgroundSessionTitleRequest,
     BackgroundSessionTitleResponse,
 )
-from omnigent.spec.skill_sources import SkillSourceContext, resolve_harness_skills
+from omnigent.spec.skill_sources import resolve_session_skills
 from omnigent.spec.types import AgentSpec, LocalToolInfo, SkillSpec
 from omnigent.terminals.control_bridge import bridge_tmux_control_to_websocket
 from omnigent.terminals.ws_common import WS_CLOSE_TERMINAL_NOT_FOUND
@@ -187,6 +187,9 @@ from omnigent.tools.builtins.load_skill import (
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger(__name__)
+
+# Allow process termination and forwarder cleanup to finish before DELETE proceeds.
+_SESSION_INIT_CANCEL_TIMEOUT_S = 20.0
 
 # Claude-native session model listing: how long one request waits inline for
 # the probe before answering 503-pending, and how long the probe may stay
@@ -2722,11 +2725,8 @@ def get_session_agent_id(session_id: str) -> str | None:
     return _session_agent_ids_ref.get(session_id)
 
 
-# How long a session's discovered skills stay cached before the runner
-# re-walks the filesystem. Short enough that a skill or plugin installed
-# mid-session surfaces in the composer menu without a session restart, long
-# enough to collapse the bursty menu-open + per-invocation resolve calls onto
-# a single walk. Module-level so it can be tuned/patched in one place.
+# Repeated invocations share a filesystem scan; installed skills become
+# resolvable after at most one minute without restarting the runner.
 _SESSION_SKILLS_CACHE_TTL_SECONDS = 60.0
 _SESSION_INIT_ENVELOPE_TTL_SECONDS = 60.0
 
@@ -3026,6 +3026,7 @@ def create_runner_app(
     _desync_terminalized: dict[str, int] = {}
     app.state.desync_terminalized = _desync_terminalized
     _background_tasks: set[asyncio.Task[Any]] = set()
+    _subagent_recovery_tasks: dict[str, asyncio.Task[None]] = {}
     _subagent_wake_pending: set[str] = set()
     _last_rewake_notice: dict[str, str] = {}
     # Parents whose wake POST exhausted its bounded retries while their inbox
@@ -4039,8 +4040,11 @@ def create_runner_app(
         if session_id not in _session_inboxes:
             _session_inboxes[session_id] = asyncio.Queue()
         # A fresh queue can mean a fresh runner process rather than a fresh
-        # session: re-queue results the previous process never drained.
-        await _recover_undrained_subagent_results(session_id)
+        # session: re-queue results the previous process never drained. Start
+        # the durable server scan now, but overlap it with terminal creation;
+        # sys_read_inbox uses the same locked helper if a turn races the scan.
+        _deliver_retained_subagent_results(session_id)
+        _subagent_recovery_task = _start_subagent_recovery(session_id)
         if session_id not in _session_async_tasks:
             _session_async_tasks[session_id] = {}
         raw_sub_agent_name = body.get("sub_agent_name")
@@ -4181,12 +4185,16 @@ def create_runner_app(
             elif harness_name == "codex-native":
 
                 async def _codex_pre_launch(has_terminal: bool) -> PreLaunchResult:
-                    needs = await _codex_session_needs_runner_terminal(server_client, session_id)
+                    needs = (
+                        init_context.envelope is not None
+                        or await _codex_session_needs_runner_terminal(server_client, session_id)
+                    )
                     if not has_terminal:
                         inbound = await _codex_native_terminal_arrives_via_transfer(
                             server_client=server_client,
                             session_id=session_id,
                             resource_registry=resource_registry,
+                            session_labels=init_context.labels,
                         )
                         _logger.info(
                             "Codex terminal transfer-inbound check: session=%s "
@@ -4346,6 +4354,11 @@ def create_runner_app(
                         )
                     finally:
                         _publish_terminal_pending(_publish_event, session_id, False)
+
+        # Preserve the initialization contract: undrained child results are
+        # recovered before POST /sessions returns. The scan no longer delays
+        # native terminal registration because it ran concurrently above.
+        await asyncio.shield(_subagent_recovery_task)
 
         # Crash recovery (Step 8.5 Scenario A): if the session
         # has existing history, check whether the last item
@@ -4578,6 +4591,33 @@ def create_runner_app(
 
     @app.delete("/v1/sessions/{session_id}")
     async def delete_session(session_id: str) -> JSONResponse:
+        # Stop initialization before it can recreate resources during teardown.
+        init_tasks = [
+            task
+            for key, task in list(_session_init_tasks.items())
+            if key[0] == session_id and not task.done()
+        ]
+        for init_task in init_tasks:
+            init_task.cancel()
+        if init_tasks:
+            # Bound cleanup time; log init failures so resource teardown still runs.
+            _finished, pending = await asyncio.wait(
+                set(init_tasks), timeout=_SESSION_INIT_CANCEL_TIMEOUT_S
+            )
+            if pending:
+                _logger.warning(
+                    "Cancelled session init for %s did not finish within %.0fs",
+                    session_id,
+                    _SESSION_INIT_CANCEL_TIMEOUT_S,
+                )
+            for done_task in _finished:
+                if not done_task.cancelled() and done_task.exception() is not None:
+                    _logger.warning(
+                        "Session init for %s failed while being cancelled: %r",
+                        session_id,
+                        done_task.exception(),
+                    )
+        await _cancel_subagent_recovery(session_id)
         turn_task = _active_turns.pop(session_id, None)
         if turn_task is not None and isinstance(turn_task, asyncio.Task):
             turn_task.cancel()
@@ -4607,6 +4647,8 @@ def create_runner_app(
         _repl_terminal_ensure_locks.pop(session_id, None)
         _interrupted_sessions.discard(session_id)
         await _cancel_auto_forwarder_task(session_id)
+        # Close any OpenCode server that no forwarder adopted.
+        await _native_runtime.teardown_opencode_native_server(session_id)
 
         if process_manager is not None:
             await process_manager.forward_cancel(session_id)
@@ -5180,7 +5222,7 @@ def create_runner_app(
             if _deliver_subagent_completion(entry).delivered_now:
                 _schedule_subagent_wake(entry)
 
-    async def _recover_undrained_subagent_results(parent_id: str) -> None:
+    async def _run_subagent_recovery(parent_id: str) -> None:
         """
         Re-queue terminal child results lost with a runner process restart.
 
@@ -5221,6 +5263,49 @@ def create_runner_app(
                 return
             _subagent_recovery_done.add(parent_id)
 
+    def _start_subagent_recovery(parent_id: str) -> asyncio.Task[None]:
+        """Return the session-owned single-flight restart recovery task."""
+        task = _subagent_recovery_tasks.get(parent_id)
+        if task is not None and not task.done():
+            return task
+        _subagent_recovery_tasks.pop(parent_id, None)
+        task = asyncio.create_task(
+            _run_subagent_recovery(parent_id),
+            name=f"subagent-recovery:{parent_id}",
+        )
+        _subagent_recovery_tasks[parent_id] = task
+        _background_tasks.add(task)
+
+        def _drop_completed_recovery(done: asyncio.Task[None]) -> None:
+            _background_tasks.discard(done)
+            if _subagent_recovery_tasks.get(parent_id) is done:
+                _subagent_recovery_tasks.pop(parent_id, None)
+
+        task.add_done_callback(_drop_completed_recovery)
+        return task
+
+    async def _cancel_subagent_recovery(parent_id: str) -> None:
+        """Stop recovery before deleting its session-local inbox and markers."""
+        task = _subagent_recovery_tasks.pop(parent_id, None)
+        if task is None:
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception:  # noqa: BLE001 - recovery failure must not block session deletion
+            _logger.warning(
+                "Sub-agent recovery failed while deleting session %s",
+                parent_id,
+                exc_info=True,
+                extra={"session_id": parent_id},
+            )
+
+    async def _recover_undrained_subagent_results(parent_id: str) -> None:
+        """Await the session-owned single-flight restart recovery task."""
+        await asyncio.shield(_start_subagent_recovery(parent_id))
+
     app.state.recover_undrained_subagent_results = _recover_undrained_subagent_results
 
     def _note_session_harness_override(conv_id: str, harness_override: str | None) -> None:
@@ -5259,6 +5344,8 @@ def create_runner_app(
         conv_id: str,
         status: str,
         error: Mapping[str, object] | None = None,
+        *,
+        source_error: Mapping[str, object] | None = None,
     ) -> None:
         if status == "waiting" and not (
             _server_version is not None and _version_supports_waiting_status(_server_version)
@@ -5282,6 +5369,14 @@ def create_runner_app(
         if error is not None:
             event["error"] = error
         if status == "failed":
+            source = source_error if source_error is not None else (error or {})
+            dimensions: dict[str, str] = {}
+            for key in ("code", "type", "status"):
+                value = source.get(key)
+                if (isinstance(value, int) and not isinstance(value, bool)) or (
+                    isinstance(value, str) and re.fullmatch(r"[\w.:-]{1,128}", value)
+                ):
+                    dimensions[f"source_{key}"] = str(value)
             # Canonical broken-turn signal: every failed turn shown in the UI
             # funnels through here, so log once at ERROR for the dashboard.
             _logger.error(
@@ -5289,7 +5384,12 @@ def create_runner_app(
                 conv_id,
                 harness,
                 error,
-                extra={"session_id": conv_id},
+                extra=debug_event(
+                    "runner_turn_failed",
+                    session_id=conv_id,
+                    harness=harness,
+                    **dimensions,
+                ),
             )
         _publish_event(conv_id, event)
 
@@ -7077,7 +7177,9 @@ def create_runner_app(
                 _publish_turn_status(conv_id, "idle")
         elif error is not None:
             if not _suppress_status:
-                _publish_turn_status(conv_id, "failed", error=_normalize_turn_error(error))
+                _publish_turn_status(
+                    conv_id, "failed", error=_normalize_turn_error(error), source_error=error
+                )
         else:
             if not has_buffered and not _suppress_status:
                 children = _subagent_work_by_parent.get(conv_id, set())
@@ -11177,58 +11279,14 @@ def create_runner_app(
         if not roots:
             roots.append(Path.cwd())
 
-        def _discover() -> list[SkillSpec]:
-            merged: list[SkillSpec] = [s for s in spec.skills if s.user_invocable]
-            seen = {s.name for s in spec.skills}
-            seen_dirs = {s.skill_dir.resolve() for s in spec.skills if s.skill_dir is not None}
-            harness = canonicalize_harness(spec.executor.harness_kind)
-            # Claude Code resolves its user scope from $CLAUDE_CONFIG_DIR
-            # (default ~/.claude); the terminal inherits this env, so the
-            # menu must read the same tier or the two surfaces diverge.
-            configured_claude_dir = os.environ.get("CLAUDE_CONFIG_DIR")
-            # Native Codex honors $CODEX_HOME for its skills; resolve the same
-            # host home the launch seeds from so the menu matches the terminal
-            # (only the native provider reads it — see codex_host_skills).
-            codex_home: Path | None = None
-            if harness is not None and "codex" in harness:
-                from omnigent.inner.codex_executor import _codex_home_config_source_from_env
-
-                codex_home = _codex_home_config_source_from_env()
-            ctx = SkillSourceContext(
-                roots=tuple(roots),
-                home=Path.home(),
-                skills_filter=spec.skills_filter,
-                bundle_dir=_resolved_spec_workdir(entry),
-                claude_config_dir=(
-                    Path(configured_claude_dir).expanduser() if configured_claude_dir else None
-                ),
-                codex_home=codex_home,
-            )
-            for hs in resolve_harness_skills(ctx, harness):
-                if hs.name in seen:
-                    continue
-                if hs.skill_dir is not None and hs.skill_dir.resolve() in seen_dirs:
-                    continue
-                seen.add(hs.name)
-                if hs.skill_dir is not None:
-                    seen_dirs.add(hs.skill_dir.resolve())
-                merged.append(hs)
-            return merged
-
-        skills = await asyncio.to_thread(_discover)
+        skills = await asyncio.to_thread(
+            resolve_session_skills, spec, tuple(roots), _resolved_spec_workdir(entry)
+        )
         _session_skills_cache[session_id] = (
             time.monotonic() + _SESSION_SKILLS_CACHE_TTL_SECONDS,
             skills,
         )
         return skills
-
-    @app.get("/v1/sessions/{session_id}/skills")
-    async def get_session_skills(session_id: str) -> JSONResponse:
-        skills = await _resolve_session_skills(session_id)
-        return JSONResponse(
-            status_code=200,
-            content={"skills": [{"name": s.name, "description": s.description} for s in skills]},
-        )
 
     @app.get("/v1/sessions/{session_id}/models")
     async def get_session_models(session_id: str) -> JSONResponse:
@@ -12865,6 +12923,12 @@ def _build_spawn_env_from_spec(
                 return None
     except ImportError:
         return None
+
+    if env is not None:
+        from omnigent.inner.agent_env import desktop_session_passthrough, strip_desktop_session_env
+
+        env = strip_desktop_session_env(env)
+        env.update(desktop_session_passthrough(effective_spec.os_env))
 
     # Point the harness process at this session's subagent-routing endpoint
     # when one is running (started at session init). Scoped to *harness* so a

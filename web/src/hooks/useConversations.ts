@@ -46,6 +46,7 @@ import { showToast } from "@/components/ui/toast";
 import { revokePermission } from "@/lib/permissionsApi";
 import { conversationDisplayLabel, setLegacyPinnedConversationId } from "@/shell/sidebarNav";
 import { apiErrorFromResponse, stopSession } from "@/lib/sessionsApi";
+import { isStaleCursorError, useRestartOnStaleCursor } from "@/lib/staleCursor";
 import { setSessionHost } from "@/lib/sessionHost";
 import {
   createProject as apiCreateProject,
@@ -529,7 +530,9 @@ async function fetchConversationsPage({
   // Plain list pagination is indexed/fast, so it keeps no timeout.
   const signal = searchQuery ? AbortSignal.timeout(SEARCH_FETCH_TIMEOUT_MS) : undefined;
   const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`, { signal });
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  // Carries the server's `code`, so a dead cursor stays recognizable as
+  // `stale_cursor` instead of an opaque "400 Bad Request".
+  if (!res.ok) throw await apiErrorFromResponse(res);
   const page = (await res.json()) as ConversationsPage;
   // Seed the session→host map from every list row, not just sessions the user
   // has opened (which is all `sessionFromWire` covers). Two payoffs: (1) the
@@ -595,17 +598,18 @@ export function useConversations(
   // If the socket is down, all consumers use a safety poll.
   const streamConnected = useSessionUpdatesConnected();
   const queryClient = useQueryClient();
-  return useInfiniteQuery({
-    // Keep the base three-element key for the unfiltered callers (byte-for-byte
-    // unchanged, so the sidebar / rename / push-delta paths are untouched); only
-    // append `project` for a concrete name; append `visibility` only when set so
-    // the "mine"/"shared" tab queries get their own cache entries without
-    // disturbing the existing all-sessions key used by every other caller.
-    queryKey: visibility
-      ? ["conversations", searchQuery, includeArchived, project ?? null, visibility]
-      : project
-        ? ["conversations", searchQuery, includeArchived, project]
-        : ["conversations", searchQuery, includeArchived],
+  // Keep the base three-element key for the unfiltered callers (byte-for-byte
+  // unchanged, so the sidebar / rename / push-delta paths are untouched); only
+  // append `project` for a concrete name; append `visibility` only when set so
+  // the "mine"/"shared" tab queries get their own cache entries without
+  // disturbing the existing all-sessions key used by every other caller.
+  const queryKey = visibility
+    ? ["conversations", searchQuery, includeArchived, project ?? null, visibility]
+    : project
+      ? ["conversations", searchQuery, includeArchived, project]
+      : ["conversations", searchQuery, includeArchived];
+  const query = useInfiniteQuery({
+    queryKey,
     queryFn: async ({ pageParam }) => {
       const fetchPage = () =>
         fetchConversationsPage({
@@ -644,7 +648,11 @@ export function useConversations(
     // A client-side search timeout is terminal — retrying would just re-arm the
     // same slow request (default 3×) and prolong the spinner. Any other failure
     // keeps React Query's default retry behaviour.
-    retry: (failureCount, error) => !isAbortTimeout(error) && failureCount < 3,
+    // A stale cursor is terminal for that page param too: the row it names is
+    // gone, so a retry reissues the same doomed cursor. The restart below
+    // recovers it instead.
+    retry: (failureCount, error) =>
+      !isAbortTimeout(error) && !isStaleCursorError(error) && failureCount < 3,
     refetchInterval: streamConnected
       ? options.reconcileWhileConnected
         ? CONNECTED_STREAM_REFETCH_INTERVAL_MS
@@ -661,6 +669,10 @@ export function useConversations(
       ? { notifyOnChangeProps: [...options.notifyOnChangeProps] }
       : {}),
   });
+  // A session deleted between two scroll pages kills the cursor; reload the
+  // list from page 1 rather than replacing the sidebar with the raw 400.
+  useRestartOnStaleCursor(queryKey);
+  return query;
 }
 
 /** PATCH /v1/sessions/{id} — exported for direct unit testing. */
@@ -2171,7 +2183,8 @@ async function fetchProjectSessionsPage(
   });
   if (after) params.set("after", after);
   const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`);
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  // Carries the server's `code`, so a dead cursor stays recognizable.
+  if (!res.ok) throw await apiErrorFromResponse(res);
   return applySessionTombstones((await res.json()) as ConversationsPage, true);
 }
 
@@ -2186,14 +2199,20 @@ async function fetchProjectSessionsPage(
  * folder paginates independently with its own infinite-scroll sentinel.
  */
 export function useProjectSessions(project: string, enabled: boolean) {
-  return useInfiniteQuery({
-    queryKey: ["project-sessions", project],
+  const queryKey = ["project-sessions", project];
+  const query = useInfiniteQuery({
+    queryKey,
     queryFn: ({ pageParam }) => fetchProjectSessionsPage(project, pageParam as string | undefined),
     initialPageParam: undefined as string | undefined,
     getNextPageParam: (lastPage) =>
       lastPage.has_more ? (lastPage.last_id ?? undefined) : undefined,
+    retry: (failureCount, error) => !isStaleCursorError(error) && failureCount < 3,
     enabled,
   });
+  // A session deleted mid-scroll kills the folder's cursor; reload the folder
+  // from page 1 rather than collapsing it into an error.
+  useRestartOnStaleCursor(queryKey);
+  return query;
 }
 
 /** Archive a session AND detach it from its project (clear project_id + the
