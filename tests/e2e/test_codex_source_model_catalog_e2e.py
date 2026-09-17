@@ -1,4 +1,4 @@
-"""Query a real Codex CLI with its source configuration and launch overrides."""
+"""Compare isolated model discovery with a real Codex CLI using its source home."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ from omnigent.harnesses.codex_native import app_server
 async def test_codex_source_catalog_and_default(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, relative: bool, override: bool
 ) -> None:
-    """Codex filters its catalog and resolves defaults without config reconstruction."""
+    """The isolated probe matches Codex's own visible choices and effective default."""
     codex = shutil.which("codex")
     assert codex is not None
     source = tmp_path / "codex-home"
@@ -70,6 +70,7 @@ async def test_codex_source_catalog_and_default(
     )
     config_path = source / "config.toml"
     config_path.write_text(config)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setattr(app_server, "_codex_home_config_source_from_env", lambda: source)
     monkeypatch.setattr(app_server, "_clean_codex_env", lambda: dict(env))
     # Resolve the override through Codex's config/read, without an Omnigent pin.
@@ -77,10 +78,18 @@ async def test_codex_source_catalog_and_default(
         ['model="catalog-first"'] if override else [], None, None
     )
 
+    with monkeypatch.context() as direct:
+        direct.setattr(app_server, "_probe_codex_home", lambda overrides: source)
+        direct_rows = await asyncio.wait_for(
+            app_server.probe_codex_model_options(codex_path=codex, launch=launch), timeout=20
+        )
+
     rows = await asyncio.wait_for(
         app_server.probe_codex_model_options(codex_path=codex, launch=launch), timeout=20
     )
 
+    assert rows == direct_rows
+    assert app_server._probe_codex_home(launch.config_overrides) != source
     assert [row["id"] for row in rows] == ["catalog-first", "configured-default"]
     expected_default = "catalog-first" if override else "configured-default"
     assert [row["id"] for row in rows if row.get("isDefault")] == [expected_default]
