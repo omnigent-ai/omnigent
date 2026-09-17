@@ -275,8 +275,7 @@ def provider_display_name(provider: str) -> str:
 
     :param provider: A provider id, e.g. ``"openai"`` or ``"together_ai"``.
     :returns: A friendly name, e.g. ``"OpenAI"`` or ``"Together AI"``.
-        Falls back to a title-cased form for ids not in the map (e.g. a
-        user-named gateway ``"my-proxy"`` → ``"My-Proxy"``).
+        Falls back to a title-cased form for ids not in the map.
     """
     return _PROVIDER_DISPLAY_NAME.get(provider, provider.replace("_", " ").title())
 
@@ -343,8 +342,9 @@ def credential_label(
     surface — the ``configure harness`` menus/listing and the ``/model``
     REPL readout — so a subscription always reads as ``"Subscription"``
     (never the raw ``"claude"`` / brand name), a vendor key names the
-    vendor + ``"API Key"``, and Databricks names its profile. Pair with
-    :func:`kind_glyph` for the glyph prefix.
+    vendor + ``"API Key"``, and Databricks names its profile. Custom gateway
+    labels keep their original spelling. Pair with :func:`kind_glyph` for
+    the glyph prefix.
 
     :param kind: The provider kind, e.g. ``"key"``, ``"subscription"``,
         ``"gateway"``, ``"local"``, ``"databricks"``, or ``"cli-config"``.
@@ -368,6 +368,8 @@ def credential_label(
         return "Subscription"
     if kind == DATABRICKS_KIND:
         return f"Databricks ({profile})" if profile else "Databricks"
+    if kind == GATEWAY_KIND:
+        return provider_name
     if kind == CLI_CONFIG_KIND:
         # Use the entry name (e.g. "isaac-databricks-codex" → "Isaac-Databricks-Codex")
         # so cli-config providers show consistently alongside other provider kinds.

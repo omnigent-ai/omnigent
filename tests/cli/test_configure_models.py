@@ -715,7 +715,7 @@ def test_configure_models_add_databricks_aborts_without_extra(
         ("key", "openai", None, "OpenAI API Key"),
         ("databricks", "databricks", "oss", "Databricks (oss)"),
         ("databricks", "databricks", None, "Databricks"),
-        ("gateway", "my-proxy", None, "My-Proxy"),  # display-name fallback
+        ("gateway", "my-proxy", None, "my-proxy"),
     ],
 )
 def test_credential_label_by_kind(
