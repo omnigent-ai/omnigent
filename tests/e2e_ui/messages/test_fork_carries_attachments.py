@@ -59,9 +59,14 @@ _TEST_IMAGE_PATH = _REPO_ROOT / "tests" / "resources" / "test_image.png"
 
 # Runner-log lines that mean the attachment did NOT survive the fork: the
 # native executor received the raw file_id (resolver never inlined it), or
-# the resolver's fetch through the fork's file endpoint failed.
+# the resolver's fetch through the fork's file endpoint failed after retries.
+# The resolver's failure lines deliberately omit the file id, so they are
+# asserted absent globally rather than paired with a specific file.
 _UNRESOLVED_SIGNATURE = "Native executor received unresolved file_id"
-_RESOLVE_FAILED_SIGNATURE = "failed to resolve file_id"
+_RESOLVE_FAILED_SIGNATURES = (
+    "Attachment metadata read failed",
+    "Attachment content read failed",
+)
 
 # claude-native built-in seeded unconditionally at server startup; forking
 # onto it switches the fork's harness (SDK -> Claude Code).
@@ -341,13 +346,17 @@ def test_fork_into_claude_native_carries_image_attachment(
         #    source's or the fork's file id.
         time.sleep(_LOG_SETTLE_S)
         log_text = _read_runner_logs()
-        for signature in (_UNRESOLVED_SIGNATURE, _RESOLVE_FAILED_SIGNATURE):
-            for file_id in (source_file_id, fork_file_id):
-                assert not (signature in log_text and file_id in log_text), (
-                    f"runner logged {signature!r} for file {file_id!r} — the forked "
-                    f"transcript rebuild did not resolve the attachment; last 4000 "
-                    f"chars:\n{log_text[-4000:]}"
-                )
+        for file_id in (source_file_id, fork_file_id):
+            assert not (_UNRESOLVED_SIGNATURE in log_text and file_id in log_text), (
+                f"runner logged {_UNRESOLVED_SIGNATURE!r} for file {file_id!r} — the "
+                f"forked transcript rebuild did not resolve the attachment; last 4000 "
+                f"chars:\n{log_text[-4000:]}"
+            )
+        for signature in _RESOLVE_FAILED_SIGNATURES:
+            assert signature not in log_text, (
+                f"runner logged {signature!r} — an attachment fetch failed during the "
+                f"forked transcript rebuild; last 4000 chars:\n{log_text[-4000:]}"
+            )
 
         # -- End on the user-visible outcome: back in the chat, the
         #    attachment still renders. (Also leaves a recording's final
