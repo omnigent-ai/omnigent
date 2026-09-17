@@ -23,14 +23,15 @@ Run `omni setup` → **Antigravity** → **Configure native agy API key / gatewa
 
 ## External Gemini API gateway
 
-Obtain the native Gemini API root and a gateway-issued key from your gateway
-operator. For example:
+Obtain the native Gemini API root and the key accepted by that route from your
+gateway operator. This may be a gateway virtual key or, for provider-key
+pass-through, a Google API key. For example:
 
 | Prompt | Example |
 |---|---|
 | Gateway label | `team-gemini` — a name you choose, not a URL |
 | Gemini gateway API root | `https://gateway.example/gemini` |
-| Gateway API key | The key issued by that gateway |
+| Gateway API key | The key accepted by that gateway's native Gemini route |
 | agy model | Leave blank for agy's default, or use a value accepted by `agy --model` |
 
 With that example root, agy sends requests to
@@ -51,6 +52,47 @@ credential or green setup row is not evidence that the full agent flow succeeded
 use the smoke steps below. External gateway keys are stored in Omnigent's secret
 store and referenced by configuration. This option does not refresh expiring
 upstream tokens.
+
+### Gateway candidates
+
+The following gateways document native Gemini-compatible frontends. These are
+documented candidates, not a list of gateways live-verified with agy.
+
+| Gateway | API root to enter | Authentication and compatibility notes |
+|---|---|---|
+| [LiteLLM Google AI Studio pass-through](https://docs.litellm.ai/docs/pass_through/google_ai_studio) | `http://127.0.0.1:4000/gemini` for a local proxy | Supports Gemini-native requests and streaming without protocol translation. Configure the Google key on the proxy and use a LiteLLM key in Omnigent. Allow all main and auxiliary models agy requests. |
+| [Bifrost GenAI integration](https://docs.getbifrost.ai/integrations/genai-sdk/overview) | `http://127.0.0.1:8080/genai` for a local instance | Documents a GenAI client using a Bifrost virtual key. Configure the Gemini backend and model routing. Because this frontend adapts requests and responses, verify tool and reasoning metadata through the full agent flow. |
+| [Cloudflare AI Gateway Google AI Studio route](https://developers.cloudflare.com/ai-gateway/usage/providers/google-ai-studio/) | `https://gateway.ai.cloudflare.com/v1/<account>/<gateway>/google-ai-studio` | The provider-key pass-through example uses a Google key. Configurations requiring the additional `cf-aig-authorization` header need more header support than the current URL-and-key form provides. |
+
+Use each gateway's current documentation to configure its upstream credentials
+and access controls. OpenAI-compatible routes from the same products are not
+interchangeable with these native Gemini routes.
+
+### Test an independent gateway
+
+Keep the existing credentialless mock journey as the deterministic regression
+test. It runs actual setup, a fresh daemon, the runner, and real agy against a
+fake native Gemini server, including a file-tool round trip:
+
+```sh
+OMNIGENT_E2E_ANTIGRAVITY=mock uv run --no-sync pytest \
+  tests/e2e_ui/shells/test_antigravity_gateway_setup.py -q -k direct
+```
+
+For independent live evidence, use a pinned LiteLLM release and an authorized
+Google AI Studio key or an already configured native Gemini gateway. Configure
+its `/gemini` root through **Gemini API gateway — URL + key**, make it the Gemini
+default, and run the [tool, follow-up, and resume smoke](#select-and-verify-the-connection).
+Check gateway logs to confirm that the main and auxiliary requests went through
+that gateway with the expected models. Use an intentionally invalid gateway key
+in a separate test credential to verify authentication fails instead of bypassing
+the gateway. Record the gateway version, agy version, model choices, and results.
+
+That live run tests the gateway implementation and its actual upstream. The mock
+journey does not establish a third-party gateway's compatibility. A local gateway
+backed by Omnigent's Databricks adapter is useful for testing setup, but does not
+replace this independent canary. Run the same smoke against a second gateway
+before claiming interoperability across implementations.
 
 ## Databricks
 
