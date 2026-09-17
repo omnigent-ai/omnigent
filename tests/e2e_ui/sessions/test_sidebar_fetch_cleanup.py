@@ -492,3 +492,72 @@ def test_directory_warning_reuses_loaded_mine_sessions(
     expect(page.get_by_test_id("workspace-picker-conflict")).to_be_visible()
     page.wait_for_load_state("networkidle")
     assert len(list_requests) == initial_requests
+
+
+@pytest.mark.parametrize("operation", ["archive", "delete"])
+def test_opaque_cursor_survives_removing_last_visible_session(
+    page: Page, request: pytest.FixtureRequest, operation: str
+) -> None:
+    base_url = request.config.getoption("--ui-base-url") or request.getfixturevalue("live_server")
+    target = "00000000000000000000000000000abc01"
+    afters: list[str | None] = []
+    tokens = [f"opaque/+page={i}==" for i in range(4)]
+
+    def sessions(route: Route) -> None:
+        params = parse_qs(urlparse(route.request.url).query)
+        if params.get("visibility") != ["mine"] or "pinned" in params:
+            route.fulfill(json={"data": [], "has_more": False})
+            return
+        after = params.get("after", [None])[0]
+        afters.append(after)
+        index = 0 if after is None else tokens.index(after) + 1
+        rows = []
+        if index >= 3:
+            rows = [
+                {
+                    "id": target if index == 3 else "00000000000000000000000000000abc02",
+                    "object": "conversation",
+                    "title": "Remove this session" if index == 3 else "Next opaque page",
+                    "permission_level": 4,
+                    "created_at": 1,
+                    "updated_at": 1,
+                    "labels": {},
+                }
+            ]
+        route.fulfill(
+            json={
+                "data": rows,
+                "last_id": tokens[index] if index < 4 else None,
+                "has_more": index < 4,
+            }
+        )
+
+    page.route_web_socket("**/v1/sessions/updates*", lambda _socket: None)
+    page.route("**/v1/sessions?*", sessions)
+    page.route(
+        f"**/v1/sessions/{target}/events", lambda route: route.fulfill(json={"queued": True})
+    )
+    page.route(
+        f"**/v1/sessions/{target}",
+        lambda route: route.fulfill(
+            json={
+                "id": target,
+                "archived": operation == "archive",
+                "deleted": operation == "delete",
+            }
+        ),
+    )
+    page.goto(base_url)
+    row = page.locator("li").filter(has=page.get_by_text("Remove this session", exact=True))
+    expect(row).to_be_visible()
+    page.wait_for_load_state("networkidle")
+    assert afters == [None, *tokens[:3]]
+    row.hover()
+    row.get_by_test_id("conversation-actions").click()
+    page.get_by_test_id(f"{operation}-conversation").click()
+    if operation == "delete":
+        page.get_by_role("dialog").get_by_role("button", name="Delete", exact=True).click()
+    expect(row).to_have_count(0)
+    page.get_by_role("button", name="Load more", exact=True).click()
+    expect(page.get_by_text("Next opaque page", exact=True)).to_be_visible()
+    assert afters[-1] == tokens[-1]

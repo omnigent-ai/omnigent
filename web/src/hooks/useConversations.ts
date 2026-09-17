@@ -32,6 +32,7 @@ import { filterSessionScope, sessionVisibility } from "@/lib/sessionVisibility";
 import { startTimedInteraction } from "@/lib/analyticsEmit";
 import {
   filtersFromConversationQueryKey,
+  lastIdAfterFiltering,
   insertNewRowsIntoPages,
   markRecentlyCreated,
   mergeItemsIntoPages,
@@ -370,7 +371,11 @@ export function clearSessionTombstones(): void {
 /**
  * Apply optimistic delete/archive state to a freshly fetched page.
  */
-function applySessionTombstones(page: ConversationsPage, dropArchiving = false): ConversationsPage {
+function applySessionTombstones(
+  page: ConversationsPage,
+  dropArchiving = false,
+  originalPage = page,
+): ConversationsPage {
   if (deletingSessionIds.size === 0 && archivingSessions.size === 0) return page;
   let changed = false;
   let lastArchivingId: string | null = null;
@@ -396,8 +401,8 @@ function applySessionTombstones(page: ConversationsPage, dropArchiving = false):
     ...page,
     data,
     first_id: data[0]?.id ?? null,
-    // Archived rows remain valid server cursors; deleted rows do not.
-    last_id: data[data.length - 1]?.id ?? lastArchivingId,
+    // Archived anchors remain valid on legacy row-ID backends.
+    last_id: lastIdAfterFiltering(originalPage, data, lastArchivingId),
   };
 }
 
@@ -503,7 +508,7 @@ export async function fetchConversationsPage({
   visibility,
   queryClient,
   signal: requestSignal,
-  limit = 30,
+  limit = sidebarConfig.sessionPageSize,
 }: {
   after?: string;
   searchQuery: string;
@@ -568,13 +573,14 @@ export async function fetchConversationsPage({
       visibility,
     ),
     !includeArchived && visibility !== "archived",
+    page,
   );
 }
 
 /**
  * Fetch the conversations list with cursor-based pagination.
  *
- * Each page holds up to 20 conversations, sorted descending by
+ * Page size comes from SidebarConfig (default 30), sorted descending by
  * `updated_at` (latest message first). `searchQuery` is forwarded to the server as
  * `?search_query=` so filtering happens server-side; callers should
  * debounce the value before passing it. `includeArchived` controls
@@ -634,6 +640,7 @@ export function useConversations(
   // If the socket is down, all consumers use a safety poll.
   const streamConnected = useSessionUpdatesConnected();
   const queryClient = useQueryClient();
+  const { sessionPageSize } = useContext(SidebarConfigContext);
   // Keep the base three-element key for the unfiltered callers (byte-for-byte
   // unchanged, so the sidebar / rename / push-delta paths are untouched); only
   // append `project` for a concrete name; append `visibility` only when set so
@@ -655,6 +662,7 @@ export function useConversations(
           project,
           visibility,
           queryClient,
+          limit: sessionPageSize,
         });
       return timeInitialConversationLoad(pageParam, visibility, fetchPage);
     },
@@ -2327,8 +2335,8 @@ async function fetchProjectSessionsPage(
  * excluded (they leave the active sidebar). `enabled` gates the fetch so a
  * collapsed folder costs nothing — pass the folder's expanded state.
  *
- * Same page size (20) and sort (`updated_at desc`) as the global list, so a
- * folder paginates independently with its own infinite-scroll sentinel.
+ * Folders keep their own 20-row pages and infinite-scroll sentinel,
+ * independently of the global list's configured page size.
  */
 export function useProjectSessions(project: string, enabled: boolean) {
   const queryKey = ["project-sessions", project];

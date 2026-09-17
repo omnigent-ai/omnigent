@@ -54,7 +54,7 @@ loaded owned sessions; unloaded and shared sessions are outside their coverage.
 Set `sharedDisplayPageSize: 30` to show at most 30 rows in the Shared view's
 Sessions section on entry, with a manual **Load more** button. This disables
 automatic scrolling loads for that view. Each click reveals up to 30 additional
-cached rows; when none remain hidden, it fetches the next backend page (30 rows).
+cached rows; when none remain hidden, it fetches the next backend page (`sessionPageSize`, default 30).
 Pins and project folders keep their independent display and pagination.
 
 ```tsx
@@ -88,10 +88,31 @@ Re-entry refreshes immediately, even inside the normal stale time, and resumes
 the configured interval. Directly opened shared conversations retain their
 independent session updates, runner health, and permissions.
 
-Each refresh requests the loaded window, up to `maxRefreshSessions` (default
-100), and merges older loaded rows beyond that cap. Load more appends the next
-30 rows. A click during refresh waits for that refresh and uses its resulting
-cursor. Archived sessions refresh on entry and have no polling schedule.
+`sessionPageSize` controls initial session-list requests and each Load more
+request (default 30). Each fetched page grows the Mine/Shared refresh window by
+that configured size, even if optimistic filtering hides some or all rows.
+`maxRefreshSessions` caps each subsequent refresh request (default 100); older
+loaded rows remain cached beyond the cap. Both settings are injectable at runtime:
+
+```tsx
+<OmnigentApp
+  {...hostProps}
+  sidebarConfig={{ sessionPageSize: 50, maxRefreshSessions: 100 }}
+/>
+```
+
+Use positive integers. With these values, initial/Load more requests use 50;
+refresh requests grow from 50 to 100, then stay capped at 100. The initial request
+uses `sessionPageSize` even when the refresh cap is smaller. Pins retain their
+separate `pinCap`, and project folders retain their independent 20-row pages.
+Archived lists use the configured session page size, refresh on entry, and have
+no polling schedule. Display page sizes remain independent of API page sizes.
+
+A click during refresh waits for that refresh and uses its resulting cursor.
+Opaque `last_id` values round-trip unchanged as `after`, including when optimistic
+archive/delete filtering empties a page; filtering preserves `has_more`. Only a
+cursor exactly matching an ID in the original unfiltered page qualifies for
+legacy row-ID repair. Cursors are never decoded.
 
 Managed hosts resolve their own feature flags and pass these configuration
 values through the embed integration; the OSS client has no SAFE dependency.
@@ -119,3 +140,8 @@ Use the example configuration and inspect `/v1/sessions` requests in Network:
    If older rows are already cached, the click reveals them without a request.
    Wait for a refresh after expanding the list: the display should keep its
    expanded size. Leave and re-enter Shared: it should start at 30 again.
+8. Set `sessionPageSize: 50` and `maxRefreshSessions: 100`. Verify initial and
+   Load more list requests use `limit=50`; after two pages, refresh uses 100 and
+   remains capped after further pagination. For a backend with opaque cursors,
+   archive/delete the last visible row and verify the next request's decoded
+   `after` query parameter exactly equals the preceding response's `last_id`.

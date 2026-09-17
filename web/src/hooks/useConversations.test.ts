@@ -11,6 +11,8 @@ import { ApiError } from "@/lib/sessionsApi";
 import { useSessionUpdatesConnected } from "./useSessionUpdatesConnected";
 import {
   deleteConversation,
+  fetchConversationsPage,
+  markSessionsDeleting,
   fetchAllArchivedProjectNames,
   renameConversation,
   useArchiveConversation,
@@ -39,6 +41,7 @@ import {
   type PinnedConversationsResult,
 } from "./useConversations";
 import { PINNED_LABEL_KEY } from "@/lib/sessionListCache";
+import { SidebarConfigContext, sidebarConfig } from "@/lib/sidebarConfig";
 import { PINNED_CONVERSATION_IDS_STORAGE_KEY } from "@/shell/sidebarNav";
 
 vi.mock("./useSessionUpdatesConnected", () => ({ useSessionUpdatesConnected: vi.fn() }));
@@ -2952,4 +2955,144 @@ it("rejects a pin at the cap without sending a request or changing membership", 
   expect(
     queryClient.getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY)?.conversations,
   ).toEqual(conversations);
+});
+
+describe("opaque pagination during optimistic removal", () => {
+  it.each([
+    ["archive", "cached", false],
+    ["archive", "cached", true],
+    ["archive", "fetched", false],
+    ["archive", "fetched", true],
+    ["delete", "cached", false],
+    ["delete", "cached", true],
+    ["delete", "fetched", false],
+    ["delete", "fetched", true],
+  ] as const)(
+    "continues after %s on a %s page (fully filtered: %s)",
+    async (operation, source, fully) => {
+      const cursor = "eyJvZmZzZXQiOjMwfQ==/+opaque";
+      const original = infinitePage([
+        ...(fully ? [] : [conversation({ id: "keep" })]),
+        conversation({ id: "conv_a" }),
+      ]);
+      original.pages[0].last_id = cursor;
+      original.pages[0].has_more = true;
+      const nextPage = infinitePage([conversation({ id: "next" })]).pages[0];
+      const responses = source === "fetched" ? [original.pages[0], nextPage] : [nextPage];
+      let finish!: (response: Response) => void;
+      const pending = new Promise<Response>((resolve) => {
+        finish = resolve;
+      });
+      fetchMock.mockImplementation((_url: string, options?: RequestInit) =>
+        options?.method && options.method !== "GET"
+          ? pending
+          : Promise.resolve(mockResponse(responses.shift())),
+      );
+      const client = new QueryClient({
+        defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+      });
+      const key = ["conversations", "", false];
+      client.setQueryData(key, original);
+      const wrapper = ({ children }: { children: ReactNode }) =>
+        createElement(QueryClientProvider, { client }, children);
+      const { result, unmount } = renderHook(
+        () => ({
+          list: { ...useConversations() },
+          archive: useArchiveConversation(),
+          remove: useStopAndDeleteConversation(),
+        }),
+        { wrapper },
+      );
+      let mutation!: Promise<unknown>;
+      act(() => {
+        mutation =
+          operation === "archive"
+            ? result.current.archive.mutateAsync({ id: "conv_a", archived: true })
+            : result.current.remove.mutateAsync({ id: "conv_a" });
+      });
+      await waitFor(() =>
+        expect(client.getQueryData<ConversationsInfiniteData>(key)!.pages[0].data).toHaveLength(
+          fully ? 0 : 1,
+        ),
+      );
+      if (source === "fetched") {
+        await act(async () => {
+          await result.current.list.refetch();
+        });
+      }
+      const first = client.getQueryData<ConversationsInfiniteData>(key)!.pages[0];
+      expect(first.data.map((r) => r.id)).toEqual(fully ? [] : ["keep"]);
+      expect(first.last_id).toBe(cursor);
+      expect(first.has_more).toBe(true);
+      await act(async () => {
+        await result.current.list.fetchNextPage();
+      });
+      const lastRequest = fetchMock.mock.calls
+        .filter(([url]) => String(url).startsWith("/v1/sessions?"))
+        .at(-1)![0];
+      expect(new URL(lastRequest, "http://localhost").searchParams.get("after")).toBe(cursor);
+      await waitFor(() => expect(result.current.list.data?.pages.at(-1)?.data[0]?.id).toBe("next"));
+      await act(async () => {
+        finish(mockResponse({ id: "conv_a", archived: true, deleted: true }));
+        await mutation;
+      });
+      unmount();
+      client.clear();
+    },
+  );
+
+  it.each([false, true])(
+    "repairs only a known legacy deleted anchor (fully filtered: %s)",
+    async (fully) => {
+      markSessionsDeleting(["deleted"]);
+      const page = infinitePage([
+        ...(fully ? [] : [conversation({ id: "keep" })]),
+        conversation({ id: "deleted" }),
+      ]).pages[0];
+      page.has_more = true;
+      fetchMock.mockResolvedValueOnce(mockResponse(page));
+      const client = new QueryClient();
+      const filtered = await fetchConversationsPage({
+        searchQuery: "",
+        includeArchived: false,
+        queryClient: client,
+      });
+      expect(filtered.last_id).toBe(fully ? null : "keep");
+      expect(filtered.has_more).toBe(true);
+      client.clear();
+    },
+  );
+});
+
+it("uses the configured API page size for archived initial loads and pagination", async () => {
+  const first = infinitePage([conversation({ id: "archived" })]).pages[0];
+  first.has_more = true;
+  first.last_id = "opaque-archive-next";
+  fetchMock
+    .mockResolvedValueOnce(mockResponse(first))
+    .mockResolvedValueOnce(mockResponse({ ...first, has_more: false }));
+  const client = new QueryClient();
+  const wrapper = ({ children }: { children: ReactNode }) =>
+    createElement(
+      QueryClientProvider,
+      { client },
+      createElement(
+        SidebarConfigContext.Provider,
+        { value: { ...sidebarConfig, sessionPageSize: 50 } },
+        children,
+      ),
+    );
+  const { result, unmount } = renderHook(
+    () => useConversations("", false, { snapshot: true }, undefined, "archived"),
+    { wrapper },
+  );
+  await waitFor(() => expect(result.current.isSuccess).toBe(true));
+  await act(async () => {
+    await result.current.fetchNextPage();
+  });
+  const calls = fetchMock.mock.calls.map(([url]) => new URL(url, "http://localhost").searchParams);
+  expect(calls.map((p) => p.get("limit"))).toEqual(["50", "50"]);
+  expect(calls[1].get("after")).toBe(first.last_id);
+  unmount();
+  client.clear();
 });

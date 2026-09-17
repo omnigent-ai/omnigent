@@ -17,6 +17,7 @@ export function useScopeCache(
   enabled = true,
   maxRefreshSessions = sidebarConfig.maxRefreshSessions,
   entryKey: string | null = null,
+  pageSize = sidebarConfig.sessionPageSize,
 ) {
   const client = useQueryClient();
   const queryKey = useMemo(
@@ -43,7 +44,9 @@ export function useScopeCache(
       if (pendingResult.current) await pendingResult.current.catch(() => {});
       signal.throwIfAborted();
       const current = client.getQueryData<ScopeCacheData>(queryKey);
-      const limit = Math.min(current?.windowSize ?? 30, maxRefreshSessions);
+      const limit = current
+        ? Math.min(current.windowSize ?? pageSize, maxRefreshSessions)
+        : pageSize;
       const page = await timeInitialConversationLoad(undefined, visibility, () =>
         fetchConversationsPage({
           searchQuery: "",
@@ -97,10 +100,11 @@ export function useScopeCache(
           visibility,
           queryClient: client,
           signal: controller.signal,
+          limit: pageSize,
         });
         if (controller.signal.aborted) return;
         client.setQueryData<ScopeCacheData>(queryKey, (current) =>
-          current ? appendScopePage(current, page) : current,
+          current ? appendScopePage(current, page, pageSize) : current,
         );
       })();
       // Refresh waits only for a page request, never for a click queued behind it.

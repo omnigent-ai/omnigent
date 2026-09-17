@@ -375,3 +375,24 @@ it("directory warnings exclude Shared rows even when its cache is active or reta
   expect(result.current.directory.data?.map((r) => r.id)).toEqual(["mine"]);
   expect(result.current.sidebar.sharedActive).toBe(false);
 });
+
+it("passes API page size and refresh cap from provider configuration to both scopes", async () => {
+  config = { ...config, sessionPageSize: 50, maxRefreshSessions: 75 };
+  view = "all";
+  const { result } = renderHook(useSidebarData, { wrapper });
+  await waitFor(() => expect(result.current.shared.isSuccess).toBe(true));
+  await act(async () => {
+    await result.current.all.fetchNextPage();
+  });
+  await act(async () => {
+    await result.current.all.refetch?.();
+  });
+  for (const scope of ["mine", "shared"]) {
+    expect(listCalls(scope).map(([url]) => params(url).get("limit"))).toEqual(["50", "50", "75"]);
+  }
+  expect(
+    fetchMock.mock.calls
+      .filter(([url]) => params(url).has("pinned"))
+      .map(([url]) => params(url).get("limit")),
+  ).toEqual(["30"]);
+});

@@ -377,3 +377,49 @@ it("rechecks ownership when viewer identity resolves without refetching the rows
   expect(result.current.shared.data?.pages[0].data.map((row) => row.id)).toEqual(["s2"]);
   expect(fetchPage).toHaveBeenCalledTimes(2);
 });
+
+it.each(["mine", "shared"] as const)(
+  "uses configured page sizes and refresh growth for %s",
+  async (scope) => {
+    const { result, rerender } = renderHook(
+      ({ size, cap }) => useScopeCache(scope, false, true, cap, null, size),
+      { wrapper, initialProps: { size: 50, cap: 75 } },
+    );
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(fetchPage.mock.calls[0][0].limit).toBe(50);
+    await act(async () => {
+      await result.current.fetchNextPage();
+    });
+    expect(fetchPage.mock.calls[1][0]).toMatchObject({ limit: 50, after: "s50" });
+    await waitFor(() => expect(result.current.data?.windowSize).toBe(100));
+    await act(async () => {
+      await result.current.refetch();
+    });
+    expect(fetchPage.mock.calls[2][0].limit).toBe(75);
+    expect(result.current.data?.pages[0].data).toHaveLength(100);
+    rerender({ size: 25, cap: 90 });
+    await act(async () => {
+      await result.current.fetchNextPage();
+    });
+    expect(fetchPage.mock.calls[3][0]).toMatchObject({ limit: 25, after: "s100" });
+    await waitFor(() => expect(result.current.data?.windowSize).toBe(125));
+    await act(async () => {
+      await result.current.refetch();
+    });
+    expect(fetchPage.mock.calls[4][0].limit).toBe(90);
+    await waitFor(() => expect(result.current.data?.pages[0].data).toHaveLength(125));
+  },
+);
+
+it("applies the refresh cap only after the initial configured page", async () => {
+  const { result } = renderHook(() => useScopeCache("mine", false, true, 20, null, 50), {
+    wrapper,
+  });
+  await waitFor(() => expect(result.current.isSuccess).toBe(true));
+  expect(fetchPage.mock.calls[0][0].limit).toBe(50);
+  await act(async () => {
+    await result.current.refetch();
+  });
+  expect(fetchPage.mock.calls[1][0].limit).toBe(20);
+  expect(result.current.data?.windowSize).toBe(50);
+});

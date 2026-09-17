@@ -96,7 +96,7 @@ describe("scope refresh", () => {
       pageParams: [undefined],
       windowSize: 30,
     };
-    const next = appendScopePage(current, sessionRowsPage([row("a", 40), row("b", 20)], true));
+    const next = appendScopePage(current, sessionRowsPage([row("a", 40), row("b", 20)], true), 30);
     expect(next.pages[0].data.map((session) => session.id)).toEqual(["a", "b"]);
     expect(next.windowSize).toBe(60);
     expect(next.pages[0].last_id).toBe("b");

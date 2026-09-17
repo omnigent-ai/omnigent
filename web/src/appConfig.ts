@@ -12,6 +12,9 @@ export interface SidebarConfig {
   displayPageSize?: number | false;
   /** Overrides displayPageSize for the Shared view only. */
   sharedDisplayPageSize?: number | false;
+  /** API page size for initial session-list loads and Load more. */
+  sessionPageSize: number;
+  /** Maximum rows requested by one Mine/Shared refresh. */
   maxRefreshSessions: number;
 }
 
@@ -30,6 +33,7 @@ export const appConfig: { readonly sidebar: Readonly<SidebarConfig> } = {
     pinsIncludeShared: true,
     pinCap: 30,
     maxAutoLoads: 3,
+    sessionPageSize: 30,
     maxRefreshSessions: 100,
   },
 };

@@ -40,6 +40,7 @@ export function refreshScopeWindow(
 export function appendScopePage(
   current: ScopeCacheData,
   incoming: ConversationsPage,
+  pageSize: number,
 ): ScopeCacheData {
   const rows = dedupeSessionRows([
     ...current.pages.flatMap((page) => page.data),
@@ -48,7 +49,8 @@ export function appendScopePage(
   return {
     pages: [{ ...incoming, data: rows, first_id: rows[0]?.id ?? null }],
     pageParams: [undefined],
-    windowSize: (current.windowSize ?? current.pages.flatMap((page) => page.data).length) + 30,
+    windowSize:
+      (current.windowSize ?? current.pages.flatMap((page) => page.data).length) + pageSize,
   };
 }
 

@@ -43,6 +43,7 @@ function useSidebarSources(config: SidebarConfig) {
     true,
     config.maxRefreshSessions,
     selectedView === "mine" || selectedView === "all" ? selectedView : null,
+    config.sessionPageSize,
   );
   const shared = useScopeCache(
     "shared",
@@ -50,6 +51,7 @@ function useSidebarSources(config: SidebarConfig) {
     sharedActive,
     config.maxRefreshSessions,
     viewNeedsShared ? selectedView : null,
+    config.sessionPageSize,
   );
   const pinned = usePinnedConversations(pinsIncludeShared, config.pinCap);
   const [folders, setFolders] = useState<Map<string, Conversation[]>>(() => new Map());
