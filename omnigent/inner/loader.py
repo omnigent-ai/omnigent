@@ -103,6 +103,7 @@ def load_agent_def(
         custom handlers — the operator already has code execution, so
         the restriction would add no security there.
     """
+    path: Path | None = None
     if isinstance(path_or_dict, (str, Path)):
         path = Path(path_or_dict)
         with open(path) as f:
@@ -118,7 +119,7 @@ def load_agent_def(
         # AttributeError — which the upload/validate path surfaced as an
         # internal error instead of naming the malformed spec.
         found = "an empty document" if data is None else f"a {type(data).__name__}"
-        where = f" in {path}" if isinstance(path_or_dict, (str, Path)) else ""
+        where = f" in {path}" if path is not None else ""
         raise ValueError(
             f"Agent spec must be a YAML mapping of top-level keys; found {found}{where}."
         )
