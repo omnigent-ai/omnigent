@@ -1384,6 +1384,26 @@ async def claude_model_catalog(
     return out
 
 
+def stored_claude_catalog_rows(
+    claude_config: ClaudeNativeUcodeConfig | None,
+) -> list[dict[str, Any]] | None:
+    """The stored catalog rows for this config, or ``None`` when unknown.
+
+    A plain file read that never probes. Callers that must distinguish an
+    authoritative empty catalog (all picker entries disabled) from a catalog
+    that has simply not been discovered yet read rows through this instead of
+    :func:`stored_claude_picker_values`, which flattens both to no values.
+
+    :param claude_config: The resolved launch config, or ``None``.
+    :returns: Stored rows (possibly empty), or ``None`` on a store miss.
+    """
+    from omnigent.models import model_catalog_store
+
+    return model_catalog_store.read_catalog(
+        "claude-native", claude_catalog_fingerprint(claude_config)
+    )
+
+
 def stored_claude_picker_values(
     claude_config: ClaudeNativeUcodeConfig | None,
     rows: Sequence[Mapping[str, object]] | None = None,

@@ -1043,14 +1043,19 @@ def _codex_config_identity(source_home: Path) -> tuple[object, ...]:
 
 
 def _codex_picker_config(source_home: Path) -> dict[str, str]:
-    """Read the CLI settings needed to reproduce its model picker."""
+    """Read the CLI settings needed to reproduce its model picker.
+
+    ``profile`` rides along because the minimal bridge copies profile
+    definitions without the active selector, and an active profile's
+    ``model`` decides the CLI's effective default.
+    """
     try:
         config = tomlkit.parse((source_home / "config.toml").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
     picker = {
         key: str(value)
-        for key in ("model", "model_catalog_json")
+        for key in ("model", "model_catalog_json", "profile")
         if isinstance(value := config.get(key), str) and value
     }
     if catalog := picker.get("model_catalog_json"):
@@ -1081,14 +1086,19 @@ def _probe_codex_home(config_overrides: Sequence[str]) -> Path:
     :param config_overrides: The probe's ``-c`` overrides.
     :returns: The created ``CODEX_HOME`` directory.
     """
-    key = hashlib.sha256("\n".join(config_overrides).encode("utf-8")).hexdigest()[:12]
+    # The source home joins the key so switching accounts (a different
+    # ``CODEX_HOME``) never reuses another source's bridged ``auth.json``
+    # symlink or account-specific cached state under identical overrides.
+    source_home = _codex_home_config_source_from_env()
+    key = hashlib.sha256(
+        "\n".join((str(source_home.resolve()), *config_overrides)).encode("utf-8")
+    ).hexdigest()[:12]
     home = Path.home() / ".omnigent" / "cache" / "codex-model-probe" / key
     home.mkdir(mode=0o700, parents=True, exist_ok=True)
     # The bridge skips files that already exist, and config.toml is copied
     # (not symlinked), so drop the copy to re-read an edited source config.
     with contextlib.suppress(OSError):
         (home / "config.toml").unlink(missing_ok=True)
-    source_home = _codex_home_config_source_from_env()
     _populate_codex_home_config(home, source_home, minimal_config=True)
     # A custom catalog replaces Codex's built-in choices, including visibility.
     picker_config = _codex_picker_config(source_home)

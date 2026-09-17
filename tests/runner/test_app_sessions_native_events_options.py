@@ -2165,6 +2165,7 @@ async def _post_model_change_with_status_sequence(
     picker_values: tuple[str, ...] = (),
     picker_source: str = "bridge",
     empty_session_catalog: bool = False,
+    stored_catalog_rows: list[dict[str, object]] | None = None,
 ) -> Any:
     """Run one claude-native ``model_change`` with a scripted status file.
 
@@ -2208,7 +2209,11 @@ async def _post_model_change_with_status_sequence(
     )
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.main.stored_claude_picker_values",
-        lambda _: list(picker_values) if picker_source == "catalog" else [],
+        lambda _config, _rows=None: list(picker_values) if picker_source == "catalog" else [],
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main.stored_claude_catalog_rows",
+        lambda _config: stored_catalog_rows,
     )
 
     async def _catalog(_config: object) -> list[dict[str, object]]:
@@ -2265,7 +2270,8 @@ async def _post_model_change_with_status_sequence(
             "/v1/sessions/68c7c1acc5eeec3978c5e62043da51a5/events",
             json={"type": "model_change", "model": model},
         )
-    assert commands == ([] if empty_session_catalog else [f"/model {model}"])
+    switch_rejected = empty_session_catalog or stored_catalog_rows == []
+    assert commands == ([] if switch_rejected else [f"/model {model}"])
     return response
 
 
@@ -2324,6 +2330,28 @@ async def test_events_empty_catalog_does_not_restore_stale_picker_values(
         picker_values=("system.ai.glm-5-3",),
         picker_source=picker_source,
         empty_session_catalog=True,
+    )
+    assert response.status_code == 503, response.text
+    assert response.json()["error"] == "claude_native_model_unsupported"
+
+
+async def test_events_empty_stored_catalog_overrides_stale_bridge_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An authoritative empty stored catalog beats launch-recorded vocabulary.
+
+    With a cold session-options cache, nonempty bridge picker values from
+    launch time must not spell a switch once background discovery has stored
+    an explicitly empty catalog (every picker entry disabled): the request is
+    rejected without injecting a command.
+    """
+    response = await _post_model_change_with_status_sequence(
+        monkeypatch,
+        ["claude-opus-4-7"],
+        model="system.ai.glm-5-3",
+        picker_values=("system.ai.glm-5-3",),
+        picker_source="bridge",
+        stored_catalog_rows=[],
     )
     assert response.status_code == 503, response.text
     assert response.json()["error"] == "claude_native_model_unsupported"

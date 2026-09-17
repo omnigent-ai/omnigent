@@ -5895,6 +5895,7 @@ def create_runner_app(
         )
         from omnigent.harnesses.claude_native.main import (
             resolve_claude_native_model_selection,
+            stored_claude_catalog_rows,
             stored_claude_picker_values,
         )
         from omnigent.models.claude_model_vocabulary import (
@@ -5922,9 +5923,16 @@ def create_runner_app(
         if cached_options is not None:
             picker_values = picker_command_values(cached_options[1])
         else:
-            picker_values = read_model_picker_values(bridge_dir)
-            if not picker_values:
-                picker_values = stored_claude_picker_values(claude_config)
+            stored_rows = stored_claude_catalog_rows(claude_config)
+            if stored_rows is not None and not stored_rows:
+                # Discovery stored an authoritative empty catalog (every
+                # picker entry disabled): launch-recorded bridge values are
+                # stale vocabulary, so nothing is switchable.
+                picker_values: list[str] = []
+            else:
+                picker_values = read_model_picker_values(bridge_dir)
+                if not picker_values:
+                    picker_values = stored_claude_picker_values(claude_config, stored_rows)
         model_arg = claude_model_command_arg(resolved_model, env, picker_values=picker_values)
         if model_arg is None:
             _logger.warning(

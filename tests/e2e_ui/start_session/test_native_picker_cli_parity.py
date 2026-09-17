@@ -23,6 +23,7 @@ custom catalog, exercising legacy /model discovery and bundled model choices.
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import json
 import os
@@ -37,6 +38,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import Page, expect
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -456,16 +458,28 @@ def _pick_agent(page: Page, label: str) -> None:
     raise AssertionError(f"agent {label!r} not offered on the landing screen")
 
 
-def _model_rows(page: Page, rig: PickerRig) -> list[dict[str, str]]:
+# The models section rendered inside the selected agent row's config flyout;
+# present (even while its rows still load) whenever the flyout is open.
+_MODELS_SECTION_TESTID = "new-chat-landing-agent-models"
+
+
+def _model_rows(page: Page, rig: PickerRig, agent_label: str) -> list[dict[str, str]]:
     """Read the selected agent's model rows from the landing agent dropdown.
 
     The host's boot probe may still be warming; the SPA retries the fetch
-    with backoff, so keep re-reading (reopening the menu when a click closed
-    it) until catalog rows appear — the same wait a person makes.
+    with backoff, so keep re-reading until catalog rows appear — the same
+    wait a person makes. Each pass re-opens whatever collapsed: the agent
+    menu when a click closed it, and the agent row's config flyout when it
+    is not showing (a first click occasionally selects without leaving the
+    flyout open, so re-clicking the row is exactly what a person does).
     """
     deadline = time.monotonic() + _PICKER_WARMUP_TIMEOUT_S
     while time.monotonic() < deadline:
         _open_agent_menu(page)
+        if page.get_by_test_id(_MODELS_SECTION_TESTID).count() == 0:
+            # Menus re-render while queries settle; a miss here just retries.
+            with contextlib.suppress(AssertionError, PlaywrightError):
+                _pick_agent(page, agent_label)
         page.wait_for_timeout(500)
         rows: list[dict[str, str]] = []
         for option in page.locator(
@@ -498,7 +512,7 @@ def test_codex_picker_offers_the_clis_catalog_and_default(
     expect(page.get_by_test_id("new-chat-landing-input")).to_be_visible(timeout=30_000)
     _pick_agent(page, "Codex")
 
-    rows = _model_rows(page, picker_rig)
+    rows = _model_rows(page, picker_rig, "Codex")
     row_ids = [row["id"] for row in rows]
 
     missing = [slug for slug in picker_rig.codex_visible_slugs if slug not in row_ids]
@@ -524,7 +538,7 @@ def test_codex_picker_offers_the_clis_catalog_and_default(
 
     selected = next(row_id for row_id in row_ids if row_id != picker_rig.codex_default)
     page.get_by_test_id(f"{_MODEL_ROW_PREFIX}{selected}").click()
-    selected_rows = _model_rows(page, picker_rig)
+    selected_rows = _model_rows(page, picker_rig, "Codex")
     assert [row["id"] for row in selected_rows if row["checked"] == "true"] == [selected]
 
 
@@ -542,7 +556,7 @@ def test_claude_picker_omits_aliases_the_cli_picker_does_not_offer(
     expect(page.get_by_test_id("new-chat-landing-input")).to_be_visible(timeout=30_000)
     _pick_agent(page, "Claude Code")
 
-    rows = _model_rows(page, picker_rig)
+    rows = _model_rows(page, picker_rig, "Claude Code")
     row_ids = [row["id"] for row in rows]
 
     missing = [alias for alias in _CLAUDE_PICKER_ALIASES if alias not in row_ids]
@@ -562,5 +576,5 @@ def test_claude_picker_omits_aliases_the_cli_picker_does_not_offer(
     )
 
     page.get_by_test_id(f"{_MODEL_ROW_PREFIX}opus").click()
-    selected_rows = _model_rows(page, picker_rig)
+    selected_rows = _model_rows(page, picker_rig, "Claude Code")
     assert [row["id"] for row in selected_rows if row["checked"] == "true"] == ["opus"]

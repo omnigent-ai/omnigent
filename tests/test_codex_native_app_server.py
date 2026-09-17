@@ -3376,6 +3376,68 @@ def test_codex_probe_home_preserves_configured_catalog(
     assert "mcp_servers" not in config
 
 
+def test_codex_probe_home_activates_the_source_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The probe home keeps the active ``profile`` selector, not just its table.
+
+    The minimal bridge copies ``[profiles.*]`` definitions without the
+    top-level ``profile`` key, and an active profile's ``model`` decides the
+    CLI's effective default. Dropping the selector would make the probe's
+    ``config/read`` resolve a different default than the configured CLI.
+    """
+    from omnigent.harnesses.codex_native import app_server
+
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "config.toml").write_text(
+        'model = "catalog-default"\n'
+        'profile = "work"\n'
+        'model_provider = "gateway"\n'
+        '[model_providers.gateway]\nname = "Gateway"\n'
+        '[profiles.work]\nmodel = "profile-model"\n'
+    )
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(app_server, "_codex_home_config_source_from_env", lambda: source)
+
+    home = app_server._probe_codex_home([])
+    config = tomllib.loads((home / "config.toml").read_text())
+    assert config["profile"] == "work"
+    assert config["profiles"]["work"]["model"] == "profile-model"
+    assert config["model"] == "catalog-default"
+
+
+def test_codex_probe_home_is_keyed_by_the_source_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Switching ``CODEX_HOME`` never reuses another source's bridged auth.
+
+    The bridge skips files that already exist, so a probe home shared across
+    source homes would keep the first source's ``auth.json`` symlink while
+    reading the second source's configuration — mixing account credentials
+    with another account's catalog.
+    """
+    from omnigent.harnesses.codex_native import app_server
+
+    homes: dict[str, Path] = {}
+    for name in ("account-a", "account-b"):
+        source = tmp_path / name
+        source.mkdir()
+        (source / "config.toml").write_text(
+            'model_provider = "gateway"\n[model_providers.gateway]\nname = "Gateway"\n'
+        )
+        (source / "auth.json").write_text(json.dumps({"account": name}))
+        monkeypatch.setattr(app_server, "_codex_home_config_source_from_env", lambda s=source: s)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        homes[name] = app_server._probe_codex_home([])
+
+    assert homes["account-a"] != homes["account-b"]
+    for name, home in homes.items():
+        auth = home / "auth.json"
+        assert auth.is_symlink()
+        assert json.loads(auth.read_text()) == {"account": name}
+
+
 @pytest.mark.parametrize(
     "change",
     ["catalog-content", "catalog-path", "default-model", "profile", "auth", "source-home"],
