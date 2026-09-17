@@ -1,6 +1,6 @@
 import { type KeyboardEvent, type RefObject, useRef, useState } from "react";
 
-import type { MentionItem, MentionState } from "@/lib/composerMentions";
+import { parseMentionToken, type MentionItem, type MentionState } from "@/lib/composerMentions";
 import { composerAttachmentKey } from "@/store/chatStore";
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 
@@ -62,10 +62,8 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
   const [mentionedItems, setMentionedItems] = useState<MentionItem[]>([]);
   const mentionOpen = mentionEntries.length > 0;
 
-  // Pre-select the top row whenever the listing changes — lets Enter/Tab act on
-  // the top hit without arrowing first. Keyed by type+path so a file and a dir
-  // of the same name stay distinct. (Render-phase state adjustment, the React
-  // "store-previous-props" pattern — mirrors the slash menu's reset.)
+  // Pre-select the top hit for Enter. Type+path keeps files and folders distinct.
+  // Adjust during render so the selection updates with the listing.
   const prevMentionMatchesRef = useRef<string[]>([]);
   const mentionEntryKeys = mentionEntries.map((e) => `${e.type}:${e.path}`);
   if (
@@ -99,11 +97,12 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
 
   const openMentionDir = (path: string) => {
     if (!mention) return;
-    const inserted = `@${path}/`;
+    const query = path ? `${path}/` : "";
+    const inserted = `@${query}`;
     const next = text.slice(0, mention.start) + inserted + text.slice(mention.end);
     setText(next);
     const caret = mention.start + inserted.length;
-    setMention({ query: `${path}/`, start: mention.start, end: caret });
+    setMention({ query, start: mention.start, end: caret });
     setMentionIndex(0);
     queueMicrotask(() => {
       const ta = textareaRef.current;
@@ -122,6 +121,32 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
   };
 
   const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>): boolean => {
+    if (!mention) return false;
+    if (e.key === "Tab") {
+      dismiss();
+      return false;
+    }
+    if (e.key === "Escape") {
+      e.preventDefault();
+      dismiss();
+      return true;
+    }
+    const { dir, filter } = parseMentionToken(mention.query);
+    const canNavigate =
+      !e.shiftKey &&
+      !e.altKey &&
+      !e.ctrlKey &&
+      !e.metaKey &&
+      e.currentTarget.selectionStart === mention.end &&
+      e.currentTarget.selectionEnd === mention.end;
+    // Parent navigation also works with an empty or still-loading listing.
+    // Backspace edits a typed filter before navigating out of its directory.
+    if (canNavigate && dir && (e.key === "ArrowLeft" || (e.key === "Backspace" && !filter))) {
+      e.preventDefault();
+      const slash = dir.lastIndexOf("/");
+      openMentionDir(slash >= 0 ? dir.slice(0, slash) : "");
+      return true;
+    }
     if (!mentionOpen) return false;
     const active = mentionIndex >= 0 ? mentionEntries[mentionIndex] : undefined;
     if (e.key === "ArrowDown") {
@@ -134,22 +159,14 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
       setMentionIndex((i) => (i <= 0 ? mentionEntries.length - 1 : i - 1));
       return true;
     }
-    // Enter: open a folder (drill in) or attach a file. Tab: attach the
-    // highlighted row as a unit — whole folder or file — without drilling.
     if (e.key === "Enter" && !e.shiftKey && !isMobile && active) {
-      e.preventDefault();
-      if (active.type === "directory") openMentionDir(active.path);
-      else attachMention(active.path, false);
-      return true;
-    }
-    if (e.key === "Tab" && active) {
       e.preventDefault();
       attachMention(active.path, active.type === "directory");
       return true;
     }
-    if (e.key === "Escape") {
+    if (e.key === "ArrowRight" && canNavigate && active?.type === "directory") {
       e.preventDefault();
-      dismiss();
+      openMentionDir(active.path);
       return true;
     }
     return false;
