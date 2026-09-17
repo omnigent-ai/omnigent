@@ -4,6 +4,9 @@ description: Install checksum-pinned, download-cached agy 1.2.4 on Linux x64
 runs:
   using: composite
   steps:
+    - name: Disable Antigravity auto-updates
+      shell: bash
+      run: echo "AGY_CLI_DISABLE_AUTO_UPDATE=true" >> "$GITHUB_ENV"
     - uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@aa5736c38f5c1258ee29452c6825d75033b952d7
       with:
         harness: agy
