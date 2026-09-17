@@ -18,6 +18,17 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - run: node --test .github/actions/setup-harness-cli/setup-harness-cli.test.mjs
+      - name: Verify pinned callers match the tested action
+        shell: bash
+        run: |
+          set -euo pipefail
+          pins="$(git grep -h -o -E \
+            'omnigent-ai/omnigent/\.github/actions/setup-harness-cli@[0-9a-f]{40}' \
+            -- .github/actions .github/workflows \
+            | cut -d@ -f2 | sort -u)"
+          test "$(printf '%s\n' "$pins" | grep -c .)" -eq 1
+          git fetch --no-tags --depth=1 origin "$pins"
+          git diff --exit-code "$pins" HEAD -- .github/actions/setup-harness-cli
 
   install:
     name: Install ${{ matrix.harness }}
@@ -33,12 +44,11 @@ jobs:
         with:
           harness: ${{ matrix.harness }}
           enable-cache: false
-      - name: Seed isolated test cache
+      - name: Seed harness download cache
         id: seed
         uses: ./.github/actions/setup-harness-cli
         with:
           harness: ${{ matrix.harness }}
-          cache-namespace: test-${{ github.run_id }}-${{ github.run_attempt }}
       - name: Remove local downloads before restore
         shell: bash
         env:
@@ -48,12 +58,11 @@ jobs:
             "$RUNNER_TEMP"/omnigent-harness-cache/*) rm -rf -- "$CACHE_PATH" ;;
             *) echo "Refusing to remove unexpected cache path: $CACHE_PATH" >&2; exit 1 ;;
           esac
-      - name: Restore isolated test cache
+      - name: Restore harness download cache
         id: restore
         uses: ./.github/actions/setup-harness-cli
         with:
           harness: ${{ matrix.harness }}
-          cache-namespace: test-${{ github.run_id }}-${{ github.run_attempt }}
       - name: Verify CLI remains available to caller steps
         env:
           CACHE_HIT: ${{ steps.restore.outputs.cache-hit }}
