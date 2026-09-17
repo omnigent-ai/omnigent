@@ -76,6 +76,16 @@ describe("currentFusionCombo", () => {
   it("falls back to the default when the id is unknown (e.g. bare 'fusion')", () => {
     expect(currentFusionCombo(DESC, "fusion").modelUid).toBe("fusion-fable-medium-swe2medium");
   });
+
+  it("resolves a stale combo id to the default (the id both display and submit use)", () => {
+    // A saved id the current catalog no longer offers (host switch / retired
+    // combo). Both the displayed selectors and the submitted model_override read
+    // through this resolver, so they can never disagree: the stale id resolves to
+    // a real combo rather than being shown as default yet submitted as-is.
+    expect(currentFusionCombo(DESC, "fusion-claude-opus-5-high-sidekick-swe-2-max").modelUid).toBe(
+      DESC.default,
+    );
+  });
 });
 
 describe("choice lists", () => {
