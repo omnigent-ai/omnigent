@@ -76,20 +76,7 @@ let fakeController: FakeFindController;
 interface FakeEditor {
   getValue: () => string;
   setValue: (v: string) => void;
-  getModel: () => {
-    setEOL: () => void;
-    getLineCount: () => number;
-    validatePosition: (p: { lineNumber: number; column: number }) => {
-      lineNumber: number;
-      column: number;
-    };
-  };
-  getLayoutInfo: () => { width: number; height: number };
-  onDidLayoutChange: (listener: () => void) => { dispose: () => void };
-  getDomNode: () => HTMLElement;
-  resize: (width: number, height: number) => void;
-  setPosition: Mock;
-  revealPositionInCenter: Mock;
+  getModel: () => { setEOL: () => void };
   addCommand: () => void;
   onDidBlurEditorWidget: () => { dispose: () => void };
   setScrollTop: (top: number) => void;
@@ -102,40 +89,12 @@ interface FakeEditor {
 
 function makeFakeEditor(initial: string): FakeEditor {
   let value = initial;
-  let width = 600;
-  let height = 800;
-  const dom = document.createElement("div");
-  const listeners = new Set<() => void>();
   return {
-    getLayoutInfo: () => ({ width, height }),
-    getDomNode: () => dom,
-    onDidLayoutChange: (listener) => {
-      listeners.add(listener);
-      return {
-        dispose: () => {
-          listeners.delete(listener);
-        },
-      };
-    },
-    resize: (nextWidth, nextHeight) => {
-      width = nextWidth;
-      height = nextHeight;
-      for (const listener of listeners) listener();
-    },
     getValue: () => value,
     setValue: (v) => {
       value = v;
     },
-    getModel: () => ({
-      setEOL: () => {},
-      getLineCount: () => value.split("\n").length,
-      validatePosition: (p) => ({
-        ...p,
-        lineNumber: Math.min(p.lineNumber, value.split("\n").length),
-      }),
-    }),
-    setPosition: vi.fn(),
-    revealPositionInCenter: vi.fn(),
+    getModel: () => ({ setEOL: () => {} }),
     addCommand: () => {},
     onDidBlurEditorWidget: () => ({ dispose: () => {} }),
     setScrollTop: () => {},
@@ -177,7 +136,10 @@ vi.mock("./useMonacoCommentLayer", () => ({ useMonacoCommentLayer: () => null })
 vi.mock("next-themes", () => ({ useTheme: () => ({ resolvedTheme: "light" }) }));
 vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: vi.fn().mockReturnValue(true) }));
 vi.mock("@/hooks/useWriteFileContent", () => ({ useWriteFileContent: vi.fn() }));
-vi.mock("@/hooks/RunnerHealthProvider", () => ({ useSessionRunnerOnline: vi.fn() }));
+vi.mock("@/hooks/RunnerHealthProvider", () => ({
+  useSessionRunnerOnline: vi.fn(),
+  useSessionHostOnline: vi.fn(),
+}));
 
 import { MonacoCodeEditor } from "./MonacoCodeEditor";
 import * as writeHook from "@/hooks/useWriteFileContent";
@@ -186,15 +148,7 @@ import * as runnerHook from "@/hooks/RunnerHealthProvider";
 const PATH = "src/a.ts";
 const INITIAL = "const x = 1;\n";
 
-function makeEditor(
-  props: {
-    position?: { line: number; column?: number };
-    content?: string;
-    truncated?: boolean;
-    searchOpen?: boolean;
-    onSearchHandled?: () => void;
-  } = {},
-) {
+function makeEditor(props: { searchOpen?: boolean; onSearchHandled?: () => void } = {}) {
   return (
     <MonacoCodeEditor
       content={INITIAL}
@@ -305,75 +259,5 @@ describe("MonacoCodeEditor find toggle", () => {
       unmount();
     });
     expect(fakeController.dispose).toHaveBeenCalled();
-  });
-});
-
-describe("Monaco source position navigation", () => {
-  const content = Array.from({ length: 100 }, (_, i) => `line ${i + 1}`).join("\n");
-  beforeEach(() => {
-    fakeEditor = makeFakeEditor(content);
-  });
-  it("jumps after mounting and on repeated same-file citations", async () => {
-    const { rerender } = await renderMounted(makeEditor({ position: { line: 12, column: 7 } }));
-    expect(fakeEditor!.setPosition).toHaveBeenLastCalledWith({ lineNumber: 12, column: 7 });
-    expect(fakeEditor!.revealPositionInCenter).toHaveBeenLastCalledWith(
-      {
-        lineNumber: 12,
-        column: 7,
-      },
-      1,
-    );
-    rerender(makeEditor({ position: { line: 30 } }));
-    expect(fakeEditor!.revealPositionInCenter).toHaveBeenLastCalledWith(
-      {
-        lineNumber: 30,
-        column: 1,
-      },
-      1,
-    );
-    rerender(makeEditor({ position: { line: 30 } }));
-    expect(fakeEditor!.revealPositionInCenter).toHaveBeenCalledTimes(3);
-  });
-});
-
-describe("source navigation layout and missing lines", () => {
-  it("waits for a visible editor and recenters when its panel grows", async () => {
-    fakeEditor!.resize(0, 0);
-    await renderMounted(makeEditor({ position: { line: 1 } }));
-    expect(fakeEditor!.revealPositionInCenter).not.toHaveBeenCalled();
-    act(() => fakeEditor!.resize(600, 100));
-    act(() => fakeEditor!.resize(600, 800));
-    expect(fakeEditor!.revealPositionInCenter).toHaveBeenCalledTimes(2);
-    expect(fakeEditor!.revealPositionInCenter).toHaveBeenLastCalledWith(
-      { lineNumber: 1, column: 1 },
-      1,
-    );
-  });
-
-  it.each(["wheel", "touchstart", "pointerdown", "keydown"])(
-    "stops recentering after %s",
-    async (type) => {
-      await renderMounted(makeEditor({ position: { line: 1 } }));
-      fakeEditor!.getDomNode().dispatchEvent(new Event(type));
-      act(() => fakeEditor!.resize(600, 900));
-      expect(fakeEditor!.revealPositionInCenter).toHaveBeenCalledTimes(1);
-    },
-  );
-
-  it("removes the layout listener when the editor unmounts", async () => {
-    const { unmount } = await renderMounted(makeEditor({ position: { line: 1 } }));
-    const editor = fakeEditor!;
-    unmount();
-    editor.resize(600, 900);
-    expect(editor.revealPositionInCenter).toHaveBeenCalledTimes(1);
-  });
-
-  it.each([true, false])("clamps to the last loaded line (truncated=%s)", async (truncated) => {
-    await renderMounted(makeEditor({ position: { line: 5000 }, truncated }));
-    expect(fakeEditor!.setPosition).toHaveBeenLastCalledWith({ lineNumber: 2, column: 1 });
-    expect(fakeEditor!.revealPositionInCenter).toHaveBeenLastCalledWith(
-      { lineNumber: 2, column: 1 },
-      1,
-    );
   });
 });

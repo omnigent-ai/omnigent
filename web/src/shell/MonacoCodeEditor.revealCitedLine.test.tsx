@@ -1,15 +1,5 @@
-// Tests for the MonacoCodeEditor cited-line reveal wiring.
-//
-// A chat citation (`path:line`) opens the file viewer with a `position`;
-// the editor must land on that line (centered) instead of parking at the top,
-// must not fight the reveal with the saved-scroll restore, and must re-reveal
-// when a later citation targets a different line of the same open file.
-//
-// Monaco can't mount in jsdom, so @monaco-editor/react's Editor is mocked to
-// invoke onMount with a thin fake editor exposing the slice of API the reveal
-// drives: revealPositionInCenter, setPosition, getModel().getLineCount(), and the
-// scroll-restore hooks (setScrollTop / onDidScrollChange). The comment layer
-// and save wiring are irrelevant here, so they're mocked out.
+// Monaco is mocked in jsdom: verify navigation and layout lifecycle here;
+// browser tests verify actual centering and collapsed diff expansion.
 
 import { act, render } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -32,7 +22,8 @@ interface FakeEditor {
     };
   };
   getLayoutInfo: () => { width: number; height: number };
-  onDidLayoutChange: () => { dispose: () => void };
+  onDidLayoutChange: (listener: () => void) => { dispose: () => void };
+  resize: (width: number, height: number) => void;
   addCommand: () => void;
   onDidBlurEditorWidget: () => { dispose: () => void };
   setScrollTop: (top: number) => void;
@@ -49,6 +40,9 @@ interface FakeEditor {
 
 function makeFakeEditor(initial: string, lineCount: number): FakeEditor {
   const dom = document.createElement("div");
+  let width = 600;
+  let height = 800;
+  const layouts = new Set<() => void>();
   const editor: FakeEditor = {
     getValue: () => initial,
     setValue: () => {},
@@ -57,8 +51,20 @@ function makeFakeEditor(initial: string, lineCount: number): FakeEditor {
       getLineCount: () => lineCount,
       validatePosition: (p) => ({ ...p, lineNumber: Math.min(p.lineNumber, lineCount) }),
     }),
-    getLayoutInfo: () => ({ width: 600, height: 800 }),
-    onDidLayoutChange: () => ({ dispose: () => {} }),
+    getLayoutInfo: () => ({ width, height }),
+    onDidLayoutChange: (listener) => {
+      layouts.add(listener);
+      return {
+        dispose: () => {
+          layouts.delete(listener);
+        },
+      };
+    },
+    resize: (nextWidth, nextHeight) => {
+      width = nextWidth;
+      height = nextHeight;
+      for (const listener of layouts) listener();
+    },
     addCommand: () => {},
     onDidBlurEditorWidget: () => ({ dispose: () => {} }),
     setScrollTop: (top) => {
@@ -102,7 +108,10 @@ vi.mock("./useMonacoCommentLayer", () => ({ useMonacoCommentLayer: () => null })
 vi.mock("next-themes", () => ({ useTheme: () => ({ resolvedTheme: "light" }) }));
 vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: vi.fn().mockReturnValue(true) }));
 vi.mock("@/hooks/useWriteFileContent", () => ({ useWriteFileContent: vi.fn() }));
-vi.mock("@/hooks/RunnerHealthProvider", () => ({ useSessionRunnerOnline: vi.fn() }));
+vi.mock("@/hooks/RunnerHealthProvider", () => ({
+  useSessionRunnerOnline: vi.fn(),
+  useSessionHostOnline: vi.fn(),
+}));
 
 import { MonacoCodeEditor } from "./MonacoCodeEditor";
 import { saveScrollTop } from "./useScrollRestore";
@@ -114,7 +123,10 @@ const PATH = "src/module.py";
 const LINE_COUNT = 400;
 const CONTENT = Array.from({ length: LINE_COUNT }, (_, i) => `filler_${i + 1}`).join("\n");
 
-function makeEditor(revealLine?: number | null) {
+function makeEditor(
+  revealLine?: number,
+  { column, truncated = false }: { column?: number; truncated?: boolean } = {},
+) {
   return (
     <MonacoCodeEditor
       content={CONTENT}
@@ -124,7 +136,8 @@ function makeEditor(revealLine?: number | null) {
       comments={[]}
       activeSelection={null}
       onSetActiveSelection={() => {}}
-      position={revealLine == null ? undefined : { line: revealLine }}
+      position={revealLine == null ? undefined : { line: revealLine, column }}
+      truncated={truncated}
     />
   );
 }
@@ -153,16 +166,6 @@ afterEach(() => {
 });
 
 describe("MonacoCodeEditor cited-line reveal", () => {
-  it("reveals the cited line (centered) on mount", async () => {
-    await renderMounted(makeEditor(350));
-
-    expect(fakeEditor!.revealPositionInCenter).toHaveBeenCalledWith(
-      { lineNumber: 350, column: 1 },
-      1,
-    );
-    expect(fakeEditor!.setPosition).toHaveBeenCalledWith({ lineNumber: 350, column: 1 });
-  });
-
   it("does not reveal anything without a citation", async () => {
     await renderMounted(makeEditor());
 
@@ -170,8 +173,8 @@ describe("MonacoCodeEditor cited-line reveal", () => {
     expect(fakeEditor!.setPosition).not.toHaveBeenCalled();
   });
 
-  it("clamps a cited line past the end of the file to the last line", async () => {
-    await renderMounted(makeEditor(9999));
+  it.each([false, true])("clamps to the last loaded line (truncated=%s)", async (truncated) => {
+    await renderMounted(makeEditor(9999, { truncated }));
 
     expect(fakeEditor!.revealPositionInCenter).toHaveBeenCalledWith(
       { lineNumber: LINE_COUNT, column: 1 },
@@ -221,16 +224,50 @@ describe("MonacoCodeEditor cited-line reveal", () => {
     );
   });
 
-  it("re-reveals when a later citation targets a different line", async () => {
-    const view = await renderMounted(makeEditor(350));
-    fakeEditor!.revealPositionInCenter.mockClear();
-
-    view.rerender(makeEditor(42));
-    await act(async () => {});
-
-    expect(fakeEditor!.revealPositionInCenter).toHaveBeenCalledWith(
+  it("centers fresh requests on mount and on repeated clicks, including columns", async () => {
+    const { rerender } = await renderMounted(makeEditor(350, { column: 7 }));
+    expect(fakeEditor!.setPosition).toHaveBeenLastCalledWith({ lineNumber: 350, column: 7 });
+    expect(fakeEditor!.revealPositionInCenter).toHaveBeenLastCalledWith(
+      { lineNumber: 350, column: 7 },
+      1,
+    );
+    rerender(makeEditor(42));
+    expect(fakeEditor!.revealPositionInCenter).toHaveBeenLastCalledWith(
       { lineNumber: 42, column: 1 },
       1,
     );
+    rerender(makeEditor(42));
+    expect(fakeEditor!.revealPositionInCenter).toHaveBeenCalledTimes(3);
+  });
+
+  it("waits for a visible editor and recenters when its panel grows", async () => {
+    fakeEditor!.resize(0, 0);
+    await renderMounted(makeEditor(1));
+    expect(fakeEditor!.revealPositionInCenter).not.toHaveBeenCalled();
+    act(() => fakeEditor!.resize(600, 100));
+    act(() => fakeEditor!.resize(600, 800));
+    expect(fakeEditor!.revealPositionInCenter).toHaveBeenCalledTimes(2);
+    expect(fakeEditor!.revealPositionInCenter).toHaveBeenLastCalledWith(
+      { lineNumber: 1, column: 1 },
+      1,
+    );
+  });
+
+  it.each(["wheel", "touchstart", "pointerdown", "keydown"])(
+    "stops recentering after %s",
+    async (type) => {
+      await renderMounted(makeEditor(1));
+      fakeEditor!.getDomNode().dispatchEvent(new Event(type));
+      act(() => fakeEditor!.resize(600, 900));
+      expect(fakeEditor!.revealPositionInCenter).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it("removes the layout listener when the editor unmounts", async () => {
+    const { unmount } = await renderMounted(makeEditor(1));
+    const editor = fakeEditor!;
+    unmount();
+    editor.resize(600, 900);
+    expect(editor.revealPositionInCenter).toHaveBeenCalledTimes(1);
   });
 });
