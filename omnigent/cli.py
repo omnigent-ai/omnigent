@@ -12521,7 +12521,9 @@ def _databricks_profile_auth_info(profile: str) -> _DatabricksWorkspaceAuthInfo 
     )
 
     try:
-        auth, _host = _resolve_databricks_auth(profile=profile)
+        # strict_profile: a pinned identity must resolve to its own profile or
+        # fail — never silently authenticate as ambient/[DEFAULT] creds.
+        auth, _host = _resolve_databricks_auth(profile=profile, strict_profile=True)
         token = auth.current_token()
     except (DatabricksAuthError, ImportError, ValueError):
         return None

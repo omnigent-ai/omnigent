@@ -713,7 +713,9 @@ def _make_auth_token_factory(
                 # A stored profile names the exact identity chosen at login;
                 # prefer it over host-keyed profile guessing.
                 if profile is not None:
-                    sdk_auth, _host = _resolve_databricks_auth(profile=profile)
+                    sdk_auth, _host = _resolve_databricks_auth(
+                        profile=profile, strict_profile=True
+                    )
                 elif workspace_host is not None:
                     sdk_auth, _host = _resolve_databricks_auth(host=workspace_host)
                 else:

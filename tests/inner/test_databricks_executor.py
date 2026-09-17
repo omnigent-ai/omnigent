@@ -821,6 +821,62 @@ def test_read_databrickscfg_missing_profile_falls_back_to_file_reader(
     assert creds.token == "dapi-fake-pat-token-for-unit-test"
 
 
+def test_read_databrickscfg_strict_missing_profile_returns_none(
+    pat_only_cfg: _Path,
+) -> None:
+    """strict=True must NOT substitute another section for a missing profile.
+
+    Without strict, a missing named profile falls through to the first
+    section (identity substitution). A pinned --profile passes strict=True so
+    a missing profile resolves to nothing and the caller fails loud instead of
+    silently authenticating as a different (possibly service-principal)
+    identity.
+    """
+    assert _read_databrickscfg("no-such-profile-xyz", strict=True) is None
+
+
+def test_read_databrickscfg_file_fallback_strict_does_not_borrow_default(
+    tmp_path: _Path,
+    monkeypatch: pytest.MonkeyPatch,
+    clean_databricks_env: None,
+) -> None:
+    """The file reader, when strict, reads only the named profile's section.
+
+    A [DEFAULT] with usable creds must not stand in for a missing named
+    profile under strict resolution.
+    """
+    cfg_path = tmp_path / "databrickscfg"
+    cfg_path.write_text(
+        "[DEFAULT]\nhost = https://example.databricks.com\ntoken = dapi-default-token\n"
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg_path))
+
+    # Non-strict borrows [DEFAULT]; strict refuses.
+    assert _read_databrickscfg_file_fallback("typo") is not None
+    assert _read_databrickscfg_file_fallback("typo", strict=True) is None
+
+
+def test_resolve_databricks_auth_strict_profile_missing_fails_loud(
+    pat_only_cfg: _Path,
+) -> None:
+    """A pinned --profile that is missing fails loud instead of substituting.
+
+    This is the root of the identity-confusion class: without strict_profile,
+    resolving a missing profile falls through to the first cfg section (here
+    the PAT profile); with strict_profile it raises, so a host never registers
+    as an unintended identity.
+    """
+    from omnigent.inner.databricks_executor import _resolve_databricks_auth
+
+    # Baseline: non-strict silently substitutes the only available identity.
+    auth, _host = _resolve_databricks_auth(profile="no-such-profile-xyz")
+    assert auth.current_token() == "dapi-fake-pat-token-for-unit-test"
+
+    # strict_profile: the missing profile fails loud, no substitution.
+    with pytest.raises(DatabricksAuthError):
+        _resolve_databricks_auth("no-such-profile-xyz", strict_profile=True)
+
+
 def test_read_databrickscfg_empty_config_file_returns_none(
     tmp_path: _Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1338,7 +1394,7 @@ def test_resolve_databricks_auth_invalid_profile_raises_clear_error(
         raise ValueError("no credentials")
 
     monkeypatch.setattr(_sdk_config_mod, "Config", _failing_config)
-    monkeypatch.setattr(db_exec, "_read_databrickscfg", lambda _p: None)
+    monkeypatch.setattr(db_exec, "_read_databrickscfg", lambda _p, **_kw: None)
     monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
 
     with pytest.raises(DatabricksAuthError, match="databricks auth login -p dogfood"):
@@ -1386,7 +1442,7 @@ def test_resolve_databricks_auth_env_profile_falls_back_to_ambient_with_warning(
         return _AmbientConfig()
 
     monkeypatch.setattr(_sdk_config_mod, "Config", _config_factory)
-    monkeypatch.setattr(db_exec, "_read_databrickscfg", lambda _p: None)
+    monkeypatch.setattr(db_exec, "_read_databrickscfg", lambda _p, **_kw: None)
     # Profile comes from env var, not an explicit argument.
     monkeypatch.setenv("DATABRICKS_CONFIG_PROFILE", "missing-profile")
 
@@ -1434,7 +1490,7 @@ def test_resolve_databricks_auth_explicit_profile_not_found_raises(
         raise ValueError("simulated: profile not found in ~/.databrickscfg")
 
     monkeypatch.setattr(_sdk_config_mod, "Config", _config_factory)
-    monkeypatch.setattr(db_exec, "_read_databrickscfg", lambda _p: None)
+    monkeypatch.setattr(db_exec, "_read_databrickscfg", lambda _p, **_kw: None)
     monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
 
     with pytest.raises(DatabricksAuthError, match="databricks auth login -p dev"):

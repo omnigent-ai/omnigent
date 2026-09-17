@@ -91,7 +91,9 @@ class DatabricksCredentials:
     token: str
 
 
-def _read_databrickscfg(profile: str | None = None) -> DatabricksCredentials | None:
+def _read_databrickscfg(
+    profile: str | None = None, *, strict: bool = False
+) -> DatabricksCredentials | None:
     """
     Resolve Databricks ``(host, bearer_token)`` for *profile* using the
     databricks-sdk's unified credential resolver.
@@ -157,7 +159,7 @@ def _read_databrickscfg(profile: str | None = None) -> DatabricksCredentials | N
             sdk_profile,
             profile_exc,
         )
-        if sdk_profile is not None:
+        if sdk_profile is not None and not strict:
             # Profile not found; fall back to ambient credentials
             # (env vars, OIDC) so the spec works on App servers too.
             logger.debug(
@@ -167,9 +169,11 @@ def _read_databrickscfg(profile: str | None = None) -> DatabricksCredentials | N
                 cfg = Config()
                 headers = cfg.authenticate()
             except ValueError:
-                return _read_databrickscfg_file_fallback(profile)
+                return _read_databrickscfg_file_fallback(profile, strict=strict)
         else:
-            return _read_databrickscfg_file_fallback(profile)
+            # strict (a pinned --profile) must not borrow ambient/[DEFAULT]
+            # creds for a missing profile — read only the named section.
+            return _read_databrickscfg_file_fallback(profile, strict=strict)
 
     host = cfg.host
     auth = headers.get("Authorization")
@@ -181,7 +185,9 @@ def _read_databrickscfg(profile: str | None = None) -> DatabricksCredentials | N
     return DatabricksCredentials(host=host, token=auth.removeprefix("Bearer "))
 
 
-def _read_databrickscfg_file_fallback(profile: str | None = None) -> DatabricksCredentials | None:
+def _read_databrickscfg_file_fallback(
+    profile: str | None = None, *, strict: bool = False
+) -> DatabricksCredentials | None:
     """
     Legacy fallback: read ``host`` and ``token`` directly from
     ``~/.databrickscfg``.
@@ -219,6 +225,12 @@ def _read_databrickscfg_file_fallback(profile: str | None = None) -> DatabricksC
         token = config[resolved_profile].get("token")
         if host and token:
             return DatabricksCredentials(host=host, token=token)
+
+    if strict:
+        # A pinned --profile must resolve to its own section or fail — never
+        # borrow [DEFAULT] or the first available section (a different, often
+        # service-principal, identity).
+        return None
 
     # Try DEFAULT section
     default = config.defaults()
@@ -661,6 +673,7 @@ def _resolve_databricks_auth(
     profile: str | None = None,
     *,
     host: str | None = None,
+    strict_profile: bool = False,
 ) -> tuple[_DatabricksBearerAuth, str]:
     """Resolve Databricks credentials and return per-request auth + host.
 
@@ -680,6 +693,15 @@ def _resolve_databricks_auth(
         profile/env fallback is NOT attempted in this mode — the
         record asked for a specific workspace, so a credential miss
         fails loud.
+    :param strict_profile: When ``True`` and *profile* is named, a
+        missing/unresolvable profile must NOT fall back to ambient or
+        ``[DEFAULT]`` credentials — it fails loud. Set by the
+        host-identity ``--profile`` paths, where silently authenticating
+        as a different identity (e.g. a co-resident service principal) is
+        the exact bug the flag prevents. Left ``False`` for the executor
+        spec path, which relies on the ambient fallback for a spec
+        authored with ``profile:`` but run on an App container with no
+        ``~/.databrickscfg``.
     :returns: ``(auth, host)`` — an httpx Auth for injection into
         ``httpx.Client``/``httpx.AsyncClient`` and the workspace URL,
         e.g. ``"https://example.cloud.databricks.com"``.
@@ -744,8 +766,9 @@ def _resolve_databricks_auth(
 
     # SDK-based resolution failed (simple PAT profile, missing auth_type,
     # etc.). Fall back to reading ~/.databrickscfg directly — static PATs
-    # don't need per-request refresh.
-    creds = _read_databrickscfg(profile)
+    # don't need per-request refresh. strict_profile forbids substituting
+    # ambient/[DEFAULT] creds for a named-but-missing profile.
+    creds = _read_databrickscfg(profile, strict=strict_profile)
     if creds is not None:
         static_cfg = type(
             "_StaticAuth",

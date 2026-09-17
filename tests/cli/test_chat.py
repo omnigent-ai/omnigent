@@ -2740,7 +2740,9 @@ def test_databricks_token_cache_reresolves_when_pointer_profile_changes(
         def current_token(self) -> str:
             return self._token
 
-    def _resolve(profile: object = None, *, host: object = None) -> tuple[object, str]:
+    def _resolve(
+        profile: object = None, *, host: object = None, strict_profile: bool = False
+    ) -> tuple[object, str]:
         return _Auth(f"token-{profile}"), "https://example.databricks.com"
 
     monkeypatch.setattr("omnigent.inner.databricks_executor._resolve_databricks_auth", _resolve)
@@ -3340,7 +3342,7 @@ def test_databricks_token_auth_resolves_sdk_once(
     resolve_calls = {"n": 0}
 
     def _fake_resolve(
-        profile: str | None = None, *, host: str | None = None
+        profile: str | None = None, *, host: str | None = None, strict_profile: bool = False
     ) -> tuple[object, str]:
         """Stand in for _resolve_databricks_auth; counts resolutions."""
         resolve_calls["n"] += 1
@@ -3395,7 +3397,7 @@ def test_databricks_token_auth_prefers_stored_profile(
     resolved: dict[str, object] = {}
 
     def _fake_resolve(
-        profile: str | None = None, *, host: str | None = None
+        profile: str | None = None, *, host: str | None = None, strict_profile: bool = False
     ) -> tuple[object, str]:
         resolved["profile"] = profile
         resolved["host"] = host
