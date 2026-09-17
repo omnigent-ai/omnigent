@@ -2825,6 +2825,87 @@ def test_run_background_host_profile_refuses_reusing_a_live_daemon(
         )
 
 
+def test_host_preflight_stored_pin_recovery_keeps_pin_and_does_not_switch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A `host` run with no flag but a stored pin recovers as the pinned identity.
+
+    When the pinned profile's credential has lapsed, recovery must retry with
+    the stored pin — not the raw (absent) flag — so host-keyed selection can't
+    pick another identity (an SP) and overwrite the record without the pin.
+    """
+    import httpx
+
+    monkeypatch.setattr(
+        "omnigent.chat._remote_headers",
+        lambda server_url=None, *, host_id=None: {"Authorization": "Bearer expired"},
+    )
+    monkeypatch.setattr(httpx, "get", lambda url, **kw: _databricks_probe_response(401))
+    monkeypatch.setattr(
+        "omnigent.cli_auth.load_databricks_workspace_host",
+        lambda server: "https://example.databricks.com",
+    )
+    monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda server: None)
+    # A profile was pinned at login, but it no longer resolves.
+    monkeypatch.setattr("omnigent.cli_auth.load_databricks_profile", lambda server: "my-user")
+    monkeypatch.setattr(cli, "_databricks_profile_auth_info", lambda profile: None)
+    monkeypatch.setattr(
+        cli, "_databricks_login", lambda *a, **k: pytest.fail("must not switch identity via login")
+    )
+
+    # No explicit --profile on this run; the stored pin must still drive recovery.
+    with pytest.raises(click.ClickException, match="--profile my-user"):
+        cli._ensure_databricks_server_auth(_HOST_DATABRICKS_SERVER, non_interactive=True)
+
+
+def test_host_preflight_profile_on_non_databricks_401_fails_loud(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`--profile` against a non-Databricks 401 server fails instead of no-op.
+
+    An ordinary OIDC/accounts 401 yields no workspace, so an explicit
+    --profile can't apply. The preflight must reject it rather than return and
+    let startup continue while ignoring the requested identity.
+    """
+    import httpx
+
+    monkeypatch.setattr(
+        "omnigent.chat._remote_headers",
+        lambda server_url=None, *, host_id=None: {"Authorization": "Bearer x"},
+    )
+    # Both the authed probe and the unauthed re-probe are plain 401s (no
+    # workspace redirect) → not Databricks-fronted.
+    monkeypatch.setattr(httpx, "get", lambda url, **kw: _databricks_probe_response(401))
+    monkeypatch.setattr("omnigent.cli_auth.load_databricks_workspace_host", lambda server: None)
+    monkeypatch.setattr(cli, "_databricks_login", lambda *a, **k: pytest.fail("login"))
+
+    with pytest.raises(click.ClickException, match="not a Databricks-fronted server"):
+        cli._ensure_databricks_server_auth(
+            _HOST_DATABRICKS_SERVER, non_interactive=True, profile="my-user"
+        )
+
+
+def test_host_command_rejects_profile_in_local_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`host --profile` with no Databricks server fails instead of starting local."""
+    monkeypatch.setattr(cli, "_load_effective_config", dict)
+    monkeypatch.setattr(
+        cli, "_run_background_host", lambda *a, **k: pytest.fail("must reject before starting")
+    )
+
+    result = CliRunner().invoke(cli_group, ["host", "--profile", "my-user"])
+
+    assert result.exit_code != 0
+    assert "does not apply to a local host" in result.output
+
+
+def test_host_command_rejects_empty_profile(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An explicit but empty `--profile` is rejected, not treated as absent."""
+    result = CliRunner().invoke(cli_group, ["host", "--server", "https://x", "--profile", ""])
+
+    assert result.exit_code != 0
+    assert "empty" in result.output
+
+
 def test_databricks_preflight_silent_sdk_refresh_skips_login(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

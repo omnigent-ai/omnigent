@@ -3735,6 +3735,15 @@ def _ensure_databricks_server_auth(
             workspace_host = _databricks_workspace_login_target(server, unauthed_probe)
         credential_rejected = workspace_host is not None and "Authorization" in headers
     if workspace_host is None:
+        # Reachable but not Databricks-fronted (e.g. an OIDC/accounts 401). An
+        # explicit --profile can't apply here, so fail loud rather than let
+        # startup continue while silently ignoring the requested identity.
+        if profile is not None:
+            raise click.ClickException(
+                f"--profile {profile!r} was requested, but {server} is not a "
+                "Databricks-fronted server, so the profile cannot be applied. "
+                "Omit --profile."
+            )
         return
     org_id = load_databricks_org_id(server)
     resolve_profile = profile or load_databricks_profile(server)
@@ -3756,7 +3765,11 @@ def _ensure_databricks_server_auth(
     # ?o= when known), not the internal API mount; it round-trips through
     # `omnigent login` back to the same API base.
     display = ServerUrl(api_base=server, org_id=org_id).display
-    profile_flag = f" --profile {profile}" if profile else ""
+    # Recovery must carry the *effective* identity (explicit flag or the stored
+    # pin), not the raw flag — otherwise a `host` run with no flag but a stored
+    # pin would retry with no profile, let host-keyed selection pick another
+    # identity (e.g. an SP), and overwrite the record without the pin.
+    profile_flag = f" --profile {resolve_profile}" if resolve_profile else ""
     login_cmd = f"omnigent login {display}{profile_flag}"
     state = (
         f"Your Databricks credential for {display} has expired or was revoked"
@@ -3772,7 +3785,9 @@ def _ensure_databricks_server_auth(
     # Login selector comes from the URL, not the stored org_id used above: on a
     # single-tenant host a replayed ?o= makes `databricks auth login --host` skip
     # workspace_id resolution, so the grant isn't workspace-bound (matches `login`).
-    _databricks_login(server, workspace_host, org_id=_org_id_from_url(server), profile=profile)
+    _databricks_login(
+        server, workspace_host, org_id=_org_id_from_url(server), profile=resolve_profile
+    )
 
 
 def _ensure_backend(server: str | None) -> str:
@@ -9049,6 +9064,11 @@ def host(
     ctx.ensure_object(dict)
     ctx.obj["server"] = server
     ctx.obj["non_interactive"] = non_interactive
+    # An explicitly supplied but empty --profile (e.g. `--profile "$VAR"` with
+    # VAR unset) must not be treated as "no profile" — that silently selects
+    # ambient/default credentials. Reject it.
+    if profile is not None and not profile.strip():
+        raise click.ClickException("--profile was given but is empty; pass a profile name.")
     if ctx.invoked_subcommand is not None:
         return
     # Kept before the config fallback below: `--background` echoes a `host
@@ -9063,6 +9083,17 @@ def host(
     # ``server`` to the spawned loopback URL — only a remote target needs
     # the sign-in pre-flight.
     remote_mode = bool(server)
+
+    # --profile only selects a Databricks workspace identity, which is
+    # meaningless in local mode; reject rather than start locally and silently
+    # ignore the flag. (A non-Databricks remote server is rejected in the
+    # sign-in pre-flight, which has the probe to tell.)
+    if profile is not None and not remote_mode:
+        raise click.ClickException(
+            "--profile selects a Databricks workspace identity and does not "
+            "apply to a local host. Omit --profile, or pass a Databricks-fronted "
+            "--server."
+        )
 
     if background:
         _run_background_host(
@@ -12554,6 +12585,12 @@ def login(server_url: str, profile: str | None) -> None:
         workspace root.
     """
     import httpx as _httpx
+
+    # An explicitly supplied but empty --profile (e.g. `--profile "$VAR"` with
+    # VAR unset) must not be treated as "no profile" — that silently selects
+    # ambient/default credentials and stores no pin. Reject it.
+    if profile is not None and not profile.strip():
+        raise click.ClickException("--profile was given but is empty; pass a profile name.")
 
     resolved = _resolve_server_url(server_url)
     server = resolved.api_base
