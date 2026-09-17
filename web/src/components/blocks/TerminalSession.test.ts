@@ -19,6 +19,7 @@ import {
   loadWebglRenderer,
   openTerminalLink,
   parseTerminalClipboardMessage,
+  resolveTerminalWorkspaceFileLink,
   sgrWheelReports,
   terminalTheme,
   terminalKeyEventPayload,
@@ -88,6 +89,70 @@ describe("openTerminalLink", () => {
     // (and kill the WebSocket-attached terminal) before window.open's
     // tab is usable. A failure here means that suppression was dropped.
     expect(preventSpy).toHaveBeenCalledOnce();
+  });
+
+  it("lets the app consume an OSC 8 file link instead of opening the browser", () => {
+    const openSpy = vi.spyOn(window, "open").mockReturnValue(null);
+    const onFileLink = vi.fn(() => true);
+    const event = new MouseEvent("click");
+
+    openTerminalLink(event, "file:///home/u/ws/src/app.ts#L42", onFileLink);
+
+    expect(onFileLink).toHaveBeenCalledWith("file:///home/u/ws/src/app.ts#L42");
+    expect(openSpy).not.toHaveBeenCalled();
+  });
+
+  it("keeps the normal external-link path when the app declines a link", () => {
+    const openSpy = vi.spyOn(window, "open").mockReturnValue(null);
+
+    openTerminalLink(new MouseEvent("click"), "https://example.com/foo", () => false);
+
+    expect(openSpy).toHaveBeenCalledWith(
+      "https://example.com/foo",
+      "_blank",
+      "noopener,noreferrer",
+    );
+  });
+
+  it.each([
+    "file:///etc/hosts#L1",
+    "javascript:alert(document.domain)",
+    "data:text/html,<script>alert(1)</script>",
+    "mailto:user@example.com",
+  ])("does not browser-open a declined non-HTTP OSC 8 link: %s", (uri) => {
+    const openSpy = vi.spyOn(window, "open").mockReturnValue(null);
+
+    openTerminalLink(new MouseEvent("click"), uri, () => false);
+
+    expect(openSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe("resolveTerminalWorkspaceFileLink", () => {
+  const ROOT = "/home/u/ws";
+  const HOME = "/home/u";
+
+  it.each([
+    ["file:///home/u/ws/src/app.ts", "src/app.ts", null],
+    ["file:///home/u/ws/src/app.ts:42", "src/app.ts", 42],
+    ["file:///home/u/ws/src/app.ts:42:7", "src/app.ts", 42],
+    ["file:///home/u/ws/src/app.ts#L43", "src/app.ts", 43],
+    ["file:///home/u/ws/src/app.ts#L44C3", "src/app.ts", 44],
+    ["file:///home/u/ws/src/app.ts#L45-L50", "src/app.ts", 45],
+    ["file:///home/u/ws/Design%20Notes.md#L46", "Design Notes.md", 46],
+  ])("resolves %s", (uri, path, line) => {
+    expect(resolveTerminalWorkspaceFileLink(uri, ROOT, HOME)).toEqual({ path, line });
+  });
+
+  it.each([
+    "https://example.com/src/app.ts#L42",
+    "file:///etc/hosts#L1",
+    "file:///home/u/ws/src/app.ts#heading",
+    "file:///home/u/ws/src/app.ts?line=42",
+    "file://fileserver/home/u/ws/src/app.ts#L42",
+    "file:///home/u/ws/%E0%A4%A.md#L42",
+  ])("rejects a non-workspace or unsafe target: %s", (uri) => {
+    expect(resolveTerminalWorkspaceFileLink(uri, ROOT, HOME)).toBeNull();
   });
 });
 
@@ -659,6 +724,15 @@ describe("TerminalSession", () => {
       (m) => typeof m === "string" && m.includes('"type":"resize"'),
     );
     expect(resizeFrame).toBeDefined();
+    session.dispose();
+  });
+
+  it("enables OSC 8 file links while keeping activation in the app handler", () => {
+    const { session } = makeSession();
+    const term = (session as unknown as { term: Terminal }).term;
+
+    expect(term.options.linkHandler?.allowNonHttpProtocols).toBe(true);
+    expect(term.options.linkHandler?.activate).toBeTypeOf("function");
     session.dispose();
   });
 
