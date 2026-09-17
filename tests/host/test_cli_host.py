@@ -344,6 +344,61 @@ def test_host_enable_subcommand_installs_user_service(
     assert "Enabled the Omnigent host user service for local" in result.output
 
 
+def test_host_enable_threads_profile_into_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`host --profile <p> enable` must resolve the persistent service as <p>.
+
+    The group accepts --profile; the enable subcommand reads group options, so
+    it must pass the profile into the sign-in preflight — otherwise the
+    persistent service can register as whatever existing token answers 200.
+    """
+    from omnigent.host.service import HostService
+
+    service_path = tmp_path / "omnigent-host.service"
+    captured: dict[str, object] = {}
+
+    def _preflight(
+        server: str, *, non_interactive: bool = False, profile: str | None = None
+    ) -> None:
+        captured["server"] = server
+        captured["profile"] = profile
+
+    monkeypatch.setattr("omnigent.cli._ensure_databricks_server_auth", _preflight)
+    monkeypatch.setattr("omnigent.cli._find_daemon_record", lambda target: None)
+    monkeypatch.setattr(
+        "omnigent.cli._build_host_daemon_env", lambda *, server_url: {"HOME": str(tmp_path)}
+    )
+    monkeypatch.setattr(
+        "omnigent.host.service.enable_user_host_service",
+        lambda server_url, *, environment: HostService(
+            kind="systemd_user", path=service_path, label=service_path.name
+        ),
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        ["host", "--server", "https://app.databricksapps.com", "--profile", "my-user", "enable"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["profile"] == "my-user"
+
+
+def test_host_enable_rejects_profile_in_local_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`host --profile <p> enable` with a local target fails instead of ignoring it."""
+    monkeypatch.setattr(
+        "omnigent.cli._ensure_databricks_server_auth",
+        lambda *a, **k: pytest.fail("preflight must not run in local mode"),
+    )
+
+    result = CliRunner().invoke(cli, ["host", "--profile", "my-user", "enable", "--server", ""])
+
+    assert result.exit_code != 0
+    assert "does not apply to a local host" in result.output
+
+
 def test_host_disable_subcommand_removes_user_service(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

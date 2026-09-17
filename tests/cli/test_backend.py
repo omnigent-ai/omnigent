@@ -2906,6 +2906,38 @@ def test_host_command_rejects_empty_profile(monkeypatch: pytest.MonkeyPatch) -> 
     assert "empty" in result.output
 
 
+def test_host_preflight_profile_probe_network_error_reports_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transport error during profile recovery reports the connection failure.
+
+    A network error on the unauthenticated re-probe is not evidence the server
+    is non-Databricks; the preflight must surface the connection failure (retry)
+    rather than tell the user to drop --profile.
+    """
+    import httpx
+
+    monkeypatch.setattr(
+        "omnigent.chat._remote_headers",
+        lambda server_url=None, *, host_id=None: {"Authorization": "Bearer x"},
+    )
+    calls = {"n": 0}
+
+    def _get(url: str, **kw: object) -> object:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _databricks_probe_response(200)  # authed probe
+        raise httpx.ConnectError("connection refused")  # unauthed re-probe
+
+    monkeypatch.setattr(httpx, "get", _get)
+    monkeypatch.setattr("omnigent.cli_auth.load_databricks_workspace_host", lambda server: None)
+
+    with pytest.raises(click.ClickException, match="Could not reach"):
+        cli._ensure_databricks_server_auth(
+            _HOST_DATABRICKS_SERVER, non_interactive=True, profile="my-user"
+        )
+
+
 def test_databricks_preflight_silent_sdk_refresh_skips_login(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

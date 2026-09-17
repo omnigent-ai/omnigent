@@ -3712,10 +3712,15 @@ def _ensure_databricks_server_auth(
         if workspace_host is None:
             try:
                 unauthed_probe = _httpx.get(f"{server}/v1/me", timeout=10.0)
-            except _httpx.HTTPError:
-                unauthed_probe = None
-            if unauthed_probe is not None:
-                workspace_host = _databricks_workspace_login_target(server, unauthed_probe)
+            except _httpx.HTTPError as exc:
+                # A transport failure is not evidence the server is
+                # non-Databricks; surface the connection error and let the
+                # user retry rather than telling them to drop --profile.
+                raise click.ClickException(
+                    f"Could not reach {server}/v1/me to determine the workspace "
+                    f"for --profile {profile!r}: {exc}. Check connectivity and retry."
+                ) from exc
+            workspace_host = _databricks_workspace_login_target(server, unauthed_probe)
         if workspace_host is None:
             raise click.ClickException(
                 f"--profile {profile!r} was requested, but {server} is not a "
@@ -9069,6 +9074,10 @@ def host(
     # ambient/default credentials. Reject it.
     if profile is not None and not profile.strip():
         raise click.ClickException("--profile was given but is empty; pass a profile name.")
+    # Carry the identity to subcommands (e.g. `enable`) so the persistent
+    # service registers under the same profile as foreground/background start.
+    if profile is not None:
+        ctx.obj["profile"] = profile
     if ctx.invoked_subcommand is not None:
         return
     # Kept before the config fallback below: `--background` echoes a `host
@@ -10140,10 +10149,22 @@ def host_enable(
     resolved_server = _resolve_host_server(server)
     group_obj = ctx.obj if isinstance(ctx.obj, dict) else {}
     non_interactive = non_interactive or bool(group_obj.get("non_interactive"))
+    profile = _host_group_option(ctx, "profile")
+    # --profile selects a Databricks workspace identity; it can't apply to a
+    # local service, so reject rather than install one that ignores the flag.
+    if profile is not None and not resolved_server:
+        raise click.ClickException(
+            "--profile selects a Databricks workspace identity and does not "
+            "apply to a local host. Omit --profile, or pass a Databricks-fronted "
+            "--server."
+        )
     if resolved_server:
+        # Pass the profile so the persistent service registers under the chosen
+        # identity, not whatever an existing token happens to authenticate as.
         _ensure_databricks_server_auth(
             resolved_server,
             non_interactive=non_interactive or not _stdin_is_tty(),
+            profile=profile,
         )
 
     target = _normalize_daemon_target(resolved_server)
