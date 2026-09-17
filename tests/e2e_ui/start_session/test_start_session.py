@@ -605,11 +605,13 @@ async def _drive_permission_mode(base_url: str, session_id: str) -> None:
             await page.get_by_test_id("new-chat-landing-input").wait_for(
                 state="visible", timeout=30_000
             )
-            # Claude Code auto-selects; the hand menu offers all six permission modes.
+            # Claude Code auto-selects; the hand menu offers all seven permission modes
+            # ("Default" is the no-flag inherit mode; "Manual" sends --permission-mode default).
             perm = page.get_by_test_id("new-chat-landing-permission-chip")
             await expect(perm).to_be_visible()
             await perm.click()
             perm_labels = (
+                "Default",
                 "Manual",
                 "Auto",
                 "Accept edits",
