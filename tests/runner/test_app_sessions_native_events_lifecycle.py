@@ -1326,6 +1326,110 @@ async def test_claude_native_model_options_use_session_launch_catalog(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("empty", [False, True])
+async def test_claude_native_model_options_refresh_the_bridge_vocabulary(
+    monkeypatch: pytest.MonkeyPatch,
+    empty: bool,
+) -> None:
+    """Serving the session listing rewrites the bridge's picker vocabulary.
+
+    A cold launch can record no picker values (the store held no catalog
+    yet) while routed picks are accepted against this listing, so the
+    executor's launch snapshot must be refreshed to the served vocabulary --
+    and an authoritative empty catalog clears stale launch values instead
+    of leaving them to spell switches the pane cannot make.
+    """
+    from omnigent.harnesses.claude_native import bridge as claude_bridge
+    from omnigent.harnesses.claude_native.main import ClaudeModelProbe, ClaudeNativeUcodeConfig
+    from tests.runner.conftest import REAL_CLAUDE_LAUNCH_CATALOG
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main.claude_launch_catalog", REAL_CLAUDE_LAUNCH_CATALOG
+    )
+    conv_id = "7b527915981fe729dd9a19a6dfcbc048"
+    claude_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return claude_spec
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main.resolve_native_claude_config",
+        lambda *, spec: ClaudeNativeUcodeConfig(env={}, api_key_helper="printf token", model=None),
+    )
+
+    async def _probe(claude_config: object) -> ClaudeModelProbe:
+        del claude_config
+        if empty:
+            return ClaudeModelProbe(alias_rows=[], disabled_models=frozenset())
+        return ClaudeModelProbe(
+            alias_rows=[
+                {"id": "opus", "model": "claude-opus-4-10", "displayName": "Opus 4.10"},
+                {"id": "system.ai.glm-5-3", "model": "system.ai.glm-5-3", "displayName": "GLM"},
+            ],
+            disabled_models=frozenset(),
+        )
+
+    monkeypatch.setattr("omnigent.harnesses.claude_native.main.probe_claude_model_options", _probe)
+    recorded: list[tuple[Any, Any, Any, list[str]]] = []
+
+    def _record(
+        bridge_dir: Any,
+        *,
+        launch_env: Any,
+        launch_model: Any,
+        picker_values: Any = None,
+    ) -> None:
+        recorded.append((bridge_dir, launch_env, launch_model, list(picker_values or [])))
+
+    monkeypatch.setattr(claude_bridge, "record_model_vocabulary", _record)
+
+    async def _fake_auto_create(
+        session_id: str,
+        resource_registry: Any,
+        publish_event: Any,
+        **kwargs: Any,
+    ) -> SessionResourceView:
+        del resource_registry, publish_event, kwargs
+        return SessionResourceView(
+            id="terminal_claude_main",
+            type="terminal",
+            session_id=session_id,
+            name="claude:main",
+            metadata={"terminal_name": "claude", "session_key": "main", "running": True},
+        )
+
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_claude_terminal", _fake_auto_create
+    )
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        listing = await client.get(f"/v1/sessions/{conv_id}/claude-model-options")
+
+    assert listing.status_code == 200, listing.text
+    assert recorded, "the listing must refresh the bridge vocabulary"
+    bridge_dir, launch_env, launch_model, picker_values = recorded[-1]
+    assert bridge_dir == claude_bridge.bridge_dir_for_bridge_id(conv_id)
+    assert launch_env is None
+    assert launch_model is None
+    assert picker_values == ([] if empty else ["opus", "system.ai.glm-5-3"])
+
+
+@pytest.mark.asyncio
 async def test_claude_native_model_options_serves_probe_rows_after_pending(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

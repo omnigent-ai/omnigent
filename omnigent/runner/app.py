@@ -11134,6 +11134,37 @@ def create_runner_app(
             time.monotonic() + _CLAUDE_MODEL_OPTIONS_CACHE_TTL_S,
             rows,
         )
+        # Executor parity: a cold launch may have recorded no picker
+        # vocabulary (the store had no catalog yet), while routing decisions
+        # accept picks against THIS listing. Refresh the bridge snapshot so
+        # a routed turn's executor translates exactly the vocabulary served
+        # here — including an authoritative empty catalog, which clears
+        # stale launch values. Best-effort: the terminal may not exist yet.
+        try:
+            from omnigent.harnesses.claude_native.bridge import (
+                bridge_dir_for_bridge_id,
+                record_model_vocabulary,
+            )
+            from omnigent.models.claude_model_vocabulary import picker_command_values
+
+            bridge_id = await _claude_native_bridge_id_for_session(
+                server_client=server_client,
+                session_id=session_id,
+            )
+            await asyncio.to_thread(
+                record_model_vocabulary,
+                bridge_dir_for_bridge_id(bridge_id),
+                launch_env=None,
+                launch_model=None,
+                picker_values=picker_command_values(rows),
+            )
+        except Exception:  # noqa: BLE001 — vocabulary refresh is advisory
+            _logger.debug(
+                "claude-native model options: bridge vocabulary refresh skipped for session=%s",
+                session_id,
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
         return JSONResponse(status_code=200, content={"models": rows})
 
     @app.get("/v1/sessions/{session_id}/model-options")
