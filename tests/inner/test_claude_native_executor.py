@@ -1054,6 +1054,67 @@ async def test_run_turn_uses_the_custom_model_slot_id_verbatim(
 
 
 @pytest.mark.asyncio
+async def test_run_turn_types_a_managed_picker_row_verbatim(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A routed model of no Claude family is spelled by the pane's picker.
+
+    A workspace-managed picker lists every served model by its own id, and
+    ``/model`` takes those verbatim — but no alias pin covers them, so the
+    switch was skipped and the turn ran on the launch model.
+    """
+    monkeypatch.delenv(REQUEST_SESSION_ID_ENV_VAR, raising=False)
+    slash_calls: list[str] = []
+
+    def fake_inject_slash_command(
+        bridge_dir_arg: Path,
+        *,
+        command: str,
+        timeout_s: float = 30.0,
+        auto_confirm: bool = False,
+        confirm_hint: str | None = None,
+    ) -> None:
+        del bridge_dir_arg, timeout_s, auto_confirm, confirm_hint
+        slash_calls.append(command)
+
+    monkeypatch.setattr(claude_native_executor, "read_launch_model", lambda _bridge: None)
+    monkeypatch.setattr(
+        claude_native_executor,
+        "read_model_env",
+        lambda _bridge: {
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": "system.ai.claude-opus-4-8[1m]",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL": "system.ai.claude-sonnet-4-6[1m]",
+        },
+    )
+    monkeypatch.setattr(
+        claude_native_executor,
+        "read_model_picker_values",
+        lambda _bridge: ["system.ai.claude-opus-4-8[1m]", "system.ai.glm-5-3"],
+    )
+    monkeypatch.setattr(claude_native_executor, "inject_slash_command", fake_inject_slash_command)
+    monkeypatch.setattr(
+        claude_native_executor,
+        "inject_user_message",
+        lambda bridge_dir_arg, *, content, timeout_s=30.0: None,
+    )
+
+    executor = ClaudeNativeExecutor(tmp_path / "bridge")
+    events = [
+        event
+        async for event in executor.run_turn(
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[],
+            system_prompt="",
+            config=ExecutorConfig(model="system.ai.glm-5-3"),
+        )
+    ]
+
+    assert slash_calls == ["/model system.ai.glm-5-3"]
+    assert events == [TurnComplete(response=None)]
+
+
+@pytest.mark.asyncio
 async def test_run_turn_skips_switch_for_untranslatable_model(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

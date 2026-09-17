@@ -5891,11 +5891,16 @@ def create_runner_app(
             inject_slash_command,
             read_claude_status_model,
             read_model_env,
+            read_model_picker_values,
         )
         from omnigent.harnesses.claude_native.main import (
             resolve_claude_native_model_selection,
+            stored_claude_picker_values,
         )
-        from omnigent.models.claude_model_vocabulary import claude_model_command_arg
+        from omnigent.models.claude_model_vocabulary import (
+            claude_model_command_arg,
+            picker_command_values,
+        )
 
         if model is None or not model.strip():
             return Response(status_code=204)
@@ -5911,18 +5916,31 @@ def create_runner_app(
             resolve_claude_native_model_selection(selected_model, claude_config) or selected_model
         )
         # ``/model`` takes only this session's own picker vocabulary — its
-        # family aliases and its one custom slot. Typing a bare catalog id
-        # outside it leaves the pane on its old model while this handler
+        # picker values, its family aliases, its one custom slot. Typing an
+        # id outside it leaves the pane on its old model while this handler
         # reports success, so fail loud instead. Same translation the routed
         # turn path and the executor apply.
         env = read_model_env(bridge_dir) or None
-        model_arg = claude_model_command_arg(resolved_model, env)
+        # The picker values matter most on a gateway-managed picker, whose
+        # rows are named by served id (``system.ai.glm-5-3``) and spelled by
+        # no alias or pin. The session's own rows, the launch's record, and
+        # the stored catalog are that picker read from whichever of the three
+        # this runner still holds.
+        cached_options = _claude_model_options_rows.get(conv_id)
+        picker_values = picker_command_values(
+            cached_options[1] if cached_options is not None else ()
+        ) or read_model_picker_values(bridge_dir)
+        if not picker_values:
+            picker_values = stored_claude_picker_values(claude_config)
+        model_arg = claude_model_command_arg(resolved_model, env, picker_values=picker_values)
         if model_arg is None:
             _logger.warning(
-                "claude-native model change: %r has no spelling session=%s accepts (pins=%s)",
+                "claude-native model change: %r has no spelling session=%s accepts "
+                "(pins=%s, picker=%s)",
                 resolved_model,
                 conv_id,
                 sorted(env or ()),
+                picker_values,
                 extra={"session_id": conv_id},
             )
             return JSONResponse(

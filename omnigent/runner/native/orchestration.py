@@ -7160,6 +7160,9 @@ async def _auto_create_claude_terminal(
     # only when it can change the outcome — to validate an explicit request,
     # or to resolve a Default launch that would otherwise pass no ``--model``
     # and leave the model to invisible CLI-private state.
+    # Bound here so the vocabulary record below reads the same rows the
+    # launch validated against, whether or not that validation ran.
+    launch_catalog: list[dict[str, object]] | None = None
     if session_model_override or launch_model is None:
         from omnigent.harnesses.claude_native.main import (
             claude_catalog_launch_spelling,
@@ -7171,7 +7174,6 @@ async def _auto_create_claude_terminal(
         )
         from omnigent.models.model_catalog_store import default_row
 
-        launch_catalog: list[dict[str, object]] | None = None
         launch_catalog_was_stale = False
         try:
             # Read staleness BEFORE the fetch: the fetch itself kicks the
@@ -7309,12 +7311,17 @@ async def _auto_create_claude_terminal(
     # ambient env (the CLI path records these at prepare time; the runner
     # resolves its config only after the bridge exists).
     from omnigent.harnesses.claude_native.bridge import record_model_vocabulary
+    from omnigent.harnesses.claude_native.main import stored_claude_picker_values
 
     await asyncio.to_thread(
         record_model_vocabulary,
         bridge_dir,
         launch_env=claude_config.env if claude_config is not None else None,
         launch_model=launch_model,
+        # The catalog rows are the CLI's own picker, so their ids are the
+        # spellings a later ``/model`` can type — a managed picker names
+        # rows no pin covers.
+        picker_values=stored_claude_picker_values(claude_config, launch_catalog),
     )
     _logger.info(
         "Claude terminal provider config resolved: session=%s configured=%s "

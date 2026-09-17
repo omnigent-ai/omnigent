@@ -38,7 +38,7 @@ from omnigent.util.json_types import JsonObject as _JsonObject
 if sys.platform != "win32":
     import termios
     import tty
-from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
@@ -1374,6 +1374,32 @@ async def claude_model_catalog(
                 }
             )
     return out
+
+
+def stored_claude_picker_values(
+    claude_config: ClaudeNativeUcodeConfig | None,
+    rows: Sequence[Mapping[str, object]] | None = None,
+) -> list[str]:
+    """The ``/model`` spellings this config's picker offers, without probing.
+
+    Catalog rows ARE the CLI's picker, so their ids are what ``/model``
+    accepts — the only vocabulary that spells a managed model of no Claude
+    family. *rows* is the catalog when the caller already holds it;
+    otherwise the stored catalog is read, a plain file read that never
+    probes, so neither a launch nor a mid-session switch waits on the CLI.
+
+    :param claude_config: The resolved launch config, or ``None``.
+    :param rows: Catalog rows already in hand, or ``None`` to read the store.
+    :returns: Picker values, empty when no catalog is known yet.
+    """
+    from omnigent.models import model_catalog_store
+    from omnigent.models.claude_model_vocabulary import picker_command_values
+
+    if rows is None:
+        rows = model_catalog_store.read_catalog(
+            "claude-native", claude_catalog_fingerprint(claude_config)
+        )
+    return picker_command_values(rows or ())
 
 
 async def claude_launch_catalog(
@@ -5033,6 +5059,7 @@ async def _prepare_claude_terminal(
             workspace=Path.cwd(),
             launch_model=claude_config.model if claude_config else None,
             launch_env=claude_config.env if claude_config else None,
+            picker_values=stored_claude_picker_values(claude_config),
         )
         _mark_startup_step(
             startup_profiler,

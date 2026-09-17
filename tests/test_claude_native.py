@@ -5886,7 +5886,7 @@ async def test_prepare_claude_terminal_cold_resume_injects_external_session_id(
     monkeypatch.setattr(
         claude_native,
         "prepare_bridge_dir",
-        lambda session_id, *, bridge_id=None, workspace, launch_model=None, launch_env=None: (
+        lambda session_id, *, bridge_id=None, workspace, **_vocabulary: (
             tmp_path / (bridge_id or session_id)
         ),
     )
@@ -6002,7 +6002,7 @@ async def test_prepare_claude_terminal_fresh_session_is_not_cold_resumed(
     monkeypatch.setattr(
         claude_native,
         "prepare_bridge_dir",
-        lambda session_id, *, bridge_id=None, workspace, launch_model=None, launch_env=None: (
+        lambda session_id, *, bridge_id=None, workspace, **_vocabulary: (
             tmp_path / (bridge_id or session_id)
         ),
     )

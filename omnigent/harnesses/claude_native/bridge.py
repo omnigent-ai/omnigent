@@ -45,7 +45,7 @@ import tempfile
 import threading
 import time
 import urllib.parse
-from collections.abc import Awaitable, Callable, Iterator, Mapping
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -1453,6 +1453,7 @@ def prepare_bridge_dir(
     workspace: Path,
     launch_model: str | None = None,
     launch_env: Mapping[str, str] | None = None,
+    picker_values: Sequence[str] | None = None,
     sandbox: OSEnvSandboxSpec | None = None,
 ) -> Path:
     """
@@ -1473,6 +1474,10 @@ def prepare_bridge_dir(
         ``ANTHROPIC_CUSTOM_MODEL_OPTION``) are persisted so runner-side
         callers — which don't share the terminal's env — can translate a
         routed model id into a ``/model`` argument the CLI accepts.
+    :param picker_values: The ``/model`` spellings this session's picker
+        offers, e.g. ``["system.ai.glm-5-3"]``. Persisted for the same
+        translation: a gateway-managed picker names rows by served id, and
+        no pin spells those.
     :param sandbox: Resolved ``os_env.sandbox`` for this session (the
         agent spec's declared sandbox, already overridden by any
         ``enforce_sandbox``/``force_sandbox`` policy verdict). Persisted
@@ -1512,6 +1517,8 @@ def prepare_bridge_dir(
     }
     if model_env:
         payload["model_env"] = model_env
+    if picker_values:
+        payload["model_picker_values"] = list(picker_values)
     if sandbox is not None:
         payload["sandbox"] = _bridge_sandbox_payload(sandbox)
     _write_json_file(bridge_dir / _CONFIG_FILE, payload)
@@ -1725,11 +1732,29 @@ def read_model_env(bridge_dir: Path) -> dict[str, str]:
     }
 
 
+def read_model_picker_values(bridge_dir: Path) -> list[str]:
+    """
+    Read the ``/model`` spellings this session's picker offers.
+
+    :param bridge_dir: Bridge directory path.
+    :returns: Picker values, e.g. ``["system.ai.glm-5-3"]``; empty when the
+        launch recorded no catalog (an older session, or a failed probe).
+    """
+    config = _read_json_file(bridge_dir / _CONFIG_FILE)
+    if not isinstance(config, dict):
+        return []
+    values = config.get("model_picker_values")
+    if not isinstance(values, list):
+        return []
+    return [value for value in values if isinstance(value, str) and value]
+
+
 def record_model_vocabulary(
     bridge_dir: Path,
     *,
     launch_env: Mapping[str, str] | None,
     launch_model: str | None,
+    picker_values: Sequence[str] | None = None,
 ) -> None:
     """
     Persist the launch's model vocabulary after the bridge dir exists.
@@ -1746,6 +1771,8 @@ def record_model_vocabulary(
         ``None`` for a bare subscription launch.
     :param launch_model: The model the launch pins via ``--model``, or
         ``None``.
+    :param picker_values: The ``/model`` spellings this session's picker
+        offers, or ``None``/empty when the catalog is unknown.
     :returns: None.
     """
     config = _read_json_file(bridge_dir / _CONFIG_FILE)
@@ -1759,6 +1786,9 @@ def record_model_vocabulary(
     changed = False
     if model_env and config.get("model_env") != model_env:
         config["model_env"] = model_env
+        changed = True
+    if picker_values and config.get("model_picker_values") != list(picker_values):
+        config["model_picker_values"] = list(picker_values)
         changed = True
     if launch_model and config.get("launch_model") != launch_model:
         config["launch_model"] = launch_model

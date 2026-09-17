@@ -2318,7 +2318,7 @@ async def test_events_model_change_mid_turn_defers_instead_of_failing(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("pins", "picked", "expected_command"),
+    ("pins", "picker_values", "picked", "expected_command"),
     [
         # The reported bug: a gateway config pins the three families but not
         # fable; picking the probed ``fable`` row injected ``/model opus`` —
@@ -2331,6 +2331,7 @@ async def test_events_model_change_mid_turn_defers_instead_of_failing(
                 "ANTHROPIC_DEFAULT_SONNET_MODEL": "databricks-claude-sonnet-5",
                 "ANTHROPIC_DEFAULT_HAIKU_MODEL": "databricks-claude-haiku-4-5",
             },
+            [],
             "fable",
             "/model fable",
             id="gateway-unpinned-family-is-never-swapped-for-the-default",
@@ -2342,6 +2343,7 @@ async def test_events_model_change_mid_turn_defers_instead_of_failing(
                 "ANTHROPIC_BASE_URL": "https://example.databricks.com/ai-gateway/anthropic",
                 "ANTHROPIC_DEFAULT_SONNET_MODEL": "databricks-claude-sonnet-5",
             },
+            [],
             "sonnet[1m]",
             "/model sonnet[1m]",
             id="pinned-bracket-alias-passes-through",
@@ -2350,15 +2352,34 @@ async def test_events_model_change_mid_turn_defers_instead_of_failing(
         # dropping the 1M-context marker.
         pytest.param(
             {},
+            [],
             "sonnet[1m]",
             "/model sonnet[1m]",
             id="bare-login-bracket-alias-keeps-its-context-marker",
+        ),
+        # A workspace-managed picker lists every model the gateway serves by
+        # its served id, including models of no Claude family. No alias and
+        # no pin spells those, so the pick answered 503 ("no spelling for
+        # that model") and the pane stayed where it was — but ``/model``
+        # takes the picker's own row verbatim.
+        pytest.param(
+            {
+                "ANTHROPIC_BASE_URL": "https://example.databricks.com/ai-gateway/anthropic",
+                "ANTHROPIC_DEFAULT_OPUS_MODEL": "system.ai.claude-opus-4-8[1m]",
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": "system.ai.claude-sonnet-4-6[1m]",
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL": "system.ai.claude-haiku-4-5",
+            },
+            ["system.ai.claude-opus-4-8[1m]", "system.ai.glm-5-3"],
+            "system.ai.glm-5-3",
+            "/model system.ai.glm-5-3",
+            id="managed-picker-row-of-no-claude-family-is-typed-as-itself",
         ),
     ],
 )
 async def test_events_model_change_applies_the_picked_alias_verbatim(
     monkeypatch: pytest.MonkeyPatch,
     pins: dict[str, str],
+    picker_values: list[str],
     picked: str,
     expected_command: str,
 ) -> None:
@@ -2388,6 +2409,11 @@ async def test_events_model_change_applies_the_picked_alias_verbatim(
 
     monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _fake_inject)
     monkeypatch.setattr(claude_native_bridge, "read_model_env", lambda _bridge_dir: dict(pins))
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "read_model_picker_values",
+        lambda _bridge_dir: list(picker_values),
+    )
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.main._CLAUDE_CODE_MANAGED_SETTINGS_PATHS", ()
     )
