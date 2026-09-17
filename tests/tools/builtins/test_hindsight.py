@@ -267,3 +267,111 @@ def test_hindsight_tools_absent_from_registry_when_sdk_missing(
     finally:
         monkeypatch.undo()
         importlib.reload(builtins_mod)
+
+
+# ---------------------------------------------------------------------------
+# Credential resolution: inline api_key / api_key_ref / HINDSIGHT_API_KEY_FILE
+# ---------------------------------------------------------------------------
+
+
+def _built_api_key(built: MagicMock) -> str:
+    """Return the api_key the (patched) Hindsight client was constructed with."""
+    return built.call_args.kwargs["api_key"]
+
+
+def test_client_uses_inline_api_key() -> None:
+    tool = HindsightRetainTool({"api_key": "hsk_inline"})
+    with patch("hindsight_client.Hindsight") as built:
+        tool._client()
+    assert _built_api_key(built) == "hsk_inline"
+
+
+def test_client_resolves_api_key_ref_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MY_HSK", "hsk_from_env")
+    tool = HindsightRetainTool({"api_key_ref": "env:MY_HSK"})
+    with patch("hindsight_client.Hindsight") as built:
+        tool._client()
+    assert _built_api_key(built) == "hsk_from_env"
+
+
+def test_client_resolves_api_key_ref_file(tmp_path) -> None:
+    key_file = tmp_path / "api-key"
+    key_file.write_text("hsk_from_ref_file\n")
+    tool = HindsightRetainTool({"api_key_ref": f"file:{key_file}"})
+    with patch("hindsight_client.Hindsight") as built:
+        tool._client()
+    assert _built_api_key(built) == "hsk_from_ref_file"
+
+
+def test_client_auto_discovers_key_file_env(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    key_file = tmp_path / "api-key"
+    key_file.write_text("hsk_from_discovery\n")
+    monkeypatch.setenv("HINDSIGHT_API_KEY_FILE", str(key_file))
+    tool = HindsightRetainTool({})  # no api_key, no api_key_ref
+    with patch("hindsight_client.Hindsight") as built:
+        tool._client()
+    assert _built_api_key(built) == "hsk_from_discovery"
+
+
+def test_client_precedence_inline_over_ref_over_env_file(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    key_file = tmp_path / "api-key"
+    key_file.write_text("hsk_env_file")
+    monkeypatch.setenv("HINDSIGHT_API_KEY_FILE", str(key_file))
+    monkeypatch.setenv("REF_HSK", "hsk_ref")
+
+    inline = HindsightRetainTool({"api_key": "hsk_inline", "api_key_ref": "env:REF_HSK"})
+    ref = HindsightRetainTool({"api_key_ref": "env:REF_HSK"})
+    with patch("hindsight_client.Hindsight") as built_inline:
+        inline._client()
+    with patch("hindsight_client.Hindsight") as built_ref:
+        ref._client()
+    assert _built_api_key(built_inline) == "hsk_inline"
+    assert _built_api_key(built_ref) == "hsk_ref"
+
+
+def test_client_empty_key_file_raises(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    key_file = tmp_path / "api-key"
+    key_file.write_text("   \n")
+    monkeypatch.setenv("HINDSIGHT_API_KEY_FILE", str(key_file))
+    tool = HindsightRetainTool({})
+    with pytest.raises(Exception) as excinfo:
+        tool._client()
+    assert str(key_file) in str(excinfo.value)
+
+
+def test_client_requires_some_credential(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("HINDSIGHT_API_KEY_FILE", raising=False)
+    tool = HindsightRetainTool({})
+    with pytest.raises(ValueError) as excinfo:
+        tool._client()
+    message = str(excinfo.value)
+    assert "api_key_ref" in message
+    assert "HINDSIGHT_API_KEY_FILE" in message
+
+
+def test_client_rotation_rebuilds_on_key_change(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    key_file = tmp_path / "api-key"
+    key_file.write_text("hsk_v1")
+    monkeypatch.setenv("HINDSIGHT_API_KEY_FILE", str(key_file))
+    tool = HindsightRetainTool({})
+    with patch("hindsight_client.Hindsight") as built:
+        tool._client()
+        assert _built_api_key(built) == "hsk_v1"
+        key_file.write_text("hsk_v2")
+        tool._client()
+        # The rotated key is picked up: a second client is built with it.
+        assert built.call_count == 2
+        assert built.call_args.kwargs["api_key"] == "hsk_v2"
+
+
+def test_client_caches_when_key_unchanged(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    key_file = tmp_path / "api-key"
+    key_file.write_text("hsk_stable")
+    monkeypatch.setenv("HINDSIGHT_API_KEY_FILE", str(key_file))
+    tool = HindsightRetainTool({})
+    with patch("hindsight_client.Hindsight") as built:
+        tool._client()
+        tool._client()
+        assert built.call_count == 1
