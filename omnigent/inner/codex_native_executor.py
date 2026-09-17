@@ -57,6 +57,7 @@ from omnigent.inner.native_attachments import (
     parse_data_uri,
     unresolved_attachment_marker,
 )
+from omnigent.llms.prompt_cache import NATIVE_HARNESS_CAPABILITY, PromptCacheCapability
 from omnigent.util.reasoning_effort import (
     CODEX_NATIVE_EFFORTS,
     effort_for_model_switch,
@@ -280,6 +281,10 @@ class CodexNativeExecutor(Executor):
         # See designs/NATIVE_INJECTION_SERIALIZATION.md. Relies on the
         # adapter caching one executor per conversation.
         self._inject_lock = asyncio.Lock()
+
+    def prompt_cache_capability(self) -> PromptCacheCapability:
+        """:returns: Observable, non-controllable: the vendor CLI owns the payload."""
+        return NATIVE_HARNESS_CAPABILITY
 
     def supports_streaming(self) -> bool:
         """:returns: ``False`` because output is emitted by the native forwarder."""

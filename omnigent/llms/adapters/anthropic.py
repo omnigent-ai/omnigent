@@ -26,6 +26,11 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.llms.adapters._content import parse_data_uri
 from omnigent.llms.adapters.base import BaseAdapter
 from omnigent.llms.anthropic_model_metadata import parse_anthropic_model_metadata
+from omnigent.llms.prompt_cache import (
+    PromptCachePlan,
+    apply_anthropic_cache_control,
+    is_cache_hint_rejection,
+)
 from omnigent.models.model_metadata import ModelMetadata, ModelReasoningMode
 from omnigent.util.reasoning_effort import ANTHROPIC_EFFORTS, validate_effort_or_llm_error
 
@@ -67,6 +72,7 @@ class AnthropicAdapter(BaseAdapter):
         *,
         connection_params: dict[str, str] | None = None,
         timeout: int | None = None,
+        prompt_cache: PromptCachePlan | None = None,
     ) -> dict[str, Any] | AsyncIterator[dict[str, Any]]:
         """
         Send a request to the Anthropic Messages API.
@@ -80,6 +86,9 @@ class AnthropicAdapter(BaseAdapter):
             ``"api_key"``, ``"base_url"``.
         :param timeout: Request timeout in seconds. ``None`` uses
             the module default.
+        :param prompt_cache: Cache plan from the client. When it applies,
+            stable-prefix ``cache_control`` breakpoints are added, and a
+            provider refusal of them is retried once without them.
         :returns: Chat Completions response dict or async chunk
             iterator.
         """
@@ -100,9 +109,15 @@ class AnthropicAdapter(BaseAdapter):
             model_metadata=model_metadata,
         )
 
+        cache_plan = prompt_cache if prompt_cache is not None and prompt_cache.apply else None
+
         if stream:
             payload["stream"] = True
             effective_to = timeout if timeout is not None else _STREAM_TIMEOUT
+            if cache_plan is not None:
+                return _stream_with_cache_fallback(
+                    headers, payload, effective_base, effective_to, cache_plan
+                )
             return _stream_request(
                 headers,
                 payload,
@@ -111,12 +126,64 @@ class AnthropicAdapter(BaseAdapter):
             )
 
         effective_to = timeout if timeout is not None else _REQUEST_TIMEOUT
+        if cache_plan is not None:
+            try:
+                return await _send_request(
+                    headers,
+                    apply_anthropic_cache_control(payload),
+                    effective_base,
+                    effective_to,
+                )
+            except httpx.HTTPStatusError as exc:
+                if not _is_cache_rejection(exc):
+                    raise
+                _record_cache_rejection(cache_plan)
         return await _send_request(
             headers,
             payload,
             effective_base,
             effective_to,
         )
+
+
+def _is_cache_rejection(exc: httpx.HTTPStatusError) -> bool:
+    """Whether Anthropic refused the ``cache_control`` breakpoints."""
+    return is_cache_hint_rejection(exc.response.status_code, exc.response.text)
+
+
+def _record_cache_rejection(plan: PromptCachePlan) -> None:
+    """Mark the plan rejected and note the fail-open retry without content."""
+    plan.mark_rejected()
+    _logger.warning("Anthropic rejected prompt cache breakpoints; retrying without them")
+
+
+async def _stream_with_cache_fallback(
+    headers: dict[str, str],
+    payload: dict[str, Any],
+    base_url: str,
+    timeout: int,
+    plan: PromptCachePlan,
+) -> AsyncIterator[dict[str, Any]]:
+    """
+    Stream with cache breakpoints, retrying uncached if they are refused.
+
+    The provider rejects the request before any chunk is produced, so the
+    retry never duplicates streamed output.
+    """
+    started = False
+    try:
+        async for chunk in _stream_request(
+            headers, apply_anthropic_cache_control(payload), base_url, timeout
+        ):
+            started = True
+            yield chunk
+        return
+    except httpx.HTTPStatusError as exc:
+        if started or not _is_cache_rejection(exc):
+            raise
+        _record_cache_rejection(plan)
+    async for chunk in _stream_request(headers, payload, base_url, timeout):
+        yield chunk
 
 
 # ── Request translation ───────────────────────────────────
@@ -581,7 +648,23 @@ def _anthropic_to_chat(resp: dict[str, Any]) -> dict[str, Any]:
             # reports ``input + output`` directly. Keep the per-operand ``or 0``
             # guards so a missing count is treated as zero.
             "total_tokens": (usage.get("input_tokens") or 0) + (usage.get("output_tokens") or 0),
+            **_cache_usage(usage),
         },
+    }
+
+
+def _cache_usage(usage: dict[str, Any]) -> dict[str, int]:
+    """
+    Pick Anthropic's additive prompt-cache counters out of a usage block.
+
+    :param usage: Anthropic ``usage`` dict.
+    :returns: The ``cache_read_input_tokens`` / ``cache_creation_input_tokens``
+        entries that are present as integers.
+    """
+    return {
+        key: usage[key]
+        for key in ("cache_read_input_tokens", "cache_creation_input_tokens")
+        if isinstance(usage.get(key), int)
     }
 
 
@@ -616,6 +699,7 @@ async def _stream_to_chat_chunks(
             metadata["model"] = msg["model"]
             if msg_usage := msg.get("usage"):
                 usage_data["input_tokens"] = msg_usage.get("input_tokens", 0)
+                usage_data.update(_cache_usage(msg_usage))
             continue
 
         if event_type == "content_block_start":
@@ -675,6 +759,7 @@ async def _stream_to_chat_chunks(
                     "total_tokens": (
                         usage_data.get("input_tokens", 0) + usage_data.get("output_tokens", 0)
                     ),
+                    **_cache_usage(usage_data),
                 },
             )
             continue

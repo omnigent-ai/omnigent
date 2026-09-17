@@ -47,6 +47,7 @@ from omnigent.harnesses.claude_native.bridge import (
 from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
 from omnigent.harnesses.claude_native.status import sync_raw_status_context
 from omnigent.inner.hook_scripts.subagent_router import AGENT_TOOL_NAMES
+from omnigent.llms.prompt_cache import observe_harness_usage
 from omnigent.models.model_metadata import concrete_reported_model
 from omnigent.native._native_post_delivery import (
     append_dead_letter,
@@ -5034,6 +5035,7 @@ async def _post_external_session_usage(
     ):
         if token_usage is not None:
             telemetry.record_llm_usage(usage_span, token_usage)
+            telemetry.record_prompt_cache(usage_span, observe_harness_usage(token_usage))
         resp = await client.post(
             f"/v1/sessions/{session_id}/events",
             json={"type": "external_session_usage", "data": payload},

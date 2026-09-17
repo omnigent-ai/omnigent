@@ -13,7 +13,10 @@ import json
 import threading
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass, field
-from typing import Any, Protocol, TypeAlias, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, TypeAlias, runtime_checkable
+
+if TYPE_CHECKING:
+    from omnigent.llms.prompt_cache import PromptCacheCapability
 
 # ---------------------------------------------------------------------------
 # Type aliases for JSON-shaped executor boundaries
@@ -648,6 +651,16 @@ class Executor:
         return False
 
     def max_context_tokens(self) -> int | None:
+        return None
+
+    def prompt_cache_capability(self) -> PromptCacheCapability | None:
+        """
+        Declare how this executor's backend exposes prompt caching.
+
+        :returns: ``None`` when undeclared; vendor CLIs that report cache
+            token counts but own their payloads return an observable,
+            non-controllable capability.
+        """
         return None
 
     async def close_session(self, session_key: str) -> None:  # noqa: ARG002 — default no-op; subclasses with per-session state override

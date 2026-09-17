@@ -17,6 +17,11 @@ import httpx
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.llms.adapters.base import BaseAdapter
+from omnigent.llms.prompt_cache import (
+    PromptCachePlan,
+    is_cache_hint_rejection,
+    openai_prompt_cache_key,
+)
 from omnigent.llms.types import (
     NATIVE_TOOL_OUTPUT_TYPES,
     FunctionCallOutput,
@@ -275,6 +280,17 @@ def _parse_sse_line(line: str) -> dict[str, Any] | None:
     return result
 
 
+def _is_cache_rejection(exc: httpx.HTTPStatusError) -> bool:
+    """Whether OpenAI refused the prompt cache hint."""
+    return is_cache_hint_rejection(exc.response.status_code, exc.response.text)
+
+
+def _record_cache_rejection(plan: PromptCachePlan) -> None:
+    """Mark the plan rejected and note the fail-open retry without content."""
+    plan.mark_rejected()
+    _logger.warning("OpenAI rejected the prompt cache hint; retrying without it")
+
+
 def _resolve_base_url(
     override: str | None,
     default: str | None,
@@ -380,6 +396,29 @@ def _parse_responses_output(
     return output
 
 
+def _parse_responses_usage(usage_data: dict[str, Any]) -> Usage:
+    """
+    Convert a Responses API ``usage`` block to :class:`Usage`.
+
+    OpenAI reports cached prompt tokens inside ``input_tokens`` via
+    ``input_tokens_details.cached_tokens``; the flag records that inclusion.
+
+    :param usage_data: The Responses API ``usage`` dict.
+    :returns: The parsed usage.
+    """
+    details = usage_data.get("input_tokens_details")
+    cached = details.get("cached_tokens") if isinstance(details, dict) else None
+    if not isinstance(cached, int):
+        cached = None
+    return Usage(
+        input_tokens=usage_data.get("input_tokens"),
+        output_tokens=usage_data.get("output_tokens"),
+        total_tokens=usage_data.get("total_tokens"),
+        cache_read_input_tokens=cached,
+        input_tokens_include_cache=cached is not None,
+    )
+
+
 def _parse_responses_response(data: dict[str, Any]) -> Response:
     """
     Convert a Responses API response dict to a :class:`Response`.
@@ -389,15 +428,7 @@ def _parse_responses_response(data: dict[str, Any]) -> Response:
     """
     output = _parse_responses_output(data.get("output", []))
     usage_data: dict[str, Any] = data.get("usage") or {}
-    usage = (
-        Usage(
-            input_tokens=usage_data.get("input_tokens"),
-            output_tokens=usage_data.get("output_tokens"),
-            total_tokens=usage_data.get("total_tokens"),
-        )
-        if usage_data
-        else None
-    )
+    usage = _parse_responses_usage(usage_data) if usage_data else None
     model = data.get("model")
     if model is None:
         raise OmnigentError(
@@ -467,6 +498,7 @@ class OpenAIAdapter(OpenAICompatibleAdapter):
         stream: bool,
         connection_params: dict[str, str] | None = None,
         timeout: int | None = None,
+        prompt_cache: PromptCachePlan | None = None,
         **kwargs: Any,
     ) -> Response | AsyncIterator[ResponseStreamEvent]:
         """
@@ -491,6 +523,10 @@ class OpenAIAdapter(OpenAICompatibleAdapter):
             ``"api_key"``, ``"base_url"``.
         :param timeout: Request timeout in seconds. ``None`` uses
             the module default.
+        :param prompt_cache: Cache plan from the client. When it applies, a
+            ``prompt_cache_key`` derived from the stable prefix (tools and
+            instructions) is added so automatic prefix caching routes
+            consistently. A provider refusal is retried once without it.
         :param kwargs: Additional API kwargs (temperature, etc.).
         :returns: A :class:`Response` or an async iterator of
             :class:`ResponseStreamEvent`.
@@ -522,8 +558,21 @@ class OpenAIAdapter(OpenAICompatibleAdapter):
             api_key_override=params.get("api_key"),
         )
 
+        cached_payload: dict[str, Any] | None = None
+        cache_plan = prompt_cache if prompt_cache is not None and prompt_cache.apply else None
+        # A caller-supplied key wins; never overwrite it.
+        if cache_plan is not None and "prompt_cache_key" not in payload:
+            cached_payload = {
+                **payload,
+                "prompt_cache_key": openai_prompt_cache_key(instructions, payload.get("tools")),
+            }
+
         if stream:
             effective_to = timeout if timeout is not None else _STREAM_TIMEOUT
+            if cache_plan is not None and cached_payload is not None:
+                return self._stream_responses_with_cache_fallback(
+                    url, headers, cached_payload, payload, effective_to, cache_plan
+                )
             return self._stream_responses(
                 url,
                 headers,
@@ -531,6 +580,14 @@ class OpenAIAdapter(OpenAICompatibleAdapter):
                 effective_to,
             )
         effective_to = timeout if timeout is not None else _REQUEST_TIMEOUT
+        if cache_plan is not None and cached_payload is not None:
+            try:
+                resp_data = await self._send_request(url, headers, cached_payload, effective_to)
+                return _parse_responses_response(resp_data)
+            except httpx.HTTPStatusError as exc:
+                if not _is_cache_rejection(exc):
+                    raise
+                _record_cache_rejection(cache_plan)
         resp_data = await self._send_request(
             url,
             headers,
@@ -538,6 +595,34 @@ class OpenAIAdapter(OpenAICompatibleAdapter):
             effective_to,
         )
         return _parse_responses_response(resp_data)
+
+    async def _stream_responses_with_cache_fallback(
+        self,
+        url: str,
+        headers: dict[str, str],
+        cached_payload: dict[str, Any],
+        payload: dict[str, Any],
+        timeout: int,
+        plan: PromptCachePlan,
+    ) -> AsyncIterator[ResponseStreamEvent]:
+        """
+        Stream with the cache hint, retrying without it if it is refused.
+
+        The refusal arrives before any event is yielded, so the retry never
+        duplicates streamed output.
+        """
+        started = False
+        try:
+            async for event in self._stream_responses(url, headers, cached_payload, timeout):
+                started = True
+                yield event
+            return
+        except httpx.HTTPStatusError as exc:
+            if started or not _is_cache_rejection(exc):
+                raise
+            _record_cache_rejection(plan)
+        async for event in self._stream_responses(url, headers, payload, timeout):
+            yield event
 
     async def _stream_responses(
         self,

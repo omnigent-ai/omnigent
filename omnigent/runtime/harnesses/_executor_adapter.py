@@ -16,7 +16,7 @@ import logging
 import secrets
 import uuid
 from collections import deque
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from fastapi import Response
@@ -98,6 +98,19 @@ def _strip_mcp_tool_prefix(name: str) -> str:
 # is the deterministic respawn-desync signature, so it triggers a Tier-1 reset on the first
 # occurrence rather than waiting for the consecutive-orphan threshold.
 _HOST_TOOL_PREFIX = "sys_os_"
+
+
+def _record_harness_prompt_cache(
+    span: Any, executor: Executor, usage: Mapping[str, object]
+) -> None:
+    """Stamp a normalized cache observation for executors that declare one."""
+    capability = executor.prompt_cache_capability()
+    if capability is None or not capability.observable:
+        return
+    from omnigent.llms.prompt_cache import observe_harness_usage
+    from omnigent.runtime.telemetry import record_prompt_cache
+
+    record_prompt_cache(span, observe_harness_usage(usage, capability))
 
 
 def _is_host_tool(tool_name: str) -> bool:
@@ -292,6 +305,7 @@ class ExecutorAdapter(HarnessApp):
                                 from omnigent.runtime.telemetry import record_llm_usage
 
                                 record_llm_usage(agent_span, event.usage)
+                                _record_harness_prompt_cache(agent_span, executor, event.usage)
                     # --- End tracing ---
                     self._translate_event(event, ctx)
                     if isinstance(event, TurnComplete):

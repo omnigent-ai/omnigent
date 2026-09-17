@@ -44,6 +44,7 @@ from omnigent.inner.native_attachments import (
     attachment_reference_line,
     framework_notices,
 )
+from omnigent.llms.prompt_cache import NATIVE_HARNESS_CAPABILITY, PromptCacheCapability
 from omnigent.models.claude_model_vocabulary import claude_model_command_arg, normalized_model_id
 
 _logger = logging.getLogger(__name__)
@@ -84,6 +85,10 @@ class ClaudeNativeExecutor(Executor):
         # ``/model`` when the model actually changes. Seeded lazily from the
         # spawn ``launch_model`` on the first turn (``None`` = not yet known).
         self._applied_model: str | None = None
+
+    def prompt_cache_capability(self) -> PromptCacheCapability:
+        """:returns: Observable, non-controllable: the vendor CLI owns the payload."""
+        return NATIVE_HARNESS_CAPABILITY
 
     def supports_streaming(self) -> bool:
         """:returns: ``False`` because output is emitted by the transcript forwarder."""

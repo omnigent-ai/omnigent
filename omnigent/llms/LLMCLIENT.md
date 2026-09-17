@@ -324,6 +324,27 @@ Model strings without a provider prefix default to `"openai"` for backward compa
 
 ---
 
+## Prompt caching — `prompt_cache.py`
+
+Off by default. Enable per call with `responses.create(..., prompt_cache="opportunistic")`
+or process-wide with `OMNIGENT_PROMPT_CACHE=opportunistic`. Disabled requests send
+byte-identical payloads.
+
+| Path | Mechanism | Controllable | What Omnigent does |
+|---|---|---|---|
+| `anthropic` adapter | explicit breakpoints | yes | `cache_control: ephemeral` on the last tool and the system prompt; messages stay uncached suffix |
+| `openai` Responses adapter (default base URL) | automatic prefix | yes | adds a `prompt_cache_key` derived from tools + instructions; no retention override |
+| `openai` with a custom `base_url` | automatic prefix | no | observes `input_tokens_details.cached_tokens` only |
+| other providers | none | no | bypass |
+| Claude Code / Codex harnesses | vendor managed | no | `Executor.prompt_cache_capability()` + normalized cache token telemetry |
+
+If a provider returns a 400 naming the cache field, the adapter retries once without it.
+`Response.prompt_cache` carries a `PromptCacheObservation` (mechanism, hit/write/miss/bypass,
+read/write tokens, closed-set reason); it never contains prompt text, keys, or digests.
+`Usage.to_cost_usage()` returns the additive shape `compute_llm_cost` prices.
+
+---
+
 ## Dependencies
 
 - `httpx` (already in pyproject.toml) — HTTP client for all providers

@@ -18,10 +18,19 @@ from omnigent.llms._responses_to_chat import (
 )
 from omnigent.llms._usage_observer import notify as _notify_usage
 from omnigent.llms.adapters import get_adapter
+from omnigent.llms.adapters.anthropic import AnthropicAdapter
 from omnigent.llms.adapters.openai import OpenAIAdapter
 from omnigent.llms.errors import (
     PermanentLLMError,
     RetryableLLMError,
+)
+from omnigent.llms.prompt_cache import (
+    PromptCacheMode,
+    PromptCachePlan,
+    PromptCachePolicy,
+    observe_response_usage,
+    plan_prompt_cache,
+    resolve_prompt_cache_policy,
 )
 from omnigent.llms.routing import parse_model_string
 from omnigent.llms.types import (
@@ -50,13 +59,48 @@ def _emit_usage_from_response(response: Response) -> None:
     )
 
 
+def _attach_prompt_cache(response: Response, plan: PromptCachePlan | None) -> None:
+    """Attach a non-sensitive cache observation to ``response``."""
+    if plan is None:
+        return
+    observation = observe_response_usage(plan, response.usage)
+    response.prompt_cache = observation
+    _logger.debug(
+        "LLM prompt cache: mechanism=%s outcome=%s reason=%s read=%s write=%s",
+        observation.mechanism.value,
+        observation.outcome.value,
+        observation.reason.value,
+        observation.cache_read_input_tokens,
+        observation.cache_creation_input_tokens,
+    )
+
+
 async def _tee_stream_for_usage(
     stream: AsyncIterator[ResponseStreamEvent],
+    plan: PromptCachePlan | None = None,
 ) -> AsyncIterator[ResponseStreamEvent]:
     async for event in stream:
         if isinstance(event, ResponseCompletedEvent):
+            _attach_prompt_cache(event.response, plan)
             _emit_usage_from_response(event.response)
         yield event
+
+
+def _plan_for(
+    model: str,
+    policy: PromptCachePolicy,
+    connection_params: dict[str, str] | None,
+) -> PromptCachePlan | None:
+    """Build the request's cache plan; ``None`` lets routing errors surface later."""
+    try:
+        provider = parse_model_string(model).provider
+    except Exception:
+        return None
+    return plan_prompt_cache(
+        provider,
+        policy,
+        base_url_override=(connection_params or {}).get("base_url"),
+    )
 
 
 class _ResponsesNamespace:
@@ -82,6 +126,7 @@ class _ResponsesNamespace:
         connection_params: dict[str, str] | None = None,
         timeout: int | None = None,
         retry: RetryPolicy | None = None,
+        prompt_cache: PromptCachePolicy | PromptCacheMode | str | None = None,
         **kwargs: Any,
     ) -> Response | AsyncIterator[ResponseStreamEvent]:
         """
@@ -113,6 +158,10 @@ class _ResponsesNamespace:
             (timeouts, rate limits). ``None`` disables
             client-level retries. Useful for standalone calls
             outside the workflow engine.
+        :param prompt_cache: Prompt-cache policy, e.g.
+            ``"opportunistic"``. ``None`` reads ``OMNIGENT_PROMPT_CACHE``
+            (disabled when unset). Disabled requests send the uncached
+            payload unchanged; cache hints never fail a request.
         :param kwargs: Additional provider-specific kwargs (e.g.
             ``temperature``, ``max_tokens``).
         :returns: A :class:`Response` when ``stream=False``, or
@@ -122,6 +171,8 @@ class _ResponsesNamespace:
         :raises RetryableLLMError: When all retry attempts are
             exhausted.
         """
+
+        cache_plan = _plan_for(model, resolve_prompt_cache_policy(prompt_cache), connection_params)
 
         async def call_fn() -> Response | AsyncIterator[ResponseStreamEvent]:
             """
@@ -138,6 +189,7 @@ class _ResponsesNamespace:
                 stream=stream,
                 connection_params=connection_params,
                 timeout=timeout,
+                cache_plan=cache_plan,
                 **kwargs,
             )
 
@@ -146,9 +198,10 @@ class _ResponsesNamespace:
         else:
             result = await _execute_with_retry(call_fn, retry)
         if isinstance(result, Response):
+            _attach_prompt_cache(result, cache_plan)
             _emit_usage_from_response(result)
             return result
-        return _tee_stream_for_usage(result)
+        return _tee_stream_for_usage(result, cache_plan)
 
     async def _do_create(
         self,
@@ -161,6 +214,7 @@ class _ResponsesNamespace:
         stream: bool,
         connection_params: dict[str, str] | None,
         timeout: int | None,
+        cache_plan: PromptCachePlan | None = None,
         **kwargs: Any,
     ) -> Response | AsyncIterator[ResponseStreamEvent]:
         """
@@ -175,11 +229,16 @@ class _ResponsesNamespace:
         :param connection_params: Connection overrides or
             ``None``.
         :param timeout: Timeout in seconds or ``None``.
+        :param cache_plan: Prompt-cache plan; only forwarded to adapters
+            when it applies, so disabled calls are unchanged.
         :param kwargs: Additional provider-specific kwargs.
         :returns: Response or async streaming event iterator.
         """
         routed = parse_model_string(model)
         adapter = get_adapter(routed.provider)
+        cache_kwargs: dict[str, PromptCachePlan] = (
+            {"prompt_cache": cache_plan} if cache_plan is not None and cache_plan.apply else {}
+        )
 
         # OpenAI supports the Responses API natively — use it
         # directly so reasoning token events flow through
@@ -200,9 +259,12 @@ class _ResponsesNamespace:
                 stream=stream,
                 connection_params=connection_params,
                 timeout=timeout,
+                **cache_kwargs,
                 **kwargs,
             )
 
+        if not isinstance(adapter, AnthropicAdapter):
+            cache_kwargs = {}
         messages = responses_input_to_chat_messages(
             input,
             instructions,
@@ -237,6 +299,7 @@ class _ResponsesNamespace:
                 extra,
                 connection_params=connection_params,
                 timeout=timeout,
+                **cache_kwargs,
             )
             assert not isinstance(chunks, dict)
             return chat_stream_to_response_events(
@@ -252,6 +315,7 @@ class _ResponsesNamespace:
             extra,
             connection_params=connection_params,
             timeout=timeout,
+            **cache_kwargs,
         )
         assert isinstance(result, dict)
         return chat_response_to_response(result)

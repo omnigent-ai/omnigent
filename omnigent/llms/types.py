@@ -11,7 +11,10 @@ and ``.arguments`` attributes.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from omnigent.llms.prompt_cache import PromptCacheObservation
 
 
 @dataclass
@@ -106,11 +109,43 @@ class Usage:
     :param input_tokens: Number of input/prompt tokens.
     :param output_tokens: Number of output/completion tokens.
     :param total_tokens: Total tokens (input + output).
+    :param cache_read_input_tokens: Prompt tokens served from the provider's
+        prompt cache, or ``None`` when the provider did not report it.
+    :param cache_creation_input_tokens: Prompt tokens written to the
+        provider's prompt cache, or ``None`` when not reported.
+    :param input_tokens_include_cache: ``True`` when ``input_tokens`` already
+        counts cached reads (OpenAI); ``False`` when cache counts are additive
+        (Anthropic).
     """
 
     input_tokens: int | None = None
     output_tokens: int | None = None
     total_tokens: int | None = None
+    cache_read_input_tokens: int | None = None
+    cache_creation_input_tokens: int | None = None
+    input_tokens_include_cache: bool = False
+
+    def to_cost_usage(self) -> dict[str, int]:
+        """
+        Usage in the additive shape :func:`compute_llm_cost` prices.
+
+        ``input_tokens`` is the uncached portion; cache reads and writes are
+        separate so they are billed at their own rates.
+
+        :returns: e.g. ``{"input_tokens": 200, "output_tokens": 50,
+            "cache_read_input_tokens": 1800}``.
+        """
+        read = self.cache_read_input_tokens or 0
+        write = self.cache_creation_input_tokens or 0
+        input_tokens = self.input_tokens or 0
+        if self.input_tokens_include_cache:
+            input_tokens = max(input_tokens - read, 0)
+        usage = {"input_tokens": input_tokens, "output_tokens": self.output_tokens or 0}
+        if read:
+            usage["cache_read_input_tokens"] = read
+        if write:
+            usage["cache_creation_input_tokens"] = write
+        return usage
 
 
 @dataclass
@@ -125,11 +160,14 @@ class Response:
     :param model: The model identifier that produced the response,
         e.g. ``"claude-sonnet-4-20250514"``.
     :param usage: Token usage information, or ``None`` if unavailable.
+    :param prompt_cache: Normalized prompt-cache observation set by the
+        client, or ``None`` when the response did not pass through it.
     """
 
     output: list[MessageOutput | FunctionCallOutput | NativeToolOutput]
     model: str
     usage: Usage | None = None
+    prompt_cache: PromptCacheObservation | None = None
 
 
 # ── Streaming event types ─────────────────────────────────

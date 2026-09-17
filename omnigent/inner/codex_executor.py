@@ -38,6 +38,7 @@ from typing import Any, Protocol, TypeAlias, cast
 from omnigent._platform import resolve_cli_binary
 from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
+from omnigent.llms.prompt_cache import NATIVE_HARNESS_CAPABILITY, PromptCacheCapability
 from omnigent.models import model_catalog
 from omnigent.models.codex_model_vocabulary import (
     EXTENDED_CATALOG_MODELS,
@@ -3713,6 +3714,10 @@ class CodexExecutor(Executor):
             if app_session_factory is not None
             else _default_app_session_factory
         )
+
+    def prompt_cache_capability(self) -> PromptCacheCapability:
+        """:returns: Observable, non-controllable: the vendor CLI owns the payload."""
+        return NATIVE_HARNESS_CAPABILITY
 
     def supports_streaming(self) -> bool:
         return True

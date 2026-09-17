@@ -50,6 +50,7 @@ from omnigent.inner.bundle_skills import ensure_bundle_plugin_manifest
 from omnigent.inner.hook_scripts import subagent_router
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.llms.adapters._content import parse_data_uri as _parse_replay_data_uri
+from omnigent.llms.prompt_cache import NATIVE_HARNESS_CAPABILITY, PromptCacheCapability
 from omnigent.models import model_catalog
 from omnigent.models.claude_model_vocabulary import (
     ALIAS_MODEL_ENV_VARS,
@@ -2122,6 +2123,10 @@ class ClaudeSDKExecutor(Executor):
 
         client._query = None
         client._transport = None
+
+    def prompt_cache_capability(self) -> PromptCacheCapability:
+        """:returns: Observable, non-controllable: the vendor CLI owns the payload."""
+        return NATIVE_HARNESS_CAPABILITY
 
     def supports_streaming(self) -> bool:
         return True

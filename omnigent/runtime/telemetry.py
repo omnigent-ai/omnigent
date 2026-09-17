@@ -45,6 +45,8 @@ if TYPE_CHECKING:
     from opentelemetry.sdk.trace.export import SpanExporter
     from opentelemetry.trace import Span
 
+    from omnigent.llms.prompt_cache import PromptCacheObservation
+
 _logger = logging.getLogger(__name__)
 
 _RESP_PREFIX = "resp_"
@@ -725,6 +727,20 @@ def record_llm_usage(span: Span, usage: dict[str, Any]) -> None:
         span.set_attribute(
             _GEN_AI_CACHE_CREATION_TOKENS, int(usage["cache_creation_input_tokens"])
         )
+
+
+def record_prompt_cache(span: Span, observation: PromptCacheObservation) -> None:
+    """
+    Record a normalized prompt-cache observation on a span.
+
+    Only closed-set enum values and token counts are recorded, never prompt
+    text, cache keys, or digests.
+
+    :param span: The LLM or agent span to annotate.
+    :param observation: The observation to record.
+    """
+    for key, value in observation.to_attributes().items():
+        span.set_attribute(key, value)
 
 
 def record_error(span: Span, exc: BaseException) -> None:
