@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import sys
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -58,6 +62,81 @@ def test_wrapper_is_scoped_to_resolved_launch() -> None:
     assert wrapped[-len(args) :] == args
     assert wrapped[wrapped.index("--profile") + 1] == "gateway-test"
     assert "OMNIGENT_AGY_DATABRICKS_PROFILE" not in env
+
+
+@pytest.mark.parametrize("shadow", ["omnigent", "httpx"])
+def test_supervisor_uses_installed_packages_from_workspace(tmp_path: Path, shadow: str) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    marker = workspace / "workspace-package-imported"
+    shadow_file = workspace / f"{shadow}.py"
+    if shadow == "omnigent":
+        shadow_file = workspace / "omnigent/__init__.py"
+        shadow_file.parent.mkdir()
+    shadow_file.write_text(
+        "from pathlib import Path\nPath('workspace-package-imported').touch()\n"
+    )
+
+    class ModelsHandler(BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: object) -> None:
+            pass
+
+        def do_GET(self) -> None:
+            if not self.path.startswith("/api/2.1/unity-catalog/model-services?") or (
+                self.headers.get("Authorization") != "Bearer supervisor-test-token"
+            ):
+                self.send_error(403)
+                return
+            body = json.dumps(
+                {"model_services": [{"name": "model-services/system.ai.gemini-3-1-pro"}]}
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    child = tmp_path / "child.py"
+    child.write_text(
+        "import os, sys, urllib.request, urllib.error\n"
+        "from pathlib import Path\n"
+        "assert Path.cwd() == Path(sys.argv[1])\n"
+        "request = urllib.request.Request(\n"
+        "    os.environ['GOOGLE_GEMINI_BASE_URL'] + '/unsupported', data=b'{}',\n"
+        "    headers={'x-goog-api-key': os.environ['GEMINI_API_KEY']})\n"
+        "try:\n"
+        "    urllib.request.urlopen(request, timeout=5)\n"
+        "except urllib.error.HTTPError as exc:\n"
+        "    assert exc.code == 404\n"
+        "else:\n"
+        "    raise AssertionError('Expected the supervisor to reject this operation')\n"
+        "sys.exit(23)\n"
+    )
+    # Use the environment's installed package, without PYTHONPATH or a safe-path override.
+    env = {key: value for key, value in os.environ.items() if key in {"PATH", "HOME", "LANG"}}
+    config_file = tmp_path / "databrickscfg"
+    env["DATABRICKS_CONFIG_FILE"] = str(config_file)
+    env["NO_PROXY"] = "127.0.0.1,localhost"
+    argv = wrap_agy_gateway_launch(
+        [sys.executable, str(child), str(workspace)],
+        {"OMNIGENT_AGY_DATABRICKS_PROFILE": "supervisor-test"},
+    )
+    with ThreadingHTTPServer(("127.0.0.1", 0), ModelsHandler) as upstream:
+        thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+        thread.start()
+        try:
+            config_file.write_text(
+                f"[supervisor-test]\nhost = http://127.0.0.1:{upstream.server_port}\n"
+                "token = supervisor-test-token\nauth_type = pat\n"
+            )
+            result = subprocess.run(
+                argv, cwd=workspace, env=env, capture_output=True, text=True, timeout=30
+            )
+        finally:
+            upstream.shutdown()
+            thread.join(timeout=5)
+    assert not marker.exists(), "Supervisor imported a workspace package"
+    assert result.returncode == 23, result.stderr
 
 
 def test_selected_databricks_profile_owns_the_host(

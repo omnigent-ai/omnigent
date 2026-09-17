@@ -184,6 +184,8 @@ def test_invalid_gateway_url_is_actionable_and_does_not_echo_secrets(url: str) -
         "https://workspace.gcp.databricks.com/ai-gateway/mlflow/v1/responses",
         "https://gateway.example/v1/responses",
         "https://gateway.example/v1/chat/completions",
+        "https://api.openai.com/v1",
+        "https://API.OPENAI.COM./v1",
     ],
 )
 def test_incompatible_saved_gateway_blocks_launch_without_ambient_fallback(
@@ -200,3 +202,39 @@ def test_incompatible_saved_gateway_blocks_launch_without_ambient_fallback(
     with pytest.raises(OmnigentError):
         build_agy_launch(conversation_id=None, model=None, resume=False)
     assert not antigravity_credentials_ready()
+
+
+@pytest.mark.parametrize("url", ["https://gateway.example/v1", "https://openai.com.example/v1"])
+def test_custom_gemini_root_can_use_v1(url: str) -> None:
+    assert validate_gemini_base_url(url) == url
+
+
+@pytest.mark.parametrize("missing_key", [False, True])
+def test_agy_cli_reports_invalid_credentials_without_crash_reporting(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, missing_key: bool
+) -> None:
+    from click.testing import CliRunner
+
+    from omnigent.cli import cli
+
+    save_provider(tmp_path)
+    if not missing_key:
+        config = yaml.safe_load((tmp_path / "config.yaml").read_text())
+        config["providers"]["gateway"]["gemini"]["base_url"] = (
+            "https://gateway.example/v1/responses"
+        )
+        (tmp_path / "config.yaml").write_text(yaml.safe_dump(config))
+        secrets.store_secret("gateway", "fake-key")
+    monkeypatch.setattr("omnigent.cli._ensure_backend", lambda _: "http://127.0.0.1:1")
+    monkeypatch.setattr(
+        "omnigent.harnesses.antigravity_native.main.agy_binary_path", lambda: "agy"
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.antigravity_native.main._preflight_local_tools", lambda: None
+    )
+    result = CliRunner().invoke(cli, ["agy"])
+    assert result.exit_code == 1
+    assert "Error:" in result.output
+    assert ("setup --no-internal-beta" if missing_key else "OpenAI Responses") in result.output
+    assert "Traceback" not in result.output
+    assert not isinstance(result.exception, OmnigentError)

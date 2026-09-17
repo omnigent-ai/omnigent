@@ -35,7 +35,8 @@ def wrap_agy_gateway_launch(argv: list[str], env: dict[str, str]) -> list[str]:
     profile = env.pop(PROFILE_ENV, None)
     if profile is None:
         return argv
-    return [sys.executable, "-m", __name__, "--profile", profile, "--", *argv]
+    # A workspace may contain an older omnigent checkout or shadow a dependency.
+    return [sys.executable, "-P", "-m", __name__, "--profile", profile, "--", *argv]
 
 
 def _model_key(model: str) -> str:

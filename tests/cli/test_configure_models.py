@@ -3790,6 +3790,7 @@ def test_native_gemini_key_setup_uses_agy_model_default(isolated_config) -> None
         ),
         ("https://gateway.example/v1/responses", "OpenAI Responses and Chat Completions"),
         ("https://gateway.example/v1/chat/completions", "OpenAI Responses and Chat Completions"),
+        ("https://api.openai.com/v1", "OpenAI Responses and Chat Completions"),
     ],
 )
 def test_gemini_gateway_setup_recovers_from_invalid_url(

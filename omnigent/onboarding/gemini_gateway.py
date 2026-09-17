@@ -42,7 +42,11 @@ def validate_gemini_base_url(value: str) -> str:
             "a workspace URL and API key cannot be used directly here.",
             code=ErrorCode.INVALID_INPUT,
         )
-    if parsed.path.endswith(("/responses", "/chat/completions", "/completions", "/openai")):
+    if (
+        hostname == "openai.com"
+        or hostname.endswith(".openai.com")
+        or parsed.path.endswith(("/responses", "/chat/completions", "/completions", "/openai"))
+    ):
         raise OmnigentError(
             "OpenAI Responses and Chat Completions endpoints cannot be used by native agy, "
             "even when they serve Gemini models. Enter a native Gemini API root instead.",

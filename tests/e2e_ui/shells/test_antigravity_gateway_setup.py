@@ -54,6 +54,12 @@ def test_setup_gateway_reaches_real_agy_through_fresh_local_daemon(
     tool_completed = threading.Event()
     workspace = tmp_path / "workspace"
     workspace.mkdir()
+    if databricks:
+        shadow_package = workspace / "omnigent"
+        shadow_package.mkdir()
+        (shadow_package / "__init__.py").write_text(
+            "raise RuntimeError('The gateway supervisor imported workspace code')\n"
+        )
     tool_file = workspace / "gateway-tool-check.txt"
     tool_file.write_text("GATEWAY_TOOL_RESULT\n")
 

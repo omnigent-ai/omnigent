@@ -91,6 +91,7 @@ from omnigent._wrapper_labels import (
 )
 from omnigent.conversation_browser import conversation_url, open_conversation_link_if_enabled
 from omnigent.entities.session_resources import terminal_resource_id
+from omnigent.errors import OmnigentError
 from omnigent.harnesses.antigravity_native.bridge import (
     AGY_PLACEHOLDER_CONVERSATION_PREFIX,
     ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
@@ -259,7 +260,10 @@ def run_antigravity_native(
         raise click.ClickException("Antigravity command must not be empty.")
     _preflight_local_tools()
     # Fail early on an invalid selected provider before starting the server.
-    launch = resolve_native_antigravity_launch(model=model)
+    try:
+        launch = resolve_native_antigravity_launch(model=model)
+    except OmnigentError as exc:
+        raise click.ClickException(exc.message) from exc
     # Detect headless ONCE here (a controlling TTY on stdin+stdout means an
     # interactive client will attach to drive agy's request-review prompt; a
     # non-TTY launch must auto-bypass or the unattended turn hangs forever).
