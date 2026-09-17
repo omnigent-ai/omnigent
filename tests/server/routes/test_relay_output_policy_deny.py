@@ -254,6 +254,9 @@ class _ScriptedStreamResponse:
     ) -> None:
         del exc_type, exc, traceback
 
+    def raise_for_status(self) -> None:
+        """The scripted stream represents a successful HTTP response."""
+
     async def aiter_text(self) -> Any:
         import json as _json
 

@@ -26,6 +26,7 @@ from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes._host_launch import HostLaunchTarget, resolve_host_launch
 from omnigent.server.routes.host_tunnel import create_host_tunnel_router
 from omnigent.server.routes.hosts import create_hosts_router
+from omnigent.server.routes.skills import create_skills_router
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -888,6 +889,16 @@ def multi_user_app(
         ),
         prefix="/v1",
     )
+    app.include_router(
+        create_skills_router(
+            registry,
+            host_store,
+            conv_store,
+            auth_provider=auth,
+            permission_store=permission_store,
+        ),
+        prefix="/v1",
+    )
     return app, registry, host_store, conv_store
 
 
@@ -955,6 +966,38 @@ async def test_get_host_403_wrong_owner(
         f"Expected 403 for wrong owner, got {resp.status_code}. "
         "Owner check on GET /v1/hosts/{{id}} is missing."
     )
+
+
+@pytest.mark.parametrize("user,status", [(None, 401), ("bob@test.com", 403)])
+async def test_host_skills_requires_owner(
+    multi_user_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    user: str | None,
+    status: int,
+) -> None:
+    from fastapi.responses import JSONResponse
+
+    from omnigent.errors import OmnigentError
+
+    app, registry, host_store, _cs = multi_user_app
+
+    @app.exception_handler(OmnigentError)
+    async def handle_error(request: Request, exc: OmnigentError) -> JSONResponse:
+        return JSONResponse(status_code=exc.http_status, content={"detail": exc.message})
+
+    host_id = "294391bc835cde1130ef2a02dcd2b7b3"
+    host_store.upsert_on_connect(host_id, "alice-laptop", "alice@test.com")
+    _register_fake_host(registry, host_id, "alice@test.com")
+    conn = registry.get(host_id)
+    assert conn is not None
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get(
+            "/v1/skills",
+            params={"host_id": host_id, "harness": "claude-native", "path": "~"},
+            headers={"x-test-user": user} if user else {},
+        )
+    assert response.status_code == status, response.text
+    assert conn.outbound_queue.empty()
+    assert conn.pending_skills == {}
 
 
 async def test_launch_runner_403_wrong_owner(

@@ -45,6 +45,7 @@ const {
   normalizeSavedServerUrl,
   fetchServerManifest,
   isDatabricksManagedServerUrl,
+  databricksWorkspaceUiUrl,
   PRE_MANIFEST_BASELINE,
   LOCAL_HOSTS,
 } = require("./url");
@@ -66,6 +67,7 @@ const arca = require("./arca");
 const isaac = require("./isaac");
 const { createArcaConnectFlow } = require("./arca_connect_window");
 const { registerSessionExpiryReload } = require("./session-expiry");
+const { ensureDatabricksSession, databricksOAuthConfigured } = require("./databricks-session");
 const { decideWindowOpen, stripCrossOriginOpenerHeaders, WEB_SCHEMES } = require("./popupPolicy");
 const {
   SETTINGS_PATH,
@@ -551,6 +553,40 @@ const EXPIRY_RELOAD_MIN_INTERVAL_MS = 15_000;
  * — see session-expiry.js. A desktop user has no address bar to refresh out of
  * the resulting "Failed to load" state manually, so the shell does it.
  */
+/**
+ * Silently re-establish the DBAUTH cookie for a managed Databricks window that
+ * just navigated away to a login/SSO page (the expiry signal). The workspace
+ * SPA bounces an expired session via a CLIENT-SIDE navigation, which
+ * webRequest.onBeforeRedirect never sees — so this hangs off the away-watch's
+ * navigation detection instead. Re-mints from the stored token (no browser) and
+ * reloads on success; on failure it does nothing and the away banner handles it.
+ * Non-managed windows are left entirely to the banner. Throttled per window.
+ *
+ * @param {Electron.BrowserWindow} win
+ */
+function silentReauthManaged(win) {
+  if (!win || win.isDestroyed()) return;
+  const origin = pinnedOrigin(win);
+  if (!origin || !databricksOAuthConfigured() || !isDatabricksManagedServerUrl(origin)) return;
+  const now = Date.now();
+  const last = lastExpiryReloadAt.get(win) ?? 0;
+  if (now - last < EXPIRY_RELOAD_MIN_INTERVAL_MS) return;
+  lastExpiryReloadAt.set(win, now);
+  console.log(`[omnigent] databricks: left ${origin} (session likely expired); silent re-mint`);
+  ensureDatabricksSession(session.defaultSession, origin, { interactive: false })
+    .then(() => {
+      if (win.isDestroyed()) return;
+      // Navigate back to the workspace, NOT reload(): by now the window has
+      // already committed to the login page, so a reload would just re-load
+      // login. Load the workspace mount so the freshly-minted DBAUTH cookie
+      // lands us back in the app.
+      const target =
+        windows.get(win)?.serverUrl || databricksWorkspaceUiUrl(origin) || `${origin}/omnigent`;
+      void win.loadURL(target);
+    })
+    .catch((err) => console.warn(`[omnigent] databricks silent re-mint failed: ${err.message}`));
+}
+
 function registerSessionExpiryAccess() {
   registerSessionExpiryReload(session.defaultSession, isPinnedServerUrl, (origin) => {
     const now = Date.now();
@@ -559,7 +595,21 @@ function registerSessionExpiryAccess() {
       const last = lastExpiryReloadAt.get(win) ?? 0;
       if (now - last < EXPIRY_RELOAD_MIN_INTERVAL_MS) continue;
       lastExpiryReloadAt.set(win, now);
-      win.webContents.reload();
+      // For a Databricks workspace, silently refresh the OAuth token and re-mint
+      // the DBAUTH cookie before reloading (interactive:false — never pops a
+      // browser here). If there's nothing to refresh, the reload still triggers
+      // the ordinary SSO re-challenge.
+      if (databricksOAuthConfigured() && isDatabricksManagedServerUrl(origin)) {
+        void ensureDatabricksSession(session.defaultSession, origin, { interactive: false })
+          .catch((err) =>
+            console.warn("[omnigent] databricks session refresh on expiry failed:", err.message),
+          )
+          .finally(() => {
+            if (!win.isDestroyed()) win.webContents.reload();
+          });
+      } else {
+        win.webContents.reload();
+      }
     }
   });
 }
@@ -1465,6 +1515,9 @@ function createWindow(targetUrl, opts = {}) {
       debugLog: (message) => console.warn(`[omnigent] ${message}`),
       onAway: (returnUrl) => returnBanner.show(win, returnUrl ?? windows.get(win)?.serverUrl),
       onReturn: () => returnBanner.hide(win),
+      // Managed Databricks: the moment we leave to a login/SSO page, try a
+      // silent cookie re-mint so the user is back before the banner would show.
+      onLeave: () => silentReauthManaged(win),
     }),
   );
   if (destination) {
@@ -1804,6 +1857,36 @@ function newWindow() {
   // Cloning an ephemeral (multi-server) window keeps the clone
   // ephemeral, so Change Server… from it still won't touch saved settings.
   createWindow(current, { ephemeral: win ? windows.get(win)?.ephemeral === true : false });
+}
+
+/**
+ * Dev-only: clear the DBAUTH cookie for the focused window's pinned origin and
+ * reload, so the workspace bounces to its login page — exactly what a real
+ * cookie expiry looks like. That trips the session-expiry seam, which silently
+ * re-mints from the stored token (refreshing it when OMNIGENT_DATABRICKS_OAUTH_
+ * FORCE_REFRESH=1). Lets the whole refresh path be exercised on demand instead
+ * of waiting for the cookie to expire. Gated to unpackaged builds (see menu).
+ */
+async function simulateSessionExpiry() {
+  const win = activeWindow();
+  const origin = win ? pinnedOrigin(win) : null;
+  if (!origin) return;
+  const ses = session.defaultSession;
+  const cookies = await ses.cookies.get({ url: origin, name: "DBAUTH" });
+  await Promise.all(
+    cookies.map((c) => {
+      const scheme = c.secure ? "https" : "http";
+      const host =
+        c.domain && c.domain.startsWith(".")
+          ? c.domain.slice(1)
+          : c.domain || new URL(origin).hostname;
+      return ses.cookies.remove(`${scheme}://${host}${c.path || "/"}`, c.name);
+    }),
+  );
+  console.log(
+    `[omnigent] dev: cleared ${cookies.length} DBAUTH cookie(s) for ${origin}; reloading to trigger re-mint`,
+  );
+  win.webContents.reload();
 }
 
 /**
@@ -2190,6 +2273,14 @@ function buildMenu() {
         }
       },
     },
+    // Dev-only: exercise the session-expiry re-mint/refresh path on demand.
+    // Hidden (and provably absent) in packaged builds.
+    {
+      id: "simulate_session_expiry",
+      label: "Simulate Session Expiry (dev)",
+      visible: !app.isPackaged,
+      click: () => void simulateSessionExpiry(),
+    },
     { type: "separator" },
     // `role: "close"` carries the standard CmdOrCtrl+W shortcut and closes
     // the focused window. There is no File menu, so Close lives under Server.
@@ -2474,7 +2565,81 @@ function browserRegistryForSender(event) {
   return windows.get(win)?.browserRegistry ?? null;
 }
 
+const WORKSPACE_PICKER_PAGE = path.join(__dirname, "..", "workspace-picker", "index.html");
+
+/**
+ * Show the searchable workspace picker (workspace-picker/index.html) as a modal
+ * of `parent`, and resolve with the chosen workspace (or null if dismissed).
+ * Used for account-scoped (SPOG) logins to choose which workspace to bridge the
+ * account token to. Sibling in spirit to genie-one-desktop's WorkspacePicker.
+ *
+ * @param {Electron.BrowserWindow} parent
+ * @param {Array<{workspaceId: string, name: string, fqdn: string}>} workspaces
+ * @returns {Promise<{workspaceId: string, name: string, fqdn: string} | null>}
+ */
+// In-flight workspace pickers, keyed by their window's webContents id. The IPC
+// handlers (registered once, in registerWorkspacePickerIpc) dispatch on
+// event.sender.id, so concurrent pickers don't collide and a foreign renderer
+// (not a picker window) is ignored — it isn't in this map.
+const workspacePickers = new Map();
+
+/** Register the workspace-picker IPC once. Handlers look the sender up in
+ * workspacePickers, so only the picker that owns a webContents can read its
+ * list or resolve it. */
+function registerWorkspacePickerIpc() {
+  ipcMain.handle(
+    "workspacePicker:list",
+    (event) => workspacePickers.get(event.sender.id)?.workspaces ?? [],
+  );
+  ipcMain.on("workspacePicker:choose", (event, workspaceId) => {
+    const entry = workspacePickers.get(event.sender.id);
+    if (entry) entry.finish(entry.workspaces.find((w) => w.workspaceId === workspaceId) ?? null);
+  });
+  ipcMain.on("workspacePicker:cancel", (event) =>
+    workspacePickers.get(event.sender.id)?.finish(null),
+  );
+}
+
+function pickWorkspaceForBridge(parent, workspaces) {
+  return new Promise((resolve) => {
+    const picker = new BrowserWindow({
+      parent,
+      modal: true,
+      width: 540,
+      height: 620,
+      resizable: true,
+      minimizable: false,
+      maximizable: false,
+      title: "Select a workspace",
+      webPreferences: {
+        preload: path.join(__dirname, "workspace_picker_preload.js"),
+        contextIsolation: true,
+        nodeIntegration: false,
+      },
+    });
+
+    const id = picker.webContents.id;
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      workspacePickers.delete(id);
+      if (!picker.isDestroyed()) picker.close();
+      resolve(value);
+    };
+    workspacePickers.set(id, { workspaces, finish });
+    // A closed window (user hit the OS close button) resolves as cancelled.
+    picker.on("closed", () => finish(null));
+
+    console.log(
+      `[omnigent] databricks workspace picker: showing ${workspaces.length} workspace(s)`,
+    );
+    void picker.loadFile(WORKSPACE_PICKER_PAGE);
+  });
+}
+
 function registerIpc() {
+  registerWorkspacePickerIpc();
   // Setup page → persist URL and navigate the SENDING window to it. We target
   // the window that owns the setup page (via its webContents) rather than a
   // global, so connecting from one window doesn't hijack another.
@@ -2523,6 +2688,10 @@ function registerIpc() {
       saveSettings(settings);
     }
     if (win) {
+      // The window loads this URL. In SPOG mode the pre-auth below can resolve a
+      // different workspace than the user typed (they pick it in the browser), so
+      // this is reassigned to the picked workspace's UI URL before loadURL.
+      let loadTarget = target;
       // The user explicitly chose this server — it becomes the window's
       // trusted origin for privileged IPC and permission grants.
       pinWindow(win, new URL(target).origin);
@@ -2535,15 +2704,52 @@ function registerIpc() {
       void fetchServerManifest(target).then((manifest) => {
         if (!win.isDestroyed()) setWindowServerManifest(win, manifest);
       });
+      // Databricks-managed workspace: authenticate in the system browser and
+      // pre-seed the DBAUTH cookie before the SPA loads, so the window never
+      // runs the (now locked-down) login page itself. Best-effort — on any
+      // failure fall through to a plain load and let the SSO gate handle it.
+      if (databricksOAuthConfigured() && isDatabricksManagedServerUrl(target)) {
+        const dbxOrigin = new URL(target).origin;
+        // `?o=<workspace_id>` on the entered URL names the workspace explicitly
+        // (Databricks' workspace selector), so an account-scoped login can
+        // auto-select it and skip the picker.
+        const workspaceId = new URL(target).searchParams.get("o") || undefined;
+        try {
+          const resolvedOrigin = await ensureDatabricksSession(session.defaultSession, dbxOrigin, {
+            workspaceId,
+            pickWorkspace: (workspaces) => pickWorkspaceForBridge(win, workspaces),
+          });
+          // SPOG: the picked workspace differs from the entered SPOG/account
+          // host — re-point the window (and its trusted origin + saved URL) to
+          // the resolved workspace's /omnigent mount, where the DBAUTH cookie
+          // we just set is valid.
+          if (resolvedOrigin && resolvedOrigin !== dbxOrigin) {
+            loadTarget = databricksWorkspaceUiUrl(resolvedOrigin) ?? `${resolvedOrigin}/omnigent`;
+            pinWindow(win, resolvedOrigin);
+            setWindowServerUrl(win, loadTarget);
+            if (!ephemeral) {
+              const s = loadSettings();
+              s.server_url = loadTarget;
+              saveSettings(s);
+            }
+          }
+        } catch (err) {
+          // Best-effort: on any failure fall through to a plain load and let the
+          // workspace's own SSO gate handle sign-in in the window.
+          console.warn(
+            `[omnigent] databricks pre-auth failed; loading without a pre-seeded session: ${err.message}`,
+          );
+        }
+      }
       win
-        .loadURL(target)
+        .loadURL(loadTarget)
         .then(() => {
           // Only a server that actually responded earns a recents slot —
           // a typo'd or unreachable URL must not show up in the
           // quick-pick list on the setup page.
           if (!ephemeral) {
             const settings = loadSettings();
-            rememberRecentServer(settings, target);
+            rememberRecentServer(settings, loadTarget);
             saveSettings(settings);
           }
           // The desktop does NOT auto-connect this machine as a runner on

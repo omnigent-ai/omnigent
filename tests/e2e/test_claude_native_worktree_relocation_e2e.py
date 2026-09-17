@@ -42,8 +42,9 @@ approval the way ``EnterWorktree`` moves it.
 Desired behavior (asserted): after the terminal approval, the parked
 ``permission-request`` hook returns, the session has no pending elicitation,
 and the ``EnterWorktree`` result is in ``GET /v1/sessions/<id>/items`` — all
-without a ``Stop`` hook. Buggy behavior: the hook stays parked and nothing
-past the relocation is mirrored, so this test FAILS on its deadline.
+without a ``Stop`` hook. Returning via ``ExitWorktree`` must also mirror its
+result, both on a fresh forwarder and one started in reattach mode. Buggy
+behavior: the hook stays parked and nothing past the relocation is mirrored.
 
 Run::
 
@@ -96,15 +97,17 @@ _SERVER_BOOTSTRAP = "from omnigent.cli import main\n\nmain()\n"
 _HEALTH_TIMEOUT_S = 120.0
 _POLL_S = 0.25
 # Wall time for the forwarder to notice a change and the server to act on it.
-# The buggy path never converges (the hook's own long-poll lasts 300s), so a
+# The buggy path never converges (the hook's own long-poll lasts a day), so a
 # short deadline is what turns the bug into a failure.
 _CONVERGE_S = 20.0
 
 _CLAUDE_VERSION = "2.1.269"
 _CLAUDE_SESSION_ID = "9a8b7c6d-5e4f-4a3b-9c2d-1e0f9a8b7c6d"
 _TOOL_USE_ID = "toolu_bdrk_01EnterWorktreeApprovedInTui"
+_EXIT_TOOL_USE_ID = "toolu_bdrk_01ExitWorktreeKeep"
 _PROMPT = "marker-user-prompt-work-in-the-existing-universe-worktree"
 _ASSISTANT_TEXT = "marker-assistant-entering-the-worktree-first"
+_REATTACH_PROMPT = "marker-preexisting-history-before-reattach"
 
 
 def _find_free_port() -> int:
@@ -426,7 +429,7 @@ def _spawn_permission_request_hook(
     commands = _matching_hook_commands(settings, "PermissionRequest", "EnterWorktree")
     assert len(commands) == 1, f"expected one PermissionRequest hook, got {commands}"
     proc = subprocess.Popen(
-        ["/bin/sh", "-c", commands[0][0]],
+        ["/bin/sh", "-c", f"exec {commands[0][0]}"],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -477,6 +480,7 @@ async def _replay_terminal_approved_enter_worktree(
     cwd: Path,
     worktree: Path,
     hook_env: dict[str, str],
+    start_at_end: bool,
 ) -> dict[str, Any]:
     """Replay the journey against the real forwarder loop.
 
@@ -498,22 +502,30 @@ async def _replay_terminal_approved_enter_worktree(
         "exit the session to be prompted."
     )
 
-    # Claude boots and takes the prompt: SessionStart + UserPromptSubmit fire,
-    # which is how the bridge learns the transcript path.
-    old_transcript.write_text(_pre_approval_transcript(cwd, worktree), encoding="utf-8")
-    for event_name, fields in (
-        ("SessionStart", {"source": "startup"}),
-        ("UserPromptSubmit", {"prompt": _PROMPT}),
-    ):
-        await asyncio.to_thread(
-            _run_hooks,
-            settings,
-            event_name,
-            _hook_payload(event_name, cwd=cwd, transcript_path=old_transcript, **fields),
+    initial_history = (
+        _record(
+            "user",
+            uuid="preexisting-user-prompt-uuid",
+            parent_uuid=None,
             cwd=cwd,
-            env=hook_env,
-            subject=str(fields.get("source", "")),
+            git_branch="main",
+            message={"role": "user", "content": _REATTACH_PROMPT},
         )
+        + "\n"
+        if start_at_end
+        else ""
+    )
+    old_transcript.write_text(initial_history, encoding="utf-8")
+    source = "resume" if start_at_end else "startup"
+    await asyncio.to_thread(
+        _run_hooks,
+        settings,
+        "SessionStart",
+        _hook_payload("SessionStart", cwd=cwd, transcript_path=old_transcript, source=source),
+        cwd=cwd,
+        env=hook_env,
+        subject=source,
+    )
 
     forwarder = asyncio.create_task(
         fwd.forward_claude_transcript_to_session(
@@ -522,12 +534,34 @@ async def _replay_terminal_approved_enter_worktree(
             session_id=session_id,
             bridge_dir=bridge_dir,
             agent_name="claude-native-ui",
-            start_at_end=False,
+            start_at_end=start_at_end,
             poll_interval_s=0.05,
         )
     )
     hook_proc: subprocess.Popen[bytes] | None = None
     try:
+        # Seed the initial cursor before the new turn; reattach skips only
+        # the history that was already present when the forwarder started.
+        assert await _await_condition(
+            lambda: fwd._read_forward_state(bridge_dir) is not None,
+            "initial transcript cursor seeded",
+            _CONVERGE_S,
+        ), "precondition: the forwarder never seeded its initial cursor"
+        with old_transcript.open("a", encoding="utf-8") as handle:
+            handle.write(_pre_approval_transcript(cwd, worktree))
+        await asyncio.to_thread(
+            _run_hooks,
+            settings,
+            "UserPromptSubmit",
+            _hook_payload(
+                "UserPromptSubmit",
+                cwd=cwd,
+                transcript_path=old_transcript,
+                prompt=_PROMPT,
+            ),
+            cwd=cwd,
+            env=hook_env,
+        )
         assert await _await_condition(
             lambda: _items_containing(base_url, session_id, _TOOL_USE_ID) >= 1,
             "EnterWorktree function_call mirrored",
@@ -588,7 +622,7 @@ async def _replay_terminal_approved_enter_worktree(
             "permission-request hook long-poll returned",
             _CONVERGE_S,
         )
-        return {
+        observed = {
             "hook_returned": hook_returned,
             "hook_exit_code": hook_proc.poll(),
             "hook_stderr": (
@@ -598,20 +632,121 @@ async def _replay_terminal_approved_enter_worktree(
             ),
             "pending": _pending_elicitations(base_url, session_id),
             "result_items": _items_containing(base_url, session_id, result_message),
+            "reattach_history_items": _items_containing(base_url, session_id, _REATTACH_PROMPT),
             "bridge_transcript_path": (
                 json.loads((bridge_dir / "state.json").read_text()).get("transcript_path")
             ),
         }
+        if not hook_returned:
+            return observed
+
+        # ExitWorktree keeps the checkout, moves the same transcript back,
+        # and reports the restored path through its own PostToolUse hook.
+        exit_input = {"action": "keep"}
+        exit_response = {
+            "action": "keep",
+            "originalCwd": str(cwd),
+            "worktreePath": str(worktree),
+            "worktreeBranch": worktree.name,
+            "message": (
+                f"Exited worktree. Your work is preserved at {worktree} on branch "
+                f"{worktree.name}. Session is now back in {cwd}."
+            ),
+        }
+        exit_call = _record(
+            "assistant",
+            uuid="exit-assistant-tool-use-uuid",
+            parent_uuid="user-tool-result-uuid",
+            cwd=worktree,
+            git_branch=worktree.name,
+            message={
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": _EXIT_TOOL_USE_ID,
+                        "name": "ExitWorktree",
+                        "input": exit_input,
+                    }
+                ],
+            },
+        )
+        with new_transcript.open("a", encoding="utf-8") as handle:
+            handle.write(exit_call + "\n")
+        assert await _await_condition(
+            lambda: _items_containing(base_url, session_id, _EXIT_TOOL_USE_ID) >= 1,
+            "ExitWorktree function_call mirrored",
+            _CONVERGE_S,
+        ), "precondition: the forwarder never mirrored the ExitWorktree call"
+        os.replace(new_transcript, old_transcript)
+        exit_result = _record(
+            "user",
+            uuid="exit-user-tool-result-uuid",
+            parent_uuid="exit-assistant-tool-use-uuid",
+            cwd=cwd,
+            git_branch="main",
+            message={
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "content": exit_response["message"],
+                        "tool_use_id": _EXIT_TOOL_USE_ID,
+                    }
+                ],
+            },
+            toolUseResult=exit_response,
+            sourceToolAssistantUUID="exit-assistant-tool-use-uuid",
+        )
+        with old_transcript.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    {
+                        "type": "worktree-state",
+                        "worktreeSession": None,
+                        "sessionId": _CLAUDE_SESSION_ID,
+                    }
+                )
+                + "\n"
+                + exit_result
+                + "\n"
+            )
+        await asyncio.to_thread(
+            _run_hooks,
+            settings,
+            "PostToolUse",
+            _hook_payload(
+                "PostToolUse",
+                cwd=cwd,
+                transcript_path=old_transcript,
+                tool_name="ExitWorktree",
+                tool_input=exit_input,
+                tool_response=exit_response,
+                tool_use_id=_EXIT_TOOL_USE_ID,
+            ),
+            cwd=cwd,
+            env=hook_env,
+            subject="ExitWorktree",
+        )
+        assert await _await_condition(
+            lambda: _items_containing(base_url, session_id, exit_response["message"]) == 1,
+            "ExitWorktree result mirrored",
+            _CONVERGE_S,
+        ), "ExitWorktree's result was not mirrored after the transcript moved back"
+        observed["result_items"] = _items_containing(base_url, session_id, result_message)
+        return observed
     finally:
         _terminate(hook_proc)
         forwarder.cancel()
         with contextlib.suppress(asyncio.CancelledError):
-            await forwarder
+            _ = await forwarder
 
 
 @pytest.mark.timeout(300)
+@pytest.mark.parametrize("start_at_end", [False, True], ids=["fresh", "reattach"])
 def test_terminal_approved_enter_worktree_clears_the_web_approval_card(
     tmp_path: Path,
+    start_at_end: bool,
 ) -> None:
     """Approving ``EnterWorktree`` in the terminal must clear the web card.
 
@@ -628,6 +763,7 @@ def test_terminal_approved_enter_worktree_clears_the_web_approval_card(
     deadline -- this test FAILS naming the stale path the bridge still holds.
 
     :param tmp_path: Per-test temp dir (server DB, artifacts, fake Claude home).
+    :param start_at_end: Reattach skips pre-existing history before the new turn.
     """
     from omnigent.harnesses.claude_native.bridge import build_hook_settings, prepare_bridge_dir
 
@@ -676,7 +812,6 @@ def test_terminal_approved_enter_worktree_clears_the_web_approval_card(
             ap_server_url=base_url,
             ap_auth_headers={},
         )
-        (bridge_dir / "claude-settings.json").write_text(json.dumps(settings), encoding="utf-8")
         # Hook subprocesses run with ``python -I`` (no PYTHONPATH), so they
         # import the installed omnigent, as in production.
         hook_env = _localhost_env({"HOME": str(tmp_path / "home")})
@@ -692,6 +827,7 @@ def test_terminal_approved_enter_worktree_clears_the_web_approval_card(
                 cwd=cwd,
                 worktree=worktree,
                 hook_env=hook_env,
+                start_at_end=start_at_end,
             )
         )
         server_tail = (tmp_path / "server.log").read_text()[-2000:]
@@ -718,10 +854,11 @@ def test_terminal_approved_enter_worktree_clears_the_web_approval_card(
             "Session still shows a pending elicitation after the terminal "
             "answered it. " + diagnostics
         )
-        assert observed["result_items"] >= 1, (
-            "EnterWorktree's result was never mirrored into the conversation "
-            "store after the transcript relocated. " + diagnostics
+        assert observed["result_items"] == 1, (
+            "EnterWorktree's result must be mirrored exactly once across both "
+            "transcript relocations. " + diagnostics
         )
+        assert observed["reattach_history_items"] == 0, diagnostics
     finally:
         _terminate(server_proc)
         server_log.close()

@@ -612,7 +612,7 @@ describe("SettingsPage", () => {
       target: { value: "github" },
     });
     fireEvent.click(screen.getByTestId("transcript-view-default-terminal"));
-    fireEvent.click(screen.getByTestId("workspace-panel-default-collapsed"));
+    fireEvent.click(screen.getByTestId("workspace-panel-default-open"));
     fireEvent.click(screen.getByTestId("workspace-tab-default-subagents"));
     fireEvent.click(screen.getByTestId("hide-unconfigured-harnesses-toggle"));
     fireEvent.click(screen.getByTestId("ui-font-size-inc"));
@@ -631,6 +631,7 @@ describe("SettingsPage", () => {
     expect(localStorage.getItem("omnigent:terminal-theme")).toBe("dark");
     expect(localStorage.getItem("omnigent:default-transcript-view")).toBe("terminal");
     expect(localStorage.getItem("omnigent:ui-theme-palette")).toBe(JSON.stringify("github"));
+    expect(localStorage.getItem("omnigent:default-workspace-panel")).toBe("open");
     expect(localStorage.getItem("omnigent:default-workspace-tab")).toBe("subagents");
     expect(localStorage.getItem("omnigent:ui-font-size")).toBe("15");
     expect(localStorage.getItem("omnigent:code-font-size")).toBe("15");
@@ -664,7 +665,7 @@ describe("SettingsPage", () => {
       "aria-checked",
       "true",
     );
-    expect(screen.getByTestId("workspace-panel-default-open")).toHaveAttribute(
+    expect(screen.getByTestId("workspace-panel-default-collapsed")).toHaveAttribute(
       "aria-checked",
       "true",
     );

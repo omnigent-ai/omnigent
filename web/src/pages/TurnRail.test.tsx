@@ -13,6 +13,7 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TurnRail, type Turn } from "./TurnRail";
+import { useChatStore } from "@/store/chatStore";
 
 // The rail calls scrollToUserMessage on click; stub it so we assert the call
 // without needing a real scroll container / DOM anchors.
@@ -116,6 +117,7 @@ function emitIntersection(
 afterEach(() => {
   cleanup();
   scrollSpy.mockReset();
+  vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
 
@@ -318,6 +320,47 @@ describe("TurnRail", () => {
     const { container } = renderRail(makeTurns(3));
     const rail = container.querySelector(".turn-rail-fade")!;
     expect(rail).toHaveClass("pointer-events-auto");
+  });
+
+  it("does not page history during automatic rail movement", () => {
+    const loadMore = vi.spyOn(useChatStore.getState(), "loadMoreHistory").mockResolvedValue();
+    const { container } = render(
+      <TurnRail turns={makeTurns(50)} hasMoreHistory loadingMoreHistory={false} />,
+    );
+    const rail = container.querySelector(".turn-rail-fade")!;
+    fireEvent.scroll(rail, { target: { scrollTop: 10 } });
+    fireEvent.scroll(rail, { target: { scrollTop: 0 } });
+    expect(loadMore).not.toHaveBeenCalled();
+
+    fireEvent.mouseEnter(rail);
+    fireEvent.scroll(rail, { target: { scrollTop: 20 } });
+    expect(loadMore).not.toHaveBeenCalled();
+    fireEvent.scroll(rail, { target: { scrollTop: 10 } });
+    expect(loadMore).toHaveBeenCalledOnce();
+  });
+
+  it("pages on upward scrolling while a rail tick has keyboard focus", () => {
+    const loadMore = vi.spyOn(useChatStore.getState(), "loadMoreHistory").mockResolvedValue();
+    const { container } = render(
+      <TurnRail turns={makeTurns(50)} hasMoreHistory loadingMoreHistory={false} />,
+    );
+    const rail = container.querySelector(".turn-rail-fade")!;
+    fireEvent.scroll(rail, { target: { scrollTop: 100 } });
+    act(() => screen.getAllByRole("button")[0]!.focus());
+    fireEvent.scroll(rail, { target: { scrollTop: 20 } });
+    expect(loadMore).toHaveBeenCalledOnce();
+  });
+
+  it("pages on an upward wheel gesture even when the rail cannot scroll", () => {
+    const loadMore = vi.spyOn(useChatStore.getState(), "loadMoreHistory").mockResolvedValue();
+    const { container } = render(
+      <TurnRail turns={makeTurns(3)} hasMoreHistory loadingMoreHistory={false} />,
+    );
+    const rail = container.querySelector(".turn-rail-fade")!;
+    fireEvent.wheel(rail, { deltaY: 100 });
+    expect(loadMore).not.toHaveBeenCalled();
+    fireEvent.wheel(rail, { deltaY: -100 });
+    expect(loadMore).toHaveBeenCalledOnce();
   });
 
   it("stays visible and interactive while older history loads", () => {

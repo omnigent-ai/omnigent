@@ -95,6 +95,7 @@ function renderViewer(
   opts: {
     viewMode?: "editor" | "preview" | "source" | "diff";
     truncated?: boolean;
+    position?: { line: number };
     onRequestEditMode?: () => void;
   } = {},
 ) {
@@ -104,6 +105,7 @@ function renderViewer(
   // a .md path to exercise the remaining Shiki path.
   return render(
     <CodeViewer
+      position={opts.position}
       conversationId="conv_1"
       path={path}
       fileQuery={makeFileQuery(content, opts.truncated)}
@@ -386,6 +388,32 @@ describe("CodeViewer markdown preview rendering (issue #970)", () => {
     const { container } = renderMd("Ship it :tada: :rocket:");
     expect(container.textContent).toContain("🎉");
     expect(container.textContent).toContain("🚀");
+  });
+
+  it("renders $$…$$ math as KaTeX, not literal TeX (issue #7503)", () => {
+    // Math rendered fine in chat but showed raw `$$…$$`/`\frac` in the file
+    // preview; the preview now runs the same remark-math + rehype-katex the
+    // chat surface does. A `.katex` node proves the formula rendered.
+    const { container } = renderMd("$$\\text{Speedup} = \\frac{1}{(1-P) + \\frac{P}{N}}$$");
+    expect(container.querySelector(".katex")).not.toBeNull();
+    // The rendered MathML carries the formula's text (the `\text{Speedup}` run).
+    expect(container.textContent).toContain("Speedup");
+  });
+
+  it("renders explicit \\(…\\) TeX delimiters, matching chat", () => {
+    // Agents emit `\(…\)` / `\[…\]`; normalizeExplicitMathDelimiters rewrites
+    // them to `$$…$$` so the preview renders them like the chat surface.
+    const { container } = renderMd("Euler's identity: \\(e^{i\\pi} + 1 = 0\\).");
+    expect(container.querySelector(".katex")).not.toBeNull();
+  });
+
+  it("leaves single-$ prose (currency) as text, not math", () => {
+    // Single `$` is prose far more often than math (currency, shell vars), so
+    // it must not pair up and render the span between as math (chat parity).
+    const { container } = renderMd("It costs $5 to make and $10 to ship.");
+    expect(container.querySelector(".katex")).toBeNull();
+    expect(container.textContent).toContain("$5");
+    expect(container.textContent).toContain("$10");
   });
 
   it("renders embedded raw HTML that GitHub supports", () => {
@@ -747,3 +775,37 @@ describe("CodeViewer .ipynb routing", () => {
     expect(screen.getByText(/truncated/i)).toBeDefined();
   });
 });
+
+describe("source line navigation", () => {
+  it("centers and highlights the requested Markdown source line", () => {
+    const scroll = vi.fn();
+    const original = HTMLElement.prototype.scrollIntoView;
+    HTMLElement.prototype.scrollIntoView = scroll;
+    try {
+      renderViewer("first\nsecond\nthird", true, "notes.md", { position: { line: 2 } });
+      const line = screen.getByText("second").closest("[data-line]")?.parentElement?.parentElement;
+      expect(scroll).toHaveBeenCalledWith({ block: "center" });
+      expect(scroll.mock.instances.at(-1)).toBe(line);
+      expect(line).toHaveClass("bg-yellow-200/40");
+    } finally {
+      HTMLElement.prototype.scrollIntoView = original;
+    }
+  });
+});
+
+it.each([true, false])(
+  "clamps Markdown citations to the last loaded line (truncated=%s)",
+  (truncated) => {
+    const scroll = vi.fn();
+    const original = HTMLElement.prototype.scrollIntoView;
+    HTMLElement.prototype.scrollIntoView = scroll;
+    try {
+      renderViewer("first\nlast", true, "notes.md", { truncated, position: { line: 5000 } });
+      const last = screen.getByText("last").closest("[data-line]")?.parentElement?.parentElement;
+      expect(scroll.mock.instances.at(-1)).toBe(last);
+      expect(last).toHaveClass("bg-yellow-200/40");
+    } finally {
+      HTMLElement.prototype.scrollIntoView = original;
+    }
+  },
+);

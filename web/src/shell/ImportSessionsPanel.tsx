@@ -185,6 +185,10 @@ export function ImportSessionsPanel() {
               ))}
             </SelectContent>
           </Select>
+          <p className="text-xs text-muted-foreground" data-testid="import-limit-help">
+            The most recent sessions you opened in the harness. Sub-agent and automation runs are
+            skipped, and sessions you've already imported are counted separately, not re-imported.
+          </p>
         </div>
       ) : (
         <div className="flex flex-col gap-2">
@@ -247,6 +251,41 @@ export function ImportSessionsPanel() {
                 </li>
               ))}
             </ul>
+          )}
+          {result !== null && result.failures.length > 0 && (
+            <div className="flex flex-col gap-2" data-testid="import-failures">
+              <span className="text-sm font-medium text-destructive">
+                {result.failed} couldn't be imported
+              </span>
+              <ul className="flex max-h-48 flex-col gap-1 overflow-y-auto">
+                {result.failures.map((f, i) => (
+                  <li
+                    key={f.externalSessionId ?? `failure-${i}`}
+                    className="text-sm text-muted-foreground"
+                    data-testid="import-failure-item"
+                  >
+                    <span className="text-destructive">{f.reason}</span>
+                    {f.externalSessionId !== null && (
+                      <span className="ml-1 font-mono text-xs">({f.externalSessionId})</span>
+                    )}
+                  </li>
+                ))}
+              </ul>
+              <div>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  data-testid="import-retry"
+                  loading={submitting}
+                  onClick={() => void handleImport()}
+                >
+                  Retry failed
+                </Button>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  Retrying re-runs the import; sessions already imported are skipped.
+                </p>
+              </div>
+            </div>
           )}
         </div>
       )}

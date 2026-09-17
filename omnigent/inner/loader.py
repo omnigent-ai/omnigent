@@ -117,22 +117,15 @@ def load_agent_def(
 
 
 def _reject_unregistered_policy_handlers(data: YamlData) -> None:
-    """Reject ``type: function`` policies whose handler is not registered.
+    """Reject unregistered handlers before parsing an uploaded policy.
 
-    Scans the raw YAML ``policies:`` mapping for handler dotted paths
-    that are not in the policy registry and raises before any import or
-    factory call. Tool ``callable:`` paths are intentionally *not*
-    scanned — they are a separate surface and are not invoked at parse
-    time. See :func:`load_agent_def` for why this only runs on the
-    untrusted bundle-upload path.
-
-    :param data: The raw agent YAML dict (pre-parse). Non-dict input
-        (malformed YAML) is ignored here and left for the parser to
-        reject.
-    :raises ValueError: If a function policy names an unregistered
-        handler, e.g. ``"subprocess.Popen"``.
+    Check legacy handler/callable fields and native function paths, including
+    wrapped handlers. Tool callable paths are validated separately.
     """
-    from omnigent.policies.registry import is_registered_handler
+    from omnigent.policies.registry import (
+        function_policy_handler_allowed,
+        is_registered_handler,
+    )
 
     if not isinstance(data, dict):
         return
@@ -148,6 +141,23 @@ def _reject_unregistered_policy_handlers(data: YamlData) -> None:
         if isinstance(handler, str) and not is_registered_handler(handler):
             raise ValueError(
                 f"Policy {pname!r}: handler {handler!r} is not a registered policy "
+                f"handler. Uploaded agent bundles may only use handlers from the "
+                f"policy registry; a server admin must add custom handlers via the "
+                f"'policy_modules' config."
+            )
+        # Native function policies may use a string or a path/arguments mapping.
+        func = pdata.get("function")
+        if isinstance(func, str):
+            func_path, func_args = func, None
+        elif isinstance(func, dict):
+            func_path, func_args = func.get("path"), func.get("arguments")
+        else:
+            func_path, func_args = None, None
+        if isinstance(func_path, str) and not function_policy_handler_allowed(
+            func_path, func_args
+        ):
+            raise ValueError(
+                f"Policy {pname!r}: handler {func_path!r} is not a registered policy "
                 f"handler. Uploaded agent bundles may only use handlers from the "
                 f"policy registry; a server admin must add custom handlers via the "
                 f"'policy_modules' config."

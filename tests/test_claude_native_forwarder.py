@@ -2608,7 +2608,17 @@ async def test_measured_prefix_never_seeks_past_the_transcript_end(tmp_path: Pat
 
 
 @pytest.mark.asyncio
-async def test_relocated_transcript_keeps_the_cursor(tmp_path: Path) -> None:
+@pytest.mark.parametrize("start_at_end", [False, True])
+@pytest.mark.parametrize("from_disk", [False, True])
+@pytest.mark.parametrize("skip_prefix", [False, True])
+@pytest.mark.parametrize("destination_delayed", [False, True])
+async def test_relocated_transcript_keeps_the_cursor(
+    tmp_path: Path,
+    start_at_end: bool,
+    from_disk: bool,
+    skip_prefix: bool,
+    destination_delayed: bool,
+) -> None:
     """
     A moved transcript is followed from the same cursor, not re-seeded.
 
@@ -2625,19 +2635,44 @@ async def test_relocated_transcript_keeps_the_cursor(tmp_path: Path) -> None:
     old_path.parent.mkdir(parents=True)
     new_path.parent.mkdir(parents=True)
     old_path.write_text(
-        json.dumps({"type": "user", "uuid": "before-move", "message": {"role": "user"}}) + "\n",
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": "before-move",
+                "message": {"role": "user", "content": "enter the worktree"},
+            }
+        )
+        + "\n",
         encoding="utf-8",
     )
-    forwarded_up_to = old_path.stat().st_size
+    forwarded_up_to = old_path.stat().st_size if skip_prefix else 0
     state = forwarder.TranscriptForwardState(
         transcript_path=old_path,
-        line_cursor=1,
+        line_cursor=int(skip_prefix),
         byte_offset=forwarded_up_to,
+        current_response_id="current-turn",
         cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(old_path, forwarded_up_to),
-        seen_source_ids=("before-move",),
+        seen_source_ids=("already-posted:0:message",),
+        settled_response_id="settled-turn",
+        pending_settled_response_id="pending-turn",
     )
+    forwarder._write_forward_state(bridge_dir, state)
 
-    os.replace(old_path, new_path)
+    if destination_delayed:
+        transit_path = old_path.with_name("moving.jsonl")
+        os.replace(old_path, transit_path)
+        waiting = await forwarder._ensure_state_for_transcript(
+            bridge_dir=bridge_dir,
+            state=None if from_disk else state,
+            transcript_path=new_path,
+            start_at_end=start_at_end,
+            session_id="conv_moved",
+        )
+        assert waiting == state
+        assert forwarder._read_forward_state(bridge_dir) == state
+        os.replace(transit_path, new_path)
+    else:
+        os.replace(old_path, new_path)
     with new_path.open("a", encoding="utf-8") as handle:
         handle.write(
             json.dumps(
@@ -2652,19 +2687,445 @@ async def test_relocated_transcript_keeps_the_cursor(tmp_path: Path) -> None:
 
     moved = await forwarder._ensure_state_for_transcript(
         bridge_dir=bridge_dir,
-        state=state,
+        state=None if from_disk else state,
         transcript_path=new_path,
-        start_at_end=True,
+        start_at_end=start_at_end,
         session_id="conv_moved",
     )
 
-    assert moved.transcript_path == new_path
-    assert moved.byte_offset == forwarded_up_to
-    assert moved.seen_source_ids == ("before-move",)
+    assert moved == replace(state, transcript_path=new_path)
     assert forwarder._read_forward_state(bridge_dir) == moved
     result = forwarder._read_transcript_items_for_state(moved, "claude-native-ui", None)
-    assert len(result.items) == 1
-    assert result.items[0].source_id.startswith("after-move")
+    assert [item.source_id for item in result.items] == (
+        [] if skip_prefix else ["before-move:0:message"]
+    ) + ["after-move:0:message"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("start_at_end", [False, True])
+@pytest.mark.parametrize("from_disk", [False, True])
+@pytest.mark.parametrize(
+    "change", ["modified-prefix", "different-session", "different-session-empty-cursor"]
+)
+async def test_unrelated_transcript_does_not_inherit_relocated_cursor(
+    tmp_path: Path, start_at_end: bool, from_disk: bool, change: str
+) -> None:
+    """Changed content or a different session id must retain cold-start semantics."""
+    bridge_dir = tmp_path / "bridge"
+    old_path = tmp_path / "original" / "sid.jsonl"
+    new_path = (
+        tmp_path
+        / "worktree"
+        / ("sid.jsonl" if change == "modified-prefix" else "other-session.jsonl")
+    )
+    old_path.parent.mkdir()
+    new_path.parent.mkdir()
+    prefix = (
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": "before-move",
+                "message": {"role": "user", "content": "enter the worktree"},
+            }
+        )
+        + "\n"
+    )
+    old_path.write_text(prefix, encoding="utf-8")
+    skip_prefix = change != "different-session-empty-cursor"
+    byte_offset = old_path.stat().st_size if skip_prefix else 0
+    state = forwarder.TranscriptForwardState(
+        transcript_path=old_path,
+        line_cursor=int(skip_prefix),
+        byte_offset=byte_offset,
+        cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(old_path, byte_offset),
+        current_response_id="current-turn",
+        seen_source_ids=("already-posted:0:message",),
+        settled_response_id="settled-turn",
+        pending_settled_response_id="pending-turn",
+    )
+    forwarder._write_forward_state(bridge_dir, state)
+    new_path.write_text(
+        prefix.replace("before-move", "other--move") if change == "modified-prefix" else prefix,
+        encoding="utf-8",
+    )
+
+    seeded = await forwarder._ensure_state_for_transcript(
+        bridge_dir=bridge_dir,
+        state=None if from_disk else state,
+        transcript_path=new_path,
+        start_at_end=start_at_end,
+        session_id="conv_different_transcript",
+    )
+
+    expected_offset = new_path.stat().st_size if start_at_end else 0
+    assert seeded == forwarder.TranscriptForwardState(
+        transcript_path=new_path,
+        line_cursor=0,
+        byte_offset=expected_offset,
+        cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(new_path, expected_offset),
+    )
+    assert forwarder._read_forward_state(bridge_dir) == seeded
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("start_at_end", [False, True])
+@pytest.mark.parametrize("from_disk", [False, True])
+@pytest.mark.parametrize("move_at", ["read", "post"])
+@pytest.mark.parametrize("destination_delayed", [False, True])
+async def test_relocation_during_batch_preserves_unread_result_without_reposting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    start_at_end: bool,
+    from_disk: bool,
+    move_at: str,
+    destination_delayed: bool,
+) -> None:
+    """A move during a read/POST preserves both the old cursor and newly posted ids."""
+    bridge_dir = tmp_path / "bridge"
+    old_path = tmp_path / "original" / "sid.jsonl"
+    new_path = tmp_path / "worktree" / "sid.jsonl"
+    old_path.parent.mkdir()
+    new_path.parent.mkdir()
+    prefix = (
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": "user-prompt",
+                "message": {"role": "user", "content": "Enter the worktree"},
+            }
+        )
+        + "\n"
+    )
+    tool_call = (
+        json.dumps(
+            {
+                "type": "assistant",
+                "uuid": "assistant-tool-call",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "enter-worktree-call",
+                            "name": "EnterWorktree",
+                            "input": {"path": str(new_path.parent)},
+                        }
+                    ],
+                },
+            }
+        )
+        + "\n"
+    )
+    tool_result = (
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": "user-tool-result",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "enter-worktree-call",
+                            "content": "Entered worktree after terminal approval",
+                        }
+                    ],
+                },
+            }
+        )
+        + "\n"
+    )
+    old_path.write_text(prefix + tool_call, encoding="utf-8")
+    byte_offset = len(prefix.encode("utf-8"))
+    state = forwarder.TranscriptForwardState(
+        transcript_path=old_path,
+        line_cursor=1,
+        byte_offset=byte_offset,
+        cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(old_path, byte_offset),
+        seen_source_ids=("user-prompt:0:message",),
+    )
+    initial = forwarder._read_transcript_items_for_state(state, "claude-native-ui", None)
+    assert len(initial.items) == 1
+    assert initial.items[0].item_type == "function_call"
+    response_id = initial.current_response_id
+    assert response_id is not None
+    state = replace(
+        state, settled_response_id="older-turn", pending_settled_response_id=response_id
+    )
+    moved_during_batch = False
+    posted_items: list[dict[str, Any]] = []
+
+    def _relocate() -> None:
+        """Move the actual transcript and append the completed tool result once."""
+        nonlocal moved_during_batch
+        if moved_during_batch:
+            return
+        os.replace(old_path, new_path)
+        with new_path.open("a", encoding="utf-8") as handle:
+            handle.write(tool_result)
+        moved_during_batch = True
+
+    if move_at == "read":
+        read_items = forwarder._read_transcript_items_for_state
+
+        def _read_then_move(
+            read_state: forwarder.TranscriptForwardState,
+            agent_name: str,
+            settled_response_id: str | None,
+        ) -> TranscriptReadResult:
+            """Relocate after a real read, before its async caller can persist the cursor."""
+            result = read_items(read_state, agent_name, settled_response_id)
+            _relocate()
+            return result
+
+        monkeypatch.setattr(forwarder, "_read_transcript_items_for_state", _read_then_move)
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        """Record posts and optionally relocate while a tool-call POST is in flight."""
+        payload = json.loads(request.content)
+        if payload["type"] == "external_conversation_item":
+            posted_items.append(payload["data"])
+            if move_at == "post":
+                _relocate()
+        return httpx.Response(202, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_handle_request), base_url="http://test"
+    ) as client:
+        dedupe = forwarder._ForwardDedupeState()
+        forwarded = await forwarder._forward_available_items(
+            client=client,
+            session_id="conv_moved",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            state=state,
+            retry_tracker=forwarder._PostRetryTracker(),
+            dedupe=dedupe,
+        )
+        assert moved_during_batch
+        assert forwarded == replace(
+            state,
+            current_response_id=response_id,
+            seen_source_ids=(*state.seen_source_ids, initial.items[0].source_id),
+        )
+        assert forwarder._read_forward_state(bridge_dir) == forwarded
+        if destination_delayed:
+            transit_path = new_path.with_name("moving.jsonl")
+            os.replace(new_path, transit_path)
+            waiting = await forwarder._ensure_state_for_transcript(
+                bridge_dir=bridge_dir,
+                state=None if from_disk else forwarded,
+                transcript_path=new_path,
+                start_at_end=start_at_end,
+                session_id="conv_moved",
+            )
+            assert waiting == forwarded
+            if from_disk:
+                dedupe = forwarder._ForwardDedupeState()
+            quiet = await forwarder._forward_available_items(
+                client=client,
+                session_id="conv_moved",
+                bridge_dir=bridge_dir,
+                agent_name="claude-native-ui",
+                state=waiting,
+                retry_tracker=forwarder._PostRetryTracker(),
+                dedupe=dedupe,
+            )
+            assert quiet == forwarded
+            assert forwarder._read_forward_state(bridge_dir) == forwarded
+            assert dedupe.pending_settled_response_id == response_id
+            assert dedupe.settled_response_id == "older-turn"
+            os.replace(transit_path, new_path)
+        relocated = await forwarder._ensure_state_for_transcript(
+            bridge_dir=bridge_dir,
+            state=None if from_disk else forwarded,
+            transcript_path=new_path,
+            start_at_end=start_at_end,
+            session_id="conv_moved",
+        )
+        assert relocated == replace(forwarded, transcript_path=new_path)
+        if from_disk:
+            dedupe = forwarder._ForwardDedupeState()
+        completed = await forwarder._forward_available_items(
+            client=client,
+            session_id="conv_moved",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            state=relocated,
+            retry_tracker=forwarder._PostRetryTracker(),
+            dedupe=dedupe,
+        )
+        assert completed.byte_offset == new_path.stat().st_size
+        assert completed.line_cursor == 3
+        assert completed.current_response_id == response_id
+        assert completed.settled_response_id == "older-turn"
+        assert completed.pending_settled_response_id == response_id
+        assert forwarder._read_forward_state(bridge_dir) == completed
+        await forwarder._forward_available_items(
+            client=client,
+            session_id="conv_moved",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            state=completed,
+            retry_tracker=forwarder._PostRetryTracker(),
+            dedupe=dedupe,
+        )
+
+    assert [item["item_type"] for item in posted_items] == [
+        "function_call",
+        "function_call_output",
+    ]
+    assert [item["source_id"] for item in posted_items] == [
+        "assistant-tool-call:0:function_call",
+        "user-tool-result:0:function_call_output",
+    ]
+    assert [item["response_id"] for item in posted_items] == [response_id, response_id]
+    assert posted_items[-1]["item_data"] == {
+        "call_id": "enter-worktree-call",
+        "output": "Entered worktree after terminal approval",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("metadata_prefix", [False, True])
+async def test_partial_transcript_tail_does_not_promote_pending_settle(
+    tmp_path: Path, metadata_prefix: bool
+) -> None:
+    """An incomplete final record is not quiescence and must not become a scheduled wake."""
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    prefix = (
+        json.dumps(
+            {
+                "type": "assistant",
+                "uuid": "before-tail",
+                "message": {"role": "assistant", "content": "Entering the worktree"},
+            }
+        )
+        + "\n"
+    )
+    tail = (
+        json.dumps(
+            {
+                "type": "assistant",
+                "uuid": "final-tail",
+                "message": {"role": "assistant", "content": "Entered the worktree"},
+            }
+        )
+        + "\n"
+    )
+    split_at = len(tail) // 2
+    metadata = json.dumps({"type": "progress"}) + "\n" if metadata_prefix else ""
+    transcript_path.write_text(prefix + metadata + tail[:split_at], encoding="utf-8")
+    byte_offset = len(prefix.encode("utf-8"))
+    state = forwarder.TranscriptForwardState(
+        transcript_path=transcript_path,
+        line_cursor=1,
+        byte_offset=byte_offset,
+        cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(transcript_path, byte_offset),
+        current_response_id="current-turn",
+        seen_source_ids=("before-tail:0:message",),
+        settled_response_id="older-turn",
+        pending_settled_response_id="current-turn",
+    )
+    forwarder._write_forward_state(bridge_dir, state)
+    posted_items: list[dict[str, Any]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        """Record conversation items without substituting transcript parsing or file reads."""
+        payload = json.loads(request.content)
+        if payload["type"] == "external_conversation_item":
+            posted_items.append(payload["data"])
+        return httpx.Response(202, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_handle_request), base_url="http://test"
+    ) as client:
+        dedupe = forwarder._ForwardDedupeState()
+
+        async def _poll(
+            current_state: forwarder.TranscriptForwardState,
+        ) -> forwarder.TranscriptForwardState:
+            """Forward one real transcript batch with the shared settle latch."""
+            return await forwarder._forward_available_items(
+                client=client,
+                session_id="conv_partial_tail",
+                bridge_dir=bridge_dir,
+                agent_name="claude-native-ui",
+                state=current_state,
+                retry_tracker=forwarder._PostRetryTracker(),
+                dedupe=dedupe,
+            )
+
+        waiting = await _poll(state)
+        expected_offset = len((prefix + metadata).encode("utf-8"))
+        assert waiting == replace(
+            state,
+            line_cursor=1 + int(metadata_prefix),
+            byte_offset=expected_offset,
+            cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(
+                transcript_path, expected_offset
+            ),
+        )
+        assert dedupe.pending_settled_response_id == "current-turn"
+        assert dedupe.settled_response_id == "older-turn"
+        assert not posted_items
+        with transcript_path.open("a", encoding="utf-8") as handle:
+            handle.write(tail[split_at:])
+        completed = await _poll(waiting)
+        assert completed.byte_offset == transcript_path.stat().st_size
+        assert completed.pending_settled_response_id == "current-turn"
+        settled = await _poll(completed)
+        assert settled.pending_settled_response_id is None
+        assert settled.settled_response_id == "current-turn"
+        assert forwarder._read_forward_state(bridge_dir) == settled
+
+    assert len(posted_items) == 1
+    assert posted_items[0]["item_type"] == "message"
+    assert posted_items[0]["source_id"] == "final-tail:0:message"
+    assert posted_items[0]["response_id"] == "current-turn"
+
+
+@pytest.mark.asyncio
+async def test_missing_transcript_persists_new_pending_settle(tmp_path: Path) -> None:
+    """A Stop received during relocation stays durable without falsely settling its turn."""
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(json.dumps({"type": "progress"}) + "\n", encoding="utf-8")
+    byte_offset = transcript_path.stat().st_size
+    state = forwarder.TranscriptForwardState(
+        transcript_path=transcript_path,
+        line_cursor=1,
+        byte_offset=byte_offset,
+        cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(transcript_path, byte_offset),
+        current_response_id="current-turn",
+        settled_response_id="older-turn",
+    )
+    forwarder._write_forward_state(bridge_dir, state)
+    os.replace(transcript_path, tmp_path / "relocated.jsonl")
+    dedupe = forwarder._ForwardDedupeState(pending_settled_response_id="current-turn")
+
+    def _unexpected_request(request: httpx.Request) -> httpx.Response:
+        """A missing transcript cannot produce conversation item posts."""
+        raise AssertionError(f"Unexpected POST to {request.url}")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_unexpected_request), base_url="http://test"
+    ) as client:
+        waiting = await forwarder._forward_available_items(
+            client=client,
+            session_id="conv_missing_stop",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            state=state,
+            retry_tracker=forwarder._PostRetryTracker(),
+            dedupe=dedupe,
+        )
+
+    assert waiting == replace(state, pending_settled_response_id="current-turn")
+    assert forwarder._read_forward_state(bridge_dir) == waiting
+    assert dedupe.pending_settled_response_id == "current-turn"
+    assert dedupe.settled_response_id == "older-turn"
 
 
 @pytest.mark.asyncio
@@ -4247,7 +4708,7 @@ async def test_relay_permission_mode_mirrors_switch_and_dedupes() -> None:
         # The launch mode is posted, so the picker has a mode to show.
         await _relay("default")
         assert [p["type"] for p in posts] == ["external_permission_mode_change"]
-        assert posts[0]["data"] == {"permission_mode": "default"}
+        assert posts[0]["data"] == {"permission_mode": "default", "initial_observation": True}
         assert dedupe.posted_permission_mode == "default"
 
         # Unchanged footer is a no-op, not a repeat POST.
@@ -4256,7 +4717,7 @@ async def test_relay_permission_mode_mirrors_switch_and_dedupes() -> None:
 
         # The user presses shift+tab into auto mode.
         await _relay("auto")
-        assert posts[-1]["data"] == {"permission_mode": "auto"}
+        assert posts[-1]["data"] == {"permission_mode": "auto", "initial_observation": False}
         assert dedupe.posted_permission_mode == "auto"
 
         # Still auto — the switch isn't re-posted every poll.
@@ -4297,7 +4758,10 @@ async def test_relay_permission_mode_posts_manual_launch_mode() -> None:
         )
 
     assert posts == [
-        {"type": "external_permission_mode_change", "data": {"permission_mode": "default"}}
+        {
+            "type": "external_permission_mode_change",
+            "data": {"permission_mode": "default", "initial_observation": True},
+        }
     ]
     assert dedupe.posted_permission_mode == "default"
 
@@ -4346,11 +4810,62 @@ async def test_relay_permission_mode_retries_after_transient_failure() -> None:
 
         await _relay("plan")
         assert [p["data"] for p in posts] == [
-            {"permission_mode": "default"},
-            {"permission_mode": "plan"},
-            {"permission_mode": "plan"},
+            {"permission_mode": "default", "initial_observation": True},
+            {"permission_mode": "plan", "initial_observation": False},
+            {"permission_mode": "plan", "initial_observation": False},
         ]
         assert dedupe.posted_permission_mode == "plan"  # now committed
+
+
+@pytest.mark.parametrize(
+    ("modes", "statuses", "expected"),
+    [
+        pytest.param(
+            [None, "auto", None, "auto", "auto"],
+            [503, 202],
+            [("auto", True), ("auto", True)],
+            id="startup-retry-remains-passive",
+        ),
+        pytest.param(
+            ["default", "auto", "auto"],
+            [503, 503, 202],
+            [("default", True), ("auto", False), ("auto", False)],
+            id="switch-before-first-successful-post",
+        ),
+        pytest.param(
+            ["default", "auto", None, "default", "default"],
+            [202, 503, 503, 202],
+            [("default", True), ("auto", False), ("default", False), ("default", False)],
+            id="switch-back-to-posted-mode-is-still-a-selection",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_relay_permission_mode_provenance_survives_delivery_failures(
+    modes: list[str | None],
+    statuses: list[int],
+    expected: list[tuple[str, bool]],
+) -> None:
+    """Unreadable panes and failed POSTs must not erase an observed selection."""
+    dedupe = forwarder._ForwardDedupeState()
+    posts: list[dict[str, Any]] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        posts.append(json.loads(request.content)["data"])
+        return httpx.Response(statuses[len(posts) - 1], json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handle), base_url="http://test"
+    ) as client:
+        for mode in modes:
+            await forwarder._relay_permission_mode(
+                client, session_id="conv_abc", mode=mode, dedupe=dedupe
+            )
+
+    assert posts == [
+        {"permission_mode": mode, "initial_observation": initial} for mode, initial in expected
+    ]
+    assert dedupe.posted_permission_mode == expected[-1][0]
 
 
 def test_validated_transcript_state_resets_legacy_byte_cursor_without_fingerprint(
@@ -6775,7 +7290,9 @@ async def test_concurrent_subagent_502s_recover_without_phantom_completion(
         )
 
     assert set(attempts.values()) == {2}
-    assert sorted(status for _, status in statuses) == ["idle"] * 5
+    # The clean quiescence edge posts the badge-only "quiesced", never the
+    # terminal "idle" (which the runner would deliver as a completion).
+    assert sorted(status for _, status in statuses) == ["quiesced"] * 5
     assert all(entry.delivery_error is None for entry in state.subagents.values())
 
 
@@ -6982,8 +7499,45 @@ async def test_parent_output_forwards_while_child_history_is_blocked(
             await task
 
 
+def _observe_subagent_scans(
+    monkeypatch: pytest.MonkeyPatch,
+    response_for: Callable[[dict[str, Any]], dict[str, Any]],
+) -> asyncio.Event:
+    """Record HTTP calls and signal completion of two real child-history scans."""
+    completed = asyncio.Event()
+    scans = 0
+    original = forwarder._forward_available_subagents
+
+    async def scan(**kwargs: Any) -> Any:
+        nonlocal scans
+        state = await original(**kwargs)
+        scans += 1
+        if scans >= 2:
+            completed.set()
+        return state
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content) if request.content else {}
+        response = (
+            [response_for(item) for item in body] if isinstance(body, list) else response_for(body)
+        )
+        return httpx.Response(202, json=response)
+
+    @contextlib.asynccontextmanager
+    async def open_mock_client(*_args: Any, **_kwargs: Any) -> Any:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), base_url="http://ap"
+        ) as client:
+            yield client
+
+    monkeypatch.setattr(forwarder, "_forward_available_subagents", scan)
+    monkeypatch.setattr("omnigent.cli_auth.open_server_client", open_mock_client)
+    return completed
+
+
 async def test_subagent_watcher_skips_subagents_already_in_state(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
     On forwarder restart, sub-agents already in
@@ -7043,10 +7597,10 @@ async def test_subagent_watcher_skips_subagents_already_in_state(
             return {"queued": False, "child_session_id": "conv_unexpected"}
         return {}
 
-    server, _thread, base_url = _start_recording_server_with_responses(response_for)
+    scanned = _observe_subagent_scans(monkeypatch, response_for)
     task = asyncio.create_task(
         forward_claude_transcript_to_session(
-            base_url=base_url,
+            base_url="http://ap",
             headers={},
             session_id="conv_parent",
             bridge_dir=bridge_dir,
@@ -7055,17 +7609,12 @@ async def test_subagent_watcher_skips_subagents_already_in_state(
             poll_interval_s=0.01,
         )
     )
-    # Let the forwarder run a few ticks. Long enough to scan the
-    # subagents dir at least twice; if it would re-register, we'd
-    # see the POST in ``starts`` within this window.
     try:
-        await asyncio.sleep(0.2)
+        await asyncio.wait_for(scanned.wait(), timeout=5.0)
     finally:
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
-        server.shutdown()
-        server.server_close()
 
     assert starts == [], (
         f"forwarder re-registered a sub-agent that was already in state: {starts!r}"
@@ -7074,6 +7623,7 @@ async def test_subagent_watcher_skips_subagents_already_in_state(
 
 async def test_subagent_watcher_preserves_parked_sentinel_across_restart(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
     A sub-agent that exhausted its permanent-failure budget is "parked"
@@ -7133,10 +7683,10 @@ async def test_subagent_watcher_preserves_parked_sentinel_across_restart(
             return {"queued": False, "child_session_id": "conv_should_not_be_used"}
         return {}
 
-    server, _thread, base_url = _start_recording_server_with_responses(response_for)
+    scanned = _observe_subagent_scans(monkeypatch, response_for)
     task = asyncio.create_task(
         forward_claude_transcript_to_session(
-            base_url=base_url,
+            base_url="http://ap",
             headers={},
             session_id="conv_parent",
             bridge_dir=bridge_dir,
@@ -7146,13 +7696,11 @@ async def test_subagent_watcher_preserves_parked_sentinel_across_restart(
         )
     )
     try:
-        await asyncio.sleep(0.2)
+        await asyncio.wait_for(scanned.wait(), timeout=5.0)
     finally:
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
-        server.shutdown()
-        server.server_close()
 
     assert starts == [], f"forwarder retried a parked sub-agent after restart: {starts!r}"
 
@@ -7895,7 +8443,7 @@ def test_transcript_forward_state_persists_settled_response_id(tmp_path: Path) -
     assert legacy.settled_response_id is None
 
 
-def test_promote_pending_settle_waits_for_turn_quiescence() -> None:
+def test_promote_pending_settle_waits_for_turn_quiescence(tmp_path: Path) -> None:
     """
     A pending settle activates only once its turn has no output in flight.
 
@@ -7904,6 +8452,8 @@ def test_promote_pending_settle_waits_for_turn_quiescence() -> None:
     carries the turn's output would mis-read the tail as a scheduled
     wake and split the answer into a phantom new turn.
     """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
     dedupe = forwarder._ForwardDedupeState()
     dedupe.pending_settled_response_id = "resp_a"
     tail = ClaudeTranscriptItem(
@@ -7912,7 +8462,12 @@ def test_promote_pending_settle_waits_for_turn_quiescence() -> None:
         data={"role": "assistant", "content": [{"type": "output_text", "text": "tail"}]},
         response_id="resp_a",
     )
-    assert forwarder._promote_pending_settle(dedupe, [tail]) is False
+    assert (
+        forwarder._promote_pending_settle(
+            dedupe, [tail], transcript_path=transcript_path, byte_offset=0
+        )
+        is False
+    )
     assert dedupe.settled_response_id is None
     assert dedupe.pending_settled_response_id == "resp_a"
 
@@ -7924,7 +8479,12 @@ def test_promote_pending_settle_waits_for_turn_quiescence() -> None:
         data={"call_id": "c1", "output": "done"},
         response_id="resp_a",
     )
-    assert forwarder._promote_pending_settle(dedupe, [late_result]) is False
+    assert (
+        forwarder._promote_pending_settle(
+            dedupe, [late_result], transcript_path=transcript_path, byte_offset=0
+        )
+        is False
+    )
     assert dedupe.pending_settled_response_id == "resp_a"
 
     # Items for OTHER turns don't defer; a truly quiet batch promotes.
@@ -7934,12 +8494,22 @@ def test_promote_pending_settle_waits_for_turn_quiescence() -> None:
         data={"role": "assistant", "content": [{"type": "output_text", "text": "hi"}]},
         response_id="resp_b",
     )
-    assert forwarder._promote_pending_settle(dedupe, [other]) is True
+    assert (
+        forwarder._promote_pending_settle(
+            dedupe, [other], transcript_path=transcript_path, byte_offset=0
+        )
+        is True
+    )
     assert dedupe.settled_response_id == "resp_a"
     assert dedupe.pending_settled_response_id is None
 
     # Idempotent once promoted.
-    assert forwarder._promote_pending_settle(dedupe, []) is False
+    assert (
+        forwarder._promote_pending_settle(
+            dedupe, [], transcript_path=transcript_path, byte_offset=0
+        )
+        is False
+    )
 
 
 @pytest.mark.asyncio

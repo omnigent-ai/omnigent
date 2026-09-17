@@ -535,18 +535,21 @@ class SubagentEntry:
         so a failed later item can leave the cursor behind without
         re-posting earlier accepted items on the next poll.
     :param last_activity_ts: Unix timestamp of the most recent item
-        observed in this sub-agent's transcript. Used by the idle
+        observed in this sub-agent's transcript. Used by the quiescence
         heuristic — when ``now - last_activity_ts >
         _SUBAGENT_IDLE_QUIESCENCE_S`` we publish an
-        ``external_session_status: idle`` event. ``None`` when no
-        items have been seen yet (so the heuristic doesn't fire
-        before there's anything to be quiescent about).
+        ``external_session_status: quiesced`` event (a badge-only
+        signal; the server never forwards it to the runner as a
+        terminal edge). ``None`` when no items have been seen yet (so
+        the heuristic doesn't fire before there's anything to be
+        quiescent about).
     :param last_status: Last status string POSTed for this
         sub-agent — used to dedupe so we don't spam ``running`` or
-        ``idle`` events on every tick when nothing changed. ``None``
+        ``quiesced`` events on every tick when nothing changed. ``None``
         means no status has been posted yet.
     :param delivery_error: Durable reason the mirrored transcript is
-        incomplete. Its quiescence edge is ``failed`` instead of ``idle``.
+        incomplete. Its quiescence edge is ``failed`` instead of
+        ``quiesced``.
     """
 
     subagent_id: str
@@ -750,6 +753,10 @@ class _ForwardDedupeState:
     # mirrors the launch mode and any in-pane shift+tab switch, neither of
     # which the web UI can observe on its own.
     posted_permission_mode: str | None = None
+    # Observation advances even when delivery fails; a pending switch must
+    # survive retries, including a switch back to the last posted mode.
+    observed_permission_mode: str | None = None
+    permission_mode_change_pending: bool = False
     # Monotonic deadline before which the next pane capture is skipped, so the
     # single ``capture-pane`` subprocess (feeding both the permission-mode and
     # /btw signals) spawns at _PANE_POLL_INTERVAL_S, not every poll.
@@ -2155,7 +2162,10 @@ async def _forward_one_subagent(
         and new_entry.last_activity_ts is not None
         and now - new_entry.last_activity_ts > _SUBAGENT_IDLE_QUIESCENCE_S
     ):
-        desired_status = "failed" if new_entry.delivery_error else "idle"
+        # A bare transcript lull is a badge-only "quiesced", never terminal
+        # "idle": the runner delivers idle/failed as authoritative completions,
+        # and a still-running sub-agent mid tool call must not complete.
+        desired_status = "failed" if new_entry.delivery_error else "quiesced"
     if desired_status is None or desired_status == new_entry.last_status:
         return
     retry_key = f"subagent_status:{entry.child_conversation_id}"
@@ -3923,9 +3933,16 @@ async def _ensure_state_for_transcript(
     for cursor in (state, disk_state):
         if cursor is None or cursor.byte_offset is None or cursor.cursor_fingerprint is None:
             continue
-        if _jsonl_cursor_fingerprint(transcript_path, cursor.byte_offset) == (
-            cursor.cursor_fingerprint
-        ):
+        if cursor.transcript_path.name != transcript_path.name:
+            continue
+        try:
+            fingerprint = _jsonl_cursor_fingerprint(
+                transcript_path, cursor.byte_offset, missing_ok=False
+            )
+        except FileNotFoundError:
+            # Keep the relocation proof while the advertised path is unavailable.
+            return cursor
+        if fingerprint == cursor.cursor_fingerprint:
             moved = replace(cursor, transcript_path=transcript_path)
             await _write_forward_state_async(bridge_dir, moved)
             return moved
@@ -3974,7 +3991,11 @@ async def _cancel_subagent_forward_task(
 
 
 def _promote_pending_settle(
-    dedupe: _ForwardDedupeState, items: list[ClaudeTranscriptItem]
+    dedupe: _ForwardDedupeState,
+    items: list[ClaudeTranscriptItem],
+    *,
+    transcript_path: Path,
+    byte_offset: int,
 ) -> bool:
     """
     Activate a pending turn settle once the transcript is quiescent.
@@ -3983,16 +4004,24 @@ def _promote_pending_settle(
     and a late tool result can appear in the same tail. Promote only when a
     batch carries no item at all for the pending turn: any activity
     means its tail may still be in flight, and promoting then would
-    mis-mark the tail as a scheduled wake.
+    mis-mark the tail as a scheduled wake. A missing transcript or an
+    unfinished trailing record is not evidence of quiescence.
 
     :param dedupe: Mutable per-session dedupe/latch state.
     :param items: Transcript items read this poll (may be empty).
+    :param transcript_path: Transcript file that supplied the batch.
+    :param byte_offset: Offset after the last complete record read.
     :returns: ``True`` when the pending settle was activated.
     """
     pending = dedupe.pending_settled_response_id
     if pending is None:
         return False
     if any(item.response_id == pending for item in items):
+        return False
+    try:
+        if transcript_path.stat().st_size != byte_offset:
+            return False
+    except FileNotFoundError:
         return False
     dedupe.settled_response_id = pending
     dedupe.pending_settled_response_id = None
@@ -4215,9 +4244,14 @@ async def _forward_available_items(
         if result.line_cursor == state.line_cursor and result.byte_offset == (
             state.byte_offset or 0
         ):
-            # Quiet poll — the transcript is fully consumed, so a pending
-            # turn settle is safe to activate (and persist) here.
-            promoted = _promote_pending_settle(dedupe, items)
+            # A quiet poll can activate a pending settle once the file is
+            # present and its last complete record reaches EOF.
+            promoted = _promote_pending_settle(
+                dedupe,
+                items,
+                transcript_path=state.transcript_path,
+                byte_offset=result.byte_offset,
+            )
             if promoted or dedupe.pending_settled_response_id != state.pending_settled_response_id:
                 state = _with_settle_latch(state, dedupe)
                 await _write_forward_state_async(bridge_dir, state)
@@ -4399,14 +4433,32 @@ async def _forward_available_items(
         await _write_forward_state_async(bridge_dir, updated)
     # Fully-consumed batch: a pending settle may activate now, provided
     # this batch carried no assistant output for the settling turn.
-    _promote_pending_settle(dedupe, items)
-    updated = TranscriptForwardState(
+    _promote_pending_settle(
+        dedupe,
+        items,
         transcript_path=state.transcript_path,
-        line_cursor=result.line_cursor,
         byte_offset=result.byte_offset,
+    )
+    fingerprint = _jsonl_cursor_fingerprint(state.transcript_path, result.byte_offset)
+    # A worktree move can race the read or POSTs. Keep the last valid cursor
+    # if the advanced one cannot be fingerprinted; seen IDs deduplicate replay.
+    cursor = (
+        state
+        if fingerprint is None
+        else replace(
+            state,
+            line_cursor=result.line_cursor,
+            byte_offset=result.byte_offset,
+            cursor_fingerprint=fingerprint,
+        )
+    )
+    updated = TranscriptForwardState(
+        transcript_path=cursor.transcript_path,
+        line_cursor=cursor.line_cursor,
+        byte_offset=cursor.byte_offset,
         current_response_id=current_response_id,
         seen_source_ids=_bounded_seen_source_ids(seen_source_ids),
-        cursor_fingerprint=_jsonl_cursor_fingerprint(state.transcript_path, result.byte_offset),
+        cursor_fingerprint=cursor.cursor_fingerprint,
         settled_response_id=dedupe.settled_response_id,
         pending_settled_response_id=dedupe.pending_settled_response_id,
     )
@@ -5085,6 +5137,7 @@ async def _post_external_permission_mode_change(
     *,
     session_id: str,
     mode: str,
+    initial_observation: bool,
 ) -> None:
     """
     Post one ``external_permission_mode_change`` event to the Sessions API.
@@ -5095,11 +5148,15 @@ async def _post_external_permission_mode_change(
     :param client: Omnigent HTTP client.
     :param session_id: Omnigent session/conversation id, e.g. ``"conv_abc123"``.
     :param mode: Permission mode the pane now shows, e.g. ``"auto"``.
+    :param initial_observation: Whether this reports startup rather than an observed switch.
     :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
     """
     resp = await client.post(
         f"/v1/sessions/{session_id}/events",
-        json={"type": "external_permission_mode_change", "data": {"permission_mode": mode}},
+        json={
+            "type": "external_permission_mode_change",
+            "data": {"permission_mode": mode, "initial_observation": initial_observation},
+        },
     )
     resp.raise_for_status()
 
@@ -5158,18 +5215,28 @@ async def _relay_permission_mode(
     hides itself. Best-effort and idempotent — an unchanged or unreadable
     (``None``) mode is a no-op, and a failed POST is retried next poll.
 
+    Only a change between readable observations establishes a selection.
+    A switch before the first readable footer is indistinguishable from a
+    settings-derived startup mode and remains a passive observation.
+
     :param client: Omnigent HTTP client.
     :param session_id: Omnigent session/conversation id.
     :param mode: The permission-mode footer parsed from the pane, or ``None``.
     :param dedupe: Shared per-session dedupe state; mutated in place.
     """
-    if mode is None or mode == dedupe.posted_permission_mode:
+    if mode is None:
+        return
+    if dedupe.observed_permission_mode is not None and mode != dedupe.observed_permission_mode:
+        dedupe.permission_mode_change_pending = True
+    dedupe.observed_permission_mode = mode
+    if mode == dedupe.posted_permission_mode and not dedupe.permission_mode_change_pending:
         return
     try:
         await _post_external_permission_mode_change(
             client,
             session_id=session_id,
             mode=mode,
+            initial_observation=not dedupe.permission_mode_change_pending,
         )
     except httpx.HTTPError:
         _logger.debug(
@@ -5181,6 +5248,7 @@ async def _relay_permission_mode(
         )
         return
     dedupe.posted_permission_mode = mode
+    dedupe.permission_mode_change_pending = False
 
 
 async def _relay_btw_overlay(
@@ -6613,14 +6681,18 @@ def _complete_jsonl_end_offset(path: Path) -> int:
     return 0
 
 
-def _jsonl_cursor_fingerprint(path: Path, byte_offset: int) -> str | None:
+def _jsonl_cursor_fingerprint(
+    path: Path, byte_offset: int, *, missing_ok: bool = True
+) -> str | None:
     """
     Hash bytes immediately before a JSONL cursor for stale-cursor checks.
 
     :param path: JSONL file path.
     :param byte_offset: Cursor byte offset, e.g. ``4096``.
+    :param missing_ok: Whether a missing path returns ``None`` instead of raising.
     :returns: SHA-256 digest for the bytes before the cursor, or
         ``None`` when the file does not exist or the offset is invalid.
+    :raises FileNotFoundError: If the path is missing and ``missing_ok`` is false.
     """
     if byte_offset < 0:
         return None
@@ -6634,6 +6706,8 @@ def _jsonl_cursor_fingerprint(path: Path, byte_offset: int) -> str | None:
             handle.seek(sample_start)
             sample = handle.read(byte_offset - sample_start)
     except FileNotFoundError:
+        if not missing_ok:
+            raise
         return None
     payload = byte_offset.to_bytes(8, "big", signed=False) + sample
     return hashlib.sha256(payload).hexdigest()

@@ -1,11 +1,16 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
+import { SidebarDataProvider } from "@/hooks/useSidebarData";
 import type * as UseTerminalsModule from "@/hooks/useTerminals";
 import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 import type * as UseSessionModule from "@/hooks/useSession";
 import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as RunnerHealthModule from "@/hooks/RunnerHealthProvider";
 
+import { useCallback } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import {
   MemoryRouter,
   Route,
@@ -14,7 +19,8 @@ import {
   useNavigate,
   useSearchParams,
 } from "react-router-dom";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { RoutingProvider, reactRouterRouting, type RoutingApi } from "@/lib/routing";
+import { useFileViewer } from "./FileViewerContext";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ServerInfo } from "@/lib/capabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
@@ -149,11 +155,13 @@ vi.mock("./FileViewer", () => ({
   FileViewer: ({
     open,
     path,
+    position,
     onClose,
     frameless,
   }: {
     open: boolean;
     path: string;
+    position?: { line: number; column?: number };
     onClose: () => void;
     frameless?: boolean;
   }) => (
@@ -161,6 +169,8 @@ vi.mock("./FileViewer", () => ({
       data-testid={frameless ? "file-viewer-inline" : "file-viewer"}
       data-state={open ? "open" : "closed"}
       data-path={path}
+      data-line={position?.line}
+      data-column={position?.column}
     >
       <button type="button" aria-label="file-viewer: close" onClick={onClose}>
         close
@@ -402,51 +412,53 @@ function renderShell(path: string, info?: ServerInfo) {
   });
   const tree = (
     <QueryClientProvider client={qc}>
-      <TooltipProvider>
-        <MemoryRouter initialEntries={[path]}>
-          <Routes>
-            <Route element={<AppShell />}>
-              <Route
-                index
-                element={
-                  <>
-                    <div>home</div>
-                    <LocationDisplay />
-                  </>
-                }
-              />
-              <Route
-                path="c/:conversationId"
-                element={
-                  <>
-                    <TerminalFirstViewProbe />
-                    <ForkDialogProbe />
-                    <NavProbe />
-                    <LocationDisplay />
-                  </>
-                }
-              />
-              {/* The settings page itself renders inside the sidebar (its nav
+      <SidebarDataProvider>
+        <TooltipProvider>
+          <MemoryRouter initialEntries={[path]}>
+            <Routes>
+              <Route element={<AppShell />}>
+                <Route
+                  index
+                  element={
+                    <>
+                      <div>home</div>
+                      <LocationDisplay />
+                    </>
+                  }
+                />
+                <Route
+                  path="c/:conversationId"
+                  element={
+                    <>
+                      <TerminalFirstViewProbe />
+                      <ForkDialogProbe />
+                      <NavProbe />
+                      <LocationDisplay />
+                    </>
+                  }
+                />
+                {/* The settings page itself renders inside the sidebar (its nav
               replaces the session list), so the body here is irrelevant — what
               matters is that the route is /settings, which is what AppShell
               keys the sidebar pin off. The nav-* links stand in for the real
               Settings button and the sidebar's Back row, both of which live in
               components mocked out here. */}
-              <Route
-                path="settings"
-                element={
-                  <>
-                    <div>settings</div>
-                    <NavProbe />
-                    <LocationDisplay />
-                  </>
-                }
-              />
-              <Route path="extensions/:extensionId/*" element={<div>extension page</div>} />
-            </Route>
-          </Routes>
-        </MemoryRouter>
-      </TooltipProvider>
+                <Route
+                  path="settings"
+                  element={
+                    <>
+                      <div>settings</div>
+                      <NavProbe />
+                      <LocationDisplay />
+                    </>
+                  }
+                />
+                <Route path="extensions/:extensionId/*" element={<div>extension page</div>} />
+              </Route>
+            </Routes>
+          </MemoryRouter>
+        </TooltipProvider>
+      </SidebarDataProvider>
     </QueryClientProvider>
   );
   // Without an explicit info the CapabilitiesContext default ("loading")
@@ -555,6 +567,7 @@ beforeEach(() => {
   // choice carries across sessions. Clear it so a stored preference from one
   // test can't change another test's default scope.
   localStorage.clear();
+  writeWorkspacePanelDefault("open");
   clearOptimisticTitles();
   // Reset terminal-first startup signals so one test's terminalPending /
   // failed status can't leak into another's terminalStartingUp.
@@ -618,33 +631,45 @@ describe("AppShell header", () => {
     expect(screen.queryByTestId("file-viewer-inline")).toBeNull();
   });
 
-  it("shows owner actions for a top-level session omitted from conversation pages", () => {
-    mockConversations([]);
-    useSessionMock.mockReturnValue({
-      session: {
-        id: "conv_off_window",
-        agentId: "ag_owner",
-        agentName: "developer",
-        runnerId: null,
-        status: "idle",
-        createdAt: 1_700_000_000,
-        title: "Off-window owner session",
-        labels: {},
-        items: [],
-        pendingElicitations: [],
-        permissionLevel: 4,
-        parentSessionId: null,
-        subAgentName: null,
-        kind: "default",
-      },
-      isLoading: false,
-      error: null,
-    });
+  it.each([
+    { title: "Off-window owner session", archived: false },
+    { title: null, archived: true },
+  ])(
+    "shows owner actions for an off-window session ($title, archived=$archived)",
+    ({ title, archived }) => {
+      mockConversations([]);
+      useSessionMock.mockReturnValue({
+        session: {
+          id: "conv_off_window",
+          agentId: "ag_owner",
+          agentName: "developer",
+          runnerId: null,
+          status: "idle",
+          createdAt: 1_700_000_000,
+          title,
+          archived,
+          labels: {},
+          items: [],
+          pendingElicitations: [],
+          permissionLevel: 4,
+          parentSessionId: null,
+          subAgentName: null,
+          kind: "default",
+        },
+        isLoading: false,
+        error: null,
+      });
 
-    renderShell("/c/conv_off_window");
+      renderShell("/c/conv_off_window");
 
-    expect(screen.getByRole("button", { name: "Conversation actions" })).toBeInTheDocument();
-  });
+      const actions = screen.getByRole("button", { name: "Conversation actions" });
+      expect(actions).toBeInTheDocument();
+      fireEvent.pointerDown(actions, { button: 0, ctrlKey: false });
+      expect(
+        screen.getByRole("menuitem", { name: archived ? "Unarchive" : "Archive" }),
+      ).toBeInTheDocument();
+    },
+  );
 
   it("keeps owner actions hidden for an off-window sub-agent", () => {
     mockConversations([]);
@@ -785,23 +810,25 @@ describe("AppShell header", () => {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const makeTree = () => (
       <QueryClientProvider client={qc}>
-        <TooltipProvider>
-          <MemoryRouter initialEntries={["/c/conv_terminal?view=terminal"]}>
-            <Routes>
-              <Route element={<AppShell />}>
-                <Route
-                  path="c/:conversationId"
-                  element={
-                    <>
-                      <TerminalFirstViewProbe />
-                      <LocationDisplay />
-                    </>
-                  }
-                />
-              </Route>
-            </Routes>
-          </MemoryRouter>
-        </TooltipProvider>
+        <SidebarDataProvider>
+          <TooltipProvider>
+            <MemoryRouter initialEntries={["/c/conv_terminal?view=terminal"]}>
+              <Routes>
+                <Route element={<AppShell />}>
+                  <Route
+                    path="c/:conversationId"
+                    element={
+                      <>
+                        <TerminalFirstViewProbe />
+                        <LocationDisplay />
+                      </>
+                    }
+                  />
+                </Route>
+              </Routes>
+            </MemoryRouter>
+          </TooltipProvider>
+        </SidebarDataProvider>
       </QueryClientProvider>
     );
     const { rerender } = render(makeTree());
@@ -882,23 +909,25 @@ describe("AppShell header", () => {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const makeTree = () => (
       <QueryClientProvider client={qc}>
-        <TooltipProvider>
-          <MemoryRouter initialEntries={["/c/conv_fresh"]}>
-            <Routes>
-              <Route element={<AppShell />}>
-                <Route
-                  path="c/:conversationId"
-                  element={
-                    <>
-                      <TerminalFirstViewProbe />
-                      <LocationDisplay />
-                    </>
-                  }
-                />
-              </Route>
-            </Routes>
-          </MemoryRouter>
-        </TooltipProvider>
+        <SidebarDataProvider>
+          <TooltipProvider>
+            <MemoryRouter initialEntries={["/c/conv_fresh"]}>
+              <Routes>
+                <Route element={<AppShell />}>
+                  <Route
+                    path="c/:conversationId"
+                    element={
+                      <>
+                        <TerminalFirstViewProbe />
+                        <LocationDisplay />
+                      </>
+                    }
+                  />
+                </Route>
+              </Routes>
+            </MemoryRouter>
+          </TooltipProvider>
+        </SidebarDataProvider>
       </QueryClientProvider>
     );
     const { rerender } = render(makeTree());
@@ -996,23 +1025,25 @@ describe("AppShell header", () => {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const makeTree = () => (
       <QueryClientProvider client={qc}>
-        <TooltipProvider>
-          <MemoryRouter initialEntries={["/c/conv_fresh_deleted"]}>
-            <Routes>
-              <Route element={<AppShell />}>
-                <Route
-                  path="c/:conversationId"
-                  element={
-                    <>
-                      <TerminalFirstViewProbe />
-                      <LocationDisplay />
-                    </>
-                  }
-                />
-              </Route>
-            </Routes>
-          </MemoryRouter>
-        </TooltipProvider>
+        <SidebarDataProvider>
+          <TooltipProvider>
+            <MemoryRouter initialEntries={["/c/conv_fresh_deleted"]}>
+              <Routes>
+                <Route element={<AppShell />}>
+                  <Route
+                    path="c/:conversationId"
+                    element={
+                      <>
+                        <TerminalFirstViewProbe />
+                        <LocationDisplay />
+                      </>
+                    }
+                  />
+                </Route>
+              </Routes>
+            </MemoryRouter>
+          </TooltipProvider>
+        </SidebarDataProvider>
       </QueryClientProvider>
     );
     const { rerender } = render(makeTree());
@@ -1053,23 +1084,25 @@ describe("AppShell header", () => {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     render(
       <QueryClientProvider client={qc}>
-        <TooltipProvider>
-          <MemoryRouter initialEntries={["/c/conv_lived"]}>
-            <Routes>
-              <Route element={<AppShell />}>
-                <Route
-                  path="c/:conversationId"
-                  element={
-                    <>
-                      <TerminalFirstViewProbe />
-                      <SessionNavButton to="/c/conv_new" />
-                    </>
-                  }
-                />
-              </Route>
-            </Routes>
-          </MemoryRouter>
-        </TooltipProvider>
+        <SidebarDataProvider>
+          <TooltipProvider>
+            <MemoryRouter initialEntries={["/c/conv_lived"]}>
+              <Routes>
+                <Route element={<AppShell />}>
+                  <Route
+                    path="c/:conversationId"
+                    element={
+                      <>
+                        <TerminalFirstViewProbe />
+                        <SessionNavButton to="/c/conv_new" />
+                      </>
+                    }
+                  />
+                </Route>
+              </Routes>
+            </MemoryRouter>
+          </TooltipProvider>
+        </SidebarDataProvider>
       </QueryClientProvider>,
     );
 
@@ -1341,23 +1374,25 @@ describe("TerminalFirstContext", () => {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const makeTree = () => (
       <QueryClientProvider client={qc}>
-        <TooltipProvider>
-          <MemoryRouter initialEntries={["/c/conv_native"]}>
-            <Routes>
-              <Route element={<AppShell />}>
-                <Route
-                  path="c/:conversationId"
-                  element={
-                    <>
-                      <TerminalFirstViewProbe />
-                      <LocationDisplay />
-                    </>
-                  }
-                />
-              </Route>
-            </Routes>
-          </MemoryRouter>
-        </TooltipProvider>
+        <SidebarDataProvider>
+          <TooltipProvider>
+            <MemoryRouter initialEntries={["/c/conv_native"]}>
+              <Routes>
+                <Route element={<AppShell />}>
+                  <Route
+                    path="c/:conversationId"
+                    element={
+                      <>
+                        <TerminalFirstViewProbe />
+                        <LocationDisplay />
+                      </>
+                    }
+                  />
+                </Route>
+              </Routes>
+            </MemoryRouter>
+          </TooltipProvider>
+        </SidebarDataProvider>
       </QueryClientProvider>
     );
     const { rerender } = render(makeTree());
@@ -1393,23 +1428,25 @@ describe("TerminalFirstContext", () => {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const makeTree = () => (
       <QueryClientProvider client={qc}>
-        <TooltipProvider>
-          <MemoryRouter initialEntries={["/c/conv_native"]}>
-            <Routes>
-              <Route element={<AppShell />}>
-                <Route
-                  path="c/:conversationId"
-                  element={
-                    <>
-                      <TerminalFirstViewProbe />
-                      <LocationDisplay />
-                    </>
-                  }
-                />
-              </Route>
-            </Routes>
-          </MemoryRouter>
-        </TooltipProvider>
+        <SidebarDataProvider>
+          <TooltipProvider>
+            <MemoryRouter initialEntries={["/c/conv_native"]}>
+              <Routes>
+                <Route element={<AppShell />}>
+                  <Route
+                    path="c/:conversationId"
+                    element={
+                      <>
+                        <TerminalFirstViewProbe />
+                        <LocationDisplay />
+                      </>
+                    }
+                  />
+                </Route>
+              </Routes>
+            </MemoryRouter>
+          </TooltipProvider>
+        </SidebarDataProvider>
       </QueryClientProvider>
     );
     const { rerender } = render(makeTree());
@@ -2024,15 +2061,17 @@ describe("Workspace rail maximize", () => {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     render(
       <QueryClientProvider client={qc}>
-        <TooltipProvider>
-          <MemoryRouter initialEntries={["/c/conv_abc"]}>
-            <Routes>
-              <Route element={<AppShell />}>
-                <Route path="c/:conversationId" element={<SessionNavButton to="/c/conv_xyz" />} />
-              </Route>
-            </Routes>
-          </MemoryRouter>
-        </TooltipProvider>
+        <SidebarDataProvider>
+          <TooltipProvider>
+            <MemoryRouter initialEntries={["/c/conv_abc"]}>
+              <Routes>
+                <Route element={<AppShell />}>
+                  <Route path="c/:conversationId" element={<SessionNavButton to="/c/conv_xyz" />} />
+                </Route>
+              </Routes>
+            </MemoryRouter>
+          </TooltipProvider>
+        </SidebarDataProvider>
       </QueryClientProvider>,
     );
 
@@ -2267,23 +2306,25 @@ describe("Subagents tab", () => {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const makeTree = () => (
       <QueryClientProvider client={qc}>
-        <TooltipProvider>
-          <MemoryRouter initialEntries={["/c/conv_abc"]}>
-            <Routes>
-              <Route element={<AppShell />}>
-                <Route
-                  path="c/:conversationId"
-                  element={
-                    <>
-                      <TerminalFirstViewProbe />
-                      <LocationDisplay />
-                    </>
-                  }
-                />
-              </Route>
-            </Routes>
-          </MemoryRouter>
-        </TooltipProvider>
+        <SidebarDataProvider>
+          <TooltipProvider>
+            <MemoryRouter initialEntries={["/c/conv_abc"]}>
+              <Routes>
+                <Route element={<AppShell />}>
+                  <Route
+                    path="c/:conversationId"
+                    element={
+                      <>
+                        <TerminalFirstViewProbe />
+                        <LocationDisplay />
+                      </>
+                    }
+                  />
+                </Route>
+              </Routes>
+            </MemoryRouter>
+          </TooltipProvider>
+        </SidebarDataProvider>
       </QueryClientProvider>
     );
     const { rerender } = render(makeTree());
@@ -2350,23 +2391,25 @@ describe("Subagents tab", () => {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const makeTree = () => (
       <QueryClientProvider client={qc}>
-        <TooltipProvider>
-          <MemoryRouter initialEntries={["/c/conv_abc"]}>
-            <Routes>
-              <Route element={<AppShell />}>
-                <Route
-                  path="c/:conversationId"
-                  element={
-                    <>
-                      <TerminalFirstViewProbe />
-                      <LocationDisplay />
-                    </>
-                  }
-                />
-              </Route>
-            </Routes>
-          </MemoryRouter>
-        </TooltipProvider>
+        <SidebarDataProvider>
+          <TooltipProvider>
+            <MemoryRouter initialEntries={["/c/conv_abc"]}>
+              <Routes>
+                <Route element={<AppShell />}>
+                  <Route
+                    path="c/:conversationId"
+                    element={
+                      <>
+                        <TerminalFirstViewProbe />
+                        <LocationDisplay />
+                      </>
+                    }
+                  />
+                </Route>
+              </Routes>
+            </MemoryRouter>
+          </TooltipProvider>
+        </SidebarDataProvider>
       </QueryClientProvider>
     );
     const { rerender } = render(makeTree());
@@ -2615,15 +2658,17 @@ describe("FilesPanel visibility", () => {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     render(
       <QueryClientProvider client={qc}>
-        <TooltipProvider>
-          <MemoryRouter initialEntries={["/c/conv_abc"]}>
-            <Routes>
-              <Route element={<AppShell />}>
-                <Route path="c/:conversationId" element={<SessionNavButton to="/c/conv_xyz" />} />
-              </Route>
-            </Routes>
-          </MemoryRouter>
-        </TooltipProvider>
+        <SidebarDataProvider>
+          <TooltipProvider>
+            <MemoryRouter initialEntries={["/c/conv_abc"]}>
+              <Routes>
+                <Route element={<AppShell />}>
+                  <Route path="c/:conversationId" element={<SessionNavButton to="/c/conv_xyz" />} />
+                </Route>
+              </Routes>
+            </MemoryRouter>
+          </TooltipProvider>
+        </SidebarDataProvider>
       </QueryClientProvider>,
     );
 
@@ -2717,11 +2762,10 @@ describe("Right workspace card visibility", () => {
     expect(screen.getByRole("button", { name: "Collapse right panel" })).toBeInTheDocument();
   });
 
-  it("starts open for a fresh session (no stored open-state)", () => {
+  it("starts collapsed for a fresh session (no stored open-state)", () => {
     // A brand-new session has no persisted open-state, so the Appearance
-    // Workspace panel default applies. With no preference stored that
-    // default is open — the card is mounted and the header offers Collapse,
-    // not Expand.
+    // Workspace panel product default applies.
+    writeWorkspacePanelDefault("collapsed");
     useEnvironmentMock.mockReturnValue({
       data: { available: false, root: null, home: null },
       isLoading: false,
@@ -2730,14 +2774,13 @@ describe("Right workspace card visibility", () => {
 
     renderShell("/c/conv_fresh");
 
-    expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Collapse right panel" })).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Expand right panel" })).toBeNull();
+    expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Expand right panel" })).toBeInTheDocument();
   });
 
-  it("starts collapsed for a fresh session when Appearance default is collapsed", () => {
+  it("starts open for a fresh session when Appearance default is open", () => {
     // The Appearance setting only seeds sessions with no saved open-state.
-    writeWorkspacePanelDefault("collapsed");
+    writeWorkspacePanelDefault("open");
     useEnvironmentMock.mockReturnValue({
       data: { available: false, root: null, home: null },
       isLoading: false,
@@ -2746,8 +2789,8 @@ describe("Right workspace card visibility", () => {
 
     renderShell("/c/conv_fresh_collapsed");
 
-    expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
-    expect(screen.getByRole("button", { name: "Expand right panel" })).toBeInTheDocument();
+    expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Collapse right panel" })).toBeInTheDocument();
   });
 
   it("restores a saved open-state even when Appearance default is collapsed", () => {
@@ -2875,15 +2918,20 @@ describe("Right workspace card visibility", () => {
       const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
       render(
         <QueryClientProvider client={qc}>
-          <TooltipProvider>
-            <MemoryRouter initialEntries={["/c/conv_from"]}>
-              <Routes>
-                <Route element={<AppShell />}>
-                  <Route path="c/:conversationId" element={<SessionNavButton to="/c/conv_to" />} />
-                </Route>
-              </Routes>
-            </MemoryRouter>
-          </TooltipProvider>
+          <SidebarDataProvider>
+            <TooltipProvider>
+              <MemoryRouter initialEntries={["/c/conv_from"]}>
+                <Routes>
+                  <Route element={<AppShell />}>
+                    <Route
+                      path="c/:conversationId"
+                      element={<SessionNavButton to="/c/conv_to" />}
+                    />
+                  </Route>
+                </Routes>
+              </MemoryRouter>
+            </TooltipProvider>
+          </SidebarDataProvider>
         </QueryClientProvider>,
       );
       expect(screen.getByRole("tab", { name: /Files/i })).toHaveAttribute("aria-selected", "true");
@@ -2931,15 +2979,20 @@ describe("Right workspace card visibility", () => {
     qc.setQueryData(["rootSessionId", "conv_child"], "conv_other_root");
     render(
       <QueryClientProvider client={qc}>
-        <TooltipProvider>
-          <MemoryRouter initialEntries={["/c/conv_from"]}>
-            <Routes>
-              <Route element={<AppShell />}>
-                <Route path="c/:conversationId" element={<SessionNavButton to="/c/conv_child" />} />
-              </Route>
-            </Routes>
-          </MemoryRouter>
-        </TooltipProvider>
+        <SidebarDataProvider>
+          <TooltipProvider>
+            <MemoryRouter initialEntries={["/c/conv_from"]}>
+              <Routes>
+                <Route element={<AppShell />}>
+                  <Route
+                    path="c/:conversationId"
+                    element={<SessionNavButton to="/c/conv_child" />}
+                  />
+                </Route>
+              </Routes>
+            </MemoryRouter>
+          </TooltipProvider>
+        </SidebarDataProvider>
       </QueryClientProvider>,
     );
     expect(screen.getByRole("tab", { name: /Agents/i })).toHaveAttribute("aria-selected", "true");
@@ -3072,23 +3125,25 @@ describe("Right workspace card visibility", () => {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const makeTree = () => (
       <QueryClientProvider client={qc}>
-        <TooltipProvider>
-          <MemoryRouter initialEntries={["/c/conv_gone"]}>
-            <Routes>
-              <Route element={<AppShell />}>
-                <Route
-                  path="c/:conversationId"
-                  element={
-                    <>
-                      <TerminalFirstViewProbe />
-                      <LocationDisplay />
-                    </>
-                  }
-                />
-              </Route>
-            </Routes>
-          </MemoryRouter>
-        </TooltipProvider>
+        <SidebarDataProvider>
+          <TooltipProvider>
+            <MemoryRouter initialEntries={["/c/conv_gone"]}>
+              <Routes>
+                <Route element={<AppShell />}>
+                  <Route
+                    path="c/:conversationId"
+                    element={
+                      <>
+                        <TerminalFirstViewProbe />
+                        <LocationDisplay />
+                      </>
+                    }
+                  />
+                </Route>
+              </Routes>
+            </MemoryRouter>
+          </TooltipProvider>
+        </SidebarDataProvider>
       </QueryClientProvider>
     );
     const { rerender } = render(makeTree());
@@ -3124,23 +3179,25 @@ describe("Right workspace card visibility", () => {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const makeTree = () => (
       <QueryClientProvider client={qc}>
-        <TooltipProvider>
-          <MemoryRouter initialEntries={["/c/conv_load"]}>
-            <Routes>
-              <Route element={<AppShell />}>
-                <Route
-                  path="c/:conversationId"
-                  element={
-                    <>
-                      <TerminalFirstViewProbe />
-                      <LocationDisplay />
-                    </>
-                  }
-                />
-              </Route>
-            </Routes>
-          </MemoryRouter>
-        </TooltipProvider>
+        <SidebarDataProvider>
+          <TooltipProvider>
+            <MemoryRouter initialEntries={["/c/conv_load"]}>
+              <Routes>
+                <Route element={<AppShell />}>
+                  <Route
+                    path="c/:conversationId"
+                    element={
+                      <>
+                        <TerminalFirstViewProbe />
+                        <LocationDisplay />
+                      </>
+                    }
+                  />
+                </Route>
+              </Routes>
+            </MemoryRouter>
+          </TooltipProvider>
+        </SidebarDataProvider>
       </QueryClientProvider>
     );
     const { rerender } = render(makeTree());
@@ -3429,23 +3486,25 @@ describe("AppShell scope view — conversation redirect (stale-closure regressio
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     render(
       <QueryClientProvider client={qc}>
-        <TooltipProvider>
-          <MemoryRouter initialEntries={["/c/conv_abc"]}>
-            <Routes>
-              <Route element={<AppShell />}>
-                <Route
-                  path="c/:conversationId"
-                  element={
-                    <>
-                      <SessionNavButton to="/c/conv_xyz" />
-                      <PathDisplay />
-                    </>
-                  }
-                />
-              </Route>
-            </Routes>
-          </MemoryRouter>
-        </TooltipProvider>
+        <SidebarDataProvider>
+          <TooltipProvider>
+            <MemoryRouter initialEntries={["/c/conv_abc"]}>
+              <Routes>
+                <Route element={<AppShell />}>
+                  <Route
+                    path="c/:conversationId"
+                    element={
+                      <>
+                        <SessionNavButton to="/c/conv_xyz" />
+                        <PathDisplay />
+                      </>
+                    }
+                  />
+                </Route>
+              </Routes>
+            </MemoryRouter>
+          </TooltipProvider>
+        </SidebarDataProvider>
       </QueryClientProvider>,
     );
 
@@ -4262,5 +4321,116 @@ describe("Terminal-first shells — opening a shell from the mobile drawer", () 
     const probe = screen.getByTestId("view-probe");
     expect(probe).toHaveAttribute("data-view", "terminal");
     expect(probe).toHaveAttribute("data-terminal-view-key", "terminal:terminal_tui_main");
+  });
+});
+
+describe("file navigation request precedence", () => {
+  function NavigationProbe() {
+    const openFile = useFileViewer();
+    return (
+      <>
+        <button type="button" onClick={() => openFile?.("README.md", { line: 100, column: 7 })}>
+          Cite README
+        </button>
+        <button type="button" onClick={() => openFile?.("README.md")}>
+          Open README
+        </button>
+        <button type="button" onClick={() => openFile?.("AGENTS.md", { line: 200, column: 3 })}>
+          Cite AGENTS
+        </button>
+      </>
+    );
+  }
+
+  function renderNavigationShell(routing = reactRouterRouting, search = "") {
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+    return render(
+      <QueryClientProvider
+        client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}
+      >
+        <TooltipProvider>
+          <MemoryRouter initialEntries={[`/c/conv_abc${search}`]}>
+            <RoutingProvider value={routing}>
+              <SidebarDataProvider>
+                <Routes>
+                  <Route element={<AppShell />}>
+                    <Route
+                      path="c/:conversationId"
+                      element={
+                        <>
+                          <NavigationProbe />
+                          <LocationDisplay />
+                        </>
+                      }
+                    />
+                  </Route>
+                </Routes>
+              </SidebarDataProvider>
+            </RoutingProvider>
+          </MemoryRouter>
+        </TooltipProvider>
+      </QueryClientProvider>,
+    );
+  }
+
+  it("a plain open suppresses stale URL coordinates before the router catches up", () => {
+    let deferred = false;
+    const pending: (() => void)[] = [];
+    const routing: RoutingApi = {
+      ...reactRouterRouting,
+      useSearchParams(defaultInit) {
+        const [params, setParams] = useSearchParams(defaultInit);
+        const setDeferredParams = useCallback<typeof setParams>(
+          (next, options) => {
+            if (deferred) pending.push(() => setParams(next, options));
+            else setParams(next, options);
+          },
+          [setParams],
+        );
+        return [params, setDeferredParams];
+      },
+    };
+    renderNavigationShell(routing);
+    fireEvent.click(screen.getByRole("button", { name: "Cite README" }));
+    expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-line", "100");
+    expect(screen.getByTestId("url-params")).toHaveTextContent("line=100");
+
+    deferred = true;
+    fireEvent.click(screen.getByRole("button", { name: "Open README" }));
+    expect(screen.getByTestId("url-params")).toHaveTextContent("line=100");
+    expect(screen.getByTestId("file-viewer-inline")).not.toHaveAttribute("data-line");
+    expect(screen.getByTestId("file-viewer-inline")).not.toHaveAttribute("data-column");
+
+    deferred = false;
+    act(() => {
+      for (const update of pending.splice(0)) update();
+    });
+    expect(screen.getByTestId("url-params")).not.toHaveTextContent("line=");
+    expect(screen.getByTestId("url-params")).not.toHaveTextContent("column=");
+    fireEvent.click(screen.getByRole("button", { name: "Cite README" }));
+    expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-line", "100");
+  });
+
+  it("initial URL citations still work until an explicit plain open overrides them", () => {
+    renderNavigationShell(reactRouterRouting, "?file=README.md&line=100&column=7");
+    expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-line", "100");
+    expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-column", "7");
+    fireEvent.click(screen.getByRole("button", { name: "Open README" }));
+    expect(screen.getByTestId("file-viewer-inline")).not.toHaveAttribute("data-line");
+  });
+
+  it("closing the active file clears both coordinates before selecting its neighbor", () => {
+    renderNavigationShell();
+    fireEvent.click(screen.getByRole("button", { name: "Cite README" }));
+    fireEvent.click(screen.getByRole("button", { name: "Cite AGENTS" }));
+    fireEvent.click(screen.getByRole("button", { name: "Close AGENTS.md" }));
+    expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "README.md");
+    expect(screen.getByTestId("file-viewer-inline")).not.toHaveAttribute("data-line");
+    expect(screen.getByTestId("url-params")).not.toHaveTextContent("line=");
+    expect(screen.getByTestId("url-params")).not.toHaveTextContent("column=");
   });
 });

@@ -356,3 +356,275 @@ def test_delete_scoped_to_owner(store: SqlAlchemyProjectStore) -> None:
     deleted = store.delete(_uid("p1"), user_id="bob@example.com")
     assert deleted is False
     assert store.get(_uid("p1"), user_id="alice@example.com") is not None
+
+
+def test_order_owner_isolation_and_last_write_wins(store: SqlAlchemyProjectStore) -> None:
+    """Local and authenticated owners have independent orders and resets."""
+    a = store.create(_uid("order-a"), "A", None)
+    b = store.create(_uid("order-b"), "B", None)
+    other = store.create(_uid("order-other"), "Other", "alice")
+    assert store.get_order(user_id=None) is None
+    store.save_order([b.id, a.id], user_id=None)
+    store.save_order([other.id], user_id="alice")
+    assert store.get_order(user_id=None) == [b.id, a.id]
+    assert store.get_order(user_id="alice") == [other.id]
+    store.save_order([a.id, b.id], user_id=None)
+    assert store.get_order(user_id=None) == [a.id, b.id]
+    for invalid in ([a.id, a.id], [other.id], ["missing"]):
+        with pytest.raises(OmnigentError):
+            store.save_order(invalid, user_id=None)
+        assert store.get_order(user_id=None) == [a.id, b.id]
+    store.save_order([], user_id=None)
+    assert store.get_order(user_id=None) == []
+    store.save_order(None, user_id=None)
+    assert store.get_order(user_id=None) is None
+    assert store.get_order(user_id="alice") == [other.id]
+
+
+def test_order_workspace_isolation(store: SqlAlchemyProjectStore) -> None:
+    """An owner's saved IDs and write validation stay inside their workspace."""
+    from omnigent.db.db_models import workspace_scope
+
+    with workspace_scope(101):
+        project = store.create(_uid("scoped-order"), "A", "alice")
+        store.save_order([project.id], user_id="alice")
+    with workspace_scope(102):
+        assert store.get_order(user_id="alice") is None
+        with pytest.raises(OmnigentError):
+            store.save_order([project.id], user_id="alice")
+        store.save_order([], user_id="alice")
+    with workspace_scope(101):
+        assert store.get_order(user_id="alice") == [project.id]
+
+
+def test_order_local_alias_does_not_change_project_ownership(
+    store: SqlAlchemyProjectStore,
+) -> None:
+    """None and local share a preference, but keep their original project scopes."""
+    project = store.create(_uid("no-auth"), "Local project", None)
+    assert store.get_order(user_id="local") is None
+    store.save_order([project.id], user_id=None)
+    assert store.get_order(user_id="local") == [project.id]
+    with pytest.raises(OmnigentError):
+        store.save_order([project.id], user_id="local")
+    assert store.get(project.id, user_id=None) is not None
+    assert store.get(project.id, user_id="local") is None
+    store.save_order(None, user_id="local")
+    assert store.get_order(user_id=None) is None
+
+
+@pytest.mark.parametrize("user_id", [None, "alice"])
+def test_order_preserves_authentication_fields(
+    store: SqlAlchemyProjectStore, user_id: str | None
+) -> None:
+    """Saving/resetting preferences leaves an existing account's identity intact."""
+    from sqlalchemy.orm import Session
+
+    from omnigent.db.db_models import SqlUser
+
+    preference_user_id = "local" if user_id is None else user_id
+    with Session(store._engine) as session:
+        session.merge(
+            SqlUser(
+                workspace_id=0,
+                id=preference_user_id,
+                is_admin=True,
+                password_hash="test-hash",
+                created_at=123,
+                last_login_at=456,
+            )
+        )
+        session.commit()
+    project = store.create(_uid("auth-order"), "A", user_id)
+    for order in ([project.id], [], None):
+        store.save_order(order, user_id=user_id)
+        with Session(store._engine) as session:
+            user = session.get(SqlUser, (0, preference_user_id))
+            assert user is not None
+            assert user.is_admin is True
+            assert user.password_hash == "test-hash"
+            assert user.created_at == 123
+            assert user.last_login_at == 456
+            assert "project_order" not in user.__dict__
+
+
+def test_order_missing_user_read_and_reset_do_not_create_accounts(
+    store: SqlAlchemyProjectStore,
+) -> None:
+    """Only a custom save needs to create a preference owner."""
+    from sqlalchemy.orm import Session
+
+    from omnigent.db.db_models import SqlUser
+
+    with Session(store._engine) as session:
+        user = session.get(SqlUser, (0, "local"))
+        if user is not None:
+            session.delete(user)
+            session.commit()
+    assert store.get_order(user_id=None) is None
+    store.save_order(None, user_id=None)
+    with Session(store._engine) as session:
+        assert session.get(SqlUser, (0, "local")) is None
+    store.save_order([], user_id=None)
+    with Session(store._engine) as session:
+        user = session.get(SqlUser, (0, "local"))
+        assert user is not None
+        assert user.is_admin is False
+        assert user.password_hash is None
+
+
+def test_alphabetical_mode_retains_manual_order(store: SqlAlchemyProjectStore) -> None:
+    a = store.create(_uid("remember-a"), "A", None)
+    b = store.create(_uid("remember-b"), "B", None)
+    store.save_order([b.id, a.id], user_id=None)
+    for _ in range(2):
+        preference = store.save_order(None, user_id=None)
+        assert preference == {"sort_mode": "alphabetical", "ordered_project_ids": [b.id, a.id]}
+        assert store.get_order(user_id=None) is None
+        reopened = SqlAlchemyProjectStore(store.storage_location)
+        assert reopened.get_order_preference(user_id=None) == preference
+        reopened.save_order(preference["ordered_project_ids"], user_id=None)
+        assert reopened.get_order(user_id=None) == [b.id, a.id]
+
+
+def test_original_array_format_preserves_manual_order(store: SqlAlchemyProjectStore) -> None:
+    import json
+
+    from sqlalchemy import update
+    from sqlalchemy.orm import Session
+
+    from omnigent.db.db_models import SqlUser
+
+    project = store.create(_uid("original-format"), "A", None)
+    store.save_order([], user_id=None)
+    with Session(store._engine) as session:
+        session.execute(
+            update(SqlUser)
+            .where(SqlUser.workspace_id == 0, SqlUser.id == "local")
+            .values(project_order=json.dumps([project.id]))
+        )
+        session.commit()
+    assert store.get_order(user_id=None) == [project.id]
+    assert store.save_order(None, user_id=None) == {
+        "sort_mode": "alphabetical",
+        "ordered_project_ids": [project.id],
+    }
+
+
+def test_concurrent_order_saves_and_mode_changes_retain_manual_ids(
+    store: SqlAlchemyProjectStore,
+) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    a = store.create(_uid("concurrent-order-a"), "A", "new-owner")
+    b = store.create(_uid("concurrent-order-b"), "B", "new-owner")
+    orders = [[a.id, b.id], [b.id, a.id]]
+    barrier = Barrier(2)
+
+    def save(ids: list[str]) -> None:
+        barrier.wait(timeout=5)
+        for _ in range(3):
+            store.save_order(ids, user_id="new-owner")
+            store.save_order(None, user_id="new-owner")
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(save, orders))
+    preference = store.get_order_preference(user_id="new-owner")
+    assert preference["sort_mode"] == "alphabetical"
+    assert preference["ordered_project_ids"] in orders
+
+
+def test_order_at_api_limit_exceeds_small_blob_capacity(store: SqlAlchemyProjectStore) -> None:
+    """The maximum accepted order survives storage on every supported backend."""
+    from sqlalchemy import func, insert, select
+    from sqlalchemy.orm import Session
+
+    from omnigent.db.db_models import SqlProject, SqlUser
+    from omnigent.server.schemas import ProjectOrderRequest
+
+    ids = [_uid(f"large-order-{i}") for i in range(10000)]
+    with Session(store._engine) as session:
+        session.execute(
+            insert(SqlProject),
+            [
+                {"workspace_id": 0, "id": id, "name": id, "user_id": "large", "created_at": 0}
+                for id in ids
+            ],
+        )
+        session.commit()
+    request = ProjectOrderRequest(ordered_project_ids=ids)
+    store.save_order(request.ordered_project_ids, user_id="large")
+    assert store.get_order(user_id="large") == ids
+    with Session(store._engine) as session:
+        size = session.scalar(
+            select(func.length(SqlUser.project_order)).where(
+                SqlUser.workspace_id == 0, SqlUser.id == "large"
+            )
+        )
+    assert size is not None and size > 65535
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b"not json",
+        b"null",
+        b"\xff",
+        b"\x00",
+        b"\x00\x01invalid",
+        b"\x00\x03{}",
+        b'{"sort_mode":"invalid","ordered_project_ids":[]}',
+        b'{"sort_mode":"manual","ordered_project_ids":[5]}',
+        b'{"sort_mode":"manual","ordered_project_ids":["invalid"]}',
+        b'{"sort_mode":"manual","ordered_project_ids":{}}',
+        b'{"sort_mode":"manual","ordered_project_ids":null}',
+    ],
+)
+def test_invalid_order_falls_back_and_can_be_replaced(
+    store: SqlAlchemyProjectStore, raw: bytes
+) -> None:
+    from sqlalchemy import LargeBinary, bindparam, text
+
+    store.save_order([], user_id=None)
+    with store._engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE users SET project_order=:raw WHERE workspace_id=0 AND id='local'"
+            ).bindparams(bindparam("raw", type_=LargeBinary)),
+            {"raw": raw},
+        )
+    default = {"sort_mode": "alphabetical", "ordered_project_ids": None}
+    assert store.get_order_preference(user_id=None) == default
+    assert store.get_order(user_id=None) is None
+    assert store.save_order(None, user_id=None) == default
+    assert store.get_order_preference(user_id=None) == default
+    store.save_order([], user_id=None)
+    assert store.get_order(user_id=None) == []
+
+
+def test_order_decoder_bounds_size_and_normalizes_duplicate_ids() -> None:
+    import json
+
+    from omnigent.db.compression import encode
+    from omnigent.stores.project_store.sqlalchemy_store import _decode_order
+
+    a, b = _uid("decode-a"), _uid("decode-b")
+    for preference in ([b, a, b], {"sort_mode": "manual", "ordered_project_ids": [b, a, b]}):
+        assert _decode_order(encode(json.dumps(preference))) == {
+            "sort_mode": "manual",
+            "ordered_project_ids": [b, a],
+        }
+    for preference in ([a] * 10001, ["x" * (512 * 1024)]):
+        assert _decode_order(encode(json.dumps(preference))) == {
+            "sort_mode": "alphabetical",
+            "ordered_project_ids": None,
+        }
+
+
+def test_apply_order_deduplicates_and_appends_unranked_projects() -> None:
+    from omnigent.stores.project_store import apply_project_order
+
+    assert apply_project_order(
+        ["b", "c", "a"], ["a", "deleted", "a"], project_id=str, project_name=str
+    ) == ["a", "b", "c"]

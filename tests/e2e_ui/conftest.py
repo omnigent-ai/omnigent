@@ -62,6 +62,7 @@ from tests.codex_parity.sidecar_harness import (
     build_sidecar_bin,
     start_codex_responses_sidecar,
 )
+from tests.e2e_ui import timings
 from tests.e2e_ui.url_safety import DEV_PORTS, unsafe_ui_base_url_reason
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -302,6 +303,7 @@ def pytest_addoption(parser: pytest.Parser) -> None:
             "instead of rebuilding. Fails if no build is present."
         ),
     )
+    timings.pytest_addoption(parser)
     # Round-robin shard split for the e2e-ui CI matrix. We roll our own
     # (rather than pull in pytest-shard / pytest-split) so the partition
     # is a dependency-free strided slice -- see pytest_collection_modifyitems
@@ -325,6 +327,7 @@ def pytest_configure(config: pytest.Config) -> None:
 
     :param config: Pytest config with repo and pytest-playwright options.
     """
+    timings.pytest_configure(config)
     base_url = config.getoption("--ui-base-url")
     if base_url:
         _validate_ui_base_url(base_url)
@@ -909,6 +912,7 @@ def _spawn_runner_against_external_server(
     # that depend on ``server_pid`` (only valid when this fixture spawns
     # the server too) will KeyError, which is the right failure shape.
     _server_state["runner_id"] = runner_id
+    _server_state["runner_pid"] = proc.pid
     # Exposed so a test whose predecessor killed the shared runner (e.g.
     # test_stale_stream) can respawn one via :func:`_ensure_runner_online`.
     _server_state["binding_token"] = binding_token
@@ -1215,6 +1219,30 @@ def live_server(
             proc.kill()
             proc.wait(timeout=5)
         log_handle.close()
+
+
+@pytest.fixture(scope="session")
+def _recover_shared_runner(
+    live_server: str, tmp_path_factory: pytest.TempPathFactory
+) -> Iterator[Callable[[], None]]:
+    """Keep a recovered runner alive until the shared server is torn down."""
+    recovered: list[subprocess.Popen[bytes]] = []
+
+    def recover() -> None:
+        runner = _ensure_runner_online(live_server, tmp_path_factory)
+        if runner is not None:
+            recovered.append(runner)
+
+    try:
+        yield recover
+    finally:
+        for runner in recovered:
+            runner.terminate()
+            try:
+                runner.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                runner.kill()
+                runner.wait(timeout=5)
 
 
 @pytest.fixture
@@ -2230,6 +2258,17 @@ def _ui_defaults() -> None:
 
 
 @pytest.fixture(autouse=True)
+def _workspace_panel_test_baseline(request: pytest.FixtureRequest) -> None:
+    """Keep unrelated UI tests explicit about requiring an open Workspace panel."""
+    if request.node.get_closest_marker("workspace_panel_product_default") is not None:
+        return
+    if "page" not in request.fixturenames:
+        return
+    page = request.getfixturevalue("page")
+    page.add_init_script("window.localStorage.setItem('omnigent:default-workspace-panel', 'open')")
+
+
+@pytest.fixture(autouse=True)
 def _record_video(
     monkeypatch: pytest.MonkeyPatch,
 ) -> Iterator[None]:
@@ -2329,11 +2368,11 @@ def server_pid(live_server: str) -> int:
 # The native codex render-parity suite drives it.
 # ---------------------------------------------------------------------------
 
-# A precise-echo agent on the openai-agents harness (same provider family as
-# hello_world, so it authenticates against the same gateway in CI). spec_version
-# 1 + executor.config.harness routes through the strict parser; arcname
-# config.yaml keeps it on that path.
+# A precise-echo agent for mock-backed render-parity tests. Use the strict
+# config.yaml parser with spec_version: 1 and executor.config.harness.
 _CUSTOM_AGENT_NAME = "echo_probe"
+# A separate mock model keeps the empty parity fallback away from other tests.
+_CUSTOM_AGENT_MODEL = "render-parity-probe"
 _CLAUDE_MOCK_MODEL = "claude-sonnet-4-20250514"
 _CODEX_MOCK_MODEL = "gpt-4o"
 _CUSTOM_AGENT_YAML = f"""\
@@ -2345,7 +2384,7 @@ prompt: |
   and nothing else — no preamble, no quotes, no trailing punctuation.
 
 executor:
-  model: gpt-4o-mini
+  model: {_CUSTOM_AGENT_MODEL}
   config:
     harness: openai-agents
 """

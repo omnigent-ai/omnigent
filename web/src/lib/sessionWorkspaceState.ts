@@ -8,7 +8,14 @@
 
 import type { RightRailTab } from "@/shell/railTabs";
 
-const RAIL_TABS: readonly RightRailTab[] = ["files", "changes", "github", "subagents", "browser"];
+const RAIL_TABS: readonly RightRailTab[] = [
+  "files",
+  "changes",
+  "github",
+  "subagents",
+  "browser",
+  "sidechat",
+];
 
 export interface SessionWorkspaceState {
   /** Whether the rail was left open in this session. */
@@ -27,6 +34,11 @@ export interface SessionWorkspaceState {
   selectedTerminalKey?: string | null;
   openBrowsers?: string[];
   selectedBrowserId?: string | null;
+  /** Ordered list of open side-chat tabs (child conversation ids). Browser-local
+   *  by design: side chats are ephemeral and vanish when the app is closed. */
+  openSideChats?: string[];
+  /** The active side-chat tab (null = a file/scope/other view is active). */
+  selectedSideChatId?: string | null;
 }
 
 const STORAGE_KEY = "omnigent:session-workspace-state";
@@ -95,6 +107,18 @@ function sanitize(entry: unknown): SessionWorkspaceState {
   if (record.selectedBrowserId === null || typeof record.selectedBrowserId === "string") {
     state.selectedBrowserId = record.selectedBrowserId;
   }
+  if (Array.isArray(record.openSideChats)) {
+    state.openSideChats = [
+      ...new Set(
+        record.openSideChats.filter(
+          (value): value is string => typeof value === "string" && value.length > 0,
+        ),
+      ),
+    ];
+  }
+  if (record.selectedSideChatId === null || typeof record.selectedSideChatId === "string") {
+    state.selectedSideChatId = record.selectedSideChatId;
+  }
   return state;
 }
 
@@ -155,6 +179,10 @@ export function writeSessionWorkspaceState(
   if (next.openBrowsers && next.openBrowsers.length > MAX_OPEN_FILES) {
     next.openBrowsers = next.openBrowsers.slice(-MAX_OPEN_FILES);
   }
+  // Same bound for side-chat tabs (also appended in open order).
+  if (next.openSideChats && next.openSideChats.length > MAX_OPEN_FILES) {
+    next.openSideChats = next.openSideChats.slice(-MAX_OPEN_FILES);
+  }
   // Drop any existing entry and re-append so the most-recently-touched session
   // moves to the end; pruning then evicts from the front (oldest-touched).
   if (existingIdx >= 0) store.splice(existingIdx, 1);
@@ -173,6 +201,7 @@ export function resetSessionWorkspaceTabSelections(): void {
     delete state.selectedFilePath;
     delete state.selectedTerminalKey;
     delete state.selectedBrowserId;
+    delete state.selectedSideChatId;
   }
   writeStore(store);
 }

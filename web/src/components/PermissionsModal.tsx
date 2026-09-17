@@ -333,7 +333,9 @@ export function PermissionsModal({
 
         {error && <p className="text-sm text-destructive">{error}</p>}
 
-        <DialogFooter className="flex-row justify-between sm:justify-between">
+        {/* Keep the default stacking below sm: one row of Copy link + QR +
+            Done overflows a phone-width dialog and widens the whole grid. */}
+        <DialogFooter className="sm:justify-between">
           <div className="flex items-center gap-2">
             <CopyLinkButton sessionId={sessionId} />
             <Button

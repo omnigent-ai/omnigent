@@ -167,6 +167,7 @@ from __future__ import annotations
 import asyncio
 import itertools
 import logging
+import math
 import posixpath
 import re
 import secrets
@@ -182,6 +183,7 @@ from fastapi import HTTPException
 
 from omnigent.db.db_models import LABEL_VALUE_MAX_LEN
 from omnigent.db.utils import builtin_agent_id, now_epoch
+from omnigent.onboarding.sandboxes.base import SandboxGoneError
 
 # RepoWorkspace lives in the launcher's own package so a launcher can accept it
 # without importing omnigent.server; re-exported here (its parser is here) so
@@ -1106,6 +1108,61 @@ def _unsupported_launcher_factory(provider: str) -> Callable[[], SandboxHostLaun
     return _reject
 
 
+_MAX_KEEP_WARM_S = 30 * 24 * 3600  # 30 days; a finite, sane ceiling on runner.idle_timeout_s
+
+
+def _parse_keep_warm_s(raw: dict[str, object]) -> int | None:
+    """Parse the top-level ``sandbox.keep_warm_s`` knob (positive seconds), or None.
+
+    The single agent-sandbox timing knob: how long an idle sandbox stays warm
+    (its runner alive) after the last turn before it suspends.
+    """
+    value = raw.get("keep_warm_s")
+    if value is None:
+        return None
+    # It becomes runner.idle_timeout_s, where the runner does float(value): a
+    # value rounding to 0 DISABLES the idle watchdog (never suspends), and an
+    # oversized one (e.g. 10**400) overflows float() and stops the runner
+    # starting. Require a whole number in [1, _MAX_KEEP_WARM_S] (30 days, far more
+    # than any real keep-warm and safely finite). bool is an int subclass (reject
+    # first); a float must be finite and integral (2.9 would silently truncate);
+    # the range check runs on the int/float directly so a huge int never reaches
+    # a float conversion here.
+    _bad = "sandbox.keep_warm_s must be a whole number of seconds, 1 to 2592000 (30 days)"
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(_bad)
+    if isinstance(value, float) and (not math.isfinite(value) or not value.is_integer()):
+        raise ValueError(_bad)
+    if not 1 <= value <= _MAX_KEEP_WARM_S:
+        raise ValueError(_bad)
+    return int(value)
+
+
+def _apply_keep_warm(
+    host_config: dict[str, object] | None, keep_warm_s: int | None
+) -> dict[str, object] | None:
+    """Map the ``keep_warm_s`` knob onto the in-sandbox ``runner.idle_timeout_s``.
+
+    ``keep_warm_s`` is the single agent-sandbox timing knob and is authoritative:
+    it wins over an explicit ``host_config.runner.idle_timeout_s`` (logging when it
+    overrides one) so there is one source of truth. A no-op when unset.
+    """
+    if keep_warm_s is None:
+        return host_config
+    merged = dict(host_config or {})
+    existing = merged.get("runner")
+    runner = dict(existing) if isinstance(existing, dict) else {}
+    if runner.get("idle_timeout_s") not in (None, keep_warm_s):
+        _logger.info(
+            "sandbox.keep_warm_s=%s overrides host_config.runner.idle_timeout_s=%s",
+            keep_warm_s,
+            runner.get("idle_timeout_s"),
+        )
+    runner["idle_timeout_s"] = keep_warm_s
+    merged["runner"] = runner
+    return merged
+
+
 def _parse_host_config(raw: dict[str, object]) -> dict[str, object] | None:
     """
     Extract and validate the top-level ``sandbox.host_config`` block.
@@ -1360,6 +1417,8 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
     # Validated regardless of provider (like server_url): a malformed
     # host_config should stop startup even for staged/unsupported providers.
     host_config = _parse_host_config(raw)
+    if provider == "agent_sandbox":
+        host_config = _apply_keep_warm(host_config, _parse_keep_warm_s(raw))
     if provider == "modal":
         launcher_factory = _modal_launcher_factory(
             _parse_modal_image(raw), _parse_modal_secrets(raw)
@@ -3800,6 +3859,7 @@ def host_sandbox_is_running(
 # replica, else two host processes flap the tunnel registration. Reused across a
 # host's many idle-stop/resume cycles, so not reaped — a .pop() could also race
 # a resume still holding it; one idle Lock per host woken is negligible.
+# custom-lint: disable-next=workspace-scoped-cache -- host_id lock; collision only serializes
 _resume_locks: dict[str, asyncio.Lock] = {}
 
 
@@ -3808,6 +3868,7 @@ async def resume_managed_host(
     host_store: HostStore,
     config: ManagedSandboxDeployment | None,
     *,
+    repos: Sequence[RepoWorkspace] = (),
     force: bool = False,
     on_stage: Callable[[str], None] | None = None,
     agent_name: str | None = None,
@@ -3817,7 +3878,7 @@ async def resume_managed_host(
 
     The send-message relaunch path calls this when a host-bound session has no
     live runner. If the host is a *resumable* managed host — a provider whose
-    sandbox idle-stops but retains its persistent volume
+    sandbox idle-stops but retains its identity
     (:attr:`SandboxLauncher.can_resume`) — and is currently offline, this
     resumes the sandbox under the SAME sandbox id, re-arms its launch token,
     re-execs ``omnigent host``, and waits for it to re-register. The caller's
@@ -3838,6 +3899,8 @@ async def resume_managed_host(
     :param host_store: Persistent host registrations (cross-replica liveness).
     :param config: The deployment's managed-sandbox config, or ``None`` when
         the ``sandbox:`` section has been removed since launch.
+    :param repos: Recorded repositories to restore when an agent-sandbox wake
+        recreates its Pod with ephemeral HOME. Existing clones are kept.
     :param force: Skip the DB-liveness no-op gate when the caller has local
         evidence that the tunnel is gone.
     :param on_stage: Progress observer forwarded to the launcher's
@@ -3850,7 +3913,9 @@ async def resume_managed_host(
         runner, or ``None`` to leave it unstamped. A wake rebuilds the runner
         from scratch, so the classifier is not carried over by the resume: the
         caller re-derives it through the same built-in gate a launch uses.
-    :raises HTTPException: 502 when the resume or host restart fails.
+    :raises SandboxGoneError: When the sandbox generation definitively no
+        longer exists, allowing the caller to create a fresh one.
+    :raises HTTPException: 502 when the resume or host restart otherwise fails.
     """
     if config is None:
         return
@@ -3869,11 +3934,13 @@ async def resume_managed_host(
         if host is None:
             return
         # Provider-matched launcher (None if config dropped / provider changed).
-        # Resume needs a reattachable volume; others (e.g. Modal) fall through
-        # to the caller's fresh relaunch path.
+        # Non-resumable providers (e.g. Modal) fall through to a fresh relaunch.
         launcher = _launcher_for_teardown(host, config)
         if launcher is None or not launcher.capabilities.resume_stopped or host.sandbox_id is None:
             return
+        # Agent-sandbox recreates its Pod and may lose HOME. Other resumable
+        # providers retain their filesystem and do not need workspace prep.
+        workspace_repos = repos if launcher.provider == "agent_sandbox" else ()
         entry = config.recorded(host.sandbox_provider)
         sandbox_id = host.sandbox_id
         _logger.info(
@@ -3924,12 +3991,14 @@ async def resume_managed_host(
                 host_id=host.host_id,
                 host_name=host.name,
                 server_url=entry.server_url,
-                repos=(),  # the persistent volume already holds the workspace
+                repos=workspace_repos,
                 host_config=entry.host_config,
                 on_stage=on_stage,
                 agent_name=agent_name,
             )
             await _wait_for_host_online(host_store, host.host_id)
+        except SandboxGoneError:
+            raise
         except Exception as exc:
             # An ordinary failed wake must NOT tear the sandbox down (the volume
             # is the user's); just surface it. Full teardown is handled above.

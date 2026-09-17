@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import os
 import queue
@@ -15,6 +16,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from http.client import BadStatusLine, RemoteDisconnected
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from itertools import pairwise
@@ -27,6 +29,7 @@ from urllib.error import URLError
 import pytest
 
 from omnigent.harnesses.claude_native import bridge as claude_native_bridge
+from omnigent.harnesses.claude_native import hook as claude_native_hook
 from omnigent.harnesses.claude_native.bridge import (
     _BACKGROUND_TASK_FIELD_MAX_CHARS,
     _LOGIN_GUIDANCE,
@@ -610,6 +613,40 @@ def test_trusted_parent_accepts_kiro_native_bridge_dir(
 
     # Same anchor as cursor-native: the uid-scoped temp dir's parent.
     assert trusted == claude_native_bridge._absolute_syntactic_path(kiro_root.parent.parent)
+
+
+def test_trusted_parent_accepts_devin_native_bridge_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The relay's bridge-root allowlist accepts devin-native bridge dirs.
+
+    devin-native keeps its bridge files under its own uid-scoped temp root
+    (``$TMPDIR/omnigent-<uid>/devin-native``), the same shape as cursor-native.
+    Without the devin branch, the comment/tool relay's
+    ``start_tool_relay`` -> ``_ensure_secure_dir`` ->
+    ``_trusted_parent_for_bridge_dir`` raises ``not under an allowed bridge
+    root`` and the relay never starts for devin sessions. This pins the
+    devin-native branch.
+    """
+    from omnigent.harnesses.devin_native import bridge as devin_native_bridge
+
+    # Distinct claude root so the devin target can't match the claude branch
+    # first (the autouse fixture points the claude root at ``tmp_path``).
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "claude-native"
+    )
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    # devin root mirrors production shape: <uid-scoped temp>/devin-native.
+    devin_root = tmp_path / "omnigent-test" / "devin-native"
+    monkeypatch.setattr(devin_native_bridge, "_BRIDGE_ROOT", devin_root)
+
+    target = claude_native_bridge._absolute_syntactic_path(devin_root / "abc123")
+    trusted = claude_native_bridge._trusted_parent_for_bridge_dir(target)
+
+    # Same anchor as cursor-native: the uid-scoped temp dir's parent.
+    assert trusted == claude_native_bridge._absolute_syntactic_path(devin_root.parent.parent)
 
 
 def test_trusted_parent_rejects_path_outside_all_roots_and_names_qwen(
@@ -3066,6 +3103,8 @@ def test_augment_claude_args_injects_mcp_and_hooks(tmp_path: Path) -> None:
     # pass the development-channels flag.
     assert "--dangerously-load-development-channels" not in args
     settings = _load_invocation_settings(args)
+    prompt_hooks = settings["hooks"]["UserPromptSubmit"][0]["hooks"]
+    assert any("framework-context" in hook["command"] for hook in prompt_hooks)
     assert (
         "omnigent.harnesses.claude_native.hook"
         in settings["hooks"]["Stop"][0]["hooks"][0]["command"]
@@ -3107,6 +3146,23 @@ def test_augment_claude_args_observes_worktree_moves(tmp_path: Path) -> None:
         "omnigent.harnesses.claude_native.hook --bridge-dir"
         in worktree_entries[0]["hooks"][0]["command"]
     )
+
+
+def test_framework_context_hook_consumes_hidden_notice(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    """The hook returns hidden context once, then removes it."""
+    path = tmp_path / "pending_framework_context.txt"
+    path.write_text("downscaled", encoding="utf-8")
+    monkeypatch.setattr(sys, "stdin", io.StringIO("{}"))
+
+    assert claude_native_hook.main(["framework-context", "--bridge-dir", str(tmp_path)]) == 0
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["hookSpecificOutput"]["additionalContext"] == "downscaled"
+    assert not path.exists()
 
 
 @pytest.mark.parametrize(
@@ -4473,6 +4529,196 @@ def test_inject_user_message_raises_when_draft_never_submits(
         inject_user_message(bridge_dir, content="fix the flaky test")
 
 
+def test_inject_user_message_backs_off_enter_retries_on_stalled_tui(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Submit-Enter retries into a stalled TUI back off instead of piling up.
+
+    Every Enter sent while the TUI is unresponsive queues in the pty and
+    replays when the TUI recovers; a fixed 1s cadence piles up dozens of
+    them over the verify window. The retries must back off exponentially
+    (capped), so the eventual replay burst stays small, while a fully
+    wedged pane still fails loud at the end of the window.
+    """
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01
+    )
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._SUBMIT_RETRY_INTERVAL_S", 0.05)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._SUBMIT_VERIFY_TIMEOUT_S", 0.5)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._SUBMIT_RETRY_MAX_INTERVAL_S",
+        0.2,
+        raising=False,
+    )
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_SETTLE_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+
+    enters: list[float] = []
+    tui = {"pane": _composer_pane()}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """
+        Simulate a stalled TUI: the draft commits but no Enter ever lands.
+
+        :param cmd: Argv list passed to subprocess.run.
+        :param kwargs: Subprocess kwargs (ignored).
+        :returns: Fake CompletedProcess; capture-pane returns the
+            simulated input-box pane, other calls return rc=0.
+        """
+        del kwargs
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "paste-buffer" in cmd:
+            tui["pane"] = _composer_pane("fix the flaky test")
+        if cmd[-1] == "Enter":
+            enters.append(time.monotonic())
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    with pytest.raises(RuntimeError, match="message was not delivered"):
+        inject_user_message(bridge_dir, content="fix the flaky test")
+
+    # The initial submit plus backed-off retries at 0.05/0.1/0.2/0.2s
+    # spacing fit ~4 Enters into the 0.5s window; a fixed 0.05s cadence
+    # (the regression) fires ~10.
+    assert 2 <= len(enters) <= 6, (
+        f"Expected few, backed-off Enter retries within the window, got {len(enters)}."
+    )
+
+
+def test_inject_user_message_outlasts_slow_submit_acceptance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    A submit accepted late — past the slow-accept warning threshold — still
+    delivers: the bridge warns that the TUI is slow and keeps retrying
+    instead of abandoning the committed draft as undelivered.
+    """
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01
+    )
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._SUBMIT_RETRY_INTERVAL_S", 0.02)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._SUBMIT_VERIFY_TIMEOUT_S", 2.0)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._SUBMIT_SLOW_ACCEPT_WARN_S",
+        0.1,
+        raising=False,
+    )
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_SETTLE_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+
+    tui = {"pane": _composer_pane(), "accept_after": None}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """
+        Simulate a TUI that only accepts an Enter arriving 0.3s post-paste.
+
+        :param cmd: Argv list passed to subprocess.run.
+        :param kwargs: Subprocess kwargs (ignored).
+        :returns: Fake CompletedProcess; capture-pane returns the
+            simulated input-box pane, other calls return rc=0.
+        """
+        del kwargs
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "paste-buffer" in cmd:
+            tui["pane"] = _composer_pane("fix the flaky test")
+            tui["accept_after"] = time.monotonic() + 0.3
+        if (
+            cmd[-1] == "Enter"
+            and tui["accept_after"] is not None
+            and time.monotonic() >= tui["accept_after"]
+        ):
+            tui["pane"] = _composer_pane()  # submitted — input box clears
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    with caplog.at_level("WARNING", logger="omnigent.harnesses.claude_native.bridge"):
+        inject_user_message(bridge_dir, content="fix the flaky test")
+
+    assert any("not accepted after" in record.getMessage() for record in caplog.records), [
+        record.getMessage() for record in caplog.records
+    ]
+
+
+def test_inject_slash_command_outlasts_slow_submit_acceptance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    The slash-command submit shares the escalating verify: a command only
+    accepted past the slow-accept threshold is delivered (with the slow-TUI
+    warning) instead of failing the turn.
+    """
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01
+    )
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._SUBMIT_RETRY_INTERVAL_S", 0.02)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._SUBMIT_VERIFY_TIMEOUT_S", 2.0)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._SUBMIT_SLOW_ACCEPT_WARN_S",
+        0.1,
+        raising=False,
+    )
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_SETTLE_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+
+    tui = {"pane": _composer_pane(), "accept_after": None}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """
+        Simulate a TUI that only accepts an Enter arriving 0.3s post-type.
+
+        :param cmd: Argv list passed to subprocess.run.
+        :param kwargs: Subprocess kwargs (ignored).
+        :returns: Fake CompletedProcess; capture-pane returns the
+            simulated input-box pane, other calls return rc=0.
+        """
+        del kwargs
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "-l" in cmd and cmd[-1] == "/effort high":
+            tui["pane"] = _composer_pane("/effort high")
+            tui["accept_after"] = time.monotonic() + 0.3
+        if (
+            cmd[-1] == "Enter"
+            and tui["accept_after"] is not None
+            and time.monotonic() >= tui["accept_after"]
+        ):
+            tui["pane"] = _composer_pane()  # submitted — input box clears
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    with caplog.at_level("WARNING", logger="omnigent.harnesses.claude_native.bridge"):
+        claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
+
+    assert any("not accepted after" in record.getMessage() for record in caplog.records), [
+        record.getMessage() for record in caplog.records
+    ]
+
+
 def test_inject_interrupt_sends_escape_keystroke(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -5304,6 +5550,32 @@ def test_post_tools_changed_normalizes_server_info_read_errors(
         post_tools_changed(tmp_path)
 
 
+def test_post_tools_changed_stops_waiting_when_cancelled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    read_started = threading.Event()
+    cancelled = threading.Event()
+    read_json = claude_native_bridge._read_json_file
+
+    def observe_read(path: Path) -> dict[str, Any]:
+        read_started.set()
+        return read_json(path)
+
+    monkeypatch.setattr(claude_native_bridge, "_read_json_file", observe_read)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        notification = executor.submit(
+            post_tools_changed, tmp_path, timeout_s=3.0, cancelled=cancelled
+        )
+        try:
+            assert read_started.wait(timeout=1.0)
+            assert not notification.done()
+            cancelled.set()
+            with pytest.raises(RuntimeError, match="notification was cancelled"):
+                notification.result(timeout=1.0)
+        finally:
+            cancelled.set()
+
+
 def test_post_tools_changed_preserves_programming_errors(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -5321,10 +5593,12 @@ def test_post_tools_changed_preserves_programming_errors(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("cancellable", [False, True])
 async def test_channel_server_relays_active_omnigent_tools(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     subprocess_bridge_root: Path,
+    cancellable: bool,
 ) -> None:
     """
     Active turn tools are advertised to Claude and dispatched through AP.
@@ -5394,7 +5668,7 @@ async def test_channel_server_relays_active_omnigent_tools(
             tool_executor=tool_executor,
             loop=asyncio.get_running_loop(),
         )
-        post_tools_changed(bridge_dir)
+        post_tools_changed(bridge_dir, cancelled=threading.Event() if cancellable else None)
         changed = await asyncio.to_thread(_read_json_line, proc.stdout, timeout_s=5.0)
         assert changed["method"] == "notifications/tools/list_changed"
 

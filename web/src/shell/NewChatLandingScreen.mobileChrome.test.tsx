@@ -1,3 +1,12 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("@/hooks/useSidebarData", () => ({
+  useLoadedConversations: () => ({ data: undefined, isLoading: false }),
+}));
+
+vi.mock("@/hooks/useSkills", () => ({
+  useSkills: () => ({ skills: [], skillsStatus: "ready", refetch: vi.fn() }),
+}));
 // The landing screen's mobile chrome. One rule, about arriving at "/" on a
 // phone: the composer is not focused, so landing here — including on the way
 // back out of Settings — never throws up the keyboard unasked. (The iOS
@@ -10,7 +19,6 @@ import type * as AgentLabelsModule from "@/lib/agentLabels";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, render, screen } from "@testing-library/react";
 import type { ReactNode } from "react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { Host } from "@/hooks/useHosts";
 import { useHosts } from "@/hooks/useHosts";

@@ -10,6 +10,7 @@ afterEach(cleanup);
 function renderSections(props: {
   models?: ComposerConfigSection;
   efforts?: ComposerConfigSection;
+  extra?: ComposerConfigSection[];
 }) {
   return render(
     <DropdownMenu open>
@@ -67,6 +68,18 @@ describe("ComposerConfigSections", () => {
     expect(screen.getByTestId("efforts-high")).toBeInTheDocument();
   });
 
+  it("omits the leading separator for a standalone effort submenu", () => {
+    renderSections({
+      efforts: {
+        testId: "efforts",
+        header: "Effort",
+        choices: [{ key: "high", label: "High", checked: true }],
+      },
+    });
+    expect(screen.getByRole("menuitemcheckbox", { name: "High" })).toBeVisible();
+    expect(screen.queryByRole("separator")).toBeNull();
+  });
+
   it("dispatches a choice's onSelect through the checkbox change handler", () => {
     const onSelect = vi.fn();
     renderSections({
@@ -78,6 +91,28 @@ describe("ComposerConfigSections", () => {
     });
     fireEvent.click(screen.getByTestId("models-opus"));
     expect(onSelect).toHaveBeenCalledTimes(1);
+  });
+
+  it("renders extra sections after Models/Effort, each with its own header and separator-led row", () => {
+    renderSections({
+      models: modelsSection("models"),
+      extra: [
+        {
+          testId: "fusion-leads",
+          header: "Lead",
+          choices: [{ key: "fable", label: "Claude Fable 5.1", checked: true, onSelect: vi.fn() }],
+        },
+        {
+          testId: "fusion-sidekicks",
+          header: "Sidekick",
+          choices: [{ key: "swe", label: "SWE-2 Medium", checked: true, onSelect: vi.fn() }],
+        },
+      ],
+    });
+    expect(within(screen.getByTestId("fusion-leads")).getByText("Lead")).toBeInTheDocument();
+    expect(
+      within(screen.getByTestId("fusion-sidekicks")).getByText("SWE-2 Medium"),
+    ).toBeInTheDocument();
   });
 
   it("omits a section whose prop is undefined and renders a static (no-onSelect) row disabled", () => {

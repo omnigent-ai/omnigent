@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import contextlib
+import contextvars
 import copy
 import json
 import logging
@@ -31,6 +32,7 @@ from rich.console import Console
 from rich.table import Table
 
 from omnigent._platform import IS_WINDOWS, resolve_repo_symlink
+from omnigent._startup_events import capture_cli_entry, record_startup_event
 from omnigent.cli_common import (
     RESUME_PICKER_SENTINEL as _RESUME_PICKER_SENTINEL,
 )
@@ -123,7 +125,7 @@ def _load_config(path: str | None) -> dict[str, Any]:  # type: ignore[explicit-a
     """
     if path is None:
         return {}
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         return yaml.safe_load(f) or {}
 
 
@@ -593,7 +595,7 @@ def _migrate_legacy_state_dir() -> None:
     legacy_pid_file = legacy_src / "host.pid"
     if legacy_pid_file.exists():
         try:
-            first_line = legacy_pid_file.read_text().strip().splitlines()[0]
+            first_line = legacy_pid_file.read_text(encoding="utf-8").strip().splitlines()[0]
             legacy_pid = int(first_line)
         except (ValueError, OSError, IndexError):
             legacy_pid = None
@@ -868,8 +870,8 @@ def _peek_default_agent_harness(target: str) -> str | None:
     if not path.is_file():
         return None
     try:
-        raw = yaml.safe_load(path.read_text()) or {}
-    except (OSError, yaml.YAMLError):
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except (OSError, UnicodeDecodeError, yaml.YAMLError):
         return None
     if not isinstance(raw, dict):
         return None
@@ -1184,7 +1186,7 @@ def _save_global_config(  # type: ignore[explicit-any]
     path = _effective_global_config_path()
     _normalize_harness_scalar_on_write(cfg, path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         yaml.safe_dump(cfg, f, default_flow_style=False, sort_keys=True)
 
 
@@ -1272,7 +1274,7 @@ def _save_local_config(
         cfg.pop(key, None)
     _normalize_harness_scalar_on_write(cfg, path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         yaml.safe_dump(cfg, f, default_flow_style=False, sort_keys=True)
 
 
@@ -1579,6 +1581,14 @@ def _preregister_agent(  # type: ignore[explicit-any]  # agent_store / artifact_
         click.echo(f"  warning: {agent_source} has no name, skipping")
         return None
 
+    # Fail loud now if a guardrail function policy can't be resolved
+    # from sys.path. Input policies evaluate in the server process, so
+    # an unresolvable path would otherwise fail-closed deny every turn
+    # on this agent with a generic "policy evaluation error" — and the
+    # agent would still register, giving the operator no signal until
+    # the first message.
+    _validate_agent_policy_functions(spec, agent_source)
+
     # Idempotent registration. Mirrors
     # :func:`omnigent.inner.cli._omnigent_register_yaml_bundle` —
     # see designs/RUN_OMNIGENT_SESSION_RESUMPTION.md. Reusing the
@@ -1626,6 +1636,53 @@ def _preregister_agent(  # type: ignore[explicit-any]  # agent_store / artifact_
     )
     click.echo(f"  agent: {spec.name} (from {agent_source})")
     return agent_id
+
+
+def _validate_agent_policy_functions(  # type: ignore[explicit-any]  # spec typed Any to avoid import cycle
+    spec: Any,
+    agent_source: Path,
+) -> None:
+    """
+    Resolve every guardrail function-policy path in *spec* from
+    ``sys.path``, raising loudly on the first one that can't be.
+
+    Walks the root spec and all sub-agents. For each function policy
+    it resolves ``function.path`` with the same importer the runtime
+    uses at evaluation time (``_resolve_dotted_path``) — resolution
+    behavior is unchanged; this only surfaces a failure early. The
+    factory (if any) is not invoked; this checks import + attribute
+    lookup only.
+
+    :param spec: The loaded :class:`~omnigent.spec.types.AgentSpec`.
+    :param agent_source: The ``--agent`` source, for the error text.
+    :raises click.ClickException: On the first policy whose function
+        path cannot be resolved; names the agent, policy, and path.
+    """
+    from omnigent.policies.function import _resolve_dotted_path
+    from omnigent.spec.types import FunctionPolicySpec
+
+    stack = [spec]
+    while stack:
+        current = stack.pop()
+        stack.extend(current.sub_agents or [])
+        guardrails = current.guardrails
+        if guardrails is None or not guardrails.policies:
+            continue
+        for policy in guardrails.policies:
+            if not isinstance(policy, FunctionPolicySpec) or policy.function is None:
+                continue
+            path = policy.function.path
+            try:
+                _resolve_dotted_path(path)
+            except Exception as exc:
+                raise click.ClickException(
+                    f"--agent {agent_source}: agent {current.name!r} policy "
+                    f"{policy.name!r} references function {path!r}, which "
+                    f"cannot be resolved from sys.path "
+                    f"({type(exc).__name__}: {exc}). Every message on this "
+                    f"agent would be denied; ship the module on the server's "
+                    f"sys.path or fix the policy path.",
+                ) from exc
 
 
 def _format_version() -> str:
@@ -1699,6 +1756,7 @@ _HARNESS_COMMANDS: frozenset[str] = frozenset(
         "codex",
         "cursor",
         "debby",
+        "devin",
         "goose",
         "hermes",
         "kimi",
@@ -2044,6 +2102,7 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
         "cursor",
         "debby",
         "debug",
+        "devin",
         "diagnose",
         "doctor",
         "extensions",
@@ -2202,6 +2261,7 @@ def _ensure_stdio_survives_unencodable_output() -> None:
                 reconfigure(errors="replace")
 
 
+@capture_cli_entry
 def main() -> None:
     """
     Console-script entry point for ``omnigent``.
@@ -2618,10 +2678,12 @@ class _SpawnedDaemonProcess:
     :param pid: Spawned process id, e.g. ``4242``.
     :param log_path: Daemon log path, e.g.
         ``"/Users/me/.omnigent/logs/host/host-abc.log"``.
+    :param process: Child process handle when this invocation spawned it.
     """
 
     pid: int
     log_path: str
+    process: subprocess.Popen[bytes] | None = None
 
 
 def _normalize_daemon_target(server_url: str | None) -> str:
@@ -2754,8 +2816,8 @@ def _read_daemon_record(path: Path) -> _HostDaemonRecord | None:
     :returns: Parsed daemon record, or ``None`` if unreadable or malformed.
     """
     try:
-        raw = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError):
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return None
     if not isinstance(raw, dict):
         return None
@@ -2881,24 +2943,13 @@ def _load_existing_host_id() -> str | None:
 
     :returns: Host id from config, e.g. ``"host_abc123"``, or ``None``.
     """
-    candidate_paths = [_effective_global_config_path()]
-    from omnigent.host.identity import CONFIG_PATH
+    from omnigent.host.identity import load_host_identity_if_present
 
-    if CONFIG_PATH not in candidate_paths:
-        candidate_paths.append(CONFIG_PATH)
-    for path in candidate_paths:
-        try:
-            raw = yaml.safe_load(path.read_text()) if path.exists() else None
-        except (OSError, yaml.YAMLError):
-            continue
-        if not isinstance(raw, dict):
-            continue
-        host = raw.get("host")
-        if isinstance(host, dict):
-            host_id = host.get("host_id")
-            if isinstance(host_id, str) and host_id:
-                return host_id
-    return None
+    try:
+        identity = load_host_identity_if_present()
+    except (OSError, UnicodeDecodeError, yaml.YAMLError):
+        return None
+    return identity.host_id if identity is not None else None
 
 
 def _daemon_tunnel_recovers(
@@ -3133,7 +3184,44 @@ def _spawn_host_daemon_process(
         return None
     finally:
         log_fh.close()
-    return _SpawnedDaemonProcess(pid=proc.pid, log_path=str(log_path))
+    return _SpawnedDaemonProcess(pid=proc.pid, log_path=str(log_path), process=proc)
+
+
+def _stop_spawned_host_daemon_process(
+    spawned: _SpawnedDaemonProcess,
+    *,
+    grace_timeout: float = _HOST_DAEMON_STOP_GRACE_S,
+) -> None:
+    """Stop a daemon child started by this invocation."""
+    proc = spawned.process
+    if proc is not None:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=grace_timeout)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+        return
+
+    if not _pid_alive(spawned.pid):
+        return
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.kill(spawned.pid, signal.SIGTERM)
+    deadline = time.monotonic() + grace_timeout
+    while time.monotonic() < deadline:
+        if not _pid_alive(spawned.pid):
+            return
+        time.sleep(0.05)
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.kill(spawned.pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+
+
+def _delete_spawned_daemon_record(target: str, spawned: _SpawnedDaemonProcess) -> None:
+    """Delete *target*'s record only when the spawned child owns it."""
+    record = _find_daemon_record(target)
+    if record is not None and record.pid == spawned.pid:
+        _delete_daemon_record(record)
 
 
 _DAEMON_CLAIM_TIMEOUT_S = 10.0
@@ -3347,10 +3435,10 @@ def _load_or_create_host_id() -> str | None:
     host_id = _load_existing_host_id()
     if host_id is not None:
         return host_id
-    from omnigent.host.identity import CONFIG_PATH, load_or_create_host_identity
+    from omnigent.host.identity import load_or_create_host_identity
 
     try:
-        return load_or_create_host_identity(CONFIG_PATH).host_id
+        return load_or_create_host_identity().host_id
     except (OSError, ValueError):
         # OSError: identity file unwritable. ValueError: a malformed persisted /
         # env host_id — a foreground host has nothing to key on, so degrade to
@@ -3370,11 +3458,28 @@ def _ensure_host_daemon(server_url: str | None) -> bool:
         rather than continue this command mid-restart. ``False`` for a
         plain reuse, a transparent tunnel-health heal, or a first spawn.
     """
+    ensure_started_at = time.monotonic()
     target = _normalize_daemon_target(server_url)
+    existing_before = _find_daemon_record(target)
+    process_was_running = existing_before is not None and _daemon_owner_is_live(existing_before)
+
+    def _record_host_state(action: str, *, running_before: bool = process_was_running) -> None:
+        record_startup_event(
+            "host_state_observed",
+            details={
+                "host_mode": "remote" if server_url else "local",
+                "host_process_state_at_launch": "running" if running_before else "not_running",
+                "host_process_action": action,
+                "host_ensure_elapsed_ms": round((time.monotonic() - ensure_started_at) * 1000, 3),
+            },
+        )
+
     decision = _reuse_existing_daemon_record(target)
     if decision.reuse:
+        _record_host_state("reused")
         return False
     if not decision.config_changed and _local_daemon_serves_target(target, server_url):
+        _record_host_state("reused_local_daemon", running_before=True)
         return False
 
     _HOST_PID_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -3383,20 +3488,42 @@ def _ensure_host_daemon(server_url: str | None) -> bool:
     config_sig = server_config_signature(include_features=not server_url)
     daemon_env = _build_host_daemon_env(server_url=server_url)
     daemon_env[DAEMON_CONFIG_SIG_ENV_VAR] = config_sig
+    expected_host_id = _load_existing_host_id()
     spawned = _spawn_host_daemon_process(args=args, env=daemon_env)
     if spawned is None:
+        _record_host_state("start_failed")
         return False
-    if _wait_for_daemon_claim(target, spawned) is None:
+    claimed = _wait_for_daemon_claim(target, spawned)
+    if claimed is None:
+        _record_host_state("start_timeout")
+        _stop_spawned_host_daemon_process(spawned)
+        _delete_spawned_daemon_record(target, spawned)
         # The spawned daemon (or a concurrent winner) never wrote its record:
         # it likely crashed during startup. Point at its log so the failure is
         # diagnosable instead of silently absent from `host status`.
-        logging.getLogger(__name__).warning(
-            "host daemon for %s did not claim its registry record within %.0fs; "
-            "see %s for the daemon's own log",
-            target,
-            _DAEMON_CLAIM_TIMEOUT_S,
-            spawned.log_path,
+        raise click.ClickException(
+            f"Host daemon for {target!r} did not claim its registry record within "
+            f"{_DAEMON_CLAIM_TIMEOUT_S:.0f}s and was stopped. See {spawned.log_path}."
         )
+    expected_host_id = expected_host_id or _load_existing_host_id()
+    if expected_host_id is not None and claimed.host_id != expected_host_id:
+        _record_host_state("start_identity_mismatch")
+        _stop_spawned_host_daemon_process(spawned)
+        _delete_spawned_daemon_record(target, spawned)
+        actual_host_id = claimed.host_id or "<missing>"
+        raise click.ClickException(
+            f"Host daemon for {target!r} registered as {actual_host_id!r}, but this "
+            f"invocation requested {expected_host_id!r}. The spawned daemon was stopped. "
+            "Check OMNIGENT_HOST_ID, OMNIGENT_HOST_NAME, and OMNIGENT_CONFIG_HOME. "
+            f"See {spawned.log_path}."
+        )
+    if claimed.pid != spawned.pid:
+        action = "started_concurrently_during_launch"
+    elif process_was_running:
+        action = "restarted_during_launch"
+    else:
+        action = "started_during_launch"
+    _record_host_state(action)
     return decision.config_changed
 
 
@@ -3427,6 +3554,19 @@ def _build_host_daemon_env(
         _RUNNER_ENV_ALLOWLIST,
         _RUNNER_ENV_ALLOWLIST_PREFIXES,
     )
+    from omnigent.host.identity import (
+        HOST_ID_ENV_VAR,
+        HOST_NAME_ENV_VAR,
+        HOST_TOKEN_ENV_VAR,
+    )
+
+    identity_env_vars = frozenset(
+        {
+            HOST_ID_ENV_VAR,
+            HOST_NAME_ENV_VAR,
+            HOST_TOKEN_ENV_VAR,
+        }
+    )
 
     if not server_url:
         daemon_env_prefixes = (*_RUNNER_ENV_ALLOWLIST_PREFIXES, *_LOCAL_DAEMON_ENV_PREFIXES)
@@ -3436,6 +3576,7 @@ def _build_host_daemon_env(
             if key in _RUNNER_ENV_ALLOWLIST
             or key in _LOCAL_DAEMON_ENV_ALLOWLIST
             or key in _HOST_DAEMON_PROXY_ENV_ALLOWLIST
+            or key in identity_env_vars
             or key.startswith(daemon_env_prefixes)
         }
     else:
@@ -3449,6 +3590,7 @@ def _build_host_daemon_env(
             for key, value in os.environ.items()
             if key in _RUNNER_ENV_ALLOWLIST
             or key in _HOST_DAEMON_PROXY_ENV_ALLOWLIST
+            or key in identity_env_vars
             or key.startswith(daemon_env_prefixes)
         }
     # The daemon outlives the dispatch that spawned it and is reused by later
@@ -3473,7 +3615,7 @@ def _read_host_pid_file() -> tuple[int, str] | None:
     if not _HOST_PID_PATH.exists():
         return None
     try:
-        lines = _HOST_PID_PATH.read_text().strip().splitlines()
+        lines = _HOST_PID_PATH.read_text(encoding="utf-8").strip().splitlines()
         if len(lines) < 2:
             return None
         return int(lines[0]), lines[1]
@@ -3638,7 +3780,8 @@ def _ensure_backend(server: str | None) -> str:
             concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool,
         ):
             auth_future = pool.submit(_ensure_databricks_server_auth, server)
-            daemon_future = pool.submit(_ensure_host_daemon, server)
+            daemon_context = contextvars.copy_context()
+            daemon_future = pool.submit(daemon_context.run, _ensure_host_daemon, server)
             # Raise auth errors before daemon errors: a login failure is
             # more actionable than a daemon-connect failure that would
             # have been caused by the same missing credentials.
@@ -4841,7 +4984,7 @@ def _write_uninstall_manifest(ledger: InstallLedger) -> Path:
     """Write the ledger fields the POSIX uninstaller needs as tab records."""
     fd, manifest_name = tempfile.mkstemp(prefix="omnigent-uninstall-ledger-", suffix=".tsv")
     manifest = Path(manifest_name)
-    with os.fdopen(fd, "w") as handle:
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
         for profile in ledger.entries.profiles:
             handle.write(
                 "\t".join(
@@ -5893,7 +6036,7 @@ def _resolve_bundle_env_vars(source: Path) -> dict[str, str]:
     # ── config.yaml ──────────────────────────────────
     config_path = source / "config.yaml"
     if config_path.exists():
-        raw = yaml.safe_load(config_path.read_text())
+        raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
         if isinstance(raw, dict):
             changed = _expand_config_env_vars(raw, expand_env_vars)
             if changed:
@@ -5909,7 +6052,7 @@ def _resolve_bundle_env_vars(source: Path) -> dict[str, str]:
     mcp_dir = source / "tools" / "mcp"
     if mcp_dir.is_dir():
         for yaml_file in sorted(mcp_dir.glob("*.yaml")):
-            raw = yaml.safe_load(yaml_file.read_text())
+            raw = yaml.safe_load(yaml_file.read_text(encoding="utf-8"))
             if not isinstance(raw, dict):
                 continue
             changed = False
@@ -7222,7 +7365,7 @@ def _materialize_harness_launcher_file(
     }
     if canonical in _OS_ENV_HARNESSES:
         raw["os_env"] = {"type": "caller_process", "sandbox": {"type": "none"}}
-    yaml_path.write_text(yaml.safe_dump(raw, default_flow_style=False))
+    yaml_path.write_text(yaml.safe_dump(raw, default_flow_style=False), encoding="utf-8")
     return yaml_path
 
 
@@ -7380,6 +7523,13 @@ _NATIVE_TERMINAL_DISPATCH_SPECS: dict[str, _NativeTerminalDispatchSpec] = {
         module="omnigent.harnesses.kimi_native.main",
         function="run_kimi_native",
         args_param="extra_args",
+    ),
+    "devin": _NativeTerminalDispatchSpec(
+        module="omnigent.harnesses.devin_native.main",
+        function="run_devin_native",
+        args_param="extra_args",
+        model_strategy="first_class",
+        prompt_param="prompt",
     ),
     "kiro": _NativeTerminalDispatchSpec(
         module="omnigent.harnesses.kiro_native.main",
@@ -10292,7 +10442,6 @@ def host_reset_id(yes: bool) -> None:
     :param yes: When ``True``, skip the confirmation prompt.
     """
     from omnigent.host.identity import (
-        CONFIG_PATH,
         HOST_ID_ENV_VAR,
         HOST_NAME_ENV_VAR,
         host_identity_env_override_active,
@@ -10327,7 +10476,7 @@ def host_reset_id(yes: bool) -> None:
             "for an administrator to clean up",
             abort=True,
         )
-    old_host_id, new_host_id = reset_host_id(CONFIG_PATH)
+    old_host_id, new_host_id = reset_host_id()
     if old_host_id is None:
         click.echo(f"No previous host id was persisted; created {new_host_id}.")
     else:
@@ -12716,8 +12865,8 @@ def _bundled_agent_brain_harness(name: str) -> str | None:
     if not config_path.is_file():
         return None
     try:
-        raw = yaml.safe_load(config_path.read_text()) or {}
-    except (OSError, yaml.YAMLError):
+        raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    except (OSError, UnicodeDecodeError, yaml.YAMLError):
         return None
     if not isinstance(raw, dict):
         return None
@@ -12941,6 +13090,22 @@ def _bundled_brain_fallback_applies(run_args: tuple[str, ...]) -> bool:
     if isinstance(configured, str) and configured and not _is_local_server_request(configured):
         return False
     return True
+
+
+def _reject_reserved_devin_resume_args(devin_args: tuple[str, ...]) -> None:
+    """Reject Devin-owned resume/session flags in passthrough args.
+
+    Omnigent owns resume: it maps a conversation id to Devin's own session id
+    and passes ``--resume <devin_session_id>`` itself, so a user-supplied
+    ``--resume``/``-c`` would fight it and reattach the wrong session. Same for
+    ``--config``/``--export``, which carry the Omnigent hook wiring.
+    """
+    reserved = {"--resume", "-r", "--continue", "-c", "--config", "--export"}
+    if any(arg == flag or arg.startswith(f"{flag}=") for arg in devin_args for flag in reserved):
+        raise click.UsageError(
+            "Devin resume/config flags are reserved for Omnigent handling; use "
+            "`omnigent devin --resume [CONVERSATION]` instead."
+        )
 
 
 def _reject_reserved_kiro_resume_args(kiro_args: tuple[str, ...]) -> None:

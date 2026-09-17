@@ -46,6 +46,7 @@ from omnigent.host.frames import (
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
     HostRunnerStatusResultFrame,
+    HostSkillsResultFrame,
     HostStatResultFrame,
     HostStopRunnerResultFrame,
     HostStoreSecretResultFrame,
@@ -778,6 +779,11 @@ async def _receive_loop(
                     }
                 )
             continue
+        if isinstance(frame, HostSkillsResultFrame):
+            skills_future = conn.pending_skills.pop(frame.request_id, None)
+            if skills_future is not None and not skills_future.done():
+                skills_future.set_result(frame)
+            continue
         if isinstance(frame, HostImportLocalSessionFrame):
             queue = conn.pending_import_local.get(frame.request_id)
             if queue is not None:
@@ -802,7 +808,12 @@ async def _receive_loop(
                 queue.put_nowait(
                     (
                         "done",
-                        {"status": frame.status, "error": frame.error, "failed": frame.failed},
+                        {
+                            "status": frame.status,
+                            "error": frame.error,
+                            "failed": frame.failed,
+                            "failures": frame.failures,
+                        },
                     )
                 )
             continue

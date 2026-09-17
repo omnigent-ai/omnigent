@@ -16,6 +16,7 @@ from fastapi import (
 from fastapi.responses import Response
 
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
 from omnigent.native.native_coding_agents import native_coding_agent_for_agent_name
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runtime.agent_cache import AgentCache
@@ -179,11 +180,24 @@ def register_agent_routes(
         :raises OmnigentError: If the session, agent, or bundle is
             not found.
         """
-        user_id = _require_user(request, auth_provider)
-        access = await _require_access_and_level(
-            user_id, session_id, LEVEL_READ, permission_store, conversation_store
-        )
-        conv = access.conversation
+        managed_token = request.headers.get(MANAGED_HOST_TOKEN_HEADER)
+        if managed_token:
+            # A sandbox host can read only bundles for sessions bound to it.
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            host_store = getattr(request.app.state, "host_store", None)
+            managed = None
+            if conv is not None and conv.host_id is not None and host_store is not None:
+                managed = await asyncio.to_thread(
+                    host_store.resolve_launch_token, conv.host_id, managed_token
+                )
+            if managed is None:
+                raise HTTPException(status_code=401, detail="unauthenticated host")
+        else:
+            user_id = _require_user(request, auth_provider)
+            access = await _require_access_and_level(
+                user_id, session_id, LEVEL_READ, permission_store, conversation_store
+            )
+            conv = access.conversation
         if conv is None:
             conv = conversation_store.get_conversation(session_id)
             if conv is None:
@@ -217,6 +231,8 @@ def register_agent_routes(
             content=bundle_bytes,
             media_type="application/gzip",
             headers={
+                "Cache-Control": "no-store",
+                "X-Agent-Id": agent.id,
                 "X-Agent-Version": str(agent.version),
                 "X-Agent-Name": agent.name,
                 # Provenance for the runner's env-expansion decision:

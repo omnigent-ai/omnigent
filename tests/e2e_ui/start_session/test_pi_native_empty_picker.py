@@ -75,7 +75,9 @@ async def _drive_empty_pi_picker(base_url: str, session_id: str) -> None:
                     body=json.dumps({"models": []}),
                 )
 
-            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+            await page.route(
+                re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
+            )
             await page.route(
                 f"**/v1/hosts/{_HOST_ID}/harnesses/pi-native/model-options",
                 handle_pi_model_options,

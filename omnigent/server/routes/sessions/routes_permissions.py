@@ -423,10 +423,11 @@ def _to_agent_object(
                 and native_coding_agent_for_agent_name(loaded.spec.name) is not None
                 else list(loaded.spec.terminals or {})
             )
-            # Bundled skills only (mirrors GET /v1/agents); the merged
-            # bundled + host-discovered set lives on the session snapshot.
+            # Bundled suggestions stay available while the host catalog loads.
             skills = [
-                SkillSummary(name=s.name, description=s.description) for s in loaded.spec.skills
+                SkillSummary(name=s.name, description=s.description)
+                for s in loaded.spec.skills
+                if s.user_invocable
             ]
             mcp_servers = [
                 MCPServerSummary(

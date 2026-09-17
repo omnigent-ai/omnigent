@@ -6,7 +6,7 @@ report:
 * Agent A exists as a user-registered template (``builtin: false`` in
   ``GET /v1/agents``) — e.g. created via ``omnigent server --agent``.
 * A newer ``omnigent run`` minted a session-scoped Agent A with a DISTINCT
-  agent_id (discovered via ``GET /v1/sessions?kind=any``), created after the
+  agent_id (discovered via ``GET /v1/sessions?visibility=mine``), created after the
   template.
 
 The picker must offer (and bind) the newest — the upload — not the stale
@@ -28,6 +28,8 @@ from collections.abc import Coroutine
 from typing import Any
 
 from playwright.async_api import Route, async_playwright, expect
+
+from tests.e2e_ui.start_session.helpers import stub_empty_host_picker_data
 
 _HOST_ID = "host_e2e"
 _SESSIONS_RE = re.compile(r"/v1/sessions(\?.*)?$")
@@ -148,7 +150,7 @@ async def _register_routes(page, *, created_session_id: str, create_requests: li
                 body=json.dumps({"id": created_session_id, "session_id": created_session_id}),
             )
         else:
-            # The picker's sessions scan (?kind=any).
+            # The picker's sessions scan (?visibility=mine).
             await route.fulfill(status=200, content_type="application/json", body=_scan_body())
 
     async def handle_events(route: Route) -> None:
@@ -162,6 +164,7 @@ async def _register_routes(page, *, created_session_id: str, create_requests: li
     # sessions matcher so it is not captured as a create/scan.
     await page.route(f"**/v1/sessions/{_SCAN_UPLOAD_SESSION}/agent", handle_upload_agent)
     await page.route("**/v1/hosts", handle_hosts)
+    await stub_empty_host_picker_data(page, _HOST_ID)
     await page.route("**/v1/agents", handle_agents)
     await page.route("**/v1/sessions/*/events", handle_events)
     await page.route(_SESSIONS_RE, handle_sessions)

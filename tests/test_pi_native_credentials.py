@@ -7,6 +7,7 @@ import stat
 from pathlib import Path
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 from omnigent.harnesses.pi_native import credentials as creds
@@ -437,6 +438,118 @@ def test_provider_launch_rejects_unavailable_qualified_selection(tmp_path: Path)
         )
 
     assert not agent_dir.exists()
+
+
+def test_key_provider_model_options_list_the_live_anthropic_listing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A key/gateway provider's picker rows come from its live model listing.
+
+    The pre-launch picker renders the resolved provider's ``models.json``;
+    for key/gateway providers that config carried only the configured
+    default (one row), so the picker offered exactly one model while the
+    endpoint serves several. The listing must be fetched live via the
+    model-catalog fetchers — the same lane the Databricks paths use — with
+    the configured default still present (it launches offline).
+    """
+    config = {
+        "providers": {
+            "zai": {
+                "kind": "gateway",
+                "default": True,
+                "anthropic": {
+                    "base_url": "https://gw.example.com/anthropic",
+                    "api_key": "sk-test-literal",
+                    "models": {"default": "glm-5.3"},
+                },
+            }
+        }
+    }
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"data": [{"id": "glm-5.3"}, {"id": "glm-5.3-flash"}, {"id": "glm-5.2"}]},
+        )
+
+    options = creds.pi_native_model_options(
+        config_loader=lambda: config, transport=httpx.MockTransport(_handler)
+    )
+
+    assert {o["model"] for o in options} == {
+        "omnigent/glm-5.3",
+        "omnigent/glm-5.3-flash",
+        "omnigent/glm-5.2",
+    }
+
+
+def test_key_provider_model_options_list_the_live_openai_listing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An openai-family key/gateway provider lists its /v1/models rows too."""
+    config = {
+        "providers": {
+            "deepseek": {
+                "kind": "key",
+                "default": True,
+                "openai": {
+                    "base_url": "https://gw.example.com/v1",
+                    "api_key": "sk-test-literal",
+                    "wire_api": "chat",
+                    "models": {"default": "deepseek-flash"},
+                },
+            }
+        }
+    }
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"data": [{"id": "deepseek-flash"}, {"id": "deepseek-v4-pro"}]},
+        )
+
+    options = creds.pi_native_model_options(
+        config_loader=lambda: config, transport=httpx.MockTransport(_handler)
+    )
+
+    assert {o["model"] for o in options} == {
+        "omnigent/deepseek-flash",
+        "omnigent/deepseek-v4-pro",
+    }
+
+
+def test_key_provider_model_options_degrade_to_default_when_listing_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unreachable listing endpoint degrades to the configured default.
+
+    The launch picker must not hard-fail when the vendor's /models endpoint
+    is offline or rejects the key: the configured default model still
+    launches, exactly as it did before live listing existed.
+    """
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, json={"error": "bad key"})
+
+    config = {
+        "providers": {
+            "zai": {
+                "kind": "gateway",
+                "default": True,
+                "anthropic": {
+                    "base_url": "https://gw.example.com/anthropic",
+                    "api_key": "sk-test-literal",
+                    "models": {"default": "glm-5.3"},
+                },
+            }
+        }
+    }
+
+    options = creds.pi_native_model_options(
+        config_loader=lambda: config, transport=httpx.MockTransport(_handler)
+    )
+
+    assert {o["model"] for o in options} == {"omnigent/glm-5.3"}
 
 
 def test_pi_native_model_options_lists_only_managed_models(

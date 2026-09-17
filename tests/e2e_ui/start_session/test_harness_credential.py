@@ -22,7 +22,7 @@ from typing import Any
 
 from playwright.async_api import Route, async_playwright, expect
 
-from tests.e2e_ui.start_session.helpers import select_landing_agent
+from tests.e2e_ui.start_session.helpers import select_landing_agent, stub_empty_host_picker_data
 
 _HOST_ID = "host_e2e"
 # The stub host reports codex installed-but-not-configured; the credential POST
@@ -178,19 +178,19 @@ async def _register_routes(page, *, credential_requests: list[dict[str, Any]]) -
         )
 
     async def handle_agent_scan(route: Route) -> None:
-        # The picker also scans GET /v1/sessions?kind=any for registered agents.
-        # The seeded_session fixture creates real sessions in the DB, so without
-        # this stub those leak in and the picker auto-selects the built-in Claude
-        # Code (ready) instead of our unconfigured Codex — no "Set up" notice
-        # (a CI-only failure). Return none so only the stubbed Codex populates it.
+        # Exclude real agents left in the shared server so the stubbed Codex
+        # stays selected and its setup notice remains visible.
         await route.fulfill(
             status=200, content_type="application/json", body=json.dumps({"data": []})
         )
 
     await page.route("**/v1/info", handle_info)
     await page.route("**/v1/hosts", handle_hosts)
+    await stub_empty_host_picker_data(page, _HOST_ID)
     await page.route("**/v1/agents", handle_agents)
-    await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+    await page.route(
+        re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
+    )
     await page.route("**/v1/harnesses", handle_harnesses)
     await page.route("**/v1/hosts/*/credentials/detected", handle_detect)
     await page.route(f"**/v1/hosts/*/harnesses/{_HARNESS}/credential", handle_credential)
@@ -209,11 +209,11 @@ async def _seed_workspace(page) -> None:
 
 
 def test_add_key_configures_needs_auth_harness(
-    seeded_session: tuple[str, str],
+    live_server: str,
 ) -> None:
     """The setup dialog offers an inline credential form for a needs-auth
     harness; pasting a key writes it and clears the readiness warning."""
-    base_url, _session_id = seeded_session
+    base_url = live_server
     _run_in_fresh_loop(_drive_add_key(base_url))
 
 
