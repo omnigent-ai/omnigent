@@ -2,13 +2,21 @@
 
 from __future__ import annotations
 
+import builtins
 import json
+import re
 from typing import Any
 
-from sqlalchemy import asc, select
+import zstandard
+from sqlalchemy import LargeBinary, asc, select, type_coerce, update
+from sqlalchemy.dialects.mysql import insert as mysql_insert
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
+from sqlalchemy.sql.dml import Insert
 
-from omnigent.db.db_models import SqlProject, current_workspace_id
+from omnigent.db.compression import decode
+from omnigent.db.db_models import SqlProject, SqlUser, current_workspace_id
 from omnigent.db.utils import (
     get_or_create_engine,
     make_named_managed_session_maker,
@@ -17,7 +25,8 @@ from omnigent.db.utils import (
 )
 from omnigent.entities import Project
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.stores.project_store import ProjectStore
+from omnigent.server.auth import RESERVED_USER_LOCAL
+from omnigent.stores.project_store import ProjectOrderPreference, ProjectStore
 
 # Max serialized length of a project's config blob. The value is persisted
 # verbatim and reflected back on every read, so an unbounded blob is a mild
@@ -81,6 +90,41 @@ def _to_entity(row: SqlProject) -> Project:
         updated_at=row.updated_at,
         config=_decode_config(row.config),
     )
+
+
+def _decode_order(raw: bytes | str | memoryview | None) -> ProjectOrderPreference:
+    """Keep invalid preferences from breaking project discovery."""
+    default: ProjectOrderPreference = {"sort_mode": "alphabetical", "ordered_project_ids": None}
+    if raw is None:
+        return default
+    try:
+        # The 10,000-ID API limit serializes to under 400 KiB, including legacy spacing.
+        decoded = json.loads(decode(raw, max_decoded_bytes=512 * 1024) or "null")
+        # The original format stored only the manual ID array.
+        if isinstance(decoded, list):
+            decoded = {"sort_mode": "manual", "ordered_project_ids": decoded}
+        if not isinstance(decoded, dict) or decoded.get("sort_mode") not in (
+            "alphabetical",
+            "manual",
+        ):
+            return default
+        ids = decoded.get("ordered_project_ids")
+        if ids is None:
+            return default
+        if (
+            not isinstance(ids, list)
+            or len(ids) > 10000
+            or any(
+                not isinstance(id, str) or re.fullmatch("[0-9a-f]{32}", id) is None for id in ids
+            )
+        ):
+            return default
+        return {
+            "sort_mode": decoded["sort_mode"],
+            "ordered_project_ids": list(dict.fromkeys(ids)),
+        }
+    except (ValueError, RecursionError, zstandard.ZstdError):
+        return default
 
 
 class SqlAlchemyProjectStore(ProjectStore):
@@ -257,3 +301,102 @@ class SqlAlchemyProjectStore(ProjectStore):
             return True
 
         return run_write_transaction(self._session_immediate, "delete_project", write)
+
+    def get_order(self, *, user_id: str | None) -> builtins.list[str] | None:
+        """Return the active order used by project-list endpoints."""
+        preference = self.get_order_preference(user_id=user_id)
+        return preference["ordered_project_ids"] if preference["sort_mode"] == "manual" else None
+
+    def get_order_preference(self, *, user_id: str | None) -> ProjectOrderPreference:
+        """Read the preference without loading authentication fields."""
+        preference_user_id = RESERVED_USER_LOCAL if user_id is None else user_id
+        with self._session("read_project_order") as session:
+            # Decode raw bytes here so malformed values cannot fail in the ORM result processor.
+            raw = session.scalar(
+                select(type_coerce(SqlUser.project_order, LargeBinary)).where(
+                    SqlUser.workspace_id == current_workspace_id(),
+                    SqlUser.id == preference_user_id,
+                )
+            )
+            return _decode_order(raw)
+
+    def save_order(
+        self, ids: builtins.list[str] | None, *, user_id: str | None
+    ) -> ProjectOrderPreference:
+        """Validate project ownership and update only the user's preference."""
+        preference_user_id = RESERVED_USER_LOCAL if user_id is None else user_id
+
+        def write(session: Session) -> ProjectOrderPreference:
+            workspace_id = current_workspace_id()
+            if ids is None:
+                raw = session.scalar(
+                    select(type_coerce(SqlUser.project_order, LargeBinary))
+                    .where(SqlUser.workspace_id == workspace_id, SqlUser.id == preference_user_id)
+                    .with_for_update()
+                )
+                preference = _decode_order(raw)
+                preference["sort_mode"] = "alphabetical"
+                if raw is None:
+                    return preference
+                session.execute(
+                    update(SqlUser)
+                    .where(
+                        SqlUser.workspace_id == workspace_id,
+                        SqlUser.id == preference_user_id,
+                    )
+                    .values(project_order=json.dumps(preference, separators=(",", ":")))
+                )
+                return preference
+            owned = set(
+                session.scalars(
+                    select(SqlProject.id).where(
+                        SqlProject.workspace_id == workspace_id,
+                        SqlProject.user_id == user_id,
+                    )
+                )
+            )
+            if len(set(ids)) != len(ids) or not set(ids).issubset(owned):
+                raise OmnigentError("Invalid project order", code=ErrorCode.INVALID_INPUT)
+            preference: ProjectOrderPreference = {
+                "sort_mode": "manual",
+                "ordered_project_ids": ids,
+            }
+            encoded = json.dumps(preference, separators=(",", ":"))
+            values = {
+                "workspace_id": workspace_id,
+                "id": preference_user_id,
+                "is_admin": False,
+                "project_order": encoded,
+            }
+            dialect = self._engine.dialect.name
+            stmt: Insert
+            if dialect == "mysql":
+                stmt = (
+                    mysql_insert(SqlUser)
+                    .values(**values)
+                    .on_duplicate_key_update(
+                        project_order=encoded,
+                    )
+                )
+            elif dialect == "sqlite":
+                stmt = (
+                    sqlite_insert(SqlUser)
+                    .values(**values)
+                    .on_conflict_do_update(
+                        index_elements=["workspace_id", "id"],
+                        set_={"project_order": encoded},
+                    )
+                )
+            else:
+                stmt = (
+                    pg_insert(SqlUser)
+                    .values(**values)
+                    .on_conflict_do_update(
+                        index_elements=["workspace_id", "id"],
+                        set_={"project_order": encoded},
+                    )
+                )
+            session.execute(stmt)
+            return preference
+
+        return run_write_transaction(self._session_immediate, "save_project_order", write)

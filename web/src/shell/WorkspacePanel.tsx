@@ -1,3 +1,4 @@
+import type { FilePosition } from "./FileViewerContext";
 import {
   BotIcon,
   FileIcon,
@@ -24,6 +25,7 @@ import {
   useState,
 } from "react";
 import { cn } from "@/lib/utils";
+import { defaultWorkspaceTabs, readDefaultWorkspaceTab } from "@/lib/workspaceTabPreferences";
 import { isEditorLevel, isOwnerLevel } from "@/lib/permissionsApi";
 import {
   DropdownMenu,
@@ -607,6 +609,7 @@ interface WorkspacePanelProps {
   rootSessionId: string | null;
   /** Active file path, or null when the Files tab shows a scope view. */
   selectedFilePath: string | null;
+  filePosition?: FilePosition;
   /** Ordered list of open file tabs, shown as a strip in the Files panel. */
   openFiles: string[];
   /** Open a file in the inline viewer (adds/activates its tab). */
@@ -693,6 +696,7 @@ function WorkspacePanelImpl({
   agentCount,
   rootSessionId,
   selectedFilePath,
+  filePosition,
   openFiles,
   openFileViewer,
   onCloseFile,
@@ -768,6 +772,76 @@ function WorkspacePanelImpl({
         tabIndex: -1,
       }
     : handleProps;
+  const defaultTab = readDefaultWorkspaceTab();
+  const tabOrder = [defaultTab, ...defaultWorkspaceTabs.filter((tab) => tab !== defaultTab)];
+  const tabTriggers = {
+    files: (pending || showFilesPanel) && (
+      <WorkspaceTabTooltip key="files" label="Files">
+        <TabsTrigger
+          value="files"
+          aria-label="Files"
+          disabled={pending}
+          className="size-6 shrink-0 p-0 hover:border-1 hover:border-muted rounded-md!"
+        >
+          <FolderTreeIcon />
+          <span className="sr-only">Files</span>
+        </TabsTrigger>
+      </WorkspaceTabTooltip>
+    ),
+    changes: (pending || showFilesPanel) && (
+      <WorkspaceTabTooltip key="changes" label="Changes">
+        <TabsTrigger
+          value="changes"
+          aria-label={changedCount > 0 ? `Changes ${changedCount} changed` : "Changes"}
+          disabled={pending}
+          className="size-6 shrink-0 p-0 hover:border-1 hover:border-muted rounded-md!"
+        >
+          <FileDiffIcon />
+          <span className="sr-only">Changes</span>
+          {changedCount > 0 && <span className="sr-only">{changedCount}</span>}
+        </TabsTrigger>
+      </WorkspaceTabTooltip>
+    ),
+    github: (pending || showGithubTab) && (
+      <WorkspaceTabTooltip key="github" label="GitHub">
+        <TabsTrigger
+          value="github"
+          aria-label="GitHub"
+          disabled={pending}
+          className="size-6 shrink-0 p-0 hover:border-1 hover:border-muted rounded-md!"
+        >
+          <GithubMono size={16} />
+          <span className="sr-only">GitHub</span>
+        </TabsTrigger>
+      </WorkspaceTabTooltip>
+    ),
+    subagents: (
+      <WorkspaceTabTooltip key="subagents" label="Agents">
+        <TabsTrigger
+          value="subagents"
+          disabled={pending}
+          aria-label={
+            subagentsWorking > 0
+              ? `Agents ${subagentsWorking}/${agentCount}`
+              : `Agents ${agentCount}`
+          }
+          className="size-6 shrink-0 p-0 hover:border-1 hover:border-muted rounded-md!"
+        >
+          <BotIcon />
+          <span className="sr-only">Agents</span>
+          <span
+            className={cn(
+              TAB_BADGE_BASE,
+              "sr-only",
+              subagentsWorking > 0 ? "text-success" : "text-muted-foreground",
+            )}
+          >
+            {subagentsWorking > 0 ? `${subagentsWorking}/${agentCount}` : agentCount}
+          </span>
+        </TabsTrigger>
+      </WorkspaceTabTooltip>
+    ),
+  };
   return (
     <aside
       aria-label="Workspace"
@@ -814,14 +888,7 @@ function WorkspacePanelImpl({
           )}
         />
       )}
-      {/* Tab strip, in display order Files · Changes · Agents.
-          Files (full folder tree) and Changes (changed-files-only list) are
-          two peer tabs — same gate (an on-disk workspace), same FilesPanel,
-          each pinned to one scope. Agents is always present (the Agents panel
-          lists at least the main agent). Shells have no nav tab — they open as
-          closable soft tabs (see the "+" NewTabMenu / TerminalTabsStrip below).
-          The Agents tab keys off ``rootSessionId``, so inside a child
-          it lists the siblings + a "main" link back to the parent. */}
+      {/* The default nav tab comes first; the remaining tabs keep their relative order. */}
       {/* Tab strip: the static nav tabs + divider stay pinned on the left at
           every rail width, and ONLY the file-tabs region scrolls (it owns the
           horizontal scroller — see below). The outer row never scrolls
@@ -856,70 +923,7 @@ function WorkspacePanelImpl({
           componentId="chat.right_rail.tabs"
         >
           <TabsList variant="pill" className="gap-1">
-            {(pending || showFilesPanel) && (
-              <WorkspaceTabTooltip label="Files">
-                <TabsTrigger
-                  value="files"
-                  aria-label="Files"
-                  disabled={pending}
-                  className="size-6 shrink-0 p-0 hover:border-1 hover:border-muted rounded-md!"
-                >
-                  <FolderTreeIcon />
-                  <span className="sr-only">Files</span>
-                </TabsTrigger>
-              </WorkspaceTabTooltip>
-            )}
-            {(pending || showFilesPanel) && (
-              <WorkspaceTabTooltip label="Changes">
-                <TabsTrigger
-                  value="changes"
-                  aria-label={changedCount > 0 ? `Changes ${changedCount} changed` : "Changes"}
-                  disabled={pending}
-                  className="size-6 shrink-0 p-0 hover:border-1 hover:border-muted rounded-md!"
-                >
-                  <FileDiffIcon />
-                  <span className="sr-only">Changes</span>
-                  {changedCount > 0 && <span className="sr-only">{changedCount}</span>}
-                </TabsTrigger>
-              </WorkspaceTabTooltip>
-            )}
-            {(pending || showGithubTab) && (
-              <WorkspaceTabTooltip label="GitHub">
-                <TabsTrigger
-                  value="github"
-                  aria-label="GitHub"
-                  disabled={pending}
-                  className="size-6 shrink-0 p-0 hover:border-1 hover:border-muted rounded-md!"
-                >
-                  <GithubMono size={16} />
-                  <span className="sr-only">GitHub</span>
-                </TabsTrigger>
-              </WorkspaceTabTooltip>
-            )}
-            <WorkspaceTabTooltip label="Agents">
-              <TabsTrigger
-                value="subagents"
-                disabled={pending}
-                aria-label={
-                  subagentsWorking > 0
-                    ? `Agents ${subagentsWorking}/${agentCount}`
-                    : `Agents ${agentCount}`
-                }
-                className="size-6 shrink-0 p-0 hover:border-1 hover:border-muted rounded-md!"
-              >
-                <BotIcon />
-                <span className="sr-only">Agents</span>
-                <span
-                  className={cn(
-                    TAB_BADGE_BASE,
-                    "sr-only",
-                    subagentsWorking > 0 ? "text-success" : "text-muted-foreground",
-                  )}
-                >
-                  {subagentsWorking > 0 ? `${subagentsWorking}/${agentCount}` : agentCount}
-                </span>
-              </TabsTrigger>
-            </WorkspaceTabTooltip>
+            {tabOrder.map((tab) => tabTriggers[tab])}
             {showBrowserTab && (
               <WorkspaceTabTooltip label="Browser">
                 <TabsTrigger
@@ -1083,6 +1087,7 @@ function WorkspacePanelImpl({
             open
             conversationId={conversationId}
             path={selectedFilePath}
+            position={filePosition}
             onClose={onShowScopeView}
             onCloseTab={handleCloseTab}
             onNavigateTo={openFileViewer}

@@ -761,6 +761,9 @@ def test_codex_command_resume_binds_session_and_passes_unknown_args(
     ``omnigent codex --resume <conv_id>`` binds the Omnigent
     session and preserves Codex CLI passthrough args after ``--``.
     """
+    monkeypatch.setattr(
+        "omnigent.cli._ensure_backend", lambda server: server or "http://localhost:0"
+    )
     captured: dict[str, object] = {}
     monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
     monkeypatch.setattr(
@@ -2338,6 +2341,9 @@ def test_server_explicit_config_overrides_omnigent_config_env(
         captured["config"] = os.environ["OMNIGENT_CONFIG"]
 
     monkeypatch.setattr(uvicorn.server.Server, "run", _fake_server_run)
+    # Config precedence does not depend on a machine-global port being free.
+    bind_probe = Mock()
+    monkeypatch.setattr("omnigent.cli._assert_server_port_bindable", bind_probe)
 
     result = CliRunner().invoke(
         cli,
@@ -2355,6 +2361,7 @@ def test_server_explicit_config_overrides_omnigent_config_env(
 
     assert result.exit_code == 0, result.output
     assert captured["config"] == str(explicit.resolve())
+    bind_probe.assert_called_once_with("127.0.0.1", 44771)
 
 
 def test_server_with_explicit_db_does_not_reuse_canonical_server(
@@ -2418,6 +2425,9 @@ def test_server_with_explicit_db_does_not_reuse_canonical_server(
         raise AssertionError("explicit-DB server must not register in the shared pidfile")
 
     monkeypatch.setattr(_local_server_mod, "register_local_server", _must_not_register)
+    # The dedicated server is stubbed; occupied-port behavior has its own test.
+    bind_probe = Mock()
+    monkeypatch.setattr("omnigent.cli._assert_server_port_bindable", bind_probe)
 
     db_path = tmp_path / "chat.db"
     result = CliRunner().invoke(
@@ -2441,6 +2451,7 @@ def test_server_with_explicit_db_does_not_reuse_canonical_server(
     assert "already running" not in result.output
     assert captured.get("uvicorn_called") is True
     assert captured["uvicorn_kwargs"]["port"] == 44769
+    bind_probe.assert_called_once_with("127.0.0.1", 44769)
 
 
 def test_server_with_explicit_port_does_not_check_canonical_server(
@@ -3366,6 +3377,91 @@ def test_preregister_agent_accepts_directory(tmp_path: Path) -> None:
     put_location, put_bytes = artifact_store.puts[0]
     assert put_location == created["bundle_location"]
     assert len(put_bytes) > 0
+
+
+def test_preregister_agent_accepts_resolvable_policy_function(tmp_path: Path) -> None:
+    """
+    A guardrail function policy whose path IS importable from
+    sys.path registers normally — the fail-loud validation must not
+    reject valid paths.
+    """
+    agent_dir = tmp_path / "guarded-agent"
+    agent_dir.mkdir()
+    _write_config(
+        agent_dir,
+        {
+            "spec_version": 1,
+            "name": "guarded-agent",
+            "executor": {"config": {"harness": "openai-agents"}},
+            "guardrails": {
+                "policies": {
+                    "guard": {
+                        "type": "function",
+                        "on": ["request"],
+                        # A real, importable builtin — resolves from sys.path.
+                        "function": "omnigent.policies.builtins.safety.ask_on_os_tools",
+                    },
+                },
+            },
+        },
+    )
+
+    agent_store = _RecordingAgentStore()
+    artifact_store = _RecordingArtifactStore()
+    agent_cache = _RecordingAgentCache()
+
+    agent_id = _preregister_agent(agent_dir, agent_store, artifact_store, agent_cache)
+
+    assert agent_id is not None
+    assert len(agent_store.created) == 1
+
+
+def test_preregister_agent_rejects_unresolvable_policy_function(
+    tmp_path: Path,
+) -> None:
+    """
+    A guardrail function policy whose path can't be resolved from
+    sys.path fails REGISTRATION loudly, naming the agent, policy, and
+    path — instead of registering an agent whose every turn would be
+    fail-closed denied with a generic policy-evaluation error.
+    """
+    agent_dir = tmp_path / "broken-agent"
+    agent_dir.mkdir()
+    _write_config(
+        agent_dir,
+        {
+            "spec_version": 1,
+            "name": "broken-agent",
+            "executor": {"config": {"harness": "openai-agents"}},
+            "guardrails": {
+                "policies": {
+                    "pack_guard": {
+                        "type": "function",
+                        "on": ["request"],
+                        # Pack-local module the server can't import.
+                        "function": "agents.mypack.policies.missing_module.check",
+                    },
+                },
+            },
+        },
+    )
+
+    agent_store = _RecordingAgentStore()
+    artifact_store = _RecordingArtifactStore()
+    agent_cache = _RecordingAgentCache()
+
+    with pytest.raises(ClickException, match=r"cannot be resolved from sys\.path") as exc:
+        _preregister_agent(agent_dir, agent_store, artifact_store, agent_cache)
+
+    # Actionable message: names the agent, the policy, and the path.
+    message = str(exc.value)
+    assert "broken-agent" in message
+    assert "pack_guard" in message
+    assert "missing_module" in message
+
+    # Nothing half-registered.
+    assert agent_store.created == []
+    assert artifact_store.puts == []
 
 
 def test_preregister_agent_accepts_omnigent_yaml_file(tmp_path: Path) -> None:
@@ -5776,6 +5872,9 @@ def test_codex_applies_auto_open_conversation_config(
     monkeypatch.setattr("omnigent.cli._GLOBAL_CONFIG_PATH", config_path)
     _save_global_config({"auto_open_conversation": True})
 
+    monkeypatch.setattr(
+        "omnigent.cli._ensure_backend", lambda server: server or "http://localhost:0"
+    )
     captured: dict[str, object] = {}
     monkeypatch.setattr(
         "omnigent.harnesses.codex_native.main.run_codex_native",

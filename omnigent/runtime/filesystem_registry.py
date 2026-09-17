@@ -73,6 +73,7 @@ def _git_timeout_seconds() -> float:
 # the one-shot config write doesn't repeat.  The host fallback path builds a
 # fresh registry per fs request (unlike the runner, which caches per session),
 # so without this guard every request would re-spawn the ``git config``.
+# custom-lint: disable-next=workspace-scoped-cache -- keyed by git-root filesystem path
 _untracked_cache_enabled: set[str] = set()
 _untracked_cache_lock = threading.Lock()
 

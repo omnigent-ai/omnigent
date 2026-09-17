@@ -1,5 +1,6 @@
 import { useEffect, useRef } from "react";
-import { CommandIcon, WandSparklesIcon } from "lucide-react";
+import { CommandIcon, LoaderCircleIcon, WandSparklesIcon } from "lucide-react";
+import type { SkillsStatus } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 /**
@@ -19,6 +20,8 @@ export const BUILTIN_SLASH_COMMANDS: Record<string, string> = {
   "/effort": "Set reasoning effort: /effort low | medium | high | default",
   "/model": "Switch the model for this session: /model <name> | default",
   "/btw": "Ask a side question — answered in a dismissable overlay, not saved to the conversation",
+  "/side":
+    "Start a side chat: an ephemeral fork opened as its own sub-agent chat, kept out of this conversation",
   "/help": "Show available slash commands",
 };
 
@@ -99,6 +102,11 @@ interface SlashCommandMenuProps {
    * with the flat match order.
    */
   commands: Record<string, string>;
+  /** Absent for menus without asynchronous skill discovery. */
+  skillsStatus?: SkillsStatus | null;
+  /** Context-specific guidance when discovery cannot run yet. */
+  skillsUnavailableMessage?: string;
+  onRetrySkills?: () => void;
 }
 
 /** One filtered menu row, carrying its index in the flat match order. */
@@ -170,6 +178,9 @@ export function SlashCommandMenu({
   activeIndex,
   onSelect,
   commands,
+  skillsStatus,
+  skillsUnavailableMessage = "Skills unavailable while disconnected.",
+  onRetrySkills,
 }: SlashCommandMenuProps) {
   const matchedNames = rankedSlashCommandNames(commands, query);
   const listRef = useRef<HTMLDivElement>(null);
@@ -181,7 +192,7 @@ export function SlashCommandMenu({
     if (activeIndex < 0 || !listRef.current) return;
     listRef.current.querySelector('[data-active="true"]')?.scrollIntoView({ block: "nearest" });
   }, [activeIndex]);
-  if (matchedNames.length === 0) return null;
+  if (matchedNames.length === 0 && skillsStatus == null) return null;
 
   // The flat match order (from rankedSlashCommandNames) drives the caller's
   // keyboard index. It ranks built-ins before skills, so the partition below
@@ -213,7 +224,41 @@ export function SlashCommandMenu({
               onSelect={onSelect}
             />
           ))}
-          {skillRows.length > 0 && sectionHeader("Skills")}
+          {(skillRows.length > 0 || skillsStatus != null) && sectionHeader("Skills")}
+          {skillsStatus === "loading" && (
+            <div
+              role="status"
+              className="flex items-center gap-2 px-1.5 py-1 text-ui text-muted-foreground"
+            >
+              <LoaderCircleIcon aria-hidden="true" className="size-3.5 shrink-0 animate-spin" />
+              Loading skills…
+            </div>
+          )}
+          {skillsStatus === "error" && (
+            <div role="status" className="px-1.5 py-1 text-ui text-muted-foreground">
+              Couldn’t load skills.{" "}
+              {onRetrySkills && (
+                <button
+                  type="button"
+                  className="underline hover:text-foreground"
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={onRetrySkills}
+                >
+                  Retry
+                </button>
+              )}
+            </div>
+          )}
+          {skillsStatus === "unavailable" && (
+            <div role="status" className="px-1.5 py-1 text-ui text-muted-foreground">
+              {skillsUnavailableMessage}
+            </div>
+          )}
+          {skillsStatus === "ready" && skillRows.length === 0 && (
+            <div role="status" className="px-1.5 py-1 text-ui text-muted-foreground">
+              {query ? "No matching skills" : "No skills available"}
+            </div>
+          )}
           {skillRows.map((row) => (
             <MenuRowButton
               key={row.name}

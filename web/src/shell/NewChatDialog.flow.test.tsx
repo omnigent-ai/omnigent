@@ -1,3 +1,17 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { useConversations as useTestConversations } from "@/hooks/useConversations";
+
+vi.mock("@/hooks/useSidebarData", () => ({ useLoadedConversations: () => useTestConversations() }));
+
+vi.mock("@/hooks/useSkills", () => ({
+  useSkills: ({ target, enabled }: { target: { agentId?: string } | null; enabled?: boolean }) => ({
+    skills:
+      useAvailableAgents().data?.find((candidate) => candidate.id === target?.agentId)?.skills ??
+      [],
+    skillsStatus: enabled === false || target === null ? "unavailable" : "ready",
+    refetch: vi.fn(),
+  }),
+}));
 import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 import type { SessionListWireItem } from "@/lib/sessionListCache";
@@ -5,7 +19,6 @@ import type { SessionListWireItem } from "@/lib/sessionListCache";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { authenticatedFetch } from "@/lib/identity";
 import { clearOptimisticTitles, getOptimisticTitle } from "@/lib/optimisticTitles";
@@ -82,7 +95,11 @@ vi.mock("@/lib/sessionUpdatesSocket", () => ({
   },
 }));
 
-vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
+vi.mock("@/lib/identity", () => ({
+  authenticatedFetch: vi.fn(),
+  getCurrentUserId: vi.fn(() => null),
+  resolveIdentity: vi.fn(async () => null),
+}));
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: vi.fn(),
   useHostModelOptions: vi.fn(() => ({
@@ -977,6 +994,35 @@ describe("NewChatLandingScreen create flow", () => {
     );
   });
 
+  it("enables Send for a file-only draft and creates the session without text", async () => {
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+
+    // An attached image alone is a sendable draft: the send path omits the
+    // input_text block for blank text, so nothing downstream needs typing.
+    const file = new File(["x"], "screenshot.png", { type: "image/png" });
+    fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
+      target: { files: [file] },
+    });
+
+    const submit = screen.getByTestId("new-chat-landing-submit");
+    await waitFor(() => expect(submit).toBeEnabled());
+    fireEvent.click(submit);
+
+    await waitFor(() =>
+      expect(setPendingInitialPromptMock).toHaveBeenCalledWith("conv_new", {
+        text: "",
+        skill: null,
+        files: [file],
+      }),
+    );
+  });
+
   it("hands a bundled-skill first message off as a structured invocation", async () => {
     vi.mocked(authenticatedFetch).mockResolvedValueOnce({
       ok: true,
@@ -1019,9 +1065,7 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    // Not a bundled skill — e.g. a typo or a host-discovered skill the
-    // server can't know pre-session. Falls through to plain text, same as
-    // the in-session composer's unknown-command path.
+    // Unknown names fall through to plain text, as in the session composer.
     typeMessage("/typo do something");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
 

@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Protocol, SupportsIndex, SupportsInt, cast
 
+import httpx
 import websockets.asyncio.client
 from websockets.exceptions import ConnectionClosed, InvalidStatus, InvalidURI
 
@@ -82,6 +83,8 @@ from omnigent.host.frames import (
     HostRunnerExitedFrame,
     HostRunnerStatusFrame,
     HostRunnerStatusResultFrame,
+    HostSkillsFrame,
+    HostSkillsResultFrame,
     HostStatFrame,
     HostStatResultFrame,
     HostStopRunnerFrame,
@@ -447,6 +450,10 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         "LOGNAME",
         "SHELL",
         "TMPDIR",
+        # The daemon and runner resolve OS-keyring credentials in the user's session.
+        "DBUS_SESSION_BUS_ADDRESS",
+        "XDG_RUNTIME_DIR",
+        "PYTHON_KEYRING_BACKEND",
         "TZ",
         "TERM",
         "TERMINFO",
@@ -477,6 +484,9 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # executor.profile propagated into the daemon's env).
         "DATABRICKS_CONFIG_PROFILE",
         "DATABRICKS_CONFIG_FILE",
+        # Discovery and invocation must read the same harness config directories.
+        "CLAUDE_CONFIG_DIR",
+        "CODEX_HOME",
         # DATABRICKS_AUTH_STORAGE selects the token-storage backend ("secure"
         # OS keychain vs "plaintext" JSON cache) — also a non-secret selector.
         # Without it a runner falls back to the ~/.databrickscfg [__settings__]
@@ -1006,6 +1016,9 @@ class HostProcess:
         if not self._interactive_shells:
             self._interactive_shells = ["bash"]
         self._runners: dict[str, _RunnerHandle] = {}
+        from omnigent.host.skills import HostSkillDiscovery
+
+        self._skill_discovery = HostSkillDiscovery(self._fetch_skill_bundle)
         # Retain the host's refreshable auth context after the first tunnel
         # handshake so runner launches can reuse its warm bearer. Failed or
         # unavailable resolution is not latched, allowing a later reconnect
@@ -1044,6 +1057,10 @@ class HostProcess:
         self._configured_harnesses: dict[str, HarnessAvailability] | None = None
         self._gateway_inference: dict[str, bool] | None = None
         self._capabilities_initialized = False
+        # Invalidates deferred probe results when an install or credential
+        # write has already produced a fresher snapshot. Capability state is
+        # mutated only on the event loop, so no cross-thread lock is needed.
+        self._capability_generation = 0
         # Consecutive login-page redirects; reset by a successful upgrade.
         self._login_redirect_streak = 0
         # Reset by a successful upgrade or non-auth error; bounds fresh-host refresh retries.
@@ -1108,6 +1125,9 @@ class HostProcess:
         # Warms the zygote at daemon start so the first launch doesn't pay
         # its one-time import; see run().
         self._zygote_prestart_task: asyncio.Task[ZygoteManager | None] | None = None
+        # Discovery belongs to the daemon so connection retries share one
+        # in-flight probe and registration waits for bounded discovery.
+        self._capability_init_task: asyncio.Task[None] | None = None
         # Inbound frames are handled on their own tasks (see
         # _start_frame_task) so one slow handler — a model-options CLI exec,
         # an npm install — can't head-of-line block a launch or a stat behind
@@ -2341,27 +2361,39 @@ class HostProcess:
                 return [], str(exc)
             return [(source, sid) for sid in ids], None
 
-        def _load(source: str, session_id: str) -> HostImportedLocalSession | None:
+        def _load(
+            source: str, session_id: str
+        ) -> tuple[HostImportedLocalSession | None, str | None]:
             from omnigent.session_import.local import load_local_session
             from omnigent.session_import.models import ImportSource, SessionImportNotFoundError
 
             try:
                 local = load_local_session(cast(ImportSource, source), session_id)
-            except (SessionImportNotFoundError, OSError, ValueError, TypeError):
-                return None
-            return HostImportedLocalSession(
-                external_session_id=local.external_session_id,
-                workspace=local.workspace,
-                items=[
-                    {
-                        "type": item.type,
-                        "response_id": item.response_id,
-                        "data": item.data.model_dump(mode="json", exclude_none=True),
-                    }
-                    for item in local.items
-                ],
-                title=local.title,
-                source=local.source,
+            except SessionImportNotFoundError as exc:
+                # Designed to be surfaced (e.g. "…has no importable history"),
+                # so pass it through as the per-session failure reason.
+                return None, str(exc)
+            except (OSError, ValueError, TypeError):
+                _logger.exception(
+                    "import_local: could not read session source=%r id=%r", source, session_id
+                )
+                return None, "This session's transcript could not be read."
+            return (
+                HostImportedLocalSession(
+                    external_session_id=local.external_session_id,
+                    workspace=local.workspace,
+                    items=[
+                        {
+                            "type": item.type,
+                            "response_id": item.response_id,
+                            "data": item.data.model_dump(mode="json", exclude_none=True),
+                        }
+                        for item in local.items
+                    ],
+                    title=local.title,
+                    source=local.source,
+                ),
+                None,
             )
 
         try:
@@ -2379,14 +2411,21 @@ class HostProcess:
             # Oldest first so the server imports newest last → newest sits atop the sidebar.
             ordered = list(reversed(targets))
             total = len(ordered)
-            load_failed = 0
+            failures: list[dict[str, object]] = []
             for source, session_id in ordered:
                 try:
-                    session = await asyncio.to_thread(_load, source, session_id)
+                    session, reason = await asyncio.to_thread(_load, source, session_id)
                     if session is None:
                         # Unreadable/corrupt transcript: no frame to send, but
-                        # report it on the done frame so the counts stay honest.
-                        load_failed += 1
+                        # report it (with a reason) on the done frame so the
+                        # server's counts stay honest and the UI can explain it.
+                        failures.append(
+                            {
+                                "external_session_id": session_id,
+                                "source": source,
+                                "reason": reason or "This session could not be read.",
+                            }
+                        )
                         continue
                     await ws.send(
                         encode_host_frame(
@@ -2406,12 +2445,21 @@ class HostProcess:
                     _logger.exception(
                         "import_local: skipping session source=%r id=%r", source, session_id
                     )
-                    load_failed += 1
+                    failures.append(
+                        {
+                            "external_session_id": session_id,
+                            "source": source,
+                            "reason": "This session could not be read.",
+                        }
+                    )
                     continue
             await ws.send(
                 encode_host_frame(
                     HostImportLocalDoneFrame(
-                        request_id=frame.request_id, status="ok", failed=load_failed
+                        request_id=frame.request_id,
+                        status="ok",
+                        failed=len(failures),
+                        failures=failures,
                     )
                 )
             )
@@ -2844,6 +2892,67 @@ class HostProcess:
             payload=payload,
         )
 
+    def _handle_skills(self, frame: HostSkillsFrame) -> HostSkillsResultFrame:
+        """Discover directory or session skills in a worker thread."""
+        from pathlib import Path
+
+        try:
+            if not frame.path or "\x00" in frame.path:
+                raise ValueError("path must be an absolute or tilde-prefixed directory")
+            root = Path(frame.path).expanduser()
+            if not root.is_absolute():
+                raise ValueError("path must be an absolute or tilde-prefixed directory")
+            if not root.is_dir():
+                return HostSkillsResultFrame(
+                    request_id=frame.request_id,
+                    status="failed",
+                    error_code="not_directory",
+                    error="skill discovery directory does not exist on host or is not a directory",
+                )
+            root = root.resolve()
+        except (ValueError, RuntimeError) as exc:
+            return HostSkillsResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error_code="invalid_path",
+                error=str(exc),
+            )
+        except OSError as exc:
+            return HostSkillsResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error_code="discovery_failed",
+                error=str(exc),
+            )
+
+        try:
+            return HostSkillsResultFrame(
+                request_id=frame.request_id,
+                status="ok",
+                skills=self._skill_discovery.discover(frame, root),
+                session_id=frame.session_id,
+                agent_id=frame.agent_id,
+            )
+        except Exception:
+            _logger.exception("Skill discovery failed for %r", frame.harness)
+            return HostSkillsResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error_code="discovery_failed",
+                error="skill discovery failed; see the host log",
+            )
+
+    def _fetch_skill_bundle(self, frame: HostSkillsFrame) -> httpx.Response:
+        """Read the bound session bundle using this host's existing credentials."""
+        from urllib.parse import quote
+
+        path = quote(frame.session_id or "", safe="")
+        return httpx.get(
+            f"{self._server_url}/v1/sessions/{path}/agent/contents",
+            headers=self._build_connect_headers(),
+            timeout=10.0,
+        )
+
     async def _prewarm_model_options(self) -> None:
         """
         Fill the on-disk model catalogs for the probing harnesses at boot.
@@ -2949,8 +3058,8 @@ class HostProcess:
                 from omnigent.harnesses.pi_native.credentials import pi_native_model_options
 
                 pi_models = await asyncio.to_thread(pi_native_model_options)
-            except Exception:
-                _logger.exception("Failed to resolve pre-launch Pi model options")
+            except Exception:  # noqa: BLE001 — no catalog, never a crash
+                _logger.warning("Pi model catalog unavailable", exc_info=True)
                 return HostModelOptionsResultFrame(
                     request_id=frame.request_id,
                     status="failed",
@@ -2960,6 +3069,28 @@ class HostProcess:
                 request_id=frame.request_id,
                 status="ok",
                 models=with_source(pi_models),
+            )
+
+        if harness == "devin-native":
+            # devin authenticates through its own CLI login; the host shells
+            # ``devin models list`` (list_devin_cli_model_options) to preview the
+            # family catalog before a session exists. Effort is a separate axis
+            # the runner recombines at launch, so the families are the picker rows.
+            try:
+                from omnigent.harnesses.devin_native.main import list_devin_cli_model_options
+
+                devin_models = await asyncio.to_thread(list_devin_cli_model_options)
+            except Exception:  # noqa: BLE001 — no catalog, never a crash
+                _logger.warning("Devin model catalog unavailable", exc_info=True)
+                return HostModelOptionsResultFrame(
+                    request_id=frame.request_id,
+                    status="failed",
+                    error="failed to resolve Devin model options",
+                )
+            return HostModelOptionsResultFrame(
+                request_id=frame.request_id,
+                status="ok",
+                models=with_source(devin_models),
             )
 
         if is_claude_sdk_harness_name(harness):
@@ -3328,9 +3459,10 @@ class HostProcess:
             return None
 
     async def _initialize_capabilities(self) -> None:
-        """Build the initial capability snapshot once, before any handshake."""
+        """Collect startup metadata before registration, with bounded fallback."""
         if self._capabilities_initialized:
             return
+        generation = self._capability_generation
         try:
             configured, gateway = await asyncio.wait_for(
                 asyncio.gather(
@@ -3350,9 +3482,29 @@ class HostProcess:
                 file=sys.stderr,
                 flush=True,
             )
-        self._configured_harnesses = configured
-        self._gateway_inference = gateway
+        if self._capability_generation == generation:
+            self._replace_capabilities(configured, gateway)
         self._capabilities_initialized = True
+
+    def _replace_capabilities(
+        self,
+        configured: dict[str, HarnessAvailability] | None,
+        gateway: dict[str, bool] | None,
+    ) -> None:
+        """Replace the advisory snapshot and invalidate older probe results."""
+        self._configured_harnesses = dict(configured) if configured is not None else None
+        self._gateway_inference = dict(gateway) if gateway is not None else None
+        self._capability_generation += 1
+
+    def _start_capability_discovery(self) -> None:
+        """Share discovery across reconnects, retrying unexpected initialization errors."""
+        if self._capability_init_task is None or (
+            self._capability_init_task.done() and not self._capabilities_initialized
+        ):
+            self._capability_init_task = asyncio.create_task(
+                self._initialize_capabilities(),
+                name="host-capability-discovery",
+            )
 
     async def _lifecycle_monitor_loop(self) -> None:
         """Self-terminate once this daemon no longer owns its registry record.
@@ -3432,11 +3584,6 @@ class HostProcess:
             authorization / outdated server, or a loopback server that
             kept refusing connections (the local server is gone).
         """
-        # Capability probes may shell out or inspect local config, so perform
-        # them once during daemon initialization. They are advisory: a broken
-        # harness is reported as unknown and must not prevent registration.
-        await self._initialize_capabilities()
-
         # Reap orphaned harness/tool grandchildren that reparent here when a
         # runner dies (this host is PID 1 in a container, or a subreaper
         # otherwise). Without this they pile up as <defunct> zombies and can
@@ -3478,6 +3625,7 @@ class HostProcess:
                 asyncio.to_thread(self._ensure_zygote_started),
                 name="host-zygote-prestart",
             )
+        self._start_capability_discovery()
         backoff = _RECONNECT_BASE_S
         try:
             while True:
@@ -3671,6 +3819,11 @@ class HostProcess:
             # takeover paths that own it (this daemon may have been superseded).
             if self._lifecycle_lock is not None:
                 self._lifecycle_lock.release()
+            if self._capability_init_task is not None:
+                self._capability_init_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await self._capability_init_task
+                self._capability_init_task = None
             if self._zygote_prestart_task is not None:
                 self._zygote_prestart_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -3937,7 +4090,10 @@ class HostProcess:
         return None
 
     async def _serve_frames(self, ws: websockets.asyncio.client.ClientConnection) -> None:
-        """Send the cached host hello, then service frames until disconnect."""
+        """Wait for bounded startup discovery, register, then service the connection."""
+        self._start_capability_discovery()
+        if self._capability_init_task is not None:
+            await asyncio.shield(self._capability_init_task)
         _tel_opt_out = False
         try:
             from omnigent.telemetry.client import is_disabled as _tel_disabled
@@ -3970,23 +4126,6 @@ class HostProcess:
             raise HostConnectError(f"Could not encode host.hello: {exc}") from exc
         await ws.send(encoded_hello)
         self._ws = ws
-        # Reports raised while disconnected must wait until registration; the
-        # server cannot route them before this connection owns the host.
-        for runner_id, error in list(self._unreported_exits.items()):
-            del self._unreported_exits[runner_id]
-            await self._report_runner_exit(runner_id, error)
-        print(
-            f"✓ Connected as {self._identity.name!r} "
-            f"({self._identity.host_id}), {len(hello.runners)} live runner(s). "
-            "Listening for sessions — Ctrl-C to disconnect.",
-            flush=True,
-        )
-
-        # Readiness refresh runs in its own task, never on this receive loop:
-        # a harness probe that blocks (a hung CLI ``--version`` / ``auth
-        # status``) must not delay ``ws.recv()`` or the inline keepalive pong
-        # the server's watchdog counts as liveness, or it closes the tunnel
-        # with ``4003 ping timeout``.
         readiness_task = asyncio.create_task(self._harness_readiness_loop(ws))
         # Warm the pre-launch model listings once a server can actually ask
         # for them, so the first picker open is served from cache instead of
@@ -3995,6 +4134,23 @@ class HostProcess:
             self._prewarm_model_options(), name="host-model-options-prewarm"
         )
         try:
+            # Reports raised while disconnected must wait until registration;
+            # the server cannot route them before this connection owns the host.
+            for runner_id, error in list(self._unreported_exits.items()):
+                del self._unreported_exits[runner_id]
+                await self._report_runner_exit(runner_id, error)
+            print(
+                f"✓ Connected as {self._identity.name!r} "
+                f"({self._identity.host_id}), {len(hello.runners)} live runner(s). "
+                "Listening for sessions — Ctrl-C to disconnect.",
+                flush=True,
+            )
+
+            # Readiness refresh runs in its own task, never on this receive loop:
+            # a harness probe that blocks (a hung CLI ``--version`` / ``auth
+            # status``) must not delay ``ws.recv()`` or the inline keepalive pong
+            # the server's watchdog counts as liveness, or it closes the tunnel
+            # with ``4003 ping timeout``.
             while True:
                 raw = await ws.recv()
                 self._conn_frame_received = True
@@ -4026,14 +4182,17 @@ class HostProcess:
         ws: websockets.asyncio.client.ClientConnection,
     ) -> None:
         """Refresh advisory capabilities without endangering the tunnel."""
-        configured = self._configured_harnesses
-        gateway = self._gateway_inference
+        published_configured = self._configured_harnesses
+        published_gateway = self._gateway_inference
         loop = asyncio.get_running_loop()
         next_quick = loop.time() + HARNESS_READINESS_REFRESH_INTERVAL_S
         next_full = loop.time() + HARNESS_READINESS_FULL_REFRESH_INTERVAL_S
         while True:
             await asyncio.sleep(max(0.0, min(next_quick, next_full) - loop.time()))
             now = loop.time()
+            generation = self._capability_generation
+            configured = self._configured_harnesses
+            gateway = self._gateway_inference
             refresh_full = configured is None or now >= next_full
             if now >= next_quick:
                 next_quick = now + HARNESS_READINESS_REFRESH_INTERVAL_S
@@ -4044,29 +4203,31 @@ class HostProcess:
                         )
                     except Exception:
                         _logger.exception("Host harness quick readiness probe failed")
-            if not refresh_full:
-                continue
-
-            latest = await self._probe_configured_harnesses(startup=False)
-            latest_gateway = await self._probe_gateway_inference(startup=False)
-            next_full = now + HARNESS_READINESS_FULL_REFRESH_INTERVAL_S
-            new_configured = latest if latest is not None else configured
-            new_gateway = latest_gateway if latest_gateway is not None else gateway
-            if new_configured is None:
-                continue
-            if new_configured != configured or new_gateway != gateway:
+            if refresh_full:
+                latest = await self._probe_configured_harnesses(startup=False)
+                latest_gateway = await self._probe_gateway_inference(startup=False)
+                next_full = now + HARNESS_READINESS_FULL_REFRESH_INTERVAL_S
+                new_configured = latest if latest is not None else configured
+                new_gateway = latest_gateway if latest_gateway is not None else gateway
+                if self._capability_generation == generation and (
+                    new_configured != configured or new_gateway != gateway
+                ):
+                    self._replace_capabilities(new_configured, new_gateway)
+            configured = self._configured_harnesses
+            gateway = self._gateway_inference
+            if configured is not None and (
+                configured != published_configured or gateway != published_gateway
+            ):
                 await ws.send(
                     encode_host_frame(
                         HostHarnessReadinessFrame(
-                            configured_harnesses=new_configured,
-                            gateway_inference=new_gateway,
+                            configured_harnesses=configured,
+                            gateway_inference=gateway,
                         )
                     )
                 )
-                configured = new_configured
-                gateway = new_gateway
-                self._configured_harnesses = configured
-                self._gateway_inference = gateway
+                published_configured = configured
+                published_gateway = gateway
 
     def _raise_connection_error(self, frame: HostConnectionErrorFrame) -> None:
         """Raise the lifecycle exception requested by a server error frame."""
@@ -4202,11 +4363,21 @@ class HostProcess:
             # The installer shells out (npm) and can run for minutes, so run
             # it off the event loop and reply when it completes.
             install_result = await asyncio.to_thread(self._handle_install_harness, frame)
+            if install_result.status == "ok":
+                self._replace_capabilities(
+                    install_result.configured_harnesses,
+                    install_result.gateway_inference,
+                )
             await ws.send(encode_host_frame(install_result))
         elif isinstance(frame, HostStoreSecretFrame):
             # The credential write touches the OS keychain / config file, so run
             # it off the event loop and reply when it completes.
             secret_result = await asyncio.to_thread(self._handle_store_secret, frame)
+            if secret_result.status == "ok":
+                self._replace_capabilities(
+                    secret_result.configured_harnesses,
+                    secret_result.gateway_inference,
+                )
             await ws.send(encode_host_frame(secret_result))
         elif isinstance(frame, HostDetectCredentialsFrame):
             # Ambient detection may probe files / a localhost socket, so run it
@@ -4228,6 +4399,9 @@ class HostProcess:
             # gh/git writes can block; run off the event loop and reply back.
             fs_write_result = await asyncio.to_thread(self._handle_fs_write, frame)
             await ws.send(encode_host_frame(fs_write_result))
+        elif isinstance(frame, HostSkillsFrame):
+            skills_result = await asyncio.to_thread(self._handle_skills, frame)
+            await ws.send(encode_host_frame(skills_result))
         elif isinstance(frame, HostModelOptionsFrame):
             # Every dispatched frame already runs on its own task (see
             # _start_frame_task), so a cold harness probe here cannot stall
@@ -4333,9 +4507,9 @@ def run_host_process(
 
     telemetry.init("omni-host")
 
-    from omnigent.host.identity import CONFIG_PATH
+    from omnigent.host.identity import host_config_path
 
-    path = config_path or CONFIG_PATH
+    path = host_config_path(config_path)
     try:
         identity = load_or_create_host_identity(path)
     except ValueError as exc:

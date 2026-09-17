@@ -80,6 +80,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+from tests.budgets import budget
 from tests.runner.helpers import NullServerClient
 from tests.runtime.harnesses._test_scaffold_harnesses import _EchoHarness
 
@@ -232,7 +233,7 @@ async def _connect_runner_tunnel(
         _websocket_scope(f"/v1/runners/{runner_id}/tunnel"),
     )
     await communicator.send_input({"type": "websocket.connect"})
-    accepted = await communicator.receive_output(timeout=2.0)
+    accepted = await communicator.receive_output(timeout=budget(2.0))
     assert accepted["type"] == "websocket.accept", (
         f"Tunnel route did not accept the WS handshake; got {accepted!r}"
     )
@@ -262,7 +263,7 @@ async def _send_hello_and_wait(
         while registry.get(runner_id) is None:
             await asyncio.sleep(0.01)
 
-    await asyncio.wait_for(_registered(), timeout=2.0)
+    await asyncio.wait_for(_registered(), timeout=budget(2.0))
 
 
 async def _forward_requests_to_runner(
@@ -300,7 +301,10 @@ async def _forward_requests_to_runner(
             # assistant message, and the test fails with "no assistant
             # text in session snapshot". 60s is well above any
             # plausible per-frame interval but still bounded so a
-            # genuinely stuck test fails rather than hangs.
+            # genuinely stuck test fails rather than hangs. Deliberately
+            # unscaled: 60s already carries the headroom scaling would add, and
+            # this sits in an unbounded relay loop where a scaled wait would
+            # outlast the lane's own suite timeout.
             output = await communicator.receive_output(timeout=60.0)
             if output["type"] == "websocket.close":
                 return
@@ -470,7 +474,7 @@ async def tunnel_three_layer_stack(tmp_path: Path) -> AsyncIterator[_TunnelStack
                 {"type": "websocket.disconnect", "code": 1000},
             )
         with contextlib.suppress(asyncio.TimeoutError, Exception):
-            await communicator.wait(timeout=2.0)
+            await communicator.wait(timeout=budget(2.0))
 
         # Close any cached WSTunnelTransport-backed clients before
         # we tear the registry down so they can flush in-flight
@@ -952,7 +956,7 @@ async def test_on_runner_connect_restarts_relay_via_router(
                     return
                 await asyncio.sleep(0.01)
 
-        await asyncio.wait_for(_relay_slot_cleared(), timeout=2.0)
+        await asyncio.wait_for(_relay_slot_cleared(), timeout=budget(2.0))
 
         # Fresh WS + hello re-registers and fires _on_runner_connect.
         new_communicator = await _connect_runner_tunnel(ap_app, _RUNNER_ID)
@@ -985,7 +989,7 @@ async def test_on_runner_connect_restarts_relay_via_router(
                 await asyncio.sleep(0.02)
 
         try:
-            await asyncio.wait_for(_hook_did_its_job(), timeout=5.0)
+            await asyncio.wait_for(_hook_did_its_job(), timeout=budget(5.0))
         except asyncio.TimeoutError:
             registry_entry = ap_app.state.tunnel_registry.get(_RUNNER_ID)
             raise AssertionError(
@@ -1044,7 +1048,7 @@ async def test_on_runner_connect_restarts_relay_via_router(
                     {"type": "websocket.disconnect", "code": 1000},
                 )
             with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError, Exception):
-                await new_communicator.wait(timeout=2.0)
+                await new_communicator.wait(timeout=budget(2.0))
 
 
 @contextlib.asynccontextmanager
@@ -1140,7 +1144,7 @@ async def _reconnect_fires_connect_hook(
                 await asyncio.sleep(0.02)
 
         try:
-            await asyncio.wait_for(_recovered(), timeout=5.0)
+            await asyncio.wait_for(_recovered(), timeout=budget(5.0))
         except asyncio.TimeoutError:
             raise AssertionError(
                 "Reconnect did not drive _on_runner_connect to call "
@@ -1163,7 +1167,7 @@ async def _reconnect_fires_connect_hook(
                     {"type": "websocket.disconnect", "code": 1000},
                 )
             with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError, Exception):
-                await communicator.wait(timeout=2.0)
+                await communicator.wait(timeout=budget(2.0))
 
 
 async def _bind_failed_session(
@@ -1529,7 +1533,7 @@ async def test_runner_disconnect_grace_defers_failed_marking(
         # time the ASGI app exits, so the grace timer is armed — but the
         # failed flip must not have happened yet.
         await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
-        await communicator.wait(timeout=2.0)
+        await communicator.wait(timeout=budget(2.0))
         assert runner_id in cleared_runners
         assert sessions_module._session_status_cache.get(session_id) != "failed", (
             "session failed immediately on disconnect — the grace window "
@@ -1550,7 +1554,7 @@ async def test_runner_disconnect_grace_defers_failed_marking(
         )
         sessions_module._session_status_cache[session_id] = "running"
         await communicator2.send_input({"type": "websocket.disconnect", "code": 1000})
-        await communicator2.wait(timeout=2.0)
+        await communicator2.wait(timeout=budget(2.0))
         reconnect_communicator = await _connect_runner_tunnel(ap_app, runner_id)
         await _send_hello_and_wait(
             reconnect_communicator, ap_app, runner_id, harnesses=[_TEST_HARNESS_NAME]
@@ -1566,7 +1570,7 @@ async def test_runner_disconnect_grace_defers_failed_marking(
                     {"type": "websocket.disconnect", "code": 1000},
                 )
             with contextlib.suppress(asyncio.TimeoutError, Exception):
-                await reconnect_communicator.wait(timeout=2.0)
+                await reconnect_communicator.wait(timeout=budget(2.0))
         sessions_module._session_status_cache.pop(session_id, None)
 
 
@@ -1624,7 +1628,7 @@ async def test_server_initiated_close_never_fails_the_turn(
     touched_runners.clear()
     try:
         await communicator.send_input({"type": "websocket.disconnect", "code": 1012})
-        await communicator.wait(timeout=2.0)
+        await communicator.wait(timeout=budget(2.0))
         assert shutdown_state.server_shutting_down(), "a 1012 close did not mark server shutdown"
         assert runner_id not in cleared_runners
         assert runner_id in touched_runners
@@ -1721,7 +1725,7 @@ async def test_on_runner_disconnect_spares_idle_sessions_and_labels_interrupted_
                     return
                 await asyncio.sleep(0.01)
 
-        await asyncio.wait_for(_hook_ran(), timeout=5.0)
+        await asyncio.wait_for(_hook_ran(), timeout=budget(5.0))
         assert sessions_module._session_status_cache.get(running_id) == "failed"
 
         # The interrupted turn is failed AND carries the cause, so the client
@@ -1740,7 +1744,7 @@ async def test_on_runner_disconnect_spares_idle_sessions_and_labels_interrupted_
         assert sessions_module._last_task_error_from_labels(idle_conv.labels) is None
     finally:
         with contextlib.suppress(asyncio.TimeoutError, Exception):
-            await communicator.wait(timeout=2.0)
+            await communicator.wait(timeout=budget(2.0))
         for session_id in session_ids:
             sessions_module._session_status_cache.pop(session_id, None)
 
@@ -1809,7 +1813,7 @@ async def test_server_initiated_close_keeps_runner_liveness_stamp(
         _drain_session_live_state()
         assert _runner_last_seen(session_id) is not None
         await communicator.send_input({"type": "websocket.disconnect", "code": 1006})
-        await communicator.wait(timeout=2.0)
+        await communicator.wait(timeout=budget(2.0))
         _drain_session_live_state()
         assert _runner_last_seen(session_id) is None
 
@@ -1819,7 +1823,7 @@ async def test_server_initiated_close_keeps_runner_liveness_stamp(
         _drain_session_live_state()
         assert _runner_last_seen(session_id) is not None
         await communicator.send_input({"type": "websocket.disconnect", "code": 1012})
-        await communicator.wait(timeout=2.0)
+        await communicator.wait(timeout=budget(2.0))
         assert shutdown_state.server_shutting_down(), "a 1012 close did not mark server shutdown"
         _drain_session_live_state()
         assert _runner_last_seen(session_id) is not None

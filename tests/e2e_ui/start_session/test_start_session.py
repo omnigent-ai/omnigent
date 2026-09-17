@@ -58,6 +58,7 @@ from playwright.async_api import Request, Route, async_playwright, expect
 from tests.e2e_ui.start_session.helpers import (
     commit_landing_workspace_picker,
     open_landing_workspace_picker,
+    stub_empty_host_picker_data,
 )
 
 # Stubbed host the composer auto-selects (the tunneled runner registers no
@@ -485,6 +486,12 @@ async def _register_common_routes(
             await route.continue_()
 
     await page.route("**/v1/hosts", handle_hosts)
+    # Fake hosts have no backend probes; tests with catalogs or git repos override these.
+    await page.route(
+        "**/v1/hosts/*/harnesses/*/model-options",
+        lambda route: route.fulfill(json={"models": []}),
+    )
+    await page.route(_WORKTREES_RE, lambda route: route.fulfill(json={"data": []}))
     await page.route("**/v1/agents", handle_agents)
     await page.route("**/v1/sessions/*/events", handle_events)
     await page.route(_SESSIONS_RE, handle_sessions)
@@ -579,7 +586,9 @@ async def _drive_permission_mode(base_url: str, session_id: str) -> None:
                     body=json.dumps({"data": []}),
                 )
 
-            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+            await page.route(
+                re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
+            )
 
             # Seed a recent working directory for the stubbed host so the
             # working-directory chip auto-fills and Send can enable without
@@ -637,7 +646,7 @@ def test_start_session_navigates_while_create_is_pending(seeded_session: tuple[s
 
     The create response is held so the test can verify the navigate-first
     window: the landing composer is already gone, the URL uses a client-only
-    ``temp:`` id, and the optimistic prompt is visible in a read-only chat.
+    ``temp:`` id, and the optimistic prompt is visible in an editable chat.
     Releasing the response must replace that temporary URL with the real id.
     """
     base_url, session_id = seeded_session
@@ -692,6 +701,7 @@ async def _drive_send_busy_spinner(base_url: str, session_id: str) -> None:
                     await route.continue_()
 
             await page.route("**/v1/hosts", handle_hosts)
+            await stub_empty_host_picker_data(page, _HOST_ID)
             await page.route("**/v1/agents", handle_agents)
             await page.route("**/v1/sessions/*/events", handle_events)
             await page.route(_SESSIONS_RE, handle_sessions)
@@ -705,7 +715,9 @@ async def _drive_send_busy_spinner(base_url: str, session_id: str) -> None:
                     body=json.dumps({"data": []}),
                 )
 
-            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+            await page.route(
+                re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
+            )
 
             await page.add_init_script(
                 f"""window.localStorage.setItem(
@@ -735,8 +747,9 @@ async def _drive_send_busy_spinner(base_url: str, session_id: str) -> None:
             )
             await expect(page.get_by_test_id("new-chat-landing-input")).to_have_count(0)
             composer = page.get_by_role("textbox", name="Message the agent")
-            await expect(composer).to_be_disabled()
-            await expect(composer).to_have_attribute("placeholder", "Starting the session…")
+            await expect(composer).to_be_editable()
+            await expect(composer).to_have_attribute("placeholder", re.compile("Send a follow-up"))
+            await expect(page.get_by_role("button", name="Send", exact=True)).to_be_disabled()
             await expect(
                 page.get_by_test_id("message-bubble").get_by_text("set up the project", exact=True)
             ).to_be_visible()
@@ -757,9 +770,9 @@ async def _drive_send_busy_spinner(base_url: str, session_id: str) -> None:
                 await expect(
                     header.get_by_role("button", name=action_name, exact=True)
                 ).to_be_disabled()
-            await expect(
-                header.get_by_role("button", name="Collapse right panel", exact=True)
-            ).to_be_enabled()
+            panel_toggle = header.get_by_role("button", name="Expand right panel", exact=True)
+            await expect(panel_toggle).to_be_enabled()
+            await panel_toggle.click()
             workspace = page.get_by_role("complementary", name="Workspace")
             await expect(workspace).to_be_visible()
             for tab_name in ("Files", "Changes", "GitHub", "Agents"):
@@ -842,6 +855,7 @@ async def _drive_ignore_uncorrelated_announcement(base_url: str, session_id: str
                     await route.continue_()
 
             await page.route("**/v1/hosts", handle_hosts)
+            await stub_empty_host_picker_data(page, _HOST_ID)
             await page.route("**/v1/agents", handle_agents)
             await page.route("**/v1/sessions/*/events", handle_events)
             await page.route(_SESSIONS_RE, handle_sessions)
@@ -853,7 +867,9 @@ async def _drive_ignore_uncorrelated_announcement(base_url: str, session_id: str
                     body=json.dumps({"data": []}),
                 )
 
-            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+            await page.route(
+                re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
+            )
 
             await page.add_init_script(
                 f"""window.localStorage.setItem(
@@ -1006,20 +1022,36 @@ async def _drive_no_redirect_after_navigating_away(
                     await route.continue_()
 
             await page.route("**/v1/hosts", handle_hosts)
+            await stub_empty_host_picker_data(page, _HOST_ID)
             await page.route("**/v1/agents", handle_agents)
             await page.route("**/v1/sessions/*/events", handle_events)
             await page.route(_SESSIONS_RE, handle_sessions)
 
-            # Keep the agent-discovery scan empty so only the stubbed Claude
-            # agent feeds the picker (see _drive_permission_mode for why).
+            # Retain the navigation target in Mine without introducing another agent.
             async def handle_agent_scan(route: Route) -> None:
                 await route.fulfill(
                     status=200,
                     content_type="application/json",
-                    body=json.dumps({"data": []}),
+                    body=json.dumps(
+                        {
+                            "data": [
+                                {
+                                    "id": session_b,
+                                    "title": "Existing session",
+                                    "created_at": 1,
+                                    "updated_at": 1,
+                                    "permission_level": 4,
+                                    "labels": {},
+                                }
+                            ],
+                            "has_more": False,
+                        }
+                    ),
                 )
 
-            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+            await page.route(
+                re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
+            )
 
             def note_create_response(response) -> None:
                 if response.request.method == "POST" and _SESSIONS_RE.search(response.url):
@@ -1137,20 +1169,36 @@ async def _drive_landing_clears_after_navigating_away(
                     await route.continue_()
 
             await page.route("**/v1/hosts", handle_hosts)
+            await stub_empty_host_picker_data(page, _HOST_ID)
             await page.route("**/v1/agents", handle_agents)
             await page.route("**/v1/sessions/*/events", handle_events)
             await page.route(_SESSIONS_RE, handle_sessions)
 
-            # Keep the agent-discovery scan empty so only the stubbed Claude
-            # agent feeds the picker (see _drive_permission_mode for why).
+            # Retain the navigation target in Mine without introducing another agent.
             async def handle_agent_scan(route: Route) -> None:
                 await route.fulfill(
                     status=200,
                     content_type="application/json",
-                    body=json.dumps({"data": []}),
+                    body=json.dumps(
+                        {
+                            "data": [
+                                {
+                                    "id": session_b,
+                                    "title": "Existing session",
+                                    "created_at": 1,
+                                    "updated_at": 1,
+                                    "permission_level": 4,
+                                    "labels": {},
+                                }
+                            ],
+                            "has_more": False,
+                        }
+                    ),
                 )
 
-            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+            await page.route(
+                re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
+            )
 
             def note_create_response(response) -> None:
                 if response.request.method == "POST" and _SESSIONS_RE.search(response.url):
@@ -1234,7 +1282,9 @@ async def _drive_remembers_last_picked_host(base_url: str, session_id: str) -> N
                     status=200, content_type="application/json", body=json.dumps({"data": []})
                 )
 
-            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+            await page.route(
+                re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
+            )
 
             # Seed recents for both hosts so the working-directory chip auto-fills
             # and the composer never blocks on the (host-less) file browser.
@@ -1311,7 +1361,9 @@ async def _drive_keeps_offline_host_selected(
                 await route.fulfill(json={"data": []})
 
             await page.route("**/v1/hosts", handle_hosts)
-            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+            await page.route(
+                re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
+            )
             if managed:
                 await page.route("**/v1/info", handle_info)
             await page.add_init_script(
@@ -1432,7 +1484,9 @@ async def _drive_preserves_unavailable_remembered_host(base_url: str, session_id
                 await page.get_by_test_id("new-chat-button").click()
             await (await landing_hosts.value).finished()
             chip = page.get_by_test_id("new-chat-landing-host-chip")
-            await expect(chip).to_have_attribute("aria-label", re.compile("Choose host"))
+            await expect(chip).to_have_attribute(
+                "aria-label", re.compile("No host selected, Offline")
+            )
 
             # A later host refresh reports the continuously preferred VM again.
             # The empty slot lets that saved choice heal automatically.
@@ -1535,7 +1589,9 @@ async def _drive_managed_remembers_host(base_url: str, session_id: str) -> None:
                     status=200, content_type="application/json", body=json.dumps({"data": []})
                 )
 
-            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+            await page.route(
+                re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
+            )
 
             await page.add_init_script(
                 f"""window.localStorage.setItem(
@@ -1642,7 +1698,9 @@ async def _drive_managed_multi_provider(base_url: str, session_id: str) -> None:
                     status=200, content_type="application/json", body=json.dumps({"data": []})
                 )
 
-            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+            await page.route(
+                re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
+            )
 
             await page.goto(f"{base_url}/")
             await page.get_by_test_id("new-chat-landing-input").wait_for(
@@ -1758,7 +1816,9 @@ async def _drive_managed_sandbox_after_slow_info(base_url: str, session_id: str)
                     status=200, content_type="application/json", body=json.dumps({"data": []})
                 )
 
-            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+            await page.route(
+                re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
+            )
 
             await page.add_init_script(
                 f"""window.localStorage.setItem(
@@ -1816,7 +1876,7 @@ async def _drive_model_effort(base_url: str, session_id: str) -> None:
             # the picker (see _drive_permission_mode for the full rationale): a
             # leaked native agent auto-selecting ahead of Claude would open the
             # wrong agent's config modal. Registered after _register_common_routes
-            # so it wins the kind=any scan.
+            # so it wins the visibility=mine scan.
             async def handle_agent_scan(route: Route) -> None:
                 await route.fulfill(
                     status=200,
@@ -1824,7 +1884,9 @@ async def _drive_model_effort(base_url: str, session_id: str) -> None:
                     body=json.dumps({"data": []}),
                 )
 
-            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+            await page.route(
+                re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
+            )
 
             # This isolated host fixture has no live harness bridge, so provide
             # the catalog the new-session picker now resolves through the host.
@@ -1951,7 +2013,9 @@ async def _drive_codex_model(base_url: str, session_id: str) -> None:
                     ),
                 )
 
-            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+            await page.route(
+                re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
+            )
             await page.route(
                 f"**/v1/hosts/{_HOST_ID}/harnesses/codex-native/model-options",
                 handle_model_options,
@@ -2047,7 +2111,9 @@ async def _drive_agent_picker_pagination_dedupe(base_url: str, session_id: str) 
                 )
 
             await page.route("**/v1/agents?after=ag_codex_fork_2", handle_agents_page_2)
-            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+            await page.route(
+                re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
+            )
             await page.add_init_script(
                 f"""window.localStorage.setItem(
                     "omnigent:recent-workspaces",
@@ -2107,7 +2173,9 @@ async def _drive_approval_mode(base_url: str, session_id: str) -> None:
                     body=json.dumps({"data": []}),
                 )
 
-            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+            await page.route(
+                re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
+            )
 
             await page.add_init_script(
                 f"""window.localStorage.setItem(
@@ -2191,7 +2259,9 @@ async def _drive_bypass_sandbox(base_url: str, session_id: str) -> None:
                     body=json.dumps({"data": []}),
                 )
 
-            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+            await page.route(
+                re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
+            )
 
             await page.add_init_script(
                 f"""window.localStorage.setItem(
@@ -2282,11 +2352,11 @@ async def _drive_select_harness(base_url: str, session_id: str) -> None:
             # Neutralize agent discovery so only the stubbed bundle agents
             # (Polly/Debby) feed the picker. The landing picker merges
             # `/v1/agents` with agents found by scanning the caller's sessions
-            # (`/v1/sessions?kind=any`); on the shared e2e_ui server, a native
+            # (`/v1/sessions?visibility=mine`); on the shared e2e_ui server, a native
             # fork another test left behind sorts ahead of bundle agents and
             # auto-selects, so the composer would show a permission-mode pill
             # (or nothing) instead of Polly's harness picker. Registered after
-            # _register_common_routes so it wins the kind=any scan.
+            # _register_common_routes so it wins the visibility=mine scan.
             async def handle_agent_scan(route: Route) -> None:
                 await route.fulfill(
                     status=200,
@@ -2294,7 +2364,9 @@ async def _drive_select_harness(base_url: str, session_id: str) -> None:
                     body=json.dumps({"data": []}),
                 )
 
-            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+            await page.route(
+                re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
+            )
 
             # Seed a recent working directory so the working-directory chip
             # auto-fills and Send can enable without touching the file browser.
@@ -2378,12 +2450,12 @@ async def _drive_pi_native_start(base_url: str, session_id: str) -> None:
 
             # Neutralize agent discovery so the picker shows ONLY the stubbed
             # built-in Pi. The landing picker merges `/v1/agents` with agents
-            # found by scanning the caller's sessions (`/v1/sessions?kind=any`);
+            # found by scanning the caller's sessions (`/v1/sessions?visibility=mine`);
             # on the shared e2e_ui server, sessions other tests left behind
             # (e.g. a claude-native fork) would otherwise leak in and — ranking
             # ahead of Pi — auto-select, so the chip would read "Claude Code".
             # Registered after _register_common_routes so it wins for the
-            # kind=any scan; the bare POST /v1/sessions create still falls
+            # visibility=mine scan; the bare POST /v1/sessions create still falls
             # through to the capturing handler.
             async def handle_agent_scan(route: Route) -> None:
                 await route.fulfill(
@@ -2392,7 +2464,9 @@ async def _drive_pi_native_start(base_url: str, session_id: str) -> None:
                     body=json.dumps({"data": []}),
                 )
 
-            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+            await page.route(
+                re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
+            )
 
             # Seed a recent working directory so the working-directory chip
             # auto-fills and Send can enable without touching the file browser.
@@ -2479,7 +2553,9 @@ async def _drive_antigravity_native_start(base_url: str, session_id: str) -> Non
                     body=json.dumps({"data": []}),
                 )
 
-            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+            await page.route(
+                re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
+            )
 
             await page.add_init_script(
                 f"""window.localStorage.setItem(
@@ -2557,11 +2633,11 @@ async def _drive_opencode_native_start(base_url: str, session_id: str) -> None:
             # Neutralize agent discovery so the picker shows ONLY the stubbed
             # built-in OpenCode. The landing picker merges `/v1/agents` with
             # agents found by scanning the caller's sessions
-            # (`/v1/sessions?kind=any`); on the shared e2e_ui server, sessions
+            # (`/v1/sessions?visibility=mine`); on the shared e2e_ui server, sessions
             # other tests left behind (e.g. a claude-native fork) would
             # otherwise leak in and — ranking ahead of OpenCode — auto-select,
             # so the chip would read the wrong label. Registered after
-            # _register_common_routes so it wins for the kind=any scan; the
+            # _register_common_routes so it wins for the visibility=mine scan; the
             # bare POST /v1/sessions create still falls through to the
             # capturing handler.
             async def handle_agent_scan(route: Route) -> None:
@@ -2571,7 +2647,9 @@ async def _drive_opencode_native_start(base_url: str, session_id: str) -> None:
                     body=json.dumps({"data": []}),
                 )
 
-            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+            await page.route(
+                re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
+            )
 
             # Seed a recent working directory so the working-directory chip
             # auto-fills and Send can enable without touching the file browser.
@@ -2650,10 +2728,10 @@ async def _drive_kimi_native_start(base_url: str, session_id: str) -> None:
 
             # Neutralize agent discovery so the picker shows ONLY the stubbed
             # built-in Kimi. The landing picker merges `/v1/agents` with agents
-            # found by scanning the caller's sessions (`/v1/sessions?kind=any`);
+            # found by scanning the caller's sessions (`/v1/sessions?visibility=mine`);
             # on the shared e2e_ui server, sessions other tests left behind would
             # otherwise leak in and — ranking ahead of Kimi — auto-select.
-            # Registered after _register_common_routes so it wins the kind=any
+            # Registered after _register_common_routes so it wins the visibility=mine
             # scan; the bare POST /v1/sessions create still falls through.
             async def handle_agent_scan(route: Route) -> None:
                 await route.fulfill(
@@ -2662,7 +2740,9 @@ async def _drive_kimi_native_start(base_url: str, session_id: str) -> None:
                     body=json.dumps({"data": []}),
                 )
 
-            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+            await page.route(
+                re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
+            )
 
             await page.add_init_script(
                 f"""window.localStorage.setItem(
@@ -2741,7 +2821,9 @@ async def _drive_kimi_picker_dedup(base_url: str, session_id: str) -> None:
                     body=json.dumps({"data": []}),
                 )
 
-            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+            await page.route(
+                re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
+            )
 
             await page.add_init_script(
                 f"""window.localStorage.setItem(
@@ -2758,11 +2840,11 @@ async def _drive_kimi_picker_dedup(base_url: str, session_id: str) -> None:
             # Open the agent picker dropdown.
             await page.get_by_test_id("new-chat-landing-agent-select").click()
 
-            # The native Kimi row is offered...
-            await page.get_by_test_id("new-chat-landing-harness-more").click()
+            # The selected native Kimi is promoted into the main list.
             await expect(
                 page.get_by_test_id("new-chat-landing-agent-ag_kimi_native_e2e")
             ).to_be_visible(timeout=30_000)
+            await expect(page.get_by_test_id("new-chat-landing-harness-more")).to_have_count(0)
             # ...and the SDK kimi row is dropped (hidden by NEW_SESSION_HIDDEN_AGENTS).
             await expect(
                 page.get_by_test_id("new-chat-landing-agent-ag_kimi_sdk_e2e")
@@ -3204,6 +3286,21 @@ async def _drive_add_worktree(base_url: str, session_id: str) -> None:
             await _register_common_routes(
                 page, created_session_id=session_id, create_bodies=create_bodies
             )
+            await page.route(
+                _WORKTREES_RE,
+                lambda route: route.fulfill(
+                    json={
+                        "data": [
+                            {
+                                "path": "/work/repo",
+                                "branch": "main",
+                                "is_main": True,
+                                "detached": False,
+                            }
+                        ]
+                    }
+                ),
+            )
             await page.add_init_script(
                 f"""window.localStorage.setItem(
                     "omnigent:recent-workspaces",
@@ -3349,7 +3446,7 @@ _FORK_OF_FORK_NAME = "claude-native-ui (fork ag_aaa11111) (fork ag_bbb22222)"
 
 
 def _fork_scan_body() -> str:
-    """Stub body for the ``GET /v1/sessions?kind=any`` agent-discovery scan.
+    """Stub body for the ``GET /v1/sessions?visibility=mine`` agent-discovery scan.
 
     Returns four session-bound agents that exercise every branch of the
     picker's shadow-dropping: the built-in's own row (dropped by id), a single
@@ -3386,7 +3483,7 @@ def test_start_session_picker_drops_fork_of_fork_shadows(
 
     The picker (``useAvailableAgents``) merges the built-in list
     (``GET /v1/agents``) with session-scoped agents discovered by scanning the
-    caller's sessions (``GET /v1/sessions?kind=any``), dropping any discovered
+    caller's sessions (``GET /v1/sessions?visibility=mine``), dropping any discovered
     agent whose clone name roots back to a built-in. A fork of a fork nests two
     clone suffixes — ``"claude-native-ui (fork …) (fork …)"`` — so a single-
     layer strip leaves ``"claude-native-ui (fork …)"``, which is not a built-in
@@ -3441,10 +3538,12 @@ async def _drive_fork_of_fork_dedup(base_url: str, session_id: str) -> None:
                 )
 
             await page.route("**/v1/hosts", handle_hosts)
+            await stub_empty_host_picker_data(page, _HOST_ID)
             await page.route("**/v1/agents", handle_agents)
-            # kind=any returns the fork + custom session-bound agents; the bare
-            # conversation-list GET still falls through to the real server.
-            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_scan)
+            # The Mine cache supplies discovery; other session scopes use the server.
+            await page.route(
+                re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_scan
+            )
             # Per-agent enrich fetch for whichever agent survives the dedup.
             await page.route(re.compile(r"/v1/sessions/[^/]+/agent$"), handle_enrich)
 
@@ -3537,7 +3636,7 @@ async def _drive_native_permissions_without_edit(
                 ),
             )
             await page.route(
-                re.compile(r"/v1/sessions\?.*kind=any"),
+                re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"),
                 lambda route: route.fulfill(json={"data": []}),
             )
             await page.add_init_script(
@@ -3623,7 +3722,9 @@ async def _drive_agy_skip_permissions(base_url: str, session_id: str) -> None:
                     body=json.dumps({"data": []}),
                 )
 
-            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+            await page.route(
+                re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
+            )
 
             await page.add_init_script(
                 f"""window.localStorage.setItem(
@@ -3716,7 +3817,9 @@ async def _drive_agy_default_permissions(base_url: str, session_id: str) -> None
                     body=json.dumps({"data": []}),
                 )
 
-            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+            await page.route(
+                re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
+            )
 
             await page.add_init_script(
                 f"""window.localStorage.setItem(

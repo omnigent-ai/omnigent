@@ -1,5 +1,5 @@
-import { fireEvent, render, screen } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { act, fireEvent, render, screen } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   ComposerHostTrigger,
   ComposerWorkspaceBar,
@@ -7,6 +7,10 @@ import {
   ComposerHarnessTrigger,
   ComposerPermissionPicker,
 } from "./ComposerControls";
+import {
+  COMPOSER_COLLAPSED_LABEL_CLASS,
+  COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS,
+} from "./ChatComposer";
 
 describe("shared composer controls", () => {
   it("uses the same workspace header and host geometry in either context", () => {
@@ -79,6 +83,39 @@ describe("shared composer controls", () => {
     );
     expect(screen.getByTestId("composer-agent-effort-value")).not.toHaveClass("hidden");
     expect(screen.getByTestId("product-icon")).toBeInTheDocument();
+    expect(screen.getByTestId("composer-agent-config-value")).toHaveClass(
+      COMPOSER_COLLAPSED_LABEL_CLASS,
+    );
+  });
+
+  it("keeps an icon-less model label visible when the action row collapses", () => {
+    render(<ComposerHarnessTrigger label="Agent" model="No agents" />);
+    expect(screen.getByTestId("composer-agent-config-value")).not.toHaveClass(
+      COMPOSER_COLLAPSED_LABEL_CLASS,
+    );
+  });
+
+  it("keeps the model trigger clickable with an accessible, mobile-visible loading spinner", () => {
+    const onClick = vi.fn();
+    render(
+      <ComposerHarnessTrigger
+        label="Configure session"
+        model=""
+        icon={<span>Harness</span>}
+        loading
+        pending
+        onClick={onClick}
+      />,
+    );
+    const trigger = screen.getByRole("button", { name: "Configure session" });
+    const spinner = screen.getByRole("status", { name: "Loading model" });
+    expect(trigger).toBeEnabled();
+    expect(trigger).toHaveAttribute("aria-busy", "true");
+    expect(spinner.parentElement).toBe(trigger);
+    expect(screen.getByTestId("composer-agent-config-value")).not.toContainElement(spinner);
+    expect(screen.queryByLabelText("Model change pending")).toBeNull();
+    fireEvent.click(trigger);
+    expect(onClick).toHaveBeenCalledOnce();
   });
 
   it("dispatches permission selections through the caller's handler", () => {
@@ -98,11 +135,170 @@ describe("shared composer controls", () => {
     for (const forbidden of ["hidden", "max-w-20"]) {
       expect(screen.getByText("Bypass permissions")).not.toHaveClass(forbidden);
     }
+    expect(screen.getByText("Bypass permissions")).toHaveClass(COMPOSER_COLLAPSED_LABEL_CLASS);
     expect(trigger).toHaveClass("w-auto", "gap-1", "px-2");
     fireEvent.keyDown(trigger, {
       key: "ArrowDown",
     });
     fireEvent.click(screen.getByRole("menuitem", { name: "Plan" }));
     expect(onSelect).toHaveBeenCalledWith("plan");
+  });
+
+  it.each([false, true])(
+    "restores permission focus unless another menu has opened (next menu=%s)",
+    async (nextMenuOpen) => {
+      vi.useFakeTimers();
+      try {
+        render(
+          <>
+            <ComposerPermissionPicker
+              label="Permission mode"
+              value="Manual"
+              options={[{ value: "plan", label: "Plan" }]}
+              onSelect={vi.fn()}
+            />
+            <div role="menu" data-state="open" tabIndex={-1} data-testid="next-menu" />
+          </>,
+        );
+        const trigger = screen.getByRole("button", { name: "Permission mode: Manual" });
+        fireEvent.keyDown(trigger, { key: "ArrowDown" });
+        fireEvent.click(screen.getByRole("menuitem", { name: "Plan" }));
+        const nextMenu = screen.getByTestId("next-menu");
+        if (nextMenuOpen) nextMenu.focus();
+
+        await act(() => vi.runOnlyPendingTimersAsync());
+
+        expect(nextMenuOpen ? nextMenu : trigger).toHaveFocus();
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it("keeps cached permissions readable but inert while their live configuration loads", () => {
+    const onSelect = vi.fn();
+    render(
+      <ComposerPermissionPicker
+        label="Permission mode"
+        value="Plan"
+        options={[{ value: "plan", label: "Plan" }]}
+        loading
+        onSelect={onSelect}
+      />,
+    );
+    const trigger = screen.getByRole("button", { name: "Permission mode: Plan" });
+    expect(trigger).toBeDisabled();
+    expect(trigger).toHaveAttribute("aria-busy", "true");
+    expect(trigger).toHaveClass("disabled:opacity-100");
+    fireEvent.pointerDown(trigger, { button: 0 });
+    fireEvent.click(trigger);
+    expect(screen.queryByRole("menu")).toBeNull();
+    expect(onSelect).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])(
+    "allows cached permission choices while refreshing unless explicitly disabled (%s)",
+    (disabled) => {
+      const onSelect = vi.fn();
+      render(
+        <ComposerPermissionPicker
+          label="Permission mode"
+          value="Default"
+          options={[{ value: "plan", label: "Plan" }]}
+          loading
+          interactiveWhileLoading
+          disabled={disabled}
+          onSelect={onSelect}
+        />,
+      );
+      const trigger = screen.getByRole("button", { name: "Permission mode: Default" });
+      expect(trigger).toHaveAttribute("aria-busy", "true");
+      if (disabled) {
+        expect(trigger).toBeDisabled();
+        fireEvent.pointerDown(trigger, { button: 0 });
+        expect(screen.queryByRole("menu")).toBeNull();
+      } else {
+        expect(trigger).toBeEnabled();
+        fireEvent.keyDown(trigger, { key: "ArrowDown" });
+        fireEvent.click(screen.getByRole("menuitem", { name: "Plan" }));
+        expect(onSelect).toHaveBeenCalledWith("plan");
+      }
+    },
+  );
+});
+
+describe("workspace bar label collapse", () => {
+  class StubResizeObserver {
+    static callbacks: ResizeObserverCallback[] = [];
+    constructor(callback: ResizeObserverCallback) {
+      StubResizeObserver.callbacks.push(callback);
+    }
+    observe(): void {}
+    unobserve(): void {}
+    disconnect(): void {}
+  }
+  const fireResize = () => {
+    for (const callback of StubResizeObserver.callbacks) callback([], {} as ResizeObserver);
+  };
+
+  afterEach(() => {
+    StubResizeObserver.callbacks = [];
+    vi.unstubAllGlobals();
+  });
+
+  // jsdom does no layout, so stand in for it with fixed scroll/client widths.
+  const defineWidth = (element: HTMLElement, clientWidth: number, scrollWidth: number) => {
+    Object.defineProperty(element, "clientWidth", { configurable: true, get: () => clientWidth });
+    Object.defineProperty(element, "scrollWidth", { configurable: true, get: () => scrollWidth });
+  };
+
+  it("marks each chip label to collapse to its icon and keeps the label as the name", () => {
+    render(
+      <ComposerWorkspaceBar>
+        <ComposerWorkspaceTrigger kind="directory" label="repo" />
+        <ComposerWorkspaceTrigger kind="worktree" label="main" aria-label="Branch: main" />
+      </ComposerWorkspaceBar>,
+    );
+    const label = screen.getByText("repo");
+    expect(label).toHaveAttribute("data-workspace-collapse-label");
+    expect(label).toHaveClass(COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS);
+    // The name survives the text hiding; a caller's explicit name still wins.
+    expect(screen.getByRole("button", { name: "repo" })).toHaveAttribute("aria-label", "repo");
+    expect(screen.getByRole("button", { name: "Branch: main" })).toBeInTheDocument();
+  });
+
+  it("collapses the labels to icons once a chip can no longer show its full text", () => {
+    vi.stubGlobal("ResizeObserver", StubResizeObserver);
+    render(
+      <ComposerWorkspaceBar data-testid="bar">
+        <ComposerWorkspaceTrigger kind="worktree" label="feature/really-long-branch-name" />
+      </ComposerWorkspaceBar>,
+    );
+    const bar = screen.getByTestId("bar");
+    const label = bar.querySelector<HTMLElement>("[data-workspace-collapse-label]")!;
+    defineWidth(bar, 200, 200);
+    // The label's text is wider than the box it was given: it is truncating.
+    defineWidth(label, 40, 120);
+    fireResize();
+    expect(bar).toHaveAttribute("data-labels", "collapsed");
+    // Given room for the full text again, the labels come back.
+    defineWidth(label, 120, 120);
+    fireResize();
+    expect(bar).not.toHaveAttribute("data-labels");
+  });
+
+  it("collapses when the row overflows even if no single label is truncating", () => {
+    vi.stubGlobal("ResizeObserver", StubResizeObserver);
+    render(
+      <ComposerWorkspaceBar data-testid="bar">
+        <ComposerWorkspaceTrigger kind="directory" label="repo" />
+      </ComposerWorkspaceBar>,
+    );
+    const bar = screen.getByTestId("bar");
+    const label = bar.querySelector<HTMLElement>("[data-workspace-collapse-label]")!;
+    defineWidth(label, 40, 40);
+    defineWidth(bar, 150, 300);
+    fireResize();
+    expect(bar).toHaveAttribute("data-labels", "collapsed");
   });
 });

@@ -60,6 +60,7 @@ def _persist_fake_daemon_claim(
             server_url=None if mode == "local" else target,
             log_path=spawned.log_path,
             started_at=int(time.time()),
+            host_id=cli_module._load_existing_host_id(),
             config_sig="test-config-signature",
         )
     )

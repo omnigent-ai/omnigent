@@ -28,7 +28,6 @@ import type {
   SessionEventInput,
   SessionItem,
   SessionStatus,
-  SkillSummary,
 } from "./types";
 
 /** Returns the client surface label for the X-Omnigent-Client telemetry header. */
@@ -239,12 +238,6 @@ interface SessionResponseWire {
     status: "pending" | "in_progress" | "completed";
     activeForm: string;
   }[];
-  /**
-   * Skills the bound agent can invoke — bundled + host-discovered
-   * (subject to the spec's ``skills_filter``). Just name + one-line
-   * description. Surfaced in the web composer's slash-command menu.
-   */
-  skills?: SkillSummary[];
   /** Runner-owned model picker rows for native sessions. */
   model_options?: NativeModelOption[];
   /**
@@ -357,7 +350,6 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     subAgentName: wire.sub_agent_name ?? null,
     kind: wire.kind === "sub_agent" ? "sub_agent" : "default",
     todos: wire.todos ?? [],
-    skills: wire.skills ?? [],
     codexModelOptions: wire.model_options ?? [],
     terminalPending: wire.terminal_pending ?? false,
     sandboxStatus: wire.sandbox_status ?? null,
@@ -530,12 +522,31 @@ export interface ImportedSessionRef {
   title: string | null;
 }
 
+/** One session that could not be imported, with a user-facing reason. */
+export interface ImportFailureRef {
+  /** null when the failing session's id wasn't known (host reported a count only). */
+  externalSessionId: string | null;
+  source: string | null;
+  reason: string;
+}
+
 /** Result of a batch local import (`POST /v1/imports/local`). */
 export interface LocalImportResult {
   imported: number;
   alreadyImported: number;
   failed: number;
   sessions: ImportedSessionRef[];
+  /** One entry per failed session, with a reason; length equals `failed`. */
+  failures: ImportFailureRef[];
+}
+
+/** Map one `failed`/`failures[]` wire record to an {@link ImportFailureRef}. */
+function toImportFailureRef(evt: Record<string, unknown>): ImportFailureRef {
+  return {
+    externalSessionId: typeof evt.external_session_id === "string" ? evt.external_session_id : null,
+    source: typeof evt.source === "string" ? evt.source : null,
+    reason: typeof evt.reason === "string" ? evt.reason : "This session could not be imported.",
+  };
 }
 
 /**
@@ -580,6 +591,7 @@ export async function importLocalSessions(
   if (res.body === null) throw new Error("Import failed: no response stream.");
 
   const sessions: ImportedSessionRef[] = [];
+  const failures: ImportFailureRef[] = [];
   let imported = 0;
   let alreadyImported = 0;
   let failed = 0;
@@ -601,10 +613,12 @@ export async function importLocalSessions(
       };
       sessions.push(ref);
       onSession?.(ref);
+    } else if (evt.event === "failed") {
+      failures.push(toImportFailureRef(evt));
     } else if (evt.event === "done") {
       imported = typeof evt.imported === "number" ? evt.imported : sessions.length;
       alreadyImported = typeof evt.already_imported === "number" ? evt.already_imported : 0;
-      failed = typeof evt.failed === "number" ? evt.failed : 0;
+      failed = typeof evt.failed === "number" ? evt.failed : failures.length;
     } else if (evt.event === "error") {
       errorMessage = typeof evt.message === "string" ? evt.message : "Import failed. Try again.";
     }
@@ -635,7 +649,7 @@ export async function importLocalSessions(
   }
 
   if (errorMessage !== null) throw new Error(errorMessage);
-  return { imported, alreadyImported, failed, sessions };
+  return { imported, alreadyImported, failed, sessions, failures };
 }
 
 /**
@@ -660,6 +674,11 @@ async function importLocalSessionsBuffered(
     already_imported: number;
     failed: number;
     sessions: { session_id: string; title: string | null }[];
+    failures?: {
+      external_session_id: string | null;
+      source: string | null;
+      reason: string;
+    }[];
   }>(res);
   const sessions = wire.sessions.map((s) => ({ id: s.session_id, title: s.title }));
   for (const s of sessions) onSession?.(s);
@@ -668,6 +687,13 @@ async function importLocalSessionsBuffered(
     alreadyImported: wire.already_imported,
     failed: wire.failed,
     sessions,
+    // Absent from a server predating failure detail (only a count); default to
+    // none so the caller can still render the tally.
+    failures: (wire.failures ?? []).map((f) => ({
+      externalSessionId: f.external_session_id,
+      source: f.source,
+      reason: f.reason,
+    })),
   };
 }
 
@@ -685,8 +711,7 @@ async function importLocalSessionsBuffered(
  * @param metadata - Session-level metadata (host_id, workspace, labels, etc.).
  *   A `project_id` files the session into that project atomically at create
  *   and lets the server default-fill absent fields from the project config.
- * @returns The created session's id, plus any non-fatal project-consistency
- *   `warnings` the server attached to a `project_id` create.
+ * @returns The created session's id.
  */
 export async function createBundledSession(
   bundle: File,
@@ -699,7 +724,7 @@ export async function createBundledSession(
     terminal_launch_args?: string[];
     git?: { branch_name: string; base_branch?: string };
   } = {},
-): Promise<{ id: string; warnings?: { code?: string; message?: string }[] }> {
+): Promise<{ id: string }> {
   const form = new FormData();
   form.append("metadata", JSON.stringify(metadata));
   form.append("bundle", bundle);
@@ -720,9 +745,8 @@ export async function createBundledSession(
   // so callers don't need to care which path was taken.
   const body = (await res.json()) as {
     session_id: string;
-    warnings?: { code?: string; message?: string }[];
   };
-  return { id: body.session_id, warnings: body.warnings };
+  return { id: body.session_id };
 }
 
 /**
@@ -1175,6 +1199,52 @@ export async function fetchSessionItemsPage(
   const page = await readJsonOrThrow<SessionItemsResponseWire>(res);
   // Server returns newest-first; reverse to chronological for rendering.
   return { items: [...page.data].reverse(), hasMore: page.has_more };
+}
+
+/**
+ * Build a portable JSONL export of a session's transcript.
+ *
+ * Same format as `omnigent session export` (see `session_export` in
+ * `omnigent/cli.py`): the first line is the session metadata
+ * (`record_type: "session_meta"`), every following line is one committed
+ * item (`record_type: "item"`) in chronological order, so the file
+ * round-trips through `omnigent session import`. Records keep the raw
+ * wire shape rather than the SPA's parsed types for that parity.
+ */
+export async function exportSessionTranscript(sessionId: string): Promise<string> {
+  const metaParams = new URLSearchParams({
+    include_items: "false",
+    include_liveness: "false",
+  });
+  const metaRes = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(sessionId)}?${metaParams}`,
+  );
+  const meta = await readJsonOrThrow<Record<string, unknown>>(metaRes);
+  const lines = [JSON.stringify({ record_type: "session_meta", ...meta })];
+
+  // Pages are a cursor chain (each request needs the previous last_id),
+  // so the fetches cannot run in parallel.
+  /* oxlint-disable no-await-in-loop */
+  let after: string | null = null;
+  for (;;) {
+    const params = new URLSearchParams({ limit: "500", order: "asc" });
+    if (after) params.set("after", after);
+    const res = await authenticatedFetch(
+      `/v1/sessions/${encodeURIComponent(sessionId)}/items?${params}`,
+    );
+    const page = await readJsonOrThrow<{
+      data: Record<string, unknown>[];
+      has_more?: boolean;
+      last_id?: string | null;
+    }>(res);
+    for (const item of page.data) {
+      lines.push(JSON.stringify({ record_type: "item", ...item }));
+    }
+    if (!page.has_more || page.last_id == null) break;
+    after = page.last_id;
+  }
+  /* oxlint-enable no-await-in-loop */
+  return lines.join("\n") + "\n";
 }
 
 /**
