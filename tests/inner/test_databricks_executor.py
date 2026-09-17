@@ -2268,6 +2268,133 @@ def test_federated_oidc_machine_auth_types_are_classified_as_sp(
     assert sp_sections == {"gh-oidc", "env-oidc"}
 
 
+def test_cloud_machine_auth_types_are_classified_as_sp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """GCP service accounts, Azure MSI, and metadata-service are machine identities.
+
+    Like the federated-OIDC flows, these SDK machine ``auth_type``s carry
+    no client_secret pair, so the credential heuristic alone would miss
+    them and drop them in the "user" bucket — where a GCP service account
+    or Azure managed identity could outrank a real user profile for the
+    same host. They must be recognized by ``auth_type``.
+    """
+    from omnigent.inner.databricks_executor import (
+        _databrickscfg_host_matches_and_sp_sections,
+    )
+
+    cfg_path = tmp_path / "databrickscfg"
+    cfg_path.write_text(
+        "[gcp-sa]\n"
+        "host = https://example.databricks.com\n"
+        "auth_type = google-credentials\n"
+        "[gcp-id]\n"
+        "host = https://example.databricks.com\n"
+        "auth_type = google-id\n"
+        "[azure-mi]\n"
+        "host = https://example.databricks.com\n"
+        "auth_type = azure-msi\n"
+        "[metadata]\n"
+        "host = https://example.databricks.com\n"
+        "auth_type = metadata-service\n"
+        "[DEFAULT]\n"
+        "host = https://example.databricks.com\n"
+        "auth_type = databricks-cli\n"
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg_path))
+
+    _matches, sp_sections = _databrickscfg_host_matches_and_sp_sections(
+        "https://example.databricks.com"
+    )
+    assert sp_sections == {"gcp-sa", "gcp-id", "azure-mi", "metadata"}
+
+
+def test_resolve_auth_for_host_prefers_user_over_gcp_service_account_first_in_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A GCP service account first in the file must not outrank the user.
+
+    ``google-credentials`` carries no client_secret pair, so before it was
+    added to the machine set it fell into the "user" bucket and a
+    first-in-file GCP service account still won — the exact wrong-identity
+    bug, unresolved for GCP. The user profile must win, and a stale-user
+    fallthrough to the service account must still warn.
+    """
+    from omnigent.inner import databricks_executor
+
+    cfg_path = tmp_path / "databrickscfg"
+    cfg_path.write_text(
+        "[gcp-sa]\n"
+        "host = https://example.databricks.com\n"
+        "auth_type = google-credentials\n"
+        "[DEFAULT]\n"
+        "host = https://example.databricks.com\n"
+        "auth_type = databricks-cli\n"
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg_path))
+    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+
+    def _fake_sdk_config(**kwargs: str) -> _StubSdkConfig:
+        token = "sa-token" if kwargs.get("profile") == "gcp-sa" else "user-token"
+        return _StubSdkConfig(host="https://example.databricks.com", token=token)
+
+    monkeypatch.setattr(databricks_executor, "_sdk_config", _fake_sdk_config)
+
+    # Healthy user wins over the first-in-file GCP service account.
+    auth, _host = databricks_executor._resolve_databricks_auth(
+        host="https://example.databricks.com"
+    )
+    assert auth.current_token() == "user-token"
+
+    # When the user profile fails, the fallthrough to the SA warns (naming it).
+    def _user_fails(**kwargs: str) -> _StubSdkConfig:
+        if kwargs.get("profile") == "gcp-sa":
+            return _StubSdkConfig(host="https://example.databricks.com", token="sa-token")
+        raise ValueError("DEFAULT: token expired")
+
+    monkeypatch.setattr(databricks_executor, "_sdk_config", _user_fails)
+    monkeypatch.setattr(databricks_executor.shutil, "which", lambda name: "/usr/bin/databricks")
+    monkeypatch.setattr(
+        databricks_executor.subprocess,
+        "run",
+        lambda args, **kw: SimpleNamespace(returncode=1, stdout="", stderr="expired"),
+    )
+    with caplog.at_level("WARNING", logger=databricks_executor.logger.name):
+        auth, _host = databricks_executor._resolve_databricks_auth(
+            host="https://example.databricks.com"
+        )
+    assert auth.current_token() == "sa-token"
+    warnings = [r.message for r in caplog.records if r.levelname == "WARNING"]
+    assert any("service principal 'gcp-sa'" in m and "DEFAULT" in m for m in warnings), warnings
+
+
+def test_resolve_auth_for_host_env_profile_selects_sp_over_valid_user(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An explicit DATABRICKS_CONFIG_PROFILE naming the SP wins end-to-end.
+
+    Ordering puts users ahead of SPs by default, but an explicit env
+    selection is intent and must win even when a valid user profile matches
+    the same host. The ordering unit test covers this; this asserts the
+    resolver actually mints the SP's token, not the user's.
+    """
+    from omnigent.inner import databricks_executor
+
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(_write_sp_and_user_cfg(tmp_path)))
+    monkeypatch.setenv("DATABRICKS_CONFIG_PROFILE", "sp")
+
+    def _fake_sdk_config(**kwargs: str) -> _StubSdkConfig:
+        token = "sp-token" if kwargs.get("profile") == "sp" else "user-token"
+        return _StubSdkConfig(host="https://example.databricks.com", token=token)
+
+    monkeypatch.setattr(databricks_executor, "_sdk_config", _fake_sdk_config)
+
+    auth, _host = databricks_executor._resolve_databricks_auth(
+        host="https://example.databricks.com"
+    )
+    assert auth.current_token() == "sp-token"
+
+
 def test_section_with_explicit_empty_host_does_not_inherit_default(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

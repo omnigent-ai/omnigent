@@ -895,11 +895,11 @@ def _section_is_service_principal(options: configparser.SectionProxy) -> bool:
     """Whether a ``~/.databrickscfg`` section holds M2M service-principal creds.
 
     A section is a service principal when it names a machine (M2M)
-    ``auth_type`` — the OAuth-M2M/Azure secret and federated-OIDC flows —
-    or carries client credentials (the generic ``client_id`` +
-    ``client_secret`` or the Azure ``azure_client_id`` +
-    ``azure_client_secret`` pair), and no user-interactive ``auth_type``
-    overrides that.
+    ``auth_type`` — OAuth-M2M, Azure secret/managed-identity, GCP service
+    account, metadata-service, and federated-OIDC flows — or carries client
+    credentials (the generic ``client_id`` + ``client_secret`` or the Azure
+    ``azure_client_id`` + ``azure_client_secret`` pair), and no
+    user-interactive ``auth_type`` overrides that.
 
     :param options: The section mapping (a ``ConfigParser`` section).
     :returns: ``True`` when the section is an M2M service principal.
@@ -918,6 +918,10 @@ def _section_is_service_principal(options: configparser.SectionProxy) -> bool:
         "env-oidc",
         "file-oidc",
         "azure-devops-oidc",
+        "google-credentials",
+        "google-id",
+        "azure-msi",
+        "metadata-service",
     }
     auth_type = options.get("auth_type", "").strip().lower()
     if auth_type in user_auth_types:
