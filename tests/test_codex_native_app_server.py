@@ -1568,6 +1568,43 @@ args = []
     }
 
 
+async def test_start_can_delegate_global_process_reconciliation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Runner-owned Codex startup leaves global cleanup to the host janitor."""
+    real_codex_home = tmp_path / "real-codex-home"
+    real_codex_home.mkdir()
+    codex_home = tmp_path / "codex-home"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(real_codex_home))
+    _disable_codex_startup_rpc(monkeypatch)
+    reconcile_calls = 0
+
+    def _record_reconcile() -> int:
+        nonlocal reconcile_calls
+        reconcile_calls += 1
+        return 0
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.reconcile_codex_native_process_registry",
+        _record_reconcile,
+    )
+    server = _test_app_server(
+        tmp_path,
+        codex_home,
+        tmp_path / "bridge",
+        workspace,
+    )
+    server.reconcile_process_registry = False
+
+    await server.start()
+    await server.close()
+
+    assert reconcile_calls == 0
+
+
 async def test_start_pins_reasoning_effort_in_config(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

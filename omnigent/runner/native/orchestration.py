@@ -4513,15 +4513,33 @@ async def _auto_create_codex_terminal(
     # not the one registered below — and so it can't mirror alongside the new one.
     await _cancel_auto_forwarder_task(session_id)
     clear_bridge_state(bridge_dir)
-    # A previous runner's app-server for THIS session can outlive a hard runner
-    # exit (it runs in its own process session) while still holding the codex
-    # thread's writer lock, which makes the ``thread/resume`` below fail with
-    # "already has an active writer". Reap it before starting a replacement.
-    from omnigent.harnesses.codex_native.process_registry import (
-        reap_codex_native_processes_for_state_dir,
-    )
+    # Only a resume can conflict with a stale writer for the same Codex thread.
+    # Fresh sessions have no thread writer to recover and must not pay for a
+    # machine-wide ``ps`` scan on their terminal-interactivity path.
+    if launch_config.external_session_id is not None:
+        from omnigent.harnesses.codex_native.process_registry import (
+            reap_codex_native_processes_for_state_dir,
+        )
 
-    await asyncio.to_thread(reap_codex_native_processes_for_state_dir, bridge_dir)
+        session_reap_started_at = time.monotonic()
+        session_reaped_processes = await asyncio.to_thread(
+            reap_codex_native_processes_for_state_dir,
+            bridge_dir,
+        )
+        session_reap_elapsed_ms = int((time.monotonic() - session_reap_started_at) * 1000)
+        _logger.info(
+            "Codex same-session stale-process cleanup completed: "
+            "session=%s elapsed_ms=%d reaped_processes=%s",
+            session_id,
+            session_reap_elapsed_ms,
+            session_reaped_processes,
+            extra=debug_event(
+                "codex_session_stale_process_cleanup",
+                session_id=session_id,
+                elapsed_ms=session_reap_elapsed_ms,
+                reaped_processes=session_reaped_processes,
+            ),
+        )
 
     # Forked clone with no native thread of its own yet: clone the SOURCE's
     # local Codex rollout into the clone's OWN CODEX_HOME under a thread id
@@ -4795,6 +4813,10 @@ async def _auto_create_codex_terminal(
         # Persist trust for every merged hook so the review finds nothing to
         # review. See trust_all_codex_hooks.
         trust_all_hooks=True,
+        # The host-global background janitor reconciles crash-leftover
+        # app-servers. A targeted same-session reap remains synchronous only
+        # for the resume path where an old writer can block correctness.
+        reconcile_process_registry=False,
     )
     # Generate routing hooks.json (and bypass codex's hook-trust prompt): the
     # app-server reads the endpoint out of its own process env at start, and

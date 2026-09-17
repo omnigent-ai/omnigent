@@ -14011,7 +14011,7 @@
     },
     "/v1/sessions/{session_id}/resources/environments/{environment_id}/shell": {
       "post": {
-        "description": "Execute a shell command in an environment.\n\n**Returns:** Shell result.",
+        "description": "Execute a shell command in an environment.\n\nOwner-only. A command has no path to inspect, so unlike the\nfilesystem proxy there is no workspace-relative form that could\nbe opened to collaborators: any command reaches the owner's own\nmachine, the same boundary `_browse_level` closes for absolute\npaths, and it passes no policy or approval gate on the way.\n\n**Returns:** Shell result.",
         "operationId": "run_environment_shell_v1_sessions__session_id__resources_environments__environment_id__shell_post",
         "parameters": [
           {
