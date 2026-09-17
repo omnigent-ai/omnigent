@@ -17,6 +17,21 @@ from __future__ import annotations
 
 import importlib
 import sys
+from collections.abc import Iterator
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _restore_omnigent_modules() -> Iterator[None]:
+    """Put the original ``omnigent`` modules back after each purge so later
+    tests in the same worker don't mix class objects from two module copies."""
+    saved = {name: mod for name, mod in sys.modules.items() if name.startswith("omnigent")}
+    yield
+    for name in [name for name in sys.modules if name.startswith("omnigent")]:
+        if name not in saved:
+            sys.modules.pop(name, None)
+    sys.modules.update(saved)
 
 
 def _purge(prefix: str) -> None:
