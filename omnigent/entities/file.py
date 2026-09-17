@@ -1,6 +1,7 @@
 """File entity."""
 
 from dataclasses import dataclass
+from typing import Any
 
 
 @dataclass
@@ -17,6 +18,13 @@ class StoredFile:
         is session-scoped, e.g. ``"conv_abc123"``. ``None`` for
         historical unscoped records created before session-scoped
         file resources were introduced.
+    :param source_metadata: Optional metadata about the original upload
+        before any server-side transform, as an opaque JSON-able dict.
+        ``None`` when there is nothing to record. Today only images that
+        were downscaled at upload populate it, with ``{"width", "height"}``
+        giving the pre-downscale pixel size — used to tell the model it is
+        viewing a reduced-resolution version. New file types may add their
+        own keys without a schema change.
     """
 
     id: str
@@ -25,3 +33,4 @@ class StoredFile:
     bytes: int
     content_type: str | None = None
     session_id: str | None = None
+    source_metadata: dict[str, Any] | None = None

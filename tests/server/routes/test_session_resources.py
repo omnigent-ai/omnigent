@@ -2267,6 +2267,83 @@ async def test_copy_files_from_direct_parent(
 
 
 @pytest.mark.asyncio
+async def test_copy_files_carries_source_metadata(
+    file_client: httpx.AsyncClient,
+    file_store: Any,
+    artifact_store: _InMemoryArtifactStore,
+) -> None:
+    """A copied downscaled image keeps its source_metadata for the subagent."""
+    source = file_store.create(
+        session_id="b460374fc8e697b296708f52dc9d8179",
+        filename="shot.webp",
+        bytes=3,
+        content_type="image/webp",
+        source_metadata={"width": 6000, "height": 4000},
+    )
+    artifact_store.put(source.id, b"abc")
+
+    resp = await file_client.post(
+        "/v1/sessions/405bfe154d5c0e795a2b87021bc897bf/resources/files:copy",
+        json={
+            "source_session_id": "b460374fc8e697b296708f52dc9d8179",
+            "file_ids": [source.id],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    new_id = resp.json()["mapping"][source.id]["new_id"]
+
+    copied = file_store.get(new_id, session_id="405bfe154d5c0e795a2b87021bc897bf")
+    assert copied is not None
+    assert copied.source_metadata == {"width": 6000, "height": 4000}
+
+
+@pytest.mark.asyncio
+async def test_downscaled_upload_reaches_native_resolver(
+    file_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from io import BytesIO
+
+    from PIL import Image
+
+    from omnigent.inner.codex_native_executor import _content_to_input_items
+    from omnigent.inner.native_attachments import framework_notices
+    from omnigent.runner.app import _resolve_forwarded_message_content
+    from omnigent.runtime import content_resolver
+
+    monkeypatch.setattr(content_resolver, "IMAGE_MODEL_BUDGET_BYTES", 1024)
+    monkeypatch.setattr(content_resolver, "IMAGE_MAX_EDGE_PX", 64)
+    original = BytesIO()
+    Image.new("RGB", (300, 200), "red").save(original, format="PNG", compress_level=0)
+    session_id = "79b22ebd2309e48fdeb450c65611d51b"
+    upload = await file_client.post(
+        f"/v1/sessions/{session_id}/resources/files",
+        files={"file": ("photo.png", original.getvalue(), "image/png")},
+    )
+    assert upload.status_code == 201, upload.text
+    file_id = upload.json()["id"]
+    resource = await file_client.get(f"/v1/sessions/{session_id}/resources/files/{file_id}")
+    assert resource.json()["metadata"]["source_metadata"] == {"width": 300, "height": 200}
+    inventory = await file_client.get(f"/v1/sessions/{session_id}/resources")
+    assert inventory.status_code == 200
+    listed = next(entry for entry in inventory.json()["data"] if entry["id"] == file_id)
+    assert listed["metadata"]["source_metadata"] == {"width": 300, "height": 200}
+    authored = [
+        {"type": "input_image", "file_id": file_id, "filename": "photo.png"},
+        {"type": "input_text", "text": "inspect this"},
+    ]
+    resolved = await _resolve_forwarded_message_content(
+        authored, session_id=session_id, server_client=file_client
+    )
+    assert "300×200" in framework_notices(resolved)[0]
+    items = _content_to_input_items(resolved, tmp_path)
+    assert "downscaled-from-300x200" in items[0]["path"]
+    assert items[1] == {"type": "text", "text": "inspect this"}
+    assert len(authored) == 2
+
+
+@pytest.mark.asyncio
 async def test_copy_files_rejects_empty_file_ids(
     file_client: httpx.AsyncClient,
 ) -> None:

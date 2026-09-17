@@ -63,13 +63,21 @@ def _fulfill_empty_agent_scan(route: Route) -> None:
 
 def test_cursor_missing_cli_shows_install_and_login_guidance(
     page: Page,
-    seeded_session: tuple[str, str],
+    live_server: str,
 ) -> None:
     """A missing Cursor CLI is badged and explained before session launch."""
-    base_url, session_id = seeded_session
-    del session_id
+    base_url = live_server
 
     page.route("**/v1/hosts", _fulfill_hosts)
+    # The fake host has no model catalog or worktrees.
+    page.route(
+        f"**/v1/hosts/{_HOST_ID}/harnesses/*/model-options",
+        lambda route: route.fulfill(json={"models": []}),
+    )
+    page.route(
+        f"**/v1/hosts/{_HOST_ID}/worktrees?*",
+        lambda route: route.fulfill(json={"data": []}),
+    )
     page.route("**/v1/agents", _fulfill_agents)
     page.route(
         re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), _fulfill_empty_agent_scan

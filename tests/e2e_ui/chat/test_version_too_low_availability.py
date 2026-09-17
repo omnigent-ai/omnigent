@@ -96,11 +96,10 @@ async def _register_routes(page, *, configured_harnesses: dict[str, Any]) -> Non
 
 
 def test_version_too_low_warns_with_outdated_cli_copy(
-    seeded_session: tuple[str, str],
+    live_server: str,
 ) -> None:
     """A version-too-low Codex host renders the outdated CLI warning."""
-    base_url, session_id = seeded_session
-    del session_id
+    base_url = live_server
     _run_in_fresh_loop(_drive_version_too_low(base_url))
 
 

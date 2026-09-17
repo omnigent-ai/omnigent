@@ -33,6 +33,8 @@ from typing import Any
 
 from playwright.async_api import Route, async_playwright, expect
 
+from tests.e2e_ui.start_session.helpers import stub_empty_host_picker_data
+
 _HOST_ID = "host_e2e_cfg"
 _PROJECT_ID = "proj_e2e_cfg"
 _PROJECT_NAME = "ConfiguredProject"
@@ -187,6 +189,7 @@ async def _drive_prefill(base_url: str, session_id: str) -> None:
                 )
 
             await page.route("**/v1/hosts", handle_hosts)
+            await stub_empty_host_picker_data(page, _HOST_ID)
             await page.route("**/v1/agents", handle_agents)
             await page.route("**/v1/sessions/projects", handle_projects_list)
             await page.route(_PROJECT_CFG_RE, handle_project_config)
@@ -428,6 +431,7 @@ async def _drive_born_filed(base_url: str, session_id: str) -> None:
                 )
 
             await page.route("**/v1/hosts", handle_hosts)
+            await stub_empty_host_picker_data(page, _HOST_ID)
             await page.route("**/v1/agents", handle_agents)
             await page.route("**/v1/sessions/projects", handle_projects_list)
             await page.route(_PROJECT_CFG_RE, handle_project_config)

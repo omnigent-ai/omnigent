@@ -169,12 +169,8 @@ async def _register_routes(page, *, install_requests: list[str]) -> None:
         await route.fulfill(status=200, content_type="application/json", body=_harnesses_body())
 
     async def handle_agent_scan(route: Route) -> None:
-        # The picker ALSO scans GET /v1/sessions?visibility=mine for registered agents.
-        # The seeded_session fixture creates real sessions in the DB, so without
-        # this stub those leak in as agents and the picker auto-selects the
-        # built-in Claude Code (ready) instead of our unconfigured Codex —
-        # leaving no "Set up Codex" notice (the CI-only failure). Return none so
-        # only the stubbed /v1/agents Codex populates the picker.
+        # Exclude real agents left in the shared server so the stubbed Codex
+        # stays selected and its setup notice remains visible.
         await route.fulfill(
             status=200, content_type="application/json", body=json.dumps({"data": []})
         )
@@ -218,11 +214,11 @@ async def _seed_workspace(page) -> None:
 
 
 def test_install_button_installs_missing_harness(
-    seeded_session: tuple[str, str],
+    live_server: str,
 ) -> None:
     """The composer offers Install for a missing harness; clicking it installs
     and clears the readiness warning."""
-    base_url, _session_id = seeded_session
+    base_url = live_server
     _run_in_fresh_loop(_drive_install(base_url))
 
 

@@ -1625,27 +1625,33 @@ class CodexNativeAppServer:
         # blocking session creation (fail-open). ``BaseException`` on the
         # outer guard so a cancellation mid-trust still tears down.
         try:
-            await self._wait_until_ready()
-            if self.policy_hook_disabled_reason is None:
+            startup_client = await self._wait_until_ready()
+            try:
+                if self.policy_hook_disabled_reason is None:
+                    try:
+                        await self._trust_policy_hooks(client=startup_client)
+                    except Exception as exc:  # noqa: BLE001 - degrade, never block startup
+                        self._disable_policy_hook(f"Codex policy hook could not be trusted: {exc}")
+            finally:
                 try:
-                    await self._trust_policy_hooks()
-                except Exception as exc:  # noqa: BLE001 - degrade, never block startup
-                    self._disable_policy_hook(f"Codex policy hook could not be trusted: {exc}")
+                    await startup_client.close()
+                except Exception:  # noqa: BLE001 - a dead control socket cannot undo trust
+                    _logger.warning("Could not close Codex startup client", exc_info=True)
         except BaseException:
             await self.close()
             raise
 
-    async def _trust_policy_hooks(self) -> None:
+    async def _trust_policy_hooks(self, *, client: CodexAppServerClient | None = None) -> None:
         """
         Mark the registered Omnigent policy hook as trusted.
 
         A freshly-written non-managed hook is ``untrusted`` and codex
         silently skips untrusted hooks — for a policy gate that is a
-        fail-open. This connects a transient app-server client and runs
-        the same ``hooks/list`` → ``config/batchWrite`` trust flow codex's
-        own TUI uses, then verifies the hook is trusted. ``--listen`` may
-        be a unix socket (local CLI) or a loopback websocket (host
-        runner); both transports are handled.
+        fail-open. It reuses the initialized startup client when supplied;
+        direct callers get a transient client. The same ``hooks/list`` →
+        ``config/batchWrite`` trust flow codex's own TUI uses then verifies
+        the hook is trusted. ``--listen`` may be a unix socket (local CLI) or
+        a loopback websocket (host runner); both transports are handled.
 
         :returns: None.
         :raises RuntimeError: If the policy hook is missing from the
@@ -1654,18 +1660,21 @@ class CodexNativeAppServer:
             The message is augmented with codex's captured configuration
             error (see :meth:`_codex_config_error_hint`) when present.
         """
-        if self.listen_url and self.listen_url.startswith("ws://"):
-            client = CodexAppServerClient(
-                ws_url=self.listen_url,
-                client_name="omnigent-policy-trust",
-            )
-        else:
-            client = CodexAppServerClient(
-                self.socket_path,
-                client_name="omnigent-policy-trust",
-            )
-        await client.connect()
+        owns_client = client is None
+        if client is None:
+            if self.listen_url and self.listen_url.startswith("ws://"):
+                client = CodexAppServerClient(
+                    ws_url=self.listen_url,
+                    client_name="omnigent-policy-trust",
+                )
+            else:
+                client = CodexAppServerClient(
+                    self.socket_path,
+                    client_name="omnigent-policy-trust",
+                )
         try:
+            if owns_client:
+                await client.connect()
             await trust_native_policy_hooks(client, cwd=str(self.cwd))
             # Routing hooks live in the same generated file but under a
             # different module, so they need their own trust pass. Best
@@ -1707,7 +1716,8 @@ class CodexNativeAppServer:
         except RuntimeError as exc:
             raise RuntimeError(f"{exc}{self._codex_config_error_hint()}") from exc
         finally:
-            await client.close()
+            if owns_client:
+                await client.close()
 
     def _codex_config_error_hint(self) -> str:
         """
@@ -1799,12 +1809,12 @@ class CodexNativeAppServer:
         self.process_registry_tag = None
         self.process_owner_lock = None
 
-    async def _wait_until_ready(self) -> None:
+    async def _wait_until_ready(self) -> CodexAppServerClient:
         """
         Wait until the app-server socket accepts an initialized
-        client.
+        client, and return that connection for startup RPCs.
 
-        :returns: None.
+        :returns: Connected app-server client. The caller owns it.
         :raises RuntimeError: If the app-server exits or never
             becomes ready before the timeout.
         """
@@ -1814,6 +1824,7 @@ class CodexNativeAppServer:
             if self.proc is not None and self.proc.returncode is not None:
                 detail = " | ".join((self.recent_stderr or [])[-5:])
                 raise RuntimeError(f"Codex app-server exited early: {detail}")
+            client: CodexAppServerClient | None = None
             try:
                 if self.listen_url and self.listen_url.startswith("ws://"):
                     client = CodexAppServerClient(
@@ -1826,10 +1837,17 @@ class CodexNativeAppServer:
                         client_name="omnigent-probe",
                     )
                 await client.connect()
-                await client.close()
-                return
+                return client
+            except asyncio.CancelledError:
+                if client is not None:
+                    with contextlib.suppress(Exception):
+                        await client.close()
+                raise
             except Exception as exc:  # noqa: BLE001 - readiness retry boundary
                 last_error = exc
+                if client is not None:
+                    with contextlib.suppress(Exception):
+                        await client.close()
                 await asyncio.sleep(_CONNECT_RETRY_DELAY_SECONDS)
         detail = " | ".join((self.recent_stderr or [])[-5:])
         raise RuntimeError(

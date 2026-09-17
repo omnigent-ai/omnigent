@@ -45,7 +45,8 @@ runs:
   using: composite
   steps:
     - name: Set up uv
-      uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+      # This action also runs from repositories checked out below the workspace root.
+      uses: omnigent-ai/omnigent/.github/actions/setup-uv@25521b2eb074b11ebe51fe5e3eaeb494e20101eb # self-contained setup
       with:
         enable-cache: true
 
@@ -62,21 +63,10 @@ runs:
       run: uv sync --extra all
 
     - name: Install Claude Code CLI
-      shell: bash
-      env:
-        NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
-        CLAUDE_CODE_VERSION: ${{ inputs.claude-code-version }}
-      run: |
-        set -euo pipefail
-        # Install outside the checked-out tree: a repo-root package.json would
-        # otherwise capture this bare `npm install` and hoist it there, leaving
-        # this dir's node_modules empty.
-        CC_CLI_DIR="${RUNNER_TEMP}/omnigent-cc-cli"
-        mkdir -p "$CC_CLI_DIR"
-        cd "$CC_CLI_DIR"
-        npm install --ignore-scripts --no-audit --no-fund "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
-        node node_modules/@anthropic-ai/claude-code/install.cjs
-        echo "$CC_CLI_DIR/node_modules/.bin" >> "$GITHUB_PATH"
+      uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@aa5736c38f5c1258ee29452c6825d75033b952d7
+      with:
+        harness: claude
+        version: ${{ inputs.claude-code-version }}
 
     - name: Write Omnigent provider config
       shell: bash

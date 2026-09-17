@@ -475,20 +475,34 @@ def _batchwrite_calls(client: _FakeCodexClient) -> list[_Req]:
     return [r for r in client.requests if r.method == "config/batchWrite"]
 
 
-async def _fake_wait_until_ready(self: CodexNativeAppServer) -> None:
+@dataclass
+class _FakeStartupClient:
+    """Minimal initialized client returned by startup unit-test probes."""
+
+    close_calls: int = 0
+
+    async def close(self) -> None:
+        self.close_calls += 1
+
+
+async def _fake_wait_until_ready(self: CodexNativeAppServer) -> _FakeStartupClient:
     """
     Skip app-server socket probing in startup unit tests.
 
     :param self: The app-server wrapper under test.
-    :returns: None.
+    :returns: Initialized fake client owned by the startup flow.
     """
+    return _FakeStartupClient()
 
 
-async def _fake_trust_policy_hooks(self: CodexNativeAppServer) -> None:
+async def _fake_trust_policy_hooks(
+    self: CodexNativeAppServer, *, client: CodexAppServerClient | None = None
+) -> None:
     """
     Skip Codex ``hooks/list`` RPCs in startup unit tests.
 
     :param self: The app-server wrapper under test.
+    :param client: Reused initialized startup client.
     :returns: None.
     """
 
@@ -1259,6 +1273,231 @@ def _test_app_server(
         bridge_dir=bridge_dir,
         python_executable="/new/python",
     )
+
+
+async def test_start_reuses_initialized_readiness_client_for_hook_trust(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Startup trusts hooks over the readiness connection, then closes it."""
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+
+    source_home = tmp_path / "source-codex-home"
+    source_home.mkdir()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+
+    async def _supported_version(_codex_path: str) -> tuple[int, int, int]:
+        return (0, 147, 0)
+
+    startup_client = _FakeStartupClient()
+    trusted_with: list[object] = []
+
+    async def _ready(_self: CodexNativeAppServer) -> _FakeStartupClient:
+        return startup_client
+
+    async def _trust(
+        _self: CodexNativeAppServer, *, client: CodexAppServerClient | None = None
+    ) -> None:
+        trusted_with.append(client)
+
+    monkeypatch.setattr(codex_native_app_server, "_codex_cli_version", _supported_version)
+    monkeypatch.setattr(CodexNativeAppServer, "_wait_until_ready", _ready)
+    monkeypatch.setattr(CodexNativeAppServer, "_trust_policy_hooks", _trust)
+    server = _test_app_server(
+        tmp_path,
+        tmp_path / "codex-home",
+        tmp_path / "bridge",
+        workspace,
+    )
+
+    await server.start()
+    try:
+        assert trusted_with == [startup_client]
+        assert startup_client.close_calls == 1
+    finally:
+        await server.close()
+
+
+async def test_start_cancellation_closes_reused_client_and_app_server(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cancellation during hook trust closes both startup resources."""
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+
+    source_home = tmp_path / "source-codex-home"
+    source_home.mkdir()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+
+    async def _supported_version(_codex_path: str) -> tuple[int, int, int]:
+        return (0, 147, 0)
+
+    startup_client = _FakeStartupClient()
+    trust_started = asyncio.Event()
+
+    async def _ready(_self: CodexNativeAppServer) -> _FakeStartupClient:
+        return startup_client
+
+    async def _trust(
+        _self: CodexNativeAppServer, *, client: CodexAppServerClient | None = None
+    ) -> None:
+        assert client is startup_client
+        trust_started.set()
+        await asyncio.Future()
+
+    monkeypatch.setattr(codex_native_app_server, "_codex_cli_version", _supported_version)
+    monkeypatch.setattr(CodexNativeAppServer, "_wait_until_ready", _ready)
+    monkeypatch.setattr(CodexNativeAppServer, "_trust_policy_hooks", _trust)
+    server = _test_app_server(
+        tmp_path,
+        tmp_path / "codex-home",
+        tmp_path / "bridge",
+        workspace,
+    )
+
+    task = asyncio.create_task(server.start())
+    await trust_started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert startup_client.close_calls == 1
+    assert server.proc is None
+    assert server.stderr_task is None
+
+
+async def test_wait_until_ready_closes_failed_client_before_reconnect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A refused readiness attempt is closed before returning its retry."""
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+
+    @dataclass
+    class _ProbeClient:
+        fail_connect: bool
+        connect_calls: int = 0
+        close_calls: int = 0
+
+        async def connect(self) -> None:
+            self.connect_calls += 1
+            if self.fail_connect:
+                raise OSError("listener not ready")
+
+        async def close(self) -> None:
+            self.close_calls += 1
+
+    first = _ProbeClient(fail_connect=True)
+    second = _ProbeClient(fail_connect=False)
+    attempts = [first, second]
+
+    def _client(*_args: object, **_kwargs: object) -> _ProbeClient:
+        return attempts.pop(0)
+
+    async def _no_sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr(codex_native_app_server, "CodexAppServerClient", _client)
+    monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    server = _test_app_server(
+        tmp_path,
+        tmp_path / "codex-home",
+        tmp_path / "bridge",
+        workspace,
+    )
+    server.proc = Mock(returncode=None)
+
+    connected = await server._wait_until_ready()
+
+    assert connected is second
+    assert first.connect_calls == 1
+    assert first.close_calls == 1
+    assert second.connect_calls == 1
+    assert second.close_calls == 0
+
+
+async def test_wait_until_ready_cancellation_closes_connecting_client(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cancellation during initialize closes the half-open startup client."""
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+
+    connect_started = asyncio.Event()
+
+    @dataclass
+    class _ConnectingClient:
+        close_calls: int = 0
+
+        async def connect(self) -> None:
+            connect_started.set()
+            await asyncio.Future()
+
+        async def close(self) -> None:
+            self.close_calls += 1
+
+    client = _ConnectingClient()
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "CodexAppServerClient",
+        lambda *_args, **_kwargs: client,
+    )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    server = _test_app_server(
+        tmp_path,
+        tmp_path / "codex-home",
+        tmp_path / "bridge",
+        workspace,
+    )
+    server.proc = Mock(returncode=None)
+
+    task = asyncio.create_task(server._wait_until_ready())
+    await connect_started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert client.close_calls == 1
+
+
+async def test_standalone_hook_trust_closes_client_when_connect_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed standalone trust handshake closes its partially-open client."""
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+
+    @dataclass
+    class _FailingClient:
+        close_calls: int = 0
+
+        async def connect(self) -> None:
+            raise RuntimeError("initialize failed")
+
+        async def close(self) -> None:
+            self.close_calls += 1
+
+    client = _FailingClient()
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "CodexAppServerClient",
+        lambda *_args, **_kwargs: client,
+    )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    server = _test_app_server(
+        tmp_path,
+        tmp_path / "codex-home",
+        tmp_path / "bridge",
+        workspace,
+    )
+
+    with pytest.raises(RuntimeError, match="initialize failed"):
+        await server._trust_policy_hooks()
+
+    assert client.close_calls == 1
 
 
 async def test_start_upserts_mcp_server_config_across_relaunches(
@@ -2138,7 +2377,10 @@ async def test_trust_failure_is_fail_open_with_reason(
     monkeypatch.setattr(CodexNativeAppServer, "_wait_until_ready", _fake_wait_until_ready)
     _set_codex_version(monkeypatch, (0, 136, 0))
 
-    async def _raise_trust(_self: CodexNativeAppServer) -> None:
+    async def _raise_trust(
+        _self: CodexNativeAppServer, *, client: CodexAppServerClient | None = None
+    ) -> None:
+        del client
         raise RuntimeError("Omnigent policy hook was not discovered for cwd ...")
 
     monkeypatch.setattr(CodexNativeAppServer, "_trust_policy_hooks", _raise_trust)

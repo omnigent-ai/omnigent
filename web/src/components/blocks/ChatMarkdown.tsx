@@ -16,7 +16,10 @@ import { defaultRemarkPlugins } from "streamdown";
 import remarkBreaks from "remark-breaks";
 import { normalizeExplicitMathDelimiters } from "@/components/ai-elements/mathMarkdown";
 import { MessageResponse } from "@/components/ai-elements/message";
-import { WORKSPACE_FILE_LINK_ATTR } from "@/components/ai-elements/streamdown-security";
+import {
+  splitWorkspaceFileCitation,
+  WORKSPACE_FILE_LINK_ATTR,
+} from "@/components/ai-elements/streamdown-security";
 import { ZoomableImage } from "@/components/ImageLightbox";
 import { useThrottledValue } from "@/hooks/useThrottledValue";
 import { isNativeShell } from "@/lib/nativeBridge";
@@ -35,9 +38,6 @@ import { showToast } from "@/components/ui/toast";
 // they destructure `node` away first. Left in, it renders as a literal
 // node="[object Object]" attribute.
 type WithHastNode<T> = T & { node?: unknown };
-
-// Trailing `:line` / `:line:col` on a cited path, e.g. `src/app.ts:42:7`.
-const POSITION_SUFFIX = /:\d+(?::\d+)?$/;
 
 /** What the chat renderers know about a cited path's openability. */
 interface WorkspaceFileOpener {
@@ -73,9 +73,12 @@ function useWorkspaceFileOpener(text: string): WorkspaceFileOpener {
 
   // Agents cite a file with the position they mean, `docs/notes.md:12` or
   // `:12:7`. The position is not part of the filename, so no such path is ever
-  // in the changed-files list or on disk; drop it before resolving. The span
-  // still displays the citation the agent wrote.
-  const cited = text.replace(POSITION_SUFFIX, "");
+  // in the changed-files list or on disk; drop it before resolving, but keep
+  // the line so the viewer can land on the cited change. The span still
+  // displays the citation the agent wrote.
+  const citation = splitWorkspaceFileCitation(text);
+  const cited = citation.path;
+  const citedLine = citation.line;
   // Collapse absolute / "~"-relative forms onto a workspace-relative path
   // (matching the changed-files list and relative filesystem routes), or keep
   // an outside-workspace path host-absolute — the FileViewer opens both.
@@ -110,7 +113,11 @@ function useWorkspaceFileOpener(text: string): WorkspaceFileOpener {
       resolvedPath: linkPath ?? "",
     };
   }
-  return { open: () => openFile(linkPath), unopenable: false, resolvedPath: linkPath };
+  return {
+    open: () => (citedLine === null ? openFile(linkPath) : openFile(linkPath, { line: citedLine })),
+    unopenable: false,
+    resolvedPath: linkPath,
+  };
 }
 
 /**

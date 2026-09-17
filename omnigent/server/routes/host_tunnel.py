@@ -808,7 +808,12 @@ async def _receive_loop(
                 queue.put_nowait(
                     (
                         "done",
-                        {"status": frame.status, "error": frame.error, "failed": frame.failed},
+                        {
+                            "status": frame.status,
+                            "error": frame.error,
+                            "failed": frame.failed,
+                            "failures": frame.failures,
+                        },
                     )
                 )
             continue

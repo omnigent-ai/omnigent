@@ -71,7 +71,7 @@ runs:
         python-version-file: ".python-version"
 
     - name: Install uv
-      uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v4
+      uses: ./.github/actions/setup-uv
       with:
         enable-cache: true
 
@@ -85,24 +85,28 @@ runs:
       shell: bash
       run: uv sync --locked --extra all --group test
 
-    - name: Install binary dependencies
-      # npm install against .github/ci-deps/package.json with --ignore-scripts
-      # to block postinstall on every package. The claude-code stub binary
-      # needs its install.cjs (audited: platform detect + same-tree hardlink,
-      # no network/exec) so we run that one explicitly; codex and pi have no
-      # install scripts and ship prebuilt CLIs. bubblewrap: the linux_bwrap
-      # sandbox backend fails loud if `bwrap` is missing, and the e2e runner
-      # runs real agents with os_env. The apparmor sysctl mirrors ci.yml
-      # (Ubuntu 24.04 blocks unprivileged user namespaces, which bwrap's
-      # unshare(CLONE_NEWUSER) needs).
-      working-directory: .github/ci-deps
+    - name: Install system dependencies
+      # bubblewrap backs the linux_bwrap sandbox. Ubuntu 24.04 restricts
+      # unprivileged user namespaces, so mirror ci.yml's AppArmor override.
       shell: bash
       run: |
         sudo apt-get install -y tmux bubblewrap
         sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-        npm install --ignore-scripts
-        node node_modules/@anthropic-ai/claude-code/install.cjs
-        echo "${GITHUB_WORKSPACE}/.github/ci-deps/node_modules/.bin" >> "$GITHUB_PATH"
+
+    - name: Install Claude Code CLI
+      uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@aa5736c38f5c1258ee29452c6825d75033b952d7
+      with:
+        harness: claude
+
+    - name: Install Codex CLI
+      uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@aa5736c38f5c1258ee29452c6825d75033b952d7
+      with:
+        harness: codex
+
+    - name: Install Pi CLI
+      uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@aa5736c38f5c1258ee29452c6825d75033b952d7
+      with:
+        harness: pi
 
     - name: Install jcode harness CLI
       # The builtin jcode catalog row launches via `jcode acp`. Host-daemon

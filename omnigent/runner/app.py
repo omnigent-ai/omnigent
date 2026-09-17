@@ -68,7 +68,11 @@ from omnigent.harness_plugins import (
     model_env_keys,
     spawn_env_builders,
 )
-from omnigent.inner.native_attachments import has_unresolved_file_id, resolve_file_id_block
+from omnigent.inner.native_attachments import (
+    framework_notice_block,
+    has_unresolved_file_id,
+    resolve_file_id_block,
+)
 from omnigent.llms.summarize import (
     build_summarization_input,
     build_summarization_prompt,
@@ -1409,15 +1413,18 @@ async def _resolve_forwarded_message_content(
     resolved: list[_JsonObject] = []
     changed = False
     for block in content:
-        new_block = None
+        result = None
         if isinstance(block, dict) and has_unresolved_file_id(block):
-            new_block = await resolve_file_id_block(
+            result = await resolve_file_id_block(
                 block, session_id=session_id, client=server_client
             )
-        if new_block is None:
+        if result is None:
             resolved.append(block)
         else:
+            new_block, notice = result
             resolved.append(new_block)
+            if notice is not None:
+                resolved.append(framework_notice_block(notice))
             changed = True
 
     return resolved if changed else content
