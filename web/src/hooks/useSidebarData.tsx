@@ -17,7 +17,7 @@ import {
   type SidebarConfig,
 } from "@/lib/sidebarConfig";
 import { filterSessionScope, sessionVisibility } from "@/lib/sessionVisibility";
-import { getCurrentUserId } from "@/lib/identity";
+import { useViewerId } from "./useViewerId";
 import { sumPendingApprovals } from "@/lib/inbox";
 import { useCommentInbox } from "./useCommentInbox";
 import {
@@ -72,7 +72,7 @@ function useSidebarSources(config: SidebarConfig) {
     [shared.data, sharedActive],
   );
   const pinnedRows = pinned.data?.conversations;
-  const viewerId = getCurrentUserId();
+  const viewerId = useViewerId();
   const loadedRows = useMemo(
     () =>
       dedupeSessionRows([

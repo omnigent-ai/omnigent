@@ -561,3 +561,63 @@ def test_opaque_cursor_survives_removing_last_visible_session(
     page.get_by_role("button", name="Load more", exact=True).click()
     expect(page.get_by_text("Next opaque page", exact=True)).to_be_visible()
     assert afters[-1] == tokens[-1]
+
+
+def test_admin_identity_resolves_after_shared_sessions_and_pins(
+    page: Page, request: pytest.FixtureRequest
+) -> None:
+    base_url = request.config.getoption("--ui-base-url") or request.getfixturevalue("live_server")
+    identity_requests: list[Route] = []
+    list_requests: list[str] = []
+    list_responses: list[str] = []
+
+    def sessions(route: Route) -> None:
+        list_requests.append(route.request.url)
+        params = parse_qs(urlparse(route.request.url).query)
+        shared = params.get("visibility") == ["shared"]
+        pinned = "pinned" in params
+        number = 1 + int(shared) + 2 * int(pinned)
+        row = {
+            "id": f"{number:032x}",
+            "object": "conversation",
+            "title": ("Shared" if shared else "Owned")
+            + (" admin pin" if pinned else " admin session"),
+            "owner": "bob@example.test" if shared else "alice@example.test",
+            "permission_level": 4,
+            "created_at": 1,
+            "updated_at": 1,
+            "labels": {"omnigent.pinned": "1"} if pinned else {},
+        }
+        route.fulfill(json={"data": [row], "has_more": False})
+
+    page.route("**/v1/me", lambda route: identity_requests.append(route))
+    page.route("**/v1/sessions?*", sessions)
+    page.route_web_socket("**/v1/sessions/updates*", lambda _socket: None)
+    page.on(
+        "response",
+        lambda response: (
+            list_responses.append(response.url) if "/v1/sessions?" in response.url else None
+        ),
+    )
+    page.add_init_script("localStorage.setItem('omnigent:session-filter', 'all')")
+    page.clock.install()
+    with page.expect_response(
+        lambda response: (
+            "/v1/sessions?" in response.url
+            and "visibility=shared" in response.url
+            and "pinned=true" in response.url
+        )
+    ):
+        page.goto(base_url, wait_until="domcontentloaded")
+    expect(page.get_by_text("Owned admin session", exact=True)).to_be_visible()
+    expect(page.get_by_text("Owned admin pin", exact=True)).to_be_visible()
+    expect(page.get_by_text("Shared admin session", exact=True)).to_have_count(0)
+    assert len(list_responses) == 4
+    assert len(identity_requests) == 1
+    before_identity = len(list_requests)
+    identity_requests[0].fulfill(json={"user_id": "alice@example.test", "is_admin": True})
+    expect(page.get_by_text("Shared admin session", exact=True)).to_be_visible()
+    expect(page.get_by_text("Shared admin pin", exact=True)).to_be_visible()
+    expect(page.get_by_text("Owned admin session", exact=True)).to_be_visible()
+    page.wait_for_load_state("networkidle")
+    assert len(list_requests) == before_identity

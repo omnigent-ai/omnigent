@@ -17,10 +17,14 @@ vi.mock("./useConversations", async (importOriginal) => ({
   ...(await importOriginal<typeof ConversationsModule>()),
   fetchConversationsPage: vi.fn(),
 }));
-const identity = vi.hoisted(() => ({ viewerId: "alice" as string | null }));
+const identity = vi.hoisted(() => ({
+  viewerId: "alice" as string | null,
+  resolution: Promise.resolve<string | null>("alice"),
+}));
 vi.mock("@/lib/identity", async (importOriginal) => ({
   ...(await importOriginal<typeof IdentityModule>()),
   getCurrentUserId: () => identity.viewerId,
+  resolveIdentity: () => identity.resolution,
 }));
 const fetchPage = vi.mocked(fetchConversationsPage);
 const key = ["conversations", "", false, null, "mine"];
@@ -38,6 +42,7 @@ const rows = (start: number, count: number, shared = false): Conversation[] =>
 let client: QueryClient;
 beforeEach(() => {
   identity.viewerId = "alice";
+  identity.resolution = Promise.resolve("alice");
   client = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: Infinity } } });
   fetchPage
     .mockReset()
@@ -359,21 +364,31 @@ it("honors configured refresh timing and a smaller refresh cap", async () => {
   expect(cached().pages[0].data).toHaveLength(60);
 });
 
-it("rechecks ownership when viewer identity resolves without refetching the rows", async () => {
+it("rechecks ownership automatically when identity resolves after the lists", async () => {
   identity.viewerId = null;
+  let resolve!: (id: string) => void;
+  identity.resolution = new Promise((finish) => {
+    resolve = finish;
+  });
   fetchPage.mockResolvedValue(
     sessionRowsPage(
-      [...rows(1, 1), ...rows(2, 1, true)].map((row) => ({ ...row, permission_level: null })),
+      [...rows(1, 1), ...rows(2, 1, true)].map((row) => ({ ...row, permission_level: 4 })),
     ),
   );
-  const { result, rerender } = renderHook(
-    () => ({ mine: useScopeCache("mine", 60000), shared: useScopeCache("shared", 180000) }),
+  const { result } = renderHook(
+    () => ({ mine: useScopeCache("mine", false), shared: useScopeCache("shared", false) }),
     { wrapper },
   );
   await waitFor(() => expect(result.current.shared.isSuccess).toBe(true));
-  identity.viewerId = "alice";
-  rerender();
-  expect(result.current.mine.data?.pages[0].data.map((row) => row.id)).toEqual(["s1"]);
+  expect(result.current.shared.data?.pages[0].data).toEqual([]);
+  await act(async () => {
+    identity.viewerId = "alice";
+    resolve("alice");
+    await identity.resolution;
+  });
+  await waitFor(() =>
+    expect(result.current.mine.data?.pages[0].data.map((row) => row.id)).toEqual(["s1"]),
+  );
   expect(result.current.shared.data?.pages[0].data.map((row) => row.id)).toEqual(["s2"]);
   expect(fetchPage).toHaveBeenCalledTimes(2);
 });

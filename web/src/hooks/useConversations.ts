@@ -1,4 +1,5 @@
 import { useContext, useEffect, useRef } from "react";
+import { useViewerId } from "./useViewerId";
 import { SidebarConfigContext, sidebarConfig } from "@/lib/sidebarConfig";
 import { revokePermission } from "@/lib/permissionsApi";
 // TanStack Query wrapper around `GET /v1/sessions`, plus mutation
@@ -1635,10 +1636,8 @@ async function fetchPinnedScope(
   // fully would need a server capability flag; deferred since pins haven't
   // shipped yet.
   const filterHonored = rows.length === 0 || conversations.length === rows.length;
-  return {
-    conversations: filterSessionScope(conversations, visibility, getCurrentUserId()),
-    filterHonored,
-  };
+  // Keep ownership-dependent filtering in the reactive query selector.
+  return { conversations, filterHonored };
 }
 
 export async function fetchPinnedConversations(
@@ -1668,6 +1667,7 @@ export async function fetchPinnedConversations(
 
 /** Server-authoritative list of the viewer's pinned sessions. */
 export function usePinnedConversations(sharedEnabled = true, limit = sidebarConfig.pinCap) {
+  const viewerId = useViewerId();
   const query = useQuery<PinnedConversationsResult>({
     queryKey: PINNED_CONVERSATIONS_KEY,
     queryFn: () => fetchPinnedConversations(sharedEnabled, limit),
@@ -1676,7 +1676,7 @@ export function usePinnedConversations(sharedEnabled = true, limit = sidebarConf
         ? data
         : {
             ...data,
-            conversations: filterSessionScope(data.conversations, "mine", getCurrentUserId()),
+            conversations: filterSessionScope(data.conversations, "mine", viewerId),
           },
     staleTime: 30_000,
   });

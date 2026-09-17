@@ -3,7 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { appendScopePage, refreshScopeWindow, type ScopeCacheData } from "@/lib/sidebarData";
 import { filterSessionScope } from "@/lib/sessionVisibility";
 import { sidebarConfig } from "@/lib/sidebarConfig";
-import { getCurrentUserId } from "@/lib/identity";
+import { useViewerId } from "./useViewerId";
 import { isStaleCursorError } from "@/lib/staleCursor";
 import {
   fetchConversationsPage,
@@ -26,7 +26,7 @@ export function useScopeCache(
   );
   const pendingPage = useRef<AbortController | null>(null);
   const pendingResult = useRef<Promise<void> | null>(null);
-  const viewerId = getCurrentUserId();
+  const viewerId = useViewerId();
   const filterData = useCallback(
     (data: ScopeCacheData): ScopeCacheData => ({
       ...data,

@@ -40,6 +40,11 @@ only, including loaded owned pins and project-folder rows.
 general Shared list. When false, pins request only `pinned=true&visibility=mine`;
 cached rows, optimistic updates, and legacy migration respect ownership.
 
+Session ownership is re-evaluated when the viewer identity resolves. Shared
+sessions and pins loaded before `/v1/me` finishes recover without another list
+request, including when polling is disabled. Pin responses retain fetched rows
+so owned-only filtering can update as identity becomes available.
+
 All three booleans default to `true`, preserving the OSS Inbox and pin behavior.
 To avoid Shared-list requests in My sessions, set `inboxIncludesShared: false`.
 Set `pinsIncludeShared: false` as well to avoid the separate shared-pin request.

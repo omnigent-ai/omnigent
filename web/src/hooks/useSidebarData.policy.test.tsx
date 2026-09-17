@@ -12,6 +12,7 @@ import type { SessionFilter } from "@/lib/sessionFilterPreferences";
 import { PINNED_LABEL_KEY } from "@/lib/sessionListCache";
 import { sessionRowsPage, type ScopeCacheData } from "@/lib/sidebarData";
 import type { Session } from "@/lib/types";
+import type * as IdentityModule from "@/lib/identity";
 import {
   PINNED_CONVERSATIONS_KEY,
   useTogglePinnedConversation,
@@ -20,6 +21,15 @@ import {
 import { SidebarDataProvider, useSidebarData, useSidebarView } from "./useSidebarData";
 import { useDirectorySessions } from "./useDirectorySessions";
 
+const identity = vi.hoisted(() => ({
+  viewerId: null as string | null,
+  resolution: Promise.resolve<string | null>(null),
+}));
+vi.mock("@/lib/identity", async (importOriginal) => ({
+  ...(await importOriginal<typeof IdentityModule>()),
+  getCurrentUserId: () => identity.viewerId,
+  resolveIdentity: () => identity.resolution,
+}));
 vi.mock("./useSessionUpdatesConnected", () => ({ useSessionUpdatesConnected: () => true }));
 const fetchMock = vi.fn();
 const row = (id: string, shared = false): Conversation => ({
@@ -61,6 +71,8 @@ const response = (rows: Conversation[], more = false) => ({
   json: async () => sessionRowsPage(rows, more),
 });
 beforeEach(() => {
+  identity.viewerId = null;
+  identity.resolution = Promise.resolve(null);
   view = "mine";
   mounted = true;
   config = { ...sidebarConfig, inboxIncludesShared: false, pinsIncludeShared: false };
@@ -396,3 +408,63 @@ it("passes API page size and refresh cap from provider configuration to both sco
       .map(([url]) => params(url).get("limit")),
   ).toEqual(["30"]);
 });
+
+it.each([true, false])(
+  "resolves delayed admin identity without refetching scopes or pins (shared pins: %s)",
+  async (includeSharedPins) => {
+    let resolve!: (id: string) => void;
+    identity.resolution = new Promise((finish) => {
+      resolve = finish;
+    });
+    config = {
+      ...config,
+      mineRefreshMs: false,
+      sharedRefreshMs: false,
+      pinsIncludeShared: includeSharedPins,
+    };
+    view = "shared";
+    const mine = { ...row("owned"), owner: "alice", pending_elicitations_count: 0 };
+    const shared = { ...row("foreign"), owner: "bob", pending_elicitations_count: 0 };
+    const ownPin = { ...mine, id: "own-pin", labels: { [PINNED_LABEL_KEY]: "2" } };
+    const sharedPin = { ...shared, id: "foreign-pin", labels: { [PINNED_LABEL_KEY]: "1" } };
+    fetchMock.mockImplementation(async (url: string) => {
+      const p = params(url);
+      // Include a foreign admin row in Mine to exercise frontend scope validation.
+      const rows = p.has("pinned")
+        ? p.get("visibility") === "mine"
+          ? includeSharedPins
+            ? [ownPin]
+            : [ownPin, sharedPin]
+          : [sharedPin]
+        : p.get("visibility") === "mine"
+          ? [mine, shared]
+          : [shared];
+      return response(rows);
+    });
+    const { result } = renderHook(useSidebarData, { wrapper });
+    await waitFor(() => expect(result.current.pinned.isSuccess).toBe(true));
+    await waitFor(() => expect(result.current.shared.isSuccess).toBe(true));
+    expect(result.current.shared.data?.pages[0].data).toEqual([]);
+    expect(
+      client
+        .getQueryData<{ conversations: Conversation[] }>(PINNED_CONVERSATIONS_KEY)
+        ?.conversations.map((r) => r.id),
+    ).toContain("foreign-pin");
+    const requestsBeforeIdentity = fetchMock.mock.calls.length;
+    await act(async () => {
+      identity.viewerId = "alice";
+      resolve("alice");
+      await identity.resolution;
+    });
+    await waitFor(() =>
+      expect(result.current.shared.data?.pages[0].data.map((r) => r.id)).toEqual(["foreign"]),
+    );
+    expect(result.current.mine.data?.pages[0].data.map((r) => r.id)).toEqual(["owned"]);
+    expect(result.current.pinned.data?.conversations.map((r) => r.id)).toEqual(
+      includeSharedPins ? ["own-pin", "foreign-pin"] : ["own-pin"],
+    );
+    expect(result.current.inboxRows.map((r) => r.id).sort()).toEqual(["own-pin", "owned"]);
+    expect(result.current.watchedIds).toContain("foreign");
+    expect(fetchMock.mock.calls).toHaveLength(requestsBeforeIdentity);
+  },
+);

@@ -9,6 +9,7 @@ import type { Conversation } from "./useConversations";
 import { SidebarDataProvider, useLoadedConversations, useSidebarData } from "./useSidebarData";
 import { useArchivedSessions } from "./useScopeCache";
 
+vi.mock("./useViewerId", () => ({ useViewerId: () => null }));
 vi.mock("./useSessionUpdatesConnected", () => ({ useSessionUpdatesConnected: () => true }));
 const fetchMock = vi.fn();
 const row = (id: string, permission_level = 4): Conversation => ({
