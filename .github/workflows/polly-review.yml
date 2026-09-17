@@ -206,7 +206,7 @@ jobs:
       - name: Set up uv
         if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
         # This workflow checks out main, which may predate the action on its PR branch.
-        uses: omnigent-ai/omnigent/.github/actions/setup-uv@426c05c43c524ea7b6565f04e75e94cb1fd10999 # self-contained setup
+        uses: omnigent-ai/omnigent/.github/actions/setup-uv@25521b2eb074b11ebe51fe5e3eaeb494e20101eb # self-contained setup
         with:
           enable-cache: true
 
