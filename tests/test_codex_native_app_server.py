@@ -1110,6 +1110,40 @@ async def test_codex_launch_catalog_caches_a_successful_empty_discovery(
     assert model_catalog_store.read_catalog("codex-native", fingerprint) == []
 
 
+async def test_codex_empty_catalog_refresh_confirms_and_advances_the_cache(
+    _catalog_launch: NativeCodexLaunch,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Refreshing an already-empty entry re-caches [] instead of failing.
+
+    A hidden-only catalog stays empty across refreshes; converting that
+    confirmation into a failure would pin the stale timestamp and re-probe
+    on every read forever.
+    """
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+    from omnigent.models import model_catalog_store
+
+    fingerprint = codex_native_app_server.codex_catalog_fingerprint(_catalog_launch)
+    model_catalog_store.write_catalog("codex-native", fingerprint, [])
+    path = model_catalog_store.catalog_path("codex-native", fingerprint)
+    old = path.stat().st_mtime - model_catalog_store.CATALOG_STALE_AFTER_S - 60
+    os.utime(path, (old, old))
+    assert await codex_native_app_server.codex_launch_catalog_is_stale(launch=_catalog_launch)
+
+    async def _probe(
+        *, codex_path: str | None = None, launch: NativeCodexLaunch | None = None
+    ) -> list[dict[str, object]]:
+        del codex_path, launch
+        return []
+
+    monkeypatch.setattr(codex_native_app_server, "probe_codex_model_options", _probe)
+    result = await codex_native_app_server.codex_reprobed_launch_catalog(launch=_catalog_launch)
+
+    assert result == []
+    assert model_catalog_store.read_catalog("codex-native", fingerprint) == []
+    assert not await codex_native_app_server.codex_launch_catalog_is_stale(launch=_catalog_launch)
+
+
 def test_mark_launch_default_preserves_a_hidden_configured_default() -> None:
     """A pinned model absent from the visible rows marks no default.
 

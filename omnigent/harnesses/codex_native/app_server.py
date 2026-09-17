@@ -1315,10 +1315,12 @@ async def _codex_launch_catalog(
         # re-probe and keeps serving the stored rows.
         return None
 
-    # Empty answers are cacheable only for true cold discovery: any refresh
-    # of an existing entry (stale-hit background refresh or an awaited
-    # re-probe) must leave a previously useful answer in place.
-    allow_empty = model_catalog_store.read_catalog("codex-native", fingerprint) is None
+    # Empty answers are cacheable when they confirm what is known: cold
+    # discovery (no entry) and a refresh of an already-empty entry persist
+    # [], advancing the timestamp so stale reads stop re-probing. Only a
+    # refresh of a previously useful NONEMPTY answer treats empty as a
+    # failed re-probe, leaving the stored rows serving.
+    allow_empty = not model_catalog_store.read_catalog("codex-native", fingerprint)
     read = model_catalog_store.reprobe_catalog if reprobe else model_catalog_store.ensure_catalog
     return await read("codex-native", fingerprint, lambda: _probe(allow_empty=allow_empty))
 
