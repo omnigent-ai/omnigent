@@ -6,6 +6,7 @@ const clipboardDescriptor = Object.getOwnPropertyDescriptor(Navigator.prototype,
 const execCommandDescriptor = Object.getOwnPropertyDescriptor(Document.prototype, "execCommand");
 
 afterEach(() => {
+  vi.unstubAllGlobals();
   cleanup();
   vi.restoreAllMocks();
   if (clipboardDescriptor) {
@@ -70,6 +71,26 @@ describe("MessageActions", () => {
   });
 });
 
+// Streamdown renders a diagram only once an IntersectionObserver reports it
+// visible; report every observed element visible so diagrams render in jsdom.
+class VisibleIntersectionObserver {
+  private readonly callback: IntersectionObserverCallback;
+  constructor(callback: IntersectionObserverCallback) {
+    this.callback = callback;
+  }
+  observe(target: Element) {
+    this.callback(
+      [{ isIntersecting: true, target } as IntersectionObserverEntry],
+      this as unknown as IntersectionObserver,
+    );
+  }
+  unobserve() {}
+  disconnect() {}
+  takeRecords(): IntersectionObserverEntry[] {
+    return [];
+  }
+}
+
 describe("MessageResponse", () => {
   it("blocks external image markdown and renders a placeholder", async () => {
     render(<MessageResponse>{"![leak](https://attacker.example/pixel.png)"}</MessageResponse>);
@@ -91,6 +112,20 @@ describe("MessageResponse", () => {
       expect(container.firstElementChild).toHaveClass("math-config-b");
     });
   });
+
+  it("explains an invalid mermaid fence instead of dumping the parser error", async () => {
+    vi.stubGlobal("IntersectionObserver", VisibleIntersectionObserver);
+    render(
+      <MessageResponse>
+        {"```mermaid\nsequenceDiagram\n    A->>B: hi\n    Note over A,B: once; twice\n```"}
+      </MessageResponse>,
+    );
+
+    const card = await screen.findByTestId("mermaid-error", {}, { timeout: 10_000 });
+    expect(card.textContent).toContain("Mermaid couldn't parse line 3");
+    expect(card.querySelector("code")?.textContent).toBe("Note over A,B: once; twice");
+    expect(card.textContent).toContain("#59;");
+  }, 15_000);
 
   it("gives prose a break opportunity for an unbroken run (OMNI-2900)", () => {
     const { container } = render(<MessageResponse>same text</MessageResponse>);

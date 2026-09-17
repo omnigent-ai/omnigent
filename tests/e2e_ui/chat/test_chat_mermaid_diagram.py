@@ -1,4 +1,5 @@
-"""E2E: mermaid diagrams in chat render, and an un-renderable one degrades.
+"""E2E: mermaid diagrams in chat render, an un-renderable one degrades, and a
+diagram Mermaid cannot parse names the failing line.
 
 Streamdown renders mermaid diagrams behind ``React.lazy``. Suspense catches a
 *pending* import, not a failed one — a rejected lazy import is re-thrown on
@@ -32,6 +33,17 @@ _MERMAID_MESSAGE = (
     "  B --> C[(Database)]\n"
     "```\n\n"
     "That is the shape of it.\n"
+)
+
+# A ``;`` inside a Note ends the statement in Mermaid's grammar, so the rest of
+# the line is read as an actor with no arrow: the most common LLM-authored slip.
+_INVALID_MERMAID_MESSAGE = (
+    "Here is the sequence:\n\n"
+    "```mermaid\n"
+    "sequenceDiagram\n"
+    "    A->>B: hi\n"
+    "    Note over A,B: proceed once; do not call Save\n"
+    "```\n"
 )
 
 
@@ -78,3 +90,38 @@ def test_unrenderable_diagram_degrades_instead_of_blanking_the_app(
 
     # The message's content survives as markdown source rather than vanishing.
     expect(page.get_by_text("That is the shape of it.")).to_be_visible(timeout=30_000)
+
+
+@pytest.fixture
+def invalid_mermaid_chat_session(
+    seeded_session: tuple[str, str],
+) -> Iterator[tuple[str, str]]:
+    """Seed a settled assistant bubble carrying a fence Mermaid cannot parse."""
+    base_url, session_id = seeded_session
+    httpx.post(
+        f"{base_url}/v1/sessions/{session_id}/events",
+        json={
+            "type": "external_assistant_message",
+            "data": {"agent": _AGENT_NAME, "text": _INVALID_MERMAID_MESSAGE},
+        },
+        timeout=10.0,
+    ).raise_for_status()
+    yield (base_url, session_id)
+
+
+def test_unparseable_diagram_names_the_failing_line(
+    page: Page, invalid_mermaid_chat_session: tuple[str, str]
+) -> None:
+    """A parse error shows the offending line and the fix, not the parser's token dump."""
+    base_url, session_id = invalid_mermaid_chat_session
+    page.goto(f"{base_url}/c/{session_id}")
+
+    card = page.get_by_test_id("mermaid-error")
+    expect(card).to_be_visible(timeout=30_000)
+    expect(card).to_contain_text("Mermaid couldn't parse line 3")
+    expect(card.locator("pre > code")).to_have_text(
+        "Note over A,B: proceed once; do not call Save"
+    )
+    expect(card).to_contain_text("#59;")
+    # The raw parser message stays available, folded under Details.
+    expect(card.locator("details")).to_contain_text("got 'NEWLINE'")
