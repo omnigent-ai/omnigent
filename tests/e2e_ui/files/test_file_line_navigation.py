@@ -130,4 +130,4 @@ def test_chat_line_link_expands_and_centers_diff_context(
         expect(modified.get_by_text(_AFTER_LINES[line - 1], exact=True)).to_be_visible()
         page.wait_for_function(_CENTERED_LINE, arg=_AFTER_LINES[line - 1], timeout=10_000)
         expect(diff).to_be_visible()
-        assert "diff=1" in page.url
+        expect(page).to_have_url(re.compile(r"[?&]diff=1(?:&|$)"))
