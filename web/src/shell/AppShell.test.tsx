@@ -659,7 +659,7 @@ describe("AppShell header", () => {
       expect(actions).toBeInTheDocument();
       fireEvent.pointerDown(actions, { button: 0, ctrlKey: false });
       expect(
-        screen.getByRole("menuitem", { name: archived ? "Unarchive" : "Archive", exact: true }),
+        screen.getByRole("menuitem", { name: archived ? "Unarchive" : "Archive" }),
       ).toBeInTheDocument();
     },
   );
