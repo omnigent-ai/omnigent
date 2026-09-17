@@ -186,7 +186,7 @@ async def _open_picker(page) -> None:
 
 
 def test_hide_unconfigured_harnesses_filters_the_picker(
-    seeded_session: tuple[str, str],
+    live_server: str,
 ) -> None:
     """Off shows every harness; flipping the setting hides host-unconfigured ones.
 
@@ -195,8 +195,7 @@ def test_hide_unconfigured_harnesses_filters_the_picker(
     2. **toggle on** — flipping the real Settings → Appearance Switch persists
        the preference; the picker now drops the Goose row while keeping Claude.
     """
-    base_url, session_id = seeded_session
-    del session_id  # this flow never creates a session — only reads the picker
+    base_url = live_server
     _run_in_fresh_loop(_drive(base_url))
 
 
@@ -266,7 +265,7 @@ async def _drive(base_url: str) -> None:
 
 
 def test_hide_unconfigured_hides_a_harness_missing_from_the_host_map(
-    seeded_session: tuple[str, str],
+    live_server: str,
 ) -> None:
     """A harness the host omits from a non-empty map is hidden under the toggle.
 
@@ -276,8 +275,7 @@ def test_hide_unconfigured_hides_a_harness_missing_from_the_host_map(
     missing key and showed Goose despite "hide unconfigured"; now the missing key
     reads as unconfigured, so Goose is hidden while Claude stays.
     """
-    base_url, session_id = seeded_session
-    del session_id  # this flow never creates a session — only reads the picker
+    base_url = live_server
     _run_in_fresh_loop(_drive_missing_key(base_url))
 
 
