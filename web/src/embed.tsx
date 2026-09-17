@@ -86,7 +86,7 @@ const queryClient = new QueryClient({
 export type { SidebarConfig } from "./appConfig";
 
 export interface OmnigentAppProps extends OmnigentHostConfig {
-  /** Runtime consumer policy and polling intervals, resolved by the host. */
+  /** Runtime consumer policy, display pagination, and polling, resolved by the host. */
   sidebarConfig?: Partial<SidebarConfig>;
   /**
    * Router basename, e.g. `/ml/omnigent-embed`. web's routes + navigation

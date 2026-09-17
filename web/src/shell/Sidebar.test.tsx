@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
 import { SidebarDataProvider } from "@/hooks/useSidebarData";
+import { sidebarConfig, type SidebarConfig } from "@/lib/sidebarConfig";
 // Integration tests for the Sidebar's session list. The search box no
 // longer carries a filter funnel (agent-type filter + "Show archived"
 // toggle were removed). The sidebar fetches a single session list with
@@ -240,12 +241,13 @@ function renderSidebar(
   info?: ServerInfo,
   extensions: ExtensionCatalogItem[] = [],
   onClose = vi.fn(),
+  config: SidebarConfig = sidebarConfig,
 ) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const sidebar = <Sidebar open={open} onClose={onClose} onOpenSearch={onOpenSearch} />;
   return render(
     <QueryClientProvider client={qc}>
-      <SidebarDataProvider>
+      <SidebarDataProvider config={config}>
         <ExtensionCatalogProvider extensions={extensions}>
           <TooltipProvider>
             <MemoryRouter initialEntries={[initialEntry]}>
@@ -3011,4 +3013,33 @@ describe("Sidebar collapsed marker", () => {
     // still match [data-collapsed] and strip the glass border while open.
     expect(openAside).not.toHaveAttribute("data-collapsed");
   });
+});
+
+it("caps Shared display independently of Mine while revealing cached rows", async () => {
+  isServerLocalMock.mockReturnValue(false);
+  const owned = Array.from({ length: 40 }, (_, i) => conv(`owned-${i}`, "agent"));
+  const shared = Array.from({ length: 70 }, (_, i) =>
+    conv(`shared-${i}`, "agent", {
+      owner: "other@example.com",
+      permission_level: 1,
+      updated_at: 100 - i,
+    }),
+  );
+  mockConversations([...owned, ...shared]);
+  renderSidebar(true, "/", undefined, undefined, [], vi.fn(), {
+    ...sidebarConfig,
+    sharedDisplayPageSize: 30,
+  });
+  selectSessionFilter("mine");
+  expect(screen.getByText("owned-39", { exact: true })).toBeInTheDocument();
+  showSharedTab();
+  expect(screen.getByText("shared-29", { exact: true })).toBeInTheDocument();
+  expect(screen.queryByText("shared-30", { exact: true })).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "Load more" }));
+  await waitFor(() => expect(screen.getByText("shared-59", { exact: true })).toBeInTheDocument());
+  expect(screen.queryByText("shared-60", { exact: true })).toBeNull();
+  selectSessionFilter("mine");
+  expect(screen.getByText("owned-39", { exact: true })).toBeInTheDocument();
+  showSharedTab();
+  expect(screen.queryByText("shared-30", { exact: true })).toBeNull();
 });

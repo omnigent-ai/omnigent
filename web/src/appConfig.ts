@@ -8,6 +8,10 @@ export interface SidebarConfig {
   pinsIncludeShared: boolean;
   pinCap: number;
   maxAutoLoads: number;
+  /** Visible Sessions rows per click; false/omitted keeps automatic loading. */
+  displayPageSize?: number | false;
+  /** Overrides displayPageSize for the Shared view only. */
+  sharedDisplayPageSize?: number | false;
   maxRefreshSessions: number;
 }
 

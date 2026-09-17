@@ -46,3 +46,28 @@ it("limits automatic loads, allows manual loads, and resets on a scope change", 
   await act(async () => intersect());
   expect(fetchMore).toHaveBeenCalledTimes(5);
 });
+
+it("requires a click when automatic loading is disabled", async () => {
+  const observe = vi.fn();
+  vi.stubGlobal(
+    "IntersectionObserver",
+    class {
+      observe = observe;
+      disconnect() {}
+    },
+  );
+  const fetchMore = vi.fn().mockResolvedValue(undefined);
+  render(
+    <InfiniteScrollSentinel
+      hasMore
+      isFetching={false}
+      fetchMore={fetchMore}
+      scrollRoot={createRef<HTMLElement>()}
+      maxAutoLoads={0}
+    />,
+  );
+  expect(observe).not.toHaveBeenCalled();
+  expect(fetchMore).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByRole("button", { name: "Load more" }));
+  await waitFor(() => expect(fetchMore).toHaveBeenCalledTimes(1));
+});

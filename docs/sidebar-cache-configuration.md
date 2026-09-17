@@ -49,6 +49,32 @@ Mine cache, including pages added with Load more. They make no separate session
 list request and do not activate Shared. These advisory warnings cover only
 loaded owned sessions; unloaded and shared sessions are outside their coverage.
 
+## Display pagination
+
+Set `sharedDisplayPageSize: 30` to show at most 30 rows in the Shared view's
+Sessions section on entry, with a manual **Load more** button. This disables
+automatic scrolling loads for that view. Each click reveals up to 30 additional
+cached rows; when none remain hidden, it fetches the next backend page (30 rows).
+Pins and project folders keep their independent display and pagination.
+
+```tsx
+<OmnigentApp
+  {...hostProps}
+  sidebarConfig={{ sharedDisplayPageSize: 30 }}
+/>
+```
+
+`displayPageSize` applies to all sidebar session views; `sharedDisplayPageSize`
+overrides it for Shared. Both accept positive integers or `false`. Omitted
+settings preserve the existing automatic loading behavior; `false` explicitly
+disables the display limit. Changes can be passed at runtime through the embed
+or provider, and standalone defaults can be set in `web/src/appConfig.ts`.
+
+The visible window resets on view entry or a page-size change. Background
+refresh keeps the number of rows the user has revealed, while updating and
+reordering their contents. Display limits do not shrink caches, change API
+page sizes or refresh caps, or restrict Inbox, pins, or agent discovery.
+
 ## Refresh and pagination
 
 Mine and Shared polling default to 60 and 180 seconds. Set either interval to
@@ -88,3 +114,8 @@ Use the example configuration and inspect `/v1/sessions` requests in Network:
    directory picker on the same host and folder. Confirm the conflict warning
    appears. Opening or reopening the picker should add no session-list request
    and no unscoped `limit=200` scan.
+7. Set `sharedDisplayPageSize: 30` and enter Shared with more than 30 sessions.
+   Scroll to the bottom: it should stop at 30 until Load more is clicked.
+   If older rows are already cached, the click reveals them without a request.
+   Wait for a refresh after expanding the list: the display should keep its
+   expanded size. Leave and re-enter Shared: it should start at 30 again.

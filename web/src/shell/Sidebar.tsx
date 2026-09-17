@@ -1,6 +1,7 @@
 import { filterSessionScope } from "@/lib/sessionVisibility";
 import { getCurrentUserId } from "@/lib/identity";
-import { PinCapacityContext } from "@/lib/sidebarConfig";
+import { PinCapacityContext, SidebarConfigContext } from "@/lib/sidebarConfig";
+import { useSidebarDisplayPagination } from "@/hooks/useSidebarDisplayPagination";
 import { useSidebarData, useSidebarView, type SidebarListQuery } from "@/hooks/useSidebarData";
 import { useArchivedSessions } from "@/hooks/useScopeCache";
 import { InfiniteScrollSentinel, type AutoLoadBudget } from "@/components/InfiniteScrollSentinel";
@@ -1689,7 +1690,7 @@ function ConversationList({
   // sessions render in their own group at the bottom (below "Shared with
   // me"); a pinned-then-archived session shows under Archived, not Pinned.
   const pinnedSet = useMemo(() => new Set(pinnedConversationIds), [pinnedConversationIds]);
-  const sections = useMemo(() => {
+  const loadedSections = useMemo(() => {
     // Merge the server pinned set in, so a pinned session outside the loaded
     // paginated window still renders. Dedupe by id: a pinned session is usually
     // also present in the paginated list, and merging both would render it twice.
@@ -1772,6 +1773,21 @@ function ConversationList({
     activeTab,
     viewerId,
   ]);
+
+  const config = useContext(SidebarConfigContext);
+  const displayPagination = useSidebarDisplayPagination(
+    loadedSections.sessions,
+    JSON.stringify([activeTab, searchQuery]),
+    activeTab === "shared"
+      ? (config.sharedDisplayPageSize ?? config.displayPageSize)
+      : config.displayPageSize,
+    conversationsQuery.hasNextPage,
+    conversationsQuery.fetchNextPage,
+  );
+  const sections = useMemo(
+    () => ({ ...loadedSections, sessions: displayPagination.rows }),
+    [loadedSections, displayPagination.rows],
+  );
 
   // Scope-active flags: which section owns the current selection UI (checkboxes
   // + bulk-action bar). Only one is ever true at a time.
@@ -2114,8 +2130,9 @@ function ConversationList({
   // the pinned query returns exactly the pinned sessions, unpinning removes the
   // label, and a deleted session drops out of the query on the server.
   const autoLoadBudget = useRef<AutoLoadBudget>({ scope: activeTab, count: 0 });
-  const hasMorePages = conversationsQuery.hasNextPage;
-  const { fetchNextPage, isFetchingNextPage } = conversationsQuery;
+  const hasMorePages = displayPagination.hasMore;
+  const fetchNextPage = displayPagination.loadMore;
+  const { isFetchingNextPage } = conversationsQuery;
 
   const sessionStatus = conversationsQuery.isError ? (
     <p role="status" className="px-2 py-1 text-destructive text-ui">
@@ -2233,6 +2250,7 @@ function ConversationList({
                   <InfiniteScrollSentinel
                     scopeKey={activeTab}
                     budgetRef={autoLoadBudget}
+                    maxAutoLoads={displayPagination.maxAutoLoads}
                     hasMore={hasMorePages}
                     isFetching={isFetchingNextPage}
                     fetchMore={fetchNextPage}
@@ -2454,6 +2472,7 @@ function ConversationList({
                   <InfiniteScrollSentinel
                     scopeKey={activeTab}
                     budgetRef={autoLoadBudget}
+                    maxAutoLoads={displayPagination.maxAutoLoads}
                     hasMore={hasMorePages}
                     isFetching={isFetchingNextPage}
                     fetchMore={fetchNextPage}
