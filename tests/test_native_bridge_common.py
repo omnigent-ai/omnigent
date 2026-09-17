@@ -10,14 +10,51 @@ from types import SimpleNamespace
 
 import pytest
 
-from omnigent.native import native_bridge_common
+from omnigent.native import native_bridge_common, owner_claim
+from omnigent.native.owner_claim import current_boot_id, current_pid_namespace
+
+
+@pytest.mark.parametrize(
+    ("sweeper_namespace", "sweeper_boot"),
+    [("pid:[other]", "boot-owner"), (None, "boot-owner"), ("pid:[owner]", "boot-other")],
+)
+def test_prune_preserves_bridge_owned_in_another_namespace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    sweeper_namespace: str | None,
+    sweeper_boot: str,
+) -> None:
+    bridge = tmp_path / "live-session"
+    bridge.mkdir()
+    state = bridge / "bridge.json"
+    state.write_text('{"session_id": "live-session"}')
+    monkeypatch.setattr(owner_claim, "current_pid_namespace", lambda: "pid:[owner]")
+    monkeypatch.setattr(owner_claim, "current_boot_id", lambda: "boot-owner")
+    native_bridge_common.write_owner_pid_marker(bridge)
+    monkeypatch.setattr(owner_claim, "current_pid_namespace", lambda: sweeper_namespace)
+    monkeypatch.setattr(owner_claim, "current_boot_id", lambda: sweeper_boot)
+    monkeypatch.setattr("omnigent.inner.terminal._process_alive", lambda _pid: False)
+
+    assert native_bridge_common.prune_orphaned_dirs(tmp_path) == 0
+    assert state.read_text() == '{"session_id": "live-session"}'
+
+
+def test_prune_preserves_legacy_owner_claim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge = tmp_path / "legacy-session"
+    bridge.mkdir()
+    (bridge / "owner.pid").write_text("123")
+    monkeypatch.setattr("omnigent.inner.terminal._process_alive", lambda _pid: False)
+    assert native_bridge_common.prune_orphaned_dirs(tmp_path) == 0
+    assert bridge.exists()
 
 
 def test_write_owner_pid_marker_records_current_pid(tmp_path: Path) -> None:
     """The marker names the process that prepared the dir (owner-pid invariant)."""
     native_bridge_common.write_owner_pid_marker(tmp_path)
     marker = tmp_path / native_bridge_common.OWNER_PID_FILENAME
-    assert marker.read_text(encoding="utf-8").strip() == str(os.getpid())
+    assert marker.read_text(encoding="utf-8").splitlines()[0] == str(os.getpid())
 
 
 def test_write_owner_pid_marker_swallows_missing_dir(tmp_path: Path) -> None:
@@ -36,13 +73,15 @@ def test_prune_removes_dead_keeps_live_and_unmarked(tmp_path: Path) -> None:
     dead_dir = root / "deadowner"
     dead_dir.mkdir()
     (dead_dir / native_bridge_common.OWNER_PID_FILENAME).write_text(
-        str(dead.pid), encoding="utf-8"
+        f"{dead.pid}\npid_ns={current_pid_namespace()}\nboot={current_boot_id() or ''}\n",
+        encoding="utf-8",
     )
 
     live_dir = root / "liveowner"
     live_dir.mkdir()
     (live_dir / native_bridge_common.OWNER_PID_FILENAME).write_text(
-        str(os.getpid()), encoding="utf-8"
+        f"{os.getpid()}\npid_ns={current_pid_namespace()}\nboot={current_boot_id() or ''}\n",
+        encoding="utf-8",
     )
 
     unmarked_dir = root / "unmarked"
@@ -86,7 +125,8 @@ def test_prune_retains_entry_when_eligibility_check_fails(
     for bridge_dir in (failing_dir, eligible_dir):
         bridge_dir.mkdir(parents=True)
         (bridge_dir / native_bridge_common.OWNER_PID_FILENAME).write_text(
-            "999999", encoding="utf-8"
+            f"999999\npid_ns={current_pid_namespace()}\nboot={current_boot_id() or ''}\n",
+            encoding="utf-8",
         )
     monkeypatch.setattr("omnigent.inner.terminal._process_alive", lambda _pid: False)
 
