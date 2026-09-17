@@ -33,6 +33,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from omnigent.process_logging import data_dir
 from omnigent.util.server_url import is_workspace_hosted_url
 
 if TYPE_CHECKING:
@@ -58,9 +59,7 @@ def _token_file_path() -> Path:
 
     :returns: Path to ``<data-dir>/auth_tokens.json``.
     """
-    from omnigent_ui_sdk.terminal._config import state_dir
-
-    return Path(state_dir()) / _TOKEN_FILE_NAME
+    return data_dir() / _TOKEN_FILE_NAME
 
 
 def _normalize_server_url(server_url: str) -> str:
