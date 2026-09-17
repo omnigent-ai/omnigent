@@ -3773,3 +3773,28 @@ def test_native_gemini_key_setup_uses_agy_model_default(isolated_config) -> None
     assert credentials.api_key == "gemini-fake-key"
     assert credentials.base_url == GEMINI_API_BASE_URL
     assert credentials.model is None
+
+
+@pytest.mark.parametrize("correct_url", [True, False], ids=["correct", "go-back"])
+def test_gemini_gateway_setup_recovers_from_invalid_url(isolated_config, correct_url) -> None:
+    inputs = ["7", "3", "1", "2", "demo-gemini", "/openai"]
+    if correct_url:
+        inputs += ["https://gateway.example/gemini", "gateway-fake-key", ""]
+    else:
+        inputs += [""]
+    inputs += ["q", "q", "q"]
+    result = CliRunner().invoke(
+        cli, ["setup", "--no-internal-beta"], input="\n".join(inputs) + "\n"
+    )
+    assert result.exit_code == 0, result.output
+    assert "Gemini gateway URL must be an http:// or https:// API root" in result.output
+    assert "Databricks — profile" in result.output
+    assert "Traceback" not in result.output
+    config = _config_yaml(isolated_config)
+    if correct_url:
+        entry = load_providers(config)["demo-gemini"]
+        assert entry.family(GEMINI_FAMILY).base_url == "https://gateway.example/gemini"
+        assert secrets.load_secret("demo-gemini") == "gateway-fake-key"
+    else:
+        assert "demo-gemini" not in config.get("providers", {})
+        assert secrets.load_secret("demo-gemini") is None

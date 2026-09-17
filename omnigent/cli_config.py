@@ -865,19 +865,32 @@ def _configure_harness_add(family: str | None = None) -> str | None:
         entry = build_subscription_provider_entry(cli_name)
 
     elif kind == "gateway":
-        name = prompt_text("Name for this gateway", default="gateway")
         gemini_gateway = family == GEMINI_FAMILY
         if gemini_gateway:
+            from omnigent.errors import OmnigentError
             from omnigent.onboarding.gemini_gateway import validate_gemini_base_url
 
-            base_url = validate_gemini_base_url(
-                prompt_text("Gemini gateway API root (without /v1beta or /openai)")
-            )
             console.print(
                 "  [dim]Requires the native Gemini API and x-goog-api-key authentication. "
-                "The gateway must also serve agy's auxiliary Gemini models.[/dim]"
+                "The gateway must also serve agy's auxiliary Gemini models. "
+                "For Databricks, go back and choose Databricks — profile.[/dim]"
             )
+            name = prompt_text("Gateway label (e.g. team-gemini)", default="gateway")
+            while True:
+                entered = prompt_text(
+                    "Gemini gateway API root (without /v1beta or /openai; empty to go back)",
+                    default="",
+                )
+                if not entered.strip():
+                    return None
+                try:
+                    base_url = validate_gemini_base_url(entered)
+                except OmnigentError as exc:
+                    console.print(f"  [red]{exc.message}[/red]")
+                else:
+                    break
         else:
+            name = prompt_text("Name for this gateway", default="gateway")
             base_url = prompt_text("Gateway base_url (OpenAI/Anthropic-compatible)")
         pasted = prompt_text("Gateway API key", hide_input=True).strip()
         if not pasted:
