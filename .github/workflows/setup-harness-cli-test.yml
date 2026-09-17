@@ -1,0 +1,43 @@
+name: Setup harness CLI action tests
+
+on:
+  pull_request:
+    paths:
+      - ".github/actions/setup-harness-cli/**"
+      - ".github/ci-deps/package.json"
+      - ".github/workflows/setup-harness-cli-test.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    name: Manifest and retry policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - run: node --test .github/actions/setup-harness-cli/setup-harness-cli.test.mjs
+
+  install:
+    name: Install ${{ matrix.harness }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        harness: [claude, codex, pi, agy]
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: ./.github/actions/setup-harness-cli
+        with:
+          harness: ${{ matrix.harness }}
+      - name: Verify CLI remains available to caller steps
+        env:
+          HARNESS: ${{ matrix.harness }}
+        run: |
+          case "$HARNESS" in
+            claude) claude --version ;;
+            codex) codex --version ;;
+            pi) pi --version ;;
+            agy) agy --version ;;
+          esac

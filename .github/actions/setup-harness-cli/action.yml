@@ -1,0 +1,67 @@
+name: Set up harness CLI
+description: Install an allowlisted, pinned harness CLI with a verified download cache
+
+inputs:
+  harness:
+    description: "Harness CLI to install: claude, codex, pi, or agy."
+    required: true
+  version:
+    description: "Exact npm package version override; archive harnesses use their manifest pin."
+    required: false
+    default: ""
+  enable-cache:
+    description: "Restore and save downloaded installation artifacts."
+    required: false
+    default: "true"
+  cache-namespace:
+    description: "Cache schema namespace; bump to invalidate all entries."
+    required: false
+    default: "v1"
+
+outputs:
+  cache-hit:
+    description: "Whether an exact harness download cache was restored."
+    value: ${{ steps.restore.outputs.cache-hit }}
+  version:
+    description: "Exact harness version installed."
+    value: ${{ steps.resolve.outputs.version }}
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve harness
+      id: resolve
+      shell: bash
+      env:
+        HARNESS: ${{ inputs.harness }}
+        HARNESS_VERSION: ${{ inputs.version }}
+        HARNESS_CACHE_NAMESPACE: ${{ inputs.cache-namespace }}
+      run: node "$GITHUB_ACTION_PATH/resolve.mjs"
+
+    # Cache download artifacts, never installed executable trees. npm and the
+    # pinned archive verifier still authenticate/reinstall before any CLI runs.
+    - name: Restore harness downloads
+      id: restore
+      if: inputs.enable-cache == 'true'
+      uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      with:
+        path: ${{ steps.resolve.outputs.cache-path }}
+        key: ${{ steps.resolve.outputs.cache-key }}
+
+    - name: Install harness CLI
+      id: install
+      shell: bash
+      env:
+        HARNESS: ${{ inputs.harness }}
+        HARNESS_VERSION: ${{ inputs.version }}
+        HARNESS_CACHE_NAMESPACE: ${{ inputs.cache-namespace }}
+        HARNESS_CACHE_HIT: ${{ steps.restore.outputs.cache-hit }}
+      run: node "$GITHUB_ACTION_PATH/install.mjs"
+
+    # Save before caller workload code can modify the download cache.
+    - name: Save harness downloads
+      if: inputs.enable-cache == 'true' && steps.restore.outputs.cache-hit != 'true'
+      uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      with:
+        path: ${{ steps.resolve.outputs.cache-path }}
+        key: ${{ steps.resolve.outputs.cache-key }}

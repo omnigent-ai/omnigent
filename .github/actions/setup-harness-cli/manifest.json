@@ -1,0 +1,33 @@
+{
+  "claude": {
+    "kind": "npm",
+    "package": "@anthropic-ai/claude-code",
+    "version": "2.1.266",
+    "binary": "claude",
+    "installScript": "node_modules/@anthropic-ai/claude-code/install.cjs"
+  },
+  "codex": {
+    "kind": "npm",
+    "package": "@openai/codex",
+    "version": "0.139.0",
+    "binary": "codex"
+  },
+  "pi": {
+    "kind": "npm",
+    "package": "@earendil-works/pi-coding-agent",
+    "version": "0.84.2",
+    "binary": "pi"
+  },
+  "agy": {
+    "kind": "archive",
+    "version": "1.2.4",
+    "binary": "agy",
+    "platforms": {
+      "Linux-X64": {
+        "url": "https://storage.googleapis.com/antigravity-public/antigravity-cli/1.2.4-6085322963025920/linux-x64/cli_linux_x64.tar.gz",
+        "sha512": "5811d39ec1bf96a82ed06de6b8ee2bb7f5be8d74423b8c52b6b975e8f0e2c84c6cc2fa0baf902aad942c7566509c3ba6ddb5ef076260c6a635c4616e6ae17897",
+        "member": "antigravity"
+      }
+    }
+  }
+}
