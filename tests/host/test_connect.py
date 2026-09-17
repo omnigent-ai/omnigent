@@ -1978,7 +1978,7 @@ async def test_run_prewarms_zygote_during_capability_discovery(
     monkeypatch.setattr(
         host, "_ensure_zygote_started", lambda: loop.call_soon_threadsafe(prewarm_started.set)
     )
-    monkeypatch.setattr(host, "_reap_orphans_once", lambda: 0)
+    monkeypatch.setattr(host, "_reap_orphans_once", lambda _child_pids=None: 0)
     run_task = asyncio.create_task(host.run())
     try:
         await asyncio.wait_for(
@@ -2339,14 +2339,7 @@ def test_reap_orphans_reaps_orphaned_children(tmp_path: Path) -> None:
 
 
 def test_reap_orphans_never_steals_tracked_runner_exit_code(tmp_path: Path) -> None:
-    """The reaper must not consume a tracked runner's exit status (#1782).
-
-    A naive ``waitpid(-1)`` reaper would reap a just-exited tracked runner
-    behind ``Popen``'s back, making ``_watch_runner``'s ``poll()`` report a
-    bogus exit 0 for a crash. ``_reap_orphans_once`` peeks with ``WNOWAIT``
-    and skips tracked pids, so the runner's real exit code survives for the
-    ``host.runner_exited`` report.
-    """
+    """The reaper collects tracked exits through Popen, preserving crash codes."""
     host = _make_host_process()
 
     # A tracked runner that exits non-zero (a "crash").
@@ -2354,10 +2347,9 @@ def test_reap_orphans_never_steals_tracked_runner_exit_code(tmp_path: Path) -> N
     host._runners["runner_crash"] = _RunnerHandle(
         proc=runner, log_path=tmp_path / "runner-crash.log"
     )
-    # Wait until the OS reports it as exited (zombie), WITHOUT Popen.wait().
+    # Exercise cleanup while the runner is exiting.
     deadline = time.monotonic() + 5.0
     while time.monotonic() < deadline and runner.poll() is None:
-        # poll() would itself reap; instead peek via the reaper repeatedly.
         host._reap_orphans_once()
         time.sleep(0.05)
 
@@ -5724,7 +5716,7 @@ async def test_run_prestarts_zygote_before_first_launch(
 
     monkeypatch.setattr(HostProcess, "_connect_and_serve", _fake_connect)
     # Keep run()'s shutdown sweep from reaping unrelated pytest children.
-    monkeypatch.setattr(HostProcess, "_reap_orphans_once", lambda self_: 0)
+    monkeypatch.setattr(HostProcess, "_reap_orphans_once", lambda self_, _child_pids=None: 0)
 
     await host.run()
 
