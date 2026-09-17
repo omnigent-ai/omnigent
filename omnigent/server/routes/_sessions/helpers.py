@@ -1592,6 +1592,14 @@ def _pending_elicitation_snapshot_for_session(
     Duplicate ids are skipped because live mirroring also records the
     ancestor copy in the in-memory index.
 
+    The in-memory index exists only in the process that parked the
+    prompt, so on a multi-replica deployment a snapshot read served by
+    another replica falls back to the payload mirror the parking
+    replica persisted alongside the pending count. The fallback uses
+    the same gate as the list's count fallback: only a runner-bound
+    session (its tunnel lives on some replica) reads the row, so an
+    unbound session stays index-only and free of the persist-lag race.
+
     The descendant walk costs one ``list_conversations`` query per
     session in the tree, so it is skipped entirely unless some session
     other than ``conv`` has an outstanding prompt in the in-memory
@@ -1603,6 +1611,8 @@ def _pending_elicitation_snapshot_for_session(
         :class:`SessionResponse.pending_elicitations`.
     """
     events = pending_elicitations.snapshot_for(conv.id)
+    if not events and conv.runner_id is not None and (conv.pending_elicitation_count or 0) > 0:
+        events = conv_store.get_pending_elicitation_events(conv.id)
     if not (set(pending_elicitations.pending_session_ids()) - {conv.id}):
         return events
     seen = {

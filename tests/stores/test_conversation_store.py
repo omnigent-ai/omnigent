@@ -5951,6 +5951,73 @@ def test_set_session_state_empty_dict(
     assert fetched.session_state == {}
 
 
+# ── pending elicitation state (cross-replica prompt mirror) ────────────────
+
+
+def test_pending_elicitation_state_round_trips_payloads_and_count(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """The payload mirror and the count persist together and clear together.
+
+    The mirror is what a replica that is not parking a prompt replays into
+    the session snapshot, so it must come back byte-for-byte and in
+    insertion order, with the count derived from the same write. Live-state
+    writes must not bump ``updated_at`` (sidebar ordering).
+    """
+    conv = conversation_store.create_conversation()
+    before = conversation_store.get_conversation(conv.id)
+    assert before is not None
+    events = [
+        {
+            "type": "response.elicitation_request",
+            "elicitation_id": "elicit_1",
+            "params": {"mode": "form", "message": "Claude wants to call **Bash**"},
+        },
+        {"type": "response.elicitation_request", "elicitation_id": "elicit_2"},
+    ]
+    conversation_store.set_pending_elicitation_state(conv.id, events)
+
+    assert conversation_store.get_pending_elicitation_events(conv.id) == events
+    fetched = conversation_store.get_conversation(conv.id)
+    assert fetched is not None
+    assert fetched.pending_elicitation_count == 2
+    assert fetched.updated_at == before.updated_at
+
+    conversation_store.set_pending_elicitation_state(conv.id, [])
+    assert conversation_store.get_pending_elicitation_events(conv.id) == []
+    cleared = conversation_store.get_conversation(conv.id)
+    assert cleared is not None
+    assert cleared.pending_elicitation_count == 0
+
+
+def test_pending_elicitation_mirror_survives_policy_state_writes(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """The mirror rides ``session_state`` invisibly to its other writers.
+
+    Policy state replaces the whole ``session_state`` dict and the Plan
+    snapshot rewrites its own reserved key; both must preserve the prompt
+    mirror, and neither the entity's ``session_state`` nor a forged
+    reserved key from a caller may reach it.
+    """
+    conv = conversation_store.create_conversation()
+    events = [{"type": "response.elicitation_request", "elicitation_id": "elicit_keep"}]
+    conversation_store.set_pending_elicitation_state(conv.id, events)
+
+    conversation_store.set_session_state(
+        conv.id,
+        {"v": 1, "_omnigent_pending_elicitations_v1": [{"forged": True}]},
+    )
+    todos = [{"content": "keep", "status": "pending", "activeForm": "keeping"}]
+    conversation_store.set_session_todos(conv.id, todos)
+
+    assert conversation_store.get_pending_elicitation_events(conv.id) == events
+    fetched = conversation_store.get_conversation(conv.id)
+    assert fetched is not None
+    assert fetched.session_state == {"v": 1}
+    assert fetched.session_todos == todos
+
+
 # ── set_session_usage ─────────────────────────────────────────────────────
 
 
@@ -6755,7 +6822,13 @@ def test_live_state_writes_via_chokepoint_land_in_scoped_workspace(
             session_live_state.configure(conversation_store)
             session_live_state.touch_runner_liveness(["runner_scoped"])
             session_live_state.persist_live_status(conv.id, "running")
-            session_live_state.persist_pending_count(conv.id, 3)
+            session_live_state.persist_pending_state(
+                conv.id,
+                [
+                    {"type": "response.elicitation_request", "elicitation_id": f"elicit_{i}"}
+                    for i in range(3)
+                ],
+            )
 
             # All three writes land on the chokepoint's ordered single-worker
             # executor, so poll the row (under the SAME scope) until ALL of

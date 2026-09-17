@@ -2,10 +2,10 @@
 
 Covers ``omnigent.server.session_live_state``: writes are deduplicated,
 ordered, and best-effort, and the pending-elicitations index drives the
-persisted count through its hook. These writes are what let a replica
-that does NOT hold a session's runner tunnel serve the sidebar's live
-fields, so the contract under test is "every real transition reaches the
-store exactly once".
+persisted state (count + parked prompt payloads) through its hook. These
+writes are what let a replica that does NOT hold a session's runner tunnel
+serve the sidebar's live fields, so the contract under test is "every real
+transition reaches the store exactly once".
 
 Writes land on a background single-worker executor, so each test waits
 on the observable effect (the recording store's captured writes) with a
@@ -52,15 +52,17 @@ class _RecordingStore:
 
     def __init__(self) -> None:
         self.status_writes: list[tuple[str, str]] = []
-        self.pending_writes: list[tuple[str, int]] = []
+        self.pending_writes: list[tuple[str, list[str]]] = []
         self.touches: list[list[str]] = []
         self.clears: list[str] = []
 
     def set_session_live_status(self, conversation_id: str, status: str) -> None:
         self.status_writes.append((conversation_id, status))
 
-    def set_pending_elicitation_count(self, conversation_id: str, count: int) -> None:
-        self.pending_writes.append((conversation_id, count))
+    def set_pending_elicitation_state(self, conversation_id: str, events: list[dict]) -> None:
+        self.pending_writes.append(
+            (conversation_id, [event["elicitation_id"] for event in events])
+        )
 
     def touch_runner_liveness(self, runner_ids: list[str], now: int) -> None:
         del now
@@ -77,7 +79,7 @@ def recording_store() -> _RecordingStore:
     session_live_state.configure(store)  # type: ignore[arg-type]
     yield store
     session_live_state.configure(None)
-    pending_elicitations.set_count_persist_hook(None)
+    pending_elicitations.set_state_persist_hook(None)
 
 
 def test_persist_live_status_dedupes_transitions(recording_store: _RecordingStore) -> None:
@@ -99,17 +101,19 @@ def test_persist_live_status_dedupes_transitions(recording_store: _RecordingStor
     ]
 
 
-def test_pending_count_hook_persists_publish_and_resolve(
+def test_pending_state_hook_persists_publish_and_resolve(
     recording_store: _RecordingStore,
 ) -> None:
-    """The elicitation index drives the persisted count through its hook.
+    """The elicitation index drives the persisted state through its hook.
 
-    A publish bumps the count, a duplicate publish of the same id does
-    not (same count → deduped), and a resolve writes the decrement —
-    including the direct-``resolve`` path the approval dispatch uses,
-    which never flows through ``record_publish``.
+    A publish writes the outstanding payloads, a duplicate publish of the
+    same id does not (same payloads → deduped), and a resolve writes the
+    shrunken set — including the direct-``resolve`` path the approval
+    dispatch uses, which never flows through ``record_publish``. The
+    payloads are the cross-replica mirror a non-parking replica serves
+    from the session snapshot.
     """
-    pending_elicitations.set_count_persist_hook(session_live_state.persist_pending_count)
+    pending_elicitations.set_state_persist_hook(session_live_state.persist_pending_state)
     request = {"type": "response.elicitation_request", "elicitation_id": "elicit_1"}
     pending_elicitations.record_publish("conv_1", request)
     pending_elicitations.record_publish("conv_1", request)  # idempotent re-publish
@@ -121,10 +125,10 @@ def test_pending_count_hook_persists_publish_and_resolve(
     pending_elicitations.resolve("conv_1", "elicit_2")
     _wait_until(lambda: len(recording_store.pending_writes) >= 4)
     assert recording_store.pending_writes == [
-        ("conv_1", 1),
-        ("conv_1", 2),
-        ("conv_1", 1),
-        ("conv_1", 0),
+        ("conv_1", ["elicit_1"]),
+        ("conv_1", ["elicit_1", "elicit_2"]),
+        ("conv_1", ["elicit_2"]),
+        ("conv_1", []),
     ]
 
 
@@ -147,7 +151,9 @@ def test_unconfigured_module_is_a_no_op() -> None:
     """
     session_live_state.configure(None)
     session_live_state.persist_live_status("conv_1", "running")
-    session_live_state.persist_pending_count("conv_1", 1)
+    session_live_state.persist_pending_state(
+        "conv_1", [{"type": "response.elicitation_request", "elicitation_id": "elicit_1"}]
+    )
     session_live_state.touch_runner_liveness(["runner_a"])
     session_live_state.clear_runner_liveness("runner_a")
 

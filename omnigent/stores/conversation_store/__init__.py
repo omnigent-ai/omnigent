@@ -1387,6 +1387,40 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def set_pending_elicitation_state(
+        self, conversation_id: str, events: list[dict[str, Any]]
+    ) -> None:
+        """
+        Persist the outstanding elicitation payloads and their count.
+
+        Written on every pending-elicitation publish/resolve by the
+        replica holding the parked prompt, so any replica's session
+        snapshot can replay the approval card. Must update the count and
+        the payload mirror atomically; empty *events* clears the mirror
+        and zeroes the count. Must NOT bump ``updated_at``.
+
+        :param conversation_id: Session/conversation identifier.
+        :param events: Outstanding ``response.elicitation_request`` event
+            payloads in insertion order; empty when none remain.
+        """
+        ...
+
+    @abstractmethod
+    def get_pending_elicitation_events(self, conversation_id: str) -> list[dict[str, Any]]:
+        """
+        Return the persisted outstanding-elicitation payload mirror.
+
+        Read by a replica whose in-memory index holds nothing for the
+        session (it is not the one parking the prompt) so its session
+        snapshot can still replay the approval card.
+
+        :param conversation_id: Session/conversation identifier.
+        :returns: Mirrored event payloads in insertion order, ``[]``
+            when none are persisted.
+        """
+        ...
+
+    @abstractmethod
     def replace_runner_id(self, conversation_id: str, runner_id: str) -> Conversation:
         """
         Replace ``conversations.runner_id`` for a conversation.

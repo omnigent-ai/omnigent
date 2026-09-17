@@ -1,7 +1,8 @@
 """Best-effort persistence of per-session live state to the conversations table.
 
 The sidebar's live fields — ``runner_online``, turn ``status``, and the
-pending-approval count — were historically served from in-memory caches
+pending-approval state (count + parked prompt payloads) — were
+historically served from in-memory caches
 that exist only on the server replica holding a session's runner tunnel
 (the tunnel registry, the SSE-relay status cache, and the
 pending-elicitations index). Under host_id replica sharding a session
@@ -38,10 +39,11 @@ unaffected.
 from __future__ import annotations
 
 import contextvars
+import json
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from omnigent.db.enum_codecs import SESSION_LIVE_STATUS
 from omnigent.db.workspace_cache import WorkspaceScopedCache
@@ -71,8 +73,9 @@ _executor: ThreadPoolExecutor | None = None
 # already logged, so repeats of either are suppressed. Unbounded like the
 # in-memory caches these writes mirror; entries live for the process.
 _last_status: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
-# Last count persisted per session, for dedupe.
-_last_pending: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
+# Fingerprint of the last pending-elicitation state persisted per session
+# (serialized payload list), for dedupe.
+_last_pending: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
 
 
 def configure(
@@ -248,31 +251,39 @@ def persist_scheduled_run_completion(
     submit("scheduled_run_completion", _transition)
 
 
-def persist_pending_count(conversation_id: str, count: int) -> None:
+def persist_pending_state(conversation_id: str, events: list[dict[str, Any]]) -> None:
     """
-    Persist an outstanding-elicitation count change.
+    Persist an outstanding-elicitation change (count + event payloads).
 
     Wired as :func:`omnigent.runtime.pending_elicitations`'s persist
-    hook; runs on the pub-sub hot path, so it must stay cheap.
+    hook; runs on the pub-sub hot path, so it must stay cheap. The
+    payloads are what a replica that does not hold the parked prompt
+    replays from ``GET /v1/sessions/{id}`` so its approval card renders.
 
     :param conversation_id: Session/conversation identifier.
-    :param count: Outstanding elicitations, ``>= 0``.
+    :param events: Outstanding ``response.elicitation_request`` payloads
+        in insertion order; empty clears the mirror and zeroes the count.
     """
-    if _store is None or _last_pending.get(conversation_id) == count:
+    if _store is None:
         return
-    _last_pending[conversation_id] = count
+    # ``default=str`` so a pathological payload can't raise on the publish
+    # hot path; the background write's own encode failure is best-effort.
+    fingerprint = json.dumps(events, separators=(",", ":"), sort_keys=True, default=str)
+    if _last_pending.get(conversation_id) == fingerprint:
+        return
+    _last_pending[conversation_id] = fingerprint
 
     def _evict() -> None:
         # See persist_live_status._evict: keep the dedupe cache honest so a
-        # dropped count write can be re-attempted by the next publish.
-        if _last_pending.get(conversation_id) == count:
+        # dropped state write can be re-attempted by the next publish.
+        if _last_pending.get(conversation_id) == fingerprint:
             _last_pending.pop(conversation_id, None)
 
     submit(
-        "pending_count",
-        _store.set_pending_elicitation_count,
+        "pending_elicitation_state",
+        _store.set_pending_elicitation_state,
         conversation_id,
-        count,
+        events,
         on_failure=_evict,
     )
 

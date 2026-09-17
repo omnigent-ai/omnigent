@@ -28,10 +28,13 @@ otherwise render as nothing.
 
 Limitations:
 
-* In-memory only; multi-replica Omnigent deploys would each see their own
-  slice. This matches the existing ``_harness_elicitation_registry``
-  constraint — when a shared backplane is added for the registry,
-  this index should be wired through the same backplane.
+* The index (and the parked awaiter beside it) is per-process; on a
+  multi-replica Omnigent deploy each replica sees only its own slice.
+  Every mutation therefore mirrors the outstanding payloads — with
+  their count — onto the conversation row through the persist hook
+  (see :func:`set_state_persist_hook`), so a replica that is not the
+  one parking a prompt can still replay it into the session snapshot.
+  Resolving remains bound to the parking replica's awaiter.
 * Events emitted before the Omnigent server starts (e.g. between turns,
   with the session_stream having dropped them) are not tracked,
   same as every other AP-server-side in-memory state.
@@ -80,30 +83,34 @@ def set_elicitation_observer(
     _observer = observer
 
 
-# Optional per-session count sink, fired with the new count whenever the
-# index changes. The server wires it to persist the count on the
-# conversation row so replicas that don't hold this session's runner
-# tunnel still show parked approvals. Must be cheap + non-blocking.
-_count_persist_hook: Callable[[str, int], None] | None = None
+# Optional per-session state sink, fired with the outstanding payloads
+# whenever the index changes. The server wires it to persist the count and
+# the event payloads on the conversation row so replicas that don't hold
+# this session's runner tunnel still show parked approvals — badge and
+# approval card alike. Must be cheap + non-blocking.
+_state_persist_hook: Callable[[str, list[dict[str, Any]]], None] | None = None
 
 
-def set_count_persist_hook(hook: Callable[[str, int], None] | None) -> None:
+def set_state_persist_hook(
+    hook: Callable[[str, list[dict[str, Any]]], None] | None,
+) -> None:
     """
-    Register (or clear) the pending-count persist hook.
+    Register (or clear) the pending-state persist hook.
 
-    :param hook: Callback invoked as ``hook(conversation_id, count)``
+    :param hook: Callback invoked as ``hook(conversation_id, events)``
         after every index mutation (publish adds, resolve drops), with
-        the session's new outstanding count. Pass ``None`` to clear.
+        the session's outstanding event payloads (deep copies, insertion
+        order; empty when none remain). Pass ``None`` to clear.
     """
-    global _count_persist_hook
-    _count_persist_hook = hook
+    global _state_persist_hook
+    _state_persist_hook = hook
 
 
-def _notify_count_hook(conversation_id: str, count: int) -> None:
-    """Fire the count persist hook, if any (read-once, like the observer)."""
-    hook = _count_persist_hook
+def _notify_state_hook(conversation_id: str, events: list[dict[str, Any]]) -> None:
+    """Fire the state persist hook, if any (read-once, like the observer)."""
+    hook = _state_persist_hook
     if hook is not None:
-        hook(conversation_id, count)
+        hook(conversation_id, events)
 
 
 def record_publish(conversation_id: str, event: dict[str, Any]) -> None:
@@ -150,8 +157,8 @@ def record_publish(conversation_id: str, event: dict[str, Any]) -> None:
         with _lock:
             ids = _pending.setdefault(conversation_id, {})
             ids[elicitation_id] = event
-            count = len(ids)
-        _notify_count_hook(conversation_id, count)
+            events = [copy.deepcopy(entry) for entry in ids.values()]
+        _notify_state_hook(conversation_id, events)
         _notify_observer(conversation_id, event)
         return
     if event_type == "response.elicitation_resolved":
@@ -209,11 +216,11 @@ def resolve(conversation_id: str, elicitation_id: str) -> None:
         if ids is None:
             return
         removed = ids.pop(elicitation_id, None) is not None
-        count = len(ids)
+        events = [copy.deepcopy(entry) for entry in ids.values()]
         if not ids:
             _pending.pop(conversation_id, None)
     if removed:
-        _notify_count_hook(conversation_id, count)
+        _notify_state_hook(conversation_id, events)
 
 
 def count_for(conversation_id: str) -> int:

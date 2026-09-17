@@ -3889,6 +3889,100 @@ async def test_list_sessions_pending_count_falls_back_to_row_for_bound_session(
     store.set_pending_elicitation_count(session_id, 0)
 
 
+async def test_get_session_replays_pending_prompt_mirror_for_bound_session(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A runner-bound session's snapshot replays the persisted prompt payloads
+    when the local in-memory index is empty (the cross-replica fallback).
+
+    The parked prompt's payload lives in the in-memory index of the replica
+    that parked it; on a multi-replica deployment a snapshot read served by
+    another replica used to return ``pending_elicitations: []`` and the web
+    UI rendered no approval card, leaving the harness waiting on a question
+    the user could not see. The parking replica now mirrors the payloads
+    onto the row next to the count, and the snapshot falls back to that
+    mirror under the same runner-bound gate as the count fallback.
+
+    :param client: Test HTTP client backed by the real app.
+    :param db_uri: The app's DB, opened directly to seed the row the way a
+        different replica's live-state write would have.
+    """
+    from omnigent.runtime import pending_elicitations
+    from omnigent.stores.conversation_store.sqlalchemy_store import (
+        SqlAlchemyConversationStore,
+    )
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    session_id = session["id"]
+
+    # Bind a runner and seed the persisted state directly — simulating the
+    # parking replica's row write. THIS replica's index stays empty (no
+    # record_publish here), so a correct read falls back to the mirror.
+    pending_elicitations.reset_for_tests()
+    store = SqlAlchemyConversationStore(db_uri)
+    assert store.set_runner_id(session_id, "runner_other_replica")
+    parked_event = {
+        "type": "response.elicitation_request",
+        "elicitation_id": "elicit_parked_elsewhere",
+        "params": {
+            "mode": "form",
+            "message": "Claude wants to call **Bash**",
+            "tool_name": "Bash",
+        },
+    }
+    store.set_pending_elicitation_state(session_id, [parked_event])
+
+    resp = await client.get(f"/v1/sessions/{session_id}")
+    assert resp.status_code == 200
+    pending = resp.json()["pending_elicitations"]
+    assert [event["elicitation_id"] for event in pending] == ["elicit_parked_elsewhere"], (
+        f"Expected the mirrored prompt payload in the snapshot, got {pending!r}. "
+        "If empty, the snapshot only read the process-local index and a "
+        "replica that is not the parking one renders no approval card."
+    )
+    assert pending[0]["params"]["message"] == "Claude wants to call **Bash**"
+
+    store.set_pending_elicitation_state(session_id, [])
+
+
+async def test_get_session_pending_prompt_mirror_ignored_when_unbound(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """An unbound session's snapshot stays index-only (no mirror fallback).
+
+    Mirrors the count fallback's gate: without a bound runner there is no
+    tunnel on any replica, so the local index is authoritative and a stale
+    row (an async mirror that lags a resolve) must not resurrect a prompt.
+
+    :param client: Test HTTP client backed by the real app.
+    :param db_uri: The app's DB, opened directly to seed a stale row.
+    """
+    from omnigent.runtime import pending_elicitations
+    from omnigent.stores.conversation_store.sqlalchemy_store import (
+        SqlAlchemyConversationStore,
+    )
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    session_id = session["id"]
+
+    pending_elicitations.reset_for_tests()
+    store = SqlAlchemyConversationStore(db_uri)
+    store.set_pending_elicitation_state(
+        session_id,
+        [{"type": "response.elicitation_request", "elicitation_id": "elicit_stale"}],
+    )
+
+    resp = await client.get(f"/v1/sessions/{session_id}")
+    assert resp.status_code == 200
+    assert resp.json()["pending_elicitations"] == []
+
+    store.set_pending_elicitation_state(session_id, [])
+
+
 async def test_get_session_includes_runner_online(
     client: httpx.AsyncClient,
 ) -> None:

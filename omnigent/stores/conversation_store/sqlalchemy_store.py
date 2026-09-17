@@ -109,11 +109,17 @@ _logger = logging.getLogger(__name__)
 
 _SESSION_TODOS_STATE_KEY = "_omnigent_native_plan_snapshot_v1"
 
+# Reserved ``session_state`` key carrying the cross-replica mirror of the
+# in-memory pending-elicitations index (the parked approval-prompt payloads).
+# Riding the existing state envelope keeps the mirror out of any new table
+# or column while staying invisible to policy-state readers.
+_PENDING_ELICITATIONS_STATE_KEY = "_omnigent_pending_elicitations_v1"
+
 
 def _decode_session_state(
     value: str | None,
-) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    """Split policy state from the reserved native Plan snapshot."""
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Split policy state from the reserved Plan and pending-prompt keys."""
     state = json.loads(value) if value else {}
     if not isinstance(state, dict):
         raise TypeError("session_state must decode to an object")
@@ -122,18 +128,26 @@ def _decode_session_state(
     if raw_todos is not None:
         with suppress(TypeError, ValueError):
             todos = validate_session_todos(raw_todos)
-    return state, todos
+    raw_pending = state.pop(_PENDING_ELICITATIONS_STATE_KEY, None)
+    pending: list[dict[str, Any]] = []
+    if isinstance(raw_pending, list):
+        pending = [event for event in raw_pending if isinstance(event, dict)]
+    return state, todos, pending
 
 
 def _encode_session_state(
     state: dict[str, Any],
     todos: list[dict[str, Any]] | None,
+    pending_elicitations: list[dict[str, Any]] | None = None,
 ) -> str:
-    """Serialize policy state while preserving an optional Plan snapshot."""
+    """Serialize policy state while preserving the reserved snapshots."""
     payload = dict(state)
     payload.pop(_SESSION_TODOS_STATE_KEY, None)
     if todos:
         payload[_SESSION_TODOS_STATE_KEY] = todos
+    payload.pop(_PENDING_ELICITATIONS_STATE_KEY, None)
+    if pending_elicitations:
+        payload[_PENDING_ELICITATIONS_STATE_KEY] = pending_elicitations
     return json.dumps(payload, separators=(",", ":"))
 
 
@@ -242,7 +256,7 @@ def _to_conversation(
         callers pass the JOINed ``{key: value}`` map.
     :returns: A :class:`Conversation` dataclass instance.
     """
-    session_state, session_todos = _decode_session_state(meta.session_state if meta else None)
+    session_state, session_todos, _ = _decode_session_state(meta.session_state if meta else None)
     session_usage: dict[str, Any] = {}
     if meta and meta.session_usage:
         session_usage = json.loads(meta.session_usage)
@@ -1463,8 +1477,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                 q = q.with_for_update()
             meta = session.scalars(q).first()
             if meta is not None:
-                _, todos = _decode_session_state(meta.session_state)
-                meta.session_state = _encode_session_state(state, todos)
+                _, todos, pending = _decode_session_state(meta.session_state)
+                meta.session_state = _encode_session_state(state, todos, pending)
 
         run_write_transaction(self._session_immediate, "set_session_state", write)
 
@@ -1523,8 +1537,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             meta = session.scalars(q).first()
             if meta is None:
                 return False
-            state, _ = _decode_session_state(meta.session_state)
-            meta.session_state = _encode_session_state(state, validated)
+            state, _, pending = _decode_session_state(meta.session_state)
+            meta.session_state = _encode_session_state(state, validated, pending)
             return True
 
         return run_write_transaction(self._session_immediate, "set_session_todos", write)
@@ -3614,6 +3628,54 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         run_write_transaction(self._session_immediate, "set_pending_elicitation_count", write)
 
+    def set_pending_elicitation_state(
+        self, conversation_id: str, events: list[dict[str, Any]]
+    ) -> None:
+        """
+        Persist the outstanding elicitation payloads and their count.
+
+        Writes the count column and the ``session_state`` payload mirror in
+        one transaction so the two can never disagree. Lives on
+        ``omnigent_conversation_metadata``, so ``conversations.updated_at``
+        (sidebar ordering) is untouched by construction. See the abstract
+        method.
+
+        :param conversation_id: Session/conversation identifier.
+        :param events: Outstanding ``response.elicitation_request`` event
+            payloads in insertion order; empty clears the mirror.
+        """
+
+        def write(session: Session) -> None:
+            q = select(SqlConversationMetadata).where(
+                SqlConversationMetadata.workspace_id == current_workspace_id(),
+                SqlConversationMetadata.id == conversation_id,
+            )
+            if self._meta_supports_for_update:
+                q = q.with_for_update()
+            meta = session.scalars(q).first()
+            if meta is None:
+                return
+            state, todos, _ = _decode_session_state(meta.session_state)
+            meta.session_state = _encode_session_state(state, todos, list(events))
+            meta.pending_elicitation_count = len(events)
+
+        run_write_transaction(self._session_immediate, "set_pending_elicitation_state", write)
+
+    def get_pending_elicitation_events(self, conversation_id: str) -> list[dict[str, Any]]:
+        """
+        Return the persisted outstanding-elicitation payload mirror.
+
+        :param conversation_id: Session/conversation identifier.
+        :returns: Mirrored event payloads in insertion order, ``[]`` when
+            none are persisted (or the row is gone).
+        """
+        with self._session("select_pending_elicitation_mirror") as session:
+            meta = session.get(SqlConversationMetadata, (current_workspace_id(), conversation_id))
+            if meta is None:
+                return []
+            _, _, pending = _decode_session_state(meta.session_state)
+            return pending
+
     def replace_runner_id(self, conversation_id: str, runner_id: str) -> Conversation:
         """
         Atomically overwrite ``conversations.runner_id``.
@@ -4828,8 +4890,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             meta = session.scalars(meta_query).first()
             if meta is not None:
                 meta.external_session_id = None
-                state, _ = _decode_session_state(meta.session_state)
-                meta.session_state = _encode_session_state(state, None)
+                state, _, pending = _decode_session_state(meta.session_state)
+                meta.session_state = _encode_session_state(state, None, pending)
                 # Launch flags are CLI-specific: a switch to a different CLI
                 # (e.g. claude-code → pi) leaves the prior CLI's flags stale —
                 # Claude Code's ``--permission-mode`` makes pi exit 1 at launch.

@@ -1722,7 +1722,7 @@ def create_app(
     # Extend a managed sandbox while its runner tunnel is live (the managed-path
     # caller for SandboxHostLauncher.keep_alive); no-op without a sandbox config.
     managed_host_keepalive.configure(conversation_store, host_store, sandbox_config)
-    pending_elicitations.set_count_persist_hook(session_live_state.persist_pending_count)
+    pending_elicitations.set_state_persist_hook(session_live_state.persist_pending_state)
 
     @app.middleware("http")
     async def _record_server_metrics(
@@ -3219,13 +3219,14 @@ def create_app(
             # helper self-gates on routing state, so the plain sessions in this
             # loop (and any archived row) cost nothing.
             prefetch_session_routing_catalogs(conv.id, conv, routed.client)
-            # Reconcile the persisted pending-elicitation count with this
-            # pod's live index. A runner that crashed with prompts parked
-            # leaves a stale row (no decrement is ever written on a crash),
-            # which the fresh index corrects to 0 here; a tunnel flap on the
-            # same pod resyncs the still-parked truth unchanged.
-            session_live_state.persist_pending_count(
-                conv.id, pending_elicitations.count_for(conv.id)
+            # Reconcile the persisted pending-elicitation state (count +
+            # payload mirror) with this pod's live index. A runner that
+            # crashed with prompts parked leaves a stale row (no decrement is
+            # ever written on a crash), which the fresh index corrects to
+            # empty here; a tunnel flap on the same pod resyncs the
+            # still-parked truth unchanged.
+            session_live_state.persist_pending_state(
+                conv.id, pending_elicitations.snapshot_for(conv.id)
             )
             # A reconnect can land the runner back on an idle session with
             # no new turn (a transient WS blip; the runner process
