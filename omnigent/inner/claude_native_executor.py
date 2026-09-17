@@ -80,6 +80,9 @@ class ClaudeNativeExecutor(Executor):
         # adapter caching one executor per conversation; per-turn
         # construction would regress the lock to per-turn scope.
         self._inject_lock = asyncio.Lock()
+        # Pane kills scheduled by a failed delivery, held so the event loop
+        # cannot drop them before they run.
+        self._reap_tasks: set[asyncio.Task[None]] = set()
         # The model the pane is currently on, so a routing turn only types
         # ``/model`` when the model actually changes. Seeded lazily from the
         # spawn ``launch_model`` on the first turn (``None`` = not yet known).
@@ -247,11 +250,11 @@ class ClaudeNativeExecutor(Executor):
                 "claude-native: prompt delivery to harness timed out",
                 extra={"session_id": self._request_session_id},
             )
-            cleanup_error = self._reap_failed_turn()
-            message = describe_exception(exc)
-            if cleanup_error is not None:
-                message = f"{message} Cleanup also failed: {cleanup_error}"
-            yield ExecutorError(message=message)
+            # Report the failure before the pane dies: the runner fails the turn
+            # and releases this harness as soon as it sees the pane exit, which
+            # would sever this stream ahead of the failure event.
+            self._schedule_reap_failed_turn()
+            yield ExecutorError(message=describe_exception(exc))
             return
         except RuntimeError as exc:
             _logger.exception(
@@ -279,8 +282,16 @@ class ClaudeNativeExecutor(Executor):
             self._reap_failed_turn()
             raise
 
-    def _reap_failed_turn(self) -> str | None:
-        """Kill the Claude pane before a delivery timeout becomes ``failed``."""
+    def _schedule_reap_failed_turn(self) -> None:
+        """Kill the Claude pane from a worker thread once the turn's failure is out."""
+        task = asyncio.create_task(
+            asyncio.to_thread(self._reap_failed_turn), name="claude-native-reap-failed-turn"
+        )
+        self._reap_tasks.add(task)
+        task.add_done_callback(self._reap_tasks.discard)
+
+    def _reap_failed_turn(self) -> None:
+        """Kill the Claude pane a failed delivery left behind."""
         try:
             kill_session(self._bridge_dir, timeout_s=1.0)
         except TmuxSessionNotAdvertised:
@@ -288,14 +299,12 @@ class ClaudeNativeExecutor(Executor):
                 "claude-native: timed-out session already disappeared",
                 extra={"session_id": self._request_session_id},
             )
-        except RuntimeError as exc:
+        except RuntimeError:
             _logger.warning(
                 "claude-native: failed to reap timed-out session",
                 exc_info=True,
                 extra={"session_id": self._request_session_id},
             )
-            return describe_exception(exc)
-        return None
 
     def _model_command_arg(self, wanted_model: str | None) -> str | None:
         """
