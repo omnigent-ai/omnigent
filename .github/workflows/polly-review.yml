@@ -33,10 +33,6 @@ permissions:
   contents: read
   pull-requests: write
 
-concurrency:
-  group: polly-review-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr }}
-  cancel-in-progress: true
-
 env:
   OMNIGENT_SKIP_WEB_UI: "true"
   UV_INDEX_URL: https://pypi.org/simple
@@ -55,6 +51,11 @@ jobs:
   review:
     name: Polly AI Review
     needs: gate
+    # Ignored comments must not cancel reviews, including the bot's own post.
+    # Queue eligible requests; the duplicate check runs after the active review.
+    concurrency:
+      group: polly-review-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr }}
+      cancel-in-progress: false
     # Fire on non-draft PRs (after gate passes), `/review` comments by write-
     # access users or REVIEW_ALLOWLIST logins, or workflow_dispatch. The
     # `!cancelled()` ensures the job runs when gate is skipped (non-PR events)
@@ -527,6 +528,7 @@ jobs:
           set -euo pipefail
 
           prompt=$(cat /tmp/review_prompt.txt)
+          review_started=$(date +%s)
 
           # Run Polly headlessly with -p; it starts a local server, sends
           # one turn, prints the assistant response, and exits.
@@ -538,6 +540,7 @@ jobs:
             2>polly-stderr.log \
             | tee /tmp/polly_output.txt \
             || { echo "::warning::Polly review exited non-zero"; cat polly-stderr.log; }
+          echo "::notice::Polly review generation took $(( $(date +%s) - review_started )) seconds."
 
           # Keep raw stdout for failures, including secret-scan and posting errors.
           # Write publishable content separately using a review marker or heading.
@@ -555,7 +558,7 @@ jobs:
               m = re.search(r'^#{1,6} ', raw, re.MULTILINE)
               cleaned = raw[m.start():] if m else ''
           if not cleaned.strip():
-              raise SystemExit('::error::Polly produced no publishable review; see the failure logs artifact.')
+              raise SystemExit('::error::Polly produced no publishable review; see the diagnostics artifact.')
           pathlib.Path('/tmp/polly_review.txt').write_text(cleaned)
           "
 
@@ -612,8 +615,9 @@ jobs:
           gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file /tmp/comment.md
           echo "Created new comment"
 
-      - name: Prepare Polly failure diagnostics
-        if: failure()
+      # Successful slow runs need the same evidence as failed reviews.
+      - name: Prepare Polly diagnostics
+        if: always() && (failure() || (steps.polly.outcome != '' && steps.polly.outcome != 'skipped'))
         env:
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
           GATEWAY_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
@@ -643,8 +647,8 @@ jobs:
               target.write_text(text)
           PY
 
-      - name: Upload logs on failure
-        if: failure()
+      - name: Upload Polly diagnostics
+        if: always() && (failure() || (steps.polly.outcome != '' && steps.polly.outcome != 'skipped'))
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: polly-review-logs-${{ github.run_id }}
