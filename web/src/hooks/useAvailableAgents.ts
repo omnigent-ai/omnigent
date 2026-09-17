@@ -46,6 +46,7 @@ export interface AvailableAgent {
   // a restarted template spuriously beat a newer upload. created_at is
   // immutable, so it is the stable signal. Omitted on older servers.
   created_at?: number | null;
+  workspace_hint?: string | null;
   // Session id used to fetch the full agent spec on hover. Only set on
   // session-discovered agents (custom uploads); absent on catalog agents
   // whose full data is already present from GET /v1/agents.
@@ -59,8 +60,13 @@ const DISPLAY_NAMES: Record<string, string> = {
   debby: "Debby",
 };
 
-function displayNameForAgent(name: string, harness?: string | null): string {
+function displayNameForAgent(
+  name: string,
+  harness?: string | null,
+  builtin?: boolean,
+): string {
   return (
+    (builtin === false ? capitalizeAgentName(name) : undefined) ??
     nativeCodingAgentForHarness(harness)?.displayName ??
     nativeCodingAgentForAgentName(name)?.displayName ??
     DISPLAY_NAMES[name] ??
@@ -102,6 +108,7 @@ interface BuiltinAgentWire {
   // older servers, where every catalog row degrades to a protected entry.
   builtin?: boolean;
   created_at?: number | null;
+  workspace_hint?: string | null;
 }
 
 interface BuiltinAgentsListWire {
@@ -134,7 +141,7 @@ export async function fetchAgentCatalog(): Promise<AvailableAgent[]> {
   return rows.map((a) => ({
     id: a.id,
     name: a.name,
-    display_name: displayNameForAgent(a.name, a.harness),
+    display_name: displayNameForAgent(a.name, a.harness, a.builtin),
     description: a.description ?? null,
     harness: a.harness ?? null,
     skills: a.skills ?? [],
@@ -143,6 +150,7 @@ export async function fetchAgentCatalog(): Promise<AvailableAgent[]> {
     // undefined as "protected" (same as true), so omission is safe.
     ...(a.builtin !== undefined ? { builtin: a.builtin } : {}),
     ...(a.created_at !== undefined ? { created_at: a.created_at } : {}),
+    ...(a.workspace_hint !== undefined ? { workspace_hint: a.workspace_hint } : {}),
   }));
 }
 

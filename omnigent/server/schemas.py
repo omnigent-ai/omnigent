@@ -284,6 +284,9 @@ class AgentObject(BaseModel):
         a user-registered template is superseded by a newer
         same-named upload. Always ``False`` for session-scoped
         agents.
+    :param workspace_hint: A trusted template's preferred host workspace.
+        Derived from an absolute ``os_env.cwd``; the host still validates it
+        before a session starts.
     """
 
     id: str
@@ -300,6 +303,7 @@ class AgentObject(BaseModel):
     skills: list[SkillSummary] = Field(default_factory=list)
     terminals: list[str] = Field(default_factory=list)
     builtin: bool = False
+    workspace_hint: str | None = None
 
 
 # ── Session Policies ───────────────────────────────────────────
