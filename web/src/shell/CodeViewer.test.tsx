@@ -402,6 +402,16 @@ describe("CodeViewer markdown preview rendering (issue #970)", () => {
     expect(card.querySelector("code")?.textContent).toBe("Note over A,B: once; twice");
   }, 15_000);
 
+  it("maps the line by position when front matter repeats the diagram text", async () => {
+    vi.stubGlobal("IntersectionObserver", VisibleIntersectionObserver);
+    renderMd(
+      "```mermaid\n---\ntitle: |\n  sequenceDiagram\n  Note over A,B: once; twice\n---\nsequenceDiagram\n  Note over A,B: once; twice\n```",
+    );
+    const card = await screen.findByTestId("mermaid-error", {}, { timeout: 10_000 });
+    expect(card.textContent).toContain("Mermaid couldn't parse line 7");
+    expect(card.querySelector("code")?.textContent).toBe("Note over A,B: once; twice");
+  }, 15_000);
+
   it("renders Mermaid fences as diagrams instead of plain code", async () => {
     const { container } = renderMd("```mermaid\nflowchart LR\n  A --> B\n```");
     expect(screen.getByTestId("mermaid-preview")).toBeDefined();

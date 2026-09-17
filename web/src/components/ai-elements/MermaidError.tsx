@@ -6,11 +6,14 @@ const ERROR_LINE_RE = /^(?:Parse|Lexical) error on line (\d+)/;
 
 // Mermaid strips these before parsing (see preprocessDiagram in mermaid 11), so
 // its line numbers count from the stripped text. Regexes copied from mermaid;
-// the tests parse through mermaid itself, so drift shows up there.
-const FRONT_MATTER_RE = /^-{3}\s*[\n\r](.*?)[\n\r]-{3}\s*[\n\r]+/s;
-const DIRECTIVE_RE =
-  /%{2}{\s*(?:(\w+)\s*:|(\w+))\s*(?:(\w+)|((?:(?!}%{2}).|\r?\n)*))?\s*(?:}%{2})?/gi;
-const COMMENT_RE = /^\s*%%(?!{)[^\n]+\n?/gm;
+// the tests parse through mermaid itself, so drift shows up there. The last
+// pattern replays the trailing `trimStart()`.
+const STRIPPED_BEFORE_PARSING = [
+  /^-{3}\s*[\n\r](.*?)[\n\r]-{3}\s*[\n\r]+/gs,
+  /%{2}{\s*(?:(\w+)\s*:|(\w+))\s*(?:(\w+)|((?:(?!}%{2}).|\r?\n)*))?\s*(?:}%{2})?/gi,
+  /^\s*%%(?!{)[^\n]+\n?/gm,
+  /^\s+/g,
+];
 
 // `;` ends a statement in sequence diagrams, and prose in a Note or message
 // routinely carries one — the classic LLM slip.
@@ -21,54 +24,65 @@ const SEMICOLON_HINT = (
   </>
 );
 
-function cleanupText(code: string): string {
-  return code.replace(/\r\n?/g, "\n");
+interface LocatedLine {
+  /** 1-based line in the author's source. */
+  line: number;
+  /** That line of the author's source. */
+  source: string;
+  /** The text Mermaid actually parsed. */
+  parsed: string;
 }
 
-function textSeenByParser(chart: string): string {
-  return cleanupText(chart)
-    .replace(FRONT_MATTER_RE, "")
-    .replace(DIRECTIVE_RE, "")
-    .replace(COMMENT_RE, "")
-    .trimStart();
-}
-
-// Only whole lines (and in-line directives) were stripped, so walking the
-// cleaned original past the stripped lines recovers the author's line number.
-function authorLine(chart: string, parsedLines: string[], index: number): number {
-  const original = cleanupText(chart)
-    .split("\n")
-    .map((line) => line.replace(DIRECTIVE_RE, ""));
-  let next = 0;
-  for (let i = 0; i < original.length; i += 1) {
-    const candidate = next === 0 ? original[i].trimStart() : original[i];
-    if (candidate !== parsedLines[next]) continue;
-    if (next === index) return i + 1;
-    next += 1;
+// Replay Mermaid's preprocessing while tracking each surviving character's
+// index in the author's text, then read the author's line off the parsed
+// line's first character. Matching line contents instead would break on text
+// that repeats itself, such as front matter quoting the diagram.
+function locateParsedLine(chart: string, parsedLineIndex: number): LocatedLine | null {
+  const original = chart.replace(/\r\n?/g, "\n");
+  let text = original;
+  let indices = Array.from(original, (_char, index) => index);
+  for (const pattern of STRIPPED_BEFORE_PARSING) {
+    const kept: number[] = [];
+    let cursor = 0;
+    for (const match of text.matchAll(pattern)) {
+      const matchStart = match.index ?? 0;
+      for (let i = cursor; i < matchStart; i += 1) kept.push(indices[i]);
+      cursor = matchStart + match[0].length;
+    }
+    for (let i = cursor; i < text.length; i += 1) kept.push(indices[i]);
+    indices = kept;
+    text = kept.map((index) => original[index]).join("");
   }
-  return index + 1;
+  let start = 0;
+  for (let n = 0; n < parsedLineIndex; n += 1) {
+    const newline = text.indexOf("\n", start);
+    if (newline === -1) return null;
+    start = newline + 1;
+  }
+  // A trailing empty line owns no character; it follows the last kept one.
+  const originalIndex =
+    start < indices.length ? indices[start] : (indices[indices.length - 1] ?? -1) + 1;
+  const line = original.slice(0, originalIndex).split("\n").length;
+  return { line, source: original.split("\n")[line - 1] ?? "", parsed: text };
 }
 
 export interface MermaidErrorDetails {
   /** 1-based line in the author's source, when the error names one. */
   line: number | null;
-  /** That line as the parser saw it. */
+  /** That line of the author's source. */
   source: string | null;
   hint: ReactNode;
 }
 
 export function describeMermaidError(chart: string, error: string): MermaidErrorDetails {
   const reported = ERROR_LINE_RE.exec(error);
-  if (!reported) return { line: null, source: null, hint: null };
-  const parsed = textSeenByParser(chart);
-  const parsedLines = parsed.split("\n");
-  const index = Number(reported[1]) - 1;
-  const source = parsedLines[index] ?? null;
-  if (source === null) return { line: null, source: null, hint: null };
+  const located = reported ? locateParsedLine(chart, Number(reported[1]) - 1) : null;
+  if (!located) return { line: null, source: null, hint: null };
+  const sequence = /^sequenceDiagram\b/i.test(located.parsed);
   return {
-    line: authorLine(chart, parsedLines, index),
-    source,
-    hint: /^sequenceDiagram\b/i.test(parsed) && source.includes(";") ? SEMICOLON_HINT : null,
+    line: located.line,
+    source: located.source,
+    hint: sequence && located.source.includes(";") ? SEMICOLON_HINT : null,
   };
 }
 
