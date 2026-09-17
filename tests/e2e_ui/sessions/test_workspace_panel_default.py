@@ -65,10 +65,10 @@ def _wait_session_ready(page: Page) -> None:
 
 
 def test_workspace_panel_default_control_defaults_and_persists(
-    page: Page, seeded_session: tuple[str, str]
+    page: Page, live_server: str
 ) -> None:
     """Collapsed is the default; picking Open persists and survives a reload."""
-    base_url, _session_id = seeded_session
+    base_url = live_server
     _open_appearance(page, base_url)
 
     # Fresh context → Collapsed is selected and nothing is stored.

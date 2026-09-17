@@ -155,11 +155,10 @@ async def _open_picker(page) -> None:
 
 
 def test_recent_harness_remains_in_other_group(
-    seeded_session: tuple[str, str],
+    live_server: str,
 ) -> None:
     """Recent launches do not change the prototype's primary harness order."""
-    base_url, session_id = seeded_session
-    del session_id  # this flow never creates a session — only reads the picker
+    base_url = live_server
     _run_in_fresh_loop(_drive_recent(base_url))
 
 
@@ -199,11 +198,10 @@ async def _drive_recent(base_url: str) -> None:
 
 
 def test_picker_leads_with_primary_harnesses(
-    seeded_session: tuple[str, str],
+    live_server: str,
 ) -> None:
     """Primary harnesses lead; the selected secondary harness joins them on reopen."""
-    base_url, session_id = seeded_session
-    del session_id  # this flow never creates a session — only reads the picker
+    base_url = live_server
     _run_in_fresh_loop(_drive(base_url))
 
 

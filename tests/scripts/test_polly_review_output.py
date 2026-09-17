@@ -82,16 +82,20 @@ def test_review_output_preserves_final_review(tmp_path: Path, raw: str, expected
     assert payload == f"{expected}{delimiter}\n"
 
 
-def test_failure_diagnostics_preserves_logs_without_gateway_secrets(tmp_path: Path) -> None:
+@pytest.mark.parametrize("gateway_path", ["", "/serving-endpoints"])
+def test_failure_diagnostics_preserves_logs_without_gateway_secrets(
+    tmp_path: Path, gateway_path: str
+) -> None:
     workflow = yaml.safe_load(_WORKFLOW.read_text())
     step = next(
         s
         for s in workflow["jobs"]["review"]["steps"]
-        if s.get("name") == "Prepare Polly failure diagnostics"
+        if s.get("name") == "Prepare Polly diagnostics"
     )
     logs = tmp_path / "logs"
     logs.mkdir()
     (logs / "runner.log").write_text("request failed: test-api-secret at https://gateway.test")
+    (logs / "codex.log").write_text("gateway: https://gateway.test/ai-gateway/codex/v1")
     (logs / "config.yaml").write_text("not a process log")
     (tmp_path / "polly-stderr.log").write_text("stderr: test-api-secret")
     output = tmp_path / "polly_output.txt"
@@ -110,7 +114,7 @@ def test_failure_diagnostics_preserves_logs_without_gateway_secrets(tmp_path: Pa
         env={
             "PATH": f"{tmp_path}{os.pathsep}{os.defpath}",
             "LLM_API_KEY": "test-api-secret",
-            "GATEWAY_BASE_URL": "https://gateway.test",
+            "GATEWAY_BASE_URL": f"https://gateway.test{gateway_path}",
         },
         text=True,
         capture_output=True,
@@ -123,12 +127,15 @@ def test_failure_diagnostics_preserves_logs_without_gateway_secrets(tmp_path: Pa
     assert (destination / "process-logs/runner.log").read_text() == (
         "request failed: [REDACTED] at [REDACTED]"
     )
+    assert (destination / "process-logs/codex.log").read_text() == (
+        "gateway: [REDACTED]/ai-gateway/codex/v1"
+    )
     assert not (destination / "process-logs/config.yaml").exists()
     assert not (destination / "polly-review.txt").exists()
 
 
-@pytest.mark.parametrize("failure_step", ["secret-scan", "posting"])
-def test_later_failure_retains_raw_stdout(tmp_path: Path, failure_step: str) -> None:
+@pytest.mark.parametrize("failure_step", ["secret-scan", "posting", None])
+def test_review_diagnostics_retain_raw_stdout(tmp_path: Path, failure_step: str | None) -> None:
     workflow = yaml.safe_load(_WORKFLOW.read_text())
     steps = {step["name"]: step for step in workflow["jobs"]["review"]["steps"]}
     review = _REVIEW + ("test-api-secret\n" if failure_step == "secret-scan" else "")
@@ -138,7 +145,7 @@ def test_later_failure_retains_raw_stdout(tmp_path: Path, failure_step: str) -> 
     (tmp_path / "python3").symlink_to(sys.executable)
     commands = {
         "uv": 'cat "$POLLY_TEST_STDOUT"\necho "stderr: test-api-secret" >&2\n',
-        "gh": 'echo "Forced posting failure" >&2\nexit 42\n',
+        "gh": 'echo "Forced posting failure" >&2\nexit 42\n' if failure_step else "exit 0\n",
     }
     for name, command in commands.items():
         executable = tmp_path / name
@@ -188,11 +195,12 @@ def test_later_failure_retains_raw_stdout(tmp_path: Path, failure_step: str) -> 
     else:
         assert result.returncode == 0, result.stdout + result.stderr
         result = run_step("Post review comment")
-        assert result.returncode == 42
-        assert "Forced posting failure" in result.stderr
+        assert result.returncode == (42 if failure_step else 0)
+        if failure_step:
+            assert "Forced posting failure" in result.stderr
         assert review in (tmp_path / "comment.md").read_text()
         assert "Starting review" not in (tmp_path / "comment.md").read_text()
-    result = run_step("Prepare Polly failure diagnostics")
+    result = run_step("Prepare Polly diagnostics")
     assert result.returncode == 0, result.stdout + result.stderr
     assert (tmp_path / "polly_output.txt").read_text() == raw
     assert (tmp_path / "polly_review.txt").read_text() == review
