@@ -18,6 +18,7 @@ import pytest
 from omnigent.host.frames import (
     HostCreateWorktreeFrame,
     HostHelloFrame,
+    HostInspectWorktreeFrame,
     HostRemoveWorktreeFrame,
     decode_host_frame,
 )
@@ -26,6 +27,7 @@ from omnigent.server.routes._host_worktree import (
     WorktreeHostUnavailableError,
     WorktreeProxyError,
     create_worktree_on_host,
+    inspect_worktree_on_host,
     remove_worktree_on_host,
 )
 
@@ -79,6 +81,7 @@ async def host_setup() -> AsyncIterator[HostRegistry]:
 
     create_reply: dict[str, Any] = {}
     remove_reply: dict[str, Any] = {}
+    inspect_reply: dict[str, Any] = {}
     # Frames the proxy sent, captured here (registry.send_text enqueues
     # to outbound_queue rather than ws.send_text, so we record from the
     # drain task instead of from the fake ws).
@@ -100,10 +103,15 @@ async def host_setup() -> AsyncIterator[HostRegistry]:
                 fut = conn.pending_remove_worktrees.pop(frame.request_id, None)
                 if fut is not None and not fut.done():
                     fut.set_result(remove_reply)
+            elif isinstance(frame, HostInspectWorktreeFrame):
+                fut = conn.pending_inspect_worktrees.pop(frame.request_id, None)
+                if fut is not None and not fut.done():
+                    fut.set_result(inspect_reply)
 
     drain_task = asyncio.create_task(_drain())
     registry._create_reply_for_test = create_reply  # type: ignore[attr-defined]
     registry._remove_reply_for_test = remove_reply  # type: ignore[attr-defined]
+    registry._inspect_reply_for_test = inspect_reply  # type: ignore[attr-defined]
     registry._sent_frames_for_test = sent_frames  # type: ignore[attr-defined]
 
     try:
@@ -297,3 +305,113 @@ async def test_create_worktree_timeout_raises_unavailable(
             base_branch=None,
         )
     assert "did not respond" in exc.value.message
+
+
+# ── inspect_worktree_on_host ─────────────────────────────
+
+
+async def test_inspect_worktree_success_returns_facts(host_setup: HostRegistry) -> None:
+    """A successful inspect reply is unpacked into the inspection facts.
+
+    Every field feeds the server's remove-vs-keep policy on archive, so
+    each must thread through the request_id/future plumbing undamaged.
+    """
+    registry = host_setup
+    registry._inspect_reply_for_test.update(  # type: ignore[attr-defined]
+        {
+            "status": "ok",
+            "dirty_files": 1,
+            "unpushed_commits": 2,
+            "merged": False,
+            "default_ref": "origin/main",
+            "error": None,
+        }
+    )
+    conn = registry.get(_HOST_ID)
+    assert conn is not None
+    result = await inspect_worktree_on_host(
+        host_registry=registry,
+        host_conn=conn,
+        worktree_path="/Users/alice/myrepo-worktrees/feature-login",
+        branch="feature/login",
+    )
+    assert result.dirty_files == 1
+    assert result.unpushed_commits == 2
+    assert result.merged is False
+    assert result.default_ref == "origin/main"
+    sent = registry._sent_frames_for_test[-1]  # type: ignore[attr-defined]
+    assert isinstance(sent, HostInspectWorktreeFrame)
+    assert sent.worktree_path == "/Users/alice/myrepo-worktrees/feature-login"
+    assert sent.branch == "feature/login"
+
+
+async def test_inspect_worktree_unknown_merged_threads_through(
+    host_setup: HostRegistry,
+) -> None:
+    """``merged=None`` (undeterminable) must survive the proxy, not coerce to False."""
+    registry = host_setup
+    registry._inspect_reply_for_test.update(  # type: ignore[attr-defined]
+        {
+            "status": "ok",
+            "dirty_files": 0,
+            "unpushed_commits": 0,
+            "merged": None,
+            "default_ref": None,
+            "error": None,
+        }
+    )
+    conn = registry.get(_HOST_ID)
+    assert conn is not None
+    result = await inspect_worktree_on_host(
+        host_registry=registry,
+        host_conn=conn,
+        worktree_path="/wt",
+        branch="b",
+    )
+    assert result.merged is None
+    assert result.default_ref is None
+
+
+async def test_inspect_worktree_failure_surfaced(host_setup: HostRegistry) -> None:
+    """A host ``status: failed`` inspect reply raises with the host's error."""
+    registry = host_setup
+    registry._inspect_reply_for_test.update(  # type: ignore[attr-defined]
+        {"status": "failed", "error": "worktree path does not exist: /ghost"}
+    )
+    conn = registry.get(_HOST_ID)
+    assert conn is not None
+    with pytest.raises(WorktreeProxyError) as exc:
+        await inspect_worktree_on_host(
+            host_registry=registry,
+            host_conn=conn,
+            worktree_path="/ghost",
+            branch="feature/ghost",
+        )
+    # A failed check must read as failure — silently treating it as an
+    # all-clear inspection would let archive destroy unverified work.
+    assert "does not exist" in exc.value.message
+
+
+async def test_inspect_worktree_incomplete_result_rejected(host_setup: HostRegistry) -> None:
+    """An ``ok`` inspect reply missing the counts is rejected, not accepted."""
+    registry = host_setup
+    registry._inspect_reply_for_test.update(  # type: ignore[attr-defined]
+        {
+            "status": "ok",
+            "dirty_files": None,
+            "unpushed_commits": None,
+            "merged": None,
+            "default_ref": None,
+            "error": None,
+        }
+    )
+    conn = registry.get(_HOST_ID)
+    assert conn is not None
+    with pytest.raises(WorktreeProxyError) as exc:
+        await inspect_worktree_on_host(
+            host_registry=registry,
+            host_conn=conn,
+            worktree_path="/wt",
+            branch="b",
+        )
+    assert "incomplete worktree inspection" in exc.value.message
