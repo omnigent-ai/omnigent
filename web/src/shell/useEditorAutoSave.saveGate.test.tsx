@@ -1,8 +1,5 @@
-// Unit tests for useEditorAutoSave's save gate: saving follows workspace
-// reachability (the signal the read path uses), not strict runner liveness.
-// A runner that reads offline while the host serves the workspace must not
-// suppress auto-save — the workspace still accepts the write, and the liveness
-// view can be stale. Only a known-unreachable workspace disables saving.
+// Saving through a reachable host can reconnect the runner. Only a workspace
+// whose runner and host are both unavailable should buffer edits.
 
 import { act, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -66,7 +63,7 @@ afterEach(() => {
 });
 
 describe("useEditorAutoSave save gate", () => {
-  it("saves while the runner reads offline but the host serves the workspace", async () => {
+  it("attempts saving while the runner is offline but its host is online", async () => {
     vi.mocked(runnerHook.useSessionRunnerOnline).mockReturnValue(false);
     vi.mocked(runnerHook.useSessionHostOnline).mockReturnValue(true);
     const { result } = renderAutoSave();

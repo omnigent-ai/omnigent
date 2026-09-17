@@ -2,7 +2,7 @@
 // Monaco code). Owns everything that was identical between the two: the write
 // mutation, the single-flight save with a mid-turn conflict check, the
 // save-after-teardown guard, and the debounce/flush wiring (on edit, on unmount,
-// on the workspace becoming reachable again). Each editor keeps its own *content access* — getContent
+// on reconnect). Each editor keeps its own *content access* — getContent
 // / isEditorDirty / baselineRef — because that's intrinsically tied to the
 // editor instance (TipTap's getMarkdown() vs Monaco's tracked buffer).
 
@@ -49,7 +49,7 @@ interface UseEditorAutoSaveOptions {
 interface UseEditorAutoSaveResult {
   /** Stable schedule / flush / cancel — safe as an effect dependency. */
   autoSave: ReturnType<typeof useAutoSave>;
-  /** True when the workspace is known-unreachable — surfaced in the editor's status UI. */
+  /** True when the workspace is unreachable — surfaced in the editor's status UI. */
   saveDisabled: boolean;
   /** The write mutation, for save-status UI (isPending / isError / isSuccess). */
   writeFile: ReturnType<typeof useWriteFileContent>;
@@ -80,10 +80,8 @@ export function useEditorAutoSave({
   const writeFile = useWriteFileContent(conversationId);
   const writeFileRef = useRef(writeFile);
   writeFileRef.current = writeFile;
-  // Gate saves on workspace reachability — the same signal the read path uses —
-  // not on strict runner liveness: with the runner reading offline but the host
-  // up, the workspace still accepts writes (and the liveness view can be stale),
-  // so suppressing the save would strand the edit until a prompt resyncs it.
+  // A reachable host lets the save endpoint reconnect a sleeping runner.
+  // Only buffer edits when neither the runner nor its host is reachable.
   const saveDisabled = useWorkspaceServeable(conversationId) === false;
 
   // The only concurrent writer is the agent during its turn, so the pre-write
