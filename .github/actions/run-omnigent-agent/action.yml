@@ -46,7 +46,7 @@ runs:
   steps:
     - name: Set up uv
       # This action also runs from repositories checked out below the workspace root.
-      uses: omnigent-ai/omnigent/.github/actions/setup-uv@a0998a4602a1c28ea962e82f587d0e9a242ec175 # self-contained setup
+      uses: omnigent-ai/omnigent/.github/actions/setup-uv@426c05c43c524ea7b6565f04e75e94cb1fd10999 # self-contained setup
       with:
         enable-cache: true
 
