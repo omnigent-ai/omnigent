@@ -499,6 +499,18 @@ export function customThemeSwatches(theme: CustomTheme): {
   };
 }
 
+const PALETTE_TOKEN_NAMES = new Set<string>(Object.values(PALETTE_TOKEN_CSS_NAMES));
+
+// CSS substitutes `var()` at the declaring element, and the style root never
+// carries `.dark` when embedded (dark lives on an inner root), so a raw
+// `var(--sidebar)` in a dark-variant value resolves against the light tokens.
+// Pin palette-token references to the mode's own `--custom-*` variable.
+function pinTokenRefsToMode(value: string, mode: "light" | "dark"): string {
+  return value.replace(/var\(--([a-z-]+)\)/g, (reference, token: string) =>
+    PALETTE_TOKEN_NAMES.has(token) ? `var(--custom-${mode}-${token})` : reference,
+  );
+}
+
 export function applyCustomTheme(theme: CustomTheme): void {
   // The `--custom-*` variables go on the style root (embedded, the scope root;
   // else the document root); the `data-custom-translucent-sidebar` attribute
@@ -518,7 +530,7 @@ export function applyCustomTheme(theme: CustomTheme): void {
       keyof DerivedThemeVariant,
       (typeof PALETTE_TOKEN_CSS_NAMES)[keyof typeof PALETTE_TOKEN_CSS_NAMES],
     ][]) {
-      style.setProperty(`--custom-${mode}-${token}`, variants[mode][key]);
+      style.setProperty(`--custom-${mode}-${token}`, pinTokenRefsToMode(variants[mode][key], mode));
     }
   }
 }
