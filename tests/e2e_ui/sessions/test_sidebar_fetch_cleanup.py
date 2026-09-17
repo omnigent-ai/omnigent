@@ -264,15 +264,14 @@ def test_archived_refreshes_on_entry_without_polling(
     page: Page, request: pytest.FixtureRequest
 ) -> None:
     base_url = request.config.getoption("--ui-base-url") or request.getfixturevalue("live_server")
-    archived_requests = 0
+    archived_requests: list[str] = []
     title = "Original archived title"
 
     def sessions(route: Route) -> None:
-        nonlocal archived_requests
         params = parse_qs(urlparse(route.request.url).query)
         data = []
         if params.get("visibility") == ["archived"]:
-            archived_requests += 1
+            archived_requests.append(route.request.url)
             data = [
                 {
                     "id": "archived-row",
@@ -288,28 +287,31 @@ def test_archived_refreshes_on_entry_without_polling(
 
     def select(scope: str) -> None:
         page.get_by_test_id("session-filter").click()
-        page.get_by_test_id(f"session-filter-{scope}").click()
+        option = page.get_by_test_id(f"session-filter-{scope}")
+        option.click()
+        expect(option).to_have_count(0)
         page.wait_for_load_state("networkidle")
-        page.clock.run_for(100)
 
     page.route_web_socket("**/v1/sessions/updates*", lambda _socket: None)
     page.route("**/v1/sessions?*", sessions)
     page.clock.install()
     page.goto(base_url)
     page.wait_for_load_state("networkidle")
-    assert archived_requests == 0
+    assert len(archived_requests) == 0
     select("archived")
     expect(page.get_by_text(title, exact=True)).to_be_visible()
-    assert archived_requests == 1
-    page.clock.pause_at(datetime.now(timezone.utc) + timedelta(seconds=5))
+    assert len(archived_requests) == 1
+    before_poll_window = len(archived_requests)
     page.clock.fast_forward(180_000)
     page.wait_for_load_state("networkidle")
-    assert archived_requests == 1
+    assert len(archived_requests) == before_poll_window
     select("mine")
+    expect(page.get_by_text(title, exact=True)).to_have_count(0)
     title = "Archived title changed remotely"
     select("archived")
     expect(page.get_by_text(title, exact=True)).to_be_visible()
-    assert archived_requests == 2
+    assert len(archived_requests) == 2
+    before_poll_window = len(archived_requests)
     page.clock.fast_forward(180_000)
     page.wait_for_load_state("networkidle")
-    assert archived_requests == 2
+    assert len(archived_requests) == before_poll_window

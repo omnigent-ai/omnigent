@@ -93,7 +93,7 @@ export function useScopeCache(
       try {
         await pending;
       } finally {
-        if (pendingResult.current === pending) pendingResult.current = null;
+        if (pendingPage.current === controller) pendingResult.current = null;
       }
     },
     onError: (error, { controller }) => {
