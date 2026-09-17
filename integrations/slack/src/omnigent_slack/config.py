@@ -26,6 +26,11 @@ class ConfigError(Exception):
 # to the server. See ``docs/DATABRICKS_APP_WEBAUTH_DESIGN.md``.
 ServerAuthMode = Literal["auto", "databricks"]
 
+# Host kind an operator may pre-select for every user. Only the managed sandbox
+# qualifies: on an authenticated server ``/v1/hosts`` is owner-scoped, so a
+# specific external host id could never be pre-selected. See the README.
+DefaultHostType = Literal["managed"]
+
 # Minimum length for the enrollment-state HMAC secret. 32 chars is a floor
 # against offline brute-forcing a weak operator value (which would let an
 # attacker forge a signed `state`); `openssl rand -hex 32` yields 64.
@@ -135,6 +140,21 @@ class Settings(BaseSettings):
     )
     log_level: str = Field(default="INFO", validation_alias="LOG_LEVEL")
 
+    # ── Operator-set setup defaults ───────────────────────────────────────
+    # Pre-select a choice in every user's ``/omnigent`` setup modal. Unset, the
+    # picker opens blank exactly as it always has; set, the menu opens on that
+    # choice and the user can still change it. See the README for the behaviour.
+    default_agent_id: str | None = Field(
+        default=None,
+        validation_alias="OMNIGENT_SLACK_DEFAULT_AGENT_ID",
+    )
+    # ``managed`` (see ``DefaultHostType``), or unset/blank for no default. Any
+    # other non-blank value fails startup rather than silently doing nothing.
+    default_host_type: DefaultHostType | None = Field(
+        default=None,
+        validation_alias="OMNIGENT_SLACK_DEFAULT_HOST_TYPE",
+    )
+
     # Fernet key (urlsafe-base64, 32 bytes) that encrypts the delegated
     # Omnigent access/refresh tokens at rest in the local SQLite store.
     # Generate with ``python -c "from cryptography.fernet import Fernet;
@@ -204,6 +224,25 @@ class Settings(BaseSettings):
         default=None,
         validation_alias="OMNIGENT_SLACK_DATABRICKS_APP_URL",
     )
+
+    @field_validator("default_agent_id", "default_host_type", mode="before")
+    @classmethod
+    def _blank_default_is_unset(cls, value: object) -> object:
+        """Treat a blank setup default as unset rather than as a bad value.
+
+        ``OMNIGENT_SLACK_DEFAULT_HOST_TYPE=`` is one way a compose file spells
+        "leave this off", so an empty or whitespace-only value means "no
+        default" — not a startup failure, and not a literal "" agent id the
+        modal could only report as unavailable. A non-blank value is still
+        validated strictly (an unknown host type fails startup).
+
+        Deliberately NOT the rule for every field here: ``server_auth_mode``
+        rejects a blank value. These two are optional pre-selections whose
+        absence is the normal case, which is what makes blank-means-off safe.
+        """
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value.strip() if isinstance(value, str) else value
 
     @field_validator("server_url")
     @classmethod
