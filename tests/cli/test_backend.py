@@ -2710,6 +2710,121 @@ def test_host_preflight_explicit_profile_resolves_and_persists_even_on_200(
     ]
 
 
+def test_host_preflight_profile_on_200_with_no_pointer_discovers_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`host --profile` on first run (200, no stored pointer) still resolves.
+
+    A 200 has no redirect target, and a first-time run has no stored pointer
+    record. The preflight must re-probe unauthenticated to discover the
+    workspace from the edge's 302, then resolve and persist the named profile
+    — otherwise the explicit --profile is silently ignored.
+    """
+    import httpx
+
+    stored: list[dict[str, str | None]] = []
+    monkeypatch.setattr(
+        "omnigent.chat._remote_headers",
+        lambda server_url=None, *, host_id=None: {"Authorization": "Bearer sp-token"},
+    )
+
+    # 1) authed probe → 200, 2) unauthed re-probe → 302 (names the workspace),
+    # 3) profile-token verify → 200.
+    responses = iter(
+        [
+            _databricks_probe_response(200),
+            _databricks_probe_response(302),
+            _databricks_probe_response(200),
+        ]
+    )
+    monkeypatch.setattr(httpx, "get", lambda url, **kw: next(responses))
+    # No stored pointer record — the first-run case.
+    monkeypatch.setattr("omnigent.cli_auth.load_databricks_workspace_host", lambda server: None)
+    monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda server: None)
+    monkeypatch.setattr("omnigent.cli_auth.load_databricks_profile", lambda server: None)
+    monkeypatch.setattr(cli, "_workspace_hosted_profile_org_id", lambda *a, **k: None)
+    monkeypatch.setattr(
+        cli,
+        "_databricks_profile_auth_info",
+        lambda profile: cli._DatabricksWorkspaceAuthInfo(token="user-token", profile_name=profile),
+    )
+    monkeypatch.setattr(cli, "_databricks_login", lambda *a, **k: pytest.fail("login"))
+    monkeypatch.setattr(
+        "omnigent.cli_auth.store_databricks_auth",
+        lambda server, workspace, user_id=None, org_id=None, profile=None: stored.append(
+            {"workspace": workspace, "profile": profile}
+        ),
+    )
+
+    cli._ensure_databricks_server_auth(
+        _HOST_DATABRICKS_SERVER, non_interactive=True, profile="my-user"
+    )
+
+    # The workspace was recovered from the unauthed re-probe and the profile persisted.
+    assert stored == [{"workspace": "https://example.databricks.com", "profile": "my-user"}]
+
+
+def test_host_preflight_profile_on_non_databricks_200_fails_loud(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`--profile` against a non-Databricks 200 server fails instead of no-op.
+
+    If neither a stored pointer nor an unauthenticated re-probe reveals a
+    workspace, the server is not Databricks-fronted, so the profile cannot be
+    applied. Failing loud beats silently ignoring the requested identity.
+    """
+    import httpx
+
+    monkeypatch.setattr(
+        "omnigent.chat._remote_headers",
+        lambda server_url=None, *, host_id=None: {"Authorization": "Bearer ambient"},
+    )
+    # authed probe → 200; unauthed re-probe → 200 (no 302, not Databricks-fronted).
+    responses = iter([_databricks_probe_response(200), _databricks_probe_response(200)])
+    monkeypatch.setattr(httpx, "get", lambda url, **kw: next(responses))
+    monkeypatch.setattr("omnigent.cli_auth.load_databricks_workspace_host", lambda server: None)
+    monkeypatch.setattr(cli, "_databricks_login", lambda *a, **k: pytest.fail("login"))
+
+    with pytest.raises(click.ClickException, match="not a Databricks-fronted server"):
+        cli._ensure_databricks_server_auth(
+            _HOST_DATABRICKS_SERVER, non_interactive=True, profile="my-user"
+        )
+
+
+def test_run_background_host_profile_refuses_reusing_a_live_daemon(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`host --profile` refuses to reuse an already-running daemon.
+
+    A reused background daemon keeps the identity it launched with, so a new
+    --profile would be silently ignored. The preflight must fail loud (asking
+    for a stop) rather than persist the pointer and reuse the stale daemon.
+    """
+    from types import SimpleNamespace
+
+    # A live, reusable daemon already exists for the target.
+    monkeypatch.setattr(
+        cli, "_reuse_existing_daemon_record", lambda target: SimpleNamespace(reuse=True)
+    )
+    # These must NOT run — we refuse before persisting or spawning.
+    monkeypatch.setattr(
+        cli,
+        "_ensure_databricks_server_auth",
+        lambda *a, **k: pytest.fail("must refuse before persisting the pointer"),
+    )
+    monkeypatch.setattr(
+        cli, "_ensure_host_daemon", lambda *a, **k: pytest.fail("must refuse before spawning")
+    )
+
+    with pytest.raises(click.ClickException, match="already running"):
+        cli._run_background_host(
+            _HOST_DATABRICKS_SERVER,
+            stop_command="omnigent host stop",
+            non_interactive=True,
+            profile="my-user",
+        )
+
+
 def test_databricks_preflight_silent_sdk_refresh_skips_login(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

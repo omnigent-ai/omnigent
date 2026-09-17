@@ -2711,6 +2711,34 @@ def test_remote_headers_falls_back_to_ambient_databricks_creds(
     assert read_calls == [None]
 
 
+def test_remote_headers_pinned_profile_failure_does_not_fall_back_to_ambient(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pinned profile that fails to resolve must not switch to ambient creds.
+
+    When the login record pins an explicit profile but its token fails to
+    resolve (e.g. an expired user login), ``_remote_headers`` must NOT fall
+    through to ambient ``~/.databrickscfg`` credentials — that would silently
+    swap identity to a co-resident service principal. It fails as the pinned
+    identity (no Authorization header) instead.
+    """
+    monkeypatch.delenv("OMNIGENT_REMOTE_AUTH_TOKEN", raising=False)
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
+    # Pinned profile is recorded, but its token resolution failed (returns None).
+    monkeypatch.setattr(chat_module, "_stored_databricks_record_token", lambda _url: None)
+    monkeypatch.setattr("omnigent.cli_auth.load_databricks_profile", lambda _url: "my-user")
+
+    def _ambient_should_not_run(profile: object) -> DatabricksCredentials:
+        raise AssertionError("ambient credentials must not be used when a profile is pinned")
+
+    monkeypatch.setattr(chat_module, "_read_databrickscfg", _ambient_should_not_run)
+
+    headers = _remote_headers(server_url="https://srv.example.com", host_id=None)
+
+    # No identity switch: the request carries no bearer rather than an SP's.
+    assert "Authorization" not in headers
+
+
 def test_remote_headers_adds_org_id_header(monkeypatch: pytest.MonkeyPatch) -> None:
     """A recorded ?o= selector rides every ad-hoc request.
 

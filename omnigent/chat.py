@@ -719,12 +719,17 @@ def _remote_headers(
     # Resolve the bearer in the documented precedence order (one credential
     # source per branch), then merge the workspace-routing header.
     headers: dict[str, str] = {}
+    # When the login record pins an explicit profile that then fails to
+    # resolve, we must NOT fall back to ambient credentials (step 4) — that
+    # would silently switch identity (e.g. an expired pinned user replaced by
+    # an ambient service principal). Hold the line on the pinned identity.
+    pinned_profile_blocks_ambient = False
     token = os.environ.get(_REMOTE_AUTH_TOKEN_ENV)
     if token and (token := token.strip()):
         # 1. Explicit env-var token.
         headers["Authorization"] = f"Bearer {token}"
     elif server_url:
-        from omnigent.cli_auth import load_token
+        from omnigent.cli_auth import load_databricks_profile, load_token
 
         # 2. Stored OIDC session token from `omnigent login`.
         oidc_token = load_token(server_url)
@@ -735,7 +740,11 @@ def _remote_headers(
             record_token = _stored_databricks_record_token(server_url)
             if record_token:
                 headers["Authorization"] = f"Bearer {record_token}"
-    if "Authorization" not in headers:
+            elif load_databricks_profile(server_url) is not None:
+                # A pinned profile was recorded but did not resolve; fail as
+                # that identity rather than switching to ambient credentials.
+                pinned_profile_blocks_ambient = True
+    if "Authorization" not in headers and not pinned_profile_blocks_ambient:
         # 4. Ambient ~/.databrickscfg credentials.
         creds = _read_databrickscfg(None)
         if creds is not None and creds.token:

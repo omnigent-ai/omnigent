@@ -3700,11 +3700,28 @@ def _ensure_databricks_server_auth(
     if probe.status_code == 200 and profile is None:
         return
     workspace_host = _databricks_workspace_login_target(server, probe)
-    # On a 200 there is no redirect target to parse the workspace from; the
-    # workspace the app fronts is in the stored pointer record from a prior
-    # login. Needed so an explicit --profile can re-resolve and persist here.
+    # On a 200 there is no redirect target to parse the workspace from. An
+    # explicit --profile still has to resolve and persist, so recover the
+    # workspace the app fronts: first from a stored pointer record (a prior
+    # login), then — on first run with no record — from an unauthenticated
+    # re-probe whose edge 302 names the workspace. If neither yields one, the
+    # server isn't Databricks-fronted (or its workspace is undiscoverable),
+    # so fail loud rather than silently ignore the requested identity.
     if workspace_host is None and probe.status_code == 200 and profile is not None:
         workspace_host = load_databricks_workspace_host(server)
+        if workspace_host is None:
+            try:
+                unauthed_probe = _httpx.get(f"{server}/v1/me", timeout=10.0)
+            except _httpx.HTTPError:
+                unauthed_probe = None
+            if unauthed_probe is not None:
+                workspace_host = _databricks_workspace_login_target(server, unauthed_probe)
+        if workspace_host is None:
+            raise click.ClickException(
+                f"--profile {profile!r} was requested, but {server} is not a "
+                "Databricks-fronted server (its workspace could not be determined), "
+                "so the profile cannot be applied. Omit --profile."
+            )
     credential_rejected = False
     if workspace_host is None and probe.status_code in (401, 403):
         # A rejected bearer can hide the edge signature. Prefer the saved
@@ -8847,9 +8864,21 @@ def _run_background_host(
         immediately, fails to register, or (local mode) never serves its local
         Omnigent server.
     """
+    target = _normalize_daemon_target(server)
+    # An explicit --profile pins a new identity, but a background daemon that
+    # is already running for this server would simply be reused — its token
+    # factory keeps the identity it launched with, so the new profile would be
+    # silently ignored. Refuse and ask for a stop first, before persisting the
+    # pointer, so the restart picks the chosen identity up cleanly.
+    if server and profile is not None and _reuse_existing_daemon_record(target).reuse:
+        raise click.ClickException(
+            f"A host daemon is already running for {server}; it keeps the identity "
+            f"it started with, so `--profile {profile}` would be ignored. Stop it "
+            f"first with `{cli_invocation()} host stop --all`, then re-run "
+            f"`{cli_invocation()} host --profile {profile}`."
+        )
     if server:
         _ensure_databricks_server_auth(server, non_interactive=non_interactive, profile=profile)
-    target = _normalize_daemon_target(server)
     previous = _find_daemon_record(target)
     _ensure_host_daemon(server or None)
     record = _find_daemon_record(target)
