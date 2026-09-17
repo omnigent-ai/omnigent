@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 from collections.abc import AsyncIterator
 from types import SimpleNamespace, TracebackType
 from typing import Any
@@ -612,7 +613,8 @@ async def test_relay_publishes_failed_status_on_tunnel_close(
             if getattr(r, "event_name", None) == "runner_stream_disconnected"
         )
         assert record.session_id == session_id
-        assert record.attributes == {"intentional_stop": False, "cached_session_status": "running"}
+        assert record.attributes["intentional_stop"] is False
+        assert record.attributes["cached_session_status"] == "running"
         assert record.exc_info is not None
     finally:
         gate.set()
@@ -810,6 +812,175 @@ async def test_runner_recovery_clears_persisted_disconnect_error_labels(
         session_stream.close(session_id)
 
 
+def _outage_records(caplog: pytest.LogCaptureFixture, event_name: str) -> list[logging.LogRecord]:
+    """Return the relay records carrying a given semantic event name.
+
+    :param caplog: Pytest log-capture fixture.
+    :param event_name: Semantic event to select, e.g. ``"relay_outage_resolved"``.
+    :returns: Matching records, in emission order.
+    """
+    return [r for r in caplog.records if getattr(r, "event_name", None) == event_name]
+
+
+@pytest.mark.asyncio
+async def test_relay_outage_log_reports_its_shape_and_failed_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A mid-turn drop records its retry count, duration, and failed outcome."""
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes import sessions as sessions_module
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
+        0.0,
+    )
+    sessions_module._runner_relay_tasks.clear()
+    gate = asyncio.Event()
+    fake_runner = _TunnelCloseRunnerClient(gate)
+    session_id = "1f2e3d4c5b6a79880918273645546372"
+    sessions_module._session_status_cache[session_id] = "running"
+
+    try:
+        with caplog.at_level(logging.INFO, logger="omnigent.server.routes.sessions"):
+            handle = await sessions_module._ensure_runner_relay_ready(
+                session_id,
+                "runner_outage_shape",
+                fake_runner,  # type: ignore[arg-type]
+                conversation_store=None,
+            )
+            assert handle is not None
+            gate.set()
+            await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+
+        lost = _outage_records(caplog, "runner_stream_disconnected")
+        assert len(lost) == 1
+        assert "after 1 attempt(s)" in lost[0].getMessage()
+        assert lost[0].attributes["attempts"] == 1
+        assert lost[0].attributes["intentional_stop"] is False
+        assert lost[0].attributes["cached_session_status"] == "running"
+
+        resolved = _outage_records(caplog, "relay_outage_resolved")
+        assert len(resolved) == 1
+        assert resolved[0].attributes["outcome"] == "turn_failed"
+        assert resolved[0].attributes["attempts"] == 1
+        assert "outage_s" in resolved[0].attributes
+        assert resolved[0].session_id == session_id
+    finally:
+        gate.set()
+        handle = sessions_module._runner_relay_tasks.get(session_id)
+        if handle is not None and not handle.task.done():
+            handle.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+        sessions_module._runner_relay_tasks.clear()
+        sessions_module._session_status_cache.pop(session_id, None)
+        session_stream.close(session_id)
+
+
+@pytest.mark.asyncio
+async def test_relay_outage_log_names_a_user_stop(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A Stop-driven teardown is recorded rather than passing silently.
+
+    This branch published a quiet ``idle`` and logged nothing at all, so a
+    tunnel loss that was entirely expected left no trace to separate it from
+    one that broke a turn.
+    """
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes import sessions as sessions_module
+
+    sessions_module._runner_relay_tasks.clear()
+    gate = asyncio.Event()
+    fake_runner = _TunnelCloseRunnerClient(gate)
+    store = _RecordingLabelStore()
+    session_id = "9a8b7c6d5e4f30211203344556677889"
+
+    try:
+        sessions_module._intentional_stop_sessions.add(session_id)
+        with caplog.at_level(logging.INFO, logger="omnigent.server.routes.sessions"):
+            handle = await sessions_module._ensure_runner_relay_ready(
+                session_id,
+                "runner_outage_user_stop",
+                fake_runner,  # type: ignore[arg-type]
+                conversation_store=store,  # type: ignore[arg-type]
+            )
+            assert handle is not None
+            gate.set()
+            await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+
+        resolved = _outage_records(caplog, "relay_outage_resolved")
+        assert len(resolved) == 1
+        assert resolved[0].attributes["outcome"] == "stopped_by_user"
+        assert "as stopped_by_user" in resolved[0].getMessage()
+    finally:
+        gate.set()
+        sessions_module._intentional_stop_sessions.discard(session_id)
+        handle = sessions_module._runner_relay_tasks.get(session_id)
+        if handle is not None and not handle.task.done():
+            handle.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+        sessions_module._runner_relay_tasks.clear()
+        sessions_module._session_status_cache.pop(session_id, None)
+        session_stream.close(session_id)
+
+
+@pytest.mark.asyncio
+async def test_relay_outage_duration_excludes_healthy_stream_time(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Each outage starts at transport loss and resets after a long-lived retry."""
+    from omnigent.server.routes._sessions import orchestration
+
+    now = 100.0
+    durations = iter([3600.0, 0.0, 30.0, 0.0])
+    calls = 0
+
+    async def relay_once(*args: object) -> None:
+        nonlocal now, calls
+        now += next(durations)
+        calls += 1
+        raise orchestration._RelayTransportLost(intentional=calls == 4)
+
+    async def paced_retry(seconds: float) -> None:
+        nonlocal now
+        now += seconds
+
+    async def persist_status(*args: object) -> None:
+        pass
+
+    local_asyncio = SimpleNamespace(
+        **{name: getattr(asyncio, name) for name in dir(asyncio) if not name.startswith("__")}
+    )
+    local_asyncio.get_running_loop = lambda: SimpleNamespace(time=lambda: now)
+    local_asyncio.sleep = paced_retry
+    monkeypatch.setattr(orchestration, "asyncio", local_asyncio)
+    monkeypatch.setattr(orchestration, "_relay_runner_stream_once", relay_once)
+    monkeypatch.setattr(orchestration, "_persist_session_status_error_labels", persist_status)
+    monkeypatch.setattr(orchestration, "_publish_status", lambda *args: None)
+    monkeypatch.setattr(orchestration, "RUNNER_DISCONNECT_GRACE_S", 10.0)
+    monkeypatch.setattr(orchestration, "_RELAY_RETRY_INTERVAL_S", 1.0)
+
+    with caplog.at_level(logging.INFO, logger="omnigent.server.routes.sessions"):
+        await orchestration._relay_runner_stream(
+            "11111111111111111111111111111111",
+            None,  # type: ignore[arg-type]
+            None,  # type: ignore[arg-type]
+        )
+
+    retries = _outage_records(caplog, "relay_transport_retry")
+    assert [record.attributes["outage_s"] for record in retries] == [0.0, 1.0, 0.0]
+    assert [record.attributes["attempt"] for record in retries] == [1, 2, 1]
+    assert [record.attributes["streamed_s"] for record in retries] == [3600.0, 0.0, 30.0]
+    resolved = _outage_records(caplog, "relay_outage_resolved")
+    assert len(resolved) == 1
+    assert resolved[0].attributes["outage_s"] == 1.0
+    assert resolved[0].attributes["attempts"] == 2
+    assert resolved[0].attributes["outcome"] == "stopped_by_user"
+
+
 @pytest.mark.asyncio
 async def test_relay_suppresses_disconnect_error_on_intentional_stop(
     caplog: pytest.LogCaptureFixture,
@@ -865,7 +1036,8 @@ async def test_relay_suppresses_disconnect_error_on_intentional_stop(
             if getattr(r, "event_name", None) == "runner_stream_disconnected"
         )
         assert record.session_id == session_id
-        assert record.attributes == {"intentional_stop": True, "cached_session_status": None}
+        assert record.attributes["intentional_stop"] is True
+        assert record.attributes["cached_session_status"] is None
 
         # No durable runner_disconnected label persists, so snapshots and
         # child summaries stay clean.
@@ -1106,7 +1278,8 @@ async def test_relay_stays_quiet_when_runner_leaves_an_idle_session(
             if getattr(r, "event_name", None) == "runner_stream_disconnected"
         )
         assert record.session_id == session_id
-        assert record.attributes == {"intentional_stop": False, "cached_session_status": "idle"}
+        assert record.attributes["intentional_stop"] is False
+        assert record.attributes["cached_session_status"] == "idle"
     finally:
         gate.set()
         if collector is not None:

@@ -6517,7 +6517,11 @@ async def _relay_runner_stream(
         ready heartbeat; see :func:`_relay_runner_stream_once`.
     """
     loop = asyncio.get_running_loop()
-    deadline: float | None = None
+    # The first loss initializes the deadline and outage counters together.
+    deadline: float = 0.0
+    # Measure from transport loss; the healthy stream duration is separate.
+    attempts = 0
+    outage_started: float | None = None
     while True:
         started = loop.time()
         try:
@@ -6530,31 +6534,50 @@ async def _relay_runner_stream(
             return
         except _RelayTransportLost as lost:
             now = loop.time()
-            # An attempt that streamed longer than the grace was a live
-            # tunnel dropping anew — give the new outage a fresh window.
-            if deadline is None or now - started > RUNNER_DISCONNECT_GRACE_S:
+            streamed_s = now - started
+            # A long-lived retry gets a fresh grace window and outage counters.
+            if outage_started is None or streamed_s > RUNNER_DISCONNECT_GRACE_S:
+                outage_started = now
+                attempts = 0
                 deadline = now + RUNNER_DISCONNECT_GRACE_S
+            attempts += 1
+            outage_s = now - outage_started
             if not lost.intentional and now + _RELAY_RETRY_INTERVAL_S < deadline:
                 _logger.info(
-                    "Relay: runner transport lost for session=%s; retrying for %.1fs",
+                    "Relay: runner transport lost for session=%s; retrying for %.1fs "
+                    "(attempt %d, streamed %.1fs)",
                     session_id,
                     deadline - now,
-                    extra={"session_id": session_id},
+                    attempts,
+                    streamed_s,
+                    extra=debug_event(
+                        "relay_transport_retry",
+                        session_id=session_id,
+                        attempt=attempts,
+                        streamed_s=round(streamed_s, 3),
+                        outage_s=round(outage_s, 3),
+                    ),
                 )
                 await asyncio.sleep(_RELAY_RETRY_INTERVAL_S)
                 continue
             _logger.warning(
-                "Relay: runner transport lost for session=%s",
+                "Relay: runner transport lost for session=%s after %d attempt(s) "
+                "over %.1fs; last attempt streamed %.1fs",
                 session_id,
+                attempts,
+                outage_s,
+                streamed_s,
                 exc_info=True,
-                extra={
-                    "session_id": session_id,
-                    "event_name": "runner_stream_disconnected",
-                    "attributes": {
-                        "intentional_stop": lost.intentional,
-                        "cached_session_status": _session_status_cache.get(session_id),
-                    },
-                },
+                extra=debug_event(
+                    "runner_stream_disconnected",
+                    session_id=session_id,
+                    attempts=attempts,
+                    outage_s=round(outage_s, 3),
+                    streamed_s=round(streamed_s, 3),
+                    intentional_stop=lost.intentional,
+                    cached_session_status=_session_status_cache.get(session_id),
+                    shutting_down=shutdown_state.server_shutting_down(),
+                ),
             )
             if lost.intentional:
                 # User clicked Stop: the Stop handler brought this runner's
@@ -6565,6 +6588,7 @@ async def _relay_runner_stream(
                 # "Error · runner_disconnected". The one-shot marker was
                 # already consumed by the relay teardown, so a genuine later
                 # disconnect surfaces normally.
+                outcome = "stopped_by_user"
                 _publish_status(session_id, "idle")
                 await _persist_session_status_error_labels(
                     session_id,
@@ -6575,6 +6599,7 @@ async def _relay_runner_stream(
                 # This server closed the tunnel on its way down; the runner is
                 # reachable, just not by a process that stopped listening. The
                 # replacement server re-adopts it on reconnect.
+                outcome = "server_shutdown"
                 _logger.info(
                     "Relay: transport lost during server shutdown for session=%s; "
                     "not failing the turn",
@@ -6591,6 +6616,7 @@ async def _relay_runner_stream(
                 # which drives the reconnect affordance. Stay silent — no
                 # status edge, and no clearing of labels either, so a genuine
                 # earlier failure keeps its error.
+                outcome = "idle_no_failure"
                 _logger.info(
                     "Relay: runner gone for idle session=%s; no failure to report",
                     session_id,
@@ -6599,6 +6625,7 @@ async def _relay_runner_stream(
             else:
                 # Publish a failed status so the client's SSE stream sees a
                 # clean error event instead of silent truncation (#1114).
+                outcome = "turn_failed"
                 disconnect_error = ErrorDetail(
                     code="runner_disconnected",
                     message="Runner disconnected unexpectedly.",
@@ -6623,6 +6650,22 @@ async def _relay_runner_stream(
                     disconnect_error,
                     conversation_store,
                 )
+            # Record the terminal outcome when this relay stops retrying.
+            _logger.info(
+                "Relay: runner outage resolved for session=%s as %s (%d attempt(s) over %.1fs)",
+                session_id,
+                outcome,
+                attempts,
+                outage_s,
+                extra=debug_event(
+                    "relay_outage_resolved",
+                    session_id=session_id,
+                    outcome=outcome,
+                    attempts=attempts,
+                    outage_s=round(outage_s, 3),
+                    streamed_s=round(streamed_s, 3),
+                ),
+            )
             return
 
 
