@@ -1,3 +1,4 @@
+import type { FilePosition } from "./FileViewerContext";
 import {
   BotIcon,
   FileIcon,
@@ -608,6 +609,7 @@ interface WorkspacePanelProps {
   rootSessionId: string | null;
   /** Active file path, or null when the Files tab shows a scope view. */
   selectedFilePath: string | null;
+  filePosition?: FilePosition;
   /** Ordered list of open file tabs, shown as a strip in the Files panel. */
   openFiles: string[];
   /** Open a file in the inline viewer (adds/activates its tab). */
@@ -694,6 +696,7 @@ function WorkspacePanelImpl({
   agentCount,
   rootSessionId,
   selectedFilePath,
+  filePosition,
   openFiles,
   openFileViewer,
   onCloseFile,
@@ -1084,6 +1087,7 @@ function WorkspacePanelImpl({
             open
             conversationId={conversationId}
             path={selectedFilePath}
+            position={filePosition}
             onClose={onShowScopeView}
             onCloseTab={handleCloseTab}
             onNavigateTo={openFileViewer}

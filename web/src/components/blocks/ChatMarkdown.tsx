@@ -37,7 +37,7 @@ import { showToast } from "@/components/ui/toast";
 type WithHastNode<T> = T & { node?: unknown };
 
 // Trailing `:line` / `:line:col` on a cited path, e.g. `src/app.ts:42:7`.
-const POSITION_SUFFIX = /:\d+(?::\d+)?$/;
+const POSITION_SUFFIX = /:(\d+)(?::(\d+))?$|#L(\d+)(?:C(\d+))?$/;
 
 /** What the chat renderers know about a cited path's openability. */
 interface WorkspaceFileOpener {
@@ -71,11 +71,15 @@ function useWorkspaceFileOpener(text: string): WorkspaceFileOpener {
   const conversationId = useFileViewerConversationId();
   const { root, home } = useWorkspacePaths();
 
-  // Agents cite a file with the position they mean, `docs/notes.md:12` or
-  // `:12:7`. The position is not part of the filename, so no such path is ever
-  // in the changed-files list or on disk; drop it before resolving. The span
-  // still displays the citation the agent wrote.
+  // Resolve the filename separately from the cited source position.
+  const suffix = text.match(POSITION_SUFFIX);
   const cited = text.replace(POSITION_SUFFIX, "");
+  const line = Number(suffix?.[1] ?? suffix?.[3]);
+  const column = Number(suffix?.[2] ?? suffix?.[4]);
+  const position =
+    Number.isSafeInteger(line) && line > 0
+      ? { line, ...(Number.isSafeInteger(column) && column > 0 ? { column } : {}) }
+      : undefined;
   // Collapse absolute / "~"-relative forms onto a workspace-relative path
   // (matching the changed-files list and relative filesystem routes), or keep
   // an outside-workspace path host-absolute — the FileViewer opens both.
@@ -110,7 +114,11 @@ function useWorkspaceFileOpener(text: string): WorkspaceFileOpener {
       resolvedPath: linkPath ?? "",
     };
   }
-  return { open: () => openFile(linkPath), unopenable: false, resolvedPath: linkPath };
+  return {
+    open: () => (position ? openFile(linkPath, position) : openFile(linkPath)),
+    unopenable: false,
+    resolvedPath: linkPath,
+  };
 }
 
 /**

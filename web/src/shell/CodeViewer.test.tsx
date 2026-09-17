@@ -95,6 +95,7 @@ function renderViewer(
   opts: {
     viewMode?: "editor" | "preview" | "source" | "diff";
     truncated?: boolean;
+    position?: { line: number };
     onRequestEditMode?: () => void;
   } = {},
 ) {
@@ -104,6 +105,7 @@ function renderViewer(
   // a .md path to exercise the remaining Shiki path.
   return render(
     <CodeViewer
+      position={opts.position}
       conversationId="conv_1"
       path={path}
       fileQuery={makeFileQuery(content, opts.truncated)}
@@ -773,3 +775,37 @@ describe("CodeViewer .ipynb routing", () => {
     expect(screen.getByText(/truncated/i)).toBeDefined();
   });
 });
+
+describe("source line navigation", () => {
+  it("centers and highlights the requested Markdown source line", () => {
+    const scroll = vi.fn();
+    const original = HTMLElement.prototype.scrollIntoView;
+    HTMLElement.prototype.scrollIntoView = scroll;
+    try {
+      renderViewer("first\nsecond\nthird", true, "notes.md", { position: { line: 2 } });
+      const line = screen.getByText("second").closest("[data-line]")?.parentElement?.parentElement;
+      expect(scroll).toHaveBeenCalledWith({ block: "center" });
+      expect(scroll.mock.instances.at(-1)).toBe(line);
+      expect(line).toHaveClass("bg-yellow-200/40");
+    } finally {
+      HTMLElement.prototype.scrollIntoView = original;
+    }
+  });
+});
+
+it.each([true, false])(
+  "clamps Markdown citations to the last loaded line (truncated=%s)",
+  (truncated) => {
+    const scroll = vi.fn();
+    const original = HTMLElement.prototype.scrollIntoView;
+    HTMLElement.prototype.scrollIntoView = scroll;
+    try {
+      renderViewer("first\nlast", true, "notes.md", { truncated, position: { line: 5000 } });
+      const last = screen.getByText("last").closest("[data-line]")?.parentElement?.parentElement;
+      expect(scroll.mock.instances.at(-1)).toBe(last);
+      expect(last).toHaveClass("bg-yellow-200/40");
+    } finally {
+      HTMLElement.prototype.scrollIntoView = original;
+    }
+  },
+);

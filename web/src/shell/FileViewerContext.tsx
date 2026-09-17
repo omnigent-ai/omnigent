@@ -4,8 +4,13 @@
 
 import { createContext, useContext } from "react";
 
+export interface FilePosition {
+  line: number;
+  column?: number;
+}
+
 interface FileViewerContextType {
-  openFile: (path: string) => void;
+  openFile: (path: string, position?: FilePosition) => void;
   /** Open GitHub in the workspace rail or mobile drawer. */
   openGithubTab: () => void;
   /**
@@ -40,7 +45,7 @@ export const FileViewerContext = createContext<FileViewerContextType | null>(nul
  * Returns the `openFile` callback when rendered inside AppShell, or
  * `null` when used outside of it (tests, Storybook, etc.).
  */
-export function useFileViewer(): ((path: string) => void) | null {
+export function useFileViewer(): FileViewerContextType["openFile"] | null {
   return useContext(FileViewerContext)?.openFile ?? null;
 }
 

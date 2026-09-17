@@ -95,7 +95,7 @@ import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { ChatHeader } from "./ChatHeader";
 import { ExecutionLogsPanel } from "./ExecutionLogsPanel";
 import { FileViewer } from "./FileViewer";
-import { FileViewerContext } from "./FileViewerContext";
+import { FileViewerContext, type FilePosition } from "./FileViewerContext";
 import { FilesPanelDrawer } from "./FilesPanelDrawer";
 import type { ChangedSort } from "./FlatFileList";
 import { GithubPanel } from "./GithubPanel";
@@ -330,6 +330,9 @@ export function AppShell() {
   const [selectedFilePath, setSelectedFilePath] = useState<string | null>(() =>
     conversationId ? (readSessionWorkspaceState(conversationId).selectedFilePath ?? null) : null,
   );
+  const [fileNavigation, setFileNavigation] = useState<{ path: string; position: FilePosition }>();
+  const filePosition =
+    fileNavigation?.path === selectedFilePath ? fileNavigation.position : undefined;
   // Ordered list of open file tabs. ``selectedFilePath`` is the active tab
   // (null = a scope view, Changed/All, is active). Tabs persist when the user
   // switches to a scope view or another rail tab; only ``closeFile`` removes
@@ -1005,6 +1008,7 @@ export function AppShell() {
     // terminal absent from the new session's list.
     pendingShellCreateRef.current = null;
     setTerminalPendingClose(null);
+    setFileNavigation(undefined);
     if (!conversationId) {
       // No session → no rail; false (not the open default) so rail-gated
       // effects stay quiet on non-session routes.
@@ -1160,8 +1164,9 @@ export function AppShell() {
   }, []);
 
   const openFileViewer = useCallback(
-    (path: string) => {
+    (path: string, position?: FilePosition) => {
       setSelectedFilePath(path);
+      setFileNavigation(position ? { path, position: { ...position } } : undefined);
       // A file and a shell tab can't both own the rail's content slot —
       // opening a file deselects any active shell tab (its tab stays in the
       // strip).
@@ -2188,6 +2193,7 @@ export function AppShell() {
                     agentCount={agentCount}
                     rootSessionId={rootSessionId}
                     selectedFilePath={selectedFilePath}
+                    filePosition={filePosition}
                     openFiles={openFiles}
                     openFileViewer={openFileViewer}
                     onCloseFile={closeFile}
@@ -2300,6 +2306,7 @@ export function AppShell() {
                     open
                     conversationId={serverConversationId}
                     path={selectedFilePath}
+                    position={filePosition}
                     onClose={closeFileViewer}
                     onNavigateTo={openFileViewer}
                     permissionLevel={permissionLevel}

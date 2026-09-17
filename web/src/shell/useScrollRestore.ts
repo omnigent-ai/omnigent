@@ -56,12 +56,13 @@ interface ScrollableEditor {
  * @param editor The editor to restore (the modified side, for a diff).
  * @param getKey Reads the current cache key (files can switch under one editor).
  * @param isCurrent False once the editor has been replaced or torn down.
+ * @returns Cancels a pending restore when explicit navigation takes priority.
  */
 export function attachEditorScrollRestore(
   editor: ScrollableEditor,
   getKey: () => string,
   isCurrent: () => boolean,
-): void {
+): () => void {
   const saved = getSavedScrollTop(getKey());
   let pending =
     saved !== undefined && saved > 0
@@ -89,6 +90,7 @@ export function attachEditorScrollRestore(
     }
     saveScrollTop(getKey(), e.scrollTop);
   });
+  return settle;
 }
 
 /**
@@ -108,12 +110,14 @@ export function attachEditorScrollRestore(
  * @param ref The scrollable element.
  * @param key Cache key for the current content (null disables persistence).
  * @param ready True once the content backing the container is present.
+ * @param restore False when explicit navigation overrides restoration; scrolling still saves.
  * @returns An onScroll handler to attach to the container.
  */
 export function useScrollRestore(
   ref: RefObject<HTMLElement | null>,
   key: string | null,
   ready: boolean,
+  restore = true,
 ): (event: UIEvent<HTMLElement>) => void {
   const pendingRef = useRef<{ target: number; deadline: number } | null>(null);
   const keyRef = useRef<string | null>(null);
@@ -128,6 +132,8 @@ export function useScrollRestore(
         }
       : null;
   }
+
+  if (!restore) pendingRef.current = null;
 
   // Arm a restore once per content identity / readiness change — NOT every
   // render. A virtualized tree re-renders on every scroll frame; re-running the
@@ -187,7 +193,7 @@ export function useScrollRestore(
     el.scrollTop = pending.target;
     frame = requestAnimationFrame(tick);
     return teardown;
-  }, [key, ready, ref]);
+  }, [key, ready, ref, restore]);
 
   return useCallback((event: UIEvent<HTMLElement>) => {
     if (keyRef.current && pendingRef.current === null) {

@@ -186,9 +186,9 @@ describe("cited positions", () => {
   it("opens an inline-code path that carries a line number", () => {
     renderMarkdown("`docs/notes.md:12` has the detail", ["docs/notes.md"]);
 
-    // The span still shows what the agent wrote; only the target drops :12.
+    // Preserve the citation text while passing the position separately.
     fireEvent.click(screen.getByRole("button", { name: "docs/notes.md:12" }));
-    expect(openFile).toHaveBeenCalledWith("docs/notes.md");
+    expect(openFile).toHaveBeenCalledWith("docs/notes.md", { line: 12 });
   });
 
   it("opens an absolute inline-code path with a line number", () => {
@@ -196,20 +196,32 @@ describe("cited positions", () => {
     renderMarkdown(`\`${WORKSPACE}/docs/notes.md:1\` contains hi`, ["docs/notes.md"]);
 
     fireEvent.click(screen.getByRole("button", { name: `${WORKSPACE}/docs/notes.md:1` }));
-    expect(openFile).toHaveBeenCalledWith("docs/notes.md");
+    expect(openFile).toHaveBeenCalledWith("docs/notes.md", { line: 1 });
   });
 
   it("opens a path citing both line and column", () => {
     renderMarkdown("`docs/notes.md:12:7` is the spot", ["docs/notes.md"]);
 
     fireEvent.click(screen.getByRole("button", { name: "docs/notes.md:12:7" }));
-    expect(openFile).toHaveBeenCalledWith("docs/notes.md");
+    expect(openFile).toHaveBeenCalledWith("docs/notes.md", { line: 12, column: 7 });
   });
 
   it("opens a markdown link whose href carries a line number", () => {
     renderMarkdown("[notes.md](docs/notes.md:12)", ["docs/notes.md"]);
 
     fireEvent.click(screen.getByRole("button", { name: "notes.md" }));
+    expect(openFile).toHaveBeenCalledWith("docs/notes.md", { line: 12 });
+  });
+
+  it("opens a Markdown link with a line anchor", () => {
+    renderMarkdown("[notes](docs/notes.md#L12)", ["docs/notes.md"]);
+    fireEvent.click(screen.getByRole("button", { name: "notes" }));
+    expect(openFile).toHaveBeenCalledWith("docs/notes.md", { line: 12 });
+  });
+
+  it.each(["0", "999999999999999999999"])("ignores an invalid line %s", (line) => {
+    renderMarkdown(`[notes](docs/notes.md:${line})`, ["docs/notes.md"]);
+    fireEvent.click(screen.getByRole("button", { name: "notes" }));
     expect(openFile).toHaveBeenCalledWith("docs/notes.md");
   });
 

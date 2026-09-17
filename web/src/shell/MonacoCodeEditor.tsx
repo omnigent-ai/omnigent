@@ -15,6 +15,7 @@
 // with the diff view. Adding a comment is gated on `canEdit && !isDirty`
 // (offsets must match the saved server content).
 
+import type { FilePosition } from "./FileViewerContext";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Editor, type EditorProps, type OnChange, type OnMount } from "@monaco-editor/react";
 import { AlertTriangleIcon, MessageSquareOffIcon } from "lucide-react";
@@ -28,6 +29,7 @@ import type { Comment } from "@/hooks/useComments";
 import { useCanEdit } from "@/hooks/usePermissions";
 import { detectLang, type ActiveSelection, type SaveStatus } from "./codeViewerHelpers";
 import { TruncatedBanner } from "./TruncatedBanner";
+import { useMonacoFilePosition } from "./useMonacoFilePosition";
 // Reused as-is — the hook is editor-agnostic (drives any editor through
 // setContentRef). Named for markdown only because that was its first caller.
 import { useMarkdownEditorSync } from "./useMarkdownEditorSync";
@@ -72,6 +74,7 @@ interface CommentProps {
 }
 
 interface MonacoCodeEditorProps extends CommentProps {
+  position?: FilePosition;
   content: string;
   conversationId: string;
   path: string;
@@ -110,6 +113,7 @@ interface MonacoCodeEditorProps extends CommentProps {
  * @returns The Monaco code editor for non-markdown files.
  */
 export function MonacoCodeEditor({
+  position,
   content,
   conversationId,
   path,
@@ -145,6 +149,7 @@ export function MonacoCodeEditor({
   return (
     <MonacoCodeEditorInner
       key={editorKey}
+      position={position}
       content={content}
       conversationId={conversationId}
       path={path}
@@ -170,6 +175,7 @@ export function MonacoCodeEditor({
 }
 
 interface InnerProps extends CommentProps {
+  position?: FilePosition;
   content: string;
   conversationId: string;
   path: string;
@@ -197,6 +203,7 @@ interface InnerProps extends CommentProps {
  * @returns The editor surface plus its save bar / conflict banner.
  */
 function MonacoCodeEditorInner({
+  position,
   content,
   conversationId,
   path,
@@ -249,6 +256,13 @@ function MonacoCodeEditorInner({
   const editorInstanceRef = useRef<CodeEditorInstance | null>(null);
   // True once the editor instance exists; gates the comment-layer wiring.
   const [mounted, setMounted] = useState(false);
+  const cancelScrollRestoreRef = useRef<(() => void) | null>(null);
+  useMonacoFilePosition({
+    editorRef: editorInstanceRef,
+    mounted,
+    position,
+    cancelScrollRestoreRef,
+  });
   // The last-saved content; edits are dirty when the buffer differs from it.
   const baselineRef = useRef<string | null>(content);
   // The live buffer content, tracked via onChange. Auto-save reads this rather
@@ -333,7 +347,7 @@ function MonacoCodeEditorInner({
       };
       // Reopening a file (or switching sessions and back) lands where the user
       // left off, and further scrolling is cached under the current file's key.
-      attachEditorScrollRestore(
+      cancelScrollRestoreRef.current = attachEditorScrollRestore(
         editor,
         () => scrollKeyRef.current,
         () => editorInstanceRef.current === editor,

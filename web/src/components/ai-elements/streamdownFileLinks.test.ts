@@ -66,7 +66,17 @@ describe("markWorkspaceFileLinks", () => {
     expectHandedOver(markHref("notes.md:12:7"), "notes.md:12:7");
   });
 
+  it.each(["docs/page.md#L12", "src/app.ts#L12C7"])(
+    "hands over a source position in %s",
+    (path) => {
+      expectHandedOver(markHref(path), path);
+    },
+  );
+
   it.each([
+    ["https://example.com/docs.md#L12", "external line anchor"],
+    ["#L12", "in-page line anchor"],
+    ["docs/page.md#heading#L12", "multiple fragments"],
     ["https://example.com/docs.md", "external URL"],
     ["http://localhost:3000/x.md", "plain http URL"],
     ["//cdn.example.com/x.md", "protocol-relative URL"],

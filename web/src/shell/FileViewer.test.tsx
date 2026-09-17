@@ -84,16 +84,19 @@ vi.mock("./MonacoDiffViewer", () => ({
   // Surface the toggle-driven props as data attributes so tests can assert the
   // "⋯" menu wires wrap-lines / hide-whitespace through to the diff editor.
   MonacoDiffViewer: ({
+    position,
     wrapLines,
     hideWhitespace,
     searchOpen,
   }: {
+    position?: { line: number };
     wrapLines?: boolean;
     hideWhitespace?: boolean;
     searchOpen?: boolean;
   }) => (
     <div
       data-testid="diff-viewer"
+      data-line={position?.line}
       data-wrap-lines={String(!!wrapLines)}
       data-hide-whitespace={String(!!hideWhitespace)}
       data-search-open={String(!!searchOpen)}
@@ -201,6 +204,7 @@ function LocationDisplay() {
 }
 
 interface RenderProps {
+  position?: { line: number; column?: number };
   open?: boolean;
   path?: string;
   /**
@@ -225,6 +229,7 @@ interface RenderProps {
  * the current params after state changes.
  */
 function viewerTree({
+  position,
   open = false,
   path = "file1.py",
   initialSearch = "",
@@ -239,6 +244,7 @@ function viewerTree({
       <MemoryRouter initialEntries={[url]}>
         <LocationDisplay />
         <FileViewer
+          position={position}
           open={open}
           conversationId="conv_1"
           path={path}
@@ -1775,5 +1781,73 @@ describe("FileViewer 3D model files", () => {
     renderViewer({ open: true, path: "mesh.obj" });
     expect(screen.queryByRole("button", { name: /^View mode/ })).toBeNull();
     expect(screen.queryByRole("button", { name: "View source" })).toBeNull();
+  });
+});
+
+describe("file position navigation", () => {
+  beforeEach(() => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+  });
+  it("opens source instead of a preferred Markdown preview and allows switching back", () => {
+    writeFileViewPreferences({
+      diffActive: false,
+      diffLayout: "unified",
+      previewableViewMode: "preview",
+      hideWhitespace: false,
+      wrapLines: false,
+    });
+    renderViewer({ open: true, path: "file1.md", position: { line: 12 } });
+    expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-view-mode", "source");
+    fireEvent.pointerDown(screen.getByRole("button", { name: /^View mode/ }), { button: 0 });
+    fireEvent.click(screen.getByRole("menuitem", { name: /Preview/ }));
+    expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-view-mode", "preview");
+  });
+
+  it.each(["file1.py", "file1.md"])(
+    "keeps diff mode for repeated citations to %s",
+    async (path) => {
+      vi.mocked(useWorkspaceChangedFiles).mockReturnValue({
+        data: {
+          available: true,
+          data: [{ path, name: path, bytes: 10, modified_at: null, status: "modified" }],
+        },
+      } as ReturnType<typeof useWorkspaceChangedFiles>);
+      const { rerender } = renderViewer({
+        open: true,
+        path,
+        position: { line: 12 },
+        initialSearch: "diff=1",
+      });
+      expect(await screen.findByTestId("diff-viewer")).toHaveAttribute("data-line", "12");
+      expect(screen.queryByTestId("code-viewer")).toBeNull();
+      expect(screen.getByTestId("url-params")).toHaveTextContent("diff=1");
+      rerender(viewerTree({ open: true, path, position: { line: 30 } }));
+      expect(await screen.findByTestId("diff-viewer")).toHaveAttribute("data-line", "30");
+      expect(screen.getByTestId("url-params")).toHaveTextContent("diff=1");
+    },
+  );
+
+  it("keeps normal view when a cited file has a diff available", () => {
+    vi.mocked(useWorkspaceChangedFiles).mockReturnValue({
+      data: {
+        available: true,
+        data: [
+          { path: "file1.py", name: "file1.py", bytes: 10, modified_at: null, status: "modified" },
+        ],
+      },
+    } as ReturnType<typeof useWorkspaceChangedFiles>);
+    renderViewer({ open: true, path: "file1.py", position: { line: 12 } });
+    expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-view-mode", "source");
+    expect(screen.queryByTestId("diff-viewer")).toBeNull();
+    expect(screen.getByTestId("url-params")).not.toHaveTextContent("diff=1");
+  });
+
+  it("keeps unsaved Markdown edits when a line navigation is cancelled", () => {
+    const { rerender } = renderViewer({ open: true, path: "file1.md" });
+    fireEvent.click(screen.getByRole("button", { name: "make dirty" }));
+    rerender(viewerTree({ open: true, path: "file1.md", position: { line: 12 } }));
+    expect(screen.getByText("Unsaved changes")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Keep editing" }));
+    expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-view-mode", "editor");
   });
 });

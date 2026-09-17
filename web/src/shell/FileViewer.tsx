@@ -9,6 +9,7 @@
 //   │  - gutter icon → add comment    │                  │
 //   └──────────────────────────────────┴──────────────────┘
 
+import type { FilePosition } from "./FileViewerContext";
 import { toast } from "sonner";
 import {
   lazy,
@@ -280,6 +281,7 @@ function useToolbarOverflow(actionsKey: string): {
 // ---------------------------------------------------------------------------
 
 interface FileViewerProps {
+  position?: FilePosition;
   open: boolean;
   conversationId: string;
   path: string;
@@ -331,6 +333,7 @@ export function FileViewer(props: FileViewerProps) {
 }
 
 function FileViewerBody({
+  position,
   open,
   conversationId,
   path,
@@ -744,9 +747,24 @@ function FileViewerBody({
         ? "preview"
         : previewableViewMode
     : "source";
-  // Derived effective view mode — diff takes priority when active and available.
+  const [dismissedPosition, setDismissedPosition] = useState<FilePosition>();
+  const [appliedPosition, setAppliedPosition] = useState(position);
+  const lastPositionRef = useRef(position);
+  useEffect(() => {
+    if (lastPositionRef.current === position) return;
+    lastPositionRef.current = position;
+    const apply = () => setAppliedPosition(position);
+    // Switching out of the rich-text editor must preserve its unsaved-edit guard.
+    if (position && lang === "markdown" && fileViewMode === "editor" && !diffActive) {
+      guardDirty(apply);
+    } else {
+      apply();
+    }
+  }, [position, lang, fileViewMode, diffActive, guardDirty]);
+  const filePosition = appliedPosition !== dismissedPosition ? appliedPosition : undefined;
+  // Citations preserve diff mode; previewable files need source to expose line numbers.
   const viewMode: "editor" | "preview" | "source" | "diff" =
-    diffActive && isDiffAvailable ? "diff" : fileViewMode;
+    diffActive && isDiffAvailable ? "diff" : filePosition ? "source" : fileViewMode;
   const diffViewActive = viewMode === "diff";
 
   // Cmd/Ctrl+F opens find-in-file on the Monaco-backed surfaces (code
@@ -828,6 +846,7 @@ function FileViewerBody({
     contentAreaRef,
     contentScrollKey,
     fileQuery.data !== undefined,
+    !filePosition,
   );
   // Measure the content area so the split toggle can hide when there isn't
   // enough room for side-by-side. Only observe while the diff is shown — the
@@ -937,6 +956,7 @@ function FileViewerBody({
       // cancels leaves both the bias and the editor intact.
       const apply = () => {
         setDeepLinkBiasPath(null);
+        setDismissedPosition(position);
         setPreviewableViewMode(mode);
       };
       if (viewMode === "editor") {
@@ -998,6 +1018,7 @@ function FileViewerBody({
       // "editor" would no-op the first click. Keying on viewMode makes one click
       // always reach the other surface.
       onSelect: () => {
+        setDismissedPosition(position);
         setPreviewableViewMode(viewMode === "preview" ? "source" : "preview");
       },
     });
@@ -1040,7 +1061,11 @@ function FileViewerBody({
       label: viewMode === "diff" ? "Exit diff view" : "Show diff",
       icon: <FileDiffIcon className="size-4" />,
       active: viewMode === "diff",
-      onSelect: () => guardDirty(() => setDiffActive((prev) => !prev)),
+      onSelect: () =>
+        guardDirty(() => {
+          setDismissedPosition(position);
+          setDiffActive(viewMode !== "diff");
+        }),
     });
   }
   if (viewMode === "diff" && splitToggleAvailable) {
@@ -1520,6 +1545,7 @@ function FileViewerBody({
                 {/* key={path} remounts per file so onMount re-runs (EOL + comment
                   wiring re-applied) and `ready` resets while the new grammar loads. */}
                 <MonacoDiffViewer
+                  position={filePosition}
                   key={path}
                   before={diffQuery.data.before}
                   after={diffQuery.data.after}
@@ -1539,6 +1565,7 @@ function FileViewerBody({
             )
           ) : (
             <CodeViewer
+              position={filePosition}
               conversationId={conversationId}
               path={path}
               fileQuery={fileQuery}

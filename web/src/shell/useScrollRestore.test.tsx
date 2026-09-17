@@ -16,14 +16,23 @@ import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   SCROLL_RESTORE_BUDGET_MS,
+  attachEditorScrollRestore,
   getSavedScrollTop,
   saveScrollTop,
   useScrollRestore,
 } from "./useScrollRestore";
 
-function Scroller({ scrollKey, ready }: { scrollKey: string | null; ready: boolean }) {
+function Scroller({
+  scrollKey,
+  ready,
+  restore = true,
+}: {
+  scrollKey: string | null;
+  ready: boolean;
+  restore?: boolean;
+}) {
   const ref = useRef<HTMLDivElement | null>(null);
-  const onScroll = useScrollRestore(ref, scrollKey, ready);
+  const onScroll = useScrollRestore(ref, scrollKey, ready, restore);
   return <div ref={ref} data-testid="scroller" onScroll={onScroll} />;
 }
 
@@ -206,4 +215,41 @@ describe("useScrollRestore", () => {
     fireEvent.scroll(el);
     expect(getSavedScrollTop("view:strict")).toBe(200);
   });
+});
+
+it("lets explicit source navigation cancel a pending Monaco scroll restore", async () => {
+  const key = "monaco-cited-position";
+  saveScrollTop(key, 500);
+  let onScroll: ((event: { scrollTop: number }) => void) | undefined;
+  const editor = {
+    setScrollTop: vi.fn(),
+    onDidScrollChange: (listener: typeof onScroll) => {
+      onScroll = listener;
+      return { dispose: () => {} };
+    },
+  };
+  const cancel = attachEditorScrollRestore(
+    editor,
+    () => key,
+    () => true,
+  );
+  expect(editor.setScrollTop).toHaveBeenCalledWith(500);
+  cancel();
+  editor.setScrollTop.mockClear();
+  onScroll?.({ scrollTop: 900 });
+  await nextFrame();
+  expect(editor.setScrollTop).not.toHaveBeenCalled();
+  expect(getSavedScrollTop(key)).toBe(900);
+});
+
+it("saves new DOM scroll positions when explicit navigation overrides restoration", async () => {
+  const key = "source-cited-position";
+  saveScrollTop(key, 500);
+  const { view, el } = mount(key);
+  view.rerender(<Scroller scrollKey={key} ready restore={false} />);
+  el.scrollTop = 900;
+  fireEvent.scroll(el);
+  await nextFrame();
+  expect(el.scrollTop).toBe(900);
+  expect(getSavedScrollTop(key)).toBe(900);
 });

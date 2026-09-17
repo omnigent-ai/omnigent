@@ -115,8 +115,8 @@ function fileUriToLocalPath(href: string): string | null {
  * instead. A fragment href is chosen because harden passes those through
  * untouched, while an anchor with *no* href is blocked like any other
  * unresolvable URL. Only hrefs that could name a real file are moved: a URL,
- * a `mailto:`/`javascript:` scheme, or anything carrying a query or fragment
- * is left for harden to judge exactly as before.
+ * a `mailto:`/`javascript:` scheme, query, or non-line fragment is left
+ * for harden to judge exactly as before.
  */
 export function markWorkspaceFileLinks() {
   return (tree: HastElement) => {
@@ -124,7 +124,12 @@ export function markWorkspaceFileLinks() {
       if (node.tagName !== "a") return;
       const href = node.properties?.href;
       if (typeof href !== "string" || !href) return;
-      if (NON_FILE_HREF.test(href) || href.includes("?") || href.includes("#")) return;
+      if (
+        NON_FILE_HREF.test(href) ||
+        href.includes("?") ||
+        (href.includes("#") && !/^[^#]+#L\d+(?:C\d+)?$/.test(href))
+      )
+        return;
       node.properties = {
         ...node.properties,
         href: PARKED_FILE_HREF,
