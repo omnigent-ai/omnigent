@@ -6076,6 +6076,7 @@ async def test_subagent_batch_partitioning_runs_off_event_loop(
 async def test_untruncatable_subagent_item_is_dead_lettered_and_checkpointed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """One impossible item cannot livelock every later child-history poll."""
     bridge_dir = tmp_path / "bridge"
@@ -6139,6 +6140,16 @@ async def test_untruncatable_subagent_item_is_dead_lettered_and_checkpointed(
     assert dead_letter["payload"]["source_id"] == item.source_id
     assert "no truncatable text" in dead_letter["reason"]
     assert dead_letter["http_status"] == 413
+
+    row = _subagent_drop_row(caplog)
+    assert row["session_id"] == "conv_child_oversized"
+    assert row["attributes"]["parent_session_id"] == "conv_parent"
+    assert row["attributes"]["drop_reason"] == "oversized_item"
+    assert row["attributes"]["item_count"] == "1"
+    assert row["attributes"]["http_status"] == "413"
+    assert row["attributes"]["response_id"] == "resp_oversized"
+    assert "exception_type" not in row["attributes"]
+    assert "x" * 100 not in json.dumps(row["attributes"])
 
 
 @pytest.mark.asyncio
@@ -6396,6 +6407,7 @@ async def test_permanent_batch_failure_redrives_items_individually(
 async def test_individual_redrive_honors_not_confirmed_retry_budget(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A fallback item is retried before a not-confirmed 503 is dead-lettered."""
     bridge_dir = tmp_path / "bridge"
@@ -6483,6 +6495,13 @@ async def test_individual_redrive_honors_not_confirmed_retry_budget(
     ]
     assert [record["payload"]["source_id"] for record in dead_letters] == [item.source_id]
     assert dead_letters[0]["reason"] == "delivery not confirmed after retries"
+
+    row = _subagent_drop_row(caplog)
+    assert row["session_id"] == "conv_child_retry"
+    assert row["attributes"]["drop_reason"] == "delivery_not_confirmed"
+    assert row["attributes"]["http_status"] == "503"
+    assert row["attributes"]["attempts"] == "2"
+    assert row["attributes"]["exception_type"] == "HTTPStatusError"
 
 
 @pytest.mark.asyncio
@@ -6776,7 +6795,10 @@ async def test_concurrent_subagent_502s_recover_without_phantom_completion(
 
 
 @pytest.mark.asyncio
-async def test_persistent_subagent_502_ends_as_explicit_failure(tmp_path: Path) -> None:
+async def test_persistent_subagent_502_ends_as_explicit_failure(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """A child that exhausts 502 retries fails with recoverable dead letters."""
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
@@ -6863,6 +6885,16 @@ async def test_persistent_subagent_502_ends_as_explicit_failure(tmp_path: Path) 
     dead_letters = (bridge_dir / "dead_letter.jsonl").read_text("utf-8").splitlines()
     assert len(dead_letters) == 1
     assert json.loads(dead_letters[0])["http_status"] == 502
+
+    row = _subagent_drop_row(caplog)
+    assert row["session_id"] == "conv_persistent_502"
+    assert row["attributes"]["parent_session_id"] == "conv_parent"
+    assert row["attributes"]["drop_reason"] == "transient_retries_exhausted"
+    assert row["attributes"]["http_status"] == "502"
+    assert row["attributes"]["attempts"] == "2"
+    assert row["attributes"]["item_count"] == "1"
+    assert row["attributes"]["exception_type"] == "HTTPStatusError"
+    assert "lost output" not in json.dumps(row["attributes"])
 
 
 @pytest.mark.asyncio
@@ -9709,8 +9741,23 @@ def test_retry_tracker_transient_failures_escalate_degraded() -> None:
     assert forwarder._forward_health.degraded_logged is False
 
 
+def _subagent_drop_row(caplog: pytest.LogCaptureFixture) -> dict[str, Any]:
+    from omnigent.debug_logging import record_to_row
+
+    records = [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "claude_subagent_transcript_dropped"
+    ]
+    assert len(records) == 1
+    return record_to_row(records[0], source="runner")
+
+
 @pytest.mark.asyncio
-async def test_subagent_item_drop_writes_dead_letter(tmp_path: Path) -> None:
+async def test_subagent_item_drop_writes_dead_letter(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """
     A permanently-rejected sub-agent transcript item is dead-lettered (#1120).
 
@@ -9785,6 +9832,15 @@ async def test_subagent_item_drop_writes_dead_letter(tmp_path: Path) -> None:
     assert record["session_id"] == "conv_child_dl"
     assert record["event_type"] == "external_conversation_item"
     assert record["payload"]["item_data"]["content"][0]["text"] == "lost"
+
+    row = _subagent_drop_row(caplog)
+    assert row["session_id"] == "conv_child_dl"
+    assert row["attributes"]["parent_session_id"] == "conv_parent"
+    assert row["attributes"]["drop_reason"] == "permanent_http_failure"
+    assert row["attributes"]["http_status"] == "400"
+    assert row["attributes"]["attempts"] == "1"
+    assert row["attributes"]["exception_type"] == "HTTPStatusError"
+    assert "lost" not in json.dumps(row["attributes"])
 
 
 @pytest.mark.asyncio
