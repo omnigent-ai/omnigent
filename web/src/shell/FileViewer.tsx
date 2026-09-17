@@ -750,22 +750,23 @@ function FileViewerBody({
   const [dismissedPosition, setDismissedPosition] = useState<FilePosition>();
   const [appliedPosition, setAppliedPosition] = useState(position);
   const lastPositionRef = useRef(position);
-  useEffect(() => {
-    if (lastPositionRef.current === position) return;
-    lastPositionRef.current = position;
-    const apply = () => setAppliedPosition(position);
-    // Switching out of the rich-text editor must preserve its unsaved-edit guard.
-    if (position && lang === "markdown" && fileViewMode === "editor" && !diffActive) {
-      guardDirty(apply);
-    } else {
-      apply();
-    }
-  }, [position, lang, fileViewMode, diffActive, guardDirty]);
   const filePosition = appliedPosition !== dismissedPosition ? appliedPosition : undefined;
   // Citations preserve diff mode; previewable files need source to expose line numbers.
   const viewMode: "editor" | "preview" | "source" | "diff" =
     diffActive && isDiffAvailable ? "diff" : filePosition ? "source" : fileViewMode;
   const diffViewActive = viewMode === "diff";
+
+  useEffect(() => {
+    if (lastPositionRef.current === position) return;
+    lastPositionRef.current = position;
+    const apply = () => setAppliedPosition(position);
+    // Switching out of the rich-text editor must preserve its unsaved-edit guard.
+    if (position && viewMode === "editor") {
+      guardDirty(apply);
+    } else {
+      apply();
+    }
+  }, [position, viewMode, guardDirty]);
 
   // Cmd/Ctrl+F opens find-in-file on the Monaco-backed surfaces (code
   // source/editor and the diff view). Those surfaces would otherwise rely on

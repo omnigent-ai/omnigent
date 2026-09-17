@@ -42,6 +42,9 @@ vi.mock("./CodeViewer", () => ({
       data-search-open={String(!!searchOpen)}
     >
       <button type="button" aria-label="make dirty" onClick={() => onDirtyChange?.(true)} />
+      {viewMode === "editor" && (
+        <textarea aria-label="Draft text" onChange={() => onDirtyChange?.(true)} />
+      )}
     </div>
   ),
 }));
@@ -1871,12 +1874,25 @@ describe("file position navigation", () => {
     expect(screen.getByTestId("url-params")).not.toHaveTextContent("diff=1");
   });
 
-  it("keeps unsaved Markdown edits when a line navigation is cancelled", () => {
-    const { rerender } = renderViewer({ open: true, path: "file1.md" });
-    fireEvent.click(screen.getByRole("button", { name: "make dirty" }));
-    rerender(viewerTree({ open: true, path: "file1.md", position: { line: 12 } }));
-    expect(screen.getByText("Unsaved changes")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Keep editing" }));
-    expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-view-mode", "editor");
-  });
+  it.each([false, true])(
+    "keeps unsaved Markdown edits when a line navigation is cancelled (diff preference=%s)",
+    (diffActive) => {
+      writeFileViewPreferences({
+        diffActive,
+        diffLayout: "unified",
+        previewableViewMode: "editor",
+        hideWhitespace: false,
+        wrapLines: false,
+      });
+      const { rerender } = renderViewer({ open: true, path: "file1.md" });
+      const draft = screen.getByRole("textbox", { name: "Draft text" });
+      fireEvent.change(draft, { target: { value: "Unsaved Markdown draft" } });
+      rerender(viewerTree({ open: true, path: "file1.md", position: { line: 12 } }));
+      expect(screen.getByText("Unsaved changes")).toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: "Keep editing" }));
+      expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-view-mode", "editor");
+      expect(screen.getByRole("textbox", { name: "Draft text" })).toBe(draft);
+      expect(draft).toHaveValue("Unsaved Markdown draft");
+    },
+  );
 });

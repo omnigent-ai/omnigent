@@ -1,4 +1,4 @@
-"""Browser regressions for chat citations into collapsed Monaco diff context.
+"""Browser regressions for chat citations into Monaco source and diff views.
 
 Only the file API responses are fixtures; chat links, view selection, diff
 calculation, collapsed regions, and scrolling run through the real UI.
@@ -20,9 +20,9 @@ _AFTER_LINES[350] = "# changed current line 351"
 _BEFORE = "\n".join(_BEFORE_LINES)
 _AFTER = "\n".join(_AFTER_LINES)
 
-_CENTERED_LINE = """text => {
+_CENTERED_LINE = """({text, diff = true}) => {
   for (const line of document.querySelectorAll(
-    '[data-testid="file-viewer"] .modified .view-line'
+    `[data-testid="file-viewer"] ${diff ? '.modified ' : ''}.view-line`
   )) {
     if (line.textContent.replace(/\u00a0/g, ' ') !== text) continue;
     const rect = line.getBoundingClientRect();
@@ -34,13 +34,12 @@ _CENTERED_LINE = """text => {
 }"""
 
 
-@pytest.mark.parametrize("layout", ["split", "unified"])
-def test_chat_line_link_expands_and_centers_diff_context(
+def _seed_citation_file(
     page: Page,
     seeded_session: tuple[str, str],
-    layout: str,
+    *,
+    truncated: bool = False,
 ) -> None:
-    """Click hidden current-file lines without changing the selected diff view."""
     base_url, session_id = seeded_session
     environment_url = f"{base_url}/v1/sessions/{session_id}/resources/environments/default"
     page.route(
@@ -71,6 +70,7 @@ def test_chat_line_link_expands_and_centers_diff_context(
                 "encoding": "utf-8",
                 "content_type": "text/plain",
                 "bytes": len(_AFTER),
+                "truncated": truncated,
             }
         ),
     )
@@ -91,12 +91,27 @@ def test_chat_line_link_expands_and_centers_diff_context(
             "type": "external_assistant_message",
             "data": {
                 "agent": "hello_world",
-                "text": f"[Line 100]({_FILE_PATH}:100) and [Line 200]({_FILE_PATH}:200)",
+                "text": (
+                    f"[Line 100]({_FILE_PATH}:100) and [Line 200]({_FILE_PATH}:200) "
+                    f"and [Last line]({_FILE_PATH}:{len(_AFTER_LINES)}) "
+                    f"and [Beyond file]({_FILE_PATH}:5000)"
+                ),
             },
         },
         timeout=10,
     )
     response.raise_for_status()
+
+
+@pytest.mark.parametrize("layout", ["split", "unified"])
+def test_chat_line_link_expands_and_centers_diff_context(
+    page: Page,
+    seeded_session: tuple[str, str],
+    layout: str,
+) -> None:
+    """Click hidden current-file lines without changing the selected diff view."""
+    _seed_citation_file(page, seeded_session)
+    base_url, session_id = seeded_session
     # Keep the rail wide enough for Monaco's actual side-by-side layout.
     page.set_viewport_size({"width": 3200, "height": 1000})
     preferences = json.dumps({"diffActive": True, "diffLayout": layout})
@@ -129,6 +144,109 @@ def test_chat_line_link_expands_and_centers_diff_context(
         page.get_by_role("button", name=f"Line {line}", exact=True).click()
         # The five inserted lines ensure original/current line numbers differ.
         expect(modified.get_by_text(_AFTER_LINES[line - 1], exact=True)).to_be_visible()
-        page.wait_for_function(_CENTERED_LINE, arg=_AFTER_LINES[line - 1], timeout=10_000)
+        page.wait_for_function(
+            _CENTERED_LINE, arg={"text": _AFTER_LINES[line - 1]}, timeout=10_000
+        )
         expect(diff).to_be_visible()
         expect(page).to_have_url(re.compile(r"[?&]diff=1(?:&|$)"))
+
+
+@pytest.mark.parametrize("truncated", [False, True])
+def test_source_citation_centers_last_loaded_line(
+    page: Page,
+    seeded_session: tuple[str, str],
+    truncated: bool,
+) -> None:
+    """Final-line and out-of-range citations center even in a truncated source buffer."""
+    _seed_citation_file(page, seeded_session, truncated=truncated)
+    base_url, session_id = seeded_session
+    page.set_viewport_size({"width": 1600, "height": 1000})
+    page.add_init_script(
+        "localStorage.setItem('omnigent:file-view-preferences', '{\"diffActive\":false}');"
+    )
+    page.goto(f"{base_url}/c/{session_id}?file={_FILE_PATH}")
+    viewer = page.locator('[data-testid="file-viewer"]:visible')
+    expect(viewer.locator(".monaco-editor")).to_be_visible(timeout=30_000)
+
+    for label in ("Last line", "Beyond file"):
+        page.get_by_role("button", name=label, exact=True).click()
+        page.wait_for_function(
+            _CENTERED_LINE, arg={"text": _AFTER_LINES[-1], "diff": False}, timeout=10_000
+        )
+        expect(viewer.locator(".monaco-diff-editor")).to_have_count(0)
+
+
+def test_citation_preserves_offline_markdown_draft_with_diff_preference(
+    page: Page, seeded_session: tuple[str, str]
+) -> None:
+    """An unchanged Markdown file still guards its draft when diff is preferred."""
+    base_url, session_id = seeded_session
+    path = "src/unchanged.md"
+    content = "# Existing document\n\nOriginal paragraph.\n"
+    environment_url = f"{base_url}/v1/sessions/{session_id}/resources/environments/default"
+    page.route(
+        environment_url,
+        lambda route: route.fulfill(json={"metadata": {"root": "/workspace"}}),
+    )
+    page.route(
+        f"{environment_url}/filesystem/src?*",
+        lambda route: route.fulfill(
+            json={
+                "object": "list",
+                "has_more": False,
+                "data": [
+                    {"path": path, "name": "unchanged.md", "type": "file", "bytes": len(content)}
+                ],
+            }
+        ),
+    )
+    page.route(
+        f"{environment_url}/changes",
+        lambda route: route.fulfill(json={"object": "list", "has_more": False, "data": []}),
+    )
+    page.route(
+        f"{environment_url}/filesystem/{path}",
+        lambda route: route.fulfill(
+            json={
+                "object": "session.environment.filesystem.file_content",
+                "path": path,
+                "content": content,
+                "encoding": "utf-8",
+                "content_type": "text/markdown",
+                "bytes": len(content),
+            }
+        ),
+    )
+    page.route(
+        f"{base_url}/health?session_ids=*",
+        lambda route: route.fulfill(
+            json={"sessions": {session_id: {"runner_online": False, "host_online": True}}}
+        ),
+    )
+    response = httpx.post(
+        f"{base_url}/v1/sessions/{session_id}/events",
+        json={
+            "type": "external_assistant_message",
+            "data": {"agent": "hello_world", "text": f"[Markdown line]({path}:2)"},
+        },
+        timeout=10,
+    )
+    response.raise_for_status()
+    preferences = json.dumps({"diffActive": True, "previewableViewMode": "editor"})
+    page.add_init_script(
+        f"localStorage.setItem('omnigent:file-view-preferences', {json.dumps(preferences)});"
+    )
+    page.goto(f"{base_url}/c/{session_id}?file={path}")
+    viewer = page.locator('[data-testid="file-viewer"]:visible')
+    editor = viewer.locator('[contenteditable="true"]')
+    expect(editor).to_be_visible(timeout=30_000)
+    editor.fill("Unsaved offline Markdown draft")
+    expect(viewer.get_by_text("Runner offline — changes save", exact=False)).to_be_visible()
+
+    page.get_by_role("button", name="Markdown line", exact=True).click()
+    dialog = page.get_by_role("dialog", name="Unsaved changes")
+    expect(dialog).to_contain_text("Unsaved changes")
+    dialog.get_by_role("button", name="Keep editing", exact=True).click()
+    expect(editor).to_be_visible()
+    expect(editor).to_have_text("Unsaved offline Markdown draft")
+    expect(viewer.locator(".monaco-editor")).to_have_count(0)
