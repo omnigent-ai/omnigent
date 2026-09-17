@@ -109,32 +109,35 @@ it("caps refresh at 200 while retaining older history and refreshing the entire 
   expect(cached().pages[0].last_id).toBe("s240");
 });
 
-it("filters both scopes when the backend ignores visibility, retaining the raw cursor and window size", async () => {
-  fetchPage.mockResolvedValue(
-    sessionRowsPage(
-      [
-        ...rows(1, 1).map((row) => ({ ...row, permission_level: null })),
-        ...rows(2, 1, true).map((row) => ({ ...row, permission_level: null })),
-      ],
-      true,
-    ),
-  );
-  const { result } = renderHook(
-    () => ({ mine: useScopeCache("mine", 60_000), shared: useScopeCache("shared", 180_000) }),
-    { wrapper },
-  );
-  await waitFor(() => expect(result.current.shared.isSuccess).toBe(true));
-  expect(result.current.mine.data?.pages[0].data.map((row) => row.id)).toEqual(["s1"]);
-  expect(result.current.shared.data?.pages[0].data.map((row) => row.id)).toEqual(["s2"]);
-  expect(result.current.mine.data?.pages[0].last_id).toBe("s2");
-  await act(async () => {
-    await result.current.mine.fetchNextPage();
-  });
-  await act(async () => {
-    await result.current.mine.refetch();
-  });
-  expect(fetchPage.mock.calls.at(-1)?.[0].limit).toBe(60);
-});
+it.each([null, 4])(
+  "filters mixed scopes with permission level %s, retaining cursor and window size",
+  async (permission_level) => {
+    fetchPage.mockResolvedValue(
+      sessionRowsPage(
+        [
+          ...rows(1, 1).map((row) => ({ ...row, permission_level })),
+          ...rows(2, 1, true).map((row) => ({ ...row, permission_level })),
+        ],
+        true,
+      ),
+    );
+    const { result } = renderHook(
+      () => ({ mine: useScopeCache("mine", 60_000), shared: useScopeCache("shared", 180_000) }),
+      { wrapper },
+    );
+    await waitFor(() => expect(result.current.shared.isSuccess).toBe(true));
+    expect(result.current.mine.data?.pages[0].data.map((row) => row.id)).toEqual(["s1"]);
+    expect(result.current.shared.data?.pages[0].data.map((row) => row.id)).toEqual(["s2"]);
+    expect(result.current.mine.data?.pages[0].last_id).toBe("s2");
+    await act(async () => {
+      await result.current.mine.fetchNextPage();
+    });
+    await act(async () => {
+      await result.current.mine.refetch();
+    });
+    expect(fetchPage.mock.calls.at(-1)?.[0].limit).toBe(60);
+  },
+);
 
 it("keeps polling, focus and invalidation to one request after loading more rows", async () => {
   vi.useFakeTimers();

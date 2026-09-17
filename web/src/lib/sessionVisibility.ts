@@ -5,9 +5,8 @@ export function sessionVisibility(
   row: Pick<Conversation, "owner" | "permission_level">,
   viewerId: string | null,
 ): "mine" | "shared" {
-  if ((viewerId !== null && row.owner === viewerId) || (row.permission_level ?? 0) >= 4)
-    return "mine";
-  if (viewerId !== null && row.owner) return "shared";
+  // Admin permissions do not change who owns a session.
+  if (viewerId !== null && row.owner) return row.owner === viewerId ? "mine" : "shared";
   if (row.permission_level != null && row.permission_level > 0 && row.permission_level < 4)
     return "shared";
   // Older single-user servers omit ownership; unknown rows must not appear as shared.

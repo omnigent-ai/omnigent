@@ -140,8 +140,9 @@ def test_scope_requests_and_bounded_automatic_pagination(
     expect(load_more).to_be_visible()
 
 
+@pytest.mark.parametrize("permission_level", [None, 4], ids=["ownership-only", "admin"])
 def test_mine_filters_a_mixed_visibility_response(
-    page: Page, request: pytest.FixtureRequest
+    page: Page, request: pytest.FixtureRequest, permission_level: int | None
 ) -> None:
     base_url = request.config.getoption("--ui-base-url") or request.getfixturevalue("live_server")
     page.route("**/v1/me", lambda route: route.fulfill(json={"user_id": "alice@example.test"}))
@@ -151,7 +152,7 @@ def test_mine_filters_a_mixed_visibility_response(
             "object": "conversation",
             "title": title,
             "owner": owner,
-            "permission_level": None,
+            "permission_level": permission_level,
             "created_at": 1,
             "updated_at": 100 - i,
             "labels": {},
