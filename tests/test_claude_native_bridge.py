@@ -7110,6 +7110,8 @@ def test_picker_values_round_trip_from_either_launch_path(
     # A launch that learned no catalog leaves the recorded picker alone.
     record_model_vocabulary(bridge_dir, launch_env=None, launch_model=None)
     assert read_model_picker_values(bridge_dir) == ["system.ai.glm-5-3"]
+    record_model_vocabulary(bridge_dir, launch_env=None, launch_model=None, picker_values=[])
+    assert read_model_picker_values(bridge_dir) == []
     assert read_model_picker_values(tmp_path / "nonexistent") == []
 
 

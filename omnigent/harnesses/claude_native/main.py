@@ -1086,12 +1086,14 @@ class ClaudeModelProbe:
     :param default_label: The harness's own label for *default_model*, or
         ``None``.
     :param disabled_models: Disabled picker values and their resolved model ids.
+    :param empty_picker: Structured discovery reported no enabled choices.
     """
 
     alias_rows: list[dict[str, object]]
     default_model: str | None = None
     default_label: str | None = None
     disabled_models: frozenset[str] = frozenset()
+    empty_picker: bool = False
 
 
 def _parse_claude_picker_models(stdout: str) -> list[dict[str, Any]] | None:
@@ -1223,6 +1225,9 @@ async def probe_claude_model_options(
     """
     text = await _run_claude_model_probe(claude_config, stream_input=True)
     models = _parse_claude_picker_models(text) if text is not None else None
+    empty_picker = models is not None and not any(
+        model.get("disabled") is not True for model in models
+    )
     if models is None:
         _logger.info("Claude structured model picker unavailable; falling back to /model")
         text = await _run_claude_model_probe(claude_config, stream_input=False)
@@ -1269,6 +1274,7 @@ async def probe_claude_model_options(
         default_model=default_resolution.get("model"),
         default_label=default_resolution.get("label"),
         disabled_models=disabled_models,
+        empty_picker=empty_picker,
     )
 
 
@@ -1294,7 +1300,7 @@ def claude_catalog_fingerprint(claude_config: ClaudeNativeUcodeConfig | None) ->
     ambient_gateway = os.environ.get(_UCODE_CLAUDE_BASE_URL_ENV) if claude_config is None else None
     return fingerprint_of(
         "claude-native",
-        "control-picker-v1",  # Invalidate catalogs built from unfiltered help aliases.
+        "control-picker-v2",
         sorted(claude_config.env.items()) if claude_config is not None else None,
         claude_config.api_key_helper if claude_config is not None else None,
         claude_config.model if claude_config is not None else None,
@@ -1326,6 +1332,8 @@ async def claude_model_catalog(
     probe = await probe_claude_model_options(claude_config)
     if probe is None:
         return None
+    if probe.empty_picker:
+        return []
     rows = list(probe.alias_rows)
     _non_canonical = (
         claude_config is not None and not _serves_canonical_anthropic_ids(claude_config)

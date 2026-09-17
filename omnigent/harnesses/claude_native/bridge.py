@@ -1517,7 +1517,7 @@ def prepare_bridge_dir(
     }
     if model_env:
         payload["model_env"] = model_env
-    if picker_values:
+    if picker_values is not None:
         payload["model_picker_values"] = list(picker_values)
     if sandbox is not None:
         payload["sandbox"] = _bridge_sandbox_payload(sandbox)
@@ -1772,7 +1772,7 @@ def record_model_vocabulary(
     :param launch_model: The model the launch pins via ``--model``, or
         ``None``.
     :param picker_values: The ``/model`` spellings this session's picker
-        offers, or ``None``/empty when the catalog is unknown.
+        offers, or ``None`` when the catalog is unknown. An empty list clears it.
     :returns: None.
     """
     config = _read_json_file(bridge_dir / _CONFIG_FILE)
@@ -1787,7 +1787,7 @@ def record_model_vocabulary(
     if model_env and config.get("model_env") != model_env:
         config["model_env"] = model_env
         changed = True
-    if picker_values and config.get("model_picker_values") != list(picker_values):
+    if picker_values is not None and config.get("model_picker_values") != list(picker_values):
         config["model_picker_values"] = list(picker_values)
         changed = True
     if launch_model and config.get("launch_model") != launch_model:

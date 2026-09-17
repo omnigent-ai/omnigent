@@ -1789,6 +1789,30 @@ async def test_turn_catalog_and_verdict_follow_the_panes_vocabulary() -> None:
     )
 
 
+async def test_turn_catalog_spells_managed_models_outside_claude_families() -> None:
+    from omnigent.server.routes._sessions.orchestration import (
+        _model_options_cache,
+        _native_turn_catalog,
+        _routed_turn_model_spelling,
+    )
+
+    session_id = "conv_managed_vocab"
+    conv = _native_conv(session_id)
+    _model_options_cache[session_id] = [
+        {"id": "opus", "model": "system.ai.claude-opus-4-8[1m]"},
+        {"id": "system.ai.glm-5-3", "model": "system.ai.glm-5-3"},
+    ]
+    try:
+        assert "system.ai.glm-5-3" in await _native_turn_catalog(session_id, conv)
+        assert (
+            _routed_turn_model_spelling(session_id, conv, "system.ai.glm-5-3")
+            == "system.ai.glm-5-3"
+        )
+        assert _routed_turn_model_spelling(session_id, conv, "system.ai.kimi-k3") is None
+    finally:
+        _model_options_cache.pop(session_id, None)
+
+
 async def test_turn_catalog_refetches_a_stale_pre_launch_catalog() -> None:
     """A pre-launch host catalog never bounds a turn once a runner is bound."""
     from omnigent.server.routes._sessions.orchestration import (

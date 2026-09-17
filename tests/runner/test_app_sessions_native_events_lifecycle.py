@@ -852,6 +852,10 @@ async def test_codex_native_model_options_query_model_list(
     from omnigent.harnesses.codex_native import app_server as codex_native_app_server
     from omnigent.spec.types import ExecutorSpec
 
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setattr(
+        "omnigent.runtime.workflow._resolve_provider_for_build", lambda *_args, **_kwargs: None
+    )
     conv_id = "68ba0a62ebe928d26adf37c8974ce1eb"
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
     bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(conv_id)
@@ -1184,8 +1188,10 @@ async def test_codex_model_catalog_writeback_uses_session_provider(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("empty", [False, True])
 async def test_claude_native_model_options_use_session_launch_catalog(
     monkeypatch: pytest.MonkeyPatch,
+    empty: bool,
 ) -> None:
     """The session listing is the launch catalog from one cached Claude config.
 
@@ -1232,6 +1238,10 @@ async def test_claude_native_model_options_use_session_launch_catalog(
     async def _probe(claude_config: object) -> ClaudeModelProbe:
         del claude_config
         probe_calls.append(1)
+        if empty:
+            return ClaudeModelProbe(
+                alias_rows=[], disabled_models=frozenset({"system.ai.claude-opus-4-10"})
+            )
         return ClaudeModelProbe(
             alias_rows=[
                 {
@@ -1304,6 +1314,8 @@ async def test_claude_native_model_options_use_session_launch_catalog(
             },
         ]
     }
+    if empty:
+        expected = {"models": []}
     assert first.status_code == 200
     assert first.json() == expected
     assert second.json() == expected
@@ -1515,8 +1527,10 @@ async def test_claude_native_model_options_config_error_is_not_retryable(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("empty", [False, True])
 async def test_claude_native_model_options_expire_and_reread_the_store(
     monkeypatch: pytest.MonkeyPatch,
+    empty: bool,
 ) -> None:
     """The session listing follows the store once its cache TTL passes.
 
@@ -1606,6 +1620,8 @@ async def test_claude_native_model_options_expire_and_reread_the_store(
             "isDefault": True,
         }
     ]
+    if empty:
+        refreshed = []
 
     async with _runner_client(app) as client:
         create_resp = await client.post(
@@ -1624,7 +1640,7 @@ async def test_claude_native_model_options_expire_and_reread_the_store(
     assert first.status_code == 200
     assert [row["model"] for row in first.json()["models"]] == ["system.ai.claude-opus-4-10"]
     assert second.status_code == 200
-    assert [row["model"] for row in second.json()["models"]] == ["system.ai.claude-opus-5"]
+    assert [row["model"] for row in second.json()["models"]] == [row["model"] for row in refreshed]
     # A warm store re-read costs no new harness probe.
     assert probe_calls == [1]
 

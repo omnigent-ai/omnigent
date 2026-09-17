@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -190,9 +191,51 @@ async def test_catalog_falls_back_for_older_claude(
     assert "--model" in launches[2]
 
 
-async def test_empty_structured_catalog_never_falls_back(monkeypatch: pytest.MonkeyPatch) -> None:
-    launches = _stub_picker(monkeypatch, [], default="")
-    assert await claude_native.claude_model_catalog(None) == []
+@pytest.mark.parametrize("configured", [False, True])
+@pytest.mark.parametrize(
+    "models",
+    [[], [{"value": "fable", "resolvedModel": "claude-fable-5-1", "disabled": True}]],
+    ids=["empty", "disabled-only"],
+)
+async def test_empty_structured_catalog_never_falls_back(
+    monkeypatch: pytest.MonkeyPatch, configured: bool, models: list[dict[str, Any]]
+) -> None:
+    launches = _stub_picker(monkeypatch, models)
+    config = (
+        claude_native.ClaudeNativeUcodeConfig(env={}, model="gateway-default")
+        if configured
+        else None
+    )
+    assert await claude_native.claude_model_catalog(config) == []
+    assert len(launches) == 1
+
+
+async def test_default_only_structured_picker_keeps_its_enabled_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_picker(monkeypatch, [{"value": "default", "resolvedModel": "claude-opus-5"}])
+    assert await claude_native.claude_model_catalog(None) == [
+        {
+            "id": "claude-opus-5",
+            "model": "claude-opus-5",
+            "displayName": "Opus 5",
+            "isDefault": True,
+        }
+    ]
+
+
+async def test_disabled_only_refresh_replaces_the_cached_catalog(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(claude_native, "claude_catalog_fingerprint", lambda _: "test-picker")
+    model = {"value": "opus", "resolvedModel": "claude-opus-5", "displayName": "Opus 5"}
+    _stub_picker(monkeypatch, [model])
+    assert await claude_native.claude_launch_catalog(None)
+
+    launches = _stub_picker(monkeypatch, [{**model, "disabled": True}])
+    assert await claude_native.claude_reprobed_launch_catalog(None) == []
+    assert await claude_native.claude_launch_catalog(None) == []
     assert len(launches) == 1
 
 

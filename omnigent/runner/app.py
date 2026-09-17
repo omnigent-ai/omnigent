@@ -5915,23 +5915,16 @@ def create_runner_app(
         resolved_model = (
             resolve_claude_native_model_selection(selected_model, claude_config) or selected_model
         )
-        # ``/model`` takes only this session's own picker vocabulary — its
-        # picker values, its family aliases, its one custom slot. Typing an
-        # id outside it leaves the pane on its old model while this handler
-        # reports success, so fail loud instead. Same translation the routed
-        # turn path and the executor apply.
+        # Translate through the pane's picker values, aliases, and custom slot.
+        # An unknown spelling must fail before any command reaches the terminal.
         env = read_model_env(bridge_dir) or None
-        # The picker values matter most on a gateway-managed picker, whose
-        # rows are named by served id (``system.ai.glm-5-3``) and spelled by
-        # no alias or pin. The session's own rows, the launch's record, and
-        # the stored catalog are that picker read from whichever of the three
-        # this runner still holds.
         cached_options = _claude_model_options_rows.get(conv_id)
-        picker_values = picker_command_values(
-            cached_options[1] if cached_options is not None else ()
-        ) or read_model_picker_values(bridge_dir)
-        if not picker_values:
-            picker_values = stored_claude_picker_values(claude_config)
+        if cached_options is not None:
+            picker_values = picker_command_values(cached_options[1])
+        else:
+            picker_values = read_model_picker_values(bridge_dir)
+            if not picker_values:
+                picker_values = stored_claude_picker_values(claude_config)
         model_arg = claude_model_command_arg(resolved_model, env, picker_values=picker_values)
         if model_arg is None:
             _logger.warning(
@@ -11120,7 +11113,7 @@ def create_runner_app(
                     "detail": "the harness model probe is still resolving",
                 },
             )
-        if not rows:
+        if rows is None:
             return JSONResponse(
                 status_code=503,
                 content={

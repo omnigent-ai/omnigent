@@ -1316,7 +1316,7 @@ async def codex_reprobed_launch_catalog(
     """
     Await a fresh catalog for one launch shape, joining an in-flight probe.
 
-    Failed or empty probes leave the stored catalog untouched; stale rows
+    Failed probes leave the stored catalog untouched; stale rows
     are never returned as the result of the refresh.
 
     :param codex_path: Optional Codex executable override.
