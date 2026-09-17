@@ -94,7 +94,7 @@ def _seed_citation_file(
                 "text": (
                     f"[Line 100]({_FILE_PATH}:100) and [Line 200]({_FILE_PATH}:200) "
                     f"and [Last line]({_FILE_PATH}:{len(_AFTER_LINES)}) "
-                    f"and [Beyond file]({_FILE_PATH}:5000)"
+                    f"and [Beyond file]({_FILE_PATH}:5000) and [Plain file]({_FILE_PATH})"
                 ),
             },
         },
@@ -270,7 +270,10 @@ def test_citation_preserves_offline_markdown_draft_with_diff_preference(
         f"{base_url}/v1/sessions/{session_id}/events",
         json={
             "type": "external_assistant_message",
-            "data": {"agent": "hello_world", "text": f"[Markdown line]({destination}:12)"},
+            "data": {
+                "agent": "hello_world",
+                "text": f"[Markdown line]({destination}:12) and [Plain Markdown]({destination})",
+            },
         },
         timeout=10,
     )
@@ -316,6 +319,15 @@ def test_citation_preserves_offline_markdown_draft_with_diff_preference(
     target = viewer.locator('[data-line="12"]')
     expect(target).to_have_text("Original paragraph 12.")
     expect(target).to_be_in_viewport()
+
+    viewer.get_by_role("button", name=re.compile(r"^View mode")).click()
+    page.get_by_role("menuitem", name="Edit", exact=True).click()
+    editor.fill("Draft after following a citation")
+    expect(viewer.get_by_text("Runner offline — changes save", exact=False)).to_be_visible()
+    page.get_by_role("button", name="Plain Markdown", exact=True).click()
+    expect(page).not_to_have_url(re.compile(r"[?&]line="))
+    expect(dialog).not_to_be_visible()
+    expect(editor).to_have_text("Draft after following a citation")
 
 
 def test_plain_markdown_open_restores_scroll_after_citing_another_file(
@@ -377,6 +389,8 @@ def test_plain_markdown_open_restores_scroll_after_citing_another_file(
     viewer = page.locator('[data-testid="file-viewer"]:visible')
     target = viewer.locator('[data-line="200"]')
     expect(target).to_be_attached(timeout=30_000)
+    # A real reader gesture stops the initial saved-scroll restoration.
+    viewer.locator('[data-line="1"]').click()
     target.evaluate("el => el.scrollIntoView({block: 'center'})")
     expect(target).to_be_in_viewport()
     original_top = target.evaluate("el => el.getBoundingClientRect().top")
@@ -392,3 +406,92 @@ def test_plain_markdown_open_restores_scroll_after_citing_another_file(
         ) < 25""",
         arg=original_top,
     )
+
+
+@pytest.mark.parametrize("mode", ["source", "split", "unified"])
+def test_plain_open_does_not_replay_a_citation(
+    page: Page, seeded_session: tuple[str, str], mode: str
+) -> None:
+    """An explicit open without a line wins over a citation still in the URL."""
+    _seed_citation_file(page, seeded_session)
+    base_url, session_id = seeded_session
+    diff = mode != "source"
+    preferences = json.dumps({"diffActive": diff, "diffLayout": mode if diff else "unified"})
+    page.add_init_script(
+        f"localStorage.setItem('omnigent:file-view-preferences', {json.dumps(preferences)});"
+    )
+    page.set_viewport_size({"width": 3200, "height": 1000})
+    page.goto(f"{base_url}/c/{session_id}?file={_FILE_PATH}")
+    viewer = page.locator('[data-testid="file-viewer"]:visible')
+    if diff:
+        expect(viewer.locator(".monaco-diff-editor")).to_be_visible(timeout=30_000)
+        separator = page.get_by_role("separator", name="Resize panel", exact=True)
+        box = separator.bounding_box()
+        assert box is not None
+        page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+        page.mouse.down()
+        page.mouse.move(1600, box["y"] + box["height"] / 2)
+        page.mouse.up()
+        if mode == "split":
+            expect(viewer.locator(".monaco-diff-editor")).to_have_class(
+                re.compile(r"\bside-by-side\b")
+            )
+        else:
+            expect(viewer.locator(".monaco-diff-editor")).not_to_have_class(
+                re.compile(r"\bside-by-side\b")
+            )
+    page.get_by_role("button", name="Line 100", exact=True).click()
+    page.wait_for_function(_CENTERED_LINE, arg={"text": _AFTER_LINES[99], "diff": diff})
+    lines = viewer.locator(".modified .view-lines:not(.line-delete)" if diff else ".view-lines")
+    lines.get_by_text(_AFTER_LINES[99], exact=True).hover()
+    page.mouse.wheel(0, -300)
+    page.wait_for_function(
+        f"arg => !({_CENTERED_LINE})(arg)", arg={"text": _AFTER_LINES[99], "diff": diff}
+    )
+    saved = lines.evaluate(
+        """async (lines, citedText) => {
+      const el = lines.closest('.monaco-editor');
+      const anchor = [...lines.querySelectorAll('.view-line')].find(line =>
+        line.textContent.replace(/\u00a0/g, ' ') === citedText
+      );
+      if (!anchor) throw new Error('Cited line missing after reader scroll');
+      let previous = anchor.getBoundingClientRect().top;
+      let stable = 0;
+      for (let frame = 0; frame < 60 && stable < 4; frame++) {
+        await new Promise(requestAnimationFrame);
+        const current = anchor.getBoundingClientRect().top;
+        stable = current === previous ? stable + 1 : 0;
+        previous = current;
+      }
+      if (stable < 4) throw new Error('Reader scroll did not settle');
+      const top = el.getBoundingClientRect().top;
+      const center = top + el.clientHeight / 2;
+      const line = [...el.querySelectorAll('.view-line')].sort((a, b) =>
+        Math.abs(a.getBoundingClientRect().top - center) -
+        Math.abs(b.getBoundingClientRect().top - center)
+      )[0];
+      return {text: line.textContent, top: line.getBoundingClientRect().top - top};
+    }""",
+        _AFTER_LINES[99],
+    )
+    page.get_by_role("button", name="Plain file", exact=True).click()
+    expect(page).not_to_have_url(re.compile(r"[?&](line|column)="))
+    page.wait_for_function(
+        """({saved, diff}) => {
+      const editor = document.querySelector(
+        '[data-testid="file-viewer"] ' +
+        (diff ? '.modified .view-lines:not(.line-delete)' : '.view-lines')
+      )?.closest('.monaco-editor');
+      if (!editor) return false;
+      return [...editor.querySelectorAll('.view-line')].some(line =>
+        line.textContent === saved.text && Math.abs(
+          line.getBoundingClientRect().top - editor.getBoundingClientRect().top - saved.top
+        ) < 3
+      );
+    }""",
+        arg={"saved": saved, "diff": diff},
+    )
+    expect(viewer.locator(".monaco-diff-editor")).to_have_count(1 if diff else 0)
+    # Plain opens do not disable a later explicit click on the same citation.
+    page.get_by_role("button", name="Line 100", exact=True).click()
+    page.wait_for_function(_CENTERED_LINE, arg={"text": _AFTER_LINES[99], "diff": diff})

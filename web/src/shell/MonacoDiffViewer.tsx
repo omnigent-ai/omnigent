@@ -292,8 +292,8 @@ export function MonacoDiffViewer({
       // wide enough for split (see SPLIT_DIFF_MIN_WIDTH), so we leave Monaco's
       // responsive default in place rather than forcing split at any width.
       minimap: { enabled: false },
-      // Collapsed context can leave too few visible lines below a citation to center it.
-      scrollBeyondLastLine: !!position,
+      // Keep centering room even after a plain open so collapsed diffs do not jump.
+      scrollBeyondLastLine: true,
       // Code-font preference (Settings → Appearance), read at creation; live
       // changes arrive via updateOptions in the effect above. An unset family
       // resolves to the shared mono stack, so the diff matches the terminal
@@ -311,7 +311,7 @@ export function MonacoDiffViewer({
       // diff / GitHub) so only changed hunks + a few context lines are shown.
       hideUnchangedRegions: { enabled: true, contextLineCount: 3 },
     };
-  }, [layout, hideWhitespace, wrapLines, position]);
+  }, [layout, hideWhitespace, wrapLines]);
 
   return (
     <div className="flex h-full flex-col">

@@ -470,8 +470,8 @@ function MonacoCodeEditorInner({
     return {
       readOnly: !canEdit,
       minimap: { enabled: false },
-      // Leave room to center citations near the end of the loaded file.
-      scrollBeyondLastLine: !!position,
+      // Keep room to center EOF without shrinking the scroll range after a plain open.
+      scrollBeyondLastLine: true,
       // Code-font preference (Settings → Appearance), read at creation; live
       // changes arrive via updateOptions in the effect below. An unset family
       // resolves to the shared mono stack, so the editor matches the terminal
@@ -484,7 +484,7 @@ function MonacoCodeEditorInner({
       // Read-only buffers still allow selection + copy; just hide the caret.
       cursorStyle: canEdit ? "line" : "underline-thin",
     };
-  }, [canEdit, position]);
+  }, [canEdit]);
 
   // Apply live code-font changes to the mounted editor. Monaco is a fixed-pixel
   // widget with no CSS-variable path like the chrome font, so the new

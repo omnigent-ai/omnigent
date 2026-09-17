@@ -335,10 +335,11 @@ export function AppShell() {
   const [selectedFilePath, setSelectedFilePath] = useState<string | null>(() =>
     conversationId ? (readSessionWorkspaceState(conversationId).selectedFilePath ?? null) : null,
   );
+  // Explicit opens override the URL, including opens without a cited position.
   const [fileNavigation, setFileNavigation] = useState<{
     conversationId: string | undefined;
     path: string;
-    position: FilePosition;
+    position: FilePosition | undefined;
   }>();
   const citationPath = searchParams.get("file");
   const citationLine = searchParams.get("line");
@@ -1194,7 +1195,7 @@ export function AppShell() {
     (path: string, options?: OpenFileOptions) => {
       const position = options?.line ? { line: options.line, column: options.column } : undefined;
       setSelectedFilePath(path);
-      setFileNavigation(position ? { conversationId, path, position: { ...position } } : undefined);
+      setFileNavigation({ conversationId, path, position });
       // A file and a shell tab can't both own the rail's content slot —
       // opening a file deselects any active shell tab (its tab stays in the
       // strip).
@@ -1236,9 +1237,9 @@ export function AppShell() {
           next.delete("comment"); // stale comment belongs to the previous file
           // A citation's cited line rides along so the viewer can land on it;
           // a plain open clears any previous citation's line.
-          if (options?.line != null) next.set("line", String(options.line));
+          if (position?.line != null) next.set("line", String(position.line));
           else next.delete("line");
-          if (options?.column != null) next.set("column", String(options.column));
+          if (position?.column != null) next.set("column", String(position.column));
           else next.delete("column");
           return next;
         },
@@ -1564,6 +1565,7 @@ export function AppShell() {
               params.set("file", neighbor);
               params.delete("comment");
               params.delete("line"); // stale citation belongs to the closed file
+              params.delete("column");
               return params;
             },
             { replace: true },
