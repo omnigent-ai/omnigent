@@ -2935,17 +2935,14 @@ def test_curated_tier_ids_strip_bracket_suffixes() -> None:
     }
     provider = creds.resolve_pi_native_provider(config_loader=lambda: config)
     assert provider is not None
-    assert provider.curated_models is True
     assert [entry["id"] for entry in provider.extra_models] == ["GLM-5.3-Flash", "GLM-5.3"]
 
 
 def test_provider_launch_scopes_picker_via_enabled_models(tmp_path: Path) -> None:
     """The managed settings.json scopes the picker to the rendered catalog.
 
-    ``enabledModels`` is the allowlist counterpart to the
-    ``OMNIGENT_PI_ENV_UNSET`` denylist: provider-qualified refs for every
-    model in the rendered models.json config, so Pi's picker shows exactly
-    the managed set even if a built-in provider's catalog gets activated.
+    Provider-qualified refs distinguish managed models from built-in entries.
+    Users can still toggle the picker back to the full catalog.
     """
     provider = creds.PiProviderConfig(
         provider_id="omnigent",
@@ -2968,29 +2965,67 @@ def test_provider_launch_scopes_picker_via_enabled_models(tmp_path: Path) -> Non
     assert settings["defaultThinkingLevel"] is None
 
 
-def test_provider_launch_curated_single_model_render_still_scopes(tmp_path: Path) -> None:
-    """A curated set that collapses to one rendered model still scopes.
-
-    The curation signal is the family ``models:`` map (``curated_models``),
-    not the rendered model count, so a ``{default: X, opus: X}`` map scopes
-    the picker to exactly X instead of falling back to no scoping.
-    """
-    provider = creds.PiProviderConfig(
-        provider_id="omnigent",
-        base_url="https://api.anthropic.com",
-        api="anthropic-messages",
-        model="GLM-5.3-Flash",
-        api_key="sk-secret",
-        auth_header=False,
-        extra_models=[{"id": "GLM-5.3-Flash"}],
-        curated_models=True,
+@pytest.mark.parametrize("kind", ["key", "gateway"])
+@pytest.mark.parametrize("duplicate_tiers", [False, True])
+@pytest.mark.parametrize("override", [None, "gpt-4.1"])
+@pytest.mark.parametrize("prior_scope", [None, ["openai/gpt-5", "anthropic/claude-sonnet-4-6"]])
+def test_setup_single_model_preserves_picker_scope(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+    duplicate_tiers: bool,
+    override: str | None,
+    prior_scope: list[str] | None,
+) -> None:
+    """Selecting a default in setup must not replace existing Pi picker preferences."""
+    from omnigent.inner import pi_settings
+    from omnigent.onboarding.configure_models import (
+        build_gateway_provider_entry,
+        build_key_provider_entry,
     )
+
+    monkeypatch.setenv("PI_TEST_API_KEY", "fake-key")
+    if kind == "key":
+        entry = build_key_provider_entry(
+            "openai", "https://api.openai.com/v1", "env:PI_TEST_API_KEY", "gpt-5"
+        )
+    else:
+        entry = build_gateway_provider_entry(
+            "https://gateway.example/v1",
+            "env:PI_TEST_API_KEY",
+            families=["openai"],
+            models={"openai": "gpt-5"},
+        )
+    entry["default"] = True
+    if duplicate_tiers:
+        family = entry["openai"]
+        assert isinstance(family, dict)
+        family["models"] = {"default": "preferred", "preferred": "gpt-5", "fast": "gpt-5"}
+    config = {"providers": {"configured": entry}}
+
+    global_dir = tmp_path / "global-agent"
+    global_dir.mkdir()
+    global_settings: dict[str, object] = {"theme": "light"}
+    if prior_scope is not None:
+        global_settings["enabledModels"] = prior_scope
+    global_file = global_dir / "settings.json"
+    global_file.write_text(json.dumps(global_settings), encoding="utf-8")
+    monkeypatch.setattr(pi_settings, "DEFAULT_PI_AGENT_DIR", global_dir)
+
+    provider = creds.resolve_pi_native_provider(model=override, config_loader=lambda: config)
+    assert provider is not None
+    assert [model["id"] for model in provider.extra_models] == [override or "gpt-5"]
     agent_dir = tmp_path / "pi-agent"
     creds.pi_native_provider_launch(agent_dir, provider)
 
     settings = json.loads((agent_dir / "settings.json").read_text(encoding="utf-8"))
-    assert settings["enabledModels"] == ["omnigent/GLM-5.3-Flash"]
+    if prior_scope is None:
+        assert "enabledModels" not in settings
+    else:
+        assert settings["enabledModels"] == prior_scope
+    assert settings["theme"] == "light"
     assert settings["defaultThinkingLevel"] is None
+    assert json.loads(global_file.read_text(encoding="utf-8")) == global_settings
 
 
 def test_provider_launch_without_curated_set_does_not_scope(tmp_path: Path) -> None:
@@ -3048,7 +3083,6 @@ def test_curated_tier_alias_resolves_to_concrete_id() -> None:
         "deepseek-v4-pro",
         "GLM-5.3",
     ]
-    assert provider.curated_models is True
 
 
 def test_curated_tier_alias_resolves_before_bracket_strip() -> None:

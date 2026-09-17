@@ -263,11 +263,6 @@ class PiProviderConfig:
     listing_provider: model_catalog.ResolvedModelProvider | None = field(
         default=None, hash=False, compare=False
     )
-    # True when the rendered model list is an operator-curated set: a family
-    # ``models:`` tier map (the authored curation contract) rather than a live
-    # discovered catalog. Lets the launch path scope Pi's picker even when a
-    # curated map collapses to a single rendered model id.
-    curated_models: bool = False
 
     @property
     def _primary_claude_only(self) -> bool:
@@ -1433,31 +1428,28 @@ def _inline_family_pi_provider(
             configured_context_window=family.context_window,
             configured_max_output_tokens=family.max_output_tokens,
         )
-        # Register the family's curated ``models:`` shortlist (its tier map)
-        # alongside the selected model, so Pi's /model picker offers exactly
-        # the deployment's verified set instead of just the launch model.
-        # Duplicate ids collapse to their first occurrence; the selected
-        # model's entry is already in the list, so skip a second copy. Tier
-        # ids get the same bracket-suffix strip as the selected model, so
-        # ``[1m]``-style operator ids don't render a gateway-rejected entry.
-        # A tier value may itself name another tier; resolve it first so an
-        # alias never renders as a picker row.
-        shortlist: list[_PiModelEntry] = [model_entry]
-        seen_ids: set[str] = {resolved_model}
-        for tier_model in family.models.values():
-            if not isinstance(tier_model, str) or not tier_model:
-                continue
-            tier_id = re.sub(r"\[.*?\]$", "", family.resolve_model_tier(tier_model))
-            if tier_id in seen_ids:
-                continue
-            seen_ids.add(tier_id)
-            shortlist.append(
-                _gateway_pi_model_entry(
-                    tier_id,
-                    configured_context_window=family.context_window,
-                    configured_max_output_tokens=family.max_output_tokens,
-                )
+        # Register the family's tiers alongside the selected model. Resolve
+        # aliases and strip bracket suffixes before deduplicating model ids.
+        tier_ids = list(
+            dict.fromkeys(
+                re.sub(r"\[.*?\]$", "", family.resolve_model_tier(tier_model))
+                for tier_model in family.models.values()
+                if isinstance(tier_model, str) and tier_model
             )
+        )
+        shortlist: list[_PiModelEntry] = [model_entry]
+        # A session override must not turn a default-only setup into a shortlist.
+        if len(tier_ids) > 1:
+            for tier_id in tier_ids:
+                if tier_id == resolved_model:
+                    continue
+                shortlist.append(
+                    _gateway_pi_model_entry(
+                        tier_id,
+                        configured_context_window=family.context_window,
+                        configured_max_output_tokens=family.max_output_tokens,
+                    )
+                )
         return PiProviderConfig(
             provider_id=_PI_PROVIDER_ID,
             base_url=family.base_url,
@@ -1469,7 +1461,6 @@ def _inline_family_pi_provider(
             # passthrough endpoint rejects it, and silence reads as a hang.
             credential_warning=_cross_family_routing_warning(entry, family_name, resolved_model),
             extra_models=shortlist,
-            curated_models=bool(family.models),
             # Record the endpoint the pre-launch picker can enumerate live; no
             # I/O happens here so session launch stays off the network.
             listing_provider=model_catalog.ResolvedModelProvider(
@@ -1654,10 +1645,7 @@ def write_pi_models_config(
 def _enabled_model_refs(rendered: _PiModelsConfig) -> list[str]:
     """Build provider-qualified ``enabledModels`` refs for a rendered config.
 
-    Every model of every rendered provider is included, so the picker's
-    scoped view lists exactly the managed catalog. (A soft preference, not an
-    enforcement boundary: the picker can toggle back to all models. The
-    ``OMNIGENT_PI_ENV_UNSET`` denylist is the fail-closed net.)
+    This is a picker preference; users can toggle back to all models.
 
     :param rendered: The rendered ``models.json`` mapping.
     :returns: ``["provider/model", ...]`` refs in rendered order (deterministic,
@@ -1742,32 +1730,13 @@ def pi_native_provider_launch(
     # applies the session-level thinking before the compat check fires).
     # Passing None in the overlay makes _deep_merge_settings write null for the
     # key; Pi's getDefaultThinkingLevel() returns null (falsy) → no thinking.
-    #
-    # ``enabledModels`` is the settings key Pi actually reads (verified against
-    # @earendil-works/pi-coding-agent 0.85): SettingsManager.getEnabledModels()
-    # returns ``settings.enabledModels``, which Pi resolves at startup and in
-    # the /model dialog into its session-scoped model list (internally
-    # ``scopedModels``); the /model dialog's scoped view and Ctrl+P cycling
-    # both then honour that resolved scope. It is a preference, not an
-    # enforcement boundary (the dialog can toggle back to all models, and a
-    # project ``.pi/settings.json`` overrides the managed file); the
-    # ``OMNIGENT_PI_ENV_UNSET`` denylist is the fail-closed net. Refs are
-    # provider-qualified so they resolve via Pi's findExactModelReferenceMatch
-    # (case-insensitive) even when a built-in provider carries the same model
-    # id. Older Pi ignores the unknown settings key harmlessly. Written only
-    # for a curated or multi-model render (see below).
     from omnigent.inner.pi_settings import prepare_managed_pi_agent_dir
 
     overlay: dict[str, object] = {"defaultThinkingLevel": None}
-    # Scope when the deployment curated a set (a family ``models:`` map,
-    # which stays curated even if its tiers collapse to one rendered id) or
-    # when the render carries several managed models (live discovered
-    # catalogs). A single, non-curated render stays unscoped: the managed
-    # model is the only one our models.json adds, and scoping would hide
-    # working built-in entries from users whose real provider credentials
-    # legitimately activate them (local/hosted runners).
+    # A default-only setup must preserve the user's existing picker scope.
+    # Multi-model catalogs use qualified refs to distinguish built-in providers.
     enabled_refs = _enabled_model_refs(rendered)
-    if enabled_refs and (provider.curated_models or len(enabled_refs) > 1):
+    if len(enabled_refs) > 1:
         overlay["enabledModels"] = enabled_refs
     prepare_managed_pi_agent_dir(agent_dir, overlay=overlay)
     env = {PI_CODING_AGENT_DIR_ENV_VAR: str(agent_dir)}
