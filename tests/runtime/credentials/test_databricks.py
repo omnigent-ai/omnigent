@@ -106,6 +106,34 @@ def test_resolves_default_when_profile_is_none(
     assert creds == WorkspaceCreds(host="https://default.example.com", token="default-token")
 
 
+def test_duplicate_default_sections_resolve_instead_of_crashing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    A ``.databrickscfg`` with a duplicate ``[DEFAULT]`` section (as written
+    by the Databricks VS Code extension) must resolve instead of raising
+    ``configparser.DuplicateOptionError``. Non-strict parsing keeps the
+    last value, matching the databricks-sdk and the executor's readers.
+    """
+    cfg = _write_cfg(
+        tmp_path,
+        (
+            "[DEFAULT]\n"
+            "host = https://first.example.com\n"
+            "token = first-token\n"
+            "\n"
+            "[DEFAULT]\n"
+            "host = https://second.example.com\n"
+            "token = second-token\n"
+        ),
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg))
+
+    creds = resolve_databricks_workspace(profile=None)
+
+    assert creds == WorkspaceCreds(host="https://second.example.com", token="second-token")
+
+
 def test_named_profile_overrides_default(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     cfg = _write_cfg(
         tmp_path,
