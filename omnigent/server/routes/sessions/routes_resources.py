@@ -2674,6 +2674,12 @@ def register_resources_routes(
         """
         Execute a shell command in an environment.
 
+        Owner-only. A command has no path to inspect, so unlike the
+        filesystem proxy there is no workspace-relative form that could
+        be opened to collaborators: any command reaches the owner's own
+        machine, the same boundary ``_browse_level`` closes for absolute
+        paths, and it passes no policy or approval gate on the way.
+
         :param session_id: Session/conversation identifier.
         :param environment_id: Environment resource id.
         :param request: JSON body with ``command`` and optional
@@ -2688,6 +2694,7 @@ def register_resources_routes(
             path,
             body,
             request=request,
+            required_level=LEVEL_OWNER,
             environment_id=environment_id,
             publish_invalidation=False,
         )
