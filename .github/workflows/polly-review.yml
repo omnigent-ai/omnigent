@@ -48,18 +48,49 @@ jobs:
     if: github.event_name == 'pull_request'
     uses: ./.github/workflows/security-gate.yml
 
+  trigger:
+    name: Validate review request
+    if: >-
+      github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request != null &&
+      contains(github.event.comment.body, '/review') &&
+      !endsWith(github.actor, '[bot]') &&
+      (
+        github.event.comment.author_association == 'OWNER' ||
+        github.event.comment.author_association == 'MEMBER' ||
+        github.event.comment.author_association == 'COLLABORATOR' ||
+        contains(fromJSON(vars.REVIEW_ALLOWLIST || '[]'), github.event.comment.user.login)
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions: {}
+    outputs:
+      eligible: ${{ steps.command.outputs.eligible }}
+    steps:
+      - name: Validate /review command
+        id: command
+        env:
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          set -euo pipefail
+          # Reject inline mentions before they can replace a pending review.
+          if grep -qE '^[[:space:]]*/review([[:space:]]|$)' <<<"$COMMENT_BODY"; then
+            echo "eligible=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::Comment mentions '/review' but not as a command; skipping."
+            echo "eligible=false" >> "$GITHUB_OUTPUT"
+          fi
+
   review:
     name: Polly AI Review
-    needs: gate
+    needs: [gate, trigger]
     # Ignored comments must not cancel reviews, including the bot's own post.
     # Queue eligible requests; the duplicate check runs after the active review.
     concurrency:
       group: polly-review-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr }}
       cancel-in-progress: false
-    # Fire on non-draft PRs (after gate passes), `/review` comments by write-
-    # access users or REVIEW_ALLOWLIST logins, or workflow_dispatch. The
-    # `!cancelled()` ensures the job runs when gate is skipped (non-PR events)
-    # but not when it fails.
+    # !cancelled() permits skipped event-specific dependencies; each event
+    # still requires its own gate or command validation to succeed.
     if: >-
       !cancelled() && (
         (
@@ -69,42 +100,25 @@ jobs:
         ) ||
         (
           github.event_name == 'issue_comment' &&
-          github.event.issue.pull_request != null &&
-          contains(github.event.comment.body, '/review') &&
-          !endsWith(github.actor, '[bot]') &&
-          (
-            github.event.comment.author_association == 'OWNER' ||
-            github.event.comment.author_association == 'MEMBER' ||
-            github.event.comment.author_association == 'COLLABORATOR' ||
-            contains(fromJSON(vars.REVIEW_ALLOWLIST || '[]'), github.event.comment.user.login)
-          )
+          needs.trigger.result == 'success' &&
+          needs.trigger.outputs.eligible == 'true'
         ) ||
         github.event_name == 'workflow_dispatch'
       )
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - name: Validate /review command
-        id: trigger
+      - name: Acknowledge /review command
         if: github.event_name == 'issue_comment'
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          COMMENT_BODY: ${{ github.event.comment.body }}
           COMMENT_ID: ${{ github.event.comment.id }}
-          ISSUE_NUMBER: ${{ github.event.issue.number }}
         run: |
           set -euo pipefail
-          # Validate `/review` appears as a command (first non-space token on a line).
-          if ! grep -qE '^[[:space:]]*/review([[:space:]]|$)' <<<"$COMMENT_BODY"; then
-            echo "::notice::Comment mentions '/review' but not as a command; skipping."
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
           # React with eyes to acknowledge.
           gh api "repos/$REPO/issues/comments/$COMMENT_ID/reactions" \
             -f content=eyes --silent || true
-          echo "skip=false" >> "$GITHUB_OUTPUT"
 
       # A commit needs reviewing once. Several triggers can fire for the same
       # head SHA (open then `/review`, or `/review` then maintainer approval),
@@ -112,7 +126,6 @@ jobs:
       # say so in one comment; `/review force` re-reviews anyway.
       - name: Skip if this commit already has a review
         id: dupe
-        if: steps.trigger.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -160,7 +173,7 @@ jobs:
             || echo "::notice::Could not post the skip note (read-only token); skipping anyway."
 
       - name: Check LLM credentials available
-        if: steps.trigger.outputs.skip != 'true' && steps.dupe.outputs.duplicate != 'true'
+        if: steps.dupe.outputs.duplicate != 'true'
         id: creds
         env:
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
@@ -177,7 +190,7 @@ jobs:
           fi
 
       - name: Resolve PR number
-        if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
+        if: steps.creds.outputs.available == 'true'
         id: pr
         run: |
           set -euo pipefail
@@ -192,46 +205,46 @@ jobs:
       # avoids the TOCTOU issue CodeQL flags when issue_comment checks
       # out untrusted PR code in a privileged workflow.
       - name: Check out repo
-        if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
+        if: steps.creds.outputs.available == 'true'
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
 
       - name: Set up Python
-        if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
+        if: steps.creds.outputs.available == 'true'
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
         with:
           python-version-file: ".python-version"
 
       - name: Set up uv
-        if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
+        if: steps.creds.outputs.available == 'true'
         # This workflow checks out main, which may predate the action on its PR branch.
         uses: omnigent-ai/omnigent/.github/actions/setup-uv@25521b2eb074b11ebe51fe5e3eaeb494e20101eb # self-contained setup
         with:
           enable-cache: true
 
       - name: Install tmux
-        if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
+        if: steps.creds.outputs.available == 'true'
         # tmux: Polly uses it for its shell terminal.
         run: |
           sudo apt-get update
           sudo apt-get install -y tmux
 
       - name: Cache virtualenv
-        if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
+        if: steps.creds.outputs.available == 'true'
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v5.0.5
         with:
           path: .venv
           key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
 
       - name: Install dependencies
-        if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
+        if: steps.creds.outputs.available == 'true'
         # Reviews a prefetched diff against trusted main; it does not run PR checks.
         run: uv sync --extra all
 
       - name: Install Claude Code CLI
-        if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
+        if: steps.creds.outputs.available == 'true'
         env:
           NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
         run: |
@@ -245,7 +258,7 @@ jobs:
           echo "$CC_CLI_DIR/node_modules/.bin" >> "$GITHUB_PATH"
 
       - name: Install Codex CLI
-        if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
+        if: steps.creds.outputs.available == 'true'
         env:
           NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
         run: |
@@ -257,13 +270,13 @@ jobs:
           echo "$CODEX_CLI_DIR/node_modules/.bin" >> "$GITHUB_PATH"
 
       - name: Set LLM credentials
-        if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
+        if: steps.creds.outputs.available == 'true'
         env:
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
         run: echo "LLM_API_KEY=${LLM_API_KEY}" >> "$GITHUB_ENV"
 
       - name: Write gateway profile (~/.databrickscfg)
-        if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
+        if: steps.creds.outputs.available == 'true'
         env:
           GATEWAY_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
@@ -281,7 +294,7 @@ jobs:
           echo "DATABRICKS_BEARER=${LLM_API_KEY}" >> "$GITHUB_ENV"
 
       - name: Write Omnigent provider config
-        if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
+        if: steps.creds.outputs.available == 'true'
         env:
           GATEWAY_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
           OMNIGENT_ANTHROPIC_MODEL: ${{ vars.OMNIGENT_CI_ANTHROPIC_MODEL }}
@@ -329,7 +342,7 @@ jobs:
           "
 
       - name: Collect PR context
-        if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
+        if: steps.creds.outputs.available == 'true'
         id: ctx
         env:
           GH_TOKEN: ${{ github.token }}
@@ -511,14 +524,14 @@ jobs:
 
       - name: Mint App token
         id: app-token
-        if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true' && vars.OMNIGENT_BOT_APP_ID != ''
+        if: steps.creds.outputs.available == 'true' && vars.OMNIGENT_BOT_APP_ID != ''
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           client-id: ${{ vars.OMNIGENT_BOT_APP_ID }}
           private-key: ${{ secrets.OMNIGENT_BOT_APP_KEY }}
 
       - name: Run Polly review
-        if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
+        if: steps.creds.outputs.available == 'true'
         id: polly
         env:
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
@@ -571,7 +584,7 @@ jobs:
           echo "${delim}" >> "$GITHUB_OUTPUT"
 
       - name: Scan review output for secrets before posting
-        if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
+        if: steps.creds.outputs.available == 'true'
         env:
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
         run: |
