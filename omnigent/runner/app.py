@@ -6595,6 +6595,68 @@ def create_runner_app(
         )
         return Response(status_code=200 if updated else 204)
 
+    async def _handle_claude_native_clear(conv_id: str) -> Response:
+        # Claude Code's own /clear rotates the pane onto a fresh session; the
+        # forwarder already notices the rotation and supersedes this
+        # conversation, so there is nothing to do server-side beyond the inject.
+        from omnigent.harnesses.claude_native.bridge import (
+            bridge_dir_for_bridge_id,
+            inject_slash_command,
+        )
+
+        bridge_id = await _claude_native_bridge_id_for_session(
+            server_client=server_client,
+            session_id=conv_id,
+        )
+        bridge_dir = bridge_dir_for_bridge_id(bridge_id)
+        await _prepare_claude_native_pane_for_injection(conv_id, bridge_dir)
+        try:
+            await asyncio.to_thread(
+                inject_slash_command,
+                bridge_dir,
+                command="/clear",
+                timeout_s=1.0,
+            )
+        except (RuntimeError, ValueError) as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "claude_native_clear_failed",
+                    "detail": _client_safe_error_detail(exc, context="claude-native clear"),
+                },
+            )
+        return Response(status_code=200)
+
+    async def _handle_codex_native_clear(conv_id: str) -> Response:
+        # Codex spells "start a new conversation" /new, not /clear. Mapping the
+        # vendor name here is what lets the composer offer one /clear for every
+        # harness.
+        registry = resource_registry.terminal_registry
+        instance = registry.get(conv_id, "codex", "main") if registry is not None else None
+        if instance is None or not instance.running:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "codex_native_clear_failed",
+                    "detail": "Codex terminal is not running; reconnect first.",
+                },
+            )
+
+        socket_path = str(instance.socket_path)
+        target = instance.tmux_target
+
+        try:
+            await asyncio.to_thread(_inject_codex_slash_command, socket_path, target, "/new")
+        except (RuntimeError, ValueError) as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "codex_native_clear_failed",
+                    "detail": _client_safe_error_detail(exc, context="codex-native clear"),
+                },
+            )
+        return Response(status_code=200)
+
     async def _handle_opencode_native_clear(conv_id: str) -> Response:
         if _session_harness_name(conv_id) != "opencode-native":
             return Response(status_code=204)
@@ -6678,16 +6740,19 @@ def create_runner_app(
             )
         return Response(status_code=200)
 
-    def _inject_codex_compact(socket_path: str, target: str) -> None:
-        # Typing "/compact" opens Codex's slash-command popup, which draws
+    def _inject_codex_slash_command(socket_path: str, target: str, command: str) -> None:
+        # Typing a slash command opens Codex's popup, which draws
         # asynchronously: an Enter sent back-to-back is swallowed by the
         # still-opening popup and the command never submits, so settle first.
         from omnigent.harnesses.claude_native.bridge import _run_tmux
 
         _run_tmux(socket_path, "send-keys", "-t", target, "C-u")
-        _run_tmux(socket_path, "send-keys", "-l", "-t", target, "/compact")
+        _run_tmux(socket_path, "send-keys", "-l", "-t", target, command)
         time.sleep(_CODEX_POPUP_RENDER_S)
         _run_tmux(socket_path, "send-keys", "-t", target, "Enter")
+
+    def _inject_codex_compact(socket_path: str, target: str) -> None:
+        _inject_codex_slash_command(socket_path, target, "/compact")
 
     def _inject_codex_permission_mode(
         socket_path: str,
@@ -9762,6 +9827,10 @@ def create_runner_app(
             return Response(status_code=204)
 
         if body_type == "clear":
+            if _session_harness_name(conversation_id) == "claude-native":
+                return await _handle_claude_native_clear(conversation_id)
+            if _session_harness_name(conversation_id) == "codex-native":
+                return await _handle_codex_native_clear(conversation_id)
             if _session_harness_name(conversation_id) == "opencode-native":
                 return await _handle_opencode_native_clear(conversation_id)
             return Response(status_code=204)

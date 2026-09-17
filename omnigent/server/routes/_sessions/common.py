@@ -67,6 +67,11 @@ _MCP_ELICITATION_TYPE: str = "mcp_elicitation"
 _COMPACT_TYPE: str = "compact"
 
 
+# "Start a new conversation, keeping this terminal". Dispatched to the runner
+# like _COMPACT_TYPE, which maps it to the harness's own vendor command.
+_CLEAR_TYPE: str = "clear"
+
+
 _SLASH_COMMAND_TYPE: str = "slash_command"
 
 
@@ -509,6 +514,7 @@ _ALLOWED_EVENT_TYPES: frozenset[str] = frozenset(ITEM_TYPE_TO_DATA_CLS.keys()) |
     _APPROVAL_TYPE,
     _MCP_ELICITATION_TYPE,
     _COMPACT_TYPE,
+    _CLEAR_TYPE,
     _STOP_SESSION_TYPE,
     _RETRY_SESSION_TYPE,
     _EXTERNAL_ASSISTANT_MESSAGE_TYPE,
@@ -977,6 +983,7 @@ __all__ = [
     "_CLAUDE_NATIVE_UI_LABEL_VALUE",
     "_CLAUDE_NATIVE_WRAPPER_LABEL_KEY",
     "_CLAUDE_NATIVE_WRAPPER_LABEL_VALUE",
+    "_CLEAR_TYPE",
     "_CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY",
     "_CODEX_NATIVE_COLLABORATION_MODES",
     "_CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY",

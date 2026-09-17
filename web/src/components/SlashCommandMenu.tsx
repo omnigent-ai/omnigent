@@ -16,6 +16,7 @@ import { cn } from "@/lib/utils";
  */
 export const BUILTIN_SLASH_COMMANDS: Record<string, string> = {
   "/compact": "Compact conversation context to free up space",
+  "/clear": "Start a new conversation, keeping this terminal",
   "/context": "Show context window usage for this session",
   "/effort": "Set reasoning effort: /effort low | medium | high | default",
   "/model": "Switch the model for this session: /model <name> | default",

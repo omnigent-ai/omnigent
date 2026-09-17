@@ -90,6 +90,7 @@ from omnigent.server.routes._errors import session_not_found as _session_not_fou
 from omnigent.server.routes._sessions.common import (
     _ALLOWED_EVENT_TYPES,
     _APPROVAL_TYPE,
+    _CLEAR_TYPE,
     _COMPACT_TYPE,
     _EXTERNAL_ACP_SUBAGENT_START_TYPE,
     _EXTERNAL_ANTIGRAVITY_SUBAGENT_START_TYPE,
@@ -679,6 +680,7 @@ def register_events_routes(
             _APPROVAL_TYPE,
             _MCP_ELICITATION_TYPE,
             _COMPACT_TYPE,
+            _CLEAR_TYPE,
             _SLASH_COMMAND_TYPE,
             _STOP_SESSION_TYPE,
             _RETRY_SESSION_TYPE,
@@ -1213,40 +1215,62 @@ def register_events_routes(
                 _mcp_elicit_payload,
             )
             return {"queued": False, "elicitation_id": elicit_id}
-        if body.type == _COMPACT_TYPE:
-            # Unified control dispatch (designs/CLAUDE_NATIVE.md
-            # "Control events dispatch on the runner"): forward /compact
-            # to the bound runner first, regardless of harness. The
-            # runner dispatches by harness — native harnesses inject
-            # /compact into the vendor TUI and return 200 on success or
-            # 5xx on failure. SDK harnesses return 204 (no-op) because
-            # their context is controlled entirely by the vendor harness.
-            # A 4xx/5xx from the runner is surfaced as an error.
+
+        async def _dispatch_tui_control(
+            event_type: str,
+            *,
+            failure_prefix: str,
+            offline_message: str,
+            unsupported_message: str,
+        ) -> dict[str, Any]:
+            """
+            Forward a context-control event to the bound runner.
+
+            Unified control dispatch (designs/CLAUDE_NATIVE.md "Control
+            events dispatch on the runner"): the event goes to the runner
+            first, regardless of harness. The runner dispatches by harness
+            — native harnesses inject the vendor command into the TUI and
+            return 200 on success or 5xx on failure. SDK harnesses return
+            204 (no-op) because their context is controlled entirely by the
+            vendor harness. A 4xx/5xx from the runner is surfaced as an
+            error.
+
+            :param event_type: Runner event type, e.g. ``"compact"``.
+            :param failure_prefix: Leads the error raised on a runner 5xx,
+                e.g. ``"Compaction failed"``.
+            :param offline_message: Raised when a native session's runner
+                is offline and could not be woken.
+            :param unsupported_message: Raised when no runner was reachable
+                and the session is not a native terminal.
+            :returns: ``{"queued": False}`` once the runner accepted it.
+            """
+            nonlocal conv
+
             # TUI budget, not the 5s default: the claude-native handler
             # drives a delivery-verified slash-command inject, and a timeout
-            # here would surface as an error mid-TUI-compact.
+            # here would surface as an error mid-inject.
             runner_result = await _forward_session_change_to_runner(
                 session_id,
                 runner_router,
-                {"type": _COMPACT_TYPE},
+                {"type": event_type},
                 timeout_s=_TUI_INJECT_FORWARD_TIMEOUT_S,
             )
             if runner_result is not None and runner_result.status_code == 200:
                 return {"queued": False}
             if runner_result is not None and runner_result.status_code != 204:
                 raise OmnigentError(
-                    f"Compaction failed: runner returned {runner_result.status_code}",
+                    f"{failure_prefix}: runner returned {runner_result.status_code}",
                     code=ErrorCode.INTERNAL_ERROR,
                 )
             # ``runner_result is None`` means no runner was reachable. For a
-            # native-terminal session /compact MUST run in the vendor TUI —
-            # falling through to server-side in-process compaction is wrong
-            # (it wouldn't compact the terminal's own context) and errors for
-            # a harness that declares no LLM model. A disconnected-but-wakeable
-            # session (runner_asleep / host_asleep) should wake and compact
-            # just like sending a message does, so relaunch the runner the same
-            # way the message-dispatch path does, then retry the forward once.
-            if runner_result is None and _is_native_terminal_session(conv):
+            # native-terminal session the command MUST run in the vendor TUI —
+            # falling through to a server-side equivalent is wrong (it wouldn't
+            # touch the terminal's own context) and errors for a harness that
+            # declares no LLM model. A disconnected-but-wakeable session
+            # (runner_asleep / host_asleep) should wake and run it just like
+            # sending a message does, so relaunch the runner the same way the
+            # message-dispatch path does, then retry the forward once.
+            if runner_result is None and conv is not None and _is_native_terminal_session(conv):
                 conv, woke_client = await _wake_bound_runner_for_control(conv)
                 if woke_client is not None:
                     # Same TUI-inject budget as the initial forward: a
@@ -1254,34 +1278,59 @@ def register_events_routes(
                     # advertised), and the claude-native injector's worst case
                     # (~16s) exceeds the 5s default — a timeout there returns
                     # None and would wrongly fall through to the "reconnect"
-                    # 503 while Claude Code is actually compacting.
+                    # 503 while the vendor TUI is actually running the command.
                     runner_result = await _forward_session_change_to_runner(
                         session_id,
                         runner_router,
-                        {"type": _COMPACT_TYPE},
+                        {"type": event_type},
                         timeout_s=_TUI_INJECT_FORWARD_TIMEOUT_S,
                     )
                     if runner_result is not None and runner_result.status_code == 200:
                         return {"queued": False}
                     if runner_result is not None and runner_result.status_code != 204:
                         raise OmnigentError(
-                            f"Compaction failed: runner returned {runner_result.status_code}",
+                            f"{failure_prefix}: runner returned {runner_result.status_code}",
                             code=ErrorCode.INTERNAL_ERROR,
                         )
                 # Native session that couldn't be woken (host offline) — the
-                # runner is the only thing that can compact it, so surface a
+                # runner is the only thing that can run this, so surface a
                 # clear "reconnect first" error rather than falling through to
-                # in-process compaction (which fails with a confusing
+                # a server-side path (which fails with a confusing
                 # no-LLM-model message).
                 raise OmnigentError(
-                    "Can't compact this session while its runner is offline. "
-                    "Reconnect the session (send a message to wake it), then "
-                    "run /compact again.",
+                    offline_message,
                     code=ErrorCode.RUNNER_UNAVAILABLE,
                 )
             raise OmnigentError(
-                "/compact is not available for this session type.",
+                unsupported_message,
                 code=ErrorCode.INVALID_INPUT,
+            )
+
+        if body.type == _COMPACT_TYPE:
+            return await _dispatch_tui_control(
+                _COMPACT_TYPE,
+                failure_prefix="Compaction failed",
+                offline_message=(
+                    "Can't compact this session while its runner is offline. "
+                    "Reconnect the session (send a message to wake it), then "
+                    "run /compact again."
+                ),
+                unsupported_message="/compact is not available for this session type.",
+            )
+        if body.type == _CLEAR_TYPE:
+            # /clear rotates the vendor session onto a fresh conversation. The
+            # harness's own rotation path then supersedes this one, and the
+            # resulting session.superseded event redirects the open client —
+            # so there is nothing to persist here.
+            return await _dispatch_tui_control(
+                _CLEAR_TYPE,
+                failure_prefix="Starting a new conversation failed",
+                offline_message=(
+                    "Can't start a new conversation while its runner is offline. "
+                    "Reconnect the session (send a message to wake it), then "
+                    "run /clear again."
+                ),
+                unsupported_message="/clear is not available for this session type.",
             )
         if body.type == "compaction":
             import uuid as _uuid

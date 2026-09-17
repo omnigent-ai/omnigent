@@ -12,6 +12,7 @@ import {
 import { isSessionSharedWithOthers } from "@/lib/permissionsApi";
 import {
   buildPendingBubbles,
+  CLEAR_CAPABLE_HARNESSES,
   buildSlashCommandMap,
   buildSlashCommandWithArgsSet,
   collectBubbleMarkdown,
@@ -1345,10 +1346,13 @@ describe("buildSlashCommandMap", () => {
   it("returns the built-ins unchanged when no skills are loaded", () => {
     const map = buildSlashCommandMap([], true, true);
     // Insertion-order: built-ins come from the static record verbatim.
-    // /btw (claude-native) and /side (codex-native) are gated off by default,
-    // so both are excluded here.
+    // /btw (claude-native), /side (codex-native) and /clear (harnesses the
+    // runner knows a new-conversation command for) are gated off by default,
+    // so all three are excluded here.
     expect(Object.keys(map)).toEqual(
-      Object.keys(BUILTIN_SLASH_COMMANDS).filter((name) => name !== "/btw" && name !== "/side"),
+      Object.keys(BUILTIN_SLASH_COMMANDS).filter(
+        (name) => name !== "/btw" && name !== "/side" && name !== "/clear",
+      ),
     );
     // Spot-check a built-in description survives the spread.
     expect(map["/help"]).toBe(BUILTIN_SLASH_COMMANDS["/help"]);
@@ -1372,6 +1376,32 @@ describe("buildSlashCommandMap", () => {
     expect(buildSlashCommandMap([], true, true, true, true)["/btw"]).toBe(
       BUILTIN_SLASH_COMMANDS["/btw"],
     );
+  });
+
+  it("includes /clear only when showClear is true", () => {
+    // Off by default and when explicitly false — a harness the runner has no
+    // new-conversation handler for would have the server reject the event, so
+    // the command must not be offered.
+    expect(buildSlashCommandMap([], true, true)["/clear"]).toBeUndefined();
+    expect(
+      buildSlashCommandMap([], true, true, true, false, false, "/", false)["/clear"],
+    ).toBeUndefined();
+    expect(buildSlashCommandMap([], true, true, true, false, false, "/", true)["/clear"]).toBe(
+      BUILTIN_SLASH_COMMANDS["/clear"],
+    );
+  });
+
+  it("gates /clear on the harnesses the runner can start a new conversation on", () => {
+    // The set is the client half of the runner's `body_type == "clear"`
+    // dispatch. A harness listed here with no runner handler would offer a
+    // command that always errors.
+    expect(CLEAR_CAPABLE_HARNESSES.has("claude-native")).toBe(true);
+    expect(CLEAR_CAPABLE_HARNESSES.has("codex-native")).toBe(true);
+    expect(CLEAR_CAPABLE_HARNESSES.has("opencode-native")).toBe(true);
+    // In-process and SDK harnesses rotate no vendor terminal.
+    expect(CLEAR_CAPABLE_HARNESSES.has("claude-sdk")).toBe(false);
+    expect(CLEAR_CAPABLE_HARNESSES.has("cursor-native")).toBe(false);
+    expect(CLEAR_CAPABLE_HARNESSES.has("")).toBe(false);
   });
 
   it("omits /effort when effort controls are hidden", () => {
@@ -1421,9 +1451,11 @@ describe("buildSlashCommandMap", () => {
       true,
     );
     // Built-ins first, then skills in their input order — the menu
-    // surfaces built-ins above user skills. /btw and /side are gated off.
+    // surfaces built-ins above user skills. /btw, /side and /clear are gated off.
     expect(Object.keys(map)).toEqual([
-      ...Object.keys(BUILTIN_SLASH_COMMANDS).filter((name) => name !== "/btw" && name !== "/side"),
+      ...Object.keys(BUILTIN_SLASH_COMMANDS).filter(
+        (name) => name !== "/btw" && name !== "/side" && name !== "/clear",
+      ),
       "/triage-issues",
       "/mlflow-bug",
     ]);

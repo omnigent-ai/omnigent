@@ -3641,3 +3641,254 @@ async def test_events_compact_on_claude_sdk_buffered_compact_failed_fallback() -
         f"swallowed); got {len(in_progress)} from types {[e.get('type') for e in events]}"
     )
     assert completed == [], "no completed should appear when nothing compacted"
+
+
+@pytest.mark.asyncio
+async def test_events_clear_on_claude_native_session_types_slash_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    POST ``/events`` with ``{"type":"clear"}`` on a claude-native session
+    injects ``/clear`` into tmux and returns 200.
+
+    "Start a new conversation" must run inside Claude Code, which owns the
+    terminal's context: its own ``/clear`` rotates the pane onto a fresh
+    session, and the forwarder then supersedes this conversation. The 200
+    (not 204) is load-bearing — the server reads it to know the control was
+    handled, and a 204 would surface as "not available for this session type".
+    """
+    from omnigent.spec.types import ExecutorSpec
+
+    captured: list[Any] = []
+
+    def _fake_inject(
+        bridge_dir: Any,
+        *,
+        command: str,
+        timeout_s: float,
+        auto_confirm: bool = False,
+        confirm_hint: str | None = None,
+    ) -> None:
+        """Record the call without touching tmux."""
+        captured.append((bridge_dir, command, timeout_s, auto_confirm))
+
+    monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _fake_inject)
+
+    native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """Return the native spec for any agent_id."""
+        del agent_id, session_id
+        return native_spec
+
+    conv_id = "b1c2d3e4f5a6978869708192a3b4c5d6"
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+
+        resp = await client.post(f"/v1/sessions/{conv_id}/events", json={"type": "clear"})
+
+    assert resp.status_code == 200, (
+        f"Native clear must return 200 from /events; got {resp.status_code}: {resp.text}"
+    )
+    assert len(captured) == 1, (
+        f"Expected one inject_slash_command call from native clear, got {len(captured)}."
+    )
+    bridge_dir, command, timeout_s, auto_confirm = captured[0]
+    assert bridge_dir == bridge_dir_for_conversation_id(conv_id)
+    # Body contract: the literal ``/clear`` is what Claude Code's TUI accepts.
+    # A shape regression (``clear``, missing slash) would land as plain prompt
+    # text and start no new conversation.
+    assert command == "/clear", f"Expected '/clear' literal, got {command!r}."
+    # 1.0s short timeout: missing tmux.json means the pane isn't attached, so
+    # there is no live Claude to rotate.
+    assert timeout_s == 1.0
+    # /clear pops no confirmation dialog, so an extra Enter would land on the
+    # prompt of the NEW conversation and submit a stray empty turn.
+    assert auto_confirm is False, f"clear must not auto-confirm; got {auto_confirm!r}."
+
+
+@pytest.mark.asyncio
+async def test_events_clear_on_codex_native_session_types_new_command(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    POST ``/events`` with ``{"type":"clear"}`` on a codex-native session
+    types ``/new`` — Codex's own name for the command — and returns 200.
+
+    The vendor-command mapping lives in the runner precisely so the composer
+    can offer one ``/clear`` for every harness. Sending the literal ``/clear``
+    to Codex would land as prompt text and start no new conversation.
+    """
+    from tests.runner.helpers import make_test_terminal_instance
+
+    typed: list[tuple[str, ...]] = []
+
+    def _recording_run_tmux(socket_path: str, *args: str) -> None:
+        """Record the keys sent to the pane without touching tmux."""
+        del socket_path
+        typed.append(args)
+
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", _recording_run_tmux)
+
+    codex_native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """Return the codex-native spec for any agent_id."""
+        del agent_id, session_id
+        return codex_native_spec
+
+    conv_id = "c7d8e9f0a1b2334455667788990a1b2c"
+    terminal_registry = TerminalRegistry()
+    instance = make_test_terminal_instance("codex", "main", tmp_path)
+    terminal_registry._by_conversation.setdefault(conv_id, {})[("codex", "main")] = instance
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        terminal_registry=terminal_registry,
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+
+        resp = await client.post(f"/v1/sessions/{conv_id}/events", json={"type": "clear"})
+
+    assert resp.status_code == 200, (
+        f"Codex-native clear must return 200 from /events; got {resp.status_code}: {resp.text}"
+    )
+    literal_sends = [args for args in typed if "-l" in args]
+    assert len(literal_sends) == 1, (
+        f"Expected exactly one literal send-keys from codex clear, got {literal_sends!r}."
+    )
+    assert literal_sends[0][-1] == "/new", (
+        f"Codex spells new-conversation '/new'; got {literal_sends[0][-1]!r}."
+    )
+    # The popup draws asynchronously, so the submit must be a SEPARATE
+    # send-keys after the settle — not appended to the literal text.
+    assert typed[-1][-1] == "Enter", f"clear must submit with Enter; got {typed[-1]!r}."
+
+
+@pytest.mark.asyncio
+async def test_events_clear_on_codex_native_returns_503_when_tmux_is_dead(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    A codex-native clear whose pane is gone returns 503 with the clear-specific
+    error code, so the server surfaces a failure instead of reporting success.
+    """
+    from tests.runner.helpers import make_test_terminal_instance
+
+    def _failing_run_tmux(socket_path: str, *args: str) -> None:
+        """Simulate a tmux pane that is no longer alive."""
+        del socket_path, args
+        raise RuntimeError("no server running on /tmp/dead.sock")
+
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", _failing_run_tmux)
+
+    codex_native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """Return the codex-native spec for any agent_id."""
+        del agent_id, session_id
+        return codex_native_spec
+
+    conv_id = "d9e0f1a2b3c4455566778899a0b1c2d3"
+    terminal_registry = TerminalRegistry()
+    instance = make_test_terminal_instance("codex", "main", tmp_path)
+    terminal_registry._by_conversation.setdefault(conv_id, {})[("codex", "main")] = instance
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        terminal_registry=terminal_registry,
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+
+        resp = await client.post(f"/v1/sessions/{conv_id}/events", json={"type": "clear"})
+
+    assert resp.status_code == 503, (
+        f"Codex-native clear with tmux failure must return 503; "
+        f"got {resp.status_code}: {resp.text}"
+    )
+    body = resp.json()
+    assert body.get("error") == "codex_native_clear_failed", (
+        f"503 body must carry the codex clear-failure error code; got {body!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_events_clear_on_non_native_session_no_ops_with_204() -> None:
+    """
+    A harness with no new-conversation handler 204s rather than claiming
+    success.
+
+    The server turns that 204 into "/clear is not available for this session
+    type", which is what keeps the composer's harness gate honest: a 200 here
+    would tell the user a new conversation started when nothing happened.
+    """
+    in_process_spec = AgentSpec(spec_version=1, name="t")
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """Return an in-process spec for any agent_id."""
+        del agent_id, session_id
+        return in_process_spec
+
+    conv_id = "e1f2a3b4c5d6778899001122334455aa"
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+
+        resp = await client.post(f"/v1/sessions/{conv_id}/events", json={"type": "clear"})
+
+    assert resp.status_code == 204, (
+        f"Non-native clear must 204 no-op; got {resp.status_code}: {resp.text}"
+    )

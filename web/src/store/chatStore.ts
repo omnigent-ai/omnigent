@@ -1190,6 +1190,13 @@ export interface ChatActions {
    */
   compact: () => Promise<void>;
   /**
+   * Start a new conversation on the active session's terminal. Posts a
+   * ``clear`` event; the runner injects the harness's own new-conversation
+   * command, and the resulting rotation supersedes this conversation. No-ops
+   * when there is no active conversation.
+   */
+  clearConversation: () => Promise<void>;
+  /**
    * Refetch runner-backed session state for the active conversation.
    *
    * Used when a native runner comes online after being unreachable: the
@@ -2684,6 +2691,12 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     const { conversationId } = get();
     if (!conversationId) return;
     await postEvent(conversationId, { type: "compact", data: {} });
+  },
+
+  clearConversation: async () => {
+    const { conversationId } = get();
+    if (!conversationId) return;
+    await postEvent(conversationId, { type: "clear", data: {} });
   },
 
   refreshSessionState: async (conversationId) => {
