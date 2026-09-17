@@ -297,6 +297,9 @@ def expand_framework_notices(messages: list[dict[str, Any]]) -> list[dict[str, A
             for block in content
             if not isinstance(block, dict) or block.get("type") != FRAMEWORK_NOTICE_BLOCK_TYPE
         ]
+        if len(visible_content) == len(content):
+            result.append(message)
+            continue
         result.extend(
             {"role": "system", "content": [{"type": "input_text", "text": notice}]}
             for notice in framework_notices(content)
