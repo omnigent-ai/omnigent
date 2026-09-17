@@ -50,7 +50,7 @@ runs:
         python-version-file: ".python-version"
 
     - name: Install uv
-      uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v4
+      uses: ./.github/actions/setup-uv
       with:
         enable-cache: true
 
@@ -64,15 +64,26 @@ runs:
       shell: bash
       run: uv sync --locked --extra all --group test
 
-    - name: Install binary dependencies
-      working-directory: .github/ci-deps
+    - name: Install system dependencies
       shell: bash
       run: |
         sudo apt-get install -y tmux bubblewrap
         sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-        npm install --ignore-scripts
-        node node_modules/@anthropic-ai/claude-code/install.cjs
-        echo "${GITHUB_WORKSPACE}/.github/ci-deps/node_modules/.bin" >> "$GITHUB_PATH"
+
+    - name: Install Claude Code CLI
+      uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@aa5736c38f5c1258ee29452c6825d75033b952d7
+      with:
+        harness: claude
+
+    - name: Install Codex CLI
+      uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@aa5736c38f5c1258ee29452c6825d75033b952d7
+      with:
+        harness: codex
+
+    - name: Install Pi CLI
+      uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@aa5736c38f5c1258ee29452c6825d75033b952d7
+      with:
+        harness: pi
 
     - name: "Build pinned old server (Config 2: new runner, old server)"
       if: ${{ inputs.server_version != '' }}

@@ -1,7 +1,7 @@
 """add blob_key to files
 
 Revision ID: hh1b2c3d4e5f
-Revises: gh1b2c3d4e5f
+Revises: hh2c3d4e5f6a
 Create Date: 2026-09-16 00:00:00.000000
 
 Adds ``blob_key`` to the ``files`` table so a file row can point at an
@@ -31,7 +31,7 @@ from alembic import op
 from omnigent.db.db_models import Uuid16
 
 revision: str = "hh1b2c3d4e5f"
-down_revision: str | None = "gh1b2c3d4e5f"
+down_revision: str | None = "hh2c3d4e5f6a"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

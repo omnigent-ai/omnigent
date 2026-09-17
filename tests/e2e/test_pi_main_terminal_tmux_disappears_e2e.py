@@ -58,6 +58,7 @@ import shutil
 import signal
 import subprocess
 import tarfile
+import tempfile
 import time
 import uuid
 from collections.abc import Iterator
@@ -154,6 +155,60 @@ def _find_pi_process(marker: str) -> tuple[int, list[str]] | None:
         if "--extension" in argv and not os.path.basename(argv[0]).startswith("tmux"):
             return int(pid_dir.name), argv
     return None
+
+
+def _marker_processes(marker: str) -> str:
+    """Summarise every live process naming *marker*, for failure messages.
+
+    Distinguishes "the tmux launcher is still there but pi never exec'd" from
+    "the whole tree is gone", which the bare pid check cannot express.
+
+    :param marker: The ``pi-native/<hash>`` bridge segment.
+    :returns: One ``pid: argv`` line per match, or a no-match note.
+    """
+    needle = marker.encode()
+    lines: list[str] = []
+    for pid_dir in Path("/proc").iterdir():
+        if not pid_dir.name.isdigit():
+            continue
+        try:
+            raw = (pid_dir / "cmdline").read_bytes()
+        except OSError:
+            continue
+        if needle not in raw:
+            continue
+        argv = " ".join(chunk.decode(errors="replace") for chunk in raw.split(b"\x00") if chunk)
+        lines.append(f"pid {pid_dir.name}: {argv[:300]}")
+    return "\n".join(lines) if lines else "<no process names the bridge marker>"
+
+
+def _capture_terminal_panes() -> str:
+    """Capture the visible pane of every Omnigent tmux terminal on this box.
+
+    Pi's own startup output only ever reaches its tmux pane, so a launch that
+    dies leaves the reason there and nowhere else -- ``keep_alive_after_exit``
+    keeps that pane readable after the process is gone.
+
+    :returns: One labelled block per terminal socket, or a no-socket note.
+    """
+    blocks: list[str] = []
+    for entry in sorted(Path(tempfile.gettempdir()).glob("omnigent-terminal-*")):
+        socket_path = entry / "tmux.sock"
+        if not socket_path.exists():
+            continue
+        try:
+            probe = subprocess.run(
+                ["tmux", "-S", str(socket_path), "capture-pane", "-t", "main", "-p", "-e"],
+                capture_output=True,
+                text=True,
+                timeout=10.0,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            blocks.append(f"[{entry.name}] capture failed: {exc}")
+            continue
+        payload = probe.stdout.strip() or probe.stderr.strip() or "<empty pane>"
+        blocks.append(f"[{entry.name}] rc={probe.returncode}\n{payload[-1500:]}")
+    return "\n".join(blocks) if blocks else "<no omnigent tmux terminals present>"
 
 
 def _kill_pi_processes(marker: str) -> None:
@@ -372,6 +427,12 @@ def pi_host(
             proc.wait()
 
 
+# Node + pi cold-start inside a fresh tmux pane is an external-CLI dependency a
+# loaded shard can miss once; retry rather than red the shard. The explicit cap
+# keeps the staged budgets below authoritative instead of the suite-wide 180s
+# process kill, which would take the whole xdist worker with it.
+@pytest.mark.timeout(360, method="signal")
+@pytest.mark.flaky(reruns=1, reruns_delay=5)
 def test_pi_main_terminal_survives_pi_exit_without_tmux_unavailable(
     pi_host: _PiHost,
     http_client: httpx.Client,
@@ -455,7 +516,10 @@ def test_pi_main_terminal_survives_pi_exit_without_tmux_unavailable(
             time.sleep(1.0)
         assert pi_pid is not None, (
             "the launched 'pi' process never appeared for session "
-            f"{session_id!r}; daemon log tail:\n{host.daemon_log.read_text()[-2000:]}"
+            f"{session_id!r}.\nProcesses naming the bridge marker:\n"
+            f"{_marker_processes(marker)}\n"
+            f"tmux panes (pi's only output sink):\n{_capture_terminal_panes()}\n"
+            f"daemon log tail:\n{host.daemon_log.read_text()[-2000:]}"
         )
 
         # 2) Confirm the pi:main terminal is a live session resource (the

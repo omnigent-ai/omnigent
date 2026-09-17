@@ -13,6 +13,7 @@ from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
 from typing import cast
 
+from omnigent.debug_logging import debug_event
 from omnigent.harnesses.codex_native import side_chat
 from omnigent.harnesses.codex_native.app_server import (
     CodexAppServerClient,
@@ -50,6 +51,8 @@ from omnigent.inner.executor import (
     TurnComplete,
 )
 from omnigent.inner.native_attachments import (
+    FRAMEWORK_NOTICE_BLOCK_TYPE,
+    codex_resize_metadata_path,
     materialize_attachment,
     parse_data_uri,
     unresolved_attachment_marker,
@@ -570,7 +573,20 @@ class CodexNativeExecutor(Executor):
                                 settings_overrides=settings_overrides,
                             )
                     except Exception as exc:
-                        _logger.exception("Codex native turn injection failed")
+                        _logger.exception(
+                            "Codex native turn injection failed",
+                            extra=debug_event(
+                                "codex_turn_injection_failed",
+                                session_id=state.session_id,
+                                turn_id=state.active_turn_id,
+                                thread_id=state.thread_id,
+                                rpc_error_code=(
+                                    exc.code
+                                    if isinstance(exc, CodexAppServerResponseError)
+                                    else None
+                                ),
+                            ),
+                        )
                         error_msg = f"Codex native executor error: {exc}"
                         # Name the servers a still-unsettled MCP startup is
                         # blocked on — the most common cause of an injection
@@ -708,6 +724,9 @@ def _content_to_input_items(content: object, bridge_dir: Path) -> list[dict[str,
             if block is None:
                 continue
             block_type = block.get("type")
+            if block_type == FRAMEWORK_NOTICE_BLOCK_TYPE:
+                _apply_resize_notice_to_latest_image(items, block.get("source_metadata"))
+                continue
             if block_type in {"input_text", "text"}:
                 text = block.get("text")
                 if isinstance(text, str) and text:
@@ -726,6 +745,18 @@ def _content_to_input_items(content: object, bridge_dir: Path) -> list[dict[str,
     if content is None:
         return []
     return [{"type": "text", "text": json.dumps(content, ensure_ascii=True)}]
+
+
+def _apply_resize_notice_to_latest_image(
+    items: list[dict[str, object]],
+    source_metadata: object,
+) -> None:
+    """Attach resize metadata to the preceding Codex image path."""
+    if items and items[-1].get("type") == "localImage":
+        item = items[-1]
+        path = item.get("path")
+        if isinstance(path, str):
+            item["path"] = str(codex_resize_metadata_path(Path(path), source_metadata))
 
 
 def _file_block_to_input_item(

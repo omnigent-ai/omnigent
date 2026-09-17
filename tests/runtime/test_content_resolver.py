@@ -1025,7 +1025,7 @@ def test_compress_image_leaves_small_image_untouched() -> None:
     Image.new("RGB", (32, 32), (10, 20, 30)).save(buffer, format="PNG")
     original = buffer.getvalue()
 
-    result, content_type = compress_image_attachment(original, "image/png")
+    result, content_type, _ = compress_image_attachment(original, "image/png")
 
     assert result is original
     assert content_type == "image/png"
@@ -1038,7 +1038,7 @@ def test_compress_image_shrinks_opaque_png_under_budget() -> None:
         compress_image_attachment,
     )
 
-    result, content_type = compress_image_attachment(_png_bytes_over_budget(), "image/png")
+    result, content_type, _ = compress_image_attachment(_png_bytes_over_budget(), "image/png")
 
     assert len(result) <= IMAGE_MODEL_BUDGET_BYTES
     assert content_type in ("image/webp", "image/jpeg")
@@ -1066,7 +1066,7 @@ def test_compress_image_shrinks_alpha_png_under_budget() -> None:
     original = buffer.getvalue()
     assert len(original) > IMAGE_MODEL_BUDGET_BYTES
 
-    result, content_type = compress_image_attachment(original, "image/png")
+    result, content_type, _ = compress_image_attachment(original, "image/png")
 
     assert len(result) <= IMAGE_MODEL_BUDGET_BYTES
     assert content_type in ("image/webp", "image/png")
@@ -1145,7 +1145,7 @@ def test_compress_image_downscales_to_edge_cap() -> None:
     original = buffer.getvalue()
     assert len(original) > IMAGE_MODEL_BUDGET_BYTES
 
-    result, _ = compress_image_attachment(original, "image/png")
+    result, _, _ = compress_image_attachment(original, "image/png")
 
     with Image.open(BytesIO(result)) as out:
         assert max(out.width, out.height) <= IMAGE_MAX_EDGE_PX
@@ -1173,7 +1173,7 @@ def test_compress_image_format_aware_pixel_cap() -> None:
     jpeg_buf = BytesIO()
     src.save(jpeg_buf, format="JPEG", quality=90)
     # JPEG decodes at a reduced scale via draft(), so it's accepted and shrunk.
-    result, _ = compress_image_attachment(jpeg_buf.getvalue(), "image/jpeg")
+    result, _, _ = compress_image_attachment(jpeg_buf.getvalue(), "image/jpeg")
     assert len(result) <= IMAGE_MAX_DECODED_PIXELS  # comfortably small
 
     png_buf = BytesIO()
@@ -1222,7 +1222,7 @@ def test_compress_image_extreme_aspect_jpeg_is_draft_reduced(
 
     monkeypatch.setattr(ImageOps, "exif_transpose", _spy)
 
-    result, _ = compress_image_attachment(data, "image/jpeg")
+    result, _, _ = compress_image_attachment(data, "image/jpeg")
 
     # draft() must reduce the long edge toward the cap (its result lands in
     # [cap, 2*cap)); a full decode of the 24000 px source would blow past this.
@@ -1258,6 +1258,115 @@ def test_compress_image_rejects_over_source_cap() -> None:
         compress_image_attachment(buffer.getvalue(), "image/jpeg")
 
 
+def test_compress_image_reports_source_dims_on_downscale() -> None:
+    """compress returns the original dims when it downscales, None otherwise."""
+    import os
+    from io import BytesIO
+
+    from PIL import Image
+
+    from omnigent.runtime.content_resolver import (
+        IMAGE_MODEL_BUDGET_BYTES,
+        compress_image_attachment,
+    )
+
+    # High-entropy image wider than the edge cap → must be downscaled to fit.
+    w, h = 3000, 2000
+    buffer = BytesIO()
+    Image.frombytes("RGB", (w, h), os.urandom(w * h * 3)).save(buffer, format="PNG")
+    over = buffer.getvalue()
+    assert len(over) > IMAGE_MODEL_BUDGET_BYTES
+
+    _, _, source_dims = compress_image_attachment(over, "image/png")
+    assert source_dims == (w, h)
+
+    # A small image passes through untouched → no downscale reported.
+    small = BytesIO()
+    Image.new("RGB", (64, 64), (1, 2, 3)).save(small, format="PNG")
+    _, _, none_dims = compress_image_attachment(small.getvalue(), "image/png")
+    assert none_dims is None
+
+
+@pytest.mark.parametrize("orientation", [5, 6, 7, 8])
+def test_resize_dimensions_follow_exif_orientation(
+    monkeypatch: pytest.MonkeyPatch, orientation: int
+) -> None:
+    from io import BytesIO
+
+    from PIL import Image
+
+    from omnigent.runtime import content_resolver
+
+    monkeypatch.setattr(content_resolver, "IMAGE_MODEL_BUDGET_BYTES", 1024)
+    monkeypatch.setattr(content_resolver, "IMAGE_MAX_EDGE_PX", 64)
+    image = Image.new("RGB", (300, 200), "red")
+    exif = image.getexif()
+    exif[274] = orientation
+    original = BytesIO()
+    image.save(original, format="PNG", compress_level=0, exif=exif)
+    result, _, source_dims = content_resolver.compress_image_attachment(
+        original.getvalue(), "image/png"
+    )
+    assert source_dims == (200, 300)
+    with Image.open(BytesIO(result)) as resized:
+        assert resized.height > resized.width
+
+
+def test_resize_notice_injected_for_downscaled_image(
+    artifact_store: FakeArtifactStore,
+) -> None:
+    """A downscaled image gets transient framework context."""
+    store = FakeFileStore(
+        files={
+            "file_big": StoredFile(
+                id="file_big",
+                created_at=0,
+                filename="shot.webp",
+                bytes=100,
+                content_type="image/webp",
+                session_id=None,
+                source_metadata={"width": 6000, "height": 4000},
+            ),
+        }
+    )
+    art = FakeArtifactStore(blobs={"file_big": b"\x00\x01\x02"})
+    item = _make_conversation_item([{"type": "input_image", "file_id": "file_big"}])
+
+    result = resolve_content_references([item], store, art)  # type: ignore[arg-type]
+
+    assert isinstance(result[0].data, MessageData)
+    blocks = result[0].data.content
+    assert blocks[0]["type"] == "input_image"
+    assert blocks[1]["type"] == "_omnigent_framework_notice"
+    assert blocks[1]["source_metadata"] == {"width": 6000, "height": 4000}
+
+
+def test_no_resize_notice_when_not_downscaled(
+    artifact_store: FakeArtifactStore,
+) -> None:
+    """An image with no recorded source dims gets no injected notice block."""
+    store = FakeFileStore(
+        files={
+            "file_img": StoredFile(
+                id="file_img",
+                created_at=0,
+                filename="a.png",
+                bytes=10,
+                content_type="image/png",
+                session_id=None,
+            ),
+        }
+    )
+    art = FakeArtifactStore(blobs={"file_img": b"x"})
+    item = _make_conversation_item([{"type": "input_image", "file_id": "file_img"}])
+
+    result = resolve_content_references([item], store, art)  # type: ignore[arg-type]
+
+    assert isinstance(result[0].data, MessageData)
+    blocks = result[0].data.content
+    assert all(b.get("type") != "_omnigent_framework_notice" for b in blocks)
+
+
 def test_compress_image_skips_non_raster_type() -> None:
     """A non-raster image type (SVG) over the budget is passed through, not 413'd."""
     from omnigent.runtime.content_resolver import (
@@ -1266,7 +1375,7 @@ def test_compress_image_skips_non_raster_type() -> None:
     )
 
     svg = b"<svg xmlns='http://www.w3.org/2000/svg'>" + b" " * (IMAGE_MODEL_BUDGET_BYTES + 1)
-    result, content_type = compress_image_attachment(svg, "image/svg+xml")
+    result, content_type, _ = compress_image_attachment(svg, "image/svg+xml")
 
     assert result is svg
     assert content_type == "image/svg+xml"
@@ -1293,7 +1402,7 @@ def test_compress_image_preserves_rgb_trns_transparency() -> None:
     original = buffer.getvalue()
     assert len(original) > IMAGE_MODEL_BUDGET_BYTES
 
-    result, content_type = compress_image_attachment(original, "image/png")
+    result, content_type, _ = compress_image_attachment(original, "image/png")
 
     assert len(result) <= IMAGE_MODEL_BUDGET_BYTES
     # Alpha-capable branch, never lossy JPEG.
@@ -1347,7 +1456,7 @@ def test_compress_image_flattens_mpo_to_primary_frame() -> None:
 
     # Declared image/jpeg (as browsers/OS label MPO photos); should compress the
     # primary frame rather than 413 as "animated".
-    result, content_type = compress_image_attachment(mpo, "image/jpeg")
+    result, content_type, _ = compress_image_attachment(mpo, "image/jpeg")
 
     assert len(result) <= IMAGE_MODEL_BUDGET_BYTES
     assert content_type in ("image/webp", "image/jpeg")

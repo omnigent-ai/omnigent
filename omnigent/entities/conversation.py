@@ -8,7 +8,10 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from omnigent.inner.native_attachments import UNRESOLVED_ATTACHMENT_MARKER_PATTERN
+from omnigent.inner.native_attachments import (
+    UNRESOLVED_ATTACHMENT_MARKER_PATTERN,
+    reject_authored_framework_notices,
+)
 from omnigent.llms.adapters._content import redact_binary_payloads
 
 # Attachment markers the native executors prepend to prompt text
@@ -308,6 +311,12 @@ class MessageData(BaseModel):
     interrupted: bool = Field(default=False, exclude_if=lambda value: value is False)
     stream_message_id: str | None = None
 
+    @field_validator("content")
+    @classmethod
+    def reject_framework_blocks(cls, content: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        reject_authored_framework_notices(content)
+        return content
+
     @model_validator(mode="after")
     def check_agent_for_assistant(self) -> MessageData:
         """
@@ -525,6 +534,7 @@ class CompactionData(BaseModel):
         :returns: The list with binary payloads replaced by a marker,
             or ``None`` unchanged.
         """
+        reject_authored_framework_notices(value)
         return redact_binary_payloads(value, _binary_payload_omitted)
 
 

@@ -34,6 +34,7 @@ CANARY_SECRETS = {
     "GITHUB_TOKEN": "canary-github",
     "SLACK_BOT_TOKEN": "canary-slack",
     "OPENROUTER_API_KEY": "canary-openrouter",
+    "PYTHON_KEYRING_BACKEND": "test_keyring_backend.FileKeyring",
 }
 
 # The per-harness families, matching the decision table on #3445.

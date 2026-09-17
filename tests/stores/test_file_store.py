@@ -57,6 +57,30 @@ def test_create_with_caller_chosen_id(file_store: SqlAlchemyFileStore) -> None:
     assert fetched.filename == "copy.png"
 
 
+def test_source_metadata_round_trips(file_store: SqlAlchemyFileStore) -> None:
+    """source_metadata is persisted as JSON and read back as a dict."""
+    f = file_store.create(
+        filename="shot.webp",
+        bytes=2048,
+        content_type="image/webp",
+        source_metadata={"width": 6000, "height": 4000},
+    )
+    assert f.source_metadata == {"width": 6000, "height": 4000}
+
+    fetched = file_store.get(f.id)
+    assert fetched is not None
+    assert fetched.source_metadata == {"width": 6000, "height": 4000}
+
+
+def test_source_metadata_defaults_none(file_store: SqlAlchemyFileStore) -> None:
+    """A file created without source_metadata reads back None (not {})."""
+    f = file_store.create(filename="plain.txt", bytes=10)
+    assert f.source_metadata is None
+    fetched = file_store.get(f.id)
+    assert fetched is not None
+    assert fetched.source_metadata is None
+
+
 def test_delete(file_store: SqlAlchemyFileStore) -> None:
     f = file_store.create(filename="temp.txt", bytes=10)
     assert file_store.delete(f.id) is True

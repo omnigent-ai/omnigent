@@ -16,6 +16,7 @@ import { toast } from "sonner";
 import { copyText } from "@/lib/clipboard";
 import { isDatabricksWorkspace, resolveWebSocketUrl } from "@/lib/host";
 import { subscribeCodeFont } from "@/lib/codeFontPreferences";
+import { useFileViewer, useWorkspacePaths } from "@/shell/FileViewerContext";
 import { resolveInitialAttachUrl, watchDirectUpgrade, withAttachParams } from "@/lib/terminals";
 import {
   readTerminalThemeMode,
@@ -29,6 +30,7 @@ import {
   type TerminalActivityListener,
   type TerminalInputListener,
   isUnexpectedTerminalClose,
+  resolveTerminalWorkspaceFileLink,
   TerminalSession,
   WS_CLOSE_WRONG_REPLICA,
 } from "./TerminalSession";
@@ -135,6 +137,19 @@ export function TerminalView({
   focusOnConnect = active,
   directAttachUrl,
 }: TerminalViewProps) {
+  const openFile = useFileViewer();
+  const workspacePaths = useWorkspacePaths();
+  const fileLinkRef = useRef({ openFile, ...workspacePaths });
+  fileLinkRef.current = { openFile, ...workspacePaths };
+  const notifyFileLink = useCallback((uri: string): boolean => {
+    const current = fileLinkRef.current;
+    if (current.openFile === null) return false;
+    const target = resolveTerminalWorkspaceFileLink(uri, current.root, current.home);
+    if (target === null) return false;
+    if (target.line === null) current.openFile(target.path);
+    else current.openFile(target.path, { line: target.line });
+    return true;
+  }, []);
   const [state, setState] = useState<ConnectionState>({ kind: "connecting" });
   const [connectAttempt, setConnectAttempt] = useState(0);
   const [resumeError, setResumeError] = useState<string | null>(null);
@@ -585,6 +600,7 @@ export function TerminalView({
           notifyClipboardRequest,
           focusOnConnectRef.current,
           terminalId === "terminal_codex_main",
+          notifyFileLink,
         );
         sessionRef.current = terminalSession;
         // Relay-connected with a direct URL on offer: negotiate the
@@ -617,6 +633,7 @@ export function TerminalView({
       notifyActivity,
       notifyInput,
       notifyClipboardRequest,
+      notifyFileLink,
       disposeActiveSession,
     ],
   );

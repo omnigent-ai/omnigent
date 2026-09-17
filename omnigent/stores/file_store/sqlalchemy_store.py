@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import builtins
+import json
+from typing import Any
 
 from sqlalchemy import and_, asc, desc, func, or_, select
 from sqlalchemy.orm import Session
@@ -35,6 +37,9 @@ def _to_entity(row: SqlFile) -> StoredFile:
         content_type=row.content_type,
         session_id=row.session_id,
         blob_key=row.blob_key,
+        source_metadata=(
+            json.loads(row.source_metadata) if row.source_metadata is not None else None
+        ),
     )
 
 
@@ -78,6 +83,7 @@ class SqlAlchemyFileStore(FileStore):
         session_id: str | None = None,
         file_id: str | None = None,
         blob_key: str | None = None,
+        source_metadata: dict[str, Any] | None = None,
     ) -> StoredFile:
         """
         Record a new file in the database.
@@ -93,6 +99,9 @@ class SqlAlchemyFileStore(FileStore):
             passes the source row's blob so the copy shares the bytes;
             ``None`` (default) points the row at its own ``file_id`` — an
             independent blob the uploader is expected to ``put`` there.
+        :param source_metadata: Opaque JSON-able dict of metadata about
+            the original upload before any server-side transform, or
+            ``None`` when there is nothing to record.
         :returns: The newly created :class:`StoredFile`.
         """
         file_id = file_id if file_id is not None else generate_file_id()
@@ -101,6 +110,7 @@ class SqlAlchemyFileStore(FileStore):
         # only pre-migration rows carry NULL and fall back to id on read.
         blob_key = blob_key if blob_key is not None else file_id
         created_at = now_epoch()
+        encoded_metadata = json.dumps(source_metadata) if source_metadata is not None else None
 
         def write(session: Session) -> StoredFile:
             row = SqlFile(
@@ -111,6 +121,7 @@ class SqlAlchemyFileStore(FileStore):
                 content_type=content_type,
                 session_id=session_id,
                 blob_key=blob_key,
+                source_metadata=encoded_metadata,
             )
             session.add(row)
             return _to_entity(row)

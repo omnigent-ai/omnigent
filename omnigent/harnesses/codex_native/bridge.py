@@ -36,6 +36,17 @@ CODEX_NATIVE_CONFIGURED_COMMAND_STARTUP_TIMEOUT_SECONDS = 120.0
 # of the configured-command watchdog before the executor reports a generic miss.
 CODEX_NATIVE_STARTUP_PUBLICATION_GRACE_SECONDS = 5.0
 
+_CODEX_COMPOSER_GLYPH = "›"
+_CODEX_DISABLED_COMPOSER_TEXT = frozenset(
+    {
+        "Input disabled.",
+        "Shutting down...",
+        "Answer the questions to continue.",
+        "Respond to the tool suggestion to continue.",
+        "Respond to the MCP server request to continue.",
+    }
+)
+
 _STATE_FILE = "state.json"
 _STATE_LOCK_FILE = "state.lock"
 _STARTUP_ERROR_FILE = "startup_error.json"
@@ -68,6 +79,40 @@ _MCP_CONFIG_FILE = "bridge.json"
 _POLICY_HOOK_FILE = "policy_hook.json"
 _BRIDGE_ROOT = Path.home() / ".omnigent" / "codex-native"
 _ORPHAN_RETENTION_SECONDS = 7 * 24 * 60 * 60
+
+
+def _codex_composer_interactive(pane: str) -> bool:
+    """Return whether Codex's message composer is accepting input.
+
+    Codex renders its live composer as the last pane row whose trimmed text
+    starts with ``›``. The same glyph is dimmed while input is disabled, so
+    reject the disabled placeholder text that accompanies those states.
+
+    :param pane: ANSI-stripped tmux pane text.
+    :returns: ``True`` when the Codex message composer is mounted and enabled.
+    """
+    for line in reversed(pane.splitlines()):
+        row = line.lstrip()
+        if not row.startswith(_CODEX_COMPOSER_GLYPH):
+            continue
+        composer_text = row[len(_CODEX_COMPOSER_GLYPH) :].strip()
+        return composer_text not in _CODEX_DISABLED_COMPOSER_TEXT
+    return False
+
+
+def codex_terminal_interactive(bridge_dir: Path, pane: str) -> bool:
+    """Return whether Codex has a live thread and accepts terminal input.
+
+    A fresh TUI renders before its app-server thread exists, while a resume
+    preloads bridge state before launching the TUI. Requiring both bridge state
+    and the enabled composer gives the same semantic endpoint for both paths
+    without waiting for MCP servers to finish starting.
+
+    :param bridge_dir: Per-session Codex bridge directory.
+    :param pane: ANSI-stripped tmux pane text.
+    :returns: ``True`` when a message typed now can enter the Codex thread.
+    """
+    return read_bridge_state(bridge_dir) is not None and _codex_composer_interactive(pane)
 
 
 def bridge_root() -> Path:

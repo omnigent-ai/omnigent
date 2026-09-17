@@ -347,6 +347,8 @@ class SqlFile(OmnigentBase):
     # blob. Read as COALESCE(blob_key, id); reference-count it before deleting
     # the blob so a fork's shared bytes survive the source's deletion.
     blob_key: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    # Opaque JSON metadata about the original upload; never SQL-filtered.
+    source_metadata: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     __table_args__ = (
         # Files are only ever listed per session (WHERE session_id = ?),

@@ -16,6 +16,7 @@ import logging
 from typing import Any
 
 from omnigent.entities import ConversationItem, MessageData
+from omnigent.inner.native_attachments import framework_notice_block, resize_dimensions
 from omnigent.stores import ArtifactStore, FileStore
 
 _logger = logging.getLogger(__name__)
@@ -322,7 +323,9 @@ def _encode_image(image: Any, image_format: str, **params: Any) -> bytes:
     return buffer.getvalue()
 
 
-def compress_image_attachment(content: bytes, content_type: str) -> tuple[bytes, str]:
+def compress_image_attachment(
+    content: bytes, content_type: str
+) -> tuple[bytes, str, tuple[int, int] | None]:
     """Shrink a raster image so its bytes fit :data:`IMAGE_MODEL_BUDGET_BYTES`.
 
     Compressible raster images upload at the larger
@@ -343,17 +346,20 @@ def compress_image_attachment(content: bytes, content_type: str) -> tuple[bytes,
 
     :param content: Raw uploaded image bytes.
     :param content_type: The resolved image MIME (``image/*``).
-    :returns: ``(bytes, content_type)`` — the (possibly re-encoded) image and
-        its MIME, with the bytes ``<=`` the budget; the content_type may change
-        (e.g. ``image/png`` → ``image/jpeg``). A high-entropy image that can't
-        reach the budget even at the smallest scale/quality raises instead.
+    :returns: ``(bytes, content_type, source_dims)`` — the (possibly re-encoded)
+        image and its MIME, with the bytes ``<=`` the budget; the content_type
+        may change (e.g. ``image/png`` → ``image/jpeg``). ``source_dims`` is the
+        original ``(width, height)`` when the image was actually downscaled (so
+        callers can record a resize notice), else ``None`` (passed through, or
+        re-encoded at the same dimensions). A high-entropy image that can't reach
+        the budget even at the smallest scale/quality raises instead.
     :raises ImageCompressionError: If the bytes don't decode as an image, are
         an oversized animation, or can't be brought under the budget. The
         message is safe to surface to the client (no raw decoder text).
     """
     # Small enough already, or a type we don't compress (SVG etc.): leave as-is.
     if not image_needs_compression(len(content), content_type):
-        return content, content_type
+        return content, content_type, None
 
     import struct
     from io import BytesIO
@@ -377,6 +383,10 @@ def compress_image_attachment(content: bytes, content_type: str) -> tuple[bytes,
             # formats (JPEG) decode scaled-down so they get the higher source
             # ceiling; others decode at full size, so cap the raw allocation.
             probe_format = probe.format
+            # Capture dimensions before draft scaling and transpose.
+            source_size = (probe.width, probe.height)
+            if probe.getexif().get(274) in {5, 6, 7, 8}:
+                source_size = (probe.height, probe.width)
             max_source_px = (
                 IMAGE_MAX_SOURCE_PIXELS
                 if probe_format in _DRAFTABLE_IMAGE_FORMATS
@@ -492,7 +502,9 @@ def compress_image_attachment(content: bytes, content_type: str) -> tuple[bytes,
             for image_format, mime, params in _encodings:
                 data = _encode_image(frame, image_format, **params)
                 if len(data) <= IMAGE_MODEL_BUDGET_BYTES:
-                    return data, mime
+                    # Report dimensions only after a real downscale.
+                    downscaled = frame.width * frame.height < source_size[0] * source_size[1]
+                    return data, mime, (source_size if downscaled else None)
     except (OSError, ValueError) as exc:
         raise ImageCompressionError("the image couldn't be re-encoded") from exc
 
@@ -783,15 +795,16 @@ def _resolve_message_content(
     changed = False
     for block in content:
         if "file_id" in block:
-            resolved.append(
-                _resolve_file_id_block(
-                    block,
-                    file_store,
-                    artifact_store,
-                    cache,
-                    session_id=session_id,
-                )
+            resolved_block, notice = _resolve_file_id_block(
+                block,
+                file_store,
+                artifact_store,
+                cache,
+                session_id=session_id,
             )
+            resolved.append(resolved_block)
+            if notice is not None:
+                resolved.append(framework_notice_block(notice))
             changed = True
         else:
             resolved.append(block)
@@ -822,7 +835,7 @@ def _resolve_file_id_block(
     cache: dict[str, str] | None = None,
     *,
     session_id: str | None = None,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], dict[str, int] | None]:
     """
     Resolve a single content block's ``file_id`` to inline content.
 
@@ -842,8 +855,9 @@ def _resolve_file_id_block(
         :func:`resolve_content_references`).
     :param session_id: Optional owning session id used to verify
         session-scoped file ownership, e.g. ``"conv_abc123"``.
-    :returns: A new dict with ``file_id`` replaced by inline
-        content. All other fields are preserved.
+    :returns: ``(block, notice)`` — a new dict with ``file_id`` replaced by
+        inline content (all other fields preserved), and an optional resize
+        source dimensions to emit alongside a downscaled image (``None`` otherwise).
     :raises ValueError: If ``file_id`` is not found in the file
         store — the file was deleted between request validation
         and agent loop execution.
@@ -876,8 +890,10 @@ def _resolve_file_id_block(
     content_type = _resolve_content_type(file_meta.content_type, file_meta.filename)
 
     block_type = block.get("type")
+    notice: dict[str, int] | None = None
     if block_type == "input_image":
         resolved["image_url"] = f"data:{content_type};base64,{encoded}"
+        notice = resize_dimensions(file_meta.source_metadata)
     else:
         # input_file and any future type: inline as file_data.
         # Uses a data: URI so providers (OpenAI, etc.) can parse
@@ -887,7 +903,7 @@ def _resolve_file_id_block(
         safe_type = _safe_file_data_mime(content_type)
         resolved["file_data"] = f"data:{safe_type};base64,{encoded}"
 
-    return resolved
+    return resolved, notice
 
 
 def _safe_file_data_mime(content_type: str) -> str:

@@ -165,7 +165,7 @@ jobs:
         uses: ./.github/actions/setup-pnpm
 
       - name: Install uv
-        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39  # v8.2.0
+        uses: ./.github/actions/setup-uv
         with:
           enable-cache: true
 
@@ -228,31 +228,17 @@ jobs:
       # native render-parity tests boot a real Claude Code / Codex CLI. The
       # rest of the e2e-ui suite (openai-agents) ignores them.
       - name: Install Claude Code CLI
-        # Same claude-code pin as .github/ci-deps. The native bridge needs a
-        # release that recognises its hook events (older ones show a blocking
-        # startup modal that swallows the first message). Runs the package's
-        # install script so the platform-specific binary is linked into the
-        # temporary CLI directory and put on PATH.
-        env:
-          NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
-        run: |
-          CC_CLI_DIR="${RUNNER_TEMP}/omnigent-cc-cli"
-          mkdir -p "$CC_CLI_DIR" && cd "$CC_CLI_DIR"
-          npm install --no-audit --no-fund @anthropic-ai/claude-code@2.1.266
-          echo "$CC_CLI_DIR/node_modules/.bin" >> "$GITHUB_PATH"
+        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@aa5736c38f5c1258ee29452c6825d75033b952d7
+        with:
+          harness: claude
 
       - name: Install Codex CLI
-        # @openai/codex at the .github/ci-deps pin (same build as e2e.yml's
-        # codex leg). `scripts: null` means no postinstall, so --ignore-scripts
-        # is a safety no-op; the native binary ships in the package and goes on
-        # PATH for the codex render-parity test's tmux pane.
-        env:
-          NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
-        run: |
-          CODEX_CLI_DIR="${RUNNER_TEMP}/omnigent-codex-cli"
-          mkdir -p "$CODEX_CLI_DIR" && cd "$CODEX_CLI_DIR"
-          npm install --ignore-scripts --no-audit --no-fund @openai/codex@0.139.0
-          echo "$CODEX_CLI_DIR/node_modules/.bin" >> "$GITHUB_PATH"
+        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@aa5736c38f5c1258ee29452c6825d75033b952d7
+        with:
+          harness: codex
+
+      - name: Install Antigravity CLI
+        uses: ./.github/actions/setup-agy
 
       - name: Run UI e2e tests
         # --ui-skip-build: the SPA was built in the previous step.
@@ -270,6 +256,7 @@ jobs:
           NIGHTLY_FULL: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
           SHARD_ID: ${{ matrix.shard_id }}
           NUM_SHARDS: ${{ matrix.num_shards }}
+          OMNIGENT_E2E_ANTIGRAVITY: mock
           # Prebuilt sidecar from build-sidecar; the codex goal-mode fixture
           # uses this instead of running cargo build. Absolute path: the
           # fixture runs with cwd at the repo root but be explicit.
@@ -292,11 +279,13 @@ jobs:
           # goes and rebalance; the 1s floor keeps trivial phases out.
           # Retry every otherwise-unmarked failure once for transient CI races;
           # per-test @pytest.mark.flaky settings still take precedence.
+          # Keep the failed attempt's traceback even when its retry passes.
           uv run pytest tests/e2e_ui \
             -v --tb=long --showlocals --log-level=INFO -r a \
             --durations=25 --durations-min=1.0 \
-            --reruns=1 --reruns-delay=5 \
+            --reruns=1 --reruns-delay=5 --rerun-show-tracebacks \
             --ui-skip-build \
+            --ui-timing-output=artifacts/ui-timings.jsonl \
             --splits="$NUM_SHARDS" \
             --group="$((SHARD_ID + 1))" \
             --tracing=retain-on-failure \
@@ -304,6 +293,15 @@ jobs:
             --video=retain-on-failure \
             -m "$MARKER" \
             || { rc=$?; [ "$rc" -eq 5 ] && echo "::notice::No tests collected in this shard; treating as a pass." || exit "$rc"; }
+
+      - name: Upload UI test timings and shard assignment
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: e2e-ui-timings-${{ github.run_id }}-${{ github.run_attempt }}-shard${{ matrix.shard_id }}
+          path: artifacts/ui-timings.jsonl
+          retention-days: 14
+          if-no-files-found: warn
 
       - name: Upload Playwright traces / videos / screenshots on failure
         id: upload_playwright
@@ -355,6 +353,8 @@ jobs:
             /tmp/pytest-of-runner/**/e2e_ui_server*/runner.log
             /tmp/pytest-of-runner/**/e2e_ui_mocked_codex_server*/server.log
             /tmp/pytest-of-runner/**/e2e_ui_mocked_codex_server*/runner.log
+            /tmp/pytest-of-runner/**/test_antigravity_survives_prob*/server.log
+            /tmp/pytest-of-runner/**/test_antigravity_survives_prob*/runner.log
             /tmp/omnigent-*/claude-native/**
             /tmp/claude-home-dump/**
             /tmp/codex-home-dump/**

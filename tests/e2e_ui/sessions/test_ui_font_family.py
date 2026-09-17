@@ -42,14 +42,14 @@ def _open_appearance(page: Page, base_url: str) -> None:
     expect(page.get_by_role("group", name="Font family", exact=True)).to_be_visible(timeout=30_000)
 
 
-def test_ui_font_family_applies_and_persists(page: Page, seeded_session: tuple[str, str]) -> None:
+def test_ui_font_family_applies_and_persists(page: Page, live_server: str) -> None:
     """Typing a family updates the applied property + value live and survives reload.
 
     A fresh context has no stored preference → empty field, no ``--ui-font-family``
     override (the UI uses the system stack). Typing a name applies the property and
     persists the choice; a page reload restores it (no reset, no flash to default).
     """
-    base_url, _session_id = seeded_session
+    base_url = live_server
     _open_appearance(page, base_url)
 
     value = page.get_by_test_id("ui-font-family-input")
@@ -75,11 +75,9 @@ def test_ui_font_family_applies_and_persists(page: Page, seeded_session: tuple[s
     assert _ui_font_family(page).startswith("Georgia"), "family was not restored after reload"
 
 
-def test_ui_font_family_reset_restores_system_default(
-    page: Page, seeded_session: tuple[str, str]
-) -> None:
+def test_ui_font_family_reset_restores_system_default(page: Page, live_server: str) -> None:
     """The Reset button clears the override and returns to the system default."""
-    base_url, _session_id = seeded_session
+    base_url = live_server
 
     # Seed a family before the app boots so the override is applied on load.
     page.goto(base_url)

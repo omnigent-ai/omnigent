@@ -1608,6 +1608,8 @@ def register_resources_routes(
             )
         read_limit = min(type_limit, MAX_ATTACHMENT_UPLOAD_BYTES)
         filename = file.filename
+        # Persist original dimensions only after a downscale.
+        source_dims: tuple[int, int] | None = None
         if content_type in _COMPRESSIBLE_IMAGE_MIMES:
             # Compressible images carry the large cap and the decode, so they are
             # the server's peak upload memory. The body is already spooled to
@@ -1621,7 +1623,7 @@ def register_resources_routes(
                 content = await _read_upload_capped(file, read_limit)
                 if image_needs_compression(len(content), content_type):
                     try:
-                        compressed, resolved_type = await asyncio.to_thread(
+                        compressed, resolved_type, source_dims = await asyncio.to_thread(
                             compress_image_attachment, content, content_type
                         )
                     except ImageCompressionError as exc:
@@ -1640,6 +1642,9 @@ def register_resources_routes(
             filename=filename,
             bytes=len(content),
             content_type=content_type,
+            source_metadata=(
+                {"width": source_dims[0], "height": source_dims[1]} if source_dims else None
+            ),
         )
         artifact_store.put(stored.id, content)
         resource = _stored_file_to_resource(session_id, stored)
@@ -1920,6 +1925,8 @@ def register_resources_routes(
                     filename=stored.filename,
                     bytes=stored.bytes,
                     content_type=stored.content_type,
+                    # Preserve transform metadata on copies.
+                    source_metadata=stored.source_metadata,
                 )
                 created.append(new.id)
                 artifact_store.put(new.id, content)

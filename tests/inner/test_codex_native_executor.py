@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import logging
 from pathlib import Path
 from typing import Any
@@ -460,6 +461,85 @@ def test_image_block_is_sent_as_local_image_not_inline_base64(
     )
 
 
+def test_resize_notice_is_encoded_in_model_visible_image_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Codex receives resize metadata without adding user-visible text."""
+    _FakeCodexNativeClient.requests = []
+    _FakeCodexNativeClient.next_turn = 1
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    _start_state(tmp_path)
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    async def run() -> None:
+        async for _ in executor.run_turn(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_image", "image_url": _PNG_DATA_URI},
+                        {
+                            "type": "_omnigent_framework_notice",
+                            "source_metadata": {"width": 4600, "height": 3400},
+                        },
+                        {"type": "input_text", "text": "inspect this"},
+                    ],
+                },
+            ],
+            [],
+            "",
+        ):
+            pass
+
+    asyncio.run(run())
+
+    start = next(
+        params for method, params in _FakeCodexNativeClient.requests if method == "turn/start"
+    )
+    image = start["input"][0]
+    assert image["type"] == "localImage"
+    assert "downscaled-from-4600x3400" in image["path"]
+    assert start["input"][1] == {"type": "text", "text": "inspect this"}
+    assert len(start["input"]) == 2
+
+
+def test_resize_paths_preserve_multiple_images_and_cached_originals(tmp_path: Path) -> None:
+    from omnigent.inner.codex_native_executor import _content_to_input_items
+    from omnigent.inner.native_attachments import framework_notice_block
+
+    content = []
+    for image_bytes, dimensions in [
+        (b"first image", {"width": 6000, "height": 4000}),
+        (b"second image", {"width": 6000, "height": 4000}),
+        (b"third image", {"width": 8000, "height": 5000}),
+    ]:
+        content.extend(
+            [
+                {
+                    "type": "input_image",
+                    "filename": "same.png",
+                    "image_url": "data:image/png;base64," + base64.b64encode(image_bytes).decode(),
+                },
+                framework_notice_block(dimensions),
+            ]
+        )
+    items = _content_to_input_items(content, tmp_path)
+    paths = [Path(item["path"]) for item in items]
+    assert len(set(paths)) == 3
+    assert [path.read_bytes() for path in paths] == [
+        b"first image",
+        b"second image",
+        b"third image",
+    ]
+    assert "downscaled-from-8000x5000" in paths[2].name
+    assert (tmp_path / "uploads" / "same.png").read_bytes() == b"first image"
+    assert _content_to_input_items(content, tmp_path) == items
+
+
 def test_input_file_text_is_inlined_as_a_text_item(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -755,6 +835,7 @@ def test_steer_does_not_retry_ambiguous_or_unrelated_errors(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     error: Exception,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Only Codex's explicit idle semantic is safe to retry."""
 
@@ -784,6 +865,25 @@ def test_steer_does_not_retry_ambiguous_or_unrelated_errors(
     state = read_bridge_state(tmp_path)
     assert state is not None
     assert state.active_turn_id == "turn_maybe_active"
+
+    from omnigent.debug_logging import record_to_row
+
+    record = next(
+        record
+        for record in caplog.records
+        if record.getMessage() == "Codex native turn injection failed"
+    )
+    row = record_to_row(record, source="runner")
+    assert row["session_id"] == state.session_id
+    assert row["event_name"] == "codex_turn_injection_failed"
+    attrs = row["attributes"]
+    assert row["turn_id"] == "turn_maybe_active"
+    assert attrs["thread_id"] == state.thread_id
+    if isinstance(error, CodexAppServerResponseError):
+        assert attrs["rpc_error_code"] == "-32600"
+    else:
+        assert "rpc_error_code" not in attrs
+    assert "do not duplicate" not in json.dumps(attrs)
 
 
 def test_stale_steer_recovery_preserves_and_steers_concurrent_new_turn(
@@ -1676,6 +1776,7 @@ def test_turn_start_is_not_gated_on_pending_mcp_startup(
 def test_turn_error_names_pending_mcp_servers(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
     A turn failure during MCP startup names the still-pending servers.
@@ -1716,6 +1817,23 @@ def test_turn_error_names_pending_mcp_servers(
 
     assert [type(event) for event in events] == [ExecutorError]
     assert "MCP startup still waiting on storage-console" in events[0].message
+
+    from omnigent.debug_logging import record_to_row
+
+    records = [
+        record
+        for record in caplog.records
+        if record.getMessage() == "Codex native turn injection failed"
+    ]
+    assert len(records) == 1
+    row = record_to_row(records[0], source="runner")
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert row["session_id"] == state.session_id
+    assert row["event_name"] == "codex_turn_injection_failed"
+    assert row["attributes"]["thread_id"] == state.thread_id
+    assert row["attributes"]["exception_type"] == "RuntimeError"
+    assert str(tmp_path) not in json.dumps(row["attributes"])
 
 
 def test_interrupt_with_active_turn_and_pending_mcp_stops_both(

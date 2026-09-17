@@ -58,6 +58,7 @@ from playwright.async_api import Request, Route, async_playwright, expect
 from tests.e2e_ui.start_session.helpers import (
     commit_landing_workspace_picker,
     open_landing_workspace_picker,
+    stub_empty_host_picker_data,
 )
 
 # Stubbed host the composer auto-selects (the tunneled runner registers no
@@ -698,6 +699,7 @@ async def _drive_send_busy_spinner(base_url: str, session_id: str) -> None:
                     await route.continue_()
 
             await page.route("**/v1/hosts", handle_hosts)
+            await stub_empty_host_picker_data(page, _HOST_ID)
             await page.route("**/v1/agents", handle_agents)
             await page.route("**/v1/sessions/*/events", handle_events)
             await page.route(_SESSIONS_RE, handle_sessions)
@@ -849,6 +851,7 @@ async def _drive_ignore_uncorrelated_announcement(base_url: str, session_id: str
                     await route.continue_()
 
             await page.route("**/v1/hosts", handle_hosts)
+            await stub_empty_host_picker_data(page, _HOST_ID)
             await page.route("**/v1/agents", handle_agents)
             await page.route("**/v1/sessions/*/events", handle_events)
             await page.route(_SESSIONS_RE, handle_sessions)
@@ -1013,6 +1016,7 @@ async def _drive_no_redirect_after_navigating_away(
                     await route.continue_()
 
             await page.route("**/v1/hosts", handle_hosts)
+            await stub_empty_host_picker_data(page, _HOST_ID)
             await page.route("**/v1/agents", handle_agents)
             await page.route("**/v1/sessions/*/events", handle_events)
             await page.route(_SESSIONS_RE, handle_sessions)
@@ -1144,6 +1148,7 @@ async def _drive_landing_clears_after_navigating_away(
                     await route.continue_()
 
             await page.route("**/v1/hosts", handle_hosts)
+            await stub_empty_host_picker_data(page, _HOST_ID)
             await page.route("**/v1/agents", handle_agents)
             await page.route("**/v1/sessions/*/events", handle_events)
             await page.route(_SESSIONS_RE, handle_sessions)
@@ -3465,6 +3470,7 @@ async def _drive_fork_of_fork_dedup(base_url: str, session_id: str) -> None:
                 )
 
             await page.route("**/v1/hosts", handle_hosts)
+            await stub_empty_host_picker_data(page, _HOST_ID)
             await page.route("**/v1/agents", handle_agents)
             # kind=any returns the fork + custom session-bound agents; the bare
             # conversation-list GET still falls through to the real server.

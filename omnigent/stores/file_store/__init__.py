@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import builtins
 from abc import ABC, abstractmethod
+from typing import Any
 
 from omnigent.entities import PagedList, StoredFile
 
@@ -41,6 +42,7 @@ class FileStore(ABC):
         session_id: str | None = None,
         file_id: str | None = None,
         blob_key: str | None = None,
+        source_metadata: dict[str, Any] | None = None,
     ) -> StoredFile:
         """
         Record a new file. Generates a unique file_id unless given one.
@@ -60,6 +62,10 @@ class FileStore(ABC):
             copy passes the source row's blob so it shares the bytes
             instead of duplicating them; ``None`` (default) points the
             row at its own ``file_id`` (an independent blob).
+        :param source_metadata: Optional opaque JSON-able dict of
+            metadata about the original upload before any server-side
+            transform (e.g. ``{"width", "height"}`` for a downscaled
+            image), or ``None`` when there is nothing to record.
         :returns: The newly created :class:`StoredFile`.
         """
         ...

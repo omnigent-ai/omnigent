@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import errno
+import logging
 import os
 import shutil
 import tempfile
@@ -14,6 +15,17 @@ from omnigent.entities import LoadedAgent
 from omnigent.spec import AgentSpec
 from omnigent.spec import load as load_spec
 from omnigent.stores.artifact_store import ArtifactStore
+
+_logger = logging.getLogger(__name__)
+
+
+def _cleanup_staging_dir(path: Path) -> None:
+    try:
+        shutil.rmtree(path)
+    except FileNotFoundError:
+        pass  # Successful publication moved this staging directory into the cache.
+    except OSError as exc:
+        _logger.warning("Could not clean agent cache staging directory %s: %s", path, exc)
 
 
 class AgentCache:
@@ -57,6 +69,7 @@ class AgentCache:
         if (
             not component
             or component in {".", ".."}
+            or component.casefold() == ".staging"
             or component != agent_id
             or "\\" in component
             or "\x00" in component
@@ -135,6 +148,8 @@ class AgentCache:
 
         Validates the new bundle in a temporary directory before
         replacing the disk directory and updating the in-memory spec.
+        Restores the previous directory if publication fails; if rollback
+        also fails, retains the backup path in the error's notes.
         Callers must coordinate replacement with concurrent use of
         this agent; the disk swap and memory update are not atomic.
 
@@ -162,9 +177,34 @@ class AgentCache:
                 prune_invalid_sub_agents=True,
             )
             workdir = self._cache_path(agent_id)
-            if workdir.is_dir():
-                shutil.rmtree(workdir)
-            staging_dir.rename(workdir)
+            backup_dir: Path | None = None
+            published = False
+            try:
+                if workdir.is_dir():
+                    backup_dir = Path(tempfile.mkdtemp(prefix="backup-", dir=staging_dir.parent))
+                    workdir.rename(backup_dir / "previous")
+                try:
+                    staging_dir.rename(workdir)
+                except OSError as publish_error:
+                    if backup_dir is not None:
+                        try:
+                            (backup_dir / "previous").rename(workdir)
+                        except OSError as restore_error:
+                            self._specs.pop(agent_id, None)
+                            restore_error.add_note(
+                                f"Previous cached bundle retained at {backup_dir / 'previous'}"
+                            )
+                            # Surface failed recovery, preserving the publish error as its cause.
+                            raise restore_error from publish_error
+                    raise
+                published = True
+            finally:
+                # A failed rollback retains its backup for manual recovery/cleanup.
+                # Crash remnants also need manual cleanup; no automatic reaper runs.
+                if backup_dir is not None and (
+                    published or not (backup_dir / "previous").exists()
+                ):
+                    _cleanup_staging_dir(backup_dir)
         self._specs[agent_id] = spec
         return LoadedAgent(spec=spec, workdir=workdir)
 
@@ -183,16 +223,18 @@ class AgentCache:
 
     @contextlib.contextmanager
     def _staging_dir(self) -> Iterator[Path]:
-        """Create scratch space outside the live agent-id namespace."""
+        """Stage on the cache filesystem in a reserved, symlink-checked namespace."""
         cache_root = self._cache_dir.resolve(strict=False)
         cache_root.mkdir(parents=True, exist_ok=True)
-        staging_dir = Path(
-            tempfile.mkdtemp(prefix=f".{cache_root.name}-staging-", dir=cache_root.parent)
-        )
+        staging_root = cache_root / ".staging"
+        if staging_root.resolve(strict=False) != staging_root:
+            raise ValueError(f"unsafe staging root: {staging_root}")
+        staging_root.mkdir(mode=0o700, exist_ok=True)
+        staging_dir = Path(tempfile.mkdtemp(prefix="bundle-", dir=staging_root))
         try:
             yield staging_dir
         finally:
-            shutil.rmtree(staging_dir, ignore_errors=True)
+            _cleanup_staging_dir(staging_dir)
 
     def _extract_and_cache(
         self,

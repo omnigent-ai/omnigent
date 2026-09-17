@@ -360,6 +360,46 @@ def _tmux_process_start_error(cmd: list[str], exc: OSError) -> RuntimeError:
     return RuntimeError(detail)
 
 
+# Unrecognized failures leave liveness unknown and are retried.
+_TMUX_TARGET_GONE_STDERR_MARKERS = (
+    "no server running on",
+    "server exited",
+    "lost server",
+    "can't find session",
+    "can't find window",
+    "can't find pane",
+    "no current target",
+    "session not found",
+    "no such session",
+)
+
+
+class _TmuxTargetGoneError(_TmuxCommandError):
+    """tmux reported that the server or target is gone."""
+
+
+class _TmuxCommandFailedError(_TmuxCommandError):
+    """tmux failed without confirming whether the target is alive."""
+
+
+def _tmux_reports_target_gone(detail: str) -> bool:
+    lowered = detail.lower()
+    return lowered.startswith(_TMUX_TARGET_GONE_STDERR_MARKERS) or (
+        lowered.startswith("error connecting to ")
+        and lowered.endswith("(no such file or directory)")
+    )
+
+
+def _tmux_command_failed_error(
+    cmd: list[str], returncode: int | None, stderr: bytes
+) -> _TmuxCommandError:
+    detail = stderr.decode(errors="replace").strip()
+    error_type = (
+        _TmuxTargetGoneError if _tmux_reports_target_gone(detail) else _TmuxCommandFailedError
+    )
+    return error_type(cmd, returncode=returncode, stderr=stderr)
+
+
 # When a web client interacts with the terminal (attach/detach, focus
 # in/out, mouse, keystroke, resize — all stamped via
 # ``TerminalInstance.note_client_interaction``), the TUI repaints in
@@ -1396,6 +1436,9 @@ class TerminalInstance:
     ) -> TerminalResult:
         """Send keystrokes to the terminal.
 
+        An error may follow partial delivery. Inspect the terminal before
+        retrying; replaying the request can duplicate text or key presses.
+
         Args:
             text: Literal text to type.  Sent via ``tmux send-keys -l`` so
                 special characters are not interpreted.  Long text is split
@@ -1427,6 +1470,8 @@ class TerminalInstance:
                     await asyncio.sleep(0.05)
                 for key in keys.split():
                     await self._tmux("send-keys", "-t", self.tmux_target, key)
+        except (_TmuxProcessStartError, _TmuxCommandFailedError) as exc:
+            return {"error": str(exc)}
         except RuntimeError:
             self.running = False
             return {
@@ -1449,6 +1494,8 @@ class TerminalInstance:
 
         try:
             result = await self._tmux_output(*args)
+        except (_TmuxProcessStartError, _TmuxCommandFailedError) as exc:
+            return {"error": str(exc)}
         except RuntimeError:
             self.running = False
             return {
@@ -1667,6 +1714,7 @@ class TerminalInstance:
                     self.name,
                     self.session_key,
                     exc,
+                    extra=self._probe_log_extra("terminal_probe_failed"),
                 )
                 session_exists = await self._tmux_session_exists_async()
                 if session_exists is not False:
@@ -1963,11 +2011,12 @@ class TerminalInstance:
                 self.name,
                 self.session_key,
                 exc,
+                extra=self._probe_log_extra("terminal_probe_failed"),
             )
             return None
 
     def _tmux_session_exists_sync(self) -> bool | None:
-        """Confirm tmux exists, or return ``None`` when the probe cannot start."""
+        """Confirm tmux exists, or return ``None`` when the probe is inconclusive."""
         started_at = time.monotonic()
         try:
             self._tmux_output_sync("has-session", "-t", self.tmux_target)
@@ -1975,6 +2024,17 @@ class TerminalInstance:
             logger.warning(
                 "tmux has-session probe could not start for terminal %s:%s; "
                 "liveness remains unknown: %s",
+                self.name,
+                self.session_key,
+                exc,
+            )
+            return None
+        except _TmuxCommandFailedError as exc:
+            self._remember_probe_failure("has-session", exc, started_at)
+            self._last_session_probe_error = str(exc)
+            logger.warning(
+                "tmux has-session probe failed without confirming the session "
+                "is gone for terminal %s:%s; liveness remains unknown: %s",
                 self.name,
                 self.session_key,
                 exc,
@@ -2093,24 +2153,11 @@ class TerminalInstance:
             thread.join(timeout=_IDLE_WATCHER_JOIN_TIMEOUT_S)
 
     async def is_alive(self) -> bool:
-        """
-        Check if the terminal's inner process is still running.
+        """Check the pane process, preserving running state on inconclusive probes.
 
-        Probes the pane's ``#{pane_dead}`` flag rather than mere session
-        existence: with ``remain-on-exit on`` (see
-        :func:`_tmux_session_persistence_commands`) the session and server
-        deliberately outlive the inner CLI's exit, so a live session no longer
-        implies a live process. The terminal is alive only when the session
-        exists AND its pane process has not exited.
-
-        When the session is gone (probe exits non-zero), the pane is dead, or
-        the probe has a permanent launch or communication failure, this marks
-        ``self.running`` false. A transient resource-related launch failure
-        leaves liveness unknown and preserves the optimistic in-memory state.
-
-        :returns: ``True`` when the pane is live or a transient launch failure
-            preserves the optimistic state; ``False`` on confirmed death or a
-            permanent probe failure.
+        A session can outlive its process with ``remain-on-exit``, so check
+        ``pane_dead`` too. Permanent probe launch/communication failures
+        mark the terminal stopped.
         """
         if not self.running:
             return False
@@ -2123,7 +2170,7 @@ class TerminalInstance:
                 "-F",
                 "#{pane_dead}",
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
             )
         except OSError as exc:
             if _is_transient_tmux_process_start_error(exc):
@@ -2139,13 +2186,24 @@ class TerminalInstance:
             return False
 
         try:
-            stdout, _ = await proc.communicate()
-            # rc != 0 → session/server gone; a "1" line → the pane process
-            # exited but the session was kept alive by remain-on-exit. Both mean
-            # not-alive. (``list-panes`` errors on an unknown target, unlike
-            # ``display-message``, which silently falls back to another pane.)
+            stdout, stderr = await proc.communicate()
+            if proc.returncode != 0:
+                detail = stderr.decode(errors="replace").strip() or "<no stderr>"
+                if not _tmux_reports_target_gone(detail):
+                    logger.warning(
+                        "tmux liveness probe failed without confirming death "
+                        "for terminal %s:%s; preserving optimistic running "
+                        "state: %s",
+                        self.name,
+                        self.session_key,
+                        detail,
+                    )
+                    return self.running
+                self.running = False
+                return False
+            # remain-on-exit can keep the session alive after its process exits.
             panes = stdout.decode().split()
-            if proc.returncode != 0 or not panes or "1" in panes:
+            if not panes or "1" in panes:
                 self.running = False
                 return False
             return True
@@ -2181,7 +2239,7 @@ class TerminalInstance:
         return out.split()[:1] == ["1"]
 
     async def _tmux_session_exists_async(self) -> bool | None:
-        """Confirm tmux exists, or return ``None`` when the probe cannot start."""
+        """Confirm tmux exists, or return ``None`` when the probe is inconclusive."""
         started_at = time.monotonic()
         try:
             await self._tmux_output("has-session", "-t", self.tmux_target)
@@ -2189,6 +2247,17 @@ class TerminalInstance:
             logger.warning(
                 "tmux has-session probe could not start for terminal %s:%s; "
                 "liveness remains unknown: %s",
+                self.name,
+                self.session_key,
+                exc,
+            )
+            return None
+        except _TmuxCommandFailedError as exc:
+            self._remember_probe_failure("has-session", exc, started_at)
+            self._last_session_probe_error = str(exc)
+            logger.warning(
+                "tmux has-session probe failed without confirming the session "
+                "is gone for terminal %s:%s; liveness remains unknown: %s",
                 self.name,
                 self.session_key,
                 exc,
@@ -2213,7 +2282,7 @@ class TerminalInstance:
             raise _tmux_process_start_error(cmd, exc) from exc
         _, stderr = await proc.communicate()
         if proc.returncode != 0:
-            raise _TmuxCommandError(cmd, returncode=proc.returncode, stderr=stderr)
+            raise _tmux_command_failed_error(cmd, proc.returncode, stderr)
 
     async def _tmux_output(self, *args: str) -> str:
         """Run a tmux command and return stdout."""
@@ -2228,7 +2297,7 @@ class TerminalInstance:
             raise _tmux_process_start_error(cmd, exc) from exc
         stdout, stderr = await proc.communicate()
         if proc.returncode != 0:
-            raise _TmuxCommandError(cmd, returncode=proc.returncode, stderr=stderr)
+            raise _tmux_command_failed_error(cmd, proc.returncode, stderr)
         return stdout.decode()
 
     def _tmux_output_sync(self, *args: str) -> str:
@@ -2245,8 +2314,11 @@ class TerminalInstance:
         :returns: The captured stdout, decoded as UTF-8.
         :raises _TmuxProcessStartError: When the tmux subprocess transiently
             cannot start because of host resource pressure.
-        :raises RuntimeError: When the subprocess permanently cannot start or
-            exits non-zero (typically because the server has gone away).
+        :raises _TmuxTargetGoneError: When tmux ran and reported the server or
+            target session gone.
+        :raises _TmuxCommandFailedError: When tmux ran and failed without
+            confirming the target gone.
+        :raises RuntimeError: When the subprocess permanently cannot start.
         """
         cmd = [*self._tmux_base_cmd(), *args]
         try:
@@ -2254,7 +2326,7 @@ class TerminalInstance:
         except OSError as exc:
             raise _tmux_process_start_error(cmd, exc) from exc
         if proc.returncode != 0:
-            raise _TmuxCommandError(cmd, returncode=proc.returncode, stderr=proc.stderr)
+            raise _tmux_command_failed_error(cmd, proc.returncode, proc.stderr)
         return proc.stdout.decode()
 
 
