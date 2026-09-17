@@ -144,7 +144,7 @@ jobs:
           standalone: true
 
       - name: Install uv
-        uses: omnigent-ai/omnigent/.github/actions/setup-uv@9582eeffe6d998e6a79ab9c9c94b5b56048f5ece # self-contained setup
+        uses: omnigent-ai/omnigent/.github/actions/setup-uv@a0998a4602a1c28ea962e82f587d0e9a242ec175 # self-contained setup
         with:
           enable-cache: true
 

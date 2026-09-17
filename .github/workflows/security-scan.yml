@@ -51,7 +51,6 @@ jobs:
         with:
           ref: main             # trusted; never the PR head
           sparse-checkout: |
-            .github/actions/setup-uv
             .github/scripts/security-scan
             .github/scripts/merge-ready
             .github/security
@@ -133,7 +132,7 @@ jobs:
 
       - name: Install uv
         if: ${{ steps.gate.outputs.scan == 'true' }}
-        uses: ./.github/actions/setup-uv
+        uses: omnigent-ai/omnigent/.github/actions/setup-uv@a0998a4602a1c28ea962e82f587d0e9a242ec175 # self-contained setup
 
       - name: OSV advisory scan (uv.lock)
         # Checks every package version pinned in the PR's uv.lock against the
