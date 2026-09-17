@@ -4070,10 +4070,8 @@ export function NewChatLandingScreen() {
   const isCloudHost =
     sandboxSelected || (selectedHost?.name?.toLowerCase().includes("cloud") ?? false);
 
-  // Sessions on the selected host that have a workspace — the narrow set
-  // the health poll needs to check for live directory conflicts. Much
-  // smaller than all 200 directorySessions (only host-matched + workspace
-  // rows), so registering them into the /health poll is cheap.
+  // Only register loaded owned sessions on the selected host with a workspace
+  // for live directory-conflict checks.
   const conflictCandidates = useMemo(
     () =>
       (directorySessions ?? []).filter((s) => s.host_id === selectedHostId && s.workspace != null),
@@ -5379,7 +5377,6 @@ export function NewChatLandingScreen() {
       if (submittedDraftRevisionRef.current === landingDraftRevision) {
         writeLandingDraft(null);
       }
-      void queryClient.invalidateQueries({ queryKey: ["directory-sessions"] });
 
       // `localConv` is set only when a real agent id was resolved up front, so
       // it's safe to POST the first message with it.

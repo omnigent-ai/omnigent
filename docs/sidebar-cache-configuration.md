@@ -44,6 +44,11 @@ All three booleans default to `true`, preserving the OSS Inbox and pin behavior.
 To avoid Shared-list requests in My sessions, set `inboxIncludesShared: false`.
 Set `pinsIncludeShared: false` as well to avoid the separate shared-pin request.
 
+Directory-conflict warnings in new, clone, and resume dialogs read the loaded
+Mine cache, including pages added with Load more. They make no separate session
+list request and do not activate Shared. These advisory warnings cover only
+loaded owned sessions; unloaded and shared sessions are outside their coverage.
+
 ## Refresh and pagination
 
 Mine and Shared polling default to 60 and 180 seconds. Set either interval to
@@ -79,3 +84,7 @@ Use the example configuration and inspect `/v1/sessions` requests in Network:
    but waiting does not cause periodic list requests.
 5. Open a shared conversation URL while My sessions is selected. Confirm its
    live updates and edit permissions still work.
+6. With a running owned session visible in My sessions, open the new-session
+   directory picker on the same host and folder. Confirm the conflict warning
+   appears. Opening or reopening the picker should add no session-list request
+   and no unscoped `limit=200` scan.

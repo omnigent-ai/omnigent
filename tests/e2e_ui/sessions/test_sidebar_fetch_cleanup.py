@@ -407,3 +407,88 @@ def test_archived_refreshes_on_entry_without_polling(
     page.clock.fast_forward(180_000)
     page.wait_for_load_state("networkidle")
     assert len(archived_requests) == before_poll_window
+
+
+def test_directory_warning_reuses_loaded_mine_sessions(
+    page: Page, request: pytest.FixtureRequest
+) -> None:
+    base_url = request.config.getoption("--ui-base-url") or request.getfixturevalue("live_server")
+    list_requests: list[dict[str, list[str]]] = []
+    session_id = "00000000000000000000000000000001"
+
+    def sessions(route: Route) -> None:
+        params = parse_qs(urlparse(route.request.url).query)
+        list_requests.append(params)
+        rows = []
+        if params.get("visibility") == ["mine"] and "pinned" not in params:
+            rows = [
+                {
+                    "id": session_id,
+                    "object": "conversation",
+                    "title": "Cached directory session",
+                    "host_id": "directory-host",
+                    "workspace": "/repo",
+                    "runner_online": True,
+                    "permission_level": 4,
+                    "created_at": 1,
+                    "updated_at": 1,
+                    "labels": {},
+                }
+            ]
+        route.fulfill(json={"data": rows, "has_more": False})
+
+    page.route_web_socket("**/v1/sessions/updates*", lambda _socket: None)
+    page.route("**/v1/sessions?*", sessions)
+    page.route(
+        "**/v1/hosts",
+        lambda route: route.fulfill(
+            json={
+                "hosts": [
+                    {
+                        "host_id": "directory-host",
+                        "name": "Directory host",
+                        "status": "online",
+                    }
+                ]
+            }
+        ),
+    )
+    page.route(
+        "**/v1/hosts/directory-host/filesystem**",
+        lambda route: route.fulfill(
+            json={
+                "data": [{"name": "src", "path": "/repo/src", "type": "directory"}],
+                "has_more": False,
+            }
+        ),
+    )
+    page.route(
+        "**/v1/hosts/directory-host/worktrees?*", lambda route: route.fulfill(json={"data": []})
+    )
+    page.route(
+        "**/health?*",
+        lambda route: route.fulfill(
+            json={
+                "sessions": {
+                    session_id: {"runner_online": True, "host_online": True},
+                }
+            }
+        ),
+    )
+    page.goto(base_url)
+    expect(page.get_by_text("Cached directory session", exact=True)).to_be_visible()
+    expect(page.get_by_test_id("new-chat-landing-host-chip")).to_be_enabled()
+    page.wait_for_load_state("networkidle")
+    initial_requests = len(list_requests)
+    assert all("visibility" in params for params in list_requests)
+    page.get_by_test_id("new-chat-landing-workspace-chip").click()
+    page.get_by_test_id("new-chat-landing-workspace-open-folder").click()
+    expect(page.get_by_test_id("workspace-picker-conflict")).to_contain_text("1 other agent is")
+    page.wait_for_load_state("networkidle")
+    assert len(list_requests) == initial_requests
+    page.get_by_test_id("workspace-picker-close").click()
+    page.get_by_test_id("new-chat-landing-workspace-chip").click()
+    page.get_by_test_id("new-chat-landing-workspace-open-folder").click()
+    expect(page.get_by_test_id("workspace-picker-conflict")).to_be_visible()
+    page.wait_for_load_state("networkidle")
+    assert len(list_requests) == initial_requests

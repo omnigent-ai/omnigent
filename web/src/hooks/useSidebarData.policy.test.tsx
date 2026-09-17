@@ -18,6 +18,7 @@ import {
   type Conversation,
 } from "./useConversations";
 import { SidebarDataProvider, useSidebarData, useSidebarView } from "./useSidebarData";
+import { useDirectorySessions } from "./useDirectorySessions";
 
 vi.mock("./useSessionUpdatesConnected", () => ({ useSessionUpdatesConnected: () => true }));
 const fetchMock = vi.fn();
@@ -315,4 +316,62 @@ it("can pin an owned conversation opened directly outside the loaded lists", asy
     ),
   );
   expect(listCalls("shared")).toHaveLength(0);
+});
+
+it("directory warnings reuse Mine pagination and cache updates without additional requests", async () => {
+  const { result, rerender } = renderHook(
+    ({ enabled }) => ({ sidebar: useSidebarData(), directory: useDirectorySessions(enabled) }),
+    { wrapper, initialProps: { enabled: false } },
+  );
+  await waitFor(() => expect(result.current.sidebar.pinned.isSuccess).toBe(true));
+  await waitFor(() => expect(result.current.sidebar.mine.isSuccess).toBe(true));
+  expect(result.current.directory.data).toBeUndefined();
+  const startupCalls = fetchMock.mock.calls.length;
+  rerender({ enabled: true });
+  expect(result.current.directory.data?.map((r) => r.id)).toEqual(["mine"]);
+  expect(fetchMock.mock.calls).toHaveLength(startupCalls);
+
+  await act(async () => {
+    await result.current.sidebar.mine.fetchNextPage();
+  });
+  await waitFor(() =>
+    expect(result.current.directory.data?.map((r) => r.id).sort()).toEqual(["mine", "mine-older"]),
+  );
+  expect(fetchMock.mock.calls).toHaveLength(startupCalls + 1);
+  act(() => {
+    client.setQueryData<ScopeCacheData>(
+      ["conversations", "", false, null, "mine"],
+      (data) =>
+        data && {
+          ...data,
+          pages: data.pages.map((page) => ({
+            ...page,
+            data: page.data.map((r) => ({ ...r, workspace: "/updated" })),
+          })),
+        },
+    );
+  });
+  await waitFor(() => expect(result.current.directory.data?.[1].workspace).toBe("/updated"));
+  rerender({ enabled: false });
+  expect(result.current.directory.data).toBeUndefined();
+  rerender({ enabled: true });
+  expect(result.current.directory.data).toHaveLength(2);
+  expect(fetchMock.mock.calls).toHaveLength(startupCalls + 1);
+  expect(listCalls("shared")).toHaveLength(0);
+  expect(fetchMock.mock.calls.every(([url]) => params(url).has("visibility"))).toBe(true);
+  expect(client.getQueryCache().find({ queryKey: ["directory-sessions"] })).toBeUndefined();
+});
+
+it("directory warnings exclude Shared rows even when its cache is active or retained", async () => {
+  view = "shared";
+  const { result, rerender } = renderHook(
+    () => ({ sidebar: useSidebarData(), directory: useDirectorySessions(true) }),
+    { wrapper },
+  );
+  await waitFor(() => expect(result.current.sidebar.shared.isSuccess).toBe(true));
+  expect(result.current.directory.data?.map((r) => r.id)).toEqual(["mine"]);
+  view = "mine";
+  rerender();
+  expect(result.current.directory.data?.map((r) => r.id)).toEqual(["mine"]);
+  expect(result.current.sidebar.sharedActive).toBe(false);
 });
