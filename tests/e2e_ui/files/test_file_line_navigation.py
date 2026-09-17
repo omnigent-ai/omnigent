@@ -11,7 +11,7 @@ import re
 
 import httpx
 import pytest
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Page, Route, expect
 
 _FILE_PATH = "src/citation_target.py"
 _BEFORE_LINES = [f"# original source line {line}" for line in range(1, 501)]
@@ -246,25 +246,30 @@ def test_citation_preserves_offline_markdown_draft_with_diff_preference(
         f"{environment_url}/changes",
         lambda route: route.fulfill(json={"object": "list", "has_more": False, "data": []}),
     )
-    for item in {path, destination}:
-        page.route(
-            f"{environment_url}/filesystem/{item}",
-            lambda route: route.fulfill(
-                json={
-                    "object": "session.environment.filesystem.file_content",
-                    "path": route.request.url.split("/filesystem/", 1)[1],
-                    "content": content,
-                    "encoding": "utf-8",
-                    "content_type": "text/markdown",
-                    "bytes": len(content),
-                }
-            ),
+    writes: list[str] = []
+
+    def serve_file(route: Route) -> None:
+        if route.request.method != "GET":
+            writes.append(route.request.url)
+            route.fulfill(status=503, json={"error": "Workspace offline"})
+            return
+        route.fulfill(
+            json={
+                "object": "session.environment.filesystem.file_content",
+                "path": route.request.url.split("/filesystem/", 1)[1],
+                "content": content,
+                "encoding": "utf-8",
+                "content_type": "text/markdown",
+                "bytes": len(content),
+            }
         )
+
+    for item in {path, destination}:
+        page.route(f"{environment_url}/filesystem/{item}", serve_file)
+    liveness = {"runner_online": True, "host_online": True}
     page.route(
         f"{base_url}/health?session_ids=*",
-        lambda route: route.fulfill(
-            json={"sessions": {session_id: {"runner_online": False, "host_online": True}}}
-        ),
+        lambda route: route.fulfill(json={"sessions": {session_id: liveness}}),
     )
     response = httpx.post(
         f"{base_url}/v1/sessions/{session_id}/events",
@@ -272,7 +277,10 @@ def test_citation_preserves_offline_markdown_draft_with_diff_preference(
             "type": "external_assistant_message",
             "data": {
                 "agent": "hello_world",
-                "text": f"[Markdown line]({destination}:12) and [Plain Markdown]({destination})",
+                "text": (
+                    f"[Markdown line]({destination}:12) and [Plain Markdown]({destination}) "
+                    f"and [Original Markdown]({path})"
+                ),
             },
         },
         timeout=10,
@@ -286,8 +294,24 @@ def test_citation_preserves_offline_markdown_draft_with_diff_preference(
     viewer = page.locator('[data-testid="file-viewer"]:visible')
     editor = viewer.locator('[contenteditable="true"]')
     expect(editor).to_be_visible(timeout=30_000)
+    # Cache both files while reachable; an offline workspace cannot load a new file.
+    if cross_file:
+        for label, target_path in [("Plain Markdown", destination), ("Original Markdown", path)]:
+            page.get_by_role("button", name=label, exact=True).click()
+            page.wait_for_function(
+                "path => new URL(location.href).searchParams.get('file') === path", arg=target_path
+            )
+            expect(editor).to_contain_text("Original paragraph 50.")
+    # A live host can reconnect a sleeping runner and save, so both must be offline.
+    liveness.update(runner_online=False, host_online=False)
+    expect(
+        viewer.get_by_role(
+            "button", name="Runner offline — your changes will save when it reconnects", exact=True
+        )
+    ).to_be_visible(timeout=30_000)
     editor.fill("Unsaved offline Markdown draft")
     expect(viewer.get_by_text("Runner offline — changes save", exact=False)).to_be_visible()
+    assert not writes, "An offline draft must not trigger a save"
 
     page.get_by_role("button", name="Markdown line", exact=True).click()
     dialog = page.get_by_role("dialog", name="Unsaved changes")
@@ -328,6 +352,7 @@ def test_citation_preserves_offline_markdown_draft_with_diff_preference(
     expect(page).not_to_have_url(re.compile(r"[?&]line="))
     expect(dialog).not_to_be_visible()
     expect(editor).to_have_text("Draft after following a citation")
+    assert not writes, "Navigation must not save an offline draft"
 
 
 def test_plain_markdown_open_restores_scroll_after_citing_another_file(
