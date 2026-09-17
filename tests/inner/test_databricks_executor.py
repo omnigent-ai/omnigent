@@ -1449,6 +1449,91 @@ def test_resolve_databricks_auth_explicit_profile_not_found_raises(
     )
 
 
+def test_resolve_databricks_auth_defers_sdk_auth_init_until_token_requested(
+    monkeypatch,
+):
+    """Resolving by profile must not initialize SDK auth.
+
+    Constructing an auth-initialized SDK ``Config`` launches a ``databricks
+    auth token`` subprocess for CLI profiles — before anything has asked for
+    a bearer. A central credential provider composed in front of this
+    resolver can only serialize refreshes if the legacy path stays quiet
+    until asked, so the auth-initialized Config must be constructed lazily,
+    on the first token request, and reused afterwards.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    from omnigent.inner.databricks_executor import _resolve_databricks_auth
+
+    auth_inits: list[dict] = []
+
+    class _FakeConfig:
+        host = "https://example.cloud.databricks.com"
+        profile = "dev"
+
+        def authenticate(self):
+            return {"Authorization": "Bearer minted-tok"}
+
+    def _config_factory(**kw):
+        # A construction without an injected strategy initializes real SDK
+        # auth — the side-effectful step that must not run at resolve time.
+        if "credentials_strategy" not in kw:
+            auth_inits.append(kw)
+        return _FakeConfig()
+
+    monkeypatch.setattr(_sdk_config_mod, "Config", _config_factory)
+    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+
+    auth, host = _resolve_databricks_auth("dev")
+
+    assert auth_inits == [], f"resolve initialized SDK auth eagerly: {auth_inits!r}"
+    assert host == "https://example.cloud.databricks.com"
+
+    assert auth.current_token() == "minted-tok"
+    assert auth_inits == [{"profile": "dev"}]
+
+    assert auth.current_token() == "minted-tok"
+    assert auth_inits == [{"profile": "dev"}], "auth-initialized Config was not reused"
+
+
+def test_resolve_databricks_auth_broken_credentials_fail_at_first_request(
+    monkeypatch,
+):
+    """A failing credential chain must not kill resolution.
+
+    A consumer that sources bearers elsewhere (a central credential
+    provider) never asks this resolver's legacy path for a token, so a
+    broken legacy chain must not raise until the first token request — and
+    then with the actionable re-login message.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    from omnigent.inner.databricks_executor import (
+        DatabricksAuthError,
+        _resolve_databricks_auth,
+    )
+
+    class _ConfigResolvesButAuthFails:
+        host = "https://example.cloud.databricks.com"
+
+        def authenticate(self):
+            raise ValueError("cannot get access token: refresh failed")
+
+    def _config_factory(**kw):
+        if "credentials_strategy" in kw:
+            return _ConfigResolvesButAuthFails()
+        raise OSError("cannot get access token: refresh failed")
+
+    monkeypatch.setattr(_sdk_config_mod, "Config", _config_factory)
+    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+
+    auth, host = _resolve_databricks_auth("dev")
+    assert host == "https://example.cloud.databricks.com"
+
+    with pytest.raises(DatabricksAuthError, match="databricks auth login -p dev"):
+        auth.current_token()
+
+
 def test_bearer_auth_injects_fresh_token_per_request():
     """``_DatabricksBearerAuth`` calls ``Config.authenticate()`` per request.
 
@@ -1950,6 +2035,77 @@ def test_resolve_auth_for_host_falls_back_to_cli_when_no_profile_matches(
 
     assert auth.current_token() == "tok-cli"
     assert host == "https://example.databricks.com"
+
+
+def test_resolve_auth_for_host_defers_probe_until_token_requested(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Host resolution must not probe credential sources at resolve time.
+
+    Probing authenticates each candidate (shelling out to ``databricks auth
+    token`` for CLI profiles); a central credential provider composed in
+    front of this resolver must stay in charge of refreshes until the
+    legacy path is actually asked for a bearer.
+    """
+    from omnigent.inner import databricks_executor
+
+    cfg_path = tmp_path / "databrickscfg"
+    cfg_path.write_text(
+        "[my-ws]\nhost = https://example.databricks.com\ntoken = fake-test-token\n"
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg_path))
+
+    constructed: list[dict[str, str]] = []
+
+    def _fake_sdk_config(**kwargs: str) -> _StubSdkConfig:
+        constructed.append(kwargs)
+        return _StubSdkConfig(host="https://example.databricks.com", token="fake-test-token")
+
+    monkeypatch.setattr(databricks_executor, "_sdk_config", _fake_sdk_config)
+
+    auth, host = databricks_executor._resolve_databricks_auth(
+        host="https://example.databricks.com"
+    )
+
+    assert constructed == [], f"resolve probed credential sources eagerly: {constructed!r}"
+    assert host == "https://example.databricks.com"
+
+    assert auth.current_token() == "fake-test-token"
+    assert constructed == [{"profile": "my-ws"}]
+
+
+def test_resolve_auth_for_host_reports_winning_profile_after_mint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``profile_name`` names the profile that supplied the credential.
+
+    ``omnigent login`` reads it to look up the workspace org id, so the
+    deferred probe must still surface which profile won once a token has
+    been minted.
+    """
+    from omnigent.inner import databricks_executor
+
+    cfg_path = tmp_path / "databrickscfg"
+    cfg_path.write_text(
+        "[my-ws]\nhost = https://example.databricks.com\ntoken = fake-test-token\n"
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg_path))
+
+    class _ProfileStub(_StubSdkConfig):
+        profile = "my-ws"
+
+    monkeypatch.setattr(
+        databricks_executor,
+        "_sdk_config",
+        lambda **kw: _ProfileStub(host="https://example.databricks.com", token="fake-test-token"),
+    )
+
+    auth, _host = databricks_executor._resolve_databricks_auth(
+        host="https://example.databricks.com"
+    )
+
+    assert auth.current_token() == "fake-test-token"
+    assert auth.profile_name == "my-ws"
 
 
 def test_profiles_for_host_normalizes_scheme_and_slash(
