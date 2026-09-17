@@ -35,7 +35,6 @@ import httpx
 from playwright.sync_api import Page, expect
 
 _QUEUED_STRIP = '[data-testid="composer-queued-strip"]'
-_PILL = '[data-testid="background-task-pill"]'
 _COMPOSER_PLACEHOLDER_IDLE = "Send a message…"
 
 
@@ -102,7 +101,9 @@ def test_message_sends_directly_while_background_task_runs(
     page.goto(f"{base_url}/c/{session_id}")
     expect(composer).to_be_visible()
 
-    # Background shells outlive the turn, but their unfinished composer control stays hidden.
+    # Background shells outlive the turn: the tally lights up in its plain
+    # idle form (the turn is over — the waiting edge normalizes to idle), so
+    # the badge must NOT claim the agent is working.
     _publish_status(
         base_url,
         session_id,
@@ -110,7 +111,9 @@ def test_message_sends_directly_while_background_task_runs(
         response_id="resp_bg_1",
         background_task_count=1,
     )
-    expect(page.locator(_PILL)).to_have_count(0)
+    expect(
+        page.get_by_role("button", name="1 background task still running", exact=True)
+    ).to_be_visible(timeout=15_000)
 
     # The composer must be free to send — NOT stuck on the queued follow-up
     # placeholder. This is the exact regression: `waiting`+response_id used
@@ -155,7 +158,9 @@ def test_message_sends_directly_after_reopening_with_background_task(
     page.goto(f"{base_url}/c/{session_id}")
     composer = page.get_by_label("Message the agent")
     expect(composer).to_be_visible()
-    expect(page.locator(_PILL)).to_have_count(0)
+    expect(
+        page.get_by_role("button", name="1 background task still running", exact=True)
+    ).to_be_visible(timeout=15_000)
     # The turn is over, so the composer is free.
     expect(composer).to_have_attribute("placeholder", _COMPOSER_PLACEHOLDER_IDLE, timeout=15_000)
 

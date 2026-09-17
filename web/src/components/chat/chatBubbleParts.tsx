@@ -372,9 +372,10 @@ export function isBackgroundTasksOnly(
 
 /**
  * Whether the agent's own turn is in progress — server `running`/`waiting`, or
- * a local send in flight.
+ * a local send in flight. Shared by the transcript's working shimmer and the
+ * composer's background-task tally, so the two surfaces never disagree.
  */
-function useAgentTurnActive(): boolean {
+export function useAgentTurnActive(): boolean {
   const sessionStatus = useChatStore((s) => s.sessionStatus);
   const localSending = useChatStore((s) => s.status === "streaming");
   return computeIsWorking(sessionStatus) || localSending;

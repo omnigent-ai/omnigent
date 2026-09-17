@@ -43,6 +43,7 @@ import {
   ComposerSendButton,
 } from "@/components/composer/ChatComposer";
 import { ComposerAddMenu } from "@/components/composer/ComposerAddMenu";
+import { BackgroundTaskIndicator } from "@/components/composer/BackgroundTaskIndicator";
 import { ReplyDraftBlocks } from "@/components/composer/ReplyDraftBlocks";
 import {
   ComposerWorkspaceBar,
@@ -3582,6 +3583,7 @@ function ComposerImpl(
                 tokensUsed={composerTokensUsed}
               />
             </div>
+            <BackgroundTaskIndicator />
           </div>
         </ComposerWorkspaceBar>
       </div>

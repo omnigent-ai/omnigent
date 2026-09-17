@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
-import { SquareTerminalIcon } from "lucide-react";
+import { Loader2Icon, SquareTerminalIcon } from "lucide-react";
 
+import { useAgentTurnActive } from "@/components/chat/chatBubbleParts";
 import { Button } from "@/components/ui/button";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import type { BackgroundTaskInfo } from "@/lib/types";
@@ -9,10 +10,15 @@ import { useChatStore } from "@/store/chatStore";
 /**
  * Compact background-task tally trailing the ComposerWorkspaceBar: a terminal
  * icon + count badge toggling a non-modal popover that lists each running
- * shell (a dev server, a background shell), independent of the "Working…"
- * shimmer. The store's count is authoritative, so a count-only edge (older
- * runner, no per-shell detail) still gets the badge plus an honest
- * unavailable-details note instead of invented rows.
+ * shell (a dev server, a background shell). The store's count is
+ * authoritative, so a count-only edge (older runner, no per-shell detail)
+ * still gets the badge plus an honest unavailable-details note instead of
+ * invented rows.
+ *
+ * While the agent's turn is active the badge carries the working state too —
+ * a spinner replaces the terminal icon and the accessible name says so. On a
+ * phone the end-of-thread "Working…" shimmer scrolls out of the viewport, so
+ * this always-on-screen badge is the only working/idle cue left.
  */
 
 function taskLabel(task: BackgroundTaskInfo): string {
@@ -27,6 +33,7 @@ export function BackgroundTaskIndicator() {
   const bgCount = useChatStore((s) => s.backgroundTaskCount);
   const bgTasks = useChatStore((s) => s.backgroundTasks);
   const conversationId = useChatStore((s) => s.conversationId);
+  const agentWorking = useAgentTurnActive();
   const [open, setOpen] = useState(false);
   // Why the popover closed last; only a session switch suppresses Radix's
   // close-autofocus, so ordinary Escape/outside closes keep restoring the
@@ -61,6 +68,9 @@ export function BackgroundTaskIndicator() {
   if (bgCount <= 0) return null;
 
   const countLabel = `${bgCount} background task${bgCount === 1 ? "" : "s"}`;
+  const statusLabel = agentWorking
+    ? `Agent working — ${countLabel} still running`
+    : `${countLabel} still running`;
   // The count is authoritative in both directions: an over-long detail list
   // is clamped, a short one is acknowledged as partially unavailable.
   const displayedTasks = bgTasks.slice(0, bgCount);
@@ -68,10 +78,10 @@ export function BackgroundTaskIndicator() {
 
   return (
     <>
-      {/* Polite tally so count changes are announced with the popover
-          closed, replacing the old pill's role="status". */}
+      {/* Polite tally so count and working-state changes are announced with
+          the popover closed, replacing the old pill's role="status". */}
       <span role="status" className="sr-only">
-        {countLabel} still running
+        {statusLabel}
       </span>
       <Popover open={open} onOpenChange={handleOpenChange}>
         <PopoverTrigger asChild>
@@ -80,10 +90,18 @@ export function BackgroundTaskIndicator() {
             variant="ghost"
             size="xs"
             data-testid="background-task-pill"
-            aria-label={`${countLabel} still running`}
+            aria-label={statusLabel}
             className="ml-auto shrink-0 px-0 md:px-2"
           >
-            <SquareTerminalIcon className="size-3.5" aria-hidden="true" />
+            {agentWorking ? (
+              <Loader2Icon
+                data-testid="background-task-working"
+                className="size-3.5 animate-spin"
+                aria-hidden="true"
+              />
+            ) : (
+              <SquareTerminalIcon className="size-3.5" aria-hidden="true" />
+            )}
             {bgCount}
           </Button>
         </PopoverTrigger>

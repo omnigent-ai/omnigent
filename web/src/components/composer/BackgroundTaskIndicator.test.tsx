@@ -31,13 +31,22 @@ const flushRadix = () =>
     });
   });
 
+function setAgentTurn(state: { sessionStatus?: "running" | "idle"; localSending?: boolean }) {
+  useChatStore.setState({
+    sessionStatus: state.sessionStatus ?? "idle",
+    status: state.localSending ? "streaming" : "idle",
+  });
+}
+
 beforeEach(() => {
   setBackground(0, [], null);
+  setAgentTurn({});
 });
 
 afterEach(() => {
-  setBackground(0, [], null);
   cleanup();
+  setBackground(0, [], null);
+  setAgentTurn({});
 });
 
 describe("BackgroundTaskIndicator", () => {
@@ -370,5 +379,37 @@ describe("BackgroundTaskIndicator", () => {
     expect(trigger).toHaveAttribute("type", "button");
     fireEvent.click(trigger);
     expect(onSubmit).not.toHaveBeenCalled();
+  });
+
+  it("carries the working state while the agent's turn runs", () => {
+    setBackground(1, [{ description: "Only task" }]);
+    setAgentTurn({ sessionStatus: "running" });
+    render(<BackgroundTaskIndicator />);
+    const trigger = badge("Agent working — 1 background task still running");
+    expect(trigger).toHaveTextContent("1");
+    expect(screen.getByTestId("background-task-working")).toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Agent working — 1 background task still running",
+    );
+  });
+
+  it("carries the working state while a local send is in flight", () => {
+    setBackground(2, [{ description: "One" }, { description: "Two" }]);
+    setAgentTurn({ localSending: true });
+    render(<BackgroundTaskIndicator />);
+    badge("Agent working — 2 background tasks still running");
+    expect(screen.getByTestId("background-task-working")).toBeInTheDocument();
+  });
+
+  it("drops the working state once the turn settles back to idle", () => {
+    setBackground(1, [{ description: "Only task" }]);
+    setAgentTurn({ sessionStatus: "running" });
+    render(<BackgroundTaskIndicator />);
+    badge("Agent working — 1 background task still running");
+
+    act(() => setAgentTurn({}));
+    badge("1 background task still running");
+    expect(screen.queryByTestId("background-task-working")).toBeNull();
+    expect(screen.getByRole("status")).toHaveTextContent("1 background task still running");
   });
 });
