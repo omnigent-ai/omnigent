@@ -1,0 +1,176 @@
+"""Setup-to-launch credential tests using isolated config and fake secrets."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+import yaml
+
+from omnigent.errors import OmnigentError
+from omnigent.harnesses.antigravity_native.bridge import ensure_agy_feedback_survey_disabled
+from omnigent.harnesses.antigravity_native.credentials import (
+    antigravity_credentials_ready,
+    resolve_antigravity_credentials,
+)
+from omnigent.harnesses.antigravity_native.launch import build_agy_launch
+from omnigent.onboarding import secrets
+from omnigent.onboarding.configure_models import build_gateway_provider_entry
+from omnigent.onboarding.gemini_gateway import GEMINI_API_BASE_URL, validate_gemini_base_url
+
+
+@pytest.fixture(autouse=True)
+def isolated_credentials(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_DISABLE_KEYRING", "1")
+    for key in ("GEMINI_API_KEY", "ANTIGRAVITY_API_KEY", "GOOGLE_GEMINI_BASE_URL"):
+        monkeypatch.delenv(key, raising=False)
+        monkeypatch.delenv(f"OMNIGENT_{key}", raising=False)
+    monkeypatch.setattr(
+        "omnigent.harnesses.antigravity_native.launch.agy_binary_path", lambda: "/test/agy"
+    )
+    monkeypatch.setattr("omnigent.onboarding.gemini_auth.gemini_login_detected", lambda: False)
+    monkeypatch.setattr(
+        "omnigent.harnesses.antigravity_native.launch.gemini_auth_has_credential", lambda: False
+    )
+
+
+def save_provider(tmp_path: Path, *, ref: str = "keychain:gateway") -> None:
+    entry = build_gateway_provider_entry(
+        "https://gateway.example/gemini/",
+        ref,
+        families=["gemini"],
+        models={"gemini": "Gemini 3.1 Pro (High)"},
+    )
+    entry["default"] = ["gemini"]
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump({"providers": {"gateway": entry}}))
+
+
+@pytest.mark.parametrize("resume", [False, True])
+def test_saved_gateway_drives_launch_and_isolated_settings(tmp_path: Path, resume: bool) -> None:
+    secrets.store_secret("gateway", "gateway-fake-key")
+    save_provider(tmp_path)
+    assert antigravity_credentials_ready()
+    argv, env = build_agy_launch(
+        conversation_id="existing" if resume else None, model=None, resume=resume
+    )
+    assert env == {
+        "GEMINI_API_KEY": "gateway-fake-key",
+        "GOOGLE_GEMINI_BASE_URL": "https://gateway.example/gemini",
+    }
+    assert argv[argv.index("--model") + 1] == "Gemini 3.1 Pro (High)"
+    assert ("--conversation" in argv) == resume
+    assert "gateway-fake-key" not in " ".join(argv)
+    assert "gateway-fake-key" not in repr(resolve_antigravity_credentials())
+    ensure_agy_feedback_survey_disabled(tmp_path / "session", launch_env=env)
+    settings = json.loads((tmp_path / "session/.gemini/antigravity-cli/settings.json").read_text())
+    assert settings["modelProvider"] == "gemini"
+    assert "gateway-fake-key" not in json.dumps(settings)
+
+
+def test_explicit_model_wins(tmp_path: Path) -> None:
+    secrets.store_secret("gateway", "fake-key")
+    save_provider(tmp_path)
+    argv, _ = build_agy_launch(conversation_id=None, model="Gemini 3.8 Flash (Low)", resume=False)
+    assert argv[argv.index("--model") + 1] == "Gemini 3.8 Flash (Low)"
+
+
+def test_selected_provider_keeps_credential_and_endpoint_together(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    secrets.store_secret("gateway", "configured-key")
+    save_provider(tmp_path)
+    monkeypatch.setenv("GEMINI_API_KEY", "ambient-key")
+    monkeypatch.setenv("GOOGLE_GEMINI_BASE_URL", "https://ambient.example/")
+    assert resolve_antigravity_credentials().environment() == {
+        "GEMINI_API_KEY": "configured-key",
+        "GOOGLE_GEMINI_BASE_URL": "https://gateway.example/gemini",
+    }
+
+
+def test_missing_selected_secret_never_falls_back_to_ambient_or_oauth(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    save_provider(tmp_path)
+    monkeypatch.setenv("GEMINI_API_KEY", "ambient-key")
+    monkeypatch.setattr("omnigent.onboarding.gemini_auth.gemini_login_detected", lambda: True)
+    assert not antigravity_credentials_ready()
+    with pytest.raises(OmnigentError):
+        build_agy_launch(conversation_id=None, model=None, resume=False)
+
+
+def test_env_reference_resolved_at_launch(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    save_provider(tmp_path, ref="env:CORPORATE_GEMINI_KEY")
+    monkeypatch.setenv("CORPORATE_GEMINI_KEY", "rotated-fake-key")
+    assert resolve_antigravity_credentials().api_key == "rotated-fake-key"
+
+
+def test_legacy_listing_url_is_not_used_for_native_requests(tmp_path: Path) -> None:
+    (tmp_path / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "providers": {
+                    "gemini": {
+                        "kind": "key",
+                        "default": True,
+                        "gemini": {
+                            "base_url": GEMINI_API_BASE_URL + "/v1beta/openai",
+                            "api_key": "fake",
+                        },
+                    }
+                }
+            }
+        )
+    )
+    assert resolve_antigravity_credentials().base_url == GEMINI_API_BASE_URL
+
+
+def test_legacy_setup_key_is_usable_by_native_agy(tmp_path: Path) -> None:
+    secrets.store_secret("antigravity", "legacy-fake")
+    (tmp_path / "config.yaml").write_text(
+        yaml.safe_dump({"antigravity": {"api_key_ref": "keychain:antigravity"}})
+    )
+    credentials = resolve_antigravity_credentials()
+    assert credentials.api_key == "legacy-fake"
+    assert credentials.base_url == GEMINI_API_BASE_URL
+
+
+@pytest.mark.parametrize("prefix", ["", "OMNIGENT_"])
+def test_ambient_gateway(monkeypatch: pytest.MonkeyPatch, prefix: str) -> None:
+    monkeypatch.setenv(prefix + "GEMINI_API_KEY", "ambient-fake")
+    monkeypatch.setenv(prefix + "GOOGLE_GEMINI_BASE_URL", "https://ambient.example/gemini/")
+    assert resolve_antigravity_credentials().base_url == "https://ambient.example/gemini"
+
+
+def test_oauth_fallback_removes_bridge_owned_gemini_provider(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr("omnigent.onboarding.gemini_auth.gemini_login_detected", lambda: True)
+    assert antigravity_credentials_ready()
+    assert resolve_antigravity_credentials() is None
+    ensure_agy_feedback_survey_disabled(tmp_path, launch_env={"GEMINI_API_KEY": "fake"})
+    _, env = build_agy_launch(conversation_id=None, model=None, resume=False)
+    assert env == {}
+    ensure_agy_feedback_survey_disabled(tmp_path, launch_env=env)
+    settings = json.loads((tmp_path / ".gemini/antigravity-cli/settings.json").read_text())
+    assert "modelProvider" not in settings
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://gateway.example/v1beta",
+        "https://gateway.example/v1beta/openai/",
+        "https://gateway.example/openai/",
+        "https://gateway.example/v1beta/models/gemini:generateContent",
+        "https://user:secret@gateway.example",
+        "https://gateway.example/?key=secret",
+        "file:///tmp/gateway",
+        "https://gateway.example:invalid",
+    ],
+)
+def test_invalid_gateway_url_is_actionable_and_does_not_echo_secrets(url: str) -> None:
+    with pytest.raises(OmnigentError) as exc:
+        validate_gemini_base_url(url)
+    assert "secret" not in str(exc.value)

@@ -196,6 +196,13 @@ def _synthesize_entry(det: DetectedProvider) -> dict[str, object] | None:
                 env_model = getenv_nonempty_with_omnigent_prefix("ANTHROPIC_MODEL")
                 if env_model is not None:
                     default_model = env_model[1]
+        if det.family == GEMINI_FAMILY:
+            from omnigent.onboarding.gemini_gateway import GEMINI_BASE_URL_ENV
+
+            endpoint = getenv_nonempty_with_omnigent_prefix(GEMINI_BASE_URL_ENV)
+            if endpoint is not None:
+                # Keep a gateway token paired with its endpoint when adopting it.
+                base_url = endpoint[1]
         return build_key_provider_entry(
             det.family, base_url, api_key_ref, default_model, wire_api=wire_api
         )

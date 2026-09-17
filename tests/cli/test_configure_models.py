@@ -618,11 +618,8 @@ def test_add_menu_options_ordering() -> None:
         "AWS Bedrock — API key",
     ]
 
-    # Gemini (antigravity) scoped: API key only — Gemini is key-only (no
-    # subscription/gateway/Databricks), and it must NOT appear in the
-    # openai-family "Other provider" catch-all (asserted via `codex` above).
     gemini = [o.label.split(None, 1)[1] for o in add_menu_options_for_family(GEMINI_FAMILY)]
-    assert gemini == ["Gemini — API key"]
+    assert gemini == ["Gemini — API key", "Gateway — custom base URL + key"]
 
 
 def test_add_menu_databricks_option_gated_on_extra(monkeypatch) -> None:
@@ -3700,3 +3697,51 @@ def test_render_listing_default_marker_survives_non_utf8_console(
     out = buffer.getvalue().decode("cp1252")
     assert "anthropic" in out
     assert "* default" in out
+
+
+def test_antigravity_gateway_setup_persists_native_provider(isolated_config) -> None:
+    # Antigravity -> native providers -> add -> gateway; retain agy's model default.
+    stdin = (
+        "\n".join(
+            [
+                "7",
+                "3",
+                "1",
+                "2",
+                "corp-gemini",
+                "https://gateway.example/gemini/",
+                "gateway-fake-key",
+                "",
+                "q",
+                "q",
+                "q",
+            ]
+        )
+        + "\n"
+    )
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    assert result.exit_code == 0, result.output
+    config = _config_yaml(isolated_config)
+    entry = load_providers(config)["corp-gemini"]
+    assert entry.kind == "gateway"
+    assert get_default_provider(config, GEMINI_FAMILY) == entry
+    assert get_default_provider(config, OPENAI_FAMILY) is None
+    assert "antigravity" not in config
+    assert entry.family(GEMINI_FAMILY).base_url == "https://gateway.example/gemini"
+    assert secrets.load_secret("corp-gemini") == "gateway-fake-key"
+    assert "gateway-fake-key" not in result.output
+    assert "gateway-fake-key" not in (isolated_config / "config.yaml").read_text()
+
+
+def test_native_gemini_key_setup_uses_agy_model_default(isolated_config) -> None:
+    from omnigent.harnesses.antigravity_native.credentials import resolve_antigravity_credentials
+    from omnigent.onboarding.gemini_gateway import GEMINI_API_BASE_URL
+
+    stdin = "\n".join(["7", "3", "1", "1", "gemini-fake-key", "", "q", "q", "q"]) + "\n"
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    assert result.exit_code == 0, result.output
+    credentials = resolve_antigravity_credentials()
+    assert credentials is not None
+    assert credentials.api_key == "gemini-fake-key"
+    assert credentials.base_url == GEMINI_API_BASE_URL
+    assert credentials.model is None

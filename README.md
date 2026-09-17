@@ -301,6 +301,31 @@ omnigent copilot                     # GitHub Copilot (SDK harness, via `omnigen
 `omnigent agy` requires agy 1.1.13 or newer. When `GEMINI_API_KEY` is set,
 direct Gemini API authentication takes precedence over agy's saved OAuth login.
 
+To connect native agy to a Gemini-compatible gateway, run `omni setup` →
+**Antigravity** → **Configure native agy API key / gateway** → **Add a credential**
+→ **Gateway**. Enter the gateway's API root (for example,
+`https://gateway.example/gemini`, without `/v1beta` or `/openai`) and API key.
+Leave the model blank for agy's default, or enter a model accepted by `agy --model`.
+The first Gemini provider becomes the default; existing defaults can be changed
+from the same credential menu. Start a new `omni agy` session to use it.
+
+The gateway must implement Gemini's `generateContent` / `streamGenerateContent`
+API with `x-goog-api-key` authentication, including the auxiliary Gemini models
+agy requests. An OpenAI-only gateway or a bearer-token refresh command is not
+supported by this route. This configures **native agy**; the Antigravity Python
+SDK retains its separate key/Vertex setup.
+
+Databricks' Gemini endpoint requires Bearer authentication and Databricks model
+names. It needs an adapter for native agy; entering its URL and token in this
+gateway flow does not translate either requirement.
+
+Keys are stored in Omnigent's secret store; the shared provider entry contains
+only a reference. An explicitly selected Gemini provider overrides ambient
+credentials. Without one, the existing Antigravity setup key or
+`GEMINI_API_KEY` / `GOOGLE_GEMINI_BASE_URL` environment pair is used; without an
+API key, agy keeps its OAuth/ADC login behavior. Restart an already-running
+local host daemon after changing shell environment variables.
+
 Using OpenClaw? See the [OpenClaw integration guide](docs/openclaw.md) to import
 its coding agents or drive a live OpenClaw Gateway session over ACP.
 

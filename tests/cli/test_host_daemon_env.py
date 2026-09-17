@@ -521,3 +521,21 @@ def test_ci_detection_stays_on_the_local_server(
     )
     assert "CI" not in runner_env
     assert "OMNIGENT_DISABLE_TELEMETRY" not in runner_env
+
+
+def test_gemini_gateway_survives_local_daemon_and_runner(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("GEMINI_API_KEY", "fake-gateway-key")
+    monkeypatch.setenv("GOOGLE_GEMINI_BASE_URL", "https://gateway.example/gemini")
+    daemon = _build_host_daemon_env(server_url=None)
+    runner = _build_runner_env(
+        daemon,
+        server_url="http://localhost:6767",
+        runner_id="test-gemini",
+        binding_token="fake-binding",
+        workspace=str(tmp_path),
+        parent_pid=os.getpid(),
+    )
+    for env in (daemon, runner):
+        assert env["GEMINI_API_KEY"] == "fake-gateway-key"
+        assert env["GOOGLE_GEMINI_BASE_URL"] == "https://gateway.example/gemini"
