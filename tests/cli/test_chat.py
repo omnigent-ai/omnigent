@@ -2711,6 +2711,47 @@ def test_remote_headers_falls_back_to_ambient_databricks_creds(
     assert read_calls == [None]
 
 
+def test_databricks_token_cache_reresolves_when_pointer_profile_changes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Switching a pointer's profile must not serve the old identity's cached auth.
+
+    The token cache is keyed by (server, profile). After resolving profile A,
+    changing the stored pointer to profile B must re-resolve as B rather than
+    return A's cached bearer — otherwise ownership checks run as the wrong
+    identity and tear down the correctly-registered daemon.
+    """
+    from omnigent import chat as chat_mod
+
+    monkeypatch.setattr(chat_mod, "_databricks_auth_cache", {})
+    monkeypatch.setattr(
+        "omnigent.cli_auth.load_databricks_workspace_host",
+        lambda _url: "https://example.databricks.com",
+    )
+    current_profile = {"value": "user-a"}
+    monkeypatch.setattr(
+        "omnigent.cli_auth.load_databricks_profile", lambda _url: current_profile["value"]
+    )
+
+    class _Auth:
+        def __init__(self, token: str) -> None:
+            self._token = token
+
+        def current_token(self) -> str:
+            return self._token
+
+    def _resolve(profile: object = None, *, host: object = None) -> tuple[object, str]:
+        return _Auth(f"token-{profile}"), "https://example.databricks.com"
+
+    monkeypatch.setattr("omnigent.inner.databricks_executor._resolve_databricks_auth", _resolve)
+
+    # Resolve as A (caches under (server, "user-a")).
+    assert chat_mod._stored_databricks_record_token("https://srv") == "token-user-a"
+    # Pointer switched to B — the (server, "user-b") key misses A's entry.
+    current_profile["value"] = "user-b"
+    assert chat_mod._stored_databricks_record_token("https://srv") == "token-user-b"
+
+
 def test_remote_headers_pinned_profile_failure_does_not_fall_back_to_ambient(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

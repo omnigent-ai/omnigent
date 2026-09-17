@@ -2938,6 +2938,36 @@ def test_host_preflight_profile_probe_network_error_reports_connection(
         )
 
 
+def test_host_preflight_initial_probe_error_fails_loud_with_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transport error on the first probe must not silently skip an explicit profile.
+
+    Returning here would let startup proceed under the stored identity while
+    an explicit --profile went unapplied. With a profile, fail loud; without
+    one, the transient path still returns (the connect path reports it).
+    """
+    import httpx
+
+    monkeypatch.setattr(
+        "omnigent.chat._remote_headers",
+        lambda server_url=None, *, host_id=None: {"Authorization": "Bearer x"},
+    )
+
+    def _boom(url: str, **kw: object) -> object:
+        raise httpx.ConnectError("connection refused")
+
+    monkeypatch.setattr(httpx, "get", _boom)
+
+    # With an explicit profile → fail loud.
+    with pytest.raises(click.ClickException, match="Could not reach"):
+        cli._ensure_databricks_server_auth(
+            _HOST_DATABRICKS_SERVER, non_interactive=True, profile="my-user"
+        )
+    # Without a profile → transient path returns (no raise).
+    cli._ensure_databricks_server_auth(_HOST_DATABRICKS_SERVER, non_interactive=True)
+
+
 def test_databricks_preflight_silent_sdk_refresh_skips_login(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

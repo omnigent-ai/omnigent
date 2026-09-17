@@ -3641,6 +3641,24 @@ def _host_daemon_alive() -> bool:
 _LOCAL_SERVER_DISCOVER_TIMEOUT_S = 120.0
 
 
+def _profile_probe_unreachable(server: str, profile: str, exc: Exception) -> click.ClickException:
+    """A ``/v1/me`` probe failed while an explicit --profile was requested.
+
+    A transport failure is not evidence the server is non-Databricks, and
+    returning would let startup proceed under the stored identity instead of
+    the requested one, so an explicit profile must fail loud and retriable.
+
+    :param server: The server whose probe failed.
+    :param profile: The explicitly requested profile.
+    :param exc: The transport error raised by the probe.
+    :returns: A ``ClickException`` naming the connection failure.
+    """
+    return click.ClickException(
+        f"Could not reach {server}/v1/me to apply --profile {profile!r}: "
+        f"{exc}. Check connectivity and retry."
+    )
+
+
 def _ensure_databricks_server_auth(
     server: str, *, non_interactive: bool = False, profile: str | None = None
 ) -> None:
@@ -3689,9 +3707,13 @@ def _ensure_databricks_server_auth(
     headers = _remote_headers(server_url=server, host_id=None)
     try:
         probe = _httpx.get(f"{server}/v1/me", headers=headers, timeout=10.0)
-    except _httpx.HTTPError:
-        # Unreachable / transient: let the connect path raise its own,
-        # already-actionable error rather than failing the pre-flight.
+    except _httpx.HTTPError as exc:
+        # Unreachable / transient. With no explicit profile, let the connect
+        # path raise its own actionable error. But an explicit --profile must
+        # not be silently skipped — startup would proceed under the stored
+        # identity — so fail loud and retriable.
+        if profile is not None:
+            raise _profile_probe_unreachable(server, profile, exc) from exc
         return
     # An explicit --profile is an instruction to register as that identity.
     # A co-resident service principal's token can answer 200 here — precisely
@@ -3713,13 +3735,7 @@ def _ensure_databricks_server_auth(
             try:
                 unauthed_probe = _httpx.get(f"{server}/v1/me", timeout=10.0)
             except _httpx.HTTPError as exc:
-                # A transport failure is not evidence the server is
-                # non-Databricks; surface the connection error and let the
-                # user retry rather than telling them to drop --profile.
-                raise click.ClickException(
-                    f"Could not reach {server}/v1/me to determine the workspace "
-                    f"for --profile {profile!r}: {exc}. Check connectivity and retry."
-                ) from exc
+                raise _profile_probe_unreachable(server, profile, exc) from exc
             workspace_host = _databricks_workspace_login_target(server, unauthed_probe)
         if workspace_host is None:
             raise click.ClickException(
@@ -3735,7 +3751,9 @@ def _ensure_databricks_server_auth(
         if workspace_host is None and "Authorization" in headers:
             try:
                 unauthed_probe = _httpx.get(f"{server}/v1/me", timeout=10.0)
-            except _httpx.HTTPError:
+            except _httpx.HTTPError as exc:
+                if profile is not None:
+                    raise _profile_probe_unreachable(server, profile, exc) from exc
                 return
             workspace_host = _databricks_workspace_login_target(server, unauthed_probe)
         credential_rejected = workspace_host is not None and "Authorization" in headers

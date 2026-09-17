@@ -762,12 +762,13 @@ def _remote_headers(
     return headers
 
 
-# Cache the resolved _DatabricksBearerAuth object per server URL so that
-# repeated calls to _remote_headers for the same URL reuse the same SDK
-# Config instance. The SDK's Config.authenticate() caches the OAuth token
-# in memory and only re-runs the CLI shell-out when it nears expiry, so
-# reusing the object is both fast and correct for long-running callers.
-_databricks_auth_cache: dict[str, object] = {}
+# Cache the resolved _DatabricksBearerAuth object per (server URL, profile) so
+# repeated calls to _remote_headers reuse the same SDK Config instance. The
+# SDK's Config.authenticate() caches the OAuth token in memory and only re-runs
+# the CLI shell-out when it nears expiry, so reusing the object is both fast and
+# correct for long-running callers. The profile is part of the key so switching
+# a pointer's identity does not serve the previous identity's cached auth.
+_databricks_auth_cache: dict[tuple[str | None, str | None], object] = {}
 
 
 def _stored_databricks_record_token(server_url: str) -> str | None:
@@ -800,8 +801,13 @@ def _stored_databricks_record_token(server_url: str) -> str | None:
     if workspace_host is None:
         return None
     profile = load_databricks_profile(server_url)
+    # Key the cache by the identity selector too, not the server alone: when a
+    # pointer's profile changes (A → B), a server-only key would keep serving
+    # A's cached auth, so ownership checks run as A while the daemon registered
+    # as B (403, then the correct daemon is torn down).
+    cache_key = (server_url, profile)
     try:
-        auth = _databricks_auth_cache.get(server_url)
+        auth = _databricks_auth_cache.get(cache_key)
         if auth is None:
             # A stored profile names the exact identity the user chose at
             # login; resolving by profile beats guessing among the profiles
@@ -810,7 +816,7 @@ def _stored_databricks_record_token(server_url: str) -> str | None:
                 auth, _host = _resolve_databricks_auth(profile=profile)
             else:
                 auth, _host = _resolve_databricks_auth(host=workspace_host)
-            _databricks_auth_cache[server_url] = auth
+            _databricks_auth_cache[cache_key] = auth
         return auth.current_token()  # type: ignore[union-attr]
     except (DatabricksAuthError, ImportError, ValueError):
         return None
