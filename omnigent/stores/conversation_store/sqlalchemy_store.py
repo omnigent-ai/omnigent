@@ -77,6 +77,7 @@ from omnigent.db.utils import (
 from omnigent.entities import (
     Conversation,
     ConversationItem,
+    ErrorData,
     NewConversationItem,
     PagedList,
     parse_item_data,
@@ -724,6 +725,37 @@ def _to_item(row: SqlConversationItem, data_json: str) -> ConversationItem:
         response_id=row.response_id,
         created_at=row.created_at,
         data=parse_item_data(item_type, json.loads(data_json)),
+        created_by=row.created_by,
+    )
+
+
+def _to_unreadable_item(row: SqlConversationItem) -> ConversationItem:
+    """
+    Build a placeholder for a row whose stored ``data`` could not be decoded.
+
+    Keeps the row's identity (id, response id, timestamp) so pagination and
+    ordering are unaffected, and surfaces the failure as an ``error`` item —
+    transcript metadata clients already render as a banner and the agent loop
+    already excludes from LLM context — instead of failing the whole read.
+
+    :param row: The SQLAlchemy ORM row whose ``data`` did not decode.
+    :returns: An ``error``-typed :class:`ConversationItem` placeholder.
+    """
+    return ConversationItem(
+        id=row.id,
+        type="error",
+        status=decode_item_status(row.status),
+        response_id=row.response_id,
+        created_at=row.created_at,
+        data=ErrorData(
+            source="execution",
+            code="item_data_unreadable",
+            message=(
+                "This item's content could not be read from conversation "
+                "storage (for example, an attachment too large to decode). "
+                "The rest of the conversation is unaffected."
+            ),
+        ),
         created_by=row.created_by,
     )
 
@@ -1949,8 +1981,11 @@ class SqlAlchemyConversationStore(ConversationStore):
             # Preserve FTS rank order
             order = {iid: i for i, iid in enumerate(item_ids)}
             ordered = sorted(rows, key=lambda r: order[r.id])
-            decoded = self._decode_item_data_batch([r.data for r in ordered])
-            return [_to_item(r, d) for r, d in zip(ordered, decoded, strict=True)]
+            decoded = self._decode_item_data_batch_for_read([r.data for r in ordered])
+            return [
+                _to_item(r, d) if d is not None else _to_unreadable_item(r)
+                for r, d in zip(ordered, decoded, strict=True)
+            ]
 
     def list_items(
         self,
@@ -2054,8 +2089,11 @@ class SqlAlchemyConversationStore(ConversationStore):
             has_more = len(rows) > limit
             if has_more:
                 rows = rows[:limit]
-            decoded = self._decode_item_data_batch([r.data for r in rows])
-            items = [_to_item(r, d) for r, d in zip(rows, decoded, strict=True)]
+            decoded = self._decode_item_data_batch_for_read([r.data for r in rows])
+            items = [
+                _to_item(r, d) if d is not None else _to_unreadable_item(r)
+                for r, d in zip(rows, decoded, strict=True)
+            ]
             return PagedList(
                 data=items,
                 first_id=items[0].id if items else None,
@@ -2132,9 +2170,14 @@ class SqlAlchemyConversationStore(ConversationStore):
                 .where(ranked.c.row_num <= per_conversation_limit)
                 .order_by(ranked.c.conversation_id, ranked.c.position.desc())
             ).all()
-            decoded = self._decode_item_data_batch([row.data for row in rows])
+            decoded = self._decode_item_data_batch_for_read([row.data for row in rows])
             for row, data_json in zip(rows, decoded, strict=True):
-                result[row.conversation_id].append(_to_item(row, data_json))  # type: ignore[arg-type]
+                item = (
+                    _to_item(row, data_json)  # type: ignore[arg-type]
+                    if data_json is not None
+                    else _to_unreadable_item(row)  # type: ignore[arg-type]
+                )
+                result[row.conversation_id].append(item)
         return result
 
     def _encode_item_data(self, data_json: str) -> str:
@@ -2176,6 +2219,44 @@ class SqlAlchemyConversationStore(ConversationStore):
         single pass (e.g. one bulk decrypt call) instead of once per row.
         """
         return stored
+
+    def _decode_item_data_batch_for_read(self, stored: list[str]) -> list[str | None]:
+        """
+        Decode a page of rows for a user-facing read, isolating decode failures.
+
+        A batched subclass decode can fail for the whole page even when only
+        one row is undecodable — e.g. a single oversized inline attachment
+        pushing a batched decrypt RPC past its transport frame limit. One such
+        row must not make the whole conversation unreadable: a failed page
+        decode is retried row by row, and a row that still fails yields
+        ``None`` so the caller can degrade it to a placeholder item.
+
+        :param stored: The page's raw ``data`` column values.
+        :returns: One decoded ``data`` JSON per input, in order; ``None`` for
+            rows that could not be decoded.
+        """
+        try:
+            return list(self._decode_item_data_batch(stored))
+        except Exception:  # noqa: BLE001 — a subclass decode can raise any transport error; degrade, never fail the read
+            _logger.warning(
+                "decoding a page of %d items failed; retrying row by row",
+                len(stored),
+                exc_info=True,
+            )
+        decoded: list[str | None] = []
+        for encoded in stored:
+            try:
+                decoded.append(self._decode_item_data_batch([encoded])[0])
+            except Exception:  # noqa: BLE001 — same boundary; a still-failing row degrades to a placeholder
+                decoded.append(None)
+        undecodable = sum(1 for d in decoded if d is None)
+        if undecodable:
+            _logger.warning(
+                "%d of %d items could not be decoded; serving placeholders",
+                undecodable,
+                len(stored),
+            )
+        return decoded
 
     def _item_search_text(self, item: NewConversationItem) -> str | None:
         """

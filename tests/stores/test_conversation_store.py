@@ -6773,6 +6773,87 @@ def test_item_data_seam_subclass_encodes_and_decodes(db_uri: str) -> None:
     assert item.data.content[0]["text"] == "secret-payload"
 
 
+class _FrameLimitedDecodeStore(SqlAlchemyConversationStore):
+    """Batch decode rejects a page whose combined payload exceeds a limit —
+    the shape of a batched decrypt RPC hitting its transport frame cap."""
+
+    frame_limit = 4096
+
+    def _decode_item_data_batch(self, stored: list[str]) -> list[str]:
+        frame = sum(len(s) for s in stored)
+        if frame > self.frame_limit:
+            raise RuntimeError(
+                f"RPC terminated with RESOURCE_EXHAUSTED. "
+                f"Frame size {frame} exceeds maximum: {self.frame_limit}"
+            )
+        return super()._decode_item_data_batch(stored)
+
+
+def test_list_items_survives_batch_decode_overflow(db_uri: str) -> None:
+    """A page whose combined size trips the batch decode still lists intact:
+    the per-row retry decodes every row, so no content is lost."""
+    store = _FrameLimitedDecodeStore(db_uri)
+    conv = store.create_conversation()
+    texts = [f"turn {i} " + "x" * 1200 for i in range(6)]
+    store.append(conv.id, [_user_message(text, "resp_bulk") for text in texts])
+
+    page = store.list_items(conv.id)
+
+    assert [item.type for item in page.data] == ["message"] * 6
+    assert [item.data.content[0]["text"] for item in page.data] == texts
+
+
+def test_list_items_degrades_undecodable_item_instead_of_failing(db_uri: str) -> None:
+    """A row too large to decode even alone becomes an ``error`` placeholder
+    while the rest of the conversation stays readable — one oversized inline
+    attachment must not make the whole session unopenable."""
+    store = _FrameLimitedDecodeStore(db_uri)
+    conv = store.create_conversation()
+    store.append(conv.id, [_user_message("before", "resp_a")])
+    store.append(conv.id, [_user_message("y" * (store.frame_limit + 1), "resp_big")])
+    store.append(conv.id, [_user_message("after", "resp_b")])
+
+    page = store.list_items(conv.id)
+
+    assert [item.type for item in page.data] == ["message", "error", "message"]
+    placeholder = page.data[1]
+    assert isinstance(placeholder.data, ErrorData)
+    assert placeholder.data.code == "item_data_unreadable"
+    assert placeholder.response_id == "resp_big"
+    assert page.data[0].data.content[0]["text"] == "before"
+    assert page.data[2].data.content[0]["text"] == "after"
+
+
+def test_latest_message_summaries_survive_undecodable_item(db_uri: str) -> None:
+    """Multi-conversation message summaries degrade an undecodable row
+    instead of failing the whole fetch."""
+    store = _FrameLimitedDecodeStore(db_uri)
+    conv = store.create_conversation()
+    store.append(conv.id, [_user_message("small", "resp_s")])
+    store.append(conv.id, [_user_message("z" * (store.frame_limit + 1), "resp_l")])
+
+    result = store.list_latest_message_items_for_conversations([conv.id])
+
+    # Newest first: the oversized row degrades, the readable one survives.
+    assert [item.type for item in result[conv.id]] == ["error", "message"]
+    assert result[conv.id][1].data.content[0]["text"] == "small"
+
+
+def test_search_results_survive_undecodable_item(db_uri: str) -> None:
+    """Search result pages degrade an undecodable row instead of failing."""
+    store = _FrameLimitedDecodeStore(db_uri)
+    conv = store.create_conversation()
+    store.append(conv.id, [_user_message("needle in a small row", "resp_s")])
+    store.append(
+        conv.id,
+        [_user_message("needle " + "w" * (store.frame_limit + 1), "resp_l")],
+    )
+
+    results = store.search("needle", conversation_id=conv.id)
+
+    assert sorted(item.type for item in results) == ["error", "message"]
+
+
 def test_item_search_text_seam_redirects_persisted_value(db_uri: str) -> None:
     """The ``_item_search_text`` hook controls what lands in ``search_text``.
 
