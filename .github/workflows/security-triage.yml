@@ -168,7 +168,7 @@ jobs:
 
       - name: Set up uv
         if: steps.creds.outputs.available == 'true'
-        uses: ./.github/actions/setup-uv
+        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v3
         with:
           enable-cache: true
 
@@ -193,9 +193,17 @@ jobs:
 
       - name: Install Claude Code CLI
         if: steps.creds.outputs.available == 'true'
-        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@aa5736c38f5c1258ee29452c6825d75033b952d7
-        with:
-          harness: claude
+        env:
+          NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+        run: |
+          # Install outside the checked-out tree: a repo-root package.json would
+          # otherwise capture this bare `npm install` and hoist it there, leaving
+          # this dir's node_modules empty.
+          CC_CLI_DIR="${RUNNER_TEMP}/omnigent-cc-cli"
+          mkdir -p "$CC_CLI_DIR" && cd "$CC_CLI_DIR"
+          npm install --ignore-scripts --no-audit --no-fund @anthropic-ai/claude-code@2.1.236
+          node node_modules/@anthropic-ai/claude-code/install.cjs
+          echo "$CC_CLI_DIR/node_modules/.bin" >> "$GITHUB_PATH"
 
       - name: Write gateway profile (~/.databrickscfg)
         if: steps.creds.outputs.available == 'true'

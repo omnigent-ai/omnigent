@@ -73,7 +73,7 @@ jobs:
 
       - name: Install uv
         if: vars.ISSUE_PRIORITIZATION_V2_ENABLED == 'true'
-        uses: ./.github/actions/setup-uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39  # v8.2.0
 
       - name: Grade, label, and comment
         if: vars.ISSUE_PRIORITIZATION_V2_ENABLED == 'true'

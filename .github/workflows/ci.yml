@@ -165,11 +165,11 @@ jobs:
           python-version-file: ".python-version"
 
       - name: Set up uv
-        uses: ./.github/actions/setup-uv
+        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v3
         with:
           enable-cache: true
 
-      - name: Install test system dependencies
+      - name: Install ripgrep + bubblewrap + tmux
         # ripgrep: the Grep tool prefers it. bubblewrap: the linux_bwrap sandbox
         # needs it. tmux: the integration-mock shard spawns harness terminals.
         # apparmor sysctl: Ubuntu 24.04 blocks unprivileged user namespaces
@@ -177,9 +177,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y ripgrep bubblewrap tmux
-          if [ "${{ matrix.group }}" = "inner-rest" ]; then
-            sudo apt-get install -y --no-install-recommends dbus-daemon gnome-keyring
-          fi
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
       - name: Cache virtualenv
@@ -206,10 +203,6 @@ jobs:
           # sysmon: the default C-trace coverage backend pushed the heaviest
           # shard past its timeout; only line coverage is collected.
           COVERAGE_CORE: sysmon
-          # Multiplies the tests' hang-guard waits (tests.budgets.budget).
-          # A shared runner under -n 4+ can stall an event loop past a 1s
-          # budget; local runs keep the unscaled default and fail fast.
-          OMNIGENT_TEST_TIMEOUT_SCALE: "4"
         run: |
           mkdir -p artifacts artifacts/progress "$(dirname "$COVERAGE_FILE")"
           # matrix.paths is unquoted on purpose: it word-splits into pytest args.
@@ -269,7 +262,7 @@ jobs:
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
         with:
           python-version-file: ".python-version"
-      - uses: ./.github/actions/setup-uv
+      - uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a
         with:
           enable-cache: true
       - name: Install dependencies
@@ -311,7 +304,7 @@ jobs:
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
         with:
           python-version-file: ".python-version"
-      - uses: ./.github/actions/setup-uv
+      - uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a
         with:
           enable-cache: true
       - name: Start CockroachDB
@@ -366,7 +359,7 @@ jobs:
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
         with:
           python-version-file: ".python-version"
-      - uses: ./.github/actions/setup-uv
+      - uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a
         with:
           enable-cache: true
       - name: Install system MySQL client library
@@ -406,7 +399,7 @@ jobs:
           python-version-file: ".python-version"
 
       - name: Set up uv
-        uses: ./.github/actions/setup-uv
+        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v3
         with:
           enable-cache: true
 
@@ -434,9 +427,11 @@ jobs:
         uses: ./.github/actions/setup-pnpm
 
       - name: Install codex CLI
-        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@aa5736c38f5c1258ee29452c6825d75033b952d7
-        with:
-          harness: codex
+        env:
+          NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+        run: |
+          pnpm install --frozen-lockfile --ignore-scripts --filter e2e-ci-deps
+          echo "${GITHUB_WORKSPACE}/.github/ci-deps/node_modules/.bin" >> "$GITHUB_PATH"
 
       - name: Cache virtualenv
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v4

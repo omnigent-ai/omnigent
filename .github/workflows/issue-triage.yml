@@ -124,7 +124,7 @@ jobs:
         run: |
           # Derive everything downstream needs from the single source of truth,
           # .github/areas.json:
-          #   /tmp/owners.json   -- flat allowlist of active area owners (the ONLY
+          #   /tmp/owners.json   -- flat allowlist of every area owner (the ONLY
           #                         logins the assignment step may ever pick).
           #   /tmp/components.json -- the set of comp:* labels the validator allows.
           #   /tmp/areas_prompt.txt -- the AREAS block injected into the triage
@@ -132,19 +132,16 @@ jobs:
           python3 <<'PYEOF'
           import json, pathlib
 
-          config = json.loads(pathlib.Path(".github/areas.json").read_text())
-          areas = config["areas"]
-          paused = {login.casefold() for login in config.get("assignment_paused", [])}
+          areas = json.loads(pathlib.Path(".github/areas.json").read_text())["areas"]
 
           owners, components, lines = [], set(), []
           for a in areas:
-              active_owners = [o for o in a.get("owners", []) if o.casefold() not in paused]
-              for o in active_owners:
+              for o in a.get("owners", []):
                   if o not in owners:
                       owners.append(o)
               components.add(a["label"])
               lines.append(
-                  f"- {a['key']}: {a['definition']} Owners: {', '.join(active_owners)}."
+                  f"- {a['key']}: {a['definition']} Owners: {', '.join(a.get('owners', []))}."
               )
 
           pathlib.Path("/tmp/owners.json").write_text(json.dumps(owners))
@@ -208,7 +205,7 @@ jobs:
 
       - name: Set up uv
         if: steps.creds.outputs.available == 'true'
-        uses: ./.github/actions/setup-uv
+        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v3
         with:
           enable-cache: true
 
@@ -233,9 +230,17 @@ jobs:
 
       - name: Install Claude Code CLI
         if: steps.creds.outputs.available == 'true'
-        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@aa5736c38f5c1258ee29452c6825d75033b952d7
-        with:
-          harness: claude
+        env:
+          NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+        run: |
+          # Install outside the checked-out tree: a repo-root package.json would
+          # otherwise capture this bare `npm install` and hoist it there, leaving
+          # this dir's node_modules empty.
+          CC_CLI_DIR="${RUNNER_TEMP}/omnigent-cc-cli"
+          mkdir -p "$CC_CLI_DIR" && cd "$CC_CLI_DIR"
+          npm install --ignore-scripts --no-audit --no-fund @anthropic-ai/claude-code@2.1.236
+          node node_modules/@anthropic-ai/claude-code/install.cjs
+          echo "$CC_CLI_DIR/node_modules/.bin" >> "$GITHUB_PATH"
 
       - name: Set LLM credentials
         if: steps.creds.outputs.available == 'true'
@@ -653,8 +658,8 @@ jobs:
 
           # Refresh state after labeling/commenting so closure and assignment do
           # not rely on the earlier read.
-          issue_status=$(gh issue view "$ISSUE_NUMBER" --repo "$REPO" --json state,assignees)
-          issue_state=$(jq -r '.state' <<<"$issue_status")
+          issue_state=$(gh issue view "$ISSUE_NUMBER" --repo "$REPO" \
+            --json state --jq '.state')
           if [ "$issue_state" != "OPEN" ]; then
             exit 0
           fi
@@ -671,27 +676,24 @@ jobs:
           # issue is later reopened — triage only fires on `opened`, so a
           # reopened issue would otherwise come back unassigned.
 
-          # Assign maintainer authors directly unless their issue assignments are paused.
+          # If the issue was filed by a maintainer, assign it to them directly.
           author=$(jq -r '.author.login // empty' /tmp/issue.json)
-          owner_assigned=$(jq -r '.assignees | length > 0' <<<"$issue_status")
-          if [ "$owner_assigned" = "false" ] && [ -n "$author" ] && grep -qxF "$author" .github/MAINTAINER && \
-            jq -e --arg author "$author" \
-              '[(.assignment_paused // [])[] | ascii_downcase] | index($author | ascii_downcase) == null' \
-              .github/areas.json > /dev/null; then
+          maintainer_assigned=false
+          if [ -n "$author" ] && grep -qxF "$author" .github/MAINTAINER; then
             echo "Issue filed by maintainer $author — assigning to author"
             gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --add-assignee "$author"
-            owner_assigned=true
+            maintainer_assigned=true
           fi
 
           # Otherwise, assign an owner: the least-loaded area owner, with LLM
           # rank as a tiebreaker (load primary, rank secondary). Symmetric with
-          # the PR reviewer path. Skipped if the issue already has an owner.
-          # Every triaged issue gets an owner — duplicates
+          # the PR reviewer path. Skipped if the maintainer-author was already
+          # assigned above. Every triaged issue gets an owner — duplicates
           # included, even ones about to be closed below — so the only issues
           # left unassigned are needs_info ones (too vague to route until the
           # reporter adds detail).
           needs_info=$(jq -r '.needs_info // false' /tmp/triage_result.json)
-          if [ "$owner_assigned" = "false" ] && [ "$needs_info" != "true" ]; then
+          if [ "$maintainer_assigned" = "false" ] && [ "$needs_info" != "true" ]; then
             # Open-issue load per candidate (fewest assigned open issues wins ties).
             # One trusted query; the LLM never sees GH_TOKEN.
             gh issue list --repo "$REPO" --state open --limit 500 \

@@ -120,9 +120,7 @@ jobs:
           python3 <<'PYEOF' || echo "::notice::Reviewer ranking failed; load-balanced fallback."
           import json, os, pathlib, re, urllib.request
 
-          config = json.loads(pathlib.Path(".github/areas.json").read_text())
-          paused = {u.casefold() for u in config.get("assignment_paused", [])}
-          areas = config["areas"]
+          areas = json.loads(pathlib.Path(".github/areas.json").read_text())["areas"]
           files = [f["path"] for f in
                    json.loads(pathlib.Path("/tmp/pr_files.json").read_text()).get("files", [])]
           if not files:
@@ -130,8 +128,7 @@ jobs:
 
           area_lines = [
               f"- {a['key']}: {a['definition']} "
-              f"Paths: {', '.join(a['paths'])}. "
-              f"Owners: {', '.join(u for u in a['owners'] if u.casefold() not in paused)}."
+              f"Paths: {', '.join(a['paths'])}. Owners: {', '.join(a['owners'])}."
               for a in areas
           ]
           system = (

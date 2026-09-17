@@ -90,7 +90,7 @@ jobs:
 
       # Needed only for the PEP 440 max() on tag pushes; cheap on other events.
       - name: Set up uv
-        uses: ./.github/actions/setup-uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39  # v8.2.0
         with:
           enable-cache: false
 
@@ -377,7 +377,7 @@ jobs:
           version: v0.21.6
 
       - name: Set up uv
-        uses: ./.github/actions/setup-uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39  # v8.2.0
         with:
           enable-cache: false
 
