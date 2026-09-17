@@ -20,6 +20,7 @@ from omnigent.llms.adapters.base import BaseAdapter
 from omnigent.llms.prompt_cache import (
     PromptCachePlan,
     is_cache_hint_rejection,
+    is_official_openai_base_url,
     openai_prompt_cache_key,
 )
 from omnigent.llms.types import (
@@ -291,6 +292,20 @@ def _record_cache_rejection(plan: PromptCachePlan) -> None:
     _logger.warning("OpenAI rejected the prompt cache hint; retrying without it")
 
 
+def resolve_adapter_base_url(adapter: OpenAICompatibleAdapter, override: str | None) -> str | None:
+    """
+    The base URL a request through ``adapter`` would use, or ``None``.
+
+    :param adapter: The adapter handling the request.
+    :param override: Per-call ``connection_params["base_url"]``.
+    :returns: The effective base URL, or ``None`` when none is configured.
+    """
+    try:
+        return _resolve_base_url(override, adapter._base_url)
+    except OmnigentError:
+        return None
+
+
 def _resolve_base_url(
     override: str | None,
     default: str | None,
@@ -523,10 +538,11 @@ class OpenAIAdapter(OpenAICompatibleAdapter):
             ``"api_key"``, ``"base_url"``.
         :param timeout: Request timeout in seconds. ``None`` uses
             the module default.
-        :param prompt_cache: Cache plan from the client. When it applies, a
-            ``prompt_cache_key`` derived from the stable prefix (tools and
-            instructions) is added so automatic prefix caching routes
-            consistently. A provider refusal is retried once without it.
+        :param prompt_cache: Cache plan from the client. When it applies and
+            the effective URL is OpenAI's own API, a ``prompt_cache_key``
+            derived from the stable prefix (tools and instructions) is added.
+            Any key sent while caching is enabled, generated or caller-supplied,
+            is dropped and the request retried once if the provider refuses it.
         :param kwargs: Additional API kwargs (temperature, etc.).
         :returns: A :class:`Response` or an async iterator of
             :class:`ResponseStreamEvent`.
@@ -559,13 +575,21 @@ class OpenAIAdapter(OpenAICompatibleAdapter):
         )
 
         cached_payload: dict[str, Any] | None = None
-        cache_plan = prompt_cache if prompt_cache is not None and prompt_cache.apply else None
-        # A caller-supplied key wins; never overwrite it.
-        if cache_plan is not None and "prompt_cache_key" not in payload:
-            cached_payload = {
-                **payload,
-                "prompt_cache_key": openai_prompt_cache_key(instructions, payload.get("tools")),
-            }
+        cache_plan = (
+            prompt_cache if prompt_cache is not None and prompt_cache.policy.enabled else None
+        )
+        if cache_plan is not None:
+            if "prompt_cache_key" in payload:
+                # A caller-supplied key wins, but still fails open if refused.
+                cached_payload = payload
+                payload = {k: v for k, v in payload.items() if k != "prompt_cache_key"}
+            elif cache_plan.apply and is_official_openai_base_url(effective_base):
+                cached_payload = {
+                    **payload,
+                    "prompt_cache_key": openai_prompt_cache_key(
+                        instructions, payload.get("tools")
+                    ),
+                }
 
         if stream:
             effective_to = timeout if timeout is not None else _STREAM_TIMEOUT

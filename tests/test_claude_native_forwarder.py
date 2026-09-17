@@ -7542,6 +7542,11 @@ async def test_post_session_usage_records_gen_ai_token_attributes(
     assert attrs["gen_ai.usage.total_tokens"] == 1523 + 847
     assert attrs["gen_ai.usage.cache_read_input_tokens"] == 200
     assert attrs["gen_ai.usage.cache_creation_input_tokens"] == 50
+    assert attrs["omnigent.prompt_cache.mechanism"] == "vendor_managed"
+    assert attrs["omnigent.prompt_cache.controllable"] is False
+    assert attrs["omnigent.prompt_cache.outcome"] == "hit"
+    assert attrs["omnigent.prompt_cache.read_tokens"] == 200
+    assert attrs["omnigent.prompt_cache.write_tokens"] == 50
 
 
 @pytest.mark.asyncio
@@ -7567,6 +7572,7 @@ async def test_post_session_usage_without_token_usage_records_no_tokens(
     assert len(spans) == 1
     attrs = dict(spans[0].attributes or {})
     assert not [key for key in attrs if key.startswith("gen_ai.usage.")]
+    assert not [key for key in attrs if key.startswith("omnigent.prompt_cache.")]
 
 
 @pytest.mark.asyncio

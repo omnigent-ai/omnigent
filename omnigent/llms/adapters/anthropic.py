@@ -645,9 +645,11 @@ def _anthropic_to_chat(resp: dict[str, Any]) -> dict[str, Any]:
             # ``(a or 0) + (b or 0) or None`` collapse a genuine zero total to
             # ``None`` (yielding an inconsistent ``prompt=0, completion=0,
             # total=None``), and it disagrees with the streaming path, which
-            # reports ``input + output`` directly. Keep the per-operand ``or 0``
+            # reports the same sum directly. Keep the per-operand ``or 0``
             # guards so a missing count is treated as zero.
-            "total_tokens": (usage.get("input_tokens") or 0) + (usage.get("output_tokens") or 0),
+            "total_tokens": (usage.get("input_tokens") or 0)
+            + (usage.get("output_tokens") or 0)
+            + sum(_cache_usage(usage).values()),
             **_cache_usage(usage),
         },
     }
@@ -656,6 +658,8 @@ def _anthropic_to_chat(resp: dict[str, Any]) -> dict[str, Any]:
 def _cache_usage(usage: dict[str, Any]) -> dict[str, int]:
     """
     Pick Anthropic's additive prompt-cache counters out of a usage block.
+
+    Anthropic's ``input_tokens`` excludes these, so totals must add them.
 
     :param usage: Anthropic ``usage`` dict.
     :returns: The ``cache_read_input_tokens`` / ``cache_creation_input_tokens``
@@ -757,7 +761,9 @@ async def _stream_to_chat_chunks(
                     "prompt_tokens": usage_data.get("input_tokens"),
                     "completion_tokens": usage_data.get("output_tokens"),
                     "total_tokens": (
-                        usage_data.get("input_tokens", 0) + usage_data.get("output_tokens", 0)
+                        usage_data.get("input_tokens", 0)
+                        + usage_data.get("output_tokens", 0)
+                        + sum(_cache_usage(usage_data).values())
                     ),
                     **_cache_usage(usage_data),
                 },

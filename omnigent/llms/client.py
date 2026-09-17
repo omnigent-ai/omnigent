@@ -19,7 +19,11 @@ from omnigent.llms._responses_to_chat import (
 from omnigent.llms._usage_observer import notify as _notify_usage
 from omnigent.llms.adapters import get_adapter
 from omnigent.llms.adapters.anthropic import AnthropicAdapter
-from omnigent.llms.adapters.openai import OpenAIAdapter
+from omnigent.llms.adapters.openai import (
+    OpenAIAdapter,
+    OpenAICompatibleAdapter,
+    resolve_adapter_base_url,
+)
 from omnigent.llms.errors import (
     PermanentLLMError,
     RetryableLLMError,
@@ -90,16 +94,25 @@ def _plan_for(
     model: str,
     policy: PromptCachePolicy,
     connection_params: dict[str, str] | None,
+    *,
+    instructions: str | None,
+    tools: list[dict[str, Any]] | None,
 ) -> PromptCachePlan | None:
     """Build the request's cache plan; ``None`` lets routing errors surface later."""
     try:
         provider = parse_model_string(model).provider
+        adapter = get_adapter(provider) if provider == "openai" else None
     except Exception:
         return None
+    base_url = None
+    if isinstance(adapter, OpenAICompatibleAdapter):
+        # Judge the URL the request will actually hit, not just a per-call override.
+        base_url = resolve_adapter_base_url(adapter, (connection_params or {}).get("base_url"))
     return plan_prompt_cache(
         provider,
         policy,
-        base_url_override=(connection_params or {}).get("base_url"),
+        base_url=base_url,
+        stable_prefix=bool(instructions) or bool(tools),
     )
 
 
@@ -172,7 +185,13 @@ class _ResponsesNamespace:
             exhausted.
         """
 
-        cache_plan = _plan_for(model, resolve_prompt_cache_policy(prompt_cache), connection_params)
+        cache_plan = _plan_for(
+            model,
+            resolve_prompt_cache_policy(prompt_cache),
+            connection_params,
+            instructions=instructions,
+            tools=tools,
+        )
 
         async def call_fn() -> Response | AsyncIterator[ResponseStreamEvent]:
             """
@@ -244,6 +263,10 @@ class _ResponsesNamespace:
         # directly so reasoning token events flow through
         # unmodified.
         if isinstance(adapter, OpenAIAdapter):
+            # Enabled plans reach the adapter even when no key is generated, so a
+            # caller-supplied prompt_cache_key still fails open.
+            if cache_plan is not None and cache_plan.policy.enabled:
+                cache_kwargs = {"prompt_cache": cache_plan}
             if reasoning and reasoning.get("effort"):
                 effort = validate_effort_or_llm_error(
                     reasoning.get("effort"), "OpenAI Responses", OPENAI_EFFORTS

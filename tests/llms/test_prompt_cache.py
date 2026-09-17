@@ -25,6 +25,8 @@ from omnigent.inner.codex_executor import (
 )
 from omnigent.inner.codex_native_executor import CodexNativeExecutor
 from omnigent.inner.executor import Executor
+from omnigent.llms import client as llm_client_module
+from omnigent.llms.adapters.openai import OpenAIAdapter
 from omnigent.llms.client import Client
 from omnigent.llms.context_window import ModelPricing, compute_llm_cost
 from omnigent.llms.prompt_cache import (
@@ -37,6 +39,8 @@ from omnigent.llms.prompt_cache import (
     PromptCachePolicy,
     PromptCacheReason,
     apply_anthropic_cache_control,
+    is_cache_hint_rejection,
+    is_official_openai_base_url,
     observe_harness_usage,
     openai_prompt_cache_key,
     plan_prompt_cache,
@@ -473,6 +477,157 @@ async def test_openai_rejected_cache_key_fail_open(
     assert b"prompt_cache_key" not in recorder.bodies[1]
     assert result.prompt_cache is not None
     assert result.prompt_cache.reason is PromptCacheReason.PROVIDER_REJECTED
+    # Automatic prefix caching still runs without the routing hint.
+    assert result.prompt_cache.mechanism is PromptCacheMechanism.AUTOMATIC_PREFIX
+    assert result.prompt_cache.outcome is PromptCacheOutcome.MISS
+
+
+async def test_openai_adapter_level_custom_url_gets_no_cache_key(
+    provider: Callable[..., _Provider],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    custom = OpenAIAdapter(base_url="https://gateway.example/openai/v1")
+    monkeypatch.setattr(llm_client_module, "get_adapter", lambda _provider: custom)
+    recorder = provider(httpx.Response(200, json=_openai_body(cached=64)))
+    result = await _create(
+        input=_input(),
+        instructions=_INSTRUCTIONS,
+        model="openai/gpt-test",
+        tools=_TOOLS,
+        connection_params={"api_key": "k"},
+        prompt_cache="opportunistic",
+    )
+    assert b"prompt_cache" not in recorder.bodies[0]
+    assert result.prompt_cache is not None
+    assert result.prompt_cache.controllable is False
+    assert result.prompt_cache.reason is PromptCacheReason.CUSTOM_ENDPOINT
+    assert result.prompt_cache.outcome is PromptCacheOutcome.HIT
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "official"),
+    [
+        (None, False),
+        ("https://api.openai.com/v1", True),
+        ("https://api.openai.com/v1/", True),
+        ("http://api.openai.com/v1", False),
+        ("https://api.openai.com.evil.example/v1", False),
+        ("https://proxy.example/v1", False),
+        ("https://api.openai.com:8443/v1", False),
+        ("https://api.openai.com/openai/v1", False),
+    ],
+)
+def test_official_openai_base_url_detection(endpoint: str | None, official: bool) -> None:
+    assert is_official_openai_base_url(endpoint) is official
+    plan = plan_prompt_cache(
+        "openai", PromptCachePolicy(PromptCacheMode.OPPORTUNISTIC), base_url=endpoint
+    )
+    assert plan.apply is official
+
+
+_CALLER_KEY_REJECTION = httpx.Response(
+    400, json={"error": {"message": "Unknown parameter: 'Prompt_Cache_Key'."}}
+)
+
+
+@pytest.mark.parametrize("endpoint", [None, "https://proxy.example/v1"])
+async def test_openai_caller_supplied_key_fails_open(
+    provider: Callable[..., _Provider],
+    endpoint: str | None,
+) -> None:
+    recorder = provider(_CALLER_KEY_REJECTION, httpx.Response(200, json=_openai_body()))
+    params = {"api_key": "k"} | ({"base_url": endpoint} if endpoint else {})
+    result = await _create(
+        input=_input(),
+        instructions=_INSTRUCTIONS,
+        model="openai/gpt-test",
+        connection_params=params,
+        prompt_cache="opportunistic",
+        prompt_cache_key="caller-key",
+    )
+    first, retry = recorder.json_bodies()
+    assert first["prompt_cache_key"] == "caller-key"
+    assert "prompt_cache_key" not in retry
+    assert {k: v for k, v in first.items() if k != "prompt_cache_key"} == retry
+    assert result.prompt_cache is not None
+    assert result.prompt_cache.reason is PromptCacheReason.PROVIDER_REJECTED
+
+
+async def test_openai_stream_caller_supplied_key_fails_open(
+    provider: Callable[..., _Provider],
+) -> None:
+    sse = f"event: response.completed\ndata: {json.dumps({'response': _openai_body()})}\n\n"
+    recorder = provider(_CALLER_KEY_REJECTION, httpx.Response(200, text=sse))
+    stream = await Client().responses.create(
+        input=_input(),
+        instructions=_INSTRUCTIONS,
+        model="openai/gpt-test",
+        stream=True,
+        connection_params={"api_key": "k"},
+        prompt_cache="opportunistic",
+        prompt_cache_key="caller-key",
+    )
+    assert not isinstance(stream, Response)
+    completed = [event async for event in stream if isinstance(event, ResponseCompletedEvent)]
+    first, retry = recorder.json_bodies()
+    assert first["prompt_cache_key"] == "caller-key"
+    assert "prompt_cache_key" not in retry
+    observation = completed[0].response.prompt_cache
+    assert observation is not None
+    assert observation.reason is PromptCacheReason.PROVIDER_REJECTED
+
+
+async def test_openai_stream_generated_key_fails_open(
+    provider: Callable[..., _Provider],
+) -> None:
+    sse = f"event: response.completed\ndata: {json.dumps({'response': _openai_body()})}\n\n"
+    recorder = provider(_CALLER_KEY_REJECTION, httpx.Response(200, text=sse))
+    stream = await Client().responses.create(
+        input=_input(),
+        instructions=_INSTRUCTIONS,
+        model="openai/gpt-test",
+        stream=True,
+        connection_params={"api_key": "k"},
+        prompt_cache="opportunistic",
+    )
+    assert not isinstance(stream, Response)
+    [event async for event in stream]
+    first, retry = recorder.json_bodies()
+    assert "prompt_cache_key" in first
+    assert "prompt_cache_key" not in retry
+
+
+async def test_no_stable_prefix_sends_no_cache_hints(
+    provider: Callable[..., _Provider],
+) -> None:
+    recorder = provider(httpx.Response(200, json=_openai_body()))
+    result = await _create(
+        input=_input(),
+        model="openai/gpt-test",
+        connection_params={"api_key": "k"},
+        prompt_cache="opportunistic",
+    )
+    assert b"prompt_cache" not in recorder.bodies[0]
+    assert result.prompt_cache is not None
+    assert result.prompt_cache.reason is PromptCacheReason.NO_STABLE_PREFIX
+
+
+@pytest.mark.parametrize(
+    ("status", "body", "rejected"),
+    [
+        (400, "tools.1.cache_control: Extra inputs are not permitted", True),
+        (400, "Unknown parameter: 'prompt_cache_key'.", True),
+        (400, "CACHE_CONTROL is not supported", True),
+        (422, '{"detail": "Prompt_Cache_Key: extra fields not permitted"}', True),
+        (400, "max_tokens: must be less than 8192", False),
+        (400, "prompt_cache_retention is not supported for this model", False),
+        (401, "cache_control", False),
+        (429, "prompt_cache_key rate limited", False),
+        (500, "cache_control", False),
+    ],
+)
+def test_cache_hint_rejection_matching(status: int, body: str, rejected: bool) -> None:
+    assert is_cache_hint_rejection(status, body) is rejected
 
 
 # ── Digest / key stability ───────────────────────────────────
@@ -542,6 +697,108 @@ async def test_unsupported_provider_request_is_unchanged(
 
 
 # ── Accounting ───────────────────────────────────────────────
+
+
+async def test_anthropic_totals_include_cache_tokens(
+    provider: Callable[..., _Provider],
+) -> None:
+    provider(
+        httpx.Response(
+            200,
+            json=_anthropic_body(cache_read_input_tokens=1800, cache_creation_input_tokens=400),
+        )
+    )
+    result = await _create(
+        input=_input(),
+        instructions=_INSTRUCTIONS,
+        model="anthropic/claude-test",
+        connection_params={"api_key": "k"},
+        prompt_cache="opportunistic",
+    )
+    assert result.usage == Usage(
+        input_tokens=12,
+        output_tokens=3,
+        total_tokens=12 + 3 + 1800 + 400,
+        cache_read_input_tokens=1800,
+        cache_creation_input_tokens=400,
+    )
+
+
+async def test_anthropic_stream_totals_include_cache_tokens(
+    provider: Callable[..., _Provider],
+) -> None:
+    sse = (
+        'data: {"type":"message_start","message":{"id":"m","model":"claude-test",'
+        '"usage":{"input_tokens":5,"cache_read_input_tokens":700,'
+        '"cache_creation_input_tokens":90}}}\n'
+        'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},'
+        '"usage":{"output_tokens":2}}\n'
+    )
+    provider(httpx.Response(200, text=sse))
+    stream = await Client().responses.create(
+        input=_input(),
+        instructions=_INSTRUCTIONS,
+        model="anthropic/claude-test",
+        stream=True,
+        connection_params={"api_key": "k"},
+        prompt_cache="opportunistic",
+    )
+    assert not isinstance(stream, Response)
+    completed = [event async for event in stream if isinstance(event, ResponseCompletedEvent)]
+    usage = completed[0].response.usage
+    assert usage is not None
+    assert usage.total_tokens == 5 + 2 + 700 + 90
+    assert (usage.cache_read_input_tokens, usage.cache_creation_input_tokens) == (700, 90)
+    assert completed[0].response.prompt_cache is not None
+    assert completed[0].response.prompt_cache.outcome is PromptCacheOutcome.HIT
+
+
+_PRICING = ModelPricing(
+    input_per_token=1.0,
+    output_per_token=2.0,
+    cache_read_per_token=0.1,
+    cache_write_per_token=1.25,
+)
+
+
+async def test_parsed_openai_usage_reaches_cost_without_double_counting(
+    provider: Callable[..., _Provider],
+) -> None:
+    provider(httpx.Response(200, json=_openai_body(cached=1792)))
+    result = await _create(
+        input=_input(),
+        instructions=_INSTRUCTIONS,
+        model="openai/gpt-test",
+        connection_params={"api_key": "k"},
+        prompt_cache="opportunistic",
+    )
+    assert result.usage is not None
+    # 2000 reported input tokens include 1792 cached: 208 full-rate + 1792 cache-rate.
+    assert compute_llm_cost(result.usage.to_cost_usage(), _PRICING) == pytest.approx(
+        208 * 1.0 + 10 * 2.0 + 1792 * 0.1
+    )
+
+
+async def test_parsed_anthropic_usage_reaches_cost_with_read_and_write(
+    provider: Callable[..., _Provider],
+) -> None:
+    provider(
+        httpx.Response(
+            200,
+            json=_anthropic_body(cache_read_input_tokens=1000, cache_creation_input_tokens=400),
+        )
+    )
+    result = await _create(
+        input=_input(),
+        instructions=_INSTRUCTIONS,
+        model="anthropic/claude-test",
+        connection_params={"api_key": "k"},
+        prompt_cache="opportunistic",
+    )
+    assert result.usage is not None
+    assert compute_llm_cost(result.usage.to_cost_usage(), _PRICING) == pytest.approx(
+        12 * 1.0 + 3 * 2.0 + 1000 * 0.1 + 400 * 1.25
+    )
 
 
 def test_anthropic_cache_usage_prices_read_and_write_separately() -> None:

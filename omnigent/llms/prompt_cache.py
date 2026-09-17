@@ -32,6 +32,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlsplit
 
 if TYPE_CHECKING:
     from omnigent.llms.types import Usage
@@ -43,8 +44,10 @@ PROMPT_CACHE_ENV_VAR = "OMNIGENT_PROMPT_CACHE"
 # Anthropic's default (5 minute) ephemeral cache breakpoint.
 ANTHROPIC_CACHE_CONTROL: dict[str, str] = {"type": "ephemeral"}
 
-_OPENAI_DEFAULT_BASE_URL = "https://api.openai.com/v1"
+_OPENAI_API_HOST = "api.openai.com"
 _OPENAI_CACHE_KEY_PREFIX = "omnigent-"
+_VALIDATION_STATUS_CODES = frozenset({400, 422})
+_CACHE_HINT_FIELDS = ("cache_control", "prompt_cache_key")
 # Leaves the key well under OpenAI's prompt_cache_key length limit.
 _OPENAI_CACHE_KEY_HEX_CHARS = 32
 
@@ -84,6 +87,7 @@ class PromptCacheReason(str, Enum):
     CUSTOM_ENDPOINT = "custom_endpoint"
     PROVIDER_REJECTED = "provider_rejected"
     VENDOR_MANAGED = "vendor_managed"
+    NO_STABLE_PREFIX = "no_stable_prefix"
     NO_USAGE = "no_usage"
 
 
@@ -149,17 +153,25 @@ class PromptCachePlan:
     :param policy: The resolved caller policy.
     :param reason: Why hints are or are not applied.
     :param rejected: Set when the provider refused the hints.
+    :param stable_prefix: Whether the request has tools or instructions to
+        cache; without them there is nothing reusable to mark.
     """
 
     capability: PromptCacheCapability
     policy: PromptCachePolicy
     reason: PromptCacheReason
     rejected: bool = False
+    stable_prefix: bool = True
 
     @property
     def apply(self) -> bool:
         """Whether the adapter should add cache hints to the payload."""
-        return self.policy.enabled and self.capability.controllable and not self.rejected
+        return (
+            self.policy.enabled
+            and self.capability.controllable
+            and self.stable_prefix
+            and not self.rejected
+        )
 
     def mark_rejected(self) -> None:
         """Record that the provider rejected the hints (fail-open retry)."""
@@ -229,28 +241,48 @@ def resolve_prompt_cache_policy(
         return PromptCachePolicy()
 
 
+def is_official_openai_base_url(base_url: str | None) -> bool:
+    """
+    Whether ``base_url`` is OpenAI's own API endpoint.
+
+    :param base_url: The adapter's effective base URL, e.g.
+        ``"https://api.openai.com/v1"``.
+    :returns: ``True`` only for ``https://api.openai.com/v1``.
+    """
+    if not base_url:
+        return False
+    parts = urlsplit(base_url.strip())
+    return (
+        parts.scheme == "https"
+        and parts.hostname == _OPENAI_API_HOST
+        and parts.port is None
+        and parts.path.rstrip("/") == "/v1"
+        and not parts.query
+    )
+
+
 def plan_prompt_cache(
     provider: str,
     policy: PromptCachePolicy,
     *,
-    base_url_override: str | None = None,
+    base_url: str | None = None,
+    stable_prefix: bool = True,
 ) -> PromptCachePlan:
     """
     Decide how one direct-provider request may use prompt caching.
 
     :param provider: Routed provider name, e.g. ``"anthropic"``.
     :param policy: The resolved caller policy.
-    :param base_url_override: Per-call ``connection_params["base_url"]``.
+    :param base_url: The adapter's effective base URL (per-call override or
+        adapter default). OpenAI hints are only sent to OpenAI's own API.
+    :param stable_prefix: Whether the request has tools or instructions.
     :returns: The plan the client passes to the adapter.
     """
     if provider == "anthropic":
         capability = EXPLICIT_BREAKPOINT_CAPABILITY
         reason = PromptCacheReason.APPLIED
     elif provider == "openai":
-        custom = base_url_override is not None and (
-            base_url_override.rstrip("/") != _OPENAI_DEFAULT_BASE_URL
-        )
-        if custom:
+        if not is_official_openai_base_url(base_url):
             # Gateways that proxy the Responses API may reject unknown fields.
             capability = AUTOMATIC_PREFIX_OBSERVE_ONLY_CAPABILITY
             reason = PromptCacheReason.CUSTOM_ENDPOINT
@@ -260,9 +292,13 @@ def plan_prompt_cache(
     else:
         capability = UNSUPPORTED_CAPABILITY
         reason = PromptCacheReason.UNSUPPORTED_PROVIDER
+    if capability.controllable and not stable_prefix:
+        reason = PromptCacheReason.NO_STABLE_PREFIX
     if not policy.enabled and capability.controllable:
         reason = PromptCacheReason.DISABLED
-    return PromptCachePlan(capability=capability, policy=policy, reason=reason)
+    return PromptCachePlan(
+        capability=capability, policy=policy, reason=reason, stable_prefix=stable_prefix
+    )
 
 
 def stable_prefix_digest(
@@ -334,9 +370,12 @@ def is_cache_hint_rejection(status_code: int, body: str) -> bool:
 
     :param status_code: HTTP status of the failed request.
     :param body: Provider error body (inspected only, never logged here).
-    :returns: ``True`` for a 400 that names a cache field.
+    :returns: ``True`` for a 400/422 validation error that names a cache field.
     """
-    return status_code == 400 and ("cache_control" in body or "prompt_cache" in body)
+    if status_code not in _VALIDATION_STATUS_CODES:
+        return False
+    lowered = body.lower()
+    return any(field in lowered for field in _CACHE_HINT_FIELDS)
 
 
 def _token_count(value: object) -> int | None:
@@ -388,10 +427,9 @@ def observe_response_usage(plan: PromptCachePlan, usage: Usage | None) -> Prompt
     if read is None and write is None:
         # Usage without cache counters means nothing was read from cache.
         read = 0
-    # OpenAI caches common prefixes automatically even without hints.
-    caching_active = not plan.rejected and (
-        plan.apply or capability.mechanism is PromptCacheMechanism.AUTOMATIC_PREFIX
-    )
+    # OpenAI keeps caching common prefixes automatically even when a routing
+    # hint is absent or rejected; explicit breakpoints only cache when sent.
+    caching_active = plan.apply or capability.mechanism is PromptCacheMechanism.AUTOMATIC_PREFIX
     return PromptCacheObservation(
         mechanism=capability.mechanism,
         outcome=_outcome(read, write, caching_active=caching_active),
