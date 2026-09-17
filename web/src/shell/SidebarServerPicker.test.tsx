@@ -9,11 +9,19 @@ import { SidebarServerPicker } from "./SidebarServerPicker";
 const getServerPicker = vi.fn();
 const switchServer = vi.fn();
 const openServerSetup = vi.fn();
+const copyText = vi.fn();
+const showToast = vi.fn();
 
 vi.mock("@/lib/nativeBridge", () => ({
   getServerPicker: () => getServerPicker(),
   switchServer: (url: string) => switchServer(url),
   openServerSetup: () => openServerSetup(),
+}));
+vi.mock("@/lib/clipboard", () => ({
+  copyText: (text: string) => copyText(text),
+}));
+vi.mock("@/components/ui/toast", () => ({
+  showToast: (...args: unknown[]) => showToast(...args),
 }));
 
 function renderPicker() {
@@ -38,9 +46,15 @@ beforeEach(() => {
   getServerPicker.mockReset();
   switchServer.mockReset();
   openServerSetup.mockReset();
+  copyText.mockReset();
+  copyText.mockResolvedValue(undefined);
+  showToast.mockReset();
 });
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+});
 
 describe("SidebarServerPicker", () => {
   it("renders nothing in a plain browser (bridge resolves null)", async () => {
@@ -126,6 +140,89 @@ describe("SidebarServerPicker", () => {
     fireEvent.click(await screen.findByText("other.example.com"));
 
     await waitFor(() => expect(switchServer).toHaveBeenCalledWith("https://other.example.com/"));
+  });
+
+  it("opens with the keyboard and activates the copy action", async () => {
+    getServerPicker.mockResolvedValue({
+      currentOrigin: "https://host.example.com:8443",
+      recentServers: [],
+    });
+    renderPicker();
+
+    const trigger = await screen.findByTestId("sidebar-server-picker");
+    trigger.focus();
+    fireEvent.keyDown(trigger, { key: "Enter" });
+
+    const openAction = await screen.findByRole("menuitem", { name: "Open server in new tab" });
+    const copyAction = screen.getByRole("menuitem", { name: "Copy server URL" });
+    expect(openAction).toHaveFocus();
+
+    fireEvent.keyDown(openAction, { key: "ArrowDown" });
+    await waitFor(() => expect(copyAction).toHaveFocus());
+    fireEvent.keyDown(copyAction, { key: "Enter" });
+
+    await waitFor(() => expect(copyText).toHaveBeenCalledWith("https://host.example.com:8443"));
+  });
+
+  it("links the exact connected server URL to a protected new tab", async () => {
+    getServerPicker.mockResolvedValue({
+      currentOrigin: "https://host.example.com:8443",
+      recentServers: [],
+    });
+    renderPicker();
+
+    await openMenu();
+    const action = await screen.findByRole("menuitem", { name: "Open server in new tab" });
+
+    expect(action).toHaveAttribute("href", "https://host.example.com:8443");
+    expect(action).toHaveAttribute("target", "_blank");
+    expect(action).toHaveAttribute("rel", "noopener noreferrer");
+  });
+
+  it("copies the exact connected server URL and confirms success visibly", async () => {
+    getServerPicker.mockResolvedValue({
+      currentOrigin: "https://host.example.com:8443",
+      recentServers: [],
+    });
+    renderPicker();
+
+    await openMenu();
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Copy server URL" }));
+
+    await waitFor(() => expect(copyText).toHaveBeenCalledWith("https://host.example.com:8443"));
+    expect(showToast).toHaveBeenCalledWith("Server URL copied.");
+  });
+
+  it("reports clipboard limitations instead of failing silently", async () => {
+    copyText.mockRejectedValue(new Error("Clipboard unavailable"));
+    getServerPicker.mockResolvedValue({
+      currentOrigin: "https://host.example.com",
+      recentServers: [],
+    });
+    renderPicker();
+
+    await openMenu();
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Copy server URL" }));
+    await waitFor(() =>
+      expect(showToast).toHaveBeenCalledWith(
+        "Couldn't copy the server URL. Copy it manually: https://host.example.com",
+        { duration: 0 },
+      ),
+    );
+  });
+
+  it("does not make unsupported server URL schemes openable", async () => {
+    getServerPicker.mockResolvedValue({
+      currentOrigin: "javascript:alert(document.domain)",
+      recentServers: [],
+    });
+    renderPicker();
+
+    await openMenu();
+    const action = await screen.findByRole("menuitem", { name: "Open server in new tab" });
+
+    expect(action).toHaveAttribute("aria-disabled", "true");
+    expect(action).not.toHaveAttribute("href");
   });
 
   it("opens the shell's setup page from 'Connect to new server…'", async () => {
