@@ -82,6 +82,48 @@ def test_review_output_preserves_final_review(tmp_path: Path, raw: str, expected
     assert payload == f"{expected}{delimiter}\n"
 
 
+@pytest.mark.parametrize(
+    ("stderr_log", "at_capacity"),
+    [
+        pytest.param("Error: Selected model is at capacity.", True, id="at-capacity"),
+        pytest.param('inner executor error: {"type": "overloaded_error"}', True, id="overloaded"),
+        pytest.param("Traceback: some unrelated crash", False, id="other-failure"),
+    ],
+)
+def test_empty_review_flags_model_capacity(
+    tmp_path: Path, stderr_log: str, at_capacity: bool
+) -> None:
+    """An empty review from a model-capacity failure is flagged; other empties aren't."""
+    workflow = yaml.safe_load(_WORKFLOW.read_text())
+    step = next(s for s in workflow["jobs"]["review"]["steps"] if s.get("id") == "polly")
+    script = step["run"][step["run"].index('python3 -c "') :]
+    output = tmp_path / "polly_output.txt"
+    review = tmp_path / "polly_review.txt"
+    output.write_text("Waiting for results.\n")
+    (tmp_path / "polly-stderr.log").write_text(stderr_log)
+    script = script.replace("/tmp/polly_output.txt", str(output))
+    script = script.replace("/tmp/polly_review.txt", str(review))
+    github_output = tmp_path / "github_output"
+    (tmp_path / "python3").symlink_to(sys.executable)
+    result = subprocess.run(
+        ["bash", "-e", "-o", "pipefail", "-c", script],
+        cwd=tmp_path,
+        env={"PATH": f"{tmp_path}{os.pathsep}{os.defpath}", "GITHUB_OUTPUT": str(github_output)},
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert not review.exists()
+    if at_capacity:
+        assert "at capacity" in result.stderr
+        assert "model_at_capacity=true" in github_output.read_text()
+    else:
+        assert "Polly produced no publishable review" in result.stderr
+        assert not github_output.exists()
+
+
 @pytest.mark.parametrize("gateway_path", ["", "/serving-endpoints"])
 def test_failure_diagnostics_preserves_logs_without_gateway_secrets(
     tmp_path: Path, gateway_path: str
