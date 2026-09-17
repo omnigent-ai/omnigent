@@ -1952,7 +1952,10 @@ def _manage_antigravity_harness() -> None:
         auth_bits.append("Gemini API key configured" if key_set else "no Gemini API key")
         native_provider = surface_default_provider(config, GEMINI_FAMILY)
         if native_provider is not None:
-            auth_bits.append(f"native provider: {native_provider.name}")
+            label = _family_credential_label(
+                config, GEMINI_FAMILY, native_provider.name, native_provider
+            )
+            auth_bits.append(f"native agy: {label}")
         header = f"Antigravity — {' · '.join(auth_bits)}"
         idx = select(header, [r.label for r in rows], clear_on_exit=True, status=status)
         if idx < 0:  # Esc / q
@@ -3948,13 +3951,16 @@ def _run_configure_harnesses_interactive() -> None:
         agy_provider = surface_default_provider(config, GEMINI_FAMILY)
         if agy_provider is not None:
             agy_ready = harness_cli_installed(GEMINI_FAMILY) and antigravity_credentials_ready()
+            label = _family_credential_label(
+                config, GEMINI_FAMILY, agy_provider.name, agy_provider
+            )
             rows.append(
                 (
                     _ANTIGRAVITY,
                     "Antigravity",
-                    agy_provider.name if agy_ready else "Provider needs setup",
+                    label if agy_ready else "Credential needs setup",
                     "ready" if agy_ready else "warn",
-                    "Configure the native agy provider.",
+                    "Open to configure native agy credentials.",
                 )
             )
         elif antigravity_api_key_configured(config) or any(
