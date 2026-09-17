@@ -1,5 +1,5 @@
 name: "Set up cached uv"
-description: "Restore or populate a cache of the pinned uv binary"
+description: "Restore or populate an authenticated cache of the pinned uv binary"
 
 inputs:
   enable-cache:
@@ -19,10 +19,19 @@ runs:
     # avoid both the manifest request and binary download.
     - name: Restore uv binary
       id: restore-uv
+      if: inputs.version == '0.12.15' && runner.arch == 'X64' && (runner.os == 'Linux' || runner.os == 'Windows')
       uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
       with:
         path: ${{ runner.tool_cache }}/uv
-        key: uv-tool-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.version }}
+        key: uv-tool-v2-${{ runner.os }}-${{ runner.arch }}-${{ inputs.version }}
+
+    - name: Authenticate restored uv binary
+      if: steps.restore-uv.outputs.cache-hit == 'true'
+      shell: bash
+      env:
+        UV_TOOL_CACHE_ROOT: ${{ runner.tool_cache }}/uv/${{ inputs.version }}
+        UV_CACHE_PLATFORM: ${{ runner.os }}-${{ runner.arch }}
+      run: node "$GITHUB_ACTION_PATH/verify-cache.mjs"
 
     - name: Install uv (attempt 1/3)
       id: install-uv-1
@@ -72,8 +81,8 @@ runs:
     # Save before the caller runs workload code, so later steps cannot alter
     # the files that populate this shared cache.
     - name: Save uv binary
-      if: steps.restore-uv.outputs.cache-hit != 'true'
+      if: inputs.version == '0.12.15' && runner.arch == 'X64' && (runner.os == 'Linux' || runner.os == 'Windows') && steps.restore-uv.outputs.cache-hit != 'true'
       uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
       with:
         path: ${{ runner.tool_cache }}/uv
-        key: uv-tool-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.version }}
+        key: uv-tool-v2-${{ runner.os }}-${{ runner.arch }}-${{ inputs.version }}
