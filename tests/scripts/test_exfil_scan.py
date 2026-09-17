@@ -181,3 +181,85 @@ def test_generic_access_token_field_not_blocked(tmp_path: Path) -> None:
         ),
     )
     assert proc.returncode == 0, proc.stdout
+
+
+def test_patch_dict_environ_override_not_blocked(tmp_path: Path) -> None:
+    """The standard ``with patch.dict(os.environ, {...}):`` test idiom scans clean.
+
+    Regression: the unanchored ``dict`` alternative in the environ-dump rule
+    matched as a substring of ``patch.dict(`` and blocked a test-only diff with
+    a ``high-risk call`` finding. Asserts exit 0 and no error annotation for
+    the exact reported line.
+    """
+    proc = _run(
+        tmp_path,
+        _diff(
+            "tests/harnesses/test_kimi_home.py",
+            [
+                "from unittest.mock import patch",
+                "",
+                "def test_kimi_home(user_home):",
+                '    with patch.dict(os.environ, {"KIMI_CODE_HOME": str(user_home)}):',
+                "        assert resolve_home() == user_home",
+            ],
+        ),
+    )
+    assert proc.returncode == 0, proc.stdout
+    assert "::error" not in proc.stdout
+
+
+def test_mock_patch_dict_environ_alias_not_blocked(tmp_path: Path) -> None:
+    """``mock.patch.dict(os.environ, ...)`` (module-alias spelling) scans clean.
+
+    Same idiom reached through ``from unittest import mock``; the attribute
+    access before ``dict`` must keep it from matching the dump rule. Asserts
+    exit 0.
+    """
+    proc = _run(
+        tmp_path,
+        _diff(
+            "tests/test_env_override.py",
+            [
+                "from unittest import mock",
+                "patcher = mock.patch.dict(os.environ, {'A': 'b'})",
+            ],
+        ),
+    )
+    assert proc.returncode == 0, proc.stdout
+    assert "::error" not in proc.stdout
+
+
+def test_wholesale_dict_environ_dump_still_blocks(tmp_path: Path) -> None:
+    """A genuine ``dict(os.environ)`` wholesale dump keeps blocking.
+
+    Anchoring the builtin names must not relax the real environ-dump rule: a
+    bare ``dict(os.environ)`` call is the exfil shape the rule exists for.
+    Asserts exit 1 with an error annotation naming the file.
+    """
+    proc = _run(
+        tmp_path,
+        _diff(
+            "tests/test_env_override.py",
+            ["import os", "payload = dict(os.environ)"],
+        ),
+    )
+    assert proc.returncode == 1
+    assert "::error file=tests/test_env_override.py" in proc.stdout
+
+
+def test_str_environ_dump_still_blocks(tmp_path: Path) -> None:
+    """A genuine ``str(os.environ)`` dump inside another call keeps blocking.
+
+    ``send(str(os.environ))`` is a dump even though ``str`` follows ``(``; the
+    anchor must only exclude attribute-call spellings like ``patch.dict(``.
+    Asserts exit 1.
+    """
+    proc = _run(
+        tmp_path,
+        _diff(
+            "tests/test_env_override.py",
+            ["import os", "send(str(os.environ))"],
+        ),
+    )
+    assert proc.returncode == 1
+    assert "::error file=tests/test_env_override.py" in proc.stdout

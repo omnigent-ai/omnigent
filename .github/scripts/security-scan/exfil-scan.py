@@ -56,8 +56,9 @@ _SECRET = re.compile(
 _STANDALONE = re.compile(
     r"/dev/tcp/"  # bash reverse shell
     # Wholesale environ dump only -- a bare `os.environ)` matched benign
-    # `helper(os.environ)` and is dropped to avoid false positives.
-    r"|(json\.dumps|dict|str|repr)\(\s*os\.environ"  # dump the whole environ
+    # `helper(os.environ)`, and an unanchored `dict` matched `patch.dict(os.environ`;
+    # the lookbehind exempts attribute calls and longer names (`asdict(`).
+    r"|(json\.dumps|(?<![.\w])(dict|str|repr))\(\s*os\.environ"  # dump the whole environ
     r"|\beval\s*\(|\bexec\s*\(|__import__\s*\("  # dynamic exec
     r"|pickle\.loads|marshal\.loads"  # deserialization exec
     r"|base64\.(b64decode|decodebytes)|codecs\.decode",  # decode (paired below)
