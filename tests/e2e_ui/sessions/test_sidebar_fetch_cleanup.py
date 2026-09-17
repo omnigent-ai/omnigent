@@ -189,6 +189,97 @@ def test_mine_filters_a_mixed_visibility_response(
     expect(page.get_by_text("Shared from mixed response", exact=True)).to_be_visible()
 
 
+@pytest.mark.parametrize("fail_shared", [False, True], ids=["loaded", "retry"])
+def test_shared_loading_keeps_pins_and_projects_mounted(
+    page: Page, request: pytest.FixtureRequest, fail_shared: bool
+) -> None:
+    base_url = request.config.getoption("--ui-base-url") or request.getfixturevalue("live_server")
+    held: list[Route] = []
+    hold_shared = True
+    project_requests = 0
+
+    def row(number: int, title: str, labels: dict[str, str], level: int = 4):
+        return {
+            "id": f"{number:032x}",
+            "object": "conversation",
+            "title": title,
+            "labels": labels,
+            "owner": "alice@example.test" if level == 4 else "bob@example.test",
+            "permission_level": level,
+            "created_at": 1,
+            "updated_at": 100 - number,
+        }
+
+    pinned = row(1, "Stable pinned session", {"omnigent.pinned": "1"})
+    filed = row(2, "Stable project session", {"omni_project": "Stable project"})
+    shared = row(3, "New shared session", {}, 1)
+
+    def respond(route: Route) -> None:
+        nonlocal project_requests
+        params = parse_qs(urlparse(route.request.url).query)
+        if "project" in params:
+            project_requests += 1
+            rows = [filed]
+        elif "pinned" in params:
+            rows = [] if params.get("visibility") == ["shared"] else [pinned]
+        elif params.get("visibility") == ["shared"]:
+            if hold_shared:
+                held.append(route)
+                return
+            if fail_shared:
+                route.fulfill(status=503, body="Shared unavailable")
+                return
+            rows = [shared]
+        else:
+            rows = [pinned, filed]
+        route.fulfill(json={"data": rows, "has_more": False})
+
+    page.route("**/v1/me", lambda route: route.fulfill(json={"user_id": "alice@example.test"}))
+    page.route_web_socket("**/v1/sessions/updates*", lambda _socket: None)
+    page.route("**/v1/sessions?*", respond)
+    page.route(
+        "**/v1/sessions/projects",
+        lambda route: route.fulfill(json=[{"id": None, "name": "Stable project"}]),
+    )
+    page.goto(base_url, wait_until="domcontentloaded")
+    pin = page.get_by_text("Stable pinned session", exact=True)
+    expect(pin).to_be_visible()
+    page.get_by_role("button", name="Stable project", exact=True).click()
+    folder_row = page.get_by_text("Stable project session", exact=True)
+    expect(folder_row).to_be_visible()
+    pin_element = pin.element_handle()
+    folder_element = folder_row.element_handle()
+    assert pin_element is not None and folder_element is not None
+
+    # All needs the pending Shared cache even on a loopback-only test server.
+    page.get_by_test_id("session-filter").click()
+    page.get_by_test_id("session-filter-all").click()
+    sessions = page.locator("section").filter(
+        has=page.get_by_role("button", name="Sessions", exact=True)
+    )
+    expect(sessions.get_by_role("status")).to_have_text("Loading…")
+    expect(pin).to_be_visible()
+    expect(folder_row).to_be_visible()
+    expect(page.get_by_test_id("session-filter")).to_be_visible()
+    assert pin_element.evaluate("el => el.isConnected")
+    assert folder_element.evaluate("el => el.isConnected")
+
+    hold_shared = False
+    assert len(held) == 1
+    respond(held.pop())
+    if fail_shared:
+        expect(sessions.get_by_role("button", name="Retry")).to_be_visible(timeout=15000)
+        expect(pin).to_be_visible()
+        expect(folder_row).to_be_visible()
+        fail_shared = False
+        sessions.get_by_role("button", name="Retry").click()
+    expect(page.get_by_text("New shared session", exact=True)).to_be_visible()
+    expect(sessions.get_by_role("status")).to_have_count(0)
+    assert pin_element.evaluate("el => el.isConnected")
+    assert folder_element.evaluate("el => el.isConnected")
+    assert project_requests == 1
+
+
 def test_templates_load_before_mine_and_discovery_reuses_its_request(
     page: Page, request: pytest.FixtureRequest
 ) -> None:

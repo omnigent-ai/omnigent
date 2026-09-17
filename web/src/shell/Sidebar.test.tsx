@@ -518,6 +518,61 @@ describe("Sidebar session list", () => {
     expect(error).not.toHaveClass("text-sm");
   });
 
+  it.each([
+    ["shared", "loading"],
+    ["shared", "error"],
+    ["all", "loading"],
+    ["all", "error"],
+    ["archived", "loading"],
+    ["archived", "error"],
+  ] as const)("keeps pins and expanded projects mounted during %s %s", (view, state) => {
+    projectsMock.push("Work");
+    mockConversations([
+      conv("pinned-session", "Claude Code"),
+      conv("filed-session", "Claude Code", { labels: { omni_project: "Work" } }),
+    ]);
+    seedPins(["pinned-session"]);
+    const original = useConvMock.getMockImplementation()!;
+    const retry = vi.fn();
+    const mineRetry = vi.fn();
+    useConvMock.mockImplementation((...args) => {
+      const query = original(...args);
+      if (args[4] !== (view === "archived" ? "archived" : "shared")) {
+        return { ...query, refetch: mineRetry };
+      }
+      return {
+        ...query,
+        data: undefined,
+        isLoading: state === "loading",
+        isError: state === "error",
+        error: state === "error" ? new Error("unavailable") : null,
+        refetch: retry,
+      } as ReturnType<typeof useConversations>;
+    });
+    renderSidebar();
+    fireEvent.click(screen.getByRole("button", { name: "Work" }));
+    const pinned = screen.getByText("pinned-session");
+    const filed = screen.getByText("filed-session");
+    const filter = screen.getByTestId("session-filter");
+
+    selectSessionFilter(view);
+
+    expect(screen.getByText("pinned-session")).toBe(pinned);
+    expect(screen.getByText("filed-session")).toBe(filed);
+    expect(screen.getByTestId("session-filter")).toBe(filter);
+    const sessions = screen.getByRole("button", { name: "Sessions" }).closest("section")!;
+    expect(within(sessions).getByRole("status")).toHaveTextContent(
+      state === "loading" ? "Loading…" : /could not be loaded|Failed to load/,
+    );
+    if (state === "error") {
+      fireEvent.click(within(sessions).getByRole("button", { name: "Retry" }));
+      expect(retry).toHaveBeenCalledOnce();
+    }
+    selectSessionFilter("mine");
+    expect(screen.getByText("pinned-session")).toBe(pinned);
+    expect(screen.getByText("filed-session")).toBe(filed);
+  });
+
   it("reveals a thin, theme-aware scrollbar only while scrolling", () => {
     vi.useFakeTimers();
     try {

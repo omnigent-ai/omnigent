@@ -2117,20 +2117,20 @@ function ConversationList({
   const hasMorePages = conversationsQuery.hasNextPage;
   const { fetchNextPage, isFetchingNextPage } = conversationsQuery;
 
-  if (conversationsQuery.isLoading) {
-    return <p className="px-2 py-1 text-muted-foreground text-sm">Loading…</p>;
-  }
-  if (conversationsQuery.isError && allConversations.length === 0) {
-    const err = conversationsQuery.error;
-    return (
-      <p className="px-2 py-1 text-destructive text-ui">
-        Failed to load: {err instanceof Error ? err.message : String(err)}
-        <button type="button" onClick={() => void conversationsQuery.refetch?.()}>
-          Retry
-        </button>
-      </p>
-    );
-  }
+  const sessionStatus = conversationsQuery.isError ? (
+    <p role="status" className="px-2 py-1 text-destructive text-ui">
+      {allConversations.length === 0
+        ? `Failed to load: ${conversationsQuery.error instanceof Error ? conversationsQuery.error.message : String(conversationsQuery.error)}`
+        : "Some sessions could not be loaded."}{" "}
+      <button type="button" onClick={() => void conversationsQuery.refetch?.()}>
+        Retry
+      </button>
+    </p>
+  ) : conversationsQuery.isLoading ? (
+    <p role="status" className="px-2 py-1 text-muted-foreground text-sm">
+      Loading…
+    </p>
+  ) : undefined;
   const showShared = activeTab === "shared";
   const emptyMessage = searchQuery ? "No matching conversations" : "No sessions";
 
@@ -2159,14 +2159,6 @@ function ConversationList({
       serverInfo={serverInfo}
       onActivate={activateRow}
     >
-      {conversationsQuery.isError && (
-        <p role="status" className="px-2 py-1 text-destructive text-ui">
-          Some sessions could not be loaded.{" "}
-          <button type="button" onClick={() => void conversationsQuery.refetch?.()}>
-            Retry
-          </button>
-        </p>
-      )}
       <DndContext
         sensors={sensors}
         collisionDetection={(args) => {
@@ -2229,7 +2221,7 @@ function ConversationList({
             {!showShared && activeDrag?.project != null && sections.sessions.length === 0 && (
               <UngroupDropZone />
             )}
-            {totalVisible === 0 && searchQuery ? (
+            {totalVisible === 0 && searchQuery && !sessionStatus ? (
               <>
                 <p className="px-2 py-1 text-ui text-muted-foreground">{emptyMessage}</p>
                 {/* The list is one paginated stream ordered by updated_at across
@@ -2392,7 +2384,8 @@ function ConversationList({
                       title="Sessions"
                       conversations={sections.sessions}
                       activeConversationId={displayedActiveId}
-                      emptyMessage={SIDEBAR_FILTER_EMPTY[activeTab]}
+                      emptyMessage={sessionStatus ? undefined : SIDEBAR_FILTER_EMPTY[activeTab]}
+                      footer={sessionStatus}
                       pinnedConversationIds={pinnedConversationIds}
                       collapsed={effectiveCollapsedSections.includes("Chats")}
                       onToggleCollapsed={() => effectiveToggleSectionCollapsed("Chats")}
