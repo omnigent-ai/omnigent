@@ -551,3 +551,26 @@ describe("SessionUpdatesProvider projects_changed frames", () => {
     ]);
   });
 });
+
+it("updates pending counts on a pinned row outside the scope windows", () => {
+  const client = new QueryClient();
+  client.setQueryData(["pinned-conversations"], {
+    conversations: [
+      { ...conv("old-pin"), labels: { "omnigent.pinned": "123" }, pending_elicitations_count: 0 },
+    ],
+    filterHonored: true,
+  });
+  renderProvider(client, ["/"]);
+  act(() =>
+    frameHandler()({
+      type: "changed",
+      items: [{ ...wireItem("old-pin", 2, 100), pending_elicitations_count: 3 }],
+    }),
+  );
+  const data = client.getQueryData<{ conversations: Conversation[] }>(["pinned-conversations"]);
+  expect(data?.conversations[0]).toMatchObject({
+    pending_elicitations_count: 3,
+    comments_count: 2,
+    labels: { "omnigent.pinned": "123" },
+  });
+});

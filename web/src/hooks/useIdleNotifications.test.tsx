@@ -1,3 +1,9 @@
+import {
+  useConversations as useTestConversations,
+  useConversations,
+} from "@/hooks/useConversations";
+
+vi.mock("@/hooks/useSidebarData", () => ({ useLoadedConversations: () => useTestConversations() }));
 import { cleanup, renderHook, act } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -37,7 +43,6 @@ vi.mock("@/lib/lastAssistantText", () => ({
   fetchLastAssistantText: vi.fn().mockResolvedValue(undefined),
 }));
 
-import { useConversations } from "@/hooks/useConversations";
 import type { Conversation } from "@/hooks/useConversations";
 import {
   getNotificationPermission,

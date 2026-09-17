@@ -1,3 +1,6 @@
+import { useConversations as useTestConversations } from "@/hooks/useConversations";
+
+vi.mock("@/hooks/useSidebarData", () => ({ useLoadedConversations: () => useTestConversations() }));
 // Tests for the `useCanEdit` edit-gate hook.
 //
 // `useCanEdit` is what every editable surface (CodeViewer,

@@ -1,3 +1,4 @@
+import { useLoadedConversations } from "@/hooks/useSidebarData";
 import { useSkills } from "@/hooks/useSkills";
 import {
   HarnessPicker,
@@ -66,7 +67,6 @@ import {
   SMART_ROUTING_LABEL,
   useBrainHarnessLabels,
 } from "@/lib/agentLabels";
-import { useConversations } from "@/hooks/useConversations";
 import { usePermissions } from "@/hooks/usePermissions";
 import type { NativeModelOption, Session, SessionStatus } from "@/lib/types";
 import { usePromptHistory } from "@/hooks/usePromptHistory";
@@ -441,7 +441,7 @@ export function ChatPage() {
     error: agentsError,
     refetch: refetchAgents,
   } = useAgents({ enabled: !urlConvId });
-  const { data: conversationsData } = useConversations("", true);
+  const { data: conversationsData } = useLoadedConversations();
   const conversations = useMemo(
     () => conversationsData?.pages.flatMap((p) => p.data),
     [conversationsData],

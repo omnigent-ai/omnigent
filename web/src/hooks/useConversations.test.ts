@@ -1654,16 +1654,16 @@ describe("fetchPinnedConversations filter-honored detection", () => {
       mockResponse({ data: [pinnedRow("conv_a"), pinnedRow("conv_b")] }),
     );
 
-    const result = await fetchPinnedConversations();
+    const result = await fetchPinnedConversations(false);
 
     expect(result.filterHonored).toBe(true);
-    expect(result.conversations.map((c) => c.id)).toEqual(["conv_a", "conv_b"]);
+    expect(result.conversations.map((c) => c.id)).toEqual(["conv_b", "conv_a"]);
   });
 
   it("reports honored for an empty page (a user with no pins)", async () => {
     fetchMock.mockResolvedValueOnce(mockResponse({ data: [] }));
 
-    const result = await fetchPinnedConversations();
+    const result = await fetchPinnedConversations(false);
 
     expect(result.filterHonored).toBe(true);
     expect(result.conversations).toEqual([]);
@@ -1675,7 +1675,7 @@ describe("fetchPinnedConversations filter-honored detection", () => {
       mockResponse({ data: [plainRow("conv_a"), plainRow("conv_b")] }),
     );
 
-    const result = await fetchPinnedConversations();
+    const result = await fetchPinnedConversations(false);
 
     expect(result.filterHonored).toBe(false);
     // Never surface unpinned rows as pinned.
@@ -1687,7 +1687,7 @@ describe("fetchPinnedConversations filter-honored detection", () => {
       mockResponse({ data: [pinnedRow("conv_a"), plainRow("conv_b")] }),
     );
 
-    const result = await fetchPinnedConversations();
+    const result = await fetchPinnedConversations(false);
 
     expect(result.filterHonored).toBe(false);
     expect(result.conversations.map((c) => c.id)).toEqual(["conv_a"]);
@@ -2900,4 +2900,56 @@ describe("undoArchiveConversations optimistic restore", () => {
     resolvePatch(mockResponse(conversation({ id: "conv_a", archived: false, updated_at: 101 })));
     await undo;
   });
+});
+
+it("fetches and deduplicates pins across mine and shared scopes", async () => {
+  const row = (id: string) => ({
+    id,
+    object: "conversation",
+    title: id,
+    created_at: 0,
+    updated_at: 1,
+    labels: { [PINNED_LABEL_KEY]: "1" },
+    permission_level: 4,
+  });
+  fetchMock
+    .mockResolvedValueOnce(mockResponse({ data: [row("mine"), row("overlap")] }))
+    .mockResolvedValueOnce(
+      mockResponse({ data: [{ ...row("shared"), permission_level: 1 }, row("overlap")] }),
+    );
+  const result = await fetchPinnedConversations();
+  expect(result.conversations.map((c) => c.id).sort()).toEqual(["mine", "overlap", "shared"]);
+  expect(result.filterHonoredByScope).toEqual({ mine: true, shared: true });
+  const params = fetchMock.mock.calls.map(
+    ([url]) => new URL(String(url), "http://localhost").searchParams,
+  );
+  expect(params.map((p) => p.get("visibility"))).toEqual(["mine", "shared"]);
+  expect(params.every((p) => p.get("limit") === "30" && p.get("pinned") === "true")).toBe(true);
+});
+
+it("rejects a pin at the cap without sending a request or changing membership", async () => {
+  const queryClient = new QueryClient();
+  const conversations = Array.from(
+    { length: 30 },
+    (_, i) =>
+      ({
+        id: `pin-${i}`,
+        object: "conversation",
+        title: `Pin ${i}`,
+        created_at: 0,
+        updated_at: 1,
+        labels: { [PINNED_LABEL_KEY]: "1" },
+        permission_level: 4,
+      }) as Conversation,
+  );
+  queryClient.setQueryData(PINNED_CONVERSATIONS_KEY, { conversations, filterHonored: true });
+  const wrapper = ({ children }: { children: ReactNode }) =>
+    createElement(QueryClientProvider, { client: queryClient }, children);
+  const { result } = renderHook(useTogglePinnedConversation, { wrapper });
+  act(() => result.current.mutate({ id: "too-many", pinned: true }));
+  await waitFor(() => expect(result.current.isError).toBe(true));
+  expect(fetchMock).not.toHaveBeenCalled();
+  expect(
+    queryClient.getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY)?.conversations,
+  ).toEqual(conversations);
 });

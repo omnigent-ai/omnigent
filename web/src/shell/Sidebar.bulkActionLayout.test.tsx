@@ -1,3 +1,5 @@
+vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
+import { SidebarDataProvider } from "@/hooks/useSidebarData";
 // Layout regression tests for the sidebar's bulk-action bar (selection
 // mode). The bar is a single bordered pill rendered under the Sessions
 // header: an inline Exit (X) button, the "N selected" count, and the
@@ -107,11 +109,13 @@ function renderSidebar() {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={qc}>
-      <TooltipProvider>
-        <MemoryRouter initialEntries={["/"]}>
-          <Sidebar open={true} onClose={vi.fn()} />
-        </MemoryRouter>
-      </TooltipProvider>
+      <SidebarDataProvider>
+        <TooltipProvider>
+          <MemoryRouter initialEntries={["/"]}>
+            <Sidebar open={true} onClose={vi.fn()} />
+          </MemoryRouter>
+        </TooltipProvider>
+      </SidebarDataProvider>
     </QueryClientProvider>,
   );
 }

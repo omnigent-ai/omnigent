@@ -1,3 +1,10 @@
+import {
+  useConversations as useTestConversations,
+  useProjectConfig,
+  useProjects,
+} from "@/hooks/useConversations";
+
+vi.mock("@/hooks/useSidebarData", () => ({ useLoadedConversations: () => useTestConversations() }));
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/hooks/useSkills", () => ({
@@ -15,7 +22,6 @@ import type { Host } from "@/hooks/useHosts";
 import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
-import { useProjectConfig, useProjects } from "@/hooks/useConversations";
 import type { ProjectConfig } from "@/lib/projectsApi";
 import { useHostWorktrees } from "@/hooks/useHostWorktrees";
 import type { HostWorktree } from "@/hooks/useHostWorktrees";

@@ -1,3 +1,5 @@
+vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
+import { SidebarDataProvider } from "@/hooks/useSidebarData";
 // Regression test for #2506: clicking a pinned session that belongs to a
 // project was auto-expanding the project folder every time, undoing the
 // user's manual collapse. The auto-expand effect exists so navigating to a
@@ -85,14 +87,16 @@ function renderAt(initialEntry: string) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={qc}>
-      <TooltipProvider>
-        <MemoryRouter initialEntries={[initialEntry]}>
-          <Routes>
-            <Route path="/" element={<Sidebar open onClose={vi.fn()} />} />
-            <Route path="/c/:conversationId" element={<Sidebar open onClose={vi.fn()} />} />
-          </Routes>
-        </MemoryRouter>
-      </TooltipProvider>
+      <SidebarDataProvider>
+        <TooltipProvider>
+          <MemoryRouter initialEntries={[initialEntry]}>
+            <Routes>
+              <Route path="/" element={<Sidebar open onClose={vi.fn()} />} />
+              <Route path="/c/:conversationId" element={<Sidebar open onClose={vi.fn()} />} />
+            </Routes>
+          </MemoryRouter>
+        </TooltipProvider>
+      </SidebarDataProvider>
     </QueryClientProvider>,
   );
 }

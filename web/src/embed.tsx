@@ -1,3 +1,5 @@
+import { appConfig } from "./appConfig";
+import { SidebarDataProvider } from "./hooks/useSidebarData";
 // Embed entry point.
 //
 // Exposes `OmnigentApp` — a plain React component (app-specific providers +
@@ -221,13 +223,15 @@ function OmnigentProviders({
               <ImageLightboxProvider>
                 <RoutingProvider value={routing}>
                   <EmbedCapabilitiesProvider>
-                    <SessionUpdatesProvider>
-                      <RunnerHealthProvider>
-                        <QueueFlushProvider>
-                          <App basename={basename} />
-                        </QueueFlushProvider>
-                      </RunnerHealthProvider>
-                    </SessionUpdatesProvider>
+                    <SidebarDataProvider config={appConfig.sidebar}>
+                      <SessionUpdatesProvider>
+                        <RunnerHealthProvider>
+                          <QueueFlushProvider>
+                            <App basename={basename} />
+                          </QueueFlushProvider>
+                        </RunnerHealthProvider>
+                      </SessionUpdatesProvider>
+                    </SidebarDataProvider>
                   </EmbedCapabilitiesProvider>
                 </RoutingProvider>
               </ImageLightboxProvider>

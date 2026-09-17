@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import builtins
+from typing import Literal
 
 from sqlalchemy import and_, asc, desc, or_, select
 from sqlalchemy.exc import IntegrityError
@@ -12,6 +13,7 @@ from omnigent.db.converters import sql_agent_to_entity
 from omnigent.db.db_models import (
     SqlAgent,
     SqlConversation,
+    SqlSessionPermission,
     current_workspace_id,
 )
 from omnigent.db.enum_codecs import encode_agent_kind
@@ -209,32 +211,54 @@ class SqlAlchemyAgentStore(AgentStore):
         after: str | None = None,
         before: str | None = None,
         order: str = "desc",
+        *,
+        kind: Literal["template", "session"] = "template",
+        accessible_by: str | None = None,
     ) -> PagedList[Agent]:
-        """
-        List registered template agents with cursor-based pagination.
+        """List one agent kind, restricting session agents to visible session roots."""
+        workspace = current_workspace_id()
+        session_filter = SqlConversation.workspace_id == workspace
+        # Permission metadata and agents share a database; conversations may not.
+        if kind == "session" and accessible_by is not None:
+            grants = select(SqlSessionPermission.conversation_id).where(
+                SqlSessionPermission.workspace_id == workspace,
+                SqlSessionPermission.user_id == accessible_by,
+            )
+            if self._conv_engine is self._engine:
+                session_filter = and_(
+                    session_filter, SqlConversation.root_conversation_id.in_(grants)
+                )
+            else:
+                with self._session("list_accessible_agent_roots") as session:
+                    root_ids = list(session.execute(grants).scalars())
+                session_filter = and_(
+                    session_filter, SqlConversation.root_conversation_id.in_(root_ids)
+                )
+        eligible_agents = select(SqlConversation.agent_id).where(session_filter).distinct()
+        eligible_ids: builtins.list[str] | None = None
+        if kind == "session" and self._conv_engine is not self._engine:
+            with self._conv_session("list_accessible_agent_ids") as session:
+                eligible_ids = [
+                    agent_id
+                    for agent_id in session.execute(eligible_agents).scalars()
+                    if agent_id is not None
+                ]
 
-        Only agents with ``kind = 'template'`` are returned; session-scoped
-        copies are excluded.
-
-        :param limit: Maximum number of agents to return.
-        :param after: Cursor agent ID; return agents appearing
-            after this agent in sort order,
-            e.g. ``"agent_abc123"``.
-        :param before: Cursor agent ID; return agents appearing
-            before this agent in sort order.
-        :param order: Sort direction, ``"desc"`` or ``"asc"``.
-        :returns: A :class:`PagedList` of :class:`Agent` objects.
-        """
         with self._session("list_agents") as session:
             is_desc = order == "desc"
             sort_fn = desc if is_desc else asc
-            is_template = SqlAgent.kind == encode_agent_kind("template")
+            is_kind = SqlAgent.kind == encode_agent_kind(kind)
+            if kind == "session":
+                is_kind = and_(
+                    is_kind,
+                    SqlAgent.id.in_(eligible_ids if eligible_ids is not None else eligible_agents),
+                )
             in_workspace = SqlAgent.workspace_id == current_workspace_id()
-            stmt = select(SqlAgent).where(in_workspace, is_template)
+            stmt = select(SqlAgent).where(in_workspace, is_kind)
             if after:
                 sub = (
                     select(SqlAgent.created_at)
-                    .where(in_workspace, SqlAgent.id == after, is_template)
+                    .where(in_workspace, SqlAgent.id == after, is_kind)
                     .scalar_subquery()
                 )
                 ts_cmp = SqlAgent.created_at < sub if is_desc else SqlAgent.created_at > sub
@@ -243,7 +267,7 @@ class SqlAlchemyAgentStore(AgentStore):
             if before:
                 sub = (
                     select(SqlAgent.created_at)
-                    .where(in_workspace, SqlAgent.id == before, is_template)
+                    .where(in_workspace, SqlAgent.id == before, is_kind)
                     .scalar_subquery()
                 )
                 ts_cmp = SqlAgent.created_at > sub if is_desc else SqlAgent.created_at < sub
@@ -256,7 +280,27 @@ class SqlAlchemyAgentStore(AgentStore):
             has_more = len(rows) > limit
             if has_more:
                 rows = rows[:limit]
-            entities = [sql_agent_to_entity(r) for r in rows]
+            anchors: dict[str, str] = {}
+            if kind == "session" and rows:
+                with self._conv_session("resolve_listed_agent_roots") as conv_session:
+                    anchors = {
+                        agent_id: root_id
+                        for agent_id, root_id in conv_session.execute(
+                            select(
+                                SqlConversation.agent_id,
+                                SqlConversation.root_conversation_id,
+                            )
+                            .where(
+                                session_filter, SqlConversation.agent_id.in_([r.id for r in rows])
+                            )
+                            .distinct()
+                        )
+                        if agent_id is not None
+                    }
+            entities = [sql_agent_to_entity(r, session_id=anchors.get(r.id)) for r in rows]
+            # A concurrently deleted session must not become a template during serialization.
+            if kind == "session":
+                entities = [agent for agent in entities if agent.session_id is not None]
             return PagedList(
                 data=entities,
                 first_id=entities[0].id if entities else None,

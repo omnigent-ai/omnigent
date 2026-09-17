@@ -1,3 +1,5 @@
+vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
+import { SidebarDataProvider } from "@/hooks/useSidebarData";
 // Integration tests for the Sidebar's session list. The search box no
 // longer carries a filter funnel (agent-type filter + "Show archived"
 // toggle were removed). The sidebar fetches a single session list with
@@ -242,13 +244,15 @@ function renderSidebar(
   const sidebar = <Sidebar open={open} onClose={onClose} onOpenSearch={onOpenSearch} />;
   return render(
     <QueryClientProvider client={qc}>
-      <ExtensionCatalogProvider extensions={extensions}>
-        <TooltipProvider>
-          <MemoryRouter initialEntries={[initialEntry]}>
-            {info ? <CapabilitiesProvider info={info}>{sidebar}</CapabilitiesProvider> : sidebar}
-          </MemoryRouter>
-        </TooltipProvider>
-      </ExtensionCatalogProvider>
+      <SidebarDataProvider>
+        <ExtensionCatalogProvider extensions={extensions}>
+          <TooltipProvider>
+            <MemoryRouter initialEntries={[initialEntry]}>
+              {info ? <CapabilitiesProvider info={info}>{sidebar}</CapabilitiesProvider> : sidebar}
+            </MemoryRouter>
+          </TooltipProvider>
+        </ExtensionCatalogProvider>
+      </SidebarDataProvider>
     </QueryClientProvider>,
   );
 }
@@ -777,19 +781,17 @@ describe("Sidebar session list", () => {
     expect(screen.getByText("conv_live")).toBeInTheDocument();
   });
 
-  it("requests the list with archived included", () => {
+  it("requests mine and shared scopes without an all-sessions scan", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
     renderSidebar();
-
-    // The sidebar makes two useConversations calls: one all-sessions query
-    // (includeArchived: true, reconcileWhileConnected: true — for inbox counts
-    // and WS reconciliation) and one tab-scoped filtered query (includeArchived:
-    // false, for display). Assert the all-sessions call is present and correct.
     const calls = useConvMock.mock.calls;
-    expect(calls.length).toBeGreaterThanOrEqual(1);
-    const allSessionsCall = calls.find((call) => call[0] === "" && call[1] === true);
-    expect(allSessionsCall).toBeDefined();
-    expect(allSessionsCall?.[2]).toMatchObject({ reconcileWhileConnected: true });
+    expect(calls.some((call) => call[1] === true)).toBe(false);
+    expect(calls.find((call) => call[4] === "mine")?.[2]).toMatchObject({
+      refreshIntervalMs: 60_000,
+    });
+    expect(calls.find((call) => call[4] === "shared")?.[2]).toMatchObject({
+      refreshIntervalMs: 180_000,
+    });
   });
 
   it("opens the command palette when the Search button is clicked", () => {
@@ -1076,11 +1078,13 @@ describe("Sidebar session list", () => {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     render(
       <QueryClientProvider client={qc}>
-        <TooltipProvider>
-          <MemoryRouter initialEntries={["/"]}>
-            <Sidebar open onClose={onClose} />
-          </MemoryRouter>
-        </TooltipProvider>
+        <SidebarDataProvider>
+          <TooltipProvider>
+            <MemoryRouter initialEntries={["/"]}>
+              <Sidebar open onClose={onClose} />
+            </MemoryRouter>
+          </TooltipProvider>
+        </SidebarDataProvider>
       </QueryClientProvider>,
     );
     fireEvent.click(screen.getByTestId("settings-button"));
@@ -1329,14 +1333,16 @@ describe("Sidebar failed session indicator", () => {
       const sidebar = <Sidebar open onClose={vi.fn()} />;
       return (
         <QueryClientProvider client={qc}>
-          <TooltipProvider>
-            <MemoryRouter initialEntries={[initialEntry]}>
-              <Routes>
-                <Route path="/c/:conversationId" element={sidebar} />
-                <Route path="*" element={sidebar} />
-              </Routes>
-            </MemoryRouter>
-          </TooltipProvider>
+          <SidebarDataProvider>
+            <TooltipProvider>
+              <MemoryRouter initialEntries={[initialEntry]}>
+                <Routes>
+                  <Route path="/c/:conversationId" element={sidebar} />
+                  <Route path="*" element={sidebar} />
+                </Routes>
+              </MemoryRouter>
+            </TooltipProvider>
+          </SidebarDataProvider>
         </QueryClientProvider>
       );
     };
@@ -1913,7 +1919,7 @@ describe("Sidebar load-more vs collapsed Sessions", () => {
     observerCallback!([{ isIntersecting: false } as IntersectionObserverEntry], {} as never);
     expect(fetchNextPage).not.toHaveBeenCalled();
     observerCallback!([{ isIntersecting: true } as IntersectionObserverEntry], {} as never);
-    expect(fetchNextPage).toHaveBeenCalledTimes(1);
+    expect(fetchNextPage).toHaveBeenCalledTimes(2);
 
     vi.unstubAllGlobals();
   });
@@ -2072,11 +2078,13 @@ describe("Sidebar project sections", () => {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     render(
       <QueryClientProvider client={qc}>
-        <TooltipProvider>
-          <MemoryRouter initialEntries={["/"]}>
-            <Sidebar open onClose={onClose} />
-          </MemoryRouter>
-        </TooltipProvider>
+        <SidebarDataProvider>
+          <TooltipProvider>
+            <MemoryRouter initialEntries={["/"]}>
+              <Sidebar open onClose={onClose} />
+            </MemoryRouter>
+          </TooltipProvider>
+        </SidebarDataProvider>
       </QueryClientProvider>,
     );
 
@@ -2110,13 +2118,15 @@ describe("Sidebar project sections", () => {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     render(
       <QueryClientProvider client={qc}>
-        <TooltipProvider>
-          <MemoryRouter initialEntries={["/c/conv_filed"]}>
-            <Routes>
-              <Route path="/c/:conversationId" element={<Sidebar open onClose={vi.fn()} />} />
-            </Routes>
-          </MemoryRouter>
-        </TooltipProvider>
+        <SidebarDataProvider>
+          <TooltipProvider>
+            <MemoryRouter initialEntries={["/c/conv_filed"]}>
+              <Routes>
+                <Route path="/c/:conversationId" element={<Sidebar open onClose={vi.fn()} />} />
+              </Routes>
+            </MemoryRouter>
+          </TooltipProvider>
+        </SidebarDataProvider>
       </QueryClientProvider>,
     );
 
@@ -2726,11 +2736,13 @@ describe("Sidebar auto-expand Pinned on pin", () => {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const tree = () => (
       <QueryClientProvider client={qc}>
-        <TooltipProvider>
-          <MemoryRouter initialEntries={["/"]}>
-            <Sidebar open onClose={vi.fn()} />
-          </MemoryRouter>
-        </TooltipProvider>
+        <SidebarDataProvider>
+          <TooltipProvider>
+            <MemoryRouter initialEntries={["/"]}>
+              <Sidebar open onClose={vi.fn()} />
+            </MemoryRouter>
+          </TooltipProvider>
+        </SidebarDataProvider>
       </QueryClientProvider>
     );
     const { rerender } = render(tree());
@@ -2864,14 +2876,16 @@ describe("Sidebar active-row auto-scroll", () => {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     return render(
       <QueryClientProvider client={qc}>
-        <TooltipProvider>
-          <MemoryRouter initialEntries={[initialEntry]}>
-            <Routes>
-              <Route path="/" element={<Sidebar open onClose={vi.fn()} />} />
-              <Route path="/c/:conversationId" element={<Sidebar open onClose={vi.fn()} />} />
-            </Routes>
-          </MemoryRouter>
-        </TooltipProvider>
+        <SidebarDataProvider>
+          <TooltipProvider>
+            <MemoryRouter initialEntries={[initialEntry]}>
+              <Routes>
+                <Route path="/" element={<Sidebar open onClose={vi.fn()} />} />
+                <Route path="/c/:conversationId" element={<Sidebar open onClose={vi.fn()} />} />
+              </Routes>
+            </MemoryRouter>
+          </TooltipProvider>
+        </SidebarDataProvider>
       </QueryClientProvider>,
     );
   }

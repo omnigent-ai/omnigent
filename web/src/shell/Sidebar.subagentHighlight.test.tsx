@@ -1,3 +1,5 @@
+vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
+import { SidebarDataProvider } from "@/hooks/useSidebarData";
 // Regression test for: clicking a sub-agent in the right rail dropped the
 // owning session's highlight in the left sidebar.
 //
@@ -119,14 +121,16 @@ function renderAt(initialEntry: string) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={qc}>
-      <TooltipProvider>
-        <MemoryRouter initialEntries={[initialEntry]}>
-          <Routes>
-            <Route path="/" element={<Sidebar open onClose={vi.fn()} />} />
-            <Route path="/c/:conversationId" element={<Sidebar open onClose={vi.fn()} />} />
-          </Routes>
-        </MemoryRouter>
-      </TooltipProvider>
+      <SidebarDataProvider>
+        <TooltipProvider>
+          <MemoryRouter initialEntries={[initialEntry]}>
+            <Routes>
+              <Route path="/" element={<Sidebar open onClose={vi.fn()} />} />
+              <Route path="/c/:conversationId" element={<Sidebar open onClose={vi.fn()} />} />
+            </Routes>
+          </MemoryRouter>
+        </TooltipProvider>
+      </SidebarDataProvider>
     </QueryClientProvider>,
   );
 }

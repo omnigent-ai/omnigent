@@ -1,3 +1,4 @@
+import { useLoadedConversations } from "@/hooks/useSidebarData";
 import {
   HarnessPicker,
   HarnessPickerEntry,
@@ -266,7 +267,6 @@ import type { NativeModelOption } from "@/lib/types";
 import { codexEffortLevelsForModel } from "@/lib/codexNativeModels";
 import { modelConfigurationSourceRows } from "@/lib/modelConfigurationSource";
 import {
-  useConversations,
   useProjectConfig,
   useProjects,
   moveConversationToProject,
@@ -2223,7 +2223,7 @@ export function NewChatLandingScreen() {
   // Omnigent sessions can pull in their existing local CLI history. Same query
   // key ChatPage already holds, so this reuses the cache. Wait for data before
   // deciding so the button doesn't flash for returning users.
-  const { data: conversationsData } = useConversations("", true);
+  const { data: conversationsData } = useLoadedConversations();
   const hasNoSessions =
     conversationsData !== undefined &&
     conversationsData.pages.every((page) => page.data.length === 0);

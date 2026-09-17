@@ -1,3 +1,5 @@
+vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
+import { SidebarDataProvider } from "@/hooks/useSidebarData";
 // Tests for the sidebar conversation-row quick actions:
 //   1. A desktop quick pin/unpin button (`quick-pin-conversation`) and a
 //      mobile-only kebab Pin item (`pin-conversation`) — two affordances for
@@ -242,17 +244,19 @@ function renderSidebar(activeId?: string, info?: ServerInfo) {
     const sidebar = <Sidebar open={true} onClose={vi.fn()} />;
     const tree = (
       <QueryClientProvider client={qc}>
-        <TooltipProvider>
-          <MemoryRouter initialEntries={[activeId ? `/c/${activeId}` : "/"]}>
-            {activeId ? (
-              <Routes>
-                <Route path="/c/:conversationId" element={sidebar} />
-              </Routes>
-            ) : (
-              sidebar
-            )}
-          </MemoryRouter>
-        </TooltipProvider>
+        <SidebarDataProvider>
+          <TooltipProvider>
+            <MemoryRouter initialEntries={[activeId ? `/c/${activeId}` : "/"]}>
+              {activeId ? (
+                <Routes>
+                  <Route path="/c/:conversationId" element={sidebar} />
+                </Routes>
+              ) : (
+                sidebar
+              )}
+            </MemoryRouter>
+          </TooltipProvider>
+        </SidebarDataProvider>
       </QueryClientProvider>
     );
     // No explicit info → CapabilitiesContext default ("loading"), matching
@@ -1356,11 +1360,13 @@ describe("peek mode row menu", () => {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     render(
       <QueryClientProvider client={qc}>
-        <TooltipProvider>
-          <MemoryRouter>
-            <Sidebar open={false} peek onClose={onClose} />
-          </MemoryRouter>
-        </TooltipProvider>
+        <SidebarDataProvider>
+          <TooltipProvider>
+            <MemoryRouter>
+              <Sidebar open={false} peek onClose={onClose} />
+            </MemoryRouter>
+          </TooltipProvider>
+        </SidebarDataProvider>
       </QueryClientProvider>,
     );
     return { onClose };

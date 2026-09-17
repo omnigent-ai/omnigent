@@ -1,3 +1,4 @@
+import { useLoadedConversations } from "@/hooks/useSidebarData";
 // Surfaces "a session needs your attention" as OS notifications and a
 // dock/taskbar badge. Rides the existing conversations poll (no new backend
 // signal).
@@ -36,7 +37,6 @@
 
 import { useEffect, useRef } from "react";
 import { useNavigate } from "@/lib/routing";
-import { useConversations } from "@/hooks/useConversations";
 import type { Conversation } from "@/hooks/useConversations";
 import {
   getNotificationPermission,
@@ -121,7 +121,7 @@ function isWindowFocused(): boolean {
  */
 export function useIdleNotifications(activeConversationId?: string): void {
   const navigate = useNavigate();
-  const { data } = useConversations("", true);
+  const { data } = useLoadedConversations();
   const prevStatus = useRef<Map<string, ConversationStatus>>(new Map());
   const prevElicitations = useRef<Map<string, number>>(new Map());
   // Last badge state sent to the shell, as a `count|navigatePath|title|body` key.

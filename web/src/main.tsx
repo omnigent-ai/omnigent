@@ -1,3 +1,5 @@
+import { appConfig } from "./appConfig";
+import { SidebarDataProvider } from "./hooks/useSidebarData";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { StrictMode, useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
@@ -141,13 +143,15 @@ function RootApp({ initialInfo }: { initialInfo: ServerInfo | "loading" }) {
             <TooltipProvider>
               <ImageLightboxProvider>
                 <BrowserRouter>
-                  <SessionUpdatesProvider>
-                    <RunnerHealthProvider>
-                      <QueueFlushProvider>
-                        <App />
-                      </QueueFlushProvider>
-                    </RunnerHealthProvider>
-                  </SessionUpdatesProvider>
+                  <SidebarDataProvider config={appConfig.sidebar}>
+                    <SessionUpdatesProvider>
+                      <RunnerHealthProvider>
+                        <QueueFlushProvider>
+                          <App />
+                        </QueueFlushProvider>
+                      </RunnerHealthProvider>
+                    </SessionUpdatesProvider>
+                  </SidebarDataProvider>
                 </BrowserRouter>
               </ImageLightboxProvider>
             </TooltipProvider>

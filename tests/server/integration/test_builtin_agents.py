@@ -433,3 +433,32 @@ async def test_catalog_description_prefers_stored_row_over_spec(
     # Stored value present → it wins; the differing spec description
     # proves the route didn't blindly overwrite with the bundle's.
     assert entry["description"] == "Curated catalog label."
+
+
+async def test_session_agent_catalog_kind_and_serialization(
+    db_uri: str,
+    agent_store: SqlAlchemyAgentStore,
+    agents_client: httpx.AsyncClient,
+    agent_cache: AgentCache,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import Mock
+
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+
+    created = SqlAlchemyConversationStore(db_uri).create_session_with_agent(
+        agent_id="b0000000000000000000000000000001",
+        agent_name="uploaded",
+        agent_bundle_location="test/bundle",
+        agent_description="uploaded agent",
+        title="session",
+    )
+    load = Mock(side_effect=FileNotFoundError)
+    monkeypatch.setattr(agent_cache, "load", load)
+    response = await agents_client.get("/v1/agents?kind=session")
+    assert response.status_code == 200
+    assert [row["id"] for row in response.json()["data"]] == [created.agent.id]
+    assert response.json()["data"][0]["builtin"] is False
+    assert load.call_args.kwargs["expand_env"] is False
+    assert (await agents_client.get("/v1/agents")).json()["data"] == []
+    assert (await agents_client.get("/v1/agents?kind=unknown")).status_code == 422

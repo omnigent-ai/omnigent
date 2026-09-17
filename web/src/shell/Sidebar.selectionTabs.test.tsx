@@ -1,3 +1,5 @@
+vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
+import { SidebarDataProvider } from "@/hooks/useSidebarData";
 // Behaviour tests for the My sessions / Shared with me scope tabs during bulk
 // selection mode. Two guarantees:
 //   1. The tabs stay visible while selection mode is active (previously the
@@ -113,11 +115,13 @@ function renderSidebar() {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={qc}>
-      <TooltipProvider>
-        <MemoryRouter initialEntries={["/"]}>
-          <Sidebar open={true} onClose={vi.fn()} />
-        </MemoryRouter>
-      </TooltipProvider>
+      <SidebarDataProvider>
+        <TooltipProvider>
+          <MemoryRouter initialEntries={["/"]}>
+            <Sidebar open={true} onClose={vi.fn()} />
+          </MemoryRouter>
+        </TooltipProvider>
+      </SidebarDataProvider>
     </QueryClientProvider>,
   );
 }

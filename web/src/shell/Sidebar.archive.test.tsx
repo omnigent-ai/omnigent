@@ -1,3 +1,5 @@
+vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
+import { SidebarDataProvider } from "@/hooks/useSidebarData";
 // Tests for the archive flow in the sidebar. Contract: archiving sends ONLY
 // the archive PATCH (`archived: true`) — no client stop. The row leaves the
 // sidebar optimistically (useArchiveConversation flips the cached `archived`
@@ -112,12 +114,14 @@ function renderSidebar() {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={qc}>
-      <TooltipProvider>
-        <MemoryRouter initialEntries={["/"]}>
-          <Sidebar open={true} onClose={vi.fn()} />
-          <Toaster />
-        </MemoryRouter>
-      </TooltipProvider>
+      <SidebarDataProvider>
+        <TooltipProvider>
+          <MemoryRouter initialEntries={["/"]}>
+            <Sidebar open={true} onClose={vi.fn()} />
+            <Toaster />
+          </MemoryRouter>
+        </TooltipProvider>
+      </SidebarDataProvider>
     </QueryClientProvider>,
   );
 }

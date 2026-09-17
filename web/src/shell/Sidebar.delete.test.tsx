@@ -1,3 +1,5 @@
+vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
+import { SidebarDataProvider } from "@/hooks/useSidebarData";
 // Tests for the optimistic delete-session flow in the sidebar. The
 // contract: clicking "Delete" in the confirm dialog fires the mutation,
 // closes the dialog, and leaves the row alone — the mutation itself
@@ -106,11 +108,13 @@ function renderSidebar() {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={qc}>
-      <TooltipProvider>
-        <MemoryRouter initialEntries={["/"]}>
-          <Sidebar open={true} onClose={vi.fn()} />
-        </MemoryRouter>
-      </TooltipProvider>
+      <SidebarDataProvider>
+        <TooltipProvider>
+          <MemoryRouter initialEntries={["/"]}>
+            <Sidebar open={true} onClose={vi.fn()} />
+          </MemoryRouter>
+        </TooltipProvider>
+      </SidebarDataProvider>
     </QueryClientProvider>,
   );
 }
@@ -262,14 +266,16 @@ function renderSidebarRouted(path: string) {
   );
   return render(
     <QueryClientProvider client={qc}>
-      <TooltipProvider>
-        <MemoryRouter initialEntries={[path]}>
-          <Routes>
-            <Route path="/" element={tree} />
-            <Route path="/c/:conversationId" element={tree} />
-          </Routes>
-        </MemoryRouter>
-      </TooltipProvider>
+      <SidebarDataProvider>
+        <TooltipProvider>
+          <MemoryRouter initialEntries={[path]}>
+            <Routes>
+              <Route path="/" element={tree} />
+              <Route path="/c/:conversationId" element={tree} />
+            </Routes>
+          </MemoryRouter>
+        </TooltipProvider>
+      </SidebarDataProvider>
     </QueryClientProvider>,
   );
 }

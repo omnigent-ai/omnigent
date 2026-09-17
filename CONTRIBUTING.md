@@ -198,6 +198,24 @@ current checkout is the one you intend to test.
 See [`dev/omnidev/README.md`](dev/omnidev/README.md) for log controls,
 clean-state testing, backend-only and LAN modes, and other options.
 
+### Session-list refresh settings
+
+The web and embedded clients share defaults in `web/src/appConfig.ts`.
+`sidebar.mineRefreshMs` defaults to 60,000 ms and `sidebar.sharedRefreshMs`
+to 180,000 ms. Set `VITE_MINE_REFRESH_MS` and `VITE_SHARED_REFRESH_MS` before
+starting Vite or building the frontend to override them with positive integer
+milliseconds, for example:
+
+```bash
+VITE_MINE_REFRESH_MS=120000 VITE_SHARED_REFRESH_MS=300000 pnpm --dir web dev
+```
+
+Each refresh requests the loaded window, capped by `sidebar.maxRefreshSessions`
+(default 200). Up to that cap, the response replaces the window. Beyond it, the
+newest 200 rows replace the refreshed portion and older loaded rows remain.
+Pagination still adds 30 rows per request. Mine and Shared results are checked
+against the viewer's ownership metadata in the frontend as well.
+
 ### Manual three-terminal fallback
 
 Use the manual flow when you need to run or debug each component separately.

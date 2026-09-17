@@ -503,3 +503,60 @@ def test_session_scoped_agent_resolves_to_root_split_db(tmp_path: Path) -> None:
     fetched = agent_store.get(created.agent.id)
     assert fetched is not None
     assert fetched.session_id == mint_id
+
+
+@pytest.mark.parametrize("split_db", [False, True])
+def test_session_agent_catalog_is_scoped_and_paginated(tmp_path: Path, split_db: bool) -> None:
+    from omnigent.db.db_models import workspace_scope
+    from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+
+    uri = f"sqlite:///{tmp_path}/agents.db"
+    conv_uri = f"sqlite:///{tmp_path}/sessions.db" if split_db else None
+    conversations = SqlAlchemyConversationStore(uri, conv_uri)
+    agents = SqlAlchemyAgentStore(uri, conv_uri)
+    permissions = SqlAlchemyPermissionStore(uri)
+    permissions.ensure_user("alice")
+    permissions.ensure_user("bob")
+
+    def create(number: int, owner: str, parent: str | None = None):
+        created = conversations.create_session_with_agent(
+            agent_id=f"{number:032x}",
+            agent_name=f"agent-{number}",
+            agent_bundle_location="test/bundle",
+            agent_description=None,
+            title=f"session-{number}",
+            parent_conversation_id=parent,
+        )
+        if parent is None:
+            permissions.grant(owner, created.conversation.id, 4)
+        return created
+
+    owned = create(1, "alice")
+    child = create(2, "alice", owned.conversation.id)
+    shared = create(3, "bob")
+    permissions.grant("alice", shared.conversation.id, 1)
+    create(4, "bob")
+    conversations.update_conversation(owned.conversation.id, archived=True)
+    with workspace_scope(17):
+        create(5, "alice")
+    agents.create(f"{6:032x}", "template", "test/bundle")
+
+    page = agents.list(kind="session", accessible_by="alice", limit=1, order="asc")
+    assert page.has_more
+    seen = []
+    while True:
+        seen.extend(page.data)
+        if not page.has_more:
+            break
+        page = agents.list(
+            kind="session", accessible_by="alice", limit=1, order="asc", after=page.last_id
+        )
+    assert [agent.id for agent in seen] == [owned.agent.id, child.agent.id, shared.agent.id]
+    assert [agent.session_id for agent in seen] == [
+        owned.conversation.id,
+        owned.conversation.id,
+        shared.conversation.id,
+    ]
+    assert [agent.name for agent in agents.list().data] == ["template"]
+    assert agents.list(kind="session", accessible_by="nobody").data == []
+    assert len(agents.list(kind="session").data) == 4
