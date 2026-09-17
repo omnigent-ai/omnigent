@@ -79,15 +79,11 @@ def _exited_process(exit_code: int) -> Iterator[subprocess.Popen[bytes]]:
             proc.stdout.close()
 
 
-def _reap(host: HostProcess, expected: int, child_pids: list[int] | None = None) -> None:
+def _reap(host: HostProcess, expected: int, child_pids: list[int]) -> None:
     deadline = time.monotonic() + 2.0
     reaped = 0
     while reaped < expected and time.monotonic() < deadline:
-        reaped += (
-            host._reap_orphans_once()
-            if child_pids is None
-            else host._reap_orphans_once(child_pids=child_pids)
-        )
+        reaped += host._reap_orphans_once(child_pids=child_pids)
         if reaped < expected:
             time.sleep(0.01)
     assert reaped == expected
@@ -96,6 +92,27 @@ def _reap(host: HostProcess, expected: int, child_pids: list[int] | None = None)
 def _assert_reaped(pid: int) -> None:
     with pytest.raises(ChildProcessError):
         os.waitpid(pid, os.WNOHANG)
+
+
+def test_child_discovery_preserves_exit_status(host: HostProcess) -> None:
+    with _exited_process(42) as proc:
+        assert proc.pid in host._orphan_child_pids()
+
+        assert proc.returncode is None
+        assert proc.wait(timeout=5.0) == 42
+
+
+def test_targeted_sweep_leaves_unrelated_child_waitable(
+    host: HostProcess, zombie_child: Callable[[], int]
+) -> None:
+    with _exited_process(43) as unrelated:
+        orphan = zombie_child()
+
+        _reap(host, expected=1, child_pids=[orphan])
+
+        _assert_reaped(orphan)
+        assert unrelated.returncode is None
+        assert unrelated.wait(timeout=5.0) == 43
 
 
 @pytest.mark.asyncio
@@ -134,7 +151,7 @@ def test_completed_runner_handle_does_not_claim_reused_pid(
         )
         behind = zombie_child()
 
-        _reap(host, expected=2)
+        _reap(host, expected=2, child_pids=[reused_pid, behind])
 
         _assert_reaped(reused_pid)
         _assert_reaped(behind)
@@ -152,7 +169,7 @@ def test_exited_runner_without_watcher_does_not_block_orphans(
         assert not host._watcher_tasks
         orphan = zombie_child()
 
-        _reap(host, expected=1)
+        _reap(host, expected=1, child_pids=[proc.pid, orphan])
 
         _assert_reaped(orphan)
         assert proc.poll() == 42
@@ -167,7 +184,7 @@ def test_exited_zygote_does_not_block_orphans_or_lose_exit_status(
         host._zygote = manager
         orphan = zombie_child()
 
-        _reap(host, expected=1)
+        _reap(host, expected=1, child_pids=[proc.pid, orphan])
 
         _assert_reaped(orphan)
         assert proc.poll() == 43
@@ -187,7 +204,7 @@ def test_completed_zygote_does_not_claim_reused_pid(
         manager._proc = proc
         host._zygote = manager
 
-        _reap(host, expected=1)
+        _reap(host, expected=1, child_pids=[reused_pid])
 
         _assert_reaped(reused_pid)
         assert proc.returncode == 43
