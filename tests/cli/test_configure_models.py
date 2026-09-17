@@ -3849,3 +3849,58 @@ def test_gemini_databricks_setup_recovers_from_auth_failure(
     assert "private-config-details" not in result.output
     assert "Traceback" not in result.output
     assert "databricks-gemini-work" not in _config_yaml(isolated_config).get("providers", {})
+
+
+@pytest.mark.parametrize("prefix", ["", "OMNIGENT_"])
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://api.openai.com/v1",
+        "https://workspace.cloud.databricks.com",
+        "https://gateway.example/v1beta",
+    ],
+)
+def test_setup_does_not_adopt_rejected_gemini_endpoint(isolated_config, monkeypatch, prefix, url):
+    from omnigent.cli_config import _adopt_detected_providers
+    from omnigent.onboarding.ambient import DetectedProvider
+
+    monkeypatch.setenv(prefix + "GEMINI_API_KEY", "fake-key")
+    monkeypatch.setenv(prefix + "GOOGLE_GEMINI_BASE_URL", url)
+    monkeypatch.setattr(
+        "omnigent.onboarding.detected.detect_providers",
+        lambda: [
+            DetectedProvider(
+                name="gemini",
+                kind="key",
+                family=GEMINI_FAMILY,
+                source="$" + prefix + "GEMINI_API_KEY",
+            )
+        ],
+    )
+    (isolated_config / "config.yaml").write_text("providers: {}\n")
+    before = (isolated_config / "config.yaml").read_bytes()
+    assert _adopt_detected_providers() == []
+    assert (isolated_config / "config.yaml").read_bytes() == before
+    monkeypatch.setenv(prefix + "GOOGLE_GEMINI_BASE_URL", "https://gateway.example/gemini/")
+    assert _adopt_detected_providers() == ["gemini"]
+    assert (
+        load_providers(_config_yaml(isolated_config))["gemini"].family(GEMINI_FAMILY).base_url
+        == "https://gateway.example/gemini"
+    )
+
+
+def test_detected_gemini_key_invalid_endpoint_returns_to_setup(isolated_config, monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "fake-env-key")
+    monkeypatch.setenv("GOOGLE_GEMINI_BASE_URL", "https://api.openai.com/v1")
+    # Suppress adoption so the detected-key confirmation path is exercised independently.
+    monkeypatch.setattr("omnigent.cli_config._adopt_detected_providers", list)
+    result = CliRunner().invoke(
+        cli,
+        ["setup", "--no-internal-beta"],
+        input="\n".join(["7", "4", "1", "1", "y", "", "q", "q", "q"]) + "\n",
+    )
+    assert result.exit_code == 0, result.output
+    assert "OpenAI Responses" in result.output, result.output
+    assert "Traceback" not in result.output
+    assert "gemini" not in _config_yaml(isolated_config).get("providers", {})
+    assert secrets.load_secret("gemini") is None

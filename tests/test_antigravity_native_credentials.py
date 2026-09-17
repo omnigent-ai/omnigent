@@ -238,3 +238,44 @@ def test_agy_cli_reports_invalid_credentials_without_crash_reporting(
     assert ("setup --no-internal-beta" if missing_key else "OpenAI Responses") in result.output
     assert "Traceback" not in result.output
     assert not isinstance(result.exception, OmnigentError)
+
+
+@pytest.mark.parametrize("kind", ["gateway", "local"])
+@pytest.mark.parametrize("compatible", [True, False])
+def test_upgrade_of_existing_gemini_block_preserves_other_defaults(
+    monkeypatch, tmp_path, kind, compatible
+):
+    from omnigent.onboarding.provider_config import default_provider_for_harness
+
+    config = {
+        "providers": {
+            "existing": {
+                "kind": kind,
+                "default": True,
+                "openai": {"base_url": "https://gateway.example/v1", "api_key": "openai-fake"},
+                "gemini": {
+                    "base_url": "https://gateway.example/gemini"
+                    if compatible
+                    else "https://gateway.example/v1/responses",
+                    "api_key": "gemini-fake",
+                },
+            }
+        }
+    }
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump(config))
+    before = path.read_bytes()
+    monkeypatch.setattr("omnigent.onboarding.gemini_auth.gemini_login_detected", lambda: True)
+    assert default_provider_for_harness(config, "native-codex").name == "existing"
+    if compatible:
+        _, env = build_agy_launch(conversation_id=None, model=None, resume=False)
+        assert env["GOOGLE_GEMINI_BASE_URL"] == "https://gateway.example/gemini"
+    else:
+        with pytest.raises(OmnigentError, match="OpenAI Responses"):
+            build_agy_launch(conversation_id=None, model=None, resume=False)
+    assert path.read_bytes() == before
+    # Remove only Gemini's default to recover OAuth without changing Codex routing.
+    config["providers"]["existing"]["default"] = ["openai"]
+    path.write_text(yaml.safe_dump(config))
+    assert build_agy_launch(conversation_id=None, model=None, resume=False)[1] == {}
+    assert default_provider_for_harness(config, "native-codex").name == "existing"

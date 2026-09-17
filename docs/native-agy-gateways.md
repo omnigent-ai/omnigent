@@ -114,6 +114,9 @@ The selected profile owns both the workspace and identity. Ambient
 `DATABRICKS_HOST`, `DATABRICKS_TOKEN`, and OAuth client settings cannot override
 it, including during token refresh. `DATABRICKS_CONFIG_FILE` can select a custom
 profile file. An invalid profile fails instead of using ambient credentials.
+The workspace host must be an HTTPS root. HTTP hosts, including loopback, are
+rejected before authentication or discovery; configure the HTTPS workspace URL
+in your Databricks profile.
 
 Omnigent starts a local adapter with each agy process. It supplies the profile's
 Bearer token, refreshes access tokens through the profile's authentication
@@ -143,6 +146,20 @@ default secure store, unset that variable before logging in again. Restart an
 existing local host daemon after changing its authentication environment.
 
 ## Select and verify the connection
+
+On upgrade, a `gemini:` block in an existing `kind: gateway` or `kind: local`
+provider becomes usable by native agy. If that provider has `default: true`,
+Gemini is included in its defaults and takes precedence over agy OAuth. An
+incompatible URL fails with a setup error rather than falling back to OAuth.
+Update it to a native Gemini API root, or replace `default: true` with an explicit
+list of its other families (for example `default: [anthropic, openai]`) in
+`config.yaml`. Excluding Gemini restores OAuth for new sessions while preserving
+the other harness defaults. You can also select another Gemini default in setup.
+
+Setup does not automatically save a detected Gemini key whose companion
+`GOOGLE_GEMINI_BASE_URL` is incompatible. Correct that environment variable and
+reopen setup. If an earlier setup already saved the rejected URL, edit or remove
+that saved provider too: changing the environment alone does not replace it.
 
 Adding the first credential makes it the Gemini default. Adding another
 credential preserves the existing default. Select the desired credential and

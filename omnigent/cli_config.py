@@ -795,6 +795,7 @@ def _configure_harness_add(family: str | None = None) -> str | None:
             "env:GEMINI_API_KEY",
             "env:OMNIGENT_GEMINI_API_KEY",
         }:
+            from omnigent.errors import OmnigentError
             from omnigent.onboarding.gemini_gateway import (
                 GEMINI_BASE_URL_ENV,
                 validate_gemini_base_url,
@@ -803,7 +804,11 @@ def _configure_harness_add(family: str | None = None) -> str | None:
 
             ambient_endpoint = getenv_nonempty_with_omnigent_prefix(GEMINI_BASE_URL_ENV)
             if ambient_endpoint is not None:
-                base_url = validate_gemini_base_url(ambient_endpoint[1])
+                try:
+                    base_url = validate_gemini_base_url(ambient_endpoint[1])
+                except OmnigentError as exc:
+                    click.echo(str(exc))
+                    return None
         entry = build_key_provider_entry(
             family=family,
             base_url=base_url,

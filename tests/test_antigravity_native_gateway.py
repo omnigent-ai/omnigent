@@ -29,6 +29,7 @@ from omnigent.onboarding.provider_config import (
     provider_families,
     set_default_provider,
 )
+from tests._helpers.https_server import enable_https
 
 
 def test_databricks_gemini_requires_opt_in_and_preserves_existing_defaults() -> None:
@@ -126,11 +127,12 @@ def test_supervisor_uses_installed_packages_from_workspace(tmp_path: Path, shado
         {"OMNIGENT_AGY_DATABRICKS_PROFILE": "supervisor-test"},
     )
     with ThreadingHTTPServer(("127.0.0.1", 0), ModelsHandler) as upstream:
+        env.update(enable_https(upstream, tmp_path / "tls"))
         thread = threading.Thread(target=upstream.serve_forever, daemon=True)
         thread.start()
         try:
             config_file.write_text(
-                f"[supervisor-test]\nhost = http://127.0.0.1:{upstream.server_port}\n"
+                f"[supervisor-test]\nhost = https://localhost:{upstream.server_port}\n"
                 "token = supervisor-test-token\nauth_type = pat\n"
             )
             result = subprocess.run(
@@ -164,7 +166,9 @@ def profile_workspace(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
             if self.path == "/.well-known/databricks-config":
                 self.reply({})
             elif self.path == "/oidc/.well-known/oauth-authorization-server":
-                self.reply({"token_endpoint": f"http://127.0.0.1:{self.server.server_port}/token"})
+                self.reply(
+                    {"token_endpoint": f"https://localhost:{self.server.server_port}/token"}
+                )
             else:
                 self.send_error(404)
 
@@ -182,10 +186,12 @@ def profile_workspace(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg))
     monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
     with ThreadingHTTPServer(("127.0.0.1", 0), AuthHandler) as upstream:
+        for name, value in enable_https(upstream, tmp_path / "tls").items():
+            monkeypatch.setenv(name, value)
         thread = threading.Thread(target=upstream.serve_forever, daemon=True)
         thread.start()
         try:
-            yield cfg, f"http://127.0.0.1:{upstream.server_port}", minted
+            yield cfg, f"https://localhost:{upstream.server_port}", minted
         finally:
             upstream.shutdown()
             thread.join(timeout=5)
@@ -400,3 +406,46 @@ async def test_proxy_preserves_tool_payload_stream_and_refreshes_token() -> None
         )
         assert "x-goog-api-key" not in request.headers
         assert request.content == payload
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "http://workspace.example.internal",
+        "http://127.0.0.1:1234",
+        "https://user:secret@workspace.example",
+        "https://workspace.example?token=secret",
+    ],
+)
+def test_databricks_rejects_unsafe_workspace_before_authentication(monkeypatch, tmp_path, host):
+    from unittest.mock import Mock
+
+    from omnigent.errors import OmnigentError
+
+    cfg = tmp_path / "databrickscfg"
+    cfg.write_text(f"[selected]\nhost = {host}\ntoken = fake-token\nauth_type = pat\n")
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg))
+    authenticate = Mock()
+    monkeypatch.setattr(
+        "omnigent.harnesses.antigravity_native.databricks_auth.ProfileAuthConfig", authenticate
+    )
+    with pytest.raises(OmnigentError, match="HTTPS"):
+        databricks_token_source("selected")
+    authenticate.assert_not_called()
+
+
+def test_auth_process_rejects_profile_changed_to_http_before_sdk(monkeypatch, tmp_path):
+    from unittest.mock import Mock
+
+    from omnigent.harnesses.antigravity_native.databricks_auth import main
+
+    cfg = tmp_path / "databrickscfg"
+    cfg.write_text("[selected]\nhost = http://workspace.example\ntoken = fake-token\n")
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg))
+    monkeypatch.setattr(
+        sys, "argv", ["auth", "--profile", "selected", "--host", "https://workspace.example"]
+    )
+    authenticate = Mock(return_value=("http://workspace.example", "fake-token"))
+    monkeypatch.setattr("omnigent.inner.databricks_token._sdk_bearer", authenticate)
+    assert main() == 1
+    authenticate.assert_not_called()

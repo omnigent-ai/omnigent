@@ -23,6 +23,7 @@ import pytest
 import yaml
 
 from omnigent.harnesses.antigravity_native.bridge import bridge_dir_for_bridge_id
+from tests._helpers.https_server import enable_https
 
 pytestmark = [
     pytest.mark.skipif(
@@ -182,6 +183,8 @@ def test_setup_gateway_reaches_real_agy_through_fresh_local_daemon(
         )
 
     with ThreadingHTTPServer(("127.0.0.1", 0), GeminiHandler) as gateway:
+        if databricks:
+            env.update(enable_https(gateway, tmp_path / "tls"))
         thread = threading.Thread(target=gateway.serve_forever, daemon=True)
         thread.start()
         try:
@@ -190,14 +193,14 @@ def test_setup_gateway_reaches_real_agy_through_fresh_local_daemon(
                 profile_file = tmp_path / "databrickscfg"
                 profile_file.write_text(
                     "[gateway-test]\n"
-                    f"host = http://127.0.0.1:{gateway.server_port}\n"
+                    f"host = https://localhost:{gateway.server_port}\n"
                     "token = gateway-test-key\nauth_type = pat\n"
                 )
                 profile_file.chmod(0o600)
                 env.update(
                     {
                         "DATABRICKS_CONFIG_FILE": str(profile_file),
-                        "DATABRICKS_HOST": f"http://127.0.0.1:{gateway.server_port}/ambient",
+                        "DATABRICKS_HOST": f"https://localhost:{gateway.server_port}/ambient",
                         "DATABRICKS_TOKEN": "ambient-wrong-token",
                         "DATABRICKS_CLIENT_ID": "ambient-client",
                         "DATABRICKS_CLIENT_SECRET": "ambient-secret",

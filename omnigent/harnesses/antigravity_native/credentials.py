@@ -26,7 +26,10 @@ if TYPE_CHECKING:
 
 def databricks_token_source(profile: str) -> "DatabricksProfileTokenProvider":
     """Bind the workspace and refreshed identity to the selected profile."""
-    from omnigent.harnesses.antigravity_native.databricks_auth import ProfileAuthConfig
+    from omnigent.harnesses.antigravity_native.databricks_auth import (
+        ProfileAuthConfig,
+        validate_workspace_host,
+    )
     from omnigent.inner.credential_proxy import DatabricksProfileTokenProvider
     from omnigent.inner.databricks_executor import _read_databrickscfg_host
 
@@ -37,6 +40,7 @@ def databricks_token_source(profile: str) -> "DatabricksProfileTokenProvider":
         raise OmnigentError(
             f"Databricks profile {profile!r} has no workspace host.", code=ErrorCode.INVALID_INPUT
         )
+    host = validate_workspace_host(host)
     try:
         import databricks.sdk.config  # noqa: F401 - check the optional dependency at setup.
     except ImportError:
