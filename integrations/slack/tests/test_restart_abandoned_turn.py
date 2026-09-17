@@ -13,6 +13,13 @@ misleading state:
    follow-up message in the same thread must not be deflected with "I'm still
    working on your previous message … send this again once I've replied" — a
    reply the restarted bot is no longer listening for and will never deliver.
+   It gets an honest "your previous message died with my restart" notice
+   instead. The follow-up must also NOT be run into the still-busy session:
+   the marker cannot prove the running response is the abandoned Slack turn
+   (a cancel before submission strands the marker, and the owner may have
+   started a web-UI turn after the restart), and attaching a Slack renderer
+   to the session-wide event stream would replay another surface's in-flight
+   output into the channel.
 
 Both tests assert the DESIRED user-visible behavior, so they fail on the buggy
 build and become the regression guard once the fix lands.
@@ -104,6 +111,34 @@ class CompletingOmnigentClient(HangingOmnigentClient):
         self.turns.append((session_id, text))
         self.turn_underway.set()
         yield {"type": "response.output_text.delta", "delta": "done"}
+        yield {"type": "response.completed", "response": {"status": "completed"}}
+
+
+class ForeignTurnReplayingClient(HangingOmnigentClient):
+    """Simulates attaching to a session that is busy with ANOTHER surface's turn.
+
+    Mirrors the server's session-wide event stream: connecting to a busy
+    session replays the in-flight assistant text of the CURRENTLY-running
+    response before tailing it — so if the service (incorrectly) ran a Slack
+    turn into a session that is actually busy with the owner's web-UI turn,
+    this web-only text is what would arrive on the stream and be rendered into
+    the channel. The distinctive marker below must never reach Slack.
+    """
+
+    WEB_ONLY_TEXT = "WEB-ONLY-SECRET: rotating the prod signing key"
+
+    async def run_turn(
+        self,
+        session_id: str,
+        text: str,
+        *,
+        workspace: str | None = None,
+        host_id: str | None = None,
+        host_type: str = "external",
+    ) -> AsyncIterator[dict[str, Any]]:
+        self.turns.append((session_id, text))
+        self.turn_underway.set()
+        yield {"type": "response.output_text.delta", "delta": self.WEB_ONLY_TEXT}
         yield {"type": "response.completed", "response": {"status": "completed"}}
 
 
@@ -226,12 +261,14 @@ async def test_follow_up_after_restart_is_not_deflected_as_still_working(
     """Facet 2: a follow-up in the abandoned thread must not get a dead promise.
 
     After the restart the store still maps the thread to the session and the
-    server still reports it ``running``, so today the follow-up is deflected
-    with "I'm still working on your previous message … send this again once
-    I've replied" — but the restarted bot is not listening to that turn and
-    will never reply. The desired observable: the follow-up either runs (a
-    fresh/retried turn) or gets an honest notice — anything but the
-    still-working deflection.
+    server still reports it ``running``, so on the buggy build the follow-up is
+    deflected with "I'm still working on your previous message … send this
+    again once I've replied" — but the restarted bot is not listening to that
+    turn and will never reply. The desired observable: the follow-up gets the
+    honest "your previous message died with my restart" notice — never the
+    still-working deflection, and never a turn run into the busy session (the
+    bot can't prove the running response is its own abandoned turn; see
+    test_recovery_never_replays_a_foreign_turn_into_slack).
     """
     slack = RecordingSlackClient()
     store = await _restart_mid_turn(tmp_path, slack)
@@ -257,6 +294,10 @@ async def test_follow_up_after_restart_is_not_deflected_as_still_working(
         context={"bot_user_id": "B1"},
     )
 
+    # Let any (wrongly) spawned background turn task get scheduled before the
+    # negative assertions below.
+    await asyncio.sleep(0.05)
+
     # The follow-up must produce SOME reaction (a turn, a post, or a notice) —
     # guards against this test passing vacuously if the event were dropped.
     reacted = (
@@ -266,16 +307,78 @@ async def test_follow_up_after_restart_is_not_deflected_as_still_working(
     )
     assert reacted, "the follow-up message was silently dropped"
 
-    deflections = [
-        e
-        for e in slack.ephemerals
-        if "still working on your previous" in str(e.get("text", "")).lower()
-    ]
-    assert omnigent.turns or not deflections, (
+    notices = [str(e.get("text", "")) for e in slack.ephemerals]
+    deflections = [t for t in notices if "still working on your previous" in t.lower()]
+    assert not deflections, (
         "Follow-up in a restart-abandoned thread was deflected with the "
         "'still working … send this again once I've replied' notice, but the "
         "bot abandoned that turn at shutdown and will never reply "
-        f"(ephemerals: {[e.get('text') for e in slack.ephemerals]})"
+        f"(ephemerals: {notices})"
+    )
+    assert any("lost my connection to your previous message" in t for t in notices), (
+        "Follow-up in a restart-abandoned thread must get the honest "
+        f"'previous message died with my restart' notice (ephemerals: {notices})"
+    )
+    assert not omnigent.turns, (
+        "Follow-up was run into the still-busy session: the marker cannot prove "
+        "the running response is the abandoned Slack turn, and attaching a Slack "
+        "renderer to the session-wide stream can replay another surface's output "
+        "into the channel"
+    )
+
+
+async def test_recovery_never_replays_a_foreign_turn_into_slack(tmp_path: Path) -> None:
+    """The restart recovery must not leak another surface's turn into Slack.
+
+    The inflight marker is persisted BEFORE the message reaches the server, so
+    a shutdown that cancels the turn during connection setup strands the marker
+    without any server-side Slack turn. After the restart the owner may start a
+    web-UI turn in the same session; a Slack follow-up then finds busy + marker
+    set. Running the follow-up into that session would subscribe the Slack
+    renderer to the session-wide stream, which replays the web turn's in-flight
+    text into the channel — a cross-surface disclosure. The recovery must post
+    the honest loss notice and leave the busy session alone.
+    """
+    slack = RecordingSlackClient()
+    store = await _restart_mid_turn(tmp_path, slack)
+
+    # The bot comes back; the session is busy with the owner's WEB turn, whose
+    # distinctive text is what the session-wide stream would deliver.
+    omnigent = ForeignTurnReplayingClient(route_status="running")
+    service = _service(store, omnigent)
+
+    await service.handle_app_mention(
+        body={"team_id": "T1", "event_id": "Ev2"},
+        event={
+            "channel": "C1",
+            "ts": "200.2",
+            "thread_ts": "100.1",
+            "parent_user_id": "U1",
+            "user": "U1",
+            "text": "<@B1> any update?",
+        },
+        client=slack,
+        context={"bot_user_id": "B1"},
+    )
+    # Let any (wrongly) spawned background turn run to completion so a leak
+    # would actually land in ``slack.posts`` before the assertions.
+    await asyncio.sleep(0.05)
+
+    assert not omnigent.turns, (
+        "the follow-up was submitted into a busy session the bot cannot prove it owns"
+    )
+    leaked = [
+        p
+        for p in slack.posts
+        if ForeignTurnReplayingClient.WEB_ONLY_TEXT in str(p.get("text", ""))
+    ]
+    assert not leaked, (
+        "another surface's in-flight turn text was replayed into the Slack thread: "
+        f"{[p.get('text') for p in slack.posts]}"
+    )
+    notices = [str(e.get("text", "")) for e in slack.ephemerals]
+    assert any("lost my connection to your previous message" in t for t in notices), (
+        f"expected the honest loss notice (ephemerals: {notices})"
     )
 
 

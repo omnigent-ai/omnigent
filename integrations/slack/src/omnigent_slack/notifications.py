@@ -216,23 +216,34 @@ class SlackNotifier:
         await self.post_ephemeral(client, key, user_id, text)
 
     async def notify_stale_turn_dropped(
-        self, client: SlackClientProtocol, key: ThreadKey, user_id: str
+        self,
+        client: SlackClientProtocol,
+        key: ThreadKey,
+        user_id: str,
+        *,
+        session_id: str | None = None,
     ) -> None:
         """Tell the owner their earlier message died with a bot restart.
 
         The honest counterpart of :meth:`notify_thread_busy` for a turn a
         restart abandoned mid-stream: the server may still report the session
-        busy, but no process is listening for that turn, so the new message
-        runs instead of being deflected with a promise the bot can't keep.
+        busy, but no process is listening for that turn, so no reply is ever
+        coming to Slack — say so instead of promising one. The new message is
+        NOT run either: while the session is busy the bot cannot prove the
+        running response is the abandoned Slack turn (it may be a web-UI turn
+        started after the restart), and rendering the session-wide stream
+        could leak another surface's output into the channel — so ask for a
+        resend once the session frees, like :meth:`notify_thread_busy` does.
         """
-        await self.post_ephemeral(
-            client,
-            key,
-            user_id,
+        link = self._session_web_link(session_id) if session_id else None
+        text = (
             ":wave: I lost my connection to your previous message in this "
-            "thread when I restarted, so I've stopped working on it — picking "
-            "up this one instead.",
+            "thread when I restarted, so I've stopped working on it and won't "
+            "be replying to it. The session is still busy right now, so "
+            "please send this message again in a moment"
         )
+        text += f", or wait / interrupt in the <{link}|web UI>." if link else "."
+        await self.post_ephemeral(client, key, user_id, text)
 
     def _session_web_link(self, session_id: str) -> str:
         # Link to the session's conversation page in the Omnigent web UI, where a

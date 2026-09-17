@@ -485,18 +485,27 @@ class SlackOmnigentService:
                     # A busy verdict can be a dead promise: a still-set inflight
                     # marker with no local stream means a restart abandoned this
                     # thread's turn, so nobody would ever deliver the promised
-                    # reply. Run the follow-up instead (the server safely buffers
-                    # a message that races the orphaned turn). A pending
-                    # elicitation still deflects — answering it (here or in the
-                    # web UI) works across a restart.
+                    # reply. Tell the owner honestly instead — but do NOT run
+                    # the follow-up into the busy session: the boolean marker
+                    # cannot prove the running response is the abandoned Slack
+                    # turn (a cancel before submission strands the marker, and
+                    # the owner may have started a web-UI turn after the
+                    # restart), and attaching a Slack renderer to the
+                    # session-wide event stream would replay another surface's
+                    # in-flight output into the channel. A pending elicitation
+                    # keeps its deflection — answering it (here or in the web
+                    # UI) works across a restart.
                     if record.turn_inflight and not activity.needs_user_action:
                         self._logger.info(
                             "Server busy thread=%s status=%s but the turn was "
-                            "abandoned by a restart; running follow-up",
+                            "abandoned by a restart; posting the honest loss "
+                            "notice instead of a still-working promise",
                             key.display(),
                             activity.status,
                         )
-                        await self._notifier.notify_stale_turn_dropped(client, key, requester)
+                        await self._notifier.notify_stale_turn_dropped(
+                            client, key, requester, session_id=record.session_id
+                        )
                     else:
                         self._logger.info(
                             "Server busy thread=%s status=%s pending=%s; deflecting",
@@ -511,7 +520,7 @@ class SlackOmnigentService:
                             needs_action=activity.needs_user_action,
                             session_id=record.session_id,
                         )
-                        return
+                    return
                 self._spawn_turn(
                     SlackTurn(
                         key=key,
