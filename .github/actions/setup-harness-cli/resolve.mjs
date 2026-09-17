@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { appendFile, readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -5,7 +6,15 @@ import { fileURLToPath } from "node:url";
 const actionDirectory = path.dirname(fileURLToPath(import.meta.url));
 
 export async function loadManifest() {
-  return JSON.parse(await readFile(path.join(actionDirectory, "manifest.json"), "utf8"));
+  const manifest = JSON.parse(await readFile(path.join(actionDirectory, "manifest.json"), "utf8"));
+  await Promise.all(
+    Object.values(manifest).map(async (spec) => {
+      if (!spec.lockfile) return;
+      spec.lockPath = path.join(actionDirectory, spec.lockfile);
+      spec.lockDigest = createHash("sha256").update(await readFile(spec.lockPath)).digest("hex");
+    }),
+  );
+  return manifest;
 }
 
 export function resolveHarness({
@@ -36,13 +45,21 @@ export function resolveHarness({
   if (spec.kind === "archive" && !spec.platforms?.[platform]) {
     throw new Error(`${harness} has no verified archive for ${platform}`);
   }
+  const useLock = spec.kind === "npm" && version === spec.version && Boolean(spec.lockDigest);
+  const integrityKey =
+    spec.kind === "archive"
+      ? spec.platforms[platform].sha512.slice(0, 16)
+      : useLock
+        ? spec.lockDigest.slice(0, 16)
+        : "unlocked";
   const cachePath = path.join(runnerTemp, "omnigent-harness-cache", harness, version, platform);
   const installPath = path.join(runnerTemp, "omnigent-harness-clis", harness, version);
   return {
-    cacheKey: `harness-cli-${cacheNamespace}-${spec.kind}-${harness}-${platform}-${version}`,
+    cacheKey: `harness-cli-${cacheNamespace}-${spec.kind}-${harness}-${platform}-${version}-${integrityKey}`,
     cachePath,
     installPath,
     spec,
+    useLock,
     version,
   };
 }

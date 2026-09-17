@@ -28,13 +28,38 @@ jobs:
         harness: [claude, codex, pi, agy]
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - uses: ./.github/actions/setup-harness-cli
+      - name: Install without cache
+        uses: ./.github/actions/setup-harness-cli
         with:
           harness: ${{ matrix.harness }}
+          enable-cache: false
+      - name: Seed isolated test cache
+        id: seed
+        uses: ./.github/actions/setup-harness-cli
+        with:
+          harness: ${{ matrix.harness }}
+          cache-namespace: test-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Remove local downloads before restore
+        shell: bash
+        env:
+          CACHE_PATH: ${{ steps.seed.outputs.cache-path }}
+        run: |
+          case "$CACHE_PATH" in
+            "$RUNNER_TEMP"/omnigent-harness-cache/*) rm -rf -- "$CACHE_PATH" ;;
+            *) echo "Refusing to remove unexpected cache path: $CACHE_PATH" >&2; exit 1 ;;
+          esac
+      - name: Restore isolated test cache
+        id: restore
+        uses: ./.github/actions/setup-harness-cli
+        with:
+          harness: ${{ matrix.harness }}
+          cache-namespace: test-${{ github.run_id }}-${{ github.run_attempt }}
       - name: Verify CLI remains available to caller steps
         env:
+          CACHE_HIT: ${{ steps.restore.outputs.cache-hit }}
           HARNESS: ${{ matrix.harness }}
         run: |
+          test "$CACHE_HIT" = true
           case "$HARNESS" in
             claude) claude --version ;;
             codex) codex --version ;;

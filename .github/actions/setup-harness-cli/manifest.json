@@ -4,19 +4,22 @@
     "package": "@anthropic-ai/claude-code",
     "version": "2.1.266",
     "binary": "claude",
+    "lockfile": "locks/claude/package-lock.json",
     "installScript": "node_modules/@anthropic-ai/claude-code/install.cjs"
   },
   "codex": {
     "kind": "npm",
     "package": "@openai/codex",
     "version": "0.139.0",
-    "binary": "codex"
+    "binary": "codex",
+    "lockfile": "locks/codex/package-lock.json"
   },
   "pi": {
     "kind": "npm",
     "package": "@earendil-works/pi-coding-agent",
     "version": "0.84.2",
-    "binary": "pi"
+    "binary": "pi",
+    "lockfile": "locks/pi/package-lock.json"
   },
   "agy": {
     "kind": "archive",

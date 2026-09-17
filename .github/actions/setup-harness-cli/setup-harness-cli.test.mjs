@@ -16,7 +16,15 @@ test("npm harness defaults match the committed CI dependency pins", async () => 
   ).dependencies;
 
   for (const harness of ["claude", "codex", "pi"]) {
-    assert.equal(ciDependencies[manifest[harness].package], manifest[harness].version);
+    const spec = manifest[harness];
+    assert.equal(ciDependencies[spec.package], spec.version);
+    const lock = JSON.parse(await readFile(spec.lockPath, "utf8"));
+    assert.equal(lock.packages[""].dependencies[spec.package], spec.version);
+    for (const [packagePath, lockedPackage] of Object.entries(lock.packages)) {
+      if (!packagePath || lockedPackage.link) continue;
+      assert.match(lockedPackage.resolved, /^https:\/\/registry\.npmjs\.org\//);
+      assert.match(lockedPackage.integrity, /^sha512-/);
+    }
   }
 });
 
@@ -30,9 +38,27 @@ test("resolver uses isolated versioned cache and install paths", async () => {
     runnerTemp: "/runner/temp",
   });
 
-  assert.equal(resolved.cacheKey, "harness-cli-v1-npm-codex-Linux-X64-0.140.0-alpha.1");
+  assert.equal(resolved.cacheKey, "harness-cli-v1-npm-codex-Linux-X64-0.140.0-alpha.1-unlocked");
   assert.equal(resolved.cachePath, "/runner/temp/omnigent-harness-cache/codex/0.140.0-alpha.1/Linux-X64");
   assert.equal(resolved.installPath, "/runner/temp/omnigent-harness-clis/codex/0.140.0-alpha.1");
+});
+
+test("resolver keys default npm caches by committed lock digest", async () => {
+  const manifest = await loadManifest();
+  const resolved = resolveHarness({
+    cacheNamespace: "v1",
+    harness: "codex",
+    manifest,
+    platform: "Linux-X64",
+    requestedVersion: "",
+    runnerTemp: "/runner/temp",
+  });
+
+  assert.equal(resolved.useLock, true);
+  assert.equal(
+    resolved.cacheKey,
+    `harness-cli-v1-npm-codex-Linux-X64-0.139.0-${manifest.codex.lockDigest.slice(0, 16)}`,
+  );
 });
 
 test("archive harness rejects versions without a pinned checksum", async () => {

@@ -44,27 +44,33 @@ function evictionWarning(cacheKey) {
 }
 
 async function installNpmHarness(resolved) {
-  const { cacheKey, cachePath, installPath, spec, version } = resolved;
+  const { cacheKey, cachePath, installPath, spec, useLock, version } = resolved;
   await mkdir(cachePath, { recursive: true });
   let discardedRestoredCache = false;
   const npm = process.platform === "win32" ? "npm.cmd" : "npm";
   await runWithRetries(async () => {
     await rm(installPath, { recursive: true, force: true });
     await mkdir(installPath, { recursive: true });
+    let args;
+    if (useLock) {
+      await copyFile(path.join(path.dirname(spec.lockPath), "package.json"), path.join(installPath, "package.json"));
+      await copyFile(spec.lockPath, path.join(installPath, "package-lock.json"));
+      args = ["ci", "--ignore-scripts"];
+    } else {
+      console.warn(`${spec.package}@${version} has no committed integrity lock`);
+      args = ["install", "--ignore-scripts", "--package-lock=false", `${spec.package}@${version}`];
+    }
     const result = run(
       npm,
       [
-        "install",
-        "--ignore-scripts",
+        ...args,
         "--no-audit",
         "--no-fund",
-        "--package-lock=false",
         "--prefer-offline",
         "--fetch-retries=0",
         "--fetch-timeout=30000",
         "--cache",
         cachePath,
-        `${spec.package}@${version}`,
       ],
       { cwd: installPath, env: { ...process.env, NPM_CONFIG_REGISTRY: "https://registry.npmjs.org/" } },
     );

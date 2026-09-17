@@ -25,6 +25,9 @@ outputs:
   version:
     description: "Exact harness version installed."
     value: ${{ steps.resolve.outputs.version }}
+  cache-path:
+    description: "Download cache path used by this invocation."
+    value: ${{ steps.resolve.outputs.cache-path }}
 
 runs:
   using: composite
