@@ -70,7 +70,11 @@ type RespondedMap = Record<
 export function InboxPage() {
   const queryClient = useQueryClient();
   const { trackClick } = useOmnigentAnalytics();
-  const { all: conversationsQuery, inboxRows: allRows, comments: commentInbox } = useSidebarData();
+  const {
+    inbox: conversationsQuery,
+    inboxRows: allRows,
+    comments: commentInbox,
+  } = useSidebarData();
   const [responded, setResponded] = useState<RespondedMap>({});
   // Manual expand/collapse toggles keyed by elicitation id. Anything
   // not in the map falls back to the default: expanded only for the
@@ -138,7 +142,8 @@ export function InboxPage() {
     snapshotQueries.some((q) => q.isLoading) ||
     commentInbox.isLoading;
   const failedSnapshots = snapshotQueries.filter((q) => q.isError);
-  const failedSessionCount = failedSnapshots.length + commentInbox.failedCount;
+  const failedSessionCount =
+    failedSnapshots.length + commentInbox.failedCount + Number(Boolean(conversationsQuery.isError));
 
   // Mirrors `chatStore.submitApproval`: optimistic flip → resolve POST →
   // rollback on error. Success invalidates the session list so the row's
@@ -209,6 +214,7 @@ export function InboxPage() {
             onClick={() => {
               failedSnapshots.forEach((q) => void q.refetch());
               commentInbox.retryFailed();
+              if (conversationsQuery.isError) void conversationsQuery.refetch?.();
             }}
             componentId="inbox.retry"
           >

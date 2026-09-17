@@ -32,6 +32,9 @@ vi.mock("@/lib/sessionUpdatesSocket", () => ({
   },
 }));
 
+import { SidebarDataProvider, useSidebarView } from "./useSidebarData";
+import { useCanEdit } from "./usePermissions";
+import { sidebarConfig } from "@/lib/sidebarConfig";
 import { SessionUpdatesProvider } from "./SessionUpdatesProvider";
 import { useSaveProjectOrder } from "./useProjectOrder";
 import * as projectsApi from "@/lib/projectsApi";
@@ -573,4 +576,54 @@ it("updates pending counts on a pinned row outside the scope windows", () => {
     comments_count: 2,
     labels: { "omnigent.pinned": "123" },
   });
+});
+
+it("keeps a directly opened shared session watched and permission-aware with the Shared list inactive", async () => {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const mine = conv("mine");
+  const sharedKey = ["conversations", "", false, null, "shared"];
+  client.setQueryData(sharedKey, {
+    pages: [{ data: [{ ...conv("retained-shared"), permission_level: 1 }] }],
+    pageParams: [undefined],
+  });
+  client.setQueryData(["session", "direct-shared"], { id: "direct-shared", permissionLevel: 1 });
+  const fetch = vi.fn(async (url: string) => ({
+    ok: true,
+    json: async () => ({ data: url.includes("pinned=true") ? [] : [mine], has_more: false }),
+  }));
+  vi.stubGlobal("fetch", fetch);
+  function Selection() {
+    useSidebarView("mine");
+    return null;
+  }
+  const wrapper = ({ children }: { children: ReactNode }) => (
+    <QueryClientProvider client={client}>
+      <MemoryRouter initialEntries={["/c/direct-shared"]}>
+        <SidebarDataProvider
+          config={{ ...sidebarConfig, inboxIncludesShared: false, pinsIncludeShared: false }}
+        >
+          <Selection />
+          <SessionUpdatesProvider>{children}</SessionUpdatesProvider>
+        </SidebarDataProvider>
+      </MemoryRouter>
+    </QueryClientProvider>
+  );
+  try {
+    const { result, unmount } = renderHook(() => useCanEdit("direct-shared"), { wrapper });
+    await waitFor(() => expect(lastWatched()).toEqual(["direct-shared", "mine"]));
+    expect(result.current).toBe(false);
+    act(() =>
+      client.setQueryData(["session", "direct-shared"], {
+        id: "direct-shared",
+        permissionLevel: 2,
+      }),
+    );
+    await waitFor(() => expect(result.current).toBe(true));
+    expect(fetch.mock.calls.some(([url]) => url.includes("visibility=shared"))).toBe(false);
+    expect(client.getQueryData(sharedKey)).toBeDefined();
+    unmount();
+  } finally {
+    client.clear();
+    vi.unstubAllGlobals();
+  }
 });

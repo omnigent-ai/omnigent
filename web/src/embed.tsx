@@ -1,4 +1,4 @@
-import { appConfig } from "./appConfig";
+import { appConfig, type SidebarConfig } from "./appConfig";
 import { SidebarDataProvider } from "./hooks/useSidebarData";
 // Embed entry point.
 //
@@ -83,7 +83,11 @@ const queryClient = new QueryClient({
   },
 });
 
+export type { SidebarConfig } from "./appConfig";
+
 export interface OmnigentAppProps extends OmnigentHostConfig {
+  /** Runtime consumer policy and polling intervals, resolved by the host. */
+  sidebarConfig?: Partial<SidebarConfig>;
   /**
    * Router basename, e.g. `/ml/omnigent-embed`. web's routes + navigation
    * use absolute paths (`/`, `/c/:conversationId`), so the app must be nested
@@ -148,10 +152,12 @@ function EmbedCapabilitiesProvider({ children }: { children: ReactNode }) {
 }
 
 function OmnigentProviders({
+  sidebarConfig: sidebarOverrides,
   routing,
   basename,
   isDarkMode,
 }: {
+  sidebarConfig?: Partial<SidebarConfig>;
   routing: RoutingApi;
   basename?: string;
   isDarkMode?: boolean;
@@ -223,7 +229,7 @@ function OmnigentProviders({
               <ImageLightboxProvider>
                 <RoutingProvider value={routing}>
                   <EmbedCapabilitiesProvider>
-                    <SidebarDataProvider config={appConfig.sidebar}>
+                    <SidebarDataProvider config={{ ...appConfig.sidebar, ...sidebarOverrides }}>
                       <SessionUpdatesProvider>
                         <RunnerHealthProvider>
                           <QueueFlushProvider>
@@ -256,6 +262,7 @@ function OmnigentProviders({
  *     under `basename` via `basenamedRouting` (the routing IoC).
  */
 export function OmnigentApp({
+  sidebarConfig,
   basename,
   routing,
   isDarkMode,
@@ -288,7 +295,12 @@ export function OmnigentApp({
   return (
     <QueryClientProvider client={queryClient}>
       <ExtensionProvider>
-        <OmnigentProviders routing={routingApi} basename={basename} isDarkMode={isDarkMode} />
+        <OmnigentProviders
+          routing={routingApi}
+          basename={basename}
+          isDarkMode={isDarkMode}
+          sidebarConfig={sidebarConfig}
+        />
       </ExtensionProvider>
     </QueryClientProvider>
   );

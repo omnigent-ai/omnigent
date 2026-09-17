@@ -79,14 +79,14 @@ it("excludes cached shared rows when disabled and keeps inbox policy separate", 
   const wrap = ({ children }: { children: ReactNode }) => (
     <QueryClientProvider client={client}>
       <SidebarDataProvider
-        sharedEnabled={enabled}
-        config={{ ...sidebarConfig, inboxIncludesShared: false }}
+        config={{ ...sidebarConfig, sharedAvailable: enabled, inboxIncludesShared: false }}
       >
         {children}
       </SidebarDataProvider>
     </QueryClientProvider>
   );
   const { result, rerender } = renderHook(useSidebarData, { wrapper: wrap });
+  act(() => result.current.registerView("all"));
   await waitFor(() => expect(result.current.watchedIds).toContain("shared"));
   expect(result.current.inboxCount).toBe(2);
   enabled = false;

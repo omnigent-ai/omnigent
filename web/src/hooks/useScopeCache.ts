@@ -13,9 +13,10 @@ import {
 
 export function useScopeCache(
   visibility: "mine" | "shared",
-  refreshIntervalMs: number,
+  refreshIntervalMs: number | false,
   enabled = true,
   maxRefreshSessions = sidebarConfig.maxRefreshSessions,
+  entryKey: string | null = null,
 ) {
   const client = useQueryClient();
   const queryKey = useMemo(
@@ -56,10 +57,24 @@ export function useScopeCache(
       return refreshScopeWindow(client.getQueryData<ScopeCacheData>(queryKey), page, limit);
     },
     select: filterData,
-    staleTime: 30_000,
-    refetchInterval: refreshIntervalMs,
+    staleTime: enabled ? 30_000 : "static",
+    refetchInterval: enabled ? refreshIntervalMs : false,
     enabled,
   });
+  const previousEntry = useRef({ enabled: false, entryKey });
+  const { data, refetch: refreshHead } = query;
+  useEffect(() => {
+    const entering =
+      enabled &&
+      (!previousEntry.current.enabled ||
+        (entryKey !== null && entryKey !== previousEntry.current.entryKey));
+    previousEntry.current = { enabled, entryKey };
+    if (!enabled) void client.cancelQueries({ queryKey, exact: true });
+    else if (entering && data) {
+      // Join an automatic entry fetch instead of cancelling and starting another.
+      void refreshHead({ cancelRefetch: false });
+    }
+  }, [enabled, entryKey, data, client, queryKey, refreshHead]);
   const pagination = useMutation({
     mutationFn: async ({ controller }: { controller: AbortController }) => {
       let refreshing = client.getQueryCache().find({ queryKey, exact: true });
@@ -128,19 +143,23 @@ export function useScopeCache(
     pagination.variables?.controller.signal.aborted || isStaleCursorError(pagination.error)
       ? null
       : pagination.error;
-  const { refetch: refreshHead } = query;
   const { isError: pageFailed, reset: resetPage } = pagination;
   const refetch = useCallback(() => {
+    if (!enabled) return Promise.resolve();
     if (pageFailed) resetPage();
     return refreshHead();
-  }, [pageFailed, resetPage, refreshHead]);
+  }, [enabled, pageFailed, resetPage, refreshHead]);
   return {
     ...query,
     refetch,
     fetchNextPage,
     hasNextPage: Boolean(query.data?.pages.at(-1)?.has_more),
-    isFetching: query.isFetching || pagination.isPending,
-    isFetchingNextPage: pagination.isPending,
+    isFetching:
+      enabled &&
+      (query.isFetching ||
+        (pagination.isPending && !pagination.variables?.controller.signal.aborted)),
+    isFetchingNextPage:
+      enabled && pagination.isPending && !pagination.variables?.controller.signal.aborted,
     error: query.error ?? pageError,
     isError: query.isError || pageError !== null,
   };

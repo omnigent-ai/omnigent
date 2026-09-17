@@ -1,5 +1,7 @@
+import { filterSessionScope } from "@/lib/sessionVisibility";
+import { getCurrentUserId } from "@/lib/identity";
 import { PinCapacityContext } from "@/lib/sidebarConfig";
-import { useSidebarData, type SidebarListQuery } from "@/hooks/useSidebarData";
+import { useSidebarData, useSidebarView, type SidebarListQuery } from "@/hooks/useSidebarData";
 import { useArchivedSessions } from "@/hooks/useScopeCache";
 import { InfiniteScrollSentinel, type AutoLoadBudget } from "@/components/InfiniteScrollSentinel";
 import {
@@ -517,26 +519,27 @@ export function useMigrateLocalPinsToServer(
   serverPinnedIds: Set<string>,
   pinnedLoaded: boolean,
   filterHonored: boolean,
+  ownedIds?: ReadonlySet<string>,
 ): void {
   const queryClient = useQueryClient();
-  const migratedRef = useRef(false);
+  const attempted = useRef(new Set<string>());
   useEffect(() => {
     // Don't migrate until the query settled AND the server proved it honors the
     // pinned filter — an old server ignores it, and migrating there wipes local
-    // pins. Leave `migratedRef` false so a later load (post server upgrade)
-    // still runs the migration.
-    if (!pinnedLoaded || !filterHonored || migratedRef.current) return;
-    migratedRef.current = true;
+    // pins. A later load can retry after the server upgrade.
+    if (!pinnedLoaded || !filterHonored) return;
     const legacyIds = readPinnedConversationIds();
-    const toMigrate = legacyIds.filter((id) => !serverPinnedIds.has(id));
+    const remaining = legacyIds.filter((id) => !serverPinnedIds.has(id));
+    const toMigrate = remaining.filter(
+      (id) => !attempted.current.has(id) && (!ownedIds || ownedIds.has(id)),
+    );
     // Ids the server already owns can be dropped from the legacy key right away;
     // ids still to migrate stay until their write succeeds (below), so a failed
     // or offline write retries next load instead of losing the pin.
-    if (toMigrate.length === 0) {
-      clearLegacyPinnedConversationIds();
-      return;
-    }
-    writeLegacyPinnedConversationIds(toMigrate);
+    if (remaining.length === 0) clearLegacyPinnedConversationIds();
+    else writeLegacyPinnedConversationIds(remaining);
+    if (toMigrate.length === 0) return;
+    toMigrate.forEach((id) => attempted.current.add(id));
     void (async () => {
       // Legacy localStorage kept pins most-recently-pinned-first, so preserve
       // that order by synthesizing descending pin timestamps: the oldest pin
@@ -552,8 +555,10 @@ export function useMigrateLocalPinsToServer(
       );
       // Keep only the ids whose write failed in the legacy key, so the next
       // load retries them; drop the succeeded ones (now server-owned).
-      const failedIds = results.filter((r) => r.conv === null).map((r) => r.id);
-      writeLegacyPinnedConversationIds(failedIds);
+      const succeeded = new Set(results.filter((r) => r.conv !== null).map((r) => r.id));
+      writeLegacyPinnedConversationIds(
+        readPinnedConversationIds().filter((id) => !succeeded.has(id)),
+      );
       // Patch the pinned-list cache with the confirmed rows rather than
       // invalidating — the `?pinned=true` index lags these writes, so a refetch
       // here would momentarily drop the just-migrated pins.
@@ -569,10 +574,9 @@ export function useMigrateLocalPinsToServer(
         });
       }
     })();
-    // Re-run when the query settles or the filter starts being honored (post
-    // server upgrade); the ref guard prevents re-entry once it actually runs.
+    // Retry newly loaded owned IDs; failed writes wait until the next mount.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pinnedLoaded, filterHonored]);
+  }, [pinnedLoaded, filterHonored, ownedIds]);
 }
 
 function SidebarImpl({
@@ -583,6 +587,7 @@ function SidebarImpl({
   onOpenSearch,
   peek,
 }: SidebarProps) {
+  const sidebarData = useSidebarData();
   const branding = useBranding();
   const serverInfo = useServerInfo();
   const usagePageEnabled = isFeatureEnabled(serverInfo, "usage_page");
@@ -596,7 +601,7 @@ function SidebarImpl({
   // A loopback-only server has one user, so "Shared" is meaningless there —
   // the filter menu drops that option. Mirrors AppShell's `shareDisabled`.
   // Read before the filter state, which validates a stored "shared" against it.
-  const multiUser = !isCurrentServerLocal();
+  const multiUser = !isCurrentServerLocal() && sidebarData.sharedAvailable;
   // Active filter from the Sessions heading's menu, seeded from the persisted
   // preference so a reload keeps the slice the viewer was last on.
   const [activeTab, setActiveTab] = useState<SidebarTab>(() => readSessionFilter(multiUser));
@@ -661,7 +666,7 @@ function SidebarImpl({
     [selectionMode, exitSelectionMode],
   );
 
-  const sidebarData = useSidebarData();
+  useSidebarView(activeTab);
   const archivedQuery = useArchivedSessions(activeTab === "archived");
   const displayQuery: SidebarListQuery =
     activeTab === "archived"
@@ -669,7 +674,7 @@ function SidebarImpl({
       : activeTab === "mine"
         ? sidebarData.mine
         : activeTab === "shared"
-          ? sidebarData.sharedEnabled
+          ? sidebarData.sharedAvailable
             ? sidebarData.shared
             : { ...sidebarData.all, data: undefined, isLoading: false, hasNextPage: false }
           : sidebarData.all;
@@ -748,15 +753,27 @@ function SidebarImpl({
   // not render a row until it's loaded. This is window-scoped and transient —
   // against a new server the migration promotes the id to a real server pinned
   // row (which carries its own row) on the same or next load.
+  const ownedPinIds = useMemo(
+    () =>
+      sidebarData.pinsIncludeShared
+        ? undefined
+        : new Set(
+            filterSessionScope(sidebarData.loadedRows, "mine", getCurrentUserId()).map(
+              (row) => row.id,
+            ),
+          ),
+    [sidebarData.pinsIncludeShared, sidebarData.loadedRows],
+  );
   const pinnedConversationIds = useMemo(() => {
     const ids = pinnedConversations.map((c) => c.id);
     const seen = new Set(ids);
-    for (const id of readPinnedConversationIds()) if (!seen.has(id)) ids.push(id);
+    for (const id of readPinnedConversationIds())
+      if (!seen.has(id) && (!ownedPinIds || ownedPinIds.has(id))) ids.push(id);
     return ids;
     // `pinnedLoaded` isn't read but is a dep on purpose: it re-reads the legacy
     // key after the migration (gated on the query settling) mutates it.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pinnedConversations, pinnedLoaded]);
+  }, [pinnedConversations, pinnedLoaded, ownedPinIds]);
   const togglePinnedMutation = useTogglePinnedConversation();
   const pinnedIdSet = useMemo(() => new Set(pinnedConversationIds), [pinnedConversationIds]);
   // The migration compares the legacy key against what the SERVER already owns
@@ -777,7 +794,7 @@ function SidebarImpl({
   // still-local pins up to the server (as the `omnigent.pinned` label) the
   // first time this build runs, so no one loses their existing pins, then
   // clear the legacy key so this runs at most once.
-  useMigrateLocalPinsToServer(serverPinnedIdSet, pinnedLoaded, pinnedFilterHonored);
+  useMigrateLocalPinsToServer(serverPinnedIdSet, pinnedLoaded, pinnedFilterHonored, ownedPinIds);
 
   // Desktop-only drag-to-resize, mirroring the right rail. The width is
   // exposed as a CSS variable consumed by the ``md:w-[var(--sidebar-width)]``

@@ -1,5 +1,14 @@
 import { replaceEqualDeep } from "@tanstack/react-query";
-import { createContext, useCallback, useContext, useMemo, useState, type ReactNode } from "react";
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useLayoutEffect,
+  useMemo,
+  useState,
+  type ReactNode,
+} from "react";
+import type { SessionFilter } from "@/lib/sessionFilterPreferences";
 import { dedupeSessionRows, mergeScopeRows, sessionRowsPage } from "@/lib/sidebarData";
 import {
   sidebarConfig,
@@ -7,7 +16,7 @@ import {
   PinCapacityContext,
   type SidebarConfig,
 } from "@/lib/sidebarConfig";
-import { sessionVisibility } from "@/lib/sessionVisibility";
+import { filterSessionScope, sessionVisibility } from "@/lib/sessionVisibility";
 import { getCurrentUserId } from "@/lib/identity";
 import { sumPendingApprovals } from "@/lib/inbox";
 import { useCommentInbox } from "./useCommentInbox";
@@ -23,15 +32,26 @@ export type SidebarListQuery = Pick<
   "data" | "error" | "isError" | "isLoading" | "isFetching" | "isFetchingNextPage" | "hasNextPage"
 > & { fetchNextPage: () => unknown; refetch?: () => unknown };
 
-function useSidebarSources(config: SidebarConfig, sharedEnabled: boolean) {
-  const mine = useScopeCache("mine", config.mineRefreshMs, true, config.maxRefreshSessions);
+function useSidebarSources(config: SidebarConfig) {
+  const [selectedView, registerView] = useState<SessionFilter | null>(null);
+  const viewNeedsShared = selectedView === "all" || selectedView === "shared";
+  const sharedActive = config.sharedAvailable && (viewNeedsShared || config.inboxIncludesShared);
+  const pinsIncludeShared = config.sharedAvailable && config.pinsIncludeShared;
+  const mine = useScopeCache(
+    "mine",
+    config.mineRefreshMs,
+    true,
+    config.maxRefreshSessions,
+    selectedView === "mine" || selectedView === "all" ? selectedView : null,
+  );
   const shared = useScopeCache(
     "shared",
     config.sharedRefreshMs,
-    sharedEnabled,
+    sharedActive,
     config.maxRefreshSessions,
+    viewNeedsShared ? selectedView : null,
   );
-  const pinned = usePinnedConversations(sharedEnabled, config.pinCap);
+  const pinned = usePinnedConversations(pinsIncludeShared, config.pinCap);
   const [folders, setFolders] = useState<Map<string, Conversation[]>>(() => new Map());
   const registerFolder = useCallback((name: string, rows: Conversation[] | null) => {
     setFolders((previous) => {
@@ -46,26 +66,29 @@ function useSidebarSources(config: SidebarConfig, sharedEnabled: boolean) {
   }, []);
   const mineRows = useMemo(() => mine.data?.pages.flatMap((p) => p.data) ?? [], [mine.data]);
   const sharedRows = useMemo(
-    () => (sharedEnabled ? (shared.data?.pages.flatMap((p) => p.data) ?? []) : []),
-    [shared.data, sharedEnabled],
+    () => (sharedActive ? (shared.data?.pages.flatMap((p) => p.data) ?? []) : []),
+    [shared.data, sharedActive],
   );
   const pinnedRows = pinned.data?.conversations;
+  const viewerId = getCurrentUserId();
   const loadedRows = useMemo(
     () =>
       dedupeSessionRows([
         ...(pinnedRows ?? []),
-        ...[...folders.values()].flat(),
+        ...(sharedActive
+          ? [...folders.values()].flat()
+          : filterSessionScope([...folders.values()].flat(), "mine", viewerId)),
         ...mineRows,
         ...sharedRows,
       ]).filter((row) => !row.archived),
-    [mineRows, sharedRows, pinnedRows, folders],
+    [mineRows, sharedRows, pinnedRows, folders, sharedActive, viewerId],
   );
   const inboxRows = useMemo(
     () =>
       config.inboxIncludesShared
         ? loadedRows
-        : loadedRows.filter((row) => sessionVisibility(row, getCurrentUserId()) === "mine"),
-    [loadedRows, config.inboxIncludesShared],
+        : loadedRows.filter((row) => sessionVisibility(row, viewerId) === "mine"),
+    [loadedRows, config.inboxIncludesShared, viewerId],
   );
   const comments = useCommentInbox(inboxRows);
   const inboxCount = sumPendingApprovals(inboxRows) + comments.items.length;
@@ -78,7 +101,7 @@ function useSidebarSources(config: SidebarConfig, sharedEnabled: boolean) {
         mineRows,
         sharedRows,
         mine.hasNextPage,
-        sharedEnabled && shared.hasNextPage,
+        sharedActive && shared.hasNextPage,
         mineCursor,
         sharedCursor,
       ),
@@ -87,61 +110,58 @@ function useSidebarSources(config: SidebarConfig, sharedEnabled: boolean) {
       sharedRows,
       mine.hasNextPage,
       shared.hasNextPage,
-      sharedEnabled,
+      sharedActive,
       mineCursor,
       sharedCursor,
     ],
   );
-  const hasNextPage = mine.hasNextPage || (sharedEnabled && shared.hasNextPage);
+  const hasNextPage = mine.hasNextPage || (sharedActive && shared.hasNextPage);
   const { fetchNextPage: fetchMinePage } = mine;
   const { fetchNextPage: fetchSharedPage } = shared;
   const fetchNextPage = useCallback(async () => {
     // A load is one action, even when both scopes have another page.
     await Promise.allSettled([
-      ...(mine.hasNextPage && !mine.isFetching ? [fetchMinePage()] : []),
-      ...(sharedEnabled && shared.hasNextPage && !shared.isFetching ? [fetchSharedPage()] : []),
+      ...(mine.hasNextPage ? [fetchMinePage()] : []),
+      ...(sharedActive && shared.hasNextPage ? [fetchSharedPage()] : []),
     ]);
-  }, [
-    mine.hasNextPage,
-    mine.isFetching,
-    fetchMinePage,
-    sharedEnabled,
-    shared.hasNextPage,
-    shared.isFetching,
-    fetchSharedPage,
-  ]);
+  }, [mine.hasNextPage, fetchMinePage, sharedActive, shared.hasNextPage, fetchSharedPage]);
   const allData = useMemo(
     () =>
-      mine.data || (sharedEnabled && shared.data)
+      mine.data || (sharedActive && shared.data)
         ? { pages: [sessionRowsPage(merged.rows, hasNextPage)], pageParams: [undefined] }
         : undefined,
-    [mine.data, shared.data, sharedEnabled, merged.rows, hasNextPage],
+    [mine.data, shared.data, sharedActive, merged.rows, hasNextPage],
   );
   const all: SidebarListQuery = {
     data: allData,
     hasNextPage,
     fetchNextPage,
     refetch: () =>
-      Promise.allSettled([mine.refetch(), ...(sharedEnabled ? [shared.refetch()] : [])]),
-    isLoading: mine.isLoading || (sharedEnabled && shared.isLoading),
-    isFetching: mine.isFetching || (sharedEnabled && shared.isFetching),
-    isFetchingNextPage: mine.isFetchingNextPage || (sharedEnabled && shared.isFetchingNextPage),
-    isError: mine.isError || (sharedEnabled && shared.isError),
-    error: mine.error ?? (sharedEnabled ? shared.error : null),
+      Promise.allSettled([mine.refetch(), ...(sharedActive ? [shared.refetch()] : [])]),
+    isLoading: mine.isLoading || (sharedActive && shared.isLoading),
+    isFetching: mine.isFetching || (sharedActive && shared.isFetching),
+    isFetchingNextPage: mine.isFetchingNextPage || (sharedActive && shared.isFetchingNextPage),
+    isError: mine.isError || (sharedActive && shared.isError),
+    error: mine.error ?? (sharedActive ? shared.error : null),
   };
   const loadedData = useMemo(
     () =>
-      mine.data !== undefined && (!sharedEnabled || shared.data !== undefined)
+      mine.data !== undefined || (sharedActive && shared.data !== undefined)
         ? { pages: [sessionRowsPage(loadedRows)], pageParams: [undefined] }
         : undefined,
-    [mine.data, shared.data, sharedEnabled, loadedRows],
+    [mine.data, shared.data, sharedActive, loadedRows],
   );
   return {
     config,
-    sharedEnabled,
+    sharedAvailable: config.sharedAvailable,
+    sharedActive,
+    selectedView,
+    registerView,
+    pinsIncludeShared,
     mine,
     shared,
     all,
+    inbox: config.inboxIncludesShared ? all : mine,
     pinned,
     loadedRows,
     loadedData,
@@ -159,13 +179,11 @@ export const SidebarDataContext = createContext<ReturnType<typeof useSidebarSour
 export function SidebarDataProvider({
   children,
   config = sidebarConfig,
-  sharedEnabled = config.sharedEnabledDefault,
 }: {
   children: ReactNode;
   config?: SidebarConfig;
-  sharedEnabled?: boolean;
 }) {
-  const data = useSidebarSources(config, sharedEnabled);
+  const data = useSidebarSources(config);
   return (
     <SidebarConfigContext.Provider value={config}>
       <SidebarDataContext.Provider value={data}>
@@ -188,5 +206,14 @@ export function useSidebarData() {
 /** Read shared rows without mounting another session-list query. */
 export function useLoadedConversations() {
   const { loadedData: data, all } = useSidebarData();
-  return { data, isLoading: all.isLoading };
+  return { data, isLoading: data === undefined && all.isLoading };
+}
+
+/** Register the mounted sidebar's persisted selection; unmount releases its demand. */
+export function useSidebarView(view: SessionFilter) {
+  const { registerView } = useSidebarData();
+  useLayoutEffect(() => {
+    registerView(view);
+    return () => registerView(null);
+  }, [view, registerView]);
 }

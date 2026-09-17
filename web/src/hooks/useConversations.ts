@@ -28,7 +28,7 @@ import {
   type QueryClient,
 } from "@tanstack/react-query";
 import { authenticatedFetch, getCurrentUserId } from "@/lib/identity";
-import { filterSessionScope } from "@/lib/sessionVisibility";
+import { filterSessionScope, sessionVisibility } from "@/lib/sessionVisibility";
 import { startTimedInteraction } from "@/lib/analyticsEmit";
 import {
   filtersFromConversationQueryKey,
@@ -110,7 +110,7 @@ function isAbortTimeout(error: unknown): boolean {
 const ARCHIVED_PROJECT_NAMES_KEY = ["archived-project-names"] as const;
 
 export interface UseConversationsOptions {
-  refreshIntervalMs?: number;
+  refreshIntervalMs?: number | false;
   snapshot?: boolean;
   reconcileWhileConnected?: boolean;
   // When false, the query is disabled (no fetch fires). Lets callers mount
@@ -1675,7 +1675,7 @@ export function usePinnedConversations(sharedEnabled = true, limit = sidebarConf
   const { refetch } = query;
   const previousSharedEnabled = useRef(sharedEnabled);
   useEffect(() => {
-    if (sharedEnabled && !previousSharedEnabled.current) void refetch();
+    if (sharedEnabled !== previousSharedEnabled.current) void refetch();
     previousSharedEnabled.current = sharedEnabled;
   }, [sharedEnabled, refetch]);
   return query;
@@ -1723,8 +1723,26 @@ function findCachedConversationRow(queryClient: QueryClient, id: string): Conver
     queryClient
       .getQueriesData<ConversationsInfiniteData>({ queryKey: ["project-sessions"] })
       .flatMap(([, data]) => data?.pages.flatMap((p) => p.data) ?? [])
-      .find((c) => c.id === id)
+      .find((c) => c.id === id) ??
+    queryClient.getQueryData<Conversation | null>(["conversation-backfill", id]) ??
+    cachedSessionRow(queryClient, id)
   );
+}
+
+function cachedSessionRow(queryClient: QueryClient, id: string): Conversation | undefined {
+  const session = queryClient.getQueryData<Session>(["session", id]);
+  if (!session) return undefined;
+  return {
+    id,
+    object: "conversation",
+    title: session.title,
+    created_at: session.createdAt,
+    updated_at: session.createdAt,
+    labels: session.labels ?? {},
+    permission_level: session.permissionLevel,
+    agent_id: session.agentId,
+    archived: session.archived,
+  };
 }
 
 /**
@@ -1757,7 +1775,9 @@ function findCachedConversationRow(queryClient: QueryClient, id: string): Conver
  * unions localStorage pins into the Pinned section, so it shows immediately.
  */
 export function useTogglePinnedConversation() {
-  const { pinCap } = useContext(SidebarConfigContext);
+  const { pinCap, pinsIncludeShared, sharedAvailable } = useContext(SidebarConfigContext);
+  const includeShared = pinsIncludeShared && sharedAvailable;
+  const viewerId = getCurrentUserId();
   const queryClient = useQueryClient();
 
   // Whether the server can store pins. Sourced from the pinned query's
@@ -1804,7 +1824,9 @@ export function useTogglePinnedConversation() {
       // list. If the query hasn't loaded yet, an optimistic patch implies the
       // server can store pins, so treat it as honored.
       const prev = old ?? { conversations: [], filterHonored: true };
-      const rest = prev.conversations.filter((c) => c.id !== id);
+      const rest = prev.conversations.filter(
+        (c) => c.id !== id && (includeShared || sessionVisibility(c, viewerId) === "mine"),
+      );
       if (!pinned) return { ...prev, conversations: rest };
       // Prefer the full cached row (keeps title/updated_at); fall back to a
       // minimal row when the session isn't in any loaded cache (rare — the pin
@@ -1813,6 +1835,9 @@ export function useTogglePinnedConversation() {
       const row: Conversation = existing
         ? { ...existing, labels }
         : ({ id, object: "conversation", labels } as Conversation);
+      if (!includeShared && (!existing || sessionVisibility(row, viewerId) !== "mine")) {
+        return { ...prev, conversations: rest };
+      }
       return { ...prev, conversations: [...rest, row] };
     });
   };
@@ -1838,11 +1863,26 @@ export function useTogglePinnedConversation() {
     // network resolves, which reads as lag. Snapshot the pinned cache so a
     // failed PATCH rolls back.
     onMutate: ({ id, pinned }) => {
+      const existing = findRow(id);
+      if (
+        pinned &&
+        !includeShared &&
+        (!existing || sessionVisibility(existing, viewerId) !== "mine")
+      ) {
+        const message = "Only your sessions can be pinned.";
+        showToast(message);
+        throw new Error(message);
+      }
       const cachedPins =
         queryClient.getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY);
       const pinIds = new Set([
-        ...(cachedPins?.conversations.map((row) => row.id) ?? []),
-        ...readPinnedConversationIds(),
+        ...(cachedPins?.conversations
+          .filter((row) => includeShared || sessionVisibility(row, viewerId) === "mine")
+          .map((row) => row.id) ?? []),
+        ...readPinnedConversationIds().filter((pinId) => {
+          const row = findRow(pinId);
+          return includeShared || (row && sessionVisibility(row, viewerId) === "mine");
+        }),
       ]);
       if (pinned && !pinIds.has(id) && pinIds.size >= pinCap) {
         const message = `You can pin up to ${pinCap} sessions. Unpin a session first.`;

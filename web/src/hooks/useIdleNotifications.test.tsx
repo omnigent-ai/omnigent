@@ -735,3 +735,16 @@ describe("useIdleNotifications lazy permission request", () => {
     expect(requestPermMock).not.toHaveBeenCalled();
   });
 });
+
+it("cancels a deferred notification when its scope leaves the loaded rows", async () => {
+  setConversations([conv("shared", "running")]);
+  const { rerender } = renderHook(() => useIdleNotifications());
+  setConversations([conv("shared", "idle")]);
+  rerender();
+  setConversations([]);
+  rerender();
+  await settle();
+  expect(showMock).not.toHaveBeenCalled();
+  expect(fetchPreviewMock).not.toHaveBeenCalled();
+  expect(setBadgeMock).toHaveBeenLastCalledWith(0);
+});

@@ -3,6 +3,7 @@ import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { sidebarConfig } from "@/lib/sidebarConfig";
 import { SidebarDataProvider } from "./useSidebarData";
 import { useAgents } from "./useAgents";
 import { refreshScopeWindow } from "@/lib/sidebarData";
@@ -49,7 +50,9 @@ function wrapper({ children }: { children: ReactNode }) {
   });
   return (
     <QueryClientProvider client={client}>
-      <SidebarDataProvider sharedEnabled={false}>{children}</SidebarDataProvider>
+      <SidebarDataProvider config={{ ...sidebarConfig, sharedAvailable: false }}>
+        {children}
+      </SidebarDataProvider>
     </QueryClientProvider>
   );
 }

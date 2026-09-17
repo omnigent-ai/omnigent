@@ -285,8 +285,6 @@ export function useIdleNotifications(activeConversationId?: string): void {
     );
     pushBadge(unread, conversations);
 
-    if (conversations.length === 0) return;
-
     const idle = detectIdleTransitions(prevStatus.current, conversations);
     const newElicitations = detectNewElicitations(prevElicitations.current, conversations);
     prevStatus.current = buildStatusMap(conversations);
@@ -295,6 +293,14 @@ export function useIdleNotifications(activeConversationId?: string): void {
     const windowFocused = windowFocusedRef.current;
     const grantedOrNative = isNativeShell() || getNotificationPermission() === "granted";
     const timers = idleNotifyTimers.current;
+    const presentIds = new Set(conversations.map((c) => c.id));
+    // An inactive scope must not deliver a previously queued notification.
+    for (const [id, timer] of timers) {
+      if (!presentIds.has(id)) {
+        clearTimeout(timer);
+        timers.delete(id);
+      }
+    }
 
     // Resume cancels a pending turn-end: any session back to `running` was just
     // between steps, not finished — drop its deferred cue before it fires.
@@ -310,7 +316,6 @@ export function useIdleNotifications(activeConversationId?: string): void {
     // Clear the "already beeped" mark for a session the user is now viewing
     // (they've dealt with it) or that dropped off the list, so a later finish
     // is allowed to beep again.
-    const presentIds = new Set(conversations.map((c) => c.id));
     for (const id of notifiedSessions.current) {
       if (!presentIds.has(id) || (windowFocused && id === activeConversationId)) {
         notifiedSessions.current.delete(id);
