@@ -14,7 +14,8 @@
 //  12. Comments are marked seen (inbox-clearing registry) only while the
 //      comments panel is open — never from merely opening the file.
 
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { useMemo } from "react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter, useSearchParams } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -179,6 +180,7 @@ import { useFileDiff } from "@/hooks/useFileDiff";
 import { getSeenCommentIds } from "@/hooks/useSeenComments";
 import { useWorkspaceChangedFiles } from "@/hooks/useWorkspaceChangedFiles";
 import { classifyAndRemapComments, FileViewer } from "./FileViewer";
+import { FileViewerContext, type FileNavigationGuard } from "./FileViewerContext";
 import { encodePdfAnchor } from "./pdfCommentHelpers";
 import { writeFileViewPreferences } from "@/lib/fileViewPreferences";
 import type { ChangedSort } from "./FlatFileList";
@@ -1910,6 +1912,51 @@ describe("file position navigation", () => {
     expect(screen.getByTestId("url-params")).not.toHaveTextContent("diff=1");
   });
 
+  it("confirms external navigation before applying it, and does not confirm twice", () => {
+    let guard: FileNavigationGuard | undefined;
+    const unregister = vi.fn();
+    const registerNavigationGuard = vi.fn((next: FileNavigationGuard) => {
+      guard = next;
+      return unregister;
+    });
+    function GuardedViewer() {
+      const contextValue = useMemo(
+        () => ({
+          openFile: vi.fn(),
+          registerNavigationGuard,
+          openGithubTab: vi.fn(),
+          isChangedPath: () => false,
+          conversationId: "conv_1",
+          workspaceRoot: null,
+          workspaceHome: null,
+        }),
+        [],
+      );
+      return (
+        <FileViewerContext.Provider value={contextValue}>
+          {viewerTree({ open: true, path: "file1.md" })}
+        </FileViewerContext.Provider>
+      );
+    }
+    const { unmount } = render(<GuardedViewer />);
+    const draft = screen.getByRole("textbox", { name: "Draft text" });
+    fireEvent.change(draft, { target: { value: "Unsaved draft" } });
+    const navigate = vi.fn();
+    act(() => guard!("file2.md", { line: 12 }, navigate));
+    expect(navigate).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Keep editing" }));
+    expect(navigate).not.toHaveBeenCalled();
+    expect(draft).toHaveValue("Unsaved draft");
+
+    // Viewer-owned navigation may already have a guard when it reaches AppShell.
+    act(() => guard!("file2.md", { line: 12 }, () => guard!("file2.md", { line: 12 }, navigate)));
+    fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
+    expect(navigate).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText("Unsaved changes")).toBeNull();
+    unmount();
+    expect(unregister).toHaveBeenCalled();
+  });
+
   it.each([false, true])(
     "keeps unsaved Markdown edits when a line navigation is cancelled (diff preference=%s)",
     (diffActive) => {
@@ -1920,15 +1967,19 @@ describe("file position navigation", () => {
         hideWhitespace: false,
         wrapLines: false,
       });
-      const { rerender } = renderViewer({ open: true, path: "file1.md" });
+      const { rerender, unmount } = renderViewer({ open: true, path: "file1.md" });
+      const request = { line: 12 };
       const draft = screen.getByRole("textbox", { name: "Draft text" });
       fireEvent.change(draft, { target: { value: "Unsaved Markdown draft" } });
-      rerender(viewerTree({ open: true, path: "file1.md", position: { line: 12 } }));
+      rerender(viewerTree({ open: true, path: "file1.md", position: request }));
       expect(screen.getByText("Unsaved changes")).toBeInTheDocument();
       fireEvent.click(screen.getByRole("button", { name: "Keep editing" }));
       expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-view-mode", "editor");
       expect(screen.getByRole("textbox", { name: "Draft text" })).toBe(draft);
       expect(draft).toHaveValue("Unsaved Markdown draft");
+      unmount();
+      renderViewer({ open: true, path: "file1.md", position: request });
+      expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-view-mode", "editor");
     },
   );
 });

@@ -16,8 +16,16 @@ export interface FilePosition {
 
 export type OpenFileOptions = Partial<FilePosition>;
 
+export type FileNavigationGuard = (
+  path: string,
+  options: OpenFileOptions | undefined,
+  navigate: () => void,
+) => void;
+
 interface FileViewerContextType {
   openFile: (path: string, options?: OpenFileOptions) => void;
+  /** The mounted viewer confirms dirty navigation before selection or URL changes. */
+  registerNavigationGuard?: (guard: FileNavigationGuard) => () => void;
   /** Open GitHub in the workspace rail or mobile drawer. */
   openGithubTab: () => void;
   /**

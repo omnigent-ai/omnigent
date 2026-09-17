@@ -9,7 +9,7 @@
 //   │  - gutter icon → add comment    │                  │
 //   └──────────────────────────────────┴──────────────────┘
 
-import type { FilePosition } from "./FileViewerContext";
+import { FileViewerContext, type FilePosition } from "./FileViewerContext";
 import {
   dismissFilePosition,
   isFilePositionDismissed,
@@ -21,6 +21,7 @@ import {
   lazy,
   Suspense,
   useCallback,
+  useContext,
   useEffect,
   useLayoutEffect,
   useMemo,
@@ -428,22 +429,31 @@ function FileViewerBody({
   // to decide whether to preserve the pending mark when the user clicks away.
   const pendingBodyRef = useRef("");
   const [isEditorDirty, setIsEditorDirty] = useState(false);
+  // Acceptance clears this synchronously before entering another navigation guard.
+  const isEditorDirtyRef = useRef(false);
+  const handleDirtyChange = useCallback((dirty: boolean) => {
+    isEditorDirtyRef.current = dirty;
+    setIsEditorDirty(dirty);
+  }, []);
   // Auto-save lifecycle reported up from the Monaco editor, shown as a status
   // chip in the toolbar (the editor itself no longer has a Save button).
   const [saveStatus, setSaveStatus] = useState<SaveStatus>("idle");
   // Brief "copied" feedback for the copy-link button.
   const [linkCopied, setLinkCopied] = useState(false);
   const linkCopiedTimerRef = useRef<number>(0);
-  const [pendingAction, setPendingAction] = useState<(() => void) | null>(null);
+  const [pendingAction, setPendingAction] = useState<{
+    apply: () => void;
+    cancel?: () => void;
+  } | null>(null);
   // TOC panel state (for markdown preview)
   const [tocOpen, setTocOpen] = useState(false);
   // Reset selection state whenever the file changes.
   useEffect(() => {
     setActiveSelection(null);
-    setIsEditorDirty(false);
+    handleDirtyChange(false);
     setSaveStatus("idle");
     setTocOpen(false);
-  }, [path]);
+  }, [path, handleDirtyChange]);
   // Reset comments initialization when the viewer transitions from closed to open,
   // so the panel state is derived from the freshly-opened file's comments.
   // When navigating via < > arrows (path changes while already open), the
@@ -489,16 +499,13 @@ function FileViewerBody({
     return () => window.removeEventListener("beforeunload", handler);
   }, [isEditorDirty]);
 
-  const guardDirty = useCallback(
-    (action: () => void) => {
-      if (isEditorDirty) {
-        setPendingAction(() => action);
-        return;
-      }
-      action();
-    },
-    [isEditorDirty],
-  );
+  const guardDirty = useCallback((action: () => void, cancel?: () => void) => {
+    if (isEditorDirtyRef.current) {
+      setPendingAction({ apply: action, cancel });
+      return;
+    }
+    action();
+  }, []);
 
   useEffect(
     () => () => {
@@ -769,6 +776,18 @@ function FileViewerBody({
     diffActive && isDiffAvailable ? "diff" : filePosition ? "source" : fileViewMode;
   const diffViewActive = viewMode === "diff";
 
+  const registerNavigationGuard = useContext(FileViewerContext)?.registerNavigationGuard;
+  useLayoutEffect(() => {
+    if (!open || !registerNavigationGuard) return;
+    return registerNavigationGuard((destination, options, navigate) => {
+      if (destination !== path || (options?.line && viewMode === "editor")) {
+        guardDirty(navigate);
+      } else {
+        navigate();
+      }
+    });
+  }, [open, path, viewMode, guardDirty, registerNavigationGuard]);
+
   useEffect(() => {
     const last = lastNavigationRef.current;
     if (last.position === position && last.path === path && last.conversationId === conversationId)
@@ -777,8 +796,13 @@ function FileViewerBody({
     lastNavigationRef.current = next;
     const apply = () => setAppliedNavigation(next);
     // Switching out of the rich-text editor must preserve its unsaved-edit guard.
-    if (position && viewMode === "editor") {
-      guardDirty(apply);
+    if (
+      position &&
+      viewMode === "editor" &&
+      last.path === path &&
+      last.conversationId === conversationId
+    ) {
+      guardDirty(apply, () => dismissFilePosition(position));
     } else {
       apply();
     }
@@ -894,14 +918,14 @@ function FileViewerBody({
   const splitToggleAvailable =
     contentWidth === null || contentWidth === 0 || contentWidth >= MONACO_SPLIT_BREAKPOINT;
   useEffect(() => {
-    if (viewMode !== "editor") setIsEditorDirty(false);
+    if (viewMode !== "editor") handleDirtyChange(false);
     // Skip on mount — only clear when the user actively switches modes.
     // Clearing on mount would race with the linked-comment effect.
     if (viewModeInitializedRef.current && (viewMode === "editor" || viewMode === "preview")) {
       setActiveSelection(null);
     }
     viewModeInitializedRef.current = true;
-  }, [viewMode]);
+  }, [viewMode, handleDirtyChange]);
 
   // Sync diff state to URL. Skip when already in sync to avoid clobbering ?file=
   // that AppShell writes (React Router v7 BrowserRouter defers via startTransition,
@@ -1600,7 +1624,7 @@ function FileViewerBody({
               conversationId={conversationId}
               path={path}
               fileQuery={fileQuery}
-              onDirtyChange={setIsEditorDirty}
+              onDirtyChange={handleDirtyChange}
               onSaveStatusChange={setSaveStatus}
               comments={openComments}
               addressedComments={addressedComments}
@@ -1684,7 +1708,10 @@ function FileViewerBody({
       <Dialog
         open={pendingAction !== null}
         onOpenChange={(isOpen) => {
-          if (!isOpen) setPendingAction(null);
+          if (!isOpen) {
+            pendingAction?.cancel?.();
+            setPendingAction(null);
+          }
         }}
       >
         <DialogContent showCloseButton={false}>
@@ -1695,14 +1722,20 @@ function FileViewerBody({
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
-            <Button variant="outline" onClick={() => setPendingAction(null)}>
+            <Button
+              variant="outline"
+              onClick={() => {
+                pendingAction?.cancel?.();
+                setPendingAction(null);
+              }}
+            >
               Keep editing
             </Button>
             <Button
               variant="destructive"
               onClick={() => {
-                setIsEditorDirty(false);
-                pendingAction?.();
+                handleDirtyChange(false);
+                pendingAction?.apply();
                 setPendingAction(null);
               }}
             >

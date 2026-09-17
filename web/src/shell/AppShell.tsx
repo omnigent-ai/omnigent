@@ -95,7 +95,12 @@ import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { ChatHeader } from "./ChatHeader";
 import { ExecutionLogsPanel } from "./ExecutionLogsPanel";
 import { FileViewer } from "./FileViewer";
-import { FileViewerContext, type FilePosition, type OpenFileOptions } from "./FileViewerContext";
+import {
+  FileViewerContext,
+  type FilePosition,
+  type OpenFileOptions,
+  type FileNavigationGuard,
+} from "./FileViewerContext";
 import { FilesPanelDrawer } from "./FilesPanelDrawer";
 import type { ChangedSort } from "./FlatFileList";
 import { GithubPanel } from "./GithubPanel";
@@ -1185,7 +1190,7 @@ export function AppShell() {
     writeFilesPanelPreferences({ ...readFilesPanelPreferences(), sort: s });
   }, []);
 
-  const openFileViewer = useCallback(
+  const commitFileNavigation = useCallback(
     (path: string, options?: OpenFileOptions) => {
       const position = options?.line ? { line: options.line, column: options.column } : undefined;
       setSelectedFilePath(path);
@@ -1241,6 +1246,27 @@ export function AppShell() {
       );
     },
     [setPanelInitialKey, terminalFirst, setSearchParams, conversationId],
+  );
+
+  // Desktop and mobile viewers can both be mounted; each may own a draft.
+  const fileNavigationGuardsRef = useRef(new Set<FileNavigationGuard>());
+  const registerNavigationGuard = useCallback((guard: FileNavigationGuard) => {
+    fileNavigationGuardsRef.current.add(guard);
+    return () => {
+      fileNavigationGuardsRef.current.delete(guard);
+    };
+  }, []);
+  const openFileViewer = useCallback(
+    (path: string, options?: OpenFileOptions) => {
+      const guards = [...fileNavigationGuardsRef.current];
+      const navigate = (index: number) => {
+        const guard = guards[index];
+        if (guard) guard(path, options, () => navigate(index + 1));
+        else commitFileNavigation(path, options);
+      };
+      navigate(0);
+    },
+    [commitFileNavigation],
   );
 
   // Strip the file-viewer URL params (file/diff/comment). Memoized on
@@ -1808,13 +1834,22 @@ export function AppShell() {
   const fileViewerContextValue = useMemo(
     () => ({
       openFile: openFileViewer,
+      registerNavigationGuard,
       openGithubTab,
       isChangedPath,
       conversationId,
       workspaceRoot,
       workspaceHome,
     }),
-    [openFileViewer, openGithubTab, isChangedPath, conversationId, workspaceRoot, workspaceHome],
+    [
+      openFileViewer,
+      registerNavigationGuard,
+      openGithubTab,
+      isChangedPath,
+      conversationId,
+      workspaceRoot,
+      workspaceHome,
+    ],
   );
 
   // Context for descendants — ChatPage's ConnectionIndicator reads

@@ -210,13 +210,15 @@ def test_source_citation_centers_last_loaded_line(
     )
 
 
+@pytest.mark.parametrize("cross_file", [False, True])
 def test_citation_preserves_offline_markdown_draft_with_diff_preference(
-    page: Page, seeded_session: tuple[str, str]
+    page: Page, seeded_session: tuple[str, str], cross_file: bool
 ) -> None:
     """An unchanged Markdown file still guards its draft when diff is preferred."""
     base_url, session_id = seeded_session
     path = "src/unchanged.md"
-    content = "# Existing document\n\nOriginal paragraph.\n"
+    destination = "src/destination.md" if cross_file else path
+    content = "\n".join(f"Original paragraph {line}." for line in range(1, 51))
     environment_url = f"{base_url}/v1/sessions/{session_id}/resources/environments/default"
     page.route(
         environment_url,
@@ -229,7 +231,13 @@ def test_citation_preserves_offline_markdown_draft_with_diff_preference(
                 "object": "list",
                 "has_more": False,
                 "data": [
-                    {"path": path, "name": "unchanged.md", "type": "file", "bytes": len(content)}
+                    {
+                        "path": item,
+                        "name": item.split("/")[-1],
+                        "type": "file",
+                        "bytes": len(content),
+                    }
+                    for item in {path, destination}
                 ],
             }
         ),
@@ -238,19 +246,20 @@ def test_citation_preserves_offline_markdown_draft_with_diff_preference(
         f"{environment_url}/changes",
         lambda route: route.fulfill(json={"object": "list", "has_more": False, "data": []}),
     )
-    page.route(
-        f"{environment_url}/filesystem/{path}",
-        lambda route: route.fulfill(
-            json={
-                "object": "session.environment.filesystem.file_content",
-                "path": path,
-                "content": content,
-                "encoding": "utf-8",
-                "content_type": "text/markdown",
-                "bytes": len(content),
-            }
-        ),
-    )
+    for item in {path, destination}:
+        page.route(
+            f"{environment_url}/filesystem/{item}",
+            lambda route: route.fulfill(
+                json={
+                    "object": "session.environment.filesystem.file_content",
+                    "path": route.request.url.split("/filesystem/", 1)[1],
+                    "content": content,
+                    "encoding": "utf-8",
+                    "content_type": "text/markdown",
+                    "bytes": len(content),
+                }
+            ),
+        )
     page.route(
         f"{base_url}/health?session_ids=*",
         lambda route: route.fulfill(
@@ -261,7 +270,7 @@ def test_citation_preserves_offline_markdown_draft_with_diff_preference(
         f"{base_url}/v1/sessions/{session_id}/events",
         json={
             "type": "external_assistant_message",
-            "data": {"agent": "hello_world", "text": f"[Markdown line]({path}:2)"},
+            "data": {"agent": "hello_world", "text": f"[Markdown line]({destination}:12)"},
         },
         timeout=10,
     )
@@ -280,10 +289,33 @@ def test_citation_preserves_offline_markdown_draft_with_diff_preference(
     page.get_by_role("button", name="Markdown line", exact=True).click()
     dialog = page.get_by_role("dialog", name="Unsaved changes")
     expect(dialog).to_contain_text("Unsaved changes")
+    page.wait_for_function(
+        "path => new URL(location.href).searchParams.get('file') === path", arg=path
+    )
+    expect(page).not_to_have_url(re.compile(r"[?&]line="))
     dialog.get_by_role("button", name="Keep editing", exact=True).click()
     expect(editor).to_be_visible()
     expect(editor).to_have_text("Unsaved offline Markdown draft")
     expect(viewer.locator(".monaco-editor")).to_have_count(0)
+
+    if not cross_file:
+        page.get_by_role("button", name="Collapse right panel").click()
+        expect(viewer).to_have_count(0)
+        page.get_by_role("button", name="Expand right panel").click()
+        expect(editor).to_be_visible()
+        expect(page).not_to_have_url(re.compile(r"[?&]line="))
+        editor.fill("Another unsaved offline draft")
+
+    page.get_by_role("button", name="Markdown line", exact=True).click()
+    dialog.get_by_role("button", name="Discard changes", exact=True).click()
+    expect(dialog).not_to_be_visible()
+    page.wait_for_function(
+        "path => new URL(location.href).searchParams.get('file') === path", arg=destination
+    )
+    expect(page).to_have_url(re.compile(r"[?&]line=12(?:&|$)"))
+    target = viewer.locator('[data-line="12"]')
+    expect(target).to_have_text("Original paragraph 12.")
+    expect(target).to_be_in_viewport()
 
 
 def test_plain_markdown_open_restores_scroll_after_citing_another_file(
