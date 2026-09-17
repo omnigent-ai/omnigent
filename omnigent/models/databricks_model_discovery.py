@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 import warnings
 from collections.abc import Iterable
@@ -19,10 +20,27 @@ _ANTHROPIC_MODELS_PATH = "/ai-gateway/anthropic/v1/models"
 _MODEL_SERVICE_PREFIX = "model-services/"
 _SYSTEM_MODEL_PREFIX = "system.ai."
 _MODEL_SERVICES_MAX_RESULTS = 1000
-_MODEL_SERVICES_PARENT = "schemas/system.ai"
+_DEFAULT_MODEL_SERVICES_PARENT = "schemas/system.ai"
+_MODEL_SERVICES_PARENT_ENV_VAR = "OMNIGENT_DATABRICKS_MODEL_SERVICES_PARENT"
 _PAGE_SIZE = 100
 _MAX_PAGES = 100
 _HTTP_TIMEOUT_S = 10.0
+
+
+def resolve_model_services_parent(override: str | None = None) -> str:
+    """Unity Catalog parent to list Databricks model-services under.
+
+    Priority: an explicit ``override`` (from provider config), then the
+    ``OMNIGENT_DATABRICKS_MODEL_SERVICES_PARENT`` env var, then the default
+    ``schemas/system.ai``. A workspace whose gateway model-services live in a
+    non-``system.ai`` schema opts in without changing stock behaviour.
+    """
+    if override and override.strip():
+        return override.strip()
+    env = os.environ.get(_MODEL_SERVICES_PARENT_ENV_VAR, "").strip()
+    if env:
+        return env
+    return _DEFAULT_MODEL_SERVICES_PARENT
 
 
 #: Catalog spellings the same endpoint can be served under. Ordered by
@@ -154,15 +172,22 @@ def _list_model_service_ids(
     client: httpx.Client,
     workspace_url: str,
     headers: dict[str, str],
+    model_services_parent: str | None = None,
 ) -> list[str]:
-    """List Databricks-managed ``system.ai`` model-service identifiers."""
+    """List Databricks-managed model-service identifiers under the parent schema.
+
+    :param model_services_parent: Provider-config override for the Unity Catalog
+        parent schema to list under. ``None`` falls back to the env var / default
+        via :func:`resolve_model_services_parent`, so a workspace whose gateway
+        model-services live outside ``system.ai`` is honored via config alone.
+    """
     model_ids: list[str] = []
     page_token: str | None = None
     seen_tokens: set[str] = set()
     for _ in range(_MAX_PAGES):
         params: dict[str, str] = {
             "max_results": str(_MODEL_SERVICES_MAX_RESULTS),
-            "parent": _MODEL_SERVICES_PARENT,
+            "parent": resolve_model_services_parent(model_services_parent),
         }
         if page_token is not None:
             params["page_token"] = page_token
@@ -254,6 +279,7 @@ def discover_databricks_claude_catalog(
     token: str,
     *,
     transport: httpx.BaseTransport | None = None,
+    model_services_parent: str | None = None,
 ) -> DatabricksClaudeCatalog:
     """Discover every Claude endpoint a Databricks workspace serves.
 
@@ -273,6 +299,9 @@ def discover_databricks_claude_catalog(
     :param workspace_url: Workspace origin, e.g. ``"https://example.com"``.
     :param token: Workspace bearer token.
     :param transport: Optional HTTP transport used by tests.
+    :param model_services_parent: Provider-config override for the Unity Catalog
+        parent schema to list model-services under. ``None`` falls back to the
+        env var / default via :func:`resolve_model_services_parent`.
     :returns: The workspace's Claude catalog. Empty ``families`` with empty
         ``model_ids`` is authoritative: the model-services listing answered
         successfully and no Claude models are exposed.
@@ -287,7 +316,9 @@ def discover_databricks_claude_catalog(
     gateway_ids: list[str] = []
     with httpx.Client(transport=transport, timeout=_HTTP_TIMEOUT_S) as client:
         try:
-            model_service_ids = _list_model_service_ids(client, workspace_url, headers)
+            model_service_ids = _list_model_service_ids(
+                client, workspace_url, headers, model_services_parent
+            )
         except (httpx.HTTPError, ValueError) as exc:
             primary_error = exc
         try:
@@ -322,6 +353,7 @@ def discover_databricks_claude_models(
     token: str,
     *,
     transport: httpx.BaseTransport | None = None,
+    model_services_parent: str | None = None,
 ) -> dict[str, str]:
     """Discover the live Claude family mapping for a Databricks workspace.
 
@@ -333,6 +365,8 @@ def discover_databricks_claude_models(
     :param workspace_url: Workspace origin, e.g. ``"https://example.com"``.
     :param token: Workspace bearer token.
     :param transport: Optional HTTP transport used by tests.
+    :param model_services_parent: Provider-config override for the Unity Catalog
+        parent schema; ``None`` falls back to env var / default.
     :returns: Family aliases mapped to routable model ids. An empty mapping is
         authoritative: the listing answered and no Claude models are exposed.
     :raises httpx.HTTPError: Same contract as the catalog lookup.
@@ -348,6 +382,7 @@ def discover_databricks_claude_models(
         workspace_url,
         token,
         transport=transport,
+        model_services_parent=model_services_parent,
     ).families
 
 
@@ -357,6 +392,7 @@ def discover_databricks_codex_models(
     token: str,
     *,
     transport: httpx.BaseTransport | None = None,
+    model_services_parent: str | None = None,
 ) -> tuple[str, ...]:
     """Discover every codex-compatible model a Databricks workspace serves.
 
@@ -368,6 +404,9 @@ def discover_databricks_codex_models(
     :param workspace_url: Workspace origin, e.g. ``"https://example.com"``.
     :param token: Workspace bearer token.
     :param transport: Optional HTTP transport used by tests.
+    :param model_services_parent: Provider-config override for the Unity Catalog
+        parent schema to list model-services under. ``None`` falls back to the
+        env var / default via :func:`resolve_model_services_parent`.
     :returns: Codex-servable model ids, best default first, e.g.
         ``("system.ai.gpt-5-6-sol", "system.ai.gpt-5-5")``. An empty tuple is
         authoritative: the listing answered and exposes no codex model.
@@ -378,7 +417,7 @@ def discover_databricks_codex_models(
 
     headers = {"Authorization": f"Bearer {token}"}
     with httpx.Client(transport=transport, timeout=_HTTP_TIMEOUT_S) as client:
-        model_ids = _list_model_service_ids(client, workspace_url, headers)
+        model_ids = _list_model_service_ids(client, workspace_url, headers, model_services_parent)
     codex_ids = [model_id for model_id in model_ids if is_codex_compatible_model(model_id)]
     return tuple(sorted(codex_ids, key=_codex_preference_rank, reverse=True))
 

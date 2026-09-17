@@ -256,6 +256,23 @@ def test_to_models_config_shape() -> None:
     assert entry["models"] == [{"id": "databricks-claude-sonnet-4-6", "reasoning": True}]
 
 
+def test_databricks_gateway_omits_adaptive_thinking_compat() -> None:
+    """Unity Gateway rejects Pi's ``thinking.type=adaptive`` request shape."""
+    provider = creds.PiProviderConfig(
+        provider_id="omnigent",
+        base_url="https://123.ai-gateway.cloud.databricks.com/anthropic/v1",
+        api="anthropic-messages",
+        model="eng_dev.ai_gateway.omni-claude-high",
+        api_key="!get-token",
+        auth_header=True,
+    )
+
+    entry = provider.to_models_config()["providers"]["omnigent"]
+
+    assert "compat" not in entry
+    assert entry["models"] == [{"id": "eng_dev.ai_gateway.omni-claude-high", "reasoning": True}]
+
+
 def test_write_models_config_is_owner_only(tmp_path: Path) -> None:
     """models.json is written 0600 in a 0700 dir (it may hold a literal key)."""
     provider = creds.PiProviderConfig(
@@ -1775,6 +1792,77 @@ def test_fetch_pi_model_lists_parses_serving_endpoints() -> None:
     # Embedding excluded
     assert "system.ai.qwen3-embedding" not in gpt_ids + completions_ids + claude_ids
     assert all(m.get("input") == ["text", "image"] for m in claude + gpt + completions)
+
+
+def test_fetch_pi_model_lists_uses_gateway_routing_target_limits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pi emits the catalog limits for a gateway alias's live target model."""
+    import unittest.mock
+
+    from omnigent.models import model_catalog
+    from omnigent.models.model_metadata import ModelMetadata
+
+    target = "us.anthropic.claude-opus-4-8"
+    monkeypatch.setattr(
+        model_catalog,
+        "catalog_model_entries",
+        lambda provider: (
+            (
+                model_catalog.ModelEntry(
+                    id=target,
+                    family="claude",
+                    metadata=ModelMetadata(context_window=1_000_000, max_output_tokens=128_000),
+                ),
+            )
+            if provider == "bedrock"
+            else ()
+        ),
+    )
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/model-services"):
+            return httpx.Response(
+                200,
+                json={
+                    "model_services": [
+                        {"name": "model-services/eng_dev.ai_gateway.omni-claude-high"}
+                    ]
+                },
+                request=request,
+            )
+        return httpx.Response(
+            200,
+            json={
+                "supported_api_types": ["anthropic/v1/messages"],
+                "config": {
+                    "routing": {
+                        "destinations": [{"external_model_config": {"target": {"model": target}}}]
+                    }
+                },
+            },
+            request=request,
+        )
+
+    real_client = httpx.Client
+    with unittest.mock.patch(
+        "httpx.Client", lambda **kwargs: real_client(transport=httpx.MockTransport(_handler))
+    ):
+        claude, _gpt, _completions, _gemini = creds._fetch_pi_model_lists(
+            "https://workspace.example.com",
+            "token",
+            model_services_parent="schemas/eng_dev.ai_gateway",
+        )
+
+    assert claude == [
+        {
+            "id": "eng_dev.ai_gateway.omni-claude-high",
+            "input": ["text", "image"],
+            "contextWindow": 1_000_000,
+            "maxTokens": 128_000,
+            "reasoning": True,
+        }
+    ]
 
 
 def test_fetch_pi_model_lists_falls_back_on_http_error() -> None:

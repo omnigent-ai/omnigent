@@ -1015,3 +1015,31 @@ def test_claude_sdk_resolution_survives_stray_cli_config_claude_entry() -> None:
     }
     entry = default_provider_for_harness(config, "claude-sdk")  # must NOT raise
     assert entry is not None and entry.name == "vendor-anthropic"
+
+
+def test_databricks_parses_model_services_parent() -> None:
+    config = {
+        "providers": {
+            "dbx": {
+                "kind": "databricks",
+                "profile": "ws",
+                "model_services_parent": "schemas/eng_dev.ai_gateway",
+            }
+        }
+    }
+    assert load_providers(config)["dbx"].model_services_parent == "schemas/eng_dev.ai_gateway"
+
+
+def test_databricks_model_services_parent_defaults_to_none() -> None:
+    config = {"providers": {"dbx": {"kind": "databricks", "profile": "ws"}}}
+    assert load_providers(config)["dbx"].model_services_parent is None
+
+
+def test_databricks_model_services_parent_rejects_blank() -> None:
+    bad = {
+        "providers": {
+            "dbx": {"kind": "databricks", "profile": "ws", "model_services_parent": "   "}
+        }
+    }
+    with pytest.raises(OmnigentError):
+        load_providers(bad)

@@ -76,8 +76,8 @@ def databricks_pi_surface_for_model(model_id: str) -> DatabricksPiSurface:
 PI_REASONING_MODEL_FRAGMENTS: tuple[str, ...] = ("deepseek",)
 
 # Claude models support extended thinking; reasoning:true in the model entry
-# enables Pi's thinking level controls. Paired with forceAdaptiveThinking in the
-# provider compat block so Pi sends thinking.type.adaptive (required by claude-4+).
+# enables Pi's thinking-level controls. Direct Claude providers additionally use
+# adaptive thinking, while gateway-backed providers retain the legacy encoding.
 PI_CLAUDE_THINKING_MODEL_FRAGMENTS: tuple[str, ...] = ("claude",)
 
 

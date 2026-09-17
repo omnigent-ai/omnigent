@@ -47,6 +47,7 @@ from cachetools import TTLCache
 
 from omnigent._platform import default_shell_argv
 from omnigent.llms.anthropic_model_metadata import parse_anthropic_model_metadata
+from omnigent.models.databricks_model_discovery import resolve_model_services_parent
 from omnigent.models.model_metadata import (
     ModelCapability,
     ModelCostTier,
@@ -101,12 +102,9 @@ _LLM_NAME_TOKENS = ("claude", "gpt", "codex", "gemini", "llama", "qwen", "kimi")
 # Chat-capable endpoint tasks ("llm/v1/chat"); embeddings/rerankers don't match.
 _LLM_TASK_TOKENS = ("chat", "completion")
 
-# DATABRICKS-PATCH(model-services-scoped-listing): scope + page the Unity
-# Catalog model-services listing. Mirrors
-# ``databricks_model_discovery._MODEL_SERVICES_PARENT`` /
-# ``_MODEL_SERVICES_MAX_RESULTS`` — including the parameter *name*, so both
-# callers of this endpoint ask for a page size the API actually honors.
-_MODEL_SERVICES_PARENT = "schemas/system.ai"
+# Scope + page the Unity Catalog model-services listing. The parent schema
+# comes from the shared resolver in databricks_model_discovery so both callers
+# stay in sync and honour the same override.
 _MODEL_SERVICES_MAX_RESULTS = 100
 _MODEL_SERVICES_MAX_PAGES = 100
 
@@ -1329,6 +1327,7 @@ def fetch_databricks_model_service_entries(
     token: str,
     *,
     transport: httpx.BaseTransport | None = None,
+    model_services_parent: str | None = None,
 ) -> tuple[ModelEntry, ...]:
     """Fetch normalized Unity Catalog model-service metadata.
 
@@ -1355,7 +1354,7 @@ def fetch_databricks_model_service_entries(
     with httpx.Client(transport=transport, timeout=_HTTP_TIMEOUT_S) as client:
         for _ in range(_MODEL_SERVICES_MAX_PAGES):
             params = {
-                "parent": _MODEL_SERVICES_PARENT,
+                "parent": resolve_model_services_parent(model_services_parent),
                 "max_results": str(_MODEL_SERVICES_MAX_RESULTS),
             }
             if page_token is not None:
@@ -1395,6 +1394,43 @@ def fetch_databricks_model_service_entries(
                 "the model list may be incomplete",
                 _MODEL_SERVICES_MAX_PAGES,
             )
+    bedrock_metadata: dict[str, ModelMetadata] | None = None
+
+    def routing_target_metadata(targets: tuple[str, ...]) -> ModelMetadata | None:
+        """Return conservative limits for the service's Bedrock route targets."""
+        nonlocal bedrock_metadata
+        if not targets:
+            return None
+        if bedrock_metadata is None:
+            try:
+                bedrock_metadata = {
+                    entry.id.lower(): entry.metadata for entry in catalog_model_entries("bedrock")
+                }
+            except Exception:  # noqa: BLE001 — catalog enrichment is best-effort
+                _logger.info(
+                    "could not load Bedrock metadata for model-service routes", exc_info=True
+                )
+                bedrock_metadata = {}
+        matched = [
+            bedrock_metadata[target.lower()]
+            for target in targets
+            if target.lower() in bedrock_metadata
+        ]
+        context_windows = [
+            metadata.context_window for metadata in matched if metadata.context_window
+        ]
+        output_limits = [
+            metadata.max_output_tokens for metadata in matched if metadata.max_output_tokens
+        ]
+        if not context_windows and not output_limits:
+            return None
+        # A weighted route can change destination between requests. Advertise
+        # only the limits every live destination can honor.
+        return ModelMetadata(
+            context_window=min(context_windows) if context_windows else None,
+            max_output_tokens=min(output_limits) if output_limits else None,
+        )
+
     models: list[ModelEntry] = []
     for service in services:
         if not isinstance(service, dict):
@@ -1409,7 +1445,38 @@ def fetch_databricks_model_service_entries(
         )
         if not name:
             continue
+        detail: object = service
         api_types = service.get("supported_api_types")
+        # Gateway-schema list entries omit both API capabilities and routing
+        # targets. Fetch their complete service record to recover both.
+        if not (isinstance(api_types, list) and api_types) or not name.startswith("system.ai."):
+            try:
+                with httpx.Client(transport=transport, timeout=_HTTP_TIMEOUT_S) as svc_client:
+                    svc_resp = svc_client.get(
+                        f"{workspace_url.rstrip('/')}/api/2.1/unity-catalog/{raw_name}",
+                        headers={"Authorization": f"Bearer {token}"},
+                    )
+                    svc_resp.raise_for_status()
+                    detail = svc_resp.json()
+                    if isinstance(detail, dict):
+                        api_types = detail.get("supported_api_types", api_types)
+            except httpx.HTTPError:
+                detail = service
+        targets: list[str] = []
+        routing = detail.get("config", {}).get("routing", {}) if isinstance(detail, dict) else {}
+        destinations = routing.get("destinations", []) if isinstance(routing, dict) else []
+        for destination in destinations if isinstance(destinations, list) else []:
+            if not isinstance(destination, dict) or destination.get("is_deleted") is True:
+                continue
+            traffic_percentage = destination.get("traffic_percentage")
+            if isinstance(traffic_percentage, (int, float)) and traffic_percentage <= 0:
+                continue
+            config = destination.get("external_model_config")
+            target = config.get("target") if isinstance(config, dict) else None
+            target_model = target.get("model") if isinstance(target, dict) else None
+            if isinstance(target_model, str) and target_model:
+                targets.append(target_model)
+        target_metadata = routing_target_metadata(tuple(targets))
         normalized_api_types = {
             api_type.lower()
             for api_type in (api_types if isinstance(api_types, list) else [])
@@ -1430,7 +1497,15 @@ def fetch_databricks_model_service_entries(
             ModelEntry(
                 id=name,
                 family=model_family_token(name),
-                metadata=ModelMetadata(wire_apis=frozenset(wire_apis)),
+                metadata=ModelMetadata(
+                    context_window=(
+                        target_metadata.context_window if target_metadata is not None else None
+                    ),
+                    max_output_tokens=(
+                        target_metadata.max_output_tokens if target_metadata is not None else None
+                    ),
+                    wire_apis=frozenset(wire_apis),
+                ),
             )
         )
     return tuple(models)

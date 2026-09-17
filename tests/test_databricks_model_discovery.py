@@ -5,7 +5,12 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from omnigent.models.databricks_model_discovery import discover_databricks_claude_catalog
+from omnigent.models.databricks_model_discovery import (
+    discover_databricks_claude_catalog,
+    resolve_model_services_parent,
+)
+
+_PARENT_ENV_VAR = "OMNIGENT_DATABRICKS_MODEL_SERVICES_PARENT"
 
 # One-shot stubs for the two discovery endpoints: ``(status, json_payload)``,
 # with a ``None`` payload meaning "no body" (a bare error response).
@@ -371,3 +376,155 @@ def test_select_servable_model_matches_legacy_spelling() -> None:
     assert select_servable_model("databricks-gpt-5-6-luna", servable) == "system.ai.gpt-5-6-luna"
     # A model the workspace does not serve is left for the caller to pass through.
     assert select_servable_model("databricks-gpt-9-9", servable) is None
+
+
+def test_resolve_model_services_parent_defaults_to_system_ai(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(_PARENT_ENV_VAR, raising=False)
+    assert resolve_model_services_parent() == "schemas/system.ai"
+
+
+def test_resolve_model_services_parent_reads_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(_PARENT_ENV_VAR, "schemas/eng_dev.ai_gateway")
+    assert resolve_model_services_parent() == "schemas/eng_dev.ai_gateway"
+
+
+def test_resolve_model_services_parent_override_beats_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(_PARENT_ENV_VAR, "schemas/from_env")
+    assert resolve_model_services_parent("schemas/from_config") == "schemas/from_config"
+
+
+def _listing_request(requests: list[httpx.Request]) -> httpx.Request:
+    """Return the captured model-services listing request."""
+    return next(r for r in requests if r.url.path.endswith("/model-services"))
+
+
+def test_claude_discovery_forwards_model_services_parent_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A config override reaches the listing request without the env var set."""
+    monkeypatch.delenv(_PARENT_ENV_VAR, raising=False)
+    requests: list[httpx.Request] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        payload = (
+            {"model_services": [{"name": "model-services/system.ai.claude-opus-5"}]}
+            if request.url.path.endswith("/model-services")
+            else {"data": []}
+        )
+        return httpx.Response(200, json=payload, request=request)
+
+    catalog = discover_databricks_claude_catalog(
+        "https://workspace.example.com",
+        "token",
+        transport=httpx.MockTransport(_handler),
+        model_services_parent="schemas/eng_dev.ai_gateway",
+    )
+
+    assert _listing_request(requests).url.params["parent"] == "schemas/eng_dev.ai_gateway"
+    # The override alone drives the parent — no env var was set.
+    assert catalog.families == {"opus": "system.ai.claude-opus-5"}
+
+
+def test_claude_discovery_defaults_to_system_ai_without_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No override and no env var lists the stock ``system.ai`` schema."""
+    monkeypatch.delenv(_PARENT_ENV_VAR, raising=False)
+    requests: list[httpx.Request] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        payload = (
+            {"model_services": []}
+            if request.url.path.endswith("/model-services")
+            else {"data": []}
+        )
+        return httpx.Response(200, json=payload, request=request)
+
+    discover_databricks_claude_catalog(
+        "https://workspace.example.com",
+        "token",
+        transport=httpx.MockTransport(_handler),
+    )
+
+    assert _listing_request(requests).url.params["parent"] == "schemas/system.ai"
+
+
+def test_claude_discovery_falls_back_to_env_without_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no config override the env var still selects the parent schema."""
+    monkeypatch.setenv(_PARENT_ENV_VAR, "schemas/from_env")
+    requests: list[httpx.Request] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        payload = (
+            {"model_services": []}
+            if request.url.path.endswith("/model-services")
+            else {"data": []}
+        )
+        return httpx.Response(200, json=payload, request=request)
+
+    discover_databricks_claude_catalog(
+        "https://workspace.example.com",
+        "token",
+        transport=httpx.MockTransport(_handler),
+    )
+
+    assert _listing_request(requests).url.params["parent"] == "schemas/from_env"
+
+
+def test_codex_discovery_forwards_model_services_parent_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The codex discovery path forwards the config override to the listing."""
+    from omnigent.models.databricks_model_discovery import discover_databricks_codex_models
+
+    monkeypatch.delenv(_PARENT_ENV_VAR, raising=False)
+    requests: list[httpx.Request] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={"model_services": [{"name": "model-services/system.ai.gpt-5-6-sol"}]},
+            request=request,
+        )
+
+    servable = discover_databricks_codex_models(
+        "https://workspace.example.com",
+        "token",
+        transport=httpx.MockTransport(_handler),
+        model_services_parent="schemas/eng_dev.ai_gateway",
+    )
+
+    assert requests[0].url.params["parent"] == "schemas/eng_dev.ai_gateway"
+    assert servable == ("system.ai.gpt-5-6-sol",)
+
+
+def test_codex_discovery_defaults_to_system_ai_without_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The codex discovery path lists ``system.ai`` when no override is passed."""
+    from omnigent.models.databricks_model_discovery import discover_databricks_codex_models
+
+    monkeypatch.delenv(_PARENT_ENV_VAR, raising=False)
+    requests: list[httpx.Request] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"model_services": []}, request=request)
+
+    discover_databricks_codex_models(
+        "https://workspace.example.com",
+        "token",
+        transport=httpx.MockTransport(_handler),
+    )
+
+    assert requests[0].url.params["parent"] == "schemas/system.ai"

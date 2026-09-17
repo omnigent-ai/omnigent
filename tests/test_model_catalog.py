@@ -1882,3 +1882,132 @@ def test_model_services_listing_stops_on_repeated_page_token(
 
     assert [entry.id for entry in entries]  # partial list kept, not an exception
     assert any("repeated a page token" in record.message for record in caplog.records)
+
+
+def test_model_services_parent_override_is_used() -> None:
+    """An explicit parent schema is passed straight through to the listing call."""
+    from omnigent.models import model_catalog
+
+    requests_seen: list[httpx.Request] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        requests_seen.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "model_services": [
+                    {
+                        "name": "model-services/eng_dev.ai_gateway.omni-gpt",
+                        "supported_api_types": ["openai/v1/responses"],
+                    }
+                ]
+            },
+            request=request,
+        )
+
+    entries = model_catalog.fetch_databricks_model_service_entries(
+        "https://workspace.example.com",
+        "token",
+        transport=httpx.MockTransport(_handler),
+        model_services_parent="schemas/eng_dev.ai_gateway",
+    )
+
+    assert requests_seen[0].url.params["parent"] == "schemas/eng_dev.ai_gateway"
+    assert [entry.id for entry in entries] == ["eng_dev.ai_gateway.omni-gpt"]
+
+
+def test_missing_api_types_fetched_per_service() -> None:
+    """A service whose list entry omits supported_api_types is fetched per-service.
+
+    MPS-backed services in a gateway schema don't advertise their wire API in
+    the list response; without the per-service fetch the entry is dropped.
+    """
+    from omnigent.models import model_catalog
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/model-services"):
+            return httpx.Response(
+                200,
+                json={
+                    "model_services": [{"name": "model-services/eng_dev.ai_gateway.omni-claude"}]
+                },
+                request=request,
+            )
+        assert request.url.path.endswith("/model-services/eng_dev.ai_gateway.omni-claude")
+        return httpx.Response(
+            200,
+            json={"supported_api_types": ["anthropic/v1/messages"]},
+            request=request,
+        )
+
+    entries = model_catalog.fetch_databricks_model_service_entries(
+        "https://workspace.example.com",
+        "token",
+        transport=httpx.MockTransport(_handler),
+        model_services_parent="schemas/eng_dev.ai_gateway",
+    )
+
+    assert [entry.id for entry in entries] == ["eng_dev.ai_gateway.omni-claude"]
+
+
+def test_gateway_model_service_inherits_limits_from_routing_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A gateway alias advertises the limits of its live Bedrock destination."""
+    target = "us.anthropic.claude-opus-4-8"
+    monkeypatch.setattr(
+        model_catalog,
+        "catalog_model_entries",
+        lambda provider: (
+            (
+                ModelEntry(
+                    id=target,
+                    family="claude",
+                    metadata=ModelMetadata(context_window=1_000_000, max_output_tokens=128_000),
+                ),
+            )
+            if provider == "bedrock"
+            else ()
+        ),
+    )
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/model-services"):
+            return httpx.Response(
+                200,
+                json={
+                    "model_services": [
+                        {"name": "model-services/eng_dev.ai_gateway.omni-claude-high"}
+                    ]
+                },
+                request=request,
+            )
+        return httpx.Response(
+            200,
+            json={
+                "supported_api_types": ["anthropic/v1/messages"],
+                "config": {
+                    "routing": {
+                        "destinations": [
+                            {
+                                "external_model_config": {"target": {"model": target}},
+                                "traffic_percentage": 100,
+                            }
+                        ]
+                    }
+                },
+            },
+            request=request,
+        )
+
+    entries = model_catalog.fetch_databricks_model_service_entries(
+        "https://workspace.example.com",
+        "token",
+        transport=httpx.MockTransport(_handler),
+        model_services_parent="schemas/eng_dev.ai_gateway",
+    )
+
+    assert len(entries) == 1
+    assert entries[0].id == "eng_dev.ai_gateway.omni-claude-high"
+    assert entries[0].metadata.context_window == 1_000_000
+    assert entries[0].metadata.max_output_tokens == 128_000

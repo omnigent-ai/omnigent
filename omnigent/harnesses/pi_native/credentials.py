@@ -366,11 +366,10 @@ class PiProviderConfig:
         }
         if self.auth_header:
             provider["authHeader"] = True
-        # Claude 4+ / Claude 5 models require thinking.type.adaptive (not
-        # thinking.type.enabled). Pi 0.84.2+ sends adaptive when forceAdaptiveThinking
-        # is set in the compat block; reasoning:true on the model entry enables Pi's
-        # thinking level controls.
-        if self.api == "anthropic-messages":
+        # Direct Claude APIs use adaptive thinking for Claude 4+. Unity Gateway's
+        # Anthropic surface rejects that request shape, so leave Pi on its legacy
+        # thinking encoding there while retaining the model-level reasoning control.
+        if self.api == "anthropic-messages" and not _is_databricks_ai_gateway_url(self.base_url):
             provider["compat"] = {"forceAdaptiveThinking": True}
         providers = {self.provider_id: provider}
         providers.update(additional)
@@ -627,9 +626,17 @@ def _databricks_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
         credential_warning = _databricks_credential_warning(entry.profile)
     else:
         try:
-            claude_models, gpt_models, completions_models, gemini_models = _fetch_pi_model_lists(
-                creds.host, creds.token
-            )
+            fetch_args = (creds.host, creds.token)
+            if entry.model_services_parent:
+                claude_models, gpt_models, completions_models, gemini_models = (
+                    _fetch_pi_model_lists(
+                        *fetch_args, model_services_parent=entry.model_services_parent
+                    )
+                )
+            else:
+                claude_models, gpt_models, completions_models, gemini_models = (
+                    _fetch_pi_model_lists(*fetch_args)
+                )
         except Exception:  # noqa: BLE001 — network failure must not break launch
             _LOGGER.info(
                 "pi-native: could not fetch workspace model list; showing default model only"
@@ -831,6 +838,8 @@ def _clamp_entries_to_output_caps(
 def _fetch_pi_model_lists(
     workspace_url: str,
     token: str,
+    *,
+    model_services_parent: str | None = None,
 ) -> _PiModelLists:
     """Fetch live model lists from the Unity Catalog model-services API.
 
@@ -856,7 +865,9 @@ def _fetch_pi_model_lists(
         Pi model entry dicts ready to write into ``models.json``.
     """
     try:
-        models = model_catalog.fetch_databricks_model_service_entries(workspace_url, token)
+        models = model_catalog.fetch_databricks_model_service_entries(
+            workspace_url, token, model_services_parent=model_services_parent
+        )
     except Exception:  # noqa: BLE001 — HTTP/network failure → empty
         _LOGGER.warning(
             "pi-native: could not fetch Databricks model list; "

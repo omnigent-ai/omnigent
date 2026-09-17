@@ -387,6 +387,10 @@ class ProviderEntry:
         ``None`` otherwise.
     :param profile: For ``kind="databricks"`` only: the Databricks profile
         name from ``~/.databrickscfg``, e.g. ``"oss"``. ``None`` otherwise.
+    :param model_services_parent: For ``kind="databricks"`` only: the Unity
+        Catalog parent schema to list model-services under, e.g.
+        ``"schemas/eng_dev.ai_gateway"``. ``None`` (the default) lists
+        ``schemas/system.ai``.
     :param model_provider: For ``kind="cli-config"`` only: the custom
         provider id in the CLI's config file that the launch pins, i.e. the
         ``X`` in ``[model_providers.X]``, e.g. ``"Databricks"``. ``None``
@@ -415,6 +419,7 @@ class ProviderEntry:
     model_provider: str | None = None
     display_name: str | None = None
     default_families: frozenset[str] = frozenset()
+    model_services_parent: str | None = None
 
     @property
     def default(self) -> bool:
@@ -1006,6 +1011,12 @@ def _parse_provider(name: str, raw: dict[str, object]) -> ProviderEntry:
                 f"provider {name!r}: a 'profile' is required when kind is 'databricks'.",
                 code=ErrorCode.INVALID_INPUT,
             )
+        parent_raw = raw.get("model_services_parent")
+        if parent_raw is not None and (not isinstance(parent_raw, str) or not parent_raw.strip()):
+            raise OmnigentError(
+                f"provider {name!r}: 'model_services_parent' must be a non-empty string.",
+                code=ErrorCode.INVALID_INPUT,
+            )
         # Databricks (ucode) routes the anthropic/openai surfaces + pi, but NOT
         # gemini: the antigravity harness drives Gemini via the dedicated google
         # SDK + GEMINI_API_KEY, not an OpenAI-compatible gateway, so a databricks
@@ -1014,6 +1025,7 @@ def _parse_provider(name: str, raw: dict[str, object]) -> ProviderEntry:
             name=name,
             kind=kind,
             profile=profile_raw,
+            model_services_parent=parent_raw.strip() if isinstance(parent_raw, str) else None,
             default_families=_parse_default_families(
                 name, default_raw, set(_VALID_FAMILIES) - {GEMINI_FAMILY}, pi_capable=True
             ),
