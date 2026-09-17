@@ -7951,7 +7951,9 @@ def create_runner_app(
         if await_notify:
             await _notify_tools_changed()
         else:
-            _notify_task = asyncio.create_task(_notify_tools_changed())
+            _notify_task = asyncio.create_task(
+                _notify_tools_changed(), name=f"tools-changed:{session_id}"
+            )
             _background_tasks.add(_notify_task)
             _notify_task.add_done_callback(_background_tasks.discard)
 
