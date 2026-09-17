@@ -667,12 +667,12 @@ def test_streaming_reply_keeps_a_bottom_pinned_view_at_the_bottom(
     # And followed the reply as it grew.
     growing = [s for s in samples if s[2] > height_before]
     assert growing, samples[:3]
-    # Each growth step lands a frame before stick-to-bottom's resize handler
-    # scrolls to it, so one frame away from the bottom is normal. Staying away
-    # is not: that is the view falling behind the reply.
+    # A resize may precede its scroll correction by one frame. Count only
+    # intervals bounded by two off-bottom samples; a delayed first sample
+    # does not establish how long the view has been behind.
     behind_ms = 0
     longest_behind_ms = 0
-    for (t0, _d0, _h0), (t1, d1, _h1) in pairwise(growing):
-        behind_ms = behind_ms + (t1 - t0) if d1 > 8 else 0
+    for (t0, d0, _h0), (t1, d1, _h1) in pairwise(growing):
+        behind_ms = behind_ms + (t1 - t0) if d0 > 8 and d1 > 8 else 0
         longest_behind_ms = max(longest_behind_ms, behind_ms)
     assert longest_behind_ms <= 100, (longest_behind_ms, [s for s in growing if s[1] > 8][:20])
