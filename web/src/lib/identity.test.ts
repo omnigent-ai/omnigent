@@ -228,6 +228,7 @@ describe("authenticatedFetch", () => {
         if (mode === "known") setSessionHost("session-a", "host_target");
         vi.doMock("./host", () => ({
           getOmnigentHostConfig: vi.fn(() => ({ fetcher: () => fetch })),
+          getOmnigentServerIdentity: vi.fn(() => "server"),
           hostFetch: fetchMock,
           isDatabricksWorkspace: vi.fn(() => true),
         }));
@@ -262,6 +263,7 @@ describe("authenticatedFetch", () => {
       }));
       vi.doMock("./host", () => ({
         getOmnigentHostConfig: vi.fn(() => ({ fetcher: () => fetch })),
+        getOmnigentServerIdentity: vi.fn(() => "server"),
         hostFetch: fetchMock,
         isDatabricksWorkspace: vi.fn(() => true),
       }));
@@ -294,6 +296,7 @@ describe("authenticatedFetch", () => {
       }));
       vi.doMock("./host", () => ({
         getOmnigentHostConfig: vi.fn(() => ({})),
+        getOmnigentServerIdentity: vi.fn(() => "server"),
         hostFetch: fetchMock,
         isDatabricksWorkspace: vi.fn(() => true),
       }));
@@ -320,6 +323,7 @@ describe("authenticatedFetch", () => {
       }));
       vi.doMock("./host", () => ({
         getOmnigentHostConfig: vi.fn(() => ({ fetcher: () => fetch })),
+        getOmnigentServerIdentity: vi.fn(() => "server"),
         hostFetch: fetchMock,
         isDatabricksWorkspace: vi.fn(() => true),
       }));
@@ -370,6 +374,7 @@ describe("authenticatedFetch", () => {
       }));
       vi.doMock("./host", () => ({
         getOmnigentHostConfig: vi.fn(() => ({ fetcher: () => fetch })),
+        getOmnigentServerIdentity: vi.fn(() => "server"),
         hostFetch: fetchMock,
         isDatabricksWorkspace: vi.fn(() => true),
       }));
@@ -515,5 +520,93 @@ describe("login redirect", () => {
 
     expect(isLoginRedirectPending()).toBe(false);
     expect(hrefWrites).toEqual([]);
+  });
+});
+
+describe("host Server switch", () => {
+  // An embedded host can point the app at another Server in place by
+  // installing a new host config. Identity is per-Server, so everything the
+  // previous Server told us must be dropped rather than reused or forwarded.
+
+  function serverFetcher(userId: string, isAdmin = false) {
+    return vi.fn(async (path: string, _init?: RequestInit) =>
+      mockJsonResponse(path === "/v1/me" ? { user_id: userId, is_admin: isAdmin } : {}),
+    );
+  }
+
+  it("re-probes /v1/me on the new Server instead of reusing the cached user", async () => {
+    const { setOmnigentHostConfig } = await import("./host");
+    const { resolveIdentity } = await import("./identity");
+    const serverA = serverFetcher("alice");
+    const serverB = serverFetcher("bob");
+
+    setOmnigentHostConfig({ serverIdentity: "server-a", fetcher: serverA });
+    expect(await resolveIdentity()).toBe("alice");
+
+    setOmnigentHostConfig({ serverIdentity: "server-b", fetcher: serverB });
+
+    expect(await resolveIdentity()).toBe("bob");
+    expect(serverB.mock.calls.map((c) => c[0])).toContain("/v1/me");
+  });
+
+  it("drops the previous Server's admin flag the moment the host switches", async () => {
+    const { setOmnigentHostConfig } = await import("./host");
+    const { resolveIdentity, getCurrentUserId, getCurrentIsAdmin } = await import("./identity");
+    const serverA = serverFetcher("alice", true);
+    const serverB = serverFetcher("bob", false);
+
+    setOmnigentHostConfig({ serverIdentity: "server-a", fetcher: serverA });
+    await resolveIdentity();
+    expect(getCurrentIsAdmin()).toBe(true);
+
+    setOmnigentHostConfig({ serverIdentity: "server-b", fetcher: serverB });
+
+    // Synchronous readers run before the new probe settles; admin chrome must
+    // not follow the previous Server's user into the new one.
+    expect(getCurrentIsAdmin()).toBe(false);
+    expect(getCurrentUserId()).toBeNull();
+    await resolveIdentity();
+    expect(getCurrentIsAdmin()).toBe(false);
+  });
+
+  it("never stamps the previous Server's user on requests to the new Server", async () => {
+    const { setOmnigentHostConfig } = await import("./host");
+    const { resolveIdentity, authenticatedFetch } = await import("./identity");
+    const serverA = serverFetcher("alice");
+    const serverB = serverFetcher("bob");
+
+    setOmnigentHostConfig({ serverIdentity: "server-a", fetcher: serverA });
+    await resolveIdentity();
+
+    setOmnigentHostConfig({ serverIdentity: "server-b", fetcher: serverB });
+    await authenticatedFetch("/v1/sessions");
+
+    const forwarded = serverB.mock.calls
+      .map((c) => new Headers((c[1] as RequestInit | undefined)?.headers).get("X-Forwarded-Email"))
+      .filter((v): v is string => v !== null);
+    expect(forwarded).not.toContain("alice");
+  });
+
+  it("ignores a /v1/me response from the previous Server that lands after the switch", async () => {
+    const { setOmnigentHostConfig } = await import("./host");
+    const { resolveIdentity, getCurrentUserId } = await import("./identity");
+    let settleServerA: ((r: Response) => void) | null = null;
+    const serverA = vi.fn(
+      () =>
+        new Promise<Response>((r) => {
+          settleServerA = r;
+        }),
+    );
+    const serverB = serverFetcher("bob");
+
+    setOmnigentHostConfig({ serverIdentity: "server-a", fetcher: serverA });
+    const pendingA = resolveIdentity();
+
+    setOmnigentHostConfig({ serverIdentity: "server-b", fetcher: serverB });
+    settleServerA!(mockJsonResponse({ user_id: "alice", is_admin: true }));
+    await pendingA;
+
+    expect(getCurrentUserId()).not.toBe("alice");
+    expect(await resolveIdentity()).toBe("bob");
   });
 });
