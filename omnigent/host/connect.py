@@ -875,6 +875,12 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # Keep the native-terminal idle-poll backoff kill switch (a non-secret
         # boolean) readable by spawned runners, where the watcher reads it.
         "OMNIGENT_TERMINAL_IDLE_POLL_BACKOFF",
+        # Path to the host-owned Hindsight memory key FILE (never the secret
+        # itself). The memory built-ins read the file at call time, so a host
+        # can deliver a rotating credential without the value ever entering the
+        # daemon env or a generated service file. A path, not a secret — same
+        # rationale as OMNIGENT_RUNNER_ENV_PASSTHROUGH / KUBECONFIG above.
+        "HINDSIGHT_API_KEY_FILE",
     }
     # Windows system / profile constants (SYSTEMROOT is mandatory for Winsock,
     # USERPROFILE for Path.home(), etc.); a no-op on POSIX. See _platform.
