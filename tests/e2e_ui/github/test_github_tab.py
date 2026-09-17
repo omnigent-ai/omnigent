@@ -276,7 +276,9 @@ def test_composer_pr_link_opens_github_tab(
         indicator = page.get_by_test_id(test_id)
         label = indicator.locator("span").last
         parts = [("icon", indicator.locator("svg").first)]
-        if collapsed:
+        # Only the directory and branch text collapse; the PR number and the
+        # context percentage stay visible in a crowded bar.
+        if collapsed and test_id in ("composer-workspace-dir", "composer-git-branch"):
             expect(label).to_be_hidden()
         else:
             expect(label).to_be_visible()
@@ -291,7 +293,7 @@ def test_composer_pr_link_opens_github_tab(
     assert pr_bounds is not None and context_bounds is not None
     group_gap = context_bounds["x"] - pr_bounds["x"] - pr_bounds["width"]
     pair_gaps = {}
-    for test_id in () if collapsed else ("composer-pr-link", "composer-context-ring"):
+    for test_id in ("composer-pr-link", "composer-context-ring"):
         icon, label = bounds[f"{test_id}.icon"], bounds[f"{test_id}.label"]
         pair_gaps[test_id] = label["x"] - icon["x"] - icon["width"]
     painted_right_edges = {
@@ -306,7 +308,6 @@ def test_composer_pr_link_opens_github_tab(
     painted_gaps = {
         test_id: bounds[f"{test_id}.label"]["x"] - right
         for test_id, right in painted_right_edges.items()
-        if not collapsed
     }
     print(f"Composer fonts ({viewport_width}px, {font_size}px preference): {font_sizes}")
     print(f"Composer centers: {centers}; group gap: {group_gap}; pair gaps: {pair_gaps}")

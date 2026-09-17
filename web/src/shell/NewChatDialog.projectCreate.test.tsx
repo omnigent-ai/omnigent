@@ -1,3 +1,16 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  useConversations as useTestConversations,
+  moveConversationToProject,
+  useProjectConfig,
+  useProjects,
+} from "@/hooks/useConversations";
+
+vi.mock("@/hooks/useSidebarData", () => ({ useLoadedConversations: () => useTestConversations() }));
+
+vi.mock("@/hooks/useSkills", () => ({
+  useSkills: () => ({ skills: [], skillsStatus: "ready", refetch: vi.fn() }),
+}));
 import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 import type * as ToastModule from "@/components/ui/toast";
@@ -6,7 +19,6 @@ import type * as SessionsApiModule from "@/lib/sessionsApi";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { authenticatedFetch } from "@/lib/identity";
 import { createBundledSession, launchRunner } from "@/lib/sessionsApi";
@@ -16,7 +28,6 @@ import type { Host } from "@/hooks/useHosts";
 import { useHosts } from "@/hooks/useHosts";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
-import { moveConversationToProject, useProjectConfig, useProjects } from "@/hooks/useConversations";
 import type { ProjectConfig } from "@/lib/projectsApi";
 import { showToast } from "@/components/ui/toast";
 import { useHostWorktrees } from "@/hooks/useHostWorktrees";
@@ -46,7 +57,11 @@ vi.mock("@/store/chatStore", () => ({
   setPendingInitialPrompt: vi.fn(),
 }));
 
-vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
+vi.mock("@/lib/identity", () => ({
+  authenticatedFetch: vi.fn(),
+  getCurrentUserId: vi.fn(() => null),
+  resolveIdentity: vi.fn(async () => null),
+}));
 vi.mock("@/components/ui/toast", async (importOriginal) => ({
   ...(await importOriginal<typeof ToastModule>()),
   showToast: vi.fn(),
@@ -462,10 +477,7 @@ describe("NewChatLandingScreen project-aware create (first-class project_id)", (
 
   it("carries project_id and the omission rules through the multipart (bundled) path", async () => {
     setProjectConfig({ host_id: "host_1", workspace: REPO, agent_id: "ag_other" });
-    vi.mocked(createBundledSession).mockResolvedValue({
-      id: "conv_new",
-      warnings: [{ code: "project_agent_mismatch", message: "bundled agent differs" }],
-    });
+    vi.mocked(createBundledSession).mockResolvedValue({ id: "conv_new" });
     renderLanding();
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("alpha"),
@@ -486,30 +498,5 @@ describe("NewChatLandingScreen project-aware create (first-class project_id)", (
     // The runner still launches with the explicit client-side workspace.
     expect(vi.mocked(launchRunner)).toHaveBeenCalledWith("host_1", "conv_new", REPO, undefined);
     expect(vi.mocked(moveConversationToProject)).not.toHaveBeenCalled();
-    await waitFor(() => expect(vi.mocked(showToast)).toHaveBeenCalledWith("bundled agent differs"));
-  });
-
-  it("surfaces server mismatch warnings from the create response as toasts", async () => {
-    setProjectConfig({ host_id: "host_1", workspace: REPO, agent_id: "ag_other" });
-    renderLanding();
-    await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain("Other"),
-    );
-    selectAgent("ag_hello");
-
-    await submitAndReadBody({
-      id: "conv_new",
-      warnings: [
-        {
-          code: "project_agent_mismatch",
-          message: "Explicit builtin agent differs from the project's custom agent hint",
-        },
-      ],
-    });
-    await waitFor(() =>
-      expect(vi.mocked(showToast)).toHaveBeenCalledWith(
-        "Explicit builtin agent differs from the project's custom agent hint",
-      ),
-    );
   });
 });

@@ -1,14 +1,24 @@
 // Tests for the shadcn Sonner renderer and the legacy showToast wrapper.
 
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { toast } from "sonner";
 import { Toaster } from "./sonner";
 import { showToast } from "./toast";
 
-afterEach(() => {
-  act(() => toast.dismiss());
+beforeEach(() => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+});
+
+afterEach(async () => {
+  // Finish Sonner's exit animations before the DOM environment is torn down.
+  await act(async () => {
+    toast.dismiss();
+    await vi.runOnlyPendingTimersAsync();
+  });
   cleanup();
+  vi.clearAllTimers();
+  vi.useRealTimers();
 });
 
 describe("Toaster", () => {

@@ -144,6 +144,12 @@ function loadMainHarness({
     },
     "./workspace-chrome": { registerWorkspaceChromeHide: () => {} },
     "./workspace-root-bounce": { registerWorkspaceRootBounce: () => {} },
+    // databricks-session (transitively) requires electron's `net`, unresolvable
+    // under the sandbox's real require; behavior is covered in databricks-*.test.js.
+    "./databricks-session": {
+      ensureDatabricksSession: async (_ses, origin) => origin,
+      databricksOAuthConfigured: () => false,
+    },
     "./omnigent_cli": {
       isExecutableFile: () => false,
       resolveCliPath: () => null,

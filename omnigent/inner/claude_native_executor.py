@@ -3,17 +3,22 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
-from collections.abc import AsyncIterator
+import threading
+from collections.abc import AsyncIterator, Callable
+from functools import partial
 from pathlib import Path
 
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_DIR_ENV_VAR,
+    CLAUDE_FRAMEWORK_CONTEXT_FILE,
     REQUEST_SESSION_ID_ENV_VAR,
     SWITCH_MODEL_DIALOG_HINT,
     ClaudePromptTimeout,
     TmuxSessionNotAdvertised,
+    cancellable_injection,
     inject_slash_command,
     inject_user_message,
     is_auth_slash_command,
@@ -34,7 +39,11 @@ from omnigent.inner.executor import (
     TurnComplete,
     describe_exception,
 )
-from omnigent.inner.native_attachments import attachment_reference_line
+from omnigent.inner.native_attachments import (
+    FRAMEWORK_NOTICE_BLOCK_TYPE,
+    attachment_reference_line,
+    framework_notices,
+)
 from omnigent.models.claude_model_vocabulary import claude_model_command_arg, normalized_model_id
 
 _logger = logging.getLogger(__name__)
@@ -110,14 +119,22 @@ class ClaudeNativeExecutor(Executor):
             return False
         try:
             async with self._inject_lock:
-                await asyncio.to_thread(
-                    inject_user_message,
-                    self._bridge_dir,
-                    content=text,
-                )
+                await self._inject_prompt(text, framework_notices(content))
         except RuntimeError:
             return False
         return True
+
+    async def _inject_prompt(self, text: str, notices: list[str]) -> None:
+        """Inject user text with one-shot context while holding the injection lock."""
+        context_path = self._bridge_dir / CLAUDE_FRAMEWORK_CONTEXT_FILE
+        context_path.unlink(missing_ok=True)
+        if notices:
+            context_path.write_text("\n\n".join(notices), encoding="utf-8")
+        try:
+            await self._inject(partial(inject_user_message, self._bridge_dir, content=text))
+        except BaseException:
+            context_path.unlink(missing_ok=True)
+            raise
 
     async def run_turn(
         self,
@@ -159,6 +176,7 @@ class ClaudeNativeExecutor(Executor):
             )
             return
         text = _latest_user_text(messages, self._bridge_dir)
+        notices = _latest_framework_notices(messages)
         if not text:
             yield ExecutorError(message="Claude native turn had no user text to send")
             return
@@ -203,27 +221,27 @@ class ClaudeNativeExecutor(Executor):
         try:
             with telemetry.span("claude_native.inject"):
                 async with self._inject_lock:
+                    context_path = self._bridge_dir / CLAUDE_FRAMEWORK_CONTEXT_FILE
+                    context_path.unlink(missing_ok=True)
                     if wanted_model_arg is not None:
                         # Accepted trade-off: ``/model <id>`` also saves the
                         # pick as the person's global default for new Claude
                         # sessions. Runs to completion before the message
                         # inject below (same lock), so its confirm Enter can't
                         # race the message.
-                        await asyncio.to_thread(
-                            inject_slash_command,
-                            self._bridge_dir,
-                            command=f"/model {wanted_model_arg}",
-                            auto_confirm=True,
-                            confirm_hint=SWITCH_MODEL_DIALOG_HINT,
+                        await self._inject(
+                            partial(
+                                inject_slash_command,
+                                self._bridge_dir,
+                                command=f"/model {wanted_model_arg}",
+                                auto_confirm=True,
+                                confirm_hint=SWITCH_MODEL_DIALOG_HINT,
+                            )
                         )
                         # Track the routed id, not the alias: the next turn's
                         # comparison is against what routing asked for.
                         self._applied_model = wanted_model
-                    await asyncio.to_thread(
-                        inject_user_message,
-                        self._bridge_dir,
-                        content=text,
-                    )
+                    await self._inject_prompt(text, notices)
         except ClaudePromptTimeout as exc:
             _logger.exception(
                 "claude-native: prompt delivery to harness timed out",
@@ -243,6 +261,23 @@ class ClaudeNativeExecutor(Executor):
             yield ExecutorError(message=describe_exception(exc))
             return
         yield TurnComplete(response=None)
+
+    async def _inject(self, operation: Callable[[], None]) -> None:
+        """Drain cancelled delivery workers before releasing the pane's injection lock."""
+        cancelled = threading.Event()
+        with cancellable_injection(cancelled):
+            worker = asyncio.create_task(asyncio.to_thread(operation))
+        try:
+            await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            cancelled.set()
+            while not worker.done():
+                with contextlib.suppress(Exception, asyncio.CancelledError):
+                    await asyncio.shield(worker)
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                worker.result()
+            self._reap_failed_turn()
+            raise
 
     def _reap_failed_turn(self) -> str | None:
         """Kill the Claude pane before a delivery timeout becomes ``failed``."""
@@ -449,6 +484,8 @@ def _content_to_text(content: EnqueuedContent, bridge_dir: Path) -> str:
             if not isinstance(block, dict):
                 continue
             block_type = block.get("type", "")
+            if block_type == FRAMEWORK_NOTICE_BLOCK_TYPE:
+                continue
             if block_type == "input_text":
                 text = block.get("text")
                 if isinstance(text, str):
@@ -458,3 +495,11 @@ def _content_to_text(content: EnqueuedContent, bridge_dir: Path) -> str:
         parts = attachment_lines + text_parts
         return "\n\n".join(parts)
     return ""
+
+
+def _latest_framework_notices(messages: list[Message]) -> list[str]:
+    """Return framework context attached to the latest user turn."""
+    for message in reversed(messages):
+        if message.get("role") == "user":
+            return framework_notices(message.get("content"))
+    return []

@@ -119,8 +119,11 @@ def test_load_existing_host_id_skips_undecodable_config(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """An undecodable global config is skipped, not a decode crash."""
+    from omnigent.host.identity import HOST_ID_ENV_VAR, HOST_NAME_ENV_VAR
+
     bad_config = tmp_path / "config.yaml"
     bad_config.write_bytes(_UNDECODABLE_YAML)
-    monkeypatch.setattr("omnigent.cli._effective_global_config_path", lambda: bad_config)
-    monkeypatch.setattr("omnigent.host.identity.CONFIG_PATH", tmp_path / "absent.yaml")
+    monkeypatch.delenv(HOST_ID_ENV_VAR, raising=False)
+    monkeypatch.delenv(HOST_NAME_ENV_VAR, raising=False)
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
     assert _load_existing_host_id() is None

@@ -1,6 +1,8 @@
+import { useLoadedConversations } from "@/hooks/useSidebarData";
+import { useSkills } from "@/hooks/useSkills";
 import {
   HarnessPicker,
-  HarnessPickerEntry,
+  HarnessPickerConfigRow,
   HarnessPickerConfigPage,
 } from "@/components/composer/HarnessPicker";
 import {
@@ -24,8 +26,8 @@ import {
   CornerUpLeftIcon,
   FileTextIcon,
   FolderIcon,
-  ImageIcon,
   Loader2Icon,
+  MessagesSquareIcon,
   XIcon,
 } from "lucide-react";
 import { Tooltip, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
@@ -42,7 +44,6 @@ import {
   ComposerSendButton,
 } from "@/components/composer/ChatComposer";
 import { ComposerAddMenu } from "@/components/composer/ComposerAddMenu";
-import { BackgroundTaskIndicator } from "@/components/composer/BackgroundTaskIndicator";
 import { ReplyDraftBlocks } from "@/components/composer/ReplyDraftBlocks";
 import {
   ComposerWorkspaceBar,
@@ -53,7 +54,7 @@ import { DropdownMenuItem, DropdownMenuSeparator } from "@/components/ui/dropdow
 import { useAppName } from "@/lib/branding";
 import { cn } from "@/lib/utils";
 import { QueuedMessagesStrip } from "@/pages/QueuedMessagesStrip";
-import { attachmentKey, validateAttachments } from "@/lib/attachments";
+import { validateAttachments } from "@/lib/attachments";
 import {
   serverSwitcherHiddenForSurface,
   useSurfaceFrontmost,
@@ -66,11 +67,12 @@ import {
   SMART_ROUTING_LABEL,
   useBrainHarnessLabels,
 } from "@/lib/agentLabels";
-import { useConversations } from "@/hooks/useConversations";
-import { usePermissions } from "@/hooks/usePermissions";
+import { usePermissions, useSessionOwner } from "@/hooks/usePermissions";
 import type { NativeModelOption, Session, SessionStatus } from "@/lib/types";
 import { usePromptHistory } from "@/hooks/usePromptHistory";
 import { useReplyDraft } from "@/hooks/useReplyDraft";
+import { useSessionModelLabel } from "@/hooks/useSessionModelLabel";
+import { useModelPickerHotkey } from "@/hooks/useModelPickerHotkey";
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
 import { useDictationInsert } from "@/hooks/useDictationInsert";
 import {
@@ -79,7 +81,8 @@ import {
   isSessionSharedWithOthers,
 } from "@/lib/permissionsApi";
 import { getCurrentAuthorId } from "@/lib/identity";
-import { retrySession } from "@/lib/sessionsApi";
+import { toast } from "sonner";
+import { createSideChat, retrySession } from "@/lib/sessionsApi";
 import { codexEffortLevelsForModel, findNativeModelOption } from "@/lib/codexNativeModels";
 import { modelConfigurationSourceRows } from "@/lib/modelConfigurationSource";
 import {
@@ -93,13 +96,21 @@ import {
 } from "@/store/chatStore";
 import {
   claudeNativeSubagentLabel,
+  codexNativeSubagentLabel,
   isNativeTerminalSession,
   nativeCodingAgentForSession,
   nativeCodingAgentForHarness,
   nativeCodingAgentForSubagentWrapper,
   WRAPPER_LABEL_KEY,
 } from "@/lib/nativeCodingAgents";
+import {
+  isSideChatCommand,
+  SIDE_CHAT_COMMAND_PREFIX,
+  supportsSideChat,
+  usesNativeSideChatFork,
+} from "@/lib/sideChat";
 import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
+import { DEVIN_NATIVE_PERMISSION_MODES } from "@/lib/nativeHarnessModes";
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import {
   buildMentionPreamble,
@@ -112,7 +123,7 @@ import {
   rankMentionEntries,
 } from "@/lib/composerMentions";
 import { useMentionBrowser } from "@/hooks/useMentionBrowser";
-import { getSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
+import { getSessionDraft, promoteSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
 import {
   serializeReplyDraft,
   snapshotReplyDraft,
@@ -167,7 +178,7 @@ import {
 } from "@/components/chat/chatBubbleParts";
 import { useSession } from "@/hooks/useSession";
 import { useOpenGithubTab } from "@/shell/FileViewerContext";
-import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
+import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useRefreshSessionStateOnRunnerOnline } from "@/hooks/useSessionOnlineRefresh";
 import {
   type LivenessRow,
@@ -194,6 +205,7 @@ import {
   type WorkspaceFile,
 } from "@/hooks/useWorkspaceChangedFiles";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
+import { ComposerAttachments } from "@/components/ComposerAttachments";
 import { isCostRoutingSession, isSubagentRoutingSession } from "@/components/CostRoutingControl";
 import {
   SMART_ROUTING_ARMS,
@@ -204,10 +216,11 @@ import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
 import { nativeModelLabel } from "@/components/HarnessConfigControls";
 import { PickerSectionHeader } from "@/components/composer/HarnessMenuRow";
 import { ComposerConfigSections } from "@/components/composer/ComposerConfigSections";
+import { buildFusionSections } from "@/components/composer/fusionSections";
+import { fusionOption, isFusionModelUid } from "@/lib/devinFusion";
 import { ComposerWorkspaceStatus } from "@/components/composer/ComposerWorkspaceStatus";
 import { ComposerPrLink } from "@/components/composer/ComposerPrLink";
 import { ComposerContextRing } from "@/components/composer/ComposerContextRing";
-import { SubagentTaskIndicator } from "@/components/composer/SubagentTaskIndicator";
 import { useComposerGitStatus } from "@/hooks/useComposerGitStatus";
 import {
   formatStatusModelLabel,
@@ -311,14 +324,12 @@ export function isSubagentRoutingEligible(
 }
 
 // Leading whitespace + the command token, so the composer overlay can tint
-// just the `/skill` and leave any args in the default color.
-const SLASH_COMMAND_SPLIT_RE = /^(\s*)(\/[A-Za-z0-9][\w:-]*)/;
+// just the `/command` or `$skill` and leave args in the default color.
+const SLASH_COMMAND_SPLIT_RE = /^(\s*)([/$][A-Za-z0-9][\w:-]*)(?=\s|$)/;
 
 /**
- * Split a slash-command draft into the command token and the rest, for the
- * composer highlight overlay. Returns null when the text isn't a command
- * (callers gate on `isSlashCommandText`, so a returned token is the full
- * command — never a `/etc/hosts`-style path prefix).
+ * Split a command or skill draft for the composer highlight overlay.
+ * Returns null for prose and file paths such as `/etc/hosts`.
  */
 export function splitSlashCommand(
   value: string,
@@ -349,6 +360,12 @@ export function splitSlashCommand(
  * instead of parking in the queue strip. The ``hasQueued`` guard still holds:
  * once this conversation has a queued message it must drain in order, or a
  * direct send could overtake a still-queued earlier one on an idle flicker.
+ *
+ * ``opensSideChat`` (a codex ``/side`` command) always POSTs now. A side chat is
+ * forked onto its own thread and is non-interrupting by design — asking while
+ * the agent works is the whole point — so it must not park in the queue behind
+ * the parent's active turn. It shares no ordering with main-thread sends, so it
+ * bypasses ``hasQueued`` too.
  */
 export function shouldQueueSend(
   conversationId: string | null,
@@ -356,8 +373,10 @@ export function shouldQueueSend(
   sessionStatus: SessionStatus,
   queuedMessages: QueuedMessage[],
   alwaysSteer = false,
+  opensSideChat = false,
 ): boolean {
   if (conversationId === null) return false;
+  if (opensSideChat) return false;
   const hasQueued = queuedMessages.some((m) => m.conversationId === conversationId);
   if (alwaysSteer) return hasQueued;
   const isBusy = status === "streaming" || sessionStatus === "running";
@@ -430,7 +449,7 @@ export function ChatPage() {
     error: agentsError,
     refetch: refetchAgents,
   } = useAgents({ enabled: !urlConvId });
-  const { data: conversationsData } = useConversations("", true);
+  const { data: conversationsData } = useLoadedConversations();
   const conversations = useMemo(
     () => conversationsData?.pages.flatMap((p) => p.data),
     [conversationsData],
@@ -521,9 +540,6 @@ export function ChatPage() {
   // handling). Overrides the liveness-derived unreachable affordances
   // below, which misread the not-yet-host-bound session as stranded.
   const sandboxLaunching = sandboxStatus !== null && sandboxStatus.stage !== "failed";
-  // Terminal-first spin-up state, read here (not just in the child surfaces) so
-  // the working-indicator gate below can defer to the "Starting up…" cue.
-  const chatTerminalFirst = useTerminalFirst();
   // Read runner liveness from the app-level batch poller (see
   // RunnerHealthProvider). `undefined` = not yet polled — the indicator
   // stays hidden until the first poll for this session resolves.
@@ -538,6 +554,7 @@ export function ChatPage() {
   const boundAgentId = useChatStore((s) => s.boundAgentId);
   const boundAgentName = useChatStore((s) => s.boundAgentName);
   const composerSessionHarness = useChatStore((s) => s.sessionHarness);
+  const composerSessionModelSeeded = useChatStore((s) => s.sessionModelSeeded);
   const composerSeededHostId = useChatStore((s) => s.sessionHostId);
   // Fallback for session-scoped agents (created by `omnigent run --server`):
   // the sessions-derived list only carries id+name, so fetch the full
@@ -594,6 +611,7 @@ export function ChatPage() {
     if (
       !shouldSendInitialPrompt({
         initialPrompt: initialPrompt?.prompt.text ?? null,
+        initialPromptFileCount: initialPrompt?.prompt.files?.length ?? 0,
         promptConversationId: initialPrompt?.conversationId ?? null,
         sentForConversationId: initialPromptSentForConvRef.current,
         conversationId: urlConvId,
@@ -714,16 +732,10 @@ export function ChatPage() {
   // + shimmer/pill) for the main chat and is suppressed mid-elicitation or
   // when the runner is known offline.
   const isWorking = !hasPendingElicitation && computeIsWorking(sessionStatus);
-  // A spin-up in flight owns the in-progress slot with more specific copy
-  // ("Starting up…" / "Cloning repository…") than the generic shimmer, and
-  // `RunnerStartingIndicator` only renders when the shimmer is absent. So the
-  // OPTIMISTIC path must stand down here: a send that has to boot a runner is
-  // exactly when the user needs to know it's booting, not just that we asked.
-  // A server-confirmed `running`/`waiting` still wins — by then the harness is
-  // up and the spin-up cue has self-gated to null.
-  const spinUpInFlight =
-    sandboxLaunching ||
-    Boolean(chatTerminalFirst?.isTerminalFirst && chatTerminalFirst.terminalStartingUp);
+  // Managed-sandbox stages own the in-progress slot with specific pipeline
+  // copy. A normal terminal runner launch keeps the standard Working shimmer
+  // so startup does not introduce a second, special chat state.
+  const spinUpInFlight = sandboxLaunching;
   const showsWorking = computeShowsWorking(sessionStatus, {
     hasPendingElicitation,
     runnerOnline,
@@ -781,7 +793,10 @@ export function ChatPage() {
   // which the owner can read) to know they granted access to anyone else.
   // Hooks stay above the early-return guards (rules-of-hooks).
   const viewerId = getCurrentAuthorId();
-  const sessionOwner = activeConv?.owner ?? null;
+  const { data: directSessionOwner } = useSessionOwner(
+    viewerId !== null && activeConv?.owner == null ? (sessionConvId ?? null) : null,
+  );
+  const sessionOwner = activeConv?.owner ?? directSessionOwner ?? null;
   const viewerOwnsSession = sessionOwner !== null && sessionOwner === viewerId;
   const { data: ownerGrants } = usePermissions(viewerOwnsSession ? (sessionConvId ?? null) : null);
   const isSessionShared = isSessionSharedWithOthers(sessionOwner, viewerId, ownerGrants);
@@ -857,6 +872,7 @@ export function ChatPage() {
   const sessionModelOptions = useChatStore((s) => s.codexModelOptions);
   const selectedModel = useChatStore((s) => s.selectedModel);
   const llmModel = useChatStore((s) => s.llmModel);
+  const sessionModelOverrideForEffort = useChatStore((s) => s.sessionModelOverride);
   // Pre-catalog fallback: a fresh native session's own catalog only arrives
   // once its CLI is up (codex answers model/list after app-server boot,
   // ~15s cold), which left the gear's Model list sparse and its Effort row
@@ -874,7 +890,9 @@ export function ChatPage() {
       ? "codex-native"
       : fallbackPickerKind === "claude"
         ? "claude-native"
-        : null;
+        : fallbackPickerKind === "devin"
+          ? "devin-native"
+          : null;
   const { data: hostProbeOptions } = useHostModelOptions(
     activeSession?.hostId ?? null,
     hostProbeHarness ?? "",
@@ -928,6 +946,12 @@ export function ChatPage() {
       // always-steer preference on, a mid-turn follow-up skips the queue and is
       // POSTed now instead.
       const chat = useChatStore.getState();
+      // A codex /side command opens its own side chat off the parent thread, so
+      // it must POST now even mid-turn rather than park in the queue (see the
+      // matching gate in the store's send()). Only the native-fork harness
+      // routes /side through send; generic /side is intercepted in the composer.
+      const opensSideChat =
+        usesNativeSideChatFork(chat.sessionHarness) && isSideChatCommand(text.trim());
       if (
         shouldQueueSend(
           chat.conversationId,
@@ -935,6 +959,7 @@ export function ChatPage() {
           chat.sessionStatus,
           chat.queuedMessages,
           readAlwaysSteer(),
+          opensSideChat,
         )
       ) {
         chat.enqueueMessage(text, files, replyDraft);
@@ -1007,40 +1032,64 @@ export function ChatPage() {
     urlConvId,
     conversationsData !== undefined,
   );
-  // Client-only conversation: no server session to POST a follow-up to yet, so
-  // the composer stays read-only until the create resolves and the id hydrates.
-  const readOnlyReason = isTempConvId(urlConvId)
-    ? "Starting the session…"
-    : readOnlyReasonForSessionLabels(activeSession, activeConv);
+  // A client-only conversation has no server session to POST to yet. Keep the
+  // composer editable so the user can draft the next message during creation,
+  // but gate submission until the temp id is promoted below.
+  const sendDisabledReason = isTempConvId(urlConvId) ? "Starting the session…" : null;
+  const readOnlyReason = readOnlyReasonForSessionLabels(activeSession, activeConv);
   // Once present, the live session snapshot is authoritative. Memoized so the
   // derived props it feeds (modelPickerKind, effortLevels, wrapperLabel) keep a
   // stable identity across the switch's re-render burst.
   const capabilitySource = useMemo(() => {
     if (activeSession)
-      return { labels: activeSession.labels ?? {}, harness: activeSession.harness };
-    // Temp/optimistic window: no server session and the sidebar row carries no
-    // native identity, so derive the wrapper label from the SEEDED native
-    // harness (create identity) — otherwise the native model/effort/permission
-    // controls fail closed until the real snapshot arrives.
-    if (isTempConvId(urlConvId)) {
-      const nativeAgent = nativeCodingAgentForHarness(composerSessionHarness);
       return {
-        labels: nativeAgent ? { [WRAPPER_LABEL_KEY]: nativeAgent.wrapperLabel } : {},
+        labels: activeSession.labels ?? {},
+        harness: activeSession.harness,
+        parentSessionId: activeSession.parentSessionId ?? null,
+      };
+    // Keep the seeded native identity through the temp-to-real ID handoff,
+    // until the session snapshot can supply its wrapper label and harness.
+    if (
+      isTempConvId(urlConvId) ||
+      (composerSessionModelSeeded && activeConversationId === urlConvId)
+    ) {
+      const nativeAgent = nativeCodingAgentForHarness(composerSessionHarness);
+      const seededLabels: Record<string, string | null> = nativeAgent
+        ? { [WRAPPER_LABEL_KEY]: nativeAgent.wrapperLabel }
+        : {};
+      return {
+        labels: seededLabels,
         harness: composerSessionHarness,
+        parentSessionId: null,
       };
     }
-    return { labels: activeConv?.labels ?? {}, harness: null };
-  }, [activeSession, activeConv, urlConvId, composerSessionHarness]);
+    return { labels: activeConv?.labels ?? {}, harness: null, parentSessionId: null };
+  }, [
+    activeSession,
+    activeConv,
+    urlConvId,
+    composerSessionHarness,
+    composerSessionModelSeeded,
+    activeConversationId,
+  ]);
   const modelPickerKind = modelPickerKindForConv(capabilitySource);
-  // Effort ladders key on the model the session is actually on — the
-  // reported `llmModel` — falling back to the sticky preference only
-  // before the first report lands. Memoized because codex-native resolves
-  // via codexEffortLevelsForModel, which returns a fresh array each call;
-  // a new identity here would defeat the memo() on MainAgentSurface/Composer
-  // on every unrelated store tick (mirrors the codexModelOptions rationale).
+  // Effort ladders key on the model the session is actually on — the reported
+  // `llmModel` — then the session's pinned `model_override`, and only then the
+  // sticky preference. The override matters for a harness that never reports a
+  // concrete model (devin pins the family there): without it the lookup finds no
+  // catalog row and a per-model ladder comes back empty, hiding the picker.
+  // Memoized because codex-native resolves via codexEffortLevelsForModel, which
+  // returns a fresh array each call; a new identity here would defeat the memo()
+  // on MainAgentSurface/Composer on every unrelated store tick (mirrors the
+  // codexModelOptions rationale).
   const effortLevels = useMemo(
-    () => effortLevelsForConv(capabilitySource, codexModelOptions, llmModel ?? selectedModel),
-    [capabilitySource, codexModelOptions, llmModel, selectedModel],
+    () =>
+      effortLevelsForConv(
+        capabilitySource,
+        codexModelOptions,
+        llmModel ?? sessionModelOverrideForEffort ?? selectedModel,
+      ),
+    [capabilitySource, codexModelOptions, llmModel, sessionModelOverrideForEffort, selectedModel],
   );
   const showEffort = shouldShowEffortPicker(capabilitySource) && effortLevels.length > 0;
 
@@ -1101,13 +1150,15 @@ export function ChatPage() {
       loadingMoreHistory={loadingMoreHistory}
       permissionLevel={permissionLevel}
       readOnlyReason={readOnlyReason}
+      sendDisabledReason={sendDisabledReason}
       effortLevels={effortLevels}
       showEffort={showEffort}
       showModels={modelPickerKind !== null}
       modelPickerKind={modelPickerKind}
       codexModelOptions={codexModelOptions}
+      modelLabelOptions={sessionModelOptions}
       showCodexPlanMode={shouldShowCodexPlanModeControl(capabilitySource)}
-      showClaudePermissionMode={shouldShowClaudePermissionModeControl(capabilitySource)}
+      showClaudePermissionMode={shouldShowPermissionModeControl(capabilitySource)}
       showCodexApprovalMode={shouldShowCodexApprovalModeControl(capabilitySource)}
       showGoalControl={shouldShowGoalControl(capabilitySource)}
       showClaudeGoalControl={shouldShowPollyClaudeGoalControl(activeSession)}
@@ -1145,6 +1196,7 @@ export function ChatPage() {
         conversationId={urlConvId}
         serverUrl={getCliServerUrl()}
         wrapper={activeConv?.labels?.["omnigent.wrapper"]}
+        harness={activeSession?.harness}
         state={reconnectState}
         isOwner={reconnectIsOwner}
         // Source prefill for the Clone tab's fork form. Mirrors AppShell's
@@ -1170,6 +1222,7 @@ export function ChatPage() {
           }}
           serverUrl={getCliServerUrl()}
           wrapper={activeConv?.labels?.["omnigent.wrapper"]}
+          harness={activeSession?.harness}
         />
       )}
     </SessionSharedContext.Provider>
@@ -1205,9 +1258,13 @@ function SessionLayout({ mainAgent }: SessionLayoutProps) {
 function SelectionPopup({
   containerRef,
   onReply,
+  onAskInSideChat,
 }: {
   containerRef: React.RefObject<HTMLElement | null>;
   onReply: (text: string) => void;
+  // Present only when the session's harness supports side chat; renders the
+  // "Ask in side chat" action beside Reply.
+  onAskInSideChat?: (text: string) => void;
 }) {
   const [popupPos, setPopupPos] = useState<{ x: number; y: number } | null>(null);
   const selectedTextRef = useRef<string>("");
@@ -1297,6 +1354,29 @@ function SelectionPopup({
         <CornerUpLeftIcon className="size-3.5" />
         Reply ↵
       </Button>
+      {onAskInSideChat ? (
+        <Button
+          type="button"
+          variant="secondary"
+          size="sm"
+          className="gap-1 shadow-md hover:bg-secondary hover:brightness-95 dark:hover:brightness-110"
+          onMouseDown={(e) => {
+            e.preventDefault();
+          }}
+          onClick={() => {
+            const text = selectedTextRef.current;
+            if (text) {
+              onAskInSideChat(text);
+              window.getSelection()?.removeAllRanges();
+              setPopupPos(null);
+              selectedTextRef.current = "";
+            }
+          }}
+        >
+          <MessagesSquareIcon className="size-3.5" />
+          Ask in side chat
+        </Button>
+      ) : null}
     </div>
   );
 }
@@ -1343,6 +1423,8 @@ interface MainAgentSurfaceProps {
   permissionLevel: number | null;
   /** Forces composer read-only with the given placeholder when non-null. See ``ComposerProps.readOnlyReason``. */
   readOnlyReason: string | null;
+  /** Keeps drafting enabled while temporarily blocking submission. */
+  sendDisabledReason: string | null;
   effortLevels: readonly string[];
   /** Show effort controls. */
   showEffort: boolean;
@@ -1352,6 +1434,8 @@ interface MainAgentSurfaceProps {
   modelPickerKind: NativeModelPickerKind | null;
   /** Runner-owned model picker rows for native sessions. */
   codexModelOptions: readonly NativeModelOption[];
+  /** Session catalog for display labels; host-probe rows remain menu-only. */
+  modelLabelOptions?: readonly NativeModelOption[];
   /** Show the Codex Plan-mode toggle. */
   showCodexPlanMode: boolean;
   showClaudePermissionMode?: boolean;
@@ -1493,11 +1577,13 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   loadingMoreHistory,
   permissionLevel,
   readOnlyReason,
+  sendDisabledReason,
   effortLevels,
   showEffort,
   showModels,
   modelPickerKind,
   codexModelOptions,
+  modelLabelOptions,
   showCodexPlanMode,
   showClaudePermissionMode = false,
   showCodexApprovalMode = false,
@@ -1539,6 +1625,9 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   // out of streaming-frame re-renders.
 
   const composerRef = useRef<ComposerHandle>(null);
+  // Cold selector (harness rarely changes) — gates the selection popup's "Ask
+  // in side chat" action to harnesses that support side chat.
+  const selectionSessionHarness = useChatStore((s) => s.sessionHarness);
 
   // Ref forwarded to SelectionPopup to scope selection detection to the
   // conversation area, preventing selections in the composer from triggering
@@ -1767,13 +1856,17 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
             showsWorking={showsWorking}
             agentsError={agentsError}
             sandboxLaunching={sandboxLaunching}
-            terminalFirst={terminalFirst}
             spacerMeasureRef={spacerMeasureRef}
           />
           {/* Floating reply button — scoped to the conversation container. */}
           <SelectionPopup
             containerRef={conversationRef}
             onReply={(text) => composerRef.current?.appendReplyQuote(text)}
+            onAskInSideChat={
+              supportsSideChat(selectionSessionHarness)
+                ? (text) => composerRef.current?.startSideChat(text)
+                : undefined
+            }
           />
 
           <Composer
@@ -1788,16 +1881,22 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
             selectedAgentId={selectedAgentId}
             permissionLevel={permissionLevel}
             readOnlyReason={readOnlyReason}
+            sendDisabledReason={sendDisabledReason}
             effortLevels={effortLevels}
             showEffort={showEffort}
             showModels={showModels}
             modelPickerKind={modelPickerKind}
             codexModelOptions={codexModelOptions}
+            modelLabelOptions={modelLabelOptions}
             showCodexPlanMode={showCodexPlanMode}
             showClaudePermissionMode={showClaudePermissionMode}
             showCodexApprovalMode={showCodexApprovalMode}
             showGoalControl={showGoalControl}
             runnerOnline={runnerOnline}
+            runnerStarting={
+              sandboxStatus?.stage !== "failed" &&
+              (sandboxLaunching || liveness.kind === "starting")
+            }
             showClaudeGoalControl={showClaudeGoalControl}
             showPollyCodexGoalControl={showPollyCodexGoalControl}
             isTerminalFirst={isTerminalFirst}
@@ -1869,6 +1968,7 @@ function ConversationLoadError({
 
 interface ComposerHandle {
   appendReplyQuote: (text: string) => void;
+  startSideChat: (selectedText: string) => void;
 }
 
 interface ComposerProps {
@@ -1900,6 +2000,8 @@ interface ComposerProps {
    * leaves the existing ``permissionLevel`` gate alone.
    */
   readOnlyReason: string | null;
+  /** Keeps drafting enabled while temporarily blocking submission. */
+  sendDisabledReason?: string | null;
   /** Reasoning-effort options to render in `/effort` and the picker dropdown. */
   effortLevels: readonly string[];
   /** Show `/effort` and the Effort picker section. */
@@ -1910,6 +2012,8 @@ interface ComposerProps {
   modelPickerKind: NativeModelPickerKind | null;
   /** Runner-owned model picker rows for native sessions. */
   codexModelOptions: readonly NativeModelOption[];
+  /** Session catalog for display labels; host-probe rows remain menu-only. */
+  modelLabelOptions?: readonly NativeModelOption[];
   /** Show the Codex Plan-mode toggle. */
   showCodexPlanMode: boolean;
   showClaudePermissionMode?: boolean;
@@ -1918,6 +2022,8 @@ interface ComposerProps {
   showGoalControl?: boolean;
   /** Whether the active session's runner tunnel is connected. */
   runnerOnline?: boolean;
+  /** The session is launching or waking its runner or managed sandbox. */
+  runnerStarting?: boolean;
   /** Show Polly's Claude SDK command-backed Goal control. */
   showClaudeGoalControl?: boolean;
   /** Show Polly's Codex command-backed Goal control. */
@@ -1983,12 +2089,11 @@ interface ComposerProps {
 /**
  * Build the full slash-command map for the composer: built-ins
  * first (so they top the menu), then one entry per session skill
- * keyed by ``/${skill.name}``. Insertion order matters — the
+ * keyed by the session's skill prefix and name. Insertion order matters — the
  * menu iterates ``Object.entries`` and the user sees built-ins
  * before skills.
  *
- * :param skills: ``Session.skills`` from the snapshot, defaulting
- *     to ``[]`` when the wire field is absent (older servers).
+ * :param skills: Session skill metadata returned by host discovery.
  * :param showEffort: Whether this session supports Web UI effort controls.
  * :param showModel: Whether to include ``/model`` (in-process sessions
  *     and claude-native, which both honor ``conv.model_override``; see
@@ -2001,6 +2106,8 @@ export function buildSlashCommandMap(
   showModel: boolean,
   showCompact = true,
   showBtw = false,
+  showSide = false,
+  skillPrefix: "/" | "$" = "/",
 ): Record<string, string> {
   const m: Record<string, string> = {};
   for (const [name, description] of Object.entries(BUILTIN_SLASH_COMMANDS)) {
@@ -2009,10 +2116,12 @@ export function buildSlashCommandMap(
     if (name === "/compact" && !showCompact) continue;
     // /btw is a Claude Code CLI built-in — only offer it on claude-native.
     if (name === "/btw" && !showBtw) continue;
+    // /side is a Codex CLI built-in (ephemeral fork) — only offer it on codex-native.
+    if (name === "/side" && !showSide) continue;
     m[name] = description;
   }
   for (const skill of skills) {
-    m[`/${skill.name}`] = skill.description;
+    m[`${skillPrefix}${skill.name}`] = skill.description;
   }
   return m;
 }
@@ -2026,24 +2135,28 @@ export function buildSlashCommandMap(
  * known skill to a ``slash_command`` event (in-process) or plaintext
  * (native sessions).
  *
- * :param skills: ``Session.skills`` from the snapshot.
+ * :param skills: Session skill metadata returned by host discovery.
  * :param showEffort: Whether ``/effort`` should be selectable.
  * :param showModel: Whether ``/model`` should be selectable (same gate
  *     as :func:`buildSlashCommandMap`'s ``showModel``).
- * :returns: A ``Set`` of slash-prefixed names.
+ * :returns: A ``Set`` of prefixed command and skill names.
  */
 export function buildSlashCommandWithArgsSet(
   skills: readonly { name: string; description: string }[],
   showEffort: boolean,
   showModel: boolean,
   showBtw = false,
+  showSide = false,
+  skillPrefix: "/" | "$" = "/",
 ): Set<string> {
   const s = new Set<string>();
   if (showEffort) s.add("/effort");
   if (showModel) s.add("/model");
   // Selecting /btw fills "/btw " so the user types the side question after it.
   if (showBtw) s.add("/btw");
-  for (const skill of skills) s.add(`/${skill.name}`);
+  // Selecting /side fills "/side " so the user types the side question after it.
+  if (showSide) s.add("/side");
+  for (const skill of skills) s.add(`${skillPrefix}${skill.name}`);
   return s;
 }
 
@@ -2089,6 +2202,7 @@ export function composerHarnessLabel(
   if (modelPickerKind === "cursor") return "Cursor";
   if (modelPickerKind === "kiro") return "Kiro";
   if (modelPickerKind === "opencode") return "OpenCode";
+  if (modelPickerKind === "devin") return "Devin";
   const display = agentName ? agentDisplayLabel(agentName) : null;
   const harness = sessionHarness ? (harnessLabels[sessionHarness] ?? null) : null;
   if (display && harness) return `${display} (${harness})`;
@@ -2162,6 +2276,10 @@ export function subAgentComposerLabel(
   if (!session || session.parentSessionId == null) return null;
   const claudeLabel = claudeNativeSubagentLabel(session.labels, session.subAgentName);
   if (claudeLabel) return claudeLabel;
+  // Codex children (incl. /side forks) title as "codex-native-ui-subagent:<uuid>";
+  // show the friendly nickname label ("Side chat") instead of that UUID suffix.
+  const codexLabel = codexNativeSubagentLabel(session.labels);
+  if (codexLabel) return codexLabel;
   // Strip the user-added "ui:" sentinel so its "agent:name" suffix reads
   // like an LLM-spawned title.
   let title = session.title ?? null;
@@ -2177,29 +2295,15 @@ export function subAgentComposerLabel(
 }
 
 /**
- * Peeking tray tucked behind the composer's top edge while the active
- * session is a sub-agent (child) — names the sub-agent the message is going
- * to, so the composer reads as "messaging the sub-agent", not the
- * orchestrator. Mirrors ``ComposerStatusLine`` (the worktree/context shelf
- * below the card) but rises above it: ``-mb-4`` slides the tray's square
- * bottom corners down behind the card (the 16px overlap exceeds the card's
- * ~14px corner radius, hiding them behind its straight sides) and ``pb-5.5``
- * re-reserves the hidden region so the label sits above the card's top edge.
- * The card is ``position:relative`` and paints on top, so its own top border
- * is the divider. Brand pink (``brand-accent``) marks this as a sub-agent
- * context cue, not a status.
- *
- * @param label - The sub-agent instance name, e.g.
- *   ``"check-account-eligibility"`` (from ``subAgentComposerLabel``).
+ * Sub-agent shelf tucked behind the workspace bar's rounded top.
+ * Bottom padding keeps the label above the overlap; opaque surfaces prevent
+ * the pink tint from bleeding through the bar.
  */
 function SubagentComposerTray({ label }: { label: string }) {
   return (
     <div
       data-testid="composer-subagent-tray"
-      className={cn(
-        "mx-auto -mb-4 flex w-full items-center gap-1.5 rounded-t-2xl bg-brand-accent/10 px-4 pt-1.5 pb-5.5 text-sm text-brand-accent",
-        COMPOSER_COLUMN_WIDTH,
-      )}
+      className="composer-subagent-surface mx-3 -mb-4 flex items-center gap-1.5 rounded-t-2xl px-4 pb-5.5 pt-1.5 text-sm text-brand-accent"
     >
       <BotIcon className="size-3.5 shrink-0" aria-hidden="true" />
       {/* truncate so a long sub-agent name never wraps the tray to two rows */}
@@ -2245,16 +2349,19 @@ function ComposerImpl(
     selectedAgentId,
     permissionLevel,
     readOnlyReason,
+    sendDisabledReason = null,
     effortLevels,
     showEffort,
     showModels,
     modelPickerKind,
     codexModelOptions,
+    modelLabelOptions = codexModelOptions,
     showCodexPlanMode,
     showClaudePermissionMode = false,
     showCodexApprovalMode = false,
     showGoalControl = false,
     runnerOnline,
+    runnerStarting = false,
     showClaudeGoalControl = false,
     showPollyCodexGoalControl = false,
     isTerminalFirst = false,
@@ -2280,6 +2387,8 @@ function ComposerImpl(
     editText,
     replaceText,
     appendQuote,
+    beginSideChatQuote,
+    sideChat,
     removeQuote,
   } = useReplyDraft();
   const [submitWithModEnter] = useState(() => readSubmitWithModEnter());
@@ -2288,6 +2397,7 @@ function ComposerImpl(
   const [commandError, setCommandError] = useState<string | null>(null);
   const [planModeBusy, setPlanModeBusy] = useState(false);
   const [goalDialogOpen, setGoalDialogOpen] = useState(false);
+  const [inputFocused, setInputFocused] = useState(false);
   // Index of the highlighted item in the slash-command suggestions menu.
   // -1 means no item highlighted (menu closed or no matches). When the menu
   // opens with matches the reset logic below pre-selects the first item (0)
@@ -2335,6 +2445,7 @@ function ComposerImpl(
   // Trails `conversationId` by one commit across a session switch; see the
   // draft-restore effect.
   const [settledConversationId, setSettledConversationId] = useState<string | null>(null);
+  const draftConversationIdRef = useRef<string | null>(null);
   // Nonce bumped when bare "/model" is submitted; opens the AgentPicker
   // dropdown instead of sending (see submit()).
   const [pickerOpenNonce, setPickerOpenNonce] = useState(0);
@@ -2361,7 +2472,8 @@ function ComposerImpl(
   // is structurally non-interactive (``readOnlyReason``). The
   // structural reason takes priority for the placeholder text since it
   // explains *why* this specific row can't receive input.
-  const isReadOnly = permissionLevel === 1 || readOnlyReason !== null;
+  const isReadOnly =
+    readOnlyReason !== null || (permissionLevel === 1 && sendDisabledReason === null);
   // A pending elicitation addressed to this session parks the turn
   // server-side (the runner blocks on the verdict Future), so a message
   // sent now would sit queued and unread until the card is answered —
@@ -2444,6 +2556,14 @@ function ComposerImpl(
   const codexApprovalMode = useChatStore((s) => s.codexApprovalMode);
   const [configBusy, setConfigBusy] = useState(false);
   const configBusyRef = useRef(false);
+
+  // Ctrl+Shift+M opens the model picker, the keyboard equivalent of bare
+  // "/model" (same nonce bump). Gated like the gear's model-open path: a picker
+  // exists and the gear isn't disabled (not read-only, unreachable, or busy).
+  useModelPickerHotkey(
+    () => setPickerOpenNonce((n) => n + 1),
+    showModels && codexModelOptions.length > 0 && !isReadOnly && !unreachable && !configBusy,
+  );
   const composerWorkspace = composerSession?.workspace;
   // Live workspace/branch/PR status for the workspace bar (lane-3 shared hook):
   // the branch comes from the host's `git worktree list`, never a PR head.
@@ -2456,11 +2576,19 @@ function ComposerImpl(
   const composerContextWindow = useChatStore((s) => s.contextWindow);
   const composerTokensUsed = useChatStore((s) => s.tokensUsed);
   const openComposerGithubTab = useOpenGithubTab();
+  // Devin shares this control but not Claude's vocabulary: its rungs are
+  // normal / accept-edits / smart / dangerous, cycled in the TUI.
+  const devinPermissionControl = modelPickerKind === "devin";
   const permissionOptions = showClaudePermissionMode
-    ? CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES
+    ? devinPermissionControl
+      ? DEVIN_NATIVE_PERMISSION_MODES
+      : CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES
     : CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS;
   const permissionLabel = showClaudePermissionMode
-    ? claudePermissionModeLabel(claudePermissionMode)
+    ? devinPermissionControl
+      ? (DEVIN_NATIVE_PERMISSION_MODES.find((m) => m.value === claudePermissionMode)?.label ??
+        claudePermissionMode)
+      : claudePermissionModeLabel(claudePermissionMode)
     : codexApprovalModeLabel(codexApprovalMode);
   const changePermission = async (mode: string) => {
     if (isReadOnly || unreachable || configBusyRef.current) return;
@@ -2522,7 +2650,15 @@ function ComposerImpl(
   isMobileRef.current = isMobile;
 
   useEffect(() => {
-    const restored = conversationId ? getSessionDraft(conversationId) : undefined;
+    const previousConversationId = draftConversationIdRef.current;
+    const promoted =
+      conversationId &&
+      previousConversationId &&
+      isTempConvId(previousConversationId) &&
+      !isTempConvId(conversationId)
+        ? promoteSessionDraft(previousConversationId, conversationId)
+        : undefined;
+    const restored = promoted ?? (conversationId ? getSessionDraft(conversationId) : undefined);
     replaceText(restored?.text ?? "", restored?.replyDraft);
     textareaRef.current = tailTextareaRef.current;
     setFiles(restored?.files ?? []);
@@ -2532,6 +2668,7 @@ function ComposerImpl(
     // hold the OUTGOING conversation's text during this commit — it waits for
     // this to settle rather than mistaking that for "the user is typing".
     setSettledConversationId(conversationId ?? null);
+    draftConversationIdRef.current = conversationId ?? null;
     if (!isMobileRef.current) textareaRef.current?.focus();
 
     return () => {
@@ -2551,10 +2688,29 @@ function ComposerImpl(
     setSessionDraft(conversationId, { text: fullText, files, replyDraft: storedReplyDraft });
   }, [conversationId, settledConversationId, fullText, files, storedReplyDraft]);
 
-  // Session skills (bundled + host-discovered) come from the snapshot
-  // on bind and populate the suggestions menu as ``/skill-name``
-  // entries alongside the built-ins.
-  const skills = useChatStore((s) => s.skills);
+  const terminalPending = useChatStore((s) => s.terminalPending);
+  const hostOnline = useSessionHostOnline(composerSessionId ?? undefined);
+  const {
+    skills,
+    skillsStatus,
+    refetch: refreshSkills,
+  } = useSkills({
+    target:
+      composerSession?.id && composerSession.hostId && composerSession.workspace
+        ? {
+            sessionId: composerSession.id,
+            scope: {
+              hostId: composerSession.hostId,
+              harness: composerSession.harness,
+              workspace: composerSession.workspace,
+              agentId: composerSession.agentId,
+              subAgentName: composerSession.subAgentName,
+            },
+          }
+        : null,
+    enabled: !isReadOnly && hostOnline !== false,
+    starting: !isReadOnly && (runnerStarting || terminalPending),
+  });
   // ``/model`` writes ``conv.model_override`` (the same column the REPL's
   // ``/model`` and native pickers write). In-process harnesses re-resolve
   // it each turn; native wrappers expose it only when they have a picker
@@ -2569,35 +2725,51 @@ function ComposerImpl(
   // claude-native sessions. Selected/typed, it sends as plaintext to the
   // vendor TUI (see submit) — the forwarder relays its answer to the overlay.
   const showBtw = sessionHarness === "claude-native";
+  const skillPrefix = sessionHarness === "codex-native" ? "$" : "/";
+  // /side is a Codex Code CLI built-in (ephemeral fork side chat), so offer it
+  // only on codex-native sessions. Selected/typed, it sends as plaintext to the
+  // vendor turn path (see submit); the runner opens the fork as a sub-agent chat.
+  const showSide = supportsSideChat(sessionHarness);
   const slashCommands = useMemo(
-    () => buildSlashCommandMap(skills, showEffort, showModel, showCompact, showBtw),
-    [skills, showEffort, showModel, showCompact, showBtw],
+    () =>
+      buildSlashCommandMap(
+        skills,
+        showEffort,
+        showModel,
+        showCompact,
+        showBtw,
+        showSide,
+        skillPrefix,
+      ),
+    [skills, showEffort, showModel, showCompact, showBtw, showSide, skillPrefix],
   );
   // Skills always need an optional argument fill-in so the user can
   // type extra context after the name; built-in commands keep their
   // existing fill/execute split.
   const slashCommandsWithArgs = useMemo(
-    () => buildSlashCommandWithArgsSet(skills, showEffort, showModel, showBtw),
-    [skills, showEffort, showModel, showBtw],
+    () =>
+      buildSlashCommandWithArgsSet(skills, showEffort, showModel, showBtw, showSide, skillPrefix),
+    [skills, showEffort, showModel, showBtw, showSide, skillPrefix],
   );
 
-  // Suggestions menu is open while the user is still typing the command
-  // name — i.e. the value starts with "/" with no spaces yet (once a
-  // space appears the command name is done and args follow) and no second
-  // "/" (guards against file-path-like strings).
+  // Suggest names until a space starts the arguments; exclude file paths.
   const trimmedValue = value.trimStart();
+  const hasCommandPrefix = trimmedValue.startsWith("/") || trimmedValue.startsWith(skillPrefix);
   const menuOpen =
+    inputFocused &&
     draft.quotes.length === 0 &&
-    trimmedValue.startsWith("/") &&
+    hasCommandPrefix &&
     !trimmedValue.slice(1).includes("/") &&
     !trimmedValue.includes(" ") &&
     files.length === 0;
-  // Query = what the user typed after the leading "/".
+  // Query = what the user typed after the command or skill prefix.
   const menuQuery = menuOpen ? trimmedValue.slice(1) : "";
-  // Tint the `/skill` token blue while the draft reads as a slash command, so
-  // the command shape is signalled as the user types it.
+  // Tint only the command or skill token, leaving arguments in the default color.
   const composerIsCommand =
-    draft.quotes.length === 0 && files.length === 0 && isSlashCommandText(value);
+    draft.quotes.length === 0 &&
+    files.length === 0 &&
+    hasCommandPrefix &&
+    splitSlashCommand(value) !== null;
   const toggleCodexPlanMode = async () => {
     if (planModeBusy) return;
     setCommandError(null);
@@ -2615,19 +2787,23 @@ function ComposerImpl(
   // keyboard nav indexes into the same list.
   const menuMatches = menuOpen ? rankedSlashCommandNames(slashCommands, menuQuery) : [];
 
-  // Pre-select the first match whenever the filtered list changes — both
-  // when the menu first opens (matches go [] → non-empty) and as the query
-  // narrows it. Highlighting the top item is what lets Tab/Enter complete it
-  // without the user arrowing down first; the keydown completion branch is
-  // gated on ``menuIndex >= 0``. Arrow navigation only mutates ``menuIndex``
-  // (not ``menuMatches``), so it never trips this reset.
-  const prevMenuMatchesRef = useRef<string[]>([]);
+  // New queries select the first match; asynchronous arrivals retain the selected name.
+  const [previousMenuMatches, setPreviousMenuMatches] = useState<{
+    query: string;
+    names: string[];
+  }>({ query: "", names: [] });
   if (
-    menuMatches.length !== prevMenuMatchesRef.current.length ||
-    menuMatches.some((m, i) => m !== prevMenuMatchesRef.current[i])
+    menuQuery !== previousMenuMatches.query ||
+    menuMatches.length !== previousMenuMatches.names.length ||
+    menuMatches.some((m, i) => m !== previousMenuMatches.names[i])
   ) {
-    prevMenuMatchesRef.current = menuMatches;
-    setMenuIndex(menuMatches.length > 0 ? 0 : -1);
+    const previousName = previousMenuMatches.names[menuIndex];
+    const retainedIndex =
+      previousMenuMatches.query === menuQuery && previousName
+        ? menuMatches.indexOf(previousName)
+        : -1;
+    setPreviousMenuMatches({ query: menuQuery, names: menuMatches });
+    setMenuIndex(retainedIndex >= 0 ? retainedIndex : menuMatches.length > 0 ? 0 : -1);
   }
 
   // "@"-mention is a drill-down file/folder browser. The token after "@"
@@ -2937,6 +3113,22 @@ function ComposerImpl(
       resetCursor();
       recallingRef.current = false;
     },
+    startSideChat(selectedText) {
+      // Add the selection as a quote card (exactly like Reply) and mark the
+      // draft as opening a side chat. The user types their question below it;
+      // submit prefixes /side so it forks instead of replying inline.
+      if (disabled || isReadOnly || unreachable || composerLockedByBtw || !selectedText.trim()) {
+        return;
+      }
+      beginSideChatQuote(selectedText);
+      textareaRef.current = tailTextareaRef.current;
+      dirtyRef.current = true;
+      replyQuoteInsertedRef.current = true;
+      setCommandError(null);
+      dismissMention();
+      resetCursor();
+      recallingRef.current = false;
+    },
   }));
 
   // Apply the caret after the updated draft has rendered and auto-grown.
@@ -3007,6 +3199,7 @@ function ComposerImpl(
     if (
       (!trimmed && files.length === 0 && mentionedItems.length === 0) ||
       disabled ||
+      sendDisabledReason !== null ||
       hasPendingElicitation
     )
       return;
@@ -3015,6 +3208,29 @@ function ComposerImpl(
     // reach here via the form submit) and Enter-key sends. Placed after the
     // guard so guarded no-ops don't emit, matching the disabled Send button.
     trackClick("chat.composer.send", "button");
+
+    // A generic (non-Codex) side chat forks the conversation and runs it on the
+    // SAME host/sandbox as the source (no new sandbox), then opens it as a rail
+    // tab; the typed text seeds the new side chat's composer so it isn't fired
+    // at a still-launching runner. Codex forks in-process instead (its /side
+    // reaches the runner as plaintext).
+    const openGenericSideChat = (question: string) => {
+      const sourceId = useChatStore.getState().conversationId;
+      if (sourceId === null) return;
+      setCommandError(null);
+      createSideChat(sourceId).then(
+        ({ childSessionId }) => {
+          // Clear the composer only once the side chat exists, so a failed
+          // create keeps the user's typed question instead of dropping it.
+          dirtyRef.current = true;
+          setValue("");
+          useChatStore.getState().openSideChatWithDraft(childSessionId, question, sourceId);
+        },
+        // Surface the failure as a toast, not an inline composer error; the
+        // composer text is left intact for a retry.
+        () => toast.error("Couldn't start a side chat for this session."),
+      );
+    };
 
     // Slash command path: the first token must read as "/name" (the shared
     // isSlashCommandText guard — file paths like "/Users/foo/bar.txt" don't
@@ -3058,8 +3274,20 @@ function ComposerImpl(
       // executed locally. It must reach the vendor TUI as plaintext so Claude
       // Code opens its side chat and the forwarder relays the answer to the
       // web overlay; fall through to the plaintext send path below.
-      if (cmd !== "/btw" && cmd in BUILTIN_SLASH_COMMANDS && cmd in slashCommands) {
+      if (
+        cmd !== "/btw" &&
+        cmd !== "/side" &&
+        cmd in BUILTIN_SLASH_COMMANDS &&
+        cmd in slashCommands
+      ) {
         executeSlashCommand(cmd, arg);
+        return;
+      }
+      // /side opens a side chat. Codex forks in-process (falls through to the
+      // plaintext path so its runner forks); every other harness forks
+      // server-side here into an empty side chat, carrying the typed question.
+      if (cmd === "/side" && !usesNativeSideChatFork(sessionHarness)) {
+        openGenericSideChat(trimmed.slice(cmd.length).trim());
         return;
       }
       // Known skill on an in-process session: send a `slash_command` event
@@ -3102,7 +3330,18 @@ function ComposerImpl(
           index === 0 ? { ...quote, before: mentionPreamble + quote.before } : quote,
         ),
       };
-      onSend(serializeReplyDraft(outgoing), sendFiles, snapshotReplyDraft(outgoing));
+      const serialized = serializeReplyDraft(outgoing);
+      if (sideChat && usesNativeSideChatFork(sessionHarness)) {
+        // Codex: the /side pipeline keys off the leading command and forks
+        // in-process. No main-chat bubble is kept, so no reply-draft snapshot.
+        onSend(SIDE_CHAT_COMMAND_PREFIX + serialized, sendFiles);
+      } else if (sideChat && supportsSideChat(sessionHarness)) {
+        // Generic: fork onto a managed side chat, seeding its composer with the
+        // quoted selection + question (no main-chat bubble either).
+        openGenericSideChat(serialized);
+      } else {
+        onSend(serialized, sendFiles, snapshotReplyDraft(outgoing));
+      }
     } else {
       onSend(mentionPreamble + trimmed, sendFiles);
     }
@@ -3146,6 +3385,25 @@ function ComposerImpl(
     // "/"-command). Takes priority over history recall and submission.
     if (!shouldPreferSendOverCompletion && handleMentionKeyDown(e)) return;
 
+    if (menuOpen && (menuMatches.length > 0 || skillsStatus != null) && e.key === "Escape") {
+      e.preventDefault();
+      setValue("");
+      setMenuIndex(-1);
+      return;
+    }
+
+    // A loading-only menu has no completion yet; don't submit the partial token.
+    if (
+      menuOpen &&
+      skillsStatus === "loading" &&
+      menuMatches.length === 0 &&
+      !shouldPreferSendOverCompletion &&
+      (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey && !isMobile))
+    ) {
+      e.preventDefault();
+      return;
+    }
+
     // When the suggestions menu is open, ArrowUp/Down navigate it and
     // Enter/Tab complete the highlighted item. These take priority over
     // history recall and normal submission.
@@ -3167,13 +3425,6 @@ function ComposerImpl(
       ) {
         e.preventDefault();
         applyMenuSelection(menuMatches[menuIndex]!);
-        return;
-      }
-      if (e.key === "Escape") {
-        e.preventDefault();
-        // Dismiss the menu by clearing the input so the user can start fresh.
-        setValue("");
-        setMenuIndex(-1);
         return;
       }
     }
@@ -3224,6 +3475,18 @@ function ComposerImpl(
     ) {
       const ta = e.currentTarget;
       if (e.key === "ArrowUp" && ta.selectionStart === 0) {
+        // Empty-composer recall takes the last queued row before browsing history.
+        if (fullText.trim() === "" && files.length === 0 && mentionedItems.length === 0) {
+          const target = queuedMessages.findLast((m) => m.conversationId === conversationId);
+          if (target !== undefined) {
+            e.preventDefault();
+            resetCursor();
+            setFiles(target.files ?? []);
+            dequeueMessage(target.queueId);
+            applyRecall(ta, target);
+            return;
+          }
+        }
         const recalled = recallPrevious(fullText, storedReplyDraft);
         if (recalled !== null) {
           e.preventDefault();
@@ -3298,40 +3561,46 @@ function ComposerImpl(
           }
         }}
       />
-      {/* Queued messages — peeks above the card like the sub-agent tray.
-          Lists follow-ups held while the agent is busy; drains FIFO on idle.
-          Scope to this conversation so a queue held elsewhere never leaks in. */}
-      <QueuedMessagesStrip
-        messages={queuedMessages.filter((m) => m.conversationId === conversationId)}
-        onDelete={dequeueMessage}
-        onEdit={(queueId) => {
-          // Pull the queued message back into the composer for editing:
-          // replace the composer's text + attachments with the queued
-          // message's, remove it from the queue, and focus the textarea.
-          // Re-sending re-queues it (busy) or sends it (idle).
-          const target = queuedMessages.find((m) => m.queueId === queueId);
-          if (!target) return;
-          replaceText(target.text, target.replyDraft);
-          dirtyRef.current = true;
-          resetCursor();
-          recallingRef.current = false;
-          textareaRef.current = tailTextareaRef.current;
-          setFiles(target.files ?? []);
-          dequeueMessage(queueId);
-          textareaRef.current?.focus();
-        }}
-        onSteer={(queueId) => steerMessage(queueId)}
-        onReorder={reorderQueuedMessage}
-        widthClassName={COMPOSER_COLUMN_WIDTH}
-      />
-      {/* Sub-agent context tray — peeks above the card; reserves its own
-          layout slot so the card sits below it (see SubagentComposerTray).
-          Truthy (not just non-null) so an empty label never peeks a
-          nameless tray. */}
-      {subAgentLabel ? <SubagentComposerTray label={subAgentLabel} /> : null}
       {/* Drop cue, spanning the chat column this composer belongs to. */}
       {isDragActive && dropTarget ? <FileDropOverlay container={dropTarget} /> : null}
+      {/* The composer stack above the card: trays dock onto the inset
+          workspace bar, so they share its column wrapper and its mx-3
+          inset — a tray's negative-margin tuck only hides its square
+          bottom corners when the surface below is at least as wide,
+          otherwise page background shows and the tray floats detached. */}
       <div className={cn("mx-auto", COMPOSER_COLUMN_WIDTH)}>
+        {/* Queued messages — peeks above the workspace bar like the
+            sub-agent tray. Lists follow-ups held while the agent is busy;
+            drains FIFO on idle. Scope to this conversation so a queue held
+            elsewhere never leaks in. */}
+        <QueuedMessagesStrip
+          messages={queuedMessages.filter((m) => m.conversationId === conversationId)}
+          onDelete={dequeueMessage}
+          onEdit={(queueId) => {
+            // Pull the queued message back into the composer for editing:
+            // replace the composer's text + attachments with the queued
+            // message's, remove it from the queue, and focus the textarea.
+            // Re-sending re-queues it (busy) or sends it (idle).
+            const target = queuedMessages.find((m) => m.queueId === queueId);
+            if (!target) return;
+            replaceText(target.text, target.replyDraft);
+            dirtyRef.current = true;
+            resetCursor();
+            recallingRef.current = false;
+            textareaRef.current = tailTextareaRef.current;
+            setFiles(target.files ?? []);
+            dequeueMessage(queueId);
+            textareaRef.current?.focus();
+          }}
+          onSteer={(queueId) => steerMessage(queueId)}
+          onReorder={reorderQueuedMessage}
+          widthClassName="mx-3 w-auto"
+        />
+        {/* Sub-agent context tray — peeks above the workspace bar; reserves
+            its own layout slot so the bar sits below it (see
+            SubagentComposerTray). Truthy (not just non-null) so an empty
+            label never peeks a nameless tray. */}
+        {subAgentLabel ? <SubagentComposerTray label={subAgentLabel} /> : null}
         <ComposerWorkspaceBar data-testid="composer-workspace-controls">
           <ComposerWorkspaceStatus
             workspacePath={composerWorkspace ?? null}
@@ -3357,8 +3626,6 @@ function ComposerImpl(
                 tokensUsed={composerTokensUsed}
               />
             </div>
-            <BackgroundTaskIndicator />
-            <SubagentTaskIndicator conversationId={composerSessionId} />
           </div>
         </ComposerWorkspaceBar>
       </div>
@@ -3374,14 +3641,14 @@ function ComposerImpl(
           ref: bindTailTextarea,
           value: draft.text,
           onChange: (e) => handleTextChange(null, e),
-          onFocus: (e) => handleTextFocus(null, e.currentTarget),
+          onFocus: (e) => {
+            setInputFocused(true);
+            handleTextFocus(null, e.currentTarget);
+          },
           onKeyDown: handleKeyDown,
           onBlur: () => {
-            // Dismiss the "@"-mention menu when focus leaves the textarea
-            // (clicking a chip's ✕, the Send button, or another field).
-            // Menu rows ``preventDefault`` on mousedown so selecting an entry
-            // keeps focus and does NOT blur — this only fires for genuine
-            // focus-out, where the lingering menu would otherwise float.
+            // Menu rows preventDefault on mousedown so selecting one keeps focus.
+            setInputFocused(false);
             dismissMention();
           },
           onPaste: handlePaste,
@@ -3396,17 +3663,20 @@ function ComposerImpl(
               ? readOnlyReason
               : isReadOnly
                 ? "You have read-only access to this session"
-                : unreachable
+                : unreachable && sendDisabledReason === null
                   ? "Session offline — reconnect below to continue"
                   : hasPendingElicitation
                     ? "Respond to the pending request above to continue"
-                    : disabled
+                    : disabled && sendDisabledReason === null
                       ? "Waiting for agents…"
                       : isStreaming
                         ? "Send a follow-up (queued) — Esc to stop"
                         : "Send a message…",
           rows: 1,
-          disabled: disabled || isReadOnly || unreachable || composerLockedByBtw,
+          disabled:
+            ((disabled || unreachable) && sendDisabledReason === null) ||
+            isReadOnly ||
+            composerLockedByBtw,
           "data-slash-command": composerIsCommand ? "true" : undefined,
           "data-has-draft": hasDraft ? "true" : undefined,
           className: cn(
@@ -3419,29 +3689,40 @@ function ComposerImpl(
         slots={{
           inputPrefix:
             draft.quotes.length > 0 ? (
-              <ReplyDraftBlocks
-                quotes={draft.quotes}
-                activeTextId={activeTextId}
-                keyboard={{ submitWithModEnter, preventsKeyboardSubmit }}
-                disabled={disabled || isReadOnly || unreachable || composerLockedByBtw}
-                onGrowth={onViewportShrinkPinScroll}
-                onRemove={(id) => {
-                  removeQuote(id);
-                  resetCursor();
-                  recallingRef.current = false;
-                  textareaRef.current = tailTextareaRef.current;
-                  dirtyRef.current = true;
-                  dismissMention();
-                }}
-                inputFor={(quote) => ({
-                  onChange: (e) => handleTextChange(quote.id, e),
-                  onFocus: (e) => handleTextFocus(quote.id, e.currentTarget),
-                  onBlur: dismissMention,
-                  onKeyDown: handleKeyDown,
-                  onPaste: handlePaste,
-                  "data-has-draft": hasDraft ? "true" : undefined,
-                })}
-              />
+              <>
+                {sideChat ? (
+                  <div
+                    data-testid="composer-side-chat-hint"
+                    className="mb-1 flex items-center gap-1 text-xs font-medium text-brand-accent"
+                  >
+                    <MessagesSquareIcon className="size-3" />
+                    Ask in a side chat forked from this main conversation
+                  </div>
+                ) : null}
+                <ReplyDraftBlocks
+                  quotes={draft.quotes}
+                  activeTextId={activeTextId}
+                  keyboard={{ submitWithModEnter, preventsKeyboardSubmit }}
+                  disabled={disabled || isReadOnly || unreachable || composerLockedByBtw}
+                  onGrowth={onViewportShrinkPinScroll}
+                  onRemove={(id) => {
+                    removeQuote(id);
+                    resetCursor();
+                    recallingRef.current = false;
+                    textareaRef.current = tailTextareaRef.current;
+                    dirtyRef.current = true;
+                    dismissMention();
+                  }}
+                  inputFor={(quote) => ({
+                    onChange: (e) => handleTextChange(quote.id, e),
+                    onFocus: (e) => handleTextFocus(quote.id, e.currentTarget),
+                    onBlur: dismissMention,
+                    onKeyDown: handleKeyDown,
+                    onPaste: handlePaste,
+                    "data-has-draft": hasDraft ? "true" : undefined,
+                  })}
+                />
+              </>
             ) : undefined,
           beforeInput: (
             <>
@@ -3452,6 +3733,8 @@ function ComposerImpl(
                   activeIndex={menuIndex}
                   onSelect={applyMenuSelection}
                   commands={slashCommands}
+                  skillsStatus={skillsStatus}
+                  onRetrySkills={() => void refreshSkills()}
                 />
               )}
               {/* "@"-file-mention browser — native coding-agent sessions only.
@@ -3489,7 +3772,7 @@ function ComposerImpl(
                   <div className="mb-2">
                     <p className="mb-1 text-xs text-muted-foreground">Answer:</p>
                     <div className="prose prose-sm dark:prose-invert max-w-none text-sm">
-                      <FilePathAwareMessageResponse>
+                      <FilePathAwareMessageResponse mode="static">
                         {btwSidechat.answer}
                       </FilePathAwareMessageResponse>
                     </div>
@@ -3501,7 +3784,7 @@ function ComposerImpl(
                 </div>
               )}
               {/* Highlight overlay: a textarea can only paint its text one color, so
-            to tint just the `/skill` token we hide the textarea's own glyphs
+            to tint just the command or skill token we hide the textarea's own glyphs
             (text-transparent, caret kept visible) and render an aligned mirror
             behind it. Same box/typography so wrapping matches the textarea
             exactly. Only mounted while the draft is a command. */}
@@ -3529,32 +3812,8 @@ function ComposerImpl(
           ),
           attachments: (
             <>
-              {/* File chips — shown below textarea when files are attached */}
-              {files.length > 0 && (
-                <div className="flex flex-wrap gap-1.5 px-4 pb-2">
-                  {files.map((file, i) => (
-                    <span
-                      key={attachmentKey(file)}
-                      className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground"
-                    >
-                      {file.type.startsWith("image/") ? (
-                        <ImageIcon className="size-3 shrink-0" />
-                      ) : (
-                        <FileTextIcon className="size-3 shrink-0" />
-                      )}
-                      <span className="max-w-[140px] truncate">{file.name || "image.png"}</span>
-                      <button
-                        type="button"
-                        onClick={() => removeFile(i)}
-                        className="ml-0.5 rounded-full hover:text-foreground"
-                        aria-label={`Remove ${file.name || "image.png"}`}
-                      >
-                        <XIcon className="size-3" />
-                      </button>
-                    </span>
-                  ))}
-                </div>
-              )}
+              {/* Pending attachments — image thumbnails (click to view) + file rows. */}
+              <ComposerAttachments files={files} onRemove={removeFile} />
               {/* Rejected-attachment feedback: unsupported type or too large */}
               {attachmentError !== null && (
                 <div className="px-4 pb-2 text-sm text-destructive whitespace-pre-wrap">
@@ -3624,6 +3883,29 @@ function ComposerImpl(
                 planDisabled={isReadOnly || planModeBusy}
                 planActive={codexPlanMode}
                 planLabel={codexPlanMode ? "Exit Plan mode" : "Enter Plan mode"}
+                onSideChat={
+                  composerSessionId && !isReadOnly && supportsSideChat(sessionHarness)
+                    ? () => {
+                        if (usesNativeSideChatFork(sessionHarness)) {
+                          // Codex forks in-process from a typed /side; prefill so
+                          // the user types the question.
+                          setValue(SIDE_CHAT_COMMAND_PREFIX);
+                          setCommandError(null);
+                          dirtyRef.current = true;
+                          return;
+                        }
+                        const sourceId = useChatStore.getState().conversationId;
+                        if (sourceId === null) return;
+                        createSideChat(sourceId).then(
+                          ({ childSessionId }) =>
+                            useChatStore.setState({
+                              sideChatToOpen: { childId: childSessionId, parentId: sourceId },
+                            }),
+                          () => toast.error("Couldn't start a side chat for this session."),
+                        );
+                      }
+                    : undefined
+                }
               />
               {!subAgentLabel && composerSessionId && (
                 <HostBadge
@@ -3665,6 +3947,8 @@ function ComposerImpl(
                   effortLevels={effortLevels}
                   modelPickerKind={modelPickerKind}
                   codexModelOptions={codexModelOptions}
+                  modelLabelOptions={modelLabelOptions}
+                  modelLabelHostId={composerSession?.hostId}
                   costRoutingEligible={costRoutingEligible}
                   subagentRoutingEligible={subagentRoutingEligible}
                   // Config changes persist server-side and apply on the next
@@ -3708,9 +3992,13 @@ function ComposerImpl(
                       disabled={
                         showInterruptButton
                           ? isReadOnly
-                          : !hasDraft || disabled || isReadOnly || hasPendingElicitation
+                          : !hasDraft ||
+                            disabled ||
+                            isReadOnly ||
+                            sendDisabledReason !== null ||
+                            hasPendingElicitation
                       }
-                      title={showInterruptButton ? "Interrupt" : undefined}
+                      title={showInterruptButton ? "Interrupt" : (sendDisabledReason ?? undefined)}
                       label={showInterruptButton ? "Interrupt" : "Send"}
                     />
                   </TooltipTrigger>
@@ -3823,8 +4111,13 @@ export function computeShowsWorking(
  * dead host surfaces as a failed send rather than a silently-dropped
  * prompt on an empty composer.
  *
- * @param params.initialPrompt Carried prompt, or ``null``/``""`` when
- *   none was passed, e.g. ``"read the README"``. Empty/falsy never sends.
+ * @param params.initialPrompt Carried prompt text, or ``null``/``""``
+ *   when none was passed, e.g. ``"read the README"``. Falsy text sends
+ *   only when the prompt carries attachments (an image-only draft).
+ * @param params.initialPromptFileCount Number of attachments on the
+ *   carried prompt, e.g. ``1`` for an image-only draft, ``0`` when none.
+ *   Files count as content: blank text with files still sends, matching
+ *   the landing composer's submit gate.
  * @param params.promptConversationId The conversation id the prompt was
  *   consumed for, or ``null``. Must equal ``conversationId`` — a mismatch
  *   means the user switched sessions before the auto-send fired, so the
@@ -3843,15 +4136,19 @@ export function computeShowsWorking(
  */
 export function shouldSendInitialPrompt(params: {
   initialPrompt: string | null;
+  initialPromptFileCount: number;
   promptConversationId: string | null;
   sentForConversationId: string | null;
   conversationId: string | null | undefined;
   loadingConversation: boolean;
   agentId: string | null;
 }): boolean {
-  // Reject falsy (null or "") so a manipulated router state can't fire
-  // send("") — defense-in-depth alongside the dialog's blank guard.
-  if (!params.initialPrompt) return false;
+  // Reject a contentless prompt — falsy text (null or "") AND no files —
+  // so a manipulated router state can't fire send(""): defense-in-depth
+  // alongside the dialog's blank guard. Blank text WITH attachments is an
+  // image-only first message and passes; send() omits the input_text
+  // block for blank text, so the wire shape stays valid.
+  if (!params.initialPrompt && !params.initialPromptFileCount) return false;
   // The prompt must still belong to the active session. `initialPrompt` is
   // set by an effect whose `setInitialPrompt` doesn't flush until the next
   // render, so when the user switches `/c/:a` → `/c/:b` the auto-send effect
@@ -3886,8 +4183,10 @@ export function shouldSendInitialPrompt(params: {
  * @param prompt The consumed pending prompt, e.g.
  *   ``{ text: "/review-pr 123", skill: { name: "review-pr", args: "123" } }``.
  * @param agentId Resolved agent id, e.g. ``"ag_abc123"``.
- * @param send ``chatStore.send`` — posts a plain user message. Always
- *   called with no files: the landing composer has no attachments.
+ * @param send ``chatStore.send`` — posts a plain user message with the
+ *   prompt's landing attachments (an empty array when none). For an
+ *   image-only draft the text is ``""`` and send() omits the
+ *   ``input_text`` block, so the message is ``input_image`` blocks alone.
  * @param sendSlashCommand ``chatStore.sendSlashCommand`` — posts a
  *   ``slash_command`` event.
  */
@@ -3974,7 +4273,7 @@ const PI_NATIVE_EFFORT_LEVELS = [
   "max",
 ] as const;
 
-type NativeModelPickerKind = "claude" | "codex" | "cursor" | "kiro" | "opencode" | "pi";
+type NativeModelPickerKind = "claude" | "codex" | "cursor" | "kiro" | "opencode" | "pi" | "devin";
 
 type LabelSource = { labels?: Record<string, string | null> | null } | null | undefined;
 
@@ -3997,7 +4296,21 @@ export function readOnlyReasonForSessionLabels(
 ): string | null {
   const closed =
     activeSession?.labels?.["omnigent.closed"] ?? activeConv?.labels?.["omnigent.closed"];
-  if (closed === "true") return "This sub-agent session is closed";
+  if (closed === "true") {
+    // A codex /side child is sealed (server-computed) once its ephemeral fork's
+    // runner is gone; give it a side-chat-specific reason rather than the
+    // generic sub-agent one so the user understands it's read-only for good.
+    // "Side chat" is the nickname the server stamps on a /side fork.
+    const wrapperLabel =
+      activeSession?.labels?.["omnigent.wrapper"] ?? activeConv?.labels?.["omnigent.wrapper"];
+    const nickname =
+      activeSession?.labels?.["omnigent.codex_native.agent_nickname"] ??
+      activeConv?.labels?.["omnigent.codex_native.agent_nickname"];
+    if (wrapperLabel === "codex-native-ui-subagent" && nickname === "Side chat") {
+      return "This side chat has ended and can't receive new messages";
+    }
+    return "This sub-agent session is closed";
+  }
   const wrapper =
     activeSession?.labels?.["omnigent.wrapper"] ?? activeConv?.labels?.["omnigent.wrapper"];
   if (wrapper === "claude-code-native-ui-subagent") {
@@ -4015,30 +4328,63 @@ export function readOnlyReasonForSessionLabels(
  * mid-session overrides — keeps the label authoritative and skips the
  * fallback.
  */
-function isLabelLessCodexNative(
+/**
+ * The wrapper label a session behaves as: its own, else the one its harness
+ * implies.
+ *
+ * A session created before its harness was renamed carries no
+ * ``omnigent.wrapper`` label — the ACP-era Devin rows are the live example — so
+ * every label-driven surface below (model picker, effort ladder, permission mode)
+ * would read it as non-native even though the runner resolves it to a native
+ * harness and gives it a pane. Deriving from the harness fixes that for any
+ * rename, and subsumes the codex-only special case this replaces.
+ *
+ * A sub-agent child is excluded: it owns no PTY and takes no input, so it must
+ * not gain a picker just because its harness is native.
+ */
+function effectiveWrapperLabel(
   conv:
-    { labels?: Record<string, string | null> | null; harness?: string | null } | null | undefined,
-): boolean {
-  return conv?.labels?.["omnigent.wrapper"] == null && conv?.harness === "codex-native";
+    | {
+        labels?: Record<string, string | null> | null;
+        harness?: string | null;
+        parentSessionId?: string | null;
+      }
+    | null
+    | undefined,
+): string | undefined {
+  const label = conv?.labels?.["omnigent.wrapper"];
+  if (label != null) return label;
+  if (conv?.parentSessionId != null) return undefined;
+  return nativeCodingAgentForHarness(conv?.harness)?.wrapperLabel;
 }
 
 export function effortLevelsForConv(
   conv:
-    { labels?: Record<string, string | null> | null; harness?: string | null } | null | undefined,
+    | {
+        labels?: Record<string, string | null> | null;
+        harness?: string | null;
+        parentSessionId?: string | null;
+      }
+    | null
+    | undefined,
   codexModelOptions: readonly NativeModelOption[] = [],
   currentModel: string | null = null,
 ): readonly string[] {
-  switch (conv?.labels?.["omnigent.wrapper"]) {
+  switch (effectiveWrapperLabel(conv)) {
     case "claude-code-native-ui":
       return CLAUDE_NATIVE_EFFORT_LEVELS;
+    case "devin-native-ui":
+      // Devin encodes effort as a model-variant suffix, and the rung set is
+      // PER MODEL (swe-2 exposes only medium/high/max; `swe-2-low` is a different
+      // Fusion model), so derive it from the selected model's catalog entry —
+      // its `supportedReasoningEfforts` — rather than a fixed ladder.
+      return codexEffortLevelsForModel(codexModelOptions, currentModel);
     case "codex-native-ui":
       return codexEffortLevelsForModel(codexModelOptions, currentModel);
     case "pi-native-ui":
       return PI_NATIVE_EFFORT_LEVELS;
     default:
-      return isLabelLessCodexNative(conv)
-        ? codexEffortLevelsForModel(codexModelOptions, currentModel)
-        : EFFORT_LEVELS;
+      return EFFORT_LEVELS;
   }
 }
 
@@ -4051,9 +4397,15 @@ export function effortLevelsForConv(
  */
 export function modelPickerKindForConv(
   conv:
-    { labels?: Record<string, string | null> | null; harness?: string | null } | null | undefined,
+    | {
+        labels?: Record<string, string | null> | null;
+        harness?: string | null;
+        parentSessionId?: string | null;
+      }
+    | null
+    | undefined,
 ): NativeModelPickerKind | null {
-  switch (conv?.labels?.["omnigent.wrapper"]) {
+  switch (effectiveWrapperLabel(conv)) {
     case "claude-code-native-ui":
       return "claude";
     case "codex-native-ui":
@@ -4070,6 +4422,10 @@ export function modelPickerKindForConv(
       // model into the session ``model_override`` (the forwarder's terminal→web
       // mirror), so the picker surfaces that as the live model.
       return "opencode";
+    case "devin-native-ui":
+      // Like opencode/pi: Devin mirrors its live model into ``model_override``
+      // (the executor types ``/model`` when a routed model changes).
+      return "devin";
     case "pi-native-ui":
       // Like cursor: the runner types a model switch into the live Pi process
       // (via the bridge inbox → Pi's ``setModel``) and Pi mirrors its own
@@ -4077,7 +4433,7 @@ export function modelPickerKindForConv(
       // model_select handler, so the picker surfaces that as the live model.
       return "pi";
     default:
-      return isLabelLessCodexNative(conv) ? "codex" : null;
+      return null;
   }
 }
 
@@ -4118,10 +4474,12 @@ export function shouldShowCodexPlanModeControl(
  *     or missing labels fails closed.
  * :returns: True only for sessions running the claude-native wrapper.
  */
-export function shouldShowClaudePermissionModeControl(
+export function shouldShowPermissionModeControl(
   conv: { labels?: Record<string, string | null> | null } | null | undefined,
 ): boolean {
-  return isClaudeNativeSession(conv);
+  // Devin cycles its own rungs with Shift+Tab, which the runner drives, so it
+  // gets the same control — with its own vocabulary (see `permissionOptions`).
+  return isClaudeNativeSession(conv) || modelPickerKindForConv(conv) === "devin";
 }
 
 /**
@@ -4209,6 +4567,8 @@ function SessionHarnessPicker({
   effortLevels,
   modelPickerKind,
   codexModelOptions,
+  modelLabelOptions,
+  modelLabelHostId,
   costRoutingEligible,
   subagentRoutingEligible,
   disabled,
@@ -4226,6 +4586,8 @@ function SessionHarnessPicker({
   effortLevels: readonly string[];
   modelPickerKind: NativeModelPickerKind | null;
   codexModelOptions: readonly NativeModelOption[];
+  modelLabelOptions: readonly NativeModelOption[];
+  modelLabelHostId: string | null | undefined;
   costRoutingEligible: boolean;
   subagentRoutingEligible: boolean;
   disabled: boolean;
@@ -4233,7 +4595,7 @@ function SessionHarnessPicker({
 }) {
   const isMobile = useIsMobileViewport();
   const [menuOpen, setMenuOpen] = useState(false);
-  const [configMenuOpen, setConfigMenuOpen] = useState(false);
+  const [configMenu, setConfigMenu] = useState<"model" | "effort" | null>(null);
   const [error, setError] = useState<string | null>(null);
   const appliedOpenNonce = useRef(0);
   const conversationId = useChatStore((state) => state.conversationId);
@@ -4244,8 +4606,24 @@ function SessionHarnessPicker({
   const selectedEffort = useSessionEffort();
   const costControlModeOverride = useChatStore((state) => state.costControlModeOverride);
   const routingOn = costRoutingEligible && costControlModeOverride === "on";
-  const { effectiveModel, modelLabel, modelOptions, pickerSelectedModel } =
-    useResolvedComposerModel(modelPickerKind, codexModelOptions);
+  const {
+    effectiveModel,
+    modelLabel,
+    modelLabelLoading,
+    modelLabelUnavailable,
+    modelOptions,
+    pickerSelectedModel,
+  } = useResolvedComposerModel(
+    modelPickerKind,
+    codexModelOptions,
+    modelLabelOptions,
+    modelLabelHostId,
+  );
+  const modelSummary = modelLabelLoading
+    ? "Loading model…"
+    : modelLabelUnavailable
+      ? "Model name unavailable"
+      : modelLabel;
   const nativeAgent =
     nativeCodingAgentForHarness(sessionHarness) ??
     (modelPickerKind ? nativeCodingAgentForHarness(modelPickerKind + "-native") : undefined);
@@ -4257,8 +4635,9 @@ function SessionHarnessPicker({
     harnessLabel,
     showModels,
     showEffort,
-    modelPickerKind,
     codexModelOptions,
+    effectiveModel,
+    modelLabel: modelSummary,
     costRoutingEligible,
   });
   const configurable = hasSessionConfig({
@@ -4272,7 +4651,9 @@ function SessionHarnessPicker({
   const effortLabel = showEffort && !routingOn ? formatStatusEffortLabel(selectedEffort) : null;
   const label = routingOn
     ? SMART_ROUTING_LABEL
-    : (modelLabel ?? nativeAgent?.displayName ?? harnessLabel ?? "Session");
+    : modelLabelLoading
+      ? ""
+      : (modelSummary ?? nativeAgent?.displayName ?? harnessLabel ?? "Session");
   const availableEfforts =
     modelPickerKind === "codex"
       ? codexEffortLevelsForModel(codexModelOptions, pickerSelectedModel)
@@ -4282,12 +4663,12 @@ function SessionHarnessPicker({
     appliedOpenNonce.current = openNonce;
     if (!disabled && configurable) {
       setMenuOpen(true);
-      setConfigMenuOpen(true);
+      setConfigMenu(showModels ? "model" : "effort");
     }
-  }, [openNonce, disabled, configurable]);
+  }, [openNonce, disabled, configurable, showModels]);
   useEffect(() => {
     setMenuOpen(false);
-    setConfigMenuOpen(false);
+    setConfigMenu(null);
     setError(null);
   }, [conversationId]);
   const apply = async (change: () => Promise<unknown>) => {
@@ -4329,56 +4710,108 @@ function SessionHarnessPicker({
       )
         await store.setCostControlMode("off");
     });
-  const configContent = (
-    <ComposerConfigSections
-      models={
-        showModels
-          ? {
-              testId: "composer-agent-models",
-              header: "Models",
-              choices: [
-                ...(!modelOptions.some((model) => model.isDefault)
-                  ? [
-                      {
-                        key: "__default__",
-                        label: "Default",
-                        checked: !routingOn && pickerSelectedModel === null,
-                        disabled: busy || pendingModelChange !== null,
-                        onSelect: () => selectModel(null),
-                        testId: "composer-agent-model-default",
-                      },
-                    ]
-                  : []),
-                ...modelOptions.map((model) => ({
-                  key: model.id,
-                  label: nativeModelLabel(model),
-                  checked:
-                    !routingOn &&
-                    (model.id === pickerSelectedModel ||
-                      (pickerSelectedModel === null && model.isDefault === true)),
-                  disabled: busy || pendingModelChange !== null,
-                  onSelect: () => selectModel(model.isDefault ? null : model.id),
-                  testId: `composer-agent-model-${model.id}`,
-                  className: "whitespace-normal break-words",
-                  data: { "data-model-id": model.id },
-                })),
-                ...(pickerSelectedModel &&
-                !modelOptions.some((model) => model.id === pickerSelectedModel)
-                  ? [
-                      {
-                        key: "__current__",
-                        label: `${modelLabel ?? effectiveModel} (current)`,
-                        checked: !routingOn,
-                        disabled: true,
-                        className: "whitespace-normal break-words",
-                        data: { "data-model-id": pickerSelectedModel },
-                      },
-                    ]
-                  : []),
-              ],
+  // Devin Fusion: the composed `fusion-…` id is the model; the lead effort is
+  // baked in, so it carries no separate reasoning effort.
+  const composerFusionOption = fusionOption(modelOptions);
+  const composerFusion = composerFusionOption?.fusion;
+  const fusionSelected = composerFusion !== undefined && isFusionModelUid(pickerSelectedModel);
+  const selectFusionModel = (modelUid: string) =>
+    void apply(async () => {
+      const store = useChatStore.getState();
+      const sourceSessionId = store.conversationId;
+      await store.setModel(modelUid, { expectConfirmation: false });
+      if (useChatStore.getState().conversationId !== sourceSessionId) return;
+      if (selectedEffort !== null) await store.setEffort(null);
+    });
+  const modelContent = (
+    <>
+      {costRoutingEligible && showModels && (
+        <>
+          <DropdownMenuItem
+            disabled={busy || pendingModelChange !== null}
+            onSelect={() =>
+              void apply(() => useChatStore.getState().setCostControlMode(routingOn ? "off" : "on"))
             }
-          : undefined
-      }
+            data-active={routingOn ? "true" : undefined}
+            className="items-center text-13 data-[active=true]:bg-muted data-[active=true]:text-foreground dark:data-[active=true]:bg-muted/50"
+          >
+            <WandSparklesIcon className="size-4" />
+            {SMART_ROUTING_LABEL}
+          </DropdownMenuItem>
+          <DropdownMenuSeparator />
+        </>
+      )}
+      <ComposerConfigSections
+        models={
+          showModels
+            ? {
+                testId: "composer-agent-models",
+                header: "Models",
+                choices: [
+                  ...(!modelOptions.some((model) => model.isDefault)
+                    ? [
+                        {
+                          key: "__default__",
+                          label: "Default",
+                          checked: !routingOn && pickerSelectedModel === null,
+                          disabled: busy || pendingModelChange !== null,
+                          onSelect: () => selectModel(null),
+                          testId: "composer-agent-model-default",
+                        },
+                      ]
+                    : []),
+                  ...modelOptions.map((model) => ({
+                    key: model.id,
+                    label: nativeModelLabel(model),
+                    checked:
+                      !routingOn &&
+                      (composerFusion !== undefined && model.id === composerFusionOption?.id
+                        ? isFusionModelUid(pickerSelectedModel)
+                        : model.id === pickerSelectedModel ||
+                          (pickerSelectedModel === null && model.isDefault === true)),
+                    disabled: busy || pendingModelChange !== null,
+                    onSelect: () =>
+                      composerFusion !== undefined && model.id === composerFusionOption?.id
+                        ? selectFusionModel(composerFusion.default)
+                        : selectModel(model.isDefault ? null : model.id),
+                    testId: `composer-agent-model-${model.id}`,
+                    className: "whitespace-normal break-words",
+                    data: { "data-model-id": model.id },
+                  })),
+                  ...(pickerSelectedModel &&
+                  !isFusionModelUid(pickerSelectedModel) &&
+                  !modelOptions.some((model) => model.id === pickerSelectedModel)
+                    ? [
+                        {
+                          key: "__current__",
+                          label: `${modelSummary ?? "Default"} (current)`,
+                          checked: !routingOn,
+                          disabled: true,
+                          className: "whitespace-normal break-words",
+                          data: { "data-model-id": pickerSelectedModel },
+                        },
+                      ]
+                    : []),
+                ],
+              }
+            : undefined
+        }
+        extra={
+          composerFusion !== undefined && fusionSelected && !routingOn
+            ? buildFusionSections({
+                descriptor: composerFusion,
+                modelUid: pickerSelectedModel ?? composerFusion.default,
+                testIdPrefix: "composer-agent",
+                onChange: selectFusionModel,
+                disabled: busy || pendingModelChange !== null,
+              })
+            : undefined
+        }
+      />
+    </>
+  );
+  const effortContent = (
+    <ComposerConfigSections
       efforts={
         showEffort && availableEfforts.length > 0
           ? {
@@ -4404,7 +4837,7 @@ function SessionHarnessPicker({
         open={menuOpen}
         onOpenChange={(next) => {
           if (!next || (!disabled && !busy && configurable)) setMenuOpen(next);
-          if (!next) setConfigMenuOpen(false);
+          if (!next) setConfigMenu(null);
         }}
         trigger={{
           label: "Configure session",
@@ -4416,6 +4849,7 @@ function SessionHarnessPicker({
           className: disabled ? "cursor-default opacity-50" : undefined,
           testIdPrefix: "composer",
           "data-testid": "composer-config-gear",
+          loading: modelLabelLoading && !routingOn,
           pending:
             (sessionModelSeeded || pendingModelChange !== null) &&
             (modelPickerKind === "claude" || modelPickerKind === "codex"),
@@ -4423,60 +4857,59 @@ function SessionHarnessPicker({
         tooltip={<ComposerConfigTooltipRows rows={summary} />}
         tooltipTestId="composer-config-gear-tooltip"
         testId="composer-agent-menu"
-        configOpen={configMenuOpen}
       >
-        {isMobile && configMenuOpen ? (
+        {isMobile && configMenu !== null ? (
           <HarnessPickerConfigPage
             backTestId="composer-agent-config-back"
-            testId="composer-agent-config-menu"
-            onBack={() => setConfigMenuOpen(false)}
+            testId={
+              configMenu === "model" ? "composer-agent-config-menu" : "composer-agent-effort-menu"
+            }
+            onBack={() => setConfigMenu(null)}
           >
-            {configContent}
+            {configMenu === "model" ? modelContent : effortContent}
           </HarnessPickerConfigPage>
         ) : (
           <>
-            <div
-              title={
-                !costRoutingEligible || !showModels
-                  ? "Smart Routing is not available for this session."
-                  : undefined
-              }
-            >
-              <DropdownMenuItem
-                disabled={
-                  busy || pendingModelChange !== null || !costRoutingEligible || !showModels
-                }
-                onSelect={() =>
-                  void apply(() =>
-                    useChatStore.getState().setCostControlMode(routingOn ? "off" : "on"),
+            <PickerSectionHeader>
+              {nativeAgent?.displayName ?? harnessLabel ?? "Session"}
+            </PickerSectionHeader>
+            {showModels && (
+              <HarnessPickerConfigRow
+                label="Model"
+                value={routingOn ? SMART_ROUTING_LABEL : (modelSummary ?? "Default")}
+                open={configMenu === "model"}
+                onOpenChange={(open) =>
+                  setConfigMenu((current) =>
+                    open ? "model" : current === "model" ? null : current,
                   )
                 }
-                data-active={routingOn ? "true" : undefined}
-                className="group/routing items-center text-13 data-[active=true]:bg-muted data-[active=true]:text-foreground dark:data-[active=true]:bg-muted/50"
+                isMobile={isMobile}
+                disabled={busy || pendingModelChange !== null}
+                valueTestId="composer-agent-model-summary"
+                testId="composer-agent-edit"
+                configTestId="composer-agent-config-menu"
               >
-                <WandSparklesIcon className="size-4" />
-                <span className="flex-1">{SMART_ROUTING_LABEL}</span>
-                <span className="min-w-0 truncate text-right text-xs text-muted-foreground opacity-0 group-hover/routing:opacity-100 group-focus/routing:opacity-100">
-                  Model
-                </span>
-              </DropdownMenuItem>
-              <DropdownMenuSeparator />
-            </div>
-            <PickerSectionHeader>{nativeAgent ? "Harnesses" : "Agents"}</PickerSectionHeader>
-            <HarnessPickerEntry
-              open={configMenuOpen}
-              onOpenChange={setConfigMenuOpen}
-              icon={<ComposerAgentIcon agent={iconAgent} />}
-              label={nativeAgent?.displayName ?? harnessLabel ?? "Session"}
-              summary={routingOn ? SMART_ROUTING_LABEL : (modelLabel ?? "Default")}
-              active={!routingOn}
-              isMobile={isMobile}
-              disabled={busy || pendingModelChange !== null}
-              summaryTestId="composer-agent-model-summary"
-              testId="composer-agent-edit"
-              configTestId="composer-agent-config-menu"
-              configContent={configContent}
-            />
+                {modelContent}
+              </HarnessPickerConfigRow>
+            )}
+            {showEffort && availableEfforts.length > 0 && (
+              <HarnessPickerConfigRow
+                label={modelPickerKind === "pi" ? "Thinking level" : "Effort"}
+                value={routingOn ? "Automatic" : (effortLabel ?? "Default")}
+                open={configMenu === "effort"}
+                onOpenChange={(open) =>
+                  setConfigMenu((current) =>
+                    open ? "effort" : current === "effort" ? null : current,
+                  )
+                }
+                isMobile={isMobile}
+                disabled={routingOn || busy || pendingModelChange !== null}
+                testId="composer-agent-effort-select"
+                configTestId="composer-agent-effort-menu"
+              >
+                {effortContent}
+              </HarnessPickerConfigRow>
+            )}
           </>
         )}
       </HarnessPicker>
@@ -4498,23 +4931,21 @@ function useSessionConfigSummary({
   harnessLabel,
   showModels,
   showEffort,
-  modelPickerKind,
   codexModelOptions,
+  effectiveModel,
+  modelLabel,
   costRoutingEligible,
 }: {
   harnessLabel: string | null;
   showModels: boolean;
   showEffort: boolean;
-  modelPickerKind: NativeModelPickerKind | null;
   codexModelOptions: readonly NativeModelOption[];
+  effectiveModel: string | null;
+  modelLabel: string | null;
   costRoutingEligible: boolean;
 }): { label: string; value: string }[] {
   const selectedEffort = useSessionEffort();
   const costControlModeOverride = useChatStore((s) => s.costControlModeOverride);
-  const { effectiveModel, modelLabel } = useResolvedComposerModel(
-    modelPickerKind,
-    codexModelOptions,
-  );
   const routingOn = costRoutingEligible && costControlModeOverride === "on";
 
   const rows: { label: string; value: string }[] = [];
@@ -4571,7 +5002,12 @@ function useSessionEffort(): string | null {
 function useResolvedComposerModel(
   modelPickerKind: NativeModelPickerKind | null,
   codexModelOptions: readonly NativeModelOption[],
+  modelLabelOptions: readonly NativeModelOption[],
+  hostId: string | null | undefined,
 ) {
+  const sessionId = useChatStore((s) => s.conversationId);
+  const agentId = useChatStore((s) => s.boundAgentId);
+  const harness = useChatStore((s) => s.sessionHarness);
   const sessionModelOverride = useChatStore((s) => s.sessionModelOverride);
   const sessionModelSeeded = useChatStore((s) => s.sessionModelSeeded);
   const llmModel = useChatStore((s) => s.llmModel);
@@ -4586,7 +5022,8 @@ function useResolvedComposerModel(
     modelPickerKind === "cursor" ||
     modelPickerKind === "kiro" ||
     modelPickerKind === "pi" ||
-    modelPickerKind === "opencode";
+    modelPickerKind === "opencode" ||
+    modelPickerKind === "devin";
   const modelOptions: readonly {
     id: string;
     model?: string;
@@ -4636,13 +5073,26 @@ function useResolvedComposerModel(
     : nativeVendorOwnsModel
       ? modelPickerKind === "cursor" || modelPickerKind === "kiro"
         ? sessionModelOverride
-        : modelPickerKind === "opencode" || modelPickerKind === "pi"
+        : modelPickerKind === "opencode" || modelPickerKind === "pi" || modelPickerKind === "devin"
           ? (sessionModelOverride ?? llmModel)
           : null
       : isReportedModelPicker
         ? llmModel
         : (sessionModelOverride ?? llmModel);
-  const modelLabel = formatStatusModelLabel(effectiveModel, codexModelOptions);
+  const {
+    label: modelLabel,
+    loading: modelLabelLoading,
+    unavailable: modelLabelUnavailable,
+  } = useSessionModelLabel(
+    { sessionId, hostId: hostId ?? null, agentId, harness },
+    effectiveModel,
+    modelLabelOptions,
+    usesServerModelOptions,
+    hostId !== undefined &&
+      !sessionModelSeeded &&
+      (!isReportedModelPicker || effectiveModel === llmModel),
+    codexModelOptions,
+  );
   return {
     llmModel,
     usesServerModelOptions,
@@ -4651,5 +5101,7 @@ function useResolvedComposerModel(
     pickerSelectedModel,
     effectiveModel,
     modelLabel,
+    modelLabelLoading,
+    modelLabelUnavailable,
   };
 }

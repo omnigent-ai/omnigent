@@ -32,6 +32,7 @@ import {
   MessageActions,
   MessageAction,
   MessageContent,
+  type MessageResponseProps,
 } from "@/components/ai-elements/message";
 import { Shimmer } from "@/components/ai-elements/shimmer";
 import {
@@ -62,6 +63,12 @@ import { type Bubble, type RenderItem, bubblesEqual } from "@/lib/renderItems";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { retryRateLimitedTurn, retrySession } from "@/lib/sessionsApi";
 import { useChatStore, type PendingUserMessage } from "@/store/chatStore";
+import { conversationRegistry } from "@/store/conversationRegistry";
+import { useConversationEntryState } from "@/hooks/useConversationEntryState";
+import {
+  ConversationScopeContext,
+  useScopedConversationId,
+} from "@/components/chat/conversationScope";
 import { useStickToBottomContext } from "use-stick-to-bottom";
 import { UserMessageNav } from "@/components/UserMessageNav";
 import { isSessionScopedDecision, showsRoutingDecisionChip } from "@/lib/routingDecision";
@@ -72,6 +79,10 @@ import { copyText } from "@/lib/clipboard";
 import { showToast } from "@/components/ui/toast";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import type { SessionStatus } from "@/lib/types";
+import {
+  TRANSCRIPT_SCROLLBAR_DRAG_EVENT,
+  type TranscriptScrollbarDragDetail,
+} from "@/pages/TranscriptScrollbar";
 
 // Matches both wordings the native executors emit: "[Attached: <path>]"
 // (claude/pi/cursor) and "[Attached file: <path>]" (codex). Capturing group
@@ -601,8 +612,25 @@ function AttachmentChip({ icon: Icon, label }: { icon: LucideIcon; label: string
   );
 }
 
+// User-authored tags and placeholders are text, including valid HTML examples.
+const USER_MESSAGE_REMARK_REHYPE_OPTIONS: MessageResponseProps["remarkRehypeOptions"] = {
+  handlers: {
+    html: (_state, node: { value: string }) =>
+      node.value
+        .split("\n")
+        .flatMap((line, index) => [
+          ...(index
+            ? [{ type: "element" as const, tagName: "br", properties: {}, children: [] }]
+            : []),
+          { type: "text" as const, value: line },
+        ]),
+  },
+};
+
 function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
-  const sessionId = useChatStore((s) => s.conversationId);
+  // Scoped so a side-chat bubble builds attachment URLs against the CHILD, not
+  // the main conversation the root store projects.
+  const sessionId = useScopedConversationId();
   // Author labels only matter once the session is shared with someone else.
   const isSessionShared = useContext(SessionSharedContext);
   // - input_image: `imagePreview` picks the variant — an uploaded file, an
@@ -753,7 +781,15 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
             {/* Render user text as markdown, matching the assistant bubble.
               `breaks` keeps single newlines as line breaks. Empty text renders
               nothing rather than an empty markdown block. */}
-            {text && <FilePathAwareMessageResponse breaks>{text}</FilePathAwareMessageResponse>}
+            {text && (
+              <FilePathAwareMessageResponse
+                breaks
+                mode="static"
+                remarkRehypeOptions={USER_MESSAGE_REMARK_REHYPE_OPTIONS}
+              >
+                {text}
+              </FilePathAwareMessageResponse>
+            )}
           </MessageContent>
         </div>
         {/* Skip an empty row when there is neither a timestamp nor a copy
@@ -801,13 +837,25 @@ function AssistantBubble({
   // The walker only emits an assistant bubble when at least one assistant-side
   // block exists. The "Working…" shimmer for the empty-items / streaming gap
   // is rendered at the page level, not inside this component.
-  const sessionStatus = useChatStore((s) => s.sessionStatus);
-  const conversationId = useChatStore((s) => s.conversationId);
-  // A pending elicitation means the turn is parked awaiting the user — still in
-  // flight even when its lifecycle or the session status reads settled.
-  const hasPendingElicitation = useChatStore((s) =>
+  //
+  // Scoped so a side-chat bubble reads the CHILD's status and targets the child
+  // for retry — not whatever the root store currently projects. Unscoped (the
+  // main transcript) reads the root store exactly as before; `useConversationEntryState(null)`
+  // is inert (no subscription, stable empty snapshot).
+  const scopedConversationId = useContext(ConversationScopeContext);
+  const scopedState = useConversationEntryState(scopedConversationId);
+  const activeConversationId = useChatStore((s) => s.conversationId);
+  const conversationId = scopedConversationId ?? activeConversationId;
+  const rootSessionStatus = useChatStore((s) => s.sessionStatus);
+  const rootHasPendingElicitation = useChatStore((s) =>
     s.blocks.some((b) => b.type === "elicitation" && b.status === "pending"),
   );
+  const sessionStatus = scopedConversationId ? scopedState.sessionStatus : rootSessionStatus;
+  // A pending elicitation means the turn is parked awaiting the user — still in
+  // flight even when its lifecycle or the session status reads settled.
+  const hasPendingElicitation = scopedConversationId
+    ? scopedState.blocks.some((b) => b.type === "elicitation" && b.status === "pending")
+    : rootHasPendingElicitation;
   // Getter computes the markdown lazily at click time.
   const { isCopied, handleCopy } = useCopyMessage(() => collectBubbleMarkdown(bubble.items));
   // null outside AppShell's provider (isolated tests) → hide the action.
@@ -816,8 +864,15 @@ function AssistantBubble({
     async (item: Extract<RenderItem, { kind: "error" }>) => {
       if (!conversationId) throw new Error("Session is not available");
       if (item.code === "rate_limit_exceeded") {
-        const current = useChatStore.getState();
-        if (current.conversationId !== conversationId) {
+        // Read a FRESH snapshot of the target conversation at click time: the
+        // scoped child's own entry in a side chat, else the root store. The
+        // child tab is fixed, so only the main chat guards against the user
+        // switching the active conversation out from under a queued retry.
+        const current = scopedConversationId
+          ? conversationRegistry.peek(scopedConversationId)?.getState()
+          : useChatStore.getState();
+        if (!current) throw new Error("The selected session has changed");
+        if (!scopedConversationId && useChatStore.getState().conversationId !== conversationId) {
           throw new Error("The selected session has changed");
         }
         if (!isLastAssistant) throw new Error("Only the latest failed turn can be retried");
@@ -839,7 +894,7 @@ function AssistantBubble({
         throw new Error("The session is already connected; no recovery was performed");
       }
     },
-    [conversationId, isLastAssistant],
+    [conversationId, scopedConversationId, isLastAssistant],
   );
 
   if (bubble.items.length === 0) return null;
@@ -1079,21 +1134,54 @@ function historyLoadThreshold(el: HTMLElement): number {
 const TOUCH_DRAG_SLOP_PX = 8;
 
 /**
- * Follow-up pages one gesture may chain beyond the page it fetched itself.
- * Settled tool-heavy turns mount folded, so a fetched page can land near-zero
- * height; a fresh gesture grants a fresh budget so older history stays reachable
- * at a reader-paced rate instead of a runaway loop.
+ * Quiet gap after which the next upward tick — a wheel notch, a scrollbar-drag
+ * move, a repeating key — counts as a new gesture with a fresh budget.
  */
-const PREPEND_CHAIN_PAGES_PER_GESTURE = 2;
-
-/** Quiet gap after which the next wheel-up tick counts as a new gesture. */
 const WHEEL_GESTURE_QUIET_MS = 300;
+
+/**
+ * Pages one gesture — a wheel flick, a finger drag, a key, a scrollbar drag —
+ * may chain beyond its first while every page folds into a turn already on
+ * screen. One enormous turn would otherwise let a single gesture page in the
+ * whole transcript with the reader's hands off.
+ */
+const SEEK_PAGES_PER_GESTURE = 30;
+
+/**
+ * Quiet time after the last scroll event before a touch-armed page may land.
+ * On a phone a flick keeps the pane moving after the finger lifts, and a page
+ * landing mid-motion writes the scroll offset, which kills that momentum dead —
+ * the fling stops a third of the way. Only a pane that moved this recently is
+ * held; a drag that has already come to rest fetches at once, finger down or
+ * not. Wheel, keyboard, and scrollbar gestures carry no native momentum and are
+ * not held.
+ */
+const TOUCH_SETTLE_MS = 120;
+
+/** Keys that scroll a pane upward: a request for older history when pressed outside an editor. */
+const HISTORY_SCROLL_KEYS = new Set(["ArrowUp", "PageUp", "Home"]);
+/** Keys that scroll a pane downward: the reader is done asking for older history. */
+const HISTORY_LEAVE_KEYS = new Set(["ArrowDown", "PageDown", "End"]);
+
+function isEditableTarget(target: EventTarget | null): boolean {
+  return (
+    target instanceof HTMLElement &&
+    (target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName))
+  );
+}
 
 export function HistoryAutoLoader({
   scrollElement,
+  rowCount,
 }: {
   scrollElement?: HTMLElement | null;
-} = {}) {
+  /**
+   * Rows the transcript renders. A page that adds none folded into a turn
+   * already on screen. A row streaming in at the bottom also counts and ends a
+   * seek one page early; the reader's next flick resumes it.
+   */
+  rowCount: number;
+}) {
   // useStickToBottomContext exposes scrollRef in the runtime context even though
   // the public TS types only declare isAtBottom and scrollToBottom. Cast to it.
   const ctx = useStickToBottomContext() as ReturnType<typeof useStickToBottomContext> & {
@@ -1108,72 +1196,173 @@ export function HistoryAutoLoader({
   const [scrollRevision, setScrollRevision] = useState(0);
   const handledScrollRevisionRef = useRef(scrollRevision);
   const oldestItemIdRef = useRef(oldestItemId);
-  // Whether the reader has asked to move the transcript upward yet. Intent, not
-  // movement: a window taller than the transcript has no scroll range at all.
+  // The reader's unserved request for older history. Armed only by input —
+  // wheel, touch, keyboard, or a scrollbar drag — and consumed by the fetch it
+  // triggers. Movement alone is not intent: the
+  // virtualizer, the bottom lock, and native anchoring all move scrollTop
+  // upward while a page settles, and reading those as gestures paged the whole
+  // transcript in with the reader's hands off the trackpad.
   const scrolledUpRef = useRef(false);
-  const lastScrollTopRef = useRef<number | null>(null);
+  // Whether the browser would send keyboard scrolling to the transcript: the
+  // last pointer press landed on it or its scrollbar, and focus has not since
+  // moved to something else on the page.
+  const pointerInTranscriptRef = useRef(false);
   const touchStartYRef = useRef<number | null>(null);
-  // Whether the current touch sequence already granted its gesture budget.
+  const touchLastYRef = useRef<number | null>(null);
+  // Whether the request in hand was armed by a finger. A touch request waits
+  // for the pane to stop moving before it fetches; see TOUCH_SETTLE_MS.
+  const touchArmedRef = useRef(false);
+  const lastScrollAtRef = useRef(Number.NEGATIVE_INFINITY);
+  const settleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Whether the current touch sequence already armed a request.
   const touchGestureSpentRef = useRef(false);
-  const lastWheelUpAtRef = useRef(Number.NEGATIVE_INFINITY);
-  // Prepend-fed fetches left before the chain must wait for a fresh gesture.
-  const chainBudgetRef = useRef(PREPEND_CHAIN_PAGES_PER_GESTURE);
+  const lastUpwardTickAtRef = useRef(Number.NEGATIVE_INFINITY);
+  // Rows on screen when the gesture being served began, while it is still
+  // seeking. A settled tool-heavy turn is one folded row, so a page can land
+  // entirely inside it and show the reader nothing; the gesture keeps paging
+  // until a page adds a row, then waits for the next gesture.
+  const seekBaseRowsRef = useRef<number | null>(null);
+  const seekPagesLeftRef = useRef(SEEK_PAGES_PER_GESTURE);
+  // Whether the current gesture has fetched yet: its first page is free, every
+  // later one — chained or from a further tick of the same gesture — spends
+  // the budget, even after a page that added a row ended the seek.
+  const gestureFetchedRef = useRef(false);
 
-  // Position across a prepend is held by native scroll anchoring, not by this
-  // component. Writing scrollTop here instead used to interrupt the reader's
-  // gesture.
+  // Position across a prepend is held by the transcript (VirtualBubbleList), not
+  // by this component. Writing scrollTop here instead used to interrupt the
+  // reader's gesture.
   useLayoutEffect(() => {
     const el = scrollElement ?? ctx.scrollRef?.current;
     if (!el) return;
-    lastScrollTopRef.current = el.scrollTop;
-    const noteUpwardGesture = () => {
+    const noteUpwardGesture = (seekPages: number, viaTouch = false) => {
+      touchArmedRef.current = viaTouch;
       scrolledUpRef.current = true;
-      chainBudgetRef.current = PREPEND_CHAIN_PAGES_PER_GESTURE;
+      // A fresh gesture seeks from what is on screen now, with a fresh budget.
+      seekBaseRowsRef.current = null;
+      seekPagesLeftRef.current = seekPages;
+      gestureFetchedRef.current = false;
       setScrollRevision((revision) => revision + 1);
     };
+    // Scrolling back down withdraws the request: the page in flight still
+    // lands, but nothing chains after it.
+    const noteDownwardGesture = () => {
+      scrolledUpRef.current = false;
+      seekBaseRowsRef.current = null;
+    };
+    // Scroll movement alone is never intent: the virtualizer, the bottom lock,
+    // and the transcript's own hold all move scrollTop while a page settles. It
+    // only re-evaluates an already armed request against the threshold.
     const handleScroll = () => {
-      const previous = lastScrollTopRef.current;
-      lastScrollTopRef.current = el.scrollTop;
-      // Only an upward move counts.
-      if (previous !== null && el.scrollTop < previous - 0.5) {
-        scrolledUpRef.current = true;
-        chainBudgetRef.current = PREPEND_CHAIN_PAGES_PER_GESTURE;
-      }
+      lastScrollAtRef.current = performance.now();
       setScrollRevision((revision) => revision + 1);
+    };
+    // One upward tick of a wheel, a scrollbar drag, or a repeating key. The
+    // first after a quiet gap is a fresh gesture; later ticks keep the request
+    // open on the same budget, so a long scroll keeps paging at the reader's
+    // pace without refilling.
+    const noteUpwardTick = () => {
+      const now = performance.now();
+      const newGesture = now - lastUpwardTickAtRef.current > WHEEL_GESTURE_QUIET_MS;
+      lastUpwardTickAtRef.current = now;
+      if (newGesture) {
+        noteUpwardGesture(SEEK_PAGES_PER_GESTURE);
+        return;
+      }
+      scrolledUpRef.current = true;
+      setScrollRevision((revision) => revision + 1);
+    };
+    // The transcript draws its own scrollbar; a thumb drag reports its direction
+    // here, so a drag up asks and a drag back down withdraws.
+    const handleScrollbarDrag = (event: Event) => {
+      const { direction } = (event as CustomEvent<TranscriptScrollbarDragDetail>).detail;
+      if (direction === "down") noteDownwardGesture();
+      else noteUpwardTick();
     };
     const handleWheel = (event: WheelEvent) => {
-      if (event.deltaY >= 0) return;
-      const now = performance.now();
-      const newGesture = now - lastWheelUpAtRef.current > WHEEL_GESTURE_QUIET_MS;
-      lastWheelUpAtRef.current = now;
-      if (newGesture) noteUpwardGesture();
+      if (event.deltaY > 0) noteDownwardGesture();
+      else if (event.deltaY < 0) noteUpwardTick();
     };
     const handleTouchStart = (event: TouchEvent) => {
       touchStartYRef.current = event.touches[0]?.clientY ?? null;
+      touchLastYRef.current = touchStartYRef.current;
       touchGestureSpentRef.current = false;
+    };
+    // Lift: re-evaluate at once, so a drag that stopped still fetches without
+    // waiting for another scroll event.
+    const handleTouchEnd = () => {
+      setScrollRevision((revision) => revision + 1);
     };
     const handleTouchMove = (event: TouchEvent) => {
       const start = touchStartYRef.current;
+      const last = touchLastYRef.current;
       const current = event.touches[0]?.clientY;
-      if (start === null || current === undefined || current <= start + TOUCH_DRAG_SLOP_PX) return;
-      if (touchGestureSpentRef.current) return;
+      if (start === null || last === null || current === undefined) return;
+      // A finger moving back up the screen (scrolling down) by more than the
+      // slop since its last position withdraws, mid-drag or not.
+      if (current < last - TOUCH_DRAG_SLOP_PX) {
+        touchLastYRef.current = current;
+        noteDownwardGesture();
+        return;
+      }
+      if (current > last) touchLastYRef.current = current;
+      if (current <= start + TOUCH_DRAG_SLOP_PX || touchGestureSpentRef.current) return;
       touchGestureSpentRef.current = true;
-      noteUpwardGesture();
+      noteUpwardGesture(SEEK_PAGES_PER_GESTURE, true);
     };
+    const inTranscript = (target: EventTarget | null) =>
+      target instanceof Node &&
+      (el.contains(target) ||
+        (target instanceof Element && target.closest("[data-transcript-scrollbar]") !== null));
+    const handlePointerDown = (event: PointerEvent) => {
+      pointerInTranscriptRef.current = inTranscript(event.target);
+    };
+    // Focus moving elsewhere (Tab, a dialog opening) takes keyboard scrolling
+    // with it; focus inside the transcript is covered by the activeElement check.
+    const handleFocusIn = (event: FocusEvent) => {
+      if (!inTranscript(event.target)) pointerInTranscriptRef.current = false;
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      // A control that consumed the key (a menu, a listbox) scrolled nothing.
+      if (event.defaultPrevented || isEditableTarget(event.target)) return;
+      // Only plain keys the browser would scroll this pane with; modified ones
+      // are shortcuts (turn navigation is Cmd/Ctrl+Alt+Arrow). Space pages down
+      // and Shift+Space pages up.
+      if (event.metaKey || event.ctrlKey || event.altKey) return;
+      // Shift+Arrow/Home/PageUp extends a text selection; only Shift+Space scrolls.
+      if (event.shiftKey && event.key !== " ") return;
+      if (!pointerInTranscriptRef.current && !el.contains(el.ownerDocument.activeElement)) return;
+      const key = event.key === " " ? (event.shiftKey ? "PageUp" : "PageDown") : event.key;
+      if (HISTORY_LEAVE_KEYS.has(key)) noteDownwardGesture();
+      if (HISTORY_SCROLL_KEYS.has(key)) noteUpwardTick();
+    };
+    const doc = el.ownerDocument;
     el.addEventListener("scroll", handleScroll, { passive: true });
     el.addEventListener("wheel", handleWheel, { passive: true });
     el.addEventListener("touchstart", handleTouchStart, { passive: true });
     el.addEventListener("touchmove", handleTouchMove, { passive: true });
+    el.addEventListener("touchend", handleTouchEnd, { passive: true });
+    el.addEventListener("touchcancel", handleTouchEnd, { passive: true });
+    el.addEventListener(TRANSCRIPT_SCROLLBAR_DRAG_EVENT, handleScrollbarDrag);
+    doc.addEventListener("pointerdown", handlePointerDown, { passive: true });
+    doc.addEventListener("focusin", handleFocusIn);
+    doc.addEventListener("keydown", handleKeyDown);
     return () => {
       el.removeEventListener("scroll", handleScroll);
       el.removeEventListener("wheel", handleWheel);
       el.removeEventListener("touchstart", handleTouchStart);
       el.removeEventListener("touchmove", handleTouchMove);
+      el.removeEventListener("touchend", handleTouchEnd);
+      el.removeEventListener("touchcancel", handleTouchEnd);
+      if (settleTimerRef.current !== null) clearTimeout(settleTimerRef.current);
+      el.removeEventListener(TRANSCRIPT_SCROLLBAR_DRAG_EVENT, handleScrollbarDrag);
+      doc.removeEventListener("pointerdown", handlePointerDown);
+      doc.removeEventListener("focusin", handleFocusIn);
+      doc.removeEventListener("keydown", handleKeyDown);
     };
   }, [ctx.scrollRef, scrollElement]);
 
-  // The single paging effect. Fetches are driven by user scrolls or a changed
-  // oldest item, including a visually height-neutral prepend.
+  // The single paging effect. Re-evaluated on reader input, scroll movement, and
+  // a changed oldest item (a settled prepend, even a height-neutral one).
   useLayoutEffect(() => {
     const el = scrollElement ?? ctx.scrollRef?.current;
     if (!el) return;
@@ -1187,45 +1376,76 @@ export function HistoryAutoLoader({
 
     if (generationChanged) {
       generationRef.current = historyGeneration;
-      // A new window is a new open: require a fresh upward scroll.
+      // A new window is a new open: require a fresh gesture, with a fresh budget.
       scrolledUpRef.current = false;
-      chainBudgetRef.current = PREPEND_CHAIN_PAGES_PER_GESTURE;
-      lastScrollTopRef.current = el.scrollTop;
+      seekBaseRowsRef.current = null;
+      seekPagesLeftRef.current = SEEK_PAGES_PER_GESTURE;
+      gestureFetchedRef.current = false;
+      lastUpwardTickAtRef.current = Number.NEGATIVE_INFINITY;
     }
 
     const state = useChatStore.getState();
-
-    // Reader-driven only. The bind fetches its whole window in one request, and
-    // this waits for the reader to actually scroll up.
     if (
-      !scrolledUpRef.current ||
       !state.oldestItemId ||
       !state.hasMoreHistory ||
       state.loadingMoreHistory ||
-      !(itemsChanged || scrollPositionChanged) ||
-      el.scrollTop >= historyLoadThreshold(el)
+      !(itemsChanged || scrollPositionChanged)
     ) {
       return;
     }
-
-    // A prepend re-feeding the chain spends gesture budget: without a bound,
-    // folded (height-neutral) pages would re-feed fetches until history ran out.
-    if (itemsChanged && !scrollPositionChanged) {
-      if (chainBudgetRef.current <= 0) return;
-      chainBudgetRef.current -= 1;
+    if (el.scrollTop >= historyLoadThreshold(el)) return;
+    // A finger-armed request waits while the pane is still moving, so the page
+    // cannot land mid-fling. A pane that has been still for the settle window
+    // fetches at once — a slow drag that stopped at the top has no momentum to
+    // protect, finger down or not. The scroll listener re-runs this effect while
+    // a fling decelerates; a timer covers the final quiet stretch.
+    if (touchArmedRef.current && (scrolledUpRef.current || seekBaseRowsRef.current !== null)) {
+      const sinceScroll = performance.now() - lastScrollAtRef.current;
+      if (sinceScroll < TOUCH_SETTLE_MS) {
+        if (settleTimerRef.current !== null) clearTimeout(settleTimerRef.current);
+        settleTimerRef.current = setTimeout(
+          () => {
+            settleTimerRef.current = null;
+            setScrollRevision((revision) => revision + 1);
+          },
+          Math.max(16, TOUCH_SETTLE_MS - sinceScroll),
+        );
+        return;
+      }
     }
-
+    if (scrolledUpRef.current) {
+      scrolledUpRef.current = false;
+      // A gesture's first page is free; the budget bounds the pages after it,
+      // including those a further tick of the same gesture asks for.
+      if (gestureFetchedRef.current) {
+        if (seekPagesLeftRef.current <= 0) return;
+        seekPagesLeftRef.current -= 1;
+      }
+      gestureFetchedRef.current = true;
+      seekBaseRowsRef.current ??= rowCount;
+      void state.loadMoreHistory();
+      return;
+    }
+    // No open request: a settled page chains only while the gesture is still
+    // seeking, the page showed the reader nothing new, and budget remains.
+    if (!itemsChanged || seekBaseRowsRef.current === null) return;
+    if (rowCount > seekBaseRowsRef.current || seekPagesLeftRef.current <= 0) {
+      seekBaseRowsRef.current = null;
+      return;
+    }
+    seekPagesLeftRef.current -= 1;
     void state.loadMoreHistory();
   }, [
     ctx.scrollRef,
     historyGeneration,
     loadingMoreHistory,
     oldestItemId,
+    rowCount,
     scrollElement,
     scrollRevision,
   ]);
 
-  // No visible control — history loads purely on scroll-up.
+  // No visible control — history loads purely on reader input.
   return null;
 }
 

@@ -36,6 +36,9 @@ class CodexNativeProcessEntry:
     :param pgid: Child process group id.
     :param tmux_session_name: Optional tmux session name owned by the child.
     :param session_tag: Unique tag also embedded in the child command line.
+    :param process_start_identity: Kernel-backed process birth identity used
+        to distinguish the registered child from a later process reusing its
+        PID. ``None`` is accepted for entries written by older versions.
     :param owner_lock_path: Lock file held by the parent while it owns
         the child. If the lock is still held during reconciliation, the
         child is a live sibling and must not be reaped.
@@ -45,6 +48,7 @@ class CodexNativeProcessEntry:
     pgid: int
     tmux_session_name: str | None
     session_tag: str
+    process_start_identity: str | None = None
     owner_lock_path: str | None = None
 
 
@@ -155,6 +159,7 @@ def register_codex_native_process(
         pgid=pgid,
         tmux_session_name=tmux_session_name,
         session_tag=session_tag,
+        process_start_identity=_process_start_identity(pid),
         owner_lock_path=str(owner_lock_path) if owner_lock_path is not None else None,
     )
     path = registry_path or codex_native_process_registry_path()
@@ -190,8 +195,9 @@ def reconcile_codex_native_process_registry(*, registry_path: Path | None = None
     """
     Reap crash-leftover native Codex children recorded by prior runs.
 
-    PID reuse is guarded by requiring the live process command line to
-    still contain the entry's unique session tag before killing anything.
+    PID reuse is guarded by comparing the process birth identity recorded at
+    spawn. Older entries without that identity retain the command-line tag
+    fallback.
 
     :param registry_path: Test override for the registry file path.
     :returns: None.
@@ -203,11 +209,13 @@ def reconcile_codex_native_process_registry(*, registry_path: Path | None = None
             if _owner_lock_held(entry.owner_lock_path):
                 survivors.append(entry)
                 continue
-            if not _pid_alive(entry.pid):
+            matches_entry = _process_matches_entry(entry)
+            if matches_entry is None:
+                survivors.append(entry)
                 continue
-            if not _process_cmdline_has_tag(entry.pid, entry.session_tag):
+            if not matches_entry:
                 continue
-            if not _terminate_process_group(entry.pgid):
+            if not _terminate_process_group(entry):
                 survivors.append(entry)
                 continue
             _reap_tmux_session(entry.tmux_session_name)
@@ -279,7 +287,12 @@ def _read_registry(path: Path) -> list[CodexNativeProcessEntry]:
 def _write_registry(path: Path, entries: list[CodexNativeProcessEntry]) -> None:
     try:
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        payload = [asdict(entry) for entry in entries]
+        payload = []
+        for entry in entries:
+            item = asdict(entry)
+            if entry.process_start_identity is None:
+                item.pop("process_start_identity")
+            payload.append(item)
         tmp = path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(payload, separators=(",", ":")) + "\n", encoding="utf-8")
         os.replace(tmp, path)
@@ -293,6 +306,7 @@ def _entry_from_json(item: object) -> CodexNativeProcessEntry | None:
     pid = item.get("pid")
     pgid = item.get("pgid")
     session_tag = item.get("session_tag")
+    process_start_identity = item.get("process_start_identity")
     tmux_session_name = item.get("tmux_session_name")
     owner_lock_path = item.get("owner_lock_path")
     if not isinstance(pid, int) or pid <= 0:
@@ -301,6 +315,8 @@ def _entry_from_json(item: object) -> CodexNativeProcessEntry | None:
         return None
     if not isinstance(session_tag, str) or not session_tag:
         return None
+    if process_start_identity is not None and not isinstance(process_start_identity, str):
+        process_start_identity = None
     if tmux_session_name is not None and not isinstance(tmux_session_name, str):
         tmux_session_name = None
     if owner_lock_path is not None and not isinstance(owner_lock_path, str):
@@ -310,6 +326,7 @@ def _entry_from_json(item: object) -> CodexNativeProcessEntry | None:
         pgid=pgid,
         tmux_session_name=tmux_session_name,
         session_tag=session_tag,
+        process_start_identity=process_start_identity,
         owner_lock_path=owner_lock_path,
     )
 
@@ -352,6 +369,44 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+def _process_matches_entry(entry: CodexNativeProcessEntry) -> bool | None:
+    if entry.process_start_identity is not None:
+        current_identity = _process_start_identity(entry.pid)
+        if current_identity is None:
+            return None if _pid_alive(entry.pid) else False
+        return current_identity == entry.process_start_identity
+    if not _pid_alive(entry.pid):
+        return False
+    cmdline = _process_cmdline(entry.pid)
+    if not cmdline:
+        return None
+    return codex_native_session_tag_cmdline_arg(entry.session_tag) in cmdline
+
+
+def _process_start_identity(pid: int) -> str | None:
+    proc_stat = Path("/proc") / str(pid) / "stat"
+    with contextlib.suppress(OSError, IndexError):
+        raw = proc_stat.read_text(encoding="utf-8")
+        fields_after_name = raw.rsplit(")", 1)[1].split()
+        start_ticks = fields_after_name[19]
+        boot_id = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
+        if boot_id:
+            return f"linux:{boot_id}:{start_ticks}"
+    try:
+        proc = subprocess.run(
+            ["ps", "-p", str(pid), "-ww", "-o", "lstart="],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=2.0,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    started_at = proc.stdout.strip()
+    return f"ps:{started_at}" if proc.returncode == 0 and started_at else None
+
+
 def _process_cmdline_has_tag(pid: int, session_tag: str) -> bool:
     needle = codex_native_session_tag_cmdline_arg(session_tag)
     cmdline = _process_cmdline(pid)
@@ -370,7 +425,8 @@ def _process_cmdline(pid: int) -> str:
             check=False,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
-            text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=2.0,
         )
     except (OSError, subprocess.TimeoutExpired):
@@ -378,16 +434,28 @@ def _process_cmdline(pid: int) -> str:
     return proc.stdout.strip() if proc.returncode == 0 else ""
 
 
-def _terminate_process_group(pgid: int) -> bool:
-    if os.name == "posix":
-        try:
-            os.killpg(pgid, signal.SIGTERM)
-        except ProcessLookupError:
-            return True
-        except (PermissionError, OSError):
-            return False
+def _terminate_process_group(entry: CodexNativeProcessEntry) -> bool:
+    if not _process_group_matches_entry(entry):
+        return False
+    try:
+        os.killpg(entry.pgid, signal.SIGTERM)
+    except ProcessLookupError:
         return True
-    return False
+    except (PermissionError, OSError):
+        return False
+    return True
+
+
+def _process_group_matches_entry(entry: CodexNativeProcessEntry) -> bool:
+    if os.name != "posix" or entry.pgid <= 1:
+        return False
+    try:
+        current_pgid = os.getpgid(entry.pid)
+    except ProcessLookupError:
+        return False
+    except (PermissionError, OSError):
+        return False
+    return current_pgid == entry.pgid and current_pgid != os.getpgrp()
 
 
 def _reap_tmux_session(tmux_session_name: str | None) -> None:
@@ -451,11 +519,14 @@ def reap_codex_native_processes_for_state_dir(
         return 0
     needle = str(state_dir)
     try:
+        # macOS ps passes raw argv bytes through, so decode leniently: one
+        # foreign process with non-UTF-8 argv must not crash the reaper.
         listing = subprocess.run(
             ["ps", "-axww", "-o", "pid=,pgid=,command="],
             check=False,
             capture_output=True,
-            text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=5.0,
         ).stdout
     except (OSError, subprocess.TimeoutExpired):

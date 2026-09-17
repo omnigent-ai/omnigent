@@ -1,5 +1,4 @@
 import GithubMono from "@lobehub/icons/es/Github/components/Mono";
-import { COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS } from "@/components/composer/ChatComposer";
 import { cn } from "@/lib/utils";
 
 /**
@@ -40,12 +39,12 @@ export function ComposerPrLink({
       )}
     >
       <GithubMono size={14} className="shrink-0" aria-hidden />
+      {/* Short and informative, so it stays when the bar collapses; a PR
+          number that would truncate still asks the bar to collapse the
+          directory and branch text, which frees the room it needs. */}
       <span
         data-workspace-collapse-label=""
-        className={cn(
-          "truncate tabular-nums underline underline-offset-2",
-          COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS,
-        )}
+        className="truncate tabular-nums underline underline-offset-2"
         title={label}
       >
         {label}

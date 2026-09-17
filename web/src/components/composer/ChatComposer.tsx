@@ -28,7 +28,11 @@ export const COMPOSER_LABELS_MIN_GAP_PX = 24;
 export const COMPOSER_COLLAPSED_LABEL_CLASS =
   "group-data-[labels=collapsed]/composer-actions:hidden";
 
-/** Hides a workspace-bar chip's text label while the bar is collapsed to icons. */
+/**
+ * Hides a workspace-bar chip's text label while the bar is collapsed to icons.
+ * Only the directory and branch chips carry it: the PR number and the context
+ * percentage are short and informative, so they stay visible.
+ */
 export const COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS =
   "group-data-[labels=collapsed]/composer-workspace:hidden";
 
@@ -78,7 +82,7 @@ export const ChatComposer = forwardRef<HTMLDivElement, ChatComposerProps>(functi
       ref={ref}
       data-composer-card
       className={cn(
-        "composer-reference-surface relative flex w-full flex-col rounded-2xl border transition-shadow duration-150 has-[textarea:focus]:shadow-[var(--composer-shadow-focus)]",
+        "composer-reference-surface relative flex w-full flex-col rounded-2xl border transition-shadow duration-150 has-[textarea:focus]:shadow-[var(--composer-shadow-focus)] md:min-h-[105px]",
         className,
       )}
       {...props}
@@ -158,11 +162,13 @@ function useCollapsedComposerLabels(
 }
 
 /**
- * Collapse the workspace bar's chip labels to icons whenever the bar cannot
- * show every label in full — a chip is truncating, or the row overflows its
- * width — and restore them once they fit again. The verdict lands on the bar
- * as `data-labels="collapsed"`, which `COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS`
- * turns into `display: none` on each chip label.
+ * Collapse the workspace bar's directory and branch labels to icons whenever
+ * the bar cannot show every label in full — a label is truncating (the PR
+ * number included, since freeing the directory and branch text gives it room),
+ * or the row overflows its width — and restore them once they fit again. The
+ * verdict lands on the bar as `data-labels="collapsed"`, which
+ * `COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS` turns into `display: none` on the
+ * labels that carry it.
  *
  * The bar's height is fixed, so it is safe to resize-observe directly — the
  * collapse never changes the observed box, so there is no probe element and no
@@ -246,7 +252,7 @@ export const ComposerTextarea = forwardRef<
     <textarea
       ref={ref}
       className={cn(
-        "composer-input-text relative max-h-[180px] w-full resize-none overflow-y-auto border-none bg-transparent p-0 text-ui text-foreground outline-none [scrollbar-width:none] placeholder:text-muted-foreground disabled:opacity-60 md:select-text [&::-webkit-scrollbar]:hidden",
+        "composer-input-text relative max-h-[180px] w-full resize-none overflow-y-auto border-none bg-transparent p-0 text-ui text-foreground outline-none [scrollbar-width:none] placeholder:text-muted-foreground disabled:opacity-60 md:min-h-[42px] md:select-text [&::-webkit-scrollbar]:hidden",
         className,
       )}
       {...props}

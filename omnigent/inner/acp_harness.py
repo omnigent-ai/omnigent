@@ -57,6 +57,7 @@ from omnigent.inner.acp_executor import AcpAgentConfig, AcpExecutor
 from omnigent.inner.acp_extension import NO_ACP_EXTENSION, AcpExtension
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import Executor
+from omnigent.inner.os_env_serialization import decode_sandbox_spec
 from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
 
 _logger = logging.getLogger(__name__)
@@ -110,7 +111,7 @@ def _resolve_os_env() -> OSEnvSpec:
         if isinstance(payload, dict):
             sandbox_payload = payload.get("sandbox")
             sandbox = (
-                OSEnvSandboxSpec(**sandbox_payload) if isinstance(sandbox_payload, dict) else None
+                decode_sandbox_spec(sandbox_payload) if isinstance(sandbox_payload, dict) else None
             )
             return OSEnvSpec(
                 type=str(payload.get("type", "caller_process")),
@@ -170,7 +171,7 @@ def create_app(extension: AcpExtension = NO_ACP_EXTENSION) -> FastAPI:
 
     :param extension: Vendor behavior for the agent this process drives. A
         vendor's own wrap calls this with its extension (see
-        :mod:`omnigent.inner.devin.harness`); the runner calls it with no
+        a vendor wrap); the runner calls it with no
         argument for ``harness: acp`` and for a builtin ACP CLI row that declares
         no vendor behavior.
     :returns: The app the runner serves.

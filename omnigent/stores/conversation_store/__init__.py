@@ -4,6 +4,7 @@ import hashlib
 import math
 import time
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -105,6 +106,12 @@ PROJECT_LABEL_KEY = "omni_project"
 # API boundary — a viewer never sees another user's pin key. The web client
 # mirrors the canonical key as ``PINNED_LABEL_KEY``.
 PINNED_LABEL_KEY = "omnigent.pinned"
+
+# Marks a top-level fork created as a side chat. A side chat surfaces only as a
+# Workspace-rail tab, so a conversation carrying this label is hidden from the
+# left sidebar (the ``GET /v1/sessions`` list filters it out). The fork
+# otherwise behaves like any other session (its own runner, transcript).
+SIDE_CHAT_LABEL_KEY = "omnigent.side_chat"
 
 # Single-user / no-auth sentinel for the per-user pin key suffix, mirroring the
 # reserved ``"local"`` identity used elsewhere (see ``RESERVED_USER_LOCAL``).
@@ -608,6 +615,11 @@ class ConversationStore(ABC):
             means return all types.
         :returns: A :class:`PagedList` of
             :class:`ConversationItem` objects.
+        :raises omnigent.errors.StaleCursorError: If the ``after``/``before``
+            item no longer exists in this conversation (e.g. deleted
+            between two page fetches) — its position is unknowable, and an
+            empty page would be indistinguishable from a completed
+            enumeration.
         """
         ...
 
@@ -759,10 +771,11 @@ class ConversationStore(ABC):
             does. Powers the sidebar's session search on
             ``GET /v1/sessions?search_query=...``.
         :param accessible_by: When set, filter to sessions the
-            user has access to via ``session_permissions``. Uses
-            a UNION subquery: sessions the user has a direct
-            grant on, plus sessions with a ``"__public__"`` grant.
-            ``None`` disables the filter (returns all sessions).
+            user has a direct grant on in ``session_permissions``.
+            Public (``"__public__"``) grants are deliberately NOT
+            included — a public-only session does not appear in the
+            user's own list. ``None`` disables the filter (returns
+            all sessions).
         :param owned_by: When set, filter to sessions the user
             *owns* (an ``owner``-level grant), a stricter form of
             ``accessible_by`` that excludes sessions merely shared
@@ -796,6 +809,10 @@ class ConversationStore(ABC):
             in a single indexed query instead of fetching all children.
         :returns: A :class:`PagedList` of :class:`Conversation`
             objects.
+        :raises omnigent.errors.StaleCursorError: If the ``after``/``before``
+            conversation no longer exists (e.g. deleted between two page
+            fetches) — its sort position is unknowable, and an empty page
+            would be indistinguishable from a completed enumeration.
         """
         ...
 
@@ -1055,8 +1072,8 @@ class ConversationStore(ABC):
         """
         Persist the full session-state snapshot for a conversation.
 
-        Overwrites the existing ``session_state`` JSON column with
-        the serialized *state* dict. Called by
+        Replaces policy-visible state while preserving the internal Plan key
+        in the existing conversation metadata JSON. Called by
         :meth:`PolicyEngine.apply_state_updates` after applying
         structured :class:`StateUpdate` operations to the hot
         cache.
@@ -1090,6 +1107,14 @@ class ConversationStore(ABC):
             sub-dict (per-model token/cost buckets), hence ``Any``.
         """
         ...
+
+    def set_session_todos(
+        self,
+        conversation_id: str,
+        todos: list[dict[str, Any]],
+    ) -> bool:
+        """Persist the native Plan snapshot; empty clears, missing metadata returns false."""
+        raise NotImplementedError
 
     @abstractmethod
     def set_conversation_project(
@@ -1635,6 +1660,7 @@ class ConversationStore(ABC):
         presentation_labels: dict[str, str] | None = None,
         up_to_response_id: str | None = None,
         project_id: str | None = None,
+        file_id_map: Mapping[str, str] | None = None,
     ) -> Conversation:
         """
         Deep-copy a conversation and its items into a new conversation.
@@ -1738,6 +1764,12 @@ class ConversationStore(ABC):
             unfiled. The caller resolves whether the fork keeps the
             source's project — projects are owner-private, so the route
             passes the source's id only when the forker owns it.
+        :param file_id_map: Source file id → fork-owned file id for the
+            session-scoped file resources the caller copies into the fork.
+            Copied items that reference a mapped id (message attachment
+            blocks, file resource events) are rewritten to the fork's copy,
+            so the fork never references files it does not own. ``None`` or
+            empty leaves every copied payload verbatim.
         :returns: The newly created :class:`Conversation`.
         :raises LookupError: If no conversation with
             *source_conversation_id* exists.

@@ -29,7 +29,9 @@ describe("ComposerPrLink", () => {
     expect(screen.getByText("#42")).toHaveAttribute("title", "#42");
     expect(link).toHaveAttribute("title", "View this PR in the GitHub tab");
     expect(link).toHaveAccessibleName("#42");
-    expect(screen.getByText("#42")).toHaveClass(COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS);
+    // A trigger for the bar's collapse, but never hidden by it.
+    expect(screen.getByText("#42")).toHaveAttribute("data-workspace-collapse-label");
+    expect(screen.getByText("#42")).not.toHaveClass(COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS);
     fireEvent.click(link);
     expect(onOpen).toHaveBeenCalledTimes(1);
   });

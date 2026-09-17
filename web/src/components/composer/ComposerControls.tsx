@@ -29,7 +29,7 @@ export function ComposerWorkspaceBar({ className, ...props }: ComponentPropsWith
     <div
       ref={barRef}
       className={cn(
-        "group/composer-workspace relative z-0 mx-3 -mb-px flex h-[37px] min-w-0 items-center gap-0.5 rounded-t-2xl border border-b-0 border-border bg-muted/70 px-2 py-1.5 md:gap-2",
+        "composer-workspace-surface group/composer-workspace relative z-0 mx-3 -mb-px flex h-[37px] min-w-0 items-center gap-0.5 rounded-t-2xl border border-b-0 border-border px-2 py-1.5 md:gap-2",
         className,
       )}
       {...props}
@@ -113,6 +113,8 @@ export function ComposerPermissionPicker({
   value,
   options,
   disabled = false,
+  loading = false,
+  interactiveWhileLoading = false,
   onSelect,
   testIdPrefix = "composer",
 }: {
@@ -120,16 +122,22 @@ export function ComposerPermissionPicker({
   value: string;
   options: readonly { value: string; label: string }[];
   disabled?: boolean;
+  loading?: boolean;
+  interactiveWhileLoading?: boolean;
   onSelect: (value: string) => void;
   testIdPrefix?: string;
 }) {
   return (
     <DropdownMenu>
-      <DropdownMenuTrigger asChild>
+      <DropdownMenuTrigger asChild disabled={disabled || (loading && !interactiveWhileLoading)}>
         <button
           type="button"
-          disabled={disabled}
-          className="flex h-8 min-w-0 w-auto cursor-pointer items-center justify-center gap-1 rounded-lg bg-transparent px-2 text-foreground transition-colors hover:bg-muted/70 dark:hover:bg-muted/50 disabled:cursor-default disabled:opacity-50 md:h-7"
+          disabled={disabled || (loading && !interactiveWhileLoading)}
+          aria-busy={loading || undefined}
+          className={cn(
+            "flex h-8 min-w-0 w-auto cursor-pointer items-center justify-center gap-1 rounded-lg bg-transparent px-2 text-foreground transition-colors hover:bg-muted/70 dark:hover:bg-muted/50 disabled:cursor-default disabled:opacity-50 md:h-7",
+            loading && "disabled:opacity-100",
+          )}
           aria-label={`${label}: ${value}`}
           title={`${label}: ${value}`}
           data-testid={`${testIdPrefix}-permission-chip`}
@@ -147,6 +155,12 @@ export function ComposerPermissionPicker({
         align="start"
         className="w-max min-w-[13.75rem] max-w-[calc(100vw-2rem)]"
         data-testid={`${testIdPrefix}-permission-menu`}
+        onCloseAutoFocus={(event) => {
+          // A closing animation must not steal focus from a newly opened menu.
+          if (document.activeElement?.closest('[role="menu"][data-state="open"]')) {
+            event.preventDefault();
+          }
+        }}
       >
         <div className="px-2 py-1 text-xs text-muted-foreground">{label}</div>
         {options.map((option) => (
@@ -189,6 +203,7 @@ export const ComposerHarnessTrigger = forwardRef<
   Omit<ComponentPropsWithoutRef<typeof Button>, "children"> & {
     label: string;
     model: string;
+    loading?: boolean;
     pending?: boolean;
     effort?: string;
     icon?: ReactNode;
@@ -201,6 +216,7 @@ export const ComposerHarnessTrigger = forwardRef<
     model,
     effort,
     icon,
+    loading = false,
     pending = false,
     testIdPrefix = "composer",
     labelClassName,
@@ -216,6 +232,7 @@ export const ComposerHarnessTrigger = forwardRef<
       variant="ghost"
       size="sm"
       aria-label={label}
+      aria-busy={loading || undefined}
       className={cn(
         "h-auto min-h-8 min-w-0 w-auto max-w-full gap-1 rounded-lg border-0 px-2 py-0 text-[13px] leading-5 font-normal text-muted-foreground hover:text-foreground md:min-h-7",
         className,
@@ -223,7 +240,15 @@ export const ComposerHarnessTrigger = forwardRef<
       {...props}
     >
       {icon}
-      {pending && (
+      {loading && (
+        <Loader2Icon
+          role="status"
+          className="size-3 shrink-0 animate-spin"
+          aria-label="Loading model"
+          data-testid={`${testIdPrefix}-model-loading`}
+        />
+      )}
+      {pending && !loading && (
         <Loader2Icon
           className="size-3 shrink-0 animate-spin"
           aria-label="Model change pending"

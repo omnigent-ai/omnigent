@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   ComposerHostTrigger,
@@ -95,6 +95,29 @@ describe("shared composer controls", () => {
     );
   });
 
+  it("keeps the model trigger clickable with an accessible, mobile-visible loading spinner", () => {
+    const onClick = vi.fn();
+    render(
+      <ComposerHarnessTrigger
+        label="Configure session"
+        model=""
+        icon={<span>Harness</span>}
+        loading
+        pending
+        onClick={onClick}
+      />,
+    );
+    const trigger = screen.getByRole("button", { name: "Configure session" });
+    const spinner = screen.getByRole("status", { name: "Loading model" });
+    expect(trigger).toBeEnabled();
+    expect(trigger).toHaveAttribute("aria-busy", "true");
+    expect(spinner.parentElement).toBe(trigger);
+    expect(screen.getByTestId("composer-agent-config-value")).not.toContainElement(spinner);
+    expect(screen.queryByLabelText("Model change pending")).toBeNull();
+    fireEvent.click(trigger);
+    expect(onClick).toHaveBeenCalledOnce();
+  });
+
   it("dispatches permission selections through the caller's handler", () => {
     const onSelect = vi.fn();
     render(
@@ -120,6 +143,88 @@ describe("shared composer controls", () => {
     fireEvent.click(screen.getByRole("menuitem", { name: "Plan" }));
     expect(onSelect).toHaveBeenCalledWith("plan");
   });
+
+  it.each([false, true])(
+    "restores permission focus unless another menu has opened (next menu=%s)",
+    async (nextMenuOpen) => {
+      vi.useFakeTimers();
+      try {
+        render(
+          <>
+            <ComposerPermissionPicker
+              label="Permission mode"
+              value="Manual"
+              options={[{ value: "plan", label: "Plan" }]}
+              onSelect={vi.fn()}
+            />
+            <div role="menu" data-state="open" tabIndex={-1} data-testid="next-menu" />
+          </>,
+        );
+        const trigger = screen.getByRole("button", { name: "Permission mode: Manual" });
+        fireEvent.keyDown(trigger, { key: "ArrowDown" });
+        fireEvent.click(screen.getByRole("menuitem", { name: "Plan" }));
+        const nextMenu = screen.getByTestId("next-menu");
+        if (nextMenuOpen) nextMenu.focus();
+
+        await act(() => vi.runOnlyPendingTimersAsync());
+
+        expect(nextMenuOpen ? nextMenu : trigger).toHaveFocus();
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it("keeps cached permissions readable but inert while their live configuration loads", () => {
+    const onSelect = vi.fn();
+    render(
+      <ComposerPermissionPicker
+        label="Permission mode"
+        value="Plan"
+        options={[{ value: "plan", label: "Plan" }]}
+        loading
+        onSelect={onSelect}
+      />,
+    );
+    const trigger = screen.getByRole("button", { name: "Permission mode: Plan" });
+    expect(trigger).toBeDisabled();
+    expect(trigger).toHaveAttribute("aria-busy", "true");
+    expect(trigger).toHaveClass("disabled:opacity-100");
+    fireEvent.pointerDown(trigger, { button: 0 });
+    fireEvent.click(trigger);
+    expect(screen.queryByRole("menu")).toBeNull();
+    expect(onSelect).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])(
+    "allows cached permission choices while refreshing unless explicitly disabled (%s)",
+    (disabled) => {
+      const onSelect = vi.fn();
+      render(
+        <ComposerPermissionPicker
+          label="Permission mode"
+          value="Default"
+          options={[{ value: "plan", label: "Plan" }]}
+          loading
+          interactiveWhileLoading
+          disabled={disabled}
+          onSelect={onSelect}
+        />,
+      );
+      const trigger = screen.getByRole("button", { name: "Permission mode: Default" });
+      expect(trigger).toHaveAttribute("aria-busy", "true");
+      if (disabled) {
+        expect(trigger).toBeDisabled();
+        fireEvent.pointerDown(trigger, { button: 0 });
+        expect(screen.queryByRole("menu")).toBeNull();
+      } else {
+        expect(trigger).toBeEnabled();
+        fireEvent.keyDown(trigger, { key: "ArrowDown" });
+        fireEvent.click(screen.getByRole("menuitem", { name: "Plan" }));
+        expect(onSelect).toHaveBeenCalledWith("plan");
+      }
+    },
+  );
 });
 
 describe("workspace bar label collapse", () => {

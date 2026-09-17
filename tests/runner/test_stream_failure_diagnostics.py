@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -74,10 +75,17 @@ class _StreamErrorHarnessClient(_ScriptedHarnessClient):
             raise httpx.ReadError(self._cause)
 
 
-def _make_app(*, cause: str, terminal_registry: TerminalRegistry | None = None) -> Any:
+def _make_app(
+    *,
+    cause: str,
+    terminal_registry: TerminalRegistry | None = None,
+    frames: list[str] | None = None,
+) -> Any:
     """Build a runner app whose harness stream drops with *cause* mid-turn."""
     harness_client = _StreamErrorHarnessClient(
-        [_sse({"type": "response.created", "response": {"id": "resp_drop"}})],
+        frames
+        if frames is not None
+        else [_sse({"type": "response.created", "response": {"id": "resp_drop"}})],
         cause=cause,
     )
     pm = _FakeProcessManager(harness_client)
@@ -136,10 +144,48 @@ async def _failed_event_message(app: Any, conv_id: str) -> tuple[dict[str, Any],
 
 
 @pytest.mark.asyncio
-async def test_causeless_failure_keeps_plain_headline_but_attaches_pane(
+@pytest.mark.parametrize("response_id", [None, "resp_drop"])
+async def test_stream_failure_logs_harness_and_response(
+    response_id: str | None, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Failures identify their response only when the harness supplied one."""
+    frames = (
+        [_sse({"type": "response.created", "response": {"id": response_id}})]
+        if response_id is not None
+        else []
+    )
+    app = _make_app(cause="private transport detail", frames=frames)
+    with caplog.at_level(logging.ERROR, logger="omnigent.runner.app"):
+        failed, _ = await _failed_event_message(app, _CONV_ID)
+
+    records = [
+        r for r in caplog.records if getattr(r, "event_name", None) == "harness_stream_failed"
+    ]
+    assert len(records) == 1
+    record = records[0]
+    assert record.session_id == _CONV_ID
+    assert record.attributes == {
+        "harness": "openai-agents",
+        "response_id": response_id,
+        # Carried so the transport cause is groupable even when the exception
+        # itself has no message.
+        "exception_type": "ReadError",
+    }
+    assert record.exc_info is not None
+    assert failed["error"]["code"] == "connection_error"
+
+
+@pytest.mark.asyncio
+async def test_causeless_failure_names_the_exception_type_and_attaches_pane(
     tmp_path: Path,
 ) -> None:
-    """An exception with empty text keeps the period headline, pane still attached."""
+    """An exception with empty text falls back to naming its type.
+
+    The headline previously degraded to the bare sentence, so every messageless
+    transport failure (httpx raises ``ReadError()`` with no text) collapsed into
+    one indistinguishable signature. Naming the type keeps the original intent —
+    never a dangling ``error: `` — while saying which transport failure it was.
+    """
     registry = TerminalRegistry()
     instance = make_test_terminal_instance("bash", "main", tmp_path)
     instance._remember_pane_snapshot("Trust this folder?\n> ")
@@ -149,8 +195,8 @@ async def test_causeless_failure_keeps_plain_headline_but_attaches_pane(
     _, message = await _failed_event_message(app, _CONV_ID)
 
     first_line = message.splitlines()[0]
-    # No cause to report: the headline stays the plain sentence, never "error: ".
-    assert first_line == "Harness stream connection error.", message
+    # No cause text, so the type stands in — never a dangling "error: ".
+    assert first_line == "Harness stream connection error: ReadError", message
     # The live pane is still the most diagnostic thing available -- attached.
     assert "Last captured terminal output:" in message, message
     assert "Trust this folder?" in message, message

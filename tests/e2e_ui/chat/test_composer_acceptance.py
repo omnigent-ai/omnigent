@@ -51,7 +51,7 @@ from tests.e2e_ui.conftest import fetch_with_retry, workspace_bar_needs_collapse
         ),
     ],
 )
-def test_status_counts_and_pr_share_workspace_bar(
+def test_pr_and_context_share_workspace_bar_with_task_controls_hidden(
     page: Page,
     seeded_session: tuple[str, str],
     tmp_path: Path,
@@ -141,18 +141,13 @@ def test_status_counts_and_pr_share_workspace_bar(
     if font_family is not None:
         applied_family = context.evaluate("el => getComputedStyle(el).fontFamily")
         assert applied_family.split(",")[0].strip("\"' ") == font_family
-    expect(bar.get_by_test_id("background-task-pill")).to_have_text("2")
-    expect(bar.get_by_test_id("subagent-task-pill")).to_have_text("1")
+    expect(bar.get_by_test_id("background-task-pill")).to_have_count(0)
+    expect(bar.get_by_test_id("subagent-task-pill")).to_have_count(0)
     expect(bar).to_contain_text("live-branch")
     expect(bar).not_to_contain_text("pr-head-not-checkout")
     bounds = bar.bounding_box()
     assert bounds is not None
-    status_ids = (
-        "composer-pr-link",
-        "composer-context-ring",
-        "background-task-pill",
-        "subagent-task-pill",
-    )
+    status_ids = ("composer-pr-link", "composer-context-ring")
     control_bounds = {}
     icon_bounds = {}
     for test_id in ("composer-workspace-dir", "composer-git-branch", *status_ids):
@@ -192,10 +187,22 @@ def test_status_counts_and_pr_share_workspace_bar(
     collapsed = bar.get_attribute("data-labels") == "collapsed"
     assert collapsed == workspace_bar_needs_collapse(bar), (viewport_width, font_size, pr_number)
     expect(pr_label).to_have_attribute("title", f"#{pr_number}")
-    if collapsed:
-        expect(pr_label).to_be_hidden()
-        expect(context.locator("span")).to_be_hidden()
-    else:
+    # The PR number and the context percentage always show; a crowded bar
+    # collapses the directory and branch text to their icons, which gives the
+    # PR number the room it needs.
+    expect(pr_label).to_be_visible()
+    expect(context.locator("span")).to_be_visible()
+    for chip in ("composer-workspace-dir", "composer-git-branch"):
+        chip_label = bar.get_by_test_id(chip).locator("[data-workspace-collapse-label]")
+        if collapsed:
+            expect(chip_label).to_be_hidden()
+        else:
+            expect(chip_label).to_be_visible()
+    # From 390px up the number shows in full. A 375px bar with the large font
+    # setting is the one place it may still ellipsize even with the directory
+    # and branch text gone (CI's fonts run wider than macOS's, so it is
+    # font-dependent there); its full value stays in the title.
+    if viewport_width >= 390:
         assert pr_label.evaluate("el => el.scrollWidth <= el.clientWidth + 1")
     for test_id in status_ids:
         rect = control_bounds[test_id]
@@ -228,12 +235,6 @@ def test_status_counts_and_pr_share_workspace_bar(
             right_id,
             right,
         )
-    if is_mobile:
-        bar.get_by_test_id("subagent-task-pill").tap()
-    else:
-        bar.get_by_test_id("subagent-task-pill").click()
-    expect(page.get_by_role("dialog")).to_contain_text("Review changes")
-    page.keyboard.press("Escape")
     if is_mobile and (pr_number == 1234567 or font_family is not None):
         pr_link.tap()
         panel = page.get_by_test_id("github-panel-drawer")

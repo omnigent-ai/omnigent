@@ -53,16 +53,14 @@ def _reset_top_gap_px(page: Page) -> float:
     )
 
 
-def test_appearance_reset_button_has_top_margin(
-    page: Page, seeded_session: tuple[str, str]
-) -> None:
+def test_appearance_reset_button_has_top_margin(page: Page, live_server: str) -> None:
     """The "Reset to defaults" button is not crammed against the controls above it.
 
     The reset wrapper's top margin must give the button breathing room comparable
     to the ``gap-8`` control rhythm. The assertion requires a comfortable margin
     (>= 24px), which the cramped layout does not meet.
     """
-    base_url, _session_id = seeded_session
+    base_url = live_server
     _open_appearance(page, base_url)
 
     gap = _reset_top_gap_px(page)
