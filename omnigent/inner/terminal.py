@@ -34,6 +34,7 @@ from omnigent.runner.identity import strip_runner_auth_secrets
 from omnigent.util.tmux_compat import MIN_TMUX_VERSION, MIN_TMUX_VERSION_HINT, tmux_version
 
 from . import _proc
+from ._subprocess_lifecycle import close_subprocess_transport
 from .agent_env import strip_desktop_session_env
 from .datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 from .egress import EgressProxyHandle, apply_egress_env, start_egress_proxy
@@ -310,6 +311,8 @@ _IDLE_EXIT_FAILURE_THRESHOLD = 3
 _PROBE_ERROR_MAX_CHARS = 1024
 # Avoid adding probe pressure while the host cannot start another process.
 _TMUX_PROBE_START_FAILURE_BACKOFF_SECONDS = 1.0
+# A stalled read client must not pin a watcher or terminal-liveness request.
+_TMUX_PROBE_TIMEOUT_SECONDS = 10.0
 
 # Process creation can fail temporarily while the host is under resource
 # pressure. Only those errno values leave terminal liveness unknown; permanent
@@ -345,6 +348,29 @@ class _TmuxCommandError(RuntimeError):
 
 class _TmuxProcessStartError(RuntimeError):
     """A tmux subprocess transiently could not start, so liveness is unknown."""
+
+
+class _TmuxProbeTimeoutError(RuntimeError):
+    """A tmux client timed out without establishing terminal liveness."""
+
+
+async def _communicate_tmux(
+    proc: asyncio.subprocess.Process, *, timeout: float | None = None
+) -> tuple[bytes, bytes]:
+    """Drain a tmux client, closing and reaping it on timeout or cancellation."""
+    try:
+        if timeout is None:
+            return await proc.communicate()
+        return await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except (TimeoutError, asyncio.CancelledError):
+        if proc.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+        # Tmux passes client pipe FDs to the server; EOF may never arrive
+        # while that server is stalled, even after the client is killed.
+        close_subprocess_transport(proc)
+        await proc.wait()
+        raise
 
 
 def _is_transient_tmux_process_start_error(exc: OSError) -> bool:
@@ -1694,9 +1720,9 @@ class TerminalInstance:
                     "-p",
                     "-e",
                 )
-            except _TmuxProcessStartError as exc:
+            except (_TmuxProcessStartError, _TmuxProbeTimeoutError) as exc:
                 logger.warning(
-                    "tmux capture-pane probe could not start for terminal %s:%s; "
+                    "tmux capture-pane probe unavailable for terminal %s:%s; "
                     "liveness remains unknown: %s",
                     self.name,
                     self.session_key,
@@ -1904,9 +1930,9 @@ class TerminalInstance:
                 return
             try:
                 snapshot = self._capture_pane_for_idle_or_none()
-            except _TmuxProcessStartError as exc:
+            except (_TmuxProcessStartError, _TmuxProbeTimeoutError) as exc:
                 logger.warning(
-                    "tmux capture-pane probe could not start for terminal %s:%s; "
+                    "tmux capture-pane probe unavailable for terminal %s:%s; "
                     "liveness remains unknown: %s",
                     self.name,
                     self.session_key,
@@ -2001,7 +2027,7 @@ class TerminalInstance:
         started_at = time.monotonic()
         try:
             return self._tmux_output_sync("capture-pane", "-t", self.tmux_target, "-p", "-e")
-        except _TmuxProcessStartError:
+        except (_TmuxProcessStartError, _TmuxProbeTimeoutError):
             raise
         except RuntimeError as exc:
             self._remember_probe_failure("capture-pane", exc, started_at)
@@ -2020,9 +2046,9 @@ class TerminalInstance:
         started_at = time.monotonic()
         try:
             self._tmux_output_sync("has-session", "-t", self.tmux_target)
-        except _TmuxProcessStartError as exc:
+        except (_TmuxProcessStartError, _TmuxProbeTimeoutError) as exc:
             logger.warning(
-                "tmux has-session probe could not start for terminal %s:%s; "
+                "tmux has-session probe unavailable for terminal %s:%s; "
                 "liveness remains unknown: %s",
                 self.name,
                 self.session_key,
@@ -2060,15 +2086,15 @@ class TerminalInstance:
         :returns: ``True`` when tmux reports ``#{pane_dead}`` as ``1``;
             ``False`` when the pane is live or tmux rejects the probe (the
             caller's capture step handles a vanished server); ``None`` when
-            the probe process cannot start and liveness is unknown.
+            the probe cannot start or times out and liveness is unknown.
         """
         try:
             out = self._tmux_output_sync(
                 "list-panes", "-t", self.tmux_target, "-F", "#{pane_dead} #{pane_dead_status}"
             )
-        except _TmuxProcessStartError as exc:
+        except (_TmuxProcessStartError, _TmuxProbeTimeoutError) as exc:
             logger.warning(
-                "tmux pane-death probe could not start for terminal %s:%s; "
+                "tmux pane-death probe unavailable for terminal %s:%s; "
                 "liveness remains unknown: %s",
                 self.name,
                 self.session_key,
@@ -2186,7 +2212,7 @@ class TerminalInstance:
             return False
 
         try:
-            stdout, stderr = await proc.communicate()
+            stdout, stderr = await _communicate_tmux(proc, timeout=_TMUX_PROBE_TIMEOUT_SECONDS)
             if proc.returncode != 0:
                 detail = stderr.decode(errors="replace").strip() or "<no stderr>"
                 if not _tmux_reports_target_gone(detail):
@@ -2207,6 +2233,14 @@ class TerminalInstance:
                 self.running = False
                 return False
             return True
+        except TimeoutError:
+            logger.warning(
+                "tmux liveness probe timed out for terminal %s:%s; "
+                "preserving optimistic running state",
+                self.name,
+                self.session_key,
+            )
+            return self.running
         except OSError:
             self.running = False
             return False
@@ -2218,15 +2252,15 @@ class TerminalInstance:
         :returns: ``True`` when tmux reports ``#{pane_dead}`` as ``1``;
             ``False`` when the pane is live or tmux rejects the probe (the
             caller's capture step handles a vanished server); ``None`` when
-            the probe process cannot start and liveness is unknown.
+            the probe cannot start or times out and liveness is unknown.
         """
         try:
             out = await self._tmux_output(
                 "list-panes", "-t", self.tmux_target, "-F", "#{pane_dead} #{pane_dead_status}"
             )
-        except _TmuxProcessStartError as exc:
+        except (_TmuxProcessStartError, _TmuxProbeTimeoutError) as exc:
             logger.warning(
-                "tmux pane-death probe could not start for terminal %s:%s; "
+                "tmux pane-death probe unavailable for terminal %s:%s; "
                 "liveness remains unknown: %s",
                 self.name,
                 self.session_key,
@@ -2243,9 +2277,9 @@ class TerminalInstance:
         started_at = time.monotonic()
         try:
             await self._tmux_output("has-session", "-t", self.tmux_target)
-        except _TmuxProcessStartError as exc:
+        except (_TmuxProcessStartError, _TmuxProbeTimeoutError) as exc:
             logger.warning(
-                "tmux has-session probe could not start for terminal %s:%s; "
+                "tmux has-session probe unavailable for terminal %s:%s; "
                 "liveness remains unknown: %s",
                 self.name,
                 self.session_key,
@@ -2280,7 +2314,7 @@ class TerminalInstance:
             )
         except OSError as exc:
             raise _tmux_process_start_error(cmd, exc) from exc
-        _, stderr = await proc.communicate()
+        _, stderr = await _communicate_tmux(proc)
         if proc.returncode != 0:
             raise _tmux_command_failed_error(cmd, proc.returncode, stderr)
 
@@ -2295,7 +2329,12 @@ class TerminalInstance:
             )
         except OSError as exc:
             raise _tmux_process_start_error(cmd, exc) from exc
-        stdout, stderr = await proc.communicate()
+        try:
+            stdout, stderr = await _communicate_tmux(proc, timeout=_TMUX_PROBE_TIMEOUT_SECONDS)
+        except TimeoutError as exc:
+            raise _TmuxProbeTimeoutError(
+                f"tmux command timed out after {_TMUX_PROBE_TIMEOUT_SECONDS}s: {' '.join(cmd)}"
+            ) from exc
         if proc.returncode != 0:
             raise _tmux_command_failed_error(cmd, proc.returncode, stderr)
         return stdout.decode()
@@ -2314,6 +2353,7 @@ class TerminalInstance:
         :returns: The captured stdout, decoded as UTF-8.
         :raises _TmuxProcessStartError: When the tmux subprocess transiently
             cannot start because of host resource pressure.
+        :raises _TmuxProbeTimeoutError: When the client exceeds the probe budget.
         :raises _TmuxTargetGoneError: When tmux ran and reported the server or
             target session gone.
         :raises _TmuxCommandFailedError: When tmux ran and failed without
@@ -2322,7 +2362,13 @@ class TerminalInstance:
         """
         cmd = [*self._tmux_base_cmd(), *args]
         try:
-            proc = subprocess.run(cmd, capture_output=True, check=False)
+            proc = subprocess.run(
+                cmd, capture_output=True, check=False, timeout=_TMUX_PROBE_TIMEOUT_SECONDS
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise _TmuxProbeTimeoutError(
+                f"tmux command timed out after {_TMUX_PROBE_TIMEOUT_SECONDS}s: {' '.join(cmd)}"
+            ) from exc
         except OSError as exc:
             raise _tmux_process_start_error(cmd, exc) from exc
         if proc.returncode != 0:
