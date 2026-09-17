@@ -5,16 +5,26 @@
 import { createContext, useContext } from "react";
 
 /**
- * How the viewer should land after opening a file. `line` is the 1-based line
- * a chat or terminal citation (`path:line`) pointed at; the viewer reveals it
- * instead of parking at the top.
+ * A 1-based citation target. Object identity is the navigation request key:
+ * preserve it when forwarding or remounting; create a fresh object for each click.
  */
-export interface OpenFileOptions {
-  line?: number;
+export interface FilePosition {
+  line: number;
+  column?: number;
 }
+
+export type OpenFileOptions = Partial<FilePosition>;
+
+export type FileNavigationGuard = (
+  path: string,
+  options: OpenFileOptions | undefined,
+  navigate: () => void,
+) => void;
 
 interface FileViewerContextType {
   openFile: (path: string, options?: OpenFileOptions) => void;
+  /** The mounted viewer confirms dirty navigation before selection or URL changes. */
+  registerNavigationGuard?: (guard: FileNavigationGuard) => () => void;
   /** Open GitHub in the workspace rail or mobile drawer. */
   openGithubTab: () => void;
   /**

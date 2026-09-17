@@ -2267,6 +2267,83 @@ async def test_copy_files_from_direct_parent(
 
 
 @pytest.mark.asyncio
+async def test_copy_files_carries_source_metadata(
+    file_client: httpx.AsyncClient,
+    file_store: Any,
+    artifact_store: _InMemoryArtifactStore,
+) -> None:
+    """A copied downscaled image keeps its source_metadata for the subagent."""
+    source = file_store.create(
+        session_id="b460374fc8e697b296708f52dc9d8179",
+        filename="shot.webp",
+        bytes=3,
+        content_type="image/webp",
+        source_metadata={"width": 6000, "height": 4000},
+    )
+    artifact_store.put(source.id, b"abc")
+
+    resp = await file_client.post(
+        "/v1/sessions/405bfe154d5c0e795a2b87021bc897bf/resources/files:copy",
+        json={
+            "source_session_id": "b460374fc8e697b296708f52dc9d8179",
+            "file_ids": [source.id],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    new_id = resp.json()["mapping"][source.id]["new_id"]
+
+    copied = file_store.get(new_id, session_id="405bfe154d5c0e795a2b87021bc897bf")
+    assert copied is not None
+    assert copied.source_metadata == {"width": 6000, "height": 4000}
+
+
+@pytest.mark.asyncio
+async def test_downscaled_upload_reaches_native_resolver(
+    file_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from io import BytesIO
+
+    from PIL import Image
+
+    from omnigent.inner.codex_native_executor import _content_to_input_items
+    from omnigent.inner.native_attachments import framework_notices
+    from omnigent.runner.app import _resolve_forwarded_message_content
+    from omnigent.runtime import content_resolver
+
+    monkeypatch.setattr(content_resolver, "IMAGE_MODEL_BUDGET_BYTES", 1024)
+    monkeypatch.setattr(content_resolver, "IMAGE_MAX_EDGE_PX", 64)
+    original = BytesIO()
+    Image.new("RGB", (300, 200), "red").save(original, format="PNG", compress_level=0)
+    session_id = "79b22ebd2309e48fdeb450c65611d51b"
+    upload = await file_client.post(
+        f"/v1/sessions/{session_id}/resources/files",
+        files={"file": ("photo.png", original.getvalue(), "image/png")},
+    )
+    assert upload.status_code == 201, upload.text
+    file_id = upload.json()["id"]
+    resource = await file_client.get(f"/v1/sessions/{session_id}/resources/files/{file_id}")
+    assert resource.json()["metadata"]["source_metadata"] == {"width": 300, "height": 200}
+    inventory = await file_client.get(f"/v1/sessions/{session_id}/resources")
+    assert inventory.status_code == 200
+    listed = next(entry for entry in inventory.json()["data"] if entry["id"] == file_id)
+    assert listed["metadata"]["source_metadata"] == {"width": 300, "height": 200}
+    authored = [
+        {"type": "input_image", "file_id": file_id, "filename": "photo.png"},
+        {"type": "input_text", "text": "inspect this"},
+    ]
+    resolved = await _resolve_forwarded_message_content(
+        authored, session_id=session_id, server_client=file_client
+    )
+    assert "300×200" in framework_notices(resolved)[0]
+    items = _content_to_input_items(resolved, tmp_path)
+    assert "downscaled-from-300x200" in items[0]["path"]
+    assert items[1] == {"type": "text", "text": "inspect this"}
+    assert len(authored) == 2
+
+
+@pytest.mark.asyncio
 async def test_copy_files_rejects_empty_file_ids(
     file_client: httpx.AsyncClient,
 ) -> None:
@@ -3480,6 +3557,111 @@ async def test_filesystem_write_proxies_to_runner(
             "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default/filesystem/new.txt",
         ),
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail_first_wake", [False, True])
+async def test_filesystem_save_reconnects_runner_on_live_host(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+    fail_first_wake: bool,
+) -> None:
+    """Save (or Retry after a failed wake) reconnects before forwarding the edit."""
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import orchestration
+
+    session_id = "79b22ebd2309e48fdeb450c65611d51b"
+    store = app.state.test_conversation_store
+    conv = store._conversations[session_id]
+    conv.host_id = "host_save"
+    conv.runner_id = "runner_old"
+    conv.workspace = "/workspace"
+    registry = app.state.test_host_registry
+    app.state.host_registry = registry
+    registry.register(
+        conv.host_id,
+        object(),  # type: ignore[arg-type]
+        HostHelloFrame(version="0.1.0-test", frame_protocol_version=1, name="save-host"),
+        owner=None,
+    )
+    fake_runner = _FakeRunnerClient(payload=_fs_write_payload())
+    connected = False
+
+    class _SleepingRouter(_FakeRunnerRouter):
+        def client_for_session_resources(
+            self, session_id: str, *, conversation: Conversation | None = None
+        ) -> _RoutedRunner:
+            if not connected:
+                raise OmnigentError("runner disconnected", code=ErrorCode.RUNNER_UNAVAILABLE)
+            assert conversation is not None and conversation.runner_id == "runner_new"
+            return super().client_for_session_resources(session_id, conversation=conversation)
+
+    router = _SleepingRouter(fake_runner)
+    set_runner_router(router)  # type: ignore[arg-type]
+    attempts = 0
+
+    async def _launch(*_args: Any, **_kwargs: Any) -> Any:
+        nonlocal connected, attempts
+        attempts += 1
+        assert fake_runner.calls == []
+        if fail_first_wake and attempts == 1:
+            raise OmnigentError("wake timed out", code=ErrorCode.RUNNER_UNAVAILABLE)
+        # Recovery replaces the row: forwarding with the old binding would fail.
+        store._conversations[session_id] = replace(conv, runner_id="runner_new")
+        connected = True
+        return SimpleNamespace(runner_id="runner_new", error_code=None, error=None)
+
+    async def _wait(*_args: Any, **kwargs: Any) -> Any:
+        assert kwargs["runner_id"] == "runner_new"
+        assert connected
+        return fake_runner
+
+    async def _no_managed_wake(**_kwargs: Any) -> bool:
+        return False
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0)
+    monkeypatch.setattr(
+        orchestration, "_maybe_wake_stale_resumable_managed_sandbox", _no_managed_wake
+    )
+    monkeypatch.setattr(orchestration, "_launch_runner_on_host", _launch)
+    monkeypatch.setattr(orchestration, "_wait_for_runner_client", _wait)
+    url = f"/v1/sessions/{session_id}/resources/environments/default/filesystem/new.txt"
+    body = {"content": "edited without a chat message", "encoding": "utf-8"}
+
+    if fail_first_wake:
+        failed = await client.put(url, json=body)
+        assert failed.status_code == 503
+        assert fake_runner.calls == []
+
+    response = await client.put(url, json=body)
+    assert response.status_code == 200
+    assert fake_runner.calls == [("PUT", url)]
+    assert attempts == (2 if fail_first_wake else 1)
+    assert store.appended_items == []
+
+
+@pytest.mark.asyncio
+async def test_filesystem_save_authorizes_before_reconnecting(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An invalid session must not trigger runner recovery."""
+    from unittest.mock import AsyncMock
+
+    from omnigent.server.routes.sessions import routes_resources
+
+    wake = AsyncMock()
+    monkeypatch.setattr(routes_resources, "ensure_runner_connected", wake)
+    response = await client.put(
+        "/v1/sessions/missing/resources/environments/default/filesystem/new.txt",
+        json={"content": "hello", "encoding": "utf-8"},
+    )
+    assert response.status_code == 404
+    wake.assert_not_awaited()
 
 
 @pytest.mark.asyncio

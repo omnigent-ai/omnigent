@@ -114,7 +114,13 @@ function useWorkspaceFileOpener(text: string): WorkspaceFileOpener {
     };
   }
   return {
-    open: () => (citedLine === null ? openFile(linkPath) : openFile(linkPath, { line: citedLine })),
+    open: () =>
+      citedLine === null
+        ? openFile(linkPath)
+        : openFile(linkPath, {
+            line: citedLine,
+            ...(citation.column ? { column: citation.column } : {}),
+          }),
     unopenable: false,
     resolvedPath: linkPath,
   };

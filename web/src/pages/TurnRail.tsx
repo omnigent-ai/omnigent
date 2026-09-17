@@ -133,10 +133,18 @@ export function TurnRail({
     const onWheel = (e: WheelEvent) => {
       if (e.deltaY < 0) fetchOlder();
     };
-    rail.addEventListener("scroll", fetchOlder, { passive: true });
+    let previousTop = rail.scrollTop;
+    const onScroll = () => {
+      const scrollingUp = rail.scrollTop < previousTop;
+      previousTop = rail.scrollTop;
+      // Active-tick tracking scrolls the rail without a reader gesture.
+      const readerInRail = interactingRef.current || rail.contains(document.activeElement);
+      if (scrollingUp && readerInRail) fetchOlder();
+    };
+    rail.addEventListener("scroll", onScroll, { passive: true });
     rail.addEventListener("wheel", onWheel, { passive: true });
     return () => {
-      rail.removeEventListener("scroll", fetchOlder);
+      rail.removeEventListener("scroll", onScroll);
       rail.removeEventListener("wheel", onWheel);
     };
   }, [hasMoreHistory, loadingMoreHistory]);

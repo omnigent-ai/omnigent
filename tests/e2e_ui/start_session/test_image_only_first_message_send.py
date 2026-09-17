@@ -88,7 +88,9 @@ async def _drive_landing_image_only(base_url: str, session_id: str, png: Path) -
                     body=json.dumps({"data": []}),
                 )
 
-            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+            await page.route(
+                re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
+            )
 
             # Registered after _register_common_routes so this handler wins
             # for /events: capture the auto-dispatched first message instead

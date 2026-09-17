@@ -79,7 +79,9 @@ def test_cursor_missing_cli_shows_install_and_login_guidance(
         lambda route: route.fulfill(json={"data": []}),
     )
     page.route("**/v1/agents", _fulfill_agents)
-    page.route(re.compile(r"/v1/sessions\?.*kind=any"), _fulfill_empty_agent_scan)
+    page.route(
+        re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), _fulfill_empty_agent_scan
+    )
     page.add_init_script(
         f"""window.localStorage.setItem(
             "omnigent:recent-workspaces",

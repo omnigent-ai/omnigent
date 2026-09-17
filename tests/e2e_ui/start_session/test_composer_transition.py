@@ -41,7 +41,7 @@ async def _drive(
                 page, created_session_id=session_id, create_bodies=create_bodies
             )
             await page.route(
-                re.compile(r"/v1/sessions\?.*kind=any"),
+                re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"),
                 lambda route: route.fulfill(json={"data": []}),
             )
             await page.route(
@@ -177,7 +177,7 @@ async def _drive_failed_create(
                 page, created_session_id=session_id, create_bodies=create_bodies
             )
             await page.route(
-                re.compile(r"/v1/sessions\?.*kind=any"),
+                re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"),
                 lambda route: route.fulfill(json={"data": []}),
             )
 

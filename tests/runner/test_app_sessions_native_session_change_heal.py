@@ -137,7 +137,9 @@ async def _open_claude_native_session(
         "read_model_env",
         lambda _bridge_dir: {"ANTHROPIC_CUSTOM_MODEL_OPTION": "claude-opus-4-7"},
     )
-    monkeypatch.setattr(claude_native_bridge, "post_tools_changed", lambda _bridge_dir: None)
+    monkeypatch.setattr(
+        claude_native_bridge, "post_tools_changed", lambda _bridge_dir, **kwargs: None
+    )
 
     async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
         del agent_id, session_id

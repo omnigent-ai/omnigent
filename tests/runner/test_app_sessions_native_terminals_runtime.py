@@ -19,6 +19,7 @@ from omnigent.entities.session_resources import SessionResourceView
 from omnigent.harnesses.antigravity_native.bridge import (
     is_placeholder_conversation_id as bridge_mod_is_placeholder,
 )
+from omnigent.harnesses.claude_native import bridge as claude_native_bridge
 from omnigent.harnesses.claude_native.bridge import (
     bridge_dir_for_bridge_id,
     prepare_bridge_dir,
@@ -438,6 +439,11 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
     monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
     monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
+    session_reap_calls: list[Path] = []
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.process_registry.reap_codex_native_processes_for_state_dir",
+        lambda bridge_dir: session_reap_calls.append(bridge_dir),
+    )
     caplog.set_level(logging.INFO, logger="omnigent.runner.app")
     bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(session_id)
     codex_native_bridge.write_bridge_state(
@@ -533,6 +539,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
         :param kwargs: Keyword arguments passed by the runner helper.
         :returns: Fake app-server.
         """
+        assert session_reap_calls == [bridge_dir]
         build_calls.append(kwargs)
         app_server.codex_home = kwargs["codex_home"]
         return app_server
@@ -714,6 +721,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     assert build_calls[0]["model"] == "gpt-5.4-mini"
     assert build_calls[0]["cwd"] == tmp_path / "workspace"
     assert build_calls[0]["trust_project"] is True
+    assert build_calls[0]["reconcile_process_registry"] is False
     assert build_calls[0]["developer_instructions"] == "Be a concise, careful coding assistant."
     assert len(launched_specs) == 1
     launched = launched_specs[0]
@@ -1651,6 +1659,10 @@ async def test_auto_create_codex_terminal_starts_relay_at_session_creation(
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
     monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
     monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.process_registry.reap_codex_native_processes_for_state_dir",
+        lambda _bridge_dir: pytest.fail("fresh Codex launch ran stale-writer recovery"),
+    )
     caplog.set_level(logging.INFO, logger="omnigent.runner.app")
 
     class _SnapshotClient:
@@ -1824,37 +1836,7 @@ async def test_claude_native_first_turn_not_blocked_by_cold_bridge_notify(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """First claude-native turn dispatches without waiting on a cold bridge.
-
-    A UI-launched (never pre-warmed) claude-native session starts the comment
-    relay lazily on the first turn. The ``tools/list_changed`` delivery
-    (``post_tools_changed``) blocks until the bridge publishes ``server.json``
-    — up to ``_TOOLS_CHANGED_READY_TIMEOUT_S`` (30s) on a still-cold bridge.
-    The turn must NOT be gated on that: the claude-native first-turn caller
-    passes ``await_notify=False``, so the relay starts and the notification is
-    fired in a background task while the turn dispatches immediately.
-
-    This holds ``post_tools_changed`` open on a never-released event (a cold
-    bridge that never publishes ``server.json``) and asserts:
-
-    (a) the notification was actually attempted — the relay genuinely started
-        and reached the delivery step. Without this, (b) passes vacuously: a
-        relay that bailed early (failed socket bind, unresolved spec) never
-        blocks, so the turn was never at risk.
-    (b) the harness still received the turn while the notification is blocked.
-
-    A regression to ``await_notify=True`` would await ``post_tools_changed``
-    inline, parking ``_run_turn_bg`` at the relay-start step until the event
-    is released, so the harness would never see the turn within the poll
-    budget and (b) fails.
-
-    :param tmp_path: Temp dir backing the runner workspace (the bridge tree
-        itself must live under the real ``/tmp`` trusted parent —
-        ``_ensure_secure_dir`` rejects a bridge dir anywhere else, so the
-        bridge root is NOT redirected into ``tmp_path``).
-    :param monkeypatch: Pytest monkeypatch fixture.
-    :returns: None.
-    """
+    """A cold bridge does not block dispatch or strand a cancelled worker."""
     session_id = uuid.uuid4().hex
     # claude-native pins the bridge tree under /tmp (see _ensure_secure_dir);
     # use the real per-user bridge dir like tests/runner/test_comment_relay.py
@@ -1864,29 +1846,29 @@ async def test_claude_native_first_turn_not_blocked_by_cold_bridge_notify(
     # create it — mirror the client's prepare_bridge_dir before launch.
     prepare_bridge_dir(session_id, workspace=tmp_path)
 
-    notify_started = threading.Event()
-    notify_release = threading.Event()
+    polling_started = threading.Event()
+    worker_finished = threading.Event()
+    cancellation_event: threading.Event | None = None
+    notification_task: asyncio.Task[Any] | None = None
+    read_json = claude_native_bridge._read_json_file
+    post_tools_changed = claude_native_bridge.post_tools_changed
 
-    def _blocking_post_tools_changed(*args: Any, **kwargs: Any) -> None:
-        """Stand in for a cold bridge: signal entry, then block until released.
+    def _observe_read(path: Path) -> dict[str, Any]:
+        result = read_json(path)
+        if path == bridge_dir / "server.json":
+            polling_started.set()
+        return result
 
-        Runs in the default thread-pool executor (``post_tools_changed`` is
-        synchronous), so a threading.Event is the right primitive.
+    def _observe_notification(target: Path, *, cancelled: threading.Event) -> None:
+        nonlocal cancellation_event
+        cancellation_event = cancelled
+        try:
+            post_tools_changed(target, cancelled=cancelled)
+        finally:
+            worker_finished.set()
 
-        :param args: Positional args from the call site (``bridge_dir``).
-        :param kwargs: Keyword args (none expected).
-        :returns: None.
-        """
-        del args, kwargs
-        notify_started.set()
-        notify_release.wait()
-
-    # The runner imports post_tools_changed from this module at call time, so
-    # patching the module attribute is picked up by _ensure_comment_relay_started.
-    monkeypatch.setattr(
-        "omnigent.harnesses.claude_native.bridge.post_tools_changed",
-        _blocking_post_tools_changed,
-    )
+    monkeypatch.setattr(claude_native_bridge, "_read_json_file", _observe_read)
+    monkeypatch.setattr(claude_native_bridge, "post_tools_changed", _observe_notification)
 
     spec = AgentSpec(
         spec_version=1,
@@ -1926,24 +1908,15 @@ async def test_claude_native_first_turn_not_blocked_by_cold_bridge_notify(
             )
             assert resp.status_code == 202, f"{resp.status_code} {resp.text}"
 
-            # (a) The relay started and reached the notification: post_tools_changed
-            # is now parked on notify_release. If start_tool_relay or the spec
-            # resolve had bailed, this never fires — making (b) vacuous.
+            # Observe the real readiness poll, not merely submission to the executor.
             for _ in range(300):
-                if notify_started.is_set():
+                if polling_started.is_set():
                     break
                 await asyncio.sleep(0.01)
-            assert notify_started.is_set(), (
-                "post_tools_changed was never invoked: the relay did not start or "
-                "did not reach the notify step, so the no-block assertion below "
-                "would be vacuous."
-            )
+            assert polling_started.is_set(), "notification never reached bridge readiness polling"
+            assert not worker_finished.is_set()
 
-            # (b) The harness received the turn even though post_tools_changed is
-            # still blocked (notify_release is NOT set). An unbounded await on the
-            # notification would park _run_turn_bg at relay-start, leaving
-            # posted_bodies empty until release — that is the ~15-30s first-turn
-            # stall this change removes.
+            # The absent bridge must not prevent the first turn reaching the harness.
             for _ in range(300):
                 if hc.posted_bodies:
                     break
@@ -1953,14 +1926,30 @@ async def test_claude_native_first_turn_not_blocked_by_cold_bridge_notify(
                 "tools/list_changed delivery was blocked — the turn is gated on a "
                 "cold-bridge notification."
             )
-            # Sanity: we never unblocked delivery, so (b) proves a bounded wait,
-            # not that the bridge came up.
-            assert not notify_release.is_set()
+            assert not (bridge_dir / "server.json").exists()
+            assert not worker_finished.is_set()
+
+            tasks = [
+                task
+                for task in asyncio.all_tasks()
+                if task.get_name() == f"tools-changed:{session_id}"
+            ]
+            assert len(tasks) == 1
+            notification_task = tasks[0]
+            notification_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await notification_task
+            assert await asyncio.to_thread(worker_finished.wait, 1.0), (
+                "cancelling the notification task left its readiness worker running"
+            )
     finally:
-        # Unblock the parked executor thread BEFORE teardown so the loop's
-        # shutdown_default_executor(wait=True) does not hang joining it, then
-        # close the relay socket/thread by deleting the session.
-        notify_release.set()
+        # Release a worker after a failed assertion, without masking a broken cancel path.
+        if cancellation_event is not None:
+            cancellation_event.set()
+        if notification_task is not None:
+            notification_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await notification_task
         with contextlib.suppress(httpx.HTTPError):
             async with _runner_client(app) as cleanup_client:
                 await cleanup_client.delete(f"/v1/sessions/{session_id}")

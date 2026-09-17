@@ -10,6 +10,8 @@
 //   Existing comments highlight the lines they span. Clicking inside a
 //   highlighted range navigates to that comment in CommentsPanel.
 
+import type { FilePosition } from "./FileViewerContext";
+import { isFilePositionPending } from "./filePositionState";
 import { createPortal } from "react-dom";
 import {
   isValidElement,
@@ -394,6 +396,7 @@ function ImageViewer({ data, path }: { data: FileContentResponse; path: string }
 // ---------------------------------------------------------------------------
 
 export interface CodeViewerProps {
+  position?: FilePosition;
   conversationId: string;
   path: string;
   fileQuery: ReturnType<typeof useFileContent>;
@@ -434,15 +437,10 @@ export interface CodeViewerProps {
    * itself can't anchor text-selection comments).
    */
   onRequestEditMode?: () => void;
-  /**
-   * 1-based line a chat citation (`path:line`) pointed at. The Monaco surface
-   * reveals it on open instead of parking at the top; the Shiki surfaces
-   * scroll their line row into view.
-   */
-  revealLine?: number | null;
 }
 
 export function CodeViewer({
+  position,
   conversationId,
   path,
   fileQuery,
@@ -461,7 +459,6 @@ export function CodeViewer({
   tocOpen = false,
   onTocToggle,
   onRequestEditMode,
-  revealLine,
 }: CodeViewerProps) {
   const canEdit = useCanEdit(conversationId);
   const activeCommentId = activeSelection?.comment_id;
@@ -517,6 +514,24 @@ export function CodeViewer({
   // Only the Shiki DOM path needs the per-line split; skip it in Monaco mode.
   const rawLines = useMemo(() => (showMonaco ? [] : content.split("\n")), [content, showMonaco]);
 
+  const revealedPositionRef = useRef<FilePosition | undefined>(undefined);
+  useEffect(() => {
+    if (
+      !position ||
+      !isFilePositionPending(position) ||
+      showMonaco ||
+      viewMode !== "source" ||
+      !fileQuery.isSuccess
+    )
+      return;
+    if (revealedPositionRef.current === position) return;
+    const index = Math.min(Math.max(1, position.line), rawLines.length) - 1;
+    const line = matchLineRefs.current.get(index);
+    if (!line) return;
+    line.scrollIntoView({ block: "center" });
+    revealedPositionRef.current = position;
+  }, [position, showMonaco, viewMode, fileQuery.isSuccess, rawLines]);
+
   // "Attach to agent" delivers a "[Attached: path:start-end]" marker the
   // composer reads — only the native coding-agent harnesses act on it, so
   // gate the button to them (same set as the "@"-mention feature).
@@ -549,16 +564,6 @@ export function CodeViewer({
     const lineNum = indexToLine(activeSelection.start_index, rawLines);
     matchLineRefs.current.get(lineNum - 1)?.scrollIntoView({ block: "center", behavior: "smooth" });
   }, [activeSelection]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  // Land on the cited line for the Shiki (per-line DOM) surfaces. The Monaco
-  // surface handles its own reveal; this covers markdown/HTML source views.
-  // Keyed on content so a late-arriving file body still gets the scroll.
-  useEffect(() => {
-    if (showMonaco || revealLine == null || rawLines.length === 0) return;
-    matchLineRefs.current
-      .get(Math.max(1, Math.min(revealLine, rawLines.length)) - 1)
-      ?.scrollIntoView({ block: "center" });
-  }, [showMonaco, revealLine, rawLines.length]);
 
   useEffect(() => {
     setCurrentMatchIdx(0);
@@ -879,6 +884,7 @@ export function CodeViewer({
         }
       >
         <MonacoCodeEditor
+          position={position}
           content={content}
           conversationId={conversationId}
           path={path}
@@ -888,7 +894,6 @@ export function CodeViewer({
           onSaveStatusChange={onSaveStatusChange}
           searchOpen={searchOpen}
           onSearchHandled={handleSearchHandled}
-          revealLine={revealLine}
           comments={comments}
           activeSelection={activeSelection}
           onSetActiveSelection={onSetActiveSelection}
@@ -1037,7 +1042,12 @@ export function CodeViewer({
                 if (el) matchLineRefs.current.set(idx, el);
                 else matchLineRefs.current.delete(idx);
               }}
-              className={cn(isCurrentMatch && "bg-yellow-200/40 dark:bg-yellow-700/30")}
+              className={cn(
+                (isCurrentMatch ||
+                  (position &&
+                    lineNum === Math.min(Math.max(1, position.line), rawLines.length))) &&
+                  "bg-yellow-200/40 dark:bg-yellow-700/30",
+              )}
             >
               <div className="flex items-stretch">
                 {/* Gutter — line number; MessageCircleIcon when a comment starts here */}

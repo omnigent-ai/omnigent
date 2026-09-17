@@ -25,6 +25,9 @@ import {
 } from "./monacoSetup";
 import { useMonacoCommentLayer, type CodeEditorInstance } from "./useMonacoCommentLayer";
 import { attachEditorScrollRestore } from "./useScrollRestore";
+import { useMonacoFilePosition } from "./useMonacoFilePosition";
+import type { FilePosition } from "./FileViewerContext";
+import { isFilePositionPending } from "./filePositionState";
 import type { monaco } from "./monacoSetup";
 import "./monacoCodeEditor.css";
 
@@ -44,6 +47,7 @@ interface FindController extends monaco.editor.IEditorContribution {
 }
 
 interface MonacoDiffViewerProps {
+  position?: FilePosition;
   /** File content before this session (null = new file). */
   before: string | null;
   /** Current file content (null = deleted file). */
@@ -76,12 +80,6 @@ interface MonacoDiffViewerProps {
    * widget's ✕) so the owning toggle resets and the next Cmd+F re-opens it.
    */
   onSearchHandled?: () => void;
-  /**
-   * 1-based line (in the "after" content) to reveal on the modified side — a
-   * chat citation's `path:line` target. When set it owns the landing position,
-   * so the saved scroll offset is not restored.
-   */
-  revealLine?: number | null;
 }
 
 /**
@@ -93,6 +91,7 @@ interface MonacoDiffViewerProps {
  * @returns The diff editor surface plus the floating "Add comment" button.
  */
 export function MonacoDiffViewer({
+  position,
   before,
   after,
   path,
@@ -106,7 +105,6 @@ export function MonacoDiffViewer({
   pendingBodyRef,
   searchOpen,
   onSearchHandled,
-  revealLine,
 }: MonacoDiffViewerProps) {
   const canEdit = useCanEdit(conversationId);
   const lang = detectLang(path);
@@ -146,16 +144,22 @@ export function MonacoDiffViewer({
   const originalModelRef = useRef<ReturnType<CodeEditorInstance["getModel"]>>(null);
   const modifiedModelRef = useRef<ReturnType<CodeEditorInstance["getModel"]>>(null);
   const [mounted, setMounted] = useState(false);
+  const cancelScrollRestoreRef = useRef<(() => void) | null>(null);
+  useMonacoFilePosition({
+    editorRef: modifiedEditorRef,
+    mounted,
+    position,
+    cancelScrollRestoreRef,
+    diffEditorRef,
+  });
 
   // The diff scrolls inside Monaco, so its offset is cached per conversation +
   // file rather than via the DOM scroll-restore hook. Kept in its own namespace
   // so a file's diff and its editor view don't share one offset.
+  const positionRef = useRef(position);
+  positionRef.current = position;
   const scrollKeyRef = useRef("");
   scrollKeyRef.current = `viewer-diff:${conversationId}:${path}`;
-  // Read by handleMount (which runs once) so a citation known at mount can
-  // suppress the saved-scroll restore that would fight the reveal.
-  const revealLineRef = useRef(revealLine);
-  revealLineRef.current = revealLine;
 
   const handleMount: DiffOnMount = useCallback(
     (diffEditor, monaco) => {
@@ -176,11 +180,11 @@ export function MonacoDiffViewer({
         );
       // Restore the reader's place in the diff and cache further scrolling under
       // the diff's own key.
-      attachEditorScrollRestore(
+      cancelScrollRestoreRef.current = attachEditorScrollRestore(
         modified,
         () => scrollKeyRef.current,
         () => modifiedEditorRef.current === modified,
-        revealLineRef.current == null,
+        !isFilePositionPending(positionRef.current),
       );
       setMounted(true);
     },
@@ -217,25 +221,6 @@ export function MonacoDiffViewer({
     },
     [],
   );
-
-  // Land on the cited line (a chat `path:line` citation) on the modified side,
-  // centered so the change sits in context. Re-runs when a later citation
-  // targets a different line of the same open file.
-  useEffect(() => {
-    if (!mounted || revealLine == null) return;
-    const modified = modifiedEditorRef.current;
-    const model = modified?.getModel();
-    if (!modified || !model) return;
-    const line = Math.max(1, Math.min(revealLine, model.getLineCount()));
-    modified.revealLineInCenter(line);
-    modified.setPosition({ lineNumber: line, column: 1 });
-    // Monaco may still be laying out at mount (a zero-height pass clamps the
-    // scroll), so re-assert once after the first real layout.
-    const raf = requestAnimationFrame(() => {
-      if (modifiedEditorRef.current === modified) modified.revealLineInCenter(line);
-    });
-    return () => cancelAnimationFrame(raf);
-  }, [mounted, revealLine]);
 
   // Mirror the "Find in file" toggle to Monaco's native find widget on the
   // modified side. Gated on `mounted` so a Cmd+F pressed while the lazy chunk
@@ -307,7 +292,8 @@ export function MonacoDiffViewer({
       // wide enough for split (see SPLIT_DIFF_MIN_WIDTH), so we leave Monaco's
       // responsive default in place rather than forcing split at any width.
       minimap: { enabled: false },
-      scrollBeyondLastLine: false,
+      // Keep centering room even after a plain open so collapsed diffs do not jump.
+      scrollBeyondLastLine: true,
       // Code-font preference (Settings → Appearance), read at creation; live
       // changes arrive via updateOptions in the effect above. An unset family
       // resolves to the shared mono stack, so the diff matches the terminal

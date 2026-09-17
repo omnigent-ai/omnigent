@@ -64,9 +64,11 @@ from omnigent.host.frames import (
     encode_host_frame,
 )
 from omnigent.host.identity import HostIdentity
+from omnigent.host.maintenance import HostMaintenanceJanitor
 from omnigent.host.runner_zygote import ZygoteUnavailable
 from omnigent.runner.identity import (
     RUNNER_DELEGATED_AUTH_ENV_VAR,
+    RUNNER_HOST_OWNS_GLOBAL_CLEANUP_ENV_VAR,
     RUNNER_ID_ENV_VAR,
     RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR,
     RUNNER_INTERACTIVE_SHELLS_ENV_VAR,
@@ -76,6 +78,7 @@ from omnigent.runner.identity import (
     RUNNER_WORKSPACE_ENV_VAR,
     token_bound_runner_id,
 )
+from omnigent.runtime.harnesses.paths import HARNESS_TMP_PARENT_ENV_VAR
 
 pytestmark = pytest.mark.asyncio
 
@@ -110,6 +113,23 @@ def _no_real_zygote(monkeypatch: pytest.MonkeyPatch) -> None:
     from omnigent.runner._zygote import ZYGOTE_ENABLED_ENV_VAR
 
     monkeypatch.setenv(ZYGOTE_ENABLED_ENV_VAR, "0")
+
+
+@pytest.fixture(autouse=True)
+def _no_real_host_maintenance(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep host-loop tests from sweeping machine-global developer state."""
+
+    class _NoOpJanitor:
+        def start(self) -> None:
+            return None
+
+        def trigger(self, _reason: str) -> None:
+            return None
+
+        async def shutdown(self) -> None:
+            return None
+
+    monkeypatch.setattr(HostMaintenanceJanitor, "for_host", lambda **_kwargs: _NoOpJanitor())
 
 
 def _write_discovery_skill(root: Path, name: str, *, visible: bool = True) -> None:
@@ -1207,6 +1227,8 @@ async def test_handle_launch_immediate_exit_reports_exit_code_and_log_tail(
     monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / ".omnigent"))
     host = _make_host_process()
+    maintenance_reasons: list[str] = []
+    host._maintenance_janitor = SimpleNamespace(trigger=maintenance_reasons.append)  # type: ignore[assignment]
     workspace = tmp_path / "project"
     workspace.mkdir()
 
@@ -1260,6 +1282,7 @@ async def test_handle_launch_immediate_exit_reports_exit_code_and_log_tail(
     assert "Runner launch failed" in output
     assert "runner process exited with code 7" in output
     assert "RuntimeError: boom-traceback" not in output
+    assert maintenance_reasons == ["runner_launch_failed"]
 
 
 async def test_watch_runner_reports_unexpected_exit(
@@ -1277,6 +1300,8 @@ async def test_watch_runner_reports_unexpected_exit(
     monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
     monkeypatch.setattr("omnigent.host.connect._RUNNER_WATCH_INTERVAL_S", 0.01)
     host = _make_host_process()
+    maintenance_reasons: list[str] = []
+    host._maintenance_janitor = SimpleNamespace(trigger=maintenance_reasons.append)  # type: ignore[assignment]
     tunnel = _FakeTunnel()
     host._ws = tunnel  # type: ignore[assignment] — duck-typed send
     workspace = tmp_path / "project"
@@ -1324,6 +1349,7 @@ async def test_watch_runner_reports_unexpected_exit(
     # The report carries the exit code and the log tail with the cause.
     assert "code 3" in report.error
     assert "tunnel rejected: crash-cause" in report.error
+    assert maintenance_reasons == ["runner_exited"]
 
 
 async def test_watch_runner_silent_on_intentional_stop(
@@ -1340,6 +1366,8 @@ async def test_watch_runner_silent_on_intentional_stop(
     monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
     monkeypatch.setattr("omnigent.host.connect._RUNNER_WATCH_INTERVAL_S", 0.01)
     host = _make_host_process()
+    maintenance_reasons: list[str] = []
+    host._maintenance_janitor = SimpleNamespace(trigger=maintenance_reasons.append)  # type: ignore[assignment]
     tunnel = _FakeTunnel()
     host._ws = tunnel  # type: ignore[assignment] — duck-typed send
     workspace = tmp_path / "project"
@@ -1383,6 +1411,7 @@ async def test_watch_runner_silent_on_intentional_stop(
     # either would mark a clean stop as a crash.
     assert tunnel.sent == []
     assert host._unreported_exits == {}
+    assert maintenance_reasons == ["runner_stopped"]
 
 
 async def test_watch_runner_silent_on_clean_exit(
@@ -1403,6 +1432,8 @@ async def test_watch_runner_silent_on_clean_exit(
     monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
     monkeypatch.setattr("omnigent.host.connect._RUNNER_WATCH_INTERVAL_S", 0.01)
     host = _make_host_process()
+    maintenance_reasons: list[str] = []
+    host._maintenance_janitor = SimpleNamespace(trigger=maintenance_reasons.append)  # type: ignore[assignment]
     tunnel = _FakeTunnel()
     host._ws = tunnel  # type: ignore[assignment] — duck-typed send
     workspace = tmp_path / "project"
@@ -1443,6 +1474,7 @@ async def test_watch_runner_silent_on_clean_exit(
     # A clean (code 0) exit is graceful, not a crash: no report, nothing parked.
     assert tunnel.sent == []
     assert host._unreported_exits == {}
+    assert maintenance_reasons == ["runner_exited"]
 
 
 async def test_unreported_exit_flushes_after_reconnect(
@@ -2093,6 +2125,37 @@ async def test_handle_stop_unknown_runner() -> None:
     assert "unknown runner" in (result.error or "")
 
 
+async def test_stop_trigger_waits_for_termination_after_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancellation cannot run maintenance before the stop worker finishes."""
+    host = _make_host_process()
+    maintenance_reasons: list[str] = []
+    host._maintenance_janitor = SimpleNamespace(trigger=maintenance_reasons.append)  # type: ignore[assignment]
+    stop_started = threading.Event()
+    release_stop = threading.Event()
+
+    def _blocking_stop(_proc: object) -> None:
+        stop_started.set()
+        release_stop.wait(5.0)
+
+    monkeypatch.setattr(host, "_stop_runner_proc", _blocking_stop)
+    stop_task = asyncio.create_task(
+        host._stop_runner_and_trigger(SimpleNamespace(), "runner_stopped")  # type: ignore[arg-type]
+    )
+    await asyncio.to_thread(stop_started.wait, 5.0)
+    stop_task.cancel()
+    await asyncio.sleep(0)
+
+    assert maintenance_reasons == []
+
+    release_stop.set()
+    with pytest.raises(asyncio.CancelledError):
+        await stop_task
+
+    assert maintenance_reasons == ["runner_stopped"]
+
+
 async def test_handle_runner_status_alive_for_running_process(tmp_path: Path) -> None:
     """
     Verify ``_handle_runner_status`` reports ``alive`` for a tracked
@@ -2173,6 +2236,8 @@ def test_alive_runner_ids_cleans_dead(tmp_path: Path) -> None:
     runners that are no longer running.
     """
     host = _make_host_process()
+    maintenance_reasons: list[str] = []
+    host._maintenance_janitor = SimpleNamespace(trigger=maintenance_reasons.append)  # type: ignore[assignment]
 
     alive_proc = subprocess.Popen(
         ["sleep", "60"],
@@ -2198,6 +2263,7 @@ def test_alive_runner_ids_cleans_dead(tmp_path: Path) -> None:
     assert "runner_alive" in alive_ids
     assert "runner_dead" not in alive_ids, "Dead runner should be cleaned up"
     assert "runner_dead" not in host._runners, "Dead runner should be removed from tracking dict"
+    assert maintenance_reasons == ["runner_exited_during_reconnect"]
 
     alive_proc.terminate()
     alive_proc.wait()
@@ -2646,7 +2712,7 @@ def test_handle_stat_expands_tilde(tmp_path: Path, monkeypatch) -> None:
     assert result.canonical_path == os.path.realpath(target)
 
 
-def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
+def test_build_runner_env_allowlists_host_env_and_strips_secrets(tmp_path: Path) -> None:
     """
     A spawned runner inherits only allowlisted host env vars — process
     essentials pass through, the host owner's NON-HARNESS secrets do
@@ -2688,6 +2754,8 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
         parent_pid=42,
         initial_auth_token="host-bootstrap-bearer",
         interactive_shells=["zsh", "bash"],
+        host_owns_global_cleanup=True,
+        harness_tmp_parent=tmp_path / "harness-sockets",
     )
 
     assert env[RUNNER_INTERACTIVE_SHELLS_ENV_VAR] == '["zsh", "bash"]'
@@ -2752,6 +2820,42 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
     assert env[RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR] == "host-bootstrap-bearer"
     assert env[RUNNER_WORKSPACE_ENV_VAR] == "/ws"
     assert env[RUNNER_PARENT_PID_ENV_VAR] == "42"
+    assert env[HARNESS_TMP_PARENT_ENV_VAR] == str((tmp_path / "harness-sockets").resolve())
+    assert env[RUNNER_HOST_OWNS_GLOBAL_CLEANUP_ENV_VAR] == "1"
+
+
+def test_build_runner_env_omits_cleanup_owner_without_active_janitor() -> None:
+    env = _build_runner_env(
+        {},
+        server_url="http://server",
+        runner_id="runner_abc",
+        binding_token="tok",
+        workspace="/ws",
+        parent_pid=42,
+    )
+
+    assert RUNNER_HOST_OWNS_GLOBAL_CLEANUP_ENV_VAR not in env
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Symlink path is POSIX-only.")
+async def test_build_runner_env_preserves_short_symlink_spelling(tmp_path: Path) -> None:
+    target = tmp_path / "private" / "tmp"
+    target.mkdir(parents=True)
+    short_root = tmp_path / "tmp"
+    short_root.symlink_to(target, target_is_directory=True)
+
+    env = _build_runner_env(
+        {},
+        server_url="http://server",
+        runner_id="runner_abc",
+        binding_token="tok",
+        workspace="/ws",
+        parent_pid=42,
+        harness_tmp_parent=short_root,
+    )
+
+    assert env[HARNESS_TMP_PARENT_ENV_VAR] == str(short_root)
+    assert env[HARNESS_TMP_PARENT_ENV_VAR] != str(target.resolve())
 
 
 def test_build_runner_env_forwards_harness_credentials_and_endpoints() -> None:
@@ -4912,117 +5016,69 @@ def test_run_host_process_announces_session_log_dir_on_start(
     assert "This host's log: ~/.omnigent/logs/host/host-" in out
 
 
-class _ConnectReachedThenPark:
-    """Async-CM stand-in for ``websockets.asyncio.client.connect``.
-
-    Signals that the host reached its connect attempt (the step that
-    registers it), then parks until the test cancels ``run()`` so a
-    background startup task can be observed completing meanwhile.
-    """
-
-    def __init__(self, reached: asyncio.Event) -> None:
-        self._reached = reached
-
-    async def __aenter__(self) -> object:
-        self._reached.set()
-        await asyncio.Event().wait()
-        raise AssertionError("unreachable")
-
-    async def __aexit__(self, *exc_info: object) -> bool:
-        return False
-
-
-async def test_run_sweeps_orphaned_native_bridge_dirs_on_startup(
+async def test_run_starts_and_shuts_down_host_maintenance(
     monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Host startup reclaims native bridge dirs orphaned by a crashed runner.
+    """Host lifecycle owns the janitor without joining runner startup."""
+    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
+    _patch_connect(monkeypatch, _ConnectSpy([asyncio.CancelledError()]))
+    calls: list[str] = []
 
-    A runner that dies uncleanly (SIGKILL / crash / host restart mid-run)
-    never runs its explicit-delete cleanup, and if no new runner ever
-    launches on the machine the runner-side startup sweep never fires
-    either — so ``~/.omnigent`` grows without bound. The host daemon's own
-    (re)start is the reliable moment to reap — in the background: the sweep
-    must complete while the connect loop (which registers the host) is
-    already underway, not as a startup prerequisite, and it must be torn
-    down cleanly when ``run()`` exits.
-    """
-    import websockets.asyncio.client as ws_client
+    class _RecordingLifecycleLock:
+        target = "test-target"
 
-    import omnigent.runner._entry as entry_mod
+        def acquire(self) -> bool:
+            calls.append("acquire")
+            return True
 
-    monkeypatch.setattr(entry_mod, "_make_auth_token_factory", lambda *, server_url=None: None)
-    connect_reached = asyncio.Event()
-    monkeypatch.setattr(
-        ws_client, "connect", lambda url, **kwargs: _ConnectReachedThenPark(connect_reached)
-    )
-    sweeps: list[int] = []
-    monkeypatch.setattr(
-        "omnigent.native.native_bridge_common.reap_orphaned_native_bridge_dirs",
-        lambda: sweeps.append(1) or 3,
-    )
+        def still_owner(self) -> bool:
+            return True
+
+        def release(self) -> None:
+            calls.append("release")
+
+    class _RecordingJanitor:
+        def start(self) -> None:
+            calls.append("start")
+
+        async def shutdown(self) -> None:
+            calls.append("shutdown")
+
+    janitor = _RecordingJanitor()
+    janitor_roots: list[Path | None] = []
+
+    def _for_host(*, harness_tmp_parent: Path | None = None) -> _RecordingJanitor:
+        janitor_roots.append(harness_tmp_parent)
+        return janitor
+
+    monkeypatch.setattr(HostMaintenanceJanitor, "for_host", _for_host)
     host = _host()
-    host._capabilities_initialized = True
-    host._zygote_disabled = True  # keep the test from prestarting a zygote
+    host._lifecycle_lock = _RecordingLifecycleLock()  # type: ignore[assignment]
+    monkeypatch.setattr(host, "_cleanup_runners", lambda: calls.append("cleanup_runners"))
 
-    caplog.set_level(logging.INFO, logger="omnigent.host.connect")
-    run_task = asyncio.create_task(host.run())
-    try:
-        await asyncio.wait_for(connect_reached.wait(), timeout=10.0)
-        sweep_task = host._bridge_sweep_task
-        assert sweep_task is not None, "run() never launched the bridge-dir sweep"
-        # The host is parked in its connect attempt; the sweep completes
-        # concurrently rather than gating registration.
-        await asyncio.wait_for(asyncio.shield(sweep_task), timeout=10.0)
-    finally:
-        run_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError, Exception):
-            await run_task
+    await host.run()
 
-    assert sweeps == [1]
-    assert "Reaped 3 orphaned native bridge dir(s)" in caplog.text
-    assert host._bridge_sweep_task is None, "run() teardown left the sweep task"
+    assert calls == ["acquire", "start", "shutdown", "cleanup_runners", "release"]
+    assert janitor_roots == [host._harness_tmp_parent]
+    assert host._maintenance_janitor is None
 
 
-async def test_run_survives_a_failing_native_bridge_dir_sweep(
+async def test_run_survives_host_maintenance_start_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A raising bridge-dir sweep must not abort host startup.
-
-    The sweep is best-effort housekeeping; a broken bridge module or an
-    unreadable bridge root must never prevent the host from registering.
-    """
+    """Best-effort cleanup cannot prevent host registration."""
     monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
     _patch_connect(monkeypatch, _ConnectSpy([asyncio.CancelledError()]))
 
-    def _boom() -> int:
-        raise OSError("bridge root unreadable")
+    def _raise(**_kwargs: object) -> None:
+        raise RuntimeError("janitor unavailable")
 
-    monkeypatch.setattr(
-        "omnigent.native.native_bridge_common.reap_orphaned_native_bridge_dirs",
-        _boom,
-    )
+    monkeypatch.setattr(HostMaintenanceJanitor, "for_host", _raise)
     host = _host()
 
-    # Startup completes (run returns via the clean cancel) despite the raise.
     await host.run()
 
-
-async def test_bridge_dir_sweep_failure_is_contained(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A failing sweep is housekeeping: it must never escape its background task."""
-
-    def _boom() -> int:
-        raise RuntimeError("sweep exploded")
-
-    monkeypatch.setattr(
-        "omnigent.native.native_bridge_common.reap_orphaned_native_bridge_dirs",
-        _boom,
-    )
-    host = _host()
-    # Must swallow the failure (logged at debug), not raise.
-    await host._sweep_orphaned_bridge_dirs()
+    assert host._maintenance_janitor is None
 
 
 async def test_launch_cancelled_midspawn_does_not_leak_untracked_runner(
@@ -5037,6 +5093,8 @@ async def test_launch_cancelled_midspawn_does_not_leak_untracked_runner(
     terminated.
     """
     host = _make_host_process()
+    maintenance_reasons: list[str] = []
+    host._maintenance_janitor = SimpleNamespace(trigger=maintenance_reasons.append)  # type: ignore[assignment]
     host._auth_token_factory = lambda: "host-bootstrap-bearer"
     host._auth_token_factory_resolved = True
     workspace = tmp_path / "project"
@@ -5079,18 +5137,36 @@ async def test_launch_cancelled_midspawn_does_not_leak_untracked_runner(
         # so we exercise the real leak window rather than a pre-spawn cancel.
         await asyncio.to_thread(spawn_started.wait, 10.0)
         task.cancel()
-        release_spawn.set()
         with pytest.raises(asyncio.CancelledError):
             await task
+        assert host._runner_stop_tasks, "abandoned spawn teardown was not retained"
+        release_spawn.set()
+        await host._drain_runner_stop_tasks()
 
     assert spawned, "the spawn thread should have created a process"
     # Never registered (that is the leak window) ...
     assert not host._runners
-    # ... but also not left running: the shield's done-callback terminates it.
+    # ... but also not left running: the retained teardown task terminates it.
     deadline = time.monotonic() + 10.0
     while time.monotonic() < deadline and spawned[0].poll() is None:
         await asyncio.sleep(0.05)
     assert spawned[0].poll() is not None, "abandoned runner was leaked, still alive"
+    while time.monotonic() < deadline and not maintenance_reasons:
+        await asyncio.sleep(0.01)
+    assert maintenance_reasons == ["runner_spawn_abandoned"]
+
+
+@pytest.mark.timeout(5, method="signal")
+async def test_drain_runner_stop_tasks_removes_completed_tasks_before_callbacks() -> None:
+    host = _make_host_process()
+    task = asyncio.create_task(asyncio.sleep(0))
+    await task
+    host._runner_stop_tasks.add(task)
+    task.add_done_callback(host._runner_stop_tasks.discard)
+
+    await host._drain_runner_stop_tasks()
+
+    assert not host._runner_stop_tasks
 
 
 async def test_handle_model_options_serves_codex_probe_rows_and_caches(
@@ -6104,6 +6180,8 @@ async def test_handle_launch_supersedes_previous_runner_for_same_session(
     transcript forwarder tailing the same session (the #5182 leak).
     """
     host = _make_host_process()
+    maintenance_reasons: list[str] = []
+    host._maintenance_janitor = SimpleNamespace(trigger=maintenance_reasons.append)  # type: ignore[assignment]
     host._auth_token_factory = lambda: "host-bootstrap-bearer"
     host._auth_token_factory_resolved = True
     workspace = tmp_path / "project"
@@ -6148,6 +6226,11 @@ async def test_handle_launch_supersedes_previous_runner_for_same_session(
     assert first_handle.proc.poll() is not None, (
         "the previous runner for the session must be terminated on relaunch"
     )
+    for _ in range(50):
+        if maintenance_reasons:
+            break
+        await asyncio.sleep(0.01)
+    assert maintenance_reasons == ["runner_superseded"]
     assert second.runner_id in host._runners
     _cleanup_host(host)
 

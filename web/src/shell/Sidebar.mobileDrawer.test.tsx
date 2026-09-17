@@ -1,3 +1,4 @@
+import { SidebarDataProvider } from "@/hooks/useSidebarData";
 // Behaviour tests for the mobile sidebar drawer shape: it stops short of the
 // right edge so a strip of the chat stays visible, tapping that strip dismisses
 // it (replacing the collapse toggle, which is now desktop-only), and Search /
@@ -103,11 +104,13 @@ function renderSidebar(props: { open?: boolean; onClose?: () => void; route?: st
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={qc}>
-      <TooltipProvider>
-        <MemoryRouter initialEntries={[props.route ?? "/"]}>
-          <Sidebar open={props.open ?? true} onClose={props.onClose ?? vi.fn()} />
-        </MemoryRouter>
-      </TooltipProvider>
+      <SidebarDataProvider>
+        <TooltipProvider>
+          <MemoryRouter initialEntries={[props.route ?? "/"]}>
+            <Sidebar open={props.open ?? true} onClose={props.onClose ?? vi.fn()} />
+          </MemoryRouter>
+        </TooltipProvider>
+      </SidebarDataProvider>
     </QueryClientProvider>,
   );
 }

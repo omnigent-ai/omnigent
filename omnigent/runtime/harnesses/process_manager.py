@@ -28,7 +28,6 @@ import shutil
 import signal
 import socket
 import sys
-import tempfile
 import time
 import uuid
 from collections.abc import Awaitable, Callable
@@ -50,6 +49,10 @@ from omnigent.runtime.harnesses._harness_zygote_client import (
     HarnessZygoteClient,
     ZygoteHarnessUnavailable,
 )
+from omnigent.runtime.harnesses.paths import (
+    HARNESS_TMP_PARENT_ENV_VAR,
+    harness_tmp_parent,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -69,11 +72,7 @@ _logger = logging.getLogger(__name__)
 # (no socket-path length concern) and has no ``/tmp`` — a literal
 # ``/tmp/omnigent`` there resolves to ``\tmp\omnigent`` on the current
 # drive — so use the real (already per-user) temp dir.
-if IS_WINDOWS:
-    _TMP_PARENT = Path(tempfile.gettempdir()) / "omnigent"
-else:
-    _TMP_PARENT = Path(f"/tmp/omnigent-{os.getuid()}")
-_TMP_PARENT_ENV_VAR = "OMNIGENT_HARNESS_TMP_PARENT"
+_TMP_PARENT_ENV_VAR = HARNESS_TMP_PARENT_ENV_VAR
 
 # S1 (security): env var carrying the per-spawn bearer token for the harness
 # control channel. The parent generates a fresh token per subprocess, ships it
@@ -209,10 +208,7 @@ def _default_tmp_parent() -> Path:
     :returns: Configured parent path, or the per-uid default
         ``/tmp/omnigent-<uid>`` on POSIX.
     """
-    configured = os.environ.get(_TMP_PARENT_ENV_VAR)
-    if configured:
-        return Path(configured).expanduser()
-    return _TMP_PARENT
+    return harness_tmp_parent()
 
 
 def _socket_path(instance_dir: Path, conversation_id: str) -> Path:
@@ -657,23 +653,26 @@ class HarnessProcessManager:
         """
         return _socket_path(self._instance_dir, conversation_id)
 
-    async def start(self) -> None:
+    async def start(self, *, sweep_orphans: bool = True) -> None:
         """
-        Initialize the per-instance dir, run the orphan sweep, and
-        start the idle-reaper background task.
+        Initialize the per-instance dir and start the idle reaper.
 
         Safe to call more than once; the second call is a no-op.
         Idempotent so AP's lifespan handler doesn't have to track
         whether boot already ran.
+
+        :param sweep_orphans: Whether this process owns machine-global stale
+            harness cleanup. Host-spawned runners disable it because the host
+            performs the sweep outside session startup.
         """
         if self._started:
             return
         self._shutting_down = False
         self._tmp_parent.mkdir(mode=_DIR_MODE, parents=True, exist_ok=True)
-        # Sweep BEFORE creating our own dir, so a crashed prior
-        # instance whose dir uuid happens to collide with ours
-        # (vanishingly unlikely but possible) gets cleaned first.
-        await self._sweep_orphans()
+        if sweep_orphans:
+            # Sweep BEFORE creating our own dir, so a crashed prior instance
+            # whose dir uuid happens to collide with ours gets cleaned first.
+            await sweep_orphaned_harness_processes(tmp_parent=self._tmp_parent)
         self._instance_dir.mkdir(mode=_DIR_MODE, parents=True, exist_ok=True)
         # Write the AP_PID sentinel so other instances' sweeps can
         # tell our dir is live. Strict ``"x"`` because the dir is
@@ -1508,103 +1507,74 @@ class HarnessProcessManager:
                         conv_id,
                     )
 
-    async def _sweep_orphans(self) -> None:
-        """
-        Kill runner processes left behind by crashed prior AP
-        instances and remove their per-instance directories.
 
-        Iterates every ``ap-*`` subdir under ``_tmp_parent``. For
-        each, reads the ``AP_PID`` sentinel; if the recorded PID
-        is not a live process, the dir belongs to a crashed AP
-        and gets cleaned. Sibling dirs whose PIDs are still live
-        are left alone (zero-downtime restart, multi-tenant
-        same-host case).
+async def sweep_orphaned_harness_processes(*, tmp_parent: Path | None = None) -> None:
+    """Clean harness processes left behind by crashed prior instances.
 
-        Best-effort throughout — a permission error or unreadable
-        sentinel logs and skips the dir rather than aborting boot.
-        """
-        if not self._tmp_parent.exists():
-            return
-        for child in self._tmp_parent.iterdir():
-            if not child.is_dir() or not child.name.startswith("ap-"):
-                continue
-            sentinel = child / _AP_PID_FILE
-            if not sentinel.exists():
-                # No sentinel — directory either pre-dates the
-                # convention or is mid-creation. Leave alone.
-                continue
-            try:
-                pid_str = sentinel.read_text(encoding="utf-8").strip()
-                pid = int(pid_str)
-            except (OSError, ValueError) as exc:
-                _logger.warning(
-                    "could not read AP_PID sentinel at %s: %s; skipping",
-                    sentinel,
-                    exc,
-                )
-                continue
-            if _pid_alive(pid):
-                # Sibling Omnigent is still running — leave it alone.
-                continue
-            _logger.info(
-                "sweeping orphaned Omnigent instance dir %s (pid %d not running)",
-                child,
-                pid,
-            )
-            await self._kill_orphan_runners(child)
-            shutil.rmtree(child, ignore_errors=True)
+    Host-spawned runners delegate this machine-global work to the host. The
+    standalone server keeps calling it from :meth:`HarnessProcessManager.start`.
 
-    async def _kill_orphan_runners(self, instance_dir: Path) -> None:
-        """
-        Send SIGTERM to runner processes whose socket lives under
-        ``instance_dir``, then escalate to SIGKILL for survivors.
-
-        Identification works by listing the socket files in the
-        dir — every active runner binds one. We don't have the
-        runner PIDs because they're orphans of a crashed AP, so
-        we shell out to ``lsof`` to find which PIDs hold each
-        socket. ``lsof`` failures fall through silently (best
-        effort).
-
-        After SIGTERM, waits :data:`_ORPHAN_SIGTERM_GRACE_S`
-        seconds, then sends SIGKILL to any runner that is still
-        alive. Prior to this escalation, orphaned
-        runners with stuck SIGTERM handlers survived the sweep
-        indefinitely.
-
-        :param instance_dir: The orphaned AP's per-instance dir
-            whose runner subprocesses to terminate.
-        """
-        all_pids: set[int] = set()
-        for socket_file in instance_dir.glob("conv-*.sock"):
-            pids = await _pids_holding_socket(socket_file)
-            for pid in pids:
-                try:
-                    os.kill(pid, signal.SIGTERM)
-                    all_pids.add(pid)
-                except ProcessLookupError:
-                    continue
-                except PermissionError:
-                    _logger.warning(
-                        "cannot signal orphan runner pid %d (permission denied)",
-                        pid,
-                    )
-                    continue
-
-        if not all_pids:
-            return
-
-        await asyncio.sleep(_ORPHAN_SIGTERM_GRACE_S)
-
-        for pid in all_pids:
-            if not _pid_alive(pid):
-                continue
+    :param tmp_parent: Harness socket root to scan. Defaults to the configured
+        machine-global root.
+    :returns: None.
+    """
+    root = tmp_parent if tmp_parent is not None else _default_tmp_parent()
+    if not root.exists():
+        return
+    for child in root.iterdir():
+        if not child.is_dir() or not child.name.startswith("ap-"):
+            continue
+        sentinel = child / _AP_PID_FILE
+        if not sentinel.exists():
+            continue
+        try:
+            pid = int(sentinel.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError) as exc:
             _logger.warning(
-                "orphan runner pid %d survived SIGTERM; escalating to SIGKILL",
-                pid,
+                "could not read AP_PID sentinel at %s: %s; skipping",
+                sentinel,
+                exc,
             )
-            with contextlib.suppress(ProcessLookupError, PermissionError):
-                os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+            continue
+        if _pid_alive(pid):
+            continue
+        _logger.info(
+            "sweeping orphaned Omnigent instance dir %s (pid %d not running)",
+            child,
+            pid,
+        )
+        await _kill_orphan_runners(child)
+        shutil.rmtree(child, ignore_errors=True)
+
+
+async def _kill_orphan_runners(instance_dir: Path) -> None:
+    """Terminate runner processes whose sockets live under *instance_dir*."""
+    all_pids: set[int] = set()
+    for socket_file in instance_dir.glob("conv-*.sock"):
+        for pid in await _pids_holding_socket(socket_file):
+            try:
+                os.kill(pid, signal.SIGTERM)
+                all_pids.add(pid)
+            except ProcessLookupError:
+                continue
+            except PermissionError:
+                _logger.warning(
+                    "cannot signal orphan runner pid %d (permission denied)",
+                    pid,
+                )
+
+    if not all_pids:
+        return
+    await asyncio.sleep(_ORPHAN_SIGTERM_GRACE_S)
+    for pid in all_pids:
+        if not _pid_alive(pid):
+            continue
+        _logger.warning(
+            "orphan runner pid %d survived SIGTERM; escalating to SIGKILL",
+            pid,
+        )
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
 
 
 def _pid_alive(pid: int) -> bool:

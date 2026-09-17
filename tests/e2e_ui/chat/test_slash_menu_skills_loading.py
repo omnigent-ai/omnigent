@@ -261,6 +261,10 @@ def test_new_session_menu_uses_the_selected_agents_effective_catalog(
         "**/v1/hosts/preview-host/harnesses/*/model-options*",
         lambda route: route.fulfill(json={"models": []}),
     )
+    page.route(
+        "**/v1/hosts/preview-host/worktrees?*",
+        lambda route: route.fulfill(json={"data": []}),
+    )
 
     def discover(route: Route) -> None:
         if "host_id" in parse_qs(urlparse(route.request.url).query):

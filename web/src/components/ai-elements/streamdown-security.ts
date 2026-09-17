@@ -41,12 +41,13 @@ export const WORKSPACE_FILE_LINK_ATTR = "data-omnigent-file";
 // lookahead keeps a cited position off the scheme branch: `notes.md:12` is a
 // filename plus a line number, but is otherwise shaped exactly like a scheme.
 const NON_FILE_HREF = /^(?:[a-zA-Z][a-zA-Z0-9+.-]*:(?!\d+(?::\d+)?$)|\/\/|#)/;
-const COLON_POSITION_SUFFIX = /:(\d+)(?::\d+)?$/;
-const HASH_POSITION_SUFFIX = /#L(\d+)(?:C\d+)?(?:-L?\d+(?:C\d+)?)?$/i;
+const COLON_POSITION_SUFFIX = /:(\d+)(?::(\d+))?$/;
+const HASH_POSITION_SUFFIX = /#L(\d+)(?:C(\d+))?(?:-L?\d+(?:C\d+)?)?$/i;
 
 export interface WorkspaceFileCitation {
   path: string;
   line: number | null;
+  column?: number;
   hasPosition: boolean;
 }
 
@@ -54,9 +55,12 @@ export interface WorkspaceFileCitation {
 export function splitWorkspaceFileCitation(text: string): WorkspaceFileCitation {
   const match = text.match(COLON_POSITION_SUFFIX) ?? text.match(HASH_POSITION_SUFFIX);
   if (!match || match.index === undefined) return { path: text, line: null, hasPosition: false };
+  const line = Number(match[1]);
+  const column = Number(match[2]);
   return {
     path: text.slice(0, match.index),
-    line: Number.parseInt(match[1] ?? "", 10) || null,
+    line: Number.isSafeInteger(line) && line > 0 ? line : null,
+    ...(Number.isSafeInteger(column) && column > 0 ? { column } : {}),
     hasPosition: true,
   };
 }

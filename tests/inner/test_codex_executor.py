@@ -160,6 +160,7 @@ class TestCodexExecutor(unittest.TestCase):
         self.assertFalse(any("/serving-endpoints" in item for item in overrides))
         self.assertTrue(any('auth={command="sh"' in item for item in overrides))
         self.assertTrue(any("databricks auth token --host" in item for item in overrides))
+        self.assertTrue(any("timeout_ms=15000" in item for item in overrides))
         self.assertTrue(any("refresh_interval_ms=900000" in item for item in overrides))
         self.assertFalse(any('env_key="DATABRICKS_TOKEN"' in item for item in overrides))
 
@@ -3253,6 +3254,7 @@ async def test_embedded_codex_materializes_provider_auth_outside_argv(
             "-c",
             auth_command,
         ]
+        assert config["model_providers"]["omnigent_provider"]["auth"]["timeout_ms"] == 15000
         assert config["model_providers"]["omnigent_provider"]["wire_api"] == "responses"
         assert stat.S_IMODE(codex_home.stat().st_mode) == 0o700
         assert stat.S_IMODE(config_path.stat().st_mode) == 0o600

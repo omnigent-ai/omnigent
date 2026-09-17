@@ -1409,6 +1409,9 @@ class CodexNativeAppServer:
         surfaces it to Omnigent (which posts a single durable banner). Prevents
         re-posting the same notice on every subsequent ensure. Not a
         constructor input.
+    :param reconcile_process_registry: Whether startup synchronously performs
+        host-global crash registry maintenance. Runner-owned launches delegate
+        it to the host janitor; standalone callers keep the safe default.
     """
 
     codex_path: str
@@ -1437,6 +1440,7 @@ class CodexNativeAppServer:
     trust_project: bool = False
     trust_all_hooks: bool = False
     router_hooks_registered: bool = False
+    reconcile_process_registry: bool = True
 
     async def start(self) -> None:
         """
@@ -1569,7 +1573,8 @@ class CodexNativeAppServer:
                     ap_server_url=self.ap_server_url,
                     ap_auth_headers=self.ap_auth_headers or {},
                 )
-        reconcile_codex_native_process_registry()
+        if self.reconcile_process_registry:
+            reconcile_codex_native_process_registry()
         resolved_listen = self.listen_url or f"unix://{self.socket_path}"
         self.process_registry_tag = f"codex-native-{uuid.uuid4().hex}"
         tagged_argv0 = (
@@ -2567,6 +2572,7 @@ def build_codex_native_server(
     trust_all_hooks: bool = False,
     reasoning_effort: str | None = None,
     model_catalog_rows: list[_JsonObject] | None = None,
+    reconcile_process_registry: bool = True,
 ) -> CodexNativeAppServer:
     """
     Build a configured native Codex app-server process wrapper.
@@ -2617,6 +2623,10 @@ def build_codex_native_server(
         the copied config's value.
     :param model_catalog_rows: Fresh rows from the shared launch-shaped
         ``model/list`` catalog, used to avoid a redundant migration probe.
+    :param reconcile_process_registry: Whether startup performs the global
+        crash registry sweep. Runner-owned launches disable this because the
+        host janitor owns it; standalone callers keep the
+        synchronous safety default.
     :returns: Configured app-server process wrapper.
     :raises ImportError: If no Codex CLI is available.
     :raises OSError: If Databricks routing was requested but no
@@ -2684,6 +2694,7 @@ def build_codex_native_server(
         model_catalog_rows=model_catalog_rows,
         trust_project=trust_project,
         trust_all_hooks=trust_all_hooks,
+        reconcile_process_registry=reconcile_process_registry,
     )
 
 

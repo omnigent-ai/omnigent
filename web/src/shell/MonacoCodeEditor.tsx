@@ -15,6 +15,8 @@
 // with the diff view. Adding a comment is gated on `canEdit && !isDirty`
 // (offsets must match the saved server content).
 
+import type { FilePosition } from "./FileViewerContext";
+import { isFilePositionPending } from "./filePositionState";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Editor, type EditorProps, type OnChange, type OnMount } from "@monaco-editor/react";
 import { AlertTriangleIcon, MessageSquareOffIcon } from "lucide-react";
@@ -28,6 +30,7 @@ import type { Comment } from "@/hooks/useComments";
 import { useCanEdit } from "@/hooks/usePermissions";
 import { detectLang, type ActiveSelection, type SaveStatus } from "./codeViewerHelpers";
 import { TruncatedBanner } from "./TruncatedBanner";
+import { useMonacoFilePosition } from "./useMonacoFilePosition";
 // Reused as-is — the hook is editor-agnostic (drives any editor through
 // setContentRef). Named for markdown only because that was its first caller.
 import { useMarkdownEditorSync } from "./useMarkdownEditorSync";
@@ -72,6 +75,7 @@ interface CommentProps {
 }
 
 interface MonacoCodeEditorProps extends CommentProps {
+  position?: FilePosition;
   content: string;
   conversationId: string;
   path: string;
@@ -99,12 +103,6 @@ interface MonacoCodeEditorProps extends CommentProps {
    * in sync — otherwise the next click would no-op instead of re-opening.
    */
   onSearchHandled?: () => void;
-  /**
-   * 1-based line to reveal (centered) once mounted — a chat citation's
-   * `path:line` target. When set it owns the landing position, so the saved
-   * scroll offset is not restored. Null/undefined = normal scroll restore.
-   */
-  revealLine?: number | null;
 }
 
 /**
@@ -116,6 +114,7 @@ interface MonacoCodeEditorProps extends CommentProps {
  * @returns The Monaco code editor for non-markdown files.
  */
 export function MonacoCodeEditor({
+  position,
   content,
   conversationId,
   path,
@@ -125,7 +124,6 @@ export function MonacoCodeEditor({
   onSaveStatusChange,
   searchOpen,
   onSearchHandled,
-  revealLine,
   comments,
   activeSelection,
   onSetActiveSelection,
@@ -152,6 +150,7 @@ export function MonacoCodeEditor({
   return (
     <MonacoCodeEditorInner
       key={editorKey}
+      position={position}
       content={content}
       conversationId={conversationId}
       path={path}
@@ -168,7 +167,6 @@ export function MonacoCodeEditor({
       onSaveStatusChange={onSaveStatusChange}
       searchOpen={searchOpen}
       onSearchHandled={onSearchHandled}
-      revealLine={revealLine}
       comments={comments}
       activeSelection={activeSelection}
       onSetActiveSelection={onSetActiveSelection}
@@ -178,6 +176,7 @@ export function MonacoCodeEditor({
 }
 
 interface InnerProps extends CommentProps {
+  position?: FilePosition;
   content: string;
   conversationId: string;
   path: string;
@@ -194,7 +193,6 @@ interface InnerProps extends CommentProps {
   onSaveStatusChange?: (status: SaveStatus) => void;
   searchOpen?: boolean;
   onSearchHandled?: () => void;
-  revealLine?: number | null;
 }
 
 /**
@@ -206,6 +204,7 @@ interface InnerProps extends CommentProps {
  * @returns The editor surface plus its save bar / conflict banner.
  */
 function MonacoCodeEditorInner({
+  position,
   content,
   conversationId,
   path,
@@ -222,7 +221,6 @@ function MonacoCodeEditorInner({
   onSaveStatusChange,
   searchOpen,
   onSearchHandled,
-  revealLine,
   comments,
   activeSelection,
   onSetActiveSelection,
@@ -259,6 +257,13 @@ function MonacoCodeEditorInner({
   const editorInstanceRef = useRef<CodeEditorInstance | null>(null);
   // True once the editor instance exists; gates the comment-layer wiring.
   const [mounted, setMounted] = useState(false);
+  const cancelScrollRestoreRef = useRef<(() => void) | null>(null);
+  useMonacoFilePosition({
+    editorRef: editorInstanceRef,
+    mounted,
+    position,
+    cancelScrollRestoreRef,
+  });
   // The last-saved content; edits are dirty when the buffer differs from it.
   const baselineRef = useRef<string | null>(content);
   // The live buffer content, tracked via onChange. Auto-save reads this rather
@@ -298,13 +303,10 @@ function MonacoCodeEditorInner({
   // Monaco scrolls internally, so its offset is cached per conversation + file
   // rather than via the DOM scroll-restore hook. Held in a ref so the mount-time
   // onDidScrollChange subscription always writes the current file's key.
+  const positionRef = useRef(position);
+  positionRef.current = position;
   const scrollKeyRef = useRef("");
   scrollKeyRef.current = `viewer:${conversationId}:${path}`;
-  // Read by handleMount (which runs once) so a citation known at mount can
-  // suppress the saved-scroll restore — its re-assert budget would otherwise
-  // fight the reveal and drag the viewer back to the remembered offset.
-  const revealLineRef = useRef(revealLine);
-  revealLineRef.current = revealLine;
 
   const handleMount: OnMount = useCallback(
     (editor, monaco) => {
@@ -348,11 +350,11 @@ function MonacoCodeEditorInner({
       };
       // Reopening a file (or switching sessions and back) lands where the user
       // left off, and further scrolling is cached under the current file's key.
-      attachEditorScrollRestore(
+      cancelScrollRestoreRef.current = attachEditorScrollRestore(
         editor,
         () => scrollKeyRef.current,
         () => editorInstanceRef.current === editor,
-        revealLineRef.current == null,
+        !isFilePositionPending(positionRef.current),
       );
       setMounted(true);
     },
@@ -365,25 +367,6 @@ function MonacoCodeEditorInner({
     },
     [setContentRef],
   );
-
-  // Land on the cited line (a chat `path:line` citation). Centered so the
-  // change sits in context rather than at the viewport edge. Re-runs when a
-  // later citation targets a different line in the same open file.
-  useEffect(() => {
-    if (!mounted || revealLine == null) return;
-    const editor = editorInstanceRef.current;
-    const model = editor?.getModel();
-    if (!editor || !model) return;
-    const line = Math.max(1, Math.min(revealLine, model.getLineCount()));
-    editor.revealLineInCenter(line);
-    editor.setPosition({ lineNumber: line, column: 1 });
-    // Monaco may still be laying out at mount (a zero-height pass clamps the
-    // scroll), so re-assert once after the first real layout.
-    const raf = requestAnimationFrame(() => {
-      if (editorInstanceRef.current === editor) editor.revealLineInCenter(line);
-    });
-    return () => cancelAnimationFrame(raf);
-  }, [mounted, revealLine]);
 
   // Mirror Monaco's native find widget to the toolbar toggle. Gated on `mounted`
   // so a Find pressed while the lazy chunk was still loading isn't dropped — when
@@ -487,7 +470,8 @@ function MonacoCodeEditorInner({
     return {
       readOnly: !canEdit,
       minimap: { enabled: false },
-      scrollBeyondLastLine: false,
+      // Keep room to center EOF without shrinking the scroll range after a plain open.
+      scrollBeyondLastLine: true,
       // Code-font preference (Settings → Appearance), read at creation; live
       // changes arrive via updateOptions in the effect below. An unset family
       // resolves to the shared mono stack, so the editor matches the terminal

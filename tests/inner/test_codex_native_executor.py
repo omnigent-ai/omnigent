@@ -461,6 +461,85 @@ def test_image_block_is_sent_as_local_image_not_inline_base64(
     )
 
 
+def test_resize_notice_is_encoded_in_model_visible_image_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Codex receives resize metadata without adding user-visible text."""
+    _FakeCodexNativeClient.requests = []
+    _FakeCodexNativeClient.next_turn = 1
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    _start_state(tmp_path)
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    async def run() -> None:
+        async for _ in executor.run_turn(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_image", "image_url": _PNG_DATA_URI},
+                        {
+                            "type": "_omnigent_framework_notice",
+                            "source_metadata": {"width": 4600, "height": 3400},
+                        },
+                        {"type": "input_text", "text": "inspect this"},
+                    ],
+                },
+            ],
+            [],
+            "",
+        ):
+            pass
+
+    asyncio.run(run())
+
+    start = next(
+        params for method, params in _FakeCodexNativeClient.requests if method == "turn/start"
+    )
+    image = start["input"][0]
+    assert image["type"] == "localImage"
+    assert "downscaled-from-4600x3400" in image["path"]
+    assert start["input"][1] == {"type": "text", "text": "inspect this"}
+    assert len(start["input"]) == 2
+
+
+def test_resize_paths_preserve_multiple_images_and_cached_originals(tmp_path: Path) -> None:
+    from omnigent.inner.codex_native_executor import _content_to_input_items
+    from omnigent.inner.native_attachments import framework_notice_block
+
+    content = []
+    for image_bytes, dimensions in [
+        (b"first image", {"width": 6000, "height": 4000}),
+        (b"second image", {"width": 6000, "height": 4000}),
+        (b"third image", {"width": 8000, "height": 5000}),
+    ]:
+        content.extend(
+            [
+                {
+                    "type": "input_image",
+                    "filename": "same.png",
+                    "image_url": "data:image/png;base64," + base64.b64encode(image_bytes).decode(),
+                },
+                framework_notice_block(dimensions),
+            ]
+        )
+    items = _content_to_input_items(content, tmp_path)
+    paths = [Path(item["path"]) for item in items]
+    assert len(set(paths)) == 3
+    assert [path.read_bytes() for path in paths] == [
+        b"first image",
+        b"second image",
+        b"third image",
+    ]
+    assert "downscaled-from-8000x5000" in paths[2].name
+    assert (tmp_path / "uploads" / "same.png").read_bytes() == b"first image"
+    assert _content_to_input_items(content, tmp_path) == items
+
+
 def test_input_file_text_is_inlined_as_a_text_item(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

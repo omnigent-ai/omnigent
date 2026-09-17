@@ -51,6 +51,8 @@ from omnigent.inner.executor import (
     TurnComplete,
 )
 from omnigent.inner.native_attachments import (
+    FRAMEWORK_NOTICE_BLOCK_TYPE,
+    codex_resize_metadata_path,
     materialize_attachment,
     parse_data_uri,
     unresolved_attachment_marker,
@@ -722,6 +724,9 @@ def _content_to_input_items(content: object, bridge_dir: Path) -> list[dict[str,
             if block is None:
                 continue
             block_type = block.get("type")
+            if block_type == FRAMEWORK_NOTICE_BLOCK_TYPE:
+                _apply_resize_notice_to_latest_image(items, block.get("source_metadata"))
+                continue
             if block_type in {"input_text", "text"}:
                 text = block.get("text")
                 if isinstance(text, str) and text:
@@ -740,6 +745,18 @@ def _content_to_input_items(content: object, bridge_dir: Path) -> list[dict[str,
     if content is None:
         return []
     return [{"type": "text", "text": json.dumps(content, ensure_ascii=True)}]
+
+
+def _apply_resize_notice_to_latest_image(
+    items: list[dict[str, object]],
+    source_metadata: object,
+) -> None:
+    """Attach resize metadata to the preceding Codex image path."""
+    if items and items[-1].get("type") == "localImage":
+        item = items[-1]
+        path = item.get("path")
+        if isinstance(path, str):
+            item["path"] = str(codex_resize_metadata_path(Path(path), source_metadata))
 
 
 def _file_block_to_input_item(

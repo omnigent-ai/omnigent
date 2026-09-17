@@ -1,3 +1,4 @@
+import { useLoadedConversations } from "@/hooks/useSidebarData";
 import { useSkills } from "@/hooks/useSkills";
 import {
   HarnessPicker,
@@ -66,8 +67,7 @@ import {
   SMART_ROUTING_LABEL,
   useBrainHarnessLabels,
 } from "@/lib/agentLabels";
-import { useConversations } from "@/hooks/useConversations";
-import { usePermissions } from "@/hooks/usePermissions";
+import { usePermissions, useSessionOwner } from "@/hooks/usePermissions";
 import type { NativeModelOption, Session, SessionStatus } from "@/lib/types";
 import { usePromptHistory } from "@/hooks/usePromptHistory";
 import { useReplyDraft } from "@/hooks/useReplyDraft";
@@ -443,7 +443,7 @@ export function ChatPage() {
     error: agentsError,
     refetch: refetchAgents,
   } = useAgents({ enabled: !urlConvId });
-  const { data: conversationsData } = useConversations("", true);
+  const { data: conversationsData } = useLoadedConversations();
   const conversations = useMemo(
     () => conversationsData?.pages.flatMap((p) => p.data),
     [conversationsData],
@@ -787,7 +787,10 @@ export function ChatPage() {
   // which the owner can read) to know they granted access to anyone else.
   // Hooks stay above the early-return guards (rules-of-hooks).
   const viewerId = getCurrentAuthorId();
-  const sessionOwner = activeConv?.owner ?? null;
+  const { data: directSessionOwner } = useSessionOwner(
+    viewerId !== null && activeConv?.owner == null ? (sessionConvId ?? null) : null,
+  );
+  const sessionOwner = activeConv?.owner ?? directSessionOwner ?? null;
   const viewerOwnsSession = sessionOwner !== null && sessionOwner === viewerId;
   const { data: ownerGrants } = usePermissions(viewerOwnsSession ? (sessionConvId ?? null) : null);
   const isSessionShared = isSessionSharedWithOthers(sessionOwner, viewerId, ownerGrants);

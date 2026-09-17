@@ -188,7 +188,9 @@ async def _register_routes(page, *, credential_requests: list[dict[str, Any]]) -
     await page.route("**/v1/hosts", handle_hosts)
     await stub_empty_host_picker_data(page, _HOST_ID)
     await page.route("**/v1/agents", handle_agents)
-    await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+    await page.route(
+        re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
+    )
     await page.route("**/v1/harnesses", handle_harnesses)
     await page.route("**/v1/hosts/*/credentials/detected", handle_detect)
     await page.route(f"**/v1/hosts/*/harnesses/{_HARNESS}/credential", handle_credential)
