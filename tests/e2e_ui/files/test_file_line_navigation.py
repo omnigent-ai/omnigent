@@ -520,3 +520,82 @@ def test_plain_open_does_not_replay_a_citation(
     # Plain opens do not disable a later explicit click on the same citation.
     page.get_by_role("button", name="Line 100", exact=True).click()
     page.wait_for_function(_CENTERED_LINE, arg={"text": _AFTER_LINES[99], "diff": diff})
+
+
+@pytest.mark.parametrize("mode", ["source", "split", "unified"])
+def test_comment_navigation_supersedes_citation(
+    page: Page, seeded_session: tuple[str, str], mode: str
+) -> None:
+    """Closing comments must not replay a citation after a comment jump."""
+    _seed_citation_file(page, seeded_session)
+    base_url, session_id = seeded_session
+    # Keep the two targets far apart in both diff layouts, without collapsed context.
+    page.route(
+        f"{base_url}/v1/sessions/{session_id}/resources/environments/default/diff/{_FILE_PATH}",
+        lambda route: route.fulfill(
+            json={
+                "object": "session.environment.filesystem.file_diff",
+                "path": _FILE_PATH,
+                "before": "\n".join(f"# previous content {i}" for i in range(500)),
+                "after": _AFTER,
+            }
+        ),
+    )
+    anchor = _AFTER_LINES[299]
+    start = _AFTER.index(anchor)
+    response = httpx.post(
+        f"{base_url}/v1/sessions/{session_id}/comments",
+        json={
+            "path": _FILE_PATH,
+            "body": "Navigate to this later comment",
+            "start_index": start,
+            "end_index": start + len(anchor),
+            "anchor_content": anchor,
+        },
+        timeout=10,
+    )
+    response.raise_for_status()
+    diff = mode != "source"
+    preferences = json.dumps({"diffActive": diff, "diffLayout": mode if diff else "unified"})
+    page.add_init_script(
+        f"localStorage.setItem('omnigent:file-view-preferences', {json.dumps(preferences)});"
+    )
+    page.set_viewport_size({"width": 3200, "height": 1000})
+    page.goto(f"{base_url}/c/{session_id}?file={_FILE_PATH}")
+    viewer = page.locator('[data-testid="file-viewer"]:visible')
+    expect(viewer.locator(".monaco-diff-editor" if diff else ".monaco-editor")).to_be_visible(
+        timeout=30_000
+    )
+    separator = page.get_by_role("separator", name="Resize panel", exact=True)
+    box = separator.bounding_box()
+    assert box is not None
+    page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+    page.mouse.down()
+    page.mouse.move(1600, box["y"] + box["height"] / 2)
+    page.mouse.up()
+    if diff:
+        expected = expect(viewer.locator(".monaco-diff-editor"))
+        if mode == "split":
+            expected.to_have_class(re.compile(r"\bside-by-side\b"))
+        else:
+            expected.not_to_have_class(re.compile(r"\bside-by-side\b"))
+    page.get_by_role("button", name="Line 100", exact=True).click()
+    page.wait_for_function(_CENTERED_LINE, arg={"text": _AFTER_LINES[99], "diff": diff})
+    viewer.get_by_role("button", name="Show comments", exact=True).click()
+    viewer.get_by_text("Navigate to this later comment", exact=True).click()
+    lines = viewer.locator(".modified .view-lines:not(.line-delete)" if diff else ".view-lines")
+    target = lines.get_by_text(anchor, exact=True)
+    expect(target).to_be_in_viewport()
+    width = lines.evaluate("lines => lines.closest('.monaco-editor').clientWidth")
+    viewer.get_by_role("button", name="Hide comments", exact=True).click()
+    page.wait_for_function(
+        """({width, diff}) => document.querySelector(
+          '[data-testid="file-viewer"] ' +
+          (diff ? '.modified .view-lines:not(.line-delete)' : '.view-lines')
+        )?.closest('.monaco-editor').clientWidth > width""",
+        arg={"width": width, "diff": diff},
+    )
+    expect(target).to_be_in_viewport()
+    # A fresh citation must still supersede the comment navigation.
+    page.get_by_role("button", name="Line 100", exact=True).click()
+    page.wait_for_function(_CENTERED_LINE, arg={"text": _AFTER_LINES[99], "diff": diff})

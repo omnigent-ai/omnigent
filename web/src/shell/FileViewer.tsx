@@ -565,6 +565,8 @@ function FileViewerBody({
   );
 
   const handleSetActiveSelection = (selection: ActiveSelection | null) => {
+    // Comment navigation supersedes a citation, including clicks outside the editor.
+    if (selection && filePosition) stopFilePosition(filePosition);
     let nextSelection = selection;
     if (selection && selection.comment_id == null) {
       const comment = openComments.find(
@@ -591,7 +593,7 @@ function FileViewerBody({
     linkedCommentAppliedRef.current = true;
     commentsInitializedRef.current = true;
     setCommentsOpen(true);
-    setActiveSelection({
+    handleSetActiveSelection({
       start_index: comment.start_index,
       end_index: comment.end_index,
       anchor_content: comment.anchor_content ?? "",
@@ -1669,7 +1671,7 @@ function FileViewerBody({
               sender.mutate({ comment_ids: ids });
             }}
             onClickComment={(comment) => {
-              setActiveSelection({
+              handleSetActiveSelection({
                 start_index: comment.start_index,
                 end_index: comment.end_index,
                 anchor_content: comment.anchor_content ?? "",

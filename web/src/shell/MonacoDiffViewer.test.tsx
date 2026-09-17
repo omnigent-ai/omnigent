@@ -57,6 +57,7 @@ vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: vi.fn(() => true) }));
 import { MonacoDiffViewer } from "./MonacoDiffViewer";
 import { codeFontFamilyForEditor, writeCodeFontSizePx } from "@/lib/codeFontPreferences";
 import { getSavedScrollTop, saveScrollTop } from "./useScrollRestore";
+import { stopFilePosition } from "./filePositionState";
 
 function diffTree(props: {
   position?: { line: number; column?: number };
@@ -565,15 +566,16 @@ describe("diff file position navigation", () => {
     },
   );
 
-  it.each(["interaction", "unmount"] as const)(
+  it.each(["interaction", "unmount", "external navigation"] as const)(
     "cancels a queued diff jump on %s",
     async (reason) => {
       const editors = navigationEditors();
+      const position = { line: 100 };
       const { unmount } = renderDiff({
         before: "old",
         after: "new",
         layout: "split",
-        position: { line: 100 },
+        position,
       });
       await waitFor(() => expect(h.onMount).not.toBeNull());
       act(() =>
@@ -588,7 +590,9 @@ describe("diff file position navigation", () => {
       try {
         act(editors.finishDiff);
         if (reason === "unmount") unmount();
+        else if (reason === "external navigation") stopFilePosition(position);
         else editors.container.dispatchEvent(new Event("pointerdown"));
+        act(editors.resize);
         act(() => vi.advanceTimersToNextFrame());
         expect(editors.modified.setPosition).not.toHaveBeenCalled();
         expect(editors.modified.revealPositionInCenter).not.toHaveBeenCalled();

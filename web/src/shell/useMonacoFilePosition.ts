@@ -24,6 +24,7 @@ export function useMonacoFilePosition({
     cancelScrollRestoreRef.current?.();
     const diff = diffEditorRef?.current;
     const center = () => {
+      if (!isFilePositionPending(position)) return;
       const model = editor.getModel();
       const { width, height } = editor.getLayoutInfo();
       if (!model || width <= 0 || height <= 0 || (diff && diff.getLineChanges() === null)) return;

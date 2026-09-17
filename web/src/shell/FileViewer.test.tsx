@@ -20,6 +20,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter, useSearchParams } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Comment } from "@/hooks/useComments";
+import { isFilePositionPending } from "./filePositionState";
 
 const codeViewerRenders = vi.hoisted(() => vi.fn());
 
@@ -1830,6 +1831,27 @@ describe("FileViewer 3D model files", () => {
 describe("file position navigation", () => {
   beforeEach(() => {
     useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+  });
+  it("comment selection supersedes a citation, while a later citation is a fresh request", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([makeComment("c1")]));
+    const position = { line: 100 };
+    const { rerender } = renderViewer({ open: true, path: "file1.py", position });
+    fireEvent.click(screen.getByRole("button", { name: "Show comments" }));
+    expect(isFilePositionPending(position)).toBe(true);
+    fireEvent.click(screen.getByRole("button", { name: "comment c1" }));
+    expect(isFilePositionPending(position)).toBe(false);
+    fireEvent.click(screen.getByRole("button", { name: "Hide comments" }));
+    const next = { line: 100 };
+    rerender(viewerTree({ open: true, path: "file1.py", position: next }));
+    expect(isFilePositionPending(next)).toBe(true);
+  });
+
+  it("a linked comment supersedes a citation supplied alongside it", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([makeComment("c1")]));
+    const position = { line: 100 };
+    renderViewer({ open: true, path: "file1.py", position, initialSearch: "comment=c1" });
+    expect(screen.getByTestId("comments-panel")).toHaveAttribute("data-active-comment-id", "c1");
+    expect(isFilePositionPending(position)).toBe(false);
   });
   it("never passes the previous file's citation into the next file's first render", () => {
     writeFileViewPreferences({
