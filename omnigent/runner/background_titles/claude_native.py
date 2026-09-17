@@ -22,13 +22,13 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
     """Generate a title with an isolated Claude Code print-mode process."""
     from omnigent._platform import resolve_cli_binary
     from omnigent.claude_launcher import resolve_claude_launch
-    from omnigent.claude_native import (
-        build_native_claude_terminal_env,
-        resolve_native_claude_config,
-    )
-    from omnigent.claude_native_bridge import (
+    from omnigent.harnesses.claude_native.bridge import (
         ClaudeNativeHookInterpreterMismatchError,
         validate_claude_hook_interpreter_compatibility,
+    )
+    from omnigent.harnesses.claude_native.main import (
+        build_native_claude_terminal_env,
+        resolve_native_claude_config,
     )
     from omnigent.runner.native.orchestration import _claude_terminal_env_unset
 
@@ -64,8 +64,14 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
     ]
     if effective_model:
         args.extend(("--model", effective_model))
-    if claude_config is not None and claude_config.api_key_helper:
-        args.extend(("--settings", json.dumps({"apiKeyHelper": claude_config.api_key_helper})))
+    settings: dict[str, object] = {}
+    if claude_config is not None:
+        if claude_config.api_key_helper:
+            settings["apiKeyHelper"] = claude_config.api_key_helper
+        if claude_config.model_overrides:
+            settings["modelOverrides"] = claude_config.model_overrides
+    if settings:
+        args.extend(("--settings", json.dumps(settings)))
 
     command, launch_args = resolve_claude_launch("claude", args)
     if command == "claude":

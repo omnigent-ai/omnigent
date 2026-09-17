@@ -13,6 +13,7 @@
 
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { getSessionSlim } from "@/lib/sessionsApi";
+import { isTempConvId } from "@/lib/tempConversationId";
 import type { Session } from "@/lib/types";
 
 /**
@@ -48,10 +49,15 @@ interface UseSessionResult {
  * for the refresh to thrash those caches.
  */
 export function useSession(conversationId: string | null | undefined): UseSessionResult {
+  // A `temp:*` id is a client-only routing token with no server session behind
+  // it (navigate-first new-chat window). Disable the fetch by construction so no
+  // caller can leak a `GET /v1/sessions/temp:*` — cheaper than gating every
+  // call site.
+  const serverId = isTempConvId(conversationId) ? null : (conversationId ?? null);
   const { data, isLoading, error } = useQuery({
-    queryKey: conversationId ? ["session", conversationId] : ["session", null],
-    queryFn: () => getSessionSlim(conversationId as string, { refreshState: true }),
-    enabled: Boolean(conversationId),
+    queryKey: serverId ? ["session", serverId] : ["session", null],
+    queryFn: () => getSessionSlim(serverId as string, { refreshState: true }),
+    enabled: serverId !== null,
     staleTime: Infinity,
     retry: false,
   });

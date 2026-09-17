@@ -11,11 +11,9 @@ from typing import Any
 import httpx
 import pytest
 
-from omnigent import (
-    claude_native_bridge,
-    codex_native_bridge,
-)
 from omnigent.entities.session_resources import SessionResourceView
+from omnigent.harnesses.claude_native import bridge as claude_native_bridge
+from omnigent.harnesses.codex_native import bridge as codex_native_bridge
 from omnigent.runner import app as runner_app_mod
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from tests.runner.helpers import NullServerClient
@@ -518,6 +516,110 @@ async def test_teardown_all_codex_native_app_servers_closes_every_session() -> N
 
 
 @pytest.mark.asyncio
+async def test_teardown_all_opencode_native_servers_closes_every_session() -> None:
+    """Shutdown cancels all forwarders, closes their servers, and clears the registries."""
+    session_ids = [
+        "dddd3333dddd3333dddd3333dddd3333",
+        "eeee4444eeee4444eeee4444eeee4444",
+    ]
+    runs = [_ForwarderRun() for _ in session_ids]
+    closed: list[str] = []
+
+    def _make_parked(run: _ForwarderRun) -> Any:
+        async def _parked() -> None:
+            run.task = asyncio.current_task()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                run.cancelled = True
+                raise
+
+        return _parked
+
+    class _FakeServer:
+        def __init__(self, sid: str) -> None:
+            self._sid = sid
+
+        async def close(self) -> None:
+            closed.append(self._sid)
+
+    try:
+        for sid, run in zip(session_ids, runs, strict=True):
+            task = asyncio.create_task(_make_parked(run)())
+            runner_app_mod._register_auto_forwarder_task(sid, task)
+            runner_app_mod._AUTO_OPENCODE_SERVERS[sid] = _FakeServer(sid)
+        await asyncio.sleep(0)
+
+        await runner_app_mod.teardown_all_opencode_native_servers()
+
+        assert sorted(closed) == sorted(session_ids), "every opencode server must be closed"
+        assert all(sid not in runner_app_mod._AUTO_OPENCODE_SERVERS for sid in session_ids)
+        assert all(sid not in runner_app_mod._AUTO_FORWARDER_TASKS for sid in session_ids)
+        assert all(run.cancelled for run in runs), "every forwarder must be cancelled"
+        # Idempotent: a second sweep with an empty registry is a no-op.
+        await runner_app_mod.teardown_all_opencode_native_servers()
+    finally:
+        for sid in session_ids:
+            runner_app_mod._AUTO_FORWARDER_TASKS.pop(sid, None)
+            runner_app_mod._AUTO_OPENCODE_SERVERS.pop(sid, None)
+        await _drain_forwarder_runs(runs)
+
+
+@pytest.mark.asyncio
+async def test_teardown_all_opencode_native_servers_survives_a_failing_close() -> None:
+    """A failed close must not abort the sweep or leave stale registry entries."""
+    failing_id = "ffff5555ffff5555ffff5555ffff5555"
+    healthy_id = "aaaa6666aaaa6666aaaa6666aaaa6666"
+    session_ids = [failing_id, healthy_id]
+    runs = [_ForwarderRun() for _ in session_ids]
+    attempted: list[str] = []
+
+    def _make_parked(run: _ForwarderRun) -> Any:
+        async def _parked() -> None:
+            run.task = asyncio.current_task()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                run.cancelled = True
+                raise
+
+        return _parked
+
+    class _FakeServer:
+        def __init__(self, sid: str, *, fail: bool) -> None:
+            self._sid = sid
+            self._fail = fail
+
+        async def close(self) -> None:
+            attempted.append(self._sid)
+            if self._fail:
+                raise RuntimeError(f"close failed for {self._sid}")
+
+    try:
+        for sid, run in zip(session_ids, runs, strict=True):
+            task = asyncio.create_task(_make_parked(run)())
+            runner_app_mod._register_auto_forwarder_task(sid, task)
+            runner_app_mod._AUTO_OPENCODE_SERVERS[sid] = _FakeServer(sid, fail=sid == failing_id)
+        await asyncio.sleep(0)
+
+        await runner_app_mod.teardown_all_opencode_native_servers()
+
+        assert sorted(attempted) == sorted(session_ids), (
+            "a failing close aborted the sweep; the remaining opencode servers were never reaped"
+        )
+        assert all(sid not in runner_app_mod._AUTO_OPENCODE_SERVERS for sid in session_ids), (
+            "a failing close left a stale registry entry behind"
+        )
+        assert all(sid not in runner_app_mod._AUTO_FORWARDER_TASKS for sid in session_ids)
+        assert all(run.cancelled for run in runs), "every forwarder must be cancelled"
+    finally:
+        for sid in session_ids:
+            runner_app_mod._AUTO_FORWARDER_TASKS.pop(sid, None)
+            runner_app_mod._AUTO_OPENCODE_SERVERS.pop(sid, None)
+        await _drain_forwarder_runs(runs)
+
+
+@pytest.mark.asyncio
 async def test_register_auto_forwarder_task_replaces_incumbent_and_survives_stale_evict() -> None:
     """
     Re-registration cancels the incumbent; its done-callback can't evict the successor.
@@ -664,7 +766,7 @@ async def test_auto_create_claude_terminal_recreate_cancels_prior_forwarder(
             raise
 
     monkeypatch.setattr(
-        "omnigent.claude_native_forwarder.supervise_forwarder",
+        "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
         _parking_forwarder,
     )
 
@@ -757,7 +859,7 @@ async def test_auto_create_codex_terminal_recreate_cancels_prior_forwarder(
     :param tmp_path: Temporary directory for isolated bridge state.
     :param monkeypatch: Pytest monkeypatch fixture.
     """
-    import omnigent.codex_native_app_server as codex_app_mod
+    import omnigent.harnesses.codex_native.app_server as codex_app_mod
 
     session_id = "a3f4361a350851cfb9eb3db2bf2b0380"
     thread_id = "019e96aa-0be2-7343-8d3b-6f914d60936b"
@@ -855,6 +957,7 @@ async def test_auto_create_codex_terminal_recreate_cancels_prior_forwarder(
         loaded_thread_id: str,
         *,
         terminal_launch_args: list[str] | None = None,
+        retain_client: bool = False,
     ) -> None:
         """
         No-op thread preload.
@@ -1047,7 +1150,7 @@ async def test_auto_create_codex_terminal_refused_resume_closes_app_server(
     :param tmp_path: Temporary directory for isolated bridge state.
     :param monkeypatch: Pytest monkeypatch fixture.
     """
-    import omnigent.codex_native_app_server as codex_app_mod
+    import omnigent.harnesses.codex_native.app_server as codex_app_mod
 
     session_id = "b7d2c1e0aa114b52b7c2f1d3e4a5b6c7"
     thread_id = "019e96aa-0be2-7343-8d3b-6f914d60936c"
@@ -1137,6 +1240,7 @@ async def test_auto_create_codex_terminal_refused_resume_closes_app_server(
         loaded_thread_id: str,
         *,
         terminal_launch_args: list[str] | None = None,
+        retain_client: bool = False,
     ) -> None:
         """
         Refuse the resume the way a stale writer-lock holder does.
@@ -1210,7 +1314,7 @@ async def test_auto_create_codex_terminal_unreadable_thread_starts_fresh(
     :param monkeypatch: Pytest monkeypatch fixture.
     :param caplog: Log capture for the fallback warning.
     """
-    import omnigent.codex_native_app_server as codex_app_mod
+    import omnigent.harnesses.codex_native.app_server as codex_app_mod
 
     session_id = "c8e3d2f1bb225c63c8d3a2e4f5b6c7d8"
     thread_id = "019e96aa-0be2-7343-8d3b-6f914d60936d"
@@ -1319,6 +1423,7 @@ async def test_auto_create_codex_terminal_unreadable_thread_starts_fresh(
         loaded_thread_id: str,
         *,
         terminal_launch_args: list[str] | None = None,
+        retain_client: bool = False,
     ) -> None:
         """
         Refuse the resume the way codex's thread-store does for a bad rollout.

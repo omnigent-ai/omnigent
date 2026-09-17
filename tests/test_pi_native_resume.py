@@ -15,7 +15,7 @@ from typing import Any
 import httpx
 import pytest
 
-from omnigent.pi_native_resume import (
+from omnigent.harnesses.pi_native.resume import (
     ensure_local_pi_resume_session,
     fetch_all_session_items_for_pi_resume,
     is_safe_pi_session_id,

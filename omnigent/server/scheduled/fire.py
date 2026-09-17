@@ -83,11 +83,13 @@ _DEFAULT_WORKSPACE = "~"
 # Strong references to in-flight background fire tasks. ``loop.create_task`` holds
 # only a weak reference, so without this a fire could be garbage-collected
 # mid-flight; each task is discarded from the set when it completes.
+# custom-lint: disable-next=workspace-scoped-cache -- set of Task objects
 _PENDING_FIRES: set[asyncio.Task[None]] = set()
 
 # Fire path overlap guard keyed by tenant + task. The scheduler's job.running
 # only covers its short on_fire callback; this covers the background
 # create/grant/dispatch work that continues after on_fire returns.
+# custom-lint: disable-next=workspace-scoped-cache -- already keyed by (workspace_id, task_id)
 _IN_FLIGHT_TASKS: set[tuple[int, str]] = set()
 
 
@@ -681,7 +683,7 @@ async def _presentation_labels(deps: FireDeps, task: ScheduledTask) -> dict[str,
     Fail-safe: any resolution error omits the labels rather than guessing, so
     the session falls back to Chat-only rather than breaking the fire.
     """
-    from omnigent.native_coding_agents import native_coding_agent_for_agent_name
+    from omnigent.native.native_coding_agents import native_coding_agent_for_agent_name
     from omnigent.server.routes.sessions import _repl_terminal_ui_labels
 
     try:

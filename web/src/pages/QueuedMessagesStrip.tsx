@@ -15,15 +15,11 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import type { QueuedMessage } from "@/store/chatStore";
 import { cn } from "@/lib/utils";
 
-/**
- * Row action buttons: compact icon buttons on desktop; on mobile (`max-md:`)
- * they grow to a 44px tap target (Apple HIG / WCAG target size) with a larger,
- * higher-contrast icon, matching the app's other mobile-adjusted controls.
- */
+/** Keep touch targets large without enlarging the visible glyphs. */
 const ACTION_BUTTON_CLASS =
   "flex shrink-0 items-center justify-center rounded p-0.5 text-muted-foreground/60 transition hover:text-foreground focus-visible:text-foreground max-md:size-11 max-md:text-muted-foreground";
 
-const ACTION_ICON_CLASS = "size-3.5 max-md:size-5";
+const ACTION_ICON_CLASS = "size-3.5 max-md:size-4";
 
 interface QueuedMessagesStripProps {
   /** Messages waiting to be flushed, in FIFO order (head first). */
@@ -43,7 +39,11 @@ interface QueuedMessagesStripProps {
    * Drives drag-to-reorder; omit to render a non-reorderable strip.
    */
   onReorder?: (queueId: string, beforeQueueId: string | null) => void;
-  /** Column-width class so the strip lines up with the composer card. */
+  /**
+   * Layout class aligning the strip with the composer surface it docks
+   * onto (its tuck only hides behind a surface at least as wide, so match
+   * that surface's width — e.g. the workspace bar's inset).
+   */
   widthClassName?: string;
 }
 
@@ -142,7 +142,8 @@ function QueuedRow({
 
 /**
  * Docked strip above the composer listing messages queued while the agent is
- * busy. Peeks above the composer card (`-mb-4` + bottom padding), mirroring
+ * busy. Peeks above the composer stack's top surface (`-mb-4` + bottom
+ * padding tuck its square bottom corners behind it), mirroring
  * `SubagentComposerTray`. Renders nothing when the queue is empty.
  *
  * Each row can be steered (sent now), edited (pulled back into the composer),

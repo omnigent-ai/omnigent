@@ -55,10 +55,10 @@ from omnigent.errors import OmnigentError
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.inner import _proc
 from omnigent.inner.databricks_executor import _DatabricksBearerAuth, _read_databrickscfg
-from omnigent.model_catalog import resolve_catalog_model
-from omnigent.model_resolver import ModelResolutionError
-from omnigent.native_coding_agents import native_coding_agent_for_wrapper_label
-from omnigent.native_dispatch import resolve_hook_for_key
+from omnigent.models.model_catalog import resolve_catalog_model
+from omnigent.models.model_resolver import ModelResolutionError
+from omnigent.native.native_coding_agents import native_coding_agent_for_wrapper_label
+from omnigent.native.native_dispatch import resolve_hook_for_key
 from omnigent.process_logging import (
     PROCESS_LOG_FILE_ENV_VAR,
     child_logging_popen_kwargs,
@@ -593,7 +593,7 @@ def run_attach(
     # snapshot gives the agent name + harness for an honest banner.
     info = _attach_session_info(base_url=base_url, conversation_id=conversation_id)
     if not info.runner_online:
-        from omnigent.server_url import display_server_url
+        from omnigent.util.server_url import display_server_url
 
         raise click.ClickException(
             f"Session {conversation_id} has no online runner on "
@@ -686,6 +686,7 @@ def _remote_headers(
     server_url: str | None = None,
     *,
     host_id: str | None,
+    org_id: str | None = None,
 ) -> dict[str, str]:
     """
     Build headers for remote AP-server requests.
@@ -711,6 +712,8 @@ def _remote_headers(
         request that keys off the runner-env host_id). Required-keyword with
         no default so every call site consciously decides — pass the request
         path's host when it has one rather than silently defaulting to unkeyed.
+    :param org_id: Workspace selector captured from the current server URL, or
+        ``None`` to fall back to the stored login record.
     :returns: Headers to pass to httpx / OmnigentClient.
     """
     # Resolve the bearer in the documented precedence order (one credential
@@ -746,7 +749,7 @@ def _remote_headers(
     if server_url:
         from omnigent.cli_auth import databricks_request_headers
 
-        headers.update(databricks_request_headers(server_url, host_id=host_id))
+        headers.update(databricks_request_headers(server_url, host_id=host_id, org_id=org_id))
     return headers
 
 
@@ -1600,7 +1603,7 @@ def _unreachable_server_message(base_url: str) -> str:
             f"It may have stopped — run `{cli_invocation()} stop`, then try again. "
             f"Server logs are under {process_log_dir_reference('server')}."
         )
-    from omnigent.server_url import display_server_url
+    from omnigent.util.server_url import display_server_url
 
     return (
         f"Could not connect to the Omnigent server at {display_server_url(base_url)}. "
@@ -1693,7 +1696,7 @@ async def _prepare_chat_session_via_daemon(
         wait_for_host_online,
         wait_for_runner_online,
     )
-    from omnigent.native_terminal import bind_session_runner
+    from omnigent.native.native_terminal import bind_session_runner
 
     async def resolve_session() -> tuple[str, bool]:
         """Fork, resume, or create the session to bind, and say if it is fresh.
@@ -2617,6 +2620,13 @@ async def _query_sessions_once(
 
     if all_text_parts:
         return "\n\n".join(p for p in all_text_parts if p)
+    # An auto-woken turn can finish between live-stream subscriptions.
+    # Recheck its durable output once the session has stopped running.
+    if chat.status not in ("running", "launching"):
+        reconciled = await _persisted_turn_text(client, bound.id)
+        if reconciled is not None:
+            logger.info("Recovered headless output from completed session %s", bound.id)
+            return reconciled
     # No assistant text at all. If the runner persisted a terminal
     # ``error`` item (e.g. a harness start failure like the cursor SDK's
     # invalid-model rejection), surface it instead of returning ``None`` —
@@ -3358,20 +3368,24 @@ def _apply_overrides_to_raw(raw: _YamlMapping, overrides: ChatOverrides) -> None
     if overrides.model is not None:
         executor_block["model"] = overrides.model
     if overrides.harness is not None:
+        prior_harness = _spec_declared_harness(raw, executor_block)
         _apply_harness_override_to_executor(raw, executor_block, overrides.harness)
-        # A harness-only override drops any prior model pin so the new
-        # harness resolves its provider default — e.g. ``omnigent run
-        # examples/polly --harness pi`` must not keep Polly's Claude-only
-        # a Claude-only ``executor.model``. An explicit ``--model``
-        # (applied above) wins and is left alone.
+        overrides_a_different_harness = prior_harness != (
+            canonicalize_harness(overrides.harness) or overrides.harness
+        )
+        # A real harness switch invalidates spec models. Otherwise, preserve
+        # them and use the environment only when no model remains.
         if overrides.model is None:
-            executor_block.pop("model", None)
             llm_block = raw.get("llm")
-            if isinstance(llm_block, dict):
-                llm_block.pop("model", None)
-            env_model = os.environ.get(_OMNIGENT_MODEL_ENV_VAR)
-            if env_model is not None:
-                executor_block["model"] = env_model
+            if overrides_a_different_harness:
+                executor_block.pop("model", None)
+                if isinstance(llm_block, dict):
+                    llm_block.pop("model", None)
+            llm_model = llm_block.get("model") if isinstance(llm_block, dict) else None
+            if not (executor_block.get("model") or llm_model):
+                env_model = os.environ.get(_OMNIGENT_MODEL_ENV_VAR)
+                if env_model is not None:
+                    executor_block["model"] = env_model
     # When neither harness nor model is declared — after overrides —
     # inject the ad-hoc default. Gated on harness absence so a YAML
     # like ``claude_code_agent.yaml`` (declares harness, no model)
@@ -3427,6 +3441,18 @@ def _apply_harness_override_to_executor(
         config = {}
         executor_block["config"] = config
     config["harness"] = canonical
+
+
+def _spec_declared_harness(raw: _YamlMapping, executor_block: _YamlMapping) -> str | None:
+    """Read the canonical harness from the spec's flat or bundle executor."""
+    if "spec_version" not in raw:
+        harness = executor_block.get("harness")
+    else:
+        config = executor_block.get("config")
+        harness = config.get("harness") if isinstance(config, dict) else None
+    if not isinstance(harness, str) or not harness.strip():
+        return None
+    return canonicalize_harness(harness.strip()) or harness.strip()
 
 
 def _validate_agent_spec(agent_path: Path) -> None:

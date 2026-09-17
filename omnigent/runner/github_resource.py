@@ -1,10 +1,9 @@
 """GitHub integration for the session workspace, backed by the ``gh`` CLI.
 
-Powers the web UI's read-only "GitHub" rail tab, which is purely a PR view: the
-changed-files list and the whole-PR patch come straight from GitHub via ``gh``
-(``gh api .../pulls/<n>/files`` and ``gh pr diff``), so they match the PR's
-"Files changed" exactly. With no PR for the branch the tab shows its "no PR"
-empty state and fetches nothing.
+Powers the session PR selector, details, and link/unlink actions. Tracked PRs
+use explicit host/repository/number identities. Branch and commit discovery
+remains a fallback for sessions without recorded PRs. Files and patches come
+from GitHub; recording an association does not modify the remote PR.
 
 Design notes:
 
@@ -21,31 +20,47 @@ Design notes:
   connected owner. Outside a sandbox the env is inherited untouched.
 - The list and patch are GitHub-computed, never a local ``git diff``, so a stale
   local ``origin/<base>`` can't inflate them with files outside the PR.
-- Only the on-demand per-file expand-context reader (:func:`github_file_diff`)
-  still uses ``git show`` for full before/after content — a unified-diff blob
-  can't drive the viewer's context expansion.
-- The branch→PR lookup resolves in one ``gh`` call, picked by whether the pushed
-  ref (``branch.<name>.merge``) was renamed from the local branch — the mark of
-  a fork / triangular push (Databricks prefixes it with ``<user>/``). Renamed →
-  ``gh pr list --head <pushed-ref>``, which matches the head ref name alone and
-  so finds a fork head a bare ``gh pr view`` misses. Not renamed → a bare ``gh pr
-  view``, which is correct and more precise for same-repo branches and returns
-  nothing for a base branch like ``master`` (``gh pr list --head master`` would
-  wrongly match a stranger's PR whose head merely shares the name).
+- Expanded context uses the selected PR's head and merge-base commits through
+  GitHub, including fork heads and renames. Legacy calls without a session
+  continue to read local git objects.
+- The branch→PR lookup is a ``gh pr view --json`` (``--json`` avoids the
+  interactive pager and the Projects-classic mis-parse of a bare view), backed by
+  a commit-identity fallback for when the remote branch name is decoupled from the
+  checkout. Fork / triangular PRs resolve once the two coordinates they turn on
+  are set explicitly: the base repo (``gh repo set-default``, which ``gh`` stores
+  in ``.git/config`` as ``remote.<name>.gh-resolved``) and the head owner (the
+  authenticated account). The panel surfaces an account + remote selector so the
+  user pins both; a per-repo account preference (``~/.omnigent/config.yaml``) is
+  applied by running each ``gh`` call as the chosen account —
+  ``GH_TOKEN=$(gh auth token --user <login>)`` — outside a sandbox (inside one we
+  keep the single broker identity).
+- When a stacking tool (git-stack, ``git pp``) pushes under a remote branch name
+  that differs from the local checkout and leaves no upstream tracking, ``gh``'s
+  branch-name lookup misses. The pushed commit is the invariant that still links
+  the checkout to its PR, so the fallback asks GitHub which PR a pushed commit
+  belongs to (``repos/{owner}/{repo}/commits/{sha}/pulls``), querying the repo it
+  was pushed to (the fork for a fork PR) — see :func:`_resolve_pr_via_commit`.
 - ``available: false`` payloads let the tab render a message ("gh not installed",
   "not a git repo") instead of surfacing an error.
 """
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import time
 from typing import Any
+from urllib.parse import quote
 
+from filelock import Timeout as FileLockTimeout
+
+from omnigent import config as _config
+from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry
 from omnigent.runtime.filesystem_registry import _git_timeout_seconds
 
 _logger = logging.getLogger(__name__)
@@ -131,17 +146,172 @@ def _in_sandbox() -> bool:
     return (os.environ.get("IS_SANDBOX") or "").strip() == "1"
 
 
-def _gh(argv: list[str], *, cwd: str) -> tuple[int | None, str, str]:
+def _gh(argv: list[str], *, cwd: str, token: str | None = None) -> tuple[int | None, str, str]:
     # In a managed sandbox the panel must authenticate as the connected owner via
     # the per-user hosts.yml that configure_host_gh writes — never an ambient
     # GH_TOKEN/GITHUB_TOKEN, which gh ranks ABOVE hosts.yml. Scrub them so a stray
     # token in the sandbox/runner env (e.g. a gh-MCP passthrough) can't silently
     # make the panel act as a shared identity. Outside a sandbox (local dev) the
     # env is inherited untouched, so the developer's own gh auth still works.
+    #
+    # ``token`` deliberately re-adds GH_TOKEN to run this one call as a chosen
+    # account (the account selector). It's only ever set outside a sandbox — see
+    # _account_token_for — so it never overrides the sandbox's broker identity.
     env: dict[str, str] | None = None
     if _in_sandbox():
-        env = {k: v for k, v in os.environ.items() if k not in ("GH_TOKEN", "GITHUB_TOKEN")}
+        env = {
+            k: v
+            for k, v in os.environ.items()
+            if k
+            not in ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN")
+        }
+    if token:
+        env = dict(os.environ) if env is None else env
+        env["GH_TOKEN"] = token
+        env["GH_ENTERPRISE_TOKEN"] = token
+        env.pop("GITHUB_TOKEN", None)
+        env.pop("GITHUB_ENTERPRISE_TOKEN", None)
     return _run(["gh", *argv], cwd=cwd, timeout=_gh_timeout_seconds(), env=env)
+
+
+# ── Account selection ────────────────────────────────────────────────────────
+# The panel offers ONE selector — the account (head owner) — since fork/triangular
+# PRs resolve by pushed-commit identity and the base repo is auto-resolved from the
+# PR. A per-workspace account preference runs every ``gh`` call as the chosen login;
+# a sandbox has a single identity so the account override no-ops there.
+
+
+def _owner_repo_from_url(url: str | None) -> str | None:
+    """Derive ``owner/repo`` from a git remote URL, or ``None``.
+
+    Handles HTTPS/SSH/scp-style GitHub URLs, stripping any ``.git`` suffix.
+    """
+    if not url:
+        return None
+    candidate = url.strip()
+    scp = re.match(r"^[\w.\-]+@[\w.\-]+:(?P<path>.+)$", candidate)
+    if scp:
+        path = scp.group("path")
+    else:
+        scheme = re.match(r"^\w+://(?:[^@/]+@)?[\w.\-]+/(?P<path>.+)$", candidate)
+        if not scheme:
+            return None
+        path = scheme.group("path")
+    parts = path.removesuffix(".git").strip("/").split("/")
+    if len(parts) < 2 or not parts[-1] or not parts[-2]:
+        return None
+    return f"{parts[-2]}/{parts[-1]}"
+
+
+def _owner_repo_from_pr_url(url: str | None) -> str | None:
+    """Derive the base ``owner/repo`` from a PR's HTML URL, or ``None``.
+
+    A PR lives on its base repo, so ``https://host/<owner>/<repo>/pull/<n>`` names
+    it in the first two path segments — lets us skip a separate ``gh repo view``
+    once a PR resolves.
+    """
+    if not url:
+        return None
+    match = re.match(r"^https?://[^/]+/([^/]+)/([^/]+)/pull/\d+", url.strip())
+    return f"{match.group(1)}/{match.group(2)}" if match else None
+
+
+def _list_accounts(root: str) -> tuple[bool, list[dict[str, Any]]]:
+    """Return ``(authenticated, accounts)`` from ``gh auth status --json hosts``.
+
+    ``accounts`` is ``[{login, active, state, host}]``; ``authenticated`` is true
+    when at least one account validates (``state == "success"``). Falls back to a
+    plain ``gh auth status`` for the boolean on an older ``gh`` without ``--json``.
+    """
+    _, out, _ = _gh(["auth", "status", "--json", "hosts"], cwd=root)
+    try:
+        data = json.loads(out)
+    except ValueError:
+        data = None
+    hosts = data.get("hosts") if isinstance(data, dict) else None
+    if isinstance(hosts, dict):
+        accounts: list[dict[str, Any]] = []
+        for host, entries in hosts.items():
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                if not isinstance(entry, dict) or not entry.get("login"):
+                    continue
+                accounts.append(
+                    {
+                        "login": entry.get("login"),
+                        "active": bool(entry.get("active")),
+                        "state": entry.get("state"),
+                        "host": entry.get("host") or host,
+                    }
+                )
+        return any(a.get("state") == "success" for a in accounts), accounts
+    # Older gh (no --json hosts): fall back to the plain status exit code.
+    rc, _, _ = _gh(["auth", "status"], cwd=root)
+    return rc == 0, []
+
+
+def _resolved_base_nwo(root: str) -> str | None:
+    """Return the gh-resolved base repo ``owner/repo`` for the checkout, or ``None``.
+
+    Reads ``gh repo set-default --view`` — a local git-config read (no network),
+    the same base ``gh`` itself resolves PRs against. ``None`` when no default is
+    set (``--view`` exits non-zero) or the output isn't an ``owner/repo``.
+    """
+    rc, out, _ = _gh(["repo", "set-default", "--view"], cwd=root)
+    if rc != 0:
+        return None
+    value = out.strip()
+    if value and "/" in value and " " not in value:
+        return value
+    return None
+
+
+def _workspace_key(root: str) -> str | None:
+    """Return the stable per-workspace key for the account preference, or ``None``.
+
+    The account preference is keyed by the **main worktree path** — the first
+    entry of ``git worktree list`` — so a checkout and all its linked worktrees
+    (which share one ``.git``) resolve to the same key, while separate clones stay
+    distinct. Purely local (no network, no auth), so it's available before any
+    ``gh`` call — the constraint that rules out keying on the resolved base repo.
+    """
+    rc, out, _ = _git(["worktree", "list", "--porcelain"], cwd=root)
+    if rc != 0:
+        return None
+    for line in out.splitlines():
+        if line.startswith("worktree "):
+            path = line[len("worktree ") :].strip()
+            return path or None
+    return None
+
+
+def _gh_auth_token(root: str, login: str, host: str = "github.com") -> str | None:
+    """Return *login*'s GitHub token via ``gh auth token --user`` (never logged)."""
+    rc, out, _ = _gh(["auth", "token", "--user", login, "-h", host], cwd=root)
+    if rc != 0:
+        return None
+    return out.strip() or None
+
+
+def _account_token_for(root: str, workspace_key: str | None = None) -> str | None:
+    """Return the GH_TOKEN to run ``gh`` as this workspace's preferred account.
+
+    ``None`` (use ``gh``'s active auth) inside a sandbox (single broker identity),
+    when the workspace key can't be resolved, or when it has no stored preference.
+
+    :param root: Absolute workspace path.
+    :param workspace_key: Precomputed key to skip a repeat resolution.
+    """
+    if _in_sandbox():
+        return None
+    key = workspace_key if workspace_key is not None else _workspace_key(root)
+    if not key:
+        return None
+    login = _config.github_account_preference(key)
+    if not login:
+        return None
+    return _gh_auth_token(root, login)
 
 
 # Cap the per-check list so a pathological rollup can't bloat the payload; the
@@ -235,75 +405,145 @@ def _shape_comments(raw: Any) -> list[dict[str, Any]]:
     return shaped
 
 
-def _current_branch(root: str) -> str | None:
-    """Return the workspace's current branch name, or ``None`` (detached / not a repo)."""
-    rc, out, _ = _git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=root)
+def _head_commit_shas(root: str) -> list[str]:
+    """Candidate commit SHAs to resolve the PR by identity, most-pushed first.
+
+    ``@{push}`` is the exact ref the branch was pushed to — the pushed tip even
+    when a stacking tool renamed the remote branch. ``HEAD`` is the local tip,
+    which equals the pushed tip right after such a push when no upstream tracking
+    was configured. Order-preserving and deduped; empty on a detached HEAD.
+    """
+    shas: list[str] = []
+    for rev in ("@{push}", "HEAD"):
+        rc, out, _ = _git(["rev-parse", "--verify", "--quiet", rev], cwd=root)
+        sha = out.strip()
+        if rc == 0 and sha and sha not in shas:
+            shas.append(sha)
+    return shas
+
+
+def _remote_nwo(root: str, remote: str) -> str | None:
+    """``owner/repo`` for a named git remote, or ``None``."""
+    rc, url, _ = _git(["remote", "get-url", remote], cwd=root)
     if rc != 0:
         return None
-    return out.strip() or None
+    return _owner_repo_from_url(url.strip())
 
 
-def _pushed_head_ref(root: str, branch: str) -> str | None:
-    """Return ``branch``'s pushed head ref name, or ``None``.
+def _commit_lookup_repo(root: str) -> str | None:
+    """The repo the branch was pushed to — where its commit (and PR) live.
 
-    Reads the configured upstream (``branch.<name>.merge``), whose value is the
-    ref that was actually pushed — which may carry a ``<user>/`` prefix under a
-    fork / triangular push flow and so differ from the local branch name.
-    ``None`` with no upstream configured.
+    The branch's tracking remote (``branch.<name>.remote``), else ``origin``. One
+    repo suffices: ``commits/{sha}/pulls`` resolves the PR across the fork network
+    (it reports the PR's own base repo, whatever that is), and a commit that
+    wasn't pushed to this repo won't be in the base repo either — so querying more
+    repos for the same commit is redundant.
     """
-    rc, out, _ = _git(["config", f"branch.{branch}.merge"], cwd=root)
-    if rc != 0 or not out.strip():
+    rc, br, _ = _git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=root)
+    branch = br.strip()
+    if rc == 0 and branch and branch != "HEAD":
+        rc, remote, _ = _git(["config", f"branch.{branch}.remote"], cwd=root)
+        remote = remote.strip()
+        if rc == 0 and remote and remote != ".":
+            nwo = _remote_nwo(root, remote)
+            if nwo:
+                return nwo
+    return _remote_nwo(root, "origin")
+
+
+def _resolve_pr_via_commit(root: str, *, token: str | None = None) -> tuple[int, str] | None:
+    """Resolve ``(PR number, base owner/repo)`` by pushed-commit identity, or ``None``.
+
+    Branch-name-independent: asks GitHub which PR a pushed commit belongs to
+    (``repos/{owner}/{repo}/commits/{sha}/pulls``), so it finds the PR even when a
+    stacking tool (git-stack, ``git pp``) pushed under a remote branch name that
+    differs from the checkout, or a fork PR whose head ``gh`` can't name. The
+    commit lives in the repo it was pushed to (the fork for a fork PR), and the
+    response names the PR's own base repo — returned so the caller fetches the PR
+    from the right place regardless of the local ``gh repo set-default``.
+
+    Only **open** PRs are accepted. For a commit already on the default branch
+    (master/main, or any merged tip) the endpoint returns the *merged* PR that
+    introduced it, which is a false positive — never the branch's own outgoing
+    PR — so a closed/merged row is skipped rather than surfaced.
+    """
+    shas = _head_commit_shas(root)
+    repo = _commit_lookup_repo(root)
+    if not shas or not repo:
         return None
-    return out.strip().removeprefix("refs/heads/") or None
-
-
-def _pr_view_json(root: str, fields: str) -> dict[str, Any] | None:
-    """Return the branch's PR as a ``gh``-JSON object for ``fields``, or ``None``.
-
-    Resolves the PR in a single ``gh`` call, choosing the query from a cheap git
-    signal: whether the pushed ref (``branch.<name>.merge``) was *renamed* from
-    the local branch name. A fork / triangular push renames it (Databricks pushes
-    carry a ``<user>/`` prefix), and only then does a bare ``gh pr view`` miss the
-    PR — its head-repo-owner guess looks in the wrong place. There we resolve by
-    the pushed ref with ``gh pr list --head`` (``--json`` takes the same fields,
-    and a row shares the shape of a ``gh pr view`` object, so it parses
-    identically; ``--state all`` keeps merged/closed PRs visible).
-
-    Otherwise a bare ``gh pr view`` is correct and *more precise*: it resolves
-    same-repo and standard-fork PRs, and returns nothing for a base branch like
-    ``master``. Using ``gh pr list --head`` there would be wrong — it matches on
-    the head ref name alone, so on ``master`` it returns a stranger's unrelated
-    PR whose head merely happens to be named ``master``.
-    """
-    branch = _current_branch(root)
-    pushed_ref = _pushed_head_ref(root, branch) if branch is not None else None
-    if pushed_ref is not None and pushed_ref != branch:
-        rc, out, _ = _gh(
-            [
-                "pr",
-                "list",
-                "--head",
-                pushed_ref,
-                "--state",
-                "all",
-                "--limit",
-                "1",
-                "--json",
-                fields,
-            ],
-            cwd=root,
-        )
+    for sha in shas:
+        rc, out, _ = _gh(["api", f"repos/{repo}/commits/{sha}/pulls"], cwd=root, token=token)
         if rc != 0:
-            return None
+            continue
         try:
             rows = json.loads(out)
         except ValueError:
-            return None
-        if isinstance(rows, list) and rows and isinstance(rows[0], dict):
-            return rows[0]
-        return None
+            continue
+        if not isinstance(rows, list) or not rows:
+            continue
 
-    rc, out, _ = _gh(["pr", "view", "--json", fields], cwd=root)
+        def _is_open(row: Any) -> bool:
+            return isinstance(row, dict) and str(row.get("state", "")).lower() == "open"
+
+        # Accept only an OPEN PR. On the default branch (and any branch whose tip
+        # is already merged) this endpoint returns the *merged* PR that introduced
+        # the commit — a false positive, since it's not the branch's own outgoing
+        # PR. A genuine fallback hit (a fork / renamed branch gh can't name) is
+        # always open, so a closed row is never the PR we want; skip it rather
+        # than falling back to the first row.
+        chosen = next((r for r in rows if _is_open(r)), None)
+        if chosen is None:
+            continue
+        number = chosen.get("number")
+        base = chosen.get("base")
+        base_repo = base.get("repo") if isinstance(base, dict) else None
+        base_full = base_repo.get("full_name") if isinstance(base_repo, dict) else None
+        if isinstance(number, int) and isinstance(base_full, str) and "/" in base_full:
+            return number, base_full
+    return None
+
+
+def _pr_view_json(root: str, fields: str, *, token: str | None = None) -> dict[str, Any] | None:
+    """Return the branch's PR as a ``gh``-JSON object for ``fields``, or ``None``.
+
+    Two-step, so a decoupled remote branch name never hides the PR:
+
+    1. ``gh pr view --json`` — resolves the current branch's PR against the
+       gh-resolved base as the authenticated account. Fast, and covers same-repo
+       branches and any push that set upstream tracking (plain ``push -u``, and
+       ``git pp``, which pushes ``-u``). ``--json`` also avoids the interactive
+       pager and the Projects-classic mis-parse of a bare ``gh pr view``.
+    2. Commit-identity fallback — when a stacking tool (git-stack, ``git pp``)
+       pushed under a remote branch name that differs from the checkout, or a
+       fork PR whose head ``gh`` can't name, the branch-name lookup misses. The
+       pushed commit still maps to the PR (:func:`_resolve_pr_via_commit`), which
+       also yields the PR's base repo so the full object is fetched with an
+       explicit ``-R``. This subsumes the old ``branch.<name>.merge`` head guess.
+
+    :param token: Optional GH_TOKEN to run the calls as the selected account.
+    """
+    rc, out, _ = _gh(["pr", "view", "--json", fields], cwd=root, token=token)
+    if rc == 0:
+        try:
+            data = json.loads(out)
+        except ValueError:
+            data = None
+        if isinstance(data, dict):
+            return data
+
+    resolved = _resolve_pr_via_commit(root, token=token)
+    if resolved is None:
+        return None
+    number, base_repo = resolved
+    # First-run convenience: point gh's default at the PR's real base so the
+    # agent's own `gh` in the terminal targets it too. Only when unset, so a
+    # manual `gh repo set-default` is never overridden; best-effort — resolution
+    # itself doesn't need it (the explicit ``-R`` below carries the base).
+    if not _resolved_base_nwo(root):
+        _gh(["repo", "set-default", base_repo], cwd=root, token=token)
+    rc, out, _ = _gh(
+        ["pr", "view", str(number), "-R", base_repo, "--json", fields], cwd=root, token=token
+    )
     if rc != 0:
         return None
     try:
@@ -313,7 +553,7 @@ def _pr_view_json(root: str, fields: str) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
-def github_info(root: str) -> dict[str, Any]:
+def _workspace_github_info(root: str) -> dict[str, Any]:
     """Resolve GitHub context for the workspace: repo, branch, base, and PR.
 
     Git-first: a git checkout is the fundamental requirement, so ``available``
@@ -325,7 +565,15 @@ def github_info(root: str) -> dict[str, Any]:
     :returns: A ``session.github.info`` object. ``available`` is false only when
         this isn't a git repo (``reason: not_a_git_repo``). ``gh_available`` /
         ``authenticated`` report whether the ``gh`` CLI is present and signed in;
-        ``repo`` / ``pr`` / ``base_ref`` are null without it.
+        ``repo`` / ``pr`` / ``base_ref`` are null without it. ``accounts`` /
+        ``selected_account`` are populated only when the repo can't be reached (to
+        drive the account selector), so the happy path stays fast.
+
+    Ordering is a fast-path optimization: resolve the PR first, and only fall to
+    the ``gh repo view`` reachability probe (and, if that fails, the ``gh auth
+    status`` account enumeration) when there's no PR. A resolved PR already tells
+    us the repo and that we're authenticated, so those extra network calls are
+    skipped whenever a PR exists.
     """
     payload: dict[str, Any] = {"object": "session.github.info"}
 
@@ -349,26 +597,18 @@ def github_info(root: str) -> dict[str, Any]:
         return payload
     payload["gh_available"] = True
 
-    auth_rc, _, _ = _gh(["auth", "status"], cwd=root)
-    authenticated = auth_rc == 0
-    payload["authenticated"] = authenticated
-    if not authenticated:
-        return payload
+    # Run the API-touching calls as the workspace's preferred account (local dev);
+    # resolving the token is local (config read + keyring), so it's always cheap.
+    token = _account_token_for(root)
 
-    rc, out, _ = _gh(["repo", "view", "--json", "nameWithOwner"], cwd=root)
-    if rc == 0:
-        try:
-            data = json.loads(out)
-            payload["repo"] = {"name_with_owner": data.get("nameWithOwner")}
-        except (ValueError, AttributeError):
-            pass
-
-    pr: dict[str, Any] | None = None
-    data = _pr_view_json(root, _PR_VIEW_FIELDS)
+    # Resolve the PR first. A hit tells us the repo (from the PR URL) and that
+    # we're authenticated, so we skip the separate `gh repo view` and the account
+    # enumeration entirely — the common case makes the fewest network calls.
+    data = _pr_view_json(root, _PR_VIEW_FIELDS, token=token)
     if data is not None:
         author = data.get("author")
         body = data.get("body")
-        pr = {
+        payload["pr"] = {
             "number": data.get("number"),
             "title": data.get("title"),
             "state": data.get("state"),
@@ -383,11 +623,208 @@ def github_info(root: str) -> dict[str, Any]:
             "body": body if isinstance(body, str) and body.strip() else None,
             "comments": _shape_comments(data.get("comments")),
         }
-    payload["pr"] = pr
+        payload["authenticated"] = True
+        payload["base_ref"] = data.get("baseRefName")
+        payload["repo"] = {"name_with_owner": _owner_repo_from_pr_url(data.get("url"))}
+        return payload
 
-    # A pure PR view: the base is the PR's base branch, else null (no PR).
-    payload["base_ref"] = pr.get("base_ref") if pr else None
+    # No PR. Probe repo reachability to tell "no PR yet" from "can't reach repo".
+    rc, out, _ = _gh(["repo", "view", "--json", "nameWithOwner"], cwd=root, token=token)
+    if rc == 0:
+        try:
+            nwo = json.loads(out).get("nameWithOwner")
+        except (ValueError, AttributeError):
+            nwo = None
+        if nwo:
+            payload["authenticated"] = True
+            payload["repo"] = {"name_with_owner": nwo}
+            return payload  # -> no-pr
+
+    # Repo unreachable / not signed in — enumerate accounts so the panel can offer
+    # the account selector (the only state where it's shown).
+    authenticated, accounts = _list_accounts(root)
+    payload["authenticated"] = authenticated
+    payload["accounts"] = accounts
+    workspace_key = _workspace_key(root)
+    pref_login = _config.github_account_preference(workspace_key) if workspace_key else None
+    active_login = next((a["login"] for a in accounts if a.get("active")), None)
+    payload["selected_account"] = pref_login or active_login
     return payload
+
+
+def _selected_pr(session_id: str, pr_url: str) -> PullRequestRef:
+    reference = PullRequestRef.from_url(pr_url)
+    for entry in SessionPrRegistry(session_id).list():
+        if entry.url == reference.url:
+            return entry
+    raise ValueError("This pull request is not associated with the session")
+
+
+def _default_pr(session_id: str | None, pr_url: str | None) -> PullRequestRef | None:
+    if session_id is None:
+        return None
+    if pr_url:
+        return _selected_pr(session_id, pr_url)
+    entries = SessionPrRegistry(session_id).list()
+    return entries[0] if entries else None
+
+
+def _pr_token(root: str, reference: PullRequestRef) -> str | None:
+    if _in_sandbox():
+        return None
+    login = _config.github_account_preference(reference.repo_argument)
+    if login:
+        return _gh_auth_token(root, login, reference.host)
+    return None
+
+
+def _pr_json(root: str, reference: PullRequestRef, fields: str) -> dict[str, Any] | None:
+    if reference.host != "github.com":
+        _, accounts = _list_accounts(root)
+        if reference.host not in {account.get("host") for account in accounts}:
+            return None
+    rc, out, _ = _gh(
+        ["pr", "view", str(reference.number), "-R", reference.repo_argument, "--json", fields],
+        cwd=root,
+        token=_pr_token(root, reference),
+    )
+    if rc != 0:
+        return None
+    try:
+        result = json.loads(out)
+    except ValueError:
+        return None
+    return result if isinstance(result, dict) else None
+
+
+def _reference_info(root: str, reference: PullRequestRef) -> dict[str, Any]:
+    info: dict[str, Any] = {
+        "object": "session.github.info",
+        "available": True,
+        "gh_available": shutil.which("gh") is not None,
+        "authenticated": False,
+        "pr": None,
+        "repo": {"name_with_owner": reference.repository},
+        "selected_pr_url": reference.url,
+    }
+    if not info["gh_available"]:
+        return info
+    _, accounts = _list_accounts(root)
+    info["accounts"] = [a for a in accounts if a.get("host") == reference.host]
+    info["selected_account"] = _config.github_account_preference(reference.repo_argument) or next(
+        (a["login"] for a in info["accounts"] if a.get("active")), None
+    )
+    data = _pr_json(root, reference, _PR_VIEW_FIELDS + ",headRefOid,baseRefOid")
+    if data is None:
+        return info
+    author = data.get("author")
+    info.update(
+        authenticated=True, branch=data.get("headRefName"), base_ref=data.get("baseRefName")
+    )
+    info["pr"] = {
+        "number": reference.number,
+        "url": reference.url,
+        "title": data.get("title"),
+        "state": data.get("state"),
+        "is_draft": data.get("isDraft", False),
+        "author": author.get("login") if isinstance(author, dict) else None,
+        "base_ref": data.get("baseRefName"),
+        "head_ref": data.get("headRefName"),
+        "head_sha": data.get("headRefOid"),
+        "base_sha": data.get("baseRefOid"),
+        "checks": _summarize_checks(data.get("statusCheckRollup")),
+        "body": data.get("body") or None,
+        "comments": _shape_comments(data.get("comments")),
+    }
+    return info
+
+
+def github_info(
+    root: str, *, session_id: str | None = None, pr_url: str | None = None
+) -> dict[str, Any]:
+    """Read the selected session PR, with branch inference for untracked sessions."""
+    if session_id is None:
+        return _workspace_github_info(root)
+    registry = SessionPrRegistry(session_id)
+    entries = registry.list()
+    if pr_url:
+        info = _reference_info(root, _selected_pr(session_id, pr_url))
+    elif entries:
+        info = _reference_info(root, entries[0])
+    else:
+        info = _workspace_github_info(root)
+        pr = info.get("pr")
+        if isinstance(pr, dict) and isinstance(pr.get("url"), str):
+            reference = PullRequestRef.from_url(pr["url"])
+            registry.record([reference], relationship="inferred", source="branch")
+            entries = registry.list()
+            if any(entry.url == reference.url for entry in entries):
+                key = _workspace_key(root)
+                account = _config.github_account_preference(key) if key else None
+                if account and not _config.github_account_preference(reference.repo_argument):
+                    _config.set_github_account_preference(reference.repo_argument, account)
+                info["selected_pr_url"] = reference.url
+            else:
+                info["pr"] = None
+    info["prs"] = [entry.model_dump() for entry in entries]
+    info["tracking_available"] = True
+    return info
+
+
+def update_session_pr(root: str, session_id: str, url: str, action: str) -> dict[str, Any]:
+    """Attach a verified PR or persist an explicit exclusion."""
+    reference = PullRequestRef.from_url(url)
+    registry = SessionPrRegistry(session_id)
+    try:
+        if action == "attach":
+            if _pr_json(root, reference, "number,url") is None:
+                raise ValueError("Cannot access this pull request using gh on the host")
+            registry.record([reference], relationship="attached", source="user")
+            return github_info(root, session_id=session_id, pr_url=reference.url)
+        if action == "remove":
+            registry.remove(reference.url)
+            return github_info(root, session_id=session_id)
+    except FileLockTimeout as exc:
+        raise ValueError("PR tracking is busy; try again.") from exc
+    raise ValueError("Expected attach or remove")
+
+
+def set_github_preference(
+    root: str,
+    *,
+    account: str | None = None,
+    remote: str | None = None,
+    session_id: str | None = None,
+    pr_url: str | None = None,
+) -> dict[str, Any]:
+    """Apply an account and/or remote selection, then return refreshed info.
+
+    The account preference is keyed per workspace (the main worktree path, shared
+    across a repo's worktrees) and persisted to the user config via
+    :func:`omnigent.config.set_github_account_preference`; an empty ``account``
+    clears the entry, falling back to ``gh``'s active account. The remote is
+    ``gh repo set-default`` (persisted by ``gh`` in ``.git/config``) — the
+    normal-case base is auto-resolved, so this is only an escape hatch.
+
+    :param root: Absolute workspace path.
+    :param account: GitHub login to prefer for this workspace, or ``None`` to
+        leave it unchanged (empty string clears it).
+    :param remote: Git remote name or ``owner/repo`` to set as the base repo, or
+        ``None`` to leave the base unchanged.
+    :returns: The refreshed :func:`github_info` payload.
+    """
+    if pr_url and session_id:
+        reference = _selected_pr(session_id, pr_url)
+        if account is not None:
+            _config.set_github_account_preference(reference.repo_argument, account or None)
+        return github_info(root, session_id=session_id, pr_url=pr_url)
+    if remote:
+        _gh(["repo", "set-default", remote], cwd=root)
+    if account is not None:
+        key = _workspace_key(root)
+        if key:
+            _config.set_github_account_preference(key, account or None)
+    return github_info(root, session_id=session_id)
 
 
 def resolve_base_ref(root: str, base: str | None) -> str | None:
@@ -443,21 +880,24 @@ _GH_STATUS_MAP = {
 }
 
 
-def _pr_number(root: str) -> int | None:
+def _pr_number(root: str, *, token: str | None = None) -> int | None:
     """Return the PR number for the workspace's branch, or ``None``.
 
     :param root: Absolute workspace path.
+    :param token: Optional GH_TOKEN to run ``gh`` as the selected account.
     :returns: The associated PR's number, or ``None`` when no PR resolves (none
         for the branch, ``gh`` missing, or not authenticated).
     """
-    data = _pr_view_json(root, "number")
+    data = _pr_view_json(root, "number", token=token)
     if data is None:
         return None
     number = data.get("number")
     return number if isinstance(number, int) else None
 
 
-def github_changed_files(root: str) -> dict[str, Any]:
+def github_changed_files(
+    root: str, *, session_id: str | None = None, pr_url: str | None = None
+) -> dict[str, Any]:
     """List the PR's changed files, straight from GitHub.
 
     Sourced from ``gh api .../pulls/<n>/files`` so the set (and each file's
@@ -469,14 +909,23 @@ def github_changed_files(root: str) -> dict[str, Any]:
         / ``status`` / ``lines_added`` / ``lines_removed``.
     """
     empty: dict[str, Any] = {"object": "list", "data": [], "has_more": False}
-    number = _pr_number(root)
+    reference = _default_pr(session_id, pr_url)
+    token = _pr_token(root, reference) if reference else _account_token_for(root)
+    number = reference.number if reference else _pr_number(root, token=token)
     if number is None:
         return empty
-    # ``{owner}`` / ``{repo}`` are filled by ``gh`` from the repo; ``--paginate``
-    # concatenates the pages of the (array) response into one JSON array.
+    repository = reference.repository if reference else "{owner}/{repo}"
+    host_args = _host_args(root, reference) if reference else []
     rc, out, _ = _gh(
-        ["api", "--paginate", f"repos/{{owner}}/{{repo}}/pulls/{number}/files?per_page=100"],
+        [
+            "api",
+            *host_args,
+            "--paginate",
+            *(["--slurp"] if reference else []),
+            f"repos/{repository}/pulls/{number}/files?per_page=100",
+        ],
         cwd=root,
+        token=token,
     )
     if rc != 0:
         return empty
@@ -487,6 +936,10 @@ def github_changed_files(root: str) -> dict[str, Any]:
     if not isinstance(entries, list):
         return empty
 
+    if reference:
+        entries = [
+            entry for page in entries for entry in (page if isinstance(page, list) else [page])
+        ]
     data: list[dict[str, Any]] = []
     for entry in entries:
         if not isinstance(entry, dict):
@@ -509,7 +962,17 @@ def github_changed_files(root: str) -> dict[str, Any]:
     return {"object": "list", "data": data, "has_more": False}
 
 
-def github_file_diff(root: str, base: str, path: str) -> dict[str, Any]:
+def github_file_diff(
+    root: str,
+    base: str,
+    path: str,
+    *,
+    session_id: str | None = None,
+    pr_url: str | None = None,
+    previous_path: str | None = None,
+    head_sha: str | None = None,
+    base_sha: str | None = None,
+) -> dict[str, Any]:
     """Return before/after content for one file, HEAD vs the base merge-base.
 
     :param root: Absolute workspace path.
@@ -520,7 +983,18 @@ def github_file_diff(root: str, base: str, path: str) -> dict[str, Any]:
         content, ``None`` for an added file) and ``after`` (HEAD content,
         ``None`` for a deleted file).
     """
-    diff_base = _resolve_diff_base(root, base)
+    reference = _default_pr(session_id, pr_url)
+    if reference:
+        return _pr_file_contents(
+            root,
+            reference,
+            path,
+            previous_path=previous_path,
+            head_sha=head_sha,
+            base_sha=base_sha,
+        )
+    resolved = resolve_base_ref(root, base or None)
+    diff_base = _resolve_diff_base(root, resolved) if resolved else None
 
     before: str | None = None
     if diff_base is not None:
@@ -541,7 +1015,9 @@ def github_file_diff(root: str, base: str, path: str) -> dict[str, Any]:
     }
 
 
-def github_pr_diff(root: str) -> dict[str, Any]:
+def github_pr_diff(
+    root: str, *, session_id: str | None = None, pr_url: str | None = None
+) -> dict[str, Any]:
     """Return the whole PR as one unified diff patch, straight from GitHub.
 
     ``gh pr diff <number>`` yields the PR's "Files changed" patch (server-computed
@@ -555,8 +1031,112 @@ def github_pr_diff(root: str) -> dict[str, Any]:
         (empty when there's no PR / no changes).
     """
     empty: dict[str, Any] = {"object": "session.github.pr_diff", "patch": ""}
-    number = _pr_number(root)
+    reference = _default_pr(session_id, pr_url)
+    token = _pr_token(root, reference) if reference else _account_token_for(root)
+    number = reference.number if reference else _pr_number(root, token=token)
     if number is None:
         return empty
-    rc, out, _ = _gh(["pr", "diff", str(number)], cwd=root)
+    if reference:
+        _host_args(root, reference)
+    repo_args = ["-R", reference.repo_argument] if reference else []
+    rc, out, _ = _gh(["pr", "diff", str(number), *repo_args], cwd=root, token=token)
     return {"object": "session.github.pr_diff", "patch": out if rc == 0 else ""}
+
+
+def _host_args(root: str, reference: PullRequestRef) -> list[str]:
+    if reference.host != "github.com":
+        _, accounts = _list_accounts(root)
+        if reference.host not in {account.get("host") for account in accounts}:
+            raise ValueError("Sign in to this GitHub host with gh before viewing its PRs")
+    return ["--hostname", reference.host]
+
+
+def _pr_api(root: str, reference: PullRequestRef, endpoint: str) -> dict[str, Any]:
+    rc, out, _ = _gh(
+        ["api", *_host_args(root, reference), endpoint],
+        cwd=root,
+        token=_pr_token(root, reference),
+    )
+    if rc != 0:
+        raise ValueError("GitHub could not load the selected PR's file content")
+    try:
+        result = json.loads(out)
+    except ValueError as exc:
+        raise ValueError("GitHub returned an unexpected file response") from exc
+    if not isinstance(result, dict):
+        raise ValueError("GitHub returned an unexpected file response")
+    return result
+
+
+def _api_string(value: object, *keys: str) -> str:
+    """Read a required nonempty string from a GitHub API response."""
+    for key in keys:
+        if not isinstance(value, dict):
+            raise ValueError("GitHub returned an unexpected file response")
+        value = value.get(key)
+    if not isinstance(value, str) or not value:
+        raise ValueError("GitHub returned an unexpected file response")
+    return value
+
+
+def _pr_file_contents(
+    root: str,
+    reference: PullRequestRef,
+    path: str,
+    *,
+    previous_path: str | None,
+    head_sha: str | None,
+    base_sha: str | None,
+) -> dict[str, Any]:
+    for candidate in (path, previous_path or path):
+        if candidate.startswith("/") or any(p in {"", ".."} for p in candidate.split("/")):
+            raise ValueError("Invalid repository-relative path")
+    pr = _pr_api(root, reference, f"repos/{reference.repository}/pulls/{reference.number}")
+    current_head = _api_string(pr, "head", "sha")
+    current_base = _api_string(pr, "base", "sha")
+    if (head_sha and head_sha != current_head) or (base_sha and base_sha != current_base):
+        raise ValueError("The pull request changed; refresh before expanding context")
+    head_repo = pr["head"].get("repo")
+    if not isinstance(head_repo, dict):
+        raise ValueError("The pull request's head repository is no longer available")
+    head_repository = _api_string(head_repo, "full_name")
+    comparison = _pr_api(
+        root,
+        reference,
+        f"repos/{reference.repository}/compare/{current_base}...{current_head}",
+    )
+    merge_base = _api_string(comparison, "merge_base_commit", "sha")
+
+    def contents(repository: str, ref: str, filename: str) -> str | None:
+        # A missing side is expected for additions/deletions. Other failures stay visible.
+        endpoint = f"repos/{repository}/contents/{quote(filename, safe='/')}?ref={quote(ref)}"
+        rc, out, err = _gh(
+            ["api", *_host_args(root, reference), endpoint],
+            cwd=root,
+            token=_pr_token(root, reference),
+        )
+        if rc != 0:
+            if "HTTP 404" in err:
+                return None
+            raise ValueError("GitHub could not load the selected file revision")
+        try:
+            value = json.loads(out)
+            if (
+                not isinstance(value, dict)
+                or value.get("encoding") != "base64"
+                or not isinstance(value.get("content"), str)
+            ):
+                raise ValueError("Unexpected file content")
+            text = base64.b64decode(value["content"]).decode("utf-8")
+            if "\x00" in text:
+                raise ValueError("Binary content")
+            return text
+        except (ValueError, UnicodeError) as exc:
+            raise ValueError("Expanded context is unavailable for this file") from exc
+
+    return {
+        "object": "session.github.file_diff",
+        "path": path,
+        "before": contents(reference.repository, merge_base, previous_path or path),
+        "after": contents(head_repository, current_head, path),
+    }

@@ -268,6 +268,11 @@ def test_terminal_typed_message_shows_author_badge_to_peers(
     bob_ctx = browser.new_context(extra_http_headers={"X-Forwarded-Email": _BOB})
     try:
         bob = bob_ctx.new_page()
+        # Attribution must work even while the Shared list is inactive.
+        bob.route(
+            "**/v1/sessions?*",
+            lambda route: route.fulfill(json={"data": [], "has_more": False}),
+        )
         bob.goto(f"{base_url}/c/{session_id}")
 
         # The committed bubble from external_conversation_item should

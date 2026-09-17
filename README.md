@@ -45,6 +45,7 @@ Omnigent lets you:
   disposable [Modal](https://modal.com), [Daytona](https://www.daytona.io),
   [Blaxel](https://blaxel.ai),
   [Islo](https://islo.dev), [E2B](https://e2b.dev),
+  [Gensee](https://gensee.ai),
   [CoreWeave](https://docs.coreweave.com/products/sandboxes),
   [Kubernetes](https://kubernetes.io), [OpenShell](https://github.com/NVIDIA/OpenShell),
   [Boxlite](https://github.com/boxlite-ai/boxlite),
@@ -110,6 +111,20 @@ Or with [Homebrew](https://github.com/omnigent-ai/homebrew-tap):
 brew install omnigent-ai/tap/omnigent
 ```
 
+For source builds on networks that require package mirrors, replace these example
+URLs with your mirrors:
+
+```bash
+HOMEBREW_PIP_INDEX_URL='https://pypi.example.com/simple' \
+HOMEBREW_CARGO_INDEX_URL='https://cargo.example.com/index/' \
+  brew install --build-from-source omnigent-ai/tap/omnigent
+```
+
+The PyPI setting also routes pip's isolated build dependencies through the mirror.
+The Cargo setting takes a sparse registry index URL ending in `/`, without the
+`sparse+` prefix. Both overrides are optional and do not affect prebuilt-bottle
+installs.
+
 Or install straight from the repo:
 
 ```bash
@@ -128,13 +143,18 @@ uv tool install -q --python 3.12 git+https://github.com/omnigent-ai/omnigent.git
   installed by `omnigent run`) and **`pnpm`** (for the web UI). You can get
   both from a single Node install; pnpm is available via
   `corepack enable` or `npm install -g pnpm`.
+- **Devin CLI** (optional), for `omnigent devin`: install with
+  `curl -fsSL https://cli.devin.ai/install.sh | bash`, then sign in with
+  `devin auth login`. Devin tool approvals appear as Chat approval cards
+  (its `PermissionRequest` hook is mirrored to the web UI) and stay
+  answerable in the embedded Terminal. See `docs/devin-native.md`.
 - **Kiro CLI** (optional), for `omnigent kiro`: install with
   `curl -fsSL https://cli.kiro.dev/install | bash`, then sign in with Kiro.
   Kiro tool approvals stay answerable in the embedded Terminal; supported
   one-time approvals also appear as Chat cards. See
   `docs/kiro-native-elicitation.md`.
 - **`tmux`**, required by the native `omnigent <harness>` terminal wrappers
-  (`claude`, `codex`, `cursor`, `hermes`, `kiro`, `pi`)
+  (`claude`, `codex`, `cursor`, `devin`, `hermes`, `kiro`, `pi`)
   (`brew install tmux` / `apt install tmux`; the installer offers
   to install it for you).
 - **`bubblewrap`** (`bwrap`), **Linux only**. The native `omnigent <harness>`
@@ -369,8 +389,10 @@ limited to 100 characters; custom title requirements may use up to 200.
 Default titles over 100 characters are rejected, leaving the first-message
 fallback title in place. Custom titles over 200 characters are truncated with
 a trailing ellipsis. Manually assigned titles are also limited to 200
-characters. The setting applies to new sessions after the local Omnigent
-server restarts.
+characters. The setting applies after the local Omnigent server restarts, both
+to new sessions and to later agent-initiated renames through `sys_session_rename`.
+Agent proposals are formatted using the same title requirements; if formatting
+fails, the existing title is preserved. Manual renames remain unchanged.
 For longer instructions, edit `~/.omnigent/config.yaml` directly and use a YAML
 block scalar:
 

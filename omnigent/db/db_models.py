@@ -23,13 +23,14 @@ from sqlalchemy import (
     TypeDecorator,
     UniqueConstraint,
     false,
+    func,
     text,
     true,
 )
 from sqlalchemy.dialects.mysql import BINARY as MySQLBinary
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
-from omnigent.db.compression import CompressedText
+from omnigent.db.compression import CompressedLargeText, CompressedText
 
 # 32-byte sha256 digest column. LargeBinary → BYTEA (Postgres) / BLOB (SQLite),
 # but MySQL cannot index a BLOB without a key-prefix length, so use fixed-length
@@ -319,6 +320,10 @@ class SqlFile(OmnigentBase):
     :param bytes: Size of the file in bytes.
     :param content_type: MIME type of the file, e.g.
         ``"application/pdf"``. ``None`` when not provided.
+    :param blob_key: Artifact-store key for this row's bytes. Normally
+        equals ``id``; a forked row points it at the source row's blob
+        so the fork shares the bytes instead of duplicating them.
+        NULL on pre-``blob_key`` rows, read as ``COALESCE(blob_key, id)``.
     """
 
     __tablename__ = "files"
@@ -337,6 +342,13 @@ class SqlFile(OmnigentBase):
     bytes: Mapped[int] = mapped_column(Integer)
     content_type: Mapped[str | None] = mapped_column(String(256), nullable=True)
     session_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    # Artifact-store key for the bytes. NULL means "under id" (pre-blob_key
+    # rows); a fork copy sets it to the source's blob so many rows share one
+    # blob. Read as COALESCE(blob_key, id); reference-count it before deleting
+    # the blob so a fork's shared bytes survive the source's deletion.
+    blob_key: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    # Opaque JSON metadata about the original upload; never SQL-filtered.
+    source_metadata: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     __table_args__ = (
         # Files are only ever listed per session (WHERE session_id = ?),
@@ -392,6 +404,10 @@ class SqlUser(OmnigentBase):
     password_hash: Mapped[str | None] = mapped_column(String(256), nullable=True)
     created_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
     last_login_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Keep the opaque preference out of routine authentication reads.
+    project_order: Mapped[str | None] = mapped_column(
+        CompressedLargeText, nullable=True, deferred=True
+    )
 
 
 class SqlAccountToken(OmnigentBase):
@@ -771,8 +787,7 @@ class SqlProject(OmnigentBase):
     __table_args__ = (
         # "list my projects" — prefix scan on (workspace_id, user_id) with
         # created_at in the key so the ORDER BY created_at, id is served by the
-        # index (no filesort). Server returns a stable order; reorder, if ever
-        # added, is a client-only concern, so there is no ``position`` column.
+        # index (no filesort). Personal display order lives in users.project_order.
         #
         # Also covers the two name lookups via its (workspace_id, user_id)
         # prefix: the store's ``_name_taken`` probe and the ``?project=<name>``
@@ -873,9 +888,10 @@ class SqlConversation(ConversationBase):
     )
 
     __table_args__ = (
-        # No bare created_at/updated_at indexes: the sessions list is ACL-scoped
-        # (id IN (...)) and resolves via the PK; the default sidebar (archived=
-        # false, updated_at DESC) is served by the archived_updated index below.
+        # Keep created_at unindexed here: ACL-selective listings may rationally
+        # use a semi-join plus sort, while an ordering index can encourage many
+        # permission probes. The default sidebar (archived=false, updated_at
+        # DESC) is served by the archived_updated index below.
         Index("ix_conversations_archived_updated", "workspace_id", "archived", "updated_at", "id"),
         Index(
             "ix_conversations_root_conversation_id",
@@ -902,6 +918,15 @@ class SqlConversation(ConversationBase):
             text("created_at DESC"),
             text("id DESC"),
         ),
+        # Session title search uses lower(title) LIKE '%query%'. Alembic owns
+        # the PostgreSQL index because its migration first enables pg_trgm;
+        # CRDB bootstrap creates its index directly from model metadata.
+        Index(
+            "ix_conversations_title_trgm",
+            func.lower(title).label("title_lower"),
+            postgresql_using="gin",
+            postgresql_ops={"title_lower": "gin_trgm_ops"},
+        ).ddl_if(dialect="cockroachdb"),
     )
 
 
@@ -1320,6 +1345,9 @@ class SqlHost(OmnigentBase):
         active host generation and awaiting successful provider termination.
         A fresh generation may be registered in ``sandbox_id`` while this
         cleanup remains pending.
+    :param deleted_at: Logical deletion timestamp for a managed host whose
+        provider sandbox cleanup is still pending. The row is physically
+        removed after every recorded sandbox id terminates successfully.
     :param configured_harnesses: JSON-encoded per-harness readiness map
         reported in the host's last ``host.hello`` frame, e.g.
         ``'{"claude-sdk": true, "codex": false}'``. ``NULL`` when the
@@ -1354,6 +1382,7 @@ class SqlHost(OmnigentBase):
     sandbox_provider: Mapped[str | None] = mapped_column(String(32), nullable=True)
     sandbox_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
     terminating_sandbox_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    deleted_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     # Opaque; never SQL-filtered — stored compressed (CompressedText).
     configured_harnesses: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
 
@@ -1367,6 +1396,13 @@ class SqlHost(OmnigentBase):
         # rotation) stays consistent.
         UniqueConstraint(
             "workspace_id", "user_id", "name", name="uq_hosts_workspace_user_id_name"
+        ),
+        Index("ix_hosts_sandbox_scan", "sandbox_id", "workspace_id", "host_id"),
+        Index(
+            "ix_hosts_terminating_sandbox_scan",
+            "terminating_sandbox_id",
+            "workspace_id",
+            "host_id",
         ),
     )
 

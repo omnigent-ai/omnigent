@@ -1,6 +1,6 @@
 import { focusManager, QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, renderHook, waitFor } from "@testing-library/react";
-import type { ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -23,12 +23,15 @@ function mockResponse(body: unknown, status = 200): Response {
   } as unknown as Response;
 }
 
-function wrapper({ children }: { children: ReactNode }) {
-  const client = new QueryClient({
-    defaultOptions: { queries: { retry: false } },
-  });
+const wrapper = function QueryWrapper({ children }: { children: ReactNode }) {
+  const [client] = useState(
+    () =>
+      new QueryClient({
+        defaultOptions: { queries: { retry: false } },
+      }),
+  );
   return <QueryClientProvider client={client}>{children}</QueryClientProvider>;
-}
+};
 
 beforeEach(() => {
   fetchMock.mockReset();
@@ -394,6 +397,23 @@ describe("useHostModelOptions", () => {
     renderHook(() => useHostModelOptions(null, "claude-native"), { wrapper });
     await Promise.resolve();
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("surfaces the host probe error from a non-OK response", async () => {
+    fetchMock.mockResolvedValue(
+      mockResponse({ detail: "the codex model probe failed — see the host log" }, 502),
+    );
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const { result } = renderHook(() => useHostModelOptions("host_1", "codex-native"), {
+        wrapper,
+      });
+      await vi.advanceTimersByTimeAsync(30_000);
+      await waitFor(() => expect(result.current.isError).toBe(true));
+      expect(result.current.error?.message).toBe("the codex model probe failed — see the host log");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("polls the host's catalog every 15 s while mounted", async () => {

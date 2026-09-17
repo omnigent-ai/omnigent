@@ -30,7 +30,7 @@ configuration and the attach command are the production ones):
    same path the codex-native runner uses), with a pane command that emits far
    more lines than the 80x24 viewport.
 2. Attach a real client PTY with the exact command ``omnigent codex`` execs in
-   ``omnigent.codex_native._attach_direct_tmux``:
+   ``omnigent.harnesses.codex_native.main._attach_direct_tmux``:
    ``tmux -S <socket> -f /dev/null attach -t main`` (with ``TMUX`` stripped).
 3. Deliver the user's scroll gestures through the attached client: Page Up,
    then SGR mouse wheel-up.
@@ -155,7 +155,7 @@ def _await_filled_history(socket_path: str) -> int:
 def _attach_native_client(socket_path: str) -> pexpect.spawn:
     """Attach a real client PTY with the production native attach command.
 
-    Mirrors ``omnigent.codex_native._attach_direct_tmux``: ``tmux -S <sock>
+    Mirrors ``omnigent.harnesses.codex_native.main._attach_direct_tmux``: ``tmux -S <sock>
     -f /dev/null attach -t main`` with ``TMUX`` stripped so an outer user tmux
     does not nest. ``TERM`` is forced because a bare CI shell may carry
     ``TERM=dumb``, which tmux refuses to attach to.

@@ -30,6 +30,7 @@ it("does not read incoming layout while flushing the outgoing view on cleanup", 
           scrollEl={scrollEl}
           lastAssistantIndex={-1}
           showsWorking={false}
+          sessionIdle={false}
           conversationId="conv-cleanup"
           hasTasks={false}
           disableVirtualization={false}

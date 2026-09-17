@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Literal
 
 from cachetools import TTLCache
 
-from omnigent.debug_logging import runner_primary_session_id
+from omnigent.debug_logging import debug_event, runner_primary_session_id
 from omnigent.entities.pagination import PagedList
 from omnigent.entities.session_resources import (
     DEFAULT_ENVIRONMENT_ID,
@@ -40,7 +40,7 @@ from omnigent.entities.session_resources import (
 from omnigent.inner.sandbox import contained_realpath, containment_prefix
 
 if TYPE_CHECKING:
-    from omnigent.claude_native_status_file import SessionStatusPoller
+    from omnigent.harnesses.claude_native.status_file import SessionStatusPoller
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
     from omnigent.inner.os_env import OSEnvironment
     from omnigent.inner.terminal import TerminalInstance
@@ -69,6 +69,35 @@ ANTIGRAVITY_NATIVE_TERMINAL_ROLE = "antigravity-native"
 QWEN_NATIVE_TERMINAL_ROLE = "qwen-native"
 KIMI_NATIVE_TERMINAL_ROLE = "kimi-native"
 HERMES_NATIVE_TERMINAL_ROLE = "hermes-native"
+DEVIN_NATIVE_TERMINAL_ROLE = "devin-native"
+
+#: Terminal roles whose PTY-activity watcher drives the session's working
+#: status (pane activity → ``running``, quiescence → ``idle``), not just the
+#: activity badge. These are the native agent terminals whose ``run_turn`` injects
+#: and returns immediately, leaving pane activity as their only running/idle
+#: source — without membership here the web "Working…" badge never clears and the
+#: turn times out. A generic shell's role is absent so its output can't move the
+#: session status. A harness whose own forwarder posts authoritative running/idle
+#: edges (devin-native, from its hook stream) is excluded instead, because pane
+#: quiescence would clobber them; ``tests/runner/test_native_terminal_lock_coverage.py``
+#: guards both sides.
+_STATUS_EMITTING_TERMINAL_ROLES: frozenset[str] = frozenset(
+    {
+        CLAUDE_NATIVE_TERMINAL_ROLE,
+        PI_NATIVE_TERMINAL_ROLE,
+        CURSOR_NATIVE_TERMINAL_ROLE,
+        KIRO_NATIVE_TERMINAL_ROLE,
+        GOOSE_NATIVE_TERMINAL_ROLE,
+        QWEN_NATIVE_TERMINAL_ROLE,
+        KIMI_NATIVE_TERMINAL_ROLE,
+        HERMES_NATIVE_TERMINAL_ROLE,
+        # devin-native is deliberately ABSENT: its hook stream carries exact turn
+        # boundaries (UserPromptSubmit -> Stop), so its forwarder posts
+        # running/idle itself. Pane quiescence would flip the session to idle
+        # after ~1s of any mid-turn lull and clobber that, which makes a follow-up
+        # bypass the queue and always steer.
+    }
+)
 # Role marker for the embedded Omnigent REPL terminal auto-created for
 # runner-hosted SDK sessions (``omnigent attach`` in a tmux pane — the
 # SDK mirror of the native terminals above). The attach WebSocket uses
@@ -1159,30 +1188,9 @@ class SessionResourceRegistry:
         exit_publisher = self._terminal_exit_publisher
         # Status edges are derived only from native agent terminals — a
         # generic shell's output must not move the session's working status.
-        emit_status = status_publisher is not None and resource_role in {
-            CLAUDE_NATIVE_TERMINAL_ROLE,
-            PI_NATIVE_TERMINAL_ROLE,
-            # cursor-native has no forwarder/hook (run_turn returns immediately
-            # after the paste), so — like pi/claude — the PTY watcher is its only
-            # status source. Without this the web "Working…" badge never clears.
-            CURSOR_NATIVE_TERMINAL_ROLE,
-            KIRO_NATIVE_TERMINAL_ROLE,
-            # goose-native injects then returns (its forwarder only mirrors the
-            # transcript, not status), so the PTY watcher is its status source too.
-            GOOSE_NATIVE_TERMINAL_ROLE,
-            # qwen-native appends then returns (its forwarder only mirrors the
-            # JSON event transcript, not status), so the PTY watcher is its
-            # status source too.
-            QWEN_NATIVE_TERMINAL_ROLE,
-            # kimi-native also has no forwarder/hook (the injection run_turn
-            # returns right after the tmux paste), so the PTY watcher is its
-            # only running/idle status source — same as cursor/pi/claude.
-            KIMI_NATIVE_TERMINAL_ROLE,
-            # hermes-native injects then returns (its forwarder only mirrors the
-            # SQLite transcript, not status), so the PTY watcher is its status
-            # source too.
-            HERMES_NATIVE_TERMINAL_ROLE,
-        }
+        emit_status = (
+            status_publisher is not None and resource_role in _STATUS_EMITTING_TERMINAL_ROLES
+        )
         if activity_publisher is None and not emit_status and exit_publisher is None:
             return
         resource_id = terminal_resource_id(terminal_name, session_key)
@@ -1382,11 +1390,11 @@ class SessionResourceRegistry:
             *blocked_on* names the dialog the agent is parked on, if any.
         :returns: A ``SessionStatusPoller`` the watcher drives per tick.
         """
-        from omnigent.claude_native_bridge import (
+        from omnigent.harnesses.claude_native.bridge import (
             bridge_dir_for_conversation_id,
             read_claude_session_id,
         )
-        from omnigent.claude_native_status_file import SessionStatusPoller
+        from omnigent.harnesses.claude_native.status_file import SessionStatusPoller
 
         bridge_dir = bridge_dir_for_conversation_id(session_id)
 
@@ -1438,7 +1446,8 @@ class SessionResourceRegistry:
         command, args_count, cwd, last_output, exit_status = _terminal_exit_diagnostics(instance)
         # Idle = clean shutdown after the turn finished. Anything else (running,
         # or never observed → boot failure) stays a failure.
-        session_was_idle = self._take_session_status_memo(session_id) == "idle"
+        session_status_before_exit = self._take_session_status_memo(session_id)
+        session_was_idle = session_status_before_exit == "idle"
 
         superseded_by: TerminalInstance | None = None
         if self._terminal_registry is not None:
@@ -1459,6 +1468,28 @@ class SessionResourceRegistry:
                     superseded_by = current
 
         publisher = self._terminal_exit_publisher
+        _logger.info(
+            "Terminal exit observed: session=%s terminal=%s:%s "
+            "lifecycle=%s status=%s superseded=%s",
+            session_id,
+            terminal_name,
+            session_key,
+            lifecycle.value,
+            session_status_before_exit or "unknown",
+            superseded_by is not None,
+            extra=debug_event(
+                "terminal_exit_observed",
+                session_id=session_id,
+                terminal_instance_id=instance.diagnostic_id if instance is not None else None,
+                terminal_id=terminal_id,
+                terminal_name=terminal_name,
+                terminal_key=session_key,
+                terminal_lifecycle=lifecycle.value,
+                session_status_before_exit=session_status_before_exit or "unknown",
+                terminal_exit_status=exit_status,
+                superseded=superseded_by is not None,
+            ),
+        )
         if superseded_by is not None:
             _logger.info(
                 "Skipping exit event for superseded terminal: session=%s terminal=%s:%s",
@@ -1501,6 +1532,17 @@ class SessionResourceRegistry:
             session_id,
         ):
             if terminal_resource_id(entry.terminal_name, entry.session_key) == terminal_id:
+                _logger.info(
+                    "Terminal close requested: session=%s terminal=%s",
+                    session_id,
+                    terminal_id,
+                    extra=debug_event(
+                        "terminal_close_requested",
+                        session_id=session_id,
+                        terminal_id=terminal_id,
+                        terminal_instance_id=entry.instance.diagnostic_id,
+                    ),
+                )
                 closed = await self._terminal_registry.close(
                     session_id,
                     entry.terminal_name,

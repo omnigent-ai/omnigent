@@ -101,8 +101,8 @@ async def test_auto_create_pi_terminal_threads_spec_model_into_models_json(
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
     """
-    import omnigent.pi_native_bridge as pi_bridge
-    import omnigent.pi_native_credentials as creds
+    import omnigent.harnesses.pi_native.bridge as pi_bridge
+    import omnigent.harnesses.pi_native.credentials as creds
 
     session_id = "conv_pi_model_e2e"
     workspace = tmp_path / "workspace"
@@ -114,7 +114,9 @@ async def test_auto_create_pi_terminal_threads_spec_model_into_models_json(
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
     monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
     # Resolve a Pi executable without requiring the real binary on PATH.
-    monkeypatch.setattr("omnigent.pi_native.resolve_pi_executable", lambda: "/usr/bin/pi")
+    monkeypatch.setattr(
+        "omnigent.harnesses.pi_native.main.resolve_pi_executable", lambda: "/usr/bin/pi"
+    )
 
     # ``resolve_pi_native_provider``'s default config_loader is bound at def
     # time, so inject the test config by patching the module symbol the runner
@@ -220,8 +222,8 @@ async def test_auto_create_pi_terminal_no_spec_model_uses_provider_default(
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
     """
-    import omnigent.pi_native_bridge as pi_bridge
-    import omnigent.pi_native_credentials as creds
+    import omnigent.harnesses.pi_native.bridge as pi_bridge
+    import omnigent.harnesses.pi_native.credentials as creds
 
     session_id = "conv_pi_model_default"
     workspace = tmp_path / "workspace"
@@ -230,7 +232,9 @@ async def test_auto_create_pi_terminal_no_spec_model_uses_provider_default(
     monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(workspace))
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
     monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
-    monkeypatch.setattr("omnigent.pi_native.resolve_pi_executable", lambda: "/usr/bin/pi")
+    monkeypatch.setattr(
+        "omnigent.harnesses.pi_native.main.resolve_pi_executable", lambda: "/usr/bin/pi"
+    )
 
     real_resolve = creds.resolve_pi_native_provider
     captured: dict[str, Any] = {}
@@ -313,8 +317,8 @@ async def test_auto_create_pi_terminal_bakes_tunnel_token_into_config(
     token. It must land in ``config.json``'s ``authHeaders`` at launch — the
     per-turn refresh runs env-scrubbed and can only preserve it, never mint it.
     """
-    import omnigent.pi_native_bridge as pi_bridge
-    import omnigent.pi_native_credentials as creds
+    import omnigent.harnesses.pi_native.bridge as pi_bridge
+    import omnigent.harnesses.pi_native.credentials as creds
     from omnigent.runner.identity import (
         RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
         RUNNER_TUNNEL_TOKEN_HEADER,
@@ -329,7 +333,9 @@ async def test_auto_create_pi_terminal_bakes_tunnel_token_into_config(
     # No Databricks bearer (guest-on-shared-host), but a tunnel binding token.
     monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
     monkeypatch.setenv(RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR, "tok-abc")
-    monkeypatch.setattr("omnigent.pi_native.resolve_pi_executable", lambda: "/usr/bin/pi")
+    monkeypatch.setattr(
+        "omnigent.harnesses.pi_native.main.resolve_pi_executable", lambda: "/usr/bin/pi"
+    )
 
     real_resolve = creds.resolve_pi_native_provider
 

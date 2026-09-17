@@ -38,7 +38,7 @@ cost while weakening a signal that already works.
 The fallback asks the CLI rather than inspecting
 ``~/.gemini/antigravity-cli/settings.json`` because omnigent's own CLI launch
 path creates that file under the real home before agy ever starts
-(:func:`omnigent.antigravity_native_bridge.ensure_agy_feedback_survey_disabled`).
+(:func:`omnigent.harnesses.antigravity_native.bridge.ensure_agy_feedback_survey_disabled`).
 Its presence proves only that omnigent ran, not that anyone signed in, so
 keying on it would leave the credential gate permanently satisfied. Nothing
 omnigent writes can make ``agy models`` exit 0.

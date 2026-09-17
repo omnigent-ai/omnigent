@@ -33,7 +33,7 @@ from tests.e2e.omnigent._pexpect_harness import (
     ensure_repl_test_theme_env,
     submit_prompt,
 )
-from tests.e2e.omnigent.conftest import configure_mock_llm
+from tests.e2e.omnigent.conftest import configure_mock_llm, set_fallback_mock_llm
 
 _MODEL = "mock-session-lifecycle"
 _HARNESS = "openai-agents"
@@ -887,6 +887,7 @@ async def test_repl_reasoning_effort_threads_through(
         [{"text": "SESSION_REASONING_OK"}],
         key=_MODEL,
     )
+    set_fallback_mock_llm(mock_llm_server_url, _MODEL, "SESSION_REASONING_OK")
     with _running_server(omnigent_python, omnigent_repo_root, env, tmp_path) as server:
         from omnigent.cli import _bundle
 
@@ -896,7 +897,10 @@ async def test_repl_reasoning_effort_threads_through(
             omnigent_repo_root,
             yaml_path,
             tmp_path,
-            extra_env={k: env[k] for k in ("OPENAI_BASE_URL", "OPENAI_API_KEY") if k in env},
+            extra_env={
+                key: env[key]
+                for key in ("OPENAI_BASE_URL", "OPENAI_API_KEY", "OMNIGENT_CONFIG_HOME")
+            },
         ) as runner_id:
             async with OmnigentClient(base_url=server.base_url) as client:
                 created = await client.sessions.create(bundle, reasoning_effort="high")

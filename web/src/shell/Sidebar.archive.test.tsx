@@ -1,9 +1,13 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
+import { SidebarDataProvider } from "@/hooks/useSidebarData";
 // Tests for the archive flow in the sidebar. Contract: archiving sends ONLY
 // the archive PATCH (`archived: true`) — no client stop. The row leaves the
 // sidebar optimistically (useArchiveConversation flips the cached `archived`
 // flag in onMutate; the list filters archived rows out client-side), so there
 // is no "Archiving…" status row — the row simply unmounts, like delete's. The
-// only mutate-level callback is the success toast pointing at Settings.
+// only synchronous side effect is the Undo pill (which also links to Settings).
 // The runner stop is the server's job once the flag commits — a client stop
 // would race the server's against the same runner, and put the runner's stop
 // timeouts in front of the flag flip. The kebab's user-facing "Stop session"
@@ -18,7 +22,6 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
 // Controllable archive + stop mutations, declared via vi.hoisted so the
@@ -112,12 +115,14 @@ function renderSidebar() {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={qc}>
-      <TooltipProvider>
-        <MemoryRouter initialEntries={["/"]}>
-          <Sidebar open={true} onClose={vi.fn()} />
-          <Toaster />
-        </MemoryRouter>
-      </TooltipProvider>
+      <SidebarDataProvider>
+        <TooltipProvider>
+          <MemoryRouter initialEntries={["/"]}>
+            <Sidebar open={true} onClose={vi.fn()} />
+            <Toaster />
+          </MemoryRouter>
+        </TooltipProvider>
+      </SidebarDataProvider>
     </QueryClientProvider>,
   );
 }
@@ -167,16 +172,21 @@ describe("archive flow", () => {
     expect(screen.getByRole("link", { name: /My Session/ })).toBeInTheDocument();
   });
 
-  it("toasts a pointer to Settings on archive", async () => {
+  it("shows an Undo pill (with a Settings link) on archive", async () => {
     mockConversations([CONV]);
     renderSidebar();
     clickArchive();
 
     // The toast fires synchronously on click (the row is about to unmount, so
     // it can't wait for a mutate callback) — no need to drive onSuccess.
-    const toast = await screen.findByTestId("toast");
-    expect(within(toast).getByText(/View archived sessions in/)).toBeInTheDocument();
-    expect(within(toast).getByRole("link", { name: "Settings" })).toHaveAttribute(
+    const toast = await screen.findByTestId("archive-undo-toast");
+    // Singular copy for one session — never "session(s)".
+    expect(toast).toHaveTextContent("Archived 1 session.");
+    // Undo is the prominent action: bold + underlined per the design.
+    const undo = within(toast).getByTestId("archive-undo-button");
+    expect(undo).toHaveClass("font-bold", "underline");
+    // The Settings pointer is kept alongside Undo.
+    expect(within(toast).getByRole("link", { name: "View in Settings" })).toHaveAttribute(
       "href",
       "/settings/archived",
     );

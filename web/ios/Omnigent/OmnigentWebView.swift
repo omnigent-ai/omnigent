@@ -6,6 +6,7 @@ struct OmnigentWebView: UIViewRepresentable {
   let initialURL: URL
   @ObservedObject var model: WebViewModel
   @ObservedObject var settings: SettingsStore
+  let databricksInternalFeaturesEnabled: Bool
   let loadFailed: (URL, String) -> Void
   let loadSucceeded: () -> Void
   /// Compose and push the current server-picker payload to the SPA.
@@ -15,6 +16,18 @@ struct OmnigentWebView: UIViewRepresentable {
   let requestSwitchServer: (String) -> Void
   /// Return the shell to its "connect to server" setup page.
   let openServerSetup: () -> Void
+
+  static func connectionErrorMessage(
+    for error: Error, databricksInternalFeaturesEnabled: Bool
+  ) -> String {
+    let nsError = error as NSError
+    if databricksInternalFeaturesEnabled, nsError.domain == NSURLErrorDomain,
+      [NSURLErrorCannotFindHost, NSURLErrorDNSLookupFailed].contains(nsError.code)
+    {
+      return "Couldn’t reach the server. Check your device’s compliance status in Jamf."
+    }
+    return error.localizedDescription
+  }
 
   func makeCoordinator() -> Coordinator {
     Coordinator(self)
@@ -520,7 +533,8 @@ struct OmnigentWebView: UIViewRepresentable {
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
       if let url = webView.url,
         ["http", "https"].contains(url.scheme?.lowercased() ?? ""),
-        url.omnigentOrigin != pinnedOrigin
+        url.omnigentOrigin != pinnedOrigin,
+        !usesInWebViewAuth(pinnedOrigin)
       {
         webView.stopLoading()
         startLogin(in: webView)
@@ -618,6 +632,21 @@ struct OmnigentWebView: UIViewRepresentable {
         ["http", "https"].contains(scheme),
         url.omnigentOrigin != pinnedOrigin
       {
+        if usesInWebViewAuth(pinnedOrigin) {
+          // Databricks authentication sets its session cookies through the
+          // WebView redirect chain. Keep IdP interactions inline, but preserve
+          // normal external-link behavior for links tapped on the app page.
+          if webView.url?.omnigentOrigin == pinnedOrigin,
+            navigationAction.navigationType == .linkActivated
+          {
+            openExternal(url)
+            decisionHandler(.cancel)
+          } else {
+            decisionHandler(.allow)
+          }
+          return
+        }
+
         if navigationAction.navigationType == .linkActivated {
           openExternal(url)
         } else {
@@ -747,7 +776,11 @@ struct OmnigentWebView: UIViewRepresentable {
 
       let failedURL = failedURL(from: nsError) ?? webView.url ?? pinnedURL ?? parent.initialURL
       guard failedURL.omnigentOrigin == pinnedOrigin else { return }
-      parent.loadFailed(failedURL, error.localizedDescription)
+      parent.loadFailed(
+        failedURL,
+        OmnigentWebView.connectionErrorMessage(
+          for: error, databricksInternalFeaturesEnabled: parent.databricksInternalFeaturesEnabled)
+      )
     }
 
     private func publishModelChanges(_ update: @escaping @MainActor (WebViewModel) -> Void) {

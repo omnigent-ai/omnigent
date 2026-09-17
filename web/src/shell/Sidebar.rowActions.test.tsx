@@ -1,3 +1,7 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
+import { SidebarDataProvider } from "@/hooks/useSidebarData";
 // Tests for the sidebar conversation-row quick actions:
 //   1. A desktop quick pin/unpin button (`quick-pin-conversation`) and a
 //      mobile-only kebab Pin item (`pin-conversation`) — two affordances for
@@ -10,7 +14,6 @@ import { useSyncExternalStore } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ServerInfo } from "@/lib/capabilities";
 import type * as IdentityModule from "@/lib/identity";
@@ -142,6 +145,12 @@ vi.mock("@/hooks/useConversations", () => ({
 vi.mock("./AgentTypeFilter", () => ({ AgentTypeFilter: () => null }));
 vi.mock("./ReportIssueButton", () => ({ ReportIssueButton: () => null }));
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
+vi.mock("./ForkSessionDialog", () => ({
+  ForkSessionDialog: ({ open, sourceSessionId }: { open: boolean; sourceSessionId: string }) =>
+    open ? (
+      <div data-testid="fork-session-dialog" data-source-session-id={sourceSessionId} />
+    ) : null,
+}));
 // Force a multi-user (non-local) server so the "Shared with me" tab renders —
 // jsdom's default loopback origin would otherwise read as single-user and hide
 // the tabs the shared-session row actions rely on.
@@ -236,17 +245,19 @@ function renderSidebar(activeId?: string, info?: ServerInfo) {
     const sidebar = <Sidebar open={true} onClose={vi.fn()} />;
     const tree = (
       <QueryClientProvider client={qc}>
-        <TooltipProvider>
-          <MemoryRouter initialEntries={[activeId ? `/c/${activeId}` : "/"]}>
-            {activeId ? (
-              <Routes>
-                <Route path="/c/:conversationId" element={sidebar} />
-              </Routes>
-            ) : (
-              sidebar
-            )}
-          </MemoryRouter>
-        </TooltipProvider>
+        <SidebarDataProvider>
+          <TooltipProvider>
+            <MemoryRouter initialEntries={[activeId ? `/c/${activeId}` : "/"]}>
+              {activeId ? (
+                <Routes>
+                  <Route path="/c/:conversationId" element={sidebar} />
+                </Routes>
+              ) : (
+                sidebar
+              )}
+            </MemoryRouter>
+          </TooltipProvider>
+        </SidebarDataProvider>
       </QueryClientProvider>
     );
     // No explicit info → CapabilitiesContext default ("loading"), matching
@@ -1133,6 +1144,18 @@ describe("mark as unread", () => {
 });
 
 describe("right-click context menu", () => {
+  it("opens the fork dialog for the selected session", () => {
+    renderSidebar();
+
+    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Fork" }));
+
+    expect(screen.getByTestId("fork-session-dialog")).toHaveAttribute(
+      "data-source-session-id",
+      "conv_1",
+    );
+  });
+
   it("opens the same action items as the kebab and drives the same handlers", () => {
     renderSidebar();
 
@@ -1338,11 +1361,13 @@ describe("peek mode row menu", () => {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     render(
       <QueryClientProvider client={qc}>
-        <TooltipProvider>
-          <MemoryRouter>
-            <Sidebar open={false} peek onClose={onClose} />
-          </MemoryRouter>
-        </TooltipProvider>
+        <SidebarDataProvider>
+          <TooltipProvider>
+            <MemoryRouter>
+              <Sidebar open={false} peek onClose={onClose} />
+            </MemoryRouter>
+          </TooltipProvider>
+        </SidebarDataProvider>
       </QueryClientProvider>,
     );
     return { onClose };

@@ -43,6 +43,7 @@
 		B40000000000000000000002 /* SnapshotHelper.swift in Sources */ = {isa = PBXBuildFile; fileRef = A40000000000000000000002 /* SnapshotHelper.swift */; };
 		B40000000000000000000003 /* RedirectConsentUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A40000000000000000000003 /* RedirectConsentUITests.swift */; };
 		B40000000000000000000005 /* ManagedServersUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A40000000000000000000005 /* ManagedServersUITests.swift */; };
+		B2000000000000000000000A /* ConnectionErrorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000000A /* ConnectionErrorTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -103,6 +104,7 @@
 		A40000000000000000000005 /* ManagedServersUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ManagedServersUITests.swift; sourceTree = "<group>"; };
 		A30000000000000000000001 /* Omnigent.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Omnigent.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		A30000000000000000000002 /* OmnigentTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = OmnigentTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		A2000000000000000000000A /* ConnectionErrorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectionErrorTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -193,6 +195,7 @@
 				A20000000000000000000008 /* WorkspaceChromeScriptTests.swift */,
 				A20000000000000000000006 /* MockHTTPServer.swift */,
 				A20000000000000000000009 /* OidcLoginManagerTests.swift */,
+				A2000000000000000000000A /* ConnectionErrorTests.swift */,
 			);
 			path = OmnigentTests;
 			sourceTree = "<group>";
@@ -382,6 +385,7 @@
 				B20000000000000000000008 /* WorkspaceChromeScriptTests.swift in Sources */,
 				B20000000000000000000006 /* MockHTTPServer.swift in Sources (OmnigentTests) */,
 				B20000000000000000000009 /* OidcLoginManagerTests.swift in Sources */,
+				B2000000000000000000000A /* ConnectionErrorTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -548,7 +552,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 0.1.2;
+				MARKETING_VERSION = 0.2.0;
 				PRODUCT_BUNDLE_IDENTIFIER = ai.omnigent.ios;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				PROVISIONING_PROFILE_SPECIFIER = "";
@@ -579,7 +583,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 0.1.2;
+				MARKETING_VERSION = 0.2.0;
 				PRODUCT_BUNDLE_IDENTIFIER = ai.omnigent.ios;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				PROVISIONING_PROFILE_SPECIFIER = "";

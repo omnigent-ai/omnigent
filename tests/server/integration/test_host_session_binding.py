@@ -667,7 +667,7 @@ async def test_managed_session_create_validator_errors_serialize_as_422(
     # The list-of-errors shape with a human-readable msg is what
     # describeCreateError picks the message from.
     assert isinstance(detail, list) and len(detail) == 1
-    assert "takes a git repository URL" in detail[0]["msg"]
+    assert "git repository URL" in detail[0]["msg"]
 
 
 async def test_managed_session_create_rejects_unconfigured_provider(
@@ -1328,6 +1328,7 @@ async def test_managed_wake_fails_when_runner_never_reconnects(
     session_id = "1a9de2e74d453be7cd665c5290b481b9"
     conv = SimpleNamespace(
         id=session_id,
+        labels={},
         host_id="cae8b33eab0bd659c87b00dd29946ade",
         workspace="/root/workspace",
         agent_id=None,
@@ -1730,7 +1731,7 @@ async def test_delete_reaped_managed_session_removes_durable_host(
         sandbox_id="sb-reaped-delete",
         expected_updated_at=host.updated_at,
     )
-    assert env.host_store.mark_terminating_sandbox_terminated(
+    assert env.host_store.mark_sandbox_terminated(
         host.host_id,
         sandbox_id="sb-reaped-delete",
     )

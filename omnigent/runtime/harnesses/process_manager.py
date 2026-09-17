@@ -39,9 +39,11 @@ from typing import Any
 import httpx
 
 from omnigent._platform import IS_WINDOWS
+from omnigent.debug_logging import debug_event
 from omnigent.harness_plugins import missing_install_packages
 from omnigent.inner import _proc
 from omnigent.inner._subprocess_lifecycle import close_subprocess_transport
+from omnigent.inner.agent_env import strip_desktop_session_env
 from omnigent.runner.identity import strip_runner_auth_secrets
 from omnigent.runtime.harnesses import _HARNESS_MODULES
 from omnigent.runtime.harnesses._harness_zygote_client import (
@@ -503,8 +505,8 @@ def _build_harness_spawn_env(env: dict[str, str] | None) -> dict[str, str]:
     Build the environment for a spawned harness subprocess.
 
     Inherits the runner's ``os.environ`` (PATH / HOME / PYTHONPATH /
-    provider creds), layers the caller's per-spawn overrides on top, then
-    strips the runner-auth secrets: the harness runs the agent's
+    provider creds) without ambient desktop-session variables, then layers
+    explicit per-spawn grants on top and strips runner-auth secrets: the harness runs the agent's
     (potentially untrusted) payload and must never see the tunnel binding
     token. Always returns an explicit dict — ``env=None`` to
     ``create_subprocess_exec`` would inherit the full env and re-leak the
@@ -513,9 +515,11 @@ def _build_harness_spawn_env(env: dict[str, str] | None) -> dict[str, str]:
     :param env: Per-spawn overrides merged over ``os.environ`` (caller
         keys win), e.g. ``{"HARNESS_CLAUDE_SDK_MODEL": "claude-opus-4-6"}``.
         ``None`` means no overrides.
-    :returns: The harness subprocess environment, runner-auth secrets removed.
+    :returns: The harness environment with explicit desktop grants and no runner-auth secrets.
     """
-    merged = {**os.environ, **env} if env else dict(os.environ)
+    merged = strip_desktop_session_env(os.environ)
+    if env:
+        merged.update(env)
     return strip_runner_auth_secrets(merged)
 
 
@@ -564,6 +568,9 @@ class HarnessProcessManager:
         # Pre-allocate the instance dir path so it stays stable
         # across re-entrant ``start()`` calls (idempotent boot).
         self._instance_dir = self._tmp_parent / f"ap-{uuid.uuid4().hex}"
+        # Monotonic clock at ``start()``; the harness_started event reports each
+        # spawn's readiness latency relative to it (harness boot vs manager boot).
+        self._started_at: float | None = None
         self._entries: dict[str, _SubprocessEntry] = {}
         # Per-conversation in-flight harness response_id. The runner's
         # ``proxy_stream`` populates it via :meth:`mark_in_flight` when
@@ -679,6 +686,7 @@ class HarnessProcessManager:
             name="harness-process-manager-idle-reaper",
         )
         self._started = True
+        self._started_at = time.monotonic()
         _logger.info(
             "HarnessProcessManager started; instance_dir=%s",
             self._instance_dir,
@@ -775,6 +783,18 @@ class HarnessProcessManager:
                     entry.harness,
                     conversation_id,
                     entry.process.returncode,
+                    extra={
+                        "session_id": conversation_id,
+                        "event_name": "harness_exit_detected",
+                        "attributes": {
+                            "harness": entry.harness,
+                            "pid": entry.process.pid,
+                            "returncode": entry.process.returncode,
+                            "tracked_response_id": self._in_flight_response_ids.get(
+                                conversation_id
+                            ),
+                        },
+                    },
                 )
                 await self._close_entry(entry)
                 entry = None
@@ -1232,9 +1252,32 @@ class HarnessProcessManager:
             "--parent-pid",
             str(parent_pid),
         ]
+        spawn_started_at = time.monotonic()
         process = await self._spawn_harness_process(runner_argv, effective_env)
         try:
             await _wait_for_bind(process, endpoint, harness, conversation_id)
+            # The harness process has bound its socket and is ready to serve —
+            # the observable "harness started" edge. Report the spawn->ready
+            # latency; on a cold runner the first spawn's manager-relative
+            # latency is the runner_start -> harness_started interval.
+            _now = time.monotonic()
+            _logger.info(
+                "harness started for conversation %s (harness=%s)",
+                conversation_id,
+                harness,
+                extra=debug_event(
+                    "harness_started",
+                    session_id=conversation_id,
+                    harness=harness,
+                    pid=process.pid,
+                    spawn_ms=int((_now - spawn_started_at) * 1000),
+                    since_manager_start_ms=(
+                        int((_now - self._started_at) * 1000)
+                        if self._started_at is not None
+                        else None
+                    ),
+                ),
+            )
 
             # ``base_url`` is required for relative-URL routing; the
             # actual host portion is irrelevant under uds transport,

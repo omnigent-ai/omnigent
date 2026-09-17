@@ -1,3 +1,7 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
+import { SidebarDataProvider } from "@/hooks/useSidebarData";
 // Tests for the Inbox page (`/inbox`) — the cross-session list of pending
 // approval prompts and unseen file comments.
 //
@@ -14,7 +18,6 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { InboxPage } from "./InboxPage";
 import type { Conversation } from "@/hooks/useConversations";
 import * as conversationsHook from "@/hooks/useConversations";
@@ -30,18 +33,28 @@ vi.mock("@/components/blocks/ApprovalCard", () => ({
     elicitationId,
     message,
     status,
+    allowAutoMode,
     onSubmit,
   }: {
     elicitationId: string;
     message: string;
     status: string;
-    onSubmit: (id: string, action: "accept" | "decline") => void;
+    allowAutoMode?: boolean;
+    onSubmit: (id: string, action: "accept" | "decline", content?: Record<string, unknown>) => void;
   }) => (
     <div data-testid="approval-card" data-status={status}>
       <span>{message}</span>
       <button type="button" onClick={() => onSubmit(elicitationId, "accept")}>
         Stub Accept
       </button>
+      {allowAutoMode && (
+        <button
+          type="button"
+          onClick={() => onSubmit(elicitationId, "accept", { allow_auto_mode: true })}
+        >
+          Stub Auto Mode
+        </button>
+      )}
     </div>
   ),
 }));
@@ -106,9 +119,11 @@ function renderPage() {
   });
   return render(
     <QueryClientProvider client={queryClient}>
-      <MemoryRouter>
-        <InboxPage />
-      </MemoryRouter>
+      <SidebarDataProvider>
+        <MemoryRouter>
+          <InboxPage />
+        </MemoryRouter>
+      </SidebarDataProvider>
     </QueryClientProvider>,
   );
 }
@@ -147,18 +162,17 @@ describe("InboxPage states", () => {
     expect(await screen.findByText("Nothing waiting on you")).toBeInTheDocument();
   });
 
-  it("does not show the empty state while more pages are still draining", () => {
+  it("offers manual loading when older sessions remain", () => {
     // WHY: `hasNextPage` keeps the inbox in the assembling state — an empty
     // `items` then only means "not done paging", so no empty state.
     vi.mocked(conversationsHook.useConversations).mockReturnValue(
       conversationsStub([], { hasNextPage: true }),
     );
     renderPage();
-    expect(screen.queryByText("Nothing waiting on you")).not.toBeInTheDocument();
-    expect(screen.getByText("Loading inbox…")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Load more sessions" })).toBeInTheDocument();
   });
 
-  it("drains remaining list pages while mounted", () => {
+  it("loads additional scope pages only after a click", async () => {
     // WHY: an awaiting session may sit below the first page, so the inbox
     // calls fetchNextPage whenever another page is available.
     const fetchNextPage = vi.fn();
@@ -166,7 +180,9 @@ describe("InboxPage states", () => {
       conversationsStub([], { hasNextPage: true, fetchNextPage }),
     );
     renderPage();
-    expect(fetchNextPage).toHaveBeenCalled();
+    expect(fetchNextPage).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Load more sessions" }));
+    await waitFor(() => expect(fetchNextPage).toHaveBeenCalled());
   });
 });
 
@@ -240,6 +256,29 @@ describe("InboxPage approval items", () => {
     );
   });
 
+  it("offers auto mode from a snapshot and sends the choice to the owning session", async () => {
+    const row = conversation({ id: "parent" });
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([row]));
+    vi.mocked(sessionsApi.getSession).mockResolvedValue({
+      pendingElicitations: [
+        rawElicitation("eli_auto", "Claude needs permission", {
+          target_session_id: "child",
+          allow_auto_mode: true,
+        }),
+      ],
+    } as unknown as Awaited<ReturnType<typeof sessionsApi.getSession>>);
+    renderPage();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Stub Auto Mode" }));
+    await waitFor(() =>
+      expect(sessionsApi.approve).toHaveBeenCalledWith("child", "eli_auto", {
+        action: "accept",
+        content: { allow_auto_mode: true },
+      }),
+    );
+    expect(screen.getByTestId("approval-card")).toHaveAttribute("data-status", "responded");
+  });
+
   it("rolls back the optimistic verdict when approve() rejects", async () => {
     // WHY: a failed resolve POST deletes the responded entry so the card
     // returns to pending and the user can retry.
@@ -274,9 +313,11 @@ describe("InboxPage approval items", () => {
     });
     const { rerender } = render(
       <QueryClientProvider client={queryClient}>
-        <MemoryRouter>
-          <InboxPage />
-        </MemoryRouter>
+        <SidebarDataProvider>
+          <MemoryRouter>
+            <InboxPage />
+          </MemoryRouter>
+        </SidebarDataProvider>
       </QueryClientProvider>,
     );
 
@@ -296,9 +337,11 @@ describe("InboxPage approval items", () => {
     vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([updatedRow]));
     rerender(
       <QueryClientProvider client={queryClient}>
-        <MemoryRouter>
-          <InboxPage />
-        </MemoryRouter>
+        <SidebarDataProvider>
+          <MemoryRouter>
+            <InboxPage />
+          </MemoryRouter>
+        </SidebarDataProvider>
       </QueryClientProvider>,
     );
 

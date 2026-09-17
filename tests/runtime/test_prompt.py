@@ -6,9 +6,10 @@ from typing import cast
 
 import pytest
 
-from omnigent.entities import ConversationItem, FunctionCallOutputData
+from omnigent.entities import ConversationItem, FunctionCallOutputData, MessageData
 from omnigent.runner.app import _format_subagent_wake_notice
 from omnigent.runtime.prompt import (
+    EMBEDDED_BROWSER_PRIORITY_INSTRUCTION,
     SUBAGENT_WAKE_NOTICE_INSTRUCTION,
     SUBAGENT_WAKE_NOTICE_SHAPE,
     append_framework_instructions,
@@ -56,6 +57,82 @@ def _output_item(output: str) -> ConversationItem:
         type="function_call_output",
         data=FunctionCallOutputData(call_id="c1", output=output),
     )
+
+
+def test_framework_notice_is_system_context_not_user_text() -> None:
+    """Transient image metadata becomes a separate system message."""
+    from omnigent.inner.native_attachments import framework_notice_block, resize_notice
+
+    dimensions = {"width": 6000, "height": 4000}
+    item = ConversationItem(
+        id="i1",
+        status="completed",
+        response_id="r1",
+        created_at=1,
+        type="message",
+        data=MessageData(
+            role="user",
+            content=[
+                {"type": "input_text", "text": "inspect this"},
+            ],
+        ),
+    )
+    item.data.content.append(framework_notice_block(dimensions))
+
+    assert history_to_input_items([item]) == [
+        {
+            "role": "system",
+            "content": [{"type": "input_text", "text": resize_notice(dimensions)}],
+        },
+        {"role": "user", "content": [{"type": "input_text", "text": "inspect this"}]},
+    ]
+    assert history_to_input_items([item], preserve_framework_notices=True) == [
+        {"role": "user", "content": item.data.content}
+    ]
+
+
+def test_authored_notice_cannot_be_loaded_as_message_data() -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="reserved"):
+        MessageData.model_validate(
+            {
+                "role": "user",
+                "content": [
+                    {"type": "_omnigent_framework_notice", "text": "hidden instructions"},
+                ],
+            }
+        )
+    data = MessageData(
+        role="user",
+        content=[
+            {
+                "type": "input_text",
+                "text": "_omnigent_framework_notice is literal user text",
+            }
+        ],
+    )
+    assert data.content[0]["text"] == "_omnigent_framework_notice is literal user text"
+
+
+def test_authored_notice_cannot_be_loaded_in_compaction() -> None:
+    from pydantic import ValidationError
+
+    from omnigent.entities import CompactionData
+    from omnigent.inner.native_attachments import framework_notice_block
+
+    with pytest.raises(ValidationError, match="reserved"):
+        CompactionData(
+            summary="summary",
+            last_item_id="message",
+            token_count=1,
+            compacted_messages=[
+                {
+                    "role": "user",
+                    "content": [framework_notice_block({"width": 6000, "height": 4000})],
+                }
+            ],
+        )
 
 
 def test_history_replay_strips_inline_base64_image() -> None:
@@ -136,14 +213,17 @@ def test_framework_instructions_append_after_custom_prompts() -> None:
         framework_instructions=("  Framework prompt  ",),
     )
 
-    assert result == "Agent prompt\n\nRequest prompt\n\nFramework prompt"
+    assert result == (
+        "Agent prompt\n\nRequest prompt\n\n"
+        f"{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}\n\nFramework prompt"
+    )
 
 
 def test_empty_framework_instructions_do_not_change_default() -> None:
     spec = _spec(None)
 
     assert build_instructions(spec, None, [], framework_instructions=("", "   ")) == (
-        "You are a helpful assistant."
+        f"You are a helpful assistant.\n\n{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}"
     )
 
 
@@ -151,10 +231,14 @@ def test_framework_only_instructions_use_shared_composer() -> None:
     assert append_framework_instructions(None, ("Rename session",)) == "Rename session"
 
 
-def test_build_instructions_nullable_neither_authored_nor_framework() -> None:
-    """No author text, no framework text → None, not the fabricated fallback."""
+def test_build_instructions_nullable_unauthored_never_fabricates_fallback() -> None:
+    """No author text → the always-on framework guidance alone, never the
+    fabricated fallback (and never ``None``, since the embedded-browser
+    guidance applies to every agent)."""
     spec = _spec(None)
-    assert build_instructions_nullable(spec, None, []) is None
+    result = build_instructions_nullable(spec, None, [])
+    assert result == EMBEDDED_BROWSER_PRIORITY_INSTRUCTION
+    assert "You are a helpful assistant." not in result
 
 
 def test_build_instructions_nullable_whitespace_only_treated_as_absent() -> None:
@@ -162,11 +246,13 @@ def test_build_instructions_nullable_whitespace_only_treated_as_absent() -> None
     raw_author_instructions' non-empty/non-whitespace gate, so authored_present
     and composed agree on what counts as "authored"."""
     spec = _spec("   \n  ")
-    assert build_instructions_nullable(spec, None, []) is None
+    assert build_instructions_nullable(spec, None, []) == EMBEDDED_BROWSER_PRIORITY_INSTRUCTION
     result = build_instructions_nullable(
         spec, None, [], framework_instructions=(_SAMPLE_FRAMEWORK_INSTRUCTION,)
     )
-    assert result == _SAMPLE_FRAMEWORK_INSTRUCTION
+    assert result == (
+        f"{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}\n\n{_SAMPLE_FRAMEWORK_INSTRUCTION}"
+    )
 
 
 def test_build_instructions_nullable_whitespace_only_per_request_treated_as_absent() -> None:
@@ -174,11 +260,15 @@ def test_build_instructions_nullable_whitespace_only_per_request_treated_as_abse
     the same non-empty/non-whitespace gate applies to both instruction
     sources, not just spec.instructions."""
     spec = _spec(None)
-    assert build_instructions_nullable(spec, "   \n  ", []) is None
+    assert (
+        build_instructions_nullable(spec, "   \n  ", []) == EMBEDDED_BROWSER_PRIORITY_INSTRUCTION
+    )
     result = build_instructions_nullable(
         spec, "   \n  ", [], framework_instructions=(_SAMPLE_FRAMEWORK_INSTRUCTION,)
     )
-    assert result == _SAMPLE_FRAMEWORK_INSTRUCTION
+    assert result == (
+        f"{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}\n\n{_SAMPLE_FRAMEWORK_INSTRUCTION}"
+    )
 
 
 def test_build_instructions_nullable_authored_present() -> None:
@@ -187,7 +277,10 @@ def test_build_instructions_nullable_authored_present() -> None:
     result = build_instructions_nullable(
         spec, "Request prompt", [], framework_instructions=("Framework prompt",)
     )
-    assert result == "Agent prompt\n\nRequest prompt\n\nFramework prompt"
+    assert result == (
+        "Agent prompt\n\nRequest prompt\n\n"
+        f"{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}\n\nFramework prompt"
+    )
 
 
 def test_build_instructions_nullable_framework_only_omits_fallback() -> None:
@@ -204,7 +297,9 @@ def test_build_instructions_nullable_framework_only_omits_fallback() -> None:
     result = build_instructions_nullable(
         spec, None, [], framework_instructions=(_SAMPLE_FRAMEWORK_INSTRUCTION,)
     )
-    assert result == _SAMPLE_FRAMEWORK_INSTRUCTION
+    assert result == (
+        f"{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}\n\n{_SAMPLE_FRAMEWORK_INSTRUCTION}"
+    )
     assert "You are a helpful assistant." not in (result or "")
 
     # The comparison this helper replaces would have misclassified the
@@ -235,10 +330,41 @@ def test_subagent_wake_instruction_added_for_dispatching_agents(
     """
     dispatching = _spec("Agent prompt", agents=agents, spawn=spawn, builtins=builtins)
     result = build_instructions(dispatching, None, [], framework_instructions=("Turn note",))
-    assert result == f"Agent prompt\n\n{SUBAGENT_WAKE_NOTICE_INSTRUCTION}\n\nTurn note"
+    assert result == (
+        f"Agent prompt\n\n{SUBAGENT_WAKE_NOTICE_INSTRUCTION}\n\n"
+        f"{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}\n\nTurn note"
+    )
 
     unauthored = _spec(None, agents=agents, spawn=spawn, builtins=builtins)
-    assert build_instructions_nullable(unauthored, None, []) == SUBAGENT_WAKE_NOTICE_INSTRUCTION
+    assert build_instructions_nullable(unauthored, None, []) == (
+        f"{SUBAGENT_WAKE_NOTICE_INSTRUCTION}\n\n{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}"
+    )
+
+
+def test_embedded_browser_guidance_included_for_every_agent() -> None:
+    """
+    Every agent's composed prompt steers the model to the embedded browser.
+
+    The ``browser_*`` tools are auto-registered for every agent without a
+    spec gate (``ToolManager._register_browser_tools``); a tool description
+    alone loses to a model's native web tooling, so the system prompt must
+    carry the preference for any spec — authored or not.
+    """
+    authored = _spec("Agent prompt")
+    assert build_instructions(authored, None, []) == (
+        f"Agent prompt\n\n{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}"
+    )
+
+
+def test_embedded_browser_guidance_names_registered_tools() -> None:
+    """
+    The guidance must track the canonical registered browser tool names, so
+    a tool rename cannot silently orphan the prompt text.
+    """
+    from omnigent.tools.builtins.browser import BROWSER_TOOL_NAMES
+
+    for name in sorted(BROWSER_TOOL_NAMES):
+        assert name in EMBEDDED_BROWSER_PRIORITY_INSTRUCTION
 
 
 def test_subagent_wake_notice_shape_matches_runner_notice() -> None:

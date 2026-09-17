@@ -324,7 +324,7 @@ def test_resume_transcript_drops_adjacent_duplicate_items() -> None:
     turn.  On the unfixed build three identical inputs produced three
     records (this test then fails with sentinel_count == 3).
     """
-    from omnigent.claude_native import _claude_transcript_records_from_session_items
+    from omnigent.harnesses.claude_native.main import _claude_transcript_records_from_session_items
 
     duplicate_item = {
         "type": "message",

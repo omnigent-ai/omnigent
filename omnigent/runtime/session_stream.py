@@ -33,12 +33,14 @@ import threading
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from typing import Any
 
+from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.debug_logging import (
     audit_event_logger,
     debug_event,
     debug_sink_enabled,
     sse_event_logger,
 )
+from omnigent.errors import ErrorImpact, ErrorPhase
 from omnigent.runtime import inflight_text, pending_elicitations
 
 _logger = logging.getLogger(__name__)
@@ -59,10 +61,10 @@ class SubscriberOverflowError(RuntimeError):
 # (queue, event_loop) pairs. The event_loop reference is needed
 # so the sync producer thread can safely deliver items via
 # ``call_soon_threadsafe`` into the queue's owning loop.
-_subscribers: dict[
+_subscribers: WorkspaceScopedCache[
     str,
     set[tuple[asyncio.Queue[dict[str, Any] | object], asyncio.AbstractEventLoop]],
-] = {}
+] = WorkspaceScopedCache()
 _lock = threading.Lock()
 
 
@@ -102,6 +104,17 @@ _TURN_OUTCOME_BY_EVENT_TYPE = {
     "response.failed": "failed",
     "response.cancelled": "cancelled",
     "response.incomplete": "incomplete",
+}
+_FAILED_EVENT_SOURCES = ("llm", "execution", "tool", "harness")
+# The authoritative progress-impact per turn outcome: this is where "the task
+# actually stopped" is known, so it overrides any per-error code default (a
+# nominally-transient retry that ultimately failed the turn lands here as
+# blocking). ``completed`` carries no impact; ``cancelled`` is a user-initiated
+# stop, not lost progress.
+_TURN_OUTCOME_IMPACT = {
+    "failed": ErrorImpact.BLOCKING,
+    "incomplete": ErrorImpact.BLOCKING,
+    "cancelled": ErrorImpact.BENIGN,
 }
 # Top-level event fields safe to log — stable identifiers, closed enums, and
 # pure numerics only. Deliberately excludes human/LLM-authored free text
@@ -152,11 +165,15 @@ def _sse_safe_attributes(event: dict[str, Any]) -> dict[str, object]:
         if isinstance(item.get("type"), str):
             attrs["item_type"] = item["type"]
     error = event.get("error")
+    if not isinstance(error, dict) and isinstance(response, dict):
+        error = response.get("error")
     if isinstance(error, dict):
         if error.get("code") is not None:
             attrs["error_code"] = error["code"]
         if error.get("source") is not None:
             attrs["error_source"] = error["source"]
+    if event.get("type") == "response.failed" and event.get("source") in _FAILED_EVENT_SOURCES:
+        attrs["error_source"] = event["source"]
     return attrs
 
 
@@ -198,8 +215,17 @@ def _log_turn_outcome(conversation_id: str, event_type: str, event: dict[str, An
         if isinstance(response, dict) and isinstance(response.get("id"), str):
             attributes["response_id"] = response["id"]
         error = event.get("error")
+        if not isinstance(error, dict) and isinstance(response, dict):
+            error = response.get("error")
         if isinstance(error, dict) and error.get("code") is not None:
             attributes["error_code"] = str(error["code"])
+        if event_type == "response.failed" and event.get("source") in _FAILED_EVENT_SOURCES:
+            attributes["error_source"] = event["source"]
+        impact = _TURN_OUTCOME_IMPACT.get(outcome)
+        if impact is not None:
+            attributes["error_impact"] = impact.value
+            # A terminal turn outcome is, by definition, in the turn phase.
+            attributes["error_phase"] = ErrorPhase.TURN.value
     level = logging.WARNING if outcome in ("failed", "incomplete") else logging.INFO
     audit_event_logger().log(level, "turn %s", outcome, extra=extra)
 
@@ -305,7 +331,9 @@ def shutdown_all() -> None:
     :func:`close` per-conversation instead.
     """
     with _lock:
-        all_subs = [entry for subs in _subscribers.values() for entry in subs]
+        # Shutdown spans every workspace and runs context-free, so sweep the
+        # whole backing rather than the current workspace's slice.
+        all_subs = [entry for subs in _subscribers.all_values() for entry in subs]
     for queue, _ in all_subs:
         _enqueue_or_overflow(queue, _DONE)
 

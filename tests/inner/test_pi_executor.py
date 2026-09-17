@@ -40,9 +40,25 @@ from omnigent.inner.pi_executor import (
     _split_pi_prompt,
     _ToolServer,
 )
-from omnigent.model_catalog import ModelEntry
-from omnigent.model_metadata import ModelMetadata, ModelWireAPI
+from omnigent.models.model_catalog import ModelEntry
+from omnigent.models.model_metadata import ModelMetadata, ModelWireAPI
 from omnigent.runtime.harnesses._scaffold import PolicyVerdictPayload
+
+
+def _cancel_all_tasks(loop):
+    """Cancel and drain leftover tasks, the way :func:`asyncio.run` does.
+
+    A task still pending when the loop closes has its callbacks invoked
+    against a dead loop and raises "Event loop is closed" from the loop's
+    exception handler. Under pytest-xdist that surfaces as an INTERNALERROR
+    which kills the whole worker instead of failing one test.
+    """
+    pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
+    if not pending:
+        return
+    for task in pending:
+        task.cancel()
+    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
 
 
 def _run(coro):
@@ -50,8 +66,11 @@ def _run(coro):
     try:
         return loop.run_until_complete(coro)
     finally:
-        loop.run_until_complete(loop.shutdown_asyncgens())
-        loop.close()
+        try:
+            _cancel_all_tasks(loop)
+            loop.run_until_complete(loop.shutdown_asyncgens())
+        finally:
+            loop.close()
 
 
 # ---------------------------------------------------------------------------
@@ -3164,7 +3183,7 @@ def test_profile_gateway_resolves_databricks_default_model() -> None:
     ):
         executor = PiExecutor(gateway=True)
     with patch(
-        "omnigent.databricks_model_discovery.discover_databricks_claude_catalog",
+        "omnigent.models.databricks_model_discovery.discover_databricks_claude_catalog",
         side_effect=RuntimeError("live listing unavailable"),
     ):
         assert _run(executor._resolve_model(ExecutorConfig(model=None))) == (
@@ -3193,7 +3212,7 @@ def test_profile_gateway_uses_discovered_model() -> None:
             return_value=SimpleNamespace(host="https://h.example.com", token="tok"),
         ),
         patch(
-            "omnigent.databricks_model_discovery.discover_databricks_claude_catalog",
+            "omnigent.models.databricks_model_discovery.discover_databricks_claude_catalog",
             return_value=SimpleNamespace(families={"opus": "system.ai.claude-opus-5"}),
         ),
     ):
@@ -3212,11 +3231,11 @@ def test_catalog_default_is_registered_in_models_json() -> None:
         ),
         # Live discovery unavailable → the bundled catalog default is used.
         patch(
-            "omnigent.databricks_model_discovery.discover_databricks_claude_catalog",
+            "omnigent.models.databricks_model_discovery.discover_databricks_claude_catalog",
             side_effect=RuntimeError("live listing unavailable"),
         ),
         patch(
-            "omnigent.model_catalog.resolve_catalog_model",
+            "omnigent.models.model_catalog.resolve_catalog_model",
             return_value=SimpleNamespace(model_id=catalog_default),
         ),
     ):
@@ -3268,11 +3287,11 @@ def test_gateway_wire_catalog_fetches_once_and_indexes_aliases() -> None:
             return_value=DatabricksCredentials(host="https://h.example.com", token="tok"),
         ),
         patch(
-            "omnigent.model_catalog.fetch_databricks_model_service_entries",
+            "omnigent.models.model_catalog.fetch_databricks_model_service_entries",
             return_value=entries,
         ) as fetch,
         patch(
-            "omnigent.model_catalog.catalog_model_entries",
+            "omnigent.models.model_catalog.catalog_model_entries",
             return_value=(
                 ModelEntry(
                     id="databricks-gpt-next",
@@ -3307,7 +3326,7 @@ def test_gateway_wire_catalog_failure_is_cached() -> None:
             return_value=DatabricksCredentials(host="https://h.example.com", token="tok"),
         ),
         patch(
-            "omnigent.model_catalog.fetch_databricks_model_service_entries",
+            "omnigent.models.model_catalog.fetch_databricks_model_service_entries",
             side_effect=OSError("offline"),
         ) as fetch,
     ):
@@ -3334,11 +3353,11 @@ def test_gateway_catalog_keeps_live_models_when_mlflow_enrichment_fails() -> Non
             return_value=DatabricksCredentials(host="https://h.example.com", token="tok"),
         ),
         patch(
-            "omnigent.model_catalog.fetch_databricks_model_service_entries",
+            "omnigent.models.model_catalog.fetch_databricks_model_service_entries",
             return_value=entries,
         ),
         patch(
-            "omnigent.model_catalog.catalog_model_entries",
+            "omnigent.models.model_catalog.catalog_model_entries",
             side_effect=OSError("offline"),
         ),
     ):
@@ -3358,14 +3377,14 @@ def test_dedicated_gateway_fetches_wire_catalog_from_workspace_host() -> None:
             return_value="gateway-token",
         ),
         patch(
-            "omnigent.pi_native_credentials.resolve_databricks_workspace",
+            "omnigent.harnesses.pi_native.credentials.resolve_databricks_workspace",
             return_value=SimpleNamespace(host="https://workspace.cloud.databricks.com"),
         ),
         patch(
-            "omnigent.model_catalog.fetch_databricks_model_service_entries",
+            "omnigent.models.model_catalog.fetch_databricks_model_service_entries",
             return_value=(),
         ) as fetch,
-        patch("omnigent.model_catalog.catalog_model_entries", return_value=()),
+        patch("omnigent.models.model_catalog.catalog_model_entries", return_value=()),
     ):
         executor = PiExecutor(
             gateway=True,
@@ -3389,7 +3408,7 @@ def test_generic_anthropic_gateway_skips_databricks_wire_catalog() -> None:
             "omnigent.inner.pi_executor._fetch_shell_command_token",
             return_value="provider-key",
         ),
-        patch("omnigent.model_catalog.fetch_databricks_model_service_entries") as fetch,
+        patch("omnigent.models.model_catalog.fetch_databricks_model_service_entries") as fetch,
     ):
         executor = PiExecutor(
             gateway=True,

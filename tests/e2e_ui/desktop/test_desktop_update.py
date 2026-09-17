@@ -112,7 +112,7 @@ def _bridge_calls(page: Page) -> list[str]:
 
 def test_settings_updates_section_check_and_mode(
     page: Page,
-    seeded_session: tuple[str, str],
+    live_server: str,
 ) -> None:
     """Settings -> Updates exposes the mode selector and a working Check button.
 
@@ -122,7 +122,7 @@ def test_settings_updates_section_check_and_mode(
     selector reflects the bridge config and ``Check for updates now`` calls the
     bridge's ``check()``.
     """
-    base_url, _session_id = seeded_session
+    base_url = live_server
 
     _install_update_stub(page, '{ state: "idle" }')
     page.goto(f"{base_url}/settings/updates")
@@ -151,8 +151,9 @@ def test_update_overlay_height_lifts_sonner_toaster(
     expect(page.locator(".app-shell")).to_be_visible(timeout=30_000)
     page.wait_for_function("() => window.__omniUpdate.hasOverlaySubscriber()")
 
-    # Archive is a provider-free, real UI path that emits showToast(). Sonner
-    # does not mount its positioned list until the first toast exists.
+    # Archive is a provider-free, real UI path that puts a toast on screen (the
+    # post-archive Undo pill). Sonner does not mount its positioned list until
+    # the first toast exists.
     row = page.locator("li").filter(has=page.locator(f'a[href="/c/{session_id}"]'))
     expect(row).to_be_visible()
     row.hover()
@@ -160,7 +161,7 @@ def test_update_overlay_height_lifts_sonner_toaster(
     page.get_by_test_id("archive-conversation").click()
     page.wait_for_url(f"{base_url}/", timeout=10_000)
 
-    toast = page.get_by_test_id("toast")
+    toast = page.get_by_test_id("archive-undo-toast")
     expect(toast).to_be_visible(timeout=10_000)
     toast.hover()  # Pause Sonner's finite dismissal timer while measuring.
     toaster = page.locator("[data-sonner-toaster]")
