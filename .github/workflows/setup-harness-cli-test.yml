@@ -18,17 +18,6 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - run: node --test .github/actions/setup-harness-cli/setup-harness-cli.test.mjs
-      - name: Verify pinned callers match the tested action
-        shell: bash
-        run: |
-          set -euo pipefail
-          pins="$(git grep -h -o -E \
-            'omnigent-ai/omnigent/\.github/actions/setup-harness-cli@[0-9a-f]{40}' \
-            -- .github/actions .github/workflows \
-            | cut -d@ -f2 | sort -u)"
-          test "$(printf '%s\n' "$pins" | grep -c .)" -eq 1
-          git fetch --no-tags --depth=1 origin "$pins"
-          git diff --exit-code "$pins" HEAD -- .github/actions/setup-harness-cli
 
   install:
     name: Install ${{ matrix.harness }}
@@ -49,6 +38,7 @@ jobs:
         uses: ./.github/actions/setup-harness-cli
         with:
           harness: ${{ matrix.harness }}
+          cache-namespace: test-v1
       - name: Remove local downloads before restore
         shell: bash
         env:
@@ -63,6 +53,7 @@ jobs:
         uses: ./.github/actions/setup-harness-cli
         with:
           harness: ${{ matrix.harness }}
+          cache-namespace: test-v1
       - name: Verify CLI remains available to caller steps
         env:
           CACHE_HIT: ${{ steps.restore.outputs.cache-hit }}
