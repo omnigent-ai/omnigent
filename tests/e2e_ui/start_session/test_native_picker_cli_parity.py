@@ -463,15 +463,26 @@ def _pick_agent(page: Page, label: str) -> None:
 _MODELS_SECTION_TESTID = "new-chat-landing-agent-models"
 
 
+def _expand_agent_config(page: Page, label: str) -> None:
+    """Open the selected agent row's config flyout with the keyboard.
+
+    The flyout trigger suppresses hover-open to keep itself stable, and a
+    pointer click acts as row selection (closing the root menu) rather than
+    reliably leaving the flyout open. ArrowRight is radix's canonical
+    submenu-open key, so it opens the flyout deterministically.
+    """
+    row = page.get_by_role("menuitem", name=label, exact=True).first
+    row.press("ArrowRight", timeout=5_000)
+
+
 def _model_rows(page: Page, rig: PickerRig, agent_label: str) -> list[dict[str, str]]:
     """Read the selected agent's model rows from the landing agent dropdown.
 
     The host's boot probe may still be warming; the SPA retries the fetch
     with backoff, so keep re-reading until catalog rows appear — the same
     wait a person makes. Each pass re-opens whatever collapsed: the agent
-    menu when a click closed it, and the agent row's config flyout when it
-    is not showing (a first click occasionally selects without leaving the
-    flyout open, so re-clicking the row is exactly what a person does).
+    menu when a click closed it, and the selected agent row's config flyout
+    when it is not showing.
     """
     deadline = time.monotonic() + _PICKER_WARMUP_TIMEOUT_S
     while time.monotonic() < deadline:
@@ -479,7 +490,7 @@ def _model_rows(page: Page, rig: PickerRig, agent_label: str) -> list[dict[str, 
         if page.get_by_test_id(_MODELS_SECTION_TESTID).count() == 0:
             # Menus re-render while queries settle; a miss here just retries.
             with contextlib.suppress(AssertionError, PlaywrightError):
-                _pick_agent(page, agent_label)
+                _expand_agent_config(page, agent_label)
         page.wait_for_timeout(500)
         rows: list[dict[str, str]] = []
         for option in page.locator(
