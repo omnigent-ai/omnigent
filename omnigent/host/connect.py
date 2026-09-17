@@ -3023,8 +3023,8 @@ class HostProcess:
                 from omnigent.harnesses.pi_native.credentials import pi_native_model_options
 
                 pi_models = await asyncio.to_thread(pi_native_model_options)
-            except Exception:
-                _logger.exception("Failed to resolve pre-launch Pi model options")
+            except Exception:  # noqa: BLE001 — no catalog, never a crash
+                _logger.warning("Pi model catalog unavailable", exc_info=True)
                 return HostModelOptionsResultFrame(
                     request_id=frame.request_id,
                     status="failed",
@@ -3045,8 +3045,8 @@ class HostProcess:
                 from omnigent.harnesses.devin_native.main import list_devin_cli_model_options
 
                 devin_models = await asyncio.to_thread(list_devin_cli_model_options)
-            except Exception:
-                _logger.exception("Failed to resolve pre-launch Devin model options")
+            except Exception:  # noqa: BLE001 — no catalog, never a crash
+                _logger.warning("Devin model catalog unavailable", exc_info=True)
                 return HostModelOptionsResultFrame(
                     request_id=frame.request_id,
                     status="failed",
