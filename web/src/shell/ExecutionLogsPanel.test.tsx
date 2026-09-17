@@ -25,6 +25,7 @@ const h = vi.hoisted(() => ({
     fetchNextPage: () => {},
   },
   sessionStatus: "idle" as string,
+  isDesktop: false,
 }));
 
 vi.mock("@/hooks/useChildSessions", async (importOriginal) => {
@@ -39,7 +40,15 @@ vi.mock("@/hooks/useSessionItems", () => ({
 }));
 
 vi.mock("@/hooks/useResizablePanel", () => ({
-  useResizablePanel: () => ({ panelWidth: 400, handleProps: { tabIndex: 0 }, isDesktop: false }),
+  useResizablePanel: () => ({
+    panelWidth: 400,
+    handleProps: {
+      role: "separator" as const,
+      "aria-label": "Resize panel",
+      tabIndex: 0,
+    },
+    isDesktop: h.isDesktop,
+  }),
 }));
 
 vi.mock("@/store/chatStore", () => ({
@@ -93,6 +102,7 @@ beforeEach(() => {
     fetchNextPage: () => {},
   };
   h.sessionStatus = "idle";
+  h.isDesktop = false;
 });
 
 afterEach(() => {
@@ -100,6 +110,18 @@ afterEach(() => {
 });
 
 describe("ExecutionLogsPanel open/close gating", () => {
+  it("renders the resize handle as the panel's unclipped boundary sibling", () => {
+    h.isDesktop = true;
+    renderPanel({ open: true });
+    const handle = screen.getByRole("separator", { name: "Resize panel" });
+    const panel = screen.getByTestId("execution-logs-panel");
+
+    expect(handle.nextElementSibling).toBe(panel);
+    expect(panel.contains(handle)).toBe(false);
+    expect(handle.closest(".overflow-hidden, .overflow-auto, .overflow-y-auto")).toBeNull();
+    expect(handle.className).toMatch(/\bz-10\b/);
+  });
+
   it("reflects open state via data-state and shows the active entry", () => {
     // WHY: when open the panel exposes data-state=open and renders the selector
     // for the main entry; the empty-content branch must not be taken.

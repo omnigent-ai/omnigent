@@ -776,9 +776,11 @@ async def _drive_send_busy_spinner(base_url: str, session_id: str) -> None:
                     workspace.get_by_role("tab", name=re.compile(tab_name))
                 ).to_be_disabled()
             await expect(workspace.get_by_role("button", name="Full screen")).to_be_disabled()
-            await expect(
-                workspace.get_by_role("separator", name="Resize panel")
-            ).to_have_attribute("aria-disabled", "true")
+            # The workspace resize gutter is a flex sibling rendered before the
+            # aside (not inside it), so locate the separator page-wide.
+            await expect(page.get_by_role("separator", name="Resize panel")).to_have_attribute(
+                "aria-disabled", "true"
+            )
             await expect(workspace.get_by_text("Starting workspace…", exact=True)).to_be_visible()
             assert temp_scoped_requests == []
 

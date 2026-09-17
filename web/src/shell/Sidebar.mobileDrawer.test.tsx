@@ -57,8 +57,10 @@ vi.mock("@/lib/serverOrigin", () => ({
 
 import { useConversations } from "@/hooks/useConversations";
 import { Sidebar } from "./Sidebar";
+import { stubMatchMedia } from "@/test-helpers/matchMedia";
 
 const useConvMock = vi.mocked(useConversations);
+const originalMatchMedia = window.matchMedia;
 
 function conv(id: string, partial: Partial<Conversation> = {}): Conversation {
   return {
@@ -113,12 +115,14 @@ function renderSidebar(props: { open?: boolean; onClose?: () => void; route?: st
 }
 
 beforeEach(() => {
+  stubMatchMedia({ width: 375 });
   mockConversations([conv("conv_a")]);
 });
 
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+  window.matchMedia = originalMatchMedia;
 });
 
 describe("mobile sidebar drawer", () => {
