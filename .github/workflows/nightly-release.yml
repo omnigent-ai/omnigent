@@ -217,7 +217,8 @@ jobs:
           python-version-file: ".python-version"
 
       - name: Install uv
-        uses: ./.github/actions/setup-uv
+        # This checkout is a prior passing main commit and may not contain the local action.
+        uses: omnigent-ai/omnigent/.github/actions/setup-uv@9582eeffe6d998e6a79ab9c9c94b5b56048f5ece # self-contained setup
         with:
           enable-cache: false
 
