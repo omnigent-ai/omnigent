@@ -5747,7 +5747,7 @@ export function NewChatLandingScreen() {
                           id="landing-branch-name"
                           type="text"
                           value={branchName}
-                          onChange={(e) => setBranchName(e.target.value)}
+                          onChange={(e) => setBranchName(e.target.value.replaceAll(" ", "-"))}
                           onFocus={() => setBranchInputFocused(true)}
                           onBlur={() => setBranchInputFocused(false)}
                           placeholder="feature/my-branch"
