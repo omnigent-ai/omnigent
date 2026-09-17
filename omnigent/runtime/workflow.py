@@ -1675,6 +1675,7 @@ def _build_acp_spawn_env(
     # Lazily import the config reader — the hot spawn-env path shouldn't pull in
     # the onboarding/config stack eagerly (mirrors the cursor builder).
     from omnigent.onboarding.acp_auth import (
+        PERMISSION_MODES,
         AcpAgentEntry,
         acp_agents,
         parse_env_passthrough,
@@ -1711,6 +1712,12 @@ def _build_acp_spawn_env(
         model = embedded.get("model")
         if model is not None and not isinstance(model, str):
             raise ValueError("executor acp_agent model must be a string or null")
+        agent_permission_mode = embedded.get("permission_mode", "auto")
+        if agent_permission_mode not in PERMISSION_MODES:
+            raise ValueError(
+                "executor acp_agent permission_mode must be one of "
+                f"{', '.join(sorted(PERMISSION_MODES))}, got {agent_permission_mode!r}"
+            )
         agent = AcpAgentEntry(
             slug=slug or "agent",
             name=name.strip(),
@@ -1720,6 +1727,7 @@ def _build_acp_spawn_env(
             send_model=send_model,
             omnigent_mcp=omnigent_mcp,
             inject_system_prompt=inject_system_prompt,
+            permission_mode=agent_permission_mode,
             env_passthrough=parse_env_passthrough(embedded.get("env_passthrough")),
         )
     else:
@@ -1759,7 +1767,11 @@ def _build_acp_spawn_env(
     # Permission stance for approval cards. Absent leaves the harness wrap on its
     # ``auto`` default (prompt); ``bypassPermissions`` skips the card for a call no
     # policy had an opinion on, so a headless ACP worker doesn't park on a prompt.
+    # An agent entry can carry its own stance; an explicit executor config still
+    # wins, so a spec can tighten (or loosen) a single run without editing config.
     permission_mode = spec.executor.config.get("permission_mode")
+    if permission_mode is None and agent is not None and agent.permission_mode != "auto":
+        permission_mode = agent.permission_mode
     if permission_mode is not None:
         env["HARNESS_ACP_PERMISSION_MODE"] = str(permission_mode)
     return env
