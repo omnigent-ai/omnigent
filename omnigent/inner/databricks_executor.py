@@ -832,6 +832,78 @@ def _resolve_databricks_auth_for_host(host: str) -> tuple[_DatabricksBearerAuth,
     return _DatabricksBearerAuth(host_cfg, failure_message=host_failure), host
 
 
+class _ReusedDatabricksTokenSource:
+    """Databricks SDK auth resolved lazily and reused across token mints.
+
+    Reuse keeps repeat mints cheap: the SDK serves the OAuth token from its
+    in-memory cache and only re-runs the Databricks CLI near expiry. The
+    reused auth can go stale mid-process — e.g. a Homebrew upgrade deletes
+    the versioned CLI binary path the SDK baked at construction — so a
+    failed mint drops the cached auth and re-resolves, letting a long-lived
+    session recover instead of failing every request until the process
+    restarts.
+    """
+
+    def __init__(self, server_url: str | None = None, *, host: str | None = None) -> None:
+        """
+        :param server_url: Server whose stored Databricks Apps pointer
+            record (from ``omnigent login <apps-url>``), when present,
+            names the workspace to authenticate against; ambient
+            profile/env resolution is the fallback.
+        :param host: Exact workspace host to authenticate against, with
+            no ambient fallback. Mutually exclusive with ``server_url``.
+        """
+        if server_url is not None and host is not None:
+            raise ValueError("_ReusedDatabricksTokenSource takes server_url or host, not both")
+        self._server_url = server_url
+        self._host = host
+        self._auth: _DatabricksBearerAuth | None = None
+
+    def _resolve(self) -> _DatabricksBearerAuth | None:
+        """Resolve SDK auth fresh, or ``None`` when no credentials resolve.
+
+        :returns: A newly resolved :class:`_DatabricksBearerAuth`, or
+            ``None`` when resolution fails.
+        """
+        try:
+            if self._host is not None:
+                return _resolve_databricks_auth(host=self._host)[0]
+            from omnigent.cli_auth import load_databricks_workspace_host
+
+            workspace_host = (
+                load_databricks_workspace_host(self._server_url) if self._server_url else None
+            )
+            if workspace_host is not None:
+                return _resolve_databricks_auth(host=workspace_host)[0]
+            return _resolve_databricks_auth()[0]
+        except (DatabricksAuthError, ImportError, ValueError):
+            return None
+
+    def current_token(self) -> str | None:
+        """Return a bearer token from the reused auth, minting via the SDK.
+
+        Resolves the auth on first call and reuses it; when the reused auth
+        fails to mint, re-resolves and retries once (see class docstring).
+
+        :returns: Bearer token string, or ``None`` when no Databricks
+            credentials resolve.
+        """
+        cached = self._auth
+        if cached is not None:
+            try:
+                return cached.current_token()
+            except DatabricksAuthError:
+                self._auth = None
+        auth = self._resolve()
+        if auth is None:
+            return None
+        self._auth = auth
+        try:
+            return auth.current_token()
+        except DatabricksAuthError:
+            return None
+
+
 def _databrickscfg_profiles_for_host(host: str) -> list[str]:
     """List ``~/.databrickscfg`` profile names whose ``host`` is *host*.
 
