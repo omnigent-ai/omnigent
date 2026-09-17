@@ -4,7 +4,7 @@ struct WebShellView: View {
   let initialURL: URL
   let connectToNewServer: () -> Void
   let switchToServer: (URL) -> Void
-  let loadFailed: (URL, String) -> Void
+  let loadFailed: (URL, String?) -> Void
   let loadSucceeded: () -> Void
 
   @Environment(\.colorScheme) private var colorScheme

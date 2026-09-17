@@ -48,7 +48,8 @@ final class ConnectionErrorTests: XCTestCase {
     defer { defaults.removePersistentDomain(forName: defaultsName) }
     let url = URL(string: "https://server.invalid")!
     let error = URLError(.cannotFindHost, userInfo: [NSURLErrorFailingURLErrorKey: url])
-    var failures: [(URL, String)] = []
+    // Nil is reserved for silent workspace cancellation; page-load failures always carry a message.
+    var failures: [(URL, String?)] = []
     let view = OmnigentWebView(
       initialURL: url, model: WebViewModel(), settings: SettingsStore(defaults: defaults),
       databricksInternalFeaturesEnabled: false,
@@ -76,6 +77,7 @@ final class ConnectionErrorTests: XCTestCase {
     XCTAssertEqual(
       failures.map(\.1),
       [jamfMessage, jamfMessage, error.localizedDescription, error.localizedDescription])
+    XCTAssertFalse(failures.contains { $0.1 == nil })
 
     coordinator.webView(webView, didFail: nil, withError: URLError(.cancelled))
     let unrelatedError = URLError(

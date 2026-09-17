@@ -207,7 +207,9 @@ Before applying a new session, conflicting old cookie names are removed. The cal
 waits for writes and reads back the session cookie before loading the page, and checks
 that the grant is still current. Canceled/stale startup work cannot load another
 context's WebView. The connecting screen offers cancellation and the native server
-menu distinguishes workspace IDs on a shared host.
+menu distinguishes workspace IDs on a shared host. Cancellation returns quietly to
+setup with the entered URL preserved; configuration and session failures still show
+an error.
 
 Reconnecting or relaunching runs bootstrap again and reuses a valid grant without
 another browser prompt. A detected login/context change while browsing currently

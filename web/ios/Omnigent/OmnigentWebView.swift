@@ -7,7 +7,8 @@ struct OmnigentWebView: UIViewRepresentable {
   @ObservedObject var model: WebViewModel
   @ObservedObject var settings: SettingsStore
   let databricksInternalFeaturesEnabled: Bool
-  let loadFailed: (URL, String) -> Void
+  /// A nil message returns to setup after cancellation without showing an error.
+  let loadFailed: (URL, String?) -> Void
   let loadSucceeded: () -> Void
   /// Compose and push the current server-picker payload to the SPA.
   let pushServerPicker: () -> Void
@@ -594,6 +595,16 @@ struct OmnigentWebView: UIViewRepresentable {
       }
     }
 
+    /// Nil stays silent after cancellation. Everything else shares the page-load wording, so an
+    /// unreachable managed host reads the same during native sign-in as during a page load.
+    static func workspaceErrorMessage(
+      _ error: Error, databricksInternalFeaturesEnabled: Bool = false
+    ) -> String? {
+      if error is CancellationError || error as? DatabricksSessionError == .cancelled { return nil }
+      return OmnigentWebView.connectionErrorMessage(
+        for: error, databricksInternalFeaturesEnabled: databricksInternalFeaturesEnabled)
+    }
+
     private func showWorkspaceFailure(_ error: Error) {
       navigationID = UUID()
       effectiveOrigin = nil
@@ -610,7 +621,11 @@ struct OmnigentWebView: UIViewRepresentable {
         parent.model.cancelAuthentication = nil
         parent.model.isLoading = false
         parent.model.cancelServerSwitcherWatchdog()
-        parent.loadFailed(parent.initialURL, error.localizedDescription)
+        parent.loadFailed(
+          parent.initialURL,
+          Self.workspaceErrorMessage(
+            error,
+            databricksInternalFeaturesEnabled: parent.databricksInternalFeaturesEnabled))
       }
     }
 

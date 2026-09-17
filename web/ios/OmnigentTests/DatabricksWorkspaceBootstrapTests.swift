@@ -198,6 +198,38 @@ final class DatabricksWorkspaceBootstrapTests: XCTestCase {
     XCTAssertTrue(store.events.isEmpty)
   }
 
+  func testCancellationReturnsToSetupWithoutAnErrorMessage() {
+    XCTAssertNil(OmnigentWebView.Coordinator.workspaceErrorMessage(CancellationError()))
+    XCTAssertNil(
+      OmnigentWebView.Coordinator.workspaceErrorMessage(DatabricksSessionError.cancelled))
+  }
+
+  func testConfigurationAndSessionFailuresStillHaveMessages() {
+    for error: Error in [
+      DatabricksOAuthError.invalidClientID, DatabricksSessionError.missingCookie,
+      DatabricksSessionError.networkUnavailable, DatabricksSessionError.rejected(403),
+    ] {
+      XCTAssertEqual(
+        OmnigentWebView.Coordinator.workspaceErrorMessage(error), error.localizedDescription)
+    }
+  }
+
+  func testUnreachableManagedHostKeepsTheSharedPageLoadGuidance() {
+    let unreachable = NSError(domain: NSURLErrorDomain, code: NSURLErrorCannotFindHost)
+    let guidance = OmnigentWebView.connectionErrorMessage(
+      for: unreachable, databricksInternalFeaturesEnabled: true)
+    XCTAssertEqual(
+      OmnigentWebView.Coordinator.workspaceErrorMessage(
+        unreachable, databricksInternalFeaturesEnabled: true), guidance)
+    XCTAssertEqual(
+      OmnigentWebView.Coordinator.workspaceErrorMessage(
+        unreachable, databricksInternalFeaturesEnabled: false), unreachable.localizedDescription)
+    // Cancellation stays silent regardless of the managed flag.
+    XCTAssertNil(
+      OmnigentWebView.Coordinator.workspaceErrorMessage(
+        DatabricksSessionError.cancelled, databricksInternalFeaturesEnabled: true))
+  }
+
   private func window() throws -> UIWindow {
     let scene = try XCTUnwrap(
       UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
