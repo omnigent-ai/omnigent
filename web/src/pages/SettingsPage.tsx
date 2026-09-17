@@ -10,9 +10,9 @@
  * Sections:
  *
  * - **General** — app-wide behavior preferences.
- * - **Appearance** — theme mode (System / Light / Dark), terminal theme,
- *   default transcript view, Workspace panel and tab defaults, and UI/code font
- *   controls.
+ * - **Appearance** — theme mode (System / Light / Dark), terminal theme and
+ *   renderer, default transcript view, Workspace panel and tab defaults, and
+ *   UI/code font controls.
  * - **Git** — Git behavior: the global "always use a random worktree" default
  *   and the default base branch pre-filled when naming a new worktree branch.
  * - **Keyboard shortcuts** — the full shortcuts reference, shown inline.
@@ -71,6 +71,8 @@ import {
   UserCogIcon,
   XIcon,
   ClockIcon,
+  ZapIcon,
+  CodeIcon,
 } from "lucide-react";
 import { useTheme } from "next-themes";
 import { PageScroll } from "@/components/PageScroll";
@@ -166,6 +168,12 @@ import {
   writeCodeFontSizePx,
   writeCodeFontWeight,
 } from "@/lib/codeFontPreferences";
+import {
+  readTerminalRendererMode,
+  TERMINAL_RENDERER_DEFAULT,
+  writeTerminalRendererMode,
+  type TerminalRendererMode,
+} from "@/lib/terminalRendererPreferences";
 import {
   readTerminalThemeMode,
   TERMINAL_THEME_DEFAULT,
@@ -353,6 +361,15 @@ const terminalThemeCards: { mode: TerminalThemeMode; label: string; icon: typeof
   { mode: "dark", label: "Dark", icon: MoonIcon },
 ];
 
+const terminalRendererCards: {
+  mode: TerminalRendererMode;
+  label: string;
+  icon: typeof SunIcon;
+}[] = [
+  { mode: "auto", label: "GPU", icon: ZapIcon },
+  { mode: "dom", label: "Compatibility", icon: CodeIcon },
+];
+
 const transcriptViewCards: {
   value: TranscriptViewDefault;
   label: string;
@@ -474,6 +491,37 @@ function TerminalThemeControl() {
         items={terminalThemeCards.map((card) => ({
           value: card.mode,
           testId: `terminal-theme-${card.mode}`,
+          body: iconCardBody(card.icon, card.label),
+        }))}
+      />
+    </ThemeSubsection>
+  );
+}
+
+/** Terminal renderer escape hatch: GPU (WebGL) or the DOM renderer. */
+function TerminalRendererControl() {
+  const [mode, setMode] = useState(() => readTerminalRendererMode());
+  const labelId = useId();
+  const choose = useCallback((next: TerminalRendererMode) => {
+    setMode(next);
+    writeTerminalRendererMode(next);
+  }, []);
+  return (
+    <ThemeSubsection
+      labelId={labelId}
+      title="Terminal renderer"
+      helper="GPU rendering keeps heavy output smooth. Switch to Compatibility if terminal text renders garbled, misaligned, or with stray glyphs."
+    >
+      <CardRadioGroup<TerminalRendererMode>
+        labelledBy={labelId}
+        value={mode}
+        onSelect={choose}
+        componentId="settings.appearance.terminal_renderer"
+        className="grid grid-cols-2 gap-3"
+        cardClassName="items-center gap-2 p-4"
+        items={terminalRendererCards.map((card) => ({
+          value: card.mode,
+          testId: `terminal-renderer-${card.mode}`,
           body: iconCardBody(card.icon, card.label),
         }))}
       />
@@ -809,6 +857,8 @@ function AppearanceSection() {
 
     writeTerminalThemeMode(TERMINAL_THEME_DEFAULT);
 
+    writeTerminalRendererMode(TERMINAL_RENDERER_DEFAULT);
+
     writeThemePalette(DEFAULT_PALETTE);
     applyThemePalette(DEFAULT_PALETTE);
     writeCustomTheme(DEFAULT_CUSTOM_THEME);
@@ -924,6 +974,8 @@ function AppearanceSection() {
         )}
 
         <TerminalThemeControl />
+
+        <TerminalRendererControl />
 
         <ColorThemeControl />
 

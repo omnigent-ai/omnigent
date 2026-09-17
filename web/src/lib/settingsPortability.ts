@@ -7,6 +7,7 @@
 // holds a non-default value.
 
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "./composerSendShortcutPreferences";
+import { TERMINAL_RENDERER_STORAGE_KEY } from "./terminalRendererPreferences";
 
 /** localStorage keys that constitute exportable user preferences. */
 const EXPORTABLE_KEYS = [
@@ -16,6 +17,7 @@ const EXPORTABLE_KEYS = [
   "omnigent:code-font-family",
   "omnigent:code-font-weight",
   "omnigent:terminal-theme",
+  TERMINAL_RENDERER_STORAGE_KEY,
   "omnigent:ui-theme-palette",
   "omnigent:custom-theme",
   "omnigent:default-workspace-panel",

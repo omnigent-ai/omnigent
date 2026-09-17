@@ -15,6 +15,10 @@ import { Toaster } from "@/components/ui/sonner";
 import { toast } from "sonner";
 import type { ConnectionState } from "./TerminalSession";
 import {
+  TERMINAL_RENDERER_DEFAULT,
+  writeTerminalRendererMode,
+} from "@/lib/terminalRendererPreferences";
+import {
   TerminalView,
   RECONNECT_BACKOFF_MS,
   RECONNECT_STABLE_MS,
@@ -37,6 +41,7 @@ const terminalSessionMock = vi.hoisted(() => ({
     onState: (state: ConnectionState) => void;
     dispose: ReturnType<typeof vi.fn>;
     setTheme: ReturnType<typeof vi.fn>;
+    setRenderer: ReturnType<typeof vi.fn>;
     setClipboardEnabled: ReturnType<typeof vi.fn>;
     focus: ReturnType<typeof vi.fn>;
   }[],
@@ -49,6 +54,7 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
   TerminalSession: class {
     dispose = vi.fn();
     setTheme = vi.fn();
+    setRenderer = vi.fn();
     setClipboardEnabled = vi.fn();
     focus = vi.fn();
 
@@ -73,6 +79,7 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
         onState,
         dispose: this.dispose,
         setTheme: this.setTheme,
+        setRenderer: this.setRenderer,
         setClipboardEnabled: this.setClipboardEnabled,
         focus: this.focus,
       });
@@ -444,6 +451,37 @@ describe("hidden pre-warmed surface", () => {
     // No reveal edge — the session's own WS-open focus owns this case;
     // an extra explicit call would steal focus on every reconnect.
     expect(terminalSessionMock.instances[0].focus).not.toHaveBeenCalled();
+  });
+});
+
+describe("appearance preferences", () => {
+  afterEach(() => {
+    writeTerminalRendererMode(TERMINAL_RENDERER_DEFAULT);
+  });
+
+  it("pushes a renderer switch to the live session", async () => {
+    // Reaching for the DOM renderer means the terminal is already
+    // unreadable, so the switch has to land on the mounted session
+    // instead of waiting for a reload.
+    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    const inst = terminalSessionMock.instances[0];
+
+    writeTerminalRendererMode("dom");
+    expect(inst.setRenderer).toHaveBeenCalledWith("dom");
+
+    writeTerminalRendererMode("auto");
+    expect(inst.setRenderer).toHaveBeenLastCalledWith("auto");
+  });
+
+  it("stops pushing renderer switches after unmount", async () => {
+    const { unmount } = render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    const inst = terminalSessionMock.instances[0];
+
+    unmount();
+    writeTerminalRendererMode("dom");
+    expect(inst.setRenderer).not.toHaveBeenCalled();
   });
 });
 
