@@ -718,3 +718,65 @@ def test_os_env_no_validation_when_absent() -> None:
     result = validate(spec)
     os_env_errors = [e for e in result.errors if e.path.startswith("os_env")]
     assert os_env_errors == [], f"absent os_env should not produce errors, got: {result.errors}"
+
+
+def test_icon_emoji_valid() -> None:
+    """An emoji grapheme is accepted as an icon."""
+    spec = _minimal_spec(icon="🔥")
+    result = validate(spec)
+    assert result.valid, f"emoji icon should validate, got: {result.errors}"
+
+
+def test_icon_relative_path_valid() -> None:
+    """A relative path with an allowed image suffix is accepted (syntax-only)."""
+    spec = _minimal_spec(icon="brand/icon.svg")
+    result = validate(spec)
+    assert result.valid, f"relative image path should validate, got: {result.errors}"
+
+
+def test_icon_absolute_path_rejected() -> None:
+    """An absolute path is rejected — icons must be agent-dir-relative."""
+    spec = _minimal_spec(icon="/etc/passwd.png")
+    result = validate(spec)
+    assert not result.valid
+    matches = [e for e in result.errors if e.path == "icon"]
+    assert matches, f"expected an icon error, got: {result.errors}"
+    assert "relative" in matches[0].message
+
+
+def test_icon_parent_traversal_rejected() -> None:
+    """A path containing ``..`` is rejected — no escaping the agent dir."""
+    spec = _minimal_spec(icon="../../secrets/icon.png")
+    result = validate(spec)
+    assert not result.valid
+    matches = [e for e in result.errors if e.path == "icon"]
+    assert matches, f"expected an icon error, got: {result.errors}"
+    assert ".." in matches[0].message
+
+
+def test_icon_bad_suffix_rejected() -> None:
+    """A path-like icon with an unsupported suffix is rejected."""
+    spec = _minimal_spec(icon="brand/icon.gif")
+    result = validate(spec)
+    assert not result.valid
+    matches = [e for e in result.errors if e.path == "icon"]
+    assert matches, f"expected an icon error, got: {result.errors}"
+
+
+def test_icon_non_string_rejected() -> None:
+    """A non-string icon value is rejected."""
+    spec = _minimal_spec(icon=123)
+    result = validate(spec)
+    assert not result.valid
+    matches = [e for e in result.errors if e.path == "icon"]
+    assert matches, f"expected an icon error, got: {result.errors}"
+    assert "string" in matches[0].message
+
+
+def test_icon_absent_no_validation() -> None:
+    """``icon`` is optional — when absent (None), no error is produced."""
+    spec = _minimal_spec()
+    assert spec.icon is None
+    result = validate(spec)
+    icon_errors = [e for e in result.errors if e.path == "icon"]
+    assert icon_errors == [], f"absent icon should not produce errors, got: {result.errors}"
