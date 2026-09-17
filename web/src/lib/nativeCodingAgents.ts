@@ -266,7 +266,8 @@ export const NATIVE_CODING_AGENTS = [
     // hermes has no brand glyph yet, so it falls back to the generic bot icon
     // (see AgentCard.iconForAgent / SubagentsPanel) — the `iconKind: "hermes"`
     // intentionally matches no icon branch. Auth/approval surface in the
-    // embedded terminal, so no capability flags are declared here.
+    // embedded terminal. The model picker reads the config default plus
+    // Hermes' cached catalog (`hermes model`), so no CLI probe is needed.
     key: "hermes",
     agentName: "hermes-native-ui",
     harness: "hermes-native",
@@ -274,6 +275,7 @@ export const NATIVE_CODING_AGENTS = [
     displayName: "Hermes",
     iconKind: "hermes",
     sortRank: 80,
+    capabilities: ["modelPicker"],
   },
 ] as const satisfies readonly NativeCodingAgentSpec[];
 

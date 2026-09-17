@@ -67,6 +67,7 @@ const pickerOptionsSchema = z.object({
     codex: z.array(modelOptionSchema),
     pi: z.array(modelOptionSchema),
     opencode: z.array(modelOptionSchema).optional(),
+    hermes: z.array(modelOptionSchema).optional(),
   }),
 });
 
