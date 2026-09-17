@@ -13,13 +13,30 @@ struct DatabricksWebSession {
   let configuration: DatabricksOAuthConfiguration
   let workspaceID: String?
 
-  func navigationURL(for url: URL) -> URL? {
+  private func pageScope(for url: URL) -> DatabricksCredentialScope? {
     guard
       let scope = try? DatabricksCredentialScope(workspaceURL: url, configuration: configuration),
       allowedOrigins.contains(scope.workspaceOrigin.absoluteString),
-      !Self.isLoginPath(url.path),
       scope.workspaceID == nil || workspaceID == nil || scope.workspaceID == workspaceID
     else { return nil }
+    return scope
+  }
+
+  func isAuthenticationURL(_ url: URL) -> Bool {
+    pageScope(for: url) != nil && Self.isLoginPath(url.path)
+  }
+
+  func isSignOutURL(_ url: URL) -> Bool {
+    guard pageScope(for: url) != nil else { return false }
+    if url.path == "/auth/logout" || url.path == "/logout" { return true }
+    return url.path == "/login.html"
+      && URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.contains {
+        $0.name == "logout" && $0.value == "1"
+      } == true
+  }
+
+  func navigationURL(for url: URL) -> URL? {
+    guard let scope = pageScope(for: url), !Self.isLoginPath(url.path) else { return nil }
     var components = URLComponents(url: url, resolvingAgainstBaseURL: false)!
     components.scheme = "https"
     components.host = scope.workspaceOrigin.host
@@ -34,7 +51,8 @@ struct DatabricksWebSession {
   }
 
   static func isLoginPath(_ path: String) -> Bool {
-    path == "/login" || path.hasPrefix("/login/") || path.hasPrefix("/oidc/")
+    path == "/login" || path == "/login.html" || path.hasPrefix("/login/")
+      || path.hasPrefix("/oidc/")
       || path == "/auth/login" || path == "/auth/callback" || path == "/auth/session/create"
   }
 }
@@ -68,7 +86,9 @@ struct DatabricksSessionClient: DatabricksSessionCreating {
     var currentURL = endpoint.url!
     var jar: [HTTPCookie] = []
     var updates: [HTTPCookie] = []
-    var workspaceID = context.scope.workspaceID
+    let pageScope = try DatabricksCredentialScope(
+      workspaceURL: context.pageURL, configuration: context.configuration)
+    var workspaceID = context.scope.workspaceID ?? pageScope.workspaceID
     for hop in 0...8 {
       try Task.checkCancellation()
       var request = URLRequest(url: currentURL)
@@ -165,7 +185,7 @@ struct DatabricksSessionClient: DatabricksSessionCreating {
         pageURL: pageURL, cookies: updates,
         allowedOrigins: Set([
           context.scope.workspaceOrigin.absoluteString, startOrigin.omnigentOrigin!,
-          pageURL.omnigentOrigin!,
+          context.pageURL.omnigentOrigin!, pageURL.omnigentOrigin!,
         ]),
         configuration: context.configuration, workspaceID: workspaceID)
     }
@@ -234,6 +254,7 @@ enum DatabricksSessionError: Error, Equatable, LocalizedError {
   case networkUnavailable
   case rejected(Int)
   case cancelled, presentationUnavailable, credentialsChanged, workspaceRequired
+  case reauthenticationRequired, recoveryExhausted, signOutIncomplete
 
   var errorDescription: String? {
     switch self {
@@ -246,6 +267,10 @@ enum DatabricksSessionError: Error, Equatable, LocalizedError {
     case .unexpectedLanding: "Databricks did not finish loading the workspace session."
     case .networkUnavailable: "Could not reach Databricks. Please try again."
     case .rejected(let status): "Databricks rejected session creation (HTTP \(status))."
+    case .reauthenticationRequired: "Your workspace session expired. Sign in again to continue."
+    case .recoveryExhausted: "The workspace session could not be restored. Reconnect to try again."
+    case .signOutIncomplete:
+      "Sign-out could not finish. Reconnect to retry cleanup before signing in."
     case .workspaceRequired:
       "Enter a workspace-specific URL, including its o parameter when required."
     case .credentialsChanged: "Workspace credentials changed. Reconnect to continue."

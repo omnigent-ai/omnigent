@@ -69,14 +69,30 @@ actor DatabricksTokenManager {
     return try store.load(for: scope) == tokens
   }
 
+  func refresh(rejected: DatabricksOAuthTokens, for scope: DatabricksCredentialScope) async throws
+    -> DatabricksOAuthTokens?
+  {
+    try Task.checkCancellation()
+    try flushPendingWrite(for: scope)
+    guard let current = try store.load(for: scope) else { return nil }
+    guard current == rejected else { throw DatabricksCredentialError.changed }
+    return try await lookup(for: scope, forceRefresh: true)
+  }
+
   /// Nil means no reusable grant. Network, configuration, and Keychain failures remain errors.
   func tokens(for scope: DatabricksCredentialScope) async throws -> DatabricksOAuthTokens? {
+    try await lookup(for: scope, forceRefresh: false)
+  }
+
+  private func lookup(for scope: DatabricksCredentialScope, forceRefresh: Bool) async throws
+    -> DatabricksOAuthTokens?
+  {
     try Task.checkCancellation()
     try flushPendingWrite(for: scope)
     if refreshes[scope] == nil {
       guard let saved = try store.load(for: scope) else { return nil }
       guard saved.isValid else { throw DatabricksCredentialError.invalidData }
-      if saved.expiresAt > now().addingTimeInterval(60) { return saved }
+      if !forceRefresh, saved.expiresAt > now().addingTimeInterval(60) { return saved }
       startRefresh(saved, for: scope)
     }
     let refreshID = refreshes[scope]!.id

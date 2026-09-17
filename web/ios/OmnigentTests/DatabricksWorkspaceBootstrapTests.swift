@@ -230,6 +230,97 @@ final class DatabricksWorkspaceBootstrapTests: XCTestCase {
         DatabricksSessionError.cancelled, databricksInternalFeaturesEnabled: true))
   }
 
+  func testSilentRecoveryDoesNotPresentBrowserWhenGrantIsMissing() async throws {
+    let context = try webContext("https://workspace.databricks.com/omnigent?o=123")
+    let login = FakeWorkspaceLogin()
+    let sessions = FakeWorkspaceSessions()
+    let bootstrap = makeBootstrap(
+      MemoryDatabricksCredentialStore(), login: login, sessions: sessions)
+    let store = FakeWebStore(identifier: context.storeIdentifier)
+    do {
+      _ = try await bootstrap.prepare(
+        context: context, store: store, anchor: window(), intent: .recover)
+      XCTFail("Expected explicit reauthentication requirement")
+    } catch { XCTAssertEqual(error as? DatabricksSessionError, .reauthenticationRequired) }
+    XCTAssertEqual(login.calls, 0)
+    XCTAssertEqual(sessions.calls, 0)
+    XCTAssertTrue(store.events.isEmpty)
+  }
+
+  func testRecoveryPreservesCurrentPageWithoutChangingCredentialContext() async throws {
+    let context = try webContext("https://workspace.cloud.databricks.com/omnigent")
+    let page = URL(string: "https://workspace.databricks.com/omnigent/c/abc?o=123#message")!
+    let credentials = MemoryDatabricksCredentialStore()
+    try credentials.save(credentialTokens(), for: context.scope)
+    let login = FakeWorkspaceLogin()
+    let bootstrap = makeBootstrap(credentials, login: login, sessions: FakeWorkspaceSessions())
+    let result = try await bootstrap.prepare(
+      context: context, store: FakeWebStore(identifier: context.storeIdentifier), anchor: window(),
+      intent: .recover, pageURL: page)
+    XCTAssertEqual(result.pageURL, page)
+    XCTAssertEqual(login.calls, 0)
+    XCTAssertNotNil(credentials.snapshot(for: context.scope))
+    let alias = try DatabricksCredentialScope(
+      workspaceURL: page, configuration: context.configuration)
+    XCTAssertNil(credentials.snapshot(for: alias))
+  }
+
+  func testSession401RefreshesOnceThenRetriesWithoutBrowser() async throws {
+    let refreshed = expectation(description: "one refresh")
+    refreshed.assertForOverFulfill = true
+    let server = OAuthTestServer { request in
+      XCTAssertEqual(request.httpMethod, "POST")
+      refreshed.fulfill()
+      return .init(data: OAuthTestServer.tokenData)
+    }
+    let context = try webContext(server.workspaceURL.absoluteString + "/omnigent?o=123")
+    let credentials = MemoryDatabricksCredentialStore()
+    try credentials.save(credentialTokens(), for: context.scope)
+    let manager = DatabricksTokenManager(
+      store: credentials, client: DatabricksOAuthClient(session: server.session),
+      now: { Date(timeIntervalSince1970: 1000) })
+    let sessions = FakeWorkspaceSessions()
+    sessions.failures = [.rejected(401)]
+    let login = FakeWorkspaceLogin()
+    let bootstrap = makeBootstrap(credentials, login: login, sessions: sessions, tokens: manager)
+    _ = try await bootstrap.prepare(
+      context: context, store: FakeWebStore(identifier: context.storeIdentifier), anchor: window(),
+      intent: .recover)
+    await fulfillment(of: [refreshed], timeout: 2)
+    XCTAssertEqual(sessions.calls, 2)
+    XCTAssertEqual(login.calls, 0)
+    XCTAssertEqual(credentials.snapshot(for: context.scope)?.accessToken, "opaque-access")
+  }
+
+  func testRepeated401DoesNotLoopOrEraseAValidRefreshGrant() async throws {
+    let refreshed = expectation(description: "one refresh")
+    refreshed.assertForOverFulfill = true
+    let server = OAuthTestServer { _ in
+      refreshed.fulfill()
+      return .init(data: OAuthTestServer.tokenData)
+    }
+    let context = try webContext(server.workspaceURL.absoluteString + "/omnigent?o=123")
+    let credentials = MemoryDatabricksCredentialStore()
+    try credentials.save(credentialTokens(), for: context.scope)
+    let manager = DatabricksTokenManager(
+      store: credentials, client: DatabricksOAuthClient(session: server.session),
+      now: { Date(timeIntervalSince1970: 1000) })
+    let sessions = FakeWorkspaceSessions()
+    sessions.failure = .rejected(401)
+    let login = FakeWorkspaceLogin()
+    let bootstrap = makeBootstrap(credentials, login: login, sessions: sessions, tokens: manager)
+    do {
+      _ = try await bootstrap.prepare(
+        context: context, store: FakeWebStore(identifier: context.storeIdentifier),
+        anchor: window(), intent: .recover)
+      XCTFail("Expected bounded failure")
+    } catch { XCTAssertEqual(error as? DatabricksSessionError, .rejected(401)) }
+    await fulfillment(of: [refreshed], timeout: 2)
+    XCTAssertEqual(sessions.calls, 2)
+    XCTAssertEqual(login.calls, 0)
+    XCTAssertNotNil(credentials.snapshot(for: context.scope))
+  }
+
   private func window() throws -> UIWindow {
     let scene = try XCTUnwrap(
       UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
@@ -238,16 +329,331 @@ final class DatabricksWorkspaceBootstrapTests: XCTestCase {
 
   private func makeBootstrap(
     _ credentials: MemoryDatabricksCredentialStore, login: FakeWorkspaceLogin,
-    sessions: FakeWorkspaceSessions
+    sessions: FakeWorkspaceSessions, tokens: DatabricksTokenManager? = nil
   ) -> DatabricksWorkspaceBootstrap {
     login.persist = { url, configuration, tokens in
       try credentials.save(
         tokens, for: DatabricksCredentialScope(workspaceURL: url, configuration: configuration))
     }
+    let tokens =
+      tokens
+      ?? DatabricksTokenManager(store: credentials, now: { Date(timeIntervalSince1970: 1000) })
+    let suite = "omnigent-signout-tests-\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suite)!
+    addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
+    let installer = DatabricksCookieInstaller()
     return DatabricksWorkspaceBootstrap(
-      tokens: DatabricksTokenManager(
-        store: credentials, now: { Date(timeIntervalSince1970: 1000) }),
-      login: login, sessions: sessions, installer: DatabricksCookieInstaller())
+      tokens: tokens, login: login, sessions: sessions, installer: installer,
+      signOuts: DatabricksSignOutManager(tokens: tokens, installer: installer, defaults: defaults))
+  }
+}
+
+@MainActor
+final class DatabricksLifecycleTests: XCTestCase {
+  func testRecoveryRequiresHealthyPageAndCooldownBeforeAnotherAttempt() {
+    var policy = DatabricksRecoveryPolicy()
+    let now = Date(timeIntervalSince1970: 1000)
+    XCTAssertTrue(policy.begin(now: now))
+    XCTAssertFalse(policy.begin(now: now.addingTimeInterval(120)))
+    policy.markReady()
+    XCTAssertFalse(policy.begin(now: now.addingTimeInterval(59)))
+    XCTAssertTrue(policy.begin(now: now.addingTimeInterval(60)))
+    XCTAssertFalse(policy.begin(now: now.addingTimeInterval(180)))
+  }
+
+  func testRecoveryPageKeepsStoreIdentityAndRejectsAnotherWorkspace() throws {
+    let context = try webContext("https://workspace.cloud.databricks.com/omnigent?o=123")
+    let target = URL(string: "https://workspace.databricks.com/omnigent/c/abc?o=123#message")!
+    let navigation = try context.navigating(to: target)
+    XCTAssertEqual(navigation.scope, context.scope)
+    XCTAssertEqual(navigation.storeIdentifier, context.storeIdentifier)
+    XCTAssertEqual(navigation.pageURL, target)
+    XCTAssertThrowsError(
+      try context.navigating(to: URL(string: "https://workspace.databricks.com/omnigent?o=456")!))
+  }
+
+  func testSignOutClearsOnlyItsContextAndSuppressesAutoOpen() async throws {
+    let f = try fixture()
+    let otherContext = try webContext("https://workspace.databricks.com/omnigent?o=456")
+    try f.credentials.save(credentialTokens(), for: f.context.scope)
+    try f.credentials.save(credentialTokens(access: "other"), for: otherContext.scope)
+    f.web.values = [try testSessionCookie(url: f.context.pageURL)]
+    let settings = SettingsStore(defaults: f.defaults)
+    settings.serverURL = f.context.pageURL.absoluteString
+    let job = try f.signOuts.begin(context: f.context, store: f.web)
+    XCTAssertTrue(f.signOuts.isPending(f.context.storeIdentifier))
+    settings.stopAutoOpening(f.context)
+    XCTAssertNil(settings.serverURL)
+    try await job.value
+    XCTAssertFalse(f.signOuts.isPending(f.context.storeIdentifier))
+    XCTAssertNil(f.credentials.snapshot(for: f.context.scope))
+    XCTAssertTrue(f.web.values.isEmpty)
+    XCTAssertEqual(f.credentials.snapshot(for: otherContext.scope)?.accessToken, "other")
+    settings.serverURL = otherContext.pageURL.absoluteString
+    settings.stopAutoOpening(f.context)
+    XCTAssertEqual(settings.serverURL, otherContext.pageURL.absoluteString)
+  }
+
+  func testFailedSignOutIsRetriedAfterManagerRecreationBeforeNewLogin() async throws {
+    let f = try fixture()
+    try f.credentials.save(credentialTokens(), for: f.context.scope)
+    f.credentials.fail(.delete)
+    do {
+      try await f.signOuts.begin(context: f.context, store: f.web).value
+      XCTFail("Expected cleanup failure")
+    } catch { XCTAssertEqual(error as? DatabricksSessionError, .signOutIncomplete) }
+    XCTAssertTrue(f.signOuts.isPending(f.context.storeIdentifier))
+    f.credentials.fail(nil)
+    let tokens = DatabricksTokenManager(store: f.credentials)
+    let restored = DatabricksSignOutManager(
+      tokens: tokens, installer: f.installer, defaults: f.defaults)
+    let login = FakeWorkspaceLogin()
+    let bootstrap = DatabricksWorkspaceBootstrap(
+      tokens: tokens, login: login, sessions: FakeWorkspaceSessions(), installer: f.installer,
+      signOuts: restored)
+    do {
+      _ = try await bootstrap.prepare(
+        context: f.context, store: f.web, anchor: window(), intent: .recover)
+      XCTFail("Expected explicit sign-in after cleanup")
+    } catch { XCTAssertEqual(error as? DatabricksSessionError, .reauthenticationRequired) }
+    XCTAssertEqual(login.calls, 0)
+    XCTAssertNil(f.credentials.snapshot(for: f.context.scope))
+    XCTAssertFalse(restored.isPending(f.context.storeIdentifier))
+  }
+
+  func testSignOutWaitsBehindAnAlreadyStartedCookieWrite() async throws {
+    let f = try fixture()
+    try f.credentials.save(credentialTokens(), for: f.context.scope)
+    let started = expectation(description: "cookie write started")
+    f.web.holdNextWrite = true
+    f.web.onWrite = { started.fulfill() }
+    let cookie = try testSessionCookie(url: f.context.pageURL)
+    let write = Task { try await f.installer.install([cookie], in: f.web, reset: false) }
+    await fulfillment(of: [started], timeout: 2)
+    let cleanup = try f.signOuts.begin(context: f.context, store: f.web)
+    f.web.releaseWrite()
+    try await write.value
+    try await cleanup.value
+    XCTAssertTrue(f.web.values.isEmpty)
+    XCTAssertEqual(f.web.events.last, "clear")
+    XCTAssertNil(f.credentials.snapshot(for: f.context.scope))
+  }
+
+  func testPendingSignOutRejectsLateCookieBootstrap() async throws {
+    let f = try fixture()
+    try f.credentials.save(credentialTokens(), for: f.context.scope)
+    let sessions = FakeWorkspaceSessions()
+    sessions.hold = true
+    let requested = expectation(description: "session request started")
+    sessions.onRequest = { requested.fulfill() }
+    let bootstrap = DatabricksWorkspaceBootstrap(
+      tokens: f.tokens, login: FakeWorkspaceLogin(), sessions: sessions, installer: f.installer,
+      signOuts: f.signOuts)
+    let anchor = try window()
+    let pending = Task {
+      try await bootstrap.prepare(context: f.context, store: f.web, anchor: anchor)
+    }
+    await fulfillment(of: [requested], timeout: 2)
+    let cleanup = try f.signOuts.begin(context: f.context, store: f.web)
+    sessions.release()
+    do {
+      _ = try await pending.value
+      XCTFail("Expected stale result rejection")
+    } catch { XCTAssertEqual(error as? DatabricksSessionError, .credentialsChanged) }
+    try await cleanup.value
+    XCTAssertTrue(f.web.values.isEmpty)
+    XCTAssertFalse(f.web.events.contains { $0.hasPrefix("write-start:") })
+  }
+
+  func testCompletedSignOutRejectsLateBootstrapEvenIfCredentialsReappear() async throws {
+    let f = try fixture()
+    let original = credentialTokens()
+    try f.credentials.save(original, for: f.context.scope)
+    let sessions = FakeWorkspaceSessions()
+    sessions.hold = true
+    let requested = expectation(description: "session request started")
+    sessions.onRequest = { requested.fulfill() }
+    let bootstrap = DatabricksWorkspaceBootstrap(
+      tokens: f.tokens, login: FakeWorkspaceLogin(), sessions: sessions, installer: f.installer,
+      signOuts: f.signOuts)
+    let anchor = try window()
+    let pending = Task {
+      try await bootstrap.prepare(context: f.context, store: f.web, anchor: anchor)
+    }
+    await fulfillment(of: [requested], timeout: 2)
+    try await f.signOuts.begin(context: f.context, store: f.web).value
+    try f.credentials.save(original, for: f.context.scope)
+    sessions.release()
+    do {
+      _ = try await pending.value
+      XCTFail("Expected old-generation rejection")
+    } catch { XCTAssertEqual(error as? DatabricksSessionError, .credentialsChanged) }
+    XCTAssertTrue(f.web.values.isEmpty)
+    XCTAssertEqual(f.credentials.snapshot(for: f.context.scope), original)
+  }
+
+  func testLogoutURLsAreDistinctFromExpiredLoginAndOtherContexts() throws {
+    let context = try webContext("https://workspace.databricks.com/omnigent?o=123")
+    let session = testWebSession(context: context, cookies: [])
+    for path in ["/auth/logout", "/logout", "/login.html?logout=1"] {
+      XCTAssertTrue(
+        session.isSignOutURL(URL(string: context.scope.workspaceOrigin.absoluteString + path)!))
+    }
+    XCTAssertFalse(
+      session.isSignOutURL(URL(string: "https://workspace.databricks.com/auth/logout?o=456")!))
+    XCTAssertFalse(session.isSignOutURL(URL(string: "https://other.databricks.com/auth/logout")!))
+    XCTAssertTrue(
+      session.isAuthenticationURL(URL(string: "https://workspace.databricks.com/login.html")!))
+    XCTAssertFalse(
+      session.isAuthenticationURL(URL(string: "https://workspace.databricks.com/omnigent")!))
+  }
+
+  func testCoordinatorRecovers401ButDoesNotRetry403() async throws {
+    for status in [401, 403] {
+      let restored = expectation(description: "recovery or failure")
+      var recoveryCount = 0
+      let targetPath = "/omnigent/c/abc?o=123#message"
+      let h = try await coordinatorFixture(
+        recover: { url in
+          XCTAssertEqual(url.path, "/omnigent/c/abc")
+          XCTAssertEqual(url.query, "o=123")
+          XCTAssertEqual(url.fragment, "message")
+          recoveryCount += 1
+          restored.fulfill()
+        },
+        failure: { message in
+          XCTAssertEqual(message, DatabricksSessionError.rejected(403).localizedDescription)
+          restored.fulfill()
+        })
+      h.view.requests.append(
+        URLRequest(url: URL(string: h.context.scope.workspaceOrigin.absoluteString + targetPath)!))
+      h.coordinator.webView(h.view, didCommit: nil)
+      XCTAssertTrue(h.coordinator.handleWorkspaceHTTPStatus(status))
+      await fulfillment(of: [restored], timeout: 2)
+      XCTAssertEqual(recoveryCount, status == 401 ? 1 : 0)
+      h.coordinator.detach()
+      h.view.removeFromSuperview()
+      await h.coordinator.websiteDataStore.removeData(
+        ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(), modifiedSince: .distantPast)
+    }
+  }
+
+  func testForegroundMissingCookieRequestsOneRecovery() async throws {
+    let recovered = expectation(description: "foreground recovery")
+    recovered.assertForOverFulfill = true
+    let h = try await coordinatorFixture(
+      recover: { _ in recovered.fulfill() }, failure: { _ in XCTFail("Unexpected failure") })
+    let cookieStore = h.coordinator.websiteDataStore.httpCookieStore
+    for cookie in await cookieStore.allCookies() { await cookieStore.deleteCookie(cookie) }
+    NotificationCenter.default.post(name: UIApplication.didBecomeActiveNotification, object: nil)
+    await fulfillment(of: [recovered], timeout: 2)
+    NotificationCenter.default.post(name: UIApplication.didBecomeActiveNotification, object: nil)
+    h.coordinator.detach()
+    h.view.removeFromSuperview()
+  }
+
+  func testNativeSignOutActionDetachesAndCompletesScopedCleanup() async throws {
+    let signedOut = expectation(description: "sign-out callback")
+    var cleanup: Task<Void, Error>?
+    let h = try await coordinatorFixture(
+      recover: { _ in XCTFail("Unexpected recovery") },
+      failure: { _ in XCTFail("Unexpected failure") },
+      signedOut: { _, job in
+        cleanup = job
+        signedOut.fulfill()
+      })
+    XCTAssertNotNil(h.model.signOut)
+    h.model.signOut?()
+    await fulfillment(of: [signedOut], timeout: 2)
+    try await XCTUnwrap(cleanup).value
+    XCTAssertNil(h.credentials.snapshot(for: h.context.scope))
+    let cookies = await h.coordinator.websiteDataStore.httpCookieStore.allCookies()
+    XCTAssertTrue(cookies.isEmpty)
+    XCTAssertNil(h.model.signOut)
+    h.view.removeFromSuperview()
+  }
+
+  private struct CoordinatorFixture {
+    let context: DatabricksWebContext
+    let credentials: MemoryDatabricksCredentialStore
+    let model: WebViewModel
+    let coordinator: OmnigentWebView.Coordinator
+    let view: RecordingWorkspaceWebView
+    let window: UIWindow
+  }
+
+  private func coordinatorFixture(
+    recover: @escaping (URL) -> Void, failure: @escaping (String?) -> Void,
+    signedOut: ((DatabricksWebContext, Task<Void, Error>) -> Void)? = nil
+  ) async throws -> CoordinatorFixture {
+    let context = try webContext(
+      "https://test-\(UUID().uuidString.lowercased()).cloud.databricks.com/omnigent?o=123")
+    let credentials = MemoryDatabricksCredentialStore()
+    let tokens = DatabricksTokenManager(
+      store: credentials, now: { Date(timeIntervalSince1970: 1000) })
+    try credentials.save(credentialTokens(), for: context.scope)
+    let suite = "omnigent-coordinator-tests-\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suite)!
+    addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
+    let installer = DatabricksCookieInstaller()
+    let bootstrap = DatabricksWorkspaceBootstrap(
+      tokens: tokens, login: FakeWorkspaceLogin(), sessions: FakeWorkspaceSessions(),
+      installer: installer,
+      signOuts: DatabricksSignOutManager(tokens: tokens, installer: installer, defaults: defaults))
+    let model = WebViewModel()
+    let parent = OmnigentWebView(
+      initialURL: context.pageURL, model: model, settings: SettingsStore(defaults: defaults),
+      databricksInternalFeaturesEnabled: false,
+      loadFailed: { _, message in failure(message) }, loadSucceeded: {}, pushServerPicker: {},
+      requestSwitchServer: { _ in }, openServerSetup: {},
+      recoverWorkspace: recover, signedOut: signedOut)
+    let coordinator = OmnigentWebView.Coordinator(parent, context: context, bootstrap: bootstrap)
+    let configuration = WKWebViewConfiguration()
+    configuration.websiteDataStore = coordinator.websiteDataStore
+    let view = RecordingWorkspaceWebView(frame: .zero, configuration: configuration)
+    let window = try window()
+    window.addSubview(view)
+    model.webView = view
+    coordinator.attach(view)
+    let loaded = expectation(description: "initial bootstrap")
+    view.onLoad = { loaded.fulfill() }
+    coordinator.load(context.pageURL, in: view)
+    await fulfillment(of: [loaded], timeout: 10)
+    return CoordinatorFixture(
+      context: context, credentials: credentials, model: model, coordinator: coordinator,
+      view: view, window: window)
+  }
+
+  private struct Fixture {
+    let context: DatabricksWebContext
+    let credentials: MemoryDatabricksCredentialStore
+    let tokens: DatabricksTokenManager
+    let installer: DatabricksCookieInstaller
+    let defaults: UserDefaults
+    let web: FakeWebStore
+    let signOuts: DatabricksSignOutManager
+  }
+
+  private func fixture() throws -> Fixture {
+    let context = try webContext("https://workspace.databricks.com/omnigent?o=123")
+    let credentials = MemoryDatabricksCredentialStore()
+    let tokens = DatabricksTokenManager(
+      store: credentials, now: { Date(timeIntervalSince1970: 1000) })
+    let installer = DatabricksCookieInstaller()
+    let suite = "omnigent-lifecycle-tests-\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suite)!
+    addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
+    return Fixture(
+      context: context, credentials: credentials, tokens: tokens, installer: installer,
+      defaults: defaults,
+      web: FakeWebStore(identifier: context.storeIdentifier),
+      signOuts: DatabricksSignOutManager(tokens: tokens, installer: installer, defaults: defaults))
+  }
+
+  private func window() throws -> UIWindow {
+    UIWindow(
+      windowScene: try XCTUnwrap(
+        UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first))
   }
 }
 
@@ -274,6 +680,7 @@ private final class FakeWorkspaceLogin: DatabricksSigningIn {
 private final class FakeWorkspaceSessions: DatabricksSessionCreating {
   var calls = 0
   var failure: DatabricksSessionError?
+  var failures: [DatabricksSessionError] = []
   var hold = false
   var onRequest: (() -> Void)?
   var onResponse: (() -> Void)?
@@ -283,6 +690,7 @@ private final class FakeWorkspaceSessions: DatabricksSessionCreating {
     -> DatabricksWebSession
   {
     calls += 1
+    if !failures.isEmpty { throw failures.removeFirst() }
     if let failure { throw failure }
     if hold {
       await withCheckedContinuation { continuation in
@@ -301,6 +709,7 @@ private final class FakeWorkspaceSessions: DatabricksSessionCreating {
 
 @MainActor
 private final class RecordingWorkspaceWebView: WKWebView {
+  override var url: URL? { requests.last?.url }
   var requests: [URLRequest] = []
   var onLoad: (() -> Void)?
   override func load(_ request: URLRequest) -> WKNavigation? {

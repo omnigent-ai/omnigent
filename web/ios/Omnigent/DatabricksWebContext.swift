@@ -18,6 +18,25 @@ struct DatabricksWebContext: Sendable {
     pageURL = WorkspaceURLExpander.workspaceUIURL(forBareRoot: url) ?? url
   }
 
+  private init(
+    configuration: DatabricksOAuthConfiguration, scope: DatabricksCredentialScope, pageURL: URL
+  ) {
+    self.configuration = configuration
+    self.scope = scope
+    self.pageURL = pageURL
+  }
+
+  func navigating(to url: URL) throws -> Self {
+    let target = try Self(url: url, configuration: configuration)
+    guard
+      scope.workspaceID == nil || target.scope.workspaceID == nil
+        || scope.workspaceID == target.scope.workspaceID
+    else {
+      throw DatabricksSessionError.workspaceChanged
+    }
+    return Self(configuration: configuration, scope: scope, pageURL: target.pageURL)
+  }
+
   static func resolve(_ url: URL) throws -> Self? {
     guard ServerAuthentication(origin: url.omnigentOrigin) == .databricksWorkspace else {
       return nil

@@ -12,6 +12,7 @@ final class WebViewModel: ObservableObject {
   @Published var isLoading = false
   @Published var isAuthenticating = false
   var cancelAuthentication: (() -> Void)?
+  var signOut: (() -> Void)?
   @Published var serverSwitcherHidden = true
 
   /// Whether the native Chat/Terminal switcher should be shown. The web app owns

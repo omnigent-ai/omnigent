@@ -6,6 +6,7 @@ struct WebShellView: View {
   let switchToServer: (URL) -> Void
   let loadFailed: (URL, String?) -> Void
   let loadSucceeded: () -> Void
+  var signedOut: ((DatabricksWebContext, Task<Void, Error>) -> Void)?
 
   @Environment(\.colorScheme) private var colorScheme
   @EnvironmentObject private var settings: SettingsStore
@@ -17,6 +18,18 @@ struct WebShellView: View {
   /// link to the current server isn't lost (its `onOpenPath` subscriber isn't
   /// mounted until the SPA finishes booting).
   @State private var deferredOpenPath: String?
+  @State private var deferredNotificationPath: String?
+  @State private var connectionID = UUID()
+  @State private var connectionIntent: DatabricksConnectionIntent = .connect
+  @State private var recoveryPageURL: URL?
+  @State private var recoveryPolicy = DatabricksRecoveryPolicy()
+  @State private var needsReauthentication = false
+  @State private var workspacePageLoaded = false
+
+  private var isWorkspace: Bool {
+    ServerAuthentication(origin: initialURL.omnigentOrigin) == .databricksWorkspace
+  }
+  private var showsServerSwitcher: Bool { isWorkspace || !model.serverSwitcherHidden }
 
   var body: some View {
     GeometryReader { geometry in
@@ -27,12 +40,24 @@ struct WebShellView: View {
           settings: settings,
           databricksInternalFeaturesEnabled: managedConfiguration.databricksInternalFeaturesEnabled,
           loadFailed: loadFailed,
-          loadSucceeded: loadSucceeded,
+          loadSucceeded: {
+            workspacePageLoaded = true
+            loadSucceeded()
+          },
           pushServerPicker: pushServerPicker,
           requestSwitchServer: switchServerIfListed,
-          openServerSetup: connectToNewServer
+          openServerSetup: connectToNewServer,
+          connectionIntent: connectionIntent,
+          recoveryPageURL: recoveryPageURL,
+          recoverWorkspace: recoverWorkspace,
+          workspaceReady: { recoveryPolicy.markReady() },
+          reauthenticateWorkspace: { page in
+            recoveryPageURL = page
+            needsReauthentication = true
+          },
+          signedOut: signedOut
         )
-        .id(DatabricksWebContext.viewIdentity(for: initialURL))
+        .id(DatabricksWebContext.viewIdentity(for: initialURL) + connectionID.uuidString)
         .ignoresSafeArea()
 
         if model.isAuthenticating {
@@ -52,13 +77,14 @@ struct WebShellView: View {
           maxWidth: ServerSwitcherMetrics.maxWidth(for: geometry.size.width),
           switchServer: switchServer,
           connectToNewServer: connectToNewServer,
-          reload: model.reload
+          reload: reload,
+          signOut: model.signOut
         )
         .padding(.top, InsetMetrics.serverSwitcherTopPadding)
-        .opacity(model.serverSwitcherHidden ? 0 : 1)
-        .scaleEffect(model.serverSwitcherHidden ? 0.96 : 1, anchor: .top)
-        .allowsHitTesting(!model.serverSwitcherHidden)
-        .accessibilityHidden(model.serverSwitcherHidden)
+        .opacity(showsServerSwitcher ? 1 : 0)
+        .scaleEffect(showsServerSwitcher ? 1 : 0.96, anchor: .top)
+        .allowsHitTesting(showsServerSwitcher)
+        .accessibilityHidden(!showsServerSwitcher)
       }
       .animation(.easeInOut(duration: 0.16), value: model.serverSwitcherHidden)
       .ignoresSafeArea(.keyboard)
@@ -85,9 +111,20 @@ struct WebShellView: View {
       }
       .ignoresSafeArea(.keyboard)
     }
+    .alert("Sign in again?", isPresented: $needsReauthentication) {
+      Button("Sign In") {
+        connectionIntent = .connect
+        workspacePageLoaded = false
+        connectionID = UUID()
+      }
+      Button("Cancel", role: .cancel) { loadFailed(initialURL, nil) }
+    } message: {
+      Text(DatabricksSessionError.reauthenticationRequired.localizedDescription)
+    }
     .onChange(of: router.pendingNotificationPath) { _, _ in
       if let path = router.consumeNotificationPath() {
-        model.emitNotificationActivation(path)
+        deferredNotificationPath = path
+        flushDeferredNavigation()
       }
     }
     .onChange(of: router.pendingOpenPath) { _, _ in
@@ -96,18 +133,11 @@ struct WebShellView: View {
       // server, or one that arrived mid-navigation), defer the path until the
       // page finishes loading — emitting now would fire into a page whose
       // `onOpenPath` subscriber isn't mounted yet and be lost.
-      if model.isLoading {
-        deferredOpenPath = path
-      } else {
-        model.emitOpenPath(path)
-      }
+      deferredOpenPath = path
+      flushDeferredNavigation()
     }
-    .onChange(of: model.isLoading) { _, loading in
-      if !loading, let path = deferredOpenPath {
-        deferredOpenPath = nil
-        model.emitOpenPath(path)
-      }
-    }
+    .onChange(of: model.isLoading) { _, _ in flushDeferredNavigation() }
+    .onChange(of: workspacePageLoaded) { _, _ in flushDeferredNavigation() }
     .onChange(of: model.isLoading) { _, loading in
       // Re-push the native bar footprints and the server-picker payload once
       // each load completes; the JS bridge caches both so later-mounting
@@ -120,6 +150,43 @@ struct WebShellView: View {
         pushServerPicker()
       }
     }
+  }
+
+  private func flushDeferredNavigation() {
+    guard !model.isLoading, !model.isAuthenticating, !needsReauthentication,
+      !isWorkspace || workspacePageLoaded
+    else { return }
+    if let path = deferredOpenPath {
+      deferredOpenPath = nil
+      model.emitOpenPath(path)
+    }
+    if let path = deferredNotificationPath {
+      deferredNotificationPath = nil
+      model.emitNotificationActivation(path)
+    }
+  }
+
+  private func recoverWorkspace(_ pageURL: URL) {
+    guard recoveryPolicy.begin() else {
+      loadFailed(initialURL, DatabricksSessionError.recoveryExhausted.localizedDescription)
+      return
+    }
+    recoveryPageURL = pageURL
+    connectionIntent = .recover
+    workspacePageLoaded = false
+    connectionID = UUID()
+  }
+
+  private func reload() {
+    guard isWorkspace else {
+      model.reload()
+      return
+    }
+    recoveryPageURL = model.currentURL ?? initialURL
+    recoveryPolicy = DatabricksRecoveryPolicy()
+    connectionIntent = .connect
+    workspacePageLoaded = false
+    connectionID = UUID()
   }
 
   /// Every server the picker may offer or switch to — administrator-preset
@@ -160,6 +227,7 @@ private struct ServerSwitcher: View {
   let switchServer: (String) -> Void
   let connectToNewServer: () -> Void
   let reload: () -> Void
+  let signOut: (() -> Void)?
 
   @Environment(\.colorScheme) private var colorScheme
 
@@ -200,6 +268,12 @@ private struct ServerSwitcher: View {
 
       Button(action: connectToNewServer) {
         Label("Connect to New Server", systemImage: "plus")
+      }
+      if let signOut {
+        Divider()
+        Button(role: .destructive, action: signOut) {
+          Label("Sign Out of Workspace", systemImage: "rectangle.portrait.and.arrow.right")
+        }
       }
     } label: {
       HStack(spacing: 6) {

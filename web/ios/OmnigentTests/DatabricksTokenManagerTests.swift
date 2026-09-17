@@ -285,6 +285,38 @@ final class DatabricksTokenManagerTests: XCTestCase {
     }
   }
 
+  func testRejectedUnexpiredAccessTokenCanBeRefreshedOnce() async throws {
+    let store = MemoryDatabricksCredentialStore()
+    let scope = try credentialScope()
+    let original = credentialTokens()
+    let rotated = credentialTokens(access: "rotated", refresh: "rotated-refresh")
+    try store.save(original, for: scope)
+    let client = RefreshStub(response: .success(rotated))
+    let manager = DatabricksTokenManager(
+      store: store, client: client, now: { Date(timeIntervalSince1970: 1000) })
+    let result = try await manager.refresh(rejected: original, for: scope)
+    XCTAssertEqual(result, rotated)
+    XCTAssertEqual(store.snapshot(for: scope), rotated)
+    let calls = await client.calls
+    XCTAssertEqual(calls.count, 1)
+  }
+
+  func testRejectedTokenCannotRefreshANewerLogin() async throws {
+    let store = MemoryDatabricksCredentialStore()
+    let scope = try credentialScope()
+    let current = credentialTokens(access: "new-login")
+    try store.save(current, for: scope)
+    let client = RefreshStub()
+    let manager = DatabricksTokenManager(store: store, client: client)
+    do {
+      _ = try await manager.refresh(rejected: credentialTokens(), for: scope)
+      XCTFail("Expected stale credentials")
+    } catch { XCTAssertEqual(error as? DatabricksCredentialError, .changed) }
+    let calls = await client.calls
+    XCTAssertTrue(calls.isEmpty)
+    XCTAssertEqual(store.snapshot(for: scope), current)
+  }
+
   private func assertCancelled(_ task: Task<DatabricksOAuthTokens?, Error>) async {
     do {
       _ = try await task.value
