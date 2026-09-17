@@ -31,22 +31,3 @@ def test_forwarder_quiescence_posts_quiesced_not_idle() -> None:
     quiescence_block = src[anchor : anchor + 800]
     assert 'else "quiesced"' in quiescence_block
     assert 'else "idle"' not in quiescence_block
-
-
-def test_runner_terminal_branch_ignores_quiesced() -> None:
-    """The runner's terminal-delivery condition admits only idle/failed."""
-    import inspect
-
-    from omnigent.runner import app as runner_app
-
-    src = inspect.getsource(runner_app)
-    terminal_block = src[
-        src.index('if status in ("idle", "failed"):') : src.index(
-            'if status in ("idle", "failed"):'
-        )
-        + 400
-    ]
-    assert 'status == "idle"' in terminal_block
-    assert '"quiesced"' not in terminal_block, (
-        "the badge value must never appear in the terminal path"
-    )

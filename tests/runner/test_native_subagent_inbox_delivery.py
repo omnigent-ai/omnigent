@@ -234,15 +234,16 @@ def _parent_snapshot(*, parent_session_id: str | None) -> dict[str, Any]:
     }
 
 
-async def _post_native_idle(
+async def _post_native_status(
     *,
     child_body: dict[str, Any],
     seed_parent_inbox: bool,
     register_work: bool,
     output: str = "review complete: LGTM",
     parent_body: dict[str, Any] | None = None,
+    status: str = "idle",
 ) -> tuple[int, list[dict[str, Any]]]:
-    """POST a native ``external_session_status: idle`` and return (http, inbox items).
+    """POST a native status event and return (http, inbox items).
 
     Models the forwarder reporting a finished native sub-agent turn.
     ``register_work`` seeds the in-memory work entry (the healthy case); leaving
@@ -282,7 +283,7 @@ async def _post_native_idle(
             f"/v1/sessions/{CHILD_SESSION_ID}/events",
             json={
                 "type": "external_session_status",
-                "data": {"status": "idle", "output": output},
+                "data": {"status": status, "output": output},
             },
         )
 
@@ -304,7 +305,7 @@ async def test_native_completion_recovers_reconnect_wiped_work_entry(
     dropped silently on the old code. The fix rebuilds the entry from the
     snapshot's ``parent_session_id`` + ``sub_agent_name`` and delivers.
     """
-    http, items = await _post_native_idle(
+    http, items = await _post_native_status(
         child_body=_child_snapshot(sub_agent_name="reviewer", parent_session_id=PARENT_SESSION_ID),
         seed_parent_inbox=True,
         register_work=False,
@@ -333,7 +334,7 @@ async def test_sys_session_create_child_without_sub_agent_name_delivers(
     link from the snapshot (keying on ``parent_session_id``) and labels the work
     with the agent name.
     """
-    http, items = await _post_native_idle(
+    http, items = await _post_native_status(
         child_body=_child_snapshot(
             sub_agent_name=None,
             parent_session_id=PARENT_SESSION_ID,
@@ -359,7 +360,7 @@ async def test_healthy_registered_work_entry_still_delivers(
     Guards against the fix regressing the common case where dispatch already
     registered the work entry on this runner.
     """
-    http, items = await _post_native_idle(
+    http, items = await _post_native_status(
         child_body=_child_snapshot(sub_agent_name="reviewer", parent_session_id=PARENT_SESSION_ID),
         seed_parent_inbox=True,
         register_work=True,
@@ -367,6 +368,52 @@ async def test_healthy_registered_work_entry_still_delivers(
 
     assert http == 204
     assert items and items[0]["status"] == "completed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("register_work", [False, True])
+@pytest.mark.parametrize(
+    "terminal_status, expected_status", [("idle", "completed"), ("failed", "failed")]
+)
+async def test_quiesced_badge_preserves_later_native_completion(
+    _clean_subagent_registry: None,
+    register_work: bool,
+    terminal_status: str,
+    expected_status: str,
+) -> None:
+    """A quiet transcript must not consume or duplicate the eventual completion."""
+    child_body = _child_snapshot(sub_agent_name="reviewer", parent_session_id=PARENT_SESSION_ID)
+    http, items = await _post_native_status(
+        child_body=child_body,
+        seed_parent_inbox=True,
+        register_work=register_work,
+        status="quiesced",
+        output="partial review",
+    )
+    assert http == 204
+    assert items == []
+
+    http, items = await _post_native_status(
+        child_body=child_body,
+        seed_parent_inbox=False,
+        register_work=False,
+        status=terminal_status,
+        output="final review",
+    )
+    assert http == 204
+    assert len(items) == 1
+    assert items[0]["status"] == expected_status
+    assert items[0]["output"] == "final review"
+
+    http, items = await _post_native_status(
+        child_body=child_body,
+        seed_parent_inbox=False,
+        register_work=False,
+        status=terminal_status,
+        output="final review",
+    )
+    assert http == 204
+    assert items == []
 
 
 @pytest.mark.asyncio
@@ -385,7 +432,7 @@ async def test_cold_parent_inbox_is_seeded_and_delivery_succeeds(
     ``_initialize_session`` seeds — instead of dropping the completion behind
     a 503 the parent's own orchestrator would otherwise wait on forever.
     """
-    http, items = await _post_native_idle(
+    http, items = await _post_native_status(
         child_body=_child_snapshot(sub_agent_name="reviewer", parent_session_id=PARENT_SESSION_ID),
         seed_parent_inbox=False,
         register_work=False,
@@ -598,7 +645,7 @@ async def test_cold_parent_delivery_route_invokes_real_seed_helper(
     original = runner_app._seed_cold_parent_delivery_queues
     runner_app._seed_cold_parent_delivery_queues = _spy_seed
     try:
-        http, items = await _post_native_idle(
+        http, items = await _post_native_status(
             child_body=_child_snapshot(
                 sub_agent_name="reviewer", parent_session_id=PARENT_SESSION_ID
             ),
@@ -620,7 +667,7 @@ async def test_nested_subagent_parent_without_inbox_receives_completion(
     _clean_subagent_registry: None,
 ) -> None:
     """A nested parent's inbox is created before acknowledging its child's completion."""
-    http, items = await _post_native_idle(
+    http, items = await _post_native_status(
         child_body=_child_snapshot(sub_agent_name="reviewer", parent_session_id=PARENT_SESSION_ID),
         seed_parent_inbox=False,
         register_work=False,
@@ -698,7 +745,7 @@ async def test_replayed_idle_after_drain_does_not_redeliver(
     """
     child_body = _child_snapshot(sub_agent_name="reviewer", parent_session_id=PARENT_SESSION_ID)
     # First completion delivers normally.
-    http1, items1 = await _post_native_idle(
+    http1, items1 = await _post_native_status(
         child_body=child_body, seed_parent_inbox=True, register_work=True
     )
     assert http1 == 204
@@ -745,7 +792,7 @@ async def test_top_level_session_idle_is_noop(
     Ensures the recovery arm does not mis-classify a non-sub-agent sender as a
     sub-agent and start 503-ing or fabricating inbox deliveries.
     """
-    http, items = await _post_native_idle(
+    http, items = await _post_native_status(
         child_body=_child_snapshot(sub_agent_name=None, parent_session_id=None),
         seed_parent_inbox=True,
         register_work=False,
