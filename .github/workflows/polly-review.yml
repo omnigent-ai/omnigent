@@ -642,6 +642,10 @@ jobs:
                   value = os.environ.get(key)
                   if value:
                       text = text.replace(value, '[REDACTED]')
+                      if key == 'GATEWAY_BASE_URL':
+                          host = value.rstrip('/').removesuffix('/serving-endpoints')
+                          if host:
+                              text = text.replace(host, '[REDACTED]')
               target = destination / name
               target.parent.mkdir(parents=True, exist_ok=True)
               target.write_text(text)

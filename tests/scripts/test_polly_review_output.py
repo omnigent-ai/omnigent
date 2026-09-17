@@ -82,7 +82,10 @@ def test_review_output_preserves_final_review(tmp_path: Path, raw: str, expected
     assert payload == f"{expected}{delimiter}\n"
 
 
-def test_failure_diagnostics_preserves_logs_without_gateway_secrets(tmp_path: Path) -> None:
+@pytest.mark.parametrize("gateway_path", ["", "/serving-endpoints"])
+def test_failure_diagnostics_preserves_logs_without_gateway_secrets(
+    tmp_path: Path, gateway_path: str
+) -> None:
     workflow = yaml.safe_load(_WORKFLOW.read_text())
     step = next(
         s
@@ -92,6 +95,7 @@ def test_failure_diagnostics_preserves_logs_without_gateway_secrets(tmp_path: Pa
     logs = tmp_path / "logs"
     logs.mkdir()
     (logs / "runner.log").write_text("request failed: test-api-secret at https://gateway.test")
+    (logs / "codex.log").write_text("gateway: https://gateway.test/ai-gateway/codex/v1")
     (logs / "config.yaml").write_text("not a process log")
     (tmp_path / "polly-stderr.log").write_text("stderr: test-api-secret")
     output = tmp_path / "polly_output.txt"
@@ -110,7 +114,7 @@ def test_failure_diagnostics_preserves_logs_without_gateway_secrets(tmp_path: Pa
         env={
             "PATH": f"{tmp_path}{os.pathsep}{os.defpath}",
             "LLM_API_KEY": "test-api-secret",
-            "GATEWAY_BASE_URL": "https://gateway.test",
+            "GATEWAY_BASE_URL": f"https://gateway.test{gateway_path}",
         },
         text=True,
         capture_output=True,
@@ -122,6 +126,9 @@ def test_failure_diagnostics_preserves_logs_without_gateway_secrets(tmp_path: Pa
     assert (destination / "polly-output.txt").read_text() == "Waiting for results. [REDACTED]"
     assert (destination / "process-logs/runner.log").read_text() == (
         "request failed: [REDACTED] at [REDACTED]"
+    )
+    assert (destination / "process-logs/codex.log").read_text() == (
+        "gateway: [REDACTED]/ai-gateway/codex/v1"
     )
     assert not (destination / "process-logs/config.yaml").exists()
     assert not (destination / "polly-review.txt").exists()
