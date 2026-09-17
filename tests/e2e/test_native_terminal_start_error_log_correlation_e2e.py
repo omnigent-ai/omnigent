@@ -21,7 +21,7 @@ subprocess, a real runner subprocess, the real ZeroBus debug-log sink):
    (``OMNIGENT_RUNNER_PRIMARY_SESSION_ID=<parent>``) with the sink enabled.
 3. Create a child session and bind it to the same runner.
 4. Make the child's native Claude terminal fail to start:
-   * a stub ``claude`` that exits immediately (generic startup failure), and
+   * a tmux creation failure (generic startup failure), and
    * separately, the child's agent deleted from the store (the expected
      ``session_agent_missing`` lifecycle path).
 5. The ensure request returns the structured error with its ``Error ID``; the
@@ -41,6 +41,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import shutil
 import signal
 import socket
@@ -256,7 +257,7 @@ class _Stack:
 
 
 @contextlib.contextmanager
-def _native_stack(tmp_path: Path, claude_stub_script: str):
+def _native_stack(tmp_path: Path, claude_stub_script: str, *, fail_tmux_launch: bool = False):
     """Spawn server + runner-for-a-parent-session with the debug-log sink live.
 
     Mirrors production wiring: the parent session exists first, the runner is
@@ -279,6 +280,23 @@ def _native_stack(tmp_path: Path, claude_stub_script: str):
     stub = stub_bin / "claude"
     stub.write_text(claude_stub_script)
     stub.chmod(0o755)
+
+    if fail_tmux_launch:
+        real_tmux = shutil.which("tmux")
+        assert real_tmux is not None
+        tmux_stub = stub_bin / "tmux"
+        # Fail creation before attachment can gate the Claude process startup.
+        tmux_stub.write_text(
+            "#!/bin/sh\n"
+            "for arg do\n"
+            '  if [ "$arg" = "new-session" ]; then\n'
+            '    echo "synthetic tmux launch failure" >&2\n'
+            "    exit 7\n"
+            "  fi\n"
+            "done\n"
+            f'exec {shlex.quote(real_tmux)} "$@"\n'
+        )
+        tmux_stub.chmod(0o755)
 
     binding_token = secrets.token_urlsafe(32)
     runner_id = token_bound_runner_id(binding_token)
@@ -446,7 +464,11 @@ def test_native_terminal_start_failure_row_correlates_to_failed_child(
     """A child session's generic native-terminal startup failure must persist a
     debug-log diagnostic carrying the CHILD's session id and a searchable
     ``attributes.error_id`` matching the error payload the child received."""
-    with _native_stack(tmp_path, claude_stub_script="#!/bin/sh\nexit 7\n") as stack:
+    with _native_stack(
+        tmp_path,
+        claude_stub_script="#!/bin/sh\nexec sleep 600\n",
+        fail_tmux_launch=True,
+    ) as stack:
         child_id, _child_agent_id = _create_session_with_scoped_agent(
             stack.base_url, "failing-child-fixture"
         )
