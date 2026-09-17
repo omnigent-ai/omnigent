@@ -10350,6 +10350,67 @@ async def test_patch_permission_mode_persists_label_and_forwards_event(
     }
 
 
+@pytest.mark.parametrize(
+    ("switch_duration_s", "expected_status", "expected_mode"),
+    [(6.0, 200, "auto"), (18.0, 200, "auto"), (30.0, 503, "default")],
+)
+async def test_patch_permission_mode_waits_for_runner_before_persisting(
+    client: httpx.AsyncClient,
+    switch_duration_s: float,
+    expected_status: int,
+    expected_mode: str,
+) -> None:
+    """A slow, successful TUI cycle must reach the durable resume state."""
+    from omnigent.runtime import set_runner_client
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content) if request.content else {}
+        if body.get("type") != "permission_mode_change":
+            return httpx.Response(204)
+        # MockTransport does not enforce HTTP timeouts; model the response
+        # deadline without spending wall-clock time on terminal repaints.
+        read_timeout = request.extensions["timeout"]["read"]
+        if read_timeout is not None and read_timeout < switch_duration_s:
+            raise httpx.ReadTimeout("Mode cycle is still running", request=request)
+        return httpx.Response(200, json={"permission_mode": "auto"})
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        base_url="http://runner",
+    )
+    set_runner_client(fake_runner)
+    try:
+        agent = await create_test_agent(client)
+        session = await _create_session(
+            client,
+            agent["id"],
+            labels={
+                "omnigent.ui": "terminal",
+                "omnigent.wrapper": "claude-code-native-ui",
+                "omnigent.claude_native.permission_mode": "default",
+            },
+            terminal_launch_args=["--model", "opus", "--permission-mode", "default"],
+        )
+
+        response = await client.patch(
+            f"/v1/sessions/{session['id']}",
+            json={"permission_mode": "auto"},
+        )
+        snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    finally:
+        await fake_runner.aclose()
+        set_runner_client(None)
+
+    assert response.status_code == expected_status, response.text
+    assert snapshot["labels"]["omnigent.claude_native.permission_mode"] == expected_mode
+    assert snapshot["terminal_launch_args"] == [
+        "--model",
+        "opus",
+        "--permission-mode",
+        expected_mode,
+    ]
+
+
 async def test_patch_permission_mode_rewrites_launch_arg_and_keeps_other_args(
     client: httpx.AsyncClient,
 ) -> None:
