@@ -15,7 +15,14 @@ from fastapi.responses import JSONResponse
 from starlette.testclient import TestClient
 
 from omnigent.db.utils import builtin_agent_id
-from omnigent.entities import Agent, Conversation, ConversationItem, MessageData, PagedList
+from omnigent.entities import (
+    Agent,
+    Conversation,
+    ConversationItem,
+    MessageData,
+    PagedList,
+    StoredFile,
+)
 from omnigent.errors import OmnigentError
 from omnigent.server.auth import AuthProvider, UnifiedAuthProvider
 from omnigent.server.managed_hosts import (
@@ -178,6 +185,7 @@ class _ConversationStore:
         presentation_labels: dict[str, str] | None = None,
         up_to_response_id: str | None = None,
         project_id: str | None = None,
+        file_id_map: dict[str, str] | None = None,
     ) -> Conversation:
         """
         Record the fork call and return a fixed new conversation.
@@ -212,6 +220,9 @@ class _ConversationStore:
         :param project_id: First-class project the fork is filed into
             (route passes the source's project only when the forker
             owns it), or ``None`` for unfiled.
+        :param file_id_map: Source file id → fork-owned file id for the
+            file resources the route copies into the fork (empty when
+            the source has none, or when no file store is configured).
         :returns: A new Conversation with a deterministic ID.
         :raises LookupError: If source is not in our map.
         :raises ValueError: If *up_to_response_id* matches no item.
@@ -239,6 +250,7 @@ class _ConversationStore:
                 "presentation_labels": presentation_labels,
                 "up_to_response_id": up_to_response_id,
                 "project_id": project_id,
+                "file_id_map": file_id_map,
             }
         )
         src = self._convs.get(source_conversation_id)
@@ -327,6 +339,139 @@ class _ConversationStore:
         )
 
 
+class _FileStore:
+    """In-memory file store stub scoped like the real one.
+
+    :param files: Pre-populated map of file_id → StoredFile.
+    """
+
+    def __init__(self, files: dict[str, StoredFile] | None = None) -> None:
+        """
+        Initialize the stub.
+
+        :param files: Map from file ID to StoredFile entity.
+        """
+        self.files: dict[str, StoredFile] = dict(files or {})
+
+    def list(
+        self,
+        session_id: str,
+        limit: int = 20,
+        after: str | None = None,
+        before: str | None = None,
+        order: str = "desc",
+        include_unscoped: bool = False,
+    ) -> PagedList[StoredFile]:
+        """
+        Return the session's files (single page — stub keeps few).
+
+        :param session_id: Owning session whose files to list.
+        :param limit: Max files.
+        :param after: Cursor (unused by the stub).
+        :param before: Cursor (unused by the stub).
+        :param order: Sort order (unused by the stub).
+        :param include_unscoped: Unused by the stub.
+        :returns: A PagedList of the session's files.
+        """
+        del after, before, order, include_unscoped
+        data = [f for f in self.files.values() if f.session_id == session_id][:limit]
+        return PagedList(
+            data=data,
+            first_id=data[0].id if data else None,
+            last_id=data[-1].id if data else None,
+            has_more=False,
+        )
+
+    def create(
+        self,
+        filename: str,
+        bytes: int,
+        content_type: str | None = None,
+        session_id: str | None = None,
+        file_id: str | None = None,
+        blob_key: str | None = None,
+        source_metadata: dict[str, Any] | None = None,
+    ) -> StoredFile:
+        """
+        Record a new file row, honoring a caller-chosen id and blob_key.
+
+        :param filename: Original filename.
+        :param bytes: File size in bytes.
+        :param content_type: MIME type.
+        :param session_id: Owning session id.
+        :param file_id: Caller-chosen id, or ``None`` to derive one.
+        :param blob_key: Artifact-store key for the bytes (a fork copy
+            shares the source's blob); defaults to the row's own id.
+        :param source_metadata: Opaque upload metadata carried onto the copy.
+        :returns: The newly created StoredFile.
+        """
+        new_id = file_id or f"gen{len(self.files):029d}"
+        stored = StoredFile(
+            id=new_id,
+            created_at=1,
+            filename=filename,
+            bytes=bytes,
+            content_type=content_type,
+            session_id=session_id,
+            blob_key=blob_key if blob_key is not None else new_id,
+            source_metadata=source_metadata,
+        )
+        self.files[new_id] = stored
+        return stored
+
+
+class _ArtifactStore:
+    """In-memory artifact (blob) store stub.
+
+    :param blobs: Pre-populated map of file_id → content bytes.
+    """
+
+    def __init__(self, blobs: dict[str, bytes] | None = None) -> None:
+        """
+        Initialize the stub.
+
+        :param blobs: Map from file ID to blob bytes.
+        """
+        self.blobs: dict[str, bytes] = dict(blobs or {})
+        self.exists_calls = 0
+
+    def exists(self, artifact_id: str) -> bool:
+        """
+        Whether a blob exists (counts calls so tests can assert no probing).
+
+        :param artifact_id: Blob key (the file id).
+        :returns: True when the blob is present.
+        """
+        self.exists_calls += 1
+        return artifact_id in self.blobs
+
+    def get(self, artifact_id: str) -> bytes:
+        """
+        Return blob bytes.
+
+        :param artifact_id: Blob key (the file id).
+        :returns: The blob's bytes.
+        """
+        return self.blobs[artifact_id]
+
+    def put(self, artifact_id: str, content: bytes) -> None:
+        """
+        Store blob bytes.
+
+        :param artifact_id: Blob key (the file id).
+        :param content: The bytes to store.
+        """
+        self.blobs[artifact_id] = content
+
+    def delete(self, artifact_id: str) -> None:
+        """
+        Delete a blob if present.
+
+        :param artifact_id: Blob key (the file id).
+        """
+        self.blobs.pop(artifact_id, None)
+
+
 # ── Helpers ──────────────────────────────────────────────────────
 
 
@@ -387,6 +532,8 @@ def _build_app(
     store: _ConversationStore,
     agent_store: _AgentStore | None = None,
     auth_provider: AuthProvider | None = None,
+    file_store: _FileStore | None = None,
+    artifact_store: _ArtifactStore | None = None,
 ) -> FastAPI:
     """
     Build a FastAPI app with the sessions router and error handler.
@@ -400,6 +547,9 @@ def _build_app(
         pre-populated stub with ``087b7cb7ac30abf4debfaa578d052ec6``.
     :param auth_provider: Auth provider supplying the caller identity, or
         ``None`` (the default) for an auth-disabled app.
+    :param file_store: File store stub for fork file-copy tests, or
+        ``None`` (the default) to leave file routes unconfigured.
+    :param artifact_store: Artifact store stub paired with *file_store*.
     :returns: A configured FastAPI app ready for TestClient.
     """
     if agent_store is None:
@@ -418,6 +568,8 @@ def _build_app(
         conversation_store=store,  # type: ignore[arg-type]
         agent_store=agent_store,  # type: ignore[arg-type]
         auth_provider=auth_provider,
+        file_store=file_store,  # type: ignore[arg-type]
+        artifact_store=artifact_store,  # type: ignore[arg-type]
     )
     app = FastAPI()
 
@@ -540,6 +692,121 @@ async def test_fork_session_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
     assert fork_call["agent_id"] == body["agent_id"], (
         "Fork must bind the same cloned agent id it asked the store to create"
     )
+
+
+@pytest.mark.asyncio
+async def test_fork_session_shares_source_file_blob_without_copying_bytes() -> None:
+    """A fork creates its own file rows but SHARES the source's blob.
+
+    The store gets the old→new id map so copied items reference the fork's
+    rows; each fork row's blob_key points at the source's blob, so no bytes
+    are duplicated. Without a fork-owned row the fork's session-scoped file
+    endpoints 404 for every attachment the copied items reference.
+    """
+    source_id = "e9f8f58523cec9a57d3bdf93be543e8c"
+    src_file_id = "aa11bb22cc33dd44ee55ff6677889900"
+    conv = _make_conversation()
+    conv_store = _ConversationStore(
+        conversations={source_id: conv},
+        items_by_conv={source_id: [_make_item("9980c8a9248139f14f4165e5d53088aa", "Hello")]},
+    )
+    file_store = _FileStore(
+        files={
+            src_file_id: StoredFile(
+                id=src_file_id,
+                created_at=1,
+                filename="photo.png",
+                bytes=4,
+                content_type="image/png",
+                session_id=source_id,
+                blob_key=src_file_id,
+            ),
+        }
+    )
+    artifact_store = _ArtifactStore(blobs={src_file_id: b"\x89PNG"})
+    client = TestClient(
+        _build_app(conv_store, file_store=file_store, artifact_store=artifact_store)
+    )
+
+    resp = client.post(f"/v1/sessions/{source_id}/fork", json={})
+
+    assert resp.status_code == 201, resp.text
+    fork_id = resp.json()["id"]
+
+    # The store fork received the complete old→new mapping.
+    file_id_map = conv_store.fork_calls[0]["file_id_map"]
+    assert set(file_id_map) == {src_file_id}
+    new_file_id = file_id_map[src_file_id]
+    assert new_file_id != src_file_id
+
+    # The fork row is its own (fork-scoped, fresh id) but points at the
+    # SOURCE's blob — metadata preserved, no bytes duplicated.
+    copied = file_store.files[new_file_id]
+    assert copied.session_id == fork_id
+    assert copied.filename == "photo.png"
+    assert copied.bytes == 4
+    assert copied.content_type == "image/png"
+    assert copied.blob_key == src_file_id
+
+    # No new blob was written: the artifact store still holds exactly the
+    # one source blob, and both the source row and blob are untouched.
+    assert set(artifact_store.blobs) == {src_file_id}
+    assert artifact_store.blobs[src_file_id] == b"\x89PNG"
+    assert file_store.files[src_file_id].session_id == source_id
+
+
+@pytest.mark.asyncio
+async def test_fork_copies_all_file_rows_without_probing_blobs() -> None:
+    """The fork carries every source file row as pure metadata — no per-file
+    artifact-store probe (an S3 HEAD / Volumes stat is real per-fork latency).
+
+    A source file whose blob is already gone still gets a fork row; it 404s on
+    read exactly as the source already does, so probing would only trade
+    latency for the same outcome. Forking never fails on a deleted file.
+    """
+    source_id = "e9f8f58523cec9a57d3bdf93be543e8c"
+    live_file_id = "aa11bb22cc33dd44ee55ff6677889900"
+    gone_file_id = "bb22cc33dd44ee55ff66778899001122"
+    conv = _make_conversation()
+    conv_store = _ConversationStore(conversations={source_id: conv})
+    file_store = _FileStore(
+        files={
+            live_file_id: StoredFile(
+                id=live_file_id,
+                created_at=1,
+                filename="kept.png",
+                bytes=4,
+                content_type="image/png",
+                session_id=source_id,
+            ),
+            gone_file_id: StoredFile(
+                id=gone_file_id,
+                created_at=1,
+                filename="lost.png",
+                bytes=4,
+                content_type="image/png",
+                session_id=source_id,
+            ),
+        }
+    )
+    # Only the live file has a blob; the fork must not probe either way.
+    artifact_store = _ArtifactStore(blobs={live_file_id: b"\x89PNG"})
+    client = TestClient(
+        _build_app(conv_store, file_store=file_store, artifact_store=artifact_store)
+    )
+
+    resp = client.post(f"/v1/sessions/{source_id}/fork", json={})
+
+    assert resp.status_code == 201, resp.text
+    # Both source files are mapped and copied — no probe-driven skipping.
+    file_id_map = conv_store.fork_calls[0]["file_id_map"]
+    assert set(file_id_map) == {live_file_id, gone_file_id}
+    fork_id = resp.json()["id"]
+    fork_owned = sorted(f.filename for f in file_store.files.values() if f.session_id == fork_id)
+    assert fork_owned == ["kept.png", "lost.png"]
+    # The fork touched the artifact store zero times (no bytes moved, no HEADs).
+    assert artifact_store.exists_calls == 0
+    assert set(artifact_store.blobs) == {live_file_id}
 
 
 @pytest.mark.asyncio

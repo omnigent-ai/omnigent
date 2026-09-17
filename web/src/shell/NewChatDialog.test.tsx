@@ -4744,29 +4744,37 @@ describe("NewChatLandingScreen", () => {
     expect(screen.queryByRole("alert")).toBeNull();
   });
 
-  it("disarms the dangerous bypass when the agent changes (re-arm per context)", () => {
+  it.each([
+    ["default", "Default"],
+    ["full-access", "Full access"],
+    ["read-only", "Read only"],
+    ["bypass", "Bypass approvals & sandbox"],
+  ])("remembers Codex %s across harness switches and fresh visits", (mode, label) => {
     renderLanding();
     selectAgent("a2");
-    pickPermissionOption("bypass");
-    expect(screen.getByTestId("new-chat-landing-permission-chip")).toHaveAccessibleName(
-      "Permission mode: Bypass approvals & sandbox",
-    );
+    pickPermissionOption("read-only");
+    pickPermissionOption(mode);
+    expect(readHarnessOptions("codex-native").mode).toBe(mode);
 
-    // A different agent starts a fresh context, so returning to Codex disarms bypass.
-    selectAgent("a1");
-    selectAgent("a2");
-    expect(screen.getByTestId("new-chat-landing-permission-chip")).toHaveAccessibleName(
-      "Permission mode: Default",
-    );
-  });
-
-  it("restores the hand dropdown's bypass selection on a fresh visit", () => {
-    renderLanding();
-    selectAgent("a2");
-    pickPermissionOption("bypass");
     remountLanding();
     expect(screen.getByTestId("new-chat-landing-permission-chip")).toHaveAccessibleName(
-      "Permission mode: Bypass approvals & sandbox",
+      `Permission mode: ${label}`,
+    );
+
+    selectAgent("a1");
+    pickPermissionOption("plan");
+    selectAgent("a2");
+    expect(screen.getByTestId("new-chat-landing-permission-chip")).toHaveAccessibleName(
+      `Permission mode: ${label}`,
+    );
+
+    remountLanding();
+    expect(screen.getByTestId("new-chat-landing-permission-chip")).toHaveAccessibleName(
+      `Permission mode: ${label}`,
+    );
+    selectAgent("a1");
+    expect(screen.getByTestId("new-chat-landing-permission-chip")).toHaveAccessibleName(
+      "Permission mode: Plan",
     );
   });
 

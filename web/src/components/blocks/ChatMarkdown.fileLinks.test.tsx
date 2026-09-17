@@ -186,7 +186,7 @@ describe("markdown links to workspace files", () => {
 describe("cited positions", () => {
   it.each([
     ["relative colon", "`docs/notes.md:12`", "docs/notes.md:12", "docs/notes.md", 12],
-    ["relative line+column", "`docs/notes.md:12:7`", "docs/notes.md:12:7", "docs/notes.md", 12],
+    ["relative line+column", "`docs/notes.md:12:7`", "docs/notes.md:12:7", "docs/notes.md", 12, 7],
     ["relative hash line", "`docs/notes.md#L13`", "docs/notes.md#L13", "docs/notes.md", 13],
     [
       "relative hash line+column",
@@ -194,6 +194,7 @@ describe("cited positions", () => {
       "docs/notes.md#L14C3",
       "docs/notes.md",
       14,
+      3,
     ],
     [
       "relative hash range",
@@ -217,25 +218,31 @@ describe("cited positions", () => {
       "README.md",
       18,
     ],
-  ])("opens an inline-code %s citation at its first line", (_label, markdown, name, path, line) => {
-    renderMarkdown(markdown, [path]);
+  ])(
+    "opens an inline-code %s citation at its first line",
+    (_label, markdown, name, path, line, column?: number) => {
+      renderMarkdown(markdown, [path]);
 
-    fireEvent.click(screen.getByRole("button", { name }));
-    expect(openFile).toHaveBeenCalledWith(path, { line });
-  });
+      fireEvent.click(screen.getByRole("button", { name }));
+      expect(openFile).toHaveBeenCalledWith(path, { line, ...(column ? { column } : {}) });
+    },
+  );
 
   it.each([
     ["relative colon", "docs/notes.md:21", "docs/notes.md", 21],
     ["relative hash range", "docs/notes.md#L22-L30", "docs/notes.md", 22],
     ["absolute hash line", `${WORKSPACE}/docs/notes.md#L23`, "docs/notes.md", 23],
-    ["home-relative line+column", "~/ws/docs/notes.md:24:9", "docs/notes.md", 24],
+    ["home-relative line+column", "~/ws/docs/notes.md:24:9", "docs/notes.md", 24, 9],
     ["file URI hash line", `file://${WORKSPACE}/docs/notes.md#L25`, "docs/notes.md", 25],
-  ])("opens a markdown %s citation at its first line", (_label, href, path, line) => {
-    renderMarkdown(`[target](${href})`, [path]);
+  ])(
+    "opens a markdown %s citation at its first line",
+    (_label, href, path, line, column?: number) => {
+      renderMarkdown(`[target](${href})`, [path]);
 
-    fireEvent.click(screen.getByRole("button", { name: "target" }));
-    expect(openFile).toHaveBeenCalledWith(path, { line });
-  });
+      fireEvent.click(screen.getByRole("button", { name: "target" }));
+      expect(openFile).toHaveBeenCalledWith(path, { line, ...(column ? { column } : {}) });
+    },
+  );
 
   it("opens a path without a position as a plain open", () => {
     renderMarkdown("see `docs/notes.md` for detail", ["docs/notes.md"]);

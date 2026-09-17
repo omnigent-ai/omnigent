@@ -9,11 +9,19 @@
 //   │  - gutter icon → add comment    │                  │
 //   └──────────────────────────────────┴──────────────────┘
 
+import { FileViewerContext, type FilePosition } from "./FileViewerContext";
+import {
+  dismissFilePosition,
+  isFilePositionDismissed,
+  isFilePositionPending,
+  stopFilePosition,
+} from "./filePositionState";
 import { toast } from "sonner";
 import {
   lazy,
   Suspense,
   useCallback,
+  useContext,
   useEffect,
   useLayoutEffect,
   useMemo,
@@ -280,6 +288,7 @@ function useToolbarOverflow(actionsKey: string): {
 // ---------------------------------------------------------------------------
 
 interface FileViewerProps {
+  position?: FilePosition;
   open: boolean;
   conversationId: string;
   path: string;
@@ -331,6 +340,7 @@ export function FileViewer(props: FileViewerProps) {
 }
 
 function FileViewerBody({
+  position,
   open,
   conversationId,
   path,
@@ -350,12 +360,6 @@ function FileViewerBody({
   // param writes to re-run the initialization logic.
   const initialDiffRef = useRef(searchParams.get("diff") === "1");
   const initialCommentIdRef = useRef(searchParams.get("comment"));
-  // 1-based line a chat citation (`path:line`) pointed at, written to ?line=
-  // by AppShell's openFileViewer. Read reactively (not once) so citing another
-  // line while the same file is already open still re-reveals.
-  const lineParam = searchParams.get("line");
-  const parsedLine = lineParam === null ? Number.NaN : Number.parseInt(lineParam, 10);
-  const revealLine = Number.isInteger(parsedLine) && parsedLine >= 1 ? parsedLine : null;
   // Seeded from the parent's persisted state on remount (e.g. returning to a
   // tab); defaults closed on a fresh open. The linked-comment / fresh-open
   // effects below only force it open, never closed, so a restored-open value
@@ -425,22 +429,31 @@ function FileViewerBody({
   // to decide whether to preserve the pending mark when the user clicks away.
   const pendingBodyRef = useRef("");
   const [isEditorDirty, setIsEditorDirty] = useState(false);
+  // Acceptance clears this synchronously before entering another navigation guard.
+  const isEditorDirtyRef = useRef(false);
+  const handleDirtyChange = useCallback((dirty: boolean) => {
+    isEditorDirtyRef.current = dirty;
+    setIsEditorDirty(dirty);
+  }, []);
   // Auto-save lifecycle reported up from the Monaco editor, shown as a status
   // chip in the toolbar (the editor itself no longer has a Save button).
   const [saveStatus, setSaveStatus] = useState<SaveStatus>("idle");
   // Brief "copied" feedback for the copy-link button.
   const [linkCopied, setLinkCopied] = useState(false);
   const linkCopiedTimerRef = useRef<number>(0);
-  const [pendingAction, setPendingAction] = useState<(() => void) | null>(null);
+  const [pendingAction, setPendingAction] = useState<{
+    apply: () => void;
+    cancel?: () => void;
+  } | null>(null);
   // TOC panel state (for markdown preview)
   const [tocOpen, setTocOpen] = useState(false);
   // Reset selection state whenever the file changes.
   useEffect(() => {
     setActiveSelection(null);
-    setIsEditorDirty(false);
+    handleDirtyChange(false);
     setSaveStatus("idle");
     setTocOpen(false);
-  }, [path]);
+  }, [path, handleDirtyChange]);
   // Reset comments initialization when the viewer transitions from closed to open,
   // so the panel state is derived from the freshly-opened file's comments.
   // When navigating via < > arrows (path changes while already open), the
@@ -486,16 +499,13 @@ function FileViewerBody({
     return () => window.removeEventListener("beforeunload", handler);
   }, [isEditorDirty]);
 
-  const guardDirty = useCallback(
-    (action: () => void) => {
-      if (isEditorDirty) {
-        setPendingAction(() => action);
-        return;
-      }
-      action();
-    },
-    [isEditorDirty],
-  );
+  const guardDirty = useCallback((action: () => void, cancel?: () => void) => {
+    if (isEditorDirtyRef.current) {
+      setPendingAction({ apply: action, cancel });
+      return;
+    }
+    action();
+  }, []);
 
   useEffect(
     () => () => {
@@ -555,6 +565,8 @@ function FileViewerBody({
   );
 
   const handleSetActiveSelection = (selection: ActiveSelection | null) => {
+    // Comment navigation supersedes a citation, including clicks outside the editor.
+    if (selection && filePosition) stopFilePosition(filePosition);
     let nextSelection = selection;
     if (selection && selection.comment_id == null) {
       const comment = openComments.find(
@@ -581,7 +593,7 @@ function FileViewerBody({
     linkedCommentAppliedRef.current = true;
     commentsInitializedRef.current = true;
     setCommentsOpen(true);
-    setActiveSelection({
+    handleSetActiveSelection({
       start_index: comment.start_index,
       end_index: comment.end_index,
       anchor_content: comment.anchor_content ?? "",
@@ -750,10 +762,65 @@ function FileViewerBody({
         ? "preview"
         : previewableViewMode
     : "source";
-  // Derived effective view mode — diff takes priority when active and available.
+  // Local state triggers rendering; the WeakSet preserves dismissal across remounts.
+  const [dismissedPosition, setDismissedPosition] = useState<FilePosition>();
+  const [appliedNavigation, setAppliedNavigation] = useState({ conversationId, path, position });
+  const lastNavigationRef = useRef(appliedNavigation);
+  const appliedPosition =
+    appliedNavigation.conversationId === conversationId && appliedNavigation.path === path
+      ? appliedNavigation.position
+      : undefined;
+  const filePosition =
+    appliedPosition !== dismissedPosition && !isFilePositionDismissed(appliedPosition)
+      ? appliedPosition
+      : undefined;
+  // Citations preserve diff mode; previewable files need source to expose line numbers.
   const viewMode: "editor" | "preview" | "source" | "diff" =
-    diffActive && isDiffAvailable ? "diff" : fileViewMode;
+    diffActive && isDiffAvailable ? "diff" : filePosition ? "source" : fileViewMode;
   const diffViewActive = viewMode === "diff";
+
+  const registerNavigationGuard = useContext(FileViewerContext)?.registerNavigationGuard;
+  useLayoutEffect(() => {
+    if (!open || !registerNavigationGuard) return;
+    return registerNavigationGuard((destination, options, navigate) => {
+      if (destination !== path || (options?.line && viewMode === "editor")) {
+        guardDirty(navigate);
+      } else {
+        navigate();
+      }
+    });
+  }, [open, path, viewMode, guardDirty, registerNavigationGuard]);
+
+  useEffect(() => {
+    const last = lastNavigationRef.current;
+    if (last.position === position && last.path === path && last.conversationId === conversationId)
+      return;
+    const next = { conversationId, path, position };
+    lastNavigationRef.current = next;
+    const apply = () => setAppliedNavigation(next);
+    // Switching out of the rich-text editor must preserve its unsaved-edit guard.
+    if (
+      position &&
+      viewMode === "editor" &&
+      last.path === path &&
+      last.conversationId === conversationId
+    ) {
+      guardDirty(apply, () => dismissFilePosition(position));
+    } else {
+      apply();
+    }
+  }, [position, path, conversationId, viewMode, guardDirty]);
+
+  useEffect(() => {
+    const el = contentAreaRef.current;
+    if (!el || !filePosition) return;
+    const stop = () => stopFilePosition(filePosition);
+    const events = ["wheel", "touchstart", "pointerdown", "keydown"] as const;
+    for (const event of events) el.addEventListener(event, stop, { passive: true, capture: true });
+    return () => {
+      for (const event of events) el.removeEventListener(event, stop, { capture: true });
+    };
+  }, [filePosition]);
 
   // Cmd/Ctrl+F opens find-in-file on the Monaco-backed surfaces (code
   // source/editor and the diff view). Those surfaces would otherwise rely on
@@ -834,6 +901,7 @@ function FileViewerBody({
     contentAreaRef,
     contentScrollKey,
     fileQuery.data !== undefined,
+    !isFilePositionPending(filePosition),
   );
   // Measure the content area so the split toggle can hide when there isn't
   // enough room for side-by-side. Only observe while the diff is shown — the
@@ -853,14 +921,14 @@ function FileViewerBody({
   const splitToggleAvailable =
     contentWidth === null || contentWidth === 0 || contentWidth >= MONACO_SPLIT_BREAKPOINT;
   useEffect(() => {
-    if (viewMode !== "editor") setIsEditorDirty(false);
+    if (viewMode !== "editor") handleDirtyChange(false);
     // Skip on mount — only clear when the user actively switches modes.
     // Clearing on mount would race with the linked-comment effect.
     if (viewModeInitializedRef.current && (viewMode === "editor" || viewMode === "preview")) {
       setActiveSelection(null);
     }
     viewModeInitializedRef.current = true;
-  }, [viewMode]);
+  }, [viewMode, handleDirtyChange]);
 
   // Sync diff state to URL. Skip when already in sync to avoid clobbering ?file=
   // that AppShell writes (React Router v7 BrowserRouter defers via startTransition,
@@ -882,7 +950,7 @@ function FileViewerBody({
       },
       { replace: true },
     );
-  }, [diffActive, isDiffAvailable, open]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [diffActive, isDiffAvailable, open, searchParams, setSearchParams]);
 
   // Toolbar actions, declared once and rendered two ways: inline icon buttons
   // when there's room, or rows in an overflow ("⋯") menu when there isn't.
@@ -943,6 +1011,8 @@ function FileViewerBody({
       // cancels leaves both the bias and the editor intact.
       const apply = () => {
         setDeepLinkBiasPath(null);
+        dismissFilePosition(position);
+        setDismissedPosition(position);
         setPreviewableViewMode(mode);
       };
       if (viewMode === "editor") {
@@ -1004,6 +1074,8 @@ function FileViewerBody({
       // "editor" would no-op the first click. Keying on viewMode makes one click
       // always reach the other surface.
       onSelect: () => {
+        dismissFilePosition(position);
+        setDismissedPosition(position);
         setPreviewableViewMode(viewMode === "preview" ? "source" : "preview");
       },
     });
@@ -1046,7 +1118,12 @@ function FileViewerBody({
       label: viewMode === "diff" ? "Exit diff view" : "Show diff",
       icon: <FileDiffIcon className="size-4" />,
       active: viewMode === "diff",
-      onSelect: () => guardDirty(() => setDiffActive((prev) => !prev)),
+      onSelect: () =>
+        guardDirty(() => {
+          dismissFilePosition(position);
+          setDismissedPosition(position);
+          setDiffActive(viewMode !== "diff");
+        }),
     });
   }
   if (viewMode === "diff" && splitToggleAvailable) {
@@ -1526,6 +1603,7 @@ function FileViewerBody({
                 {/* key={path} remounts per file so onMount re-runs (EOL + comment
                   wiring re-applied) and `ready` resets while the new grammar loads. */}
                 <MonacoDiffViewer
+                  position={filePosition}
                   key={path}
                   before={diffQuery.data.before}
                   after={diffQuery.data.after}
@@ -1540,16 +1618,16 @@ function FileViewerBody({
                   pendingBodyRef={pendingBodyRef}
                   searchOpen={searchOpen}
                   onSearchHandled={handleSearchHandled}
-                  revealLine={revealLine}
                 />
               </Suspense>
             )
           ) : (
             <CodeViewer
+              position={filePosition}
               conversationId={conversationId}
               path={path}
               fileQuery={fileQuery}
-              onDirtyChange={setIsEditorDirty}
+              onDirtyChange={handleDirtyChange}
               onSaveStatusChange={setSaveStatus}
               comments={openComments}
               addressedComments={addressedComments}
@@ -1564,7 +1642,6 @@ function FileViewerBody({
               tocOpen={tocOpen}
               onTocToggle={() => setTocOpen((prev) => !prev)}
               onRequestEditMode={lang === "markdown" ? handleRequestEditMode : undefined}
-              revealLine={revealLine}
             />
           )}
         </div>
@@ -1595,7 +1672,7 @@ function FileViewerBody({
               sender.mutate({ comment_ids: ids });
             }}
             onClickComment={(comment) => {
-              setActiveSelection({
+              handleSetActiveSelection({
                 start_index: comment.start_index,
                 end_index: comment.end_index,
                 anchor_content: comment.anchor_content ?? "",
@@ -1634,7 +1711,10 @@ function FileViewerBody({
       <Dialog
         open={pendingAction !== null}
         onOpenChange={(isOpen) => {
-          if (!isOpen) setPendingAction(null);
+          if (!isOpen) {
+            pendingAction?.cancel?.();
+            setPendingAction(null);
+          }
         }}
       >
         <DialogContent showCloseButton={false}>
@@ -1645,14 +1725,20 @@ function FileViewerBody({
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
-            <Button variant="outline" onClick={() => setPendingAction(null)}>
+            <Button
+              variant="outline"
+              onClick={() => {
+                pendingAction?.cancel?.();
+                setPendingAction(null);
+              }}
+            >
               Keep editing
             </Button>
             <Button
               variant="destructive"
               onClick={() => {
-                setIsEditorDirty(false);
-                pendingAction?.();
+                handleDirtyChange(false);
+                pendingAction?.apply();
                 setPendingAction(null);
               }}
             >

@@ -46,3 +46,6 @@ async def select_landing_agent(page: Page, agent_id: str) -> None:
     if await trigger.get_attribute("aria-expanded") == "true":
         await page.keyboard.press("Escape")
     await expect(trigger).to_have_attribute("aria-expanded", "false")
+    # The closed menu's dismissal layer outlives aria-expanded and swallows the
+    # next pointerdown; wait for it to unmount so a follow-up click lands.
+    await expect(page.locator("[data-radix-popper-content-wrapper]")).to_have_count(0)

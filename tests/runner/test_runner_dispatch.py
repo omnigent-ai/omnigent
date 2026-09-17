@@ -92,7 +92,7 @@ from omnigent.runtime.harnesses._scaffold import ToolResultEvent as _ToolResultE
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 from omnigent.runtime.prompt import EMBEDDED_BROWSER_PRIORITY_INSTRUCTION
 from omnigent.server.schemas import CreateResponseRequest as _CreateResponseRequest
-from omnigent.spec.types import AgentSpec, ExecutorSpec, SharePolicy
+from omnigent.spec.types import AgentSpec, ExecutorSpec, SharePolicy, ToolsConfig
 from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
 from tests.runner.conftest import (
     _FakeProcessManager as _RecoveryFakeProcessManager,
@@ -4115,6 +4115,7 @@ def _spec_with_real_subagent(harness: str) -> AgentSpec:
     return AgentSpec(
         spec_version=1,
         name="parent",
+        tools=ToolsConfig(agents=["worker"]),
         sub_agents=[
             AgentSpec(
                 spec_version=1,

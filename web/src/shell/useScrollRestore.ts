@@ -56,16 +56,15 @@ interface ScrollableEditor {
  * @param editor The editor to restore (the modified side, for a diff).
  * @param getKey Reads the current cache key (files can switch under one editor).
  * @param isCurrent False once the editor has been replaced or torn down.
- * @param restoreSaved When false, skip restoring the saved offset (scrolling is
- *     still persisted). Used when something else owns the landing position,
- *     e.g. a cited-line reveal — the restore's re-assert would fight it.
+ * @param restoreSaved Whether to restore a saved offset on attachment.
+ * @returns Cancels a pending restore when explicit navigation takes priority.
  */
 export function attachEditorScrollRestore(
   editor: ScrollableEditor,
   getKey: () => string,
   isCurrent: () => boolean,
   restoreSaved = true,
-): void {
+): () => void {
   const saved = restoreSaved ? getSavedScrollTop(getKey()) : undefined;
   let pending =
     saved !== undefined && saved > 0
@@ -93,6 +92,7 @@ export function attachEditorScrollRestore(
     }
     saveScrollTop(getKey(), e.scrollTop);
   });
+  return settle;
 }
 
 /**
@@ -112,31 +112,35 @@ export function attachEditorScrollRestore(
  * @param ref The scrollable element.
  * @param key Cache key for the current content (null disables persistence).
  * @param ready True once the content backing the container is present.
+ * @param restore False when explicit navigation overrides restoration; scrolling still saves.
  * @returns An onScroll handler to attach to the container.
  */
 export function useScrollRestore(
   ref: RefObject<HTMLElement | null>,
   key: string | null,
   ready: boolean,
+  restore = true,
 ): (event: UIEvent<HTMLElement>) => void {
   const pendingRef = useRef<{ target: number; deadline: number } | null>(null);
   const keyRef = useRef<string | null>(null);
-  if (key !== keyRef.current) {
-    keyRef.current = key;
-    // The deadline belongs to the pending entry, not to an effect run, so
-    // re-renders during the restore can't keep extending the window.
-    pendingRef.current = key
-      ? {
-          target: scrollTopCache.get(key) ?? 0,
-          deadline: performance.now() + SCROLL_RESTORE_BUDGET_MS,
-        }
-      : null;
-  }
 
   // Arm a restore once per content identity / readiness change — NOT every
   // render. A virtualized tree re-renders on every scroll frame; re-running the
   // restore then would fight the user and re-read layout each frame.
   useLayoutEffect(() => {
+    // Only committed navigation may replace or cancel the active restore.
+    if (key !== keyRef.current) {
+      keyRef.current = key;
+      // Keep the deadline stable across readiness changes and StrictMode replay.
+      pendingRef.current = key
+        ? {
+            target: scrollTopCache.get(key) ?? 0,
+            deadline: performance.now() + SCROLL_RESTORE_BUDGET_MS,
+          }
+        : null;
+    }
+    if (!restore) pendingRef.current = null;
+
     const el = ref.current;
     const pending = pendingRef.current;
     if (!el || !pending || !ready) return;
@@ -191,7 +195,7 @@ export function useScrollRestore(
     el.scrollTop = pending.target;
     frame = requestAnimationFrame(tick);
     return teardown;
-  }, [key, ready, ref]);
+  }, [key, ready, ref, restore]);
 
   return useCallback((event: UIEvent<HTMLElement>) => {
     if (keyRef.current && pendingRef.current === null) {

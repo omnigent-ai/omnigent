@@ -320,6 +320,10 @@ class SqlFile(OmnigentBase):
     :param bytes: Size of the file in bytes.
     :param content_type: MIME type of the file, e.g.
         ``"application/pdf"``. ``None`` when not provided.
+    :param blob_key: Artifact-store key for this row's bytes. Normally
+        equals ``id``; a forked row points it at the source row's blob
+        so the fork shares the bytes instead of duplicating them.
+        NULL on pre-``blob_key`` rows, read as ``COALESCE(blob_key, id)``.
     """
 
     __tablename__ = "files"
@@ -338,6 +342,11 @@ class SqlFile(OmnigentBase):
     bytes: Mapped[int] = mapped_column(Integer)
     content_type: Mapped[str | None] = mapped_column(String(256), nullable=True)
     session_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    # Artifact-store key for the bytes. NULL means "under id" (pre-blob_key
+    # rows); a fork copy sets it to the source's blob so many rows share one
+    # blob. Read as COALESCE(blob_key, id); reference-count it before deleting
+    # the blob so a fork's shared bytes survive the source's deletion.
+    blob_key: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
     # Opaque JSON metadata about the original upload; never SQL-filtered.
     source_metadata: Mapped[str | None] = mapped_column(Text, nullable=True)
 

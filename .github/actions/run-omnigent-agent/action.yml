@@ -37,9 +37,9 @@ inputs:
     description: Model API key (referenced by the provider config, used to scan output).
     required: true
   claude-code-version:
-    description: "@anthropic-ai/claude-code npm version to install."
+    description: "Optional exact Claude Code version override; defaults to the shared harness pin."
     required: false
-    default: 2.1.266
+    default: ""
 
 runs:
   using: composite
