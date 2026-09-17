@@ -3365,6 +3365,30 @@ class HostProcess:
                 ),
                 routable_models=[model.id for model in listing.models],
             )
+
+        if harness == "hermes-native":
+            # Render Hermes' own launch choices: the config default plus the
+            # cached picker catalog `hermes model` maintains. No binary probe
+            # is needed — both files are plain JSON/YAML on disk.
+            try:
+                from omnigent.harnesses.hermes_native.models import (
+                    hermes_native_model_options,
+                )
+
+                hermes_models = await asyncio.to_thread(hermes_native_model_options)
+            except Exception:
+                _logger.exception("Failed to resolve pre-launch Hermes model options")
+                return HostModelOptionsResultFrame(
+                    request_id=frame.request_id,
+                    status="failed",
+                    error="failed to resolve Hermes model options",
+                )
+            return HostModelOptionsResultFrame(
+                request_id=frame.request_id,
+                status="ok",
+                models=with_source(hermes_models),
+            )
+
         if harness != "claude-native":
             return HostModelOptionsResultFrame(
                 request_id=frame.request_id,

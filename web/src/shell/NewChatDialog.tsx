@@ -73,6 +73,7 @@ import { showToast } from "@/components/ui/toast";
 import {
   CLAUDE_NATIVE_EFFORTS,
   PI_NATIVE_EFFORTS,
+  HERMES_NATIVE_EFFORTS,
   EFFORT_SELECT_NONE,
   EFFORT_UNAVAILABLE_PLACEHOLDER,
   MODEL_SELECT_DEFAULT,
@@ -3075,6 +3076,14 @@ export function NewChatLandingScreen() {
     canLoadHostModels("pi-native"),
     { poll: selectedNativeHarness === "pi-native" },
   );
+  const { data: hostHermesModelOptions, isLoading: hostHermesModelsLoading } = useHostModelOptions(
+    selectedHostId,
+    "hermes-native",
+    canLoadHostModels("hermes-native"),
+    {
+      poll: selectedNativeHarness === "hermes-native",
+    },
+  );
   // Keep this host's cached choices while requests wait for readiness.
   // A fetched catalog, including an empty one, takes precedence.
   const cachedHostModels =
@@ -3118,6 +3127,12 @@ export function NewChatLandingScreen() {
     hostPiModelOptions,
     hostPiModelsLoading,
     cachedHostModels?.pi,
+  );
+  const availableHermesModels = availableHostModels(
+    "hermes-native",
+    hostHermesModelOptions,
+    hostHermesModelsLoading,
+    cachedHostModels?.hermes,
   );
   const {
     data: hostDevinModelOptions,
@@ -3201,6 +3216,10 @@ export function NewChatLandingScreen() {
             source: option.source,
           })),
     [availablePiModels, sandboxSelected, sandboxCatalog],
+  );
+  const hermesModelOptions = useMemo(
+    () => (sandboxSelected ? (sandboxCatalog ?? []) : (availableHermesModels ?? [])),
+    [availableHermesModels, sandboxSelected, sandboxCatalog],
   );
   const supportsPermissionMode = nativeAgentHasCapability(selectedAgent, "permissionMode");
   const supportsDevinMode = nativeAgentHasCapability(selectedAgent, "devinMode");
@@ -3291,14 +3310,21 @@ export function NewChatLandingScreen() {
       return [{ label: "Permission mode", value: AUTO_PERMISSION_MODE.label }];
     }
     if (supportsModelPicker && !supportsPermissionMode) {
+      const pickerOptions =
+        selectedNativeHarness === "hermes-native" ? hermesModelOptions : piModelOptions;
       const modelValue =
-        piModelOptions.find((model) => model.id === pickedModel)?.displayName ??
-        defaultModelLabel(piModelOptions);
+        pickerOptions.find((model) => model.id === pickedModel)?.displayName ??
+        defaultModelLabel(pickerOptions);
       const thinkingLevelValue = normalizeEffortLabel(pickedEffort);
+      const thinkingLabel =
+        selectedNativeHarness === "pi-native" || selectedNativeHarness === "hermes-native"
+          ? "Thinking level"
+          : "Effort";
       return [
         { label: "Model", value: modelValue },
-        ...(selectedNativeHarness === "pi-native" && thinkingLevelValue
-          ? [{ label: "Thinking level", value: thinkingLevelValue }]
+        ...((selectedNativeHarness === "pi-native" || selectedNativeHarness === "hermes-native") &&
+        thinkingLevelValue
+          ? [{ label: thinkingLabel, value: thinkingLevelValue }]
           : []),
         ...sourceRows(piModelOptions),
       ];
@@ -3409,6 +3435,7 @@ export function NewChatLandingScreen() {
     claudeModelOptions,
     codexModelOptions,
     piModelOptions,
+    hermesModelOptions,
     pickedEffort,
     permissionMode,
     approvalMode,
@@ -3436,9 +3463,11 @@ export function NewChatLandingScreen() {
         ? devinModelOptions
         : selectedNativeHarness === "pi-native"
           ? piModelOptions
-          : selectedNativeHarness === "codex-native"
-            ? codexModelOptions
-            : [];
+          : selectedNativeHarness === "hermes-native"
+            ? hermesModelOptions
+            : selectedNativeHarness === "codex-native"
+              ? codexModelOptions
+              : [];
   const [pickerModelSearch, setPickerModelSearch] = useState("");
   const pickerModelsLoading =
     sandboxCatalogPending ||
@@ -3450,9 +3479,11 @@ export function NewChatLandingScreen() {
           ? hostCodexModelsLoading
           : selectedNativeHarness === "pi-native"
             ? hostPiModelsLoading
-            : selectedNativeHarness === "devin-native"
-              ? hostDevinModelsLoading
-              : false));
+            : selectedNativeHarness === "hermes-native"
+              ? hostHermesModelsLoading
+              : selectedNativeHarness === "devin-native"
+                ? hostDevinModelsLoading
+                : false));
   const pickerModelsError = sandboxSelected
     ? sandboxCatalogError
       ? new Error(sandboxCatalogError)
@@ -3517,6 +3548,7 @@ export function NewChatLandingScreen() {
               claude: availableClaudeModels,
               codex: availableCodexModels,
               pi: availablePiModels,
+              hermes: availableHermesModels,
             },
           }
         : null,
@@ -3529,6 +3561,7 @@ export function NewChatLandingScreen() {
       availableClaudeModels,
       availableCodexModels,
       availablePiModels,
+      availableHermesModels,
     ],
   );
   useEffect(() => {
@@ -3577,12 +3610,14 @@ export function NewChatLandingScreen() {
         ).map((value) => ({ value, label: normalizeEffortLabel(value) }))
       : selectedNativeHarness === "pi-native"
         ? PI_NATIVE_EFFORTS
-        : selectedNativeHarness === "codex-native"
-          ? codexEffortLevelsForModel(
-              codexModelOptions,
-              pickedModel || codexModelOptions.find((option) => option.isDefault)?.id,
-            ).map((value) => ({ value, label: normalizeEffortLabel(value) }))
-          : [];
+        : selectedNativeHarness === "hermes-native"
+          ? HERMES_NATIVE_EFFORTS
+          : selectedNativeHarness === "codex-native"
+            ? codexEffortLevelsForModel(
+                codexModelOptions,
+                pickedModel || codexModelOptions.find((option) => option.isDefault)?.id,
+              ).map((value) => ({ value, label: normalizeEffortLabel(value) }))
+            : [];
   const rememberPickerOptions = (harness: string, options: HarnessOptions) => {
     const previous = pickerEdits;
     setPickerEdits({
@@ -3917,7 +3952,12 @@ export function NewChatLandingScreen() {
             ? nativeModelLabel(model)
             : defaultModelLabel(catalog),
       );
-      const efforts = native.iconKind === "pi" ? PI_NATIVE_EFFORTS : CLAUDE_NATIVE_EFFORTS;
+      const efforts =
+        native.iconKind === "pi" || native.iconKind === "hermes"
+          ? native.iconKind === "hermes"
+            ? HERMES_NATIVE_EFFORTS
+            : PI_NATIVE_EFFORTS
+          : CLAUDE_NATIVE_EFFORTS;
       const effort =
         native.iconKind === "codex"
           ? normalizeEffortLabel(saved.effort ?? "")
@@ -3996,13 +4036,15 @@ export function NewChatLandingScreen() {
   const projectModelVocab =
     selectedNativeHarness === "pi-native"
       ? piModelOptions
-      : selectedNativeHarness === "claude-native"
-        ? claudeModelOptions
-        : selectedNativeHarness === "devin-native"
-          ? devinModelOptions
-          : selectedNativeHarness === "codex-native"
-            ? codexModelOptions
-            : [];
+      : selectedNativeHarness === "hermes-native"
+        ? hermesModelOptions
+        : selectedNativeHarness === "claude-native"
+          ? claudeModelOptions
+          : selectedNativeHarness === "devin-native"
+            ? devinModelOptions
+            : selectedNativeHarness === "codex-native"
+              ? codexModelOptions
+              : [];
   const projectDefaultModelValid =
     projectDefaultModel != null && projectModelVocab.some((m) => m.id === projectDefaultModel)
       ? projectDefaultModel
@@ -5591,7 +5633,9 @@ export function NewChatLandingScreen() {
           supportsAgySkipPermissions: agentSupportsAgySkip,
           supportsModelPicker: agentSupportsModelPicker || nativeAgent?.harness === "codex-native",
           supportsEffortPicker:
-            selectedNativeHarness === "pi-native" || selectedNativeHarness === "codex-native",
+            selectedNativeHarness === "pi-native" ||
+            selectedNativeHarness === "codex-native" ||
+            selectedNativeHarness === "hermes-native",
           permissionMode,
           approvalMode,
           bypassSandbox,

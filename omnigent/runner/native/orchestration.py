@@ -3301,6 +3301,7 @@ async def _auto_create_hermes_terminal(
         write_tmux_target,
     )
     from omnigent.harnesses.hermes_native.forwarder import clear_hermes_bridge_state
+    from omnigent.harnesses.hermes_native.models import hermes_launch_args
     from omnigent.harnesses.hermes_native.status import clear_hermes_status_state
 
     bridge_dir = bridge_dir_for_session_id(session_id)
@@ -3329,6 +3330,16 @@ async def _auto_create_hermes_terminal(
     # cursor (clear_hermes_bridge_state above) starts it at that row's first row.
     launch_epoch_s = time.time()
     hermes_args = [*(launch_config.terminal_launch_args or [])]
+    # The pre-launch picker's model and reasoning selections reach the TUI as
+    # launch flags (both are invocation-scoped in Hermes; the persistent
+    # choices stay in Hermes' own config). User pass-through args win: a
+    # bare `-m/--model/--reasoning` already in the args means the user pinned
+    # their own launch line.
+    hermes_args = hermes_launch_args(
+        launch_config.terminal_launch_args or [],
+        model_override=launch_config.model_override,
+        reasoning_effort=launch_config.reasoning_effort,
+    )
     # Resolve the per-session HERMES_HOME early: the fork block below needs it
     # to place the cloned state.db, and the env block after needs it for the
     # HERMES_HOME env var.
