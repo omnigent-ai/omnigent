@@ -318,3 +318,53 @@ async def test_flush_with_supplied_row_skips_tree_root_rereads(db_uri: str) -> N
         f"1: the persist's fresh clamp baseline); statements={point_reads}"
     )
     assert _usage(store, conv.id)["total_cost_usd"] == pytest.approx(3.0)
+
+
+@pytest.mark.asyncio
+async def test_flush_telemetry_reports_the_callers_installation_id(db_uri: str) -> None:
+    """The usage event names the posting machine from its request header only.
+
+    The header is what makes the attribution free: the server never looks the
+    host up, so a flush from a client that sends no header leaves the field
+    unset rather than costing a read.
+    """
+    from unittest.mock import patch
+
+    from omnigent.server.routes._sessions.orchestration import (
+        _persist_external_session_usage,
+    )
+    from omnigent.server.schemas import SessionEventInput
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="flush-telemetry", agent_id=_AGENT_ID)
+    row = store.get_conversation(conv.id)
+    assert row is not None
+
+    events: list = []
+    with patch(
+        "omnigent.server.routes._sessions.orchestration._tel_emit",
+        side_effect=events.append,
+    ):
+        await _persist_external_session_usage(
+            conv.id,
+            SessionEventInput(
+                type="external_session_usage",
+                data={"cumulative_cost_usd": 3.0, "model": "m1"},
+            ),
+            store,
+            row,
+            "alice@example.com",
+            "inst-host-9",
+        )
+        await _persist_external_session_usage(
+            conv.id,
+            SessionEventInput(
+                type="external_session_usage",
+                data={"cumulative_cost_usd": 4.0, "model": "m1"},
+            ),
+            store,
+            row,
+            "alice@example.com",
+        )
+
+    assert [e.host_installation_id for e in events] == ["inst-host-9", None]
