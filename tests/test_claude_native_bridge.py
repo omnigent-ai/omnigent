@@ -7069,6 +7069,34 @@ def test_record_model_vocabulary_backfills_a_runner_prepared_bridge(
     }
 
 
+def test_record_model_vocabulary_never_materializes_an_unprepared_bridge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Recording is a no-op until a prepared bridge config exists.
+
+    A model-options listing can race terminal creation; writing vocabulary
+    into a nonexistent bridge would materialize an incomplete dir with no
+    owner.pid, which orphan pruning then skips forever.
+    """
+    from omnigent.harnesses.claude_native.bridge import (
+        bridge_dir_for_bridge_id,
+        record_model_vocabulary,
+    )
+
+    root = tmp_path / "root"
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", root)
+
+    bridge_dir = bridge_dir_for_bridge_id("conv_unprepared")
+    record_model_vocabulary(
+        bridge_dir,
+        launch_env=None,
+        launch_model=None,
+        picker_values=["system.ai.glm-5-3"],
+    )
+    assert not bridge_dir.exists()
+
+
 def test_picker_values_round_trip_from_either_launch_path(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

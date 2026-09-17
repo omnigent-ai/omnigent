@@ -1781,7 +1781,10 @@ def record_model_vocabulary(
     # with its own stale read.
     with _bridge_config_write_lock(bridge_dir):
         config = _read_json_file(bridge_dir / _CONFIG_FILE)
-        if not isinstance(config, dict):
+        if not isinstance(config, dict) or not config:
+            # No prepared bridge config yet (missing/malformed reads as {}):
+            # recording would materialize an incomplete bridge dir that has
+            # no owner.pid, which orphan pruning then skips forever.
             return
         model_env = {
             key: launch_env[key]
