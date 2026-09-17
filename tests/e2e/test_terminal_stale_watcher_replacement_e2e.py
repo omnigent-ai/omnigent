@@ -19,7 +19,6 @@ import asyncio
 import shutil
 import tempfile
 import threading
-import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
 
@@ -117,9 +116,7 @@ def test_stale_watcher_dead_pane_result_must_not_stop_healthy_replacement(
 
     # Replace the watcher: its bounded join expires (the old probe is parked),
     # and the replacement begins polling the healthy terminal.
-    terminal.start_idle_watcher_thread(
-        on_exit=live_exit.set, poll_interval_s=0.05, replace=True
-    )
+    terminal.start_idle_watcher_thread(on_exit=live_exit.set, poll_interval_s=0.05, replace=True)
     assert terminal.running
 
     # Release the stale probe. Its result must be discarded because its own stop
@@ -155,9 +152,7 @@ def test_stale_watcher_must_not_fire_previous_owner_callback_after_replacement(
     terminal.start_idle_watcher_thread(on_tick=stale_tick.set, poll_interval_s=0.05)
     assert entered.wait(_TIMEOUT_S), "original watcher never entered the capture probe"
 
-    terminal.start_idle_watcher_thread(
-        on_tick=lambda: None, poll_interval_s=0.05, replace=True
-    )
+    terminal.start_idle_watcher_thread(on_tick=lambda: None, poll_interval_s=0.05, replace=True)
     assert terminal.running
 
     # The original watcher can only reach its tick callback after this release,
