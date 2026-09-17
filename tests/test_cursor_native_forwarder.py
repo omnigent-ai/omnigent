@@ -1265,3 +1265,774 @@ async def test_persist_native_compaction_item_no_store_skips_messages() -> None:
     assert body["type"] == "compaction"
     assert body["data"]["last_item_id"] == "item_abc"
     assert "compacted_messages" not in body["data"]
+
+
+# ---------------------------------------------------------------------------
+# ``/clear`` rotation (the pane starts a sibling chat)
+# ---------------------------------------------------------------------------
+
+#: Resource id the runner registers the cursor pane under.
+_TERMINAL_ID = "terminal_cursor_main"
+
+
+def _seed_rotation_chat(
+    chats_root: Path,
+    workspace: str,
+    chat_id: str,
+    created_ms: int,
+    prompts: tuple[str, ...] = (),
+    *,
+    model: str | None = None,
+) -> Path:
+    """Create a cursor chat dir (``store.db`` + ``meta.json``) and return the store."""
+    return _seed_rotation_chat_in_dir(
+        chats_root / hashlib.md5(workspace.encode()).hexdigest(),
+        chat_id,
+        created_ms,
+        prompts,
+        model=model,
+    )
+
+
+def _seed_rotation_chat_in_dir(
+    hash_dir: Path,
+    chat_id: str,
+    created_ms: int,
+    prompts: tuple[str, ...] = (),
+    *,
+    model: str | None = None,
+) -> Path:
+    """Seed one chat under an explicitly named hash dir; return its store path."""
+    chat = hash_dir / chat_id
+    chat.mkdir(parents=True)
+    writer = _make_store(
+        chat / "store.db",
+        [
+            (f"{chat_id}-b{i}", _user(f"<user_query>\n{text}\n</user_query>"))
+            for i, text in enumerate(prompts)
+        ],
+    )
+    if model is not None:
+        _write_meta_model(writer, model)
+    writer.close()
+    (chat / "meta.json").write_text(json.dumps({"createdAtMs": created_ms}), encoding="utf-8")
+    return chat / "store.db"
+
+
+class TestDetectRotatedChat:
+    """``_detect_rotated_chat`` spots the sibling chat a ``/clear`` created.
+
+    The bound ``store.db`` survives a ``/clear``, so the loop's only re-discovery
+    trigger (a vanished store) never fires. These pin the successor scan — and,
+    just as importantly, every case where it must stay silent, since a false
+    positive rotates the session onto the wrong chat.
+    """
+
+    def _root(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+        root = tmp_path / "chats"
+        monkeypatch.setattr(fwd, "_cursor_chats_root", lambda: root)
+        return root
+
+    def test_detects_newer_sibling_chat(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        root = self._root(tmp_path, monkeypatch)
+        bound = _seed_rotation_chat(root, "/ws", _CHAT_ID, 1_000, ("before",))
+        rotated = _seed_rotation_chat(root, "/ws", _CHAT_ID_2, 2_000, ("after",))
+        assert fwd._detect_rotated_chat(bound_store=bound, launch_epoch_ms=1_000) == rotated
+
+    def test_ignores_older_sibling_chat(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        root = self._root(tmp_path, monkeypatch)
+        bound = _seed_rotation_chat(root, "/ws", _CHAT_ID, 2_000, ("bound",))
+        _seed_rotation_chat(root, "/ws", _CHAT_ID_2, 1_000, ("older",))
+        assert fwd._detect_rotated_chat(bound_store=bound, launch_epoch_ms=1_000) is None
+
+    def test_ignores_bound_chat_itself(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        root = self._root(tmp_path, monkeypatch)
+        bound = _seed_rotation_chat(root, "/ws", _CHAT_ID, 2_000, ("bound",))
+        assert fwd._detect_rotated_chat(bound_store=bound, launch_epoch_ms=1_000) is None
+
+    def test_ignores_chat_created_before_launch_epoch(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A cold resume legitimately binds a chat created BEFORE this launch, so
+        # "newer than bound" alone would let an older bystander chat impersonate a
+        # rotation; the launch-epoch floor (minus the skew) is what rules it out.
+        root = self._root(tmp_path, monkeypatch)
+        bound = _seed_rotation_chat(root, "/ws", _CHAT_ID, 1_000, ("resumed",))
+        _seed_rotation_chat(root, "/ws", _CHAT_ID_2, 2_000, ("bystander",))
+        assert fwd._detect_rotated_chat(bound_store=bound, launch_epoch_ms=100_000) is None
+
+    def test_ignores_chat_missing_meta_json(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # ``_chat_created_ms`` returns 0 without ``meta.json``, so a half-written
+        # chat dir is invisible until cursor finishes creating it.
+        root = self._root(tmp_path, monkeypatch)
+        bound = _seed_rotation_chat(root, "/ws", _CHAT_ID, 1_000, ("bound",))
+        rotated = _seed_rotation_chat(root, "/ws", _CHAT_ID_2, 2_000, ("after",))
+        (rotated.parent / "meta.json").unlink()
+        assert fwd._detect_rotated_chat(bound_store=bound, launch_epoch_ms=1_000) is None
+
+    def test_ignores_chat_missing_store_db(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        root = self._root(tmp_path, monkeypatch)
+        bound = _seed_rotation_chat(root, "/ws", _CHAT_ID, 1_000, ("bound",))
+        rotated = _seed_rotation_chat(root, "/ws", _CHAT_ID_2, 2_000, ("after",))
+        rotated.unlink()
+        assert fwd._detect_rotated_chat(bound_store=bound, launch_epoch_ms=1_000) is None
+
+    def test_ignores_empty_new_chat(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The TUI creates the chat dir lazily on the first message, and meta.json
+        # can land before the first blob. Rotating onto a row-less store would
+        # hand the new conversation a chat that may still be abandoned.
+        root = self._root(tmp_path, monkeypatch)
+        bound = _seed_rotation_chat(root, "/ws", _CHAT_ID, 1_000, ("bound",))
+        _seed_rotation_chat(root, "/ws", _CHAT_ID_2, 2_000, ())
+        assert fwd._detect_rotated_chat(bound_store=bound, launch_epoch_ms=1_000) is None
+
+    def test_ignores_other_workspace_hash(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Deliberately NOT ``_discover_store``: its cross-hash fallback exists for
+        # a first bind under a path-hash mismatch and would adopt an unrelated
+        # workspace's chat as "our" rotation.
+        root = self._root(tmp_path, monkeypatch)
+        bound = _seed_rotation_chat(root, "/ws", _CHAT_ID, 1_000, ("bound",))
+        _seed_rotation_chat(root, "/other/ws", _CHAT_ID_2, 2_000, ("stranger",))
+        assert fwd._detect_rotated_chat(bound_store=bound, launch_epoch_ms=1_000) is None
+
+    def test_detects_sibling_under_a_hash_dir_no_workspace_would_compute(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The path-hash fallback binds stores whose hash dir is NOT
+        # ``md5(workspace)``. Seeding under a name no md5 could produce pins the
+        # scan to the bound store's OWN dir — those binds must stay rotatable.
+        root = self._root(tmp_path, monkeypatch)
+        bound = _seed_rotation_chat_in_dir(root / "not-an-md5-hash", _CHAT_ID, 1_000, ("bound",))
+        rotated = _seed_rotation_chat_in_dir(
+            root / "not-an-md5-hash", _CHAT_ID_2, 2_000, ("after",)
+        )
+        assert fwd._detect_rotated_chat(bound_store=bound, launch_epoch_ms=1_000) == rotated
+
+
+class _APServer:
+    """Mock Omnigent server for the rotation handshake and the mirror POSTs.
+
+    Records every ``(method, path, body)`` so a test can assert the handshake
+    *order*, and counts ``POST /v1/sessions`` separately because "exactly one
+    replacement session" is the property that keeps a rotation from storming.
+    """
+
+    def __init__(
+        self,
+        *,
+        old: str = "conv_old",
+        new: str = "conv_new",
+        runner_id: str | None = "runner_one",
+        labels: dict[str, str] | None = None,
+        snapshot_extra: dict[str, object] | None = None,
+        create_status: int = 201,
+        fail_old_item_posts: bool = False,
+    ) -> None:
+        self.old = old
+        self.new = new
+        self._runner_id = runner_id
+        self._labels = {"omnigent.ui": "terminal"} if labels is None else labels
+        self._snapshot_extra = snapshot_extra or {}
+        self._create_status = create_status
+        self._fail_old_item_posts = fail_old_item_posts
+        self.calls: list[tuple[str, str, dict | None]] = []
+        self.unexpected: list[tuple[str, str]] = []
+        self.create_attempts = 0
+
+    @property
+    def paths(self) -> list[tuple[str, str]]:
+        return [(method, path) for method, path, _ in self.calls]
+
+    def bodies(self, method: str, path: str) -> list[dict | None]:
+        return [b for m, p, b in self.calls if (m, p) == (method, path)]
+
+    def event_types(self, session_id: str) -> list[str]:
+        return [
+            str(body.get("type"))
+            for body in self.bodies("POST", f"/v1/sessions/{session_id}/events")
+            if isinstance(body, dict)
+        ]
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        """Answer one request, recording it first."""
+        body = json.loads(request.content.decode("utf-8")) if request.content else None
+        method, path = request.method, request.url.path
+        self.calls.append((method, path, body))
+        if method == "GET" and path == f"/v1/sessions/{self.old}":
+            snapshot: dict[str, object] = {
+                "id": self.old,
+                "agent_id": "ag_cursor",
+                "labels": dict(self._labels),
+            }
+            if self._runner_id:
+                snapshot["runner_id"] = self._runner_id
+            snapshot.update(self._snapshot_extra)
+            return httpx.Response(200, json=snapshot)
+        if method == "POST" and path == "/v1/sessions":
+            self.create_attempts += 1
+            if self._create_status >= 400:
+                return httpx.Response(self._create_status, json={"error": {"message": "boom"}})
+            return httpx.Response(self._create_status, json={"id": self.new})
+        if method == "PATCH" and path in (
+            f"/v1/sessions/{self.old}",
+            f"/v1/sessions/{self.new}",
+        ):
+            return httpx.Response(200, json={"id": path.rsplit("/", 1)[-1]})
+        if (
+            method == "POST"
+            and path == f"/v1/sessions/{self.old}/resources/terminals/{_TERMINAL_ID}/transfer"
+        ):
+            return httpx.Response(200, json={"id": _TERMINAL_ID})
+        if method == "POST" and path.endswith("/events"):
+            if self._fail_old_item_posts and path == f"/v1/sessions/{self.old}/events":
+                # A connection-level failure keeps ``retrying_items`` set for
+                # good, which is exactly the state the rotation must not run in.
+                raise httpx.ConnectError("server unreachable", request=request)
+            return httpx.Response(200, json={"queued": False, "item_id": "item_x"})
+        self.unexpected.append((method, path))
+        return httpx.Response(404, json={"error": {"message": "unrouted"}})
+
+
+class _RotationHarness:
+    """Runs the real forwarder loop against a real chats tree and ``_APServer``.
+
+    Builds the bridge dir the way production does (``bridge.json`` present, so
+    ``read_active_session_id`` / ``write_active_session_id`` work), pre-seeds the
+    forwarder cursor onto the bound chat so the loop binds it on the first poll,
+    and routes the loop's own ``httpx.AsyncClient`` through a ``MockTransport``
+    so the rotation handshake is observed as real HTTP rather than stubbed out.
+    """
+
+    workspace = "/ws"
+    launch_epoch_ms = 1_000
+
+    def __init__(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, server: _APServer) -> None:
+        from omnigent.harnesses.cursor_native import bridge as cursor_bridge
+
+        self.server = server
+        self.chats_root = tmp_path / "chats"
+        self.bridge_root = tmp_path / "omnigent-test" / "cursor-native"
+        monkeypatch.setattr(fwd, "_cursor_chats_root", lambda: self.chats_root)
+        monkeypatch.setattr(cursor_bridge, "_BRIDGE_ROOT", self.bridge_root)
+        self.bridge = cursor_bridge
+        self.bridge_dir = cursor_bridge.bridge_dir_for_session_id(server.old)
+        cursor_bridge.write_mcp_bridge_config(self.bridge_dir)
+        cursor_bridge.write_active_session_id(self.bridge_dir, server.old)
+        self.bound_store: Path | None = None
+        self.rotated_store: Path | None = None
+        self.rotations: list[tuple[str, str]] = []
+        self.polls = 0
+
+        real_client = fwd.httpx.AsyncClient
+
+        def _client_factory(*args: object, **kwargs: object) -> httpx.AsyncClient:
+            kwargs.pop("transport", None)
+            return real_client(  # type: ignore[return-value]
+                *args, transport=httpx.MockTransport(server.handler), **kwargs
+            )
+
+        monkeypatch.setattr(fwd.httpx, "AsyncClient", _client_factory)
+
+        real_count = fwd.cursor_native_status.count_turn_ends
+
+        def _counting_turn_ends(bridge_dir: Path) -> int:
+            # Called once at the top of every poll — a deterministic poll clock.
+            self.polls += 1
+            return real_count(bridge_dir)
+
+        monkeypatch.setattr(fwd.cursor_native_status, "count_turn_ends", _counting_turn_ends)
+
+    def seed_bound(
+        self,
+        prompts: tuple[str, ...] = ("before",),
+        *,
+        created_ms: int = 2_000,
+        model: str | None = None,
+        mirror_existing: bool = False,
+    ) -> Path:
+        """Seed the bound chat and pre-seed the forwarder cursor onto it.
+
+        With *mirror_existing* the cursor starts at 0 so the existing rows are
+        mirrored (used to hold ``retrying_items``); otherwise it starts at the
+        store's current rowid so only post-rotation traffic shows up.
+        """
+        store = _seed_rotation_chat(
+            self.chats_root, self.workspace, _CHAT_ID, created_ms, prompts, model=model
+        )
+        fwd._write_state(
+            self.bridge_dir,
+            fwd._ForwardState(
+                store_path=str(store),
+                last_rowid=0 if mirror_existing else fwd._get_current_rowid(store),
+                launch_epoch_ms=self.launch_epoch_ms,
+            ),
+        )
+        self.bound_store = store
+        return store
+
+    def seed_rotated(
+        self,
+        prompts: tuple[str, ...] = ("after clear",),
+        *,
+        created_ms: int = 3_000,
+        model: str | None = None,
+    ) -> Path:
+        """Seed the sibling chat a ``/clear`` would have created."""
+        self.rotated_store = _seed_rotation_chat(
+            self.chats_root, self.workspace, _CHAT_ID_2, created_ms, prompts, model=model
+        )
+        return self.rotated_store
+
+    def claim_by_sibling(self, store: Path, *, launch_epoch_ms: int = 500) -> None:
+        """Let another live bridge dir claim *store* (earlier launch wins)."""
+        sibling = self.bridge_root / "sibling"
+        sibling.mkdir(parents=True)
+        fwd._write_state(
+            sibling,
+            fwd._ForwardState(
+                store_path=str(store), last_rowid=0, launch_epoch_ms=launch_epoch_ms
+            ),
+        )
+
+    def active_session_id(self) -> str | None:
+        return self.bridge.read_active_session_id(self.bridge_dir)
+
+    async def _wait(self, predicate, max_ticks: int) -> None:
+        for _ in range(max_ticks):
+            if predicate():
+                return
+            await asyncio.sleep(0.001)
+        raise AssertionError("forwarder never reached the expected state (wedged?)")
+
+    async def run(self, *, until, extra_polls: int = 0, max_ticks: int = 6000) -> None:
+        """Drive the loop until *until* holds, then let *extra_polls* more run."""
+        task = asyncio.create_task(
+            fwd.forward_cursor_store_to_session(
+                base_url="http://ap",
+                headers={},
+                session_id=self.server.old,
+                bridge_dir=self.bridge_dir,
+                agent_name="cursor-native-ui",
+                workspace=self.workspace,
+                launch_epoch_ms=self.launch_epoch_ms,
+                poll_interval_s=0.001,
+                on_session_rotated=lambda old, new: self.rotations.append((old, new)),
+            )
+        )
+        try:
+            await self._wait(until, max_ticks)
+            if extra_polls:
+                target = self.polls + extra_polls
+                await self._wait(lambda: self.polls >= target, max_ticks)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+
+class TestClearRotation:
+    """The pane's ``/clear`` moves the Omnigent session to a new conversation.
+
+    Drives the real poll loop so the whole transaction is covered: detect the
+    sibling chat, create the replacement session, carry the runner binding and
+    launch settings over, point it at the new chat id, transfer the tmux
+    terminal, re-key the superseded session, notify it, and re-aim every
+    subsequent POST at the new conversation.
+    """
+
+    @pytest.mark.asyncio
+    async def test_new_chat_rotates_session_and_transfers_terminal(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        server = _APServer(
+            snapshot_extra={
+                "workspace": "/ws",
+                "terminal_launch_args": ["--force"],
+                "model_override": "composer-2.5",
+            }
+        )
+        harness = _RotationHarness(tmp_path, monkeypatch, server)
+        harness.seed_bound(("before",))
+        harness.seed_rotated(("after clear",))
+
+        await harness.run(until=lambda: ("POST", "/v1/sessions/conv_new/events") in server.paths)
+
+        assert server.unexpected == []
+        # The handshake runs in a fixed order: read the old session, create the
+        # replacement, bind the runner, point it at the new chat, move the
+        # terminal, then release the old session.
+        start = server.paths.index(("GET", "/v1/sessions/conv_old"))
+        assert server.paths[start : start + 6] == [
+            ("GET", "/v1/sessions/conv_old"),
+            ("POST", "/v1/sessions"),
+            ("PATCH", "/v1/sessions/conv_new"),
+            ("PATCH", "/v1/sessions/conv_new"),
+            (
+                "POST",
+                f"/v1/sessions/conv_old/resources/terminals/{_TERMINAL_ID}/transfer",
+            ),
+            ("PATCH", "/v1/sessions/conv_old"),
+        ]
+        # The replacement inherits the agent, the labels (including the bridge-id
+        # label that keeps it pointed at the ORIGINAL pane's bridge dir) and the
+        # launch settings a later cold resume reads back off the snapshot.
+        assert server.bodies("POST", "/v1/sessions") == [
+            {
+                "agent_id": "ag_cursor",
+                "labels": {
+                    "omnigent.ui": "terminal",
+                    "omnigent.cursor_native.bridge_id": "conv_old",
+                },
+                "workspace": "/ws",
+                "terminal_launch_args": ["--force"],
+                "model_override": "composer-2.5",
+            }
+        ]
+        assert server.bodies("PATCH", "/v1/sessions/conv_new") == [
+            {"runner_id": "runner_one"},
+            {"external_session_id": _CHAT_ID_2},
+        ]
+        assert server.bodies(
+            "POST", f"/v1/sessions/conv_old/resources/terminals/{_TERMINAL_ID}/transfer"
+        ) == [{"target_session_id": "conv_new"}]
+        # The superseded session is re-keyed onto its own bridge id so resuming it
+        # later cannot stomp the live pane's ``active_session_id``.
+        assert server.bodies("PATCH", "/v1/sessions/conv_old")[-2:] == [
+            {"labels": {"omnigent.cursor_native.bridge_id": "conv_old-cleared"}},
+            {"runner_id": ""},
+        ]
+        # The bridge now names the new conversation, so the shared serve-mcp
+        # bridge and the other two mirrors follow without being told.
+        assert harness.active_session_id() == "conv_new"
+        assert harness.rotations == [("conv_old", "conv_new")]
+        assert fwd._read_state(harness.bridge_dir).store_path == str(harness.rotated_store)
+        # The old conversation only ever receives the supersession trio; the new
+        # chat's messages go to the new conversation.
+        assert server.event_types("conv_old") == [
+            "external_session_status",
+            "external_conversation_item",
+            "external_session_superseded",
+        ]
+        assert "external_conversation_item" in server.event_types("conv_new")
+
+    @pytest.mark.asyncio
+    async def test_rotation_creates_exactly_one_replacement_session(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The storm guard: many polls, one replacement conversation.
+
+        The bound store survives ``/clear``, so a detector that kept firing would
+        mint a conversation every 0.7s. Once rotated, the new chat becomes the
+        bound one and nothing newer exists, so detection goes quiet.
+        """
+        server = _APServer()
+        harness = _RotationHarness(tmp_path, monkeypatch, server)
+        harness.seed_bound(("before",))
+        harness.seed_rotated(("after clear",))
+
+        await harness.run(until=lambda: harness.active_session_id() == "conv_new", extra_polls=6)
+
+        assert server.create_attempts == 1
+        assert harness.rotations == [("conv_old", "conv_new")]
+
+    @pytest.mark.asyncio
+    async def test_rotation_gives_up_after_bounded_attempts(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A persistently failing handshake is retried a bounded number of times.
+
+        Without the bound, a server that rejects session creation would be hit
+        every poll forever. With it the pane's new chat simply stays unmirrored —
+        the pre-rotation behaviour — and the bound chat keeps mirroring.
+        """
+        server = _APServer(create_status=500)
+        harness = _RotationHarness(tmp_path, monkeypatch, server)
+        harness.seed_bound(("before",))
+        harness.seed_rotated(("after clear",))
+
+        await harness.run(
+            until=lambda: server.create_attempts >= fwd._MAX_ROTATION_ATTEMPTS,
+            extra_polls=6,
+        )
+
+        assert server.create_attempts == fwd._MAX_ROTATION_ATTEMPTS
+        assert harness.active_session_id() == "conv_old"
+        assert harness.rotations == []
+        assert fwd._read_state(harness.bridge_dir).store_path == str(harness.bound_store)
+
+    @pytest.mark.asyncio
+    async def test_rotation_skipped_while_items_are_retrying(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A retrying item blocks rotation so the old chat's tail is not lost.
+
+        ``/clear`` is usually typed right after a reply, so rotating while the
+        last turn is still being retried would drop it.
+        """
+        server = _APServer(fail_old_item_posts=True)
+        harness = _RotationHarness(tmp_path, monkeypatch, server)
+        harness.seed_bound(("before",), mirror_existing=True)
+        harness.seed_rotated(("after clear",))
+
+        await harness.run(until=lambda: harness.polls >= 8)
+
+        assert server.create_attempts == 0
+        assert harness.active_session_id() == "conv_old"
+
+    @pytest.mark.asyncio
+    async def test_rotation_skipped_when_chat_claimed_by_other_bridge(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A sibling session in the same cwd owns the new chat — don't take it.
+
+        cursor keeps one chat per working dir, so two cursor-native sessions in
+        the same cwd see each other's new chats. The claim check runs against the
+        candidate immediately before rotating.
+        """
+        server = _APServer()
+        harness = _RotationHarness(tmp_path, monkeypatch, server)
+        harness.seed_bound(("before",))
+        rotated = harness.seed_rotated(("after clear",))
+        harness.claim_by_sibling(rotated)
+
+        await harness.run(until=lambda: harness.polls >= 8)
+
+        assert server.create_attempts == 0
+        assert harness.active_session_id() == "conv_old"
+
+    @pytest.mark.asyncio
+    async def test_rotation_resets_rowid_cursor_and_model_state(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The new conversation starts from row 1 and re-posts the pane's model.
+
+        The replacement conversation's timeline is empty, so the new chat must be
+        mirrored from its first row; resetting the model dedupe makes the web
+        picker show the right model with no extra code.
+        """
+        server = _APServer()
+        harness = _RotationHarness(tmp_path, monkeypatch, server)
+        harness.seed_bound(("before",), model="composer-1")
+        harness.seed_rotated(("after clear",), model="composer-2")
+
+        await harness.run(until=lambda: "external_model_change" in server.event_types("conv_new"))
+
+        assert server.unexpected == []
+        assert [
+            body["data"]["model"]
+            for body in server.bodies("POST", "/v1/sessions/conv_new/events")
+            if isinstance(body, dict) and body.get("type") == "external_model_change"
+        ] == ["composer-2"]
+        mirrored = [
+            body["data"]["item_data"]["content"][0]["text"]
+            for body in server.bodies("POST", "/v1/sessions/conv_new/events")
+            if isinstance(body, dict) and body.get("type") == "external_conversation_item"
+        ]
+        assert "after clear" in mirrored
+        state = fwd._read_state(harness.bridge_dir)
+        assert state.store_path == str(harness.rotated_store)
+        assert state.last_rowid >= 1
+
+    @pytest.mark.asyncio
+    async def test_bound_store_is_not_rotated_without_a_new_chat(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No sibling chat, no rotation — the ordinary steady state."""
+        server = _APServer()
+        harness = _RotationHarness(tmp_path, monkeypatch, server)
+        bound = harness.seed_bound(("before",))
+
+        await harness.run(until=lambda: harness.polls >= 8)
+
+        assert server.create_attempts == 0
+        assert harness.rotations == []
+        assert harness.active_session_id() == "conv_old"
+        assert fwd._read_state(harness.bridge_dir).store_path == str(bound)
+
+    @pytest.mark.asyncio
+    async def test_attempt_budget_survives_gaps_in_detection(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A poll that detects nothing must not refund the retry budget.
+
+        Detection legitimately drops to ``None`` between attempts — an item goes
+        back into retry, the new store is momentarily unreadable. Keying the
+        budget on the candidate *chat id* rather than on equality with the last
+        observed value is what stops one ``/clear`` from spending five attempts
+        over and over and minting a conversation each time.
+        """
+        server = _APServer(create_status=500)
+        harness = _RotationHarness(tmp_path, monkeypatch, server)
+        harness.seed_bound(("before",))
+        rotated = harness.seed_rotated(("after clear",))
+
+        real_detect = fwd._detect_rotated_chat
+        flip = {"n": 0}
+
+        def _intermittent(**kwargs: object) -> Path | None:
+            # Every other poll sees nothing, the way a retrying item does.
+            flip["n"] += 1
+            return None if flip["n"] % 2 == 0 else real_detect(**kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(fwd, "_detect_rotated_chat", _intermittent)
+
+        await harness.run(
+            until=lambda: server.create_attempts >= fwd._MAX_ROTATION_ATTEMPTS,
+            extra_polls=12,
+        )
+
+        assert server.create_attempts == fwd._MAX_ROTATION_ATTEMPTS
+        assert harness.active_session_id() == "conv_old"
+        assert rotated.exists()
+
+    @pytest.mark.asyncio
+    async def test_pending_turn_end_is_posted_to_the_old_session(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The old chat's completed turn wakes its OWN conversation, not the new one.
+
+        The rotation's ``continue`` skips the turn-end block below it, so a marker
+        recorded before the rotation would be posted on the next poll — by which
+        time every POST targets the replacement conversation, waking a parent
+        orchestrator before the new chat has produced anything.
+        """
+        from omnigent.harnesses.cursor_native import status as cursor_status
+
+        server = _APServer()
+        harness = _RotationHarness(tmp_path, monkeypatch, server)
+        harness.seed_bound(("before",))
+        harness.seed_rotated(("after clear",))
+        cursor_status.record_turn_end(harness.bridge_dir)
+
+        await harness.run(until=lambda: harness.active_session_id() == "conv_new", extra_polls=6)
+
+        assert "external_session_status" in server.event_types("conv_old")
+        assert cursor_status.read_posted_count(harness.bridge_dir) == 1
+        # The replacement must not inherit the old chat's completion.
+        idle_on_new = [
+            body
+            for body in server.bodies("POST", "/v1/sessions/conv_new/events")
+            if isinstance(body, dict) and body.get("type") == "external_session_status"
+        ]
+        assert idle_on_new == []
+
+    @pytest.mark.asyncio
+    async def test_old_session_is_rekeyed_before_its_runner_is_cleared(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Two PATCHes, label first — the order that cannot leave two pane owners.
+
+        The server applies a PATCH's fields in separate store calls, so clearing
+        the runner and re-keying the bridge label in one request can half-apply.
+        Re-keying first means a failure in between leaves the old session pointed
+        at its own fresh bridge dir rather than at the live one.
+        """
+        server = _APServer()
+        harness = _RotationHarness(tmp_path, monkeypatch, server)
+        harness.seed_bound(("before",))
+        harness.seed_rotated(("after clear",))
+
+        await harness.run(until=lambda: harness.active_session_id() == "conv_new", extra_polls=2)
+
+        # Two separate requests, never one combined body, and the label first.
+        cleanup = server.bodies("PATCH", "/v1/sessions/conv_old")[-2:]
+        assert cleanup == [
+            {"labels": {fwd.CURSOR_NATIVE_BRIDGE_ID_LABEL_KEY: "conv_old-cleared"}},
+            {"runner_id": ""},
+        ]
+
+
+@pytest.mark.asyncio
+async def test_post_clear_supersession_notifies_old_session() -> None:
+    """The superseded conversation is told what happened, three ways.
+
+    In order: an ``idle`` status so its spinner stops (its terminal moved away,
+    so no turn-end edge will ever arrive), a persisted assistant message linking
+    to the new conversation, and a transient redirect event for a live viewer.
+    """
+    calls: list[tuple[str, str, dict | None]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8")) if request.content else None
+        calls.append((request.method, request.url.path, body))
+        return httpx.Response(200, json={"queued": False, "item_id": "item_x"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ap"
+    ) as client:
+        await fwd._post_clear_supersession(
+            client,
+            old_session_id="conv_old",
+            new_session_id="conv_new",
+            agent_name="cursor-native-ui",
+        )
+
+    assert len(calls) == 3
+    assert all(
+        (method, path) == ("POST", "/v1/sessions/conv_old/events") for method, path, _ in calls
+    )
+    assert calls[0][2] == {"type": "external_session_status", "data": {"status": "idle"}}
+    notice_body = calls[1][2]
+    assert notice_body is not None
+    assert notice_body["type"] == "external_conversation_item"
+    item_data = notice_body["data"]["item_data"]
+    assert item_data["role"] == "assistant"
+    assert item_data["agent"] == "cursor-native-ui"
+    notice_text = item_data["content"][0]["text"]
+    assert "/clear" in notice_text
+    assert "/c/conv_new" in notice_text
+    assert calls[2][2] == {
+        "type": "external_session_superseded",
+        "data": {"target_conversation_id": "conv_new"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_post_clear_supersession_skips_when_old_equals_new() -> None:
+    """Collapsed ids are a no-op: never banner the live conversation."""
+    calls: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append((request.method, request.url.path))
+        return httpx.Response(200, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ap"
+    ) as client:
+        await fwd._post_clear_supersession(
+            client,
+            old_session_id="conv_same",
+            new_session_id="conv_same",
+            agent_name="cursor-native-ui",
+        )
+
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_post_clear_supersession_swallows_post_failure() -> None:
+    """A failed notice must not break the poll loop — the rotation already ran."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"error": {"message": "boom"}})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ap"
+    ) as client:
+        await fwd._post_clear_supersession(
+            client,
+            old_session_id="conv_old",
+            new_session_id="conv_new",
+            agent_name="cursor-native-ui",
+        )

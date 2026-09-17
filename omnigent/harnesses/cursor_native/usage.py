@@ -192,6 +192,17 @@ class _UsageAccumulator:
             self.model = model  # latest turn's model wins (mirrors a /model switch)
         return True
 
+    def reset_totals(self) -> None:
+        """Zero the cumulative counts, keeping the counted-generation set.
+
+        A rotated-to conversation must start billing from zero, but the turns
+        already folded in stay in ``seen`` so re-reading the append-only log
+        cannot count them again.
+        """
+        self.input_tokens = 0
+        self.output_tokens = 0
+        self.cache_read_tokens = 0
+
 
 def _read_usage_state(bridge_dir: Path) -> _UsageAccumulator:
     """Load the persisted accumulator, or a cold zero default."""
@@ -286,6 +297,10 @@ async def forward_cursor_usage_to_session(
     is persisted to ``bridge_dir`` so a supervisor restart resumes without
     re-counting. Never returns normally; cancel the task to stop it.
 
+    A TUI ``/clear`` rotates the pane onto a new conversation and the forwarder
+    rebinds the bridge config, so the target session is re-read from it every
+    poll and the cumulative totals restart for the conversation being billed.
+
     Turn completion is forwarded separately by
     :mod:`omnigent.harnesses.cursor_native.forwarder`, which can order the
     terminal edge after transcript delivery. Usage must never post completion:
@@ -294,13 +309,34 @@ async def forward_cursor_usage_to_session(
     """
     import httpx
 
+    # Imported here, not at module scope: the ``stop``-hook recorder path shares
+    # this module and must stay stdlib-only so it never slows a turn end.
+    from omnigent.harnesses.cursor_native.bridge import read_active_session_id
+
     acc = _read_usage_state(bridge_dir)
     timeout = httpx.Timeout(_POST_TIMEOUT_S)
     from omnigent.cli_auth import open_server_client
 
     async with open_server_client(base_url, headers=headers, auth=auth, timeout=timeout) as client:
+        # Seeded from the bridge, not the launch-time ``session_id``: a restart
+        # after a ``/clear`` rotation still arrives with the superseded id, and
+        # seeding from it would zero totals the new conversation already reported.
+        current_session_id = read_active_session_id(bridge_dir) or session_id
         while True:
             try:
+                rotated_from = current_session_id
+                current_session_id = read_active_session_id(bridge_dir) or session_id
+                if current_session_id != rotated_from:
+                    _logger.info(
+                        "cursor usage forwarder following session rotation; old=%s new=%s",
+                        rotated_from,
+                        current_session_id,
+                    )
+                    # Cumulative totals are per conversation; persist the zeroed
+                    # state at once so a restart cannot replay the old session's
+                    # spend onto the new one.
+                    acc.reset_totals()
+                    await asyncio.to_thread(_write_usage_state, bridge_dir, acc)
                 lines = await asyncio.to_thread(_read_usage_lines, bridge_dir)
                 changed = False
                 for line in lines:
@@ -308,7 +344,7 @@ async def forward_cursor_usage_to_session(
                         changed = True
                 if changed:
                     resp = await client.post(
-                        f"/v1/sessions/{session_id}/events",
+                        f"/v1/sessions/{current_session_id}/events",
                         json={"type": "external_session_usage", "data": _usage_post_body(acc)},
                     )
                     resp.raise_for_status()
@@ -320,7 +356,7 @@ async def forward_cursor_usage_to_session(
             except Exception:
                 _logger.exception(
                     "cursor usage forwarder poll failed; session=%s bridge_dir=%s",
-                    session_id,
+                    current_session_id,
                     bridge_dir,
                 )
             await asyncio.sleep(poll_interval_s)
