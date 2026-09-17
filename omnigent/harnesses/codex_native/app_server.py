@@ -1116,8 +1116,12 @@ def mark_launch_default(rows: list[_JsonObject], pinned_model: str | None) -> li
     """
     Reduce ``model/list`` rows to exactly one ``isDefault`` marker.
 
-    The launch-pinned model wins when a row names it (either spelling);
-    otherwise Codex's own first default stands. Rows are otherwise verbatim.
+    The launch-pinned model wins when a row names it (either spelling).
+    A pinned model no visible row names (a hidden configured default is
+    explicitly supported) marks NO default: crowning a different visible
+    model would let the launch path pin a model the configuration never
+    selected. Only an unpinned launch keeps Codex's own first default.
+    Rows are otherwise verbatim.
 
     Codex's own ``isDefault`` is its built-in preference, which says nothing
     about the model this session launched on, so a picker that trusted it
@@ -1143,7 +1147,12 @@ def mark_launch_default(rows: list[_JsonObject], pinned_model: str | None) -> li
                 if isinstance(spelling, str) and comparable_model_id(spelling) == pinned_key:
                     pinned_index = index
                     break
-    default_index = pinned_index if pinned_index is not None else codex_default_index
+    if pinned_key is not None:
+        # The effective model is authoritative even when hidden from the
+        # visible rows; never substitute a model the config did not select.
+        default_index = pinned_index
+    else:
+        default_index = codex_default_index
     if default_index is not None:
         marked[default_index]["isDefault"] = True
     return marked

@@ -1775,26 +1775,47 @@ def record_model_vocabulary(
         offers, or ``None`` when the catalog is unknown. An empty list clears it.
     :returns: None.
     """
-    config = _read_json_file(bridge_dir / _CONFIG_FILE)
-    if not isinstance(config, dict):
-        return
-    model_env = {
-        key: launch_env[key]
-        for key in MODEL_VOCABULARY_ENV_VARS
-        if launch_env is not None and launch_env.get(key)
-    }
-    changed = False
-    if model_env and config.get("model_env") != model_env:
-        config["model_env"] = model_env
-        changed = True
-    if picker_values is not None and config.get("model_picker_values") != list(picker_values):
-        config["model_picker_values"] = list(picker_values)
-        changed = True
-    if launch_model and config.get("launch_model") != launch_model:
-        config["launch_model"] = launch_model
-        changed = True
-    if changed:
-        _write_json_file(bridge_dir / _CONFIG_FILE, config)
+    # Read-modify-write under the bridge dir's cross-process lock so a
+    # vocabulary refresh (e.g. serving model options) can never replace a
+    # concurrent bridge preparation's config — sandbox settings included —
+    # with its own stale read.
+    with _bridge_config_write_lock(bridge_dir):
+        config = _read_json_file(bridge_dir / _CONFIG_FILE)
+        if not isinstance(config, dict):
+            return
+        model_env = {
+            key: launch_env[key]
+            for key in MODEL_VOCABULARY_ENV_VARS
+            if launch_env is not None and launch_env.get(key)
+        }
+        changed = False
+        if model_env and config.get("model_env") != model_env:
+            config["model_env"] = model_env
+            changed = True
+        if picker_values is not None and config.get("model_picker_values") != list(picker_values):
+            config["model_picker_values"] = list(picker_values)
+            changed = True
+        if launch_model and config.get("launch_model") != launch_model:
+            config["launch_model"] = launch_model
+            changed = True
+        if changed:
+            _write_json_file(bridge_dir / _CONFIG_FILE, config)
+
+
+@contextlib.contextmanager
+def _bridge_config_write_lock(bridge_dir: Path) -> Iterator[None]:
+    """Cross-process mutual exclusion for bridge-config read-modify-writes.
+
+    Uses the same on-disk lock file as bridge-dir preparation
+    (``<bridge root>/.locks/<bridge dir>.lock``), so config rewrites and
+    :func:`prepare_bridge_dir` exclude each other across processes.
+    """
+    from filelock import FileLock
+
+    lock_dir = bridge_dir.parent / ".locks"
+    lock_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with FileLock(str(lock_dir / f"{bridge_dir.name}.lock"), mode=0o600):
+        yield
 
 
 def read_bridge_id(bridge_dir: Path) -> str | None:

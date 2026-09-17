@@ -1076,6 +1076,24 @@ async def test_codex_reprobed_launch_catalog_preserves_prior_cache_on_no_rows(
     assert await codex_native_app_server.codex_launch_catalog_is_stale(launch=_catalog_launch)
 
 
+def test_mark_launch_default_preserves_a_hidden_configured_default() -> None:
+    """A pinned model absent from the visible rows marks no default.
+
+    Hidden configured models are explicitly supported: crowning a different
+    visible model would let a Default launch pin a model the configuration
+    never selected. An unpinned launch still keeps Codex's own first default.
+    """
+    from omnigent.harnesses.codex_native.app_server import mark_launch_default
+
+    rows = [{"id": "gpt-5.5", "isDefault": True}, {"id": "gpt-5.4"}]
+    hidden = mark_launch_default(rows, "gpt-5.5-secret")
+    assert all("isDefault" not in row for row in hidden)
+    unpinned = mark_launch_default(rows, None)
+    assert [row.get("isDefault") for row in unpinned] == [True, None]
+    pinned = mark_launch_default(rows, "gpt-5.4")
+    assert [row.get("isDefault") for row in pinned] == [None, True]
+
+
 @pytest.mark.parametrize("reprobe", [False, True])
 async def test_codex_launch_catalog_unresolvable_launch_returns_none(
     monkeypatch: pytest.MonkeyPatch, reprobe: bool
