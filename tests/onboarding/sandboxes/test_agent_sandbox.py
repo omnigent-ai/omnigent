@@ -199,6 +199,18 @@ def test_agent_sandbox_inherits_multi_repo_capability() -> None:
     assert _launcher().capabilities.multi_repo is True
 
 
+def test_agent_sandbox_declares_resume_requires_workspace_prep() -> None:
+    """A resume rebuilds the Pod, so a default ephemeral HOME comes back without
+    the session's clones and the wake has to re-prepare them. The Job provider
+    it inherits from wakes onto an empty workspace today, so it stays off and
+    the override does not leak up to it."""
+    from omnigent.onboarding.sandboxes.kubernetes import KubernetesSandboxLauncher
+
+    job_provider = KubernetesSandboxLauncher(in_cluster=True)
+    assert _launcher().capabilities.resume_requires_workspace_prep is True
+    assert job_provider.capabilities.resume_requires_workspace_prep is False
+
+
 # ── manifest conversion ────────────────────────────────
 
 

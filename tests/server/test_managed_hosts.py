@@ -36,6 +36,7 @@ from omnigent.onboarding.sandboxes.registry import (
     SandboxProviderMetadata,
     reset_plugin_state_for_tests,
 )
+from omnigent.onboarding.sandboxes.types import SandboxCapabilities
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.managed_hosts import (
@@ -3186,6 +3187,10 @@ async def test_resume_agent_sandbox_prepares_recorded_workspace(
     class _AgentSandboxFakeLauncher(_EntrypointFakeLauncher):
         provider: ClassVar[str] = "agent_sandbox"
 
+        @property
+        def capabilities(self) -> SandboxCapabilities:
+            return replace(super().capabilities, resume_requires_workspace_prep=True)
+
     workspace = tmp_path / "home with spaces" / "workspace"
     clone_dir = workspace / "repo"
     temporary = workspace / "repo.tmp"
@@ -3444,6 +3449,45 @@ async def test_resume_agent_sandbox_prepares_recorded_workspace(
         assert calls == []
         assert list(workspace.iterdir()) == []
     assert captured["repos"] == ([repo] if repo is not None else [])
+
+
+@pytest.mark.parametrize("needs_prep", [True, False])
+async def test_resume_workspace_prep_follows_capability_not_provider_name(
+    db_uri: str, needs_prep: bool
+) -> None:
+    """
+    The wake gates workspace prep on the declared capability, so a provider the
+    server has never heard of gets its clones restored purely by asking for it,
+    and one that does not ask is left alone.
+    """
+    host_store = HostStore(db_uri)
+
+    class _AcmeFakeLauncher(_EntrypointFakeLauncher):
+        """Out-of-tree provider declaring the wake-prep capability itself."""
+
+        provider: ClassVar[str] = "acme-cloud"
+
+        @property
+        def capabilities(self) -> SandboxCapabilities:
+            return replace(super().capabilities, resume_requires_workspace_prep=needs_prep)
+
+    fake = _AcmeFakeLauncher(host_store)
+    fake.can_resume = True
+    host = host_store.register_managed_host(
+        host_id=uuid.uuid4().hex,
+        name="managed-capability-wake",
+        user_id=_OWNER,
+        token="old-token",
+        provider="acme-cloud",
+        sandbox_id="sb-capability-wake",
+        token_expires_at=now_epoch() + 60,
+    )
+    repo = parse_repo_workspace("https://github.com/org/repo.git#main")
+
+    await resume_managed_host(host.host_id, host_store, _injected_config(fake), repos=[repo])
+
+    assert fake.resumed == ["sb-capability-wake"]
+    assert fake.start_calls[-1]["repos"] == ([repo] if needs_prep else [])
 
 
 @pytest.mark.parametrize("raw_repo", [None, "https://github.com/org/repo.git#release/test", "bad"])

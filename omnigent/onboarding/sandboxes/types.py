@@ -92,6 +92,13 @@ class SandboxCapabilities:
         single session's workspace. Off by default, so a provider that
         clones only one repo (and every out-of-tree provider) is never
         handed a multi-repo request; providers opt in explicitly.
+    :param resume_requires_workspace_prep: A wake must re-prepare the
+        session's repository checkouts, because resuming this provider can
+        come back without them (agent-sandbox rebuilds its Pod, and a
+        default ephemeral HOME takes the clones with it). Prep keeps a
+        checkout that is still present, so a resume onto a persistent
+        filesystem leaves its clones and their uncommitted work untouched.
+        Only meaningful alongside ``resume_stopped``.
     """
 
     cli_bootstrap: bool = False
@@ -107,6 +114,7 @@ class SandboxCapabilities:
     # compatibility for out-of-tree providers.
     snapshot_restore: bool = False
     multi_repo: bool = False
+    resume_requires_workspace_prep: bool = False
 
 
 @dataclass(frozen=True)

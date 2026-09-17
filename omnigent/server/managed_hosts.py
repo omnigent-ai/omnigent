@@ -3841,8 +3841,8 @@ async def resume_managed_host(
     :param host_store: Persistent host registrations (cross-replica liveness).
     :param config: The deployment's managed-sandbox config, or ``None`` when
         the ``sandbox:`` section has been removed since launch.
-    :param repos: Recorded repositories to restore when an agent-sandbox wake
-        recreates its Pod with ephemeral HOME. Existing clones are kept.
+    :param repos: Recorded repositories to restore when the provider declares
+        ``resume_requires_workspace_prep``. Existing clones are kept.
     :param force: Skip the DB-liveness no-op gate when the caller has local
         evidence that the tunnel is gone.
     :param on_stage: Progress observer forwarded to the launcher's
@@ -3880,9 +3880,9 @@ async def resume_managed_host(
         launcher = _launcher_for_teardown(host, config)
         if launcher is None or not launcher.capabilities.resume_stopped or host.sandbox_id is None:
             return
-        # Agent-sandbox recreates its Pod and may lose HOME. Other resumable
-        # providers retain their filesystem and do not need workspace prep.
-        workspace_repos = repos if launcher.provider == "agent_sandbox" else ()
+        # Only providers that declare a wake needs it: re-preparing a workspace
+        # the resume kept would touch the clone's uncommitted work.
+        workspace_repos = repos if launcher.capabilities.resume_requires_workspace_prep else ()
         entry = config.recorded(host.sandbox_provider)
         sandbox_id = host.sandbox_id
         _logger.info(

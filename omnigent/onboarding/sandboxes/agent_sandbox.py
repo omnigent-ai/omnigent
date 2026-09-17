@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import logging
 import os
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, ClassVar
 
@@ -74,6 +75,8 @@ from omnigent.onboarding.sandboxes.kubernetes import (
 
 if TYPE_CHECKING:
     from kubernetes import client as k8s_client
+
+    from omnigent.onboarding.sandboxes.types import SandboxCapabilities
 
 
 _logger = logging.getLogger(__name__)
@@ -308,6 +311,14 @@ class AgentSandboxLauncher(KubernetesSandboxLauncher):
 
     provider: ClassVar[str] = "agent_sandbox"
     workload_kind: ClassVar[str] = "sandbox"
+
+    @property
+    def capabilities(self) -> SandboxCapabilities:
+        # The Sandbox survives a resume, but its backing Pod is rebuilt: with a
+        # default ephemeral HOME the session's clones do not come back, so a
+        # wake re-prepares them. A configured workspace claim keeps them, and
+        # prep leaves an existing checkout alone.
+        return replace(super().capabilities, resume_requires_workspace_prep=True)
 
     # ── clients ─────────────────────────────────────────────
 
