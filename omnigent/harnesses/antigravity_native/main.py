@@ -1023,13 +1023,16 @@ async def _launch_and_record(
     )
     # Lead the args so the flag is never swallowed by a later positional.
     argv = [argv[0], f"--gemini_dir={agy_gemini_dir(bridge_dir)}", *argv[1:]]
+    from omnigent.harnesses.antigravity_native.gateway import wrap_agy_gateway_launch
+
+    argv = wrap_agy_gateway_launch([command, *argv[1:]], env_overrides)
     _update_progress(startup_progress, "Starting Antigravity terminal...")
     launched = await _launch_antigravity_terminal(
         client,
         session_id,
         argv=argv,
         env=env_overrides,
-        command=command,
+        command=argv[0],
     )
     # Advertise the tmux pane so a web turn to this CLI-launched session can be
     # bootstrapped into the idle agy TUI by the executor (agy mints its

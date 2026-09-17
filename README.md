@@ -315,9 +315,15 @@ agy requests. An OpenAI-only gateway or a bearer-token refresh command is not
 supported by this route. This configures **native agy**; the Antigravity Python
 SDK retains its separate key/Vertex setup.
 
-Databricks' Gemini endpoint requires Bearer authentication and Databricks model
-names. It needs an adapter for native agy; entering its URL and token in this
-gateway flow does not translate either requirement.
+For Databricks, choose **Databricks — profile** in the same add menu and enter
+an existing Databricks CLI profile. This requires the `databricks` extra and a
+working profile login. Omnigent starts a local adapter with each agy process,
+refreshes the profile's Bearer token, and translates agy's model names to the
+workspace's Gemini model services. The workspace must expose the corresponding
+main and auxiliary model versions; unavailable models produce an error rather
+than selecting another version. Tool calls and streaming responses pass through
+the native Gemini API. The adapter stops with agy and is recreated on resume.
+This selection applies only to native agy.
 
 Keys are stored in Omnigent's secret store; the shared provider entry contains
 only a reference. An explicitly selected Gemini provider overrides ambient

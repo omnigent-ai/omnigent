@@ -544,8 +544,8 @@ def _add_option_families(opt: AddOption) -> frozenset[str]:
     Used to scope the add menu to the harness the user drilled into
     (``configure harness`` → Claude / Codex / Gemini / Pi → "Add a
     provider"): a Claude add should not offer an OpenAI-only key, and vice
-    versa. Gemini gateways drive native agy; Databricks serves only the
-    Anthropic/OpenAI/Pi surfaces. Gemini credentials never drive Pi.
+    versa. Gemini gateways and Gemini-scoped Databricks profiles drive native
+    agy. Gemini credentials never drive Pi.
 
     :param opt: One add-menu option.
     :returns: The surfaces this option can configure — a subset of
@@ -554,7 +554,7 @@ def _add_option_families(opt: AddOption) -> frozenset[str]:
     if opt.kind == GATEWAY_KIND:
         return frozenset({ANTHROPIC_FAMILY, OPENAI_FAMILY, GEMINI_FAMILY, PI_SURFACE})
     if opt.kind == DATABRICKS_KIND:
-        return frozenset({ANTHROPIC_FAMILY, OPENAI_FAMILY, PI_SURFACE})
+        return frozenset({ANTHROPIC_FAMILY, OPENAI_FAMILY, GEMINI_FAMILY, PI_SURFACE})
     if opt.kind == BEDROCK_KIND:
         # Bedrock mode drives only the native Claude terminal (anthropic
         # family); codex/pi reject it, so it never serves their surfaces.
@@ -595,7 +595,23 @@ def add_menu_options_for_family(family: str) -> list[AddOption]:
         ``"pi"`` (Pi).
     :returns: The subset of :func:`add_menu_options` serving *family*.
     """
-    return [opt for opt in add_menu_options() if family in _add_option_families(opt)]
+    options = [opt for opt in add_menu_options() if family in _add_option_families(opt)]
+    if family == GEMINI_FAMILY:
+        options = [
+            AddOption(
+                label=f"{kind_glyph(DATABRICKS_KIND)} Databricks — profile",
+                description=(
+                    "Use an existing Databricks CLI profile for native agy."
+                    if databricks_sdk_installed()
+                    else opt.description
+                ),
+                kind=DATABRICKS_KIND,
+            )
+            if opt.kind == DATABRICKS_KIND
+            else opt
+            for opt in options
+        ]
+    return options
 
 
 def other_key_providers() -> list[str]:

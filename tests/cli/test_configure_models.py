@@ -619,7 +619,11 @@ def test_add_menu_options_ordering() -> None:
     ]
 
     gemini = [o.label.split(None, 1)[1] for o in add_menu_options_for_family(GEMINI_FAMILY)]
-    assert gemini == ["Gemini — API key", "Gateway — custom base URL + key"]
+    assert gemini == [
+        "Gemini — API key",
+        "Gateway — custom base URL + key",
+        "Databricks — profile",
+    ]
 
 
 def test_add_menu_databricks_option_gated_on_extra(monkeypatch) -> None:
@@ -940,6 +944,30 @@ def test_remove_databricks_cleans_ucode_wiring_without_asking(isolated_config) -
     assert doc["model"] == "gpt-5.4"
     # ucode's sidecar is deleted too.
     assert not (codex_dir / "ucode.config.toml").exists()
+
+
+def test_remove_databricks_gemini_preserves_other_harness_wiring(isolated_config) -> None:
+    (isolated_config / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "providers": {
+                    "agy-db": {"kind": "databricks", "profile": "test", "native_gemini": True}
+                }
+            }
+        )
+    )
+    codex_dir = isolated_config / ".codex"
+    codex_dir.mkdir()
+    wiring = codex_dir / "ucode.config.toml"
+    wiring.write_text('model_provider = "ucode-databricks"\n')
+    result = CliRunner().invoke(
+        cli,
+        ["setup", "--no-internal-beta"],
+        input="\n".join(["7", "3", "1", "2", "q", "q", "q"]) + "\n",
+    )
+    assert result.exit_code == 0, result.output
+    assert "agy-db" not in _config_yaml(isolated_config).get("providers", {})
+    assert wiring.read_text() == 'model_provider = "ucode-databricks"\n'
 
 
 def test_remove_databricks_without_ucode_wiring_still_removes(isolated_config) -> None:

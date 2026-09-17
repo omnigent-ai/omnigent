@@ -987,6 +987,15 @@ def _configure_harness_add(family: str | None = None) -> str | None:
             default_model=default_model,
         )
 
+    elif kind == DATABRICKS_KIND and family == GEMINI_FAMILY:
+        from omnigent.harnesses.antigravity_native.credentials import databricks_token_source
+
+        profile = prompt_text("Databricks profile (from ~/.databrickscfg)").strip()
+        credentials = databricks_token_source(profile)
+        credentials.resolve()
+        name = f"databricks-gemini-{profile}"
+        entry = {**build_databricks_provider_entry(profile), "native_gemini": True}
+
     else:  # databricks
         # Gate on the `databricks` extra: a `kind: databricks` provider mints
         # workspace OAuth tokens via databricks-sdk at runtime
@@ -3164,7 +3173,7 @@ def _manage_credential(provider: str, family: str) -> str | None:
     # harness configs outside ~/.omnigent/config.yaml — so removing it
     # also cleans those edits up (otherwise codex keeps routing through
     # the workspace gateway).
-    if entry.kind == DATABRICKS_KIND:
+    if entry.kind == DATABRICKS_KIND and not entry.native_gemini:
         return _remove_databricks_provider(provider)
     return _remove_credential(provider)
 

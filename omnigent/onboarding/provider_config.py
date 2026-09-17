@@ -433,6 +433,8 @@ class ProviderEntry:
     model_provider: str | None = None
     display_name: str | None = None
     default_families: frozenset[str] = frozenset()
+    # Databricks Gemini routing is opt-in and has a separate default scope.
+    native_gemini: bool = False
 
     @property
     def default(self) -> bool:
@@ -1024,17 +1026,18 @@ def _parse_provider(name: str, raw: dict[str, object]) -> ProviderEntry:
                 f"provider {name!r}: a profile or connection: databricks is required.",
                 code=ErrorCode.INVALID_INPUT,
             )
-        # Databricks (ucode) routes the anthropic/openai surfaces + pi, but NOT
-        # gemini: the antigravity harness drives Gemini via the dedicated google
-        # SDK + GEMINI_API_KEY, not an OpenAI-compatible gateway, so a databricks
-        # profile cannot serve (or default) the Gemini surface.
+        native_gemini = raw.get("native_gemini", False)
+        if not isinstance(native_gemini, bool):
+            raise OmnigentError("native_gemini must be a boolean", code=ErrorCode.INVALID_INPUT)
+        served = {GEMINI_FAMILY} if native_gemini else set(_PI_FALLBACK_FAMILIES)
         return ProviderEntry(
             name=name,
             kind=kind,
             profile=profile_raw if isinstance(profile_raw, str) else None,
             connection=connection_raw,
+            native_gemini=native_gemini,
             default_families=_parse_default_families(
-                name, default_raw, set(_VALID_FAMILIES) - {GEMINI_FAMILY}, pi_capable=True
+                name, default_raw, served, pi_capable=not native_gemini
             ),
         )
 
@@ -1237,7 +1240,8 @@ def provider_families(entry: ProviderEntry) -> frozenset[str]:
       serves the ``anthropic`` surface, ``codex`` serves the ``openai``
       surface, ``pi`` serves only the :data:`PI_SURFACE` scope (signals
       "use Pi's own native auth"). Other CLIs serve nothing.
-    - ``databricks``: both families plus pi — ucode routes the Claude,
+    - ``databricks``: Gemini only when ``native_gemini`` is enabled;
+      otherwise both families plus pi — ucode routes the Claude,
       Codex, and pi surfaces.
 
     :param entry: The provider entry to classify.
@@ -1289,9 +1293,8 @@ def provider_families(entry: ProviderEntry) -> frozenset[str]:
             return frozenset({OPENAI_FAMILY})
         return frozenset()
     if entry.kind == DATABRICKS_KIND:
-        # ucode routes anthropic/openai + pi, never the Gemini surface (which
-        # needs the antigravity SDK + GEMINI_API_KEY, not a gateway).
-        return (frozenset(_VALID_FAMILIES) - {GEMINI_FAMILY}) | {PI_SURFACE}
+        served = frozenset(_PI_FALLBACK_FAMILIES) | {PI_SURFACE}
+        return frozenset({GEMINI_FAMILY}) if entry.native_gemini else served
     return frozenset()
 
 

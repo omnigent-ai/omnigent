@@ -6596,6 +6596,9 @@ async def _auto_create_antigravity_terminal(
         launch_env={**os.environ, **env_overrides},
     )
     argv = [argv[0], f"--gemini_dir={agy_gemini_dir(bridge_dir)}", *argv[1:]]
+    from omnigent.harnesses.antigravity_native.gateway import wrap_agy_gateway_launch
+
+    argv = wrap_agy_gateway_launch(argv, env_overrides)
     # Start the shared comment/sys_* relay against THIS session's bridge dir before
     # launch so its tool_relay.json is on disk when agy first scans the MCP server.
     # ``await_notify=False``: agy starts its MCP client lazily, so awaiting the

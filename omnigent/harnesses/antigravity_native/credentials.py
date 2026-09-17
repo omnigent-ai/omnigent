@@ -1,6 +1,7 @@
 """Resolve setup credentials for the native agy process."""
 
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.onboarding.antigravity_auth import antigravity_api_key_ref
@@ -10,6 +11,7 @@ from omnigent.onboarding.gemini_gateway import (
     validate_gemini_base_url,
 )
 from omnigent.onboarding.provider_config import (
+    DATABRICKS_KIND,
     GEMINI_FAMILY,
     KEY_KIND,
     default_provider_for_harness,
@@ -17,6 +19,33 @@ from omnigent.onboarding.provider_config import (
     resolve_secret,
 )
 from omnigent.util.env_credentials import getenv_nonempty_with_omnigent_prefix
+
+if TYPE_CHECKING:
+    from omnigent.inner.credential_proxy import DatabricksProfileTokenProvider
+
+
+def databricks_token_source(profile: str) -> "DatabricksProfileTokenProvider":
+    """Bind SDK authentication to the selected profile's host, like native Codex."""
+    from omnigent.inner.credential_proxy import DatabricksProfileTokenProvider
+    from omnigent.inner.databricks_executor import _read_databrickscfg_host
+
+    if not profile.strip():
+        raise OmnigentError("Enter a Databricks profile name.", code=ErrorCode.INVALID_INPUT)
+    host = _read_databrickscfg_host(profile)
+    if not host:
+        raise OmnigentError(
+            f"Databricks profile {profile!r} has no workspace host.", code=ErrorCode.INVALID_INPUT
+        )
+    try:
+        from databricks.sdk.config import Config
+    except ImportError:
+        raise OmnigentError(
+            "Native agy Databricks routing requires `pip install 'omnigent[databricks]'`.",
+            code=ErrorCode.INVALID_INPUT,
+        ) from None
+    return DatabricksProfileTokenProvider(
+        profile, config_factory=lambda name: Config(profile=name, host=host)
+    )
 
 
 @dataclass(frozen=True)
@@ -26,10 +55,14 @@ class AntigravityCredentials:
     api_key: str = field(repr=False)
     base_url: str
     model: str | None = None
+    profile: str | None = None
 
     def environment(self) -> dict[str, str]:
         """Return the environment consumed by agy's Gemini API route."""
-        return {"GEMINI_API_KEY": self.api_key, GEMINI_BASE_URL_ENV: self.base_url}
+        environment = {"GEMINI_API_KEY": self.api_key, GEMINI_BASE_URL_ENV: self.base_url}
+        if self.profile is not None:
+            environment["OMNIGENT_AGY_DATABRICKS_PROFILE"] = self.profile
+        return environment
 
 
 def resolve_antigravity_credentials() -> AntigravityCredentials | None:
@@ -41,6 +74,11 @@ def resolve_antigravity_credentials() -> AntigravityCredentials | None:
     config = load_config()
     provider = default_provider_for_harness(config, "antigravity-native")
     if provider is not None:
+        if provider.kind == DATABRICKS_KIND and provider.native_gemini:
+            source = databricks_token_source(provider.profile or "")
+            return AntigravityCredentials(
+                "omnigent-adapter-pending", source.workspace_url, profile=provider.profile
+            )
         family = provider.family(GEMINI_FAMILY)
         key = (family.api_key or "").strip() if family is not None else ""
         if family is None or not key:

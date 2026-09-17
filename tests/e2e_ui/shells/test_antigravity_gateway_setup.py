@@ -44,7 +44,10 @@ def _wait(check, message: str, timeout: float = 90):
     raise AssertionError(message)
 
 
-def test_setup_gateway_reaches_real_agy_through_fresh_local_daemon(tmp_path: Path) -> None:
+@pytest.mark.parametrize("databricks", [False, True], ids=["direct", "databricks"])
+def test_setup_gateway_reaches_real_agy_through_fresh_local_daemon(
+    tmp_path: Path, databricks: bool
+) -> None:
     assert shutil.which("agy") and shutil.which("tmux"), "install agy and tmux"
     captured: list[dict] = []
     tool_requested = threading.Event()
@@ -58,11 +61,43 @@ def test_setup_gateway_reaches_real_agy_through_fresh_local_daemon(tmp_path: Pat
         def log_message(self, format: str, *args: object) -> None:
             pass
 
-        def do_POST(self) -> None:
+        def do_GET(self) -> None:
             if (
-                not self.path.startswith("/gemini/v1beta/models/")
+                not self.path.startswith("/api/2.1/unity-catalog/model-services?")
+                or self.headers.get("Authorization") != "Bearer gateway-test-key"
+            ):
+                self.send_error(403)
+                return
+            payload = json.dumps(
+                {
+                    "model_services": [
+                        {"name": "model-services/system.ai.gemini-3-1-pro"},
+                        {"name": "model-services/system.ai.gemini-3-1-flash-lite"},
+                    ]
+                }
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def do_POST(self) -> None:
+            prefix = (
+                "/ai-gateway/gemini/v1beta/models/system.ai."
+                if databricks
+                else "/gemini/v1beta/models/"
+            )
+            authenticated = (
+                self.headers.get("Authorization") == "Bearer gateway-test-key"
+                and "x-goog-api-key" not in self.headers
+                if databricks
+                else self.headers.get("x-goog-api-key") == "gateway-test-key"
+            )
+            if (
+                not self.path.startswith(prefix)
                 or ":streamGenerateContent" not in self.path
-                or self.headers.get("x-goog-api-key") != "gateway-test-key"
+                or not authenticated
             ):
                 self.send_error(403)
                 return
@@ -145,11 +180,22 @@ def test_setup_gateway_reaches_real_agy_through_fresh_local_daemon(tmp_path: Pat
         thread.start()
         try:
             endpoint = f"http://127.0.0.1:{gateway.server_port}/gemini"
+            if databricks:
+                profile_file = tmp_path / "databrickscfg"
+                profile_file.write_text(
+                    "[gateway-test]\n"
+                    f"host = http://127.0.0.1:{gateway.server_port}\n"
+                    "token = gateway-test-key\nauth_type = pat\n"
+                )
+                profile_file.chmod(0o600)
+                env["DATABRICKS_CONFIG_FILE"] = str(profile_file)
             result = cli(
                 "setup",
                 "--no-internal-beta",
                 stdin="\n".join(
-                    [
+                    ["7", "3", "1", "3", "gateway-test", "q", "q", "q"]
+                    if databricks
+                    else [
                         "7",
                         "3",
                         "1",
@@ -170,7 +216,16 @@ def test_setup_gateway_reaches_real_agy_through_fresh_local_daemon(tmp_path: Pat
             config_text = (tmp_path / "config/config.yaml").read_text()
             assert "gateway-test-key" not in config_text
             config = yaml.safe_load(config_text)
-            assert config["providers"]["test-gemini"]["gemini"]["base_url"] == endpoint
+            if databricks:
+                from omnigent.onboarding.provider_config import load_providers
+
+                provider = config["providers"]["databricks-gemini-gateway-test"]
+                assert provider["profile"] == "gateway-test"
+                assert load_providers(config)[
+                    "databricks-gemini-gateway-test"
+                ].default_families == {"gemini"}
+            else:
+                assert config["providers"]["test-gemini"]["gemini"]["base_url"] == endpoint
             # No ambient credentials: the new daemon must read what setup saved.
             assert "GEMINI_API_KEY" not in env and "GOOGLE_GEMINI_BASE_URL" not in env
             result = cli("host", "--background", "--non-interactive")
