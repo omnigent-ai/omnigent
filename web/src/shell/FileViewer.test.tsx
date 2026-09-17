@@ -568,6 +568,35 @@ describe("FileViewer prev/next navigation order", () => {
 });
 
 describe("FileViewer URL sync — diff param", () => {
+  it("restores the active diff param after another navigation replaces the search params", async () => {
+    function FileNavigation() {
+      const [, setParams] = useSearchParams();
+      return (
+        <button type="button" onClick={() => setParams({ file: "file1.py", tab: "files" })}>
+          Open file citation
+        </button>
+      );
+    }
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <MemoryRouter initialEntries={["/?file=file1.py&diff=1"]}>
+          <LocationDisplay />
+          <FileNavigation />
+          <FileViewer open conversationId="conv_1" path="file1.py" onClose={vi.fn()} />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    expect(await screen.findByTestId("diff-viewer")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Open file citation" }));
+
+    expect(screen.getByTestId("diff-viewer")).toBeInTheDocument();
+    expect(screen.getByTestId("url-params")).toHaveTextContent("diff=1");
+    expect(screen.getByTestId("url-params")).toHaveTextContent("file=file1.py");
+    expect(screen.getByTestId("url-params")).toHaveTextContent("tab=files");
+  });
+
   it("initializes diff view when URL contains ?diff=1 and the file is in the changed list", async () => {
     // file1.py is returned by the useWorkspaceChangedFiles mock → isDiffAvailable=true.
     // Starting with ?diff=1 means diffActive is initialized to true, so viewMode="diff".

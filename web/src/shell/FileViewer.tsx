@@ -895,7 +895,7 @@ function FileViewerBody({
       },
       { replace: true },
     );
-  }, [diffActive, isDiffAvailable, open]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [diffActive, isDiffAvailable, open, searchParams, setSearchParams]);
 
   // Toolbar actions, declared once and rendered two ways: inline icon buttons
   // when there's room, or rows in an overflow ("⋯") menu when there isn't.

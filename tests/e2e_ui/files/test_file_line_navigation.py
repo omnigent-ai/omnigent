@@ -108,6 +108,7 @@ def test_chat_line_link_expands_and_centers_diff_context(
     viewer = page.locator('[data-testid="file-viewer"]:visible')
     diff = viewer.locator(".monaco-diff-editor")
     expect(diff).to_be_visible(timeout=30_000)
+    expect(page).to_have_url(re.compile(r"[?&]diff=1(?:&|$)"))
     modified = diff.locator(".modified .view-lines")
     expect(diff.get_by_text("339 hidden lines", exact=True)).to_be_visible(timeout=20_000)
     expect(modified.get_by_text(_AFTER_LINES[350], exact=True)).to_be_visible()
