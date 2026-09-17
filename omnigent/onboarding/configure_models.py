@@ -26,7 +26,7 @@ delete a key and write the result wholesale.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from omnigent.onboarding.ambient import DetectedProvider
 from omnigent.onboarding.databricks_config import databricks_sdk_installed
@@ -599,20 +599,26 @@ def add_menu_options_for_family(family: str) -> list[AddOption]:
     """
     options = [opt for opt in add_menu_options() if family in _add_option_families(opt)]
     if family == GEMINI_FAMILY:
-        options = [
-            AddOption(
-                label=f"{kind_glyph(DATABRICKS_KIND)} Databricks — profile",
-                description=(
-                    "Use an existing Databricks CLI profile for native agy."
-                    if databricks_sdk_installed()
-                    else opt.description
-                ),
-                kind=DATABRICKS_KIND,
-            )
-            if opt.kind == DATABRICKS_KIND
-            else opt
-            for opt in options
-        ]
+        for index, opt in enumerate(options):
+            if opt.kind == DATABRICKS_KIND:
+                options[index] = replace(
+                    opt,
+                    label=f"{kind_glyph(DATABRICKS_KIND)} Databricks — profile",
+                    description=(
+                        "Use a Databricks CLI profile with the workspace's native Gemini API."
+                        if databricks_sdk_installed()
+                        else opt.description
+                    ),
+                )
+            elif opt.kind == GATEWAY_KIND:
+                options[index] = replace(
+                    opt,
+                    label=f"{kind_glyph(GATEWAY_KIND)} Gemini API gateway — URL + key",
+                    description=(
+                        "Requires native Gemini requests and x-goog-api-key authentication. "
+                        "OpenAI Responses / Chat Completions gateways are not supported."
+                    ),
+                )
     return options
 
 

@@ -872,7 +872,8 @@ def _configure_harness_add(family: str | None = None) -> str | None:
 
             console.print(
                 "  [dim]Requires the native Gemini API and x-goog-api-key authentication. "
-                "The gateway must also serve agy's auxiliary Gemini models. "
+                "OpenAI Responses / Chat Completions endpoints are not supported. "
+                "The gateway must serve agy's main and auxiliary Gemini models. "
                 "For Databricks, go back and choose Databricks — profile.[/dim]"
             )
             name = prompt_text("Gateway label (e.g. team-gemini)", default="gateway")
@@ -1001,11 +1002,35 @@ def _configure_harness_add(family: str | None = None) -> str | None:
         )
 
     elif kind == DATABRICKS_KIND and family == GEMINI_FAMILY:
-        from omnigent.harnesses.antigravity_native.credentials import databricks_token_source
+        from shlex import quote
 
-        profile = prompt_text("Databricks profile (from ~/.databrickscfg)").strip()
-        credentials = databricks_token_source(profile)
-        credentials.resolve()
+        from rich.markup import escape
+
+        from omnigent.errors import OmnigentError
+        from omnigent.harnesses.antigravity_native.credentials import databricks_token_source
+        from omnigent.onboarding.databricks_config import (
+            DATABRICKS_EXTRA_INSTALL_HINT,
+            databricks_sdk_installed,
+        )
+
+        if not databricks_sdk_installed():
+            console.print(f"  [red]{escape(DATABRICKS_EXTRA_INSTALL_HINT)}[/red]")
+            return None
+        profile = prompt_text(
+            "Databricks profile (from ~/.databrickscfg; empty to go back)"
+        ).strip()
+        if not profile:
+            return None
+        try:
+            credentials = databricks_token_source(profile)
+            credentials.resolve()
+        except (OmnigentError, OSError, ValueError):
+            console.print(
+                f"  [red]Could not authenticate Databricks profile {escape(profile)!r}. "
+                "Check the profile configuration. For CLI OAuth, sign in again with "
+                f"`databricks auth login --profile {escape(quote(profile))}`.[/red]"
+            )
+            return None
         name = f"databricks-gemini-{profile}"
         entry = {**build_databricks_provider_entry(profile), "native_gemini": True}
 

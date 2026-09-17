@@ -2,6 +2,7 @@
 
 from urllib.parse import urlsplit
 
+from omnigent.databricks_ai_gateway import DATABRICKS_TRUSTED_HOST_SUFFIXES
 from omnigent.errors import ErrorCode, OmnigentError
 
 GEMINI_API_BASE_URL = "https://generativelanguage.googleapis.com"
@@ -33,7 +34,21 @@ def validate_gemini_base_url(value: str) -> str:
             error,
             code=ErrorCode.INVALID_INPUT,
         )
-    if parsed.path.endswith(("/v1beta", "/openai")) or "/models/" in parsed.path:
+    hostname = (parsed.hostname or "").rstrip(".")
+    if hostname.endswith(DATABRICKS_TRUSTED_HOST_SUFFIXES):
+        raise OmnigentError(
+            "Choose Databricks — profile for a Databricks workspace. "
+            "Its native Gemini API needs profile authentication and model-name mapping; "
+            "a workspace URL and API key cannot be used directly here.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    if parsed.path.endswith(("/responses", "/chat/completions", "/completions", "/openai")):
+        raise OmnigentError(
+            "OpenAI Responses and Chat Completions endpoints cannot be used by native agy, "
+            "even when they serve Gemini models. Enter a native Gemini API root instead.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    if parsed.path.endswith("/v1beta") or "/models/" in parsed.path:
         raise OmnigentError(
             "Use the Gemini gateway API root, without /v1beta, /openai, or a model path; "
             "agy appends /v1beta/models/... itself.",

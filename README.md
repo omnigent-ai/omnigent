@@ -301,36 +301,27 @@ omnigent copilot                     # GitHub Copilot (SDK harness, via `omnigen
 `omnigent agy` requires agy 1.1.13 or newer. When `GEMINI_API_KEY` is set,
 direct Gemini API authentication takes precedence over agy's saved OAuth login.
 
-To connect native agy to a Gemini-compatible gateway, run `omni setup` →
+To configure native agy credentials, run `omni setup` →
 **Antigravity** → **Configure native agy API key / gateway** → **Add a credential**
-→ **Gateway**. Enter the gateway's API root (for example,
-`https://gateway.example/gemini`, without `/v1beta` or `/openai`) and API key.
-Leave the model blank for agy's default, or enter a model accepted by `agy --model`.
-The first Gemini provider becomes the default; existing defaults can be changed
-from the same credential menu. Start a new `omni agy` session to use it.
+and choose the option matching your connection:
 
-The gateway must implement Gemini's `generateContent` / `streamGenerateContent`
-API with `x-goog-api-key` authentication, including the auxiliary Gemini models
-agy requests. An OpenAI-only gateway or a bearer-token refresh command is not
-supported by this route. This configures **native agy**; the Antigravity Python
-SDK retains its separate key/Vertex setup.
+- **Gemini — API key** for a Google AI Studio key.
+- **Gemini API gateway — URL + key** for an external gateway implementing native
+  Gemini requests and `x-goog-api-key` authentication. Supply its API root, such
+  as `https://gateway.example/gemini`, without `/v1beta` or a model operation.
+- **Databricks — profile** for a Databricks workspace with native Gemini API
+  access. Omnigent manages profile authentication and model-name mapping; no
+  workspace URL or token needs to be pasted into the gateway form.
 
-For Databricks, choose **Databricks — profile** in the same add menu and enter
-an existing Databricks CLI profile. This requires the `databricks` extra and a
-working profile login. Omnigent starts a local adapter with each agy process,
-refreshes the profile's Bearer token, and translates agy's model names to the
-workspace's Gemini model services. The workspace must expose the corresponding
-main and auxiliary model versions; unavailable models produce an error rather
-than selecting another version. Tool calls and streaming responses pass through
-the native Gemini API. The adapter stops with agy and is recreated on resume.
-This selection applies only to native agy.
+OpenAI Responses and Chat Completions endpoints are **not supported by native
+agy**, even when they serve Gemini models. A separate protocol adapter would be
+required. The first Gemini credential becomes the default; select **Make default
+for Gemini** when switching, then start a fresh `omni agy` session.
 
-Keys are stored in Omnigent's secret store; the shared provider entry contains
-only a reference. An explicitly selected Gemini provider overrides ambient
-credentials. Without one, the existing Antigravity setup key or
-`GEMINI_API_KEY` / `GOOGLE_GEMINI_BASE_URL` environment pair is used; without an
-API key, agy keeps its OAuth/ADC login behavior. Restart an already-running
-local host daemon after changing shell environment variables.
+See the [native agy gateway guide](docs/native-agy-gateways.md) for compatibility
+requirements, model and authentication behavior, troubleshooting, and smoke
+steps. These settings configure native agy; the Antigravity Python SDK retains
+its separate key/Vertex setup.
 
 Using OpenClaw? See the [OpenClaw integration guide](docs/openclaw.md) to import
 its coding agents or drive a live OpenClaw Gateway session over ACP.

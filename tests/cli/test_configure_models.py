@@ -621,7 +621,7 @@ def test_add_menu_options_ordering() -> None:
     gemini = [o.label.split(None, 1)[1] for o in add_menu_options_for_family(GEMINI_FAMILY)]
     assert gemini == [
         "Gemini — API key",
-        "Gateway — custom base URL + key",
+        "Gemini API gateway — URL + key",
         "Databricks — profile",
     ]
 
@@ -3727,7 +3727,10 @@ def test_render_listing_default_marker_survives_non_utf8_console(
     assert "* default" in out
 
 
-def test_antigravity_gateway_setup_persists_native_provider(isolated_config) -> None:
+def test_antigravity_gateway_setup_persists_native_provider(isolated_config, monkeypatch) -> None:
+    monkeypatch.setattr(
+        "omnigent.onboarding.databricks_config.databricks_sdk_installed", lambda: False
+    )
     # Antigravity -> native providers -> add -> gateway; retain agy's model default.
     stdin = (
         "\n".join(
@@ -3776,8 +3779,23 @@ def test_native_gemini_key_setup_uses_agy_model_default(isolated_config) -> None
 
 
 @pytest.mark.parametrize("correct_url", [True, False], ids=["correct", "go-back"])
-def test_gemini_gateway_setup_recovers_from_invalid_url(isolated_config, correct_url) -> None:
-    inputs = ["7", "3", "1", "2", "demo-gemini", "/openai"]
+@pytest.mark.parametrize(
+    "url,error",
+    [
+        ("/openai", "Gemini gateway URL must be an http:// or https:// API root"),
+        ("https://workspace.cloud.databricks.com", "Choose Databricks — profile"),
+        (
+            "https://workspace.cloud.databricks.com/ai-gateway/mlflow/v1/responses",
+            "Choose Databricks — profile",
+        ),
+        ("https://gateway.example/v1/responses", "OpenAI Responses and Chat Completions"),
+        ("https://gateway.example/v1/chat/completions", "OpenAI Responses and Chat Completions"),
+    ],
+)
+def test_gemini_gateway_setup_recovers_from_invalid_url(
+    isolated_config, correct_url, url, error
+) -> None:
+    inputs = ["7", "3", "1", "2", "demo-gemini", url]
     if correct_url:
         inputs += ["https://gateway.example/gemini", "gateway-fake-key", ""]
     else:
@@ -3787,7 +3805,7 @@ def test_gemini_gateway_setup_recovers_from_invalid_url(isolated_config, correct
         cli, ["setup", "--no-internal-beta"], input="\n".join(inputs) + "\n"
     )
     assert result.exit_code == 0, result.output
-    assert "Gemini gateway URL must be an http:// or https:// API root" in result.output
+    assert error in " ".join(result.output.split())
     assert "Databricks — profile" in result.output
     assert "Traceback" not in result.output
     config = _config_yaml(isolated_config)
@@ -3798,3 +3816,35 @@ def test_gemini_gateway_setup_recovers_from_invalid_url(isolated_config, correct
     else:
         assert "demo-gemini" not in config.get("providers", {})
         assert secrets.load_secret("demo-gemini") is None
+
+
+@pytest.mark.parametrize("failure_at", ["config", "token"])
+def test_gemini_databricks_setup_recovers_from_auth_failure(
+    isolated_config, monkeypatch, failure_at
+) -> None:
+    from omnigent.errors import OmnigentError
+
+    source = Mock()
+    if failure_at == "config":
+        source.side_effect = ValueError("Invalid refresh token; private-config-details")
+    else:
+        source.return_value.resolve.side_effect = OmnigentError(
+            "Authentication failed; private-config-details"
+        )
+    monkeypatch.setattr(
+        "omnigent.harnesses.antigravity_native.credentials.databricks_token_source", source
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.databricks_config.databricks_sdk_installed", lambda: True
+    )
+    result = CliRunner().invoke(
+        cli,
+        ["setup", "--no-internal-beta"],
+        input="\n".join(["7", "3", "1", "3", "work", "q", "q", "q"]) + "\n",
+    )
+    assert result.exit_code == 0, result.output
+    source.assert_called_once_with("work")
+    assert "databricks auth login --profile work" in " ".join(result.output.split()), result.output
+    assert "private-config-details" not in result.output
+    assert "Traceback" not in result.output
+    assert "databricks-gemini-work" not in _config_yaml(isolated_config).get("providers", {})

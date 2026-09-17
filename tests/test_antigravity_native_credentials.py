@@ -174,3 +174,29 @@ def test_invalid_gateway_url_is_actionable_and_does_not_echo_secrets(url: str) -
     with pytest.raises(OmnigentError) as exc:
         validate_gemini_base_url(url)
     assert "secret" not in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://workspace.cloud.databricks.com/",
+        "https://workspace.azuredatabricks.net/ai-gateway/gemini",
+        "https://workspace.gcp.databricks.com/ai-gateway/mlflow/v1/responses",
+        "https://gateway.example/v1/responses",
+        "https://gateway.example/v1/chat/completions",
+    ],
+)
+def test_incompatible_saved_gateway_blocks_launch_without_ambient_fallback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, url: str
+) -> None:
+    entry = {
+        "kind": "gateway",
+        "default": ["gemini"],
+        "gemini": {"base_url": url, "api_key_ref": "keychain:gateway"},
+    }
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump({"providers": {"gateway": entry}}))
+    secrets.store_secret("gateway", "configured-key")
+    monkeypatch.setenv("GEMINI_API_KEY", "ambient-key")
+    with pytest.raises(OmnigentError):
+        build_agy_launch(conversation_id=None, model=None, resume=False)
+    assert not antigravity_credentials_ready()
