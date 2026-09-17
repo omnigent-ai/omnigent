@@ -461,17 +461,26 @@ class OmnigentClient:
         await _raise_for_status(response)
         self._logger.info("Deleted Omnigent session session_id=%s", session_id)
 
-    async def submit_message(self, session_id: str, text: str) -> None:
+    async def submit_message(
+        self,
+        session_id: str,
+        text: str,
+        attachments: list[dict[str, Any]] | None = None,
+    ) -> None:
         self._logger.info(
-            "Submitting Slack message to Omnigent session_id=%s chars=%s",
+            "Submitting Slack message to Omnigent session_id=%s chars=%s attachments=%s",
             session_id,
             len(text),
+            len(attachments or []),
         )
+        content: list[dict[str, Any]] = [{"type": "input_text", "text": text}]
+        if attachments:
+            content.extend(attachments)
         payload = {
             "type": "message",
             "data": {
                 "role": "user",
-                "content": [{"type": "input_text", "text": text}],
+                "content": content,
             },
         }
         response = await self._request("POST", f"/v1/sessions/{session_id}/events", json=payload)
@@ -683,6 +692,44 @@ class OmnigentClient:
                 ) from exc
             raise self._unreachable(exc) from exc
 
+    async def upload_session_file(
+        self,
+        session_id: str,
+        *,
+        filename: str,
+        content_type: str | None,
+        data: bytes,
+    ) -> dict[str, Any]:
+        """Upload an attachment into the session's file namespace.
+
+        :param session_id: Target session/conversation identifier.
+        :param filename: Name to store the file under.
+        :param content_type: Declared MIME type, or ``None`` to let the
+            server resolve the type from the filename.
+        :param data: File bytes.
+        :returns: The created session file resource (``id`` is the file id
+            to reference in a content block).
+        """
+        self._logger.info(
+            "Uploading attachment to Omnigent session_id=%s filename=%s bytes=%s",
+            session_id,
+            filename,
+            len(data),
+        )
+        response = await self._request(
+            "POST",
+            f"/v1/sessions/{session_id}/resources/files",
+            files={"file": (filename, data, content_type)},
+        )
+        await _raise_for_status(response)
+        resource = response.json()
+        self._logger.debug(
+            "Uploaded Omnigent attachment session_id=%s file_id=%s",
+            session_id,
+            resource.get("id"),
+        )
+        return resource
+
     async def run_turn(
         self,
         session_id: str,
@@ -692,9 +739,12 @@ class OmnigentClient:
         host_id: str | None = None,
         host_type: HostType = "external",
         idle_grace_seconds: float = 600.0,
+        attachments: list[dict[str, Any]] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         try:
-            async for event in self._run_turn_once(session_id, text, idle_grace_seconds):
+            async for event in self._run_turn_once(
+                session_id, text, idle_grace_seconds, attachments
+            ):
                 yield event
             return
         except RunnerUnavailableError:
@@ -718,7 +768,7 @@ class OmnigentClient:
             )
             await self.launch_runner(session_id, workspace=workspace, host_id=host_id)
 
-        async for event in self._run_turn_once(session_id, text, idle_grace_seconds):
+        async for event in self._run_turn_once(session_id, text, idle_grace_seconds, attachments):
             yield event
 
     async def _run_turn_once(
@@ -726,6 +776,7 @@ class OmnigentClient:
         session_id: str,
         text: str,
         idle_grace_seconds: float,
+        attachments: list[dict[str, Any]] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         # Turn-end detection is SERVER-AUTHORITATIVE and HARNESS-AGNOSTIC,
         # mirroring the web UI's reducer. The discriminator is "is a response
@@ -802,7 +853,7 @@ class OmnigentClient:
                     if not submitted:
                         # Submit ONCE: the server keeps running the turn across a
                         # reconnect, so re-submitting would start a second turn.
-                        await self.submit_message(session_id, text)
+                        await self.submit_message(session_id, text, attachments)
                         submitted = True
                     iterator = events.__aiter__()
                     # A single in-flight "next event" task. A liveness timeout must
