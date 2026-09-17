@@ -390,6 +390,7 @@ class _FileStore:
         session_id: str | None = None,
         file_id: str | None = None,
         blob_key: str | None = None,
+        source_metadata: dict[str, Any] | None = None,
     ) -> StoredFile:
         """
         Record a new file row, honoring a caller-chosen id and blob_key.
@@ -401,6 +402,7 @@ class _FileStore:
         :param file_id: Caller-chosen id, or ``None`` to derive one.
         :param blob_key: Artifact-store key for the bytes (a fork copy
             shares the source's blob); defaults to the row's own id.
+        :param source_metadata: Opaque upload metadata carried onto the copy.
         :returns: The newly created StoredFile.
         """
         new_id = file_id or f"gen{len(self.files):029d}"
@@ -412,6 +414,7 @@ class _FileStore:
             content_type=content_type,
             session_id=session_id,
             blob_key=blob_key if blob_key is not None else new_id,
+            source_metadata=source_metadata,
         )
         self.files[new_id] = stored
         return stored

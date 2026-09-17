@@ -3054,12 +3054,31 @@ def register_core_routes(
         # before the fork is announced or returned, so no reader sees the ids
         # dangling. Each row points at the SOURCE's blob (blob_key), so no
         # bytes move: the fork shares the source's artifact and both sessions
-        # resolve the same content independently. A failed row create is
-        # logged and skipped — nothing to roll back since no blob was written,
-        # and that one attachment degrades exactly as a missing file does.
+        # resolve the same content independently, and the source's
+        # source_metadata (e.g. an image's pre-downscale dimensions) is
+        # carried so the fork's copy is not left less descriptive than the
+        # original. Every step is best-effort: a source file whose blob has
+        # since vanished (deleted between the scan above and here) is skipped,
+        # and a failed row create is logged and skipped — nothing to roll back
+        # since no blob was written, and that one attachment degrades exactly
+        # as a missing file does. So forking never fails on a deleted file.
+        #
+        # Accepted residual race (not closed here): a source-file/session
+        # delete that runs fully concurrently with this fork can pass its
+        # own orphan check before the row below is inserted, then delete the
+        # shared blob after the fork completes, 404-ing the fork's attachment.
+        # Forking a session while deleting its attachments is unlikely enough
+        # that we accept it rather than add cross-operation locking or
+        # deferred blob GC; the copy-bytes alternative is the fallback if it
+        # ever proves to matter.
         if file_store is not None and artifact_store is not None:
             for stored_file in fork_source_files:
                 copied_file_id = fork_file_id_map[stored_file.id]
+                source_blob_key = stored_file.blob_key or stored_file.id
+                # Re-check right before the insert so a blob deleted mid-fork
+                # is skipped instead of minting a row that points at nothing.
+                if not await asyncio.to_thread(artifact_store.exists, source_blob_key):
+                    continue
                 try:
                     await asyncio.to_thread(
                         file_store.create,
@@ -3068,7 +3087,8 @@ def register_core_routes(
                         content_type=stored_file.content_type,
                         session_id=new_conv.id,
                         file_id=copied_file_id,
-                        blob_key=stored_file.blob_key or stored_file.id,
+                        blob_key=source_blob_key,
+                        source_metadata=stored_file.source_metadata,
                     )
                 except Exception:
                     _logger.warning(
