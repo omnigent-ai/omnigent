@@ -58,7 +58,7 @@ the configured interval. Directly opened shared conversations retain their
 independent session updates, runner health, and permissions.
 
 Each refresh requests the loaded window, up to `maxRefreshSessions` (default
-200), and merges older loaded rows beyond that cap. Load more appends the next
+100), and merges older loaded rows beyond that cap. Load more appends the next
 30 rows. A click during refresh waits for that refresh and uses its resulting
 cursor. Archived sessions refresh on entry and have no polling schedule.
 

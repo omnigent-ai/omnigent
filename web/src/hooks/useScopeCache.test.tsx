@@ -86,7 +86,7 @@ it.each(["mine", "shared"] as const)(
   },
 );
 
-it("caps refresh at 200 while retaining older history and refreshing the entire prefix", async () => {
+it("caps refresh at 100 while retaining older history and refreshing the entire prefix", async () => {
   const { result } = renderHook(() => useScopeCache("mine", 60_000), { wrapper });
   await waitFor(() => expect(result.current.isSuccess).toBe(true));
   // Each page needs the cursor returned by its predecessor.
@@ -97,14 +97,14 @@ it("caps refresh at 200 while retaining older history and refreshing the entire 
     });
   }
   expect(cached().pages[0].data).toHaveLength(240);
-  const replacement = [{ ...rows(1, 1)[0], id: "new", updated_at: 20000 }, ...rows(2, 199)];
+  const replacement = [{ ...rows(1, 1)[0], id: "new", updated_at: 20000 }, ...rows(2, 99)];
   fetchPage.mockClear().mockResolvedValueOnce(sessionRowsPage(replacement, true));
   await act(async () => {
     await result.current.refetch();
   });
-  expect(fetchPage.mock.calls[0][0].limit).toBe(200);
+  expect(fetchPage.mock.calls[0][0].limit).toBe(100);
   expect(cached().pages[0].data.map((row) => row.id)).toEqual(
-    [...replacement, ...rows(201, 40)].map((row) => row.id),
+    [...replacement, ...rows(101, 140)].map((row) => row.id),
   );
   expect(cached().pages[0].last_id).toBe("s240");
 });

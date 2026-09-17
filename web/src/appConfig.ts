@@ -26,6 +26,6 @@ export const appConfig: { readonly sidebar: Readonly<SidebarConfig> } = {
     pinsIncludeShared: true,
     pinCap: 30,
     maxAutoLoads: 3,
-    maxRefreshSessions: 200,
+    maxRefreshSessions: 100,
   },
 };

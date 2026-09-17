@@ -92,7 +92,7 @@ def test_scope_requests_and_bounded_automatic_pagination(
     assert sum(q.get("visibility") == ["mine"] for q in polls) == 3
     assert sum(q.get("visibility") == ["shared"] for q in polls) == 1
     assert all("after" not in q and "pinned" not in q for q in polls)
-    assert all(q["limit"] == ["150"] for q in polls if q["visibility"] == ["mine"])
+    assert all(q["limit"] == ["100"] for q in polls if q["visibility"] == ["mine"])
     load_more.click()
     page.wait_for_load_state("networkidle")
     assert mine()[-1]["after"] == [f"{150:032x}"]
@@ -105,7 +105,7 @@ def test_scope_requests_and_bounded_automatic_pagination(
     page.clock.fast_forward(60_000)
     page.wait_for_load_state("networkidle")
     assert len(requests[start_count:]) == 1
-    assert requests[-1]["limit"] == ["200"]
+    assert requests[-1]["limit"] == ["100"]
     load_more.click()
     page.wait_for_load_state("networkidle")
     assert mine()[-1]["after"] == [f"{240:032x}"]
