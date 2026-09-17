@@ -116,6 +116,73 @@ def test_resolve_secret_env_ref_accepts_omnigent_prefixed_alias(
     assert resolve_secret("$ANTHROPIC_API_KEY") == "sk-ant-prefixed"
 
 
+def test_resolve_secret_file_ref_reads_and_strips(tmp_path: Path) -> None:
+    """``file:<path>`` reads the file and strips surrounding whitespace."""
+    key_file = tmp_path / "api-key"
+    key_file.write_text("  sk-from-file\n")
+
+    assert resolve_secret(f"file:{key_file}") == "sk-from-file"
+
+
+def test_resolve_secret_file_ref_refuses_empty(tmp_path: Path) -> None:
+    """An empty (whitespace-only) key file fails loud rather than silently."""
+    key_file = tmp_path / "api-key"
+    key_file.write_text("   \n")
+
+    with pytest.raises(OmnigentError) as excinfo:
+        resolve_secret(f"file:{key_file}")
+    assert str(key_file) in str(excinfo.value)
+
+
+def test_resolve_secret_file_ref_rejects_relative_path() -> None:
+    """A relative ``file:`` path is rejected; refs must be absolute."""
+    with pytest.raises(OmnigentError):
+        resolve_secret("file:relative/api-key")
+
+
+def test_resolve_secret_file_ref_rejects_missing_file(tmp_path: Path) -> None:
+    """A missing key file fails with the path named."""
+    missing = tmp_path / "absent"
+    with pytest.raises(OmnigentError) as excinfo:
+        resolve_secret(f"file:{missing}")
+    assert str(missing) in str(excinfo.value)
+
+
+def test_resolve_secret_file_ref_rejects_directory(tmp_path: Path) -> None:
+    """A directory path is rejected; the ref must name a regular file."""
+    with pytest.raises(OmnigentError):
+        resolve_secret(f"file:{tmp_path}")
+
+
+def test_resolve_secret_file_ref_expands_user_and_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``~`` and ``$VAR`` inside a ``file:`` path are expanded before reading."""
+    key_file = tmp_path / "api-key"
+    key_file.write_text("sk-expanded")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("KEYDIR", str(tmp_path))
+
+    assert resolve_secret("file:~/api-key") == "sk-expanded"
+    assert resolve_secret("file:$KEYDIR/api-key") == "sk-expanded"
+
+
+def test_resolve_secret_file_ref_error_never_leaks_value(tmp_path: Path) -> None:
+    """A read failure names the path but never the file's secret contents."""
+    secret = "sk-super-secret-value"
+    key_file = tmp_path / "api-key"
+    key_file.write_text(secret)
+    key_file.chmod(0o000)
+    try:
+        with pytest.raises(OmnigentError) as excinfo:
+            resolve_secret(f"file:{key_file}")
+    finally:
+        key_file.chmod(0o600)
+    message = str(excinfo.value)
+    assert str(key_file) in message
+    assert secret not in message
+
+
 def test_default_provider_for_pi_skips_subscription_defaults() -> None:
     """For the unmapped ``pi`` harness, a subscription default is skipped.
 
