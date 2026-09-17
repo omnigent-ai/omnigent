@@ -64,6 +64,7 @@ def test_oauth_error_carries_the_no_store_pair_and_merges_extras() -> None:
 
 
 def test_sliding_window_allows_up_to_the_ceiling_then_refuses() -> None:
+    """Hits are admitted up to the ceiling, then refused until they age out."""
     limiter = SlidingWindowRateLimiter(3, 60, 10)
     assert [limiter.allow("ip", 1000.0) for _ in range(4)] == [True, True, True, False]
     # A key whose hits have aged out is admitted again.

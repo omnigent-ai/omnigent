@@ -64,8 +64,14 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
     ]
     if effective_model:
         args.extend(("--model", effective_model))
-    if claude_config is not None and claude_config.api_key_helper:
-        args.extend(("--settings", json.dumps({"apiKeyHelper": claude_config.api_key_helper})))
+    settings: dict[str, object] = {}
+    if claude_config is not None:
+        if claude_config.api_key_helper:
+            settings["apiKeyHelper"] = claude_config.api_key_helper
+        if claude_config.model_overrides:
+            settings["modelOverrides"] = claude_config.model_overrides
+    if settings:
+        args.extend(("--settings", json.dumps(settings)))
 
     command, launch_args = resolve_claude_launch("claude", args)
     if command == "claude":

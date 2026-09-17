@@ -62,6 +62,7 @@ from typing import TYPE_CHECKING, ClassVar
 
 import click
 
+from omnigent.onboarding.sandboxes.base import SandboxGoneError
 from omnigent.onboarding.sandboxes.kubernetes import (
     _POD_READY_REQUEST_TIMEOUT_S,
     KubernetesSandboxLauncher,
@@ -550,8 +551,30 @@ class AgentSandboxLauncher(KubernetesSandboxLauncher):
 
         click.echo(f"▸ Resuming agent-sandbox '{sandbox_id}'")
         namespace = self._resolve_namespace()
+        custom = self._load_custom()
         core = self._load_core()
         try:
+            try:
+                custom.get_namespaced_custom_object(
+                    API_GROUP,
+                    API_VERSION,
+                    namespace,
+                    SANDBOX_PLURAL,
+                    sandbox_id,
+                    _request_timeout=_POD_READY_REQUEST_TIMEOUT_S,
+                )
+            except ApiException as exc:
+                if getattr(exc, "status", None) == 404:
+                    raise SandboxGoneError(
+                        f"agent-sandbox '{sandbox_id}' no longer exists"
+                    ) from exc
+                raise click.ClickException(
+                    _format_api_error("inspect sandbox", sandbox_id, exc)
+                ) from exc
+            except HTTPError as exc:
+                raise click.ClickException(
+                    f"Could not inspect agent-sandbox '{sandbox_id}': {_api_reason(exc)}"
+                ) from exc
             for kind, delete in (
                 (
                     "token secret",

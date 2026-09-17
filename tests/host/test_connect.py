@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import errno
+import json
 import logging
 import subprocess
 import sys
@@ -30,6 +31,7 @@ from omnigent.host.connect import (
 )
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    WORKSPACE_MISSING_ERROR_CODE,
     HostConnectionErrorFrame,
     HostCreateDirFrame,
     HostCreateDirResultFrame,
@@ -50,6 +52,8 @@ from omnigent.host.frames import (
     HostRunnerExitedFrame,
     HostRunnerStatusFrame,
     HostRunnerStatusResultFrame,
+    HostSkillsFrame,
+    HostSkillsResultFrame,
     HostStatFrame,
     HostStatResultFrame,
     HostStopRunnerFrame,
@@ -65,6 +69,7 @@ from omnigent.runner.identity import (
     RUNNER_DELEGATED_AUTH_ENV_VAR,
     RUNNER_ID_ENV_VAR,
     RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR,
+    RUNNER_INTERACTIVE_SHELLS_ENV_VAR,
     RUNNER_LAUNCH_HARNESS_ENV_VAR,
     RUNNER_PARENT_PID_ENV_VAR,
     RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
@@ -105,6 +110,149 @@ def _no_real_zygote(monkeypatch: pytest.MonkeyPatch) -> None:
     from omnigent.runner._zygote import ZYGOTE_ENABLED_ENV_VAR
 
     monkeypatch.setenv(ZYGOTE_ENABLED_ENV_VAR, "0")
+
+
+def _write_discovery_skill(root: Path, name: str, *, visible: bool = True) -> None:
+    skill_dir = root / name
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        f"---\nname: {name}\ndescription: {name} description\n"
+        f"user-invocable: {str(visible).lower()}\n---\nprivate skill body\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "harness,expected",
+    [
+        ("claude-native", {"project", "user", "toolkit:review"}),
+        ("codex-native", {"codex-user"}),
+    ],
+)
+async def test_host_discovers_harness_skills_without_a_runner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, harness: str, expected: set[str]
+) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "project with spaces"
+    home.mkdir()
+    (home / "project with spaces").symlink_to(workspace, target_is_directory=True)
+    monkeypatch.setattr(Path, "home", lambda: home)
+    monkeypatch.setenv("HOME", str(home))
+    config = tmp_path / "claude-config"
+    codex_home = tmp_path / "codex-config"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _write_discovery_skill(workspace / ".claude" / "skills", "project")
+    _write_discovery_skill(workspace / ".claude" / "skills", "hidden", visible=False)
+    _write_discovery_skill(workspace / ".agents" / "skills", "agents")
+    _write_discovery_skill(config / "skills", "user")
+    _write_discovery_skill(config / "skills", "project")
+    _write_discovery_skill(codex_home / "skills", "codex-user")
+    _write_discovery_skill(home / ".claude" / "skills", "wrong-config-home")
+    plugin = config / "plugins" / "cache" / "market" / "toolkit" / "1.0"
+    _write_discovery_skill(plugin / "skills", "review")
+    (config / "settings.json").write_text(json.dumps({"enabledPlugins": {"toolkit@market": True}}))
+    (config / "plugins" / "installed_plugins.json").write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "plugins": {"toolkit@market": [{"scope": "user", "installPath": str(plugin)}]},
+            }
+        )
+    )
+
+    host = _make_host_process()
+    result = host._handle_skills(
+        HostSkillsFrame(request_id="r", harness=harness, path="~/project with spaces")
+    )
+    assert result.status == "ok", result.error
+    assert {skill["name"] for skill in result.skills} == expected
+    assert len(result.skills) == len(expected)
+    assert all(set(skill) == {"name", "description"} for skill in result.skills)
+    assert "private skill body" not in encode_host_frame(result)
+    assert host._alive_runner_ids() == []
+
+
+@pytest.mark.parametrize(
+    "path,error_code",
+    [
+        ("", "invalid_path"),
+        ("relative/path", "invalid_path"),
+        ("bad\x00path", "invalid_path"),
+        ("missing", "not_directory"),
+        ("file", "not_directory"),
+    ],
+)
+async def test_host_skills_rejects_invalid_directory(
+    tmp_path: Path, path: str, error_code: str
+) -> None:
+    (tmp_path / "file").write_text("not a directory")
+    if path in {"missing", "file"}:
+        path = str(tmp_path / path)
+    result = _make_host_process()._handle_skills(
+        HostSkillsFrame(request_id="r", harness="claude-native", path=path)
+    )
+    assert result.status == "failed"
+    assert result.error_code == error_code
+
+
+async def test_host_skills_distinguishes_empty_and_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.host import skills as skill_sources
+
+    host = _make_host_process()
+    frame = HostSkillsFrame(request_id="r", harness="claude-native", path=str(tmp_path))
+    monkeypatch.setattr(skill_sources, "resolve_harness_skills", lambda *_: [])
+    assert host._handle_skills(frame) == HostSkillsResultFrame(request_id="r", status="ok")
+
+    def fail(*_args: object) -> None:
+        raise OSError("unreadable skill directory")
+
+    monkeypatch.setattr(skill_sources, "resolve_harness_skills", fail)
+    host = _make_host_process()
+    result = host._handle_skills(frame)
+    assert result.status == "failed"
+    assert result.error_code == "discovery_failed"
+
+
+async def test_host_skills_does_not_block_tunnel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.host import skills as skill_sources
+
+    host = _make_host_process()
+    ws = _RecordingWS()
+    started = asyncio.Event()
+    release = threading.Event()
+    loop = asyncio.get_running_loop()
+
+    def slow_discovery(*_args: object) -> list[object]:
+        loop.call_soon_threadsafe(started.set)
+        assert release.wait(timeout=5)
+        return []
+
+    monkeypatch.setattr(skill_sources, "resolve_harness_skills", slow_discovery)
+    host._start_frame_task(
+        ws,  # type: ignore[arg-type] — duck-typed WebSocket
+        encode_host_frame(
+            HostSkillsFrame(request_id="skills", harness="claude-native", path=str(tmp_path))
+        ),
+    )
+    try:
+        await asyncio.wait_for(started.wait(), timeout=2)
+        await host._handle_raw_message(
+            ws,  # type: ignore[arg-type] — duck-typed WebSocket
+            encode_host_frame(HostStatFrame(request_id="stat", path=str(tmp_path))),
+        )
+        reply = decode_host_frame(ws.sent[0])
+        assert isinstance(reply, HostStatResultFrame)
+        assert reply.request_id == "stat"
+    finally:
+        release.set()
+        await _drain_frame_tasks(host)
+    assert decode_host_frame(ws.sent[-1]) == HostSkillsResultFrame(
+        request_id="skills", status="ok"
+    )
 
 
 async def test_handle_model_options_serves_the_claude_catalog(
@@ -447,7 +595,10 @@ async def test_handle_launch_spawns_subprocess(
     _cleanup_host(host)
 
 
-async def test_handle_launch_fails_for_bad_workspace() -> None:
+async def test_handle_launch_fails_for_bad_workspace(
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     """
     Verify that _handle_launch returns status='failed' when the
     workspace path does not exist.
@@ -460,19 +611,25 @@ async def test_handle_launch_fails_for_bad_workspace() -> None:
         request_id="req_002",
         binding_token="token_xyz",
         workspace="/nonexistent/path/that/does/not/exist",
+        session_id="session_missing_workspace",
     )
 
-    result = await host._handle_launch(frame)
+    with caplog.at_level(logging.WARNING, logger="omnigent.host.connect"):
+        result = await host._handle_launch(frame)
 
     assert isinstance(result, HostLaunchRunnerResultFrame)
     assert result.status == "failed", "Should fail for nonexistent workspace"
+    assert result.error_code == WORKSPACE_MISSING_ERROR_CODE
     assert "does not exist" in (result.error or ""), (
         f"Error should mention path doesn't exist, got: {result.error!r}"
     )
-    assert result.error_code == "workspace_missing", (
-        f"Should carry workspace_missing error_code, got: {result.error_code!r}"
-    )
     assert result.runner_id is None
+    assert "session_missing_workspace" in caplog.text
+    assert "/nonexistent/path/that/does/not/exist" in caplog.text
+    output = capsys.readouterr().out
+    assert "Runner launch failed" in output
+    assert "session_missing_workspace" in output
+    assert "/nonexistent/path/that/does/not/exist" in output
 
 
 async def test_handle_launch_refuses_unconfigured_harness(
@@ -560,9 +717,11 @@ async def test_handle_launch_native_cursor_message_points_at_cursor_installer(
     assert host._runners == {}
 
 
+@pytest.mark.parametrize("discovery_pending", [False, True])
 async def test_handle_launch_configured_harness_proceeds_to_spawn(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    discovery_pending: bool,
 ) -> None:
     """
     Verify a configured harness passes the check and the launch
@@ -579,6 +738,13 @@ async def test_handle_launch_configured_harness_proceeds_to_spawn(
         "omnigent.host.connect.harness_is_configured",
         lambda harness: True,
     )
+    if discovery_pending:
+
+        async def _blocked_discovery() -> None:
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(host, "_initialize_capabilities", _blocked_discovery)
+        host._start_capability_discovery()
 
     original_popen = subprocess.Popen
 
@@ -601,16 +767,23 @@ async def test_handle_launch_configured_harness_proceeds_to_spawn(
         workspace=str(workspace),
         harness="claude-sdk",
     )
-    with patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen):
-        result = await host._handle_launch(frame)
+    try:
+        with patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen):
+            result = await asyncio.wait_for(host._handle_launch(frame), timeout=2.0)
 
-    assert result.status == "launched", (
-        f"Configured harness must launch, got {result.status!r}: {result.error}"
-    )
-    assert result.error_code is None
-
-    # Clean up the spawned sleep process (and its exit watcher).
-    _cleanup_host(host)
+        assert result.status == "launched", (
+            f"Configured harness must launch, got {result.status!r}: {result.error}"
+        )
+        assert result.error_code is None
+        if discovery_pending:
+            assert host._capability_init_task is not None
+            assert not host._capability_init_task.done()
+            assert host._configured_harnesses is None
+            assert host._gateway_inference is None
+    finally:
+        _cleanup_host(host)
+        if host._capability_init_task is not None:
+            await _cancel(host._capability_init_task)
 
 
 async def test_handle_launch_without_harness_skips_check(
@@ -789,6 +962,27 @@ class _RecordingWS:
         """
         self.sent.append(data)
         self.first_send.set()
+
+
+class _BlockingTunnel:
+    """Fake tunnel that records sends and parks the receive loop."""
+
+    def __init__(self) -> None:
+        self.sent: list[str] = []
+        self.first_send = asyncio.Event()
+        self.second_send = asyncio.Event()
+        self.disconnect = asyncio.Event()
+
+    async def send(self, data: str) -> None:
+        self.sent.append(data)
+        if len(self.sent) == 1:
+            self.first_send.set()
+        elif len(self.sent) == 2:
+            self.second_send.set()
+
+    async def recv(self) -> str:
+        await self.disconnect.wait()
+        raise ConnectionError("test disconnect")
 
 
 async def _cancel(task: asyncio.Task[None]) -> None:
@@ -999,6 +1193,8 @@ async def test_live_host_repushes_when_only_gateway_inference_changes(
 async def test_handle_launch_immediate_exit_reports_exit_code_and_log_tail(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """An immediate runner death fails the launch with the actual cause.
 
@@ -1042,7 +1238,10 @@ async def test_handle_launch_immediate_exit_reports_exit_code_and_log_tail(
         binding_token="tok_dead",
         workspace=str(workspace),
     )
-    with patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen):
+    with (
+        caplog.at_level(logging.WARNING, logger="omnigent.host.connect"),
+        patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen),
+    ):
         result = await host._handle_launch(frame)
 
     assert result.status == "failed"
@@ -1053,6 +1252,14 @@ async def test_handle_launch_immediate_exit_reports_exit_code_and_log_tail(
     assert "~/.omnigent/logs/runner/runner-" in error
     # The tail carries the actual cause — the whole point of the report.
     assert "RuntimeError: boom-traceback" in error
+    # Host lifecycle output names the failure and log location but must not
+    # duplicate arbitrary runner output into the daemon log or foreground.
+    assert "runner process exited with code 7" in caplog.text
+    assert "RuntimeError: boom-traceback" not in caplog.text
+    output = capsys.readouterr().out
+    assert "Runner launch failed" in output
+    assert "runner process exited with code 7" in output
+    assert "RuntimeError: boom-traceback" not in output
 
 
 async def test_watch_runner_reports_unexpected_exit(
@@ -1269,11 +1476,11 @@ async def test_unreported_exit_flushes_after_reconnect(
     assert host._unreported_exits == {}
 
 
-async def test_capability_probe_timeout_does_not_block_connection(
+async def test_capability_probe_timeout_preserves_unknown_registration_fallback(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """A hung startup probe degrades to unknown metadata after its deadline."""
+    """The bounded discovery wait preserves the existing degraded registration."""
     host = _make_host_process()
     never = asyncio.Event()
 
@@ -1285,11 +1492,504 @@ async def test_capability_probe_timeout_does_not_block_connection(
     monkeypatch.setattr(host, "_probe_gateway_inference", _blocked)
     monkeypatch.setattr("omnigent.host.connect._HOST_CAPABILITY_INIT_TIMEOUT_S", 0.01)
 
-    await host._initialize_capabilities()
+    tunnel = _FakeTunnel()
+    with pytest.raises(ConnectionError, match="test disconnect"):
+        await host._serve_frames(tunnel)  # type: ignore[arg-type]
 
+    hello = decode_host_frame(tunnel.sent[0])
+    assert isinstance(hello, HostHelloFrame)
+    assert hello.configured_harnesses is None
+    assert hello.gateway_inference is None
+    assert host._capabilities_initialized
     assert host._configured_harnesses is None
     assert host._gateway_inference is None
     assert "capability discovery timed out" in capsys.readouterr().err
+
+
+async def test_fast_capability_discovery_is_included_in_hello(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The first hello carries both readiness and gateway backing."""
+    host = _make_host_process()
+
+    async def _discover() -> None:
+        host._configured_harnesses = {"codex-native": True}
+        host._gateway_inference = {"codex-native": True}
+        host._capabilities_initialized = True
+
+    monkeypatch.setattr(host, "_initialize_capabilities", _discover)
+    tunnel = _BlockingTunnel()
+    serve_task = asyncio.create_task(host._serve_frames(tunnel))  # type: ignore[arg-type]
+    try:
+        await asyncio.wait_for(tunnel.first_send.wait(), timeout=1.0)
+    finally:
+        await _cancel(serve_task)
+
+    hello = decode_host_frame(tunnel.sent[0])
+    assert isinstance(hello, HostHelloFrame)
+    assert len(tunnel.sent) == 1
+    assert hello.configured_harnesses == {"codex-native": True}
+    assert hello.gateway_inference == {"codex-native": True}
+
+
+async def test_slow_capability_discovery_blocks_registration_and_frame_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No host registration or launch handling occurs until discovery finishes."""
+    host = _make_host_process()
+    discovery_release = asyncio.Event()
+    discovery_started = asyncio.Event()
+
+    async def _discover() -> None:
+        discovery_started.set()
+        await discovery_release.wait()
+        host._configured_harnesses = {"claude-native": True}
+        host._gateway_inference = {"claude-native": True}
+        host._capabilities_initialized = True
+
+    monkeypatch.setattr(host, "_initialize_capabilities", _discover)
+    tunnel = _BlockingTunnel()
+    serve_task = asyncio.create_task(host._serve_frames(tunnel))  # type: ignore[arg-type]
+    try:
+        await asyncio.wait_for(discovery_started.wait(), timeout=1.0)
+        assert tunnel.sent == []
+        assert host._ws is None
+        assert host._frame_tasks == set()
+
+        discovery_release.set()
+        await asyncio.wait_for(tunnel.first_send.wait(), timeout=1.0)
+    finally:
+        await _cancel(serve_task)
+        if host._capability_init_task is not None:
+            await _cancel(host._capability_init_task)
+
+    assert discovery_started.is_set()
+    hello = decode_host_frame(tunnel.sent[0])
+    assert isinstance(hello, HostHelloFrame)
+    assert hello.configured_harnesses == {"claude-native": True}
+    assert hello.gateway_inference == {"claude-native": True}
+
+
+@pytest.mark.parametrize(
+    ("configured", "gateway"),
+    [
+        ({}, {}),
+        (None, {"codex-native": False}),
+        ({"codex-native": True}, None),
+        ({"codex-native": True}, {}),
+        ({"claude-native": True}, {"codex-native": True}),
+    ],
+)
+async def test_incomplete_startup_capabilities_preserve_registration_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    configured: dict[str, bool] | None,
+    gateway: dict[str, bool] | None,
+) -> None:
+    """Missing advisory fields do not introduce a new registration rejection."""
+    host = _make_host_process()
+    monkeypatch.setattr(
+        host,
+        "_probe_configured_harnesses",
+        lambda *, startup: asyncio.sleep(0, result=configured),
+    )
+    monkeypatch.setattr(
+        host,
+        "_probe_gateway_inference",
+        lambda *, startup: asyncio.sleep(0, result=gateway),
+    )
+    tunnel = _FakeTunnel()
+
+    with pytest.raises(ConnectionError, match="test disconnect"):
+        await host._serve_frames(tunnel)  # type: ignore[arg-type]
+
+    hello = decode_host_frame(tunnel.sent[0])
+    assert isinstance(hello, HostHelloFrame)
+    assert hello.configured_harnesses == configured
+    assert hello.gateway_inference == gateway
+    assert host._capabilities_initialized
+    assert host._configured_harnesses == configured
+    assert host._gateway_inference == gateway
+
+
+async def test_incomplete_startup_discovery_is_reused_across_reconnects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Handled probe failures keep periodic recovery rather than startup retries."""
+    host = _make_host_process()
+    gateway_calls = 0
+
+    async def _gateway(*, startup: bool) -> dict[str, bool] | None:
+        nonlocal gateway_calls
+        gateway_calls += 1
+        return None if gateway_calls == 1 else {"codex-native": True}
+
+    monkeypatch.setattr(
+        host,
+        "_probe_configured_harnesses",
+        lambda *, startup: asyncio.sleep(0, result={"codex-native": True}),
+    )
+    monkeypatch.setattr(host, "_probe_gateway_inference", _gateway)
+    first = _FakeTunnel()
+    with pytest.raises(ConnectionError, match="test disconnect"):
+        await host._serve_frames(first)  # type: ignore[arg-type]
+    first_hello = decode_host_frame(first.sent[0])
+    assert isinstance(first_hello, HostHelloFrame)
+    assert first_hello.configured_harnesses == {"codex-native": True}
+    assert first_hello.gateway_inference is None
+
+    second = _FakeTunnel()
+    with pytest.raises(ConnectionError, match="test disconnect"):
+        await host._serve_frames(second)  # type: ignore[arg-type]
+    hello = decode_host_frame(second.sent[0])
+    assert isinstance(hello, HostHelloFrame)
+    assert hello.configured_harnesses == {"codex-native": True}
+    assert hello.gateway_inference is None
+    assert gateway_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("request_frame", "fresh_result"),
+    [
+        pytest.param(
+            HostStoreSecretFrame(
+                request_id="req_fresh_credential",
+                harness="codex-native",
+                kind="gateway",
+                secret_value="not-used",
+            ),
+            HostStoreSecretResultFrame(
+                request_id="req_fresh_credential",
+                status="ok",
+                configured_harnesses={"codex-native": True},
+                gateway_inference={"codex-native": True},
+            ),
+            id="credential",
+        ),
+        pytest.param(
+            HostInstallHarnessFrame(
+                request_id="req_fresh_install",
+                harness="codex-native",
+            ),
+            HostInstallHarnessResultFrame(
+                request_id="req_fresh_install",
+                status="ok",
+                configured_harnesses={"codex-native": True},
+                gateway_inference={"codex-native": True},
+            ),
+            id="install",
+        ),
+    ],
+)
+async def test_startup_discovery_cannot_publish_after_newer_capability_result(
+    monkeypatch: pytest.MonkeyPatch,
+    request_frame: HostStoreSecretFrame | HostInstallHarnessFrame,
+    fresh_result: HostStoreSecretResultFrame | HostInstallHarnessResultFrame,
+) -> None:
+    """A stale startup probe never follows a fresher authoritative snapshot."""
+    host = _make_host_process()
+    discovery_started = asyncio.Event()
+    discovery_release = asyncio.Event()
+
+    async def _stale_configured(*, startup: bool) -> dict[str, bool]:
+        assert startup is True
+        discovery_started.set()
+        await discovery_release.wait()
+        return {"codex-native": False}
+
+    async def _stale_gateway(*, startup: bool) -> dict[str, bool]:
+        assert startup is True
+        await discovery_release.wait()
+        return {"codex-native": False}
+
+    monkeypatch.setattr(host, "_probe_configured_harnesses", _stale_configured)
+    monkeypatch.setattr(host, "_probe_gateway_inference", _stale_gateway)
+    if isinstance(request_frame, HostStoreSecretFrame):
+        monkeypatch.setattr(host, "_handle_store_secret", lambda frame: fresh_result)
+    else:
+        monkeypatch.setattr(host, "_handle_install_harness", lambda frame: fresh_result)
+    tunnel = _FakeTunnel()
+    host._start_capability_discovery()
+    discovery_task = host._capability_init_task
+    assert discovery_task is not None
+    try:
+        await asyncio.wait_for(discovery_started.wait(), timeout=1.0)
+        await host._dispatch_host_frame(tunnel, request_frame)  # type: ignore[arg-type]
+        discovery_release.set()
+        await asyncio.wait_for(asyncio.shield(discovery_task), timeout=1.0)
+        with pytest.raises(ConnectionError, match="test disconnect"):
+            await host._serve_frames(tunnel)  # type: ignore[arg-type]
+    finally:
+        await _cancel(discovery_task)
+
+    result = decode_host_frame(tunnel.sent[0])
+    assert result == fresh_result
+    update = decode_host_frame(tunnel.sent[1])
+    assert isinstance(update, HostHelloFrame)
+    assert update.configured_harnesses == {"codex-native": True}
+    assert update.gateway_inference == {"codex-native": True}
+    assert host._configured_harnesses == {"codex-native": True}
+    assert host._gateway_inference == {"codex-native": True}
+
+
+@pytest.mark.parametrize(
+    ("operation", "initial_readiness"),
+    [
+        pytest.param("install", False, id="install"),
+        pytest.param("credential", "needs-auth", id="credential"),
+        pytest.param("credential", True, id="gateway-only"),
+    ],
+)
+async def test_capability_result_publishes_without_full_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    initial_readiness: bool | str,
+) -> None:
+    """Known capability changes publish after startup without another full probe."""
+    host = _make_host_process()
+    configured_probes: list[bool] = []
+    gateway_probes: list[bool] = []
+
+    async def _configured(*, startup: bool) -> dict[str, bool | str]:
+        configured_probes.append(startup)
+        return {"codex-native": initial_readiness}
+
+    async def _gateway(*, startup: bool) -> dict[str, bool]:
+        gateway_probes.append(startup)
+        return {"codex-native": False}
+
+    monkeypatch.setattr(host, "_probe_configured_harnesses", _configured)
+    monkeypatch.setattr(host, "_probe_gateway_inference", _gateway)
+    monkeypatch.setattr(
+        "omnigent.host.connect._unavailable_harness_became_ready", lambda configured: False
+    )
+    monkeypatch.setattr("omnigent.host.connect.HARNESS_READINESS_REFRESH_INTERVAL_S", 0.01)
+    monkeypatch.setattr("omnigent.host.connect.HARNESS_READINESS_FULL_REFRESH_INTERVAL_S", 3600.0)
+    request: HostInstallHarnessFrame | HostStoreSecretFrame
+    result: HostInstallHarnessResultFrame | HostStoreSecretResultFrame
+    if operation == "install":
+        request = HostInstallHarnessFrame(request_id="req_install", harness="codex-native")
+        result = HostInstallHarnessResultFrame(
+            request_id=request.request_id,
+            status="ok",
+            configured_harnesses={"codex-native": True},
+            gateway_inference={"codex-native": True},
+        )
+        monkeypatch.setattr(host, "_handle_install_harness", lambda frame: result)
+    else:
+        request = HostStoreSecretFrame(
+            request_id="req_credential",
+            harness="codex-native",
+            kind="gateway",
+            secret_value="not-used",
+        )
+        result = HostStoreSecretResultFrame(
+            request_id=request.request_id,
+            status="ok",
+            configured_harnesses={"codex-native": True},
+            gateway_inference={"codex-native": True},
+        )
+        monkeypatch.setattr(host, "_handle_store_secret", lambda frame: result)
+    ws = _RecordingWS()
+    await host._initialize_capabilities()
+    readiness_task = asyncio.create_task(
+        host._harness_readiness_loop(ws)  # type: ignore[arg-type]
+    )
+    try:
+        await asyncio.sleep(0)
+        assert ws.sent == []
+        assert host._capabilities_initialized
+
+        await host._dispatch_host_frame(ws, request)  # type: ignore[arg-type]
+        ws.first_send.clear()
+        await asyncio.wait_for(ws.first_send.wait(), timeout=1.0)
+
+        assert [decode_host_frame(frame) for frame in ws.sent] == [
+            result,
+            HostHarnessReadinessFrame(
+                configured_harnesses={"codex-native": True},
+                gateway_inference={"codex-native": True},
+            ),
+        ]
+        assert configured_probes == [True]
+        assert gateway_probes == [True]
+    finally:
+        await _cancel(readiness_task)
+        if host._capability_init_task is not None:
+            await _cancel(host._capability_init_task)
+
+
+async def test_failed_startup_discovery_can_retry_before_registration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Failed startup discovery retries without advertising an incomplete host."""
+    host = _make_host_process()
+    calls = 0
+
+    async def _discover() -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("probe exploded")
+        host._configured_harnesses = {"codex-native": True}
+        host._gateway_inference = {"codex-native": True}
+        host._capabilities_initialized = True
+
+    monkeypatch.setattr(host, "_initialize_capabilities", _discover)
+    first = _FakeTunnel()
+    with pytest.raises(RuntimeError, match="probe exploded"):
+        await host._serve_frames(first)  # type: ignore[arg-type]
+    assert first.sent == []
+
+    second = _FakeTunnel()
+    with pytest.raises(ConnectionError, match="test disconnect"):
+        await host._serve_frames(second)  # type: ignore[arg-type]
+    hello = decode_host_frame(second.sent[0])
+    assert isinstance(hello, HostHelloFrame)
+    assert hello.configured_harnesses == {"codex-native": True}
+    assert calls == 2
+
+
+async def test_launch_preflight_remains_authoritative_while_capabilities_are_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Unknown advisory metadata never bypasses the launch-time harness check."""
+    host = _make_host_process()
+    blocked = asyncio.Event()
+
+    async def _blocked_discovery() -> None:
+        await blocked.wait()
+
+    capability_task = asyncio.create_task(_blocked_discovery())
+    host._capability_init_task = capability_task
+    monkeypatch.setattr("omnigent.host.connect.harness_is_configured", lambda harness: False)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    result = await host._handle_launch(
+        HostLaunchRunnerFrame(
+            request_id="req_capability_unknown",
+            binding_token="binding-token",
+            workspace=str(workspace),
+            harness="codex-native",
+        )
+    )
+    await _cancel(capability_task)
+
+    assert result.status == "failed"
+    assert result.error_code == HARNESS_NOT_CONFIGURED_ERROR_CODE
+
+
+async def test_reconnect_does_not_cancel_or_repeat_startup_capability_discovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tunnel generation can end without owning the daemon-wide probe."""
+    host = _make_host_process()
+    release = asyncio.Event()
+    started = asyncio.Event()
+    calls = 0
+
+    async def _discover() -> None:
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+        host._configured_harnesses = {"codex-native": True}
+        host._gateway_inference = {"codex-native": True}
+        host._capabilities_initialized = True
+
+    monkeypatch.setattr(host, "_initialize_capabilities", _discover)
+    first = _FakeTunnel()
+    serve_task = asyncio.create_task(host._serve_frames(first))  # type: ignore[arg-type]
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    await _cancel(serve_task)
+    assert first.sent == []
+
+    task = host._capability_init_task
+    assert task is not None
+    assert not task.cancelled()
+    release.set()
+    await task
+
+    second = _FakeTunnel()
+    with pytest.raises(ConnectionError, match="test disconnect"):
+        await host._serve_frames(second)  # type: ignore[arg-type]
+
+    hello = decode_host_frame(second.sent[0])
+    assert isinstance(hello, HostHelloFrame)
+    assert hello.configured_harnesses == {"codex-native": True}
+    assert calls == 1
+
+
+async def test_run_prewarms_zygote_during_capability_discovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Runner prewarming and connection setup overlap the pending startup probe."""
+    host = _make_host_process()
+    host._zygote = _FakeZygote(fail_at="none", running=True)  # type: ignore[assignment]
+    host._zygote_disabled = False
+    discovery_started = asyncio.Event()
+    connection_started = asyncio.Event()
+    prewarm_started = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    async def _discover() -> None:
+        discovery_started.set()
+        await asyncio.Event().wait()
+
+    async def _connect() -> None:
+        connection_started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(host, "_initialize_capabilities", _discover)
+    monkeypatch.setattr(host, "_connect_and_serve", _connect)
+    monkeypatch.setattr(
+        host, "_ensure_zygote_started", lambda: loop.call_soon_threadsafe(prewarm_started.set)
+    )
+    monkeypatch.setattr(host, "_reap_orphans_once", lambda: 0)
+    run_task = asyncio.create_task(host.run())
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(
+                discovery_started.wait(), connection_started.wait(), prewarm_started.wait()
+            ),
+            timeout=1.0,
+        )
+        assert host._capability_init_task is not None
+        assert not host._capability_init_task.done()
+        assert not host._capabilities_initialized
+    finally:
+        await _cancel(run_task)
+
+
+async def test_run_cancels_inflight_capability_discovery_on_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Daemon shutdown awaits and clears its background capability task."""
+    host = _host()
+    host._zygote_disabled = True
+    discovery_started = asyncio.Event()
+    discovery_cancelled = asyncio.Event()
+
+    async def _discover() -> None:
+        discovery_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            discovery_cancelled.set()
+
+    async def _connect_and_serve() -> None:
+        host._start_capability_discovery()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(host, "_initialize_capabilities", _discover)
+    monkeypatch.setattr(host, "_connect_and_serve", _connect_and_serve)
+    run_task = asyncio.create_task(host.run())
+    await asyncio.wait_for(discovery_started.wait(), timeout=1.0)
+    await _cancel(run_task)
+
+    assert discovery_cancelled.is_set()
+    assert host._capability_init_task is None
 
 
 async def test_capability_probe_failure_does_not_block_registration(
@@ -1317,6 +2017,7 @@ async def test_capability_probe_failure_does_not_block_registration(
     assert isinstance(hello, HostHelloFrame)
     assert hello.configured_harnesses is None
     assert hello.gateway_inference == {"codex": False}
+    assert host._capabilities_initialized
     assert "Permission denied: '/usr/local/bin/codex'" in capsys.readouterr().err
 
 
@@ -1986,7 +2687,10 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets() -> None:
         workspace="/ws",
         parent_pid=42,
         initial_auth_token="host-bootstrap-bearer",
+        interactive_shells=["zsh", "bash"],
     )
+
+    assert env[RUNNER_INTERACTIVE_SHELLS_ENV_VAR] == '["zsh", "bash"]'
 
     # Process essentials + the locale family pass through.
     assert env["PATH"] == "/usr/bin:/bin"
@@ -4208,8 +4912,29 @@ def test_run_host_process_announces_session_log_dir_on_start(
     assert "This host's log: ~/.omnigent/logs/host/host-" in out
 
 
+class _ConnectReachedThenPark:
+    """Async-CM stand-in for ``websockets.asyncio.client.connect``.
+
+    Signals that the host reached its connect attempt (the step that
+    registers it), then parks until the test cancels ``run()`` so a
+    background startup task can be observed completing meanwhile.
+    """
+
+    def __init__(self, reached: asyncio.Event) -> None:
+        self._reached = reached
+
+    async def __aenter__(self) -> object:
+        self._reached.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    async def __aexit__(self, *exc_info: object) -> bool:
+        return False
+
+
 async def test_run_sweeps_orphaned_native_bridge_dirs_on_startup(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Host startup reclaims native bridge dirs orphaned by a crashed runner.
 
@@ -4217,21 +4942,46 @@ async def test_run_sweeps_orphaned_native_bridge_dirs_on_startup(
     never runs its explicit-delete cleanup, and if no new runner ever
     launches on the machine the runner-side startup sweep never fires
     either — so ``~/.omnigent`` grows without bound. The host daemon's own
-    (re)start is the reliable moment to reap: ``run()`` must invoke the
-    cross-harness bridge-dir sweep before entering the connect loop.
+    (re)start is the reliable moment to reap — in the background: the sweep
+    must complete while the connect loop (which registers the host) is
+    already underway, not as a startup prerequisite, and it must be torn
+    down cleanly when ``run()`` exits.
     """
-    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
-    _patch_connect(monkeypatch, _ConnectSpy([asyncio.CancelledError()]))
+    import websockets.asyncio.client as ws_client
+
+    import omnigent.runner._entry as entry_mod
+
+    monkeypatch.setattr(entry_mod, "_make_auth_token_factory", lambda *, server_url=None: None)
+    connect_reached = asyncio.Event()
+    monkeypatch.setattr(
+        ws_client, "connect", lambda url, **kwargs: _ConnectReachedThenPark(connect_reached)
+    )
     sweeps: list[int] = []
     monkeypatch.setattr(
         "omnigent.native.native_bridge_common.reap_orphaned_native_bridge_dirs",
         lambda: sweeps.append(1) or 3,
     )
     host = _host()
+    host._capabilities_initialized = True
+    host._zygote_disabled = True  # keep the test from prestarting a zygote
 
-    await host.run()
+    caplog.set_level(logging.INFO, logger="omnigent.host.connect")
+    run_task = asyncio.create_task(host.run())
+    try:
+        await asyncio.wait_for(connect_reached.wait(), timeout=10.0)
+        sweep_task = host._bridge_sweep_task
+        assert sweep_task is not None, "run() never launched the bridge-dir sweep"
+        # The host is parked in its connect attempt; the sweep completes
+        # concurrently rather than gating registration.
+        await asyncio.wait_for(asyncio.shield(sweep_task), timeout=10.0)
+    finally:
+        run_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await run_task
 
     assert sweeps == [1]
+    assert "Reaped 3 orphaned native bridge dir(s)" in caplog.text
+    assert host._bridge_sweep_task is None, "run() teardown left the sweep task"
 
 
 async def test_run_survives_a_failing_native_bridge_dir_sweep(
@@ -4256,6 +5006,23 @@ async def test_run_survives_a_failing_native_bridge_dir_sweep(
 
     # Startup completes (run returns via the clean cancel) despite the raise.
     await host.run()
+
+
+async def test_bridge_dir_sweep_failure_is_contained(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failing sweep is housekeeping: it must never escape its background task."""
+
+    def _boom() -> int:
+        raise RuntimeError("sweep exploded")
+
+    monkeypatch.setattr(
+        "omnigent.native.native_bridge_common.reap_orphaned_native_bridge_dirs",
+        _boom,
+    )
+    host = _host()
+    # Must swallow the failure (logged at debug), not raise.
+    await host._sweep_orphaned_bridge_dirs()
 
 
 async def test_launch_cancelled_midspawn_does_not_leak_untracked_runner(
@@ -5719,10 +6486,200 @@ async def test_handle_import_local_reports_unreadable_sessions_as_failed(
     session_frames = [f for f in frames if isinstance(f, HostImportLocalSessionFrame)]
     done_frames = [f for f in frames if isinstance(f, HostImportLocalDoneFrame)]
 
-    # Only the readable session got a frame; the corrupt one is counted, not sent.
+    # Only the readable session got a frame; the corrupt one is counted, not
+    # sent, and carries a reason so the UI can explain it rather than show a bare
+    # "1 failed".
     assert [f.session.external_session_id for f in session_frames] == ["good"]
     assert len(done_frames) == 1
     assert done_frames[0].status == "ok" and done_frames[0].failed == 1
+    assert done_frames[0].failures == [
+        {
+            "external_session_id": "corrupt",
+            "source": "claude",
+            "reason": "This session's transcript could not be read.",
+        }
+    ]
+
+
+async def test_handle_import_local_unexpected_error_skips_only_that_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unexpected error loading one session must not abort the whole batch.
+
+    ``_load`` returns None for the expected read failures, but a surprise
+    exception type (here ``RuntimeError``) escapes it; the handler still has to
+    skip just that session and keep uploading the rest, ending status="ok".
+    """
+    from omnigent.host.frames import (
+        HostImportLocalDoneFrame,
+        HostImportLocalSessionFrame,
+        decode_host_frame,
+    )
+
+    host = _make_host_process()
+
+    # "bad" is streamed between two good sessions so a batch abort would drop
+    # the trailing "after" session.
+    def _fake_across(*, limit: int) -> list[tuple[str, str]]:
+        return [("claude", "before"), ("claude", "bad"), ("claude", "after")]
+
+    def _fake_load(source: str, session_id: str) -> SimpleNamespace:
+        if session_id == "bad":
+            raise RuntimeError("normalizer blew up")
+        item = SimpleNamespace(
+            type="message",
+            response_id="r1",
+            data=SimpleNamespace(model_dump=lambda **_kw: {"role": "user"}),
+        )
+        return SimpleNamespace(
+            external_session_id=session_id,
+            workspace="/repo",
+            items=[item],
+            title="ok",
+            source=source,
+        )
+
+    monkeypatch.setattr(
+        "omnigent.session_import.local.list_recent_sessions_across_harnesses", _fake_across
+    )
+    monkeypatch.setattr("omnigent.session_import.local.load_local_session", _fake_load)
+
+    sent: list[str] = []
+
+    class _FakeWs:
+        async def send(self, text: str) -> None:
+            sent.append(text)
+
+    await host._handle_import_local(
+        _FakeWs(),  # type: ignore[arg-type]
+        HostImportLocalFrame(request_id="req_boom", source="all", limit=5),
+    )
+
+    frames = [decode_host_frame(text) for text in sent]
+    session_frames = [f for f in frames if isinstance(f, HostImportLocalSessionFrame)]
+    done_frames = [f for f in frames if isinstance(f, HostImportLocalDoneFrame)]
+
+    # The batch runs (oldest first): both good sessions streamed, the bad one
+    # counted with a reason, and the stream closed cleanly rather than
+    # status="failed".
+    assert [f.session.external_session_id for f in session_frames] == ["after", "before"]
+    assert len(done_frames) == 1
+    assert done_frames[0].status == "ok" and done_frames[0].failed == 1
+    assert done_frames[0].failures == [
+        {
+            "external_session_id": "bad",
+            "source": "claude",
+            "reason": "This session could not be read.",
+        }
+    ]
+
+
+async def test_handle_import_local_send_failure_skips_only_that_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-ConnectionClosed error while sending one session frame is skipped.
+
+    Encoding/sending one session can fail (e.g. a bad payload TypeError) without
+    the tunnel being dead; that session must be counted and skipped, not abort
+    the batch.
+    """
+    from omnigent.host.frames import (
+        HostImportLocalDoneFrame,
+        HostImportLocalSessionFrame,
+        decode_host_frame,
+    )
+
+    host = _make_host_process()
+
+    def _fake_across(*, limit: int) -> list[tuple[str, str]]:
+        return [("claude", "before"), ("claude", "bad"), ("claude", "after")]
+
+    def _fake_load(source: str, session_id: str) -> SimpleNamespace:
+        item = SimpleNamespace(
+            type="message",
+            response_id="r1",
+            data=SimpleNamespace(model_dump=lambda **_kw: {"role": "user"}),
+        )
+        return SimpleNamespace(
+            external_session_id=session_id,
+            workspace="/repo",
+            items=[item],
+            title="ok",
+            source=source,
+        )
+
+    monkeypatch.setattr(
+        "omnigent.session_import.local.list_recent_sessions_across_harnesses", _fake_across
+    )
+    monkeypatch.setattr("omnigent.session_import.local.load_local_session", _fake_load)
+
+    sent: list[str] = []
+
+    class _FakeWs:
+        async def send(self, text: str) -> None:
+            frame = decode_host_frame(text)
+            if (
+                isinstance(frame, HostImportLocalSessionFrame)
+                and frame.session.external_session_id == "bad"
+            ):
+                raise TypeError("frame not serializable")
+            sent.append(text)
+
+    await host._handle_import_local(
+        _FakeWs(),  # type: ignore[arg-type]
+        HostImportLocalFrame(request_id="req_send", source="all", limit=5),
+    )
+
+    frames = [decode_host_frame(text) for text in sent]
+    session_frames = [f for f in frames if isinstance(f, HostImportLocalSessionFrame)]
+    done_frames = [f for f in frames if isinstance(f, HostImportLocalDoneFrame)]
+
+    # The send that raised is skipped; the other two sessions still stream and
+    # the batch closes ok with the failed one counted.
+    assert [f.session.external_session_id for f in session_frames] == ["after", "before"]
+    assert len(done_frames) == 1
+    assert done_frames[0].status == "ok" and done_frames[0].failed == 1
+
+
+async def test_handle_import_local_send_connection_closed_aborts_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dead tunnel (ConnectionClosed) on send aborts, never a per-session skip."""
+    host = _make_host_process()
+
+    def _fake_across(*, limit: int) -> list[tuple[str, str]]:
+        return [("claude", "s1"), ("claude", "s2")]
+
+    def _fake_load(source: str, session_id: str) -> SimpleNamespace:
+        item = SimpleNamespace(
+            type="message",
+            response_id="r1",
+            data=SimpleNamespace(model_dump=lambda **_kw: {"role": "user"}),
+        )
+        return SimpleNamespace(
+            external_session_id=session_id,
+            workspace="/repo",
+            items=[item],
+            title="ok",
+            source=source,
+        )
+
+    monkeypatch.setattr(
+        "omnigent.session_import.local.list_recent_sessions_across_harnesses", _fake_across
+    )
+    monkeypatch.setattr("omnigent.session_import.local.load_local_session", _fake_load)
+
+    class _FakeWs:
+        async def send(self, text: str) -> None:
+            raise ConnectionClosedError(None, None)
+
+    # Propagates so _run_frame_handler owns reconnect; it is not swallowed as a
+    # skipped session nor turned into a status="failed" done frame.
+    with pytest.raises(ConnectionClosedError):
+        await host._handle_import_local(
+            _FakeWs(),  # type: ignore[arg-type]
+            HostImportLocalFrame(request_id="req_cc", source="all", limit=5),
+        )
 
 
 async def test_dispatch_fs_write_op_routes_github_set_preference(
@@ -5733,7 +6690,7 @@ async def test_dispatch_fs_write_op_routes_github_set_preference(
 
     seen: dict[str, object] = {}
 
-    def fake_set(root, *, account=None, remote=None):
+    def fake_set(root, *, account=None, remote=None, session_id=None, pr_url=None):
         seen.update({"root": root, "account": account, "remote": remote})
         return {"object": "session.github.info", "ok": True}
 
@@ -5751,3 +6708,43 @@ async def test_dispatch_fs_write_op_unknown_op_raises() -> None:
     """An unknown write op fails loud rather than silently no-op'ing."""
     with pytest.raises(ValueError, match="unknown fs write op"):
         HostProcess._dispatch_fs_write_op("/ws", "bogus", {})
+
+
+@pytest.mark.parametrize("action", ["attach", "remove"])
+async def test_github_pr_update_reports_lock_contention_on_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, action: str
+) -> None:
+    from filelock import FileLock
+
+    from omnigent.host.frames import HostFsWriteFrame
+    from omnigent.runner import github_resource
+    from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(github_resource, "_pr_json", lambda *_a, **_kw: {"number": 42})
+    monkeypatch.setattr(github_resource, "_reference_info", lambda *_a: {"pr": {"number": 42}})
+    url = "https://github.com/example/one/pull/42"
+    registry = SessionPrRegistry("session")
+    registry.record(
+        [PullRequestRef.from_url(url), PullRequestRef.from_url(url.replace("42", "99"))],
+        relationship="created",
+        source="test",
+    )
+    before = registry.path.read_bytes()
+    target = url.replace("42", "100") if action == "attach" else url
+    frame = HostFsWriteFrame(
+        request_id="pr-update",
+        op="github_prs_update",
+        workspace=str(tmp_path),
+        session_id="session",
+        params={"url": target, "action": action},
+    )
+    host = _make_host_process()
+    with FileLock(str(registry.path) + ".lock"):
+        result = host._handle_fs_write(frame)
+    assert result.status == "error"
+    assert result.error_status == 400
+    assert result.error == "PR tracking is busy; try again."
+    assert registry.path.read_bytes() == before
+    assert host._handle_fs_write(frame).status == "ok"
+    assert (target in {entry.url for entry in registry.list()}) == (action == "attach")

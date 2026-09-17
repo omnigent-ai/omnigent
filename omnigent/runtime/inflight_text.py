@@ -87,6 +87,8 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
+from omnigent.db.workspace_cache import WorkspaceScopedCache
+
 # Terminal turn-lifecycle event types. Any of these clears the
 # conversation's in-flight entry: the turn is over, so its streamed
 # text is either about to be persisted (``completed``) or discarded.
@@ -141,7 +143,7 @@ class _InFlightTurn:
 # Present only while a turn is streaming; popped on any terminal event.
 # Populated by ``record_publish`` on the SSE publish chokepoint; read
 # by ``snapshot_for`` from ``subscribe``'s ``pre_ready_snapshot`` hook.
-_inflight: dict[str, _InFlightTurn] = {}
+_inflight: WorkspaceScopedCache[str, _InFlightTurn] = WorkspaceScopedCache()
 _lock = threading.Lock()
 
 
@@ -180,12 +182,12 @@ class _NativeMessage:
 
 # Per-conversation, insertion-ordered mapping of message_id to streamed text.
 # Native done items carry no message_id, so they reconcile by text content.
-_native_inflight: dict[str, dict[str, _NativeMessage]] = {}
+_native_inflight: WorkspaceScopedCache[str, dict[str, _NativeMessage]] = WorkspaceScopedCache()
 
 # Only the latest few committed messages can race their deltas. A count
 # window avoids clocks, expiry, hashing, and unbounded stale state.
 _RECENT_NATIVE_MESSAGES = 3
-_native_recent_committed: dict[str, deque[str]] = {}
+_native_recent_committed: WorkspaceScopedCache[str, deque[str]] = WorkspaceScopedCache()
 
 
 def _committed_message_text(item: dict[str, Any]) -> str | None:

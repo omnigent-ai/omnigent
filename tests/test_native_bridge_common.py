@@ -75,6 +75,31 @@ def test_prune_missing_root_returns_zero(tmp_path: Path) -> None:
     assert native_bridge_common.prune_orphaned_dirs(tmp_path / "never-created") == 0
 
 
+def test_prune_retains_entry_when_eligibility_check_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failing retention check keeps that dir and does not stop the sweep."""
+    root = tmp_path / "bridge-root"
+    failing_dir = root / "failing"
+    eligible_dir = root / "eligible"
+    for bridge_dir in (failing_dir, eligible_dir):
+        bridge_dir.mkdir(parents=True)
+        (bridge_dir / native_bridge_common.OWNER_PID_FILENAME).write_text(
+            "999999", encoding="utf-8"
+        )
+    monkeypatch.setattr("omnigent.inner.terminal._process_alive", lambda _pid: False)
+
+    def _should_prune(bridge_dir: Path) -> bool:
+        if bridge_dir == failing_dir:
+            raise OSError("unreadable activity timestamp")
+        return True
+
+    assert native_bridge_common.prune_orphaned_dirs(root, should_prune=_should_prune) == 1
+    assert failing_dir.exists()
+    assert not eligible_dir.exists()
+
+
 def test_reap_invokes_prune_for_every_native_agent(monkeypatch: pytest.MonkeyPatch) -> None:
     """The dynamic sweep calls each native agent's module-level prune once."""
     agents = (

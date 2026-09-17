@@ -27,6 +27,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from omnigent.db.db_models import InvalidUuidError, uuid_to_bytes
 from omnigent.debug_logging import debug_event, set_current_user_id
+from omnigent.errors import ErrorCategory, ErrorImpact, ErrorPhase
 from omnigent.host.frames import (
     HostConnectionErrorFrame,
     HostCreateDirResultFrame,
@@ -45,6 +46,7 @@ from omnigent.host.frames import (
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
     HostRunnerStatusResultFrame,
+    HostSkillsResultFrame,
     HostStatResultFrame,
     HostStopRunnerResultFrame,
     HostStoreSecretResultFrame,
@@ -598,15 +600,26 @@ async def _receive_loop(
             continue
 
         if isinstance(frame, HostRunnerExitedFrame):
-            # One-way report: a runner this host spawned died
-            # unexpectedly. Stash the cause so the runner status
-            # endpoint can answer "offline, and here is why" to the
-            # client still waiting for the runner to connect.
+            # One-way report: a runner this host spawned died unexpectedly. Stash
+            # the cause so the runner status endpoint can answer "offline, and
+            # here is why" to the client still waiting for the runner to connect.
+            # A runner-process fault; the free-text cause is unparsed, so the
+            # lifecycle stage is unknown.
             _logger.warning(
                 "Host %s reported runner %s exited: %s",
                 host_id,
                 frame.runner_id,
                 frame.error,
+                extra=debug_event(
+                    "runner_exited",
+                    host_id=host_id,
+                    runner_id=frame.runner_id,
+                    error_category=ErrorCategory.RUNNER.value,
+                    error_impact=ErrorImpact.BLOCKING.value,
+                    # The runner may have died before or during a turn; the host
+                    # can't tell from the exit alone.
+                    error_phase=ErrorPhase.UNKNOWN.value,
+                ),
             )
             if runner_exit_reports is not None:
                 runner_exit_reports.record(frame.runner_id, frame.error, conn.owner)
@@ -766,6 +779,11 @@ async def _receive_loop(
                     }
                 )
             continue
+        if isinstance(frame, HostSkillsResultFrame):
+            skills_future = conn.pending_skills.pop(frame.request_id, None)
+            if skills_future is not None and not skills_future.done():
+                skills_future.set_result(frame)
+            continue
         if isinstance(frame, HostImportLocalSessionFrame):
             queue = conn.pending_import_local.get(frame.request_id)
             if queue is not None:
@@ -790,7 +808,12 @@ async def _receive_loop(
                 queue.put_nowait(
                     (
                         "done",
-                        {"status": frame.status, "error": frame.error, "failed": frame.failed},
+                        {
+                            "status": frame.status,
+                            "error": frame.error,
+                            "failed": frame.failed,
+                            "failures": frame.failures,
+                        },
                     )
                 )
             continue

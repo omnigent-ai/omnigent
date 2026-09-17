@@ -16,6 +16,8 @@ from fastapi.responses import FileResponse, JSONResponse
 
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID, Conversation, ConversationItem, PagedList
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.host.frames import HostHelloFrame
+from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
 from omnigent.runtime import (
     _globals,
     session_stream,
@@ -24,6 +26,7 @@ from omnigent.runtime import (
     set_runner_router,
 )
 from omnigent.server._runner_ws_tunnel import DirectAttachEndpoint
+from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes.sessions import _ancestor_session_ids, create_sessions_router
 from omnigent.server.schemas import SessionEventInput
 
@@ -469,7 +472,9 @@ def app(runner_globals_reset: None) -> FastAPI:
     del runner_globals_reset
     app = FastAPI()
     conversation_store = _ConversationStore()
+    host_registry = HostRegistry()
     app.state.test_conversation_store = conversation_store
+    app.state.test_host_registry = host_registry
 
     @app.exception_handler(OmnigentError)
     async def _handle_omnigent_error(
@@ -496,6 +501,7 @@ def app(runner_globals_reset: None) -> FastAPI:
         create_sessions_router(
             conversation_store,  # type: ignore[arg-type]
             _StubAgentStore(),  # type: ignore[arg-type]
+            host_registry=host_registry,
         ),
         prefix="/v1",
     )
@@ -629,6 +635,49 @@ async def test_list_session_resources_rejects_malformed_runner_response(
 
     assert resp.status_code == 502
     assert resp.json()["detail"] == "runner session-resources endpoint returned malformed response"
+
+
+@pytest.mark.asyncio
+async def test_list_session_resources_missing_session_agent_returns_typed_410(
+    client: httpx.AsyncClient,
+) -> None:
+    """A runner 410 ``session_agent_missing`` passes through typed, not as 502.
+
+    The session's bound agent was deleted or rebound — a session-lifecycle
+    condition the client resolves by recreating the agent or starting a new
+    session. The list proxy re-derives the typed 410 from the runner body's
+    error code instead of flattening the non-200 to a generic 502 gateway
+    failure, so the public contract matches the runner's classification.
+    """
+    fake_runner = _FakeRunnerClient(
+        responses={
+            "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources": (
+                410,
+                {
+                    "error": {
+                        "code": "session_agent_missing",
+                        "message": (
+                            "session spec resolver: agent 'ag_gone' for "
+                            "session 'conv_test' was not found"
+                        ),
+                    }
+                },
+            ),
+        },
+    )
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.get("/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources")
+
+    assert resp.status_code == 410
+    body = resp.json()
+    assert body["error"]["code"] == "session_agent_missing"
+    # The client-safe message must not leak the internal resolver text or
+    # the raw agent id — matching the native-terminal payload's hygiene.
+    message = body["error"]["message"]
+    assert "session spec resolver" not in message
+    assert "ag_gone" not in message
+    assert "no longer available" in message
 
 
 @pytest.mark.asyncio
@@ -1221,6 +1270,49 @@ async def test_get_resource_by_id_404_from_runner(
 
 
 @pytest.mark.asyncio
+async def test_get_resource_by_id_missing_session_agent_returns_typed_410(
+    client: httpx.AsyncClient,
+) -> None:
+    """A runner 410 ``session_agent_missing`` passes through typed, not as 502.
+
+    The session's bound agent was deleted or rebound — a session-lifecycle
+    condition the client resolves by recreating the agent or starting a new
+    session. The GET proxy re-derives the typed 410 from the runner body's
+    error code instead of flattening the non-200 to a generic 502 gateway
+    failure, so the public contract matches the runner's classification.
+    """
+    fake_runner = _FakeRunnerClient(
+        responses={
+            "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/env_gone": (
+                410,
+                {
+                    "error": {
+                        "code": "session_agent_missing",
+                        "message": (
+                            "session spec resolver: agent 'ag_gone' for "
+                            "session 'conv_test' was not found"
+                        ),
+                    }
+                },
+            ),
+        },
+    )
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.get("/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/env_gone")
+
+    assert resp.status_code == 410
+    body = resp.json()
+    assert body["error"]["code"] == "session_agent_missing"
+    # The client-safe message must not leak the internal resolver text or
+    # the raw agent id — matching the native-terminal payload's hygiene.
+    message = body["error"]["message"]
+    assert "session spec resolver" not in message
+    assert "ag_gone" not in message
+    assert "no longer available" in message
+
+
+@pytest.mark.asyncio
 async def test_get_resource_by_id_404_with_non_mapping_body(
     client: httpx.AsyncClient,
 ) -> None:
@@ -1290,6 +1382,40 @@ def bash_terminal_spec(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
+@pytest.fixture
+def bash_only_native_host(app: FastAPI, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Bind the canned session to a native spec on a bash-only host."""
+    from omnigent.inner.datamodel import TerminalEnvSpec
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.spec.types import AgentSpec
+
+    session_id = "79b22ebd2309e48fdeb450c65611d51b"
+    conv = app.state.test_conversation_store._conversations[session_id]
+    conv.host_id = "host_bash_only"
+    conv.workspace = "/workspace"
+    app.state.test_host_registry.register(
+        conv.host_id,
+        object(),  # type: ignore[arg-type]
+        HostHelloFrame(
+            version="0.1.0-test",
+            frame_protocol_version=1,
+            name="bash-only",
+            interactive_shells=["bash"],
+        ),
+        owner=None,
+    )
+    spec = AgentSpec(
+        spec_version=1,
+        name=CLAUDE_NATIVE_AGENT_NAME,
+        terminals={"zsh": TerminalEnvSpec(command="zsh")},
+    )
+    monkeypatch.setattr(
+        sessions_module,
+        "_load_agent_spec_for_session",
+        lambda conv, agent_store: spec,
+    )
+
+
 @pytest.mark.asyncio
 async def test_create_terminal_proxies_to_runner(
     client: httpx.AsyncClient,
@@ -1322,6 +1448,58 @@ async def test_create_terminal_proxies_to_runner(
     assert fake_runner.calls == [
         ("POST", "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_create_terminal_uses_native_host_shell_inventory(
+    client: httpx.AsyncClient,
+    bash_only_native_host: None,
+) -> None:
+    """A native host shell is allowed even when the baked spec differs."""
+    terminal_resource = {
+        "id": "terminal_bash_s1",
+        "object": "session.resource",
+        "type": "terminal",
+        "session_id": "79b22ebd2309e48fdeb450c65611d51b",
+        "name": "bash:s1",
+        "environment": DEFAULT_ENVIRONMENT_ID,
+        "metadata": {
+            "terminal_name": "bash",
+            "session_key": "s1",
+            "running": True,
+        },
+    }
+    fake_runner = _FakeRunnerClient(payload=terminal_resource)
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.post(
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals",
+        json={"terminal": "bash", "session_key": "s1"},
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert fake_runner.calls == [
+        ("POST", "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_create_terminal_rejects_shell_absent_from_native_host(
+    client: httpx.AsyncClient,
+    bash_only_native_host: None,
+) -> None:
+    """A shell baked on the server cannot be launched on a host lacking it."""
+    fake_runner = _FakeRunnerClient(payload={})
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.post(
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals",
+        json={"terminal": "zsh", "session_key": "s1"},
+    )
+
+    assert resp.status_code == 400
+    assert "bash" in resp.json()["error"]["message"]
+    assert fake_runner.calls == []
 
 
 @pytest.mark.asyncio
@@ -3162,6 +3340,90 @@ async def test_filesystem_download_forwards_runner_errors(
 
 
 @pytest.mark.asyncio
+async def test_filesystem_download_missing_session_agent_returns_typed_410(
+    client: httpx.AsyncClient,
+) -> None:
+    """A runner 410 ``session_agent_missing`` on download is typed and sanitized.
+
+    The session's bound agent was deleted or rebound — a session-lifecycle
+    condition. The download proxy re-derives the typed 410 with the fixed
+    client-safe message instead of forwarding the runner's raw resolver
+    text (which names the resolver and the raw agent id) verbatim.
+    """
+    runner = FastAPI()
+
+    @runner.get(_FS_ROUTE)
+    async def _serve(session_id: str, environment_id: str, relative_path: str) -> JSONResponse:
+        del session_id, environment_id, relative_path
+        return JSONResponse(
+            status_code=410,
+            content={
+                "error": {
+                    "code": "session_agent_missing",
+                    "message": (
+                        "session spec resolver: agent 'ag_gone' for "
+                        "session 'conv_test' was not found"
+                    ),
+                }
+            },
+        )
+
+    async with _runner_app_client(runner):
+        resp = await client.get(_DOWNLOAD_URL)
+
+    assert resp.status_code == 410
+    body = resp.json()
+    assert body["error"]["code"] == "session_agent_missing"
+    message = body["error"]["message"]
+    assert "session spec resolver" not in message
+    assert "ag_gone" not in message
+    assert "no longer available" in message
+
+
+@pytest.mark.asyncio
+async def test_filesystem_write_missing_session_agent_returns_typed_410(
+    client: httpx.AsyncClient,
+) -> None:
+    """A runner 410 ``session_agent_missing`` on a mutation is typed and sanitized.
+
+    Same lifecycle condition as the read/download paths: the mutation proxy
+    re-derives the typed 410 with the fixed client-safe message instead of
+    forwarding the runner's raw resolver text verbatim.
+    """
+    path = (
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default"
+        "/filesystem/new.txt"
+    )
+    fake_runner = _FakeRunnerClient(
+        responses={
+            path: (
+                410,
+                {
+                    "error": {
+                        "code": "session_agent_missing",
+                        "message": (
+                            "session spec resolver: agent 'ag_gone' for "
+                            "session 'conv_test' was not found"
+                        ),
+                    }
+                },
+            ),
+        },
+    )
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.put(path, json={"content": "hello", "encoding": "utf-8"})
+
+    assert resp.status_code == 410
+    body = resp.json()
+    assert body["error"]["code"] == "session_agent_missing"
+    message = body["error"]["message"]
+    assert "session spec resolver" not in message
+    assert "ag_gone" not in message
+    assert "no longer available" in message
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("operation", ["read", "download", "write"])
 async def test_filesystem_forwards_a_literal_percent_still_encoded(
     client: httpx.AsyncClient,
@@ -3438,6 +3700,9 @@ class _FakeStreamCtx:
         """Exit the context without suppressing exceptions."""
         return False
 
+    def raise_for_status(self) -> None:
+        """The scripted stream represents a successful HTTP response."""
+
     async def aiter_text(self) -> AsyncIterator[str]:
         """Yield each configured SSE frame string in order."""
         for frame in self._frames:
@@ -3499,6 +3764,9 @@ class _ScriptedStreamCtx:
     async def __aexit__(self, *exc: object) -> bool:
         """Exit the context without suppressing exceptions."""
         return False
+
+    def raise_for_status(self) -> None:
+        """The scripted stream represents a successful HTTP response."""
 
     async def aiter_text(self) -> AsyncIterator[str]:
         """Yield frame steps in order, running callable steps in between."""
@@ -6328,3 +6596,60 @@ async def test_sibling_environment_routes_are_not_gzipped(
 
     assert resp.status_code == 200
     assert "content-encoding" not in resp.headers
+
+
+@pytest.mark.parametrize(
+    "resource,op",
+    [
+        ("", "github_info"),
+        ("/changes", "github_changes"),
+        ("/diff", "github_pr_diff"),
+        ("/diff/new.py", "github_diff"),
+    ],
+)
+async def test_selected_pr_reaches_offline_host(
+    offline_env_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    resource: str,
+    op: str,
+) -> None:
+    from omnigent.server.routes import _host_filesystem
+
+    captured: dict[str, Any] = {}
+
+    async def read(**kwargs: Any) -> dict[str, Any]:
+        captured.update(kwargs)
+        return {"object": "session.github.info"}
+
+    monkeypatch.setattr(_host_filesystem, "read_workspace_from_host", read)
+    url = "https://github.com/example/second/pull/42"
+    response = await offline_env_client.get(
+        f"/v1/sessions/{_OFFLINE_SESSION}/resources/github{resource}", params={"pr_url": url}
+    )
+    assert response.status_code == 200
+    assert captured["op"] == op
+    assert captured["session_id"] == _OFFLINE_SESSION
+    assert captured["params"]["pr_url"] == url
+
+
+async def test_pr_attachment_uses_bound_session_when_runner_offline(
+    offline_env_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.server.routes import _host_filesystem
+
+    captured: dict[str, Any] = {}
+
+    async def write(**kwargs: Any) -> dict[str, Any]:
+        captured.update(kwargs)
+        return {"object": "session.github.info", "prs": []}
+
+    monkeypatch.setattr(_host_filesystem, "write_workspace_from_host", write)
+    url = "https://github.com/example/second/pull/42"
+    response = await offline_env_client.post(
+        f"/v1/sessions/{_OFFLINE_SESSION}/resources/github/prs",
+        json={"url": url, "action": "attach", "session_id": "untrusted"},
+    )
+    assert response.status_code == 200, response.text
+    assert captured["op"] == "github_prs_update"
+    assert captured["params"] == {"url": url, "action": "attach", "session_id": _OFFLINE_SESSION}

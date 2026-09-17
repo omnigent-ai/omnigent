@@ -25,6 +25,22 @@ export const SESSION_PAGE_DEFAULT_LIMIT = 25;
 export const SESSION_PAGE_MAX_LIMIT = 1_000;
 export const SESSIONS_LIST_ALL_MAX_PAGES = 200;
 export const SESSIONS_LIST_ALL_MAX_SESSIONS = 5_000;
+export const SESSIONS_LIST_ALL_MAX_RESTARTS = 3;
+
+/**
+ * Host error code for a page whose cursor no longer resolves, because the
+ * session it named was deleted mid-walk. The server answers `stale_cursor`
+ * rather than silently skipping rows, so the walk has to start over.
+ */
+export const STALE_CURSOR_ERROR_CODE = "StaleCursor";
+
+function isStaleCursorFailure(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    (error as { code?: unknown }).code === STALE_CURSOR_ERROR_CODE
+  );
+}
 
 export function validateSessionPageLimit(
   value: number | undefined,
@@ -40,7 +56,32 @@ export function validateSessionPageLimit(
   return limit;
 }
 
+/**
+ * Walk every page of the session list.
+ *
+ * A session deleted mid-walk invalidates the cursor pointing at it, so the
+ * server rejects the next page with a stale-cursor error instead of
+ * silently truncating. Restart the whole walk from page 1 in that case —
+ * a partial list is discarded, since pages taken before and after a
+ * deletion cannot be stitched together — bounded by
+ * `SESSIONS_LIST_ALL_MAX_RESTARTS` so a churning list still terminates.
+ */
 export async function drainSessionPages(
+  fetchPage: (after: string | null) => Promise<ExtensionSessionPage>,
+  fail: (code: string, message: string) => Error,
+): Promise<ExtensionSessionSummary[]> {
+  for (let restart = 0; ; restart += 1) {
+    try {
+      return await drainOnce(fetchPage, fail);
+    } catch (error) {
+      if (!isStaleCursorFailure(error) || restart >= SESSIONS_LIST_ALL_MAX_RESTARTS) {
+        throw error;
+      }
+    }
+  }
+}
+
+async function drainOnce(
   fetchPage: (after: string | null) => Promise<ExtensionSessionPage>,
   fail: (code: string, message: string) => Error,
 ): Promise<ExtensionSessionSummary[]> {

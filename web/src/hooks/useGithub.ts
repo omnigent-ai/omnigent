@@ -1,4 +1,4 @@
-// TanStack Query hooks for the runner's read-only GitHub resource API.
+// TanStack Query hooks for session PR resources and local associations.
 //
 //   useGithubInfo        — GET /resources/github
 //                          repo / branch / base ref / associated PR + CI summary.
@@ -68,6 +68,8 @@ export interface GithubPr {
   base_ref: string | null;
   head_ref: string | null;
   checks: GithubChecks;
+  head_sha?: string;
+  base_sha?: string;
   /** PR description (GitHub-flavored markdown); null when empty. Optional: a
    *  host predating the Summary tab omits it, so treat undefined as none. */
   body?: string | null;
@@ -96,8 +98,23 @@ export interface GithubAccount {
  *    404s "Resource 'github' not found"; synthesized in {@link fetchGithubInfo}. */
 export type GithubUnavailableReason = "not_a_git_repo" | "no_os_env" | "host_outdated";
 
+export interface GithubPrAssociation {
+  url: string;
+  host: string;
+  repository: string;
+  number: number;
+  relationship: "created" | "worked_on" | "attached" | "inferred";
+}
+
+function prQuery(prUrl?: string): string {
+  return prUrl ? `?${new URLSearchParams({ pr_url: prUrl })}` : "";
+}
+
 export interface GithubInfo {
   object: "session.github.info";
+  prs?: GithubPrAssociation[];
+  selected_pr_url?: string;
+  tracking_available?: boolean;
   /** False only when this isn't a git repo (see reason); the diff needs one. */
   available: boolean;
   /** Why unavailable — see {@link GithubUnavailableReason}. */
@@ -172,9 +189,9 @@ export function githubNotFoundReason(message: string | undefined): GithubUnavail
     : "no_os_env";
 }
 
-export async function fetchGithubInfo(conversationId: string): Promise<GithubInfo> {
+export async function fetchGithubInfo(conversationId: string, prUrl?: string): Promise<GithubInfo> {
   const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github`,
+    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github${prQuery(prUrl)}`,
   );
   if (res.status === 404) {
     // Preserve the server's message so an outdated host (no github route) is
@@ -262,7 +279,10 @@ export function computeGithubPollInterval(info: GithubInfo | undefined): number 
  * Disabled when the runner is known offline. Retries the runner-offline case
  * with capped backoff so a cold-booting runner resolves before any error UI.
  */
-export function useGithubInfo(rawConversationId: string | undefined, options?: { poll?: boolean }) {
+export function useGithubInfo(
+  rawConversationId: string | undefined,
+  options?: { poll?: boolean; prUrl?: string },
+) {
   // A `temp:*` id (navigate-first new-chat window) has no server session.
   const conversationId = isTempConvId(rawConversationId) ? undefined : rawConversationId;
   const serveable = useWorkspaceServeable(conversationId);
@@ -271,13 +291,18 @@ export function useGithubInfo(rawConversationId: string | undefined, options?: {
   // so it works for every harness (no per-harness tool detection).
   useTrailingInvalidate(conversationId, useSessionActive(conversationId), "github-info");
   return useQuery({
-    queryKey: ["github-info", conversationId],
-    queryFn: () => fetchGithubInfo(conversationId!),
+    queryKey: ["github-info", conversationId, ...(options?.prUrl ? [options.prUrl] : [])],
+    queryFn: () => fetchGithubInfo(conversationId!, options?.prUrl),
     enabled: !!conversationId && serveable !== false,
     retry: shouldRetryRunnerOffline,
     retryDelay: runnerOfflineRetryDelay,
     staleTime: 30_000,
-    refetchInterval: options?.poll ? (query) => computeGithubPollInterval(query.state.data) : false,
+    refetchInterval: options?.poll
+      ? (query) =>
+          query.state.data?.tracking_available
+            ? 10_000
+            : computeGithubPollInterval(query.state.data)
+      : false,
     refetchIntervalInBackground: false,
   });
 }
@@ -286,6 +311,7 @@ export function useGithubInfo(rawConversationId: string | undefined, options?: {
  *  to pin for this session's workspace. Either may be omitted to leave it as-is;
  *  an empty `account` clears the per-repo preference. */
 export interface GithubPreferenceInput {
+  pr_url?: string;
   account?: string;
   remote?: string;
 }
@@ -324,15 +350,19 @@ export function useSetGithubPreference(conversationId: string | undefined) {
     mutationFn: (body: GithubPreferenceInput) => postGithubPreference(conversationId!, body),
     onSuccess: (info) => {
       queryClient.setQueryData(["github-info", conversationId], info);
+      queryClient.invalidateQueries({ queryKey: ["github-info", conversationId] });
       queryClient.invalidateQueries({ queryKey: ["github-changed-files", conversationId] });
       queryClient.invalidateQueries({ queryKey: ["github-pr-diff", conversationId] });
     },
   });
 }
 
-async function fetchGithubChangedFiles(conversationId: string): Promise<GithubChangedFilesResult> {
+async function fetchGithubChangedFiles(
+  conversationId: string,
+  prUrl?: string,
+): Promise<GithubChangedFilesResult> {
   const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/changes`,
+    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/changes${prQuery(prUrl)}`,
   );
   if (res.status === 404) return { available: false, data: [] };
   if (res.status === 503 && (await isRunnerUnavailable503(res))) {
@@ -348,11 +378,16 @@ async function fetchGithubChangedFiles(conversationId: string): Promise<GithubCh
  * PR exists (pass `hasPr` from {@link useGithubInfo}); the runner returns an
  * empty list otherwise.
  */
-export function useGithubChangedFiles(conversationId: string | undefined, hasPr: boolean) {
+export function useGithubChangedFiles(
+  conversationId: string | undefined,
+  hasPr: boolean,
+  prUrl?: string,
+  revision?: string,
+) {
   const serveable = useWorkspaceServeable(conversationId);
   return useQuery({
-    queryKey: ["github-changed-files", conversationId],
-    queryFn: () => fetchGithubChangedFiles(conversationId!),
+    queryKey: ["github-changed-files", conversationId, ...(prUrl ? [prUrl, revision] : [])],
+    queryFn: () => fetchGithubChangedFiles(conversationId!, prUrl),
     // Only a PR has files to show — skip the call in every no-PR / unavailable
     // / unauthenticated state (the panel shows an empty state instead).
     enabled: !!conversationId && hasPr && serveable !== false,
@@ -371,10 +406,16 @@ export async function fetchGithubFileContents(
   conversationId: string,
   path: string,
   base: string | undefined,
+  selected?: { pr_url: string; previous_path?: string; head_sha?: string; base_sha?: string },
 ): Promise<GithubFileDiffResponse> {
   // Encode each path segment individually so slashes remain structural.
   const encodedPath = path.split("/").map(encodeURIComponent).join("/");
-  const params = base ? `?base=${encodeURIComponent(base)}` : "";
+  const query = new URLSearchParams();
+  if (base) query.set("base", base);
+  for (const [key, value] of Object.entries(selected ?? {})) {
+    if (value) query.set(key, value);
+  }
+  const params = query.size ? `?${query}` : "";
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(conversationId)}` +
       `/resources/github/diff/${encodedPath}${params}`,
@@ -392,9 +433,12 @@ export interface GithubPrDiffResponse {
   patch: string;
 }
 
-async function fetchGithubPrDiff(conversationId: string): Promise<GithubPrDiffResponse> {
+async function fetchGithubPrDiff(
+  conversationId: string,
+  prUrl?: string,
+): Promise<GithubPrDiffResponse> {
   const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/diff`,
+    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/diff${prQuery(prUrl)}`,
   );
   if (res.status === 503 && (await isRunnerUnavailable503(res))) {
     throw new RunnerOfflineError();
@@ -409,14 +453,51 @@ async function fetchGithubPrDiff(conversationId: string): Promise<GithubPrDiffRe
  * call. Enabled only when a PR exists (pass `hasPr` from {@link useGithubInfo});
  * disabled when the runner is known offline.
  */
-export function useGithubPrDiff(conversationId: string | undefined, hasPr: boolean) {
+export function useGithubPrDiff(
+  conversationId: string | undefined,
+  hasPr: boolean,
+  prUrl?: string,
+  revision?: string,
+) {
   const serveable = useWorkspaceServeable(conversationId);
   return useQuery({
-    queryKey: ["github-pr-diff", conversationId],
-    queryFn: () => fetchGithubPrDiff(conversationId!),
+    queryKey: ["github-pr-diff", conversationId, ...(prUrl ? [prUrl, revision] : [])],
+    queryFn: () => fetchGithubPrDiff(conversationId!, prUrl),
     enabled: !!conversationId && hasPr && serveable !== false,
     retry: shouldRetryRunnerOffline,
     retryDelay: runnerOfflineRetryDelay,
     staleTime: 30_000,
+  });
+}
+
+export function useUpdateSessionPr(conversationId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (body: { url: string; action: "attach" | "remove" }) => {
+      const response = await authenticatedFetch(
+        `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/prs`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        },
+      );
+      if (!response.ok) throw await errorFromResponse(response);
+      return (await response.json()) as GithubInfo;
+    },
+    onSuccess: async (info, body) => {
+      await queryClient.cancelQueries({ queryKey: ["github-info", conversationId] });
+      queryClient.setQueryData(["github-info", conversationId], info);
+      if (info.selected_pr_url) {
+        queryClient.setQueryData(["github-info", conversationId, info.selected_pr_url], info);
+      }
+      if (body.action === "remove") {
+        queryClient.removeQueries({
+          queryKey: ["github-info", conversationId, body.url],
+          exact: true,
+        });
+      }
+      queryClient.invalidateQueries({ queryKey: ["github-info", conversationId] });
+    },
   });
 }

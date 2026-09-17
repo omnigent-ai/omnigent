@@ -284,10 +284,6 @@ _AUTHORIZE_RATE_WINDOW_SECONDS = 60  # …per client per this window.
 _PURGE_MIN_INTERVAL_SECONDS = 300
 
 
-# The limiter itself lives in routes/_oauth.py: the client-credentials grant
-# throttles its own unauthenticated endpoint with the same primitive.
-
-
 def _resolve_signing_config(auth_provider: UnifiedAuthProvider) -> tuple[bytes, str]:
     """Return ``(cookie_secret, provider_name)`` for token minting.
 

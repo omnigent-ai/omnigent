@@ -212,6 +212,7 @@ def _client(
 
 
 def test_config_enabled_reads_all_fields(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every configured field lands on the parsed config, TTL included."""
     _configure(monkeypatch, ttl="900")
     config = MachineClientConfig.from_env()
     assert config is not None
@@ -222,6 +223,7 @@ def test_config_enabled_reads_all_fields(monkeypatch: pytest.MonkeyPatch) -> Non
 
 
 def test_config_disabled_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    """All variables unset is the one clean "off" — no config, no error."""
     _clear(monkeypatch)
     assert MachineClientConfig.from_env() is None
 
@@ -307,6 +309,7 @@ def test_config_reserved_principal_is_an_error(
 
 
 def test_config_default_ttl(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An unset TTL takes the 3600s default rather than being unbounded."""
     _configure(monkeypatch)
     config = MachineClientConfig.from_env()
     assert config is not None and config.token_ttl_seconds == 3600
@@ -344,6 +347,7 @@ def _basic(client_id: str, secret: str, *, scheme: str = "Basic") -> str:
 
 
 def test_presented_client_from_form() -> None:
+    """RFC 6749 §2.3.1: form-encoded client credentials are accepted."""
     request = MagicMock()
     request.headers = {}
     form = FormData([("client_id", _CLIENT_ID), ("client_secret", _CLIENT_SECRET)])
@@ -351,6 +355,7 @@ def test_presented_client_from_form() -> None:
 
 
 def test_presented_client_from_basic_header_takes_precedence() -> None:
+    """§2.3.1: a Basic header wins over form fields when both are sent."""
     request = MagicMock()
     request.headers = {"Authorization": _basic("basic-id", "basic-secret")}
     form = FormData([("client_id", _CLIENT_ID), ("client_secret", _CLIENT_SECRET)])
@@ -366,6 +371,7 @@ def test_presented_client_basic_scheme_is_case_insensitive(scheme: str) -> None:
 
 
 def test_presented_client_none_when_secret_absent() -> None:
+    """A client_id with no secret is not a usable pair — reads as absent."""
     request = MagicMock()
     request.headers = {}
     form = FormData([("client_id", _CLIENT_ID)])
@@ -385,12 +391,14 @@ def test_presented_client_basic_credentials_are_form_urldecoded() -> None:
 
 
 def test_presented_client_none_on_malformed_basic() -> None:
+    """Undecodable Basic material reads as absent, never as a 500."""
     request = MagicMock()
     request.headers = {"Authorization": "Basic !!!not-base64!!!"}
     assert _presented_client(request, FormData([])) is None
 
 
 def test_client_matches_true_for_correct_pair(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The configured id + secret verify against the stored digest."""
     _configure(monkeypatch)
     config = MachineClientConfig.from_env()
     assert config is not None
@@ -400,6 +408,7 @@ def test_client_matches_true_for_correct_pair(monkeypatch: pytest.MonkeyPatch) -
 def test_client_matches_false_for_wrong_secret_or_id(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Either half wrong fails the match — id and secret both count."""
     _configure(monkeypatch)
     config = MachineClientConfig.from_env()
     assert config is not None
@@ -411,7 +420,7 @@ def test_client_matches_false_for_wrong_secret_or_id(
 
 
 def test_unconfigured_grant_builds_no_handler(monkeypatch: pytest.MonkeyPatch) -> None:
-    """BLOCKING contract: no machine client → no handler.
+    """No machine client configured → no handler.
 
     The grant is opt-in like the device grant next door; a deployment that
     configures none must not gain a working ``client_credentials`` exchange.
@@ -438,7 +447,7 @@ def test_unconfigured_grant_is_an_unsupported_grant_type(
 def test_admin_sub_is_not_enabled(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """BLOCKING guard: an admin ``sub`` refuses to enable the grant.
+    """An admin ``sub`` refuses to enable the grant.
 
     The path allowlist confines the token to the session APIs but not its
     privilege there — /v1/sessions' ``is_admin → LEVEL_OWNER`` override would
@@ -540,6 +549,7 @@ def test_dedicated_machine_sub_does_not_warn(
 
 
 def test_token_form_credentials_succeed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The happy path: form credentials mint a token with the delegated shape."""
     client = _client(monkeypatch, ttl="1800")
     resp = client.post(
         "/oauth/token",
@@ -587,6 +597,7 @@ def test_token_response_carries_the_granted_scope(monkeypatch: pytest.MonkeyPatc
 
 
 def test_token_basic_auth_credentials_succeed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The same happy path driven through the Basic header instead."""
     client = _client(monkeypatch)
     resp = client.post(
         "/oauth/token",
@@ -639,7 +650,7 @@ def test_token_response_is_not_cacheable(monkeypatch: pytest.MonkeyPatch) -> Non
 
 
 def test_machine_grant_registers_no_second_token_route(monkeypatch: pytest.MonkeyPatch) -> None:
-    """BLOCKING contract: the grant is a branch, never a second route.
+    """The grant is a branch, never a second route.
 
     FastAPI resolves first-match-wins with no warning, so a parallel router on
     ``POST /oauth/token`` would leave whichever registered second as dead code
@@ -659,7 +670,7 @@ def test_machine_grant_registers_no_second_token_route(monkeypatch: pytest.Monke
 def test_machine_grant_answers_under_the_device_grant_router(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """BLOCKING regression: the device flow must not shadow the machine grant.
+    """The device flow must not shadow the machine grant.
 
     The device-grant router builds its own token endpoint, so a machine grant
     living on a parallel router went silent whenever the device grant was
@@ -726,6 +737,7 @@ def test_machine_grant_does_not_throttle_other_grant_types(
 
 
 def test_token_wrong_secret_is_invalid_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    """§5.2: a bad secret is 401 invalid_client, and the answer is uncacheable."""
     client = _client(monkeypatch)
     resp = client.post(
         "/oauth/token",
@@ -756,6 +768,7 @@ def test_token_rejected_basic_header_gets_a_challenge(monkeypatch: pytest.Monkey
 def test_token_absent_credentials_is_invalid_client(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """A request carrying no credentials at all is refused the same way."""
     client = _client(monkeypatch)
     resp = client.post("/oauth/token", data={"grant_type": "client_credentials"})
     assert resp.status_code == 401 and resp.json()["error"] == "invalid_client"
@@ -764,6 +777,11 @@ def test_token_absent_credentials_is_invalid_client(
 def test_token_wrong_client_id_is_invalid_client(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """A wrong client_id is refused identically to a wrong secret.
+
+    Same code and status for both halves, so the response reveals nothing
+    about which one was wrong.
+    """
     client = _client(monkeypatch)
     resp = client.post(
         "/oauth/token",
@@ -984,6 +1002,7 @@ def test_token_authority_table(
     provider = _make_oidc_provider()
     token = token_factory()
     assert provider._check_cookie(_req("/v1/sessions", bearer=token)) == allowlisted, shape
+    assert provider._check_cookie(_req("/v1/skills", bearer=token)) == allowlisted, shape
     assert provider._check_cookie(_req("/auth/users", bearer=token)) == non_allowlisted, shape
 
 
@@ -1023,6 +1042,7 @@ def test_no_minted_token_shape_is_ever_cached() -> None:
 
 
 def test_scope_token_allowed_on_allowlisted_path() -> None:
+    """A machine token reaches allowlisted prefixes and their sub-paths."""
     provider = _make_oidc_provider()
     assert provider._check_cookie(_req("/v1/sessions", bearer=_machine_token())) == _MACHINE_SUB
     assert (
@@ -1032,6 +1052,7 @@ def test_scope_token_allowed_on_allowlisted_path() -> None:
 
 
 def test_scope_token_rejected_on_non_allowlisted_path() -> None:
+    """The same token is refused everywhere off the allowlist."""
     provider = _make_oidc_provider()
     assert provider._check_cookie(_req("/auth/users", bearer=_machine_token())) is None
     assert provider._check_cookie(_req("/v1/me", bearer=_machine_token())) is None
@@ -1096,6 +1117,7 @@ def test_non_string_grant_id_is_rejected() -> None:
 
 
 def test_expired_scope_token_rejected() -> None:
+    """Expiry is checked before the allowlist — a stale token is simply invalid."""
     provider = _make_oidc_provider()
     payload = {
         "sub": _MACHINE_SUB,

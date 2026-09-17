@@ -18,7 +18,6 @@ unit-tested without a live host/runner.
 from __future__ import annotations
 
 import asyncio
-import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -810,20 +809,24 @@ async def test_on_fire_returns_before_launch_completes() -> None:
     """on_fire must return fast so the scheduler timer re-arms immediately."""
     store = FakeScheduledTaskStore(rows={"task_1": _task()})
     release = asyncio.Event()
+    launch_finished = asyncio.Event()
 
     async def _slow_launch(conv: Any, task: Any) -> None:
         await release.wait()
+        launch_finished.set()
 
     on_fire = build_on_fire(_deps(store), launch_dispatch=_slow_launch)
 
-    t0 = time.monotonic()
     await on_fire(0, "task_1")
-    elapsed = time.monotonic() - t0
 
-    # Returned without waiting on the (still-blocked) launch.
-    assert elapsed < 0.5
+    # on_fire returned while the launch is still parked on *release*, which
+    # is the property under test: the launch was handed to a background task
+    # rather than awaited inline. Asserting on the launch's state instead of
+    # a wall-clock budget keeps this honest on a loaded CI runner.
+    assert not launch_finished.is_set()
     release.set()
     await _drain()
+    assert launch_finished.is_set()
 
 
 @pytest.mark.asyncio

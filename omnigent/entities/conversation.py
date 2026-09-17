@@ -101,6 +101,8 @@ class Conversation:
         nested ``by_model`` object. Persisted as a JSON column and
         loaded by the policy engine builder at workflow start. Empty
         dict when no LLM calls have been recorded yet.
+    :param session_todos: Latest native Plan display snapshot, restored after
+        Server restart without invoking the harness or replaying task work.
     :param reasoning_effort: Per-session reasoning-effort hint,
         e.g. ``"high"``. ``None`` means use the agent default.
         Set at session creation via ``POST /v1/sessions`` metadata
@@ -240,6 +242,7 @@ class Conversation:
     labels: dict[str, str] = field(default_factory=dict)
     session_state: dict[str, Any] = field(default_factory=dict)
     session_usage: dict[str, Any] = field(default_factory=dict)
+    session_todos: list[dict[str, Any]] = field(default_factory=list)
     reasoning_effort: str | None = None
     model_override: str | None = None
     reported_model: str | None = None
@@ -258,9 +261,13 @@ class Conversation:
     # so any replica's session list can serve them. ``live_status`` is the
     # last relay-observed turn status ("idle"/"running"/"waiting"/"failed",
     # None = never reported); ``pending_elicitation_count`` is the
-    # outstanding approval-prompt count (None = never written).
+    # outstanding approval-prompt count (None = never written);
+    # ``runner_last_seen`` is the runner tunnel's last heartbeat (epoch
+    # seconds, None = no live stamp) — carried on the row so a session list
+    # can judge runner liveness without a second connectivity query.
     live_status: str | None = None
     pending_elicitation_count: int | None = None
+    runner_last_seen: int | None = None
     project_id: str | None = None
     # Transient: populated only by list_conversations on a content search;
     # never read from or written to the DB.
@@ -288,6 +295,9 @@ class MessageData(BaseModel):
         turn, e.g. Codex ``turn/completed`` with status
         ``"interrupted"``. Defaults to ``False`` and is omitted from
         serialized payloads in that case.
+    :param stream_message_id: Native live-preview stream finalized by
+        this assistant message. Persisted so reconnect snapshots can
+        suppress delayed preview chunks after the authoritative item.
     """
 
     role: Literal["user", "assistant"]
@@ -296,6 +306,7 @@ class MessageData(BaseModel):
     agent: str | None = Field(default=None, serialization_alias="model")
     is_meta: bool = Field(default=False, exclude_if=lambda value: value is False)
     interrupted: bool = Field(default=False, exclude_if=lambda value: value is False)
+    stream_message_id: str | None = None
 
     @model_validator(mode="after")
     def check_agent_for_assistant(self) -> MessageData:

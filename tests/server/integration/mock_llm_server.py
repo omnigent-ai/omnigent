@@ -460,6 +460,110 @@ def anthropic_sse_text_response(
     return "".join(events)
 
 
+def anthropic_sse_thinking_text_response(
+    thinking: str,
+    text: str,
+    model: str = "mock-model",
+    usage: dict | None = None,
+) -> str:
+    """Build Anthropic Messages API SSE stream: a thinking block, then text.
+
+    Emits the extended-thinking wire shape — ``content_block_start`` of type
+    ``thinking``, word-chunked ``thinking_delta`` events, a ``signature_delta``,
+    ``content_block_stop`` — followed by the normal text block. Scripts a model
+    turn that visibly thinks before answering (e.g. Claude Code streaming
+    thinking into its TUI and transcript).
+
+    :param thinking: The thought text streamed in the thinking block.
+    :param text: The final assistant text streamed after the thought.
+    :param usage: Optional prompt-usage overrides merged into
+        ``message_start`` (see :func:`anthropic_sse_text_response`).
+    """
+    msg_id = f"msg_{_uuid_mod.uuid4().hex[:12]}"
+    output_tokens = max(5, len(text.split()) + len(thinking.split()))
+
+    events: list[str] = []
+
+    def _evt(evt_type: str, data: dict) -> None:
+        events.append(f"event: {evt_type}\ndata: {json.dumps(data)}\n\n")
+
+    _evt(
+        "message_start",
+        {
+            "type": "message_start",
+            "message": {
+                "id": msg_id,
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": model,
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": {"input_tokens": 10, "output_tokens": 0, **(usage or {})},
+            },
+        },
+    )
+    _evt(
+        "content_block_start",
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "thinking", "thinking": "", "signature": ""},
+        },
+    )
+    # Word-chunked deltas so a paced stream (``chunk_delay``) shows the
+    # thought arriving progressively, the way a real thinking turn does.
+    words = thinking.split(" ")
+    for at in range(0, len(words), 6):
+        _evt(
+            "content_block_delta",
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {
+                    "type": "thinking_delta",
+                    "thinking": " ".join(words[at : at + 6]) + " ",
+                },
+            },
+        )
+    _evt(
+        "content_block_delta",
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "signature_delta", "signature": "mock-signature"},
+        },
+    )
+    _evt("content_block_stop", {"type": "content_block_stop", "index": 0})
+    _evt(
+        "content_block_start",
+        {
+            "type": "content_block_start",
+            "index": 1,
+            "content_block": {"type": "text", "text": ""},
+        },
+    )
+    _evt(
+        "content_block_delta",
+        {
+            "type": "content_block_delta",
+            "index": 1,
+            "delta": {"type": "text_delta", "text": text},
+        },
+    )
+    _evt("content_block_stop", {"type": "content_block_stop", "index": 1})
+    _evt(
+        "message_delta",
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+            "usage": {"output_tokens": output_tokens},
+        },
+    )
+    _evt("message_stop", {"type": "message_stop"})
+    return "".join(events)
+
+
 def anthropic_sse_tool_call_response(
     tool_calls: list[dict[str, str]],
     model: str = "mock-model",
@@ -648,6 +752,14 @@ class QueuedResponse:
     # this category (e.g. ``"cyber"``) instead of text — used to exercise
     # Claude Code's refusal-fallback on the claude-sdk harness.
     refusal_category: str | None = None
+    # When set, ``/v1/messages`` streams an extended-thinking block carrying
+    # this text before the ``text`` block — scripts a turn where the model
+    # visibly thinks before answering.
+    thinking: str | None = None
+    # Seconds to sleep between SSE events on ``/v1/messages``. ``0`` keeps the
+    # historical single-chunk body; a small value paces the stream so live
+    # surfaces (a native TUI) visibly render intermediate deltas.
+    chunk_delay: float = 0.0
     _gate: asyncio.Event = field(default_factory=asyncio.Event)
     _pending: asyncio.Event = field(default_factory=asyncio.Event)
 
@@ -982,6 +1094,10 @@ async def create_message(
         sse_body = anthropic_sse_refusal_response(model=echo_model, category=qr.refusal_category)
     elif qr.tool_calls:
         sse_body = anthropic_sse_tool_call_response(qr.tool_calls, model=echo_model)
+    elif qr.thinking:
+        sse_body = anthropic_sse_thinking_text_response(
+            qr.thinking, qr.text, model=echo_model, usage=qr.usage
+        )
     else:
         sse_body = anthropic_sse_text_response(qr.text, model=echo_model, usage=qr.usage)
 
@@ -989,8 +1105,19 @@ async def create_message(
     if qr.truncate_after is not None:
         sse_body = truncate_sse(sse_body, qr.truncate_after)
 
+    chunk_delay = qr.chunk_delay
+
     async def _generate() -> AsyncIterator[str]:
-        yield sse_body
+        if chunk_delay > 0:
+            # Pace the stream one SSE event at a time so live surfaces
+            # render intermediate deltas instead of one instant repaint.
+            for event in sse_body.split("\n\n"):
+                if not event:
+                    continue
+                yield event + "\n\n"
+                await asyncio.sleep(chunk_delay)
+        else:
+            yield sse_body
 
     return StreamingResponse(
         _generate(),
@@ -1195,6 +1322,8 @@ async def configure(request: Request) -> dict[str, object]:
                     truncate_after=entry.get("truncate_after"),
                     usage=entry.get("usage"),
                     refusal_category=entry.get("refusal_category"),
+                    thinking=entry.get("thinking"),
+                    chunk_delay=entry.get("chunk_delay", 0.0),
                 )
             )
         count = len(queue.responses)

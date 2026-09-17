@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
-from collections.abc import AsyncIterator
+import threading
+from collections.abc import AsyncIterator, Callable
+from functools import partial
 from pathlib import Path
 
 from omnigent.harnesses.claude_native.bridge import (
@@ -14,8 +17,10 @@ from omnigent.harnesses.claude_native.bridge import (
     SWITCH_MODEL_DIALOG_HINT,
     ClaudePromptTimeout,
     TmuxSessionNotAdvertised,
+    cancellable_injection,
     inject_slash_command,
     inject_user_message,
+    is_auth_slash_command,
     kill_session,
     read_active_session_id,
     read_claude_status_model,
@@ -99,13 +104,17 @@ class ClaudeNativeExecutor(Executor):
         text = _content_to_text(content, self._bridge_dir)
         if not text:
             return False
+        if is_auth_slash_command(text):
+            # Same dead end as in run_turn(): /login and /logout must
+            # never be typed into the pane. Refusing the live injection
+            # keeps the runner's buffered copy (no injection.consumed is
+            # emitted), so the message re-arrives as the next turn and
+            # run_turn's short-circuit answers it with the `omni setup`
+            # guidance instead of spending a model turn on it.
+            return False
         try:
             async with self._inject_lock:
-                await asyncio.to_thread(
-                    inject_user_message,
-                    self._bridge_dir,
-                    content=text,
-                )
+                await self._inject(partial(inject_user_message, self._bridge_dir, content=text))
         except RuntimeError:
             return False
         return True
@@ -153,6 +162,23 @@ class ClaudeNativeExecutor(Executor):
         if not text:
             yield ExecutorError(message="Claude native turn had no user text to send")
             return
+        if is_auth_slash_command(text):
+            # Claude Code's sign-in flow is an interactive TUI handoff the
+            # bridge cannot drive, so /login is escaped into plain text and
+            # reaches the model as a prompt. An expired login answers it with
+            # "Login expired · Please run /login" — a loop. Point at the host
+            # command that does re-authenticate instead of typing anything.
+            # `omni setup` covers both directions: its harness menu signs in
+            # (`claude auth login --claudeai`) and signs out (`claude auth
+            # logout`), so one pointer serves /login and /logout alike.
+            yield ExecutorError(
+                message=(
+                    "Claude Code's sign-in runs in its own terminal, so /login and "
+                    "/logout do nothing from the web chat. Run omni setup on the host "
+                    "to sign in again — or to sign out — then retry."
+                )
+            )
+            return
         from omnigent.runtime import telemetry
 
         # Span the tmux send-keys inject — the input half of the decoupled
@@ -183,20 +209,20 @@ class ClaudeNativeExecutor(Executor):
                         # sessions. Runs to completion before the message
                         # inject below (same lock), so its confirm Enter can't
                         # race the message.
-                        await asyncio.to_thread(
-                            inject_slash_command,
-                            self._bridge_dir,
-                            command=f"/model {wanted_model_arg}",
-                            auto_confirm=True,
-                            confirm_hint=SWITCH_MODEL_DIALOG_HINT,
+                        await self._inject(
+                            partial(
+                                inject_slash_command,
+                                self._bridge_dir,
+                                command=f"/model {wanted_model_arg}",
+                                auto_confirm=True,
+                                confirm_hint=SWITCH_MODEL_DIALOG_HINT,
+                            )
                         )
                         # Track the routed id, not the alias: the next turn's
                         # comparison is against what routing asked for.
                         self._applied_model = wanted_model
-                    await asyncio.to_thread(
-                        inject_user_message,
-                        self._bridge_dir,
-                        content=text,
+                    await self._inject(
+                        partial(inject_user_message, self._bridge_dir, content=text)
                     )
         except ClaudePromptTimeout as exc:
             _logger.exception(
@@ -217,6 +243,23 @@ class ClaudeNativeExecutor(Executor):
             yield ExecutorError(message=describe_exception(exc))
             return
         yield TurnComplete(response=None)
+
+    async def _inject(self, operation: Callable[[], None]) -> None:
+        """Drain cancelled delivery workers before releasing the pane's injection lock."""
+        cancelled = threading.Event()
+        with cancellable_injection(cancelled):
+            worker = asyncio.create_task(asyncio.to_thread(operation))
+        try:
+            await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            cancelled.set()
+            while not worker.done():
+                with contextlib.suppress(Exception, asyncio.CancelledError):
+                    await asyncio.shield(worker)
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                worker.result()
+            self._reap_failed_turn()
+            raise
 
     def _reap_failed_turn(self) -> str | None:
         """Kill the Claude pane before a delivery timeout becomes ``failed``."""

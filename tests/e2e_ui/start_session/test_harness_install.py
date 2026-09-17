@@ -21,6 +21,8 @@ from typing import Any
 
 from playwright.async_api import Route, async_playwright, expect
 
+from tests.e2e_ui.start_session.helpers import stub_empty_host_picker_data
+
 _HOST_ID = "host_e2e"
 # The stub host reports Claude ready and Codex missing. Claude remains the
 # selected inline default, so Codex exercises the picker's More submenu before
@@ -193,6 +195,7 @@ async def _register_routes(page, *, install_requests: list[str]) -> None:
 
     await page.route("**/v1/info", handle_info)
     await page.route("**/v1/hosts", handle_hosts)
+    await stub_empty_host_picker_data(page, _HOST_ID)
     await page.route("**/v1/agents", handle_agents)
     await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
     await page.route("**/v1/harnesses", handle_harnesses)
@@ -247,6 +250,8 @@ async def _drive_install(base_url: str) -> None:
             codex_option = page.get_by_test_id("new-chat-landing-agent-ag_codex_e2e")
             await expect(codex_option).to_be_visible(timeout=60_000)
             await codex_option.click()
+            await page.keyboard.press("Escape")
+            await expect(page.get_by_role("menu")).to_have_count(0)
 
             setup = page.get_by_test_id("new-chat-landing-harness-setup")
             await expect(setup).to_be_visible(timeout=60_000)

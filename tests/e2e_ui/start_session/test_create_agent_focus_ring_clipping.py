@@ -29,6 +29,8 @@ from typing import Any
 
 from playwright.async_api import Route, async_playwright, expect
 
+from tests.e2e_ui.start_session.helpers import stub_empty_host_picker_data
+
 # Stubbed host the composer auto-selects.
 _HOST_ID = "host_e2e"
 
@@ -196,6 +198,7 @@ async def _register_routes(page) -> None:
         )
 
     await page.route("**/v1/hosts", handle_hosts)
+    await stub_empty_host_picker_data(page, _HOST_ID)
     await page.route("**/v1/agents", handle_agents)
     await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
 
@@ -238,6 +241,7 @@ async def _drive_focus_ring(base_url: str) -> None:
 
             # Open the agent picker and click "Create custom agent".
             await page.get_by_test_id("new-chat-landing-agent-select").click()
+            await page.get_by_test_id("new-chat-landing-custom-agents").click()
             await page.get_by_test_id("new-chat-landing-create-agent").click()
 
             dialog = page.get_by_test_id("create-agent-dialog")

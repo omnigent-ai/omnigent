@@ -258,6 +258,9 @@ async def start_direct_attach_listener(app: FastAPI) -> DirectAttachListener | N
         port=0,
         log_level="warning",
         access_log=False,
+        # The default dictConfig closes process-wide handlers and can block
+        # startup while asynchronous handlers drain. Reuse runner logging.
+        log_config=None,
     )
     server = uvicorn.Server(config)
     task = asyncio.create_task(server.serve(), name="runner-direct-attach")

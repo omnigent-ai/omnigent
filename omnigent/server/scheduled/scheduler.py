@@ -314,6 +314,7 @@ class ScheduledTaskScheduler:
 # Strong references to in-flight fire coroutines. ``loop.create_task`` only
 # holds a weak reference, so without this a fire could be garbage-collected
 # mid-flight; we discard each task from the set when it completes.
+# custom-lint: disable-next=workspace-scoped-cache -- set of Task objects
 _PENDING_FIRES: set[Any] = set()
 
 

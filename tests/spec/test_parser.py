@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+import ntpath
+from functools import partialmethod
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import yaml
 
 from omnigent.errors import OmnigentError
+from omnigent.inner import sandbox
+from omnigent.spec import parser
 from omnigent.spec.parser import _parse_skill, discover_host_skills, parse
 from omnigent.spec.types import ApiKeyAuth, DatabricksAuth, ProviderAuth, SharePolicy
 
@@ -428,6 +434,76 @@ def test_parse_instructions_file_reference(agent_dir: Path) -> None:
     assert spec.instructions == "Custom system prompt from file."
 
 
+@pytest.mark.parametrize("instruction_key", ["instructions", "prompt"])
+def test_parse_instructions_embedded_nul_stays_literal(
+    agent_dir: Path, instruction_key: str
+) -> None:
+    value = "invalid\0instructions.md"
+    config = {"spec_version": 1, instruction_key: value}
+    (agent_dir / "config.yaml").write_text(yaml.dump(config))
+    (agent_dir / "AGENTS.md").write_text("Lower-priority instructions.")
+
+    assert parse(agent_dir).instructions == value
+
+
+@pytest.mark.parametrize("instruction_key", ["instructions", "prompt", None])
+def test_parse_instructions_decode_error_propagates(
+    agent_dir: Path, monkeypatch: pytest.MonkeyPatch, instruction_key: str | None
+) -> None:
+    """Decode real files as UTF-8 regardless of the test machine's locale."""
+    monkeypatch.setattr(Path, "read_text", partialmethod(Path.read_text, encoding="utf-8"))
+    config = {"spec_version": 1}
+    if instruction_key is not None:
+        config[instruction_key] = "AGENTS.md"
+    (agent_dir / "config.yaml").write_text(yaml.dump(config))
+    (agent_dir / "AGENTS.md").write_bytes(b"\xff")
+    (agent_dir / "CLAUDE.md").write_text("Lower-priority instructions.")
+
+    with pytest.raises(UnicodeDecodeError):
+        parse(agent_dir)
+
+
+@pytest.mark.parametrize(
+    "resolved_root",
+    [
+        pytest.param(r"\\server\share", id="unc-share"),
+        pytest.param("\\\\server\\share\\", id="unc-share-trailing-separator"),
+        pytest.param(r"\\?\UNC\server\share", id="extended-unc-share"),
+        pytest.param(r"C:\bundle", id="drive-directory"),
+    ],
+)
+@pytest.mark.parametrize("outside", [False, True], ids=["contained", "sibling"])
+def test_read_contained_file_windows_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, resolved_root: str, outside: bool
+) -> None:
+    """Simulate Windows canonical paths without requiring a live network share."""
+    resolved_candidate = (
+        resolved_root.rstrip(ntpath.sep) + ("-other" if outside else "") + r"\AGENTS.md"
+    )
+    realpath = Mock(side_effect=[resolved_root, resolved_candidate])
+    windows_os = SimpleNamespace(
+        path=SimpleNamespace(realpath=realpath, join=ntpath.join), sep=ntpath.sep
+    )
+    candidate = Mock(spec=Path)
+    candidate.is_file.return_value = True
+    candidate.read_text.return_value = "Instruction file contents."
+    path_factory = Mock(return_value=candidate)
+    monkeypatch.setattr(parser, "os", windows_os)
+    monkeypatch.setattr(sandbox, "os", windows_os)
+    monkeypatch.setattr(parser, "Path", path_factory)
+
+    result = parser._read_contained_file(tmp_path, "AGENTS.md")
+
+    assert realpath.call_count == 2
+    if outside:
+        assert result is None
+        path_factory.assert_not_called()
+    else:
+        assert result == "Instruction file contents."
+        path_factory.assert_called_once_with(resolved_candidate)
+        candidate.read_text.assert_called_once_with()
+
+
 def test_parse_instructions_rejects_path_traversal(tmp_path: Path) -> None:
     """An ``instructions`` value escaping the bundle is treated as literal text.
 
@@ -460,6 +536,74 @@ def test_parse_instructions_overrides_agents_md(agent_dir: Path) -> None:
     (agent_dir / "config.yaml").write_text(yaml.dump(config))
     spec = parse(agent_dir)
     assert spec.instructions == "Inline wins."
+
+
+@pytest.mark.parametrize("instruction_key", ["instructions", "prompt", None])
+@pytest.mark.parametrize("filename", ["AGENTS.md", "CLAUDE.md", ".cursorrules"])
+def test_parse_instructions_rejects_symlink_escape(
+    tmp_path: Path, instruction_key: str | None, filename: str
+) -> None:
+    secret = tmp_path / "secret.txt"
+    secret.write_text("TOP SECRET RUNNER FILE")
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    (bundle / filename).symlink_to(secret)
+    config = {"spec_version": 1, "name": "test-agent"}
+    if instruction_key is not None:
+        config[instruction_key] = filename
+    (bundle / "config.yaml").write_text(yaml.dump(config))
+
+    spec = parse(bundle)
+
+    assert spec.instructions == (filename if instruction_key is not None else None)
+
+
+@pytest.mark.parametrize("instruction_key", ["instructions", "prompt"])
+def test_parse_instructions_rejects_sibling_prefix(tmp_path: Path, instruction_key: str) -> None:
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    sibling = tmp_path / "bundle-other"
+    sibling.mkdir()
+    secret = sibling / "secret.txt"
+    secret.write_text("TOP SECRET RUNNER FILE")
+    config = {"spec_version": 1, instruction_key: str(secret)}
+    (bundle / "config.yaml").write_text(yaml.dump(config))
+
+    assert parse(bundle).instructions == str(secret)
+
+
+@pytest.mark.parametrize("root_kind", ["direct", "relative", "symlink"])
+@pytest.mark.parametrize("reference_kind", ["nested", "absolute", "symlink"])
+@pytest.mark.parametrize("instruction_key", ["instructions", "prompt"])
+def test_parse_instructions_reads_contained_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    root_kind: str,
+    reference_kind: str,
+    instruction_key: str,
+) -> None:
+    bundle = tmp_path / "bundle"
+    prompt_dir = bundle / "prompts"
+    prompt_dir.mkdir(parents=True)
+    prompt_file = prompt_dir / "system.md"
+    prompt_file.write_text("Contained instructions.")
+    reference = "prompts/system.md"
+    if reference_kind == "absolute":
+        reference = str(prompt_file)
+    elif reference_kind == "symlink":
+        (bundle / "linked.md").symlink_to(prompt_file)
+        reference = "linked.md"
+    config = {"spec_version": 1, instruction_key: reference}
+    (bundle / "config.yaml").write_text(yaml.dump(config))
+    root = bundle
+    if root_kind == "relative":
+        monkeypatch.chdir(tmp_path)
+        root = Path("bundle")
+    elif root_kind == "symlink":
+        root = tmp_path / "bundle-alias"
+        root.symlink_to(bundle, target_is_directory=True)
+
+    assert parse(root).instructions == "Contained instructions."
 
 
 def test_parse_instructions_file_overrides_agents_md(agent_dir: Path) -> None:
@@ -554,6 +698,25 @@ def test_auto_detect_none_when_no_context_files(agent_dir: Path) -> None:
     """No context files present → instructions is None."""
     spec = parse(agent_dir)
     assert spec.instructions is None
+
+
+def test_auto_detect_skips_escaping_context_file(tmp_path: Path) -> None:
+    secret = tmp_path / "secret.txt"
+    secret.write_text("TOP SECRET RUNNER FILE")
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    (bundle / "config.yaml").write_text(yaml.dump({"spec_version": 1}))
+    (bundle / "AGENTS.md").symlink_to(secret)
+    (bundle / "CLAUDE.md").write_text("Safe fallback.")
+
+    assert parse(bundle).instructions == "Safe fallback."
+
+
+def test_auto_detect_empty_context_file_keeps_priority(agent_dir: Path) -> None:
+    (agent_dir / "AGENTS.md").write_text("")
+    (agent_dir / "CLAUDE.md").write_text("Lower priority.")
+
+    assert parse(agent_dir).instructions == ""
 
 
 def test_parse_skill(agent_dir: Path) -> None:
@@ -3993,7 +4156,7 @@ def test_parse_credential_proxy_databricks_cli_rejected_on_macos(tmp_path: Path)
                     "source": {"env": "X", "file": "/tmp/s"},
                 }
             ],
-            r"exactly one of 'env', 'file', or 'command'",
+            r"exactly one of 'env', 'file', 'command', or 'unix_socket'",
         ),
         # Malformed ``env`` injection-shim name.
         (

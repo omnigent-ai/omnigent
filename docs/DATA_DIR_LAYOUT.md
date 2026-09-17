@@ -63,6 +63,33 @@ directly instead of going through `data_dir()`.
 | `profiles/` | cProfile output when CLI profiling is enabled. | `omnigent/cli.py` |
 | `debug/` **†** | Per-session JSONL event tapes, `events-<session_id>.jsonl`. | `omnigent/repl/_event_tape.py` |
 
+### Agent cache staging and recovery
+
+The server CLI places the extracted agent cache at `<artifact_dir>/.cache/`;
+`AgentCache` can also be constructed with another cache root. Each published
+bundle lives at `<cache_root>/<agent_id>/`. The reserved `.staging/` directory
+holds private `bundle-*` extractions and `backup-*/previous` directories used
+while replacing a bundle. These stay on the cache filesystem for `rename()`.
+
+Normal operations remove their scratch directories. If replacement and rollback
+both fail, the exception names the retained backup and the memory cache is
+invalidated so a later load can retry from the ArtifactStore. Cleanup errors
+emit a warning with the directory path instead of hiding the failure or
+changing the outcome of publication. A process crash can also leave scratch
+files without a warning.
+
+Retained backups and crash remnants are **not automatically reaped**. Monitor
+`.staging` disk usage, especially after storage or permission failures. To
+clean it up:
+
+1. Stop every process using that cache root, including any other server sharing
+   the volume. Age alone does not establish that a staging directory is unused.
+2. Inspect the named backups and keep anything needed for recovery. Confirm the
+   required agent bundles are available in the configured ArtifactStore.
+3. Remove only the reviewed `bundle-*` and `backup-*` entries in `.staging`,
+   repair disk-space or permission problems, and restart the server. Future
+   cache misses re-extract bundles from the ArtifactStore.
+
 ### Native harness state
 
 Some native (TUI) harnesses keep resumable session state under `~/.omnigent`:

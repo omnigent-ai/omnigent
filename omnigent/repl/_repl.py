@@ -30,6 +30,7 @@ from omnigent_client import (
     ResponseEndBlock,
     ResponseStartBlock,
     Session,
+    StaleCursorError,
     StreamHooks,
     ToolExecution,
     ToolGroup,
@@ -218,6 +219,10 @@ WELCOME_HINTS = ["/help help", "Ctrl+O debug", "Ctrl+T show tools", "Esc cancel"
 # overlay's single-page fetch silently dropped everything past
 # position 99.
 _LIST_ITEMS_PAGE_SIZE = 100
+
+# Full re-walks allowed when a page cursor's item is deleted mid-enumeration
+# before the overlay settles for whatever it managed to fetch.
+_LIST_ITEMS_MAX_RESTARTS = 3
 
 # Sub-agent tree (state badge + ``↓`` menu). The depth cap mirrors web's
 # ``MAX_TREE_DEPTH`` so the CLI tree matches the web Agents rail; the poll
@@ -6480,6 +6485,7 @@ async def _list_all_conversation_items(
     all_items: list[dict[str, object]] = []
     page_size = _LIST_ITEMS_PAGE_SIZE
     after: str | None = None
+    restarts = 0
     while True:
         try:
             raw_page = await client.sessions.list_items(
@@ -6488,7 +6494,19 @@ async def _list_all_conversation_items(
                 after=after,
                 order="asc",
             )
-        except Exception:  # noqa: BLE001 — overlay builder: any per-page error falls back to whatever was already fetched; partial sidebar beats no sidebar
+        except StaleCursorError:
+            # An item deleted mid-walk. Keeping the fetched prefix here is
+            # exactly the truncated-sidebar bug this walk exists to fix, so
+            # rebuild from the first page instead of settling for a partial
+            # list — unlike the broad fallback below, this failure is
+            # recoverable.
+            if restarts >= _LIST_ITEMS_MAX_RESTARTS:
+                break
+            restarts += 1
+            all_items = []
+            after = None
+            continue
+        except Exception:  # noqa: BLE001 — overlay builder: any other per-page error falls back to whatever was already fetched; partial sidebar beats no sidebar
             break
         page: list[dict[str, object]] = list(raw_page) if raw_page else []
         if not page:

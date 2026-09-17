@@ -1,29 +1,7 @@
-"""E2E: the New Chat picker leads with fully supported harnesses.
+"""E2E: the prototype picker leads with Claude Code, Cursor, and Codex.
 
-The landing composer (``NewChatLandingScreen`` in
-``web/src/shell/NewChatDialog.tsx``) splits its **Harnesses** group by *support
-level*, not host readiness: only harnesses flagged ``fullySupported`` in
-``web/src/lib/nativeCodingAgents.ts`` (Claude Code and Codex) list inline, and
-every other harness folds into the "More" submenu.
-
-Why the stub marks **every** harness configured: readiness could otherwise
-populate "More" on its own, and the test would pass without proving anything
-about the support-level split. With all four harnesses ready on the host, the
-only thing that can push Cursor and Pi behind "More" is the flag — so this
-covers the actual behavior rather than a confound.
-
-The two rules that interact with the split get their own assertions: the
-currently-selected harness is pinned inline even when it isn't fully supported
-(so the active pick is never buried), and the ordering inside "More" follows the
-same ``sortRank`` as the primary list.
-
-Why the ``page.route`` stubbing and the async-in-a-fresh-thread shape: both are
-inherited from ``chat/test_hide_unconfigured_harnesses.py`` — the e2e harness's
-runner tunnels into the server and registers no *host*, so faking ``/v1/hosts``
-(with ``configured_harnesses``) and ``/v1/agents`` is the established way to
-drive the landing picker, and once a pytest-playwright *sync* test has run in
-the session, pytest-asyncio can't start a loop on the main thread, so each
-async body runs in its own thread via :func:`asyncio.run`.
+Other harnesses stay in Other unless selected; the current pick is promoted on reopen.
+All stubbed harnesses are ready, so grouping is independent of availability.
 """
 
 from __future__ import annotations
@@ -37,14 +15,14 @@ from typing import Any
 
 from playwright.async_api import Route, async_playwright, expect
 
+from tests.e2e_ui.start_session.helpers import stub_empty_host_picker_data
+
 # Stubbed host the composer auto-selects (the tunneled runner registers no
 # host). Keyed identically in the recent-workspaces localStorage seed.
 _HOST_ID = "host_e2e"
 _HOST_NAME = "e2e-host"
 
-# Two fully supported harnesses (lead inline) and two that are not (fold into
-# "More"). Cursor (sortRank 30) precedes Pi (40), which the "More" ordering
-# assertion relies on.
+# Claude Code, Cursor and Codex are primary; Pi starts in Other.
 _CLAUDE_AGENT_ID = "ag_claude_e2e"
 _CODEX_AGENT_ID = "ag_codex_e2e"
 _CURSOR_AGENT_ID = "ag_cursor_e2e"
@@ -81,9 +59,7 @@ def _run_in_fresh_loop(coro: Coroutine[Any, Any, None]) -> None:
 def _hosts_body() -> str:
     """Stub body for ``GET /v1/hosts``: one online host, every harness ready.
 
-    Marking all four harnesses configured is the point of the fixture — it
-    removes readiness as a possible cause for the "More" grouping, leaving the
-    ``fullySupported`` flag as the only explanation.
+    All four harnesses are configured so availability cannot affect grouping.
     """
     return json.dumps(
         {
@@ -168,6 +144,7 @@ async def _register_routes(page) -> None:
         )
 
     await page.route("**/v1/hosts", handle_hosts)
+    await stub_empty_host_picker_data(page, _HOST_ID)
     await page.route("**/v1/agents", handle_agents)
     await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
 
@@ -177,16 +154,10 @@ async def _open_picker(page) -> None:
     await page.get_by_test_id("new-chat-landing-agent-select").click()
 
 
-def test_previously_launched_harness_is_promoted_inline(
+def test_recent_harness_remains_in_other_group(
     seeded_session: tuple[str, str],
 ) -> None:
-    """A harness in ``omnigent:recent-harnesses`` leads instead of hiding in "More".
-
-    Same fixture as the split test — every harness configured — so the promotion
-    can only come from the stored recents list. Seeding localStorage rather than
-    driving a real launch keeps this a picker test: the create path's write is
-    covered by the ``NewChatDialog.flow`` unit test.
-    """
+    """Recent launches do not change the prototype's primary harness order."""
     base_url, session_id = seeded_session
     del session_id  # this flow never creates a session — only reads the picker
     _run_in_fresh_loop(_drive_recent(base_url))
@@ -215,30 +186,22 @@ async def _drive_recent(base_url: str) -> None:
             )
             await _open_picker(page)
 
-            # Pi was launched before → inline alongside the supported harnesses.
+            # Recent Pi remains in Other, keeping the primary list stable.
             await expect(
                 page.get_by_test_id(f"new-chat-landing-agent-{_PI_AGENT_ID}")
-            ).to_be_visible(timeout=30_000)
-            # Cursor was not → still behind "More", so the promotion is specific
-            # to the stored entry rather than a blanket un-grouping.
+            ).to_have_count(0)
+            # Cursor is always primary, independently of launch history.
             await expect(
                 page.get_by_test_id(f"new-chat-landing-agent-{_CURSOR_AGENT_ID}")
-            ).to_have_count(0)
+            ).to_be_visible()
         finally:
             await browser.close()
 
 
-def test_picker_leads_with_fully_supported_harnesses(
+def test_picker_leads_with_primary_harnesses(
     seeded_session: tuple[str, str],
 ) -> None:
-    """Claude Code and Codex lead; other harnesses fold into "More".
-
-    1. **primary list** — Claude Code and Codex render inline, in rank order.
-    2. **"More"** — Cursor and Pi are absent inline and appear (in rank order)
-       only after opening the submenu, even though the host reports both ready.
-    3. **selected pick pinned** — choosing Pi promotes it inline, so the active
-       harness is never buried behind a hover.
-    """
+    """Primary harnesses lead; the selected secondary harness joins them on reopen."""
     base_url, session_id = seeded_session
     del session_id  # this flow never creates a session — only reads the picker
     _run_in_fresh_loop(_drive(base_url))
@@ -271,11 +234,10 @@ async def _drive(base_url: str) -> None:
             await expect(claude).to_be_visible(timeout=30_000)
             await expect(codex).to_be_visible(timeout=30_000)
 
-            # 2. Cursor and Pi are configured on this host yet still not inline:
-            #    support level, not readiness, put them behind "More".
+            # Cursor is primary; Pi appears only after opening Other.
             await expect(
                 page.get_by_test_id(f"new-chat-landing-agent-{_CURSOR_AGENT_ID}")
-            ).to_have_count(0)
+            ).to_be_visible()
             await expect(
                 page.get_by_test_id(f"new-chat-landing-agent-{_PI_AGENT_ID}")
             ).to_have_count(0)
@@ -285,25 +247,24 @@ async def _drive(base_url: str) -> None:
             pi_row = page.get_by_test_id(f"new-chat-landing-agent-{_PI_AGENT_ID}")
             await expect(cursor_row).to_be_visible(timeout=30_000)
             await expect(pi_row).to_be_visible()
-            # "More" keeps the primary list's rank ordering: Cursor (30) → Pi (40).
+            # Primary rows precede the Other submenu.
             assert await _renders_before(page, _CURSOR_AGENT_ID, _PI_AGENT_ID), (
-                "expected Cursor to render before Pi inside the More submenu"
+                "expected primary Cursor row to precede Pi in Other"
             )
 
-            # 3. Committing Pi pins it inline — the active pick is never buried.
+            # Selecting Pi keeps its config reachable, then promotes it on reopen.
             await pi_row.click()
-            await expect(page.get_by_test_id("new-chat-landing-agent-select")).to_contain_text(
-                "Pi"
+            await expect(page.get_by_test_id("new-chat-landing-agent-select")).to_have_attribute(
+                "aria-label", re.compile("Pi")
             )
-            # Committing closes the menu; wait for it to unmount before
-            # reopening, else the click lands mid-close and never reopens.
-            await page.get_by_test_id("new-chat-landing-harness-more").wait_for(
-                state="detached", timeout=10_000
-            )
+            await page.keyboard.press("Escape")
+            await expect(page.get_by_role("menu")).to_have_count(0)
             await _open_picker(page)
+            await expect(page.get_by_test_id("new-chat-landing-harness-more")).to_have_count(0)
+            await expect(pi_row).to_be_visible()
             await expect(
                 page.get_by_test_id(f"new-chat-landing-agent-{_PI_AGENT_ID}")
-            ).to_be_visible(timeout=30_000)
+            ).to_have_attribute("data-active", "true")
         finally:
             await browser.close()
 

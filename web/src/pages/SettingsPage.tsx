@@ -11,7 +11,8 @@
  *
  * - **General** — app-wide behavior preferences.
  * - **Appearance** — theme mode (System / Light / Dark), terminal theme,
- *   default transcript view, Workspace panel default, and UI/code font controls.
+ *   default transcript view, Workspace panel and tab defaults, and UI/code font
+ *   controls.
  * - **Git** — Git behavior: the global "always use a random worktree" default
  *   and the default base branch pre-filled when naming a new worktree branch.
  * - **Keyboard shortcuts** — the full shortcuts reference, shown inline.
@@ -41,11 +42,15 @@ import {
   useRef,
   useState,
 } from "react";
+import GithubMono from "@lobehub/icons/es/Github/components/Mono";
 import { useViewerId } from "@/hooks/useViewerId";
 import {
   ArchiveRestoreIcon,
   AlertTriangleIcon,
+  BotIcon,
   DownloadIcon,
+  FileDiffIcon,
+  FilesIcon,
   KeyRoundIcon,
   Loader2Icon,
   LaptopMinimalIcon,
@@ -105,6 +110,12 @@ import {
   fetchGithubStatus,
   type GithubConnectionStatus,
 } from "@/lib/githubIntegration";
+import {
+  beginDatabricksConnect,
+  disconnectDatabricks,
+  fetchDatabricksStatus,
+  type DatabricksConnectionStatus,
+} from "@/lib/databricksIntegration";
 import { getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useOmnigentAnalytics, useOmnigentPageView } from "@/lib/analytics";
@@ -173,6 +184,12 @@ import {
   writeTranscriptViewDefault,
   type TranscriptViewDefault,
 } from "@/lib/transcriptViewPreferences";
+import {
+  DEFAULT_WORKSPACE_TAB,
+  readDefaultWorkspaceTab,
+  writeDefaultWorkspaceTab,
+  type DefaultWorkspaceTab,
+} from "@/lib/workspaceTabPreferences";
 import { readDefaultBaseBranch, writeDefaultBaseBranch } from "@/lib/baseBranchPreferences";
 import { readAlwaysSteer, writeAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import {
@@ -354,11 +371,22 @@ const workspacePanelCards: {
   { value: "collapsed", label: "Collapsed", icon: PanelRightCloseIcon },
 ];
 
+const workspaceTabCards: {
+  value: DefaultWorkspaceTab;
+  label: string;
+  icon: ComponentType<{ className?: string }>;
+}[] = [
+  { value: "files", label: "Files", icon: FilesIcon },
+  { value: "changes", label: "Changes", icon: FileDiffIcon },
+  { value: "github", label: "GitHub", icon: GithubMono },
+  { value: "subagents", label: "Agents", icon: BotIcon },
+];
+
 /** Centered icon + label body shared by the Mode and Terminal theme cards. */
-function iconCardBody(Icon: typeof SunIcon, label: string) {
+function iconCardBody(Icon: ComponentType<{ className?: string }>, label: string) {
   return (
     <>
-      <Icon className="size-6 text-muted-foreground" />
+      <Icon aria-hidden="true" className="size-6 text-muted-foreground" />
       <span className="text-ui font-medium">{label}</span>
     </>
   );
@@ -512,6 +540,36 @@ function WorkspacePanelDefaultControl() {
         items={workspacePanelCards.map((card) => ({
           value: card.value,
           testId: `workspace-panel-default-${card.value}`,
+          body: iconCardBody(card.icon, card.label),
+        }))}
+      />
+    </ThemeSubsection>
+  );
+}
+
+/** Fallback tab for sessions without a remembered Workspace tab. */
+function WorkspaceTabDefaultControl() {
+  const [value, setValue] = useState(() => readDefaultWorkspaceTab());
+  const labelId = useId();
+  const choose = useCallback((next: DefaultWorkspaceTab) => {
+    setValue(next);
+    writeDefaultWorkspaceTab(next);
+  }, []);
+  return (
+    <ThemeSubsection
+      labelId={labelId}
+      title="Default Workspace tab"
+      helper="Shown first in Workspace. Changing this also updates existing chats when reopened or refreshed. Later tab choices are remembered. File links still open the linked file."
+    >
+      <CardRadioGroup<DefaultWorkspaceTab>
+        labelledBy={labelId}
+        value={value}
+        onSelect={choose}
+        className="grid grid-cols-2 gap-3 sm:grid-cols-4"
+        cardClassName="items-center gap-2 p-4"
+        items={workspaceTabCards.map((card) => ({
+          value: card.value,
+          testId: `workspace-tab-default-${card.value}`,
           body: iconCardBody(card.icon, card.label),
         }))}
       />
@@ -760,6 +818,8 @@ function AppearanceSection() {
 
     writeWorkspacePanelDefault(WORKSPACE_PANEL_DEFAULT);
 
+    writeDefaultWorkspaceTab(DEFAULT_WORKSPACE_TAB);
+
     writeHideUnconfiguredHarnesses(DEFAULT_HIDE_UNCONFIGURED_HARNESSES);
 
     applyDesktopUiFontSize(UI_FONT_SIZE_DEFAULT);
@@ -786,6 +846,7 @@ function AppearanceSection() {
           "omnigent:custom-theme",
           "omnigent:default-transcript-view",
           "omnigent:default-workspace-panel",
+          "omnigent:default-workspace-tab",
           "omnigent:hide-unconfigured-harnesses",
         ]) {
           window.localStorage.removeItem(key);
@@ -869,6 +930,8 @@ function AppearanceSection() {
         <TranscriptViewDefaultControl />
 
         <WorkspacePanelDefaultControl />
+
+        <WorkspaceTabDefaultControl />
 
         <HideUnconfiguredHarnessesControl />
 
@@ -1026,6 +1089,7 @@ function GithubMark({ className }: { className?: string }) {
  */
 const CONNECTION_PANELS: Record<string, ComponentType> = {
   github: GithubIntegrationControl,
+  databricks: DatabricksIntegrationControl,
 };
 
 /**
@@ -1207,6 +1271,131 @@ function AlwaysUseWorktreeControl() {
         className="mt-0.5 shrink-0"
         componentId="settings.git.always_use_worktree"
       />
+    </div>
+  );
+}
+
+/**
+ * Connect / disconnect a Databricks workspace. Once connected, a managed
+ * sandbox launched by this user reaches the Databricks AI Gateway (MCP + model
+ * serving) as them, using their per-user OAuth token. Databricks is
+ * multi-workspace, so the user supplies their workspace URL. The connect action
+ * is a full-page redirect to the workspace OAuth consent; on return the callback
+ * lands here with ``?databricks=connected|error``.
+ */
+function DatabricksIntegrationControl() {
+  const [status, setStatus] = useState<DatabricksConnectionStatus | null | "loading">("loading");
+  const [busy, setBusy] = useState(false);
+  const [notice, setNotice] = useState<"connected" | "error" | null>(null);
+  const [workspace, setWorkspace] = useState("");
+
+  const refresh = useCallback(async () => {
+    try {
+      setStatus(await fetchDatabricksStatus());
+    } catch {
+      setStatus(null);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+    const params = new URLSearchParams(window.location.search);
+    const outcome = params.get("databricks");
+    if (outcome === "connected" || outcome === "error") {
+      setNotice(outcome);
+      params.delete("databricks");
+      const qs = params.toString();
+      window.history.replaceState({}, "", `${window.location.pathname}${qs ? `?${qs}` : ""}`);
+    }
+  }, [refresh]);
+
+  const onDisconnect = useCallback(async () => {
+    setBusy(true);
+    try {
+      await disconnectDatabricks();
+      await refresh();
+    } finally {
+      setBusy(false);
+    }
+  }, [refresh]);
+
+  const returnTo = `${window.location.pathname}${window.location.search}`;
+
+  // Feature not configured on this server: render nothing (like a build without it).
+  if (status !== "loading" && status !== null && !status.enabled) {
+    return null;
+  }
+  if (status === "loading") {
+    return <p className="text-sm text-muted-foreground">Checking…</p>;
+  }
+  if (status === null) {
+    return <p className="text-sm text-muted-foreground">Databricks status is unavailable.</p>;
+  }
+
+  return (
+    <div className="flex flex-col gap-4">
+      {notice === "connected" && (
+        <div
+          role="status"
+          className="rounded-md border border-success/40 bg-success/10 px-3 py-2 text-sm"
+        >
+          Databricks workspace connected.
+        </div>
+      )}
+      {notice === "error" && (
+        <div
+          role="alert"
+          className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+        >
+          Couldn't connect your Databricks workspace. Please try again.
+        </div>
+      )}
+
+      <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
+        <div className="flex min-w-0 flex-1 flex-col">
+          <span className="text-sm font-medium">Databricks</span>
+          <span className="text-sm text-muted-foreground">
+            {status.connected && status.workspace_host
+              ? `Connected to ${status.workspace_host}${status.databricks_user ? ` as ${status.databricks_user}` : ""}. New sandboxes reach the Databricks AI Gateway (MCP + model serving) as you.`
+              : "Connect your Databricks workspace so new sandboxes reach its AI Gateway (MCP + model serving) as you."}
+          </span>
+        </div>
+        <div className="flex shrink-0 items-center gap-2">
+          {status.connected ? (
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-9"
+              disabled={busy}
+              data-testid="databricks-disconnect"
+              onClick={() => void onDisconnect()}
+            >
+              Disconnect
+            </Button>
+          ) : (
+            <>
+              <Input
+                type="text"
+                inputMode="url"
+                placeholder="workspace-host.cloud.databricks.com"
+                className="h-9 w-64"
+                value={workspace}
+                onChange={(e) => setWorkspace(e.target.value)}
+                data-testid="databricks-workspace"
+              />
+              <Button
+                size="sm"
+                className="h-9"
+                disabled={busy || workspace.trim() === ""}
+                data-testid="databricks-connect"
+                onClick={() => beginDatabricksConnect(workspace.trim(), returnTo)}
+              >
+                Connect Databricks
+              </Button>
+            </>
+          )}
+        </div>
+      </div>
     </div>
   );
 }

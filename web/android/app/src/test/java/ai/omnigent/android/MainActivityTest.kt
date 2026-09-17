@@ -4,9 +4,13 @@ import android.content.Context
 import android.content.RestrictionsManager
 import android.content.res.Configuration
 import android.os.Bundle
+import android.os.Looper
+import android.text.TextUtils
+import android.view.View
 import android.view.ViewGroup
 import android.webkit.RenderProcessGoneDetail
 import android.webkit.WebView
+import android.widget.TextView
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.test.core.app.ApplicationProvider
 import org.junit.Assert.assertEquals
@@ -22,6 +26,7 @@ import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
 import org.robolectric.shadow.api.Shadow
 import org.robolectric.shadows.ShadowRestrictionsManager
+import java.time.Duration
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35])
@@ -84,6 +89,81 @@ class MainActivityTest {
         activity.onConfigurationChanged(lightConfiguration)
         assertTrue(insetsController.isAppearanceLightStatusBars)
         assertTrue(insetsController.isAppearanceLightNavigationBars)
+    }
+
+    @Test
+    fun `navigation hides the server pill until the watchdog expires`() {
+        val activity = launch()
+        val webView = activity.webView()
+        val pill = activity.switchButton()
+
+        webView.webViewClient.onPageStarted(webView, "https://example.com/app", null)
+        assertEquals(View.GONE, pill.visibility)
+
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(7))
+        assertEquals(View.VISIBLE, pill.visibility)
+    }
+
+    @Test
+    fun `picker requests cancel the watchdog and hide a visible fallback`() {
+        val activity = launch()
+        val webView = activity.webView()
+
+        webView.webViewClient.onPageStarted(webView, "https://example.com/app", null)
+        activity.invoke("onServerPickerRequested")
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(7))
+        assertEquals(View.GONE, activity.switchButton().visibility)
+
+        webView.webViewClient.onPageStarted(webView, "https://example.com/app", null)
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(7))
+        assertEquals(View.VISIBLE, activity.switchButton().visibility)
+
+        activity.invoke("onServerPickerRequested")
+
+        assertEquals(View.GONE, activity.switchButton().visibility)
+        val script = shadowOf(webView).lastEvaluatedJavascript.orEmpty()
+        assertTrue(script.contains("__omnigentNativeEmitServerPicker"))
+        assertTrue(script.contains("currentOrigin") && script.contains("example.com"))
+    }
+
+    @Test
+    fun `server switches accept only picker-offered URLs`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        ServerStore(context).connect("https://second.example.test")
+        val activity = launch()
+
+        activity.invoke(
+            "onSwitchServerRequested",
+            arrayOf(String::class.java),
+            "https://unlisted.example.test",
+        )
+        assertEquals("https://example.com", ServerStore(context).currentServerUrl())
+
+        activity.invoke(
+            "onSwitchServerRequested",
+            arrayOf(String::class.java),
+            "https://second.example.test",
+        )
+        assertEquals("https://second.example.test", ServerStore(context).currentServerUrl())
+        assertEquals("https://second.example.test", shadowOf(activity.webView()).lastLoadedUrl)
+    }
+
+    @Test
+    fun `server pill tracks the container width and truncates in the middle`() {
+        val activity = launch()
+        val pill = activity.switchButton() as TextView
+        val container = pill.parent as ViewGroup
+        val density = activity.resources.displayMetrics.density
+
+        container.layout(0, 0, (300 * density).toInt(), (800 * density).toInt())
+        assertEquals((120 * density).toInt(), pill.maxWidth)
+
+        container.layout(0, 0, (400 * density).toInt(), (800 * density).toInt())
+        assertEquals((152 * density).toInt(), pill.maxWidth)
+
+        container.layout(0, 0, (500 * density).toInt(), (800 * density).toInt())
+        assertEquals((172 * density).toInt(), pill.maxWidth)
+        assertEquals(TextUtils.TruncateAt.MIDDLE, pill.ellipsize)
     }
 
     @Test
@@ -251,4 +331,28 @@ class MainActivityTest {
             .getDeclaredField("webView")
             .apply { isAccessible = true }
             .get(this) as WebView
+
+    private fun launch(): MainActivity {
+        ServerStore(ApplicationProvider.getApplicationContext()).connect("https://example.com")
+        return Robolectric.buildActivity(MainActivity::class.java).setup().get()
+    }
+
+    private fun MainActivity.switchButton(): View =
+        MainActivity::class
+            .java
+            .getDeclaredField("switchButton")
+            .apply { isAccessible = true }
+            .get(this) as View
+
+    private fun MainActivity.invoke(
+        name: String,
+        parameterTypes: Array<Class<*>> = emptyArray(),
+        vararg args: Any,
+    ) {
+        MainActivity::class
+            .java
+            .getDeclaredMethod(name, *parameterTypes)
+            .apply { isAccessible = true }
+            .invoke(this, *args)
+    }
 }

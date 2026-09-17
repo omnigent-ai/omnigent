@@ -210,7 +210,7 @@ async def _mint_token(client: httpx.AsyncClient) -> str:
 async def test_default_deployment_does_not_serve_the_grant(
     unconfigured_env: httpx.AsyncClient,
 ) -> None:
-    """BLOCKING contract: the grant stays off for a deployment that never opted in.
+    """The grant stays off for a deployment that never opted in.
 
     ``/oauth/token`` itself is routed regardless — the app mounts it for
     login-issued refresh grants — so the default-off signal is the grant type
@@ -270,7 +270,7 @@ async def _login_grant_token(client: httpx.AsyncClient) -> str:
 async def test_login_grant_keeps_full_authority_beside_the_machine_grant(
     env: SimpleNamespace,
 ) -> None:
-    """BLOCKING invariant: the two token shapes must not swap authority.
+    """The two token shapes must not swap authority.
 
     In one app, one process: a machine token (``scope``, no ``grant_id``) is
     confined to the delegated allowlist, while a login-grant token
@@ -297,6 +297,7 @@ async def test_login_grant_keeps_full_authority_beside_the_machine_grant(
 
 
 async def test_bad_client_is_rejected(env: SimpleNamespace) -> None:
+    """A wrong secret is 401 invalid_client; an unknown grant type is 400."""
     bad = await env.client.post(
         "/oauth/token",
         data={
@@ -434,7 +435,7 @@ async def test_scope_token_cache_does_not_bypass_allowlist(env: SimpleNamespace)
 async def test_machine_client_still_mints_with_the_device_grant_enabled(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """BLOCKING regression: the device grant must not shadow the machine grant.
+    """The device grant must not shadow the machine grant.
 
     Both used to claim ``POST /oauth/token`` with their own router. FastAPI
     registers duplicates and resolves first-match-wins with no warning, so

@@ -319,6 +319,14 @@ class RunnerRouter:
                 return ErrorCode.WRONG_REPLICA
         return ErrorCode.RUNNER_UNAVAILABLE
 
+    def host_is_on_another_replica(self, host_id: str) -> bool:
+        """Return whether a live host is absent from this replica.
+
+        Host-scoped routes use this before consulting replica-local metadata,
+        so a misrouted request can be retried instead of using stale defaults.
+        """
+        return self._runner_absent_code(host_id) == ErrorCode.WRONG_REPLICA
+
     def _client_for_runner(self, runner_id: str) -> httpx.AsyncClient:
         """
         Return a cached tunnel-backed client for *runner_id*.

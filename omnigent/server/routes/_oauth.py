@@ -72,6 +72,13 @@ class SlidingWindowRateLimiter:
     """
 
     def __init__(self, max_events: int, window_seconds: int, max_keys: int) -> None:
+        """Build a limiter admitting *max_events* per key per *window_seconds*.
+
+        :param max_events: Events allowed per key inside the window.
+        :param window_seconds: Width of the sliding window, in seconds.
+        :param max_keys: Hard cap on tracked keys; see
+            :data:`RATE_LIMITER_MAX_KEYS` for what happens at the cap.
+        """
         self._max = max_events
         self._window = window_seconds
         self._max_keys = max_keys
@@ -84,6 +91,17 @@ class SlidingWindowRateLimiter:
             self._hits.pop(k, None)
 
     def allow(self, key: str, now: float) -> bool:
+        """Record a hit for *key* and report whether it is under the limit.
+
+        Counts every call, not just rejected ones, so the caller bounds the
+        RATE rather than the failure rate.
+
+        :param key: Throttle key — the client IP at both call sites.
+        :param now: Current wall-clock time, seconds since the epoch.
+        :returns: True when the caller may proceed. Also True — failing OPEN —
+            for a new key once the table is full of live keys, so an exhausted
+            table stops throttling rather than growing without bound.
+        """
         cutoff = now - self._window
         # New key while at capacity: sweep aged-out keys first; if the table
         # is still full of live keys, fail open rather than grow unbounded.

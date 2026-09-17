@@ -58,7 +58,9 @@ All three of the first group must be set to enable the grant, or all unset to
 leave it off; any other combination — a malformed secret hash, an unusable
 TTL — is an operator error and refuses to start rather than coming up with a
 grant branch that answers every request ``invalid_request``, which reads as a
-client bug.
+client bug. That check only runs in the modes this grant is built for: in
+header mode ``app.py`` never reaches the config at all, so a misconfigured
+machine client there is silently inert rather than a startup failure.
 
 The minted token reuses the delegated JWT shape
 (:func:`omnigent.server.routes.device_auth.mint_delegated_token`) with the
@@ -126,16 +128,11 @@ _SECRET_HASH_RE = re.compile(r"\A[0-9a-fA-F]{64}\Z")
 _TOKEN_ENDPOINT_REALM = "omnigent"
 
 # ── Abuse control on the unauthenticated client check ─────────────
-# The branch answers before anything has authenticated, so the client-secret
-# comparison is reachable by anyone who can reach the port — the same exposure
-# the device grant throttles on its public authorize endpoint. Only the secret's
-# digest is configured, so the server cannot require entropy of the secret
-# itself; a coarse per-IP sliding window slows the guess rate, up to the
-# limiter's key-table ceiling, past which it fails open (see
-# RATE_LIMITER_MAX_KEYS). The secret's entropy is the actual boundary. The
-# ceiling sits far above honest use: a machine client mints once per token TTL,
-# not once per request. Scoped to this grant rather than the whole token
-# endpoint so it never throttles a login grant's refresh traffic.
+# The secret comparison is reachable by anyone who can reach the port, so a
+# coarse per-IP sliding window slows guessing — but only below the limiter's
+# key-table ceiling, past which it fails open (see RATE_LIMITER_MAX_KEYS). The
+# secret's entropy is the actual boundary. Scoped to this grant, not the whole
+# token endpoint, so it never throttles a login grant's refresh traffic.
 _TOKEN_RATE_MAX = 10  # max token requests…
 _TOKEN_RATE_WINDOW_SECONDS = 60  # …per client IP per this window.
 

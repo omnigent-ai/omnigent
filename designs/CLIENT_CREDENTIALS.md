@@ -68,9 +68,18 @@ separate `OMNIGENT_DEVICE_GRANT_ENABLED` because its endpoints are useful with
 zero config; this grant has nothing to serve without a configured client.)
 
 Anything else — two of three, a malformed secret hash, a reserved principal,
-an unparseable / non-positive / over-ceiling TTL — raises at startup. A
-half-configured deploy that came up anyway would look like a client bug from
-the outside; failing to start puts the error where the operator can act on it.
+an unparseable / non-positive / over-ceiling TTL — raises at startup **in
+`oidc` / `accounts` mode**. A half-configured deploy that came up anyway would
+look like a client bug from the outside; failing to start puts the error where
+the operator can act on it.
+
+The qualifier is load-bearing. `app.py` only reaches this config when the auth
+mode is `oidc` or `accounts`, so in **header mode** a machine client is never
+parsed and never validated: a fully misconfigured one is silently inert. That
+is the one place this grant does fail quiet. It is the same shape as the device
+grant, whose flag is likewise ignored in header mode (neither mode can mint,
+since header auth has no server-held signing key), but an operator who sets
+`OMNIGENT_MACHINE_*` under header auth gets no signal at all.
 
 The TTL ceiling is enforced, not advised: expiry is this grant's only
 revocation (below), so the TTL is the whole bound on a stolen token. 3600s

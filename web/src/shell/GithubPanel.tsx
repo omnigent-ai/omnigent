@@ -42,14 +42,17 @@ import {
   type LucideIcon,
   PanelLeftCloseIcon,
   PanelLeftOpenIcon,
+  PlusIcon,
   Rows2Icon,
   TerminalIcon,
+  Trash2Icon,
 } from "lucide-react";
 import { FileDiff } from "@pierre/diffs/react";
 import { parsePatchFiles, type FileDiffMetadata } from "@pierre/diffs";
 import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
@@ -72,6 +75,7 @@ import {
   useGithubInfo,
   useGithubPrDiff,
   useSetGithubPreference,
+  useUpdateSessionPr,
   type GithubChangedFile,
   type GithubCheckRun,
   type GithubChecks,
@@ -142,7 +146,7 @@ function GithubAccountSelector({
     <div className="flex w-full max-w-xs flex-col items-center gap-2 pt-2">
       <Select
         value={selectedAccount}
-        onValueChange={(login) => setPref.mutate({ account: login })}
+        onValueChange={(login) => setPref.mutate({ account: login, pr_url: info.selected_pr_url })}
         disabled={setPref.isPending}
       >
         <SelectTrigger aria-label="GitHub account" className="h-8 w-full text-ui">
@@ -216,11 +220,13 @@ export function deriveGithubPanelState(info: {
 function IconButton({
   label,
   onClick,
+  disabled,
   className,
   children,
 }: {
   label: string;
   onClick: () => void;
+  disabled?: boolean;
   className?: string;
   children: React.ReactNode;
 }) {
@@ -232,6 +238,7 @@ function IconButton({
           size="icon-xs"
           aria-label={label}
           onClick={onClick}
+          disabled={disabled}
           className={cn("shrink-0", className)}
         >
           {children}
@@ -760,16 +767,197 @@ function SidebarNode({
 }
 
 export function GithubPanel({ conversationId }: { conversationId: string }) {
-  // Poll for live CI status only while this panel is mounted (the status-line
-  // indicator keeps the non-polling default). Self-limits to unsettled checks.
-  const info = useGithubInfo(conversationId, { poll: true });
-  // The tab is a pure PR view: the list + patch are the PR's, fetched only when
-  // one exists. `baseRef` is kept for the on-demand expand-context loader
-  // (git show <base>:<path>) and the "branch → base" label.
+  const [selection, setSelection] = useState<{ sessionId: string; url?: string }>();
+  const [linking, setLinking] = useState(false);
+  const [url, setUrl] = useState("");
+  const selected = selection?.sessionId === conversationId ? selection.url : undefined;
+  const info = useGithubInfo(conversationId, { poll: true, prUrl: selected });
+  const [knownAssociations, setKnownAssociations] = useState<{
+    sessionId: string;
+    data: Pick<GithubInfo, "prs" | "tracking_available" | "selected_pr_url">;
+  }>();
+  useEffect(() => {
+    if (info.data) {
+      const { prs, tracking_available, selected_pr_url } = info.data;
+      setKnownAssociations({
+        sessionId: conversationId,
+        data: { prs, tracking_available, selected_pr_url },
+      });
+    }
+  }, [conversationId, info.data]);
+  // Switching the metadata query must not unmount the session's PR controls.
+  const associations =
+    info.data ??
+    (knownAssociations?.sessionId === conversationId ? knownAssociations.data : undefined);
+  const update = useUpdateSessionPr(conversationId);
+  useEffect(() => {
+    if (!selected && info.data?.selected_pr_url) {
+      setSelection({ sessionId: conversationId, url: info.data.selected_pr_url });
+    }
+  }, [conversationId, selected, info.data?.selected_pr_url]);
+  const changeSelection = (next?: string) => setSelection({ sessionId: conversationId, url: next });
+  const prs = associations?.prs ?? [];
+  const linkInEmptyState = prs.length === 0 && deriveGithubPanelState(info).kind === "no-pr";
+  const linkControls = (
+    <>
+      {linking && (
+        <form
+          className="mt-2 flex gap-2"
+          onKeyDown={(event) => {
+            if (event.key === "Escape") {
+              event.preventDefault();
+              event.stopPropagation();
+              setLinking(false);
+            }
+          }}
+          onSubmit={(event) => {
+            event.preventDefault();
+            update.mutate(
+              { url, action: "attach" },
+              {
+                onSuccess: (data) => {
+                  changeSelection(data.selected_pr_url);
+                  setLinking(false);
+                  setUrl("");
+                },
+              },
+            );
+          }}
+        >
+          <Input
+            aria-label="Pull request URL"
+            type="url"
+            required
+            value={url}
+            onChange={(event) => setUrl(event.target.value)}
+            placeholder="https://github.com/owner/repo/pull/123"
+            className="flex-1 focus-visible:ring-0"
+          />
+          <Button type="submit" disabled={update.isPending}>
+            Link
+          </Button>
+          <Button type="button" variant="outline" onClick={() => setLinking(false)}>
+            Cancel
+          </Button>
+        </form>
+      )}
+      {update.isError && (
+        <p role="alert" className="mt-1 text-ui text-destructive">
+          {update.error.message}
+        </p>
+      )}
+    </>
+  );
+  const openPrFallback =
+    associations?.tracking_available && selected && !info.isLoading && !info.data?.pr ? (
+      <div className="mt-2 flex flex-col items-center gap-2 text-ui">
+        <span className="text-muted-foreground">or</span>
+        <a
+          href={selected}
+          target="_blank"
+          rel="noreferrer"
+          className="text-foreground underline underline-offset-4"
+        >
+          Open the PR on GitHub
+        </a>
+      </div>
+    ) : undefined;
+  return (
+    <div className="flex h-full min-h-0 flex-col">
+      {associations?.tracking_available && !linkInEmptyState && (
+        <div className="shrink-0 border-b border-border p-2">
+          <div className="flex items-center gap-2">
+            {prs.length > 0 && (
+              <Select
+                value={selected ?? associations.selected_pr_url ?? ""}
+                onValueChange={changeSelection}
+              >
+                <SelectTrigger
+                  aria-label="Session pull request"
+                  className="min-w-0 flex-1 *:data-[slot=select-value]:block *:data-[slot=select-value]:truncate"
+                >
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent
+                  position="popper"
+                  align="start"
+                  className="w-(--radix-select-trigger-width)"
+                >
+                  {prs.map((pr) => (
+                    <SelectItem key={pr.url} value={pr.url} className="break-all">
+                      {pr.host === "github.com" ? "" : `${pr.host}/`}
+                      {pr.repository} #{pr.number}
+                      {pr.relationship === "inferred" ? " (from branch)" : ""}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            )}
+            <div className="ml-auto flex shrink-0 items-center gap-1">
+              <TooltipProvider delayDuration={0}>
+                <IconButton label="Link a PR" onClick={() => setLinking(!linking)}>
+                  <PlusIcon className="size-3.5" aria-hidden="true" />
+                </IconButton>
+                {selected && (
+                  <IconButton
+                    label="Unlink PR"
+                    disabled={update.isPending}
+                    onClick={() =>
+                      update.mutate(
+                        { url: selected, action: "remove" },
+                        {
+                          onSuccess: (data) => changeSelection(data.selected_pr_url),
+                        },
+                      )
+                    }
+                  >
+                    <Trash2Icon className="size-3.5" aria-hidden="true" />
+                  </IconButton>
+                )}
+              </TooltipProvider>
+            </div>
+          </div>
+          {linkControls}
+        </div>
+      )}
+      <div className="min-h-0 flex-1">
+        <GithubPanelDetails
+          key={`${conversationId}:${selected ?? ""}`}
+          conversationId={conversationId}
+          info={info}
+          emptyStateAction={
+            associations?.tracking_available && linkInEmptyState ? (
+              <div className="mt-2 w-full max-w-sm">
+                <Button onClick={() => setLinking(!linking)}>Link a PR</Button>
+                {linkControls}
+              </div>
+            ) : (
+              openPrFallback
+            )
+          }
+        />
+      </div>
+    </div>
+  );
+}
+
+function GithubPanelDetails({
+  conversationId,
+  info,
+  emptyStateAction,
+}: {
+  conversationId: string;
+  info: ReturnType<typeof useGithubInfo>;
+  emptyStateAction?: React.ReactNode;
+}) {
   const baseRef = info.data?.base_ref ?? undefined;
+  const prUrl = info.data?.selected_pr_url;
+  const headSha = info.data?.pr?.head_sha;
+  const baseSha = info.data?.pr?.base_sha;
+  const revision = `${baseSha ?? ""}:${headSha ?? ""}`;
   const hasPr = !!info.data?.pr;
-  const changes = useGithubChangedFiles(conversationId, hasPr);
-  const prDiff = useGithubPrDiff(conversationId, hasPr);
+  const changes = useGithubChangedFiles(conversationId, hasPr, prUrl, revision);
+  const prDiff = useGithubPrDiff(conversationId, hasPr, prUrl, revision);
 
   // Summary (PR body + comments) vs Changes (the stacked diff). Summary is the
   // landing tab — like GitHub's PR page opening on the Conversation view.
@@ -854,13 +1042,20 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
   // the reader expands unchanged regions.
   const loadDiffFiles = useCallback(
     async (fd: FileDiffMetadata) => {
-      const { before, after } = await fetchGithubFileContents(conversationId, fd.name, baseRef);
+      const { before, after } = prUrl
+        ? await fetchGithubFileContents(conversationId, fd.name, baseRef, {
+            pr_url: prUrl,
+            previous_path: fd.prevName,
+            head_sha: headSha,
+            base_sha: baseSha,
+          })
+        : await fetchGithubFileContents(conversationId, fd.name, baseRef);
       return {
         oldFile: { name: fd.prevName ?? fd.name, contents: before ?? "" },
         newFile: { name: fd.name, contents: after ?? "" },
       };
     },
-    [conversationId, baseRef],
+    [conversationId, baseRef, prUrl, headSha, baseSha],
   );
 
   const diffOptions = useMemo<DiffOptions>(
@@ -938,17 +1133,27 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
       );
     case "runner-offline":
       return (
-        <PanelMessage>The agent is asleep. Send a message to reconnect its runner.</PanelMessage>
+        <PanelMessage>
+          <p>The agent is asleep. Send a message to reconnect its runner.</p>
+          {emptyStateAction}
+        </PanelMessage>
       );
     case "error":
-      return <PanelMessage>Couldn’t load GitHub info: {panelState.message}</PanelMessage>;
+      return (
+        <PanelMessage>
+          <p>Couldn’t load GitHub info: {panelState.message}</p>
+          {emptyStateAction}
+        </PanelMessage>
+      );
     case "host-outdated":
       return (
         <GithubEmptyState
           icon={DownloadIcon}
           title="Update your host to use GitHub"
           hint="The GitHub panel needs the host running Omnigent 0.13.0 or later. Update the host, then reconnect the session."
-        />
+        >
+          {emptyStateAction}
+        </GithubEmptyState>
       );
     case "not-a-git-repo":
       return (
@@ -956,7 +1161,9 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
           icon={GitBranchIcon}
           title="Not a git repository"
           hint="This workspace isn’t a git checkout, so there’s no branch or PR to show."
-        />
+        >
+          {emptyStateAction}
+        </GithubEmptyState>
       );
     case "no-gh-cli":
       return (
@@ -969,7 +1176,9 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
               branch’s pull request and CI status.
             </>
           }
-        />
+        >
+          {emptyStateAction}
+        </GithubEmptyState>
       );
     case "repo-unresolved":
       return (
@@ -984,6 +1193,7 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
           }
         >
           {info.data && <GithubAccountSelector conversationId={conversationId} info={info.data} />}
+          {emptyStateAction}
         </GithubEmptyState>
       );
     case "no-pr":
@@ -998,8 +1208,10 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
               No open PR for <span className="font-mono">{panelState.branch ?? "this branch"}</span>
             </>
           }
-          hint="When you open a pull request for this branch, it’ll show up here."
-        />
+          hint="Pull requests created in this session appear here. You can also link an existing PR."
+        >
+          {emptyStateAction}
+        </GithubEmptyState>
       );
     case "unavailable":
       return (
@@ -1007,7 +1219,9 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
           icon={AlertCircleIcon}
           title="GitHub isn’t available"
           hint="There’s no GitHub information to show for this session."
-        />
+        >
+          {emptyStateAction}
+        </GithubEmptyState>
       );
   }
 

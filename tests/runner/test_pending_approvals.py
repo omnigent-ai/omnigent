@@ -119,6 +119,24 @@ async def test_cleanup_unknown_id_is_noop() -> None:
 
 
 @pytest.mark.asyncio
+async def test_server_reconnect_notifies_only_replayable_approvals() -> None:
+    """Reconnect wakes server-issued gates without replaying external MCP work."""
+    replayable = pending_approvals.register(
+        "elicit_server_policy",
+        retry_on_server_reconnect=True,
+    )
+    external = pending_approvals.register("elicit_external_mcp")
+
+    assert pending_approvals.notify_server_reconnect() == 1
+    with pytest.raises(pending_approvals.ServerReconnected):
+        await replayable
+    assert not external.done()
+
+    pending_approvals.cleanup("elicit_server_policy")
+    pending_approvals.cleanup("elicit_external_mcp")
+
+
+@pytest.mark.asyncio
 async def test_wait_for_user_approval_returns_true_on_accept() -> None:
     """The wait helper returns True when resolved with approved=True.
 
@@ -190,6 +208,9 @@ async def test_wait_for_user_approval_returns_false_on_timeout() -> None:
     # would show a phantom prompt forever.
     assert len(publishes) == 1
     assert publishes[0][1]["elicitation_id"] == "elicit_timeout"
+    # Nobody answered: the card must read "Prompt expired", not the neutral
+    # "Resolved elsewhere" pill that implies someone did.
+    assert publishes[0][1].get("reason") == "unanswered"
 
 
 @pytest.mark.asyncio
@@ -225,6 +246,8 @@ async def test_wait_for_user_approval_publishes_on_cancellation() -> None:
     # leave permanent stuck badges on their session.
     assert len(publishes) == 1
     assert publishes[0][1]["elicitation_id"] == "elicit_cancel"
+    # A cancelled wait ended without a verdict too.
+    assert publishes[0][1].get("reason") == "unanswered"
 
 
 @pytest.mark.asyncio
