@@ -294,12 +294,8 @@ describe("UserBubble long-prompt collapse", () => {
     render(<BubbleView bubble={userBubble(SHORT_TEXT)} isLastAssistant={false} />);
 
     expect(screen.getByTestId("message-bubble")).toHaveTextContent(SHORT_TEXT);
-    expect(
-      screen.queryByRole("button", { name: /show full prompt/i }),
-    ).toBeNull();
-    expect(
-      screen.queryByRole("button", { name: /collapse prompt/i }),
-    ).toBeNull();
+    expect(screen.queryByRole("button", { name: /show full prompt/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: /collapse prompt/i })).toBeNull();
   });
 
   it("collapses a long prompt by default and shows the expand button with char count", () => {
@@ -310,9 +306,7 @@ describe("UserBubble long-prompt collapse", () => {
     // Button label should include the formatted character count.
     expect(expandBtn).toHaveTextContent("8,001");
     // Collapse button must not be visible while collapsed.
-    expect(
-      screen.queryByRole("button", { name: /collapse prompt/i }),
-    ).toBeNull();
+    expect(screen.queryByRole("button", { name: /collapse prompt/i })).toBeNull();
   });
 
   it("expands the prompt when the expand button is clicked", () => {
@@ -321,12 +315,8 @@ describe("UserBubble long-prompt collapse", () => {
     fireEvent.click(screen.getByRole("button", { name: /show full prompt/i }));
 
     // Expand button should be gone; collapse button should appear.
-    expect(
-      screen.queryByRole("button", { name: /show full prompt/i }),
-    ).toBeNull();
-    expect(
-      screen.getByRole("button", { name: /collapse prompt/i }),
-    ).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /show full prompt/i })).toBeNull();
+    expect(screen.getByRole("button", { name: /collapse prompt/i })).toBeInTheDocument();
   });
 
   it("collapses the prompt again when the collapse button is clicked", () => {
@@ -336,12 +326,7 @@ describe("UserBubble long-prompt collapse", () => {
     fireEvent.click(screen.getByRole("button", { name: /show full prompt/i }));
     fireEvent.click(screen.getByRole("button", { name: /collapse prompt/i }));
 
-    expect(
-      screen.getByRole("button", { name: /show full prompt/i }),
-    ).toBeInTheDocument();
-    expect(
-      screen.queryByRole("button", { name: /collapse prompt/i }),
-    ).toBeNull();
+    expect(screen.getByRole("button", { name: /show full prompt/i })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /collapse prompt/i })).toBeNull();
   });
 });
-
