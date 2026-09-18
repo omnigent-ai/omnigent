@@ -18,6 +18,7 @@ from .datamodel import (
     OSEnvSpec,
     ParamDef,
     TerminalEnvSpec,
+    parse_write_paths,
 )
 from .policies import (
     FunctionPolicy,
@@ -281,6 +282,12 @@ def _parse_agent_def(
     executor_data = data.get("executor")
     if executor_data:
         agent.executor = _parse_executor_spec(executor_data)
+
+    from omnigent.sandbox.copy_on_write import validate_copy_on_write_harness
+
+    validate_copy_on_write_harness(
+        agent.os_env, agent.executor.harness if agent.executor else None
+    )
 
     # Params
     for pname, pdata in data.get("params", {}).items():
@@ -784,6 +791,11 @@ def _parse_os_env_sandbox_spec(data: YamlData | str | bool | None) -> OSEnvSandb
         if raw_type is not None and not isinstance(raw_type, str):
             raise TypeError("os_env.sandbox.type must be a string or null")
         sandbox_type = _resolve_sandbox_type(raw_type)
+    parsed_write_paths = parse_write_paths(data.get("write_paths"))
+    if sandbox_type != "linux_bwrap" and any(
+        not isinstance(p, str) and p.copy_on_write for p in parsed_write_paths or []
+    ):
+        raise ValueError("copy_on_write requires sandbox.type=linux_bwrap")
     egress_rules = data.get("egress_rules")
     # Mirror the Omnigent parser's hard reject of ``egress_rules`` paired with
     # a backend that cannot enforce them at spawn time. Without this
@@ -850,11 +862,7 @@ def _parse_os_env_sandbox_spec(data: YamlData | str | bool | None) -> OSEnvSandb
     return OSEnvSandboxSpec(
         type=sandbox_type,
         read_paths=data.get("read_paths"),
-        write_paths=(
-            list(data["write_paths"])
-            if "write_paths" in data and data.get("write_paths") is not None
-            else None
-        ),
+        write_paths=parsed_write_paths,
         write_files=(
             list(data["write_files"])
             if "write_files" in data and data.get("write_files") is not None

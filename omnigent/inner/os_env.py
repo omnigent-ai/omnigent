@@ -25,6 +25,7 @@ from omnigent.runner.identity import (
     OMNIGENT_SESSION_ENV_VAR,
     strip_runner_auth_secrets,
 )
+from omnigent.sandbox.copy_on_write import SHARED_ENVIRONMENT_VAR, CopyOnWriteEnvironment
 from omnigent.util.json_types import JsonValue
 
 from .agent_env import strip_desktop_session_env
@@ -227,7 +228,9 @@ def build_helper_env(
         # Opted out of sandboxing (incl. env filtering): mirror parent
         # env, but still drop the runner-auth secret — opting out of the
         # sandbox must not also hand the agent the binding token.
-        return strip_runner_auth_secrets(parent_env)
+        env = strip_runner_auth_secrets(parent_env)
+        env.pop(SHARED_ENVIRONMENT_VAR, None)
+        return env
 
     allowed = set(_DEFAULT_ENV_PASSTHROUGH)
     if sandbox.env_passthrough is not None:
@@ -241,6 +244,7 @@ def build_helper_env(
     # The default allowlist already excludes the runner-auth secrets,
     # but strip again so a spec author can't re-admit one by naming it
     # in ``sandbox.env_passthrough``.
+    env.pop(SHARED_ENVIRONMENT_VAR, None)
     return strip_runner_auth_secrets(env)
 
 
@@ -344,6 +348,15 @@ class OSEnvironment(ABC):
     ) -> OpResult:
         raise NotImplementedError
 
+    def prepare_sandbox(self, policy: SandboxPolicy) -> None:
+        """Attach environment-owned resources before launching a consumer."""
+        if policy.copy_on_write_roots:
+            raise RuntimeError("This environment cannot own copy-on-write mounts")
+
+    @property
+    def copy_on_write_environment(self) -> CopyOnWriteEnvironment | None:
+        return None
+
     def close(self) -> None:  # noqa: B027 — optional override hook; default is a no-op
         """Release any process or file resources held by the environment.
 
@@ -365,7 +378,9 @@ class _HelperProcessClient:
         start_in_scratch: bool = False,
         egress_rules: list[str] | None = None,
         egress_allow_private_destinations: bool = False,
+        copy_on_write_environment: CopyOnWriteEnvironment | None = None,
     ) -> None:
+        self._copy_on_write_environment = copy_on_write_environment
         self.cwd = cwd
         self.shell_path = shell_path
         self.sandbox = sandbox
@@ -451,6 +466,8 @@ class _HelperProcessClient:
 
     def _start_locked(self) -> None:
         sandbox = self.sandbox
+        if self._copy_on_write_environment is not None:
+            self._copy_on_write_environment.prepare(sandbox)
         env = build_helper_env(os.environ, sandbox)
         project_root = str(_project_root())
         existing_pythonpath = env.get("PYTHONPATH")
@@ -606,7 +623,7 @@ class _HelperProcessClient:
                 stderr=subprocess.PIPE,
                 text=True,
                 bufsize=1,
-                cwd=str(self.cwd),
+                cwd="/" if sandbox.copy_on_write_namespace else str(self.cwd),
                 env=env,
                 **popen_kwargs,
             )
@@ -841,7 +858,33 @@ class CallerProcessOSEnvironment(OSEnvironment):
     _egress_rules: list[str] | None = None
     _egress_allow_private_destinations: bool = False
 
+    _copy_on_write_environment: CopyOnWriteEnvironment | None = None
+    _owns_copy_on_write: bool = False
+
+    @property
+    def copy_on_write_environment(self) -> CopyOnWriteEnvironment | None:
+        return self._copy_on_write_environment
+
+    def prepare_sandbox(self, policy: SandboxPolicy) -> None:
+        if self._copy_on_write_environment is not None:
+            self._copy_on_write_environment.prepare(policy)
+        elif policy.copy_on_write_roots:
+            if policy.copy_on_write_roots != self.sandbox.copy_on_write_roots:
+                raise ValueError("Inherited copy-on-write paths must match their environment")
+            policy.copy_on_write_namespace = self.sandbox.copy_on_write_namespace
+            if policy.copy_on_write_namespace is None:
+                raise RuntimeError("Missing copy-on-write environment")
+
     def __post_init__(self) -> None:
+        if (
+            self.sandbox.copy_on_write_roots
+            and self._copy_on_write_environment is None
+            and self.sandbox.copy_on_write_namespace is None
+        ):
+            self._copy_on_write_environment = CopyOnWriteEnvironment(
+                self.sandbox.copy_on_write_roots
+            )
+            self._owns_copy_on_write = True
         self._helper = _HelperProcessClient(
             cwd=self.cwd,
             shell_path=self.shell_path,
@@ -849,6 +892,7 @@ class CallerProcessOSEnvironment(OSEnvironment):
             start_in_scratch=self._start_in_scratch,
             egress_rules=self._egress_rules,
             egress_allow_private_destinations=self._egress_allow_private_destinations,
+            copy_on_write_environment=self._copy_on_write_environment,
         )
 
     async def read(
@@ -928,6 +972,8 @@ class CallerProcessOSEnvironment(OSEnvironment):
 
     def close(self) -> None:
         self._helper.close()
+        if self._owns_copy_on_write and self._copy_on_write_environment is not None:
+            self._copy_on_write_environment.close()
         if self._fork_dir is not None:
             shutil.rmtree(self._fork_dir, ignore_errors=True)
             self._fork_dir = None
@@ -936,7 +982,12 @@ class CallerProcessOSEnvironment(OSEnvironment):
         self.close()
 
 
-def create_os_environment(spec: OSEnvSpec | None) -> OSEnvironment | None:
+def create_os_environment(
+    spec: OSEnvSpec | None,
+    *,
+    copy_on_write_environment: CopyOnWriteEnvironment | None = None,
+    sandbox_policy: SandboxPolicy | None = None,
+) -> OSEnvironment | None:
     """Instantiate the configured OS environment."""
     if spec is None:
         return None
@@ -950,7 +1001,7 @@ def create_os_environment(spec: OSEnvSpec | None) -> OSEnvironment | None:
         effective_cwd = fork_dir / "root"
         _copy_tree(cwd, effective_cwd)
         cwd = effective_cwd
-    sandbox = resolve_sandbox(spec, cwd)
+    sandbox = replace(sandbox_policy) if sandbox_policy is not None else resolve_sandbox(spec, cwd)
     if spec.start_in_scratch and not sandbox.active:
         raise ValueError(
             "os_env.start_in_scratch requires an active sandbox; "
@@ -970,6 +1021,7 @@ def create_os_environment(spec: OSEnvSpec | None) -> OSEnvironment | None:
         cwd=cwd,
         sandbox=sandbox,
         shell_path=shell_path,
+        _copy_on_write_environment=copy_on_write_environment,
         _fork_dir=fork_dir,
         _start_in_scratch=spec.start_in_scratch,
         _egress_rules=egress_rules,

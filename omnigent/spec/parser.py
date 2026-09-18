@@ -30,6 +30,7 @@ from omnigent.inner.datamodel import (
     OSEnvSandboxSpec,
     OSEnvSpec,
     TerminalEnvSpec,
+    parse_write_paths,
 )
 from omnigent.inner.sandbox import containment_prefix
 from omnigent.spec.types import (
@@ -275,6 +276,9 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
     compaction = _parse_compaction(raw.get("compaction"))
     guardrails = _parse_guardrails(raw.get("guardrails"), expand_env=expand_env)
     os_env = _parse_os_env(raw.get("os_env"))
+    from omnigent.sandbox.copy_on_write import validate_copy_on_write_harness
+
+    validate_copy_on_write_harness(os_env, executor.harness_kind)
     terminals = _parse_terminals(raw.get("terminals"))
     params = raw.get("params", {})
     # Top-level ``async:`` flag gates the LLM-callable async-dispatch
@@ -1000,6 +1004,16 @@ def _parse_os_env_sandbox(
                 code=ErrorCode.INVALID_INPUT,
             )
         sandbox_type = _resolve_sandbox_type(raw_type)
+    try:
+        parsed_write_paths = parse_write_paths(write_paths_raw)
+    except ValueError as exc:
+        raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+    if sandbox_type != "linux_bwrap" and any(
+        not isinstance(p, str) and p.copy_on_write for p in parsed_write_paths or []
+    ):
+        raise OmnigentError(
+            "copy_on_write requires sandbox.type=linux_bwrap", code=ErrorCode.INVALID_INPUT
+        )
     if egress_rules and sandbox_type not in ("linux_bwrap", "darwin_seatbelt"):
         raise OmnigentError(
             "os_env.sandbox.egress_rules requires sandbox.type=linux_bwrap "
@@ -1041,7 +1055,7 @@ def _parse_os_env_sandbox(
     return OSEnvSandboxSpec(
         type=sandbox_type,
         read_paths=[str(p) for p in read_paths_raw] if read_paths_raw is not None else None,
-        write_paths=[str(p) for p in write_paths_raw] if write_paths_raw is not None else None,
+        write_paths=parsed_write_paths,
         write_files=[str(p) for p in write_files_raw] if write_files_raw is not None else None,
         allow_network=bool(raw.get("allow_network", True)),
         cwd_allow_hidden=cwd_allow_hidden,
