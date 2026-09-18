@@ -126,6 +126,7 @@ import {
 import { useMentionBrowser } from "@/hooks/useMentionBrowser";
 import { getSessionDraft, promoteSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
 import {
+  restoreReplyDraft,
   serializeReplyDraft,
   snapshotReplyDraft,
   type ComposerDraft,
@@ -2420,6 +2421,10 @@ function ComposerImpl(
   // Text + attachments handed back by a send that failed before the server
   // took ownership. Drained below so the message can be retried.
   const failedSendDraft = useChatStore((s) => s.failedSendDraft);
+  // A restored failed-send draft whose fate is still unknown — flips to
+  // `delivered` when the send turns out to have reached the server, so the
+  // retraction effect below can empty the composer.
+  const restoredSendDraft = useChatStore((s) => s.restoredSendDraft);
   // A settled /btw side-chat overlay is open, so Escape dismisses it here
   // (before the "Esc cancels turn" branch) rather than interrupting a turn.
   const btwSidechat = useChatStore((s) => s.btwSidechat);
@@ -2934,8 +2939,48 @@ function ComposerImpl(
       setFiles(accepted);
       setAttachmentError(errors.length > 0 ? errors.join("\n") : null);
     }
+    // Remember what was restored: if the "failed" send turns out to have been
+    // delivered (its stable id shows up as a committed item), the retraction
+    // effect below empties the composer instead of leaving an already-sent
+    // prompt primed for a duplicate send.
+    if (failedSendDraft.stableId) {
+      useChatStore.setState({
+        restoredSendDraft: {
+          conversationId: failedSendDraft.conversationId,
+          stableId: failedSendDraft.stableId,
+          text: failedSendDraft.text,
+          files: failedSendDraft.files,
+          replyDraft: failedSendDraft.replyDraft,
+          delivered: false,
+        },
+      });
+    }
     if (!isMobileRef.current) textareaRef.current?.focus();
   }, [failedSendDraft, conversationId, settledConversationId, replaceText]);
+
+  // Retract a restored failed-send draft once its send is proven delivered:
+  // the network cut the POST's acknowledgement, not the request
+  // (backgrounding, a VPN blip), and the message's committed item — persisted
+  // under the send's stable id — arrived over the stream or a reconnect
+  // snapshot. The prompt was sent and answered, so the composer must not keep
+  // it primed for a duplicate send. Edits win: the text is cleared only while
+  // it is exactly what the restore put there.
+  useEffect(() => {
+    if (restoredSendDraft === null || !restoredSendDraft.delivered) return;
+    if (restoredSendDraft.conversationId !== conversationId) return;
+    if (settledConversationId !== conversationId) return;
+    useChatStore.setState({ restoredSendDraft: null });
+    const expected = serializeReplyDraft(
+      restoreReplyDraft(restoredSendDraft.text, restoredSendDraft.replyDraft),
+    );
+    const filesUnedited = filesRef.current.every((f) => restoredSendDraft.files.includes(f));
+    if (valueRef.current !== expected || !filesUnedited) return;
+    replaceText("");
+    setFiles([]);
+    setAttachmentError(null);
+    dirtyRef.current = false;
+    if (conversationId) setSessionDraft(conversationId, { text: "", files: [] });
+  }, [restoredSendDraft, conversationId, settledConversationId, replaceText]);
 
   /**
    * Execute a slash command by name + optional argument string.

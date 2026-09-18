@@ -3141,6 +3141,70 @@ describe("Composer reply quotes", () => {
     if (structured) expect(vi.mocked(props.onSend).mock.calls[0]?.[2]).toEqual(replyDraft);
   });
 
+  it("empties the composer when a restored failed send turns out delivered", () => {
+    const stableId = "c".repeat(32);
+    render(<Composer {...composerProps()} />);
+    act(() =>
+      useChatStore.setState({
+        failedSendDraft: {
+          conversationId: "conv_test",
+          text: "resend me",
+          files: [],
+          stableId,
+        },
+      }),
+    );
+    expect(textarea()).toHaveValue("resend me");
+    expect(useChatStore.getState().restoredSendDraft).toMatchObject({ stableId, delivered: false });
+
+    // The send's committed item arrived (see retractDeliveredSendDraft):
+    // the message was delivered, so the untouched restore must go away.
+    act(() =>
+      useChatStore.setState({
+        restoredSendDraft: {
+          conversationId: "conv_test",
+          stableId,
+          text: "resend me",
+          files: [],
+          delivered: true,
+        },
+      }),
+    );
+    expect(textarea()).toHaveValue("");
+    expect(useChatStore.getState().restoredSendDraft).toBeNull();
+    expect(getSessionDraft("conv_test")).toBeUndefined();
+  });
+
+  it("keeps the user's edits when the delivered retraction lands", () => {
+    const stableId = "d".repeat(32);
+    render(<Composer {...composerProps()} />);
+    act(() =>
+      useChatStore.setState({
+        failedSendDraft: {
+          conversationId: "conv_test",
+          text: "resend me",
+          files: [],
+          stableId,
+        },
+      }),
+    );
+    fireEvent.change(textarea(), { target: { value: "resend me, but edited" } });
+
+    act(() =>
+      useChatStore.setState({
+        restoredSendDraft: {
+          conversationId: "conv_test",
+          stableId,
+          text: "resend me",
+          files: [],
+          delivered: true,
+        },
+      }),
+    );
+    expect(textarea()).toHaveValue("resend me, but edited");
+    expect(useChatStore.getState().restoredSendDraft).toBeNull();
+  });
+
   it.each([false, true])(
     "edits and persists queued messages with explicit metadata only: %s",
     (structured) => {

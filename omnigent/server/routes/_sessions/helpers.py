@@ -6851,11 +6851,26 @@ def _build_new_item(
             f"invalid data for {body.type!r} item: {exc}",
             code=ErrorCode.INVALID_INPUT,
         ) from exc
+    # A web send carries a client-minted stable_id so the message persists
+    # under a client-known id: appends become idempotent on retry, and the
+    # client can recognize its own send coming back (e.g. a POST whose
+    # acknowledgement a network drop swallowed) instead of treating it as
+    # failed. Same shape-gated adoption as the native pending-input path.
+    raw_stable_id = body.data.get("stable_id")
+    stable_id = (
+        raw_stable_id
+        if body.type == "message"
+        and body.data.get("role") == "user"
+        and isinstance(raw_stable_id, str)
+        and re.fullmatch(r"[0-9a-f]{32}", raw_stable_id)
+        else None
+    )
     return NewConversationItem(
         type=body.type,
         response_id=response_id,
         data=data,
         created_by=created_by,
+        stable_id=stable_id,
     )
 
 

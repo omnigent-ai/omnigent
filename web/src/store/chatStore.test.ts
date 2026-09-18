@@ -4132,6 +4132,103 @@ describe("chatStore — send (file attachments)", () => {
   });
 });
 
+describe("chatStore — delivered-but-unacked send", () => {
+  // A network failure on the send POST only proves the acknowledgement was
+  // lost (backgrounding / VPN blip): the message may still have reached the
+  // server, where it persists under the send's stable id. Its committed item
+  // arriving is proof of delivery — the failed-send draft must be retracted
+  // instead of repopulating the composer with an already-sent prompt.
+
+  it("retracts the failed-send draft when its message commits under the send's stable id", async () => {
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+    });
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/v1/sessions/conv_existing/events") && init?.method === "POST") {
+        return Promise.reject(new TypeError("Failed to fetch"));
+      }
+      return defaultFetchHandler(input, init);
+    });
+    await useChatStore.getState().send("summarize the deploy status", "agent_xyz");
+    const draft = useChatStore.getState().failedSendDraft;
+    expect(draft).toMatchObject({ text: "summarize the deploy status" });
+    const stableId = draft?.stableId;
+    expect(stableId).toBeTruthy();
+
+    handleSessionEvent({
+      type: "session_input_consumed",
+      itemId: stableId!,
+      itemType: "message",
+      data: {
+        role: "user",
+        content: [{ type: "input_text", text: "summarize the deploy status" }],
+      },
+    });
+
+    expect(useChatStore.getState().failedSendDraft).toBeNull();
+    const last = useChatStore.getState().blocks.at(-1) as UserMessageBlock;
+    expect(last.type).toBe("user_message");
+    expect(last.ctx.itemId).toBe(stableId);
+  });
+
+  it("flips a restored draft to delivered and stops the stable-id reuse", () => {
+    const stableId = "a".repeat(32);
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      restoredSendDraft: {
+        conversationId: "conv_existing",
+        stableId,
+        text: "resend me",
+        files: [],
+        delivered: false,
+      },
+      pendingRetryStableId: stableId,
+    });
+
+    handleSessionEvent({
+      type: "session_input_consumed",
+      itemId: stableId,
+      itemType: "message",
+      data: { role: "user", content: [{ type: "input_text", text: "resend me" }] },
+    });
+
+    expect(useChatStore.getState().restoredSendDraft).toMatchObject({ stableId, delivered: true });
+    expect(useChatStore.getState().pendingRetryStableId).toBeNull();
+  });
+
+  it("hands back no draft when the message committed before the send failure settled", async () => {
+    const stableId = "b".repeat(32);
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+    });
+    // The committed item beats the fetch rejection through (stream raced ahead).
+    handleSessionEvent({
+      type: "session_input_consumed",
+      itemId: stableId,
+      itemType: "message",
+      data: {
+        role: "user",
+        content: [{ type: "input_text", text: "summarize the deploy status" }],
+      },
+    });
+    // send() reuses this as the stable id, pinning the send to the committed item.
+    useChatStore.setState({ pendingRetryStableId: stableId });
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/v1/sessions/conv_existing/events") && init?.method === "POST") {
+        return Promise.reject(new TypeError("Failed to fetch"));
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    await useChatStore.getState().send("summarize the deploy status", "agent_xyz");
+
+    expect(useChatStore.getState().failedSendDraft).toBeNull();
+    expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+  });
+});
+
 describe("chatStore — stop", () => {
   it("posts {type: 'interrupt'} to the events endpoint without aborting the local stream", async () => {
     const controller = new AbortController();

@@ -787,6 +787,25 @@ export interface ConversationState {
    */
   pendingRetryStableId: string | null;
   /**
+   * A failed-send draft the composer has restored, kept until the send's
+   * fate is known. A network failure only proves the POST's *response* was
+   * lost — the request may still have reached the server (backgrounding or
+   * a VPN blip cuts the network after the send goes out). The server
+   * persists a web send under its client `stable_id`, so a committed item
+   * with that id later arriving proves delivery: `delivered` flips true and
+   * the composer drops the restored text instead of priming a duplicate
+   * send (see ChatPage's retraction effect). User edits win over the
+   * retraction.
+   */
+  restoredSendDraft: {
+    conversationId: string;
+    stableId: string;
+    text: string;
+    files: File[];
+    replyDraft?: StoredReplyDraft;
+    delivered: boolean;
+  } | null;
+  /**
    * When a send last latched THIS conversation's `status` to "streaming", or
    * `null`. Conversation-scoped, not a module global, because `status` is now
    * per-conversation: two conversations can each hold a hung send, and a single
@@ -1783,6 +1802,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   streamBudgetBannerDismissed: false,
   failedSendDraft: null,
   pendingRetryStableId: null,
+  restoredSendDraft: null,
   sendLatchedAt: null,
   llmModel: null,
   pendingModelChange: null,
@@ -2278,7 +2298,18 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // (`failedSendDraft` is conversation-scoped); the composer reads whichever
       // conversation is active and guards on the id before restoring.
       const draftSessionId = postedSessionId ?? submitConversationId;
-      if (draftSessionId !== null && (text.trim() !== "" || (files?.length ?? 0) > 0)) {
+      // A network failure can lose only the POST's response: if the message's
+      // committed item (persisted under this send's stable id) already came
+      // back over the stream, the send was delivered — restoring a draft
+      // would repopulate the composer with an already-sent prompt.
+      const draftState =
+        draftSessionId === null ? get() : (setterForState(draftSessionId) ?? get());
+      const deliveredDespiteFailure = draftState.blocks.some((b) => b.ctx.itemId === stableId);
+      if (
+        !deliveredDespiteFailure &&
+        draftSessionId !== null &&
+        (text.trim() !== "" || (files?.length ?? 0) > 0)
+      ) {
         setterFor(draftSessionId)({
           failedSendDraft: {
             conversationId: draftSessionId,
@@ -4570,6 +4601,7 @@ async function rehydrateWindowOnReconnect(
   snapshotNativeMessageIds.forEach((messageId) => ignoredNativeMessageIds.add(messageId));
   const freshBlocks = itemsToBlocks(fresh.items);
   const snapshotPending = pendingElicitationBlocksFromSnapshot(session);
+  const freshItemIds = new Set(fresh.items.map((it) => it.id));
   set((s) => {
     const rid = s.activeResponse?.state === "streaming" ? s.activeResponse.responseId : null;
     const currentBlocks = withoutNativePreviews(s.blocks, snapshotNativeMessageIds);
@@ -4589,6 +4621,9 @@ async function rehydrateWindowOnReconnect(
     );
     return {
       ...reconnectStatusPatch(session, s, launchBeforeFetch),
+      // Same delivery proof as the backfill path: a rehydrated item can be
+      // a send whose POST died in the gap.
+      ...retractDeliveredSendDraft(s, freshItemIds),
       blocks:
         reconcileElicitationBlocks(
           merged,
@@ -4720,13 +4755,19 @@ async function reconcileOnReconnect(
 
   const snapshotBlocks = itemsToBlocks(items);
   const snapshotPending = pendingElicitationBlocksFromSnapshot(session);
+  const snapshotItemIds = new Set(items.map((it) => it.id));
   set((s) => {
     const currentBlocks = withoutNativePreviews(s.blocks, snapshotNativeMessageIds);
     const seen = new Set(
       currentBlocks.map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
     );
     const unseen = snapshotBlocks.filter((b) => b.ctx.itemId && !seen.has(b.ctx.itemId));
-    const patch: Partial<ChatState> = reconnectStatusPatch(session, s, launchBeforeFetch);
+    const patch: Partial<ChatState> = {
+      ...reconnectStatusPatch(session, s, launchBeforeFetch),
+      // A gap-committed item can be a send whose POST died in the gap — its
+      // presence in the snapshot proves delivery, so retract the draft.
+      ...retractDeliveredSendDraft(s, snapshotItemIds),
+    };
     // `session.input.consumed` is not replayed, so recovered user blocks are
     // the durable equivalent of its FIFO acknowledgement.
     const recoveredUserInputs = unseen.filter(
@@ -5839,6 +5880,45 @@ function hasCommittedItem(blocks: AnyBlock[], itemId: string): boolean {
 }
 
 /**
+ * Retract a failed-send draft once its message is proven delivered.
+ *
+ * A send whose POST failed client-side may still have reached the server —
+ * the network was cut after the request went out (backgrounding, VPN blip),
+ * so only the acknowledgement was lost. The server persists a web send under
+ * its client `stable_id`, so a committed item with that id IS that send.
+ * Clears an un-restored draft (nothing to hand back), flips a restored one
+ * to `delivered` so the composer drops its text (ChatPage's retraction
+ * effect), and stops the next send from reusing the stable id — the store
+ * would dedupe the new message away as a replay of the delivered one.
+ *
+ * @param s - The conversation's state.
+ * @param committedItemIds - Item ids just committed (live event or snapshot).
+ * @returns The state patch, empty when nothing matches.
+ */
+function retractDeliveredSendDraft(
+  s: ChatState,
+  committedItemIds: ReadonlySet<string>,
+): Partial<ChatState> {
+  const patch: Partial<ChatState> = {};
+  const delivered = (id: string | null | undefined): boolean =>
+    id != null && committedItemIds.has(id);
+  if (s.failedSendDraft !== null && delivered(s.failedSendDraft.stableId)) {
+    patch.failedSendDraft = null;
+  }
+  if (
+    s.restoredSendDraft !== null &&
+    !s.restoredSendDraft.delivered &&
+    delivered(s.restoredSendDraft.stableId)
+  ) {
+    patch.restoredSendDraft = { ...s.restoredSendDraft, delivered: true };
+  }
+  if (delivered(s.pendingRetryStableId)) {
+    patch.pendingRetryStableId = null;
+  }
+  return patch;
+}
+
+/**
  * Build the committed user-message content from a consumed event,
  * preserving optimistic file blocks the native transcript drops.
  *
@@ -6586,6 +6666,10 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       return;
     }
     case "session_input_consumed":
+      // This committed item may be a send whose POST failed client-side —
+      // its arrival proves that send was delivered, so retract the draft
+      // before it (re)populates the composer with an already-sent prompt.
+      applyToConversation((s) => retractDeliveredSendDraft(s, new Set([event.itemId])));
       // Hidden meta inputs stay hidden — except a background-task wake,
       // which `userContentFromEvent` re-labels as a system marker.
       if (event.isMeta === true && userContentFromEvent(event) === null) return;
