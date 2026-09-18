@@ -470,6 +470,9 @@ struct OmnigentWebView: UIViewRepresentable {
         parent.model.cancelServerSwitcherWatchdog()
         parent.model.cancelAuthentication = nil
         parent.model.signOut = nil
+        #if DEBUG
+          parent.model.injectDebugFault = nil
+        #endif
         parent.model.isAuthenticating = false
       }
       urlObservation = nil
@@ -571,6 +574,15 @@ struct OmnigentWebView: UIViewRepresentable {
         model.isLoading = true
         model.bottomBarVisible = false
         model.signOut = self?.webStore == nil ? nil : { self?.requestSignOut() }
+        #if DEBUG
+          model.injectDebugFault =
+            self?.webStore == nil
+            ? nil
+            : { [weak self] fault in
+              guard let self else { return "This workspace view is no longer attached." }
+              return await injectDebugFault(fault)
+            }
+        #endif
         if model.isAuthenticating {
           model.cancelAuthentication = {
             self?.showWorkspaceFailure(DatabricksSessionError.cancelled)
@@ -696,6 +708,22 @@ struct OmnigentWebView: UIViewRepresentable {
         }
       } catch { showWorkspaceFailure(error) }
     }
+
+    #if DEBUG
+      /// Break the live session on request so a tester can watch recovery, refresh, and the sign-in
+      /// prompt without waiting for a real expiry. Returns what to expect next. Debug builds only.
+      private func injectDebugFault(_ fault: DatabricksDebugFault) async -> String {
+        guard case .success(let context?) = contextResult, let webStore else {
+          return "This server does not use native workspace sign-in."
+        }
+        do {
+          guard try await workspaceBootstrap.inject(fault, context: context, store: webStore) else {
+            return "No saved credentials for this workspace. Sign in first."
+          }
+          return fault.expectation
+        } catch { return error.localizedDescription }
+      }
+    #endif
 
     /// Nil stays silent after cancellation. Everything else shares the page-load wording, so an
     /// unreachable managed host reads the same during native sign-in as during a page load.

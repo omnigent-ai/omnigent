@@ -13,6 +13,10 @@ final class WebViewModel: ObservableObject {
   @Published var isAuthenticating = false
   var cancelAuthentication: (() -> Void)?
   var signOut: (() -> Void)?
+  #if DEBUG
+    /// Set only while a native workspace view is attached; answers with what to expect next.
+    var injectDebugFault: ((DatabricksDebugFault) async -> String)?
+  #endif
   @Published var serverSwitcherHidden = true
 
   /// Whether the native Chat/Terminal switcher should be shown. The web app owns

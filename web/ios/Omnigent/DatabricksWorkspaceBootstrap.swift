@@ -116,6 +116,24 @@ final class DatabricksWorkspaceBootstrap {
     return session
   }
 
+  #if DEBUG
+    /// Break one piece of the live session so a tester can watch recovery happen. False when the
+    /// workspace has no saved credentials to fault. Debug builds only.
+    func inject(
+      _ fault: DatabricksDebugFault, context: DatabricksWebContext, store: any DatabricksWebStoring
+    ) async throws -> Bool {
+      guard store.identifier == context.storeIdentifier else {
+        throw DatabricksSessionError.workspaceChanged
+      }
+      guard let credential = fault.credential else {
+        // Same serialized queue as bootstrap, so a concurrent install cannot interleave.
+        try await installer.install([], in: store, reset: false)
+        return true
+      }
+      return try await tokens.inject(credential, for: context.scope)
+    }
+  #endif
+
   func beginSignOut(context: DatabricksWebContext, store: any DatabricksWebStoring) throws -> Task<
     Void, Error
   > {
@@ -129,6 +147,63 @@ final class DatabricksWorkspaceBootstrap {
 enum DatabricksConnectionIntent {
   case connect, recover
 }
+
+#if DEBUG
+  /// One broken piece of a live workspace session, offered by the debug menu. Each case names the
+  /// behavior it should produce so a tester can tell a real regression from the injected fault.
+  enum DatabricksDebugFault: String, CaseIterable, Identifiable, Sendable {
+    case sessionCookie, accessToken, rejectedAccessToken, refreshToken
+
+    var id: String { rawValue }
+
+    var title: String {
+      switch self {
+      case .sessionCookie: "Clear Session Cookie"
+      case .accessToken: "Clear Access Token"
+      case .rejectedAccessToken: "Reject Access Token"
+      case .refreshToken: "Clear Refresh Token"
+      }
+    }
+
+    var systemImage: String {
+      switch self {
+      case .sessionCookie: "trash"
+      case .accessToken: "key"
+      case .rejectedAccessToken: "exclamationmark.shield"
+      case .refreshToken: "arrow.triangle.2.circlepath"
+      }
+    }
+
+    /// What the app should do next, shown after injecting so the expectation is explicit.
+    var expectation: String {
+      switch self {
+      case .sessionCookie:
+        "Cleared the session cookie. Expect a silent repair on the next page change, or after "
+          + "leaving and reopening the app."
+      case .accessToken:
+        "Cleared the access token. Expect a silent refresh and no browser prompt."
+      case .rejectedAccessToken:
+        "Kept an unusable access token. Expect the workspace to reject it once, then one refresh "
+          + "and retry."
+      case .refreshToken:
+        "Cleared both tokens. Expect a Sign In prompt instead of a silent retry."
+      }
+    }
+
+    var credential: DatabricksCredentialFault? {
+      switch self {
+      case .sessionCookie: nil
+      case .accessToken: .clearedAccessToken
+      case .rejectedAccessToken: .rejectedAccessToken
+      case .refreshToken: .clearedRefreshToken
+      }
+    }
+  }
+
+  enum DatabricksCredentialFault: Sendable {
+    case clearedAccessToken, rejectedAccessToken, clearedRefreshToken
+  }
+#endif
 
 struct DatabricksRecoveryPolicy {
   private var lastAttempt: Date?

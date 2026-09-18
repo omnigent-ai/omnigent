@@ -321,6 +321,132 @@ final class DatabricksWorkspaceBootstrapTests: XCTestCase {
     XCTAssertNotNil(credentials.snapshot(for: context.scope))
   }
 
+  #if DEBUG
+    func testDebugCookieFaultClearsOnlyTheSessionCookie() async throws {
+      let context = try webContext("https://workspace.databricks.com/omnigent?o=123")
+      let credentials = MemoryDatabricksCredentialStore()
+      let saved = credentialTokens()
+      try credentials.save(saved, for: context.scope)
+      let bootstrap = makeBootstrap(
+        credentials, login: FakeWorkspaceLogin(), sessions: FakeWorkspaceSessions())
+      let store = FakeWebStore(identifier: context.storeIdentifier)
+      let unrelated = try XCTUnwrap(
+        HTTPCookie(properties: [
+          .name: "omnigent-theme", .value: "dark", .domain: try XCTUnwrap(context.pageURL.host),
+          .path: "/",
+        ]))
+      store.values = [try testSessionCookie(url: context.pageURL), unrelated]
+      let injected = try await bootstrap.inject(.sessionCookie, context: context, store: store)
+      XCTAssertTrue(injected)
+      XCTAssertEqual(store.values.map(\.name), ["omnigent-theme"])
+      XCTAssertFalse(store.events.contains("clear"))
+      XCTAssertEqual(credentials.snapshot(for: context.scope), saved)
+    }
+
+    func testDebugTokenFaultsKeepTheRefreshGrantUntilItIsTheChosenFault() async throws {
+      let context = try webContext("https://workspace.databricks.com/omnigent?o=123")
+      let credentials = MemoryDatabricksCredentialStore()
+      let now = Date(timeIntervalSince1970: 1000)
+      try credentials.save(credentialTokens(), for: context.scope)
+      let bootstrap = makeBootstrap(
+        credentials, login: FakeWorkspaceLogin(), sessions: FakeWorkspaceSessions(),
+        tokens: DatabricksTokenManager(store: credentials, now: { now }))
+      let store = FakeWebStore(identifier: context.storeIdentifier)
+
+      var injected = try await bootstrap.inject(.accessToken, context: context, store: store)
+      XCTAssertTrue(injected)
+      var stored = try XCTUnwrap(credentials.snapshot(for: context.scope))
+      XCTAssertNotEqual(stored.accessToken, "test-access")
+      XCTAssertEqual(stored.refreshToken, "test-refresh")
+      XCTAssertLessThan(stored.expiresAt, now)
+
+      try credentials.save(credentialTokens(), for: context.scope)
+      injected = try await bootstrap.inject(.rejectedAccessToken, context: context, store: store)
+      XCTAssertTrue(injected)
+      stored = try XCTUnwrap(credentials.snapshot(for: context.scope))
+      XCTAssertNotEqual(stored.accessToken, "test-access")
+      XCTAssertEqual(stored.refreshToken, "test-refresh")
+      // Unexpired, so the workspace rejects the token instead of the app refreshing it first.
+      XCTAssertGreaterThan(stored.expiresAt, now.addingTimeInterval(60))
+
+      injected = try await bootstrap.inject(.refreshToken, context: context, store: store)
+      XCTAssertTrue(injected)
+      stored = try XCTUnwrap(credentials.snapshot(for: context.scope))
+      XCTAssertNotEqual(stored.refreshToken, "test-refresh")
+      XCTAssertLessThan(stored.expiresAt, now)
+      XCTAssertTrue(store.events.isEmpty)
+    }
+
+    func testDebugFaultNeedsSavedCredentialsAndTheSelectedStore() async throws {
+      let context = try webContext("https://workspace.databricks.com/omnigent?o=123")
+      let credentials = MemoryDatabricksCredentialStore()
+      let bootstrap = makeBootstrap(
+        credentials, login: FakeWorkspaceLogin(), sessions: FakeWorkspaceSessions())
+      let store = FakeWebStore(identifier: context.storeIdentifier)
+      let injected = try await bootstrap.inject(.accessToken, context: context, store: store)
+      XCTAssertFalse(injected)
+      do {
+        _ = try await bootstrap.inject(
+          .sessionCookie, context: context, store: FakeWebStore(identifier: UUID()))
+        XCTFail("Expected a store from another workspace to be rejected")
+      } catch { XCTAssertEqual(error as? DatabricksSessionError, .workspaceChanged) }
+    }
+
+    func testInjectedAccessTokenFaultRecoversWithoutBrowserSignIn() async throws {
+      let refreshed = expectation(description: "one refresh")
+      refreshed.assertForOverFulfill = true
+      let server = OAuthTestServer { _ in
+        refreshed.fulfill()
+        return .init(data: OAuthTestServer.tokenData)
+      }
+      let context = try webContext(server.workspaceURL.absoluteString + "/omnigent?o=123")
+      let credentials = MemoryDatabricksCredentialStore()
+      try credentials.save(credentialTokens(), for: context.scope)
+      let login = FakeWorkspaceLogin()
+      let sessions = FakeWorkspaceSessions()
+      let bootstrap = makeBootstrap(
+        credentials, login: login, sessions: sessions,
+        tokens: DatabricksTokenManager(
+          store: credentials, client: DatabricksOAuthClient(session: server.session),
+          now: { Date(timeIntervalSince1970: 1000) }))
+      let store = FakeWebStore(identifier: context.storeIdentifier)
+      let injected = try await bootstrap.inject(.accessToken, context: context, store: store)
+      XCTAssertTrue(injected)
+      _ = try await bootstrap.prepare(
+        context: context, store: store, anchor: window(), intent: .recover)
+      await fulfillment(of: [refreshed], timeout: 2)
+      XCTAssertEqual(login.calls, 0)
+      XCTAssertEqual(credentials.snapshot(for: context.scope)?.accessToken, "opaque-access")
+    }
+
+    func testInjectedRefreshFaultAsksForSignInInsteadOfOpeningTheBrowser() async throws {
+      let server = OAuthTestServer { _ in
+        .init(status: 400, data: Data(#"{"error":"invalid_grant"}"#.utf8))
+      }
+      let context = try webContext(server.workspaceURL.absoluteString + "/omnigent?o=123")
+      let credentials = MemoryDatabricksCredentialStore()
+      try credentials.save(credentialTokens(), for: context.scope)
+      let login = FakeWorkspaceLogin()
+      let bootstrap = makeBootstrap(
+        credentials, login: login, sessions: FakeWorkspaceSessions(),
+        tokens: DatabricksTokenManager(
+          store: credentials, client: DatabricksOAuthClient(session: server.session),
+          now: { Date(timeIntervalSince1970: 1000) }))
+      let store = FakeWebStore(identifier: context.storeIdentifier)
+      let injected = try await bootstrap.inject(.refreshToken, context: context, store: store)
+      XCTAssertTrue(injected)
+      do {
+        _ = try await bootstrap.prepare(
+          context: context, store: store, anchor: window(), intent: .recover)
+        XCTFail("Expected explicit reauthentication")
+      } catch {
+        XCTAssertEqual(error as? DatabricksSessionError, .reauthenticationRequired)
+      }
+      XCTAssertEqual(login.calls, 0)
+      XCTAssertNil(credentials.snapshot(for: context.scope))
+    }
+  #endif
+
   private func window() throws -> UIWindow {
     let scene = try XCTUnwrap(
       UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)

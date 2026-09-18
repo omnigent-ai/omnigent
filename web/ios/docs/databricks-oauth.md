@@ -298,6 +298,10 @@ are authorized to access:
 6. In the disposable context, expire/remove its session cookie, then navigate or
    foreground the app. Confirm silent recovery preserves the current conversation.
    Test revoked credentials separately: the app should ask before opening sign-in.
+   Debug builds carry a floating **Debug** menu on workspace connections that
+   breaks one piece of the live session on demand—session cookie, access token,
+   an access token the workspace will reject, or the refresh token—and then
+   states the behavior to expect. It is compiled out of release builds.
 7. Sign out using the native menu, relaunch, and confirm setup remains visible.
    Explicitly reconnect and verify a fresh native sign-in occurs without old web
    state. Verify the other workspace still works.

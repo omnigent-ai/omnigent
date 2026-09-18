@@ -110,6 +110,15 @@ struct WebShellView: View {
         .animation(.easeInOut(duration: 0.2), value: model.bottomBarVisible)
       }
       .ignoresSafeArea(.keyboard)
+      #if DEBUG
+        .overlay(alignment: .bottomLeading) {
+          if isWorkspace, !model.isAuthenticating {
+            WorkspaceDebugMenu(inject: { await model.injectDebugFault?($0) })
+            .padding(.leading, 12)
+            .padding(.bottom, InsetMetrics.bottomBarFootprint + 10)
+          }
+        }
+      #endif
     }
     .alert("Sign in again?", isPresented: $needsReauthentication) {
       Button("Sign In") {
@@ -314,6 +323,81 @@ private struct ServerSwitcher: View {
     .accessibilityLabel("Switch server")
   }
 }
+
+#if DEBUG
+  /// Breaks one piece of the live workspace session on demand so recovery, refresh, and the sign-in
+  /// prompt can be exercised by hand. Compiled out of release builds.
+  private struct WorkspaceDebugMenu: View {
+    let inject: (DatabricksDebugFault) async -> String?
+
+    @Environment(\.colorScheme) private var colorScheme
+    @State private var status: String?
+    @State private var busy = false
+
+    var body: some View {
+      VStack(alignment: .leading, spacing: 6) {
+        if let status {
+          Text(status)
+            .font(.system(size: 11))
+            .foregroundStyle(DesignTokens.foreground(colorScheme))
+            .padding(.horizontal, 9)
+            .padding(.vertical, 7)
+            .frame(maxWidth: 240, alignment: .leading)
+            .background(
+              .ultraThinMaterial, in: RoundedRectangle(cornerRadius: 9, style: .continuous)
+            )
+            .onTapGesture { self.status = nil }
+            .accessibilityHint("Tap to dismiss")
+        }
+
+        Menu {
+          ForEach(DatabricksDebugFault.allCases) { fault in
+            Button(role: .destructive) {
+              run(fault)
+            } label: {
+              Label(fault.title, systemImage: fault.systemImage)
+            }
+          }
+        } label: {
+          HStack(spacing: 5) {
+            Image(systemName: "ladybug")
+              .font(.system(size: 11, weight: .semibold))
+            Text("Debug")
+              .font(.system(size: 12))
+            if busy {
+              ProgressView().controlSize(.mini)
+            }
+          }
+          .foregroundStyle(DesignTokens.foreground(colorScheme))
+          .padding(.horizontal, 10)
+          .frame(height: InsetMetrics.serverSwitcherHeight)
+          .contentShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .disabled(busy)
+        // Chrome stays outside the label closure; see ServerSwitcher for why.
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+        .overlay {
+          RoundedRectangle(cornerRadius: 9, style: .continuous)
+            .stroke(Color.primary.opacity(colorScheme == .dark ? 0.16 : 0.10), lineWidth: 0.5)
+        }
+        .shadow(color: .black.opacity(colorScheme == .dark ? 0.22 : 0.08), radius: 10, y: 4)
+        .accessibilityLabel("Break workspace session for testing")
+      }
+    }
+
+    private func run(_ fault: DatabricksDebugFault) {
+      guard !busy else { return }
+      busy = true
+      status = nil
+      Task {
+        let message = await inject(fault)
+        busy = false
+        status = message ?? "The workspace view is not ready yet."
+      }
+    }
+  }
+#endif
 
 private enum ServerSwitcherMetrics {
   static func maxWidth(for containerWidth: CGFloat) -> CGFloat {
