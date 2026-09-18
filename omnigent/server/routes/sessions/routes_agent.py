@@ -119,7 +119,7 @@ def register_agent_routes(
         )
         conv = access.conversation
         if conv is None:
-            conv = conversation_store.get_conversation(session_id)
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             if conv is None:
                 raise OmnigentError(
                     f"Session not found: {session_id!r}",
@@ -199,7 +199,7 @@ def register_agent_routes(
             )
             conv = access.conversation
         if conv is None:
-            conv = conversation_store.get_conversation(session_id)
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             if conv is None:
                 raise OmnigentError(
                     f"Session not found: {session_id!r}",
@@ -221,7 +221,7 @@ def register_agent_routes(
                 "Artifact store not configured",
                 code=ErrorCode.INTERNAL_ERROR,
             )
-        bundle_bytes = artifact_store.get(agent.bundle_location)
+        bundle_bytes = await asyncio.to_thread(artifact_store.get, agent.bundle_location)
         if bundle_bytes is None:
             raise OmnigentError(
                 "Agent bundle not found in artifact store",
@@ -276,7 +276,7 @@ def register_agent_routes(
         )
         conv = access.conversation
         if conv is None:
-            conv = conversation_store.get_conversation(session_id)
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             if conv is None:
                 raise OmnigentError(
                     f"Session not found: {session_id!r}",
@@ -336,7 +336,7 @@ def register_agent_routes(
                 "Artifact store not configured",
                 code=ErrorCode.INTERNAL_ERROR,
             )
-        artifact_store.put(new_loc, bundle_bytes)
+        await asyncio.to_thread(artifact_store.put, new_loc, bundle_bytes)
         updated = await asyncio.to_thread(agent_store.update, agent.id, new_loc)
         if updated is None:
             raise OmnigentError(

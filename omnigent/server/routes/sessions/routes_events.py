@@ -2092,7 +2092,7 @@ def register_events_routes(
             runner_client,
             conversation_store,
         )
-        _agent = agent_store.get(conv.agent_id) if conv.agent_id else None
+        _agent = await asyncio.to_thread(agent_store.get, conv.agent_id) if conv.agent_id else None
         # Determine whether the agent has MCP servers so the runner's
         # proxy_stream handler knows to initialise ProxyMcpManager.
         # agent_cache.load() is O(1) on a warm in-memory cache; the

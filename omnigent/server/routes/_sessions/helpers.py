@@ -8558,7 +8558,7 @@ async def _persist_policy_deny_sentinel(
     import uuid
 
     sentinel = f"{_DENY_SENTINEL_PREFIX}{reason}]"
-    agent = agent_store.get(conv.agent_id) if conv.agent_id else None
+    agent = await asyncio.to_thread(agent_store.get, conv.agent_id) if conv.agent_id else None
     agent_name = agent.name if agent is not None else conv.agent_id or "policy"
     item = NewConversationItem(
         type="message",

@@ -9065,7 +9065,9 @@ async def _create_session_from_existing_agent(
     # is assigned to the same runner (sub-agent co-location).
     inherited_runner_id: str | None = None
     if body.parent_session_id is not None:
-        parent_conv = conversation_store.get_conversation(body.parent_session_id)
+        parent_conv = await asyncio.to_thread(
+            conversation_store.get_conversation, body.parent_session_id
+        )
         if parent_conv is not None:
             inherited_runner_id = parent_conv.runner_id
             # Defense-in-depth: don't inherit a runner the
@@ -9226,7 +9228,8 @@ async def _create_session_from_existing_agent(
             )
 
     try:
-        conv = conversation_store.create_conversation(
+        conv = await asyncio.to_thread(
+            conversation_store.create_conversation,
             agent_id=agent.id,
             title=body.title,
             parent_conversation_id=body.parent_session_id,

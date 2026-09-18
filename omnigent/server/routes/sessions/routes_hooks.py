@@ -811,7 +811,10 @@ def register_hooks_routes(
                 content=json.dumps({"result": "POLICY_ACTION_ALLOW"}),
                 media_type="application/json",
             )
-        agent = agent_store.get(conv.agent_id) if conv.agent_id else None
+        # Threaded: a native harness calls this hook once per tool call, and a
+        # blocking store read here stalls the whole event loop — every other
+        # session's stream included — for one database round-trip.
+        agent = await asyncio.to_thread(agent_store.get, conv.agent_id) if conv.agent_id else None
         if agent is None:
             # No agent — no policies. Return unspecified (pass-through).
             return Response(
@@ -819,8 +822,13 @@ def register_hooks_routes(
                 media_type="application/json",
             )
 
-        loaded = _sf.get_agent_cache().load(
-            agent.id, agent.bundle_location, expand_env=agent.session_id is None
+        # Warm-cache loads are in-memory; the thread hop covers the cold path
+        # that extracts the bundle from disk.
+        loaded = await asyncio.to_thread(
+            _sf.get_agent_cache().load,
+            agent.id,
+            agent.bundle_location,
+            expand_env=agent.session_id is None,
         )
 
         _caps = _sf.get_caps()

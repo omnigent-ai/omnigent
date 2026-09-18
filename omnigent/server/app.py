@@ -2565,7 +2565,8 @@ def create_app(
         # boolean about whether setup is pending, not a secret.
         needs_setup = False
         if accounts_enabled and account_store is not None:
-            needs_setup = not any(u.has_password for u in account_store.list_users())
+            users = await asyncio.to_thread(account_store.list_users)
+            needs_setup = not any(u.has_password for u in users)
         # databricks_features gates the Databricks-deployment-only UI hints
         # (the "Databricks Lakebox" connect tab). True only when the internal
         # lakebox launcher module is present — it is excluded from the OSS
@@ -2757,10 +2758,14 @@ def create_app(
         # endpoints actually authorize — e.g. for an identity added to the
         # admin-list file who hasn't re-logged-in yet (so ``promote_if_listed``
         # hasn't flipped the DB flag).
-        is_admin = user_id is not None and (
-            (permission_store is not None and permission_store.is_admin(user_id))
-            or admin_list.is_admin(user_id)
+        # Threaded: every page load hits this, and the admin flag is a
+        # database read that would otherwise stall the loop for all clients.
+        db_admin = (
+            user_id is not None
+            and permission_store is not None
+            and await asyncio.to_thread(permission_store.is_admin, user_id)
         )
+        is_admin = user_id is not None and (db_admin or admin_list.is_admin(user_id))
         return {"user_id": user_id, "is_admin": is_admin}
 
     app.include_router(

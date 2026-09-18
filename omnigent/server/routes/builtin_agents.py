@@ -20,6 +20,7 @@ through session creation.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from fastapi import APIRouter, Query, Request
@@ -161,7 +162,9 @@ def create_builtin_agents_router(
         :returns: A :class:`PaginatedList` of built-in agents.
         """
         _require_user(request, auth_provider)
-        page = agent_store.list(limit=limit, after=after, before=before, order=order)
+        page = await asyncio.to_thread(
+            agent_store.list, limit=limit, after=after, before=before, order=order
+        )
         return PaginatedList(
             data=[_to_agent_object(a, agent_cache) for a in page.data],
             first_id=page.first_id,

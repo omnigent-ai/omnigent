@@ -1513,7 +1513,8 @@ def register_resources_routes(
                 status_code=501,
                 detail="file store not configured",
             )
-        page = file_store.list(
+        page = await asyncio.to_thread(
+            file_store.list,
             session_id=session_id,
             limit=limit,
             after=after,
@@ -1637,7 +1638,8 @@ def register_resources_routes(
             # PDF/text/SVG and other non-compressed types use their smaller
             # per-type caps and aren't decoded, so they read outside the gate.
             content = await _read_upload_capped(file, read_limit)
-        stored = file_store.create(
+        stored = await asyncio.to_thread(
+            file_store.create,
             session_id=session_id,
             filename=filename,
             bytes=len(content),
@@ -1646,7 +1648,7 @@ def register_resources_routes(
                 {"width": source_dims[0], "height": source_dims[1]} if source_dims else None
             ),
         )
-        artifact_store.put(stored.id, content)
+        await asyncio.to_thread(artifact_store.put, stored.id, content)
         resource = _stored_file_to_resource(session_id, stored)
         _publish_and_persist_resource_event(
             session_id,
@@ -1683,7 +1685,7 @@ def register_resources_routes(
                 status_code=501,
                 detail="file store not configured",
             )
-        stored = file_store.get(file_id, session_id=session_id)
+        stored = await asyncio.to_thread(file_store.get, file_id, session_id=session_id)
         if stored is None:
             raise OmnigentError(
                 "File not found",
@@ -1895,10 +1897,15 @@ def register_resources_routes(
         sources: list[StoredFile] = []
         total_bytes = 0
         for file_id in body.file_ids:
-            stored = file_store.get(file_id, session_id=body.source_session_id)
+            stored = await asyncio.to_thread(
+                file_store.get, file_id, session_id=body.source_session_id
+            )
             # The source row may itself share a blob (blob_key != id), so probe
             # existence under the effective blob key, not the row id.
-            if stored is None or not artifact_store.exists(stored.blob_key or stored.id):
+            blob_present = stored is not None and await asyncio.to_thread(
+                artifact_store.exists, stored.blob_key or stored.id
+            )
+            if stored is None or not blob_present:
                 raise OmnigentError(
                     f"File '{file_id}' not found in source session",
                     code=ErrorCode.NOT_FOUND,
@@ -1919,8 +1926,9 @@ def register_resources_routes(
         copied: list[StoredFile] = []
         try:
             for stored in sources:
-                content = artifact_store.get(stored.blob_key or stored.id)
-                new = file_store.create(
+                content = await asyncio.to_thread(artifact_store.get, stored.blob_key or stored.id)
+                new = await asyncio.to_thread(
+                    file_store.create,
                     session_id=session_id,
                     filename=stored.filename,
                     bytes=stored.bytes,
@@ -1929,7 +1937,7 @@ def register_resources_routes(
                     source_metadata=stored.source_metadata,
                 )
                 created.append(new.id)
-                artifact_store.put(new.id, content)
+                await asyncio.to_thread(artifact_store.put, new.id, content)
                 # Carry the preserved filename + content_type back so the
                 # caller can attach the copy without a follow-up metadata GET.
                 mapping[stored.id] = CopiedFile(
@@ -1941,7 +1949,7 @@ def register_resources_routes(
         except Exception as exc:
             for new_id in created:
                 try:
-                    file_store.delete(new_id, session_id=session_id)
+                    await asyncio.to_thread(file_store.delete, new_id, session_id=session_id)
                 except Exception:
                     _logger.warning(
                         "Failed to delete copied file row during rollback: session=%s file_id=%s",
@@ -1950,7 +1958,7 @@ def register_resources_routes(
                         exc_info=True,
                     )
                 try:
-                    artifact_store.delete(new_id)
+                    await asyncio.to_thread(artifact_store.delete, new_id)
                 except Exception:
                     _logger.warning(
                         "Failed to delete copied file blob during rollback: session=%s file_id=%s",
