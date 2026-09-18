@@ -371,13 +371,14 @@ def _note_forward_success() -> None:
     _forward_health.degraded_logged = False
 
 
-def _note_forward_failure(retry_key: str, exc: httpx.HTTPError) -> None:
+def _note_forward_failure(retry_key: str, exc: httpx.HTTPError, *, session_id: str) -> None:
     """
     Record a forward post failure; escalate once when sync degrades.
 
     :param retry_key: Stable retry key of the failed post, e.g.
         ``"item:source-1"``.
     :param exc: The latest failed post's HTTP exception.
+    :param session_id: Session targeted by the failed post.
     :returns: None.
     """
     _forward_health.consecutive_failures += 1
@@ -392,6 +393,7 @@ def _note_forward_failure(retry_key: str, exc: httpx.HTTPError) -> None:
             _forward_health.consecutive_failures,
             retry_key,
             extra={
+                "session_id": session_id,
                 "event_name": "claude_forward_sync_degraded",
                 "attributes": {
                     "exception_type": type(exc).__name__,
@@ -954,17 +956,20 @@ class _PostRetryTracker:
         # delivered); reset process-level forward-sync health (#1120).
         _note_forward_success()
 
-    def record_failure(self, key: str, exc: httpx.HTTPError) -> _PostRetryDecision:
+    def record_failure(
+        self, key: str, exc: httpx.HTTPError, *, session_id: str
+    ) -> _PostRetryDecision:
         """
         Record one failed post and compute the next retry action.
 
         :param key: Stable retry key, e.g. ``"item:source-1"``.
         :param exc: HTTP exception raised while posting the event.
+        :param session_id: Session targeted by the failed post.
         :returns: Retry decision for this failure.
         """
         # Count every failed post (transient or permanent) so a sustained
         # outage escalates once to a degraded-sync signal (#1120).
-        _note_forward_failure(key, exc)
+        _note_forward_failure(key, exc, session_id=session_id)
         entry = self._entries.get(key)
         if entry is None:
             entry = _PostRetryEntry()
@@ -1998,7 +2003,18 @@ async def _forward_one_subagent(
                 "child=%s source_id=%s",
                 entry.child_conversation_id,
                 item.source_id,
-                extra={"session_id": parent_session_id},
+                extra={
+                    "session_id": entry.child_conversation_id,
+                    "event_name": "claude_subagent_transcript_dropped",
+                    "attributes": {
+                        "parent_session_id": parent_session_id,
+                        "drop_reason": "oversized_item",
+                        "item_count": 1,
+                        "http_status": 413,
+                        "attempts": 0,
+                        "response_id": item.response_id,
+                    },
+                },
             )
             append_dead_letter(
                 bridge_dir,
@@ -2030,7 +2046,9 @@ async def _forward_one_subagent(
                     batch_capability=batch_capability,
                 )
             except httpx.HTTPError as exc:
-                decision = item_retry_tracker.record_failure(retry_key, exc)
+                decision = item_retry_tracker.record_failure(
+                    retry_key, exc, session_id=entry.child_conversation_id
+                )
                 if not decision.exhausted:
                     _logger.warning(
                         "Failed to forward claude-native sub-agent item batch; "
@@ -2055,7 +2073,18 @@ async def _forward_one_subagent(
                         len(batch),
                         decision.attempts,
                         _http_status_for_log(exc),
-                        extra={"session_id": parent_session_id},
+                        extra={
+                            "session_id": entry.child_conversation_id,
+                            "event_name": "claude_subagent_transcript_dropped",
+                            "attributes": {
+                                "parent_session_id": parent_session_id,
+                                "drop_reason": "transient_retries_exhausted",
+                                "item_count": len(batch),
+                                "http_status": _http_status_for_log(exc),
+                                "attempts": decision.attempts,
+                                "exception_type": type(exc).__name__,
+                            },
+                        },
                     )
                     for pending_item in batch:
                         item = pending_item.item
@@ -2104,7 +2133,9 @@ async def _forward_one_subagent(
                         item=item,
                     )
                 except httpx.HTTPError as item_exc:
-                    item_decision = item_retry_tracker.record_failure(item_retry_key, item_exc)
+                    item_decision = item_retry_tracker.record_failure(
+                        item_retry_key, item_exc, session_id=entry.child_conversation_id
+                    )
                     if not item_decision.exhausted:
                         stop_after_batch = True
                         _logger.warning(
@@ -2120,20 +2151,35 @@ async def _forward_one_subagent(
                             extra={"session_id": parent_session_id},
                         )
                         break
+                    if _is_permanent_http_error(item_exc):
+                        dead_letter_reason = "permanent HTTP failure after retries"
+                        drop_category = "permanent_http_failure"
+                    elif _is_subagent_delivery_not_confirmed(item_exc):
+                        dead_letter_reason = "delivery not confirmed after retries"
+                        drop_category = "delivery_not_confirmed"
+                    else:
+                        dead_letter_reason = "transient HTTP failure after retries"
+                        drop_category = "transient_retries_exhausted"
                     _logger.error(
                         "Dropping claude-native sub-agent transcript item after "
                         "individual delivery retries; child=%s source_id=%s http_status=%s",
                         entry.child_conversation_id,
                         item.source_id,
                         _http_status_for_log(item_exc),
-                        extra={"session_id": parent_session_id},
+                        extra={
+                            "session_id": entry.child_conversation_id,
+                            "event_name": "claude_subagent_transcript_dropped",
+                            "attributes": {
+                                "parent_session_id": parent_session_id,
+                                "drop_reason": drop_category,
+                                "item_count": 1,
+                                "http_status": _http_status_for_log(item_exc),
+                                "attempts": item_decision.attempts,
+                                "exception_type": type(item_exc).__name__,
+                                "response_id": item.response_id,
+                            },
+                        },
                     )
-                    if _is_permanent_http_error(item_exc):
-                        dead_letter_reason = "permanent HTTP failure after retries"
-                    elif _is_subagent_delivery_not_confirmed(item_exc):
-                        dead_letter_reason = "delivery not confirmed after retries"
-                    else:
-                        dead_letter_reason = "transient HTTP failure after retries"
                     append_dead_letter(
                         bridge_dir,
                         session_id=entry.child_conversation_id,
@@ -2203,7 +2249,9 @@ async def _forward_one_subagent(
             output=new_entry.delivery_error if desired_status == "failed" else None,
         )
     except httpx.HTTPError as exc:
-        decision = status_retry_tracker.record_failure(retry_key, exc)
+        decision = status_retry_tracker.record_failure(
+            retry_key, exc, session_id=entry.child_conversation_id
+        )
         _logger.warning(
             "Failed to forward claude-native sub-agent status; child=%s status=%s "
             "attempt=%s next_retry_s=%.3f http_status=%s",
@@ -2452,7 +2500,9 @@ async def _forward_available_subagents(
                     tool_use_id=meta["toolUseId"],
                 )
             except httpx.HTTPError as exc:
-                decision = start_retry_tracker.record_failure(retry_key, exc)
+                decision = start_retry_tracker.record_failure(
+                    retry_key, exc, session_id=immediate_parent_session_id
+                )
                 if decision.exhausted:
                     _logger.error(
                         "Dropping claude-native sub-agent after permanent HTTP failures; "
@@ -3721,7 +3771,9 @@ async def _forward_available_status_events(
                                 retry_tracker.clear(retry_key)
                                 await _mark_compaction_persisted(bridge_dir, seq)
                             else:
-                                decision = retry_tracker.record_failure(retry_key, exc)
+                                decision = retry_tracker.record_failure(
+                                    retry_key, exc, session_id=session_id
+                                )
                                 if decision.exhausted:
                                     _logger.error(
                                         "Dropping compaction boundary (hook path) after "
@@ -3853,7 +3905,7 @@ async def _forward_available_status_events(
                 background_tasks=(None if status == "failed" else record.background_tasks),
             )
         except httpx.HTTPError as exc:
-            decision = retry_tracker.record_failure(retry_key, exc)
+            decision = retry_tracker.record_failure(retry_key, exc, session_id=session_id)
             if decision.exhausted:
                 _logger.error(
                     "Dropping Claude hook status after permanent HTTP failures; "
@@ -4192,7 +4244,7 @@ async def _handle_compact_summary_item(
             retry_tracker.clear(retry_key)
             await _mark_compaction_persisted(bridge_dir, seq, expect_completion_ack=True)
             return True
-        decision = retry_tracker.record_failure(retry_key, exc)
+        decision = retry_tracker.record_failure(retry_key, exc, session_id=session_id)
         _logger.warning(
             "Failed to persist compaction boundary (transcript path); "
             "session=%s seq=%s attempt=%s permanent=%s next_retry_s=%.3f http_status=%s",
@@ -4368,7 +4420,7 @@ async def _forward_available_items(
                 item=item,
             )
         except httpx.HTTPError as exc:
-            decision = retry_tracker.record_failure(retry_key, exc)
+            decision = retry_tracker.record_failure(retry_key, exc, session_id=session_id)
             if decision.exhausted:
                 _logger.error(
                     "Dropping Claude transcript item after permanent HTTP failures; "
