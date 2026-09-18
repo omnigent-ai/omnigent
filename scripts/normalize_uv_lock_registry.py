@@ -105,7 +105,9 @@ def main(argv: list[str]) -> int:
                 )
                 print(
                     "Fix with: python scripts/normalize_uv_lock_registry.py "
-                    f"{name} && git add {name}"
+                    f"{name}\n"
+                    "Exit 1 means the file was rewritten. Inspect the changes, "
+                    f"then stage them with: git add {name}"
                 )
         return 0 if ok else 1
 
