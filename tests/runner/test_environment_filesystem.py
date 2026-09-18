@@ -723,11 +723,18 @@ async def test_filesystem_session_without_agent_id_returns_typed_404(
 
 
 @pytest.mark.asyncio
-async def test_filesystem_missing_session_agent_returns_typed_404(
+async def test_filesystem_missing_session_agent_returns_typed_410(
     registry: SessionResourceRegistry,
 ) -> None:
     """
-    Missing session agent spec returns a typed 404.
+    Missing session agent spec returns a typed 410 ``session_agent_missing``.
+
+    A session that still references an ``agent_id`` whose bundle no longer
+    resolves is a session-lifecycle condition (the agent was deleted or
+    rebound), not a plain ``not_found``. The shared session spec resolver
+    raises ``SESSION_AGENT_MISSING`` (HTTP 410 Gone), so every endpoint that
+    lets the resolver error propagate — including this filesystem read —
+    reports 410 rather than 404: retrying cannot recreate the deleted agent.
 
     :param registry: Registry with a real caller-process environment.
     """
@@ -774,9 +781,9 @@ async def test_filesystem_missing_session_agent_returns_typed_404(
             f"/{DEFAULT_ENVIRONMENT_ID}/filesystem/hello.txt"
         )
 
-    assert resp.status_code == 404
+    assert resp.status_code == 410
     body = resp.json()
-    assert body["error"]["code"] == "not_found"
+    assert body["error"]["code"] == "session_agent_missing"
     assert body["error"]["message"] == (
         "session spec resolver: agent 'ag_missing' for session 'conv_test' was not found"
     )

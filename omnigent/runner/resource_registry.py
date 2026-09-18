@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Literal
 
 from cachetools import TTLCache
 
-from omnigent.debug_logging import runner_primary_session_id
+from omnigent.debug_logging import debug_event, runner_primary_session_id
 from omnigent.entities.pagination import PagedList
 from omnigent.entities.session_resources import (
     DEFAULT_ENVIRONMENT_ID,
@@ -69,6 +69,35 @@ ANTIGRAVITY_NATIVE_TERMINAL_ROLE = "antigravity-native"
 QWEN_NATIVE_TERMINAL_ROLE = "qwen-native"
 KIMI_NATIVE_TERMINAL_ROLE = "kimi-native"
 HERMES_NATIVE_TERMINAL_ROLE = "hermes-native"
+DEVIN_NATIVE_TERMINAL_ROLE = "devin-native"
+
+#: Terminal roles whose PTY-activity watcher drives the session's working
+#: status (pane activity → ``running``, quiescence → ``idle``), not just the
+#: activity badge. These are the native agent terminals whose ``run_turn`` injects
+#: and returns immediately, leaving pane activity as their only running/idle
+#: source — without membership here the web "Working…" badge never clears and the
+#: turn times out. A generic shell's role is absent so its output can't move the
+#: session status. A harness whose own forwarder posts authoritative running/idle
+#: edges (devin-native, from its hook stream) is excluded instead, because pane
+#: quiescence would clobber them; ``tests/runner/test_native_terminal_lock_coverage.py``
+#: guards both sides.
+_STATUS_EMITTING_TERMINAL_ROLES: frozenset[str] = frozenset(
+    {
+        CLAUDE_NATIVE_TERMINAL_ROLE,
+        PI_NATIVE_TERMINAL_ROLE,
+        CURSOR_NATIVE_TERMINAL_ROLE,
+        KIRO_NATIVE_TERMINAL_ROLE,
+        GOOSE_NATIVE_TERMINAL_ROLE,
+        QWEN_NATIVE_TERMINAL_ROLE,
+        KIMI_NATIVE_TERMINAL_ROLE,
+        HERMES_NATIVE_TERMINAL_ROLE,
+        # devin-native is deliberately ABSENT: its hook stream carries exact turn
+        # boundaries (UserPromptSubmit -> Stop), so its forwarder posts
+        # running/idle itself. Pane quiescence would flip the session to idle
+        # after ~1s of any mid-turn lull and clobber that, which makes a follow-up
+        # bypass the queue and always steer.
+    }
+)
 # Role marker for the embedded Omnigent REPL terminal auto-created for
 # runner-hosted SDK sessions (``omnigent attach`` in a tmux pane — the
 # SDK mirror of the native terminals above). The attach WebSocket uses
@@ -373,6 +402,8 @@ class SessionResourceRegistry:
         # hook; all access goes through the ``_*_session_status_memo`` helpers
         # under ``self._lock``.
         self._last_session_status: dict[str, str] = {}
+        self._session_activity_epoch: dict[str, int] = {}
+        self._active_session_turns: set[str] = set()
         # Last status *edge published to the server* per session, shared by the
         # watcher and the native forwarders' hook-derived edges so the two
         # dedup against one baseline. Kept separate from the exit memo above,
@@ -465,14 +496,24 @@ class SessionResourceRegistry:
         if tasks:
             await asyncio.gather(*tasks)
 
-    def _set_session_status_memo(self, session_id: str, status: str) -> None:
+    def _set_session_status_memo(
+        self, session_id: str, status: str, *, record_activity: bool = True
+    ) -> None:
         """Record the session's latest PTY status for exit classification."""
         with self._lock:
+            if record_activity and status in {"running", "waiting"}:
+                self._active_session_turns.add(session_id)
+                self._session_activity_epoch[session_id] = (
+                    self._session_activity_epoch.get(session_id, 0) + 1
+                )
+            if status in {"idle", "failed"}:
+                self._active_session_turns.discard(session_id)
             self._last_session_status[session_id] = status
 
     def _take_session_status_memo(self, session_id: str) -> str | None:
         """Pop and return the session's recorded PTY status (or ``None``)."""
         with self._lock:
+            self._active_session_turns.discard(session_id)
             self._published_session_status.pop(session_id, None)
             self._status_pollers.pop(session_id, None)
             return self._last_session_status.pop(session_id, None)
@@ -537,6 +578,16 @@ class SessionResourceRegistry:
                 extra={"session_id": runner_primary_session_id()},
             )
 
+    def session_activity_epoch(self, session_id: str) -> int:
+        """Count explicit turn activity, retaining it after idle or terminal exit."""
+        with self._lock:
+            return self._session_activity_epoch.get(session_id, 0)
+
+    def session_turn_is_active(self, session_id: str) -> bool:
+        """Whether an explicitly observed turn is unfinished, excluding pane repaints."""
+        with self._lock:
+            return session_id in self._active_session_turns
+
     def note_session_turn_started(self, session_id: str) -> None:
         """Mark a session as having an in-flight turn.
 
@@ -567,8 +618,8 @@ class SessionResourceRegistry:
         :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
         :param status: External native status, e.g. ``"running"`` or ``"idle"``.
         """
-        if status == "idle":
-            self._set_session_status_memo(session_id, "idle")
+        if status in {"idle", "failed"}:
+            self._set_session_status_memo(session_id, status)
         elif status in {"running", "waiting"}:
             self._set_session_status_memo(session_id, "running")
         self._sync_status_edge(session_id, status)
@@ -1159,30 +1210,9 @@ class SessionResourceRegistry:
         exit_publisher = self._terminal_exit_publisher
         # Status edges are derived only from native agent terminals — a
         # generic shell's output must not move the session's working status.
-        emit_status = status_publisher is not None and resource_role in {
-            CLAUDE_NATIVE_TERMINAL_ROLE,
-            PI_NATIVE_TERMINAL_ROLE,
-            # cursor-native has no forwarder/hook (run_turn returns immediately
-            # after the paste), so — like pi/claude — the PTY watcher is its only
-            # status source. Without this the web "Working…" badge never clears.
-            CURSOR_NATIVE_TERMINAL_ROLE,
-            KIRO_NATIVE_TERMINAL_ROLE,
-            # goose-native injects then returns (its forwarder only mirrors the
-            # transcript, not status), so the PTY watcher is its status source too.
-            GOOSE_NATIVE_TERMINAL_ROLE,
-            # qwen-native appends then returns (its forwarder only mirrors the
-            # JSON event transcript, not status), so the PTY watcher is its
-            # status source too.
-            QWEN_NATIVE_TERMINAL_ROLE,
-            # kimi-native also has no forwarder/hook (the injection run_turn
-            # returns right after the tmux paste), so the PTY watcher is its
-            # only running/idle status source — same as cursor/pi/claude.
-            KIMI_NATIVE_TERMINAL_ROLE,
-            # hermes-native injects then returns (its forwarder only mirrors the
-            # SQLite transcript, not status), so the PTY watcher is its status
-            # source too.
-            HERMES_NATIVE_TERMINAL_ROLE,
-        }
+        emit_status = (
+            status_publisher is not None and resource_role in _STATUS_EMITTING_TERMINAL_ROLES
+        )
         if activity_publisher is None and not emit_status and exit_publisher is None:
             return
         resource_id = terminal_resource_id(terminal_name, session_key)
@@ -1195,7 +1225,9 @@ class SessionResourceRegistry:
         # means "never emitted", so the first changed tick always fires.
         last_activity_emit: dict[str, float | None] = {"value": None}
 
-        def _publish_status(status: str, blocked_on: str | None = None) -> None:
+        def _publish_status(
+            status: str, blocked_on: str | None = None, *, record_activity: bool = False
+        ) -> None:
             # Publish one running/idle edge: dedup against the last value,
             # memo for exit classification, and hop to the loop (publishers
             # are loop-only). Shared by the PTY edges and the claude-native
@@ -1205,9 +1237,14 @@ class SessionResourceRegistry:
             # :meth:`note_external_session_status`).
             if status_publisher is None:
                 return
+            explicit_activity = record_activity and status in {"running", "waiting"}
+            if explicit_activity:
+                self._set_session_status_memo(session_id, status)
             if not self._claim_status_edge(session_id, status, blocked_on):
                 return
-            self._set_session_status_memo(session_id, status)
+            # Pane repaints can be startup output, not a new agent turn.
+            if not explicit_activity:
+                self._set_session_status_memo(session_id, status, record_activity=False)
             loop.call_soon_threadsafe(status_publisher, session_id, status, blocked_on)
 
         def _file_owns_status() -> bool:
@@ -1230,7 +1267,9 @@ class SessionResourceRegistry:
             self._build_claude_native_status_poller(
                 session_id=session_id,
                 instance=instance,
-                on_status=_publish_status,
+                on_status=lambda status, blocked_on=None: _publish_status(
+                    status, blocked_on, record_activity=True
+                ),
             )
             if emit_status and resource_role == CLAUDE_NATIVE_TERMINAL_ROLE
             else None
@@ -1438,7 +1477,8 @@ class SessionResourceRegistry:
         command, args_count, cwd, last_output, exit_status = _terminal_exit_diagnostics(instance)
         # Idle = clean shutdown after the turn finished. Anything else (running,
         # or never observed → boot failure) stays a failure.
-        session_was_idle = self._take_session_status_memo(session_id) == "idle"
+        session_status_before_exit = self._take_session_status_memo(session_id)
+        session_was_idle = session_status_before_exit == "idle"
 
         superseded_by: TerminalInstance | None = None
         if self._terminal_registry is not None:
@@ -1459,6 +1499,28 @@ class SessionResourceRegistry:
                     superseded_by = current
 
         publisher = self._terminal_exit_publisher
+        _logger.info(
+            "Terminal exit observed: session=%s terminal=%s:%s "
+            "lifecycle=%s status=%s superseded=%s",
+            session_id,
+            terminal_name,
+            session_key,
+            lifecycle.value,
+            session_status_before_exit or "unknown",
+            superseded_by is not None,
+            extra=debug_event(
+                "terminal_exit_observed",
+                session_id=session_id,
+                terminal_instance_id=instance.diagnostic_id if instance is not None else None,
+                terminal_id=terminal_id,
+                terminal_name=terminal_name,
+                terminal_key=session_key,
+                terminal_lifecycle=lifecycle.value,
+                session_status_before_exit=session_status_before_exit or "unknown",
+                terminal_exit_status=exit_status,
+                superseded=superseded_by is not None,
+            ),
+        )
         if superseded_by is not None:
             _logger.info(
                 "Skipping exit event for superseded terminal: session=%s terminal=%s:%s",
@@ -1501,6 +1563,17 @@ class SessionResourceRegistry:
             session_id,
         ):
             if terminal_resource_id(entry.terminal_name, entry.session_key) == terminal_id:
+                _logger.info(
+                    "Terminal close requested: session=%s terminal=%s",
+                    session_id,
+                    terminal_id,
+                    extra=debug_event(
+                        "terminal_close_requested",
+                        session_id=session_id,
+                        terminal_id=terminal_id,
+                        terminal_instance_id=entry.instance.diagnostic_id,
+                    ),
+                )
                 closed = await self._terminal_registry.close(
                     session_id,
                     entry.terminal_name,
@@ -1571,6 +1644,12 @@ class SessionResourceRegistry:
                 moved_status = self._last_session_status.pop(source_session_id, None)
                 if moved_status is not None and target_session_id not in self._last_session_status:
                     self._last_session_status[target_session_id] = moved_status
+                    if source_session_id in self._active_session_turns:
+                        self._active_session_turns.add(target_session_id)
+                        self._session_activity_epoch[target_session_id] = (
+                            self._session_activity_epoch.get(target_session_id, 0) + 1
+                        )
+                self._active_session_turns.discard(source_session_id)
                 # The watcher restart below rebuilds the poller under the
                 # target, so drop the source's entry rather than leaving a
                 # retired poller to be re-armed on every later reconnect.
@@ -1616,6 +1695,7 @@ class SessionResourceRegistry:
         """
         self._take_session_status_memo(session_id)
         with self._lock:
+            self._session_activity_epoch.pop(session_id, None)
             primary = self._primary_envs.pop(session_id, None)
             stale_role_keys = [key for key in self._terminal_roles if key[0] == session_id]
             for key in stale_role_keys:

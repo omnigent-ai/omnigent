@@ -30,8 +30,12 @@ from omnigent.db.utils import (
     generate_agent_id,
     generate_item_id,
     get_or_create_engine,
+    is_cockroachdb,
+    is_postgresql_family,
     make_managed_session_maker,
+    normalize_database_url,
     run_migrations_with_retry,
+    run_write_transaction,
     set_lakebase_token_provider,
     shared_read_scope,
     strip_nul_bytes,
@@ -88,6 +92,134 @@ def test_non_sqlite_engine_has_pool_settings(
     # the database server restarts or closes idle connections.
     # Failure means connections could persist indefinitely and break.
     assert captured_kwargs.get("pool_recycle") == 1800
+
+
+def test_cockroachdb_dialect_helpers_and_url() -> None:
+    assert normalize_database_url("cockroachdb://root@host/db") == (
+        "cockroachdb+psycopg://root@host/db"
+    )
+    assert is_cockroachdb("cockroachdb")
+    assert is_postgresql_family("cockroachdb")
+    assert is_postgresql_family("postgresql")
+    assert not is_postgresql_family("mysql")
+
+
+def test_cockroachdb_engine_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    from omnigent.db import utils
+
+    captured: dict[str, Any] = {}
+    mock_engine = MagicMock()
+
+    def capture(uri: str, **kwargs: Any) -> MagicMock:
+        captured["uri"] = uri
+        captured.update(kwargs)
+        return mock_engine
+
+    monkeypatch.setattr(utils, "create_engine", capture)
+    engine = utils._create_engine("cockroachdb://root@host/db")
+
+    assert engine is mock_engine
+    assert captured["uri"] == "cockroachdb+psycopg://root@host/db"
+    assert captured["isolation_level"] == "READ COMMITTED"
+    assert captured["pool_size"] == 200
+    assert captured["max_overflow"] == 20
+    assert captured["pool_timeout"] == 10.0
+
+
+def test_run_write_transaction_retries_only_serialization_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from collections.abc import Iterator
+    from contextlib import contextmanager
+
+    from sqlalchemy.exc import DBAPIError
+
+    from omnigent.db import current_query_name, query_name_scope
+
+    class SerializationFailure(Exception):
+        sqlstate = "40001"
+
+    class NamedMaker:
+        def __init__(self) -> None:
+            self.engine = MagicMock()
+            self.engine.dialect.name = "cockroachdb"
+            self.query_name_prefix = "omnigent.test"
+            self.sessions: list[MagicMock] = []
+
+        @contextmanager
+        def __call__(self, query_name: str) -> Iterator[MagicMock]:
+            session = MagicMock()
+            self.sessions.append(session)
+            with query_name_scope(f"{self.query_name_prefix}.{query_name}"):
+                try:
+                    yield session
+                    session.commit()
+                except Exception:
+                    session.rollback()
+                    raise
+
+    maker = NamedMaker()
+    attempts = 0
+    observed_names: list[str | None] = []
+    retry_metrics: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        "omnigent.db.utils.record_transaction_retry",
+        lambda operation, outcome: retry_metrics.append((operation, outcome)),
+    )
+
+    def write(_session: object) -> str:
+        nonlocal attempts
+        attempts += 1
+        observed_names.append(current_query_name())
+        if attempts < 3:
+            raise DBAPIError("statement", {}, SerializationFailure(), False)
+        return "committed"
+
+    sleeps: list[float] = []
+    result = run_write_transaction(
+        maker,
+        "write",
+        write,
+        sleep=sleeps.append,
+        random_value=lambda: 1.0,
+    )
+
+    assert result == "committed"
+    assert attempts == 3
+    assert sleeps == [0.025, 0.05]
+    assert observed_names == ["omnigent.test.write"] * 3
+    assert retry_metrics == [
+        ("omnigent.test.write", "scheduled"),
+        ("omnigent.test.write", "scheduled"),
+    ]
+    assert [session.rollback.call_count for session in maker.sessions] == [1, 1, 0]
+    assert [session.commit.call_count for session in maker.sessions] == [0, 0, 1]
+
+    maker.engine.dialect.name = "postgresql"
+    attempts = 0
+    with pytest.raises(DBAPIError):
+        run_write_transaction(maker, "write", write, sleep=sleeps.append)
+    assert attempts == 1
+
+    class DeadlockFailure(Exception):
+        sqlstate = "40P01"
+
+    maker.engine.dialect.name = "cockroachdb"
+
+    def deadlock(_session: object) -> None:
+        raise DBAPIError("statement", {}, DeadlockFailure(), False)
+
+    session_count = len(maker.sessions)
+    with pytest.raises(DBAPIError):
+        run_write_transaction(maker, "write", deadlock, sleep=sleeps.append)
+    assert len(maker.sessions) == session_count + 1
+
+    def serialization_failure(_session: object) -> None:
+        raise DBAPIError("statement", {}, SerializationFailure(), False)
+
+    with pytest.raises(DBAPIError):
+        run_write_transaction(maker, "exhausted", serialization_failure, max_retries=0)
+    assert retry_metrics[-1] == ("omnigent.test.exhausted", "exhausted")
 
 
 def test_missing_psycopg_translates_to_actionable_error(
@@ -174,20 +306,42 @@ def test_translate_missing_driver_passes_through_unrelated_errors() -> None:
     assert _translate_missing_driver_error("not a uri at all", garbage) is garbage
 
 
-def test_paas_postgres_scheme_gets_conversion_guidance() -> None:
+def test_paas_postgres_scheme_is_normalized_by_the_engine_factory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """
-    ``postgres://`` is not a SQLAlchemy dialect at all — it fails with an
+    ``postgres://`` is not a SQLAlchemy dialect at all, but it never reaches
+    SQLAlchemy: the central engine factory normalizes it to
+    ``postgresql+psycopg://`` (spawn-path parity), so a direct
+    ``--database-uri`` in the PaaS form simply works.
+    """
+    from omnigent.db import utils
+
+    captured: dict[str, Any] = {}
+
+    def capture(uri: str, **kwargs: Any) -> MagicMock:
+        captured["uri"] = uri
+        return MagicMock()
+
+    monkeypatch.setattr(utils, "create_engine", capture)
+    utils._create_engine("postgres://user:secret@host:5432/db")
+
+    assert captured["uri"] == "postgresql+psycopg://user:secret@host:5432/db"
+
+
+def test_unnormalizable_postgres_scheme_gets_conversion_guidance() -> None:
+    """
+    A Postgres-family scheme the factory cannot normalize still fails with an
     opaque ``NoSuchModuleError`` *before* any driver import. The engine
     factory must append conversion guidance pointing at
-    ``postgresql+psycopg://`` (the spawn path normalizes this away, but a
-    direct ``--database-uri`` can still get here). Credentials must not leak.
+    ``postgresql+psycopg://``. Credentials must not leak.
     """
     from sqlalchemy.exc import NoSuchModuleError
 
     from omnigent.db import utils
 
     with pytest.raises(NoSuchModuleError) as excinfo:
-        utils._create_engine("postgres://user:secret@host:5432/db")
+        utils._create_engine("postgres+asyncpg://user:secret@host:5432/db")
 
     message = str(excinfo.value)
     assert "postgresql+psycopg://" in message

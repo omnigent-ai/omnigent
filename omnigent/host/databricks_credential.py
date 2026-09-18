@@ -40,10 +40,14 @@ import os
 import shlex
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import httpx
 
 from omnigent.host.identity import HOST_TOKEN_ENV_VAR, MANAGED_HOST_TOKEN_HEADER
+
+if TYPE_CHECKING:
+    from omnigent.spec.types import AgentSpec
 
 _logger = logging.getLogger(__name__)
 
@@ -207,6 +211,60 @@ def broker_token_command(host: str, cfg_path: Path | None = None) -> str | None:
     return f"python3 -m {module} token --coords {shlex.quote(str(path))}"
 
 
+def https_url_on_workspace_host(url: str, workspace_host: str) -> bool:
+    """True when *url* is HTTPS and shares *workspace_host*'s network location.
+
+    The managed-connect harnesses forward a broker-minted bearer to a base URL
+    that ultimately comes from a writable on-disk file (ucode ``state.json`` or
+    the generated opencode config). Bind that destination to the sidecar/profile
+    workspace so a stale or tampered file can't aim the bearer at another origin.
+    A scheme-less *workspace_host* is treated as HTTPS.
+    """
+    from urllib.parse import urlsplit
+
+    if not url:
+        return False
+    expected = urlsplit(
+        workspace_host if "://" in workspace_host else f"https://{workspace_host}"
+    ).netloc
+    if not expected:
+        return False
+    parts = urlsplit(url)
+    return parts.scheme == "https" and parts.netloc == expected
+
+
+def api_key_auth_precludes_broker(spec: AgentSpec | None) -> bool:
+    """True when an explicit ``ApiKeyAuth`` is configured, so the managed-connect
+    broker fallback must not reroute it through the owner's Databricks gateway.
+
+    The broker fallback is a last resort for a host with **no** credential intent
+    at all. An explicit API key resolves to ``None`` in the shared provider
+    resolver on purpose: the claude-sdk / openai builders and the native CLIs
+    thread the bare key themselves. Rerouting it through the owner's gateway would
+    silently ignore the user's key, so claude/codex/pi gate their broker fallback
+    on ``not api_key_auth_precludes_broker(...)``.
+
+    Precedence: a spec's own ``executor.auth`` wins; when the spec declares no
+    auth of its own (or there is no spec, e.g. pi resolving off machine config)
+    the global ``auth:`` block carries the key intent. A **global** ``ApiKeyAuth``
+    must also preclude the broker — the shared resolver returns ``None`` for it,
+    which would otherwise fall through to the broker fallback and silently reroute
+    the configured key.
+    """
+    from omnigent.spec.types import ApiKeyAuth
+
+    # A spec's own explicit ApiKeyAuth precludes the broker outright.
+    if spec is not None and isinstance(getattr(spec.executor, "auth", None), ApiKeyAuth):
+        return True
+    # No spec, or a spec that declares no auth of its own → consult the global
+    # ``auth:`` block, which is the only remaining place a key intent can live.
+    if spec is None or getattr(spec.executor, "auth", None) is None:
+        from omnigent.runtime.workflow import _load_global_auth
+
+        return isinstance(_load_global_auth(), ApiKeyAuth)
+    return False
+
+
 def configure_host_databricks(server_url: str, host_id: str) -> bool:
     """Point the sandbox's Databricks auth at the owner's per-user broker.
 
@@ -269,7 +327,13 @@ def main(argv: list[str] | None = None) -> int:
     resolved = fetch_broker_bearer(coords["server"], coords["host_id"], coords["host_token"])
     if resolved is None:
         return 0
-    _workspace_host, bearer = resolved
+    refreshed_host, bearer = resolved
+    # The harness's gateway base URL is pinned to the sidecar's workspace. If the
+    # owner has since reconnected to a different workspace, the broker now vends
+    # that workspace's bearer — emitting it would present a token to the pinned
+    # (now-wrong) origin. Withhold it so auth fails cleanly instead.
+    if refreshed_host.rstrip("/") != coords["workspace_host"].rstrip("/"):
+        return 0
     sys.stdout.write(bearer + "\n")
     return 0
 

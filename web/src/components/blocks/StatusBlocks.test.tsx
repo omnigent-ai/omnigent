@@ -30,6 +30,12 @@ const TERMINAL_ERROR = [
   "Pane is dead (status 0, Tue Aug 11 17:00:46 2026)",
 ].join("\n");
 
+const RATE_LIMIT_ERROR = [
+  "API Error: Request rejected (429) · REQUEST_LIMIT_EXCEEDED: Exceeded workspace",
+  "input tokens per minute rate limit for databricks-test-model. Work with your",
+  "Databricks account team to request a higher FMAPI rate limit tier.",
+].join(" ");
+
 describe("ErrorBanner", () => {
   beforeEach(() => vi.mocked(copyText).mockClear());
 
@@ -404,6 +410,58 @@ describe("ErrorBanner", () => {
     expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
   });
 
+  it("retries classified rate-limit errors and preserves the provider's details", async () => {
+    let resolveRetry: (() => void) | undefined;
+    const onRetry = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveRetry = resolve;
+        }),
+    );
+    render(
+      <ErrorBanner
+        message={RATE_LIMIT_ERROR}
+        source="llm"
+        code="rate_limit_exceeded"
+        onRetry={onRetry}
+      />,
+    );
+
+    expect(screen.getByTestId("error-headline")).toHaveTextContent(
+      "The model's rate limit was reached. You can retry this turn.",
+    );
+    fireEvent.click(screen.getByRole("button", { name: /model's rate limit was reached/i }));
+    expect(screen.getByTestId("error-message-content")).toHaveTextContent(RATE_LIMIT_ERROR);
+
+    const retry = screen.getByRole("button", { name: "Retry" });
+    act(() => {
+      retry.click();
+      retry.click();
+    });
+    expect(onRetry).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("status")).toHaveTextContent(/^Retrying$/);
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+
+    await act(async () => resolveRetry?.());
+    expect(screen.queryByRole("status")).toBeNull();
+    expect(screen.queryByTestId("error-headline")).toBeNull();
+  });
+
+  it("does not offer rate-limit retry without a handler", () => {
+    render(<ErrorBanner message={RATE_LIMIT_ERROR} source="llm" code="rate_limit_exceeded" />);
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+  });
+
+  it.each(["native_turn_error", "codex_turn_error", "codex_reauth_required", "unauthorized"])(
+    "does not infer rate-limit retry from the message for code %s",
+    (code) => {
+      render(
+        <ErrorBanner message={RATE_LIMIT_ERROR} source="execution" code={code} onRetry={vi.fn()} />,
+      );
+      expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+    },
+  );
+
   it.each(["executor_error", "connection_error", "runner_error", "wrong_replica"])(
     "does not offer reconnect for live-runner code %s",
     (code) => {
@@ -544,6 +602,43 @@ describe("routing decision — harness / scope / raw pick", () => {
       expect(screen.getByTestId("routing-decision-scope")).toHaveTextContent(badge);
     }
   });
+
+  // A shared type or rationale cannot identify the work a decision governs.
+  it("card: names the task the decision governed, in place of the shared type row", () => {
+    render(
+      <RoutingDecisionCard
+        model="databricks-claude-sonnet-4-6"
+        applied={false}
+        rationale="Routing unavailable; spawn allowed unchanged"
+        agent="general-purpose"
+        routing={{ scope: "native_subagent", taskDescription: "Research auth flows" }}
+      />,
+    );
+    expect(screen.getByTestId("routing-decision-task")).toHaveTextContent("Research auth flows");
+    // The shared type stays visible on the scope badge.
+    expect(screen.getByTestId("routing-decision-scope")).toHaveTextContent(
+      "subagent: general-purpose",
+    );
+    fireEvent.click(screen.getByTestId("routing-decision-raw-toggle"));
+    expect(screen.getByText(/"task_description": "Research auth flows"/)).toBeInTheDocument();
+  });
+
+  it.each([undefined, "", " \t\n"])(
+    "card: an unlabeled spawn (%j) keeps the agent row label",
+    (taskDescription) => {
+      render(
+        <RoutingDecisionCard
+          model="databricks-claude-sonnet-4-6"
+          applied={false}
+          rationale="x"
+          agent="general-purpose"
+          routing={{ scope: "native_subagent", taskDescription }}
+        />,
+      );
+      expect(screen.queryByTestId("routing-decision-task")).toBeNull();
+      expect(screen.getByTestId("routing-decision-card")).toHaveTextContent("general-purpose");
+    },
+  );
 
   // The router's vocabulary pick may have had no endpoint and been mapped to a
   // servable id — that must be visible. When it resolves to the same short

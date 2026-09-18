@@ -50,7 +50,7 @@ interface ErrorBannerProps {
   remediation?: string;
   /** `"info"` renders a neutral notice (no failure tone) instead of a destructive error. */
   level?: "error" | "info";
-  /** Reconnect the existing session without replaying or duplicating user input. */
+  /** Recover the existing session or continue after a retryable turn failure. */
   onRetry?: () => Promise<void>;
 }
 
@@ -75,6 +75,7 @@ const FAILURE_CODE_DESCRIPTIONS: Record<string, string> = {
     "Codex hit an error reloading the earlier transcript, so it started a fresh thread.",
   codex_turn_error: "Codex ran into an error during this turn.",
   native_turn_error: "The agent ran into an error during this turn.",
+  rate_limit_exceeded: "The model's rate limit was reached. You can retry this turn.",
 };
 
 const RETRYABLE_ERROR_CODES = new Set([
@@ -83,6 +84,7 @@ const RETRYABLE_ERROR_CODES = new Set([
   "runner_disconnected",
   "runner_failed_to_start",
   "runner_unavailable",
+  "rate_limit_exceeded",
 ]);
 
 interface ParsedErrorMessage {
@@ -224,7 +226,7 @@ export function ErrorBanner({
           className="relative z-10 h-auto rounded-xl border-border bg-background px-4 py-2 text-sm font-normal text-muted-foreground shadow-xs"
         >
           <Loader2Icon aria-hidden="true" className="animate-spin" />
-          Reconnecting
+          {code === "rate_limit_exceeded" ? "Retrying" : "Reconnecting"}
         </Badge>
       </div>
     );
@@ -597,6 +599,7 @@ export function RoutingDecisionCard({
   routing,
 }: RoutingDecisionCardProps) {
   const { harness, scope, decisionId, rawModel, attemptedOverride, routerSource } = routing ?? {};
+  const taskDescription = routing?.taskDescription?.trim();
   const short = shortModelName(model);
   const rawShort = rawPickName(model, rawModel);
   const attemptedShort = attemptedPickName(model, attemptedOverride);
@@ -611,6 +614,7 @@ export function RoutingDecisionCard({
           applied,
           rationale,
           ...(agent ? { agent } : {}),
+          ...(taskDescription ? { task_description: taskDescription } : {}),
           ...(harness ? { harness } : {}),
           ...(scope ? { scope } : {}),
           ...(decisionId ? { decision_id: decisionId } : {}),
@@ -626,6 +630,7 @@ export function RoutingDecisionCard({
       applied,
       rationale,
       agent,
+      taskDescription,
       harness,
       scope,
       decisionId,
@@ -678,7 +683,18 @@ export function RoutingDecisionCard({
         </CollapsibleTrigger>
       </div>
       <div className="flex items-center gap-2 text-sm">
-        <span className="min-w-0 truncate font-mono text-foreground">{rowLabel}</span>
+        {taskDescription ? (
+          // Name the work even when sibling spawns share a type and rationale.
+          <span
+            className="min-w-0 truncate text-foreground"
+            data-testid="routing-decision-task"
+            title={taskDescription}
+          >
+            {taskDescription}
+          </span>
+        ) : (
+          <span className="min-w-0 truncate font-mono text-foreground">{rowLabel}</span>
+        )}
         {attemptedShort ? (
           // The spawn named its own model and the router picked another — the
           // substitution is the whole point of the row, so it shows at a glance.

@@ -4,6 +4,7 @@ import hashlib
 import math
 import time
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -106,6 +107,12 @@ PROJECT_LABEL_KEY = "omni_project"
 # mirrors the canonical key as ``PINNED_LABEL_KEY``.
 PINNED_LABEL_KEY = "omnigent.pinned"
 
+# Marks a top-level fork created as a side chat. A side chat surfaces only as a
+# Workspace-rail tab, so a conversation carrying this label is hidden from the
+# left sidebar (the ``GET /v1/sessions`` list filters it out). The fork
+# otherwise behaves like any other session (its own runner, transcript).
+SIDE_CHAT_LABEL_KEY = "omnigent.side_chat"
+
 # Single-user / no-auth sentinel for the per-user pin key suffix, mirroring the
 # reserved ``"local"`` identity used elsewhere (see ``RESERVED_USER_LOCAL``).
 _PINNED_LABEL_LOCAL_USER = "local"
@@ -181,10 +188,24 @@ _INSTANCE_SCOPED_LABEL_KEYS = frozenset(
 )
 
 # Source identity belongs only to the original imported session, and a fork is
-# born unarchived so it must not inherit its parent's archive time. Unlike
-# runtime instance labels, these survive an in-place agent switch but never a
-# fork.
-_FORK_ONLY_DROPPED_LABEL_KEYS = IMPORT_PROVENANCE_LABEL_KEYS | {ARCHIVED_AT_LABEL_KEY}
+# born unarchived so it must not inherit its parent's archive time. The sandbox
+# repository records what THIS session's sandbox was built from and a relaunch
+# re-clones from it, so a fork that asked for an empty sandbox would otherwise
+# have the source's repo re-cloned into it on the first relaunch; the fork's own
+# managed launch re-stamps whatever repository it resolves. Unlike runtime
+# instance labels, these survive an in-place agent switch but never a fork.
+#
+# Recorded one label PER repo (``omnigent.sandbox.repo.<index>``), a
+# dynamic-suffix family like the per-user pins, so a fork drops the whole family
+# by prefix in ``fork_conversation`` (this bare base key still covers any legacy
+# single-label session). The literal mirrors the server's
+# ``MANAGED_REPO_LABEL_KEY``; a store test cross-checks it so a rename there
+# fails loudly here.
+_SANDBOX_REPO_LABEL_KEY = "omnigent.sandbox.repo"
+_FORK_ONLY_DROPPED_LABEL_KEYS = IMPORT_PROVENANCE_LABEL_KEYS | {
+    ARCHIVED_AT_LABEL_KEY,
+    _SANDBOX_REPO_LABEL_KEY,
+}
 
 
 @dataclass(frozen=True)
@@ -594,6 +615,11 @@ class ConversationStore(ABC):
             means return all types.
         :returns: A :class:`PagedList` of
             :class:`ConversationItem` objects.
+        :raises omnigent.errors.StaleCursorError: If the ``after``/``before``
+            item no longer exists in this conversation (e.g. deleted
+            between two page fetches) — its position is unknowable, and an
+            empty page would be indistinguishable from a completed
+            enumeration.
         """
         ...
 
@@ -745,10 +771,11 @@ class ConversationStore(ABC):
             does. Powers the sidebar's session search on
             ``GET /v1/sessions?search_query=...``.
         :param accessible_by: When set, filter to sessions the
-            user has access to via ``session_permissions``. Uses
-            a UNION subquery: sessions the user has a direct
-            grant on, plus sessions with a ``"__public__"`` grant.
-            ``None`` disables the filter (returns all sessions).
+            user has a direct grant on in ``session_permissions``.
+            Public (``"__public__"``) grants are deliberately NOT
+            included — a public-only session does not appear in the
+            user's own list. ``None`` disables the filter (returns
+            all sessions).
         :param owned_by: When set, filter to sessions the user
             *owns* (an ``owner``-level grant), a stricter form of
             ``accessible_by`` that excludes sessions merely shared
@@ -782,6 +809,10 @@ class ConversationStore(ABC):
             in a single indexed query instead of fetching all children.
         :returns: A :class:`PagedList` of :class:`Conversation`
             objects.
+        :raises omnigent.errors.StaleCursorError: If the ``after``/``before``
+            conversation no longer exists (e.g. deleted between two page
+            fetches) — its sort position is unknowable, and an empty page
+            would be indistinguishable from a completed enumeration.
         """
         ...
 
@@ -1041,8 +1072,8 @@ class ConversationStore(ABC):
         """
         Persist the full session-state snapshot for a conversation.
 
-        Overwrites the existing ``session_state`` JSON column with
-        the serialized *state* dict. Called by
+        Replaces policy-visible state while preserving the internal Plan key
+        in the existing conversation metadata JSON. Called by
         :meth:`PolicyEngine.apply_state_updates` after applying
         structured :class:`StateUpdate` operations to the hot
         cache.
@@ -1076,6 +1107,14 @@ class ConversationStore(ABC):
             sub-dict (per-model token/cost buckets), hence ``Any``.
         """
         ...
+
+    def set_session_todos(
+        self,
+        conversation_id: str,
+        todos: list[dict[str, Any]],
+    ) -> bool:
+        """Persist the native Plan snapshot; empty clears, missing metadata returns false."""
+        raise NotImplementedError
 
     @abstractmethod
     def set_conversation_project(
@@ -1242,23 +1281,17 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
-    def get_session_owner(self, conversation_id: str) -> str | None:
+    def get_session_owner(self, conversation_id: str, *, owner_only: bool = False) -> str | None:
         """
-        Return the user id that owns a session (its creator).
+        Return the highest-privilege non-public grantee of a session.
 
-        The owner is the highest-privilege grantee in
-        ``session_permissions`` for this conversation — the
-        ``LEVEL_OWNER`` grant the creator receives at session
-        creation (the ``"__public__"`` read sentinel and any
-        read/edit grants are lower-level, so they are never
-        returned ahead of it). Used to attribute a session's LLM
-        spend to a single user for per-user daily cost rollups.
+        By default, lower-level grants are a fallback when no owner grant exists,
+        preserving cost attribution for shared sessions. Use ``owner_only=True``
+        for ownership checks; sharing alone does not establish ownership.
 
-        :param conversation_id: The session to look up, e.g.
-            ``"conv_abc123"``.
-        :returns: The owner's user id, e.g. ``"alice@example.com"``,
-            or ``None`` when the session has no permission grants
-            (e.g. single-user mode, where access is not tracked).
+        :param conversation_id: The session to look up, e.g. ``"conv_abc123"``.
+        :param owner_only: Require an explicit owner-level grant.
+        :returns: The grantee's user id, or ``None`` if no qualifying grant exists.
         """
         ...
 
@@ -1354,7 +1387,9 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
-    def replace_runner_id(self, conversation_id: str, runner_id: str) -> Conversation:
+    def replace_runner_id(
+        self, conversation_id: str, runner_id: str, *, expected_runner_id: str | None = None
+    ) -> Conversation:
         """
         Replace ``conversations.runner_id`` for a conversation.
 
@@ -1372,6 +1407,8 @@ class ConversationStore(ABC):
         :param runner_id: Runner identifier to bind to,
             e.g. ``"runner_abc123"``. Online-ness is validated
             by the route before calling the store.
+        :param expected_runner_id: Update only while the old binding matches; otherwise
+            return the current conversation unchanged. None means unconditional.
         :returns: The updated :class:`Conversation`.
         :raises ConversationNotFoundError: If no conversation row
             with ``conversation_id`` exists.
@@ -1621,6 +1658,7 @@ class ConversationStore(ABC):
         presentation_labels: dict[str, str] | None = None,
         up_to_response_id: str | None = None,
         project_id: str | None = None,
+        file_id_map: Mapping[str, str] | None = None,
     ) -> Conversation:
         """
         Deep-copy a conversation and its items into a new conversation.
@@ -1724,6 +1762,12 @@ class ConversationStore(ABC):
             unfiled. The caller resolves whether the fork keeps the
             source's project — projects are owner-private, so the route
             passes the source's id only when the forker owns it.
+        :param file_id_map: Source file id → fork-owned file id for the
+            session-scoped file resources the caller copies into the fork.
+            Copied items that reference a mapped id (message attachment
+            blocks, file resource events) are rewritten to the fork's copy,
+            so the fork never references files it does not own. ``None`` or
+            empty leaves every copied payload verbatim.
         :returns: The newly created :class:`Conversation`.
         :raises LookupError: If no conversation with
             *source_conversation_id* exists.

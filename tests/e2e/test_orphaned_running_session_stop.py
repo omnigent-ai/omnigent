@@ -27,6 +27,8 @@ The journey is faithful: we bring a runner online, create a session bound to
 it, and drive a real (blocked) turn so the framework itself persists
 ``running`` — we never fabricate the end state. Then we shut the server down,
 start a fresh one on the same DB, and observe exactly what the CLI observes.
+A server-initiated close keeps the heartbeat fresh for reconnecting runners;
+the orphan assertion waits boundedly for that production liveness window.
 
 Runs against the mock LLM server — no real credentials needed::
 
@@ -494,6 +496,13 @@ def test_runner_less_session_remains_running_after_shutdown_and_stop(
         # ── 6. Observe what the CLI observes on the replacement server. ────
         item_b = _list_session(client_b, session_id)
         assert item_b is not None, f"Session {session_id} missing from replacement server list"
+        orphan_deadline = time.monotonic() + RUNNER_LIVENESS_TTL_S + 30.0
+        while item_b.get("status") == "running" and time.monotonic() < orphan_deadline:
+            time.sleep(POLL_INTERVAL_S)
+            item_b = _list_session(client_b, session_id)
+            assert item_b is not None, (
+                f"Session {session_id} disappeared while waiting for orphan reconciliation"
+            )
         status_after_restart = item_b.get("status")
         runner_still_online = _runner_online(client_b, runner_id)
 

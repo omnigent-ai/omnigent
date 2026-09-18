@@ -18,9 +18,13 @@ never exercised.
 
 from __future__ import annotations
 
+import uuid
+from collections.abc import Iterator
+from contextlib import suppress
 from datetime import datetime, timedelta
 
 import httpx
+import pytest
 from playwright.sync_api import Page, expect
 
 
@@ -94,6 +98,31 @@ def _create_task(
     )
     resp.raise_for_status()
     return resp.json()["id"]
+
+
+def _task_id_by_name(base_url: str, name: str) -> str:
+    """The id of the single scheduled task exactly named ``name``."""
+    resp = httpx.get(f"{base_url}/v1/scheduled-tasks", timeout=10.0)
+    resp.raise_for_status()
+    matches = [t["id"] for t in resp.json()["scheduled_tasks"] if t["name"] == name]
+    assert len(matches) == 1, f"expected 1 task named {name!r}, got {len(matches)}"
+    return matches[0]
+
+
+@pytest.fixture
+def scheduled_task_cleanup(live_server: str) -> Iterator[list[str]]:
+    """Collect created task ids; delete exactly those after the test.
+
+    Scoped to ids the test registered: a rerun never inherits rows, and
+    unrelated tasks on a shared or external server are never touched.
+    """
+    created: list[str] = []
+    yield created
+    for task_id in created:
+        with suppress(httpx.HTTPError):
+            httpx.delete(
+                f"{live_server}/v1/scheduled-tasks/{task_id}", timeout=10.0
+            ).raise_for_status()
 
 
 def _row_by_name(page: Page, name: str):
@@ -259,6 +288,7 @@ def test_scheduled_task_next_run_label_live_ticks_without_navigation(
 def test_scheduled_task_create_edit_modal_and_time_picker(
     page: Page,
     live_server: str,
+    scheduled_task_cleanup: list[str],
 ) -> None:
     """Create/edit modal supports typed time input and the compact minute picker.
 
@@ -266,12 +296,17 @@ def test_scheduled_task_create_edit_modal_and_time_picker(
     REST + client state, and no scheduled run fires.
     """
     agent_id = _builtin_agent_id(live_server, "hello_world")
+    # Unique per attempt: a rerun's strict row lookup must not collide with
+    # rows a failed attempt left behind.
+    name_suffix = uuid.uuid4().hex[:8]
+    typed_name = f"Typed time daily {name_suffix}"
+    edit_name = f"Edit footer task {name_suffix}"
 
     page.goto(f"{live_server}/tasks")
 
     page.get_by_test_id("new-task-button").click()
     expect(page.get_by_test_id("create-scheduled-task-dialog")).to_be_visible(timeout=30_000)
-    page.get_by_test_id("task-name-input").fill("Typed time daily")
+    page.get_by_test_id("task-name-input").fill(typed_name)
     page.get_by_test_id("task-prompt-input").fill("Summarize the day.")
     agent_trigger = page.get_by_test_id("task-agent-picker").get_by_test_id(
         "new-chat-landing-agent-select"
@@ -297,24 +332,22 @@ def test_scheduled_task_create_edit_modal_and_time_picker(
     expect(time_input).to_have_value("09:45 AM")
     page.get_by_test_id("create-scheduled-task-submit").click()
 
-    created_row = _row_by_name(page, "Typed time daily")
+    created_row = _row_by_name(page, typed_name)
     expect(created_row).to_be_visible(timeout=30_000)
+    scheduled_task_cleanup.append(_task_id_by_name(live_server, typed_name))
     # `to_contain_text`: the line may also carry the server next-run suffix.
     expect(created_row.get_by_test_id("task-schedule-line")).to_contain_text(
         "Every day at 9:45 AM",
         timeout=30_000,
     )
 
-    _create_task(
-        live_server,
-        agent_id,
-        "Edit footer task",
-        "FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
+    scheduled_task_cleanup.append(
+        _create_task(live_server, agent_id, edit_name, "FREQ=DAILY;BYHOUR=9;BYMINUTE=0")
     )
     page.set_viewport_size({"width": 900, "height": 520})
     page.reload()
 
-    edit_row = _row_by_name(page, "Edit footer task")
+    edit_row = _row_by_name(page, edit_name)
     expect(edit_row).to_be_visible(timeout=30_000)
     edit_row.hover()
     edit_row.get_by_test_id("task-row-menu").click()

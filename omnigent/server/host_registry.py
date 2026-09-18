@@ -12,10 +12,9 @@ request/response traffic. No per-request reassembly queues needed.
 
 The registry also holds what connected hosts *report* about themselves and
 nothing persists — today the per-family gateway-inference map (see
-:mod:`omnigent.gateway_inference`). It is delivered on the connect handshake, so
-a replica that has never seen a host simply knows nothing about it, and the
-readers' unknown-is-backed rule covers that window until the host reconnects and
-re-reports.
+:mod:`omnigent.gateway_inference`) and interactive-shell inventory. They are
+delivered on the connect handshake, so a replica that has never seen a host
+simply knows nothing about them until the host reconnects and re-reports.
 """
 
 from __future__ import annotations
@@ -30,8 +29,9 @@ from typing import Any, Protocol
 
 from cachetools import TTLCache
 
+from omnigent._platform import normalize_interactive_shells
 from omnigent.db.db_models import InvalidUuidError, current_workspace_id, uuid_to_bytes
-from omnigent.host.frames import HostHelloFrame
+from omnigent.host.frames import HostHelloFrame, HostSkillsResultFrame
 
 _logger = logging.getLogger(__name__)
 
@@ -259,6 +259,7 @@ class HostConnection:
         ``error_code``, and ``error``.
     :param pending_model_options: Per-``request_id`` futures for pre-launch
         model catalogs resolved by the selected host.
+    :param pending_skills: Per-``request_id`` futures for sessionless skill discovery.
     """
 
     workspace_id: int
@@ -315,6 +316,9 @@ class HostConnection:
     pending_model_options: dict[str, asyncio.Future[dict[str, Any]]] = field(
         default_factory=dict,
     )
+    pending_skills: dict[str, asyncio.Future[HostSkillsResultFrame]] = field(
+        default_factory=dict,
+    )
     # Import streams one session per frame, so the tunnel pushes each onto a
     # per-request queue the /imports/local handler drains (vs a single future).
     # Each item is a ("session", dict) or ("done", dict) tuple.
@@ -344,6 +348,7 @@ class HostRegistry:
         # answer) and lost with the process, which is the point — a restarted
         # server re-learns it from the reconnect handshake.
         self._gateway_inference: dict[str, dict[str, bool]] = {}
+        self._interactive_shells: dict[str, list[str]] = {}
 
     def register(
         self,
@@ -402,6 +407,12 @@ class HostRegistry:
                 )
                 old.outbound_queue.put_nowait(None)
             self._hosts[key] = conn
+            if hello.interactive_shells is not None:
+                self._interactive_shells[host_id] = normalize_interactive_shells(
+                    hello.interactive_shells
+                )
+            else:
+                self._interactive_shells.pop(host_id, None)
         return conn
 
     def deregister(
@@ -542,6 +553,12 @@ class HostRegistry:
         with self._lock:
             reported = self._gateway_inference.get(_canonical_host_id(host_id))
         return dict(reported) if reported is not None else None
+
+    def interactive_shells(self, host_id: str) -> list[str] | None:
+        """Return the ordered shell inventory last reported by *host_id*."""
+        with self._lock:
+            reported = self._interactive_shells.get(_canonical_host_id(host_id))
+        return list(reported) if reported is not None else None
 
     def send_text(self, conn: HostConnection, data: str) -> None:
         """Enqueue a text frame for sending to the host.

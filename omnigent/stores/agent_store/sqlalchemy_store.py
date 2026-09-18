@@ -6,6 +6,7 @@ import builtins
 
 from sqlalchemy import and_, asc, desc, or_, select
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
 
 from omnigent.db.converters import sql_agent_to_entity
 from omnigent.db.db_models import (
@@ -19,6 +20,7 @@ from omnigent.db.utils import (
     get_or_create_engine,
     make_named_managed_session_maker,
     now_epoch,
+    run_write_transaction,
 )
 from omnigent.entities import Agent, PagedList
 from omnigent.stores.agent_store import AgentStore
@@ -55,6 +57,11 @@ class SqlAlchemyAgentStore(AgentStore):
         self._session = make_named_managed_session_maker(
             self._engine,
             query_name_prefix="omnigent.agent_store",
+        )
+        self._session_immediate = make_named_managed_session_maker(
+            self._engine,
+            query_name_prefix="omnigent.agent_store",
+            immediate=True,
         )
         conv_uri = conversation_storage_location or storage_location
         self._conv_engine = (
@@ -123,16 +130,9 @@ class SqlAlchemyAgentStore(AgentStore):
         :param description: Optional free-text description.
         :returns: The newly created :class:`Agent`.
         """
-        row = SqlAgent(
-            id=agent_id,
-            created_at=now_epoch(),
-            name=name,
-            bundle_location=bundle_location,
-            version=1,
-            kind=encode_agent_kind("template"),
-            description=description,
-        )
-        with self._session("create_agent") as session:
+        created_at = now_epoch()
+
+        def write(session: Session) -> Agent:
             # Template names are unique within a workspace. This can't be a
             # partial unique index (MySQL has none), so enforce it here.
             conflict = session.execute(
@@ -148,8 +148,19 @@ class SqlAlchemyAgentStore(AgentStore):
                     params={"name": name},
                     orig=Exception(f"UNIQUE constraint: name={name!r}"),
                 )
+            row = SqlAgent(
+                id=agent_id,
+                created_at=created_at,
+                name=name,
+                bundle_location=bundle_location,
+                version=1,
+                kind=encode_agent_kind("template"),
+                description=description,
+            )
             session.add(row)
             return sql_agent_to_entity(row)
+
+        return run_write_transaction(self._session_immediate, "create_agent", write)
 
     def get(self, agent_id: str) -> Agent | None:
         """
@@ -292,13 +303,21 @@ class SqlAlchemyAgentStore(AgentStore):
         :returns: The updated :class:`Agent`, or ``None`` if not
             found.
         """
-        with self._session("update_agent") as session:
+        updated_at = now_epoch()
+
+        def write(session: Session) -> SqlAgent | None:
             row = session.get(SqlAgent, (current_workspace_id(), agent_id))
             if not row:
                 return None
             row.bundle_location = bundle_location
             row.version = row.version + 1
-            row.updated_at = now_epoch()
+            row.updated_at = updated_at
+            session.flush()
+            return row
+
+        row = run_write_transaction(self._session_immediate, "update_agent", write)
+        if row is None:
+            return None
         # Reverse lookup targets the AP DB — see _session_id_for_agent.
         session_id: str | None = None
         if row.kind == encode_agent_kind("session"):
@@ -314,9 +333,12 @@ class SqlAlchemyAgentStore(AgentStore):
         :returns: ``True`` if the agent was deleted, ``False`` if
             it did not exist.
         """
-        with self._session("delete_agent") as session:
+
+        def write(session: Session) -> bool:
             row = session.get(SqlAgent, (current_workspace_id(), agent_id))
             if not row:
                 return False
             session.delete(row)
             return True
+
+        return run_write_transaction(self._session_immediate, "delete_agent", write)

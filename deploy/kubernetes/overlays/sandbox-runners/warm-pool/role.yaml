@@ -1,0 +1,19 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: omnigent-sandbox-warm-pool
+  namespace: omnigent-sandboxes
+  labels:
+    app.kubernetes.io/name: omnigent
+    app.kubernetes.io/component: server
+rules:
+  - apiGroups: ["extensions.agents.x-k8s.io"]
+    resources: ["sandboxclaims"]
+    verbs: ["create", "get", "patch", "delete"]
+  - apiGroups: ["extensions.agents.x-k8s.io"]
+    resources: ["sandboxtemplates", "sandboxwarmpools"]
+    verbs: ["get"]
+  # Kubernetes cannot restrict exec to the activation helper command.
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create", "get"]

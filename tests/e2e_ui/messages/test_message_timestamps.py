@@ -88,20 +88,6 @@ def _opacity(locator: Locator) -> str:
     return locator.evaluate("el => getComputedStyle(el).opacity")
 
 
-def _wait_opacity(locator: Locator, value: str, timeout_s: float = 5.0) -> None:
-    """Poll the computed opacity until it reaches ``value``.
-
-    ``expect.poll`` is not available in the pinned Playwright, and the
-    hover reveal is a CSS transition (no DOM event to await), so poll.
-    """
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        if _opacity(locator) == value:
-            return
-        time.sleep(0.05)
-    raise AssertionError(f"opacity never became {value!r} within {timeout_s}s")
-
-
 def test_hover_reveals_timestamp_on_user_and_assistant_bubbles(
     page: Page,
     seeded_session: tuple[str, str],
@@ -122,15 +108,15 @@ def test_hover_reveals_timestamp_on_user_and_assistant_bubbles(
 
     # At rest on a desktop viewport the row is fully transparent — the
     # timestamp must not permanently occupy visual space.
-    assert _opacity(user_row) == "0"
+    expect(user_row).to_have_css("opacity", "0")
     # The row exists at the design's 24px height even while hidden.
     assert round(user_row.bounding_box()["height"]) == 24
 
     user_bubble.hover()
-    _wait_opacity(user_row, "1")
+    expect(user_row).to_have_css("opacity", "1")
 
     # Design order: timestamp → Copy at the bubble's right edge.
-    copy_button = user_bubble.get_by_role("button", name="Copy")
+    copy_button = user_bubble.get_by_role("button", name="Copy", exact=True)
     assert user_ts.bounding_box()["x"] < copy_button.bounding_box()["x"]
 
     # --- assistant bubble ---
@@ -144,14 +130,14 @@ def test_hover_reveals_timestamp_on_user_and_assistant_bubbles(
 
     # The assistant response is the final message, so its actions remain
     # partially visible without hover.
-    assert _opacity(assistant_row) == "0.4"
+    expect(assistant_row).to_have_css("opacity", "0.4")
     assert round(assistant_row.bounding_box()["height"]) == 24
 
     assistant_bubble.hover()
-    _wait_opacity(assistant_row, "1")
+    expect(assistant_row).to_have_css("opacity", "1")
 
     # Design order: Copy/Fork → timestamp at the bubble's left edge.
-    assistant_copy = assistant_bubble.get_by_role("button", name="Copy")
+    assistant_copy = assistant_bubble.get_by_role("button", name="Copy", exact=True)
     assert assistant_copy.bounding_box()["x"] < assistant_ts.bounding_box()["x"]
 
     # --- persistence: reload must show the same server-stamped values ---

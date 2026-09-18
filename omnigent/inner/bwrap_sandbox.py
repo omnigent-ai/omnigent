@@ -629,6 +629,16 @@ class BwrapSandboxBackend(SandboxBackend):
             str(chdir_target),
             "--",
         ]
+        if policy.credential_source_paths:
+            bind_flags = {"--bind", "--bind-try", "--ro-bind", "--ro-bind-try"}
+            for index, argument in enumerate(bwrap_args[:-2]):
+                if argument not in bind_flags:
+                    continue
+                mounted_source = Path(bwrap_args[index + 1]).resolve()
+                if any(
+                    path.is_relative_to(mounted_source) for path in policy.credential_source_paths
+                ):
+                    raise ValueError("credential source must stay outside sandbox-visible mounts")
         bwrap_args.extend(argv)
         return bwrap_args
 
@@ -938,7 +948,7 @@ def _interpreter_chain_binds(argv: Sequence[str], covered_prefixes: list[Path]) 
     seen_dest: set[Path] = set()
 
     def _emit(src: Path, dst: Path) -> None:
-        if dst in seen_dest:
+        if dst in seen_dest or dst == dst.parent or src == src.parent:
             return
         # The destination is the literal path bwrap/the kernel will
         # traverse. Skip when that literal lives under a default mount.
@@ -951,6 +961,8 @@ def _interpreter_chain_binds(argv: Sequence[str], covered_prefixes: list[Path]) 
         """Bind ``literal``'s parent and grandparent at their literal
         paths, sourcing from each path's realpath so intermediate
         directory-symlinks resolve correctly inside the sandbox."""
+        if any(_is_within(literal, root, resolve=False) for root in covered_prefixes):
+            return
         parent_literal = literal.parent
         parent_real = Path(os.path.realpath(str(parent_literal)))
         _emit(parent_real, parent_literal)

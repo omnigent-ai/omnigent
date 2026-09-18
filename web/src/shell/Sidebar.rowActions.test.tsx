@@ -1,3 +1,7 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
+import { SidebarDataProvider } from "@/hooks/useSidebarData";
 // Tests for the sidebar conversation-row quick actions:
 //   1. A desktop quick pin/unpin button (`quick-pin-conversation`) and a
 //      mobile-only kebab Pin item (`pin-conversation`) — two affordances for
@@ -10,7 +14,6 @@ import { useSyncExternalStore } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ServerInfo } from "@/lib/capabilities";
 import type * as IdentityModule from "@/lib/identity";
@@ -242,17 +245,19 @@ function renderSidebar(activeId?: string, info?: ServerInfo) {
     const sidebar = <Sidebar open={true} onClose={vi.fn()} />;
     const tree = (
       <QueryClientProvider client={qc}>
-        <TooltipProvider>
-          <MemoryRouter initialEntries={[activeId ? `/c/${activeId}` : "/"]}>
-            {activeId ? (
-              <Routes>
-                <Route path="/c/:conversationId" element={sidebar} />
-              </Routes>
-            ) : (
-              sidebar
-            )}
-          </MemoryRouter>
-        </TooltipProvider>
+        <SidebarDataProvider>
+          <TooltipProvider>
+            <MemoryRouter initialEntries={[activeId ? `/c/${activeId}` : "/"]}>
+              {activeId ? (
+                <Routes>
+                  <Route path="/c/:conversationId" element={sidebar} />
+                </Routes>
+              ) : (
+                sidebar
+              )}
+            </MemoryRouter>
+          </TooltipProvider>
+        </SidebarDataProvider>
       </QueryClientProvider>
     );
     // No explicit info → CapabilitiesContext default ("loading"), matching
@@ -1356,11 +1361,13 @@ describe("peek mode row menu", () => {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     render(
       <QueryClientProvider client={qc}>
-        <TooltipProvider>
-          <MemoryRouter>
-            <Sidebar open={false} peek onClose={onClose} />
-          </MemoryRouter>
-        </TooltipProvider>
+        <SidebarDataProvider>
+          <TooltipProvider>
+            <MemoryRouter>
+              <Sidebar open={false} peek onClose={onClose} />
+            </MemoryRouter>
+          </TooltipProvider>
+        </SidebarDataProvider>
       </QueryClientProvider>,
     );
     return { onClose };

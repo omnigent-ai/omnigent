@@ -153,6 +153,13 @@ function loadNavigationHarness({
       chooseDeepLinkStrategy: () => null,
     },
     "./workspace-chrome": { registerWorkspaceChromeHide: () => {} },
+    // Stubbed like the other electron-dependent siblings: databricks-session
+    // (transitively) requires electron's `net`, which isn't resolvable under the
+    // sandbox's real require. Its behavior is unit-tested in databricks-*.test.js.
+    "./databricks-session": {
+      ensureDatabricksSession: async (_ses, origin) => origin,
+      databricksOAuthConfigured: () => false,
+    },
     // The bounce's behavior is unit-tested in workspace-root-bounce.test.js;
     // stubbed here because it would call into the stubbed ./url module. The
     // away banner is intentionally NOT stubbed: its wiring through
