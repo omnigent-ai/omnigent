@@ -156,3 +156,50 @@ async def test_inherited_downgrade_budget_allows_cheaper_child_model(
     allowed = await _evaluate(client, child_id, phase)
     assert allowed["result"] == "POLICY_ACTION_ALLOW", allowed
     assert interrupted_sessions == []
+
+
+@pytest.mark.parametrize("shared_bundle", [False, True], ids=["separate-agent", "same-bundle"])
+async def test_parent_tool_restriction_preserves_agent_scope(
+    client: httpx.AsyncClient,
+    shared_bundle: bool,
+) -> None:
+    """A separately bound worker can write even when its parent agent cannot."""
+    parent = await create_test_agent(
+        client,
+        name="supervisor",
+        sub_agents=[{"name": "worker"}],
+        guardrails={
+            "policies": {
+                "parent_read_only": {
+                    "type": "function",
+                    "function": {
+                        "path": "omnigent.policies.builtins.orchestration.read_only_os",
+                        "arguments": {"deny_reason": "Delegate writes to the worker."},
+                    },
+                },
+            },
+        },
+    )
+    worker = parent if shared_bundle else await create_test_agent(client, name="worker")
+    child_body = {"agent_id": worker["id"], "parent_session_id": parent["_session_id"]}
+    if shared_bundle:
+        child_body["sub_agent_name"] = "worker"
+    created = await client.post("/v1/sessions", json=child_body)
+    assert created.status_code == 201, created.text
+    child_id = created.json()["id"]
+
+    event = {
+        "type": "PHASE_TOOL_CALL",
+        "data": {"name": "Write", "arguments": {"file_path": "result.txt", "content": "ok"}},
+    }
+    for session_id, expected in (
+        (parent["_session_id"], "POLICY_ACTION_DENY"),
+        (child_id, "POLICY_ACTION_DENY" if shared_bundle else "POLICY_ACTION_ALLOW"),
+    ):
+        response = await client.post(
+            f"/v1/sessions/{session_id}/policies/evaluate", json={"event": event}
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["result"] == expected, response.text
+        if expected == "POLICY_ACTION_DENY":
+            assert "Delegate writes to the worker." in response.json()["reason"]
