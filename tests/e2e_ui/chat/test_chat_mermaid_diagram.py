@@ -1,5 +1,6 @@
-"""E2E: mermaid diagrams in chat render, an un-renderable one degrades, and a
-diagram Mermaid cannot parse names the failing line.
+"""E2E: mermaid diagrams in chat render, an un-renderable one degrades, a diagram
+Mermaid cannot parse names the failing line, and punctuation semicolons in a
+sequence diagram are escaped so it renders anyway.
 
 Streamdown renders mermaid diagrams behind ``React.lazy``. Suspense catches a
 *pending* import, not a failed one — a rejected lazy import is re-thrown on
@@ -37,12 +38,25 @@ _MERMAID_MESSAGE = (
 
 # A ``;`` inside a Note ends the statement in Mermaid's grammar, so the rest of
 # the line is read as an actor with no arrow: the most common LLM-authored slip.
+# The bad arrow on the next line keeps the diagram unrenderable even once the
+# semicolon is escaped, so this exercises the error card.
 _INVALID_MERMAID_MESSAGE = (
     "Here is the sequence:\n\n"
     "```mermaid\n"
     "sequenceDiagram\n"
     "    A->>B: hi\n"
     "    Note over A,B: proceed once; do not call Save\n"
+    "    A=>B: again\n"
+    "```\n"
+)
+
+# The same slip on its own: escaping the semicolons is enough to render it.
+_SEMICOLON_MERMAID_MESSAGE = (
+    "Here is the flow:\n\n"
+    "```mermaid\n"
+    "sequenceDiagram\n"
+    "    O->>O: Bind initiating user/run; check session policy\n"
+    "    B->>B: Load grant; refresh if needed\n"
     "```\n"
 )
 
@@ -125,3 +139,33 @@ def test_unparseable_diagram_names_the_failing_line(
     expect(card).to_contain_text("#59;")
     # The raw parser message stays available, folded under Details.
     expect(card.locator("details")).to_contain_text("got 'NEWLINE'")
+
+
+@pytest.fixture
+def semicolon_mermaid_chat_session(
+    seeded_session: tuple[str, str],
+) -> Iterator[tuple[str, str]]:
+    """Seed a settled assistant bubble whose only diagram fault is text semicolons."""
+    base_url, session_id = seeded_session
+    httpx.post(
+        f"{base_url}/v1/sessions/{session_id}/events",
+        json={
+            "type": "external_assistant_message",
+            "data": {"agent": _AGENT_NAME, "text": _SEMICOLON_MERMAID_MESSAGE},
+        },
+        timeout=10.0,
+    ).raise_for_status()
+    yield (base_url, session_id)
+
+
+def test_semicolon_diagram_renders_with_an_escape_note(
+    page: Page, semicolon_mermaid_chat_session: tuple[str, str]
+) -> None:
+    """Text semicolons are escaped so the diagram renders, and a note says so."""
+    base_url, session_id = semicolon_mermaid_chat_session
+    page.goto(f"{base_url}/c/{session_id}")
+
+    escaped = page.get_by_test_id("mermaid-escaped")
+    expect(escaped.locator("svg[aria-roledescription]")).to_be_visible(timeout=30_000)
+    expect(escaped).to_contain_text("2 semicolons escaped as #59; (first on line 2)")
+    expect(page.get_by_test_id("mermaid-error")).to_have_count(0)

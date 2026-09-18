@@ -380,7 +380,7 @@ describe("CodeViewer markdown preview rendering (issue #970)", () => {
   it("explains an invalid Mermaid fence instead of dumping the parser error", async () => {
     vi.stubGlobal("IntersectionObserver", VisibleIntersectionObserver);
     renderMd(
-      "```mermaid\nsequenceDiagram\n    A->>B: hi\n    Note over A,B: proceed once; do not call Save\n```",
+      "```mermaid\nsequenceDiagram\n    A->>B: hi\n    Note over A,B: proceed once; do not call Save\n    A=>B: again\n```",
     );
     const card = await screen.findByTestId("mermaid-error", {}, { timeout: 10_000 });
     expect(card.textContent).toContain("Mermaid couldn't parse line 3");
@@ -395,21 +395,21 @@ describe("CodeViewer markdown preview rendering (issue #970)", () => {
   it("reports the author's line number past front matter and comments Mermaid strips", async () => {
     vi.stubGlobal("IntersectionObserver", VisibleIntersectionObserver);
     renderMd(
-      "```mermaid\n---\ntitle: Flow\n---\n\n%% comment\nsequenceDiagram\n    A->>B: hi\n    Note over A,B: once; twice\n```",
+      "```mermaid\n---\ntitle: Flow\n---\n\n%% comment\nsequenceDiagram\n    A->>B: hi\n    Note over A,B once twice\n```",
     );
     const card = await screen.findByTestId("mermaid-error", {}, { timeout: 10_000 });
     expect(card.textContent).toContain("Mermaid couldn't parse line 8");
-    expect(card.querySelector("code")?.textContent).toBe("Note over A,B: once; twice");
+    expect(card.querySelector("code")?.textContent).toBe("Note over A,B once twice");
   }, 15_000);
 
   it("maps the line by position when front matter repeats the diagram text", async () => {
     vi.stubGlobal("IntersectionObserver", VisibleIntersectionObserver);
     renderMd(
-      "```mermaid\n---\ntitle: |\n  sequenceDiagram\n  Note over A,B: once; twice\n---\nsequenceDiagram\n  Note over A,B: once; twice\n```",
+      "```mermaid\n---\ntitle: |\n  sequenceDiagram\n  Note over A,B once twice\n---\nsequenceDiagram\n  Note over A,B once twice\n```",
     );
     const card = await screen.findByTestId("mermaid-error", {}, { timeout: 10_000 });
     expect(card.textContent).toContain("Mermaid couldn't parse line 7");
-    expect(card.querySelector("code")?.textContent).toBe("Note over A,B: once; twice");
+    expect(card.querySelector("code")?.textContent).toBe("Note over A,B once twice");
   }, 15_000);
 
   it("renders Mermaid fences as diagrams instead of plain code", async () => {

@@ -117,7 +117,9 @@ describe("MessageResponse", () => {
     vi.stubGlobal("IntersectionObserver", VisibleIntersectionObserver);
     render(
       <MessageResponse>
-        {"```mermaid\nsequenceDiagram\n    A->>B: hi\n    Note over A,B: once; twice\n```"}
+        {
+          "```mermaid\nsequenceDiagram\n    A->>B: hi\n    Note over A,B: once; twice\n    A=>B: again\n```"
+        }
       </MessageResponse>,
     );
 
