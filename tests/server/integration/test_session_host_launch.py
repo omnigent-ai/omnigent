@@ -2461,6 +2461,21 @@ async def test_concurrent_relaunches_are_single_flight(
 
     set_runner_client(None)
 
+    launch_runner = sessions_module._launch_runner_on_host
+    both_callers_ready = asyncio.Event()
+    observed_bindings: list[str | None] = []
+
+    async def _race_launch(*args: Any, **kwargs: Any) -> Any:
+        observed_bindings.append(args[0].runner_id)
+        if len(observed_bindings) == 2:
+            both_callers_ready.set()
+        await both_callers_ready.wait()
+        return await launch_runner(*args, **kwargs)
+
+    # Both requests must snapshot the offline binding before either rotates it.
+    # With startup grace disabled, a later snapshot would request another launch.
+    monkeypatch.setattr(sessions_module, "_launch_runner_on_host", _race_launch)
+
     def _post() -> Any:
         return client.post(
             f"/v1/sessions/{session_id}/events",
@@ -2476,6 +2491,8 @@ async def test_concurrent_relaunches_are_single_flight(
     tasks = [asyncio.create_task(_post()), asyncio.create_task(_post())]
     launches: list[HostLaunchRunnerFrame] = []
     try:
+        await asyncio.wait_for(both_callers_ready.wait(), timeout=10.0)
+        assert observed_bindings == [session["runner_id"], session["runner_id"]]
         # Collect every frame the host sees inside a bounded window; a
         # second launch frame (the double-spawn) would arrive well within
         # it since both requests are already in flight.
