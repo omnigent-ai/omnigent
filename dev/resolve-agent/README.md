@@ -12,6 +12,8 @@ test), then does one of two things:
   outcome may require changes across layers; independent fixes or features must
   be removed or split out. Resolve requests a structured scope assessment from
   Polly with `resolve_scope=true` and validates it before approval or handoff.
+  Scope findings appear under Polly's blocking issues; the review workflow still
+  succeeds, and Resolve enforces the approval decision.
   This applies only to Resolve's existing-PR review path; ordinary Polly reviews
   and repository merge requirements are unchanged.
 - **If no fix exists yet**, it **authors the fix** in a fresh worktree, adds

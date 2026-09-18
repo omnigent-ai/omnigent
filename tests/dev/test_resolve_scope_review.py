@@ -256,9 +256,11 @@ def test_render_collapses_data_without_changing_verdict(
 
 
 @pytest.mark.parametrize("enabled", [True, False])
+@pytest.mark.parametrize("classification", ["necessary", "unrelated", "uncertain"])
 def test_comment_step_formats_scope_only_when_requested(
-    tmp_path: Path, report: dict, enabled: bool
+    tmp_path: Path, report: dict, enabled: bool, classification: str
 ) -> None:
+    report["files"][0]["changes"][0]["classification"] = classification
     workflow = yaml.safe_load((ROOT / ".github/workflows/polly-review.yml").read_text())
     step = next(
         step
@@ -364,10 +366,7 @@ def test_scope_review_is_opt_in_and_bypasses_old_review_deduplication(
     inputs = workflow[True]["workflow_dispatch"]["inputs"]
     assert inputs["resolve_scope"]["default"] is False
     steps = workflow["jobs"]["review"]["steps"]
-    validation = next(
-        step for step in steps if step["name"] == "Validate Resolve scope assessment"
-    )
-    assert validation["if"] == "github.event_name == 'workflow_dispatch' && inputs.resolve_scope"
+    assert all("scope_review.py check" not in step.get("run", "") for step in steps)
     dupe = next(step for step in steps if step.get("id") == "dupe")
     gh = tmp_path / "gh"
     gh.write_text("""#!/bin/sh

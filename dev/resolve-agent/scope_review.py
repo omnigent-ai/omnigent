@@ -165,9 +165,10 @@ Classify every distinct change in each file as `necessary`, `unrelated`, or
 exactly once; include multiple changes when a file mixes purposes. Do not turn
 uncertainty into a pass. `scope.status` is `clear` only for one established
 outcome; otherwise use `uncertain` and explain what a human must clarify.
-Unrelated or uncertain changes block Resolve approval even if tests pass. Describe
-what must be removed or split in the visible review. This is separate from
-correctness severity; do not downgrade scope findings to bypass this gate.
+Unrelated or uncertain changes block Resolve approval even if tests pass. Put
+these findings under Blocking issues in the visible review and describe what
+must be removed, split, or clarified. A completed review with blocking findings
+is still a successful Polly workflow; Resolve enforces the approval decision.
 
 Pass this contract and the context file to each independent reviewer. Reconcile
 their assessments conservatively: unresolved scope disagreements are uncertain.

@@ -679,15 +679,6 @@ jobs:
           gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file /tmp/comment.md
           echo "Created new comment"
 
-      - name: Validate Resolve scope assessment
-        if: github.event_name == 'workflow_dispatch' && inputs.resolve_scope
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
-        run: |
-          python3 dev/resolve-agent/scope_review.py check --repo "$REPO" --pr "$PR_NUMBER"
-
       # Successful slow runs need the same evidence as failed reviews.
       - name: Prepare Polly diagnostics
         if: always() && (failure() || (steps.polly.outcome != '' && steps.polly.outcome != 'skipped'))

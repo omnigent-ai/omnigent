@@ -1128,10 +1128,13 @@ gh workflow run polly-review.yml -R omnigent-ai/omnigent -f pr=<pr>
 **Existing-PR review path only (Step 2A):** add `-f resolve_scope=true` to this
 dispatch and every retry. This requests a fresh Polly assessment of the full
 diff against the original problem, with a scope statement and classifications
-for each changed file. The workflow's **Validate Resolve scope assessment** step
-must succeed: missing, malformed, stale, unrelated, or uncertain assessments
-fail that step. A normal Polly review without this step does not satisfy this
-review-path requirement. The author path uses the normal dispatch above.
+for each changed file. Polly reports unrelated or uncertain changes under
+**Blocking issues**; those findings do not fail the review workflow. Resolve
+must run the read-only check in Step 4.5: missing, malformed, stale, unrelated,
+or uncertain assessments block approval or handoff. A green workflow is not a
+passing scope assessment. A normal Polly review without a structured scope
+assessment does not satisfy this review-path requirement. The author path uses
+the normal dispatch above.
 
 Your App token carries `actions: write`, so this dispatch is expected to succeed;
 a `403` means the App lost that permission — record `polly_review` as "could not
