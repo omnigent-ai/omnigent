@@ -21,6 +21,7 @@ from omnigent.entities import Agent, Conversation, ConversationItem, MessageData
 from omnigent.errors import OmnigentError
 from omnigent.server.routes import sessions as sessions_mod
 from omnigent.server.routes.sessions import create_sessions_router
+from omnigent.stores.conversation_store import CompactionStats
 
 # ── Stubs ────────────────────────────────────────────────────────
 
@@ -75,6 +76,10 @@ class _ConversationStore:
     def get_conversation(self, conversation_id: str) -> Conversation | None:
         """:returns: The conversation if present, else None."""
         return self._convs.get(conversation_id)
+
+    def get_compaction_stats(self, conversation_id: str) -> CompactionStats:
+        """:returns: The empty aggregate; these tests persist no compactions."""
+        return CompactionStats(count=0, last_compaction_at=None)
 
     def set_session_todos(self, conversation_id: str, todos: list[dict[str, Any]]) -> bool:
         self.todo_updates.append(todos)

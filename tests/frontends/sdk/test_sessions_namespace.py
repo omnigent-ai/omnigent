@@ -266,6 +266,46 @@ async def test_get_updated_at_defaults_to_none_when_omitted() -> None:
 
 
 @pytest.mark.asyncio
+async def test_get_parses_compaction_aggregate() -> None:
+    """The compaction stall signal round-trips into the typed Session."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(
+            200,
+            json=_session_response_body()
+            | {"compaction_count": 2, "last_compaction_at": 1700000041},
+        )
+
+    ns, client = _make_namespace(handler)
+    try:
+        session = await ns.get("conv_abc")
+    finally:
+        await client.aclose()
+
+    assert session.compaction_count == 2
+    assert session.last_compaction_at == 1700000041
+
+
+@pytest.mark.asyncio
+async def test_get_compaction_aggregate_defaults_when_omitted() -> None:
+    """Older servers without the compaction fields remain parseable."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(200, json=_session_response_body())
+
+    ns, client = _make_namespace(handler)
+    try:
+        session = await ns.get("conv_abc")
+    finally:
+        await client.aclose()
+
+    assert session.compaction_count == 0
+    assert session.last_compaction_at is None
+
+
+@pytest.mark.asyncio
 async def test_get_parses_agent_name() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(

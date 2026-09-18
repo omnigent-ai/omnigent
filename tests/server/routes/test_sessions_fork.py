@@ -33,7 +33,7 @@ from omnigent.server.managed_hosts import (
 )
 from omnigent.server.routes import _session_create_validation as create_validation
 from omnigent.server.routes.sessions import create_sessions_router, routes_core
-from omnigent.stores.conversation_store import _FORK_ONLY_DROPPED_LABEL_KEYS
+from omnigent.stores.conversation_store import _FORK_ONLY_DROPPED_LABEL_KEYS, CompactionStats
 
 # ── Minimal store stubs ──────────────────────────────────────────
 
@@ -160,6 +160,15 @@ class _ConversationStore:
         :returns: The Conversation if found, else None.
         """
         return self._convs.get(conversation_id)
+
+    def get_compaction_stats(self, conversation_id: str) -> CompactionStats:
+        """
+        Return the empty compaction aggregate.
+
+        :param conversation_id: Conversation ID to aggregate.
+        :returns: ``count=0`` — these tests persist no compaction items.
+        """
+        return CompactionStats(count=0, last_compaction_at=None)
 
     def fork_conversation(
         self,

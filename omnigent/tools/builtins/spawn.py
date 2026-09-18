@@ -519,7 +519,9 @@ class SysSessionListTool(Tool):
       ``agent_name`` filter narrows this list. This powers
       orchestration: discovering sessions to inspect
       (``sys_agent_get`` / ``sys_session_get_info``) or drive
-      (``sys_session_send`` by ``session_id``).
+      (``sys_session_send`` by ``session_id``). List rows carry no
+      progress or stall signal — for that (``last_activity_at``, the
+      compaction aggregate) call ``sys_session_get_info`` per session.
 
     The global ``sessions`` view is populated only on the runner
     (REST) path, where the server enforces permissions; the in-process
@@ -544,7 +546,10 @@ class SysSessionListTool(Tool):
             "for orchestration (inspect via sys_agent_get / "
             "sys_session_get_info, or drive via sys_session_send by "
             "session_id). Pass agent_name to filter the global list to "
-            "sessions running that agent. Calls without pagination keep "
+            "sessions running that agent. List rows carry status + "
+            "connectivity only — for progress/stall signals "
+            "(last_activity_at, compaction count) call "
+            "sys_session_get_info on the session. Calls without pagination keep "
             "the complete result while it fits the tool-output budget; "
             "larger global session lists return a page with has_more "
             "metadata and an opaque next_cursor. Pass that cursor to continue; sub_agents stays "
@@ -667,11 +672,14 @@ class SysSessionGetInfoTool(Tool):
     status, title, agent binding (id + name), runner binding and live
     connectivity, host and its reported harness readiness, reasoning effort,
     effective model, parent
-    linkage, workspace / git branch, persisted last-activity time, and
+    linkage, workspace / git branch, persisted last-activity time, the
+    compaction aggregate, and
     the count of outstanding approval prompts. Comparing
     ``last_activity_at`` across polls distinguishes a running session that
-    is advancing from one whose persisted output has stalled. For the
-    conversation transcript, use
+    is advancing from one whose persisted output has stalled; a climbing
+    ``compaction_count`` (with ``last_compaction_at``) while activity
+    stays frozen marks a session parked at repeated context compactions.
+    For the conversation transcript, use
     ``sys_session_get_history`` instead.
 
     ``session_id`` is optional — when omitted, the caller's own
@@ -697,7 +705,9 @@ class SysSessionGetInfoTool(Tool):
             "agent binding (id/name), runner binding + connectivity, "
             "host + configured harness readiness, reasoning effort, model, "
             "parent session, workspace, "
-            "persisted last-activity time, and outstanding approval "
+            "persisted last-activity time, compaction count + last "
+            "compaction time (a climbing count with frozen activity marks "
+            "a stalled session), and outstanding approval "
             "prompts. Global read — any "
             "session you can access. Pass session_id to target another "
             "session; omit it to describe your own. Metadata only — "

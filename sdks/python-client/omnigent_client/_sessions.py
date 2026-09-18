@@ -140,6 +140,14 @@ class Session:
         resets the clock — treat it as a session-write heartbeat, not a pure
         item-append signal. ``None`` when connected to an older server that
         does not return the field.
+    :param compaction_count: Total context compactions persisted to this
+        session's transcript, e.g. ``2``. ``0`` when the session has never
+        compacted (or when connected to an older server that does not
+        return the field). A climbing count while ``updated_at`` stays
+        frozen is the repeated-compaction stall signature.
+    :param last_compaction_at: Unix epoch seconds of the most recent
+        persisted compaction item, or ``None`` when the session has never
+        compacted (or the server predates the field).
     :param title: Optional human-readable title, e.g.
         ``"debugging auth flow"``. ``None`` when unset.
     :param labels: Session-scoped guardrails labels. Empty dict
@@ -188,6 +196,8 @@ class Session:
     status: str
     created_at: int
     updated_at: int | None = None
+    compaction_count: int = 0
+    last_compaction_at: int | None = None
     agent_name: str | None = None
     title: str | None = None
     labels: dict[str, str] = field(default_factory=dict)
@@ -218,12 +228,17 @@ class Session:
         raw_cw = raw.get("context_window")
         raw_ltt = raw.get("last_total_tokens")
         raw_updated_at = raw.get("updated_at")
+        raw_last_compaction_at = raw.get("last_compaction_at")
         return cls(
             id=str(raw["id"]),
             agent_id=str(raw["agent_id"]),
             status=str(raw["status"]),
             created_at=int(raw["created_at"]),
             updated_at=int(raw_updated_at) if raw_updated_at is not None else None,
+            compaction_count=int(raw.get("compaction_count", 0)),
+            last_compaction_at=(
+                int(raw_last_compaction_at) if raw_last_compaction_at is not None else None
+            ),
             agent_name=raw.get("agent_name"),
             title=raw.get("title"),
             labels=labels_raw if isinstance(labels_raw, dict) else {},

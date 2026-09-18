@@ -355,6 +355,7 @@ from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
     PINNED_LABEL_KEY,
+    CompactionStats,
     ConversationNotFoundError,
     NameAlreadyExistsError,
     pinned_label_key,
@@ -1042,6 +1043,7 @@ def _build_session_response(
     viewer_id: str | None = None,
     agent_store: AgentStore | None = None,
     agent_cache: AgentCache | None = None,
+    compaction_stats: CompactionStats | None = None,
     side_chat_sealed: bool = False,
 ) -> SessionResponse:
     """
@@ -1110,6 +1112,11 @@ def _build_session_response(
         ``None`` is treated as ``[]``.
     :param agent_store: Optional store used to resolve the session harness.
     :param agent_cache: Optional cache used to load the session harness spec.
+    :param compaction_stats: Precomputed compaction aggregate for this
+        conversation (from :meth:`ConversationStore.get_compaction_stats`),
+        surfaced as ``compaction_count`` / ``last_compaction_at`` so
+        metadata pollers can detect a repeated-compaction stall without
+        reading the transcript. ``None`` reports zero compactions.
     :returns: The :class:`SessionResponse` for the API.
     :raises OmnigentError: If ``conv.agent_id`` is ``None``.
     """
@@ -1149,6 +1156,11 @@ def _build_session_response(
         background_tasks=background_tasks,
         created_at=conv.created_at,
         updated_at=conv.updated_at,
+        # Metadata-level compaction signal: lets an orchestrator polling
+        # snapshots spot a session repeatedly compacting with no progress,
+        # which the transcript-free projection otherwise cannot see.
+        compaction_count=compaction_stats.count if compaction_stats else 0,
+        last_compaction_at=(compaction_stats.last_compaction_at if compaction_stats else None),
         title=title_without_closed_marker(conv.title),
         labels=labels,
         runner_id=conv.runner_id,
@@ -10503,6 +10515,11 @@ async def _get_session_snapshot(
         conv_store,
         root_conversation_id=conv.root_conversation_id,
     )
+    # Compaction aggregate for the metadata-level stall signal
+    # (compaction_count / last_compaction_at). One indexed COUNT/MAX off
+    # the event loop; independent of include_items so the slim snapshot
+    # the orchestration tools consume still carries it.
+    compaction_stats = await asyncio.to_thread(conv_store.get_compaction_stats, conv.id)
     # Static signal telling the open view a host-bound, host-down session is a
     # resumable managed host it can wake by sending a message, vs a terminal
     # host_offline dead-end. Computed independently of liveness_lookup (the web
@@ -10540,6 +10557,7 @@ async def _get_session_snapshot(
         viewer_id=viewer_id,
         agent_store=agent_store,
         agent_cache=agent_cache,
+        compaction_stats=compaction_stats,
     )
 
 
