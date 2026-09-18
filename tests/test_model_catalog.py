@@ -1709,6 +1709,29 @@ def test_spec_harness_derivation() -> None:
     assert spec_harness(SimpleNamespace()) is None
 
 
+@pytest.mark.parametrize(
+    ("provider_base", "expected"),
+    [
+        ("https://api.openai.com/v1", "https://api.openai.com/v1/models"),
+        ("https://api.openai.com/v1/", "https://api.openai.com/v1/models"),
+        ("https://api.anthropic.com", "https://api.anthropic.com/v1/models"),
+        ("https://api.z.ai/api/coding/paas/v4", "https://api.z.ai/api/coding/paas/v4/models"),
+        ("https://gw.example.com/v6", "https://gw.example.com/v6/models"),
+    ],
+)
+def test_models_url_appends_models_to_any_versioned_base(
+    provider_base: str, expected: str
+) -> None:
+    """A base ending in a version segment lists at ``<base>/models``.
+
+    ``_models_url`` special-cased only a trailing ``/v1``; any other
+    versioned base (e.g. z.ai's coding endpoint ends ``/v4``) built
+    ``…/v4/v1/models`` — a URL no server serves — so live model discovery
+    404'd for providers configured with such a base.
+    """
+    assert model_catalog._models_url(provider_base) == expected
+
+
 def test_openai_compatible_listing_mints_bearer_via_auth_command(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
