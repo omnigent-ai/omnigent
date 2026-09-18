@@ -1908,6 +1908,106 @@ _GATEWAY_WITH_MODELS = (
 )
 
 
+@pytest.mark.parametrize("harness", ["acp", "acp:custom"])
+@pytest.mark.parametrize("has_credentials", [False, True])
+def test_acp_listing_uses_only_curated_ids_without_remote_discovery(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    harness: str,
+    has_credentials: bool,
+) -> None:
+    """ACP discovery matches the configured policy regardless of gateway credentials."""
+    _isolate_config(
+        monkeypatch,
+        tmp_path,
+        "providers:\n"
+        "  gateway:\n"
+        "    kind: gateway\n"
+        "    openai:\n"
+        "      base_url: https://gateway.example.com/v1\n"
+        "      api_key: $ACP_TEST_CATALOG_API_KEY\n"
+        "      models:\n"
+        "        alternate: vendor/custom-b\n"
+        "        primary: databricks-gpt-5-4\n"
+        "        default: primary\n",
+    )
+    if has_credentials:
+        monkeypatch.setenv("ACP_TEST_CATALOG_API_KEY", "fake-key")
+    else:
+        monkeypatch.delenv("ACP_TEST_CATALOG_API_KEY", raising=False)
+    requests_seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests_seen.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {"id": "databricks-gpt-5-4"},
+                    {"id": "vendor/custom-b"},
+                    {"id": "outside-configured-list"},
+                ]
+            },
+        )
+
+    listing = list_models_for_worker(
+        _worker_spec(harness, auth=ProviderAuth(name="gateway")),
+        harness,
+        transport=httpx.MockTransport(handler),
+    )
+
+    assert [entry.id for entry in listing.models] == [
+        "databricks-gpt-5-4",
+        "vendor/custom-b",
+    ]
+    assert listing.source == "static"
+    assert listing.verified is False
+    assert requests_seen == []
+
+
+@pytest.mark.parametrize(
+    "models_yaml",
+    [
+        "",
+        "      models:\n        default: gpt-5\n",
+        "      models:\n        default: primary\n        primary: gpt-5\n        fast: gpt-5\n",
+    ],
+)
+def test_acp_listing_without_curation_keeps_live_discovery(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, models_yaml: str
+) -> None:
+    """Default-only and uncurated providers retain their unrestricted remote catalog."""
+    _isolate_config(
+        monkeypatch,
+        tmp_path,
+        "providers:\n"
+        "  gateway:\n"
+        "    kind: gateway\n"
+        "    openai:\n"
+        "      base_url: https://gateway.example.com/v1\n"
+        "      api_key: fake-key\n" + models_yaml,
+    )
+    requests_seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests_seen.append(request)
+        return httpx.Response(
+            200,
+            json={"data": [{"id": "gpt-5"}, {"id": "vendor/other-model"}]},
+        )
+
+    listing = list_models_for_worker(
+        _worker_spec("acp:custom", auth=ProviderAuth(name="gateway")),
+        "acp:custom",
+        transport=httpx.MockTransport(handler),
+    )
+
+    assert {entry.id for entry in listing.models} == {"gpt-5", "vendor/other-model"}
+    assert listing.source == "openai-compatible"
+    assert listing.verified is True
+    assert len(requests_seen) == 1
+
+
 @pytest.mark.parametrize("model", [None, "gpt-5.4", "outside-configured-list"])
 def test_acp_curated_models_independent_of_session_model(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, model: str | None

@@ -15,7 +15,7 @@ from omnigent.runner.app import _build_spawn_env_from_spec
 from omnigent.runtime import get_agent_cache, get_agent_store, get_conversation_store
 from omnigent.server.routes._sessions import orchestration
 from omnigent.server.routes._sessions.helpers import _load_agent_spec_for_session
-from tests.server.helpers import create_test_agent
+from tests.server.helpers import build_agent_bundle, create_test_agent
 
 pytestmark = pytest.mark.asyncio
 
@@ -300,28 +300,65 @@ async def test_nested_child_uses_its_own_harness_and_provider(
     assert accepted.json()["model_override"] == _CHILD_DEFAULT
 
 
-async def test_invalid_default_rejects_create_even_with_listed_override(
-    client: httpx.AsyncClient,
+async def _agent_with_removed_default(
+    client: httpx.AsyncClient, config_home: Path
+) -> dict[str, Any]:
+    """Create a valid agent, then remove its pinned default from the provider's catalog."""
+    path = config_home / "config.yaml"
+    original = path.read_text()
+    config = yaml.safe_load(original)
+    config["providers"]["curated"]["openai"]["models"]["temporary"] = _UNLISTED
+    path.write_text(yaml.safe_dump(config))
+    try:
+        return await create_test_agent(
+            client, executor={**_executor(), "model": _UNLISTED}, include_llm=False
+        )
+    finally:
+        path.write_text(original)
+
+
+@pytest.mark.parametrize("model", [None, _ALTERNATE])
+async def test_invalid_default_rejects_create_before_persistence(
+    client: httpx.AsyncClient, tmp_path: Path, model: str | None
 ) -> None:
-    """A valid override cannot hide a default that the running session cannot restore."""
-    agent = await create_test_agent(
-        client, executor={**_executor(), "model": _UNLISTED}, include_llm=False
-    )
+    """Creation rejects an invalid default with or without a listed override."""
+    agent = await _agent_with_removed_default(client, tmp_path)
+    store = get_conversation_store()
+    before_ids = {conv.id for conv in store.list_conversations().data}
     response = await client.post(
         "/v1/sessions",
-        json={"agent_id": agent["id"], "model_override": _ALTERNATE, "initial_items": []},
+        json={"agent_id": agent["id"], "model_override": model, "initial_items": []},
     )
     assert response.status_code == 400, response.text
+    assert "configured model list" in response.text
+    assert {conv.id for conv in store.list_conversations().data} == before_ids
+
+
+async def test_invalid_default_rejects_multipart_create_before_persistence(
+    client: httpx.AsyncClient,
+) -> None:
+    """Uploading an ACP bundle cannot persist a session with an invalid default."""
+    bundle = build_agent_bundle(
+        "invalid-acp", executor={**_executor(), "model": _UNLISTED}, include_llm=False
+    )
+    store = get_conversation_store()
+    before_ids = {conv.id for conv in store.list_conversations().data}
+    response = await client.post(
+        "/v1/sessions",
+        data={"metadata": "{}"},
+        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
+    )
+    assert response.status_code == 400, response.text
+    assert "configured model list" in response.text
+    assert {conv.id for conv in store.list_conversations().data} == before_ids
 
 
 @pytest.mark.parametrize("model", [_ALTERNATE, "default"])
 async def test_invalid_default_rejects_patch_without_mutating_metadata(
-    client: httpx.AsyncClient, model: str
+    client: httpx.AsyncClient, tmp_path: Path, model: str
 ) -> None:
     """Both selecting and resetting require a default inside the curated catalog."""
-    agent = await create_test_agent(
-        client, executor={**_executor(), "model": _UNLISTED}, include_llm=False
-    )
+    agent = await _agent_with_removed_default(client, tmp_path)
     session_id = agent["_session_id"]
     before = (await client.get(f"/v1/sessions/{session_id}")).json()
     response = await client.patch(
@@ -389,6 +426,27 @@ async def test_provider_resolution_failure_rejects_create_before_persistence(
     response = await client.post(
         "/v1/sessions",
         json={"agent_id": agent["id"], "model_override": model, "initial_items": []},
+    )
+    assert response.status_code == expected_status, response.text
+    assert {conv.id for conv in store.list_conversations().data} == before_ids
+
+
+@pytest.mark.parametrize("failure", ["missing-provider", "resolution-error"])
+async def test_provider_resolution_failure_rejects_multipart_before_persistence(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    failure: str,
+) -> None:
+    """Multipart creation requires resolving an ACP bundle's explicit provider."""
+    bundle = build_agent_bundle("invalid-acp", executor=_executor(), include_llm=False)
+    store = get_conversation_store()
+    before_ids = {conv.id for conv in store.list_conversations().data}
+    expected_status = _break_provider_resolution(failure, monkeypatch, tmp_path)
+    response = await client.post(
+        "/v1/sessions",
+        data={"metadata": "{}"},
+        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
     )
     assert response.status_code == expected_status, response.text
     assert {conv.id for conv in store.list_conversations().data} == before_ids

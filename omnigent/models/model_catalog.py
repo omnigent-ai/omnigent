@@ -1028,7 +1028,8 @@ def list_models_for_worker(
     cache) its unfiltered model listing, then applies the harness's
     family rule from :func:`~omnigent.models.model_override.model_family_mismatch`
     — claude harnesses keep Claude ids, codex harnesses keep GPT ids,
-    pi keeps everything.
+    pi keeps everything. Curated generic ACP workers return their configured
+    shortlist without resolving credentials or querying the gateway.
 
     :param spec: The worker's (sub-)agent spec.
     :param harness: The worker's harness id, e.g. ``"codex-native"``.
@@ -1036,6 +1037,18 @@ def list_models_for_worker(
         the HTTP boundary; ``None`` uses the default transport.
     :returns: The worker's :class:`ModelListing`.
     """
+    if canonicalize_harness(harness) == "acp":
+        curated = acp_curated_models(spec)
+        if curated:
+            return ModelListing(
+                source="static",
+                verified=False,
+                models=tuple(
+                    ModelEntry(id=model_id, family=model_family_token(model_id))
+                    for model_id in curated
+                ),
+                note="Configured ACP provider model shortlist; vendor CLI owns authentication.",
+            )
     provider = resolve_model_provider(spec, harness)
     # Pi harnesses use system.ai.* ids (via the Unity Catalog model-services API)
     # so supervisors see the ids Pi can actually route. Other harnesses use the

@@ -9003,7 +9003,6 @@ async def _create_session_from_existing_agent(
         from omnigent.harness_aliases import canonicalize_harness
         from omnigent.models.model_catalog import (
             _acp_launch_model,
-            acp_curated_models,
             validate_acp_model,
         )
         from omnigent.runtime.workflow import _find_spec_by_name
@@ -9031,12 +9030,9 @@ async def _create_session_from_existing_agent(
             selection_spec is not None
             and canonicalize_harness(harness_override or _spec_harness(selection_spec)) == "acp"
         ):
-            if model_override is None:
-                # Reject unresolved explicit providers before creating the row.
-                await asyncio.to_thread(acp_curated_models, selection_spec)
-            else:
-                default_model = await asyncio.to_thread(_acp_launch_model, selection_spec)
-                await asyncio.to_thread(validate_acp_model, selection_spec, default_model)
+            default_model = await asyncio.to_thread(_acp_launch_model, selection_spec)
+            await asyncio.to_thread(validate_acp_model, selection_spec, default_model)
+            if model_override is not None:
                 await asyncio.to_thread(validate_acp_model, selection_spec, model_override)
 
     # Inherit runner affinity from the parent session so the child
@@ -9586,6 +9582,11 @@ def _create_session_from_bundle(
             enforce_handler_allowlist=not local_single_user_enabled(),
         )
     assert spec.name is not None
+
+    if _spec_harness(spec) == "acp":
+        from omnigent.models.model_catalog import _acp_launch_model, validate_acp_model
+
+        validate_acp_model(spec, _acp_launch_model(spec))
 
     if metadata.reasoning_effort is None and spec.executor.reasoning_effort is not None:
         _, seeded_effort = validate_session_model_metadata(
