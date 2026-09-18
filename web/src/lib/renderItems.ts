@@ -172,6 +172,9 @@ export type Bubble =
       lifecycle: ActiveResponse["state"];
       /** Free-form error message when `lifecycle === "failed"`. */
       error: string | null;
+      /** Failure code paired with `error`, when the wire carried one —
+       *  keys the failure-description lookup for the turn-level pill. */
+      errorCode?: string | null;
       items: RenderItem[];
       /**
        * Wall-clock seconds the turn spent working, when derivable —
@@ -986,6 +989,8 @@ function walkBubbles(
           ? activeResponse.state
           : "completed";
     const error = activeResponse?.responseId === groupResponseId ? activeResponse.error : null;
+    const errorCode =
+      activeResponse?.responseId === groupResponseId ? (activeResponse.errorCode ?? null) : null;
 
     const subIndex = subIndexByResp.get(groupResponseId) ?? 0;
     subIndexByResp.set(groupResponseId, subIndex + 1);
@@ -1037,6 +1042,7 @@ function walkBubbles(
       stableId,
       lifecycle,
       error,
+      errorCode,
       // `sessionLive` spins this turn's trailing tools when the session is
       // running and this is the newest turn — for a harness with no streaming
       // `activeResponse`. `lifecycle` (and thus fork/fold) is untouched.
@@ -1766,6 +1772,7 @@ export function bubblesEqual(a: Bubble, b: Bubble): boolean {
       a.stableId !== b.stableId ||
       a.lifecycle !== b.lifecycle ||
       a.error !== b.error ||
+      a.errorCode !== b.errorCode ||
       // Render-affecting timestamp — must stay visible to the memo like
       // the user branch's `createdAtS` comparison below.
       a.createdAtS !== b.createdAtS ||

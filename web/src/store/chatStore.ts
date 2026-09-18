@@ -5581,7 +5581,14 @@ export async function pumpStreamEvents(
         // are the authoritative source for user-initiated terminals.
         if (active?.state !== "cancelled") {
           const errorMsg = block.response?.error?.message ?? null;
-          finalizeActive(set, block.status as ActiveResponse["state"], errorMsg);
+          const errorCode = block.response?.error?.code ?? null;
+          finalizeActive(
+            set,
+            block.status as ActiveResponse["state"],
+            errorMsg,
+            undefined,
+            errorCode,
+          );
         }
         // agent_run complete + create_session settle. Read the finalized state so
         // a `session.interrupted` cancelled (kept above) wins over block.status.
@@ -6958,12 +6965,13 @@ function finalizeActive(
   state: ActiveResponse["state"],
   error: string | null,
   responseIdOverride?: string | null,
+  errorCode: string | null = null,
 ): void {
   set((s) => {
     if (s.activeResponse === null && !responseIdOverride) return {};
     const responseId = s.activeResponse?.responseId ?? responseIdOverride ?? "";
     return {
-      activeResponse: { responseId, state, error, completedAt: Date.now() },
+      activeResponse: { responseId, state, error, errorCode, completedAt: Date.now() },
     };
   });
 }
@@ -6976,7 +6984,13 @@ function failUnavailableStream(set: Setter, error: string): void {
     const activeResponse =
       s.activeResponse === null
         ? null
-        : { ...s.activeResponse, state: "failed" as const, error, completedAt: Date.now() };
+        : {
+            ...s.activeResponse,
+            state: "failed" as const,
+            error,
+            errorCode: STREAM_UNAVAILABLE_CODE,
+            completedAt: Date.now(),
+          };
     const blocks = s.blocks.filter(
       (block) => block.type !== "error" || block.code !== STREAM_UNAVAILABLE_CODE,
     );

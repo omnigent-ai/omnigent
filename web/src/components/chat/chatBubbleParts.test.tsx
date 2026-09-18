@@ -113,6 +113,35 @@ describe("UserBubble literal text", () => {
   });
 });
 
+describe("AssistantBubble turn-failure pill", () => {
+  function failedBubble(errorCode: string | null): Extract<Bubble, { kind: "assistant" }> {
+    return {
+      kind: "assistant",
+      responseId: "resp_failed",
+      stableId: "turn_failed",
+      lifecycle: "failed",
+      error: "inner executor error: synthetic provider failure",
+      errorCode,
+      items: [{ kind: "text", itemId: "text_failed", text: "Sure, let me", final: false }],
+    };
+  }
+
+  it("shows the semantic failure description when the failure carried a code", () => {
+    render(<BubbleView bubble={failedBubble("executor_error")} isLastAssistant />);
+
+    expect(
+      screen.getByText("The agent runtime hit an error while running the turn."),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/Something went wrong/)).toBeNull();
+  });
+
+  it("falls back to the generic headline when the failure carried no code", () => {
+    render(<BubbleView bubble={failedBubble(null)} isLastAssistant />);
+
+    expect(screen.getByText("Something went wrong")).toBeInTheDocument();
+  });
+});
+
 describe("AssistantBubble error retry", () => {
   it("submits one continuation for a rate limit without replaying the original input", async () => {
     let finishRetry: ((response: Response) => void) | undefined;

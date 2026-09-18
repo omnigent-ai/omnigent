@@ -1072,7 +1072,7 @@ function AssistantBubble({
       {/* Surface a turn-level failure as the same destructive pill an error
           block renders — never raw red text. */}
       {bubble.lifecycle === "failed" && bubble.error && (
-        <ErrorBanner message={bubble.error} source="" code="" />
+        <ErrorBanner message={bubble.error} source="" code={bubble.errorCode ?? ""} />
       )}
     </>
   );
