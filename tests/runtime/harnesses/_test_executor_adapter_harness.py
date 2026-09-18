@@ -11,6 +11,8 @@ Four scripts:
 - ``"tool_call"``: a ToolCallRequest, then a ToolCallComplete
   with a result, then a TurnComplete (no further text).
 - ``"error"``: an ExecutorError event.
+- ``"error_with_sdk_cause"``: an ExecutorError carrying the SDK
+  exception it caught (an ``openai.RateLimitError``).
 - ``"cancelled"``: a TurnCancelled event.
 - ``"capture_messages"``: writes the received messages list as
   JSON to the path in ``MOCK_EXECUTOR_CAPTURE_PATH``, then
@@ -178,6 +180,35 @@ def _build_error_with_usage() -> Executor:
     return executor
 
 
+def _build_error_with_sdk_cause() -> Executor:
+    """
+    MockExecutor scripted with an :class:`ExecutorError` carrying the SDK
+    exception it caught (an ``openai.RateLimitError`` for an upstream 429).
+
+    Mirrors the openai-agents executor's model-capacity failure: the SDK
+    raises on the provider's 429 and the executor flattens it into the
+    message string. The carried exception lets the adapter chain it, so
+    the scaffold's error detail classifies as ``rate_limit_exceeded``
+    instead of falling back to the wrapper's class name.
+
+    :returns: A configured :class:`MockExecutor` instance.
+    """
+    import httpx
+    import openai
+
+    request = httpx.Request("POST", "https://model-serving.test/v1/responses")
+    cause = openai.RateLimitError(
+        "Error code: 429 - Selected model is at capacity. Please try a different model.",
+        response=httpx.Response(429, request=request),
+        body=None,
+    )
+    executor = MockExecutor()
+    executor._turns.append(
+        [ExecutorError(message=f"OpenAI Agents SDK error: {cause}", exception=cause)]
+    )
+    return executor
+
+
 def _build_cancelled() -> Executor:
     """
     MockExecutor scripted with a provider-side :class:`TurnCancelled`.
@@ -230,6 +261,7 @@ _SCRIPTS: dict[str, Callable[[], Executor]] = {
     "tool_call": _build_tool_call,
     "error": _build_error,
     "error_with_usage": _build_error_with_usage,
+    "error_with_sdk_cause": _build_error_with_sdk_cause,
     "cancelled": _build_cancelled,
     "capture_messages": _build_capture_messages,
 }
