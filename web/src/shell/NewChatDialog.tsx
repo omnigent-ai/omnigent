@@ -3031,10 +3031,8 @@ export function NewChatLandingScreen() {
   // the project default instead of reusing).
   const forkFreshMainPath = useMemo<string | null | undefined>(() => {
     if (!forkFreshArmed) return null;
-    // A probe error (non-400; the hook already maps 400 → []) leaves data
-    // undefined for good. Treat it as "no redirect" so the seed still lands on
-    // the candidate as-is, rather than waiting on data that never arrives and
-    // leaving the workspace blank forever.
+    // A failed probe leaves no data. Keep the candidate as-is instead of
+    // waiting forever and leaving the workspace blank.
     if (seedWorktreesErrored) return null;
     if (seedWorktreesArePlaceholder || seedWorktrees === undefined) return undefined;
     const norm = normalizeWorkspacePath(autoSeedCandidate);
@@ -4174,6 +4172,18 @@ export function NewChatLandingScreen() {
     worktreesEnabled ? selectedHostId : null,
     worktreesEnabled ? workspaceTrimmed : null,
   );
+  const workspaceIsNonGit =
+    worktreesEnabled && !hostWorktreesArePlaceholder && hostWorktrees?.length === 0;
+
+  // Discard worktree choices only after the current directory is confirmed non-Git.
+  useEffect(() => {
+    if (!workspaceIsNonGit) return;
+    setBranchName("");
+    setAutoSeededBranch("");
+    setPrefilledBranch("");
+    setWorktreePopoverOpen(false);
+  }, [workspaceIsNonGit]);
+
   // Linked worktrees (exclude the main work tree — "starting in the main
   // repo" is just picking that directory, not selecting a worktree).
   const linkedWorktrees = useMemo(
@@ -4213,7 +4223,8 @@ export function NewChatLandingScreen() {
     activeWorktree !== null && prefilledBranch !== "" && branchName.trim() === prefilledBranch;
   // A new, isolated worktree is created only when a branch is named and the
   // workspace isn't already sitting on that existing worktree.
-  const shouldCreateWorktree = branchName.trim() !== "" && !startInExistingWorktree;
+  const shouldCreateWorktree =
+    !workspaceIsNonGit && branchName.trim() !== "" && !startInExistingWorktree;
   // Auto-fill the base branch when a new-worktree branch is named, but only
   // until the user touches the base field — then their choice (including a
   // cleared field) stands. Clearing the branch name (so the base field goes
@@ -4687,6 +4698,7 @@ export function NewChatLandingScreen() {
         : (selectedHostDisplayName ?? "No host selected");
   const worktreeControlAvailable =
     !sandboxSelected &&
+    !workspaceIsNonGit &&
     (branchName.trim() !== "" ||
       (worktreesEnabled && (hostWorktrees === undefined || hostWorktrees.length > 0)));
   const showGithubRepoPicker = githubReposEnabled && sandboxRepoPickerConnected;
@@ -5282,7 +5294,9 @@ export function NewChatLandingScreen() {
                     ? { branch_name: trimmedBranch, base_branch: baseBranch.trim() || undefined }
                     : startInExistingWorktree
                       ? { branch_name: trimmedBranch, existing_worktree: true }
-                      : undefined,
+                      : createProjectId !== null && workspaceIsNonGit
+                        ? null
+                        : undefined,
                 }),
             // Native-wrapper labels + codex bypass + the born-filed project
             // label (see `createLabels` above).
