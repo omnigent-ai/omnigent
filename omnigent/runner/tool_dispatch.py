@@ -52,6 +52,7 @@ from omnigent.debug_logging import runner_primary_session_id
 from omnigent.harness_aliases import canonicalize_harness, is_native_harness
 from omnigent.models.model_override import (
     harness_supports_model_override,
+    inherited_model_unservable_reason,
     model_family_mismatch,
     normalize_model_for_provider,
     validate_model_override,
@@ -1806,7 +1807,10 @@ async def _inherited_parent_model(
       worker's author chose that model deliberately;
     - a child harness without model-override plumbing runs its default;
     - a parent model outside the child harness's family (e.g. a Claude
-      selection dispatched to a codex worker) is not forced across vendors.
+      selection dispatched to a codex worker) is not forced across vendors;
+    - a parent model the child's launch path cannot serve (a bare id for
+      opencode, a claude id for pi without an Anthropic route) is skipped —
+      see :func:`inherited_model_unservable_reason`.
 
     :param server_client: HTTP client pointed at the Omnigent server.
     :param conversation_id: The parent session id.
@@ -1841,7 +1845,7 @@ async def _inherited_parent_model(
     except ValueError:
         return None
     if child_harness is not None and model_family_mismatch(child_harness, parent_model):
-        _logger.debug(
+        _logger.info(
             "sys_session_send: not inheriting parent model %r for sub-agent %r "
             "(family mismatch with harness %s); child runs its default",
             parent_model,
@@ -1850,6 +1854,37 @@ async def _inherited_parent_model(
             extra={"session_id": runner_primary_session_id()},
         )
         return None
+    if child_harness is not None:
+        from omnigent.models.model_catalog import resolve_model_provider
+
+        provider = (
+            resolve_model_provider(sub_spec, child_harness) if sub_spec is not None else None
+        )
+        sub_config = getattr(getattr(sub_spec, "executor", None), "config", None)
+        spec_profile = sub_config.get("profile") if isinstance(sub_config, dict) else None
+        # Profile precedence mirrors the opencode launch path
+        # (_opencode_native_profile_from_spec): spec config, else ambient env.
+        unservable = inherited_model_unservable_reason(
+            child_harness,
+            parent_model,
+            provider_kind=provider.kind if provider is not None else None,
+            provider_family=provider.family if provider is not None else None,
+            databricks_profile=(
+                str(spec_profile)
+                if spec_profile
+                else os.environ.get("DATABRICKS_CONFIG_PROFILE") or None
+            ),
+        )
+        if unservable is not None:
+            _logger.info(
+                "sys_session_send: not inheriting parent model %r for sub-agent %r "
+                "(%s); child runs its default",
+                parent_model,
+                sub_agent_name,
+                unservable,
+                extra={"session_id": runner_primary_session_id()},
+            )
+            return None
     return parent_model
 
 

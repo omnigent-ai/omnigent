@@ -200,6 +200,89 @@ def model_family_mismatch(harness: str, model: str) -> str | None:
     return None
 
 
+# Canonical spellings of the multi-model harnesses whose launch paths still
+# cannot serve every validated id, so best-effort parent-model inheritance
+# checks servability before pushing an id through (an explicit ``args.model``
+# keeps its fail-loud contract at the harness instead).
+_OPENCODE_HARNESSES: frozenset[str] = frozenset({"opencode-native", "native-opencode", "opencode"})
+_PI_HARNESSES: frozenset[str] = frozenset({"pi", "pi-native", "native-pi"})
+
+# Provider kinds whose host is a Databricks gateway, where pi's
+# ``databricks-anthropic`` route (``/serving-endpoints/anthropic``) exists.
+# A ``cli-config`` entry is guaranteed by selection to be a Databricks AI
+# Gateway and registers pi's claude family (see
+# ``_apply_cli_config_databricks_to_pi`` in omnigent/runtime/workflow.py).
+_PI_CLAUDE_SERVABLE_PROVIDER_KINDS: frozenset[str] = frozenset({"databricks", "cli-config"})
+
+_ANTHROPIC_PROVIDER_FAMILY = "anthropic"
+
+
+def inherited_model_unservable_reason(
+    harness: str,
+    model: str,
+    *,
+    provider_kind: str | None,
+    provider_family: str | None,
+    databricks_profile: str | None,
+) -> str | None:
+    """
+    Return why inheriting *model* onto *harness* cannot be served, or ``None``.
+
+    Complements :func:`model_family_mismatch` for the multi-model harnesses it
+    waves through: family compatibility alone does not make an id servable.
+
+    - opencode resolves a model's provider from the id's ``provider/`` prefix
+      against its own auth, so a bare id is only usable when a Databricks
+      profile lets the launch synthesize a gateway provider (which re-pins
+      the id to a serving endpoint).
+    - pi routes any ``claude`` id to its ``databricks-anthropic`` provider,
+      which only exists on a Databricks gateway host or when the resolved
+      provider configures an Anthropic-family base URL.
+
+    :param harness: The child's harness id, alias or canonical, e.g.
+        ``"opencode-native"``.
+    :param model: A model id that already passed
+        :func:`validate_model_override`.
+    :param provider_kind: The child's resolved provider kind from
+        :func:`omnigent.models.model_catalog.resolve_model_provider`;
+        ``None`` when unresolvable.
+    :param provider_family: The resolved provider's inline family
+        (``"anthropic"`` / ``"openai"``), else ``None``.
+    :param databricks_profile: The Databricks profile the child's launch
+        would use (spec ``executor.config.profile``, else the ambient
+        ``DATABRICKS_CONFIG_PROFILE``); ``None`` when absent.
+    :returns: Human-readable reason to skip inheritance, or ``None`` when
+        the id is servable (or servability is not this function's concern).
+    """
+    canon = canonicalize_harness(harness)
+    if canon in _OPENCODE_HARNESSES:
+        if "/" in model:
+            return None
+        if databricks_profile:
+            # The launch-time Databricks gateway synthesis owns the id: it
+            # pins the matching serving endpoint (or the catalog default).
+            return None
+        return (
+            f"opencode resolves a model's provider from its 'provider/' prefix; "
+            f"the bare id {model!r} has none and no Databricks profile is "
+            "configured to synthesize a gateway provider for it"
+        )
+    if canon in _PI_HARNESSES:
+        if "claude" not in model.lower():
+            return None
+        if provider_kind in _PI_CLAUDE_SERVABLE_PROVIDER_KINDS:
+            return None
+        if provider_family == _ANTHROPIC_PROVIDER_FAMILY:
+            return None
+        return (
+            f"pi routes any 'claude' id to its Databricks-only "
+            f"'databricks-anthropic' provider, and the resolved provider "
+            f"(kind {provider_kind or 'none'!r}) has no Anthropic route "
+            f"for {model!r}"
+        )
+    return None
+
+
 # Bare canonical vendor ids ("claude-opus-4-8", "gpt-5-4", "glm-5-2",
 # "kimi-k2-instruct"); slash/colon/bracket/vendor-prefixed shapes have no
 # mechanical gateway counterpart. The GLM/Kimi families belong here for the

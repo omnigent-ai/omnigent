@@ -7,7 +7,9 @@ the parent session: the gate reads the parent's effective model
 child's ``model_override``. Inheritance is best-effort and skips quietly
 when the sub-agent spec pins its own model, the child harness has no
 override plumbing, the parent model's family cannot run on the child
-harness, or the parent snapshot is unavailable.
+harness, the child's launch path cannot serve the id (a bare id for
+opencode, a claude id for pi without an Anthropic route), or the parent
+snapshot is unavailable.
 """
 
 from __future__ import annotations
@@ -25,18 +27,52 @@ def _spec_with_worker(
     harness: str,
     *,
     worker_model: str | None = None,
+    worker_profile: str | None = None,
 ) -> SimpleNamespace:
     """
     Build a parent-spec stub declaring one ``worker`` sub-agent.
 
     :param harness: The sub-agent's declared harness, e.g. ``"claude-sdk"``.
     :param worker_model: Optional ``executor.model`` pin on the worker spec.
+    :param worker_profile: Optional ``executor.config.profile`` on the worker.
     :returns: A structural parent-spec stub for ``execute_tool``.
     """
-    executor = SimpleNamespace(type="omnigent", config={"harness": harness})
+    config: dict[str, Any] = {"harness": harness}
+    if worker_profile is not None:
+        config["profile"] = worker_profile
+    executor = SimpleNamespace(type="omnigent", config=config)
     if worker_model is not None:
         executor.model = worker_model
     return SimpleNamespace(sub_agents=[SimpleNamespace(name="worker", executor=executor)])
+
+
+def _pin_servability_probes(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    provider_kind: str,
+    provider_family: str | None = None,
+) -> None:
+    """
+    Pin the dispatch gate's environment probes for servability tests.
+
+    The harness-CLI probe is stubbed present (the gate is under test, not the
+    binary), the child's provider resolution is pinned, and the ambient
+    Databricks profile is cleared so the opencode rule reads the spec alone.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param provider_kind: ``ResolvedModelProvider.kind`` to report.
+    :param provider_family: ``ResolvedModelProvider.family`` to report.
+    """
+    from omnigent.models import model_catalog
+    from omnigent.onboarding import harness_install
+
+    monkeypatch.setattr(harness_install, "missing_harness_cli", lambda _harness: None)
+    monkeypatch.setattr(
+        model_catalog,
+        "resolve_model_provider",
+        lambda _spec, _harness: SimpleNamespace(kind=provider_kind, family=provider_family),
+    )
+    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
 
 
 async def _dispatch_without_model(
@@ -299,3 +335,131 @@ async def test_unreachable_parent_snapshot_skips_inheritance(
         parent_snapshot=None,
     )
     assert "model_override" not in bodies[0]
+
+
+@pytest.mark.asyncio
+async def test_opencode_worker_skips_bare_id_inheritance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A bare vendor id is not inherited onto an opencode worker: opencode
+    resolves a model's provider from its ``provider/`` prefix, so the bare id
+    would land verbatim in ``opencode.json`` and fail the first turn with
+    ``ProviderModelNotFoundError``. The child keeps its own default.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    _pin_servability_probes(monkeypatch, provider_kind="none")
+    bodies = await _dispatch_without_model(
+        monkeypatch,
+        agent_spec=_spec_with_worker("opencode-native"),
+        conv_id="conv_parent_opencode_bare_id",
+        parent_snapshot={
+            "id": "conv_parent_opencode_bare_id",
+            "agent_id": "ag_parent",
+            "model_override": "claude-opus-5",
+            "llm_model": None,
+        },
+    )
+    assert "model_override" not in bodies[0]
+
+
+@pytest.mark.asyncio
+async def test_opencode_worker_inherits_provider_prefixed_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A ``provider/model`` id is inherited onto an opencode worker verbatim —
+    opencode resolves the provider from the prefix against its own auth.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    _pin_servability_probes(monkeypatch, provider_kind="none")
+    bodies = await _dispatch_without_model(
+        monkeypatch,
+        agent_spec=_spec_with_worker("opencode-native"),
+        conv_id="conv_parent_opencode_prefixed",
+        parent_snapshot={
+            "id": "conv_parent_opencode_prefixed",
+            "agent_id": "ag_parent",
+            "model_override": "anthropic/claude-sonnet-4-5",
+            "llm_model": None,
+        },
+    )
+    assert bodies[0]["model_override"] == "anthropic/claude-sonnet-4-5"
+
+
+@pytest.mark.asyncio
+async def test_opencode_worker_with_profile_inherits_gateway_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A worker spec naming a Databricks profile keeps inheriting: the launch
+    synthesizes a gateway provider that pins the id's serving endpoint.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    _pin_servability_probes(monkeypatch, provider_kind="none")
+    bodies = await _dispatch_without_model(
+        monkeypatch,
+        agent_spec=_spec_with_worker("opencode-native", worker_profile="oss"),
+        conv_id="conv_parent_opencode_profile",
+        parent_snapshot={
+            "id": "conv_parent_opencode_profile",
+            "agent_id": "ag_parent",
+            "model_override": "databricks-claude-opus-4-8",
+            "llm_model": None,
+        },
+    )
+    assert bodies[0]["model_override"] == "databricks-claude-opus-4-8"
+
+
+@pytest.mark.asyncio
+async def test_pi_worker_skips_claude_inheritance_without_anthropic_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A claude id is not inherited onto a pi worker whose provider has no
+    Anthropic route: pi maps any 'claude' id to its Databricks-only
+    ``databricks-anthropic`` provider, so a non-Databricks gateway 404s.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    _pin_servability_probes(monkeypatch, provider_kind="gateway", provider_family="openai")
+    bodies = await _dispatch_without_model(
+        monkeypatch,
+        agent_spec=_spec_with_worker("pi"),
+        conv_id="conv_parent_pi_no_anthropic",
+        parent_snapshot={
+            "id": "conv_parent_pi_no_anthropic",
+            "agent_id": "ag_parent",
+            "model_override": "claude-opus-5",
+            "llm_model": None,
+        },
+    )
+    assert "model_override" not in bodies[0]
+
+
+@pytest.mark.asyncio
+async def test_pi_worker_inherits_claude_on_databricks_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A pi worker routed through a Databricks workspace keeps inheriting a
+    claude selection; normalization localizes the bare id for the gateway.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    _pin_servability_probes(monkeypatch, provider_kind="databricks")
+    bodies = await _dispatch_without_model(
+        monkeypatch,
+        agent_spec=_spec_with_worker("pi"),
+        conv_id="conv_parent_pi_databricks",
+        parent_snapshot={
+            "id": "conv_parent_pi_databricks",
+            "agent_id": "ag_parent",
+            "model_override": "claude-opus-5",
+            "llm_model": None,
+        },
+    )
+    assert bodies[0]["model_override"] == "databricks-claude-opus-5"
