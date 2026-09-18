@@ -658,6 +658,12 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # Keep host and spawned-runner routing decisions aligned when the
         # host-slice-key kill switch is explicitly disabled.
         "OMNIGENT_HOST_SLICE_KEY_ENABLED",
+        # Path to the host-owned Hindsight memory key FILE (never the secret
+        # itself). The memory built-ins read the file at call time, so a host
+        # can deliver a rotating credential without the value ever entering the
+        # daemon env or a generated service file. A path, not a secret — same
+        # rationale as OMNIGENT_RUNNER_ENV_PASSTHROUGH / KUBECONFIG above.
+        "HINDSIGHT_API_KEY_FILE",
     }
     # Windows system / profile constants (SYSTEMROOT is mandatory for Winsock,
     # USERPROFILE for Path.home(), etc.); a no-op on POSIX. See _platform.

@@ -2850,6 +2850,24 @@ async def test_build_runner_env_preserves_short_symlink_spelling(tmp_path: Path)
     assert env[HARNESS_TMP_PARENT_ENV_VAR] != str(target.resolve())
 
 
+def test_build_runner_env_forwards_hindsight_key_file_path() -> None:
+    """HINDSIGHT_API_KEY_FILE (a path, not a secret) forwards host->runner so
+    the memory tools can read the host-owned key file from inside the runner."""
+    base = {
+        "PATH": "/usr/bin:/bin",
+        "HINDSIGHT_API_KEY_FILE": "/home/alice/.config/hindsight-repo/api-key",
+    }
+    env = _build_runner_env(
+        base,
+        server_url="http://server",
+        runner_id="runner_abc",
+        binding_token="tok",
+        workspace="/ws",
+        parent_pid=42,
+    )
+    assert env["HINDSIGHT_API_KEY_FILE"] == "/home/alice/.config/hindsight-repo/api-key"
+
+
 def test_build_runner_env_forwards_harness_credentials_and_endpoints() -> None:
     """
     Every var in HARNESS_CREDENTIAL_ENV_VARS forwards when present —
