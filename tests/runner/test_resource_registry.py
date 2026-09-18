@@ -612,15 +612,18 @@ async def test_hook_status_resyncs_watcher_dedup(tmp_path: Path) -> None:
     assert callable(on_activity)
     on_activity()
     assert registry.session_activity_epoch("conv_resync") == 0
+    assert not registry.session_turn_is_active("conv_resync")
     poller.active = True
 
     poller.emit("running")
     await asyncio.sleep(0)
     assert statuses == ["running"]
     assert registry.session_activity_epoch("conv_resync") > 0
+    assert registry.session_turn_is_active("conv_resync")
 
     # The forwarder posts Stop → idle straight to the server.
     registry.note_external_session_status("conv_resync", "idle")
+    assert not registry.session_turn_is_active("conv_resync")
 
     # The file catches up moments later with the same edge — deduped away, so
     # the user sees one idle rather than a flicker.
@@ -948,6 +951,7 @@ async def test_required_terminal_exit_after_new_turn_is_failure(tmp_path: Path) 
 
     assert len(exits) == 1
     assert exits[0].session_was_idle is False
+    assert not registry.session_turn_is_active("conv_turn")
 
 
 @pytest.mark.asyncio
@@ -961,11 +965,13 @@ async def test_cleanup_session_clears_status_memo(tmp_path: Path) -> None:
     registry.note_session_turn_started("conv_cleanup")
     assert "conv_cleanup" in registry._last_session_status
     assert registry.session_activity_epoch("conv_cleanup") > 0
+    assert registry.session_turn_is_active("conv_cleanup")
 
     await registry.cleanup_session("conv_cleanup")
 
     assert "conv_cleanup" not in registry._last_session_status
     assert registry.session_activity_epoch("conv_cleanup") == 0
+    assert not registry.session_turn_is_active("conv_cleanup")
 
 
 @pytest.mark.asyncio
@@ -1017,6 +1023,9 @@ async def test_transfer_terminal_moves_status_memo(
     assert moved is not None
     assert "conv_src" not in registry._last_session_status
     assert registry._last_session_status.get("conv_dst") == "running"
+    assert not registry.session_turn_is_active("conv_src")
+    assert registry.session_turn_is_active("conv_dst")
+    assert registry.session_activity_epoch("conv_dst") > 0
 
 
 def test_get_resource_finds_default() -> None:

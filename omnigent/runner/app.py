@@ -4462,7 +4462,6 @@ def create_runner_app(
         ):
             # Active execution, including a newer message, takes precedence over
             # automatic continuation. Initialization alone cannot consume it.
-            _recovery_turn_ids.setdefault(session_id, set()).add(recovery_id)
             if (
                 not execution_seen
                 and session_id not in _active_turns
@@ -4497,6 +4496,7 @@ def create_runner_app(
                 _active_turns[session_id] = recovery_task
                 recovery_task.add_done_callback(_background_tasks.discard)
                 _background_tasks.add(recovery_task)
+            _recovery_turn_ids.setdefault(session_id, set()).add(recovery_id)
 
         status = "running" if session_id in _active_turns else "idle"
         return JSONResponse(

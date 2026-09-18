@@ -403,6 +403,7 @@ class SessionResourceRegistry:
         # under ``self._lock``.
         self._last_session_status: dict[str, str] = {}
         self._session_activity_epoch: dict[str, int] = {}
+        self._active_session_turns: set[str] = set()
         # Last status *edge published to the server* per session, shared by the
         # watcher and the native forwarders' hook-derived edges so the two
         # dedup against one baseline. Kept separate from the exit memo above,
@@ -501,14 +502,18 @@ class SessionResourceRegistry:
         """Record the session's latest PTY status for exit classification."""
         with self._lock:
             if record_activity and status in {"running", "waiting"}:
+                self._active_session_turns.add(session_id)
                 self._session_activity_epoch[session_id] = (
                     self._session_activity_epoch.get(session_id, 0) + 1
                 )
+            if status in {"idle", "failed"}:
+                self._active_session_turns.discard(session_id)
             self._last_session_status[session_id] = status
 
     def _take_session_status_memo(self, session_id: str) -> str | None:
         """Pop and return the session's recorded PTY status (or ``None``)."""
         with self._lock:
+            self._active_session_turns.discard(session_id)
             self._published_session_status.pop(session_id, None)
             self._status_pollers.pop(session_id, None)
             return self._last_session_status.pop(session_id, None)
@@ -579,9 +584,9 @@ class SessionResourceRegistry:
             return self._session_activity_epoch.get(session_id, 0)
 
     def session_turn_is_active(self, session_id: str) -> bool:
-        """Whether the native terminal has unfinished work, including between status edges."""
+        """Whether an explicitly observed turn is unfinished, excluding pane repaints."""
         with self._lock:
-            return self._last_session_status.get(session_id) in {"running", "waiting"}
+            return session_id in self._active_session_turns
 
     def note_session_turn_started(self, session_id: str) -> None:
         """Mark a session as having an in-flight turn.
@@ -613,8 +618,8 @@ class SessionResourceRegistry:
         :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
         :param status: External native status, e.g. ``"running"`` or ``"idle"``.
         """
-        if status == "idle":
-            self._set_session_status_memo(session_id, "idle")
+        if status in {"idle", "failed"}:
+            self._set_session_status_memo(session_id, status)
         elif status in {"running", "waiting"}:
             self._set_session_status_memo(session_id, "running")
         self._sync_status_edge(session_id, status)
@@ -1639,6 +1644,12 @@ class SessionResourceRegistry:
                 moved_status = self._last_session_status.pop(source_session_id, None)
                 if moved_status is not None and target_session_id not in self._last_session_status:
                     self._last_session_status[target_session_id] = moved_status
+                    if source_session_id in self._active_session_turns:
+                        self._active_session_turns.add(target_session_id)
+                        self._session_activity_epoch[target_session_id] = (
+                            self._session_activity_epoch.get(target_session_id, 0) + 1
+                        )
+                self._active_session_turns.discard(source_session_id)
                 # The watcher restart below rebuilds the poller under the
                 # target, so drop the source's entry rather than leaving a
                 # retired poller to be re-armed on every later reconnect.

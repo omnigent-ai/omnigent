@@ -435,13 +435,18 @@ async def test_newer_turn_finishing_during_initialization_supersedes_recovery() 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "statuses, startup_repaint",
-    [(("running", "idle"), False), (("waiting", "idle"), False), (("running", "idle"), True)],
+    [
+        (("running", "idle"), None),
+        (("waiting", "idle"), None),
+        (("running", "idle"), "settled"),
+        (("running", "idle"), "busy"),
+    ],
 )
 async def test_native_activity_during_initialization_distinguishes_turns_from_repaints(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     statuses: tuple[str, str],
-    startup_repaint: bool,
+    startup_repaint: str | None,
 ) -> None:
     """Explicit turns suppress recovery after returning to idle; startup repaints do not."""
     from unittest.mock import AsyncMock
@@ -480,7 +485,8 @@ async def test_native_activity_during_initialization_distinguishes_turns_from_re
                 on_activity, on_idle = callbacks["on_activity"], callbacks["on_idle"]
                 assert callable(on_activity) and callable(on_idle)
                 on_activity()
-                on_idle()
+                if startup_repaint == "settled":
+                    on_idle()
             else:
                 for status in statuses:
                     response = await client.post(
@@ -492,9 +498,13 @@ async def test_native_activity_during_initialization_distinguishes_turns_from_re
         finally:
             release.set()
         assert (await recovery).status_code == 201
+        if startup_repaint == "busy":
+            on_idle = callbacks["on_idle"]
+            assert callable(on_idle)
+            on_idle()
         turn = app.state.active_turns.get(SESSION_ID)
         if turn is not None:
             await asyncio.wait_for(turn, timeout=5)
-        assert len(harness.posted_bodies) == int(startup_repaint)
+        assert len(harness.posted_bodies) == int(startup_repaint is not None)
         assert (await client.post("/v1/sessions", json=payload)).status_code == 201
-        assert len(harness.posted_bodies) == int(startup_repaint)
+        assert len(harness.posted_bodies) == int(startup_repaint is not None)
