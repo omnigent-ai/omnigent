@@ -426,3 +426,53 @@ async def test_newer_turn_finishing_during_initialization_supersedes_recovery() 
         assert _session_histories_ref[SESSION_ID] is history
         await client.post("/v1/sessions", json=payload)
         assert len(harness.posted_bodies) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("statuses", [("running", "idle"), ("waiting", "idle")])
+async def test_completed_native_activity_during_initialization_supersedes_recovery(
+    monkeypatch: pytest.MonkeyPatch, statuses: tuple[str, str]
+) -> None:
+    """Direct terminal activity remains visible after it returns to idle."""
+    from unittest.mock import AsyncMock
+
+    from omnigent.runner import app as runner_app
+
+    launched = AsyncMock(return_value=True)
+    monkeypatch.setattr(runner_app, "_launch_native_terminal", launched)
+    monkeypatch.setattr(runner_app, "_resolve_native_spawn_env", AsyncMock(return_value={}))
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    class PausedSeedServer(_HistoryServerClient):
+        async def get(self, url: str, **kwargs: Any) -> Any:
+            response = await super().get(url, **kwargs)
+            if url.endswith(f"/{SESSION_ID}/items") and not entered.is_set():
+                launched.assert_awaited_once()
+                entered.set()
+                await release.wait()
+            return response
+
+    app, _pm, harness = _build_sdk_app(PausedSeedServer())
+    payload = _session_init_payload(suppress_recovery_turn=False)
+    payload["session_init"].update(resume_interrupted_turn=True, recovery_id="native-interrupted")
+    payload["session_init"]["snapshot"]["harness_override"] = "cursor-native"
+    async with _runner_client(app) as client:
+        recovery = asyncio.create_task(client.post("/v1/sessions", json=payload))
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        try:
+            for status in statuses:
+                response = await client.post(
+                    f"/v1/sessions/{SESSION_ID}/events",
+                    json={"type": "external_session_status", "data": {"status": status}},
+                )
+                assert response.status_code == 204, response.text
+            assert SESSION_ID not in app.state.active_turns
+        finally:
+            release.set()
+        assert (await recovery).status_code == 201
+        turn = app.state.active_turns.get(SESSION_ID)
+        if turn is not None:
+            await asyncio.wait_for(turn, timeout=5)
+        assert not harness.posted_bodies, "recovery repeated completed native activity"
+        assert (await client.post("/v1/sessions", json=payload)).status_code == 201
+        assert not harness.posted_bodies

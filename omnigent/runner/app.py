@@ -3869,6 +3869,7 @@ def create_runner_app(
         session_id = cast(str, session_id)
         agent_id = cast(str, agent_id)
         initial_turn_epoch = _turn_bind_epoch.get(session_id)
+        initial_native_activity = resource_registry.session_activity_epoch(session_id)
         initially_active = session_id in _active_turns or resource_registry.session_turn_is_active(
             session_id
         )
@@ -4417,7 +4418,11 @@ def create_runner_app(
             history = []
         else:
             history = await _load_history_as_input(session_id)
-        execution_seen = initially_active or _turn_bind_epoch.get(session_id) != initial_turn_epoch
+        execution_seen = (
+            initially_active
+            or _turn_bind_epoch.get(session_id) != initial_turn_epoch
+            or resource_registry.session_activity_epoch(session_id) != initial_native_activity
+        )
         if history and not execution_seen and session_id not in _active_turns:
             _session_histories[session_id] = history
             last = history[-1]

@@ -402,6 +402,7 @@ class SessionResourceRegistry:
         # hook; all access goes through the ``_*_session_status_memo`` helpers
         # under ``self._lock``.
         self._last_session_status: dict[str, str] = {}
+        self._session_activity_epoch: dict[str, int] = {}
         # Last status *edge published to the server* per session, shared by the
         # watcher and the native forwarders' hook-derived edges so the two
         # dedup against one baseline. Kept separate from the exit memo above,
@@ -497,6 +498,10 @@ class SessionResourceRegistry:
     def _set_session_status_memo(self, session_id: str, status: str) -> None:
         """Record the session's latest PTY status for exit classification."""
         with self._lock:
+            if status in {"running", "waiting"}:
+                self._session_activity_epoch[session_id] = (
+                    self._session_activity_epoch.get(session_id, 0) + 1
+                )
             self._last_session_status[session_id] = status
 
     def _take_session_status_memo(self, session_id: str) -> str | None:
@@ -565,6 +570,11 @@ class SessionResourceRegistry:
                 sessions,
                 extra={"session_id": runner_primary_session_id()},
             )
+
+    def session_activity_epoch(self, session_id: str) -> int:
+        """Count observed native activity, retaining it after idle or terminal exit."""
+        with self._lock:
+            return self._session_activity_epoch.get(session_id, 0)
 
     def session_turn_is_active(self, session_id: str) -> bool:
         """Whether the native terminal has unfinished work, including between status edges."""
@@ -1663,6 +1673,7 @@ class SessionResourceRegistry:
         """
         self._take_session_status_memo(session_id)
         with self._lock:
+            self._session_activity_epoch.pop(session_id, None)
             primary = self._primary_envs.pop(session_id, None)
             stale_role_keys = [key for key in self._terminal_roles if key[0] == session_id]
             for key in stale_role_keys:

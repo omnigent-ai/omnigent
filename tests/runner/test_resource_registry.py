@@ -731,6 +731,7 @@ async def test_required_terminal_exit_while_idle_is_clean_shutdown(
         registry, terminal_registry, instance, "conv_idle"
     )
 
+    initial_activity = registry.session_activity_epoch("conv_idle")
     # The agent worked, then its turn completed (pane quiesced → idle).
     on_activity = callbacks["on_activity"]
     on_idle = callbacks["on_idle"]
@@ -746,6 +747,7 @@ async def test_required_terminal_exit_while_idle_is_clean_shutdown(
     assert len(exits) == 1
     assert exits[0].lifecycle == TerminalLifecycle.REQUIRED
     assert exits[0].session_was_idle is True
+    assert registry.session_activity_epoch("conv_idle") > initial_activity
     record = next(
         record
         for record in caplog.records
@@ -950,10 +952,12 @@ async def test_cleanup_session_clears_status_memo(tmp_path: Path) -> None:
     registry = SessionResourceRegistry()
     registry.note_session_turn_started("conv_cleanup")
     assert "conv_cleanup" in registry._last_session_status
+    assert registry.session_activity_epoch("conv_cleanup") > 0
 
     await registry.cleanup_session("conv_cleanup")
 
     assert "conv_cleanup" not in registry._last_session_status
+    assert registry.session_activity_epoch("conv_cleanup") == 0
 
 
 @pytest.mark.asyncio
