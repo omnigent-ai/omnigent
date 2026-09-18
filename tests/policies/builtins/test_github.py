@@ -1061,6 +1061,109 @@ def test_force_push_plus_refspec_allowed_when_opt_out() -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Layer 1 — write_violation_action escalation (DENY / ASK)
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def test_write_violation_defaults_to_deny() -> None:
+    """Omitting the argument keeps the historical hard-deny for unlisted repos."""
+    policy = github_policy(write_repos=[_REPO])
+    result = policy(tc("mcp__github__create_pull_request", {"owner": "octo", "repo": "other"}))
+    assert _action(result) == "DENY"
+
+
+def test_write_violation_action_ask_escalates_unlisted_repo() -> None:
+    """ASK routes an unlisted repo to the user instead of refusing outright."""
+    policy = github_policy(write_repos=[_REPO], write_violation_action="ASK")
+    result = policy(tc("mcp__github__create_pull_request", {"owner": "octo", "repo": "other"}))
+    assert _action(result) == "ASK"
+
+
+def test_write_violation_action_ask_escalates_unlisted_branch() -> None:
+    """A branch outside write_branches escalates on an otherwise allowed repo."""
+    policy = github_policy(
+        write_repos=[_REPO], write_branches=["main"], write_violation_action="ASK"
+    )
+    result = policy(
+        tc("mcp__github__push_files", {"owner": "octo", "repo": "hello", "branch": "wip"})
+    )
+    assert _action(result) == "ASK"
+
+
+def test_write_violation_action_ask_escalates_undeterminable_target() -> None:
+    """An MCP write naming no repo escalates rather than failing closed."""
+    policy = github_policy(write_repos=[_REPO], write_violation_action="ASK")
+    result = policy(tc("mcp__github__create_pull_request", {"title": "x"}))
+    assert _action(result) == "ASK"
+
+
+def test_write_violation_action_ask_still_allows_listed_repo() -> None:
+    """Escalation does not disturb the allow path for a listed repo."""
+    policy = github_policy(write_repos=[_REPO], write_violation_action="ASK")
+    assert policy(tc("mcp__github__create_issue", {"owner": "octo", "repo": "hello"})) is None
+
+
+def test_write_violation_action_ask_escalates_shell_writes_too() -> None:
+    """The shell surface reads the same setting as the MCP surface."""
+    policy = github_policy(write_repos=[_REPO], write_violation_action="ASK")
+    result = policy(_sh("git push https://github.com/octo/other.git main"))
+    assert _action(result) == "ASK"
+
+
+@pytest.mark.parametrize(
+    ("tool", "args"),
+    [
+        ("mcp__github__delete_branch", {"owner": "octo", "repo": "other", "branch": "x"}),
+        ("mcp__github__delete_file", {"owner": "octo", "repo": "other", "branch": "x"}),
+    ],
+)
+def test_destructive_on_unlisted_repo_still_denies_under_ask(
+    tool: str, args: dict[str, Any]
+) -> None:
+    """A destructive op is refused outright, so ASK must not soften it.
+
+    Without this the escalation would open a bypass: the allowlist miss would
+    ASK and return before the destructive guard was ever consulted.
+    """
+    policy = github_policy(write_repos=[_REPO], write_violation_action="ASK")
+    assert _action(policy(tc(tool, args))) == "DENY"
+
+
+def test_destructive_with_undeterminable_target_still_denies_under_ask() -> None:
+    """The same holds when the destructive op names no repo at all."""
+    policy = github_policy(write_repos=[_REPO], write_violation_action="ASK")
+    assert _action(policy(tc("mcp__github__delete_branch", {"branch": "x"}))) == "DENY"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git push --force origin main",
+        "git push --tags origin",
+    ],
+)
+def test_force_and_tag_push_still_deny_under_ask(command: str) -> None:
+    """Force pushes and tag pushes are not allowlist misses and keep denying."""
+    policy = github_policy(write_repos=[_REPO], write_violation_action="ASK")
+    assert _action(policy(_sh(command))) == "DENY"
+
+
+@pytest.mark.parametrize("value", ["ask", " Ask ", "ASK"])
+def test_write_violation_action_is_case_and_space_insensitive(value: str) -> None:
+    """Operators write these in YAML, so accept the obvious spellings."""
+    policy = github_policy(write_repos=[_REPO], write_violation_action=value)
+    result = policy(tc("mcp__github__create_pull_request", {"owner": "octo", "repo": "other"}))
+    assert _action(result) == "ASK"
+
+
+@pytest.mark.parametrize("value", ["ALLOW", "prompt", "", "warn"])
+def test_write_violation_action_rejects_an_unusable_value(value: str) -> None:
+    """A typo must fail loudly at construction, not silently gate nothing."""
+    with pytest.raises(ValueError, match="write_violation_action"):
+        github_policy(write_repos=[_REPO], write_violation_action=value)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Layer 2 — spec resolution through resolve_function_policy
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1138,3 +1241,26 @@ def test_registry_validates_factory_params() -> None:
     err_unknown = validate_factory_params(_HANDLER, {"bogus": 1})
     assert err_unknown is not None and "bogus" in err_unknown
     assert validate_factory_params(_HANDLER, {"read_all": "yes"}) is not None
+
+
+@pytest.mark.parametrize("value", ["DENY", "ASK"])
+def test_registry_accepts_write_violation_action(value: str) -> None:
+    """The escalation setting is reachable from a bundle, not just Python."""
+    load_registry()
+    assert validate_factory_params(_HANDLER, {"write_violation_action": value}) is None
+
+
+def test_registry_publishes_the_write_violation_choices() -> None:
+    """The schema advertises the allowed verdicts so the registry UI can offer them.
+
+    Param validation is type-only, so a bad *string* passes here and is caught
+    by the factory's ValueError instead; the enum is the discoverable contract.
+    """
+    load_registry()
+    by_handler = {e.handler: e for e in get_registry()}
+    schema = by_handler[_HANDLER].params_schema
+    assert schema is not None
+    prop = schema["properties"]["write_violation_action"]
+    assert prop["enum"] == ["DENY", "ASK"]
+    assert prop["default"] == "DENY"
+    assert validate_factory_params(_HANDLER, {"write_violation_action": 1}) is not None

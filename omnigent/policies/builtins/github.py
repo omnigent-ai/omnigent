@@ -945,6 +945,7 @@ def github_policy(
     read_repos: list[str] | None = None,
     write_repos: list[str] | None = None,
     write_branches: list[str] | None = None,
+    write_violation_action: str = "DENY",
     allow_destructive: bool = False,
     deny_tag_push: bool = True,
     deny_force_push: bool = True,
@@ -965,6 +966,11 @@ def github_policy(
     :param write_branches: Branches writable within an allowed repo, e.g.
         ``["main", "develop"]``. ``None`` / empty means branches are not
         restricted (any branch on an allowed repo is writable).
+    :param write_violation_action: Verdict on a write outside the repo / branch
+        allowlist, or one whose target could not be determined — ``"DENY"``
+        (default) or ``"ASK"``. ``"ASK"`` suits a trusted allowlist that should
+        still permit user-authorized work elsewhere. Destructive operations,
+        force pushes and tag pushes keep denying either way.
     :param allow_destructive: When ``False`` (default), irreversible destructive
         operations (deletes) are denied even on allowed repos. Set to ``True``
         to let destructive operations through normal write gating.
@@ -992,7 +998,15 @@ def github_policy(
     :param deny_reason: Reason prefix attached to DENY decisions.
     :returns: A one-argument policy callable returning a :class:`PolicyResponse`
         or ``None`` (abstain → ALLOW).
+    :raises ValueError: If ``write_violation_action`` is not ``"DENY"`` or
+        ``"ASK"``.
     """
+    write_violation = write_violation_action.strip().upper()
+    if write_violation not in ("DENY", "ASK"):
+        raise ValueError(
+            f"github_policy: write_violation_action must be 'DENY' or 'ASK', "
+            f"got {write_violation_action!r}"
+        )
     allowed_read_repos = _normalize_repos(read_repos)
     allowed_write_repos = _normalize_repos(write_repos)
     allowed_write_branches = _normalize_branches(write_branches)
@@ -1025,6 +1039,15 @@ def github_policy(
             f"this call targets {sorted(repos)}."
         )
 
+    def _write_violation(reason: str) -> PolicyResponse:
+        """
+        Build the configured verdict for an unauthorized write (DENY or ASK).
+
+        :param reason: Human-readable explanation of the violated allowlist.
+        :returns: A :class:`PolicyResponse` carrying ``write_violation_action``.
+        """
+        return {"result": write_violation, "reason": reason}  # type: ignore[typeddict-item]
+
     def _gate_write(
         repos: set[str],
         branches: set[str],
@@ -1032,6 +1055,7 @@ def github_policy(
         branch_targeted: bool,
         no_repo: PolicyResponse,
         no_branch: PolicyResponse,
+        destructive: bool = False,
     ) -> PolicyResponse | None:
         """
         Apply the write repo + branch allowlists to a write operation.
@@ -1051,12 +1075,17 @@ def github_policy(
         :param no_branch: Decision for a branch-targeted write whose branch could
             not be determined while branches are restricted (DENY for MCP, ASK
             for shell).
+        :param destructive: Whether the op is independently denied as
+            destructive. Such an op is never softened to ASK.
         :returns: ``None`` to allow, or a DENY / *no_repo* / *no_branch* decision.
         """
+        # A destructive op is refused outright, so an allowlist miss on one must
+        # keep denying even where the operator asked for ASK.
+        verdict = _deny if destructive else _write_violation
         if not repos:
             return no_repo
         if not (repos <= allowed_write_repos):
-            return _deny(
+            return verdict(
                 f"{deny_reason} Write is restricted to the configured repos; "
                 f"this call targets {sorted(repos)}."
             )
@@ -1064,7 +1093,7 @@ def github_policy(
             if branches:
                 bad = branches - allowed_write_branches
                 if bad:
-                    return _deny(
+                    return verdict(
                         f"{deny_reason} Write is restricted to branches "
                         f"{sorted(allowed_write_branches)}; this call targets {sorted(bad)}."
                     )
@@ -1105,16 +1134,19 @@ def github_policy(
             )
         # cls == "write"
         branches = _extract_branches_from_args(args)
+        is_destructive = not allow_destructive and _mcp_base(canonical) in _MCP_DESTRUCTIVE_TOOLS
+        unauthorized = _deny if is_destructive else _write_violation
         write_result = _gate_write(
             repos,
             branches,
             branch_targeted=_mcp_base(canonical) in _MCP_BRANCH_WRITE_TOOLS,
-            no_repo=_deny(f"{deny_reason} Write call carries no identifiable target repo."),
-            no_branch=_deny(
+            no_repo=unauthorized(f"{deny_reason} Write call carries no identifiable target repo."),
+            no_branch=unauthorized(
                 f"{deny_reason} Write is restricted to branches "
                 f"{sorted(allowed_write_branches)} and this call's target branch could "
                 f"not be determined."
             ),
+            destructive=is_destructive,
         )
         if write_result is not None:
             return write_result
@@ -1281,6 +1313,14 @@ POLICY_REGISTRY: list[dict[str, Any]] = [  # type: ignore[explicit-any]
                     "type": "array",
                     "items": {"type": "string"},
                     "description": "Branches writable within an allowed repo. Empty = any branch.",
+                },
+                "write_violation_action": {
+                    "type": "string",
+                    "enum": ["DENY", "ASK"],
+                    "description": "Verdict on a write outside the repo/branch allowlist, "
+                    "or one whose target cannot be determined. Destructive operations, "
+                    "force pushes and tag pushes keep denying either way.",
+                    "default": "DENY",
                 },
                 "allow_destructive": {
                     "type": "boolean",
