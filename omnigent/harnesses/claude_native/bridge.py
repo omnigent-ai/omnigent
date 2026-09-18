@@ -76,6 +76,7 @@ from omnigent.inner.hook_scripts.subagent_router import (
 )
 from omnigent.native import native_bridge_common
 from omnigent.tools.base import Tool, ToolContext
+from omnigent.util.pane_diagnostics import diagnose_pane
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS
 
 CLAUDE_FRAMEWORK_CONTEXT_FILE = "pending_framework_context.txt"
@@ -445,7 +446,35 @@ def validate_claude_hook_interpreter_compatibility(
 
 
 class ClaudePromptTimeout(RuntimeError):
-    """Claude Code's input box did not render before delivery timed out."""
+    """Claude Code's input box did not render before delivery timed out.
+
+    :param args: Standard exception args; ``args[0]`` is the message.
+    :param blocked_on: Slug naming what the pane was showing instead of the
+        input box (see :func:`_classify_unready_pane`), e.g.
+        ``"launch-preamble"``. ``"unknown"`` for a screen no marker matched.
+    :param pane_shape: Structural flags from
+        :func:`omnigent.util.pane_diagnostics.pane_shape`. Meaningful even when
+        *blocked_on* is ``"unknown"``.
+    :param pane_fingerprint: Stable hash from
+        :func:`omnigent.util.pane_diagnostics.pane_fingerprint`, so screens
+        nobody has classified still group by volume.
+
+    Callers log all three as structured attributes, so the unrelated causes
+    behind this one timeout can be counted apart whether or not a marker for
+    them exists yet.
+    """
+
+    def __init__(
+        self,
+        *args: object,
+        blocked_on: str = "unknown",
+        pane_shape: tuple[str, ...] = (),
+        pane_fingerprint: str = "",
+    ) -> None:
+        super().__init__(*args)
+        self.blocked_on = blocked_on
+        self.pane_shape = pane_shape
+        self.pane_fingerprint = pane_fingerprint
 
 
 class ClaudeInjectionCancelled(RuntimeError):
@@ -5196,6 +5225,73 @@ def _format_terminal_failure_tail(pane: str) -> str:
     return f" Last terminal output:\n{tail}"
 
 
+# Known screens that block readiness, ordered from most to least specific.
+# Markers match the last non-empty capture case-insensitively.
+_UNREADY_PANE_CAUSES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    # Match the launcher's announcement, not a bare mention of "password:".
+    (
+        "password-prompt",
+        ("you will be prompted for your password", "enter password to configure"),
+    ),
+    # A browser SSO / OAuth handshake the person never completed.
+    (
+        "sso-login-wait",
+        (
+            "logging in via sso",
+            "if the browser does not open automatically",
+            "code_challenge=",
+            "a browser may open for",
+        ),
+    ),
+    # Narrow setup markers avoid labeling ordinary agent output as a preamble.
+    (
+        "launch-preamble",
+        (
+            "claude-code mcp client config",
+            "unity ai gateway connected",
+            "running dbcert to obtain a new certificate",
+        ),
+    ),
+    # A modal Claude Code draws over the composer and waits on a keypress.
+    (
+        "startup-dialog",
+        (
+            "enter to confirm",
+            "version pin",
+            "update installed",
+            "what should claude do instead?",
+        ),
+    ),
+)
+
+
+def _classify_unready_pane(pane: str) -> str:
+    """
+    Name what the pane was showing instead of Claude Code's input box.
+
+    These timeouts all surface as one error, but they are several unrelated
+    faults — a blocked ``sudo`` prompt, an unfinished browser login, a launch
+    script that never reached Claude Code, a modal waiting on a keypress — and
+    only the pane text tells them apart. Reducing it to a slug lets the
+    failures be counted by cause without regex over captured terminal output
+    (which also carries the person's paths, so it is a poor grouping key).
+
+    :param pane: The last non-empty capture the readiness gate observed.
+        Empty when every capture came back blank.
+    :returns: A cause slug from :data:`_UNREADY_PANE_CAUSES`, ``"no-output"``
+        when nothing was ever captured, or ``"unknown"``.
+    """
+    if not pane.strip():
+        return "no-output"
+    # ``_capture_pane`` asks tmux for plain text (no ``-e``), so the capture
+    # carries no escape sequences to strip.
+    haystack = pane.lower()
+    for slug, markers in _UNREADY_PANE_CAUSES:
+        if any(marker in haystack for marker in markers):
+            return slug
+    return "unknown"
+
+
 def _wait_for_claude_prompt_ready(
     socket_path: str,
     tmux_target: str,
@@ -5226,14 +5322,14 @@ def _wait_for_claude_prompt_ready(
         :data:`_TMUX_READY_SLOW_BOOT_TIMEOUT_S`; a dead pane or rejected
         query ends the wait at the next liveness check.
     :returns: None.
-    :raises ClaudePromptTimeout: If the prompt never renders in time
-        (Claude failed to boot, or a slow boot outlasted even the hard
-        cap). The message carries the seconds actually waited, a poll
-        count, how many of those polls saw an empty capture, and the tail
-        of the last non-empty capture the loop actually observed (see
+    :raises ClaudePromptTimeout: If the prompt never renders before the hard
+        cap, or the pane exits. The exception carries the actual wait time,
+        poll counts, a ``blocked_on`` cause, structural shape, fingerprint,
+        and the tail of the last non-empty capture the loop observed (see
         :func:`_format_terminal_failure_tail`) so the true failure mode —
-        a startup crash, a torn/empty capture under a mid-turn repaint, or
-        a box that never appeared — is diagnosable from the error alone.
+        a blocked credential prompt, a startup crash, a torn/empty capture
+        under a mid-turn repaint, or a box that never appeared — is
+        diagnosable from the error alone.
     """
     started = time.monotonic()
     next_liveness_probe = started + timeout_s
@@ -5273,11 +5369,16 @@ def _wait_for_claude_prompt_ready(
     # with no box point at Claude never rendering the prompt (a boot crash,
     # e.g. a ``JSON Parse error``, whose text the tail then surfaces).
     waited_s = time.monotonic() - started
+    blocked_on = _classify_unready_pane(last_nonempty)
+    diagnosis = diagnose_pane(last_nonempty)
     raise ClaudePromptTimeout(
         f"Claude Code terminal did not become ready within {waited_s:.1f}s "
         f"(input prompt never rendered in {polls} polls, "
         f"{empty_polls} empty captures). The message was not delivered."
-        + _format_terminal_failure_tail(last_nonempty)
+        + _format_terminal_failure_tail(last_nonempty),
+        blocked_on=blocked_on,
+        pane_shape=diagnosis.shape,
+        pane_fingerprint=diagnosis.fingerprint,
     )
 
 

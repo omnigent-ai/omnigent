@@ -8481,6 +8481,183 @@ def test_format_terminal_failure_tail_caps_length(monkeypatch: pytest.MonkeyPatc
     assert len(body) <= 51
 
 
+# Pane text taken from real readiness-timeout reports, trimmed and with paths
+# replaced. Each stands for one of the unrelated faults the single timeout
+# covers, so the classifier is tested against what it actually meets.
+_OBSERVED_UNREADY_PANES: tuple[tuple[str, str], ...] = (
+    (
+        "launch-preamble",
+        "Generating claude-code MCP client config...\nNo changes made to /h/u/.claude.json.\n",
+    ),
+    (
+        "sso-login-wait",
+        "dbcert: Certificate requested by: dbexec\n"
+        "dbcert: Logging in via SSO...\n"
+        "dbcert: If the browser does not open automatically, please open the following URL:\n"
+        "\thttps://example.okta.com/oauth2/v1/authorize?client_id=abc&code_challenge=xyz\n",
+    ),
+    (
+        "password-prompt",
+        "Managed settings drift detected, applying updates...\n"
+        "Managed settings need to be updated. You will be prompted for your password.\n"
+        "Password:\n",
+    ),
+    (
+        "startup-dialog",
+        "New MCP server found in this project: databricks\n\n  Enter to confirm\n",
+    ),
+)
+
+
+@pytest.mark.parametrize(("expected", "pane"), _OBSERVED_UNREADY_PANES)
+def test_classify_unready_pane_names_each_observed_cause(expected: str, pane: str) -> None:
+    """Each unrelated fault behind this one timeout gets its own slug.
+
+    :param expected: Cause slug the pane should classify as.
+    :param pane: Captured pane text standing in for that cause.
+    :returns: None.
+    """
+    assert claude_native_bridge._classify_unready_pane(pane) == expected
+
+
+def test_classify_unready_pane_ignores_a_bare_password_mention() -> None:
+    """The word alone must not claim the first-checked label.
+
+    The password table is scanned before every other cause, so a marker loose
+    enough to match ordinary agent output would relabel unrelated failures.
+
+    :returns: None.
+    """
+    pane = "Reading config...\n  db_password: <redacted>\nPassword: rotated\n"
+    assert claude_native_bridge._classify_unready_pane(pane) == "unknown"
+
+
+def test_classify_unready_pane_separates_no_output_from_unknown() -> None:
+    """A blank capture is a torn read, not an unrecognized screen.
+
+    :returns: None.
+    """
+    assert claude_native_bridge._classify_unready_pane("") == "no-output"
+    assert claude_native_bridge._classify_unready_pane("   \n \n") == "no-output"
+    assert claude_native_bridge._classify_unready_pane("some novel startup crash") == "unknown"
+
+
+def test_classify_unready_pane_prefers_the_blocking_prompt_over_the_preamble() -> None:
+    """A password prompt is the cause even when the preamble is still on screen.
+
+    Both appear together in practice — the launch script prints its progress and
+    then blocks on ``sudo`` — and the blocking prompt is the actionable half.
+
+    :returns: None.
+    """
+    pane = (
+        "Generating claude-code MCP client config...\n"
+        "No changes made to /h/u/.claude.json.\n"
+        "Managed settings need to be updated. You will be prompted for your password.\n"
+        "Password:\n"
+    )
+    assert claude_native_bridge._classify_unready_pane(pane) == "password-prompt"
+
+
+def test_wait_for_claude_prompt_ready_reports_the_blocking_cause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The timeout carries diagnostic attributes for its logger.
+
+    The tail already carried the evidence, but it is per-person terminal text;
+    the slug is what lets these failures be counted by cause.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    pane = "Generating claude-code MCP client config...\nNo changes made to /h/u/.claude.json.\n"
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._capture_pane",
+        lambda socket_path, tmux_target: pane,
+    )
+    with pytest.raises(claude_native_bridge.ClaudePromptTimeout) as excinfo:
+        claude_native_bridge._wait_for_claude_prompt_ready(
+            "/tmp/example/tmux.sock",
+            "claude:0.0",
+            timeout_s=0.0,
+        )
+    assert excinfo.value.blocked_on == "launch-preamble"
+    message = str(excinfo.value)
+    assert "blocked_on=" not in message
+    # The existing shape survives: counts, the sentence, and the tail.
+    assert "1 polls, 1 empty captures" not in message
+    assert "The message was not delivered." in message
+    assert "Last terminal output:" in message
+
+
+def test_unrecognized_screen_is_still_diagnosable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A screen no marker matches must not be a dead end.
+
+    The cause table can only name failures somebody already investigated. The
+    shape and fingerprint are cause-independent, so a novel screen still says
+    what kind of thing it was and still groups with other reports of itself.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    novel = (
+        "Some future setup step nobody has written a marker for\n"
+        "Continue with the migration? [y/N]\n"
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._capture_pane",
+        lambda socket_path, tmux_target: novel,
+    )
+    with pytest.raises(claude_native_bridge.ClaudePromptTimeout) as excinfo:
+        claude_native_bridge._wait_for_claude_prompt_ready(
+            "/tmp/example/tmux.sock",
+            "claude:0.0",
+            timeout_s=0.0,
+        )
+    error = excinfo.value
+    assert error.blocked_on == "unknown"
+    # Cause unknown, but the screen still describes itself: the CLI never drew
+    # its UI and something is waiting on a keypress.
+    assert "no-tui-frame" in error.pane_shape
+    assert "awaiting-input" in error.pane_shape
+    assert error.pane_fingerprint not in ("", "blank")
+    message = str(error)
+    assert "blocked_on=" not in message
+    assert error.pane_fingerprint not in message
+
+
+def test_empty_capture_timeout_reports_no_output_cause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A timeout with nothing ever captured classifies as ``no-output``.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._capture_pane",
+        lambda socket_path, tmux_target: "",
+    )
+    with pytest.raises(claude_native_bridge.ClaudePromptTimeout) as excinfo:
+        claude_native_bridge._wait_for_claude_prompt_ready(
+            "/tmp/example/tmux.sock",
+            "claude:0.0",
+            timeout_s=0.0,
+        )
+    assert excinfo.value.blocked_on == "no-output"
+    assert "blocked_on=" not in str(excinfo.value)
+
+
+def test_claude_prompt_timeout_defaults_to_unknown_cause() -> None:
+    """A hand-raised timeout still exposes ``blocked_on`` for its logger.
+
+    :returns: None.
+    """
+    assert claude_native_bridge.ClaudePromptTimeout("boom").blocked_on == "unknown"
+
+
 def test_wait_for_claude_prompt_ready_surfaces_terminal_output_on_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
