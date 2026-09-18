@@ -489,6 +489,42 @@ def pi_own_login_model_arg(selection: str) -> str | None:
     return None if "/" in split[1] else split[1]
 
 
+def pi_own_login_serves_reference(reference: str | None, agent_dir: Path | None = None) -> bool:
+    """Whether *reference* names a model on one of Pi's own logged-in providers.
+
+    A live Pi picker selection is persisted as the ``provider/model``
+    reference the resident Pi reported (e.g. ``openai-codex/gpt-5.6-sol`` on
+    Pi's own OAuth login). String shape alone cannot separate such a reference
+    from a slash-shaped gateway model id (``openai/gpt-4o`` on OpenRouter), so
+    membership in Pi's own login catalog -- ``auth.json`` +
+    ``models-store.json``, the same files :func:`pi_own_login_model_options`
+    renders -- is the provenance signal: only a reference that catalog
+    actually serves selects Pi's own login.
+
+    :param reference: A candidate ``provider/model`` picker value.
+    :param agent_dir: Pi agent dir override (tests); defaults to the host's
+        own Pi agent dir.
+    :returns: ``True`` when the reference's provider is logged in and its
+        cached catalog lists the model id.
+    """
+    if not reference:
+        return False
+    provider_id, separator, model_id = reference.partition("/")
+    if not (separator and provider_id and model_id):
+        return False
+    root = agent_dir if agent_dir is not None else _global_pi_agent_dir()
+    if provider_id not in _read_json_object(root / "auth.json"):
+        return False
+    payload = _read_json_object(root / "models-store.json").get(provider_id)
+    if not _is_str_object_dict(payload):
+        return False
+    models = payload.get("models")
+    return any(
+        _is_str_object_dict(model) and model.get("id") == model_id
+        for model in (models if isinstance(models, list) else [])
+    )
+
+
 def pi_native_model_options(
     *,
     config_loader: Callable[[], dict[str, object]] | None = None,
@@ -1489,8 +1525,11 @@ def resolve_pi_native_provider(
     Reads the default provider for the Pi surface from
     ``~/.omnigent/config.yaml`` and translates it into Pi ``models.json``
     config. Returns ``None`` — leaving Pi to use its own ``/login`` — when no
-    usable provider is configured, or the default is a subscription / CLI-login
-    provider (a CLI's own login can't be reused outside that CLI).
+    usable provider is configured, the default is a subscription / CLI-login
+    provider (a CLI's own login can't be reused outside that CLI), or *model*
+    is a provider-qualified reference Pi's own login serves (see
+    :func:`pi_own_login_serves_reference`) — an explicit pick of one of Pi's
+    own providers must not be re-routed through the configured one.
 
     :param model: Session model override (``model_override``), or ``None`` to
         use the provider's default model.
@@ -1505,6 +1544,24 @@ def resolve_pi_native_provider(
         _, model = selection
     try:
         config = config_loader()
+        if selection is None and model and "/" in model:
+            prefix, _, bare = model.partition("/")
+            providers = config.get("providers")
+            names_configured_provider = (
+                bool(bare) and isinstance(providers, dict) and prefix in providers
+            )
+            # An explicit reference to one of Pi's OWN providers (e.g. a live
+            # picker selection on its openai-codex OAuth login) must not be
+            # funneled through the configured provider: that rewrites it into
+            # the generated ``omnigent`` namespace, an id no endpoint serves.
+            if not names_configured_provider and pi_own_login_serves_reference(model):
+                _LOGGER.info(
+                    "pi-native: model %r is served by Pi's own %r login; "
+                    "Pi will use its own login.",
+                    model,
+                    prefix,
+                )
+                return None
         # Pi is multi-family; ``omnigent setup`` marks defaults per family, not
         # for ``pi``. Use the shared house-pattern selection so pi resolves its
         # default exactly like the rest of the codebase — an explicit pi default

@@ -2472,7 +2472,9 @@ async def _auto_create_pi_terminal(
         )
 
         # Provider-qualified picker values select one of the models rendered
-        # from the provider configured through ``omni setup``.
+        # from the provider configured through ``omni setup``; a reference
+        # served by Pi's own login resolves to no managed provider and passes
+        # through as ``--model`` below.
         spec_model = launch_config.model_override or _pi_native_model_from_spec(agent_spec)
         provider = resolve_pi_native_provider(model=spec_model)
         if provider is not None:
@@ -2494,7 +2496,8 @@ async def _auto_create_pi_terminal(
                 or launch.effort_warning
             )
         elif spec_model:
-            # No managed provider: Pi runs on its own login, but the pinned
+            # No managed provider (none configured, or the pick names Pi's
+            # own login): Pi runs on its own login, but the pinned
             # model must still reach it — without this the pick is silently
             # dropped and Pi opens its own default model. A managed pick that
             # cannot be expressed for Pi's own resolver (slash-bearing model
