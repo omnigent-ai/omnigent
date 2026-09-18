@@ -11948,6 +11948,7 @@ def create_runner_app(
     async def cleanup_session_resources(
         session_id: str,
     ) -> JSONResponse:
+        _required_terminal_exit_errors.pop(session_id, None)
         _codex_terminal_ensure_locks.pop(session_id, None)
         _claude_terminal_ensure_locks.pop(session_id, None)
         _pi_terminal_ensure_locks.pop(session_id, None)
@@ -11975,6 +11976,7 @@ def create_runner_app(
 
     @app.post("/v1/sessions/{session_id}/reset-state")
     async def reset_session_state(session_id: str) -> JSONResponse:
+        _required_terminal_exit_errors.pop(session_id, None)
         _codex_terminal_ensure_locks.pop(session_id, None)
         _claude_terminal_ensure_locks.pop(session_id, None)
         _pi_terminal_ensure_locks.pop(session_id, None)
