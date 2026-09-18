@@ -360,9 +360,15 @@ def test_ensure_local_omnigent_server_spawns_when_none_healthy(
 def test_spawn_local_server_preserves_runtime_and_workspace(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The server retains the selected installation without importing from cwd."""
+    """Keep the selected runtime and workspace tools, cwd, and state paths."""
     workspace = tmp_path / "workspace"
     workspace.mkdir()
+    (workspace / "workspace_tool_module.py").write_text("def echo(message):\n    return message\n")
+    conflicting = workspace / "omnigent"
+    conflicting.mkdir()
+    (conflicting / "__init__.py").write_text(
+        'raise RuntimeError("conflicting workspace omnigent checkout was imported")\n'
+    )
     monkeypatch.chdir(workspace)
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
@@ -386,14 +392,25 @@ def test_spawn_local_server_preserves_runtime_and_workspace(
     }
     probe_env.update(HOME=str(tmp_path), USERPROFILE=str(tmp_path))
     probe = textwrap.dedent("""\
-        import json, os, sys
+        import contextlib, io, json, os, runpy, sys
 
         startup_path = list(sys.path)
         import omnigent
         from omnigent.config import global_config_path
         from omnigent.host.local_server import _local_data_dir
 
+        # --help runs the CLI entry without starting a server.
+        with contextlib.redirect_stdout(io.StringIO()):
+            try:
+                sys.argv = ["omnigent.cli", "--help"]
+                runpy.run_module("omnigent.cli", run_name="__main__")
+            except SystemExit as exc:
+                assert exc.code == 0, exc.code
+
+        import workspace_tool_module
+
         print(json.dumps(dict(
+            tool=workspace_tool_module.echo("ok"),
             safe_path=sys.flags.safe_path,
             startup_path=startup_path,
             cwd=os.getcwd(),
@@ -409,90 +426,17 @@ def test_spawn_local_server_preserves_runtime_and_workspace(
         capture_output=True,
         text=True,
         check=True,
-        timeout=30,
+        timeout=120,
     )
     observed = json.loads(result.stdout)
     assert "" not in observed["startup_path"]
     assert workspace.resolve() not in {Path(entry).resolve() for entry in observed["startup_path"]}
     assert observed["safe_path"] is True
+    assert observed["tool"] == "ok"
     assert Path(observed["runtime"]).resolve() == Path(omnigent.__file__).resolve()
     assert Path(observed["cwd"]) == workspace.resolve()
     assert Path(observed["config"]) == local_server.global_config_path()
     assert Path(observed["data"]) == local_server._local_data_dir()
-
-
-def test_spawned_server_entry_keeps_workspace_tools_importable(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """Workspace tools import after startup without replacing the selected runtime."""
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    (workspace / "workspace_tool_module.py").write_text("def echo(message):\n    return message\n")
-    conflicting = workspace / "omnigent"
-    conflicting.mkdir()
-    (conflicting / "__init__.py").write_text(
-        'raise RuntimeError("conflicting workspace omnigent checkout was imported")\n'
-    )
-    monkeypatch.chdir(workspace)
-    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
-    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
-    monkeypatch.setenv("OMNIGENT_AUTH_PROVIDER", "header")
-    for name in ("PYTHONSAFEPATH", "PYTHONPATH", "OMNIGENT_DATABASE_URI"):
-        monkeypatch.delenv(name, raising=False)
-
-    with patch.object(local_server.subprocess, "Popen") as popen:
-        local_server._spawn_local_server(8765)
-    args = popen.call_args.args[0]
-    kwargs = popen.call_args.kwargs
-    module_index = args.index("-m")
-    probe_env = {
-        name: value
-        for name, value in kwargs["env"].items()
-        if name in {"PATH", "SYSTEMROOT", "WINDIR", "OMNIGENT_CONFIG_HOME", "OMNIGENT_DATA_DIR"}
-    }
-    # Pin the tree under test so the probe exercises this checkout's entry
-    # even when the installed distribution points elsewhere.
-    probe_env.update(
-        HOME=str(tmp_path),
-        USERPROFILE=str(tmp_path),
-        PYTHONPATH=str(Path(local_server.__file__).resolve().parents[2]),
-    )
-    # Run the real `-m omnigent.cli` entry (--help aborts dispatch after the
-    # entry's path setup), then report what it left importable.
-    probe = textwrap.dedent("""\
-        import contextlib, io, json, os, runpy, sys
-
-        sink = io.StringIO()
-        with contextlib.suppress(SystemExit), contextlib.redirect_stdout(sink), \\
-                contextlib.redirect_stderr(sink):
-            sys.argv = ["omnigent.cli", "--help"]
-            runpy.run_module("omnigent.cli", run_name="__main__")
-
-        import omnigent
-        import workspace_tool_module
-
-        print(json.dumps(dict(
-            cwd_on_path=os.getcwd() in sys.path,
-            runtime=omnigent.__file__,
-            tool=workspace_tool_module.echo("ok"),
-        )))
-    """)
-    result = subprocess.run(
-        [*args[:module_index], "-c", probe],
-        cwd=kwargs.get("cwd"),
-        env=probe_env,
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
-    assert result.returncode == 0, (
-        f"probe failed (rc={result.returncode}).\n"
-        f"--- stdout ---\n{result.stdout}\n--- stderr ---\n{result.stderr}"
-    )
-    observed = json.loads(result.stdout)
-    assert observed["cwd_on_path"] is True
-    assert observed["tool"] == "ok"
-    assert not Path(observed["runtime"]).resolve().is_relative_to(workspace.resolve())
 
 
 def test_stop_local_omnigent_server_waits_for_process_exit(
