@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import hashlib
 import json
 import logging
 import math
@@ -68,6 +69,10 @@ _logger = logging.getLogger(__name__)
 _NO_ACTIVE_TURN_ERROR_CODE = -32600
 _NO_ACTIVE_TURN_ERROR_MESSAGE = "no active turn to steer"
 _ACTIVE_TURN_MISMATCH_MARKERS = ("expected active turn id", "but found")
+_INPUT_TOO_LARGE_ERROR_CODE = -32602
+_INPUT_TOO_LARGE_ERROR_NAME = "input_too_large"
+_INPUT_TOO_LARGE_FALLBACK_MAX_CHARS = 1 << 20
+_INPUT_TOO_LARGE_HEADROOM_CHARS = 4096
 _LEGACY_BRIDGE_STATE_POLL_COUNT = 60
 
 
@@ -115,6 +120,145 @@ def _is_stale_active_turn(error: CodexAppServerResponseError) -> bool:
     return _is_no_active_turn_to_steer(error) or _is_active_turn_mismatch(error)
 
 
+def _input_too_large_details(
+    error: CodexAppServerResponseError,
+) -> tuple[int | None, int | None] | None:
+    """Return ``(actual_chars, max_chars)`` for Codex's oversized-input error."""
+    if error.code != _INPUT_TOO_LARGE_ERROR_CODE:
+        return None
+    payload = _json_object(error.error)
+    data = _json_object(payload.get("data")) if payload is not None else None
+    if data is None or data.get("input_error_code") != _INPUT_TOO_LARGE_ERROR_NAME:
+        return None
+    actual_chars = data.get("actual_chars")
+    max_chars = data.get("max_chars")
+    return (
+        actual_chars if type(actual_chars) is int and actual_chars > 0 else None,
+        max_chars if type(max_chars) is int and max_chars > 0 else None,
+    )
+
+
+def _oversized_text_path(text: str, bridge_dir: Path) -> tuple[Path, bytes]:
+    """Return a stable upload path and UTF-8 bytes for oversized user text."""
+    raw = text.encode("utf-8", errors="replace")
+    digest = hashlib.sha256(raw).hexdigest()[:16]
+    return bridge_dir / "uploads" / f"oversized-user-input-{digest}.txt", raw
+
+
+def _oversized_text_reference(path: Path) -> str:
+    """Build the short Codex input that points at materialized user text."""
+    return (
+        f"[Attached file: {path}]\n"
+        "Read this file in full; it contains this part of the user's message."
+    )
+
+
+def _write_oversized_text(path: Path, raw: bytes) -> None:
+    """Write materialized user text unless the same payload is already present."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists() and path.stat().st_size == len(raw) and path.read_bytes() == raw:
+        return
+    path.write_bytes(raw)
+
+
+def _materialize_oversized_input_text(
+    input_items: list[dict[str, object]],
+    bridge_dir: Path,
+    *,
+    actual_chars: int | None,
+    max_chars: int | None,
+) -> tuple[list[dict[str, object]], int] | None:
+    """Move enough large text items to files for one bounded retry."""
+    candidates: list[tuple[int, str, Path, bytes, str]] = []
+    inline_chars = 0
+    for index, item in enumerate(input_items):
+        text = item.get("text") if item.get("type") == "text" else None
+        if not isinstance(text, str) or not text:
+            continue
+        inline_chars += len(text)
+        path, raw = _oversized_text_path(text, bridge_dir)
+        reference = _oversized_text_reference(path)
+        if len(reference) < len(text):
+            candidates.append((index, text, path, raw, reference))
+    if not candidates:
+        return None
+
+    maximum = max_chars or _INPUT_TOO_LARGE_FALLBACK_MAX_CHARS
+    headroom = min(_INPUT_TOO_LARGE_HEADROOM_CHARS, max(1, maximum // 100))
+    target = maximum - headroom
+    estimated_chars = max(actual_chars or inline_chars, maximum + 1)
+    replacements: dict[int, str] = {}
+    writes: list[tuple[Path, bytes]] = []
+    for index, text, path, raw, reference in sorted(
+        candidates,
+        key=lambda candidate: len(candidate[1]),
+        reverse=True,
+    ):
+        if replacements and estimated_chars <= target:
+            break
+        replacements[index] = reference
+        writes.append((path, raw))
+        estimated_chars += len(reference) - len(text)
+
+    if estimated_chars > maximum:
+        return None
+    for path, raw in writes:
+        _write_oversized_text(path, raw)
+    recovered = [
+        {**item, "text": replacements[index]} if index in replacements else dict(item)
+        for index, item in enumerate(input_items)
+    ]
+    return recovered, len(replacements)
+
+
+async def _request_with_oversized_input_recovery(
+    client: CodexAppServerClient,
+    method: str,
+    params: dict[str, object],
+    *,
+    bridge_dir: Path,
+    session_id: str,
+    turn_id: str | None,
+) -> dict[str, object]:
+    """Retry one rejected Codex input after moving its large text to files."""
+    try:
+        return await client.request(method, params)
+    except CodexAppServerResponseError as error:
+        details = _input_too_large_details(error)
+        raw_input = params.get("input")
+        if details is None or not isinstance(raw_input, list):
+            raise
+        input_items = [item for item in raw_input if isinstance(item, dict)]
+        if len(input_items) != len(raw_input):
+            raise
+        actual_chars, max_chars = details
+        recovered = _materialize_oversized_input_text(
+            input_items,
+            bridge_dir,
+            actual_chars=actual_chars,
+            max_chars=max_chars,
+        )
+        if recovered is None:
+            raise
+        recovered_items, materialized_count = recovered
+        # The rejected RPC did not start or steer a turn, so one retry cannot
+        # duplicate model work.
+        response = await client.request(method, {**params, "input": recovered_items})
+        _logger.info(
+            "Codex native recovered oversized turn input",
+            extra=debug_event(
+                "codex_native_input_too_large_recovered",
+                session_id=session_id,
+                turn_id=turn_id,
+                rpc_method=method,
+                actual_chars=actual_chars,
+                max_chars=max_chars,
+                materialized_text_items=materialized_count,
+            ),
+        )
+        return response
+
+
 async def _start_codex_turn(
     client: CodexAppServerClient,
     *,
@@ -152,7 +296,8 @@ async def _start_codex_turn(
                     "Failed to mirror codex effort switch into config.toml: effort=%s",
                     switched_effort,
                 )
-    response = await client.request(
+    response = await _request_with_oversized_input_recovery(
+        client,
         "turn/start",
         {
             "threadId": state.thread_id,
@@ -164,6 +309,9 @@ async def _start_codex_turn(
                 }
             ],
         },
+        bridge_dir=bridge_dir,
+        session_id=state.session_id,
+        turn_id=None,
     )
     result = _json_object(response.get("result"))
     turn = _json_object(result.get("turn")) if result is not None else None
@@ -182,13 +330,17 @@ async def _steer_codex_turn(
 ) -> None:
     """Steer one bridge-recorded active Codex turn."""
     assert state.active_turn_id is not None
-    response = await client.request(
+    response = await _request_with_oversized_input_recovery(
+        client,
         "turn/steer",
         {
             "threadId": state.thread_id,
             "expectedTurnId": state.active_turn_id,
             "input": input_items,
         },
+        bridge_dir=bridge_dir,
+        session_id=state.session_id,
+        turn_id=state.active_turn_id,
     )
     result = _json_object(response.get("result"))
     turn_id = result.get("turnId") if result is not None else None
