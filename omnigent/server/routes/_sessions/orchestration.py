@@ -70,6 +70,7 @@ from omnigent.models.model_metadata import concrete_reported_model
 from omnigent.native.native_coding_agents import (
     native_coding_agent_for_agent_name,
     native_coding_agent_for_harness,
+    native_coding_agent_for_wrapper_label,
 )
 from omnigent.policies.types import (
     ElicitationRequest,
@@ -289,6 +290,7 @@ from omnigent.server.routes._sessions.helpers import (
     _publish_error_event,
     _publish_external_conversation_item,
     _publish_input_consumed,
+    _publish_model_options,
     _publish_sandbox_status,
     _publish_status,
     _publish_terminal_pending,
@@ -4266,16 +4268,6 @@ async def _ensure_runner_session_initialized(
         # via the same warning path rather than silently forwarding into a
         # half-initialized runner.
         resp.raise_for_status()
-        await _publish_runner_recovered_status(session_id, conversation_store)
-        try:
-            payload = resp.json()
-        except ValueError:
-            return False
-        return bool(
-            isinstance(payload, dict)
-            and payload.get("session_init_protocol_version") == 2
-            and payload.get("terminal_ready") is True
-        )
     except (httpx.HTTPError, ConnectionError) as exc:
         _logger.warning(
             "Session-init handshake to runner failed for session %s; "
@@ -4290,6 +4282,31 @@ async def _ensure_runner_session_initialized(
                 code=ErrorCode.RUNNER_UNAVAILABLE,
             ) from exc
         return False
+
+    await _publish_runner_recovered_status(session_id, conversation_store)
+    from omnigent.server.child_session_recovery import (
+        restore_active_children,
+        schedule_child_restoration,
+    )
+
+    # Legacy callers leave descendant restoration to the runner-connect hook.
+    if initializer is not None:
+        if suppress_recovery_turn and not require_success:
+            schedule_child_restoration(conv, runner_client, conversation_store, initializer)
+        else:
+            await _ensure_runner_relay_ready(
+                session_id, conv.runner_id, runner_client, conversation_store
+            )
+            await restore_active_children(conv, runner_client, conversation_store, initializer)
+    try:
+        payload = resp.json()
+    except ValueError:
+        return False
+    return bool(
+        isinstance(payload, dict)
+        and payload.get("session_init_protocol_version") == 2
+        and payload.get("terminal_ready") is True
+    )
 
 
 def _is_native_terminal_session(conv: Conversation) -> bool:
@@ -4336,6 +4353,7 @@ async def _ensure_native_terminal_ready(
     conv: Conversation,
     *,
     persist_resource_event: bool = True,
+    runner_router: RunnerRouter | None = None,
 ) -> _NativeTerminalEnsureOutcome:
     """
     Ask the runner to create or return the native terminal for a message.
@@ -4346,6 +4364,13 @@ async def _ensure_native_terminal_ready(
     durable error item; a 2xx response preserves the normal boot grace
     because the runner has accepted responsibility for terminal startup.
 
+    A runner tunnel that drops while the request is in flight is the one
+    transport failure that is not definitive: the runner is usually alive
+    but stalled and re-registers shortly. With a *runner_router* the probe
+    waits up to ``_NATIVE_TERMINAL_ENSURE_RECONNECT_GRACE_S`` for the
+    session's runner to reconnect and asks once more; the runner-side ensure
+    is idempotent, so a terminal created before the drop is simply returned.
+
     :param runner_client: HTTP client pointed at the session's runner.
     :param session_id: Session/conversation identifier, e.g.
         ``"conv_abc123"``.
@@ -4353,13 +4378,16 @@ async def _ensure_native_terminal_ready(
     :param persist_resource_event: Whether a newly created terminal should be
         appended to conversation history. Retry recovery disables persistence
         while retaining the live resource event for connected clients.
+    :param runner_router: Router used to wait for the session's runner to
+        reconnect after a tunnel drop. ``None`` fails a drop immediately.
     :returns: The probe outcome — a definitive ``error`` when the terminal
         could not start, else ``error=None``.
     """
     display_name, _, harness = _native_terminal_runtime(conv)
     terminal_name = _native_terminal_name_for_harness(harness)
-    try:
-        resp = await runner_client.post(
+
+    async def _post_ensure() -> httpx.Response:
+        return await runner_client.post(
             f"/v1/sessions/{session_id}/resources/terminals",
             json={
                 "terminal": terminal_name,
@@ -4369,7 +4397,8 @@ async def _ensure_native_terminal_ready(
             },
             timeout=10.0,
         )
-    except (httpx.HTTPError, ConnectionError) as exc:
+
+    def _transport_failure(exc: httpx.HTTPError | ConnectionError) -> _NativeTerminalEnsureOutcome:
         # WSTunnelTransport raises bare ConnectionError on tunnel close
         # ("tunnel closed before request completed"); without this clause
         # a runner tunnel drop escaped to the catch-all handler and the
@@ -4379,12 +4408,46 @@ async def _ensure_native_terminal_ready(
             "%s terminal ensure transport failed for session=%s",
             display_name,
             session_id,
-            exc_info=True,
+            exc_info=exc,
             extra={"session_id": session_id},
         )
         return _NativeTerminalEnsureOutcome(
             error=_native_terminal_ensure_transport_error(exc, display_name=display_name),
         )
+
+    try:
+        resp = await _post_ensure()
+    except (httpx.HTTPError, ConnectionError) as exc:
+        if (
+            runner_router is None
+            or conv.runner_id is None
+            or not isinstance(exc, ConnectionError | httpx.ConnectError)
+        ):
+            return _transport_failure(exc)
+        _logger.warning(
+            "%s terminal ensure lost the runner tunnel for session=%s; waiting up to "
+            "%.0fs for runner %s to reconnect",
+            display_name,
+            session_id,
+            _NATIVE_TERMINAL_ENSURE_RECONNECT_GRACE_S,
+            conv.runner_id,
+            extra={"session_id": session_id},
+        )
+        if not await runner_router.wait_for_runner(
+            conv.runner_id, timeout_s=_NATIVE_TERMINAL_ENSURE_RECONNECT_GRACE_S
+        ):
+            return _transport_failure(exc)
+        _logger.info(
+            "Runner %s reconnected; repeating %s terminal ensure for session=%s",
+            conv.runner_id,
+            display_name,
+            session_id,
+            extra={"session_id": session_id},
+        )
+        try:
+            resp = await _post_ensure()
+        except (httpx.HTTPError, ConnectionError) as retry_exc:
+            return _transport_failure(retry_exc)
     if resp.status_code < 400:
         return _NativeTerminalEnsureOutcome(
             error=None,
@@ -4991,8 +5054,8 @@ def _routed_turn_model_spelling(
     Translate a routed model into the spelling this pane can switch to.
 
     A mid-turn switch on a Claude Code pane is typed as ``/model``, which
-    takes only this session's own picker vocabulary — its family aliases
-    and its one custom slot. An id outside that vocabulary is skipped by
+    takes only this session's own picker vocabulary — its picker values,
+    its family aliases, its one custom slot. An id outside it is skipped by
     the executor (fail open, the turn runs on the current model), so it
     must be neither pinned on the row nor recorded as applied. Sessions
     that are not claude-native panes, and panes whose vocabulary is not
@@ -5014,8 +5077,17 @@ def _routed_turn_model_spelling(
     from omnigent.models.claude_model_vocabulary import (
         claude_model_command_arg,
         model_vocabulary_env,
+        picker_command_values,
+        picker_value_for_model,
     )
 
+    # Row ids are the pane's picker values, which ``/model`` takes verbatim —
+    # the only spelling a managed row of no Claude family has, and exact
+    # where a family alias would step onto the newest generation.
+    picker_values = picker_command_values(options)
+    picked = picker_value_for_model(model, picker_values)
+    if picked is not None:
+        return picked
     env = model_vocabulary_env(options)
     if not env:
         return model
@@ -5023,10 +5095,12 @@ def _routed_turn_model_spelling(
     if spelling is None:
         _logger.warning(
             "smart_routing: routed model %s has no spelling the claude-native pane "
-            "for session=%s accepts (vocabulary=%s); leaving the session's model alone",
+            "for session=%s accepts (vocabulary=%s, picker=%s); leaving the session's "
+            "model alone",
             model,
             session_id,
             sorted(env.values()),
+            picker_values,
             extra={"session_id": session_id},
         )
     return spelling
@@ -6080,6 +6154,7 @@ async def _dispatch_session_event_to_runner_impl(
     runner_router: RunnerRouter | None = None,
     native_terminal_ready: bool = False,
     host_store: HostStore | None = None,
+    host_registry: HostRegistry | None = None,
     background_titles_enabled: bool = True,
 ) -> _SessionEventDispatchResult:
     """
@@ -6176,6 +6251,7 @@ async def _dispatch_session_event_to_runner_impl(
                 runner_client,
                 session_id,
                 conv,
+                runner_router=runner_router,
             )
         )
         if ensure_outcome.error is not None:
@@ -6216,6 +6292,20 @@ async def _dispatch_session_event_to_runner_impl(
         opens_side_chat = _native_pane_harness(conv) == "codex-native" and is_side_chat_command(
             _extract_user_text_for_routing(body)
         )
+        # An older host forwards `/side` to Codex as a plain prompt (no fork), so
+        # the web side chat opens and hangs and the question lands on the main
+        # thread. Refuse here — before the forward — with a clear reason instead.
+        if (
+            opens_side_chat
+            and conv.host_id is not None
+            and host_registry is not None
+            and not host_registry.host_supports_codex_side_chat(conv.host_id)
+        ):
+            raise OmnigentError(
+                "This session's host is too old to open a Codex side chat. Update "
+                "omnigent on the host (>= 0.15.0) and reconnect it, then try again.",
+                code=ErrorCode.INVALID_INPUT,
+            )
         pending_id: str | None = (
             pending_inputs.record(
                 session_id,
@@ -6420,6 +6510,10 @@ async def _dispatch_session_event_to_runner_impl(
 RUNNER_DISCONNECT_GRACE_S: float = 10.0
 # Delay between relay stream reconnect attempts inside the grace window.
 _RELAY_RETRY_INTERVAL_S: float = 0.5
+# A tunnel that drops mid-ensure usually belongs to a runner that is alive but
+# stalled and re-registers once it can (observed: 24 s). Hold the message that
+# long before failing it instead of discarding it on a drop the runner outlives.
+_NATIVE_TERMINAL_ENSURE_RECONNECT_GRACE_S: float = 30.0
 # Session statuses that mean a turn was in flight. A runner going away
 # only interrupts work in one of these states; from any other state the
 # departure is a benign disconnect, carried by liveness rather than a
@@ -8997,6 +9091,42 @@ async def _create_session_from_existing_agent(
             _validated_harness_override, body.harness_override, agent
         )
 
+    if agent_cache is not None:
+        from omnigent.harness_aliases import canonicalize_harness
+        from omnigent.models.model_catalog import (
+            _acp_launch_model,
+            validate_acp_model,
+        )
+        from omnigent.runtime.workflow import _find_spec_by_name
+
+        try:
+            selection_spec = (
+                await asyncio.to_thread(
+                    agent_cache.load,
+                    agent.id,
+                    agent.bundle_location,
+                    expand_env=agent.session_id is None,
+                )
+            ).spec
+        except (KeyError, AttributeError, ValueError, ImportError, OSError):
+            if model_override is not None:
+                raise
+            # Without a selection, retain creation when the harness is unknown.
+            _logger.debug(
+                "create-time model policy: agent %r failed to load", agent.name, exc_info=True
+            )
+            selection_spec = None
+        if selection_spec is not None and body.sub_agent_name:
+            selection_spec = _find_spec_by_name(selection_spec, body.sub_agent_name)
+        if (
+            selection_spec is not None
+            and canonicalize_harness(harness_override or _spec_harness(selection_spec)) == "acp"
+        ):
+            default_model = await asyncio.to_thread(_acp_launch_model, selection_spec)
+            await asyncio.to_thread(validate_acp_model, selection_spec, default_model)
+            if model_override is not None:
+                await asyncio.to_thread(validate_acp_model, selection_spec, model_override)
+
     # Inherit runner affinity from the parent session so the child
     # is assigned to the same runner (sub-agent co-location).
     inherited_runner_id: str | None = None
@@ -9544,6 +9674,11 @@ def _create_session_from_bundle(
             enforce_handler_allowlist=not local_single_user_enabled(),
         )
     assert spec.name is not None
+
+    if _spec_harness(spec) == "acp":
+        from omnigent.models.model_catalog import _acp_launch_model, validate_acp_model
+
+        validate_acp_model(spec, _acp_launch_model(spec))
 
     if metadata.reasoning_effort is None and spec.executor.reasoning_effort is not None:
         _, seeded_effort = validate_session_model_metadata(
@@ -10097,6 +10232,7 @@ async def _fetch_model_options(
     runner_client: httpx.AsyncClient | None,
     session_id: str,
     conv: Conversation,
+    agent_store: AgentStore | None = None,
 ) -> list[dict[str, Any]]:
     """
     Resolve the Web UI model-picker options for a native session.
@@ -10115,12 +10251,20 @@ async def _fetch_model_options(
       With no runner bound and a cold cache (server restart while the
       session slept), the session's host resolves a pre-launch preview
       instead — the same source the new-session picker uses.
+    * **acp** — the deployment's curated provider ``models:`` shortlist from
+      the session's explicit provider (provider default first). Local to the
+      server, so a cold cache re-resolves inline with no runner round trip.
+      Served only when the deployment actually curated a set (2+ models); a
+      session configured without one shows no picker, matching pi-native's
+      no-scope-when-uncurated rule.
 
     :param runner_client: HTTP client pointed at the bound runner, or
         ``None`` when no runner is bound.
     :param session_id: Session/conversation identifier,
         e.g. ``"conv_abc123"``.
     :param conv: Conversation row whose labels identify the wrapper.
+    :param agent_store: Optional store for the ACP spec lookup; resolves
+        from the runtime globals when ``None``.
     :returns: Model options, or ``[]`` when the session has no model picker or
         the runner-owned options are not yet available.
     """
@@ -10135,6 +10279,11 @@ async def _fetch_model_options(
         return _pushed_model_options_cache.get(session_id, [])
     endpoint = _MODEL_OPTIONS_ENDPOINT_BY_WRAPPER.get(wrapper or "")
     if endpoint is None:
+        # Generic ACP sessions carry no native wrapper label; their picker
+        # serves the deployment's curated provider ``models:`` shortlist
+        # resolved from the spec instead of a runner-owned catalog.
+        if _resolve_harness_impl_is_acp(conv, agent_store):
+            return await _load_acp_model_options(session_id, conv, agent_store)
         return []
     cached = _model_options_cache.get(session_id)
     if runner_client is None:
@@ -10212,6 +10361,132 @@ async def _codex_side_chat_fork_sealed(conv: Conversation, conv_store: Conversat
         return False
     parent = await asyncio.to_thread(conv_store.get_conversation, conv.parent_conversation_id)
     return parent is not None and bool(parent.runner_id) and parent.runner_id != conv.runner_id
+
+
+def _resolve_harness_impl_is_acp(conv: Conversation, agent_store: AgentStore | None) -> bool:
+    """Return whether *conv* runs a generic ``acp`` harness.
+
+    ``canonicalize_harness`` folds ``acp:<slug>`` ids to ``"acp"``, so any
+    configured or embedded generic ACP agent matches.
+
+    :param conv: Conversation row the session snapshot was built from.
+    :param agent_store: Optional store for the harness lookup; ``None`` lets
+        :func:`_resolve_harness` fall back to the runtime global.
+    :returns: ``True`` when the session's resolved harness is ``"acp"``.
+    """
+    from omnigent.harness_aliases import canonicalize_harness
+
+    return canonicalize_harness(_resolve_harness(conv, agent_store=agent_store)) == "acp"
+
+
+def _validate_session_model_selection(
+    conv: Conversation, model: str | None, agent_store: AgentStore
+) -> None:
+    """Validate a model mutation against the resolved harness and current provider config.
+
+    :param conv: The conversation whose model is changing.
+    :param model: Requested model id, or ``None`` to restore the configured default.
+    :param agent_store: Store for loading the conversation's bound agent spec.
+    :raises OmnigentError: If the harness cannot be resolved or its model policy rejects the pick.
+    """
+    from omnigent.harness_aliases import canonicalize_harness
+    from omnigent.models.model_catalog import _acp_launch_model, validate_acp_model
+    from omnigent.runtime.workflow import _find_spec_by_name
+
+    harness = canonicalize_harness(conv.harness_override)
+    if harness and harness != "acp":
+        return
+    if not harness and native_coding_agent_for_wrapper_label(
+        conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
+    ):
+        return
+    try:
+        root_spec = _load_agent_spec_for_session(conv, agent_store)
+        selection_spec = root_spec
+        if root_spec is not None and conv.sub_agent_name:
+            selection_spec = _find_spec_by_name(root_spec, conv.sub_agent_name)
+        if root_spec is None or selection_spec is None:
+            raise OmnigentError(
+                "Cannot resolve the session's agent spec to validate model selection.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        harness = harness or canonicalize_harness(
+            selection_spec.executor.config.get("harness")
+            or root_spec.executor.config.get("harness")
+            or selection_spec.executor.type
+        )
+    except OmnigentError:
+        raise
+    except Exception as exc:
+        raise OmnigentError(
+            "Cannot load the session's agent spec to validate model selection.",
+            code=ErrorCode.INVALID_INPUT,
+        ) from exc
+    if not harness or harness == "omnigent":
+        raise OmnigentError(
+            "Cannot resolve the session's harness to validate model selection.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    if harness == "acp":
+        validate_acp_model(selection_spec, _acp_launch_model(selection_spec))
+        validate_acp_model(selection_spec, model)
+
+
+async def _load_acp_model_options(
+    session_id: str,
+    conv: Conversation,
+    agent_store: AgentStore | None,
+) -> list[dict[str, Any]]:
+    """Resolve the curated picker options for a generic ACP session.
+
+    Serves the explicitly selected provider's verified shortlist in provider
+    order. The default row restores the agent's configured launch model.
+    The resolved options, including an empty catalog, stay cached while the
+    session sleeps without needing a runner round trip. Spec and provider
+    configuration reads run off the event loop.
+
+    Fewer than two curated models returns ``[]`` so the picker does not render.
+
+    :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
+    :param conv: Conversation row the options are resolved for.
+    :param agent_store: Store for the bound-agent spec load; ``None`` falls
+        back to the runtime global store.
+    :returns: Option dicts (``id`` / ``displayName`` / ``isDefault``), or
+        ``[]`` when nothing was curated.
+    """
+    cached = _model_options_cache.get(session_id)
+    if cached is not None:
+        return cached
+    if agent_store is None:
+        from omnigent.runtime._globals import _agent_store
+
+        agent_store = _agent_store
+    if agent_store is None:
+        return []
+    spec = await asyncio.to_thread(_load_agent_spec_for_session, conv, agent_store)
+    if spec is None:
+        return []
+    from omnigent.models.model_catalog import _acp_launch_model, acp_curated_models
+    from omnigent.runtime.workflow import _find_spec_by_name
+
+    def resolve_options() -> list[dict[str, Any]]:
+        resolved_spec = spec
+        if conv.sub_agent_name:
+            resolved_spec = _find_spec_by_name(spec, conv.sub_agent_name) or spec
+        curated = acp_curated_models(resolved_spec)
+        if len(curated) < 2:
+            return []
+        default_model = _acp_launch_model(resolved_spec)
+        return [
+            {"id": model_id, "displayName": model_id, "isDefault": model_id == default_model}
+            for model_id in curated
+        ]
+
+    options = await asyncio.to_thread(resolve_options)
+    _model_options_cache[session_id] = options
+    _model_options_stale.discard(session_id)
+    _publish_model_options(session_id)
+    return options
 
 
 async def _get_session_snapshot(
@@ -10443,7 +10718,7 @@ async def _get_session_snapshot(
     # session's live Codex app-server ``model/list`` response. Best-effort
     # and cache-backed so a snapshot poll cannot wedge the
     # runner while a turn is active.
-    model_options = await _fetch_model_options(runner_client, session_id, conv)
+    model_options = await _fetch_model_options(runner_client, session_id, conv, agent_store)
     # Dynamic override from the forwarder (real Claude Code window).
     # Only present after the first statusLine tick; before that the
     # spec default applies.

@@ -64,6 +64,16 @@ describe("ChatComposer", () => {
     );
   });
 
+  it("uses the theme primary color for an enabled send action", () => {
+    render(<ComposerSendButton label="Send" />);
+    expect(screen.getByRole("button", { name: "Send" })).toHaveClass(
+      "bg-primary",
+      "text-primary-foreground",
+      "disabled:bg-muted",
+      "disabled:text-muted-foreground",
+    );
+  });
+
   it("places context, overlays, attachments and controls around the same input", () => {
     const cardRef = createRef<HTMLDivElement>();
     render(

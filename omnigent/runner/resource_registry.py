@@ -402,6 +402,8 @@ class SessionResourceRegistry:
         # hook; all access goes through the ``_*_session_status_memo`` helpers
         # under ``self._lock``.
         self._last_session_status: dict[str, str] = {}
+        self._session_activity_epoch: dict[str, int] = {}
+        self._active_session_turns: set[str] = set()
         # Last status *edge published to the server* per session, shared by the
         # watcher and the native forwarders' hook-derived edges so the two
         # dedup against one baseline. Kept separate from the exit memo above,
@@ -494,14 +496,24 @@ class SessionResourceRegistry:
         if tasks:
             await asyncio.gather(*tasks)
 
-    def _set_session_status_memo(self, session_id: str, status: str) -> None:
+    def _set_session_status_memo(
+        self, session_id: str, status: str, *, record_activity: bool = True
+    ) -> None:
         """Record the session's latest PTY status for exit classification."""
         with self._lock:
+            if record_activity and status in {"running", "waiting"}:
+                self._active_session_turns.add(session_id)
+                self._session_activity_epoch[session_id] = (
+                    self._session_activity_epoch.get(session_id, 0) + 1
+                )
+            if status in {"idle", "failed"}:
+                self._active_session_turns.discard(session_id)
             self._last_session_status[session_id] = status
 
     def _take_session_status_memo(self, session_id: str) -> str | None:
         """Pop and return the session's recorded PTY status (or ``None``)."""
         with self._lock:
+            self._active_session_turns.discard(session_id)
             self._published_session_status.pop(session_id, None)
             self._status_pollers.pop(session_id, None)
             return self._last_session_status.pop(session_id, None)
@@ -566,6 +578,16 @@ class SessionResourceRegistry:
                 extra={"session_id": runner_primary_session_id()},
             )
 
+    def session_activity_epoch(self, session_id: str) -> int:
+        """Count explicit turn activity, retaining it after idle or terminal exit."""
+        with self._lock:
+            return self._session_activity_epoch.get(session_id, 0)
+
+    def session_turn_is_active(self, session_id: str) -> bool:
+        """Whether an explicitly observed turn is unfinished, excluding pane repaints."""
+        with self._lock:
+            return session_id in self._active_session_turns
+
     def note_session_turn_started(self, session_id: str) -> None:
         """Mark a session as having an in-flight turn.
 
@@ -596,8 +618,8 @@ class SessionResourceRegistry:
         :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
         :param status: External native status, e.g. ``"running"`` or ``"idle"``.
         """
-        if status == "idle":
-            self._set_session_status_memo(session_id, "idle")
+        if status in {"idle", "failed"}:
+            self._set_session_status_memo(session_id, status)
         elif status in {"running", "waiting"}:
             self._set_session_status_memo(session_id, "running")
         self._sync_status_edge(session_id, status)
@@ -1203,7 +1225,9 @@ class SessionResourceRegistry:
         # means "never emitted", so the first changed tick always fires.
         last_activity_emit: dict[str, float | None] = {"value": None}
 
-        def _publish_status(status: str, blocked_on: str | None = None) -> None:
+        def _publish_status(
+            status: str, blocked_on: str | None = None, *, record_activity: bool = False
+        ) -> None:
             # Publish one running/idle edge: dedup against the last value,
             # memo for exit classification, and hop to the loop (publishers
             # are loop-only). Shared by the PTY edges and the claude-native
@@ -1213,9 +1237,14 @@ class SessionResourceRegistry:
             # :meth:`note_external_session_status`).
             if status_publisher is None:
                 return
+            explicit_activity = record_activity and status in {"running", "waiting"}
+            if explicit_activity:
+                self._set_session_status_memo(session_id, status)
             if not self._claim_status_edge(session_id, status, blocked_on):
                 return
-            self._set_session_status_memo(session_id, status)
+            # Pane repaints can be startup output, not a new agent turn.
+            if not explicit_activity:
+                self._set_session_status_memo(session_id, status, record_activity=False)
             loop.call_soon_threadsafe(status_publisher, session_id, status, blocked_on)
 
         def _file_owns_status() -> bool:
@@ -1238,7 +1267,9 @@ class SessionResourceRegistry:
             self._build_claude_native_status_poller(
                 session_id=session_id,
                 instance=instance,
-                on_status=_publish_status,
+                on_status=lambda status, blocked_on=None: _publish_status(
+                    status, blocked_on, record_activity=True
+                ),
             )
             if emit_status and resource_role == CLAUDE_NATIVE_TERMINAL_ROLE
             else None
@@ -1613,6 +1644,12 @@ class SessionResourceRegistry:
                 moved_status = self._last_session_status.pop(source_session_id, None)
                 if moved_status is not None and target_session_id not in self._last_session_status:
                     self._last_session_status[target_session_id] = moved_status
+                    if source_session_id in self._active_session_turns:
+                        self._active_session_turns.add(target_session_id)
+                        self._session_activity_epoch[target_session_id] = (
+                            self._session_activity_epoch.get(target_session_id, 0) + 1
+                        )
+                self._active_session_turns.discard(source_session_id)
                 # The watcher restart below rebuilds the poller under the
                 # target, so drop the source's entry rather than leaving a
                 # retired poller to be re-armed on every later reconnect.
@@ -1658,6 +1695,7 @@ class SessionResourceRegistry:
         """
         self._take_session_status_memo(session_id)
         with self._lock:
+            self._session_activity_epoch.pop(session_id, None)
             primary = self._primary_envs.pop(session_id, None)
             stale_role_keys = [key for key in self._terminal_roles if key[0] == session_id]
             for key in stale_role_keys:

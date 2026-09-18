@@ -61,6 +61,7 @@ from fastapi import APIRouter, HTTPException, Request
 from starlette.datastructures import FormData
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import UnifiedAuthProvider
 from omnigent.server.device_grant_store import DeviceGrantStore, hash_secret
 from omnigent.server.routes._oauth import (
@@ -197,6 +198,7 @@ def mint_delegated_token(
     client_id: str,
     jti: str,
     scope: str | None = DELEGATED_SCOPE,
+    account_generation: str | None = None,
 ) -> str:
     """Mint a grant-derived or client-credential access token.
 
@@ -248,6 +250,8 @@ def mint_delegated_token(
         "jti": jti,
         "act": {"client_id": client_id},
     }
+    if account_generation is not None:
+        payload["account_generation"] = account_generation
     if grant_id is not None:
         payload["grant_id"] = grant_id
     if scope is not None:
@@ -428,6 +432,12 @@ def create_oauth_token_router(
             _logger.debug("oauth/token: opportunistic grant purge failed", exc_info=True)
 
     def _issue_access_token(grant_id: str, user_id: str, client_id: str) -> str:
+        grant = device_grant_store.authorize_access(grant_id)
+        if grant is None or (
+            auth_provider._source == "accounts"
+            and not auth_provider.accepts_account_generation(user_id, grant.account_generation)
+        ):
+            raise OmnigentError("grant authority has been revoked", code=ErrorCode.UNAUTHORIZED)
         # A first-party login grant renews with the SAME authority as the
         # session JWT it replaces (scope=None); a third-party device grant
         # stays restricted to the delegated allowlist.
@@ -437,6 +447,7 @@ def create_oauth_token_router(
             cookie_secret,
             _ACCESS_TOKEN_TTL_SECONDS,
             provider_name,
+            account_generation=grant.account_generation,
             grant_id=grant_id,
             client_id=client_id or "",
             jti=secrets.token_urlsafe(16),
@@ -464,9 +475,15 @@ def create_oauth_token_router(
                 return _oauth_error("invalid_client", status_code=401)
             if handle_device_code is None:
                 return _oauth_error("unsupported_grant_type")
-            return handle_device_code(str(form.get("device_code") or ""))
+            try:
+                return handle_device_code(str(form.get("device_code") or ""))
+            except OmnigentError:
+                return _oauth_error("invalid_grant")
         if grant_type == "refresh_token":
-            return _handle_refresh_grant(str(form.get("refresh_token") or ""))
+            try:
+                return _handle_refresh_grant(str(form.get("refresh_token") or ""))
+            except OmnigentError:
+                return _oauth_error("invalid_grant")
         if grant_type == "client_credentials":
             # RFC 6749 §4.4: the machine client presents its OWN credential,
             # so it authenticates itself rather than passing the device
@@ -657,11 +674,18 @@ def create_device_auth_router(
     _last_purge = {"at": 0.0}
 
     def _issue_access_token(grant_id: str, user_id: str, client_id: str) -> str:
+        grant = device_grant_store.authorize_access(grant_id)
+        if grant is None or (
+            auth_provider._source == "accounts"
+            and not auth_provider.accepts_account_generation(user_id, grant.account_generation)
+        ):
+            raise OmnigentError("grant authority has been revoked", code=ErrorCode.UNAUTHORIZED)
         return mint_delegated_token(
             user_id,
             cookie_secret,
             _ACCESS_TOKEN_TTL_SECONDS,
             provider_name,
+            account_generation=grant.account_generation,
             grant_id=grant_id,
             client_id=client_id or "",
             jti=secrets.token_urlsafe(16),

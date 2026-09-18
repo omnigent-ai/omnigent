@@ -855,6 +855,33 @@ def _required_runner_env(name: str) -> str:
     return value
 
 
+def _runner_workspace_dir() -> str:
+    """
+    Resolve the runner's workspace for a native-terminal launch.
+
+    ``OMNIGENT_RUNNER_WORKSPACE`` is authoritative. The process cwd is only a
+    fallback for in-process setups that never export it, and reading it can
+    itself fail: a session whose worktree was removed under the runner makes
+    ``Path.cwd()`` raise ``FileNotFoundError``. So cwd is consulted only when
+    the variable is absent, and its failure is reported as the missing-workspace
+    condition it is rather than an opaque ``[Errno 2]`` from ``os.getcwd()``.
+
+    :returns: Absolute workspace path used as the terminal's cwd.
+    :raises RuntimeError: If neither the variable nor the process cwd resolves.
+    """
+    workspace = os.environ.get("OMNIGENT_RUNNER_WORKSPACE")
+    if workspace:
+        return workspace
+    try:
+        return str(Path.cwd())
+    except OSError as exc:
+        raise RuntimeError(
+            "Cannot resolve a workspace for the native terminal: "
+            "OMNIGENT_RUNNER_WORKSPACE is unset and the runner's working "
+            "directory no longer exists."
+        ) from exc
+
+
 def _codex_session_workspace(session_workspace: str | None) -> Path:
     """
     Resolve the cwd for a runner-owned Codex terminal.
@@ -2361,6 +2388,7 @@ async def _auto_create_pi_terminal(
     from omnigent.harnesses.pi_native.bridge import (
         PI_NATIVE_CONFIG_ENV_VAR,
         clear_inbox,
+        pi_native_env_unset,
         pi_session_dir,
         prepare_bridge_dir,
         write_extension_files,
@@ -2521,6 +2549,13 @@ async def _auto_create_pi_terminal(
             command=pi_command,
             args=pi_args,
             env=pi_env,
+            # Credential vars the operator declared off-limits for Pi
+            # (OMNIGENT_PI_ENV_UNSET): Pi activates a built-in provider's
+            # whole catalog on the mere presence of its credential, flooding
+            # the picker with entries that bypass the managed models.json
+            # provider — and Pi needs no credential env (its auth rides the
+            # managed apiKey). Empty list = no scrubbing.
+            env_unset=pi_native_env_unset(os.environ),
             scrollback=100_000,
             tmux_allow_passthrough=True,
             tmux_start_on_attach=False,
@@ -6758,19 +6793,35 @@ def _measured_prefix_bytes(transcript_path: Path) -> int | None:
         return None
 
 
-def _native_terminal_start_error_payload(exc: BaseException, runtime_name: str) -> dict[str, str]:
+def _native_terminal_start_error_payload(
+    exc: BaseException, runtime_name: str, *, session_id: str
+) -> dict[str, str]:
     """
     Build the structured error payload for a native terminal start failure.
 
     :param exc: Exception raised by the native terminal creation path,
         e.g. ``ImportError("Native Codex requires the 'codex' CLI on PATH.")``.
     :param runtime_name: Human-readable runtime name, e.g. ``"Codex"``.
+    :param session_id: Session whose terminal failed, which may be a runner's child.
     :returns: ``{"code": ..., "message": ...}`` payload for SSE and
         JSON error responses. Known actionable configuration errors surface
         their safe message directly; other causes point to the runner log.
     """
     error_id = f"err_{uuid.uuid4().hex}"
-    if isinstance(exc, OmnigentError) and exc.code == ErrorCode.SESSION_AGENT_MISSING:
+    missing_agent = isinstance(exc, OmnigentError) and exc.code == ErrorCode.SESSION_AGENT_MISSING
+    extra = debug_event(
+        "native_terminal_start_failed",
+        session_id=session_id,
+        error_id=error_id,
+        runtime=runtime_name,
+        code=ErrorCode.SESSION_AGENT_MISSING
+        if missing_agent
+        else _NATIVE_TERMINAL_START_FAILED_CODE,
+        exception_type=type(exc).__name__,
+        exception_cause_type=type(exc.__cause__).__name__ if exc.__cause__ is not None else None,
+        cause_code=exc.code if isinstance(exc, OmnigentError) else None,
+    )
+    if missing_agent:
         # Expected session-lifecycle condition: the session's agent was deleted
         # or rebound, so its bundle no longer resolves. This is not a
         # terminal-startup defect — log it without a stack and surface a
@@ -6782,7 +6833,7 @@ def _native_terminal_start_error_payload(exc: BaseException, runtime_name: str) 
             runtime_name,
             error_id,
             exc,
-            extra={"session_id": runner_primary_session_id(), "error_id": error_id},
+            extra=extra,
         )
         return {
             "code": ErrorCode.SESSION_AGENT_MISSING,
@@ -6799,7 +6850,7 @@ def _native_terminal_start_error_payload(exc: BaseException, runtime_name: str) 
         error_id,
         exc,
         exc_info=exc,
-        extra={"session_id": runner_primary_session_id(), "error_id": error_id},
+        extra=extra,
     )
     from omnigent.harnesses.claude_native.bridge import ClaudeNativeHookInterpreterMismatchError
 
@@ -6856,7 +6907,7 @@ def _publish_native_terminal_start_error(
     :returns: The structured error payload that was published on the
         status event.
     """
-    error = _native_terminal_start_error_payload(exc, runtime_name)
+    error = _native_terminal_start_error_payload(exc, runtime_name, session_id=session_id)
     publish_event(
         session_id,
         {
@@ -6868,18 +6919,23 @@ def _publish_native_terminal_start_error(
     return error
 
 
-def _native_terminal_start_error_response(exc: BaseException, runtime_name: str) -> JSONResponse:
+def _native_terminal_start_error_response(
+    exc: BaseException, runtime_name: str, *, session_id: str
+) -> JSONResponse:
     """
     Return a structured JSON error for native terminal ensure failures.
 
     :param exc: Exception raised by terminal auto-create.
     :param runtime_name: Human-readable runtime name, e.g. ``"Codex"``.
+    :param session_id: Session whose terminal ensure failed.
     :returns: HTTP 500 response with an ``error`` object carrying the
         real failure message.
     """
     return JSONResponse(
         status_code=500,
-        content={"error": _native_terminal_start_error_payload(exc, runtime_name)},
+        content={
+            "error": _native_terminal_start_error_payload(exc, runtime_name, session_id=session_id)
+        },
     )
 
 
@@ -7283,7 +7339,7 @@ async def _auto_create_claude_terminal(
     workspace = (
         session_init.snapshot.workspace
         if session_init is not None and session_init.snapshot.workspace
-        else os.environ.get("OMNIGENT_RUNNER_WORKSPACE", str(Path.cwd()))
+        else _runner_workspace_dir()
     )
     started_at = time.monotonic()
     _logger.info(
@@ -7658,6 +7714,9 @@ async def _auto_create_claude_terminal(
     # only when it can change the outcome — to validate an explicit request,
     # or to resolve a Default launch that would otherwise pass no ``--model``
     # and leave the model to invisible CLI-private state.
+    # Bound here so the vocabulary record below reads the same rows the
+    # launch validated against, whether or not that validation ran.
+    launch_catalog: list[dict[str, object]] | None = None
     if session_model_override or launch_model is None:
         from omnigent.harnesses.claude_native.main import (
             claude_catalog_launch_spelling,
@@ -7669,7 +7728,6 @@ async def _auto_create_claude_terminal(
         )
         from omnigent.models.model_catalog_store import default_row
 
-        launch_catalog: list[dict[str, object]] | None = None
         launch_catalog_was_stale = False
         try:
             # Read staleness BEFORE the fetch: the fetch itself kicks the
@@ -7807,12 +7865,17 @@ async def _auto_create_claude_terminal(
     # ambient env (the CLI path records these at prepare time; the runner
     # resolves its config only after the bridge exists).
     from omnigent.harnesses.claude_native.bridge import record_model_vocabulary
+    from omnigent.harnesses.claude_native.main import stored_claude_picker_values
 
     await asyncio.to_thread(
         record_model_vocabulary,
         bridge_dir,
         launch_env=claude_config.env if claude_config is not None else None,
         launch_model=launch_model,
+        # The catalog rows are the CLI's own picker, so their ids are the
+        # spellings a later ``/model`` can type — a managed picker names
+        # rows no pin covers.
+        picker_values=stored_claude_picker_values(claude_config, launch_catalog),
     )
     _logger.info(
         "Claude terminal provider config resolved: session=%s configured=%s "
@@ -8163,7 +8226,7 @@ async def _auto_create_repl_terminal(
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
 
     started_at = time.monotonic()
-    workspace = os.environ.get("OMNIGENT_RUNNER_WORKSPACE", str(Path.cwd()))
+    workspace = _runner_workspace_dir()
     server_url = os.environ.get("RUNNER_SERVER_URL", "http://localhost:6767")
     # Inherit the agent's os_env so its sandbox (e.g. ``type: none``) is honoured;
     # without sandbox= here and parent_os_env below, launch_terminal falls back to
@@ -8907,7 +8970,9 @@ async def _ensure_native_terminal(
                     ctx.session_id,
                     extra={"session_id": ctx.session_id},
                 )
-            return _native_terminal_start_error_response(exc, agent.display_name)
+            return _native_terminal_start_error_response(
+                exc, agent.display_name, session_id=ctx.session_id
+            )
         return respond(view)
 
 

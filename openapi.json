@@ -4527,6 +4527,18 @@
             ],
             "title": "Scope",
             "type": "string"
+          },
+          "task_description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Human label of the task/spawn this decision governed, e.g. `\"Research auth flows\"` \u2014 what ties a fan-out's decision to its sub-agent when every spawn shares one `agent` type. `None` when the spawn carried none, and on rows written before the field existed.",
+            "title": "Task Description"
           }
         },
         "required": [
@@ -5380,6 +5392,11 @@
             ],
             "description": "Which configured sandbox provider to provision on `host_type: \"managed\"` (one of the server's `sandbox_providers`); `None` takes the server's first. Only valid with `host_type: \"managed\"`.",
             "title": "Sandbox Provider"
+          },
+          "side_chat": {
+            "default": false,
+            "title": "Side Chat",
+            "type": "boolean"
           },
           "terminal_launch_args": {
             "anyOf": [

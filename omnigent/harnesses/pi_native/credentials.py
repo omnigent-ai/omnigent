@@ -263,6 +263,8 @@ class PiProviderConfig:
     listing_provider: model_catalog.ResolvedModelProvider | None = field(
         default=None, hash=False, compare=False
     )
+    # Only configured tier maps with multiple distinct models scope the picker.
+    curated_models: bool = False
 
     @property
     def _primary_claude_only(self) -> bool:
@@ -1400,7 +1402,14 @@ def _inline_family_pi_provider(
             auth_header = True
         else:
             continue
-        resolved_model = model or entry.family_default_model(family_name)
+        if model is not None:
+            resolved_model = model
+        else:
+            # A ``default:`` tier may name another tier (an alias such as
+            # ``deepseek-pro: deepseek-v4-pro``); launch with the id the
+            # endpoint actually serves, not the alias.
+            default_tier = entry.family_default_model(family_name)
+            resolved_model = family.resolve_model_tier(default_tier) if default_tier else None
         if not resolved_model:
             continue
         # A session override can arrive as a Databricks-gateway id, which only
@@ -1412,13 +1421,38 @@ def _inline_family_pi_provider(
         if model is not None:
             resolved_model = normalize_model_for_provider(resolved_model, entry.kind)
         # Strip bracket suffixes (e.g. "[1m]") — accepted by the direct
-        # Anthropic API but rejected by the Databricks AI Gateway.
+        # Anthropic API but rejected by the Databricks AI Gateway, and in a Pi
+        # ``enabledModels`` ref the "[" would route the pattern through Pi's
+        # glob matcher instead of its exact reference match.
         resolved_model = re.sub(r"\[.*?\]$", "", resolved_model)
         model_entry = _gateway_pi_model_entry(
             resolved_model,
             configured_context_window=family.context_window,
             configured_max_output_tokens=family.max_output_tokens,
         )
+        # Register the family's tiers alongside the selected model. Resolve
+        # aliases and strip bracket suffixes before deduplicating model ids.
+        tier_ids = list(
+            dict.fromkeys(
+                re.sub(r"\[.*?\]$", "", family.resolve_model_tier(tier_model))
+                for tier_model in family.models.values()
+                if isinstance(tier_model, str) and tier_model
+            )
+        )
+        shortlist: list[_PiModelEntry] = [model_entry]
+        # A session override must not turn a default-only setup into a shortlist.
+        curated_models = len(tier_ids) > 1
+        if curated_models:
+            for tier_id in tier_ids:
+                if tier_id == resolved_model:
+                    continue
+                shortlist.append(
+                    _gateway_pi_model_entry(
+                        tier_id,
+                        configured_context_window=family.context_window,
+                        configured_max_output_tokens=family.max_output_tokens,
+                    )
+                )
         return PiProviderConfig(
             provider_id=_PI_PROVIDER_ID,
             base_url=family.base_url,
@@ -1429,7 +1463,8 @@ def _inline_family_pi_provider(
             # Advisory when the model landed on the other family's wire; a raw
             # passthrough endpoint rejects it, and silence reads as a hang.
             credential_warning=_cross_family_routing_warning(entry, family_name, resolved_model),
-            extra_models=[model_entry],
+            extra_models=shortlist,
+            curated_models=curated_models,
             # Record the endpoint the pre-launch picker can enumerate live; no
             # I/O happens here so session launch stays off the network.
             listing_provider=model_catalog.ResolvedModelProvider(
@@ -1611,6 +1646,26 @@ def write_pi_models_config(
     return models_path
 
 
+def _enabled_model_refs(rendered: _PiModelsConfig) -> list[str]:
+    """Build provider-qualified ``enabledModels`` refs for a rendered config.
+
+    This is a picker preference; users can toggle back to all models.
+
+    :param rendered: The rendered ``models.json`` mapping.
+    :returns: ``["provider/model", ...]`` refs in rendered order (deterministic,
+        matching the picker's listing order).
+    """
+    refs: list[str] = []
+    providers = rendered.get("providers", {})
+    for provider_id, payload in providers.items():
+        if not isinstance(payload, dict):
+            continue
+        for model in payload.get("models", []):
+            if isinstance(model, dict) and isinstance(model.get("id"), str) and model["id"]:
+                refs.append(f"{provider_id}/{model['id']}")
+    return refs
+
+
 class PiNativeLaunch(NamedTuple):
     """Env, CLI args and any effort notice for a managed pi-native launch.
 
@@ -1681,7 +1736,13 @@ def pi_native_provider_launch(
     # key; Pi's getDefaultThinkingLevel() returns null (falsy) → no thinking.
     from omnigent.inner.pi_settings import prepare_managed_pi_agent_dir
 
-    prepare_managed_pi_agent_dir(agent_dir, overlay={"defaultThinkingLevel": None})
+    overlay: dict[str, object] = {"defaultThinkingLevel": None}
+    # Only configured shortlists override the user's picker preferences.
+    # Qualified refs distinguish managed models from built-in providers.
+    enabled_refs = _enabled_model_refs(rendered)
+    if provider.curated_models and enabled_refs:
+        overlay["enabledModels"] = enabled_refs
+    prepare_managed_pi_agent_dir(agent_dir, overlay=overlay)
     env = {PI_CODING_AGENT_DIR_ENV_VAR: str(agent_dir)}
     # When the model id contains a "/" Pi's arg parser splits on the first
     # slash and treats the left part as a provider name, overriding

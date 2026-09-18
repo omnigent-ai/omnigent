@@ -27,6 +27,7 @@ from omnigent.harnesses.claude_native.bridge import (
     read_claude_status_model,
     read_launch_model,
     read_model_env,
+    read_model_picker_values,
 )
 from omnigent.inner.executor import (
     EnqueuedContent,
@@ -215,8 +216,8 @@ class ClaudeNativeExecutor(Executor):
         # box and verifies its submit) delivers the message — in order,
         # once.
         wanted_model = config.model if config is not None else None
-        # ``/model`` only accepts this session's aliases / custom slot; a
-        # bare catalog id is ignored and the pane keeps its old model.
+        # ``/model`` only accepts this session's picker values, aliases, and
+        # custom slot; anything else is ignored and the pane keeps its model.
         wanted_model_arg = self._model_command_arg(wanted_model)
         try:
             with telemetry.span("claude_native.inject"):
@@ -304,9 +305,10 @@ class ClaudeNativeExecutor(Executor):
         Two gates: the switch must be needed at all
         (:meth:`_should_switch_model`), and the routed catalog id must
         translate into vocabulary ``/model`` accepts — the session's
-        family aliases, or the exact id of its custom picker slot. The
-        pinning comes from the terminal's launch env, recorded in the
-        bridge config because this process doesn't share that env.
+        picker values, its family aliases, or the exact id of its custom
+        picker slot. Both the pinning and the picker come from the launch,
+        recorded in the bridge config because this process doesn't share
+        the terminal's env.
 
         An untranslatable id fails open: the message still goes in, on
         the current model, with a warning. Typing a value the CLI won't
@@ -330,19 +332,24 @@ class ClaudeNativeExecutor(Executor):
             )
             return None
         env = read_model_env(self._bridge_dir) or None
-        wanted_arg = claude_model_command_arg(wanted_model, env)
+        # The launch recorded this pane's picker, which is the only
+        # vocabulary that spells a managed model of no Claude family.
+        picker_values = read_model_picker_values(self._bridge_dir)
+        wanted_arg = claude_model_command_arg(wanted_model, env, picker_values=picker_values)
         if wanted_arg is None:
             _logger.warning(
                 "claude-native: skipping /model — routed model %r has no spelling this "
-                "session accepts (pins=%s); sending the turn on the current model",
+                "session accepts (pins=%s, picker=%s); sending the turn on the current model",
                 wanted_model,
                 sorted(env or ()),
+                picker_values,
                 extra={"session_id": self._request_session_id},
             )
             return None
         if (
             self._applied_model is not None
-            and claude_model_command_arg(self._applied_model, env) == wanted_arg
+            and claude_model_command_arg(self._applied_model, env, picker_values=picker_values)
+            == wanted_arg
         ):
             # Resolves to the model the pane is already on, so the switch
             # would be a pointless prompt (and can pop a confirm dialog).

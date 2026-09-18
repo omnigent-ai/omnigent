@@ -1279,7 +1279,8 @@ function remountLanding(infoOverrides: Partial<ServerInfo> = {}): void {
 describe("model picker hotkey", () => {
   beforeEach(setupLandingMocks);
 
-  it("drills into the selected harness's model submenu on Cmd/Ctrl+Shift+M", () => {
+  it("drills into the selected harness's model submenu on Ctrl+Shift+M and focuses its model", async () => {
+    const user = userEvent.setup();
     mockAgents(DEFAULT_LANDING_AGENTS);
     renderLanding();
     // Nothing open yet.
@@ -1290,7 +1291,28 @@ describe("model picker hotkey", () => {
 
     // Lands directly on the selected harness's edit submenu (Models / Effort),
     // not just the harness list.
-    expect(screen.getByTestId("new-chat-landing-agent-models")).toBeVisible();
+    expect(await screen.findByTestId("new-chat-landing-agent-models")).toBeVisible();
+    const selectedModel = screen.getByRole("menuitemcheckbox", { name: "Harness default" });
+    await waitFor(() => expect(selectedModel).toHaveFocus());
+    await user.keyboard("{ArrowDown}");
+    const nextModel = screen.getByRole("menuitemcheckbox", { name: "Opus 4.8" });
+    expect(nextModel).toHaveFocus();
+
+    // Focus remains where the user moved it, and the shortcut works again
+    // after returning to the already-open harness menu.
+    await act(
+      () =>
+        new Promise((resolve) => {
+          window.setTimeout(resolve, 200);
+        }),
+    );
+    expect(nextModel).toHaveFocus();
+    await user.keyboard("{ArrowLeft}");
+    expect(screen.getByRole("menuitem", { name: "Claude Code" })).toHaveFocus();
+    fireEvent.keyDown(window, { code: "KeyM", ctrlKey: true, shiftKey: true });
+    await waitFor(() =>
+      expect(screen.getByRole("menuitemcheckbox", { name: "Harness default" })).toHaveFocus(),
+    );
   });
 });
 
@@ -3056,6 +3078,196 @@ describe("NewChatLandingScreen", () => {
     expect(worktree).toBeDisabled();
   });
 
+  describe("worktree choices after workspace changes", () => {
+    const gitWorkspace = "/Users/corey/repo";
+    const nextWorkspace = "/Users/corey/next-workspace";
+    const branchName = "feature/workspace-switch";
+    const mainWorktree = {
+      path: gitWorkspace,
+      branch: "main",
+      is_main: true,
+      detached: false,
+    };
+
+    beforeEach(() => {
+      localStorage.setItem(RECENT_KEY, JSON.stringify({ host_1: [gitWorkspace, nextWorkspace] }));
+      useHostWorktreesMock.mockImplementation(
+        (_host, path) =>
+          ({
+            ...SUCCESS_QUERY_STATE,
+            data: path === gitWorkspace ? [mainWorktree] : [],
+            isPlaceholderData: false,
+          }) as ReturnType<typeof useHostWorktrees>,
+      );
+      authenticatedFetchMock.mockResolvedValue(new Response(JSON.stringify({ id: "conv_new" })));
+    });
+
+    function selectWorkspace(path: string) {
+      fireEvent.click(screen.getByTestId("new-chat-landing-workspace-chip"));
+      fireEvent.click(screen.getByRole("button", { name: path }));
+      expect(screen.getByTestId("new-chat-landing-workspace-chip")).toHaveAttribute("title", path);
+    }
+
+    async function selectNewWorktree(autoSeeded = false) {
+      if (autoSeeded) localStorage.setItem("omnigent:always-use-worktree", "true");
+      renderLanding();
+      const worktree = screen.getByTestId("new-chat-landing-branch-chip");
+      await waitFor(() =>
+        expect(worktree).toHaveTextContent(
+          autoSeeded ? /^worktree-[0-9a-f]{8}$/ : /^New worktree$/,
+        ),
+      );
+      fireEvent.click(worktree);
+      if (!autoSeeded) {
+        fireEvent.change(screen.getByTestId("new-chat-landing-branch-input"), {
+          target: { value: branchName },
+        });
+      }
+      fireEvent.change(screen.getByTestId("new-chat-landing-base-branch-input"), {
+        target: { value: "release" },
+      });
+      return worktree;
+    }
+
+    it.each([false, true])(
+      "clears a named worktree when the new workspace is confirmed non-git (auto-seeded: %s)",
+      async (autoSeeded) => {
+        const worktree = await selectNewWorktree(autoSeeded);
+        selectWorkspace(nextWorkspace);
+
+        expect(worktree).toBeDisabled();
+        expect(worktree).toHaveTextContent(/^Worktree$/);
+        expect(worktree).toHaveAttribute(
+          "title",
+          "Choose a Git working directory to use worktrees",
+        );
+        fireEvent.click(worktree);
+        expect(screen.queryByTestId("new-chat-landing-branch-input")).toBeNull();
+
+        selectWorkspace(gitWorkspace);
+        expect(worktree).toBeEnabled();
+        if (autoSeeded) {
+          await waitFor(() => expect(worktree).toHaveTextContent(/^worktree-[0-9a-f]{8}$/));
+        }
+        fireEvent.click(worktree);
+        if (!autoSeeded) {
+          expect(screen.getByTestId("new-chat-landing-branch-input")).toHaveValue("");
+          fireEvent.change(screen.getByTestId("new-chat-landing-branch-input"), {
+            target: { value: "feature/fresh-choice" },
+          });
+        }
+        expect(screen.getByTestId("new-chat-landing-base-branch-input")).toHaveValue("");
+      },
+    );
+
+    it("closes the worktree popover when a delayed probe confirms a non-git workspace", async () => {
+      let probeResolved = false;
+      useHostWorktreesMock.mockImplementation(
+        (_host, path) =>
+          ({
+            ...SUCCESS_QUERY_STATE,
+            data: path === nextWorkspace && probeResolved ? [] : [mainWorktree],
+            isPlaceholderData: path === nextWorkspace && !probeResolved,
+            isFetching: path === nextWorkspace && !probeResolved,
+            fetchStatus: path === nextWorkspace && !probeResolved ? "fetching" : "idle",
+          }) as ReturnType<typeof useHostWorktrees>,
+      );
+      const worktree = await selectNewWorktree();
+      selectWorkspace(nextWorkspace);
+      expect(worktree).toBeEnabled();
+      expect(worktree).toHaveTextContent(branchName);
+      fireEvent.click(worktree);
+      expect(screen.getByTestId("new-chat-landing-branch-input")).toHaveValue(branchName);
+
+      probeResolved = true;
+      fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+        target: { value: "Use the resolved working directory" },
+      });
+      expect(worktree).toBeDisabled();
+      expect(worktree).toHaveTextContent(/^Worktree$/);
+      expect(screen.queryByTestId("new-chat-landing-branch-input")).toBeNull();
+      expect(screen.queryByTestId("new-chat-landing-base-branch-input")).toBeNull();
+      fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+      const { body } = await readCreateBody();
+      expect(body.workspace).toBe(nextWorkspace);
+      expect(body.git).toBeUndefined();
+    });
+
+    it.each([false, true])(
+      "omits stale git options when submitting a non-git workspace (auto-seeded: %s)",
+      async (autoSeeded) => {
+        await selectNewWorktree(autoSeeded);
+        selectWorkspace(nextWorkspace);
+        fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+          target: { value: "Work in this plain folder" },
+        });
+        expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled();
+        fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+        const { body } = await readCreateBody();
+        expect(body.workspace).toBe(nextWorkspace);
+        expect(body.git).toBeUndefined();
+      },
+    );
+
+    it.each(["loading", "placeholder", "error", "ready"] as const)(
+      "preserves a named worktree while switching to another git workspace (%s)",
+      async (state) => {
+        let nextResult = {
+          ...(state === "loading" ? PENDING_QUERY_STATE : SUCCESS_QUERY_STATE),
+          ...(state === "error"
+            ? {
+                status: "error",
+                isError: true,
+                isSuccess: false,
+                error: new Error("host worktrees fetch failed: HTTP 400"),
+              }
+            : {}),
+          data:
+            state === "loading" || state === "error"
+              ? undefined
+              : state === "placeholder"
+                ? []
+                : [{ ...mainWorktree, path: nextWorkspace }],
+          isFetching: state === "loading" || state === "placeholder",
+          fetchStatus: state === "loading" || state === "placeholder" ? "fetching" : "idle",
+          isPlaceholderData: state === "placeholder",
+        } as ReturnType<typeof useHostWorktrees>;
+        useHostWorktreesMock.mockImplementation(
+          (_host, path) =>
+            (path === nextWorkspace
+              ? nextResult
+              : {
+                  ...SUCCESS_QUERY_STATE,
+                  data: [mainWorktree],
+                  isPlaceholderData: false,
+                }) as ReturnType<typeof useHostWorktrees>,
+        );
+        const worktree = await selectNewWorktree();
+        selectWorkspace(nextWorkspace);
+        expect(worktree).toHaveTextContent(branchName);
+
+        nextResult = {
+          ...SUCCESS_QUERY_STATE,
+          data: [{ ...mainWorktree, path: nextWorkspace }],
+          isPlaceholderData: false,
+        } as ReturnType<typeof useHostWorktrees>;
+        fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+          target: { value: "Keep my worktree in the next repository" },
+        });
+        expect(worktree).toBeEnabled();
+        fireEvent.click(worktree);
+        expect(screen.getByTestId("new-chat-landing-branch-input")).toHaveValue(branchName);
+        expect(screen.getByTestId("new-chat-landing-base-branch-input")).toHaveValue("release");
+        fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+
+        const { body } = await readCreateBody();
+        expect(body.workspace).toBe(nextWorkspace);
+        expect(body.git).toEqual({ branch_name: branchName, base_branch: "release" });
+      },
+    );
+  });
+
   it("uses the host's advertised display name in the landing picker", () => {
     mockClaudeModels([
       { id: "opus", model: "system.ai.claude-opus-4-6", displayName: "Opus", isDefault: true },
@@ -3359,7 +3571,10 @@ describe("NewChatLandingScreen", () => {
     expect(screen.getByTestId("new-chat-landing-agent-effort-value")).toHaveTextContent("xHigh");
     expect(screen.getByTestId("new-chat-landing-agent-summary-a2")).toHaveTextContent("xHigh");
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-model-databricks-gpt-5-5"));
-    expect(screen.queryByTestId("new-chat-landing-agent-effort-default")).toBeNull();
+    expect(screen.getByTestId("new-chat-landing-agent-effort-default")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
     expect(screen.queryByTestId("new-chat-landing-agent-effort-value")).toBeNull();
     closeMenu();
     selectAgent("a1");
@@ -4575,11 +4790,7 @@ describe("NewChatLandingScreen", () => {
     // Back to GPT-5.5, whose ladder has no xhigh: the stale rung
     // resets so Save can't commit a level the model rejects.
     fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "GPT-5.5" }));
-    expect(
-      within(screen.getByTestId("new-chat-landing-agent-efforts")).queryByRole("menuitemcheckbox", {
-        checked: true,
-      }),
-    ).toBeNull();
+    expect(selectedPickerEffort().textContent).toContain("Default");
     closePrimaryPicker();
 
     fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
@@ -4601,11 +4812,7 @@ describe("NewChatLandingScreen", () => {
     // Claude's row reopens on its own remembered effort (nothing stored →
     // Default) — the Codex pick must not ride the shared state across.
     openAgentModels("a1");
-    expect(
-      within(screen.getByTestId("new-chat-landing-agent-efforts")).queryByRole("menuitemcheckbox", {
-        checked: true,
-      }),
-    ).toBeNull();
+    expect(selectedPickerEffort().textContent).toContain("Default");
     closePrimaryPicker();
 
     // Codex reopens on the remembered pick, still valid for its ladder.
@@ -6241,17 +6448,13 @@ describe("NewChatLandingScreen skills menu", () => {
     renderLanding();
     typeMessage("/");
     // Both bundled skills render as rows under the "Skills" section header
-    // — proving bundled skills stay available before discovery. Row testids, not text: the
-    // active entry's name also renders in the detail card.
+    // — proving bundled skills stay available before discovery.
     expect(screen.getByText("Skills")).toBeTruthy();
     expect(screen.getByTestId("slash-menu-item-review-pr")).toBeTruthy();
     expect(screen.getByTestId("slash-menu-item-cross-review")).toBeTruthy();
-    // Descriptions live in the detail card beside the panel and follow the
-    // highlight: the pre-selected first row's blurb shows, the other's
-    // doesn't until ArrowDown moves the highlight.
+    // Descriptions render inline on each row (grouped "+"-tray style), so both
+    // skills' blurbs are visible immediately — not gated behind the highlight.
     expect(screen.getByText("Review a pull request")).toBeTruthy();
-    expect(screen.queryByText("Cross-vendor review")).toBeNull();
-    fireEvent.keyDown(screen.getByTestId("new-chat-landing-input"), { key: "ArrowDown" });
     expect(screen.getByText("Cross-vendor review")).toBeTruthy();
   });
 
@@ -6837,6 +7040,36 @@ describe("NewChatLandingScreen agent picker + config gear", () => {
     expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(
       "Codex, Model GPT-5.5",
     );
+  });
+
+  it("hides Codex's transport namespace in the new-session model label", () => {
+    const wireModel = "system.ai.gpt-6-astra";
+    useHostModelOptionsMock.mockImplementation(
+      (_hostId, harness) =>
+        (harness === "codex-native"
+          ? {
+              ...CODEX_MODEL_OPTIONS_RESULT,
+              data: [
+                {
+                  id: wireModel,
+                  model: wireModel,
+                  displayName: wireModel,
+                  isDefault: true,
+                  supportedReasoningEfforts: [{ reasoningEffort: "xhigh" }],
+                },
+              ],
+            }
+          : CLAUDE_MODEL_OPTIONS_RESULT) as unknown as ReturnType<typeof useHostModelOptions>,
+    );
+
+    renderLanding();
+    selectAgent("a2");
+
+    const picker = screen.getByTestId("new-chat-landing-agent-select");
+    expect(picker).toHaveAccessibleName("Codex, Model gpt-6-astra");
+    expect(picker).not.toHaveTextContent("system.ai");
+    openAgentModels("a2");
+    expect(screen.getByRole("menuitemcheckbox", { name: "gpt-6-astra" })).toBeVisible();
   });
 
   it("edits Claude models without opening a permissions modal", () => {

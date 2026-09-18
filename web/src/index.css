@@ -475,6 +475,18 @@
     var(--background);
 }
 
+/* Soft brand-accent wash behind the whole side-chat pane: a single diffuse
+   glow from the top-right that fades to nothing, matching the design. One
+   gradient (no seam) over the full pane height (no hard edge above the
+   composer), kept very subtle so it reads fine behind message bubbles too. */
+.side-chat-backdrop {
+  background: radial-gradient(
+    150% 110% at 100% 0%,
+    color-mix(in oklch, var(--brand-accent) 8%, transparent),
+    transparent 70%
+  );
+}
+
 /* Fixed default icon geometry: a 14px glyph centered in a 16px SVG box. */
 .ui-icon {
   box-sizing: border-box;
@@ -1338,7 +1350,28 @@ aside[aria-label="Workspace"][data-maximized] {
   vertical-align: -0.075em;
 }
 
-/* Flash highlight on nav jump. Duration must match FLASH_DURATION_MS in chatStore.ts. */
+/* Message highlights must match FLASH_DURATION_MS in chatStore.ts. */
+@keyframes message-highlight {
+  0%,
+  40% {
+    background-color: var(--message-highlight);
+  }
+  100% {
+    background-color: transparent;
+  }
+}
+
+.animate-message-highlight {
+  --message-highlight: color-mix(in oklch, var(--warning) 16%, transparent);
+  animation: message-highlight 1500ms ease-out;
+  border-radius: var(--radius-lg);
+}
+
+.dark .animate-message-highlight {
+  --message-highlight: color-mix(in oklch, var(--warning) 24%, transparent);
+}
+
+/* Workspace navigation keeps its compact outline highlight. */
 @keyframes user-msg-flash {
   0% {
     box-shadow: 0 0 0 0 var(--ring);
@@ -1356,8 +1389,13 @@ aside[aria-label="Workspace"][data-maximized] {
   border-radius: var(--radius-2xl);
 }
 
-/* Reduced-motion: static outline still signals the target. */
+/* Reduced-motion: static highlights still signal the target. */
 @media (prefers-reduced-motion: reduce) {
+  .animate-message-highlight {
+    animation: none;
+    background-color: var(--message-highlight);
+  }
+
   .animate-user-msg-flash {
     animation: none;
     box-shadow: 0 0 0 2px var(--ring);

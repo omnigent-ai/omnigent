@@ -22,6 +22,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from fastapi import APIRouter, Query, Request
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from omnigent.db.account_authority import account_generation, current_account_user
 from omnigent.entities import ScheduledTask, ScheduledTaskRun
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
@@ -297,6 +298,12 @@ def create_scheduled_tasks_router(
         )
         return canonical_workspace, validated_model, validated_effort
 
+    def _owns_task(task: ScheduledTask, owner: str | None) -> bool:
+        return task.user_id == owner and (
+            current_account_user() is None
+            or task.account_generation == account_generation(owner or RESERVED_USER_LOCAL)
+        )
+
     def _require_owned(scheduled_task_id: str, owner: str | None) -> ScheduledTask:
         """Load a task the caller owns, or raise 404.
 
@@ -304,7 +311,7 @@ def create_scheduled_tasks_router(
         enumerable across users.
         """
         task = store.get(scheduled_task_id)
-        if task is None or task.user_id != owner:
+        if task is None or not _owns_task(task, owner):
             raise OmnigentError("Scheduled task not found", code=ErrorCode.NOT_FOUND)
         return task
 
@@ -368,7 +375,7 @@ def create_scheduled_tasks_router(
         """
         owner = _owner(request)
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
-        tasks = store.list(owner_user_id=owner_id)
+        tasks = [t for t in store.list(owner_user_id=owner_id) if _owns_task(t, owner_id)]
         task_ids = [t.id for t in tasks]
         running = store.list_running_runs_for_tasks(task_ids)
         # Force-fail stale orphans FIRST so the completion badge below reports a

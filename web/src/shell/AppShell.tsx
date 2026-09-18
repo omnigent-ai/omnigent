@@ -1148,6 +1148,9 @@ export function AppShell() {
   // Validate the latest selection, including a tab queued by session restoration.
   useEffect(() => {
     setRightRailTab((tab) => {
+      // "sidechat" is a dynamic mode (a side-chat tab is selected), not a
+      // gated nav tab — always valid, and never a fallback target.
+      if (tab === "sidechat") return tab;
       if (railTabsAvailable[tab]) return tab;
       return (
         (["files", "changes", "github", "subagents", "browser"] as const).find(
@@ -1593,20 +1596,15 @@ export function AppShell() {
     [selectedFilePath, selectedTerminalKey, clearFileViewerUrl],
   );
 
-  // A `/side` fork the user just opened: reveal it in the Agents rail on the
-  // SIDE CHAT itself, and leave the main chat's rail untouched. `ChatPage`
-  // navigates off `redirectToConversationId`; the rail tab is per-conversation,
-  // so we wait until the router has actually landed on the child
-  // (`conversationId === sideChatRailRequest`) before switching the tab —
-  // otherwise the tab would persist onto the main chat we're leaving.
-  const sideChatRailRequest = useChatStore((s) => s.sideChatRailRequest);
-  const clearSideChatRailRequest = useChatStore((s) => s.clearSideChatRailRequest);
+  // A side chat the user just opened must be visible: reveal the Workspace rail
+  // so its soft tab shows. WorkspacePanel owns opening/selecting the tab and
+  // clearing the one-shot `sideChatToOpen` signal (it holds the side-chat tab
+  // state, like the browser tabs); AppShell only ensures the rail is open.
+  const sideChatToOpen = useChatStore((s) => s.sideChatToOpen);
   useEffect(() => {
-    if (sideChatRailRequest === null) return;
-    if (conversationId !== sideChatRailRequest) return;
-    handleRightRailTabChange("subagents");
-    clearSideChatRailRequest();
-  }, [sideChatRailRequest, clearSideChatRailRequest, handleRightRailTabChange, conversationId]);
+    if (sideChatToOpen === null) return;
+    setRightPanelOpen(true);
+  }, [sideChatToOpen]);
 
   function openTerminalsPanel(key: string) {
     setSelectedFilePath(null); // close file viewer

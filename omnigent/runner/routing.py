@@ -225,6 +225,17 @@ class RunnerRouter:
         """
         return self._registry.get(runner_id) is not None
 
+    async def wait_for_runner(self, runner_id: str, *, timeout_s: float) -> bool:
+        """
+        Wait until *runner_id* has a live tunnel or *timeout_s* elapses.
+
+        :param runner_id: Runner UUID, e.g.
+            ``"runner_0123456789abcdef"``.
+        :param timeout_s: Maximum seconds to wait, e.g. ``30.0``.
+        :returns: ``True`` when the runner is connected when the wait ends.
+        """
+        return await self._registry.wait_for_runner(runner_id, timeout_s=timeout_s) is not None
+
     def runner_owner(self, runner_id: str) -> str | None:
         """
         Return the authenticated owner of *runner_id*, or ``None``.

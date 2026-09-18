@@ -2304,6 +2304,9 @@ def _normalize_subagent_model(
     """
     from omnigent.models.model_catalog import resolve_model_provider
 
+    # ACP commands own their model namespace, even when provider credentials are shared.
+    if canonicalize_harness(harness) == "acp":
+        return model
     sub_spec = _find_subagent_spec(sub_agent_name, agent_spec)
     if sub_spec is None or harness is None:
         return model

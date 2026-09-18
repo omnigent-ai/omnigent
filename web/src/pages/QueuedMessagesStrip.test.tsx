@@ -37,6 +37,118 @@ describe("QueuedMessagesStrip", () => {
     expect(screen.getByText("second")).toBeInTheDocument();
   });
 
+  it.each([
+    ["screenshot.png", "image/png"],
+    ["report.pdf", "application/pdf"],
+    ["notes.txt", "text/plain"],
+  ])("shows the filename for an attachment-only message: %s", (name, type) => {
+    render(
+      <QueuedMessagesStrip
+        messages={[{ ...msg("q_1", ""), files: [new File([], name, { type })] }]}
+        onDelete={vi.fn()}
+        onEdit={vi.fn()}
+      />,
+    );
+    expect(screen.getByText(name)).toBeInTheDocument();
+  });
+
+  it.each(["", "Look at these"])(
+    "shows one filename and an overflow count with all filenames on hover (text: %j)",
+    (text) => {
+      const filenames = ["Screenshot before the layout change.png", "after.png", "notes.txt"];
+      render(
+        <QueuedMessagesStrip
+          messages={[{ ...msg("q_1", text), files: filenames.map((name) => new File([], name)) }]}
+          onDelete={vi.fn()}
+          onEdit={vi.fn()}
+        />,
+      );
+      const chip = screen.getByTestId("queued-message-attachments");
+      expect(screen.getByText(filenames[0]!)).toHaveClass("truncate");
+      expect(screen.getByText("+2")).toHaveAttribute("aria-hidden", "true");
+      expect(chip).toHaveAttribute("title", filenames.join("\n"));
+      expect(chip.querySelector(".sr-only")).toHaveTextContent("after.png, notes.txt");
+    },
+  );
+
+  it("shows filenames when the message text is only whitespace", () => {
+    render(
+      <QueuedMessagesStrip
+        messages={[{ ...msg("q_1", " \n\t "), files: [new File([], "screenshot.png")] }]}
+        onDelete={vi.fn()}
+        onEdit={vi.fn()}
+      />,
+    );
+    expect(screen.getByText("screenshot.png")).toBeInTheDocument();
+  });
+
+  it.each(["", "Look at this"])(
+    "uses the composer/upload filename for an unnamed attachment (text: %j)",
+    (text) => {
+      render(
+        <QueuedMessagesStrip
+          messages={[{ ...msg("q_1", text), files: [new File([], "")] }]}
+          onDelete={vi.fn()}
+          onEdit={vi.fn()}
+        />,
+      );
+      expect(screen.getByText("image.png")).toBeInTheDocument();
+      expect(screen.getByTestId("queued-message-attachments")).toHaveAttribute(
+        "title",
+        "image.png",
+      );
+    },
+  );
+
+  it.each([
+    ["short", "Look at this"],
+    ["long", "Explain the layout in this screenshot. ".repeat(30).trim()],
+  ])("keeps separate truncating previews for %s text and attachments", (_length, text) => {
+    render(
+      <QueuedMessagesStrip
+        messages={[{ ...msg("q_1", text), files: [new File([], "screenshot.png")] }]}
+        onDelete={vi.fn()}
+        onEdit={vi.fn()}
+      />,
+    );
+    const textPreview = screen.getByText(text);
+    const attachmentPreview = screen.getByText("screenshot.png");
+    expect(textPreview).toHaveClass("truncate");
+    expect(textPreview).toHaveAttribute("title", text);
+    expect(attachmentPreview).toHaveClass("truncate");
+    const chip = screen.getByTestId("queued-message-attachments");
+    expect(chip).toHaveAttribute("title", "screenshot.png");
+    expect(chip).toHaveClass("shrink-0");
+    expect(chip.parentElement).toBe(textPreview.parentElement);
+  });
+
+  it("does not render an attachment chip for a text-only message", () => {
+    render(
+      <QueuedMessagesStrip
+        messages={[{ ...msg("q_1", "Just text"), files: [] }]}
+        onDelete={vi.fn()}
+        onEdit={vi.fn()}
+      />,
+    );
+    expect(screen.getByText("Just text")).toBeInTheDocument();
+    expect(screen.queryByTestId("queued-message-attachments")).not.toBeInTheDocument();
+  });
+
+  it("keeps the filename visible when text is added to an attachment-only queue entry", () => {
+    const file = new File([], "screenshot.png", { type: "image/png" });
+    const props = { onDelete: vi.fn(), onEdit: vi.fn() };
+    const { rerender } = render(
+      <QueuedMessagesStrip {...props} messages={[{ ...msg("q_1", ""), files: [file] }]} />,
+    );
+    expect(screen.getByText(file.name)).toBeInTheDocument();
+    rerender(
+      <QueuedMessagesStrip {...props} messages={[{ ...msg("q_1", "Hey"), files: [file] }]} />,
+    );
+    expect(screen.getByText("Hey")).toBeInTheDocument();
+    expect(screen.getByText(file.name)).toBeInTheDocument();
+    expect(screen.queryByText("+0")).not.toBeInTheDocument();
+  });
+
   it("calls onDelete with the row's queueId when its remove button is clicked", () => {
     const onDelete = vi.fn();
     render(

@@ -1498,6 +1498,43 @@ describe("useTogglePinnedConversation cache patching", () => {
     ).toEqual([]);
   });
 
+  it("keeps a concurrent move's optimistic project label on the unpin reconcile", async () => {
+    // A drag-drop files the row and unpins it in one gesture. The unpin PATCH
+    // usually resolves first, and its labels snapshot predates the move's
+    // PATCH — reconciling it wholesale would erase the optimistic
+    // omni_project label and bounce the row into the flat list.
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({
+        id: "conv_x",
+        object: "conversation",
+        title: "Session X",
+        created_at: 0,
+        labels: {},
+      }),
+    );
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    queryClient.setQueryData(
+      ["conversations", "", false],
+      infinitePage([
+        conversation({
+          id: "conv_x",
+          updated_at: 150,
+          labels: { [PINNED_LABEL_KEY]: "123", omni_project: "Legacy" },
+        }),
+      ]),
+    );
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const rendered = renderHook(() => useTogglePinnedConversation(), { wrapper });
+
+    rendered.result.current.mutate({ id: "conv_x", pinned: false });
+    await waitFor(() => expect(rendered.result.current.isSuccess).toBe(true));
+
+    const list = queryClient.getQueryData<ConversationsInfiniteData>(["conversations", "", false]);
+    const row = list!.pages[0].data.find((c) => c.id === "conv_x")!;
+    expect(row.labels).toEqual({ omni_project: "Legacy" });
+  });
+
   it("does not blank an existing list row's updated_at (labels-only overlay)", async () => {
     const { queryClient, rendered } = seed(true);
 
@@ -2312,6 +2349,151 @@ describe("useMoveToProject", () => {
 
     resolveList(mockResponse({ object: "list", data: [{ id: "p_sprint", name: "Sprint 42" }] }));
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
+  });
+
+  it("overlays label-only folder membership through the legacy label before the network resolves", async () => {
+    // The target folder exists only through another session's omni_project
+    // label (no first-class row → null id in the projects cache), so there is
+    // no id to overlay — membership must be written through the legacy label
+    // the sidebar dual-reads, or the row regroups into the flat list for the
+    // whole create-on-demand round trip (the pinned-drop flicker).
+    let resolveList: (value: Response) => void = () => {};
+    fetchMock.mockReset();
+    fetchMock
+      .mockReturnValueOnce(
+        new Promise<Response>((resolve) => {
+          resolveList = resolve;
+        }),
+      )
+      .mockResolvedValueOnce(mockResponse({ id: "p_new", object: "project", name: "Legacy" }))
+      .mockResolvedValueOnce(
+        mockResponse({
+          id: "conv_move",
+          object: "conversation",
+          title: "t",
+          created_at: 0,
+          updated_at: 1,
+          project_id: "p_new",
+          labels: {},
+        }),
+      );
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    queryClient.setQueryData(["projects"], [{ id: null, name: "Legacy" }]);
+    queryClient.setQueryData(
+      ["conversations", "", false],
+      infinitePage([conversation({ id: "conv_move", project_id: "p_old" })]),
+    );
+    queryClient.setQueryData(
+      ["project-sessions", "Old folder"],
+      infinitePage([conversation({ id: "conv_move", project_id: "p_old" })]),
+    );
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useMoveToProject(), { wrapper });
+
+    result.current.mutate({ id: "conv_move", project: "Legacy" });
+
+    await waitFor(() => {
+      const data = queryClient.getQueryData<ConversationsInfiniteData>([
+        "conversations",
+        "",
+        false,
+      ]);
+      const row = data!.pages[0].data.find((c) => c.id === "conv_move")!;
+      expect(row.labels).toEqual({ omni_project: "Legacy" });
+      expect(row.project_id).toBeNull();
+    });
+    // The old folder's pages drop the row immediately (no dual-show).
+    const oldFolder = queryClient.getQueryData<ConversationsInfiniteData>([
+      "project-sessions",
+      "Old folder",
+    ]);
+    expect(oldFolder!.pages[0].data.find((c) => c.id === "conv_move")).toBeUndefined();
+
+    resolveList(mockResponse({ object: "list", data: [] }));
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+  });
+
+  it("skips the overlay when the name has no cached folder (brand-new project)", async () => {
+    // An uncached name renders no folder yet, so there is nowhere for an
+    // optimistic regroup to land; the row must stay put until the reconcile.
+    let resolveList: (value: Response) => void = () => {};
+    fetchMock.mockReset();
+    fetchMock
+      .mockReturnValueOnce(
+        new Promise<Response>((resolve) => {
+          resolveList = resolve;
+        }),
+      )
+      .mockResolvedValueOnce(mockResponse({ id: "p_new", object: "project", name: "Fresh" }))
+      .mockResolvedValueOnce(
+        mockResponse({
+          id: "conv_move",
+          object: "conversation",
+          title: "t",
+          created_at: 0,
+          updated_at: 1,
+          project_id: "p_new",
+          labels: {},
+        }),
+      );
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    queryClient.setQueryData(["projects"], [{ id: null, name: "Legacy" }]);
+    queryClient.setQueryData(
+      ["conversations", "", false],
+      infinitePage([conversation({ id: "conv_move", labels: { keep: "me" } })]),
+    );
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useMoveToProject(), { wrapper });
+
+    result.current.mutate({ id: "conv_move", project: "Fresh" });
+
+    // The name→id resolution request firing means onMutate has finished.
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    const data = queryClient.getQueryData<ConversationsInfiniteData>(["conversations", "", false]);
+    const row = data!.pages[0].data.find((c) => c.id === "conv_move")!;
+    expect(row.labels).toEqual({ keep: "me" });
+
+    resolveList(mockResponse({ object: "list", data: [] }));
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+  });
+
+  it("seeds the promoted folder's first-class id into the projects cache on success", async () => {
+    // The refetches the move fires race each other: a conversations refetch
+    // can land with the row's legacy label already cleared while the projects
+    // list still caches the folder id-less — that folder then can't claim the
+    // row by project_id and it flashes into the flat list. The PATCH response
+    // carries the promoted id, so it lands in the projects cache first.
+    fetchMock.mockReset();
+    fetchMock
+      .mockResolvedValueOnce(mockResponse({ object: "list", data: [] }))
+      .mockResolvedValueOnce(mockResponse({ id: "p_new", object: "project", name: "Legacy" }))
+      .mockResolvedValueOnce(
+        mockResponse({
+          id: "conv_move",
+          object: "conversation",
+          title: "t",
+          created_at: 0,
+          updated_at: 1,
+          project_id: "p_new",
+          labels: {},
+        }),
+      );
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    queryClient.setQueryData(["projects"], [{ id: null, name: "Legacy" }]);
+    queryClient.setQueryData(
+      ["conversations", "", false],
+      infinitePage([conversation({ id: "conv_move" })]),
+    );
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useMoveToProject(), { wrapper });
+
+    result.current.mutate({ id: "conv_move", project: "Legacy" });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    expect(queryClient.getQueryData(["projects"])).toEqual([{ id: "p_new", name: "Legacy" }]);
   });
 
   it("unfiles optimistically without needing the projects cache", async () => {

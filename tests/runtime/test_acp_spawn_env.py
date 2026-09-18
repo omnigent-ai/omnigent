@@ -17,8 +17,9 @@ from pathlib import Path
 import pytest
 import yaml
 
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runtime.workflow import _build_acp_spawn_env
-from omnigent.spec.types import AgentSpec, ExecutorSpec, LLMConfig
+from omnigent.spec.types import AgentSpec, ExecutorSpec, LLMConfig, ProviderAuth
 
 _AGENTS = [
     {"name": "Gemini CLI", "command": "gemini --experimental-acp"},
@@ -51,6 +52,7 @@ def _make_spec(
     model: str | None = None,
     acp_agent: object = _MISSING,
     permission_mode: str | None = None,
+    provider: str | None = None,
 ) -> AgentSpec:
     config: dict[str, object] = {"harness": harness}
     if model is not None:
@@ -63,7 +65,12 @@ def _make_spec(
         spec_version=1,
         name="test-acp",
         instructions="You are a test agent.",
-        executor=ExecutorSpec(type="omnigent", config=config, model=model),
+        executor=ExecutorSpec(
+            type="omnigent",
+            config=config,
+            model=model,
+            auth=ProviderAuth(name=provider) if provider else None,
+        ),
         llm=LLMConfig(model=model) if model is not None else None,
     )
 
@@ -340,3 +347,202 @@ def test_no_permission_mode_omits_env_var(_isolate_config: Path) -> None:
     assert "HARNESS_ACP_PERMISSION_MODE" not in _build_acp_spawn_env(
         _make_spec(harness="acp:goose")
     )
+
+
+# ── Curated model list + env denylist forwarding ────────────────────────────
+
+
+def _write_provider_config(tmp_path: Path, models: dict[str, str] | None = None) -> None:
+    provider = {
+        "kind": "gateway",
+        "default": True,
+        "anthropic": {
+            "base_url": "https://gw.example.com/anthropic",
+            "api_key": "sk-anthropic",
+        },
+        "openai": {
+            "base_url": "https://gw.example.com/openai",
+            "api_key": "sk-openai",
+            "wire_api": "chat",
+            "models": models or {},
+        },
+    }
+    (tmp_path / "config.yaml").write_text(
+        yaml.safe_dump({"acp": {"agents": _AGENTS}, "providers": {"bifrost": provider}})
+    )
+
+
+def test_curated_model_list_is_independent_of_selection(_isolate_config: Path) -> None:
+    """Selecting a model never changes the provider's approved catalog."""
+    _write_provider_config(
+        _isolate_config,
+        {"default": "gpt-5.4", "reasoner": "deepseek-v4-pro"},
+    )
+    env = _build_acp_spawn_env(
+        _make_spec(harness="acp:goose", model="deepseek-v4-pro", provider="bifrost")
+    )
+    assert env["HARNESS_ACP_MODEL"] == "deepseek-v4-pro"
+    assert env["HARNESS_ACP_MODEL_LIST"] == "gpt-5.4,deepseek-v4-pro"
+
+
+def test_provider_default_model_pins_launch_model(_isolate_config: Path) -> None:
+    """An explicitly bound ACP agent honors its provider's default."""
+    _write_provider_config(
+        _isolate_config,
+        {"default": "deepseek-v4-pro", "flash": "deepseek-v4-flash"},
+    )
+    env = _build_acp_spawn_env(_make_spec(harness="acp:gemini-cli", provider="bifrost"))
+    assert env["HARNESS_ACP_MODEL"] == "deepseek-v4-pro"
+    assert env["HARNESS_ACP_MODEL_LIST"] == "deepseek-v4-pro,deepseek-v4-flash"
+
+
+def test_unrelated_global_provider_leaves_acp_configuration_unchanged(
+    _isolate_config: Path,
+) -> None:
+    _write_provider_config(_isolate_config, {"default": "model-a", "small": "model-b"})
+    env = _build_acp_spawn_env(_make_spec(harness="acp:gemini-cli"))
+    assert "HARNESS_ACP_MODEL" not in env
+    assert "HARNESS_ACP_MODEL_LIST" not in env
+
+
+def test_default_only_provider_does_not_restrict_agent_models(_isolate_config: Path) -> None:
+    _write_provider_config(_isolate_config, {"default": "model-a", "alias": "model-a"})
+    env = _build_acp_spawn_env(
+        _make_spec(harness="acp:goose", model="model-b", provider="bifrost")
+    )
+    assert env["HARNESS_ACP_MODEL"] == "model-b"
+    assert "HARNESS_ACP_MODEL_LIST" not in env
+
+
+def test_curated_spawn_rejects_unlisted_model(_isolate_config: Path) -> None:
+    _write_provider_config(_isolate_config, {"default": "model-a", "small": "model-b"})
+    with pytest.raises(OmnigentError, match="configured model list"):
+        _build_acp_spawn_env(_make_spec(harness="acp:goose", model="model-c", provider="bifrost"))
+
+
+@pytest.mark.parametrize("embedded", [False, True])
+def test_explicit_acp_databricks_model_is_preserved(
+    _isolate_config: Path,
+    embedded: bool,
+) -> None:
+    agent = {"name": "Helper", "command": "helper --acp", "model": "databricks-model-a"}
+    _write_acp_config(_isolate_config, agents=[agent])
+    spec = _make_spec(harness="acp:helper", acp_agent=agent if embedded else _MISSING)
+    assert _build_acp_spawn_env(spec)["HARNESS_ACP_MODEL"] == "databricks-model-a"
+
+
+def test_embedded_agent_without_model_uses_selected_provider_default(
+    _isolate_config: Path,
+) -> None:
+    _write_provider_config(_isolate_config, {"default": "model-a", "small": "model-b"})
+    env = _build_acp_spawn_env(
+        _make_spec(
+            harness="acp",
+            provider="bifrost",
+            acp_agent={"name": "Helper", "command": "helper --acp"},
+        )
+    )
+    assert env["HARNESS_ACP_MODEL"] == "model-a"
+    assert env["HARNESS_ACP_MODEL_LIST"] == "model-a,model-b"
+
+
+def test_curated_provider_without_default_has_stable_launch_model(_isolate_config: Path) -> None:
+    _write_provider_config(_isolate_config, {"fast": "model-a", "large": "model-b"})
+    env = _build_acp_spawn_env(_make_spec(harness="acp:gemini-cli", provider="bifrost"))
+    assert env["HARNESS_ACP_MODEL"] == "model-a"
+    assert env["HARNESS_ACP_MODEL_LIST"] == "model-a,model-b"
+
+
+@pytest.mark.parametrize("default_source", ["spec", "configured-agent", "embedded-agent"])
+@pytest.mark.parametrize("model_override", [None, "model-b"])
+def test_runner_rejects_unlisted_default_even_with_valid_override(
+    _isolate_config: Path,
+    default_source: str,
+    model_override: str | None,
+) -> None:
+    """A valid pick cannot hide an invalid model that clearing the override would restore."""
+    from omnigent.runner.app import _build_spawn_env_from_spec
+
+    _write_provider_config(_isolate_config, {"default": "model-a", "large": "model-b"})
+    spec = _make_spec(
+        harness="acp:goose",
+        model="old-model" if default_source == "spec" else None,
+        provider="bifrost",
+        acp_agent=(
+            {"name": "Helper", "command": "helper --acp", "model": "old-model"}
+            if default_source == "embedded-agent"
+            else _MISSING
+        ),
+    )
+    with pytest.raises(OmnigentError, match="configured model list") as exc_info:
+        _build_spawn_env_from_spec(spec, "acp", model_override=model_override)
+    rejected_model = "gpt-5.3" if default_source == "configured-agent" else "old-model"
+    assert rejected_model in str(exc_info.value)
+
+
+def test_runner_valid_override_preserves_original_default(_isolate_config: Path) -> None:
+    from omnigent.runner.app import _build_spawn_env_from_spec
+
+    _write_provider_config(_isolate_config, {"default": "model-a", "large": "model-b"})
+    spec = _make_spec(harness="acp:goose", model="model-a", provider="bifrost")
+    env = _build_spawn_env_from_spec(spec, "acp", model_override="model-b")
+    assert env is not None
+    assert env["HARNESS_ACP_MODEL"] == "model-b"
+    assert env["HARNESS_ACP_DEFAULT_MODEL"] == "model-a"
+    assert env["HARNESS_ACP_MODEL_LIST"] == "model-a,model-b"
+    assert spec.executor.model == "model-a"
+
+
+@pytest.mark.parametrize("failure", ["missing-provider", "resolution-error"])
+@pytest.mark.parametrize("model_override", [None, "model-b"])
+def test_runner_rejects_failed_explicit_provider_resolution(
+    _isolate_config: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+    model_override: str | None,
+) -> None:
+    """Neither a pinned model nor an override permits launch without resolving its policy."""
+    from omnigent.runner.app import _build_spawn_env_from_spec
+
+    _write_acp_config(_isolate_config)
+    if failure == "resolution-error":
+
+        def fail_resolution(*_args: object, **_kwargs: object) -> None:
+            raise RuntimeError("provider configuration unavailable")
+
+        monkeypatch.setattr(
+            "omnigent.runtime.workflow._resolve_provider_for_build", fail_resolution
+        )
+    spec = _make_spec(harness="acp:goose", model="model-a", provider="bifrost")
+    expected_code = (
+        ErrorCode.INVALID_INPUT if failure == "missing-provider" else ErrorCode.INTERNAL_ERROR
+    )
+    with pytest.raises(OmnigentError) as error:
+        _build_spawn_env_from_spec(spec, "acp", model_override=model_override)
+    assert error.value.code == expected_code
+    with pytest.raises(OmnigentError):
+        _build_acp_spawn_env(spec)
+
+
+def test_curated_model_list_absent_when_nothing_curated(_isolate_config: Path) -> None:
+    """No models: map anywhere → no HARNESS_ACP_MODEL_LIST (uncurated op)."""
+    _write_acp_config(_isolate_config)
+    env = _build_acp_spawn_env(_make_spec(harness="acp:goose", model="gpt-5.3"))
+    assert "HARNESS_ACP_MODEL_LIST" not in env
+
+
+def test_env_unset_denylist_forwarded(
+    monkeypatch: pytest.MonkeyPatch, _isolate_config: Path
+) -> None:
+    """OMNIGENT_ACP_ENV_UNSET rides the spawn env so the wrap can scrub the CLI env."""
+    _write_acp_config(_isolate_config)
+    monkeypatch.setenv("OMNIGENT_ACP_ENV_UNSET", "ANTHROPIC_AUTH_TOKEN,OPENAI_API_KEY")
+    env = _build_acp_spawn_env(_make_spec(harness="acp:goose"))
+    assert env["HARNESS_ACP_ENV_UNSET"] == "ANTHROPIC_AUTH_TOKEN,OPENAI_API_KEY"
+
+
+def test_env_unset_absent_by_default(_isolate_config: Path) -> None:
+    """Unset operator denylist forwards nothing — no scrubbing (safe default)."""
+    _write_acp_config(_isolate_config)
+    env = _build_acp_spawn_env(_make_spec(harness="acp:goose"))
+    assert "HARNESS_ACP_ENV_UNSET" not in env

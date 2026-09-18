@@ -110,6 +110,7 @@ def binding_app(
     """
     registry = HostRegistry()
     host_store = HostStore(db_uri)
+    registry.launch_authorizer = host_store.admit_launch
     conv_store = SqlAlchemyConversationStore(db_uri)
     app = FastAPI()
     app.include_router(

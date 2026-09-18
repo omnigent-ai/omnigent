@@ -1674,6 +1674,12 @@ def _build_acp_spawn_env(
 
     # Lazily import the config reader — the hot spawn-env path shouldn't pull in
     # the onboarding/config stack eagerly (mirrors the cursor builder).
+    # Also lazy: model_catalog pulls the onboarding provider config eagerly.
+    from omnigent.models.model_catalog import (
+        _acp_launch_model,
+        acp_curated_models,
+        validate_acp_model,
+    )
     from omnigent.onboarding.acp_auth import (
         AcpAgentEntry,
         acp_agents,
@@ -1741,13 +1747,27 @@ def _build_acp_spawn_env(
             # Names only; the harness reads each value from its own environment.
             env["HARNESS_ACP_ENV_PASSTHROUGH"] = ",".join(agent.env_passthrough)
 
-        model = _resolve_spec_model(spec)
-        if model is not None and not model.startswith(("databricks-", "databricks/")):
+        model = _acp_launch_model(spec)
+        validate_acp_model(spec, model)
+        if model is not None:
             env["HARNESS_ACP_MODEL"] = model
-        elif agent.model:
-            env["HARNESS_ACP_MODEL"] = agent.model
     # else: no agent configured — leave HARNESS_ACP_COMMAND unset so the wrap
     # raises a clear request-time error pointing the user at `omnigent setup`.
+
+    # The approved catalog is independent of the selected model.
+    curated = acp_curated_models(spec)
+    if curated:
+        env["HARNESS_ACP_MODEL_LIST"] = ",".join(curated)
+
+    # Credential vars the operator declared off-limits for generic ACP agents.
+    # The vendor CLI activates built-in providers on the mere presence of
+    # their credential (any value), flooding its own picker with entries that
+    # bypass the deployment's curated set. Names are forwarded (never values);
+    # the harness reads each from its own environment before spawning the CLI.
+    # Unset means no scrubbing, matching pi-native's OMNIGENT_PI_ENV_UNSET.
+    denylist = os.environ.get("OMNIGENT_ACP_ENV_UNSET", "").strip()
+    if denylist:
+        env["HARNESS_ACP_ENV_UNSET"] = denylist
 
     # Session workspace (selected working folder). ``None`` lets the acp
     # harness fall back to OMNIGENT_RUNNER_WORKSPACE — see HARNESS_ACP_CWD.

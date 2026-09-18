@@ -313,46 +313,21 @@ def test_observer_hook_stderr_is_logged_incrementally(
     assert len(caplog.records) == record_count
 
 
-def test_missing_transcript_logs_actionable_snapshot_once(
+def test_missing_transcript_warns_then_escalates_once(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A silent observer failure becomes a bounded, session-scoped error."""
+    """A slow observer warns; only a stuck one becomes a session-scoped error."""
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
     record_hook_event(bridge_dir, {"hook_event_name": "UserPromptSubmit"})
     (bridge_dir / "claude-settings.json").write_text("{}", encoding="utf-8")
     diagnostics = forwarder._TranscriptDiscoveryDiagnostics(started_at=100.0)
     warning_at = diagnostics.started_at + forwarder._TRANSCRIPT_DISCOVERY_WARNING_S
+    error_at = diagnostics.started_at + forwarder._TRANSCRIPT_DISCOVERY_ERROR_S
     caplog.set_level(logging.INFO, logger=forwarder.__name__)
 
-    forwarder._observe_transcript_discovery(
-        bridge_dir=bridge_dir,
-        session_id="conv_abc",
-        transcript_path=None,
-        diagnostics=diagnostics,
-        now=warning_at - 0.1,
-    )
-    assert "has not started" not in caplog.text
-
-    for now in (warning_at, warning_at + 30.0):
-        forwarder._observe_transcript_discovery(
-            bridge_dir=bridge_dir,
-            session_id="conv_abc",
-            transcript_path=None,
-            diagnostics=diagnostics,
-            now=now,
-        )
-
-    failures = [record for record in caplog.records if "has not started" in record.getMessage()]
-    assert len(failures) == 1
-    assert failures[0].session_id == "conv_abc"
-    assert "last_hook=UserPromptSubmit" in failures[0].getMessage()
-    assert "observer_stderr_bytes=missing" in failures[0].getMessage()
-    assert "hook_settings=present" in failures[0].getMessage()
-
-    transcript_path = tmp_path / "claude-session.jsonl"
-    for now in (warning_at + 31.0, warning_at + 32.0):
+    def observe(now: float, transcript_path: Path | None = None) -> None:
         forwarder._observe_transcript_discovery(
             bridge_dir=bridge_dir,
             session_id="conv_abc",
@@ -360,8 +335,69 @@ def test_missing_transcript_logs_actionable_snapshot_once(
             diagnostics=diagnostics,
             now=now,
         )
-    discoveries = [record for record in caplog.records if "path discovered" in record.getMessage()]
-    assert len(discoveries) == 1
+
+    def matching(needle: str) -> list[logging.LogRecord]:
+        return [record for record in caplog.records if needle in record.getMessage()]
+
+    observe(warning_at - 0.1)
+    assert not matching("still waiting")
+    assert not matching("has not started")
+
+    # A slow start warns once and stays a warning, however long it is polled.
+    for now in (warning_at, warning_at + 30.0, error_at - 0.1):
+        observe(now)
+    warnings = matching("still waiting")
+    assert len(warnings) == 1
+    assert warnings[0].levelno == logging.WARNING
+    assert "last_hook=UserPromptSubmit" in warnings[0].getMessage()
+    assert "observer_stderr_bytes=missing" in warnings[0].getMessage()
+    assert "hook_settings=present" in warnings[0].getMessage()
+    assert not matching("has not started")
+
+    # Past the escalation deadline it is stuck, not slow: one error, then quiet.
+    for now in (error_at, error_at + 60.0):
+        observe(now)
+    failures = matching("has not started")
+    assert len(failures) == 1
+    assert failures[0].levelno == logging.ERROR
+    assert failures[0].session_id == "conv_abc"
+    assert "last_hook=UserPromptSubmit" in failures[0].getMessage()
+
+    transcript_path = tmp_path / "claude-session.jsonl"
+    for now in (error_at + 61.0, error_at + 62.0):
+        observe(now, transcript_path)
+    assert len(matching("path discovered")) == 1
+
+
+def test_missing_transcript_discovered_after_warning_never_errors(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A hook that reports late is a warning the whole way, never an error."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    (bridge_dir / "claude-settings.json").write_text("{}", encoding="utf-8")
+    diagnostics = forwarder._TranscriptDiscoveryDiagnostics(started_at=0.0)
+    caplog.set_level(logging.INFO, logger=forwarder.__name__)
+
+    for now in (forwarder._TRANSCRIPT_DISCOVERY_WARNING_S, 100.0):
+        forwarder._observe_transcript_discovery(
+            bridge_dir=bridge_dir,
+            session_id="conv_slow",
+            transcript_path=None,
+            diagnostics=diagnostics,
+            now=now,
+        )
+    forwarder._observe_transcript_discovery(
+        bridge_dir=bridge_dir,
+        session_id="conv_slow",
+        transcript_path=tmp_path / "claude-session.jsonl",
+        diagnostics=diagnostics,
+        now=106.0,
+    )
+
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert len([r for r in caplog.records if "path discovered" in r.getMessage()]) == 1
 
 
 @pytest.mark.asyncio
@@ -2605,6 +2641,527 @@ async def test_measured_prefix_never_seeks_past_the_transcript_end(tmp_path: Pat
     )
 
     assert state.byte_offset == transcript_path.stat().st_size
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("start_at_end", [False, True])
+@pytest.mark.parametrize("from_disk", [False, True])
+@pytest.mark.parametrize("skip_prefix", [False, True])
+@pytest.mark.parametrize("destination_delayed", [False, True])
+async def test_relocated_transcript_keeps_the_cursor(
+    tmp_path: Path,
+    start_at_end: bool,
+    from_disk: bool,
+    skip_prefix: bool,
+    destination_delayed: bool,
+) -> None:
+    """
+    A moved transcript is followed from the same cursor, not re-seeded.
+
+    ``EnterWorktree`` moves ``<old-cwd-slug>/<sid>.jsonl`` into the worktree's
+    project dir and Claude keeps appending there. The bytes before the cursor
+    are unchanged, so the fingerprint still matches at the new path and the
+    cursor must carry over: re-seeding at EOF would skip the tool result
+    appended after the move, and byte 0 would re-post the whole turn.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    old_path = tmp_path / "projects" / "-repo" / "sid.jsonl"
+    new_path = tmp_path / "projects" / "-worktree" / "sid.jsonl"
+    old_path.parent.mkdir(parents=True)
+    new_path.parent.mkdir(parents=True)
+    old_path.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": "before-move",
+                "message": {"role": "user", "content": "enter the worktree"},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    forwarded_up_to = old_path.stat().st_size if skip_prefix else 0
+    state = forwarder.TranscriptForwardState(
+        transcript_path=old_path,
+        line_cursor=int(skip_prefix),
+        byte_offset=forwarded_up_to,
+        current_response_id="current-turn",
+        cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(old_path, forwarded_up_to),
+        seen_source_ids=("already-posted:0:message",),
+        settled_response_id="settled-turn",
+        pending_settled_response_id="pending-turn",
+    )
+    forwarder._write_forward_state(bridge_dir, state)
+
+    if destination_delayed:
+        transit_path = old_path.with_name("moving.jsonl")
+        os.replace(old_path, transit_path)
+        waiting = await forwarder._ensure_state_for_transcript(
+            bridge_dir=bridge_dir,
+            state=None if from_disk else state,
+            transcript_path=new_path,
+            start_at_end=start_at_end,
+            session_id="conv_moved",
+        )
+        assert waiting == state
+        assert forwarder._read_forward_state(bridge_dir) == state
+        os.replace(transit_path, new_path)
+    else:
+        os.replace(old_path, new_path)
+    with new_path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(
+                {
+                    "type": "user",
+                    "uuid": "after-move",
+                    "message": {"role": "user", "content": "entered the worktree"},
+                }
+            )
+            + "\n"
+        )
+
+    moved = await forwarder._ensure_state_for_transcript(
+        bridge_dir=bridge_dir,
+        state=None if from_disk else state,
+        transcript_path=new_path,
+        start_at_end=start_at_end,
+        session_id="conv_moved",
+    )
+
+    assert moved == replace(state, transcript_path=new_path)
+    assert forwarder._read_forward_state(bridge_dir) == moved
+    result = forwarder._read_transcript_items_for_state(moved, "claude-native-ui", None)
+    assert [item.source_id for item in result.items] == (
+        [] if skip_prefix else ["before-move:0:message"]
+    ) + ["after-move:0:message"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("start_at_end", [False, True])
+@pytest.mark.parametrize("from_disk", [False, True])
+@pytest.mark.parametrize(
+    "change", ["modified-prefix", "different-session", "different-session-empty-cursor"]
+)
+async def test_unrelated_transcript_does_not_inherit_relocated_cursor(
+    tmp_path: Path, start_at_end: bool, from_disk: bool, change: str
+) -> None:
+    """Changed content or a different session id must retain cold-start semantics."""
+    bridge_dir = tmp_path / "bridge"
+    old_path = tmp_path / "original" / "sid.jsonl"
+    new_path = (
+        tmp_path
+        / "worktree"
+        / ("sid.jsonl" if change == "modified-prefix" else "other-session.jsonl")
+    )
+    old_path.parent.mkdir()
+    new_path.parent.mkdir()
+    prefix = (
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": "before-move",
+                "message": {"role": "user", "content": "enter the worktree"},
+            }
+        )
+        + "\n"
+    )
+    old_path.write_text(prefix, encoding="utf-8")
+    skip_prefix = change != "different-session-empty-cursor"
+    byte_offset = old_path.stat().st_size if skip_prefix else 0
+    state = forwarder.TranscriptForwardState(
+        transcript_path=old_path,
+        line_cursor=int(skip_prefix),
+        byte_offset=byte_offset,
+        cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(old_path, byte_offset),
+        current_response_id="current-turn",
+        seen_source_ids=("already-posted:0:message",),
+        settled_response_id="settled-turn",
+        pending_settled_response_id="pending-turn",
+    )
+    forwarder._write_forward_state(bridge_dir, state)
+    new_path.write_text(
+        prefix.replace("before-move", "other--move") if change == "modified-prefix" else prefix,
+        encoding="utf-8",
+    )
+
+    seeded = await forwarder._ensure_state_for_transcript(
+        bridge_dir=bridge_dir,
+        state=None if from_disk else state,
+        transcript_path=new_path,
+        start_at_end=start_at_end,
+        session_id="conv_different_transcript",
+    )
+
+    expected_offset = new_path.stat().st_size if start_at_end else 0
+    assert seeded == forwarder.TranscriptForwardState(
+        transcript_path=new_path,
+        line_cursor=0,
+        byte_offset=expected_offset,
+        cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(new_path, expected_offset),
+    )
+    assert forwarder._read_forward_state(bridge_dir) == seeded
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("start_at_end", [False, True])
+@pytest.mark.parametrize("from_disk", [False, True])
+@pytest.mark.parametrize("move_at", ["read", "post"])
+@pytest.mark.parametrize("destination_delayed", [False, True])
+async def test_relocation_during_batch_preserves_unread_result_without_reposting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    start_at_end: bool,
+    from_disk: bool,
+    move_at: str,
+    destination_delayed: bool,
+) -> None:
+    """A move during a read/POST preserves both the old cursor and newly posted ids."""
+    bridge_dir = tmp_path / "bridge"
+    old_path = tmp_path / "original" / "sid.jsonl"
+    new_path = tmp_path / "worktree" / "sid.jsonl"
+    old_path.parent.mkdir()
+    new_path.parent.mkdir()
+    prefix = (
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": "user-prompt",
+                "message": {"role": "user", "content": "Enter the worktree"},
+            }
+        )
+        + "\n"
+    )
+    tool_call = (
+        json.dumps(
+            {
+                "type": "assistant",
+                "uuid": "assistant-tool-call",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "enter-worktree-call",
+                            "name": "EnterWorktree",
+                            "input": {"path": str(new_path.parent)},
+                        }
+                    ],
+                },
+            }
+        )
+        + "\n"
+    )
+    tool_result = (
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": "user-tool-result",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "enter-worktree-call",
+                            "content": "Entered worktree after terminal approval",
+                        }
+                    ],
+                },
+            }
+        )
+        + "\n"
+    )
+    old_path.write_text(prefix + tool_call, encoding="utf-8")
+    byte_offset = len(prefix.encode("utf-8"))
+    state = forwarder.TranscriptForwardState(
+        transcript_path=old_path,
+        line_cursor=1,
+        byte_offset=byte_offset,
+        cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(old_path, byte_offset),
+        seen_source_ids=("user-prompt:0:message",),
+    )
+    initial = forwarder._read_transcript_items_for_state(state, "claude-native-ui", None)
+    assert len(initial.items) == 1
+    assert initial.items[0].item_type == "function_call"
+    response_id = initial.current_response_id
+    assert response_id is not None
+    state = replace(
+        state, settled_response_id="older-turn", pending_settled_response_id=response_id
+    )
+    moved_during_batch = False
+    posted_items: list[dict[str, Any]] = []
+
+    def _relocate() -> None:
+        """Move the actual transcript and append the completed tool result once."""
+        nonlocal moved_during_batch
+        if moved_during_batch:
+            return
+        os.replace(old_path, new_path)
+        with new_path.open("a", encoding="utf-8") as handle:
+            handle.write(tool_result)
+        moved_during_batch = True
+
+    if move_at == "read":
+        read_items = forwarder._read_transcript_items_for_state
+
+        def _read_then_move(
+            read_state: forwarder.TranscriptForwardState,
+            agent_name: str,
+            settled_response_id: str | None,
+        ) -> TranscriptReadResult:
+            """Relocate after a real read, before its async caller can persist the cursor."""
+            result = read_items(read_state, agent_name, settled_response_id)
+            _relocate()
+            return result
+
+        monkeypatch.setattr(forwarder, "_read_transcript_items_for_state", _read_then_move)
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        """Record posts and optionally relocate while a tool-call POST is in flight."""
+        payload = json.loads(request.content)
+        if payload["type"] == "external_conversation_item":
+            posted_items.append(payload["data"])
+            if move_at == "post":
+                _relocate()
+        return httpx.Response(202, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_handle_request), base_url="http://test"
+    ) as client:
+        dedupe = forwarder._ForwardDedupeState()
+        forwarded = await forwarder._forward_available_items(
+            client=client,
+            session_id="conv_moved",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            state=state,
+            retry_tracker=forwarder._PostRetryTracker(),
+            dedupe=dedupe,
+        )
+        assert moved_during_batch
+        assert forwarded == replace(
+            state,
+            current_response_id=response_id,
+            seen_source_ids=(*state.seen_source_ids, initial.items[0].source_id),
+        )
+        assert forwarder._read_forward_state(bridge_dir) == forwarded
+        if destination_delayed:
+            transit_path = new_path.with_name("moving.jsonl")
+            os.replace(new_path, transit_path)
+            waiting = await forwarder._ensure_state_for_transcript(
+                bridge_dir=bridge_dir,
+                state=None if from_disk else forwarded,
+                transcript_path=new_path,
+                start_at_end=start_at_end,
+                session_id="conv_moved",
+            )
+            assert waiting == forwarded
+            if from_disk:
+                dedupe = forwarder._ForwardDedupeState()
+            quiet = await forwarder._forward_available_items(
+                client=client,
+                session_id="conv_moved",
+                bridge_dir=bridge_dir,
+                agent_name="claude-native-ui",
+                state=waiting,
+                retry_tracker=forwarder._PostRetryTracker(),
+                dedupe=dedupe,
+            )
+            assert quiet == forwarded
+            assert forwarder._read_forward_state(bridge_dir) == forwarded
+            assert dedupe.pending_settled_response_id == response_id
+            assert dedupe.settled_response_id == "older-turn"
+            os.replace(transit_path, new_path)
+        relocated = await forwarder._ensure_state_for_transcript(
+            bridge_dir=bridge_dir,
+            state=None if from_disk else forwarded,
+            transcript_path=new_path,
+            start_at_end=start_at_end,
+            session_id="conv_moved",
+        )
+        assert relocated == replace(forwarded, transcript_path=new_path)
+        if from_disk:
+            dedupe = forwarder._ForwardDedupeState()
+        completed = await forwarder._forward_available_items(
+            client=client,
+            session_id="conv_moved",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            state=relocated,
+            retry_tracker=forwarder._PostRetryTracker(),
+            dedupe=dedupe,
+        )
+        assert completed.byte_offset == new_path.stat().st_size
+        assert completed.line_cursor == 3
+        assert completed.current_response_id == response_id
+        assert completed.settled_response_id == "older-turn"
+        assert completed.pending_settled_response_id == response_id
+        assert forwarder._read_forward_state(bridge_dir) == completed
+        await forwarder._forward_available_items(
+            client=client,
+            session_id="conv_moved",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            state=completed,
+            retry_tracker=forwarder._PostRetryTracker(),
+            dedupe=dedupe,
+        )
+
+    assert [item["item_type"] for item in posted_items] == [
+        "function_call",
+        "function_call_output",
+    ]
+    assert [item["source_id"] for item in posted_items] == [
+        "assistant-tool-call:0:function_call",
+        "user-tool-result:0:function_call_output",
+    ]
+    assert [item["response_id"] for item in posted_items] == [response_id, response_id]
+    assert posted_items[-1]["item_data"] == {
+        "call_id": "enter-worktree-call",
+        "output": "Entered worktree after terminal approval",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("metadata_prefix", [False, True])
+async def test_partial_transcript_tail_does_not_promote_pending_settle(
+    tmp_path: Path, metadata_prefix: bool
+) -> None:
+    """An incomplete final record is not quiescence and must not become a scheduled wake."""
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    prefix = (
+        json.dumps(
+            {
+                "type": "assistant",
+                "uuid": "before-tail",
+                "message": {"role": "assistant", "content": "Entering the worktree"},
+            }
+        )
+        + "\n"
+    )
+    tail = (
+        json.dumps(
+            {
+                "type": "assistant",
+                "uuid": "final-tail",
+                "message": {"role": "assistant", "content": "Entered the worktree"},
+            }
+        )
+        + "\n"
+    )
+    split_at = len(tail) // 2
+    metadata = json.dumps({"type": "progress"}) + "\n" if metadata_prefix else ""
+    transcript_path.write_text(prefix + metadata + tail[:split_at], encoding="utf-8")
+    byte_offset = len(prefix.encode("utf-8"))
+    state = forwarder.TranscriptForwardState(
+        transcript_path=transcript_path,
+        line_cursor=1,
+        byte_offset=byte_offset,
+        cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(transcript_path, byte_offset),
+        current_response_id="current-turn",
+        seen_source_ids=("before-tail:0:message",),
+        settled_response_id="older-turn",
+        pending_settled_response_id="current-turn",
+    )
+    forwarder._write_forward_state(bridge_dir, state)
+    posted_items: list[dict[str, Any]] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        """Record conversation items without substituting transcript parsing or file reads."""
+        payload = json.loads(request.content)
+        if payload["type"] == "external_conversation_item":
+            posted_items.append(payload["data"])
+        return httpx.Response(202, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_handle_request), base_url="http://test"
+    ) as client:
+        dedupe = forwarder._ForwardDedupeState()
+
+        async def _poll(
+            current_state: forwarder.TranscriptForwardState,
+        ) -> forwarder.TranscriptForwardState:
+            """Forward one real transcript batch with the shared settle latch."""
+            return await forwarder._forward_available_items(
+                client=client,
+                session_id="conv_partial_tail",
+                bridge_dir=bridge_dir,
+                agent_name="claude-native-ui",
+                state=current_state,
+                retry_tracker=forwarder._PostRetryTracker(),
+                dedupe=dedupe,
+            )
+
+        waiting = await _poll(state)
+        expected_offset = len((prefix + metadata).encode("utf-8"))
+        assert waiting == replace(
+            state,
+            line_cursor=1 + int(metadata_prefix),
+            byte_offset=expected_offset,
+            cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(
+                transcript_path, expected_offset
+            ),
+        )
+        assert dedupe.pending_settled_response_id == "current-turn"
+        assert dedupe.settled_response_id == "older-turn"
+        assert not posted_items
+        with transcript_path.open("a", encoding="utf-8") as handle:
+            handle.write(tail[split_at:])
+        completed = await _poll(waiting)
+        assert completed.byte_offset == transcript_path.stat().st_size
+        assert completed.pending_settled_response_id == "current-turn"
+        settled = await _poll(completed)
+        assert settled.pending_settled_response_id is None
+        assert settled.settled_response_id == "current-turn"
+        assert forwarder._read_forward_state(bridge_dir) == settled
+
+    assert len(posted_items) == 1
+    assert posted_items[0]["item_type"] == "message"
+    assert posted_items[0]["source_id"] == "final-tail:0:message"
+    assert posted_items[0]["response_id"] == "current-turn"
+
+
+@pytest.mark.asyncio
+async def test_missing_transcript_persists_new_pending_settle(tmp_path: Path) -> None:
+    """A Stop received during relocation stays durable without falsely settling its turn."""
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(json.dumps({"type": "progress"}) + "\n", encoding="utf-8")
+    byte_offset = transcript_path.stat().st_size
+    state = forwarder.TranscriptForwardState(
+        transcript_path=transcript_path,
+        line_cursor=1,
+        byte_offset=byte_offset,
+        cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(transcript_path, byte_offset),
+        current_response_id="current-turn",
+        settled_response_id="older-turn",
+    )
+    forwarder._write_forward_state(bridge_dir, state)
+    os.replace(transcript_path, tmp_path / "relocated.jsonl")
+    dedupe = forwarder._ForwardDedupeState(pending_settled_response_id="current-turn")
+
+    def _unexpected_request(request: httpx.Request) -> httpx.Response:
+        """A missing transcript cannot produce conversation item posts."""
+        raise AssertionError(f"Unexpected POST to {request.url}")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_unexpected_request), base_url="http://test"
+    ) as client:
+        waiting = await forwarder._forward_available_items(
+            client=client,
+            session_id="conv_missing_stop",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            state=state,
+            retry_tracker=forwarder._PostRetryTracker(),
+            dedupe=dedupe,
+        )
+
+    assert waiting == replace(state, pending_settled_response_id="current-turn")
+    assert forwarder._read_forward_state(bridge_dir) == waiting
+    assert dedupe.pending_settled_response_id == "current-turn"
+    assert dedupe.settled_response_id == "older-turn"
 
 
 @pytest.mark.asyncio
@@ -7954,7 +8511,7 @@ def test_transcript_forward_state_persists_settled_response_id(tmp_path: Path) -
     assert legacy.settled_response_id is None
 
 
-def test_promote_pending_settle_waits_for_turn_quiescence() -> None:
+def test_promote_pending_settle_waits_for_turn_quiescence(tmp_path: Path) -> None:
     """
     A pending settle activates only once its turn has no output in flight.
 
@@ -7963,6 +8520,8 @@ def test_promote_pending_settle_waits_for_turn_quiescence() -> None:
     carries the turn's output would mis-read the tail as a scheduled
     wake and split the answer into a phantom new turn.
     """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
     dedupe = forwarder._ForwardDedupeState()
     dedupe.pending_settled_response_id = "resp_a"
     tail = ClaudeTranscriptItem(
@@ -7971,7 +8530,12 @@ def test_promote_pending_settle_waits_for_turn_quiescence() -> None:
         data={"role": "assistant", "content": [{"type": "output_text", "text": "tail"}]},
         response_id="resp_a",
     )
-    assert forwarder._promote_pending_settle(dedupe, [tail]) is False
+    assert (
+        forwarder._promote_pending_settle(
+            dedupe, [tail], transcript_path=transcript_path, byte_offset=0
+        )
+        is False
+    )
     assert dedupe.settled_response_id is None
     assert dedupe.pending_settled_response_id == "resp_a"
 
@@ -7983,7 +8547,12 @@ def test_promote_pending_settle_waits_for_turn_quiescence() -> None:
         data={"call_id": "c1", "output": "done"},
         response_id="resp_a",
     )
-    assert forwarder._promote_pending_settle(dedupe, [late_result]) is False
+    assert (
+        forwarder._promote_pending_settle(
+            dedupe, [late_result], transcript_path=transcript_path, byte_offset=0
+        )
+        is False
+    )
     assert dedupe.pending_settled_response_id == "resp_a"
 
     # Items for OTHER turns don't defer; a truly quiet batch promotes.
@@ -7993,12 +8562,22 @@ def test_promote_pending_settle_waits_for_turn_quiescence() -> None:
         data={"role": "assistant", "content": [{"type": "output_text", "text": "hi"}]},
         response_id="resp_b",
     )
-    assert forwarder._promote_pending_settle(dedupe, [other]) is True
+    assert (
+        forwarder._promote_pending_settle(
+            dedupe, [other], transcript_path=transcript_path, byte_offset=0
+        )
+        is True
+    )
     assert dedupe.settled_response_id == "resp_a"
     assert dedupe.pending_settled_response_id is None
 
     # Idempotent once promoted.
-    assert forwarder._promote_pending_settle(dedupe, []) is False
+    assert (
+        forwarder._promote_pending_settle(
+            dedupe, [], transcript_path=transcript_path, byte_offset=0
+        )
+        is False
+    )
 
 
 @pytest.mark.asyncio

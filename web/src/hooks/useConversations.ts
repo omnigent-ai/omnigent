@@ -1919,11 +1919,21 @@ export function useTogglePinnedConversation() {
       // it and need the anchor to suppress that self-bump). Anchoring here would
       // instead mark a session with genuine unread activity as read on pin.
       //
-      // Reconcile with the server-confirmed labels (authoritative pin
-      // timestamp). Don't invalidate the pinned query — the `?pinned=true` label
-      // index lags the write, so a refetch would momentarily revert the toggle;
-      // the query's `staleTime` converges it later.
-      patch(updated.id, updated.labels, pinned);
+      // Reconcile only the pin label (authoritative timestamp) onto the
+      // currently cached labels. Don't invalidate the pinned query — the
+      // `?pinned=true` label index lags the write, so a refetch would
+      // momentarily revert the toggle; the query's `staleTime` converges it
+      // later. And don't write this PATCH snapshot's labels wholesale: a
+      // drag-drop files the row and unpins it in one gesture, and the unpin
+      // usually resolves first — its snapshot predates the move's optimistic
+      // project label, so wholesale it would erase that label and bounce the
+      // row into the flat list until the move landed.
+      const base = findRow(updated.id)?.labels ?? updated.labels;
+      const pinValue = updated.labels[PINNED_LABEL_KEY] ?? base[PINNED_LABEL_KEY];
+      const labels = pinned
+        ? { ...base, ...(pinValue !== undefined ? { [PINNED_LABEL_KEY]: pinValue } : {}) }
+        : Object.fromEntries(Object.entries(base).filter(([k]) => k !== PINNED_LABEL_KEY));
+      patch(updated.id, labels, pinned);
     },
   });
 }
@@ -2110,11 +2120,13 @@ export async function moveConversationToProject(
  * onto every cached copy of the row and it regroups on the next frame — rather
  * than after the PATCH + list refetches round-trip, which parked the row in
  * its old section for the whole request (multi-second against a slow server).
- * The target id is read from the cached `["projects"]` list, the same data the
- * move UI rendered its targets from. A name with no cached first-class id yet
- * (label-only folder or brand-new name) is created over the network inside the
- * mutation, so that path skips the overlay and regroups on the reconcile
- * below, exactly as before.
+ * The target is read from the cached `["projects"]` list, the same data the
+ * move UI rendered its targets from: a first-class target overlays its id, and
+ * a label-only folder (cached with a null id — its first-class row is created
+ * over the network inside the mutation) overlays the legacy label instead,
+ * which the sidebar dual-reads into the same folder. Only a name absent from
+ * the cache (a brand-new project) skips the overlay and regroups on the
+ * reconcile below — there is no folder to regroup into yet.
  *
  * `onSuccess` still invalidates: membership pagination, project counts, and
  * ordering are server-owned, and those refetches start after the PATCH commits
@@ -2200,15 +2212,15 @@ export function useMoveToProject() {
     mutationFn: ({ id, project }: { id: string; project: string }) =>
       moveConversationToProject(id, project),
     onMutate: async ({ id, project }) => {
-      // `""` unfiles (no id needed); a file target must resolve to a cached
-      // first-class id for the overlay to be truthful about the outcome. The
-      // `?? undefined` folds a label-only folder's null id into "unknown".
+      // `""` unfiles (no id needed); a file target must exist in the cached
+      // projects list for the overlay to be truthful about the outcome — an
+      // uncached name (brand-new project) has no folder to regroup into.
       const target =
         project === ""
           ? null
           : (queryClient
               .getQueryData<ProjectSummary[]>(["projects"])
-              ?.find((p) => p.name === project)?.id ?? undefined);
+              ?.find((p) => p.name === project) ?? undefined);
       if (target === undefined) return undefined;
       // Cancel in-flight list refetches so a response that started before the
       // overlay can't resolve after it and snap the row back to its old spot.
@@ -2229,10 +2241,17 @@ export function useMoveToProject() {
         }),
         backfill: queryClient.getQueryData<Conversation | null>(["conversation-backfill", id]),
       };
-      const labels = Object.fromEntries(
+      const baseLabels = Object.fromEntries(
         Object.entries(row.labels).filter(([labelKey]) => labelKey !== PROJECT_LABEL_KEY),
       );
-      overlayMembership(row, target, labels, project === "" ? null : project);
+      // A label-only folder has no first-class id to overlay yet, so its
+      // membership is written through the legacy label — the sidebar
+      // dual-reads it into the same folder the eventual PATCH files into.
+      const labels =
+        target !== null && target.id === null
+          ? { ...baseLabels, [PROJECT_LABEL_KEY]: project }
+          : baseLabels;
+      overlayMembership(row, target?.id ?? null, labels, project === "" ? null : project);
       return previous;
     },
     onError: (_err, { id }, previous) => {
@@ -2244,8 +2263,20 @@ export function useMoveToProject() {
         queryClient.setQueryData(["conversation-backfill", id], previous.backfill);
       }
     },
-    onSuccess: (updated) => {
+    onSuccess: (updated, { project }) => {
       markConversationSeen(updated.id, updated.updated_at);
+      // Filing can promote a label-only folder to first-class inside the
+      // mutation. Seed the confirmed id into the cached projects list before
+      // the refetches race: a conversations refetch can land first with the
+      // row's legacy label already cleared, and an id-less cached folder
+      // couldn't claim that row by `project_id` — it would flash into the
+      // flat list until the projects refetch landed.
+      const confirmedId = updated.project_id;
+      if (project !== "" && confirmedId != null) {
+        queryClient.setQueryData<ProjectSummary[]>(["projects"], (old) =>
+          old?.map((p) => (p.name === project && p.id === null ? { ...p, id: confirmedId } : p)),
+        );
+      }
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
       // Moving into/out of a project changes both folders' paginated lists.

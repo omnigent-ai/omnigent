@@ -40,7 +40,7 @@ export function useSessionModelLabel(
   const key = confirmed ? getSessionModelLabelCacheKey(scope, raw) : null;
   const catalogReady = options.length > 0;
   const option = options.find((row) => row.id === raw) ?? options.find((row) => row.model === raw);
-  const displayName = option?.displayName ?? null;
+  const displayName = option?.displayName != null ? nativeModelLabel(option) : null;
   const stored = useMemo(() => readSessionModelLabelCache(key), [key]);
   const remembered = useRef<{ key: string; displayName: string | null } | null>(null);
   const cached =
@@ -57,7 +57,9 @@ export function useSessionModelLabel(
     scope.harness != null && isCodexHarness(scope.harness)
       ? findNativeModelOption(hostOptions, raw)
       : (hostOptions.find((row) => row.id === raw) ?? hostOptions.find((row) => row.model === raw));
-  const fallbackLabel = cached ?? (hostOption ? nativeModelLabel(hostOption) : null);
+  const cachedLabel =
+    cached !== null && raw !== null ? nativeModelLabel({ id: raw, displayName: cached }) : null;
+  const fallbackLabel = cachedLabel ?? (hostOption ? nativeModelLabel(hostOption) : null);
   const waiting = expectsCatalog && raw !== null && !catalogReady && fallbackLabel === null;
   // Finishing identity bootstrap must not restart an in-flight metadata wait.
   const target = JSON.stringify([scope.sessionId, scope.hostId, scope.agentId, scope.harness, raw]);

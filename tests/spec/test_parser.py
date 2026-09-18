@@ -11,10 +11,15 @@ from unittest.mock import Mock
 import pytest
 import yaml
 
-from omnigent.errors import OmnigentError
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.inner import sandbox
 from omnigent.spec import parser
-from omnigent.spec.parser import _parse_skill, discover_host_skills, parse
+from omnigent.spec.parser import (
+    AgentImageConfigMissingError,
+    _parse_skill,
+    discover_host_skills,
+    parse,
+)
 from omnigent.spec.types import ApiKeyAuth, DatabricksAuth, ProviderAuth, SharePolicy
 
 
@@ -53,6 +58,21 @@ def test_parse_minimal(agent_dir: Path) -> None:
 def test_parse_missing_config_yaml(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError, match=r"config.yaml not found"):
         parse(tmp_path)
+
+
+def test_parse_missing_config_yaml_is_a_coded_not_found(tmp_path: Path) -> None:
+    """A missing config.yaml must not reach the server as an unhandled 500.
+
+    Kept a ``FileNotFoundError`` as well, so the documented contract and any
+    caller already catching that still hold.
+    """
+    with pytest.raises(AgentImageConfigMissingError) as caught:
+        parse(tmp_path)
+
+    assert isinstance(caught.value, OmnigentError)
+    assert isinstance(caught.value, FileNotFoundError)
+    assert caught.value.code == ErrorCode.NOT_FOUND
+    assert caught.value.http_status == 404
 
 
 def test_parse_non_mapping_config(tmp_path: Path) -> None:
@@ -501,7 +521,7 @@ def test_read_contained_file_windows_boundary(
     else:
         assert result == "Instruction file contents."
         path_factory.assert_called_once_with(resolved_candidate)
-        candidate.read_text.assert_called_once_with()
+        candidate.read_text.assert_called_once_with(encoding="utf-8")
 
 
 def test_parse_instructions_rejects_path_traversal(tmp_path: Path) -> None:

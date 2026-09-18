@@ -2581,6 +2581,10 @@ class SessionForkRequest(BaseModel):
     host_type: Literal["external", "managed"] = "external"
     sandbox_provider: str | None = None
     workspace: str | None = None
+    # Marks the fork as a side chat: it is stamped with the side-chat label so
+    # it is hidden from the left sidebar (it surfaces only as a Workspace-rail
+    # side-chat tab). The fork otherwise behaves normally (its own runner).
+    side_chat: bool = False
 
     model_config = ConfigDict(extra="forbid")
 

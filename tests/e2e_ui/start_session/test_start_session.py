@@ -1850,13 +1850,13 @@ async def _drive_managed_sandbox_after_slow_info(base_url: str, session_id: str)
 def test_start_session_select_model_and_effort(seeded_session: tuple[str, str]) -> None:
     """Picking a model + reasoning effort rides along to the create call.
 
-    For the Claude-native agent the Edit menu shows model/effort
-    choices that start with NOTHING selected — no model/effort default is
-    forced, so an untouched picker omits the override and Claude Code keeps its
-    own configured model. Explicitly selecting "Opus" and "High" must (a) update
-    those selects as immediate feedback and (b) reach ``POST /v1/sessions`` as
-    ``model_override: "opus"`` + ``reasoning_effort: "high"`` (the runner reads
-    them as ``--model`` / ``--effort`` at terminal launch).
+    For the Claude-native agent the Edit menu starts on its explicit default
+    entries, so an untouched picker omits the overrides and Claude Code keeps
+    its own configured model and effort. Explicitly selecting "Opus" and
+    "High" must (a) update those selects as immediate feedback and (b) reach
+    ``POST /v1/sessions`` as ``model_override: "opus"`` +
+    ``reasoning_effort: "high"`` (the runner reads them as ``--model`` /
+    ``--effort`` at terminal launch).
     """
     base_url, session_id = seeded_session
     _run_in_fresh_loop(_drive_model_effort(base_url, session_id))
@@ -1921,7 +1921,7 @@ async def _drive_model_effort(base_url: str, session_id: str) -> None:
             await page.get_by_test_id("new-chat-landing-input").wait_for(
                 state="visible", timeout=30_000
             )
-            # No override is forced until the user selects a model or effort.
+            # Default entries are selected without forcing an override.
             await _open_entry_models(page, "ag_claude_e2e")
             await _expect_model_menu_without_advanced_settings(page)
             model = page.locator(
@@ -1931,10 +1931,10 @@ async def _drive_model_effort(base_url: str, session_id: str) -> None:
                 '[data-testid^="new-chat-landing-agent-effort-"][aria-checked="true"]'
             )
             await expect(model).to_contain_text("Harness default")
-            await expect(effort).to_have_count(0)
+            await expect(effort).to_contain_text("Default")
             await expect(
                 page.get_by_role("menuitemcheckbox", name="Default", exact=True)
-            ).to_have_count(0)
+            ).to_have_count(1)
 
             # Model and effort picks commit immediately using the live host catalog.
             await page.get_by_role("menuitemcheckbox", name="Opus 4.8", exact=True).click()

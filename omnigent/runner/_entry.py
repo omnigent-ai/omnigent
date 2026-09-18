@@ -1595,6 +1595,7 @@ def create_app(
         app.state.subagent_launch_reaper = asyncio.create_task(
             run_subagent_launch_reaper(
                 mark_terminal=app.state.mark_subagent_terminal_and_wake,
+                reconcile_pending=app.state.reconcile_pending_subagent_results,
             ),
             name="runner-subagent-launch-reaper",
         )

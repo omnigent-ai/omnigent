@@ -50,12 +50,15 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
+from enum import Enum
 from typing import Any
 
+from omnigent.db.account_authority import account_authority_scope
 from omnigent.db.db_models import workspace_scope
 from omnigent.entities import Conversation, ScheduledTask
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_LOCAL
+from omnigent.server.host_registry import host_owner_scope
 from omnigent.server.routes._session_create_validation import (
     validate_existing_host_workspace,
     validate_session_agent,
@@ -98,6 +101,12 @@ _IN_FLIGHT_TASKS: set[tuple[int, str]] = set()
 # orchestration can be unit-tested without a live host/runner.
 LaunchDispatch = Callable[[Conversation, ScheduledTask], Awaitable[None]]
 ConnectedHostPreflight = Callable[[ScheduledTask], Awaitable[None]]
+
+
+class _FireResult(Enum):
+    STARTED = "started"
+    INACTIVE = "inactive"
+    IN_FLIGHT = "in_flight"
 
 
 class _CannotLaunchScheduledFire(RuntimeError):
@@ -143,7 +152,7 @@ def build_on_fire(
     deps: FireDeps,
     *,
     launch_dispatch: LaunchDispatch | None = None,
-) -> Callable[[int, str], Awaitable[None]]:
+) -> Callable[[int, str], Awaitable[bool]]:
     """Build the real ``on_fire`` callback bound to server ``deps``.
 
     :param deps: Server stores/registries the fire path operates on.
@@ -151,7 +160,8 @@ def build_on_fire(
         prompt for a created session. Defaults to the real connected-host
         implementation; tests inject a fake.
     :returns: An ``async on_fire(workspace_id, scheduled_task_id)`` suitable for
-        :class:`ScheduledTaskScheduler`.
+        :class:`ScheduledTaskScheduler`. False tells it to remove an inactive
+        task's timer; an overlapping fire keeps its next occurrence armed.
     """
     preflight: ConnectedHostPreflight | None = None
     if launch_dispatch is None:
@@ -160,8 +170,8 @@ def build_on_fire(
     else:
         dispatch = launch_dispatch
 
-    async def on_fire(workspace_id: int, scheduled_task_id: str) -> None:
-        await _trigger_fire(
+    async def on_fire(workspace_id: int, scheduled_task_id: str) -> bool:
+        result = await _trigger_fire(
             deps,
             workspace_id,
             scheduled_task_id,
@@ -169,6 +179,7 @@ def build_on_fire(
             preflight,
             require_active=True,
         )
+        return result is not _FireResult.INACTIVE
 
     return on_fire
 
@@ -205,7 +216,7 @@ def build_run_now(
         dispatch = launch_dispatch
 
     async def run_now(workspace_id: int, scheduled_task_id: str) -> bool:
-        return await _trigger_fire(
+        result = await _trigger_fire(
             deps,
             workspace_id,
             scheduled_task_id,
@@ -213,6 +224,7 @@ def build_run_now(
             preflight,
             require_active=False,
         )
+        return result is _FireResult.STARTED
 
     return run_now
 
@@ -225,7 +237,7 @@ async def _trigger_fire(
     preflight: ConnectedHostPreflight | None,
     *,
     require_active: bool,
-) -> bool:
+) -> _FireResult:
     """Synchronously guard a fire, then dispatch the run in the background.
 
     Shared by the scheduled fire path (``require_active=True``) and the manual
@@ -234,8 +246,8 @@ async def _trigger_fire(
     fire-and-forget so the caller (scheduler timer or ``POST /run`` route)
     returns immediately.
 
-    :returns: ``True`` if a background fire was started, ``False`` if skipped
-        (row gone / not active when required / already in flight).
+    :returns: Whether work started, the task is inactive, or a fire is already
+        in flight. Only an inactive task should lose its recurring timer.
     """
     # Re-read the row: never trust the caller. A deleted (or, for the scheduled
     # path, non-active) row is a logged no-op done synchronously.
@@ -243,19 +255,19 @@ async def _trigger_fire(
         task = await asyncio.to_thread(deps.scheduled_task_store.get, scheduled_task_id)
         if task is None:
             _logger.info("scheduled fire: task %s no longer exists — skipping", scheduled_task_id)
-            return False
-        if require_active and task.state != "active":
+            return _FireResult.INACTIVE
+        if task.state == "deleted" or (require_active and task.state != "active"):
             _logger.info(
                 "scheduled fire: task %s is %s (not active) — skipping",
                 scheduled_task_id,
                 task.state,
             )
-            return False
+            return _FireResult.INACTIVE
 
     key = (workspace_id, scheduled_task_id)
     if key in _IN_FLIGHT_TASKS:
         _logger.info("scheduled fire: task %s already in flight — skipping", scheduled_task_id)
-        return False
+        return _FireResult.IN_FLIGHT
     _IN_FLIGHT_TASKS.add(key)
 
     # Fire-and-forget: the session create + launch runs in the background so the
@@ -268,7 +280,7 @@ async def _trigger_fire(
     _PENDING_FIRES.add(fire_task)
     fire_task.add_done_callback(_PENDING_FIRES.discard)
     fire_task.add_done_callback(lambda _task: _IN_FLIGHT_TASKS.discard(key))
-    return True
+    return _FireResult.STARTED
 
 
 async def _run_fire(
@@ -290,7 +302,7 @@ async def _run_fire(
         if task is None:
             _logger.info("scheduled fire: task %s no longer exists — skipping", scheduled_task_id)
             return
-        if require_active and task.state != "active":
+        if task.state == "deleted" or (require_active and task.state != "active"):
             _logger.info(
                 "scheduled fire: task %s is %s (not active) — skipping",
                 scheduled_task_id,
@@ -300,7 +312,11 @@ async def _run_fire(
 
         scheduled_at = int(time.time())
         try:
-            await _run_fire_for_task(deps, task, dispatch, preflight, scheduled_at)
+            with (
+                account_authority_scope(task.user_id, task.account_generation),
+                host_owner_scope(task.user_id, task.account_generation),
+            ):
+                await _run_fire_for_task(deps, task, dispatch, preflight, scheduled_at)
         except Exception:
             _logger.exception("scheduled fire: task %s failed", task.id)
 
@@ -329,6 +345,24 @@ async def _run_fire_for_task(
                 "skipped",
                 error=f"execution_target {task.execution_target!r} not supported yet",
                 error_code="unsupported_target",
+            )
+            return
+
+        if await _owner_is_deleted(deps, task):
+            _logger.warning(
+                "scheduled fire: task %s owner %r registration is inactive; disabling task",
+                task.id,
+                task.user_id,
+            )
+            await asyncio.to_thread(deps.scheduled_task_store.update, task.id, state="deleted")
+            await _record_run(
+                deps,
+                task,
+                None,
+                scheduled_at,
+                status="failed",
+                error=f"owner {task.user_id!r} registration is no longer active; task disabled",
+                error_code="owner_deleted",
             )
             return
 
@@ -481,6 +515,19 @@ async def _run_fire_for_task(
         _logger.exception("scheduled fire: task %s failed", task.id)
 
 
+async def _owner_is_deleted(deps: FireDeps, task: ScheduledTask) -> bool:
+    """True when the task's captured owner registration is no longer active.
+
+    A NULL owner (single-user / OSS) always resolves to
+    :data:`RESERVED_USER_LOCAL` and is never considered deleted; without a
+    permission store there is no account to check against.
+    """
+    if task.user_id is None or deps.permission_store is None:
+        return False
+    owner = await asyncio.to_thread(deps.permission_store.get_user, task.user_id)
+    return owner is None or owner.account_generation != task.account_generation
+
+
 async def _resolve_effective_task(deps: FireDeps, task: ScheduledTask) -> ScheduledTask:
     """Resolve the host/workspace the fire actually launches against.
 
@@ -540,6 +587,8 @@ async def _resolve_owner_host(deps: FireDeps, task: ScheduledTask) -> str:
     owner = task.user_id or RESERVED_USER_LOCAL
     hosts = await asyncio.to_thread(deps.host_store.list_hosts, owner)
     for host in hosts:
+        if task.user_id is not None and host.account_generation != task.account_generation:
+            continue
         if deps.host_registry.get(host.host_id) is not None:
             return str(host.host_id)
     raise _CannotLaunchScheduledFire(
@@ -789,14 +838,18 @@ async def _grant_owner(deps: FireDeps, task: ScheduledTask, conversation_id: str
     """Write the LEVEL_OWNER grant so the run is visible to its owner.
 
     A NULL ``user_id`` (single-user / OSS) resolves to
-    :data:`RESERVED_USER_LOCAL`. When ``permission_store`` is ``None`` (no auth
-    configured) this is a no-op — the session is still accessible because auth
-    is disabled system-wide.
+    :data:`RESERVED_USER_LOCAL`, whose row is created on demand. A real owner's
+    row is never (re)created here — a deleted account must stay deleted. When
+    ``permission_store`` is ``None`` (no auth configured) this is a no-op — the
+    session is still accessible because auth is disabled system-wide.
     """
     if deps.permission_store is None:
         return
-    owner = task.user_id or RESERVED_USER_LOCAL
-    await asyncio.to_thread(deps.permission_store.ensure_user, owner)
+    if task.user_id is None:
+        await asyncio.to_thread(deps.permission_store.ensure_user, RESERVED_USER_LOCAL)
+        owner = RESERVED_USER_LOCAL
+    else:
+        owner = task.user_id
     await asyncio.to_thread(deps.permission_store.grant, owner, conversation_id, LEVEL_OWNER)
 
 
@@ -935,6 +988,11 @@ async def _authorize_pinned_host(deps: FireDeps, task: ScheduledTask, host_id: s
         raise _CannotLaunchScheduledFire(
             f"connected host {host_id!r} is not owned by the scheduled task owner",
             error_code="host_not_owned",
+        )
+    if task.user_id is not None and host.account_generation != task.account_generation:
+        raise _CannotLaunchScheduledFire(
+            f"connected host {host_id!r} belongs to a different account registration",
+            error_code="host_authority_revoked",
         )
 
 

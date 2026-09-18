@@ -311,6 +311,24 @@ def test_hello_frame_without_interactive_shells_is_backward_compatible() -> None
     )
     assert isinstance(decoded, HostHelloFrame)
     assert decoded.interactive_shells is None
+    # An older host advertises no capabilities — the server must read this as an
+    # empty set (feature unsupported), not choke on the missing key.
+    assert decoded.capabilities == []
+
+
+def test_hello_frame_capabilities_round_trip() -> None:
+    """Advertised capability tokens survive encode → decode."""
+    from omnigent.host.frames import CAP_CODEX_SIDE_CHAT
+
+    original = HostHelloFrame(
+        version="0.1.0",
+        frame_protocol_version=1,
+        name="new-host",
+        capabilities=[CAP_CODEX_SIDE_CHAT],
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostHelloFrame)
+    assert decoded.capabilities == [CAP_CODEX_SIDE_CHAT]
 
 
 def test_hello_frame_empty_runners() -> None:

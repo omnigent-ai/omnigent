@@ -148,6 +148,8 @@ export type Bubble =
   | {
       kind: "user";
       itemId: string;
+      /** Queued input that does not yet have a persisted transcript item. */
+      pending?: boolean;
       content: MessageContentBlock[];
       /** Human author email, when known. */
       createdBy?: string;
@@ -1785,6 +1787,7 @@ export function bubblesEqual(a: Bubble, b: Bubble): boolean {
   if (a.kind === "user" && b.kind === "user") {
     if (
       a.itemId !== b.itemId ||
+      Boolean(a.pending) !== Boolean(b.pending) ||
       a.createdBy !== b.createdBy ||
       a.createdAtS !== b.createdAtS ||
       a.stableKey !== b.stableKey ||

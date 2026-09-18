@@ -30,6 +30,7 @@ from sqlalchemy.orm import QueryableAttribute, Session, load_only
 from sqlalchemy.sql.selectable import Subquery
 
 from omnigent._wrapper_labels import UI_MODE_LABEL_KEY, WRAPPER_LABEL_KEY
+from omnigent.db.account_authority import AccountAuthority, require_active_account
 from omnigent.db.converters import sql_agent_to_entity
 from omnigent.db.db_models import (
     LABEL_VALUE_MAX_LEN,
@@ -42,6 +43,7 @@ from omnigent.db.db_models import (
     SqlPolicy,
     SqlProject,
     SqlSessionPermission,
+    SqlUser,
     SqlUserDailyCost,
     current_workspace_id,
     uuid_to_bytes,
@@ -1644,6 +1646,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         now = now_epoch()
 
         def write(session: Session) -> None:
+            require_active_account(session, user_id)
             dialect = session.bind.dialect.name if session.bind is not None else ""
             if dialect == "sqlite" or is_postgresql_family(dialect):
                 self._upsert_daily_cost_dialect(session, dialect, user_id, day_utc, delta_usd, now)
@@ -1809,6 +1812,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         now = now_epoch()
 
         def write(session: Session) -> None:
+            require_active_account(session, user_id)
             dialect = session.bind.dialect.name if session.bind is not None else ""
             if dialect == "sqlite" or is_postgresql_family(dialect):
                 # Typed as Any to sidestep the mypy variance between the
@@ -1862,36 +1866,50 @@ class SqlAlchemyConversationStore(ConversationStore):
             write,
         )
 
-    def get_session_owner(self, conversation_id: str) -> str | None:
+    def get_session_owner(self, conversation_id: str, *, owner_only: bool = False) -> str | None:
         """
-        Return the user id that owns a session (its creator).
+        Return the highest-privilege non-public grantee of a session.
 
-        Reads ``session_permissions`` and returns the
-        highest-``level`` grantee: the creator's ``LEVEL_OWNER``
-        (4) grant outranks any read (1) / edit (2) / manage (3)
-        grant, so ``ORDER BY level DESC LIMIT 1`` yields the owner
-        without hardcoding the owner-level integer. The
-        ``"__public__"`` public-access sentinel is excluded, so a
-        session that only carries a public grant (and no real
-        owner) returns ``None`` rather than the sentinel.
+        By default, lower-level grants are a fallback when no owner grant exists,
+        preserving cost attribution for shared sessions. Use ``owner_only=True``
+        for ownership checks; sharing alone does not establish ownership.
 
-        :param conversation_id: The session to look up, e.g.
-            ``"conv_abc123"``.
-        :returns: The owner's user id, e.g. ``"alice@example.com"``,
-            or ``None`` when the session has no real (non-public)
-            permission grants.
+        :param conversation_id: The session to look up, e.g. ``"conv_abc123"``.
+        :param owner_only: Require an explicit owner-level grant.
+        :returns: The grantee's user id, or ``None`` if no qualifying grant exists.
         """
-        from omnigent.server.auth import RESERVED_USER_PUBLIC
+        owner = self.get_session_owner_authority(conversation_id, owner_only=owner_only)
+        return owner.user_id if owner is not None else None
 
+    def get_session_owner_authority(
+        self, conversation_id: str, *, owner_only: bool = False
+    ) -> AccountAuthority | None:
+        """Read the owner grant and registration together, including external identities."""
+        from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_PUBLIC
+
+        query = (
+            select(SqlSessionPermission.user_id, SqlUser.account_generation)
+            .outerjoin(
+                SqlUser,
+                and_(
+                    SqlUser.workspace_id == SqlSessionPermission.workspace_id,
+                    SqlUser.id == SqlSessionPermission.user_id,
+                ),
+            )
+            .where(SqlSessionPermission.workspace_id == current_workspace_id())
+            .where(SqlSessionPermission.conversation_id == conversation_id)
+            .where(SqlSessionPermission.user_id != RESERVED_USER_PUBLIC)
+            .where(SqlUser.deleted_at.is_(None))
+            .order_by(SqlSessionPermission.level.desc())
+            .limit(1)
+        )
+        if owner_only:
+            query = query.where(SqlSessionPermission.level >= LEVEL_OWNER)
         with self._session("select_session_owner") as session:
-            return session.execute(
-                select(SqlSessionPermission.user_id)
-                .where(SqlSessionPermission.workspace_id == current_workspace_id())
-                .where(SqlSessionPermission.conversation_id == conversation_id)
-                .where(SqlSessionPermission.user_id != RESERVED_USER_PUBLIC)
-                .order_by(SqlSessionPermission.level.desc())
-                .limit(1)
-            ).scalar_one_or_none()
+            row = session.execute(query).one_or_none()
+            if row is None:
+                return None
+            return AccountAuthority(row.user_id, row.account_generation, current_workspace_id())
 
     def search(
         self,
@@ -3614,7 +3632,9 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         run_write_transaction(self._session_immediate, "set_pending_elicitation_count", write)
 
-    def replace_runner_id(self, conversation_id: str, runner_id: str) -> Conversation:
+    def replace_runner_id(
+        self, conversation_id: str, runner_id: str, *, expected_runner_id: str | None = None
+    ) -> Conversation:
         """
         Atomically overwrite ``conversations.runner_id``.
 
@@ -3637,7 +3657,19 @@ class SqlAlchemyConversationStore(ConversationStore):
                 raise ConversationNotFoundError(
                     f"conversation {conversation_id!r} does not exist",
                 )
-            meta.runner_id = runner_id
+            if expected_runner_id is None:
+                meta.runner_id = runner_id
+            else:
+                session.execute(
+                    update(SqlConversationMetadata)
+                    .where(
+                        SqlConversationMetadata.workspace_id == current_workspace_id(),
+                        SqlConversationMetadata.id == conversation_id,
+                        SqlConversationMetadata.runner_id == expected_runner_id,
+                    )
+                    .values(runner_id=runner_id)
+                )
+                session.refresh(meta)
             return meta
 
         meta = run_write_transaction(self._session_immediate, "replace_runner_id", write)

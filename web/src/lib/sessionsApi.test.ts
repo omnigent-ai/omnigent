@@ -768,7 +768,7 @@ describe("runner binding", () => {
     expect(JSON.parse(init.body as string)).toEqual({ subagent_routing_override: null });
   });
 
-  it("forwards silent:true so bind-time auto-apply skips runner forward", async () => {
+  it("forwards silent:true for persistence-only session updates", async () => {
     fetchMock.mockResolvedValueOnce(
       mockJsonResponse({
         id: "conv_abc",

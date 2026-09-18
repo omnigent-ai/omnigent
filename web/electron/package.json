@@ -35,6 +35,7 @@
   "devDependencies": {
     "electron": "^42.3.2",
     "electron-builder": "^26.0.0",
+    "jsdom": "^29.1.1",
     "playwright": "^1.62.1"
   },
   "build": {
@@ -62,6 +63,7 @@
     "files": [
       "src/**/*",
       "about/**/*",
+      "workspace-picker/**/*",
       "setup/**/*",
       "arca-connect/**/*",
       "server-selector-v2/**/*",

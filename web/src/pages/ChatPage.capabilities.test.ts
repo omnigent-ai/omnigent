@@ -93,7 +93,26 @@ describe("shouldShowModelPicker", () => {
     expect(shouldShowModelPicker({ labels: { "omnigent.wrapper": "devin-native-ui" } })).toBe(true);
   });
 
+  it("shows the picker for generic ACP sessions with a curated catalog", () => {
+    const catalog = [{ id: "gpt-5.4" }, { id: "claude-fable-5" }];
+    expect(shouldShowModelPicker({ labels: {}, harness: "acp" }, catalog)).toBe(true);
+    expect(modelPickerKindForConv({ labels: {}, harness: "acp" }, catalog)).toBe("acp");
+  });
+
+  it("hides the ACP picker until there are models to choose between", () => {
+    const conv = { labels: {}, harness: "acp" };
+    expect(shouldShowModelPicker(conv)).toBe(false);
+    expect(shouldShowModelPicker(conv, [])).toBe(false);
+    expect(shouldShowModelPicker(conv, [{ id: "gpt-5.4" }])).toBe(false);
+  });
+
   it("hides the picker for other wrappers and missing labels (fail closed)", () => {
+    // A label-less session resolves its wrapper label from the harness
+    // (nativeCodingAgentForHarness), so the negative cases pin harnesses that
+    // map to no picker family.
+    expect(shouldShowModelPicker({ labels: {}, harness: "claude-sdk" })).toBe(false);
+    expect(shouldShowModelPicker({ labels: {}, harness: "pi" })).toBe(false);
+    expect(shouldShowModelPicker({ labels: {}, harness: null })).toBe(false);
     // WHY: a wrapper-looking string is not a resolved harness, and
     // pre-hydration rows still have no capability evidence.
     expect(shouldShowModelPicker({ labels: { "omnigent.wrapper": "codex-native" } })).toBe(false);

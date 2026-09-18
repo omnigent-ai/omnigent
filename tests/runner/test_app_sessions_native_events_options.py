@@ -2160,6 +2160,12 @@ async def _post_model_change_with_status_sequence(
     monkeypatch: pytest.MonkeyPatch,
     status_values: list[str | None],
     pane_status: str | None = None,
+    *,
+    model: str = "claude-opus-4-7",
+    picker_values: tuple[str, ...] = (),
+    picker_source: str = "bridge",
+    empty_session_catalog: bool = False,
+    stored_catalog_rows: list[dict[str, object]] | None = None,
 ) -> Any:
     """Run one claude-native ``model_change`` with a scripted status file.
 
@@ -2173,6 +2179,8 @@ async def _post_model_change_with_status_sequence(
     from omnigent.runner import app as runner_app_module
     from omnigent.spec.types import ExecutorSpec
 
+    commands: list[str] = []
+
     def _fake_inject(
         bridge_dir: Any,
         *,
@@ -2181,7 +2189,8 @@ async def _post_model_change_with_status_sequence(
         auto_confirm: bool = False,
         confirm_hint: str | None = None,
     ) -> None:
-        del bridge_dir, command, timeout_s, auto_confirm, confirm_hint
+        del bridge_dir, timeout_s, auto_confirm, confirm_hint
+        commands.append(command)
 
     monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _fake_inject)
     monkeypatch.setattr(
@@ -2189,6 +2198,30 @@ async def _post_model_change_with_status_sequence(
         "read_model_env",
         lambda _bridge_dir: {"ANTHROPIC_CUSTOM_MODEL_OPTION": "claude-opus-4-7"},
     )
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main.resolve_native_claude_config",
+        lambda *, spec: None,
+    )
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "read_model_picker_values",
+        lambda _: list(picker_values) if picker_source == "bridge" else [],
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main.stored_claude_picker_values",
+        lambda _config, _rows=None: list(picker_values) if picker_source == "catalog" else [],
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main.stored_claude_catalog_rows",
+        lambda _config: stored_catalog_rows,
+    )
+
+    async def _catalog(_config: object) -> list[dict[str, object]]:
+        if empty_session_catalog:
+            return []
+        return [{"id": value, "model": value} for value in picker_values]
+
+    monkeypatch.setattr("omnigent.harnesses.claude_native.main.claude_launch_catalog", _catalog)
     script = list(status_values)
 
     def _scripted_status(_bridge_dir: Any) -> str | None:
@@ -2228,10 +2261,18 @@ async def _post_model_change_with_status_sequence(
         assert create_resp.status_code == 201, create_resp.text
         if pane_status is not None:
             app.state.native_pane_status["68c7c1acc5eeec3978c5e62043da51a5"] = pane_status
-        return await client.post(
+        if picker_source == "session" or empty_session_catalog:
+            catalog = await client.get(
+                "/v1/sessions/68c7c1acc5eeec3978c5e62043da51a5/claude-model-options"
+            )
+            assert catalog.status_code == 200, catalog.text
+        response = await client.post(
             "/v1/sessions/68c7c1acc5eeec3978c5e62043da51a5/events",
-            json={"type": "model_change", "model": "claude-opus-4-7"},
+            json={"type": "model_change", "model": model},
         )
+    switch_rejected = empty_session_catalog or stored_catalog_rows == []
+    assert commands == ([] if switch_rejected else [f"/model {model}"])
+    return response
 
 
 @pytest.mark.asyncio
@@ -2249,6 +2290,71 @@ async def test_events_model_change_confirms_against_the_status_file(
         ["claude-opus-4-6", "claude-opus-4-6", "claude-opus-4-7"],
     )
     assert resp.status_code == 204, resp.text
+
+
+@pytest.mark.parametrize("picker_source", ["bridge", "catalog", "session"])
+async def test_events_managed_glm_switch_confirms_the_terminal_model(
+    monkeypatch: pytest.MonkeyPatch, picker_source: str
+) -> None:
+    response = await _post_model_change_with_status_sequence(
+        monkeypatch,
+        ["claude-opus-4-7", "claude-opus-4-7", "system.ai.glm-5-3"],
+        model="system.ai.glm-5-3",
+        picker_values=("system.ai.glm-5-3",),
+        picker_source=picker_source,
+    )
+    assert response.status_code == 204, response.text
+
+
+async def test_events_managed_glm_switch_rejects_an_unchanged_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = await _post_model_change_with_status_sequence(
+        monkeypatch,
+        ["claude-opus-4-7"],
+        model="system.ai.glm-5-3",
+        picker_values=("system.ai.glm-5-3",),
+    )
+    assert response.status_code == 503, response.text
+    assert response.json()["error"] == "claude_native_model_unconfirmed"
+
+
+@pytest.mark.parametrize("picker_source", ["bridge", "catalog"])
+async def test_events_empty_catalog_does_not_restore_stale_picker_values(
+    monkeypatch: pytest.MonkeyPatch, picker_source: str
+) -> None:
+    response = await _post_model_change_with_status_sequence(
+        monkeypatch,
+        ["claude-opus-4-7"],
+        model="system.ai.glm-5-3",
+        picker_values=("system.ai.glm-5-3",),
+        picker_source=picker_source,
+        empty_session_catalog=True,
+    )
+    assert response.status_code == 503, response.text
+    assert response.json()["error"] == "claude_native_model_unsupported"
+
+
+async def test_events_empty_stored_catalog_overrides_stale_bridge_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An authoritative empty stored catalog beats launch-recorded vocabulary.
+
+    With a cold session-options cache, nonempty bridge picker values from
+    launch time must not spell a switch once background discovery has stored
+    an explicitly empty catalog (every picker entry disabled): the request is
+    rejected without injecting a command.
+    """
+    response = await _post_model_change_with_status_sequence(
+        monkeypatch,
+        ["claude-opus-4-7"],
+        model="system.ai.glm-5-3",
+        picker_values=("system.ai.glm-5-3",),
+        picker_source="bridge",
+        stored_catalog_rows=[],
+    )
+    assert response.status_code == 503, response.text
+    assert response.json()["error"] == "claude_native_model_unsupported"
 
 
 @pytest.mark.asyncio
@@ -2318,7 +2424,7 @@ async def test_events_model_change_mid_turn_defers_instead_of_failing(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("pins", "picked", "expected_command"),
+    ("pins", "picker_values", "picked", "expected_command"),
     [
         # The reported bug: a gateway config pins the three families but not
         # fable; picking the probed ``fable`` row injected ``/model opus`` —
@@ -2331,6 +2437,7 @@ async def test_events_model_change_mid_turn_defers_instead_of_failing(
                 "ANTHROPIC_DEFAULT_SONNET_MODEL": "databricks-claude-sonnet-5",
                 "ANTHROPIC_DEFAULT_HAIKU_MODEL": "databricks-claude-haiku-4-5",
             },
+            [],
             "fable",
             "/model fable",
             id="gateway-unpinned-family-is-never-swapped-for-the-default",
@@ -2342,6 +2449,7 @@ async def test_events_model_change_mid_turn_defers_instead_of_failing(
                 "ANTHROPIC_BASE_URL": "https://example.databricks.com/ai-gateway/anthropic",
                 "ANTHROPIC_DEFAULT_SONNET_MODEL": "databricks-claude-sonnet-5",
             },
+            [],
             "sonnet[1m]",
             "/model sonnet[1m]",
             id="pinned-bracket-alias-passes-through",
@@ -2350,15 +2458,30 @@ async def test_events_model_change_mid_turn_defers_instead_of_failing(
         # dropping the 1M-context marker.
         pytest.param(
             {},
+            [],
             "sonnet[1m]",
             "/model sonnet[1m]",
             id="bare-login-bracket-alias-keeps-its-context-marker",
+        ),
+        # Managed picker ids can name models outside Claude's family aliases.
+        pytest.param(
+            {
+                "ANTHROPIC_BASE_URL": "https://example.databricks.com/ai-gateway/anthropic",
+                "ANTHROPIC_DEFAULT_OPUS_MODEL": "system.ai.claude-opus-4-8[1m]",
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": "system.ai.claude-sonnet-4-6[1m]",
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL": "system.ai.claude-haiku-4-5",
+            },
+            ["system.ai.claude-opus-4-8[1m]", "system.ai.glm-5-3"],
+            "system.ai.glm-5-3",
+            "/model system.ai.glm-5-3",
+            id="managed-picker-row-of-no-claude-family-is-typed-as-itself",
         ),
     ],
 )
 async def test_events_model_change_applies_the_picked_alias_verbatim(
     monkeypatch: pytest.MonkeyPatch,
     pins: dict[str, str],
+    picker_values: list[str],
     picked: str,
     expected_command: str,
 ) -> None:
@@ -2388,6 +2511,11 @@ async def test_events_model_change_applies_the_picked_alias_verbatim(
 
     monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _fake_inject)
     monkeypatch.setattr(claude_native_bridge, "read_model_env", lambda _bridge_dir: dict(pins))
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "read_model_picker_values",
+        lambda _bridge_dir: list(picker_values),
+    )
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.main._CLAUDE_CODE_MANAGED_SETTINGS_PATHS", ()
     )

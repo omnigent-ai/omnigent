@@ -8,6 +8,7 @@ from typing import Any
 from sqlalchemy import and_, asc, delete, desc, func, or_, select, tuple_
 from sqlalchemy.orm import Session
 
+from omnigent.db.account_authority import require_active_account
 from omnigent.db.db_models import (
     DEFAULT_WORKSPACE_ID,
     SqlScheduledTask,
@@ -48,6 +49,7 @@ def _to_entity(row: SqlScheduledTask) -> ScheduledTask:
         name=row.name,
         prompt=row.prompt,
         user_id=row.user_id,
+        account_generation=row.account_generation,
         agent_id=row.agent_id,
         timezone=row.timezone,
         created_at=row.created_at,
@@ -146,7 +148,9 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         created_at = now_epoch()
 
         def write(session: Session) -> ScheduledTask:
+            generation = require_active_account(session, user_id)
             row = SqlScheduledTask(
+                account_generation=generation,
                 id=scheduled_task_id,
                 name=name,
                 prompt=prompt,
@@ -291,6 +295,8 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             row = session.get(SqlScheduledTask, (current_workspace_id(), scheduled_task_id))
             if row is None:
                 return None
+            if state is not None and state != "deleted":
+                require_active_account(session, row.user_id, generation=row.account_generation)
             changed = False
             if name is not None and row.name != name:
                 row.name = name

@@ -177,14 +177,26 @@ class FakeConversationStore:
 
 
 class FakePermissionStore:
-    def __init__(self, *, fail_grant: bool = False) -> None:
+    def __init__(self, *, fail_grant: bool = False, users: set[str] | None = None) -> None:
         self.ensured: list[str] = []
         self.grants: list[tuple[str, str, int]] = []
         self.grant_workspace_ids: list[int] = []
         self.fail_grant = fail_grant
+        # ``None`` means every owner exists (the default for most tests).
+        self.users: set[str] | None = set(users) if users is not None else None
 
     def ensure_user(self, user_id: str, *, is_admin: bool = False) -> None:
         self.ensured.append(user_id)
+        if self.users is not None:
+            self.users.add(user_id)
+
+    def user_exists(self, user_id: str) -> bool:
+        return self.users is None or user_id in self.users
+
+    def get_user(self, user_id: str):
+        from omnigent.entities.account import Account
+
+        return Account(user_id, False, None, None, False) if self.user_exists(user_id) else None
 
     def grant(self, user_id: str, conversation_id: str, level: int) -> Any:
         self.grant_workspace_ids.append(current_workspace_id())
@@ -198,6 +210,7 @@ class FakePermissionStore:
 class _FakeHost:
     host_id: str
     user_id: str
+    account_generation: str | None = None
 
 
 class FakeHostStore:
@@ -400,6 +413,7 @@ async def test_active_creates_session_grant_and_run() -> None:
     assert len(conv_store.created) == 1
     assert conv_store.created[0]["agent_id"] == "ag_1"
     # NULL owner resolved to "local" and granted LEVEL_OWNER.
+    assert perm.ensured == [RESERVED_USER_LOCAL]
     assert perm.grants and perm.grants[0][0] == RESERVED_USER_LOCAL
     assert perm.grants[0][2] == LEVEL_OWNER
     # The launch seam was invoked.
@@ -408,6 +422,57 @@ async def test_active_creates_session_grant_and_run() -> None:
     assert len(store.runs) == 1
     assert any("last_run_at" in u for u in store.updates)
     assert any("last_run_conversation_id" in u for u in store.updates)
+
+
+@pytest.mark.asyncio
+async def test_existing_owner_is_granted_without_ensure_user() -> None:
+    """A real owner's row is never (re)created by the fire path."""
+    perm = FakePermissionStore(users={"alice"})
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task(user_id="alice")})
+
+    async def _launch(conv: Any, task: Any) -> None:
+        pass
+
+    on_fire = build_on_fire(
+        _deps(store, permission_store=perm, conversation_store=conv_store),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert len(conv_store.created) == 1
+    assert perm.ensured == []
+    assert [(g[0], g[2]) for g in perm.grants] == [("alice", LEVEL_OWNER)]
+
+
+@pytest.mark.asyncio
+async def test_deleted_owner_disables_task_and_records_failed_run() -> None:
+    """A task whose owner no longer exists is disabled, not resurrected."""
+    perm = FakePermissionStore(users=set())
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task(user_id="alice")})
+    launched: list[Any] = []
+
+    async def _launch(conv: Any, task: Any) -> None:
+        launched.append(conv)
+
+    on_fire = build_on_fire(
+        _deps(store, permission_store=perm, conversation_store=conv_store),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert launched == []
+    assert conv_store.created == []
+    assert perm.ensured == []
+    assert perm.grants == []
+    assert {"id": "task_1", "state": "deleted"} in store.updates
+    assert len(store.runs) == 1
+    assert store.runs[0]["status"] == "failed"
+    assert store.runs[0]["error_code"] == "owner_deleted"
+    assert "alice" in store.runs[0]["error"]
 
 
 def _claude_agent_deps(
@@ -715,8 +780,8 @@ async def test_overlapping_fire_skips_second_launch() -> None:
         _deps(store, conversation_store=conv_store),
         launch_dispatch=_slow_launch,
     )
-    await on_fire(0, "task_1")
-    await on_fire(0, "task_1")
+    assert await on_fire(0, "task_1") is True
+    assert await on_fire(0, "task_1") is True
 
     for _ in range(100):
         if conv_store.created:
@@ -1381,9 +1446,10 @@ async def test_run_now_fires_paused_task() -> None:
 
 
 @pytest.mark.asyncio
-async def test_run_now_missing_row_is_noop() -> None:
+@pytest.mark.parametrize("row", [None, _task(state="deleted")])
+async def test_run_now_missing_row_is_noop(row) -> None:
     """Run-now on a deleted/missing task starts nothing and records no run."""
-    store = FakeScheduledTaskStore(rows={})
+    store = FakeScheduledTaskStore(rows={"task_1": row} if row else {})
     launched: list[Any] = []
 
     async def _launch(conv: Any, task: Any) -> None:
@@ -1395,6 +1461,21 @@ async def test_run_now_missing_row_is_noop() -> None:
 
     assert started is False
     assert launched == []
+    assert store.runs == []
+
+
+@pytest.mark.asyncio
+async def test_run_now_rechecks_deleted_state_before_session_creation() -> None:
+    store = SequencedScheduledTaskStore([_task(), _task(state="deleted")])
+    conversations = FakeConversationStore()
+
+    async def launch(conv, task):
+        pytest.fail("a deleted task must not launch a runner")
+
+    run_now = build_run_now(_deps(store, conversation_store=conversations), launch_dispatch=launch)
+    assert await run_now(0, "task_1") is True
+    await _drain()
+    assert conversations.created == []
     assert store.runs == []
 
 

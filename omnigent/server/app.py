@@ -10,6 +10,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
+from functools import partial
 from importlib import import_module
 from pathlib import Path
 from typing import Any, Literal, Protocol
@@ -1579,6 +1580,14 @@ def create_app(
             # inside shutdown_all().
             await _mcp_pool.shutdown_all()
 
+    from omnigent.server.auth import UnifiedAuthProvider
+
+    runner_account_store = (
+        account_store
+        if isinstance(auth_provider, UnifiedAuthProvider) and auth_provider._source == "accounts"
+        else None
+    )
+
     app = FastAPI(title="Omnigent Server", lifespan=_lifespan)
     from omnigent.runtime import telemetry
 
@@ -1592,6 +1601,10 @@ def create_app(
     app.state.background_title_coordinator = background_title_coordinator
     app.state.host_registry = host_registry
     app.state.host_store = host_store
+    if host_store is not None:
+        host_registry.launch_authorizer = partial(
+            host_store.admit_launch, require_account_owner=runner_account_store is not None
+        )
     app.state.agent_store = agent_store
     app.state.sandbox_config = sandbox_config
     app.state.branding_snapshot = branding_snapshot
@@ -3139,6 +3152,10 @@ def create_app(
 
         :param runner_id: The reconnecting runner's id.
         """
+        from omnigent.server.child_session_recovery import (
+            is_parent_owned_subagent,
+            restore_active_children,
+        )
         from omnigent.server.routes._sessions.common import (
             _session_sandbox_status_cache,
         )
@@ -3165,6 +3182,10 @@ def create_app(
         convs = await asyncio.to_thread(
             conversation_store.list_conversations_by_runner_id, runner_id
         )
+        # Restore each tree from its root before ordinary child initialization
+        # can clear the interruption status or cache an init without continuation.
+        bound_ids = {conv.id for conv in convs}
+        convs.sort(key=lambda conv: conv.parent_conversation_id in bound_ids)
         _logger.info(
             "_on_runner_connect: runner=%s, %d bound session(s)",
             runner_id,
@@ -3195,12 +3216,18 @@ def create_app(
                     "_on_runner_connect: skipping session-init POST for %s (no agent_id)",
                     conv.id,
                 )
-            else:
+            elif not is_parent_owned_subagent(conv) and not (
+                conv.parent_conversation_id in bound_ids and conv.host_id is None
+            ):
                 try:
-                    await runner_session_initializer.initialize(
+                    init_response = await runner_session_initializer.initialize(
                         conv,
                         routed.client,
                         timeout=10.0,
+                    )
+                    init_response.raise_for_status()
+                    await restore_active_children(
+                        conv, routed.client, conversation_store, runner_session_initializer
                     )
                 except Exception:
                     _logger.exception(
@@ -3237,9 +3264,12 @@ def create_app(
             # is reachable again. The helper self-guards: it only clears a
             # session whose persisted failure is ``runner_disconnected``, so
             # a genuine task failure survives the reconnect untouched.
-            await _publish_runner_recovered_status(
-                conv.id, conversation_store, require_disconnect_code=True
-            )
+            if not is_parent_owned_subagent(conv) and not (
+                conv.parent_conversation_id in bound_ids and conv.host_id is None
+            ):
+                await _publish_runner_recovered_status(
+                    conv.id, conversation_store, require_disconnect_code=True
+                )
             # A managed launch that outlived its connect timeout cached
             # sandbox_status "failed"; this runner connecting proves the
             # sandbox is live, so drop the stale banner. Only "failed" is
@@ -3248,6 +3278,12 @@ def create_app(
             cached_sandbox = _session_sandbox_status_cache.get(conv.id)
             if cached_sandbox is not None and cached_sandbox.stage == "failed":
                 _publish_sandbox_status(conv.id, "ready")
+
+    def _mint_managed_runner_token(runner_id: str, ttl_seconds: int) -> str | None:
+        assert runner_account_store is not None and auth_provider is not None
+        return runner_account_store.with_runner_authority(
+            runner_id, lambda owner: auth_provider.mint_runner_token(owner, ttl_seconds)
+        )
 
     def _resolve_managed_runner_owner(runner_id: str) -> str | None:
         """Owner for a delegated runner, by its bound session.
@@ -3261,6 +3297,11 @@ def create_app(
         :returns: The session owner's user id, or ``None`` when no session
             is bound to this runner (the handshake is then refused).
         """
+        if runner_account_store is not None:
+            try:
+                return runner_account_store.with_runner_authority(runner_id, lambda owner: owner)
+            except OmnigentError:
+                return None
         for conv in conversation_store.list_conversations_by_runner_id(runner_id):
             owner = conversation_store.get_session_owner(conv.id)
             if owner is not None:
@@ -3277,6 +3318,9 @@ def create_app(
             auth_provider=auth_provider,
             runner_exit_reports=runner_exit_reports,
             resolve_managed_runner_owner=_resolve_managed_runner_owner,
+            mint_managed_runner_token=(
+                _mint_managed_runner_token if runner_account_store is not None else None
+            ),
         ),
         prefix="/v1",
         tags=["runners"],
@@ -3411,10 +3455,15 @@ def create_app(
             and auth_provider._source == "accounts"
             and account_store is not None
         ):
+            from omnigent.server.auth import AccountAuthenticationMiddleware
             from omnigent.server.routes.accounts_auth import (
                 create_accounts_auth_router,
             )
 
+            # A deleted account's still-signed session JWTs must stop
+            # authenticating; every request checks the generation and tombstone.
+            auth_provider.set_account_check(account_store.accepts_generation)
+            app.add_middleware(AccountAuthenticationMiddleware, auth_provider=auth_provider)
             app.include_router(
                 create_accounts_auth_router(
                     auth_provider,
@@ -3422,6 +3471,7 @@ def create_app(
                     admin_list,
                     permission_store,
                     device_grant_store,
+                    scheduled_task_store,
                 ),
                 prefix="/auth",
                 tags=["auth"],

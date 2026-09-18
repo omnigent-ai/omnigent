@@ -76,6 +76,7 @@ import {
   CLAUDE_NATIVE_EFFORTS,
   PI_NATIVE_EFFORTS,
   ConfigRow,
+  EFFORT_SELECT_NONE,
   EFFORT_UNAVAILABLE_PLACEHOLDER,
   MODEL_SELECT_DEFAULT,
   MODEL_SELECT_SMART,
@@ -1453,6 +1454,7 @@ export function AgentHarnessPicker({
   // Tracks the last-applied openNonce so the imperative-open effect (below,
   // after the drill-in state it drives) skips the initial value.
   const appliedOpenNonce = useRef(0);
+  const pendingConfigAgentId = useRef<string | null>(null);
   const queryClient = useQueryClient();
   const info = useServerInfo();
   // Feature ON → single "needs setup" badge; OFF → per-reason original text.
@@ -1505,8 +1507,10 @@ export function AgentHarnessPicker({
   }, [cacheKey, loading, resolvedPreview]);
 
   const isMobile = useIsMobileViewport();
+  const hasSelectedConfig = selectedConfigContent != null;
   const [menuPage, setMenuPage] = useState<"more" | "custom" | "config" | null>(null);
   const [configAgentId, setConfigAgentId] = useState<string | null>(null);
+  const [focusConfigAgentId, setFocusConfigAgentId] = useState<string | null>(null);
   const [inlineHarnessId, setInlineHarnessId] = useState(effectiveAgentId);
   // Keep desktop rows anchored while a config flyout is open; promote on reopen.
   useEffect(() => {
@@ -1534,12 +1538,22 @@ export function AgentHarnessPicker({
   useEffect(() => {
     if (!openNonce || openNonce === appliedOpenNonce.current) return;
     appliedOpenNonce.current = openNonce;
-    setOpen(true);
-    if (effectiveAgentId && selectedConfigContent != null) {
-      setConfigAgentId(effectiveAgentId);
-      if (isMobile) setMenuPage("config");
+    pendingConfigAgentId.current = null;
+    setFocusConfigAgentId(null);
+    if (effectiveAgentId && hasSelectedConfig) {
+      if (isMobile) {
+        setConfigAgentId(effectiveAgentId);
+        setMenuPage("config");
+      } else if (open) {
+        setFocusConfigAgentId(effectiveAgentId);
+        setConfigAgentId(effectiveAgentId);
+      } else {
+        setFocusConfigAgentId(effectiveAgentId);
+        pendingConfigAgentId.current = effectiveAgentId;
+      }
     }
-  }, [openNonce, effectiveAgentId, selectedConfigContent, isMobile]);
+    setOpen(true);
+  }, [openNonce, effectiveAgentId, hasSelectedConfig, isMobile, open]);
 
   const renderEntry = (agent: AvailableAgent): ReactNode => {
     const active = !autoHarnessActive && agent.id === effectiveAgentId;
@@ -1572,6 +1586,10 @@ export function AgentHarnessPicker({
         }}
         onSelect={() => onSelectAgent(agent)}
         configContent={active ? selectedConfigContent : null}
+        focusConfig={focusConfigAgentId === agent.id}
+        onConfigFocused={() => {
+          setFocusConfigAgentId((current) => (current === agent.id ? null : current));
+        }}
         testId={`new-chat-landing-agent-${agent.id}`}
         icon={<ComposerAgentIcon agent={agent} />}
         label={agent.display_name}
@@ -1721,6 +1739,10 @@ export function AgentHarnessPicker({
       modal={dropdownModal}
       open={open}
       onOpenChange={(next) => {
+        if (!next) {
+          pendingConfigAgentId.current = null;
+          setFocusConfigAgentId(null);
+        }
         setOpen(next);
         onOpenChange?.(next);
         if (next) {
@@ -1766,6 +1788,12 @@ export function AgentHarnessPicker({
       contentAlign={contentAlign}
       contentClassName={cn(showConfig && "composer-agent-config-menu", contentClassName)}
       configOpen={configAgentId !== null}
+      onInitialSelectionFocus={() => {
+        const agentId = pendingConfigAgentId.current;
+        if (!agentId) return;
+        pendingConfigAgentId.current = null;
+        setConfigAgentId(agentId);
+      }}
     >
       {showConfig ? (
         <HarnessPickerConfigPage
@@ -3030,10 +3058,8 @@ export function NewChatLandingScreen() {
   // the project default instead of reusing).
   const forkFreshMainPath = useMemo<string | null | undefined>(() => {
     if (!forkFreshArmed) return null;
-    // A probe error (non-400; the hook already maps 400 → []) leaves data
-    // undefined for good. Treat it as "no redirect" so the seed still lands on
-    // the candidate as-is, rather than waiting on data that never arrives and
-    // leaving the workspace blank forever.
+    // A failed probe leaves no data. Keep the candidate as-is instead of
+    // waiting forever and leaving the workspace blank.
     if (seedWorktreesErrored) return null;
     if (seedWorktreesArePlaceholder || seedWorktrees === undefined) return undefined;
     const norm = normalizeWorkspacePath(autoSeedCandidate);
@@ -3545,8 +3571,9 @@ export function NewChatLandingScreen() {
   };
   const selectPickerEffort = (effort: string) => {
     if (!selectedNativeHarness) return;
-    setPickedEffort(effort);
-    rememberPickerOptions(selectedNativeHarness, { effort });
+    const picked = effort === EFFORT_SELECT_NONE ? "" : effort;
+    setPickedEffort(picked);
+    rememberPickerOptions(selectedNativeHarness, { effort: picked });
   };
   // Devin Fusion: the composed `fusion-…` variant id IS the model, so it lands
   // in pickedModel with no separate effort (the lead effort is baked in).
@@ -3674,14 +3701,24 @@ export function NewChatLandingScreen() {
               ? {
                   testId: "new-chat-landing-agent-efforts",
                   header: selectedNativeHarness === "pi-native" ? "Thinking level" : "Effort",
-                  choices: pickerEffortOptions.map((option) => ({
-                    key: option.value,
-                    label: option.label,
-                    checked: !routingOn && pickedEffort === option.value,
-                    disabled: routingOn,
-                    onSelect: () => selectPickerEffort(option.value),
-                    testId: `new-chat-landing-agent-effort-${option.value}`,
-                  })),
+                  choices: [
+                    {
+                      key: "__default__",
+                      label: "Default",
+                      checked: !routingOn && pickedEffort === "",
+                      disabled: routingOn,
+                      onSelect: () => selectPickerEffort(EFFORT_SELECT_NONE),
+                      testId: "new-chat-landing-agent-effort-default",
+                    },
+                    ...pickerEffortOptions.map((option) => ({
+                      key: option.value,
+                      label: option.label,
+                      checked: !routingOn && pickedEffort === option.value,
+                      disabled: routingOn,
+                      onSelect: () => selectPickerEffort(option.value),
+                      testId: `new-chat-landing-agent-effort-${option.value}`,
+                    })),
+                  ],
                 }
               : undefined
           }
@@ -3834,7 +3871,7 @@ export function NewChatLandingScreen() {
   // Seed the harness's knobs from the user's last picks when the selected
   // harness changes (including the first mount), so a returning user starts a
   // new session on the options they used last for that harness instead of the
-  // default. Keyed on the harness so an in-session edit isn't clobbered on
+  // default. Keyed on the harness so an in-composer edit isn't clobbered on
   // re-render — only a harness switch reseeds.
   useEffect(() => {
     if (!selectedNativeHarness) return;
@@ -4162,6 +4199,18 @@ export function NewChatLandingScreen() {
     worktreesEnabled ? selectedHostId : null,
     worktreesEnabled ? workspaceTrimmed : null,
   );
+  const workspaceIsNonGit =
+    worktreesEnabled && !hostWorktreesArePlaceholder && hostWorktrees?.length === 0;
+
+  // Discard worktree choices only after the current directory is confirmed non-Git.
+  useEffect(() => {
+    if (!workspaceIsNonGit) return;
+    setBranchName("");
+    setAutoSeededBranch("");
+    setPrefilledBranch("");
+    setWorktreePopoverOpen(false);
+  }, [workspaceIsNonGit]);
+
   // Linked worktrees (exclude the main work tree — "starting in the main
   // repo" is just picking that directory, not selecting a worktree).
   const linkedWorktrees = useMemo(
@@ -4201,7 +4250,8 @@ export function NewChatLandingScreen() {
     activeWorktree !== null && prefilledBranch !== "" && branchName.trim() === prefilledBranch;
   // A new, isolated worktree is created only when a branch is named and the
   // workspace isn't already sitting on that existing worktree.
-  const shouldCreateWorktree = branchName.trim() !== "" && !startInExistingWorktree;
+  const shouldCreateWorktree =
+    !workspaceIsNonGit && branchName.trim() !== "" && !startInExistingWorktree;
   // Auto-fill the base branch when a new-worktree branch is named, but only
   // until the user touches the base field — then their choice (including a
   // cleared field) stands. Clearing the branch name (so the base field goes
@@ -4675,6 +4725,7 @@ export function NewChatLandingScreen() {
         : (selectedHostDisplayName ?? "No host selected");
   const worktreeControlAvailable =
     !sandboxSelected &&
+    !workspaceIsNonGit &&
     (branchName.trim() !== "" ||
       (worktreesEnabled && (hostWorktrees === undefined || hostWorktrees.length > 0)));
   const showGithubRepoPicker = githubReposEnabled && sandboxRepoPickerConnected;
@@ -5201,7 +5252,7 @@ export function NewChatLandingScreen() {
           localConv = beginLocalConversation(initialPrompt, files, provisional, localProject, {
             // Seed the temp session with the NORMALIZED create identity so the
             // optimistic composer shows the model/effort/harness/routing being
-            // created — not the previous session's sticky state (#7039).
+            // created, not state projected from the previously active session.
             modelOverride: normalizedModelOverride,
             llmModel: resolvedDefaultModel,
             reasoningEffort: normalizedReasoningEffort,
@@ -5270,7 +5321,9 @@ export function NewChatLandingScreen() {
                     ? { branch_name: trimmedBranch, base_branch: baseBranch.trim() || undefined }
                     : startInExistingWorktree
                       ? { branch_name: trimmedBranch, existing_worktree: true }
-                      : undefined,
+                      : createProjectId !== null && workspaceIsNonGit
+                        ? null
+                        : undefined,
                 }),
             // Native-wrapper labels + codex bypass + the born-filed project
             // label (see `createLabels` above).
@@ -5302,9 +5355,8 @@ export function NewChatLandingScreen() {
                           )?.args ?? [])
                         : undefined,
             // Model + reasoning effort, persisted on the session row before
-            // the runner launches. Claude, Codex, and Pi read model_override at
-            // terminal launch; an unselected ("") knob is omitted so the
-            // harness keeps its own configured/default model.
+            // the runner launches. An unselected ("") knob is omitted so the
+            // harness keeps its own configured/default value.
             model_override: normalizedModelOverride ?? undefined,
             reasoning_effort: normalizedReasoningEffort ?? undefined,
             cost_control_mode_override: costControlOverride,

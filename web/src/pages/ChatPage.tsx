@@ -44,6 +44,7 @@ import {
   ComposerSendButton,
 } from "@/components/composer/ChatComposer";
 import { ComposerAddMenu } from "@/components/composer/ComposerAddMenu";
+import { BackgroundTaskIndicator } from "@/components/composer/BackgroundTaskIndicator";
 import { ReplyDraftBlocks } from "@/components/composer/ReplyDraftBlocks";
 import {
   ComposerWorkspaceBar,
@@ -81,7 +82,8 @@ import {
   isSessionSharedWithOthers,
 } from "@/lib/permissionsApi";
 import { getCurrentAuthorId } from "@/lib/identity";
-import { retrySession } from "@/lib/sessionsApi";
+import { toast } from "sonner";
+import { createSideChat, retrySession } from "@/lib/sessionsApi";
 import { codexEffortLevelsForModel, findNativeModelOption } from "@/lib/codexNativeModels";
 import { modelConfigurationSourceRows } from "@/lib/modelConfigurationSource";
 import {
@@ -102,7 +104,12 @@ import {
   nativeCodingAgentForSubagentWrapper,
   WRAPPER_LABEL_KEY,
 } from "@/lib/nativeCodingAgents";
-import { isSideChatCommand, SIDE_CHAT_COMMAND_PREFIX, supportsSideChat } from "@/lib/sideChat";
+import {
+  isSideChatCommand,
+  SIDE_CHAT_COMMAND_PREFIX,
+  supportsSideChat,
+  usesNativeSideChatFork,
+} from "@/lib/sideChat";
 import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { DEVIN_NATIVE_PERMISSION_MODES } from "@/lib/nativeHarnessModes";
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
@@ -181,6 +188,7 @@ import {
   livenessRowFromSession,
   useSessionLiveness,
 } from "@/hooks/useSessionLiveness";
+import { useMessageDeepLinkChatView } from "@/hooks/useMessageDeepLink";
 import { useMarkConversationSeen } from "@/hooks/useUnseenConversations";
 import { useFileDropTarget } from "@/hooks/useFileDropTarget";
 import { HostBadge } from "@/components/HostBadge";
@@ -864,7 +872,6 @@ export function ChatPage() {
   }, [activeConv?.title, subAgentTabTitle, showsWorking, urlConvId, appName]);
 
   const sessionModelOptions = useChatStore((s) => s.codexModelOptions);
-  const selectedModel = useChatStore((s) => s.selectedModel);
   const llmModel = useChatStore((s) => s.llmModel);
   const sessionModelOverrideForEffort = useChatStore((s) => s.sessionModelOverride);
   // Pre-catalog fallback: a fresh native session's own catalog only arrives
@@ -942,8 +949,10 @@ export function ChatPage() {
       const chat = useChatStore.getState();
       // A codex /side command opens its own side chat off the parent thread, so
       // it must POST now even mid-turn rather than park in the queue (see the
-      // matching gate in the store's send()). Mirror that gate here.
-      const opensSideChat = supportsSideChat(chat.sessionHarness) && isSideChatCommand(text.trim());
+      // matching gate in the store's send()). Only the native-fork harness
+      // routes /side through send; generic /side is intercepted in the composer.
+      const opensSideChat =
+        usesNativeSideChatFork(chat.sessionHarness) && isSideChatCommand(text.trim());
       if (
         shouldQueueSend(
           chat.conversationId,
@@ -1064,10 +1073,9 @@ export function ChatPage() {
     composerSessionModelSeeded,
     activeConversationId,
   ]);
-  const modelPickerKind = modelPickerKindForConv(capabilitySource);
+  const modelPickerKind = modelPickerKindForConv(capabilitySource, codexModelOptions);
   // Effort ladders key on the model the session is actually on — the reported
-  // `llmModel` — then the session's pinned `model_override`, and only then the
-  // sticky preference. The override matters for a harness that never reports a
+  // `llmModel` — then the session's pinned `model_override`. The override matters for a harness that never reports a
   // concrete model (devin pins the family there): without it the lookup finds no
   // catalog row and a per-model ladder comes back empty, hiding the picker.
   // Memoized because codex-native resolves via codexEffortLevelsForModel, which
@@ -1079,9 +1087,9 @@ export function ChatPage() {
       effortLevelsForConv(
         capabilitySource,
         codexModelOptions,
-        llmModel ?? sessionModelOverrideForEffort ?? selectedModel,
+        llmModel ?? sessionModelOverrideForEffort,
       ),
-    [capabilitySource, codexModelOptions, llmModel, sessionModelOverrideForEffort, selectedModel],
+    [capabilitySource, codexModelOptions, llmModel, sessionModelOverrideForEffort],
   );
   const showEffort = shouldShowEffortPicker(capabilitySource) && effortLevels.length > 0;
 
@@ -1604,6 +1612,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   // including stopped/resumable sessions, and the connection indicator
   // remains below it for offline sessions.
   const showTerminal = shouldShowTerminalSurface(conversationId, terminalFirst, runnerOnline);
+  useMessageDeepLinkChatView(conversationId);
 
   // All hook calls below must run on every render regardless of
   // `showTerminal` — Rules of Hooks. The single return at the bottom
@@ -3201,6 +3210,29 @@ function ComposerImpl(
     // guard so guarded no-ops don't emit, matching the disabled Send button.
     trackClick("chat.composer.send", "button");
 
+    // A generic (non-Codex) side chat forks the conversation and runs it on the
+    // SAME host/sandbox as the source (no new sandbox), then opens it as a rail
+    // tab; the typed text seeds the new side chat's composer so it isn't fired
+    // at a still-launching runner. Codex forks in-process instead (its /side
+    // reaches the runner as plaintext).
+    const openGenericSideChat = (question: string) => {
+      const sourceId = useChatStore.getState().conversationId;
+      if (sourceId === null) return;
+      setCommandError(null);
+      createSideChat(sourceId).then(
+        ({ childSessionId }) => {
+          // Clear the composer only once the side chat exists, so a failed
+          // create keeps the user's typed question instead of dropping it.
+          dirtyRef.current = true;
+          setValue("");
+          useChatStore.getState().openSideChatWithDraft(childSessionId, question, sourceId);
+        },
+        // Surface the failure as a toast, not an inline composer error; the
+        // composer text is left intact for a retry.
+        () => toast.error("Couldn't start a side chat for this session."),
+      );
+    };
+
     // Slash command path: the first token must read as "/name" (the shared
     // isSlashCommandText guard — file paths like "/Users/foo/bar.txt" don't
     // match, while args after the name may carry paths or URLs, e.g.
@@ -3252,6 +3284,13 @@ function ComposerImpl(
         executeSlashCommand(cmd, arg);
         return;
       }
+      // /side opens a side chat. Codex forks in-process (falls through to the
+      // plaintext path so its runner forks); every other harness forks
+      // server-side here into an empty side chat, carrying the typed question.
+      if (cmd === "/side" && !usesNativeSideChatFork(sessionHarness)) {
+        openGenericSideChat(trimmed.slice(cmd.length).trim());
+        return;
+      }
       // Known skill on an in-process session: send a `slash_command` event
       // (the REPL's wire shape) so the server resolves the skill and
       // injects its instructions, instead of the agent seeing the literal
@@ -3293,11 +3332,14 @@ function ComposerImpl(
         ),
       };
       const serialized = serializeReplyDraft(outgoing);
-      if (sideChat && supportsSideChat(sessionHarness)) {
-        // Route the quoted selection + question to a side chat: the /side
-        // pipeline keys off the leading command and forks. No main-chat bubble
-        // is kept for a side chat, so no reply-draft snapshot is persisted.
+      if (sideChat && usesNativeSideChatFork(sessionHarness)) {
+        // Codex: the /side pipeline keys off the leading command and forks
+        // in-process. No main-chat bubble is kept, so no reply-draft snapshot.
         onSend(SIDE_CHAT_COMMAND_PREFIX + serialized, sendFiles);
+      } else if (sideChat && supportsSideChat(sessionHarness)) {
+        // Generic: fork onto a managed side chat, seeding its composer with the
+        // quoted selection + question (no main-chat bubble either).
+        openGenericSideChat(serialized);
       } else {
         onSend(serialized, sendFiles, snapshotReplyDraft(outgoing));
       }
@@ -3585,6 +3627,7 @@ function ComposerImpl(
                 tokensUsed={composerTokensUsed}
               />
             </div>
+            <BackgroundTaskIndicator />
           </div>
         </ComposerWorkspaceBar>
       </div>
@@ -3842,6 +3885,29 @@ function ComposerImpl(
                 planDisabled={isReadOnly || planModeBusy}
                 planActive={codexPlanMode}
                 planLabel={codexPlanMode ? "Exit Plan mode" : "Enter Plan mode"}
+                onSideChat={
+                  composerSessionId && !isReadOnly && supportsSideChat(sessionHarness)
+                    ? () => {
+                        if (usesNativeSideChatFork(sessionHarness)) {
+                          // Codex forks in-process from a typed /side; prefill so
+                          // the user types the question.
+                          setValue(SIDE_CHAT_COMMAND_PREFIX);
+                          setCommandError(null);
+                          dirtyRef.current = true;
+                          return;
+                        }
+                        const sourceId = useChatStore.getState().conversationId;
+                        if (sourceId === null) return;
+                        createSideChat(sourceId).then(
+                          ({ childSessionId }) =>
+                            useChatStore.setState({
+                              sideChatToOpen: { childId: childSessionId, parentId: sourceId },
+                            }),
+                          () => toast.error("Couldn't start a side chat for this session."),
+                        );
+                      }
+                    : undefined
+                }
               />
               {!subAgentLabel && composerSessionId && (
                 <HostBadge
@@ -4209,7 +4275,8 @@ const PI_NATIVE_EFFORT_LEVELS = [
   "max",
 ] as const;
 
-type NativeModelPickerKind = "claude" | "codex" | "cursor" | "kiro" | "opencode" | "pi" | "devin";
+type NativeModelPickerKind =
+  "claude" | "codex" | "cursor" | "kiro" | "opencode" | "pi" | "devin" | "acp";
 
 type LabelSource = { labels?: Record<string, string | null> | null } | null | undefined;
 
@@ -4340,6 +4407,7 @@ export function modelPickerKindForConv(
       }
     | null
     | undefined,
+  modelOptions: readonly NativeModelOption[] = [],
 ): NativeModelPickerKind | null {
   switch (effectiveWrapperLabel(conv)) {
     case "claude-code-native-ui":
@@ -4369,6 +4437,9 @@ export function modelPickerKindForConv(
       // model_select handler, so the picker surfaces that as the live model.
       return "pi";
     default:
+      // Generic ACP sessions carry no wrapper label; the server canonicalizes
+      // ``acp:<slug>`` ids to "acp" in the snapshot's harness field.
+      if (conv?.harness === "acp" && modelOptions.length > 1) return "acp";
       return null;
   }
 }
@@ -4376,8 +4447,9 @@ export function modelPickerKindForConv(
 export function shouldShowModelPicker(
   conv:
     { labels?: Record<string, string | null> | null; harness?: string | null } | null | undefined,
+  modelOptions: readonly NativeModelOption[] = [],
 ): boolean {
-  return modelPickerKindForConv(conv) !== null;
+  return modelPickerKindForConv(conv, modelOptions) !== null;
 }
 
 /**
@@ -4911,19 +4983,10 @@ function useSessionConfigSummary({
  * The effort this conversation is actually at.
  *
  * `sessionReasoningEffort` is conversation-scoped, so two live conversations at
- * different efforts each read their own; `selectedEffort` is the single
- * app-global sticky pick, used only as the pre-hydration fallback. Reading the
- * sticky pick alone would show a warm-switched conversation the last effort
- * picked anywhere.
+ * different efforts each read their own.
  */
 function useSessionEffort(): string | null {
-  const sessionReasoningEffort = useChatStore((s) => s.sessionReasoningEffort);
-  const seeded = useChatStore((s) => s.sessionEffortSeeded);
-  const stickyEffort = useChatStore((s) => s.selectedEffort);
-  // A seeded conversation's effort is authoritative even when null (an
-  // intentional "no effort" from the create), so it never borrows the
-  // app-global sticky pick; only an unhydrated conversation falls back.
-  return seeded ? sessionReasoningEffort : (sessionReasoningEffort ?? stickyEffort);
+  return useChatStore((s) => s.sessionReasoningEffort);
 }
 
 /**
@@ -4959,7 +5022,8 @@ function useResolvedComposerModel(
     modelPickerKind === "kiro" ||
     modelPickerKind === "pi" ||
     modelPickerKind === "opencode" ||
-    modelPickerKind === "devin";
+    modelPickerKind === "devin" ||
+    modelPickerKind === "acp";
   const modelOptions: readonly {
     id: string;
     model?: string;
@@ -4973,9 +5037,8 @@ function useResolvedComposerModel(
   // native sessions: `llmModel` carries the verbatim reported model (the
   // launch's own report, or an in-pane switch), and the chip, the gear
   // highlight, and the hover summary all resolve from it alone. The user's
-  // request (`sessionModelOverride`) and the cross-session sticky
-  // (`selectedModel`) are inputs, never display state — rendering a request
-  // as if it were truth is exactly how a record/pane divergence hides.
+  // request (`sessionModelOverride`) is input, never display state — rendering
+  // a request as if it were truth is exactly how a record/pane divergence hides.
   const isReportedModelPicker = modelPickerKind === "claude" || modelPickerKind === "codex";
   // The row the reported model maps to: its catalog row when one matches
   // exactly (by id or wire model), else the raw reported value itself — the
@@ -5000,7 +5063,7 @@ function useResolvedComposerModel(
   // mirror both ways into ``model_override``. Those wrappers keep their
   // override-derived surface until they adopt reported-model semantics.
   // SDK/bundle agents (no native picker) resolve the session override or the
-  // bound default — never the cross-session sticky.
+  // bound default.
   const pickerSelectedModel = isReportedModelPicker
     ? (reportedRowId ?? requestedRowId)
     : sessionModelOverride;

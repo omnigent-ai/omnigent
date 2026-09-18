@@ -712,6 +712,9 @@ def _spawn_local_server(port: int) -> _SpawnedLocalServer:
             proc: subprocess.Popen[bytes] = subprocess.Popen(
                 [
                     sys.executable,
+                    # Keep the selected installation, including editable installs,
+                    # without adding the workspace to the startup import path.
+                    "-P",
                     "-m",
                     "omnigent.cli",
                     "server",

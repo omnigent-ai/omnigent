@@ -5554,3 +5554,86 @@ def test_agent_sandbox_reuses_the_kubernetes_config_block() -> None:
     # keep_alive is what the managed path needs from it, so it must not be the
     # raising capability default it inherits two levels up.
     assert type(launcher).keep_alive is not SandboxHostLauncher.keep_alive
+
+
+def test_keep_warm_sets_runner_idle_timeout() -> None:
+    """keep_warm_s maps onto runner.idle_timeout_s and is authoritative (wins over
+    an explicit value, preserves other runner keys); a no-op when unset."""
+    from omnigent.server.managed_hosts import _apply_keep_warm, _parse_keep_warm_s
+
+    assert _parse_keep_warm_s({"keep_warm_s": 30}) == 30
+    assert _parse_keep_warm_s({"keep_warm_s": 30.0}) == 30  # whole float ok
+    assert _parse_keep_warm_s({"keep_warm_s": 2592000}) == 2592000  # 30-day ceiling ok
+    # An oversized value must be rejected at config time: it becomes
+    # runner.idle_timeout_s, and the runner's float() would OverflowError on a
+    # value this large, stopping the runner from starting.
+    for bad in (0, 0.5, 2.9, -5, True, "x", float("nan"), float("inf"), 2592001, 10**400):
+        with pytest.raises(ValueError):
+            _parse_keep_warm_s({"keep_warm_s": bad})
+    assert _apply_keep_warm(None, 30) == {"runner": {"idle_timeout_s": 30}}
+    assert (
+        _apply_keep_warm({"runner": {"idle_timeout_s": 999}}, 30)["runner"]["idle_timeout_s"] == 30
+    )
+    assert _apply_keep_warm({"runner": {"foo": 1}}, 30)["runner"] == {
+        "foo": 1,
+        "idle_timeout_s": 30,
+    }
+    assert _parse_keep_warm_s({}) is None
+    assert _apply_keep_warm({"x": 1}, None) == {"x": 1}
+    with pytest.raises(ValueError):
+        _parse_keep_warm_s({"keep_warm_s": -5})
+
+
+@pytest.mark.parametrize("relaunch", [False, True])
+async def test_account_deleted_after_provision_terminates_unregistered_sandbox(db_uri, relaunch):
+    from omnigent.db.account_authority import account_authority_scope
+    from omnigent.server.accounts_store import SqlAlchemyAccountStore
+
+    accounts = SqlAlchemyAccountStore(db_uri)
+    account = accounts.create_user_with_password(_OWNER, "test-password-hash")
+    hosts = HostStore(db_uri)
+
+    def connect(invocation):
+        hosts.upsert_on_connect(invocation.host_id, invocation.host_name, _OWNER)
+
+    fake = FakeSandboxLauncher(on_host_start=connect)
+    config = _injected_config(fake)
+    host = None
+    if relaunch:
+        first = await launch_managed_host(config=config, owner=_OWNER, host_store=hosts)
+        host = hosts.get_host(first.host_id)
+    provision = fake.provision
+    unregistered = []
+
+    def delete_after_provision(name):
+        sandbox_id = provision(name)
+        unregistered.append(sandbox_id)
+        assert accounts.delete_user(_OWNER) is True
+        return sandbox_id
+
+    fake.provision = delete_after_provision
+    with account_authority_scope(_OWNER, account.account_generation):
+        with pytest.raises(HTTPException) as error:
+            if relaunch:
+                await relaunch_managed_host(config=config, host=host, host_store=hosts)
+            else:
+                await launch_managed_host(config=config, owner=_OWNER, host_store=hosts)
+    assert "revoked" in str(error.value.detail)
+    assert len(unregistered) == 1
+    assert unregistered[0] in fake.terminated
+    assert len(fake.host_starts) == (1 if relaunch else 0)
+
+
+async def test_registration_database_failure_still_attempts_provider_cleanup(db_uri, monkeypatch):
+    hosts = HostStore(db_uri)
+    fake = FakeSandboxLauncher()
+
+    def unavailable(*args, **kwargs):
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(hosts, "register_managed_host", unavailable)
+    monkeypatch.setattr(hosts, "get_host", unavailable)
+    with pytest.raises(HTTPException, match="database unavailable"):
+        await launch_managed_host(config=_injected_config(fake), owner=_OWNER, host_store=hosts)
+    assert len(fake.terminated) == 1
+    assert fake.host_starts == []

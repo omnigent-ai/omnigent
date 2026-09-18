@@ -922,6 +922,17 @@ def create_hosts_router(
                     workspace = worktree.worktree_path
                     git_branch = worktree.branch
 
+            try:
+                await host_registry.admit_launch(
+                    conn,
+                    body.session_id,
+                    allow_unbound=True,
+                    transfer_from_host_id=target.conv.host_id,
+                )
+            except BaseException:
+                await _rollback_worktree()
+                raise
+
             bound = await asyncio.to_thread(
                 conversation_store.set_runner_id,
                 body.session_id,

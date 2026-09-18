@@ -121,9 +121,21 @@ def test_read_relay_policy_config_returns_none_when_session_id_absent(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("env_denylist", "expected_env_unset"),
+    [
+        (None, []),
+        (
+            " OPENAI_API_KEY,ANTHROPIC_AUTH_TOKEN,OPENAI_API_KEY, ",
+            ["ANTHROPIC_AUTH_TOKEN", "OPENAI_API_KEY"],
+        ),
+    ],
+)
 async def test_auto_create_pi_terminal_launches_required_terminal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    env_denylist: str | None,
+    expected_env_unset: list[str],
 ) -> None:
     """
     Pi-native auto-create must launch a *required* terminal.
@@ -139,12 +151,18 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
 
     :param tmp_path: Pytest-provided temporary directory.
     :param monkeypatch: Pytest monkeypatch fixture.
+    :param env_denylist: Optional operator-supplied credential variable names.
+    :param expected_env_unset: Variables the terminal must remove before launch.
     """
     import omnigent.harnesses.pi_native.bridge as pi_native_bridge
     import omnigent.harnesses.pi_native.credentials as pi_native_credentials
     import omnigent.harnesses.pi_native.main as pi_native
 
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    if env_denylist is None:
+        monkeypatch.delenv("OMNIGENT_PI_ENV_UNSET", raising=False)
+    else:
+        monkeypatch.setenv("OMNIGENT_PI_ENV_UNSET", env_denylist)
     monkeypatch.setattr(pi_native_bridge, "_BRIDGE_ROOT", tmp_path / "pi-bridge")
     # The lifecycle of the launch — not the binary or credentials — is under
     # test, so neither a real Pi install nor a configured provider is needed.
@@ -211,6 +229,7 @@ async def test_auto_create_pi_terminal_launches_required_terminal(
     assert captured["session_key"] == "main"
     assert captured["resource_role"] == PI_NATIVE_TERMINAL_ROLE
     assert captured["spec"].command == "pi"
+    assert captured["spec"].env_unset == expected_env_unset
     config = json.loads(
         Path(captured["spec"].env[pi_native_bridge.PI_NATIVE_CONFIG_ENV_VAR]).read_text()
     )

@@ -213,11 +213,11 @@ def test_codex_multistep_turn_reports_cumulative_usage(
                 f"{len(requests)} - the codex/mock wiring broke, not the bug"
             )
 
-            # Open the agent-info popover and expand the per-model breakdown.
-            page.get_by_test_id("agent-info-trigger").click()
+            # Keyboard activation keeps this usage check out of the hover-close timer.
+            page.get_by_test_id("agent-info-trigger").press("Enter")
             usage_section = page.get_by_test_id("agent-info-usage-by-model")
             expect(usage_section).to_be_visible(timeout=30_000)
-            usage_section.locator("summary").click()
+            usage_section.locator("summary").press("Enter")
 
             model_group = page.get_by_test_id(f"agent-info-model-{model}")
             expect(model_group).to_be_visible(timeout=30_000)

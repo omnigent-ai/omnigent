@@ -36,10 +36,9 @@ interface HostWorktreesResponse {
 /**
  * Fetch the git worktrees of a repository on a host.
  *
- * A 400 response means the path is not a git repository (or git
- * failed) — the picker treats that as "no worktrees here", so we
- * resolve to an empty list rather than throwing. Other non-OK
- * responses throw so React Query surfaces the error.
+ * Only an explicit not-a-repo 400 resolves to an empty list. Other
+ * failures throw so a transient git failure cannot masquerade as a
+ * non-git workspace and discard the user's worktree selection.
  *
  * @param hostId Host identifier, e.g. ``"host_a1b2..."``.
  * @param repoPath Absolute path inside the repo to list worktrees for.
@@ -52,8 +51,8 @@ async function fetchHostWorktrees(hostId: string, repoPath: string): Promise<Hos
     `/v1/hosts/${encodeURIComponent(hostId)}/worktrees?${params.toString()}`,
   );
   if (res.status === 400) {
-    // Not a git repository — no worktrees to offer.
-    return [];
+    const text = await res.text().catch(() => "");
+    if (/not a git (?:repo|repository)/i.test(text)) return [];
   }
   if (!res.ok) {
     throw new Error(`host worktrees fetch failed: HTTP ${res.status}`);

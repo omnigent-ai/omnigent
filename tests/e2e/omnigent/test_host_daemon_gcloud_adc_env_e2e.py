@@ -51,12 +51,14 @@ import signal
 import subprocess
 import sys
 import threading
+import uuid
 from pathlib import Path
 
 import httpx
 import pytest
 
-from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
+from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN, RUNNER_PARENT_PID_ENV_VAR
+from tests.e2e.conftest import lookup_agent_id, register_inline_agent
 from tests.e2e.omnigent.test_host_ctrl_c_stop_server import (
     _connect_env,
     _read_local_server_record,
@@ -100,6 +102,9 @@ def _adc_env(base_env: dict[str, str], home: Path) -> dict[str, str]:
         values (mutated in place onto a copy of ``_ADC_SELECTORS``).
     """
     env = _connect_env(base_env, home)
+    # Other test daemons can reconnect when the local server port is reused.
+    env["OMNIGENT_HOST_ID"] = uuid.uuid4().hex
+    env["OMNIGENT_HOST_NAME"] = "adc-env-e2e"
     gcloud_dir = home / ".config" / "gcloud"
     gcloud_dir.mkdir(parents=True, exist_ok=True)
     adc_path = gcloud_dir / "application_default_credentials.json"
@@ -124,6 +129,9 @@ def _adc_env(base_env: dict[str, str], home: Path) -> dict[str, str]:
     env["OMNIGENT_RUNNER_ENV_PASSTHROUGH"] = "AGY_ADC_AUTH,GOOGLE_APPLICATION_CREDENTIALS"
     env["OTEL_METRICS_EXPORTER"] = "otlp"
     env["OMNIGENT_TELEMETRY_ENABLED"] = "1"
+    # /proc exposes exec-time env, not a forked runner's os.environ updates.
+    # Use a direct spawn so the process observation tests the delivered env.
+    env["OMNIGENT_RUNNER_ZYGOTE"] = "0"
     return env
 
 
@@ -315,15 +323,22 @@ def test_daemon_spawned_runner_receives_gcloud_adc_selectors(
             timeout=30.0,
             headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
         ) as client:
-            host_id = _online_host_id(client, timeout=_BOOT_TIMEOUT)
-            agents = client.get("/v1/agents")
-            agents.raise_for_status()
-            rows = agents.json()["data"]
-            assert rows, "server registered no agents"
+            host_id = _online_host_id(
+                client, host_id=env["OMNIGENT_HOST_ID"], timeout=_BOOT_TIMEOUT
+            )
+            agent_name = register_inline_agent(
+                client,
+                name="adc-env-e2e",
+                harness="openai-agents",
+                model="gpt-4o",
+                profile="",
+                prompt="Reply briefly.",
+                mock_llm_base_url=env["OPENAI_BASE_URL"],
+            )
             create = client.post(
                 "/v1/sessions",
                 json={
-                    "agent_id": rows[0]["id"],
+                    "agent_id": lookup_agent_id(client, agent_name),
                     "host_id": host_id,
                     "workspace": str(workspace),
                 },
@@ -333,6 +348,8 @@ def test_daemon_spawned_runner_receives_gcloud_adc_selectors(
 
         runner_env = _wait_for_runner_env(workspace, timeout=_RUNNER_APPEAR_TIMEOUT)
         runner_pid = int(runner_env["_OMNI_TEST_RUNNER_PID"])
+        assert runner_env.get(RUNNER_PARENT_PID_ENV_VAR) == str(daemon_pid)
+        assert runner_env.get("HOME") == str(home)
         _assert_adc_selectors_survived(runner_env, expected, process="runner")
     finally:
         if runner_pid > 0:
@@ -343,10 +360,11 @@ def test_daemon_spawned_runner_receives_gcloud_adc_selectors(
             _sigterm(server_pid)
 
 
-def _online_host_id(client: httpx.Client, timeout: float) -> str:
-    """Poll ``GET /v1/hosts`` until a host is online; return its id.
+def _online_host_id(client: httpx.Client, *, host_id: str, timeout: float) -> str:
+    """Poll ``GET /v1/hosts`` until this test's host is online; return its id.
 
     :param client: HTTP client pointed at the detached local server.
+    :param host_id: Unique identity assigned to this test's daemon.
     :param timeout: Max seconds to wait for the daemon's host registration.
     :returns: The online host's ``host_id``.
     :raises AssertionError: If no host comes online within *timeout*.
@@ -355,12 +373,12 @@ def _online_host_id(client: httpx.Client, timeout: float) -> str:
     while elapsed < timeout:
         resp = client.get("/v1/hosts")
         if resp.status_code == 200:
-            online = [h for h in resp.json().get("hosts", []) if h.get("status") == "online"]
-            if online:
-                return str(online[0]["host_id"])
+            for host in resp.json().get("hosts", []):
+                if host.get("host_id") == host_id and host.get("status") == "online":
+                    return host_id
         _POLL_PAUSE.wait(0.5)
         elapsed += 0.5
-    raise AssertionError(f"no host came online within {timeout}s")
+    raise AssertionError(f"host {host_id} did not come online within {timeout}s")
 
 
 def _wait_for_runner_env(workspace: Path, *, timeout: float) -> dict[str, str]:

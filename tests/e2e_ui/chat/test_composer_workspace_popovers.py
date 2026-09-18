@@ -17,7 +17,6 @@ _BRANCH = "feature/" + "long-branch-name-" * 5
 @pytest.mark.parametrize("viewport_width", [1440, 390], ids=["desktop", "mobile"])
 @pytest.mark.parametrize("font_size", [13, 18], ids=["default-font", "large-font"])
 @pytest.mark.parametrize("has_binding", [True, False], ids=["long-label", "fallback"])
-@pytest.mark.parametrize("popover", ["workspace", "worktree"])
 def test_composer_details_wrap_without_clipping(
     page: Page,
     seeded_session: tuple[str, str],
@@ -25,7 +24,6 @@ def test_composer_details_wrap_without_clipping(
     viewport_width: int,
     font_size: int,
     has_binding: bool,
-    popover: str,
 ) -> None:
     """Long values and fallback explanations fit both informational popovers."""
     base_url, session_id = seeded_session
@@ -57,51 +55,57 @@ def test_composer_details_wrap_without_clipping(
     page.goto(f"{base_url}/c/{session_id}")
     controls = page.get_by_test_id("composer-workspace-controls")
     expect(controls).to_be_visible(timeout=30_000)
-    controls.get_by_role("button").nth(0 if popover == "workspace" else 1).click()
+    for popover in ("workspace", "worktree"):
+        controls.get_by_role("button").nth(0 if popover == "workspace" else 1).click()
 
-    menu = page.get_by_role("menu")
-    expect(
-        menu.get_by_text("Workspace" if popover == "workspace" else "Git branch", exact=True)
-    ).to_be_visible()
-    if popover == "workspace":
-        detail = _WORKSPACE if has_binding else "This session has no workspace binding."
-        explanation = "The working directory the session runs in."
-    else:
-        detail = _BRANCH if has_binding else "The workspace branch could not be determined."
-        explanation = None
-    expect(menu.locator("p")).to_have_text([detail, explanation] if explanation else [detail])
-    menu.screenshot(path=tmp_path / f"{popover}-{viewport_width}.png", animations="disabled")
+        menu = page.get_by_role("menu")
+        expect(
+            menu.get_by_text("Workspace" if popover == "workspace" else "Git branch", exact=True)
+        ).to_be_visible()
+        if popover == "workspace":
+            detail = _WORKSPACE if has_binding else "This session has no workspace binding."
+            explanation = "The working directory the session runs in."
+        else:
+            detail = _BRANCH if has_binding else "The workspace branch could not be determined."
+            explanation = None
+        expect(menu.locator("p")).to_have_text([detail, explanation] if explanation else [detail])
+        menu.screenshot(path=tmp_path / f"{popover}-{viewport_width}.png", animations="disabled")
 
-    dimensions = menu.evaluate(
-        """menu => {
-          const bounds = menu.getBoundingClientRect();
-          return {
-            left: bounds.left,
-            right: bounds.right,
-            top: bounds.top,
-            bottom: bounds.bottom,
-            viewport: window.innerWidth,
-            lines: [...menu.querySelectorAll('p')].flatMap(paragraph => {
-              const range = document.createRange();
-              range.selectNodeContents(paragraph);
-              return [...range.getClientRects()].map(line => ({
-                left: line.left, right: line.right, top: line.top, bottom: line.bottom,
-              }));
-            }),
-          };
-        }"""
-    )
-    assert dimensions["left"] >= 0
-    assert dimensions["right"] <= dimensions["viewport"]
-    assert dimensions["right"] - dimensions["left"] <= min(dimensions["viewport"] * 0.9, 448) + 1
-    if has_binding and viewport_width == 1440:
-        assert dimensions["right"] - dimensions["left"] == pytest.approx(448, abs=1)
-    assert dimensions["lines"]
-    for line in dimensions["lines"]:
-        assert line["left"] >= dimensions["left"] - 1
-        assert line["right"] <= dimensions["right"] + 1
-        assert line["top"] >= dimensions["top"] - 1
-        assert line["bottom"] <= dimensions["bottom"] + 1
+        dimensions = menu.evaluate(
+            """menu => {
+              const bounds = menu.getBoundingClientRect();
+              return {
+                left: bounds.left,
+                right: bounds.right,
+                top: bounds.top,
+                bottom: bounds.bottom,
+                viewport: window.innerWidth,
+                lines: [...menu.querySelectorAll('p')].flatMap(paragraph => {
+                  const range = document.createRange();
+                  range.selectNodeContents(paragraph);
+                  return [...range.getClientRects()].map(line => ({
+                    left: line.left, right: line.right, top: line.top, bottom: line.bottom,
+                  }));
+                }),
+              };
+            }"""
+        )
+        assert dimensions["left"] >= 0
+        assert dimensions["right"] <= dimensions["viewport"]
+        assert (
+            dimensions["right"] - dimensions["left"] <= min(dimensions["viewport"] * 0.9, 448) + 1
+        )
+        if has_binding and viewport_width == 1440:
+            assert dimensions["right"] - dimensions["left"] == pytest.approx(448, abs=1)
+        assert dimensions["lines"]
+        for line in dimensions["lines"]:
+            assert line["left"] >= dimensions["left"] - 1
+            assert line["right"] <= dimensions["right"] + 1
+            assert line["top"] >= dimensions["top"] - 1
+            assert line["bottom"] <= dimensions["bottom"] + 1
+
+        page.keyboard.press("Escape")
+        expect(menu).to_have_count(0)
 
 
 @pytest.mark.parametrize(
