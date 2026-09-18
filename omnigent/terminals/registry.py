@@ -101,6 +101,16 @@ class TerminalListEntry:
     instance: TerminalInstance
 
 
+class TerminalLaunchSupersededError(RuntimeError):
+    """A terminal finished starting after its conversation's launches were superseded.
+
+    Raised by :meth:`TerminalRegistry.launch` instead of registering the
+    instance (which is closed first) when
+    :meth:`TerminalRegistry.supersede_inflight_launches` — the session
+    reset — ran while the launch was in flight.
+    """
+
+
 class TerminalRegistry:
     """The single registry of per-conversation tmux terminal instances.
 
@@ -139,6 +149,13 @@ class TerminalRegistry:
         # between them — plenty of room for another send to slip in).
         # See ``designs/OMNIGENT_TERMINAL_BRIDGE.md`` §9.1.
         self._instance_locks: dict[tuple[str, str, str], threading.Lock] = {}
+        # Per-conversation launch generation, bumped by
+        # ``supersede_inflight_launches`` (the session reset). ``launch``
+        # captures it before the lock-free spawn and refuses to register
+        # when it changed — the reset only closes terminals registered at
+        # that moment, so a later registration would leak a terminal built
+        # from a spec the reset retired.
+        self._launch_generations: dict[str, int] = {}
         # Threading lock — see module docstring for the rationale.
         # Protects both ``_by_conversation`` and ``_instance_locks``.
         self._lock = threading.Lock()
@@ -202,9 +219,14 @@ class TerminalRegistry:
         :raises RuntimeError: If tmux isn't on PATH or the launch
             fails. Inner code surfaces a clear error; the caller
             tool wraps in a JSON error envelope.
+        :raises TerminalLaunchSupersededError: If
+            :meth:`supersede_inflight_launches` ran (a session reset)
+            while this launch was starting. The started instance is
+            closed before raising.
         """
         key = (terminal_name, session_key)
         with self._lock:
+            launch_generation = self._launch_generations.get(conversation_id, 0)
             existing = self._by_conversation.get(conversation_id, {}).get(key)
         if existing is not None and existing.running:
             if await existing.is_alive():
@@ -242,40 +264,81 @@ class TerminalRegistry:
                 f"terminal {terminal_name}:{session_key} exited before it became available"
             )
 
+        superseded = False
         with self._lock:
-            slot = self._by_conversation.setdefault(conversation_id, {})
-            # Re-check: another concurrent launch for the same key may
-            # have raced ours. Take the second-arrival policy: close
-            # ours and return the racer's. Avoids two live tmux
-            # sessions for the same key.
-            racer = slot.get(key)
-            if racer is not None and racer.running:
-                # Close ours outside the lock; racer wins.
+            if self._launch_generations.get(conversation_id, 0) != launch_generation:
+                # A reset superseded this conversation's launches while the
+                # spawn ran: the spec this terminal was built from is
+                # retired, so close it instead of registering it.
+                superseded = True
                 instance_to_close: TerminalInstance | None = created.instance
-                winning_instance = racer
-            else:
-                slot[key] = created.instance
-                instance_to_close = None
                 winning_instance = created.instance
-                # Allocate a per-instance lock alongside the
-                # registration. Tools fetch it via
-                # :meth:`get_instance_lock` to serialize concurrent
-                # tmux ops on this instance.
-                self._instance_locks[(conversation_id, terminal_name, session_key)] = (
-                    threading.Lock()
-                )
+            else:
+                slot = self._by_conversation.setdefault(conversation_id, {})
+                # Re-check: another concurrent launch for the same key may
+                # have raced ours. Take the second-arrival policy: close
+                # ours and return the racer's. Avoids two live tmux
+                # sessions for the same key.
+                racer = slot.get(key)
+                if racer is not None and racer.running:
+                    # Close ours outside the lock; racer wins.
+                    instance_to_close = created.instance
+                    winning_instance = racer
+                else:
+                    slot[key] = created.instance
+                    instance_to_close = None
+                    winning_instance = created.instance
+                    # Allocate a per-instance lock alongside the
+                    # registration. Tools fetch it via
+                    # :meth:`get_instance_lock` to serialize concurrent
+                    # tmux ops on this instance.
+                    self._instance_locks[(conversation_id, terminal_name, session_key)] = (
+                        threading.Lock()
+                    )
 
         if instance_to_close is not None:
             try:
                 await asyncio.wait_for(instance_to_close.close(), timeout=_CLOSE_TIMEOUT_S)
             except asyncio.TimeoutError:
                 logger.warning(
-                    "Race-loser terminal close timed out for %s:%s in conv %s",
+                    "Discarded terminal close timed out for %s:%s in conv %s",
                     terminal_name,
                     session_key,
                     conversation_id,
                 )
+        if superseded:
+            raise TerminalLaunchSupersededError(
+                f"terminal {terminal_name}:{session_key} finished starting after a "
+                f"reset superseded conversation {conversation_id}'s launches"
+            )
         return winning_instance
+
+    def supersede_inflight_launches(self, conversation_id: str) -> None:
+        """Refuse registration for this conversation's launches already running.
+
+        Called by the session reset *before* it tears terminals down: the
+        teardown only closes what is registered at that moment, and a
+        creator past its registry re-check would take the slot afterwards.
+        A superseded :meth:`launch` closes its instance and raises
+        :class:`TerminalLaunchSupersededError` instead of registering.
+
+        :param conversation_id: The conversation being reset.
+        """
+        with self._lock:
+            self._launch_generations[conversation_id] = (
+                self._launch_generations.get(conversation_id, 0) + 1
+            )
+
+    def drop_launch_generation(self, conversation_id: str) -> None:
+        """Forget a deleted conversation's launch generation.
+
+        Bookkeeping only — called when the session itself is deleted, so the
+        map doesn't grow one entry per conversation that ever reset.
+
+        :param conversation_id: The conversation being deleted.
+        """
+        with self._lock:
+            self._launch_generations.pop(conversation_id, None)
 
     def get_instance_lock(
         self,

@@ -25,7 +25,7 @@ import pytest
 
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 from omnigent.inner.terminal import TerminalCreateResult, TerminalInstance
-from omnigent.terminals import TerminalRegistry
+from omnigent.terminals import TerminalLaunchSupersededError, TerminalRegistry
 from omnigent.terminals import registry as registry_mod
 from omnigent.terminals.registry import TerminalListEntry, conversation_link_for_id
 
@@ -301,6 +301,101 @@ async def test_launch_replaces_stale_running_entry(
     assert result is created
     assert stale.closed is True
     assert reg.get("conv_x", "shell", "s1") is created
+
+
+class _LatchedTerminal(TerminalInstance):
+    """Terminal instance whose ``launch`` blocks until released."""
+
+    entered: asyncio.Event
+    release: asyncio.Event
+    closed: bool = False
+
+    async def launch(self, *, cwd: Path | None = None) -> None:
+        del cwd
+        self.entered.set()
+        await self.release.wait()
+        self.running = True
+
+    async def is_alive(self) -> bool:
+        return self.running
+
+    async def close(self) -> None:
+        self.closed = True
+        self.running = False
+
+
+@pytest.mark.asyncio
+async def test_supersede_inflight_launches_refuses_late_registration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A launch that finishes after supersession is closed, not registered.
+
+    The session reset closes only the terminals registered at that moment,
+    so a creator mid-start must not take the slot afterwards — it would
+    hand the session a terminal built from a spec the reset retired.
+    """
+    reg = TerminalRegistry()
+    created = _LatchedTerminal(
+        name="shell",
+        session_key="s1",
+        socket_path=tmp_path / "created.sock",
+        private_dir=tmp_path / "created",
+        running=False,
+    )
+    created.entered = asyncio.Event()
+    created.release = asyncio.Event()
+
+    def _fake_create_terminal_instance(*_args: object, **_kwargs: object) -> TerminalCreateResult:
+        return TerminalCreateResult(instance=created, cwd=tmp_path)
+
+    monkeypatch.setattr(registry_mod, "create_terminal_instance", _fake_create_terminal_instance)
+
+    launch_task = asyncio.create_task(
+        reg.launch("conv_x", "shell", "s1", TerminalEnvSpec(command="bash"))
+    )
+    await asyncio.wait_for(created.entered.wait(), timeout=10.0)
+
+    reg.supersede_inflight_launches("conv_x")
+    created.release.set()
+
+    with pytest.raises(TerminalLaunchSupersededError):
+        await asyncio.wait_for(launch_task, timeout=10.0)
+
+    assert created.closed is True
+    assert reg.get("conv_x", "shell", "s1") is None
+    assert reg.get_instance_lock("conv_x", "shell", "s1") is None
+
+
+@pytest.mark.asyncio
+async def test_launch_after_supersession_registers_normally(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The fence is exactly as wide as the reset: later launches register."""
+    reg = TerminalRegistry()
+    created = _LatchedTerminal(
+        name="shell",
+        session_key="s1",
+        socket_path=tmp_path / "created.sock",
+        private_dir=tmp_path / "created",
+        running=False,
+    )
+    created.entered = asyncio.Event()
+    created.release = asyncio.Event()
+    created.release.set()
+
+    def _fake_create_terminal_instance(*_args: object, **_kwargs: object) -> TerminalCreateResult:
+        return TerminalCreateResult(instance=created, cwd=tmp_path)
+
+    monkeypatch.setattr(registry_mod, "create_terminal_instance", _fake_create_terminal_instance)
+
+    reg.supersede_inflight_launches("conv_x")
+    result = await reg.launch("conv_x", "shell", "s1", TerminalEnvSpec(command="bash"))
+
+    assert result is created
+    assert reg.get("conv_x", "shell", "s1") is created
+    assert created.closed is False
 
 
 def test_transfer_moves_terminal_without_closing_tmux(tmp_path: Path) -> None:

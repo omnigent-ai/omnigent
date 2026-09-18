@@ -144,6 +144,7 @@ from omnigent.runner.native import (
     _rewrap_like,
     _session_labels_for_runner_spawn,
     _session_payload_for_host_spawn_check,
+    _session_reset_during_launch_response,
     _unwrap_resolved_spec,
 )
 from omnigent.runner.native import orchestration as _native_runtime
@@ -183,6 +184,7 @@ from omnigent.server.schemas import (
 from omnigent.spec.skill_sources import resolve_session_skills
 from omnigent.spec.types import AgentSpec, LocalToolInfo, SkillSpec
 from omnigent.terminals.control_bridge import bridge_tmux_control_to_websocket
+from omnigent.terminals.registry import TerminalLaunchSupersededError
 from omnigent.terminals.ws_common import WS_CLOSE_TERMINAL_NOT_FOUND
 from omnigent.tools.builtins.load_skill import (
     find_skill_by_name,
@@ -2910,6 +2912,17 @@ def create_runner_app(
 
     _version_cache: dict[str, int] = {}  # conversation_id → last seen agent_version
     _spec_cache: dict[str, _SpecEntry] = {}  # agent_id → cached AgentSpec for terminal tools
+    _session_terminal_epochs: dict[str, int] = {}  # session_id → terminal generation
+
+    def _terminal_registration_fence(session_id: str) -> Callable[[], bool]:
+        """Capture the terminal generation a launch is about to start under.
+
+        A session reset bumps the generation, so a terminal that only finishes
+        starting afterwards is holding a spec the reset retired.
+        """
+        epoch = _session_terminal_epochs.get(session_id, 0)
+        return lambda: _session_terminal_epochs.get(session_id, 0) == epoch
+
     _resp_to_conv: dict[str, str] = {}  # harness response_id → conversation_id
     _live_response_id: dict[str, str] = {}
     app.state.live_response_id = _live_response_id
@@ -4157,6 +4170,7 @@ def create_runner_app(
                 publish_event=_publish_event,
                 server_client=server_client,
                 ensure_comment_relay=_ensure_comment_relay_started,
+                registration_is_current=_terminal_registration_fence(session_id),
             )
             _launch_pre: Callable[[bool], Awaitable[PreLaunchResult]] | None = None
             _launch_build: (
@@ -4782,6 +4796,9 @@ def create_runner_app(
         _kimi_terminal_ensure_locks.pop(session_id, None)
         _hermes_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
+        _session_terminal_epochs.pop(session_id, None)
+        if resource_registry.terminal_registry is not None:
+            resource_registry.terminal_registry.drop_launch_generation(session_id)
         _interrupted_sessions.discard(session_id)
         await _cancel_auto_forwarder_task(session_id)
         # Close any OpenCode server that no forwarder adopted.
@@ -8727,6 +8744,7 @@ def create_runner_app(
                         publish_event=_publish_event,
                         server_client=server_client,
                         ensure_comment_relay=_ensure_comment_relay_started,
+                        registration_is_current=_terminal_registration_fence(conv_id),
                     ),
                     ensure_locks=_opencode_terminal_ensure_locks,
                     resolve_agent_spec=lambda: _resolve_session_agent_spec_or_none(conv_id),
@@ -10308,6 +10326,7 @@ def create_runner_app(
                 publish_event=_publish_ensure_event,
                 server_client=server_client,
                 ensure_comment_relay=_ensure_comment_relay_started,
+                registration_is_current=_terminal_registration_fence(session_id),
             )
             _ensure_build: (
                 Callable[[NativeLaunchContext], Awaitable[NativeLaunchContext]] | None
@@ -10418,6 +10437,10 @@ def create_runner_app(
         sandbox_override = body.get("sandbox")
         spec = body.get("spec") or {}
 
+        # Captured before spec resolution: a reset landing after this point
+        # retires the spec this launch is about to build from.
+        registration_is_current = _terminal_registration_fence(session_id)
+
         agent_spec = await _resolve_session_agent_spec(session_id)
         agent_os_env = getattr(agent_spec, "os_env", None) if agent_spec is not None else None
 
@@ -10507,6 +10530,20 @@ def create_runner_app(
                 parent_os_env=agent_os_env,
                 resource_role=(CLAUDE_NATIVE_TERMINAL_ROLE if bridge_inject else None),
             )
+        except TerminalLaunchSupersededError:
+            # The registry refused the registration: a reset landed while the
+            # terminal was starting. Same contract as the fence check below,
+            # with nothing left to close.
+            _logger.info(
+                "Discarding terminal %s:%s for %s: session was reset mid-launch",
+                terminal_name,
+                session_key,
+                session_id,
+                extra={"session_id": session_id},
+            )
+            if launched_relay is not None:
+                _discard_comment_relay(session_id, launched_relay)
+            return _session_reset_during_launch_response()
         except RuntimeError as exc:
             if launched_relay is not None:
                 _discard_comment_relay(session_id, launched_relay)
@@ -10519,6 +10556,21 @@ def create_runner_app(
                     }
                 },
             )
+
+        if not registration_is_current():
+            # Same fence as the native paths: a reset that landed mid-start
+            # retired this terminal's spec, so drop it rather than attach it.
+            _logger.info(
+                "Discarding terminal %s:%s for %s: session was reset mid-launch",
+                terminal_name,
+                session_key,
+                session_id,
+                extra={"session_id": session_id},
+            )
+            if launched_relay is not None:
+                _discard_comment_relay(session_id, launched_relay)
+            await resource_registry.close_terminal(session_id, resource_view.id)
+            return _session_reset_during_launch_response()
 
         if bridge_inject:
             _publish_tmux_target_for_bridge(
@@ -12135,6 +12187,14 @@ def create_runner_app(
 
     @app.post("/v1/sessions/{session_id}/reset-state")
     async def reset_session_state(session_id: str) -> JSONResponse:
+        # Bumped first: a terminal already starting must not register after the
+        # teardown below, which only closes what is registered right now.
+        _session_terminal_epochs[session_id] = _session_terminal_epochs.get(session_id, 0) + 1
+        # Registry-level twin of that bump: fences creators that publish
+        # through TerminalRegistry.launch directly (e.g. sys_terminal_launch),
+        # which never see the per-context fence above.
+        if resource_registry.terminal_registry is not None:
+            resource_registry.terminal_registry.supersede_inflight_launches(session_id)
         _required_terminal_exit_errors.pop(session_id, None)
         _codex_terminal_ensure_locks.pop(session_id, None)
         _claude_terminal_ensure_locks.pop(session_id, None)
@@ -12148,6 +12208,9 @@ def create_runner_app(
         _hermes_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
         await _teardown_session_terminals(session_id)
+        # A codex app-server stored before its terminal registered is invisible
+        # to the teardown above; close it or the subprocess outlives the reset.
+        await _native_runtime.teardown_codex_native_app_server(session_id)
         await resource_registry.cleanup_session(session_id)
         _clear_session_agent_caches(session_id, _session_agent_ids.get(session_id))
         return JSONResponse(

@@ -9,9 +9,14 @@ See ``designs/OMNIGENT_TERMINAL_BRIDGE.md`` for the design and the
 :mod:`omnigent.inner.terminal` for the underlying tmux machinery.
 """
 
-from omnigent.terminals.registry import TerminalListEntry, TerminalRegistry
+from omnigent.terminals.registry import (
+    TerminalLaunchSupersededError,
+    TerminalListEntry,
+    TerminalRegistry,
+)
 
 __all__ = [
+    "TerminalLaunchSupersededError",
     "TerminalListEntry",
     "TerminalRegistry",
 ]
