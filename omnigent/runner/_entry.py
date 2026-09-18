@@ -45,7 +45,9 @@ _RUNNER_PREWARM_SPEC_PATH_ENV_VAR = "RUNNER_PREWARM_SPEC_PATH"
 # with the CLI/server/host) instead of a hard-coded placeholder.
 _RUNNER_VERSION = VERSION
 _RUNNER_CONFIG_HOME_ENV_VAR = "OMNIGENT_CONFIG_HOME"
-_DEFAULT_RUNNER_IDLE_TIMEOUT_S = 60 * 60
+# A day, not an hour: the idle window must span an overnight gap so a
+# session left in the evening still has its runner the next morning.
+_DEFAULT_RUNNER_IDLE_TIMEOUT_S = 24 * 60 * 60
 _RUNNER_IDLE_MONITOR_MAX_POLL_INTERVAL_S = 60.0
 _AUTH_DISCOVERY_RETRY_INTERVAL_S = 5.0
 # The runner offloads short native-CLI/IPC ops via asyncio.to_thread. Python's
@@ -64,6 +66,12 @@ _GRACEFUL_SHUTDOWN_TUNNEL_TIMEOUT_S = 15.0
 # expires, so a live session's HTTP callbacks never present an expired
 # token. Well under the server-side token TTL.
 _MANAGED_MINT_REFRESH_SKEW_S = 300.0
+# Cadence of the idle mint keepalive. Must stay well under
+# _MANAGED_MINT_REFRESH_SKEW_S: each re-mint then happens while the previous
+# JWT (promoted to the proxy bearer) is still valid, so the mint chain
+# survives idle gaps longer than the token TTL instead of latching
+# proxy_auth_failed on the next-morning request.
+_MANAGED_MINT_KEEPALIVE_INTERVAL_S = 120.0
 _logger = logging.getLogger(__name__)
 
 # Module-level singleton set once at runner startup. All later
@@ -149,12 +157,13 @@ def _load_runner_idle_timeout_s_from_config() -> float:
     """Load the runner inactivity timeout from config.
 
     Reads ``runner.idle_timeout_s`` from the global config file. Missing
-    config or missing key defaults to 1 hour. A value of ``0`` disables the
-    inactivity watchdog. Negative, boolean, or non-numeric values fail loud
-    during runner startup so the user does not get silently different
-    lifecycle behavior than requested.
+    config or missing key defaults to 24 hours, so an overnight-idle
+    session keeps its runner. A value of ``0`` disables the inactivity
+    watchdog. Negative, boolean, or non-numeric values fail loud during
+    runner startup so the user does not get silently different lifecycle
+    behavior than requested.
 
-    :returns: Idle timeout in seconds, e.g. ``3600.0``. ``0.0`` disables
+    :returns: Idle timeout in seconds, e.g. ``86400.0``. ``0.0`` disables
         the watchdog.
     :raises RuntimeError: If ``runner.idle_timeout_s`` is invalid.
     """
@@ -283,6 +292,38 @@ async def _run_inactivity_monitor(
             request_shutdown()
             return
         await asyncio.sleep(min(poll_interval_s, idle_timeout_s - elapsed_s))
+
+
+async def _run_mint_keepalive(
+    keepalive: Callable[[], None],
+    *,
+    interval_s: float = _MANAGED_MINT_KEEPALIVE_INTERVAL_S,
+) -> None:
+    """Keep the managed mint auth chain alive across idle gaps.
+
+    The mint factory refreshes only on demand, so a runner idle longer than
+    the owner-JWT TTL would next mint with an expired proxy bearer and latch
+    ``proxy_auth_failed`` — leaving a credential-less managed runner alive but
+    unable to authenticate. Calling the factory on a cadence inside the
+    refresh skew re-mints while the previous JWT is still valid, so auth
+    survives the full idle window.
+
+    :param keepalive: The factory's ``keepalive`` hook (a cheap cache read
+        outside the refresh-skew window; a re-mint inside it).
+    :param interval_s: Keepalive cadence in seconds; must stay under
+        :data:`_MANAGED_MINT_REFRESH_SKEW_S`.
+    :returns: None. Runs until cancelled.
+    """
+    while True:
+        await asyncio.sleep(interval_s)
+        try:
+            await asyncio.to_thread(keepalive)
+        except Exception:  # noqa: BLE001 — keepalive must never kill the runner
+            _logger.debug(
+                "managed mint keepalive attempt failed",
+                exc_info=True,
+                extra={"session_id": runner_primary_session_id()},
+            )
 
 
 class _RunnerDatabricksAuth(ThreadedAuth):
@@ -571,6 +612,17 @@ class _InitialAuthTokenFactory:
                 extra={"session_id": runner_primary_session_id()},
             )
             return True
+
+    def keepalive(self) -> None:
+        """Forward keepalive to an already-resolved managed mint fallback.
+
+        Never triggers fallback discovery: while the host bearer is in use
+        (or no fallback exists yet) there is no mint chain to keep alive.
+        """
+        with self._lock:
+            fallback_keepalive = getattr(self._fallback_factory, "keepalive", None)
+        if callable(fallback_keepalive):
+            fallback_keepalive()
 
 
 def _make_auth_token_factory(
@@ -1029,6 +1081,16 @@ class _ManagedMintTokenFactory:
             self._cached_token = None
             self._cached_expires_at = 0.0
             return True
+
+    def keepalive(self) -> None:
+        """Refresh the mint chain while the runner is idle.
+
+        A cheap cache read outside the refresh-skew window; inside it, a
+        re-mint that still presents a valid proxy bearer. Driven on a cadence
+        by :func:`_run_mint_keepalive` so an idle gap longer than the token
+        TTL cannot leave the next on-demand mint with an expired bearer.
+        """
+        self()
 
     def _still_valid_cached_token(self, now: float) -> str | None:
         """Return the cached token if it hasn't expired outright.
@@ -1873,6 +1935,17 @@ async def _run_tunnel_from_env() -> None:
             ),
             name=f"runner-idle-monitor:{runner_id}",
         )
+    # Managed mint chain keepalive: without it, a runner idle longer than the
+    # owner-JWT TTL re-mints with an expired proxy bearer and can never
+    # re-authenticate (see _run_mint_keepalive). Only factories that expose a
+    # keepalive hook participate; every other credential path is a no-op here.
+    keepalive_task: asyncio.Task[None] | None = None
+    mint_keepalive = getattr(auth_token_factory, "keepalive", None)
+    if callable(mint_keepalive):
+        keepalive_task = asyncio.create_task(
+            _run_mint_keepalive(cast("Callable[[], None]", mint_keepalive)),
+            name=f"runner-mint-keepalive:{runner_id}",
+        )
     if parent_pid is not None:
 
         def _request_parent_death_shutdown() -> None:
@@ -1932,6 +2005,10 @@ async def _run_tunnel_from_env() -> None:
             )
         for task in wait_tasks:
             task.cancel()
+        if keepalive_task is not None:
+            keepalive_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await keepalive_task
         with contextlib.suppress(asyncio.CancelledError):
             await stop_task
         with contextlib.suppress(asyncio.CancelledError):

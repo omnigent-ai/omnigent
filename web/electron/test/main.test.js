@@ -36,9 +36,13 @@ function loadNavigationHarness({
   serverUrl = "https://host.example/ml/omnigents",
   savedServerUrl,
   registerFallbacks = true,
+  // Reuse a previous harness's userData dir to simulate an app relaunch with
+  // the same profile (persisted settings.json intact).
+  userData: existingUserData,
 } = {}) {
-  const userData = fs.mkdtempSync(path.join(os.tmpdir(), "omnigent-navigation-test-"));
-  if (savedServerUrl) {
+  const userData =
+    existingUserData ?? fs.mkdtempSync(path.join(os.tmpdir(), "omnigent-navigation-test-"));
+  if (savedServerUrl && !existingUserData) {
     fs.writeFileSync(
       path.join(userData, "settings.json"),
       JSON.stringify({ server_url: savedServerUrl }),
@@ -257,6 +261,8 @@ function loadNavigationHarness({
       currentUrl = url;
     },
     win,
+    userData,
+    readSettings: () => JSON.parse(fs.readFileSync(path.join(userData, "settings.json"), "utf8")),
     cleanup: () => {
       api.windows.clear();
       fs.rmSync(userData, { recursive: true, force: true });
@@ -1002,5 +1008,131 @@ describe("browser-view teardown on server change (src/main.js)", () => {
         "close a registry with nothing open. Keep the guard.",
       ].join(" "),
     );
+  });
+});
+
+// A relaunch must return the user to the conversation they left open, not the
+// new-chat home page. createWindow's normal saved-server launch restores the
+// last in-app route persisted by registerLastRoutePersistence; deep links,
+// explicit targets, ephemeral windows, foreign-server routes, and malformed
+// settings entries never participate. Exercised end-to-end through the REAL
+// createWindow + settings.json in a scratch userData dir.
+describe("next-day route restore (src/main.js)", () => {
+  const SERVER = "https://host.example/ml/omnigents";
+
+  it("persists the last in-app route from committed navigations", (t) => {
+    const harness = loadNavigationHarness({ savedServerUrl: SERVER, registerFallbacks: false });
+    t.after(harness.cleanup);
+
+    harness.api.createWindow();
+    harness.emit("did-navigate", `${SERVER}/c/abc`, 200, "OK");
+
+    assert.equal(harness.readSettings().last_routes[SERVER], "/c/abc");
+  });
+
+  it("persists SPA route changes from main-frame in-page navigations only", (t) => {
+    const harness = loadNavigationHarness({ savedServerUrl: SERVER, registerFallbacks: false });
+    t.after(harness.cleanup);
+
+    harness.api.createWindow();
+    harness.emit("did-navigate-in-page", `${SERVER}/c/subframe`, false);
+    assert.equal(harness.readSettings().last_routes, undefined);
+
+    harness.emit("did-navigate-in-page", `${SERVER}/c/xyz`, true);
+    assert.equal(harness.readSettings().last_routes[SERVER], "/c/xyz");
+  });
+
+  it("relaunch restores the persisted route instead of the server root", (t) => {
+    const day1 = loadNavigationHarness({ savedServerUrl: SERVER, registerFallbacks: false });
+    day1.api.createWindow();
+    assert.equal(day1.calls.loadURL[0][0], SERVER);
+    day1.emit("did-navigate", `${SERVER}/c/abc`, 200, "OK");
+    day1.api.windows.clear();
+
+    const day2 = loadNavigationHarness({
+      savedServerUrl: SERVER,
+      registerFallbacks: false,
+      userData: day1.userData,
+    });
+    t.after(day2.cleanup);
+    day2.api.createWindow();
+
+    assert.equal(
+      day2.calls.loadURL[0][0],
+      `${SERVER}/c/abc`,
+      "relaunch landed on the server root (the new-chat home page) instead of the conversation left open",
+    );
+  });
+
+  it("never persists foreign-origin routes or HTTP-error commits", (t) => {
+    const harness = loadNavigationHarness({ savedServerUrl: SERVER, registerFallbacks: false });
+    t.after(harness.cleanup);
+
+    harness.api.createWindow();
+    harness.emit("did-navigate", "https://evil.example/c/abc", 200, "OK");
+    harness.emit("did-navigate", `${SERVER}/c/error`, 500, "Internal Server Error");
+
+    assert.equal(harness.readSettings().last_routes, undefined);
+  });
+
+  it("never persists for ephemeral windows", (t) => {
+    const harness = loadNavigationHarness({ savedServerUrl: SERVER, registerFallbacks: false });
+    t.after(harness.cleanup);
+
+    const win = harness.api.createWindow(undefined, { ephemeral: true });
+    // An ephemeral window later connected from its setup page is pinned to
+    // the server window-only; mirror that state without persisting it.
+    harness.api.windows.set(win, {
+      origin: new URL(SERVER).origin,
+      serverUrl: SERVER,
+      ephemeral: true,
+      badgeCount: 0,
+      browserRegistry: { closeAll: () => {} },
+    });
+    harness.emit("did-navigate", `${SERVER}/c/abc`, 200, "OK");
+
+    assert.equal(harness.readSettings().last_routes, undefined);
+  });
+
+  it("deep links and explicit targets never restore a stored route", (t) => {
+    const seeded = loadNavigationHarness({ savedServerUrl: SERVER, registerFallbacks: false });
+    seeded.api.createWindow();
+    seeded.emit("did-navigate", `${SERVER}/c/stored`, 200, "OK");
+    seeded.api.windows.clear();
+
+    const explicit = loadNavigationHarness({
+      registerFallbacks: false,
+      userData: seeded.userData,
+    });
+    explicit.api.createWindow(`${SERVER}/c/explicit`);
+    assert.equal(explicit.calls.loadURL[0][0], `${SERVER}/c/explicit`);
+    explicit.api.windows.clear();
+
+    const deepLink = loadNavigationHarness({
+      registerFallbacks: false,
+      userData: seeded.userData,
+    });
+    t.after(deepLink.cleanup);
+    deepLink.api.createWindow(undefined, { serverUrl: SERVER, path: "/c/deep" });
+    assert.equal(deepLink.calls.loadURL[0][0], `${SERVER}/c/deep`);
+  });
+
+  it("ignores malformed or escaping stored routes and loads the root", (t) => {
+    for (const badRoute of [42, "no-slash", "https://evil.example/c/x", "/c/../../x", "/"]) {
+      const userData = fs.mkdtempSync(path.join(os.tmpdir(), "omnigent-navigation-test-"));
+      fs.writeFileSync(
+        path.join(userData, "settings.json"),
+        JSON.stringify({ server_url: SERVER, last_routes: { [SERVER]: badRoute } }),
+      );
+      const harness = loadNavigationHarness({ registerFallbacks: false, userData });
+      t.after(harness.cleanup);
+      harness.api.createWindow();
+      assert.equal(
+        harness.calls.loadURL[0][0],
+        SERVER,
+        `stored route ${JSON.stringify(badRoute)} must not be restored`,
+      );
+      harness.api.windows.clear();
+    }
   });
 });

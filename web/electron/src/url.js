@@ -233,6 +233,41 @@
   }
 
   /**
+   * Extract the in-app route (path + search + hash, relative to the server's
+   * mount) from an absolute URL, or null when the URL lives outside the
+   * server — a different origin, or a path outside the server's mount. The
+   * result always begins with "/" and joins back onto the server URL as
+   * ``serverUrl + route`` (see main.js resolveServerPath), so a stored route
+   * can be validated by round-tripping it through this function.
+   *
+   * @param {string} rawUrl An absolute URL (e.g. a committed navigation).
+   * @param {string} serverUrl The clean server identity (origin or
+   *   origin+mount, no conversation path).
+   * @returns {string | null}
+   */
+  function inAppRoutePath(rawUrl, serverUrl) {
+    let url;
+    let server;
+    try {
+      url = new URL(rawUrl);
+      server = new URL(serverUrl);
+    } catch {
+      return null;
+    }
+    if (url.origin !== server.origin) return null;
+    const mount = server.pathname.replace(/\/+$/, "");
+    let route;
+    if (url.pathname === mount || url.pathname === mount + "/") {
+      route = "/";
+    } else if (url.pathname.startsWith(mount + "/")) {
+      route = url.pathname.slice(mount.length);
+    } else {
+      return null;
+    }
+    return route + url.search + url.hash;
+  }
+
+  /**
    * True when a server URL is hosted by Databricks — a workspace domain
    * (workspace-mounted Omnigent) or a Databricks App. Https-only: a local or
    * self-hosted server is never "Databricks-managed", whatever its hostname
@@ -421,6 +456,7 @@
     serverDisplayLabel,
     isPlainHttpRemote,
     normalizeSavedServerUrl,
+    inAppRoutePath,
     WORKSPACE_UI_PATH,
     WORKSPACE_PROBE_TIMEOUT_MS,
     databricksWorkspaceUiUrl,

@@ -20,6 +20,7 @@ import pytest
 from omnigent.runner._entry import (
     _DEFAULT_RUNNER_IDLE_TIMEOUT_S,
     _DEFAULT_RUNNER_THREADPOOL_MAX_WORKERS,
+    _MANAGED_MINT_REFRESH_SKEW_S,
     _agent_cache_dest,
     _apply_host_interactive_shells,
     _host_interactive_shells_from_env,
@@ -35,6 +36,7 @@ from omnigent.runner._entry import (
     _parent_process_is_alive,
     _resolve_agent_spec_from_server,
     _run_inactivity_monitor,
+    _run_mint_keepalive,
     _run_parent_death_killer,
     _runner_parent_pid_from_env,
     _runner_threadpool_max_workers,
@@ -1204,6 +1206,172 @@ def test_initial_host_token_re_resolves_to_sdk_when_remint_403s_after_expiry(
     assert factory() == "sdk-token"
 
 
+def _make_ttl_bound_mint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> set[str]:
+    """Install a fake mint endpoint that enforces proxy-bearer validity.
+
+    Models the Apps edge in front of the mint endpoint: a mint succeeds only
+    while the presented ``proxy_bearer`` is in the returned live set, and each
+    successful mint issues ``jwt-<n>`` and adds it to that set. Tests expire a
+    bearer by discarding it.
+
+    :param monkeypatch: Pytest environment patch fixture.
+    :returns: The mutable set of currently-valid proxy bearers.
+    """
+    valid_bearers: set[str] = {"host-bearer"}
+    minted_count = [0]
+
+    def _mint(
+        mint_url: str, server_url: str, binding_token: str, *, proxy_bearer: str | None = None
+    ) -> tuple[str, float]:
+        if proxy_bearer not in valid_bearers:
+            request = httpx.Request("POST", mint_url)
+            raise httpx.HTTPStatusError(
+                "Invalid Token", request=request, response=httpx.Response(403, request=request)
+            )
+        minted_count[0] += 1
+        token = f"jwt-{minted_count[0]}"
+        valid_bearers.add(token)
+        return (token, time.time() + 1800.0)
+
+    monkeypatch.setattr("omnigent.runner._entry._mint_managed_owner_token", _mint)
+    return valid_bearers
+
+
+def test_managed_mint_chain_breaks_when_idle_gap_outlives_token_ttl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without keepalive, an idle gap longer than the token TTL kills auth.
+
+    Pins the failure mode the mint keepalive exists to prevent: the factory
+    only re-mints on demand, so after an idle gap that outlives both the
+    cached JWT and the proxy bearer it promoted, the next request's re-mint
+    presents a dead bearer, the edge answers 403, and ``proxy_auth_failed``
+    latches — a credential-less managed runner is then alive but can never
+    re-authenticate.
+
+    :param monkeypatch: Pytest environment patch fixture.
+    :returns: None.
+    """
+    valid_bearers = _make_ttl_bound_mint(monkeypatch)
+
+    factory = _make_managed_mint_factory(
+        "https://s.example.com", "btok", proxy_bearer="host-bearer"
+    )
+    assert isinstance(factory, _ManagedMintTokenFactory)
+    assert factory() == "jwt-1"
+
+    # Overnight idle gap: every bearer the factory could present expires, and
+    # the cached JWT lapses before anything re-mints.
+    valid_bearers.clear()
+    factory._cached_expires_at = time.time() - 1.0
+
+    assert factory() is None
+    assert factory.proxy_auth_failed is True
+    assert factory.declined is False
+
+
+def test_mint_keepalive_preserves_auth_across_idle_gap_longer_than_token_ttl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keepalive ticks re-mint inside the skew window, so idle auth survives.
+
+    Walks an idle gap spanning several token lifetimes: each keepalive tick
+    that lands inside the refresh-skew window re-mints while the current JWT
+    is still edge-valid, then the superseded bearer expires. The chain never
+    presents a dead bearer, so a next-morning request still authenticates.
+
+    :param monkeypatch: Pytest environment patch fixture.
+    :returns: None.
+    """
+    valid_bearers = _make_ttl_bound_mint(monkeypatch)
+
+    factory = _make_managed_mint_factory(
+        "https://s.example.com", "btok", proxy_bearer="host-bearer"
+    )
+    assert isinstance(factory, _ManagedMintTokenFactory)
+    assert factory() == "jwt-1"
+    valid_bearers.discard("host-bearer")
+
+    # Three token lifetimes of idle, keepalive ticking throughout. Entering
+    # the skew window stands in for the wall-clock advancing to ~5 minutes
+    # before the cached JWT's expiry.
+    for generation in (2, 3, 4):
+        factory._cached_expires_at = time.time() + _MANAGED_MINT_REFRESH_SKEW_S - 1.0
+        factory.keepalive()
+        assert factory._cached_token == f"jwt-{generation}"
+        valid_bearers.discard(f"jwt-{generation - 1}")
+
+    assert factory() == "jwt-4"
+    assert factory.proxy_auth_failed is False
+    assert factory.declined is False
+
+
+def test_initial_factory_keepalive_never_triggers_credential_discovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The wrapper's keepalive only forwards to an already-resolved fallback.
+
+    While the host bearer is live there is no mint chain to keep alive, and a
+    keepalive tick must not start credential discovery (network probes) on an
+    idle runner.
+
+    :param monkeypatch: Pytest environment patch fixture.
+    :returns: None.
+    """
+
+    def _unexpected_discovery(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("keepalive must not trigger credential discovery")
+
+    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", _unexpected_discovery)
+
+    factory = _InitialAuthTokenFactory("host-bearer", "https://s.example.com")
+    factory.keepalive()  # no fallback resolved yet: must be a no-op
+    assert factory() == "host-bearer"
+
+    calls: list[int] = []
+
+    class _FallbackWithKeepalive:
+        def keepalive(self) -> None:
+            calls.append(1)
+
+    factory._fallback_factory = _FallbackWithKeepalive()
+    factory.keepalive()
+    assert calls == [1]
+
+
+def test_run_mint_keepalive_ticks_and_survives_hook_errors() -> None:
+    """The keepalive loop keeps ticking after a failed attempt.
+
+    A transient mint error must not end the loop — the next tick is what
+    recovers the chain before the skew window closes.
+
+    :returns: None.
+    """
+    calls: list[int] = []
+
+    def _hook() -> None:
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("transient mint failure")
+
+    async def _run() -> None:
+        task = asyncio.create_task(_run_mint_keepalive(_hook, interval_s=0.01))
+        try:
+            deadline = asyncio.get_running_loop().time() + 5.0
+            while len(calls) < 3:
+                if asyncio.get_running_loop().time() > deadline:
+                    raise AssertionError(f"keepalive stalled after {len(calls)} tick(s)")
+                await asyncio.sleep(0.01)
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+    asyncio.run(_run())
+
+
 def test_mint_managed_owner_token_posts_binding_token_and_parses_response(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1702,7 +1870,7 @@ def test_load_runner_idle_timeout_defaults_when_config_missing(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """Missing runner config uses the default one-hour idle timeout.
+    """Missing runner config uses the default 24-hour idle timeout.
 
     :param monkeypatch: Pytest environment patch fixture.
     :param tmp_path: Isolated config home.

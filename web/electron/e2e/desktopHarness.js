@@ -22,6 +22,7 @@
 "use strict";
 
 const { spawn, spawnSync } = require("node:child_process");
+const { createHash, randomBytes } = require("node:crypto");
 const fs = require("node:fs");
 const net = require("node:net");
 const os = require("node:os");
@@ -45,6 +46,18 @@ const MOCK_LLM_SERVER = path.join(
 
 /** The Python interpreter used to run the server + mock (override for venvs). */
 const PYTHON = process.env.OMNIGENT_PYTHON || "python3";
+
+// Mirrors tests/_helpers/compat.py server_pythonpath: prepend the worktree
+// and its in-repo SDKs, keep the caller's entries, so the spawned server
+// resolves omnigent + omnigent_client even when neither is pip-installed.
+const SPAWN_PYTHONPATH = [
+  REPO_ROOT,
+  path.join(REPO_ROOT, "sdks", "python-client"),
+  path.join(REPO_ROOT, "sdks", "ui"),
+  process.env.PYTHONPATH || "",
+]
+  .filter(Boolean)
+  .join(path.delimiter);
 
 /** A minimal agent spec, mirroring conftest's _TEST_AGENT_YAML. The
  * ``executor.harness`` is required (the spec loader rejects the spec without
@@ -116,6 +129,27 @@ function httpStatus(url) {
   });
 }
 
+/** GET a URL, resolving the parsed JSON body (or rejecting on any failure). */
+function httpJson(url) {
+  return new Promise((resolve, reject) => {
+    const req = http.get(url, (res) => {
+      let body = "";
+      res.on("data", (chunk) => {
+        body += chunk;
+      });
+      res.on("end", () => {
+        try {
+          resolve(JSON.parse(body));
+        } catch (err) {
+          reject(err);
+        }
+      });
+    });
+    req.on("error", reject);
+    req.setTimeout(2000, () => req.destroy(new Error("timeout")));
+  });
+}
+
 /** Poll `url` until it returns 200 or the deadline passes. */
 async function waitForHealthy(url, label, logPath) {
   const deadline = Date.now() + HEALTH_TIMEOUT_MS;
@@ -140,10 +174,12 @@ async function waitForHealthy(url, label, logPath) {
 }
 
 /**
- * Spawn the mock-LLM server and an `omnigent server` wired to it, mirroring
- * the env + argv of tests/e2e_ui/conftest.py's `mock_llm_server` +
- * `live_server` fixtures (so the desktop shell talks to the same fake backend
- * the Python lanes do — no real provider creds, deterministic replies).
+ * Spawn the mock-LLM server, an `omnigent server` wired to it, and a sibling
+ * runner tunneled into that server, mirroring the env + argv of
+ * tests/e2e_ui/conftest.py's `mock_llm_server` + `live_server` fixtures (so
+ * the desktop shell talks to the same fake backend the Python lanes do — no
+ * real provider creds, deterministic replies). The runner is what makes a
+ * host show "online" in the SPA, which session creation requires.
  *
  * The caller MUST have built the SPA into WEB_UI_DIST first (see README): the
  * server serves it from there, and building it lazily under the recorder
@@ -153,7 +189,7 @@ async function waitForHealthy(url, label, logPath) {
  * @param {string} tmpDir A scratch dir for the db, artifacts, agent, and logs.
  * @returns {Promise<{ serverUrl: string, close: () => Promise<void> }>}
  */
-async function spawnServer(tmpDir) {
+async function spawnServer(tmpDir, opts = {}) {
   if (!fs.existsSync(path.join(WEB_UI_DIST, "index.html"))) {
     throw new Error(
       `SPA bundle missing at ${WEB_UI_DIST}. Build it first:\n` +
@@ -173,7 +209,7 @@ async function spawnServer(tmpDir) {
 
   const mockOut = fs.openSync(mockLog, "w");
   const mockProc = spawn(PYTHON, [MOCK_LLM_SERVER, String(mockPort)], {
-    env: { ...process.env, PYTHONPATH: REPO_ROOT },
+    env: { ...process.env, PYTHONPATH: SPAWN_PYTHONPATH },
     stdio: ["ignore", mockOut, mockOut],
   });
   // A bad PYTHON (ENOENT) fires 'error' async; surface it as a rejection rather
@@ -197,15 +233,25 @@ async function spawnServer(tmpDir) {
   }
 
   const serverOut = fs.openSync(serverLog, "w");
-  // Strip ambient runner/host env so a nested runner (if the journey starts a
-  // host) boots clean rather than taking the zygote-fork path and hanging —
-  // the same leak the Python recorder guards against. Rebuild by filtering
-  // (rather than deleting keys) to keep the object shape static.
+  // Strip ambient omnigent env: when this harness itself runs inside an
+  // omnigent session, the inherited wiring (runner identity, data dir,
+  // process-log path, server URL) would redirect or crash the spawned
+  // server/runner — only the explicitly-set variables below may configure
+  // them. Rebuild by filtering (rather than deleting keys) to keep the
+  // object shape static.
   const cleanEnv = Object.fromEntries(
     Object.entries(process.env).filter(
-      ([key]) => !key.startsWith("OMNIGENT_RUNNER_") && !key.startsWith("OMNIGENT_HOST_"),
+      ([key]) => !key.startsWith("OMNIGENT_") && key !== "RUNNER_SERVER_URL",
     ),
   );
+  // Keep all runtime data (db/artifacts/process + CLI logs) in the scratch
+  // dir; the default lives under $HOME, which sandboxed runs mount read-only.
+  const dataDir = path.join(tmpDir, "omnigent-data");
+  // Same binding-token-derived identity omnigent.runner.identity computes.
+  const bindingToken = randomBytes(32).toString("base64url");
+  const runnerId =
+    "runner_token_" +
+    createHash("sha256").update(`omnigent-runner:${bindingToken}`).digest("hex").slice(0, 32);
   const serverProc = spawn(
     PYTHON,
     [
@@ -226,7 +272,9 @@ async function spawnServer(tmpDir) {
     {
       env: {
         ...cleanEnv,
-        PYTHONPATH: REPO_ROOT,
+        PYTHONPATH: SPAWN_PYTHONPATH,
+        OMNIGENT_DATA_DIR: dataDir,
+        OMNIGENT_RUNNER_TUNNEL_TOKEN: bindingToken,
         OPENAI_BASE_URL: `${mockUrl}/v1`,
         OPENAI_API_KEY: "mock-key",
         ANTHROPIC_API_KEY: "",
@@ -241,33 +289,149 @@ async function spawnServer(tmpDir) {
   });
   const serverUrl = `http://127.0.0.1:${serverPort}`;
 
+  // Optional compressed idle window: a config home with runner.idle_timeout_s
+  // makes the runner's inactivity watchdog reap it after a few seconds instead
+  // of the day-long default, so a journey can observe a reaped session without
+  // waiting out the real window.
+  const runnerIdleEnv = {};
+  if (opts.idleTimeoutS != null) {
+    const runnerConfigHome = path.join(tmpDir, "runner-config");
+    fs.mkdirSync(runnerConfigHome, { recursive: true });
+    fs.writeFileSync(
+      path.join(runnerConfigHome, "config.yaml"),
+      `runner:\n  idle_timeout_s: ${opts.idleTimeoutS}\n`,
+    );
+    runnerIdleEnv.OMNIGENT_CONFIG_HOME = runnerConfigHome;
+  }
+
+  const runnerLog = path.join(tmpDir, "runner.log");
+  const runnerOut = fs.openSync(runnerLog, "w");
+  const runnerProc = spawn(PYTHON, ["-m", "omnigent.runner._entry"], {
+    env: {
+      ...cleanEnv,
+      PYTHONPATH: SPAWN_PYTHONPATH,
+      OMNIGENT_DATA_DIR: dataDir,
+      OMNIGENT_RUNNER_ID: runnerId,
+      OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN: bindingToken,
+      OMNIGENT_RUNNER_PARENT_PID: String(process.pid),
+      RUNNER_SERVER_URL: serverUrl,
+      OPENAI_BASE_URL: `${mockUrl}/v1`,
+      OPENAI_API_KEY: "mock-key",
+      ...runnerIdleEnv,
+    },
+    stdio: ["ignore", runnerOut, runnerOut],
+  });
+  let runnerSpawnError = null;
+  runnerProc.on("error", (err) => {
+    runnerSpawnError = err;
+  });
+
   const close = async () => {
-    for (const proc of [serverProc, mockProc]) {
+    for (const proc of [runnerProc, serverProc, mockProc]) {
       if (proc.exitCode === null) {
         proc.kill("SIGTERM");
       }
     }
     // Give them a moment; escalate is left to process teardown.
     await sleep(200);
-    try {
-      fs.closeSync(serverOut);
-    } catch {
-      /* already closed */
-    }
-    try {
-      fs.closeSync(mockOut);
-    } catch {
-      /* already closed */
+    for (const handle of [runnerOut, serverOut, mockOut]) {
+      try {
+        fs.closeSync(handle);
+      } catch {
+        /* already closed */
+      }
     }
   };
 
   try {
     await waitForHealthy(`${serverUrl}/health`, "omnigent server", serverLog);
+    // The SPA only enables session creation once the runner's host is online.
+    const deadline = Date.now() + 90_000;
+    let online = false;
+    let lastError = "not polled yet";
+    /* oxlint-disable no-await-in-loop */
+    while (Date.now() < deadline) {
+      if (runnerProc.exitCode !== null) {
+        lastError = `runner exited with code ${runnerProc.exitCode}`;
+        break;
+      }
+      try {
+        const status = await httpJson(`${serverUrl}/v1/runners/${runnerId}/status`);
+        if (status && status.online === true) {
+          online = true;
+          break;
+        }
+        lastError = JSON.stringify(status);
+      } catch (err) {
+        lastError = `${err && err.code ? err.code : err}`;
+      }
+      await sleep(HEALTH_POLL_MS);
+    }
+    /* oxlint-enable no-await-in-loop */
+    if (!online) {
+      const log = fs.existsSync(runnerLog) ? fs.readFileSync(runnerLog, "utf8") : "";
+      throw new Error(
+        `runner never reported online (last_error=${lastError}).\n${log.slice(-3000)}`,
+      );
+    }
   } catch (err) {
     await close();
-    throw serverSpawnError ?? err;
+    throw serverSpawnError ?? runnerSpawnError ?? err;
   }
-  return { serverUrl, close };
+
+  // Create a runner-bound hello_world session via the API, exactly as
+  // tests/e2e_ui/conftest.py's `seeded_session` does (POST a hello_world
+  // bundle, then PATCH it onto the online runner). Returns the session id so
+  // a journey can open the real conversation the SPA serves at /c/<id>.
+  const createConversation = () => {
+    const script = [
+      "import io, gzip, json, tarfile, sys, httpx",
+      `AGENT = ${JSON.stringify(TEST_AGENT_YAML)}`,
+      "buf = io.BytesIO()",
+      'with gzip.GzipFile(fileobj=buf, mode="wb", mtime=0) as gz, tarfile.open(fileobj=gz, mode="w") as tar:',
+      "    data = AGENT.encode()",
+      '    info = tarfile.TarInfo(name="hello_world.yaml")',
+      "    info.size = len(data)",
+      "    tar.addfile(info, io.BytesIO(data))",
+      `base = ${JSON.stringify(serverUrl)}`,
+      'r = httpx.post(base + "/v1/sessions", data={"metadata": json.dumps({})},',
+      '               files={"bundle": ("agent.tar.gz", buf.getvalue(), "application/gzip")}, timeout=30.0)',
+      "r.raise_for_status()",
+      'sid = r.json()["session_id"]',
+      `p = httpx.patch(base + "/v1/sessions/" + sid, json={"runner_id": ${JSON.stringify(runnerId)}}, timeout=10.0)`,
+      "p.raise_for_status()",
+      "sys.stdout.write(sid)",
+    ].join("\n");
+    const res = spawnSync(PYTHON, ["-c", script], {
+      env: { ...cleanEnv, PYTHONPATH: SPAWN_PYTHONPATH },
+      encoding: "utf8",
+    });
+    if (res.status !== 0) {
+      throw new Error(`createConversation failed: ${res.stderr || res.stdout}`);
+    }
+    return res.stdout.trim();
+  };
+
+  // Poll until the server reports the runner offline (the idle watchdog reaped
+  // it, or the process died). Returns true if offline within the deadline.
+  const waitForRunnerOffline = async (deadlineMs = 90_000) => {
+    const deadline = Date.now() + deadlineMs;
+    /* oxlint-disable no-await-in-loop */
+    while (Date.now() < deadline) {
+      if (runnerProc.exitCode !== null) return true;
+      try {
+        const status = await httpJson(`${serverUrl}/v1/runners/${runnerId}/status`);
+        if (status && status.online === false) return true;
+      } catch {
+        /* transient during teardown */
+      }
+      await sleep(HEALTH_POLL_MS);
+    }
+    /* oxlint-enable no-await-in-loop */
+    return false;
+  };
+
+  return { serverUrl, runnerId, createConversation, waitForRunnerOffline, close };
 }
 
 /** Whether ffmpeg is on PATH — needed for the composited display capture. */

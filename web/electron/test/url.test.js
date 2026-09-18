@@ -13,6 +13,7 @@ const {
   serverDisplayLabel,
   isPlainHttpRemote,
   normalizeSavedServerUrl,
+  inAppRoutePath,
   isDatabricksManagedServerUrl,
   databricksWorkspaceUiUrl,
   expandDatabricksWorkspaceUrl,
@@ -243,6 +244,40 @@ describe("normalizeSavedServerUrl", () => {
     assert.equal(normalizeSavedServerUrl(""), "");
     assert.equal(normalizeSavedServerUrl(undefined), undefined);
     assert.equal(normalizeSavedServerUrl("not a url"), "not a url");
+  });
+});
+
+describe("inAppRoutePath", () => {
+  it("extracts conversation routes on a root-mounted server", () => {
+    assert.equal(inAppRoutePath("https://h.example/c/abc", "https://h.example"), "/c/abc");
+    assert.equal(
+      inAppRoutePath("https://h.example/c/abc?tab=files#top", "https://h.example/"),
+      "/c/abc?tab=files#top",
+    );
+  });
+
+  it("extracts routes relative to a workspace mount", () => {
+    const server = "https://ws.cloud.databricks.com/ml/omnigents";
+    assert.equal(
+      inAppRoutePath("https://ws.cloud.databricks.com/ml/omnigents/c/abc", server),
+      "/c/abc",
+    );
+    assert.equal(inAppRoutePath("https://ws.cloud.databricks.com/ml/omnigents", server), "/");
+    assert.equal(inAppRoutePath("https://ws.cloud.databricks.com/ml/omnigents/", server), "/");
+  });
+
+  it("rejects other origins and paths outside the mount", () => {
+    const server = "https://ws.cloud.databricks.com/ml/omnigents";
+    assert.equal(inAppRoutePath("https://evil.example/c/abc", server), null);
+    assert.equal(inAppRoutePath("http://ws.cloud.databricks.com/ml/omnigents/c/abc", server), null);
+    assert.equal(inAppRoutePath("https://ws.cloud.databricks.com/ml/other/c/abc", server), null);
+    assert.equal(inAppRoutePath("https://ws.cloud.databricks.com/", server), null);
+  });
+
+  it("rejects unparseable input", () => {
+    assert.equal(inAppRoutePath("not a url", "https://h.example"), null);
+    assert.equal(inAppRoutePath("https://h.example/c/abc", "not a url"), null);
+    assert.equal(inAppRoutePath("", ""), null);
   });
 });
 

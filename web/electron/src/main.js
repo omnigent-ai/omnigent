@@ -43,6 +43,7 @@ const {
   normalizeRecentServers,
   expandDatabricksWorkspaceUrl,
   normalizeSavedServerUrl,
+  inAppRoutePath,
   fetchServerManifest,
   isDatabricksManagedServerUrl,
   databricksWorkspaceUiUrl,
@@ -1313,6 +1314,66 @@ function loadServerUrl(win, serverUrl, routePath) {
 }
 
 /**
+ * The last in-app route persisted for ``serverUrl``, or null when none was
+ * saved, the entry is malformed (hand-edited settings.json), or it does not
+ * survive a join+extract round-trip (it would land outside the server).
+ * ``"/"`` also returns null: restoring the home page is the default load.
+ *
+ * @param {string} serverUrl The saved clean server identity.
+ * @returns {string | null}
+ */
+function savedLastRoute(serverUrl) {
+  const routes = loadSettings().last_routes;
+  const route =
+    routes && typeof routes === "object" && !Array.isArray(routes) ? routes[serverUrl] : null;
+  if (typeof route !== "string" || !route.startsWith("/") || route === "/") return null;
+  if (inAppRoutePath(resolveServerPath(serverUrl, route), serverUrl) !== route) return null;
+  return route;
+}
+
+/**
+ * Persist the window's last in-app route so the next normal launch can
+ * restore it (a relaunch must return to the conversation the user left open,
+ * not the new-chat home page). Listens to main-frame committed navigations
+ * (`did-navigate`, skipping HTTP-error commits) and SPA route changes
+ * (main-frame `did-navigate-in-page`). Routes are keyed by the window's
+ * clean server identity, and only persisted while that identity is the saved
+ * server — ephemeral windows, setup/foreign-origin pages, and explicit-URL
+ * windows never write.
+ *
+ * @param {BrowserWindow} win
+ */
+function registerLastRoutePersistence(win) {
+  const persist = (url) => {
+    const state = windows.get(win);
+    if (!state || state.ephemeral || !state.serverUrl) return;
+    const route = inAppRoutePath(url ?? "", state.serverUrl);
+    if (route === null) return;
+    const settings = loadSettings();
+    if (state.serverUrl !== normalizeSavedServerUrl(settings.server_url)) return;
+    const routes =
+      settings.last_routes &&
+      typeof settings.last_routes === "object" &&
+      !Array.isArray(settings.last_routes)
+        ? settings.last_routes
+        : {};
+    if (routes[state.serverUrl] === route) return;
+    routes[state.serverUrl] = route;
+    settings.last_routes = routes;
+    saveSettings(settings);
+  };
+  win.webContents.on("did-navigate", (_event, url, httpResponseCode) => {
+    // An HTTP-error commit (4xx/5xx page) is not a route the user was on.
+    if (typeof httpResponseCode === "number" && httpResponseCode >= 400) return;
+    persist(url);
+  });
+  win.webContents.on("did-navigate-in-page", (_event, url, isMainFrame) => {
+    if (!isMainFrame) return;
+    persist(url);
+  });
+}
+
+/**
  * Detach the window's embedded-browser view whenever the shell's main frame
  * commits a new document (`did-navigate`: a reload, the session-expiry
  * reload's login-page redirect, an SSO hop). The committing navigation tears
@@ -1479,12 +1540,25 @@ function createWindow(targetUrl, opts = {}) {
     (ephemeral ? null : typeof saved === "string" && saved.length > 0 ? saved : null);
   // loadUrl: what the webContents actually loads. A deep-link path resolves
   // under the server URL (mount-aware — see resolveServerPath); an explicit
-  // target (New Window) loads that exact URL; otherwise load the server URL.
+  // target (New Window) loads that exact URL; a normal saved-server launch
+  // restores the last in-app route the user was on (persisted by
+  // registerLastRoutePersistence — deep links, explicit targets, and
+  // ephemeral windows name their own destination and never restore);
+  // otherwise load the server URL.
+  const restoredRoute =
+    !explicit &&
+    !ephemeral &&
+    !(typeof opts.path === "string" && opts.path.length > 0) &&
+    !(typeof opts.serverUrl === "string" && opts.serverUrl.length > 0) &&
+    serverUrl
+      ? savedLastRoute(serverUrl)
+      : null;
   const loadUrl =
     (typeof opts.path === "string" && opts.path.length > 0 && serverUrl
       ? resolveServerPath(serverUrl, opts.path)
       : null) ??
     explicit ??
+    (restoredRoute && serverUrl ? resolveServerPath(serverUrl, restoredRoute) : null) ??
     serverUrl;
   // A serverUrl that doesn't parse (hand-edited/corrupt settings.json) is
   // treated as "no server configured" rather than crashing window creation.
@@ -1504,6 +1578,7 @@ function createWindow(targetUrl, opts = {}) {
     browserRegistry: createBrowserRegistryForWindow(win),
   });
   registerWorkspaceRootBounce(win.webContents, () => pinnedOrigin(win));
+  registerLastRoutePersistence(win);
   // Show the return banner when the window navigates away from its server
   // (e.g. SSO) and stays away. The watch's on-away URL is the last committed
   // page on the server — subpage, mount path, and query args included.
