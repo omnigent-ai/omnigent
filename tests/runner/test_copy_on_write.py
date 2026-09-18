@@ -190,6 +190,52 @@ async def test_cached_cow_still_rejects_host_io_when_spec_unavailable(spec, tmp_
 
 
 @pytest.mark.asyncio
+async def test_tool_grant_probe_keeps_session_relative_cow_configuration(tmp_path, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from omnigent.runner import tool_dispatch
+    from omnigent.spec.types import AgentSpec, BuiltinToolConfig, ExecutorSpec, ToolsConfig
+
+    workspace = tmp_path / "workspace"
+    (workspace / "dependencies").mkdir(parents=True)
+    runner = tmp_path / "runner"
+    runner.mkdir()
+    monkeypatch.chdir(runner)
+    os_spec = OSEnvSpec(
+        cwd=".",
+        sandbox=OSEnvSandboxSpec(
+            type="linux_bwrap", write_paths=[WritePathSpec("dependencies", True)]
+        ),
+    )
+    agent = AgentSpec(
+        spec_version=1,
+        os_env=os_spec,
+        tools=ToolsConfig(builtins=[BuiltinToolConfig(name="upload_file")]),
+        executor=ExecutorSpec(type="omnigent", config={"harness": "openai-agents"}),
+    )
+    execute = AsyncMock(return_value="session file")
+    monkeypatch.setattr(tool_dispatch, "_execute_os_env_tool", execute)
+    result = await tool_dispatch.execute_tool(
+        tool_name="sys_os_read",
+        arguments='{"path":"dependencies/original"}',
+        agent_spec=agent,
+        conversation_id="session",
+        runner_workspace=str(workspace),
+    )
+    assert result == "session file"
+    assert execute.call_args.kwargs["agent_spec"].os_env is os_spec
+    assert os_spec.sandbox is not None
+    assert os_spec.sandbox.write_path_specs == [WritePathSpec("dependencies", True)]
+    refused = await tool_dispatch.execute_tool(
+        tool_name="upload_file",
+        arguments='{"path":"dependencies/original"}',
+        agent_spec=agent,
+        conversation_id="session",
+    )
+    assert "does not yet support copy_on_write" in refused
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("harness", ["codex", "openai-agents"])
 async def test_stream_setup_errors_are_sanitized_before_spawn(
     spec, tmp_path, monkeypatch, harness
