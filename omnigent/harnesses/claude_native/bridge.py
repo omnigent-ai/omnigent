@@ -78,6 +78,8 @@ from omnigent.native import native_bridge_common
 from omnigent.tools.base import Tool, ToolContext
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS
 
+CLAUDE_FRAMEWORK_CONTEXT_FILE = "pending_framework_context.txt"
+
 _logger = logging.getLogger(__name__)
 _INJECTION_CANCEL_EVENT: ContextVar[threading.Event | None] = ContextVar(
     "claude_native_injection_cancel_event", default=None
@@ -535,6 +537,15 @@ def _trusted_parent_for_bridge_dir(target: Path) -> Path:
     if target.is_relative_to(cursor_root):
         return _absolute_syntactic_path(cursor_root.parent.parent)
 
+    from omnigent.harnesses.devin_native.bridge import bridge_root as devin_bridge_root
+
+    devin_root = _absolute_syntactic_path(devin_bridge_root())
+    if target.is_relative_to(devin_root):
+        # Same shape as cursor-native ($TMPDIR/omnigent-<uid>/devin-native): trust
+        # the uid-scoped temp dir's parent and validate/chmod the two
+        # bridge-owned directories below it.
+        return _absolute_syntactic_path(devin_root.parent.parent)
+
     from omnigent.harnesses.antigravity_native.bridge import bridge_root as antigravity_bridge_root
 
     # antigravity-native keeps its bridge files below ``~/.omnigent/antigravity-native``,
@@ -608,8 +619,8 @@ def _trusted_parent_for_bridge_dir(target: Path) -> Path:
     raise RuntimeError(
         f"bridge dir {target!s} is not under an allowed bridge root "
         f"({claude_root!s}, {codex_root!s}, {pi_root!s}, {cursor_root!s}, "
-        f"{antigravity_root!s}, {qwen_root!s}, {hermes_root!s}, {opencode_root!s}, "
-        f"{kiro_root!s}, {acp_root!s}, {router_root!s})"
+        f"{devin_root!s}, {antigravity_root!s}, {qwen_root!s}, {hermes_root!s}, "
+        f"{opencode_root!s}, {kiro_root!s}, {acp_root!s}, {router_root!s})"
     )
 
 
@@ -1490,55 +1501,56 @@ def prepare_bridge_dir(
     """
     resolved_bridge_id = bridge_id or conversation_id
     bridge_dir = bridge_dir_for_bridge_id(resolved_bridge_id)
-    _ensure_secure_dir(bridge_dir)
-    # A parked permission hook only touches files in this root, so the runner
-    # owns creating and validating it before any hook can fire. Derived from the
-    # bridge dir just validated rather than read from the module global, so it
-    # lands in the same tree the caller asked for.
-    _ensure_secure_dir(bridge_dir.parent / _APPROVAL_WAIT_DIR_NAME)
-    config = _read_json_file(bridge_dir / _CONFIG_FILE)
-    token = config.get("token") if isinstance(config, dict) else None
-    if not isinstance(token, str) or not token:
-        token = secrets.token_urlsafe(32)
-    payload: dict[str, object] = {
-        "bridge_id": resolved_bridge_id,
-        "active_session_id": conversation_id,
-        "conversation_id": conversation_id,
-        "workspace": str(workspace),
-        "token": token,
-        "updated_at": time.time(),
-    }
-    if launch_model is not None:
-        payload["launch_model"] = launch_model
-    model_env = {
-        key: launch_env[key]
-        for key in MODEL_VOCABULARY_ENV_VARS
-        if launch_env is not None and launch_env.get(key)
-    }
-    if model_env:
-        payload["model_env"] = model_env
-    if picker_values is not None:
-        payload["model_picker_values"] = list(picker_values)
-    if sandbox is not None:
-        payload["sandbox"] = _bridge_sandbox_payload(sandbox)
-    _write_json_file(bridge_dir / _CONFIG_FILE, payload)
-    # Keep ``_PERMISSION_HOOK_FILE`` — the PermissionRequest command hook
-    # reads the Omnigent server URL from it at runtime, so wiping it on re-prep
-    # breaks approval routing on reattach/rebind. ``build_hook_settings``
-    # rewrites it on cold launch.
-    for filename in (
-        _SERVER_FILE,
-        _STATE_FILE,
-        _HOOKS_FILE,
-        OBSERVER_HOOK_STDERR_FILE,
-        _TOOL_RELAY_FILE,
-        _TMUX_FILE,
-    ):
-        with contextlib.suppress(FileNotFoundError):
-            (bridge_dir / filename).unlink()
-    # Owner-pid marker for the periodic dead-owner prune; refreshed every
-    # turn so it always names the current runner. See native_bridge_common.
-    native_bridge_common.write_owner_pid_marker(bridge_dir)
+    with native_bridge_common.bridge_dir_preparation_lock(bridge_dir):
+        _ensure_secure_dir(bridge_dir)
+        # A parked permission hook only touches files in this root, so the runner
+        # owns creating and validating it before any hook can fire. Derived from the
+        # bridge dir just validated rather than read from the module global, so it
+        # lands in the same tree the caller asked for.
+        _ensure_secure_dir(bridge_dir.parent / _APPROVAL_WAIT_DIR_NAME)
+        config = _read_json_file(bridge_dir / _CONFIG_FILE)
+        token = config.get("token") if isinstance(config, dict) else None
+        if not isinstance(token, str) or not token:
+            token = secrets.token_urlsafe(32)
+        payload: dict[str, object] = {
+            "bridge_id": resolved_bridge_id,
+            "active_session_id": conversation_id,
+            "conversation_id": conversation_id,
+            "workspace": str(workspace),
+            "token": token,
+            "updated_at": time.time(),
+        }
+        if launch_model is not None:
+            payload["launch_model"] = launch_model
+        model_env = {
+            key: launch_env[key]
+            for key in MODEL_VOCABULARY_ENV_VARS
+            if launch_env is not None and launch_env.get(key)
+        }
+        if model_env:
+            payload["model_env"] = model_env
+        if picker_values is not None:
+            payload["model_picker_values"] = list(picker_values)
+        if sandbox is not None:
+            payload["sandbox"] = _bridge_sandbox_payload(sandbox)
+        _write_json_file(bridge_dir / _CONFIG_FILE, payload)
+        # Keep ``_PERMISSION_HOOK_FILE`` — the PermissionRequest command hook
+        # reads the Omnigent server URL from it at runtime, so wiping it on re-prep
+        # breaks approval routing on reattach/rebind. ``build_hook_settings``
+        # rewrites it on cold launch.
+        for filename in (
+            _SERVER_FILE,
+            _STATE_FILE,
+            _HOOKS_FILE,
+            OBSERVER_HOOK_STDERR_FILE,
+            _TOOL_RELAY_FILE,
+            _TMUX_FILE,
+        ):
+            with contextlib.suppress(FileNotFoundError):
+                (bridge_dir / filename).unlink()
+        # Owner-pid marker for the periodic dead-owner prune; refreshed every
+        # turn so it always names the current runner. See native_bridge_common.
+        native_bridge_common.write_owner_pid_marker(bridge_dir)
     return bridge_dir
 
 
@@ -1547,7 +1559,7 @@ def prune_orphaned_bridge_dirs() -> int:
     Remove claude-native bridge dirs whose owner process is provably dead.
 
     Delegates to the shared sweep against this harness's bridge root; the
-    runner calls it (via ``native_bridge_common.reap_orphaned_native_bridge_dirs``)
+    global maintenance calls it (via ``native_bridge_common.reap_orphaned_native_bridge_dirs``)
     at startup to reclaim dirs leaked by a prior runner that died without
     running the explicit delete path.
 
@@ -2003,6 +2015,19 @@ def build_hook_settings(
     observer_stderr = shlex.quote(str(bridge_dir / OBSERVER_HOOK_STDERR_FILE))
     command = f"{shlex.join(command_parts)} 2>> {observer_stderr}"
     hook = {"type": "command", "command": command}
+    framework_context_parts = [
+        python,
+        "-I",
+        "-m",
+        "omnigent.harnesses.claude_native.hook",
+        "framework-context",
+        "--bridge-dir",
+        str(bridge_dir),
+    ]
+    framework_context_hook = {
+        "type": "command",
+        "command": f"{shlex.join(framework_context_parts)} 2>> {observer_stderr}",
+    }
     session_start_hook = {
         "type": "command",
         "command": command,
@@ -2030,7 +2055,7 @@ def build_hook_settings(
         # (web-UI message via tmux send-keys, or direct keystrokes
         # into the embedded terminal). The transcript forwarder
         # translates it into ``session.status: running``.
-        "UserPromptSubmit": [{"hooks": [hook]}],
+        "UserPromptSubmit": [{"hooks": [hook, framework_context_hook]}],
         # ``TaskCreated`` fires when Claude creates a new native task
         # (shown with ``□`` in the TUI). The payload carries ``task_id``
         # and ``task_subject``; the forwarder converts all current tasks
@@ -2048,9 +2073,13 @@ def build_hook_settings(
         # calls ``TaskUpdate`` to change a native task's status (e.g.
         # to ``"in_progress"``). The payload carries ``tool_input.taskId``
         # and ``tool_input.status``.
+        # ``EnterWorktree`` / ``ExitWorktree`` move the session transcript
+        # into the new cwd's ``~/.claude/projects/<slug>/`` dir; observing
+        # them hands the forwarder the moved path now, not at the turn's Stop.
         "PostToolUse": [
             {"matcher": "TodoWrite", "hooks": [hook]},
             {"matcher": "TaskUpdate", "hooks": [hook]},
+            {"matcher": "EnterWorktree|ExitWorktree", "hooks": [hook]},
         ],
         # ``PreCompact`` fires right before Claude compacts its own
         # context — for both a manual ``/compact`` (web-UI button or
@@ -4713,6 +4742,7 @@ def post_tools_changed(
     bridge_dir: Path,
     *,
     timeout_s: float = _TOOLS_CHANGED_READY_TIMEOUT_S,
+    cancelled: threading.Event | None = None,
 ) -> None:
     """
     Notify Claude Code that the MCP tool list changed.
@@ -4724,12 +4754,13 @@ def post_tools_changed(
     :param bridge_dir: Bridge directory path.
     :param timeout_s: Seconds to wait for the bridge HTTP control
         endpoint to publish itself, e.g. ``30.0``.
+    :param cancelled: Stops waiting when the notifying task is cancelled.
     :returns: None.
     :raises RuntimeError: If the bridge server is not ready, cannot
         be reached, or rejects the notification.
     """
     try:
-        server = _wait_for_server_info(bridge_dir, timeout_s=timeout_s)
+        server = _wait_for_server_info(bridge_dir, timeout_s=timeout_s, cancelled=cancelled)
     except OSError as exc:
         # Reading the advertisement can fail for reasons other than the file
         # being absent — fd exhaustion is the one seen in the wild. Callers
@@ -8153,22 +8184,30 @@ def _summary_text_from_blocks(content: object) -> str:
     return "\n".join(parts)
 
 
-def _wait_for_server_info(bridge_dir: Path, *, timeout_s: float) -> _JsonObject:
+def _wait_for_server_info(
+    bridge_dir: Path, *, timeout_s: float, cancelled: threading.Event | None = None
+) -> _JsonObject:
     """
     Wait for the bridge control HTTP endpoint file.
 
     :param bridge_dir: Bridge directory path.
     :param timeout_s: Seconds to wait, e.g. ``30.0``.
+    :param cancelled: Stops polling when the caller no longer needs the endpoint.
     :returns: Parsed server-info JSON object.
     :raises RuntimeError: If the server file never appears.
     """
     deadline = time.monotonic() + timeout_s
     path = bridge_dir / _SERVER_FILE
     while time.monotonic() < deadline:
+        if cancelled is not None and cancelled.is_set():
+            raise RuntimeError("Claude native bridge notification was cancelled")
         payload = _read_json_file(path)
         if isinstance(payload, dict) and payload.get("url") and payload.get("token"):
             return payload
-        time.sleep(0.05)
+        if cancelled is None:
+            time.sleep(0.05)
+        else:
+            cancelled.wait(0.05)
     raise RuntimeError(
         "Claude native bridge is not ready yet. Wait for Claude Code "
         "startup to finish before notifying tool list changes."

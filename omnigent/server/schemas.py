@@ -30,6 +30,7 @@ from omnigent.entities import (
     USER_SESSION_TITLE_MAX_CHARS,
     ConversationItem,
 )
+from omnigent.inner.native_attachments import reject_authored_framework_notices
 
 # ── Shared ──────────────────────────────────────────────────────
 
@@ -261,10 +262,9 @@ class AgentObject(BaseModel):
     :param skills: Skills bundled in the agent spec
         (``skills/<dir>/SKILL.md``). Lets the Web UI's
         new-session composer offer a slash-command menu before a
-        session (and its runner) exists. Host-discovered skills
-        are runner-owned, so they are NOT listed here — the
-        session snapshot's ``skills`` field carries the merged
-        set once a runner is bound. Empty list when the spec
+        session exists. ``GET /skills`` discovers host skills and,
+        when given ``session_id``, merges the session's bundled skills.
+        Empty list when the spec
         bundles no skills or when the bundle cannot be loaded.
     :param terminals: Terminal names declared in the spec's
         ``terminals:`` block, in declaration order, e.g.
@@ -932,6 +932,20 @@ class ErrorDetail(BaseModel):
     remediation: str | None = None
 
 
+class ErrorResponse(BaseModel):
+    """
+    The body every failed request carries: a single ``error`` object.
+
+    Mirrors what the FastAPI exception handler emits for an
+    :class:`~omnigent.errors.OmnigentError`, so documented error responses
+    and the runtime envelope stay the same shape.
+
+    :param error: Machine-readable detail about the failure.
+    """
+
+    error: ErrorDetail
+
+
 class IncompleteDetails(BaseModel):
     """
     Details explaining why a response is incomplete.
@@ -1277,6 +1291,12 @@ class SessionEventInput(BaseModel):
     model_override: str | None = None
     tools: list[dict[str, Any]] | None = None
     created_by: str | None = None
+
+    @field_validator("data")
+    @classmethod
+    def reject_framework_blocks(cls, data: dict[str, Any]) -> dict[str, Any]:
+        reject_authored_framework_notices(data)
+        return data
 
 
 class SessionGitOptions(BaseModel):
@@ -2103,16 +2123,6 @@ class SessionResponse(BaseModel):
     :param todos: Current native Plan items reported by a harness. Each has
         ``content``, ``status``, and ``activeForm``. Persisted in conversation
         metadata; empty before the first report or after an explicit clear.
-    :param skills: Skills the bound agent has access to — the
-        merged result of the agent spec's bundled ``skills``
-        and the host-scope skills discovered along the agent
-        workdir / ``~/.claude/skills/`` (subject to the spec's
-        ``skills_filter``). Mirrors what the TUI passes to the
-        runner at startup. Empty list when the agent spec
-        cannot be loaded, or when bundled + host discovery
-        yields nothing.
-    :param skills_status: Skill discovery state. A ready catalog may be empty;
-        errors and disconnected runners must not leave clients loading.
     :param model_options: Runner-owned model-picker options for native
         sessions. Claude supplies launch-time gateway aliases; Codex includes
         each model's supported reasoning efforts. Empty while unavailable.
@@ -2198,8 +2208,6 @@ class SessionResponse(BaseModel):
     git_branch: str | None = None
     archived: bool = False
     todos: list[dict[str, Any]] = Field(default_factory=list)
-    skills: list[SkillSummary] = Field(default_factory=list)
-    skills_status: Literal["loading", "ready", "error", "unavailable"] = "unavailable"
     model_options: list[NativeModelOption] = Field(default_factory=list)
     terminal_pending: bool = False
     sandbox_status: SandboxStatus | None = None
@@ -2573,6 +2581,10 @@ class SessionForkRequest(BaseModel):
     host_type: Literal["external", "managed"] = "external"
     sandbox_provider: str | None = None
     workspace: str | None = None
+    # Marks the fork as a side chat: it is stamped with the side-chat label so
+    # it is hidden from the left sidebar (it surfaces only as a Workspace-rail
+    # side-chat tab). The fork otherwise behaves normally (its own runner).
+    side_chat: bool = False
 
     model_config = ConfigDict(extra="forbid")
 
@@ -3465,38 +3477,6 @@ class SessionMcpStartupEvent(_SSEEventBase):
     type: Literal["session.mcp_startup"]
     conversation_id: str
     servers: dict[str, McpServerStartup]
-
-
-class SessionSkillsEvent(_SSEEventBase):
-    """
-    Signal that a session's runner-owned skill discovery has settled.
-
-    Skills are discovered against the bound runner's filesystem and
-    fetched off the session-snapshot hot path: the snapshot kicks a
-    single background fetch (``_load_runner_skills`` in
-    ``omnigent/server/routes/sessions.py``) and serves ``[]`` until
-    it lands. This event fires the moment that background fetch
-    populates the per-session skills cache or first fails, so a connected web client
-    can re-read the snapshot and fill its slash-command menu instead
-    of waiting for the next bind.
-
-    Carries no payload beyond the conversation id — it is a "skills
-    are ready, re-read the snapshot" nudge, mirroring the
-    invalidate-then-refetch shape used by
-    :class:`SessionChangedFilesInvalidatedEvent`. The snapshot's
-    ``skills`` and ``skills_status`` fields stay the source of truth.
-
-    :param type: Always ``"session.skills"``.
-    :param conversation_id: Session identifier,
-        e.g. ``"conv_abc123"``.
-
-    Category: **transient** (SSE-only). On reconnect, clients seed
-    the menu from the session snapshot's ``skills`` field, which is
-    populated by the runner-skills cache at snapshot build time.
-    """
-
-    type: Literal["session.skills"]
-    conversation_id: str
 
 
 class SessionModelOptionsEvent(_SSEEventBase):
@@ -4756,7 +4736,6 @@ ServerStreamEvent = Annotated[
     | SessionTerminalPendingEvent
     | SessionSandboxStatusEvent
     | SessionMcpStartupEvent
-    | SessionSkillsEvent
     | SessionModelOptionsEvent
     | SessionInputConsumedEvent
     | SessionInterruptedEvent
@@ -4971,6 +4950,24 @@ HarnessStreamEvent = (
 
 
 # ── Projects ──────────────────────────────────────────────────────
+
+
+class ProjectOrderRequest(BaseModel):
+    """Rank owned project IDs; unranked projects append in discovery order.
+
+    Null selects alphabetical mode without erasing the remembered manual IDs.
+    """
+
+    ordered_project_ids: (
+        list[Annotated[str, Field(min_length=32, max_length=32, pattern="^[0-9a-f]{32}$")]] | None
+    ) = Field(..., max_length=10000)
+
+
+class ProjectOrderResponse(BaseModel):
+    """Current sorting mode and the manual order retained in either mode."""
+
+    sort_mode: Literal["alphabetical", "manual"]
+    ordered_project_ids: list[str] | None
 
 
 class ProjectObject(BaseModel):

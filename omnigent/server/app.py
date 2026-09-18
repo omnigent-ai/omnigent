@@ -39,7 +39,14 @@ from omnigent.debug_logging import (
     set_current_session_id,
     set_current_user_id,
 )
-from omnigent.errors import ErrorCategory, ErrorCode, ErrorImpact, ErrorPhase, OmnigentError
+from omnigent.errors import (
+    ErrorCategory,
+    ErrorCode,
+    ErrorImpact,
+    ErrorPhase,
+    OmnigentError,
+    is_cancelled_rpc_error,
+)
 from omnigent.extensions import ExtensionPluginState
 from omnigent.extensions.assets import (
     ResolvedBundle,
@@ -115,7 +122,11 @@ from omnigent.stores import (
     FileStore,
 )
 from omnigent.stores.comment_store import CommentStore
-from omnigent.stores.conversation_store import SessionConnectivity, runner_seen_is_fresh
+from omnigent.stores.conversation_store import (
+    ConversationNotFoundError,
+    SessionConnectivity,
+    runner_seen_is_fresh,
+)
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.policy_store import PolicyStore
@@ -312,6 +323,11 @@ def _error_audit_extra(
     """
     route = request.scope.get("route")
     operation = getattr(route, "name", None) or "unmatched"
+    attributes.setdefault("method", request.method)
+    attributes.setdefault("route", getattr(route, "path", None) or "<unmatched>")
+    request_id = getattr(request.state, "audit_request_id", None)
+    if isinstance(request_id, str):
+        attributes.setdefault("request_id", request_id)
     return debug_event(
         operation,
         session_id=_session_id_from_request(request),
@@ -1727,6 +1743,7 @@ def create_app(
         :returns: The downstream route response.
         """
         request_id = uuid.uuid4().hex
+        request.state.audit_request_id = request_id
         set_request_id_for_access_log(request_id)
         set_request_user_agent_for_access_log(
             request.headers.get("user-agent"),
@@ -1970,6 +1987,51 @@ def create_app(
         )
         return await request_validation_exception_handler(request, exc)
 
+    @app.exception_handler(ConversationNotFoundError)
+    async def _handle_conversation_not_found(
+        request: Request,
+        exc: ConversationNotFoundError,
+    ) -> JSONResponse:
+        """
+        Map a missing conversation row to 404 rather than an unhandled 500.
+
+        Stores raise this when absence is not a benign no-op — creating a child
+        under a parent that is gone, for example. With no handler it reached the
+        catch-all and was booked as ``internal_error``, so a caller referencing
+        a deleted conversation read as a server fault and counted against the
+        mid-session error rate.
+
+        :param request: The incoming request; its path supplies the session id
+            threaded into the error log.
+        :param exc: The store's not-found error.
+        :returns: A 404 JSON response with the ``not_found`` code.
+        """
+        add_audit_attrs(
+            code=str(ErrorCode.NOT_FOUND),
+            http_status="404",
+            error_category=ErrorCategory.USER.value,
+            error_impact=ErrorImpact.BENIGN.value,
+            error_phase=ErrorPhase.REQUEST.value,
+        )
+        # Keep a trace: usually a caller referencing a deleted row, but this
+        # branch would otherwise mask a server-side id-threading defect. The
+        # audit extra carries the operation and session id, so a 404 that is
+        # really our bug stays queryable.
+        _logger.info(
+            "Conversation not found, mapped to 404: %s",
+            exc,
+            extra=_error_audit_extra(
+                request,
+                phase="not_found",
+                code=str(ErrorCode.NOT_FOUND),
+                http_status="404",
+            ),
+        )
+        return JSONResponse(
+            status_code=404,
+            content={"error": {"code": ErrorCode.NOT_FOUND, "message": "Not found."}},
+        )
+
     @app.exception_handler(StatementError)
     async def _handle_statement_error(
         request: Request,
@@ -2046,6 +2108,31 @@ def create_app(
         :param exc: The unhandled exception.
         :returns: A 500 JSON response with ``internal_error`` code.
         """
+        if is_cancelled_rpc_error(exc):
+            # A peer-cancelled backing call (upstream teardown/restart) is an
+            # expected, retryable condition, not a fault: attribute it as
+            # transient upstream at WARNING — keeping the ERROR stream for real
+            # 500s — and answer with the coded 499 via the standard handler.
+            cancelled = OmnigentError(
+                "The backing service cancelled the call; please retry.",
+                code=ErrorCode.UPSTREAM_CANCELLED,
+            )
+            _logger.warning(
+                "Upstream call cancelled by its peer: %s",
+                exc,
+                exc_info=exc,
+                extra=_error_audit_extra(
+                    request,
+                    phase="cancelled",
+                    code=str(cancelled.code),
+                    http_status=str(cancelled.http_status),
+                    error_category=cancelled.category.value,
+                    error_impact=cancelled.impact.value,
+                    error_phase=cancelled.phase.value,
+                    error_type=type(exc).__name__,
+                ),
+            )
+            return await _handle_omnigent_error(request, cancelled)
         # UNKNOWN, not SERVER: an uncaught exception has no code that confirms the
         # fault is ours. Booking it as server would inflate our fault rate; the
         # exception type is logged as a signature to rank for promotion to a real
@@ -2064,8 +2151,10 @@ def create_app(
                 error_type=type(exc).__name__,
             ),
         )
+        request_id = getattr(request.state, "audit_request_id", None)
         return JSONResponse(
             status_code=500,
+            headers={"X-Request-Id": request_id} if isinstance(request_id, str) else None,
             content={
                 "error": {
                     "code": ErrorCode.INTERNAL_ERROR,
@@ -3050,6 +3139,10 @@ def create_app(
 
         :param runner_id: The reconnecting runner's id.
         """
+        from omnigent.server.child_session_recovery import (
+            is_parent_owned_subagent,
+            restore_active_children,
+        )
         from omnigent.server.routes._sessions.common import (
             _session_sandbox_status_cache,
         )
@@ -3076,6 +3169,10 @@ def create_app(
         convs = await asyncio.to_thread(
             conversation_store.list_conversations_by_runner_id, runner_id
         )
+        # Restore each tree from its root before ordinary child initialization
+        # can clear the interruption status or cache an init without continuation.
+        bound_ids = {conv.id for conv in convs}
+        convs.sort(key=lambda conv: conv.parent_conversation_id in bound_ids)
         _logger.info(
             "_on_runner_connect: runner=%s, %d bound session(s)",
             runner_id,
@@ -3106,12 +3203,18 @@ def create_app(
                     "_on_runner_connect: skipping session-init POST for %s (no agent_id)",
                     conv.id,
                 )
-            else:
+            elif not is_parent_owned_subagent(conv) and not (
+                conv.parent_conversation_id in bound_ids and conv.host_id is None
+            ):
                 try:
-                    await runner_session_initializer.initialize(
+                    init_response = await runner_session_initializer.initialize(
                         conv,
                         routed.client,
                         timeout=10.0,
+                    )
+                    init_response.raise_for_status()
+                    await restore_active_children(
+                        conv, routed.client, conversation_store, runner_session_initializer
                     )
                 except Exception:
                     _logger.exception(
@@ -3148,9 +3251,12 @@ def create_app(
             # is reachable again. The helper self-guards: it only clears a
             # session whose persisted failure is ``runner_disconnected``, so
             # a genuine task failure survives the reconnect untouched.
-            await _publish_runner_recovered_status(
-                conv.id, conversation_store, require_disconnect_code=True
-            )
+            if not is_parent_owned_subagent(conv) and not (
+                conv.parent_conversation_id in bound_ids and conv.host_id is None
+            ):
+                await _publish_runner_recovered_status(
+                    conv.id, conversation_store, require_disconnect_code=True
+                )
             # A managed launch that outlived its connect timeout cached
             # sandbox_status "failed"; this runner connecting proves the
             # sandbox is live, so drop the stale banner. Only "failed" is
@@ -3202,6 +3308,7 @@ def create_app(
     if host_store is not None:
         from omnigent.server.routes.host_tunnel import create_host_tunnel_router
         from omnigent.server.routes.hosts import create_hosts_router
+        from omnigent.server.routes.skills import create_skills_router
 
         async def _on_hosts_changed(_host_id: str, owner: str | None) -> None:
             announce_hosts_changed(owner)
@@ -3233,6 +3340,19 @@ def create_app(
             ),
             prefix="/v1",
             tags=["hosts"],
+        )
+        app.include_router(
+            create_skills_router(
+                host_registry,
+                host_store,
+                conversation_store,
+                agent_store=agent_store,
+                agent_cache=agent_cache,
+                auth_provider=auth_provider,
+                permission_store=permission_store,
+            ),
+            prefix="/v1",
+            tags=["skills"],
         )
         # Host-facing credential vending: a sandbox fetches its owner's
         # per-provider credential over the launch-token-authenticated channel

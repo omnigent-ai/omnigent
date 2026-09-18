@@ -46,12 +46,13 @@ function fakeTimers() {
 function makeWatch({ pinned = ORIGIN, url = "", ...opts } = {}) {
   const webContents = new FakeWebContents(url);
   const timers = fakeTimers();
-  const events = { away: [], returns: 0 };
+  const events = { away: [], returns: 0, leaves: 0 };
   const getPinnedOrigin = typeof pinned === "function" ? pinned : () => pinned;
   const watch = registerServerAwayWatch(webContents, {
     getPinnedOrigin,
     onAway: (returnUrl) => events.away.push(returnUrl),
     onReturn: () => events.returns++,
+    onLeave: () => events.leaves++,
     setTimeoutFn: timers.setTimeoutFn,
     clearTimeoutFn: timers.clearTimeoutFn,
     ...opts,
@@ -93,6 +94,33 @@ describe("registerServerAwayWatch", () => {
 
     timers.run();
     assert.deepEqual(events.away, []);
+  });
+
+  it("fires onLeave once per away episode, immediately (before the delay)", () => {
+    const { webContents, events } = makeWatch();
+    webContents.emit("did-navigate", {}, `${ORIGIN}/omnigent`);
+    webContents.url = `${FOREIGN}/login`;
+    webContents.emit("did-navigate", {}, `${FOREIGN}/login`);
+    // Immediate — no timer needs to run.
+    assert.equal(events.leaves, 1);
+    // A second foreign hop in the same episode does not re-fire.
+    webContents.url = `${FOREIGN}/mfa`;
+    webContents.emit("did-navigate", {}, `${FOREIGN}/mfa`);
+    assert.equal(events.leaves, 1);
+  });
+
+  it("re-arms onLeave after returning to the server", () => {
+    const { webContents, events } = makeWatch();
+    webContents.emit("did-navigate", {}, `${ORIGIN}/omnigent`);
+    webContents.url = `${FOREIGN}/login`;
+    webContents.emit("did-navigate", {}, `${FOREIGN}/login`);
+    assert.equal(events.leaves, 1);
+    // Back on the server, then away again → a new episode fires onLeave again.
+    webContents.url = `${ORIGIN}/omnigent`;
+    webContents.emit("did-navigate", {}, `${ORIGIN}/omnigent`);
+    webContents.url = `${FOREIGN}/login`;
+    webContents.emit("did-navigate", {}, `${FOREIGN}/login`);
+    assert.equal(events.leaves, 2);
   });
 
   it("restarts the countdown on each foreign commit (long SSO flows)", () => {

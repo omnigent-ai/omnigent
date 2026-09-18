@@ -237,9 +237,7 @@ def _open_appearance(page: Page, base_url: str) -> None:
     expect(_color_theme_select(page)).to_be_visible(timeout=30_000)
 
 
-def test_color_palette_applies_persists_and_resets(
-    page: Page, seeded_session: tuple[str, str]
-) -> None:
+def test_color_palette_applies_persists_and_resets(page: Page, live_server: str) -> None:
     """Selecting a palette skins ``<html>`` + persists; the default clears it.
 
     Fresh load is the default "Omnigent" (its name shown, nothing stored, no
@@ -247,7 +245,7 @@ def test_color_palette_applies_persists_and_resets(
     and survives a reload (re-applied at boot). Returning to Omnigent removes the
     attribute and clears the stored key.
     """
-    base_url, _session_id = seeded_session
+    base_url = live_server
     _open_appearance(page, base_url)
 
     # Fresh context → default "Omnigent": the trigger shows it, no override, and
@@ -277,9 +275,7 @@ def test_color_palette_applies_persists_and_resets(
     assert _stored_palette(page) is None, "the palette key was not cleared for the default"
 
 
-def test_color_palette_composes_with_dark_mode(
-    page: Page, seeded_session: tuple[str, str]
-) -> None:
+def test_color_palette_composes_with_dark_mode(page: Page, live_server: str) -> None:
     """The palette (``data-theme``) and light/dark mode (``dark`` class) coexist.
 
     They are independent axes, so a palette + Dark mode leaves <html> carrying
@@ -288,7 +284,7 @@ def test_color_palette_composes_with_dark_mode(
     # Pin a light OS so Dark is an explicit, observable change.
     page.emulate_media(color_scheme="light")
 
-    base_url, _session_id = seeded_session
+    base_url = live_server
     _open_appearance(page, base_url)
 
     # Pick a palette (dropdown), then Dark mode (radiogroup) — independent axes.
@@ -303,10 +299,10 @@ def test_color_palette_composes_with_dark_mode(
     assert _html_has_dark(page), "dark class missing — the palette should compose with dark mode"
 
 
-def test_solarized_dark_uses_canonical_canvas(page: Page, seeded_session: tuple[str, str]) -> None:
+def test_solarized_dark_uses_canonical_canvas(page: Page, live_server: str) -> None:
     """Solarized is selectable and applies its canonical dark surface colors."""
     page.emulate_media(color_scheme="light")
-    base_url, _session_id = seeded_session
+    base_url = live_server
     _open_appearance(page, base_url)
 
     _pick_palette(page, "Solarized")
@@ -401,11 +397,9 @@ def test_guided_custom_theme_applies_to_both_modes_and_persists(
     )
 
 
-def test_contrast_round_trip_restores_preset_tokens(
-    page: Page, seeded_session: tuple[str, str]
-) -> None:
+def test_contrast_round_trip_restores_preset_tokens(page: Page, live_server: str) -> None:
     page.emulate_media(color_scheme="light")
-    base_url, _session_id = seeded_session
+    base_url = live_server
     _open_appearance(page, base_url)
 
     for mode in ["Light", "Dark"]:
@@ -420,11 +414,9 @@ def test_contrast_round_trip_restores_preset_tokens(
             assert _computed_theme_tokens(page) == before, f"{mode} {palette} did not round-trip"
 
 
-def test_text_selection_stands_out_in_every_palette(
-    page: Page, seeded_session: tuple[str, str]
-) -> None:
+def test_text_selection_stands_out_in_every_palette(page: Page, live_server: str) -> None:
     page.emulate_media(color_scheme="light")
-    base_url, _session_id = seeded_session
+    base_url = live_server
     _open_appearance(page, base_url)
 
     for mode in ["Light", "Dark"]:
@@ -441,11 +433,9 @@ def test_text_selection_stands_out_in_every_palette(
                     assert result["highlightDeltaE"] >= 8, context
 
 
-def test_custom_theme_colors_can_be_randomized(
-    page: Page, seeded_session: tuple[str, str]
-) -> None:
+def test_custom_theme_colors_can_be_randomized(page: Page, live_server: str) -> None:
     """Randomizing accent and tint updates the picker and persisted theme."""
-    base_url, _session_id = seeded_session
+    base_url = live_server
     _open_appearance(page, base_url)
     # The color popover animates in and Floating UI repositions it on mount,
     # which can leave its controls briefly unstable / remounting on a loaded

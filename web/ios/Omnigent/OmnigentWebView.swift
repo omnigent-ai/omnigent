@@ -6,6 +6,7 @@ struct OmnigentWebView: UIViewRepresentable {
   let initialURL: URL
   @ObservedObject var model: WebViewModel
   @ObservedObject var settings: SettingsStore
+  let databricksInternalFeaturesEnabled: Bool
   let loadFailed: (URL, String) -> Void
   let loadSucceeded: () -> Void
   /// Compose and push the current server-picker payload to the SPA.
@@ -15,6 +16,18 @@ struct OmnigentWebView: UIViewRepresentable {
   let requestSwitchServer: (String) -> Void
   /// Return the shell to its "connect to server" setup page.
   let openServerSetup: () -> Void
+
+  static func connectionErrorMessage(
+    for error: Error, databricksInternalFeaturesEnabled: Bool
+  ) -> String {
+    let nsError = error as NSError
+    if databricksInternalFeaturesEnabled, nsError.domain == NSURLErrorDomain,
+      [NSURLErrorCannotFindHost, NSURLErrorDNSLookupFailed].contains(nsError.code)
+    {
+      return "Couldn’t reach the server. Check your device’s compliance status in Jamf."
+    }
+    return error.localizedDescription
+  }
 
   func makeCoordinator() -> Coordinator {
     Coordinator(self)
@@ -763,7 +776,11 @@ struct OmnigentWebView: UIViewRepresentable {
 
       let failedURL = failedURL(from: nsError) ?? webView.url ?? pinnedURL ?? parent.initialURL
       guard failedURL.omnigentOrigin == pinnedOrigin else { return }
-      parent.loadFailed(failedURL, error.localizedDescription)
+      parent.loadFailed(
+        failedURL,
+        OmnigentWebView.connectionErrorMessage(
+          for: error, databricksInternalFeaturesEnabled: parent.databricksInternalFeaturesEnabled)
+      )
     }
 
     private func publishModelChanges(_ update: @escaping @MainActor (WebViewModel) -> Void) {

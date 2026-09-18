@@ -18,12 +18,14 @@ vi.mock("@/components/blocks/TerminalView", () => ({
     sessionId,
     terminalId,
     readOnly,
+    directAttachUrl,
     onResume,
     resumePending,
   }: {
     sessionId: string;
     terminalId: string;
     readOnly?: boolean;
+    directAttachUrl?: string;
     onResume?: () => void | Promise<void>;
     resumePending?: boolean;
   }) => {
@@ -39,6 +41,7 @@ vi.mock("@/components/blocks/TerminalView", () => ({
         data-terminal-id={terminalId}
         data-read-only={String(readOnly ?? false)}
         data-instance={String(instance.current)}
+        data-direct-attach-url={directAttachUrl ?? ""}
         data-resume-pending={String(resumePending ?? false)}
       >
         {onResume && (
@@ -389,6 +392,55 @@ describe("MainTerminalView — native wrapper sessions", () => {
     // A new instance id proves the mount was torn down and rebuilt for the
     // new session rather than reused with stale scrollback.
     expect(view.getAttribute("data-instance")).not.toBe(first);
+  });
+
+  it("re-attaches the agent terminal when a host switch resets the terminals cache", () => {
+    // SwitchHostDialog resets the terminals cache after a successful switch:
+    // a synchronous clear to [] followed by an invalidate/refetch
+    // (web/src/shell/SwitchHostDialog.tsx). The agent terminal keeps the
+    // same resource id across hosts, so the keyed mount only tears down
+    // because of the empty intermediate render — if MainTerminalView ever
+    // kept the pane alive across an empty inventory, the pill's Terminal
+    // view would stay attached to the previous host's PTY (old WS, old
+    // scrollback) after "Switch host…". This pins the reset's other half:
+    // the clear unmounts the pane and the refetched row (the new host's
+    // attach info) rebuilds it.
+    const paneOnHostA: TerminalInfo = {
+      id: "terminal_claude_main",
+      name: "claude",
+      session: "main",
+      running: true,
+      directAttachUrl: "ws://127.0.0.1:40001/?token=host-a",
+    };
+    const paneOnHostB: TerminalInfo = {
+      ...paneOnHostA,
+      directAttachUrl: "ws://127.0.0.1:40002/?token=host-b",
+    };
+    const { rerender } = renderView({
+      terminals: [paneOnHostA],
+      isNativeWrapper: true,
+      conversationId: "conv_switch",
+    });
+    const first = screen.getByTestId("terminal-view").getAttribute("data-instance");
+
+    // The dialog's setQueryData(…, []) lands synchronously: the old host's
+    // pane must unmount (dropping its WebSocket), not linger.
+    rerender(viewTree({ terminals: [], isNativeWrapper: true, conversationId: "conv_switch" }));
+    expect(screen.queryByTestId("terminal-view")).toBeNull();
+
+    // …then the invalidate's refetch delivers the new host's pane.
+    rerender(
+      viewTree({
+        terminals: [paneOnHostB],
+        isNativeWrapper: true,
+        conversationId: "conv_switch",
+      }),
+    );
+    const view = screen.getByTestId("terminal-view");
+    // A fresh instance id proves a new mount — a new xterm + WebSocket
+    // attach — carrying the new host's attach info.
+    expect(view.getAttribute("data-instance")).not.toBe(first);
+    expect(view).toHaveAttribute("data-direct-attach-url", "ws://127.0.0.1:40002/?token=host-b");
   });
 
   it("renders a rail-opened shell chrome-free with the close X", () => {

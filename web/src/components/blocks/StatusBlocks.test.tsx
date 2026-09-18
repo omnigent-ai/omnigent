@@ -603,6 +603,43 @@ describe("routing decision — harness / scope / raw pick", () => {
     }
   });
 
+  // A shared type or rationale cannot identify the work a decision governs.
+  it("card: names the task the decision governed, in place of the shared type row", () => {
+    render(
+      <RoutingDecisionCard
+        model="databricks-claude-sonnet-4-6"
+        applied={false}
+        rationale="Routing unavailable; spawn allowed unchanged"
+        agent="general-purpose"
+        routing={{ scope: "native_subagent", taskDescription: "Research auth flows" }}
+      />,
+    );
+    expect(screen.getByTestId("routing-decision-task")).toHaveTextContent("Research auth flows");
+    // The shared type stays visible on the scope badge.
+    expect(screen.getByTestId("routing-decision-scope")).toHaveTextContent(
+      "subagent: general-purpose",
+    );
+    fireEvent.click(screen.getByTestId("routing-decision-raw-toggle"));
+    expect(screen.getByText(/"task_description": "Research auth flows"/)).toBeInTheDocument();
+  });
+
+  it.each([undefined, "", " \t\n"])(
+    "card: an unlabeled spawn (%j) keeps the agent row label",
+    (taskDescription) => {
+      render(
+        <RoutingDecisionCard
+          model="databricks-claude-sonnet-4-6"
+          applied={false}
+          rationale="x"
+          agent="general-purpose"
+          routing={{ scope: "native_subagent", taskDescription }}
+        />,
+      );
+      expect(screen.queryByTestId("routing-decision-task")).toBeNull();
+      expect(screen.getByTestId("routing-decision-card")).toHaveTextContent("general-purpose");
+    },
+  );
+
   // The router's vocabulary pick may have had no endpoint and been mapped to a
   // servable id — that must be visible. When it resolves to the same short
   // name there is nothing to disclose, so the row stays off.

@@ -29,7 +29,7 @@ export function ComposerWorkspaceBar({ className, ...props }: ComponentPropsWith
     <div
       ref={barRef}
       className={cn(
-        "group/composer-workspace relative z-0 mx-3 -mb-px flex h-[37px] min-w-0 items-center gap-0.5 rounded-t-2xl border border-b-0 border-border bg-muted/70 px-2 py-1.5 md:gap-2",
+        "composer-workspace-surface group/composer-workspace relative z-0 mx-3 -mb-px flex h-[37px] min-w-0 items-center gap-0.5 rounded-t-2xl border border-b-0 border-border px-2 py-1.5 md:gap-2",
         className,
       )}
       {...props}
@@ -155,6 +155,12 @@ export function ComposerPermissionPicker({
         align="start"
         className="w-max min-w-[13.75rem] max-w-[calc(100vw-2rem)]"
         data-testid={`${testIdPrefix}-permission-menu`}
+        onCloseAutoFocus={(event) => {
+          // A closing animation must not steal focus from a newly opened menu.
+          if (document.activeElement?.closest('[role="menu"][data-state="open"]')) {
+            event.preventDefault();
+          }
+        }}
       >
         <div className="px-2 py-1 text-xs text-muted-foreground">{label}</div>
         {options.map((option) => (

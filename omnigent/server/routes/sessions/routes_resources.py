@@ -80,6 +80,8 @@ from omnigent.server.routes._sessions.helpers import (
     _proxy_get_session_resources_to_runner,
     _publish_and_persist_resource_event,
     _publish_changed_files_invalidated,
+    _raise_if_runner_session_agent_missing,
+    _raise_if_session_agent_missing_payload,
     _read_upload_capped,
     _stored_file_to_resource,
 )
@@ -372,6 +374,10 @@ def register_resources_routes(
             payload = None
         if not isinstance(payload, dict) or not isinstance(payload.get("error"), dict):
             raise HTTPException(status_code=502, detail="runner download failed")
+        # Re-derive the typed session-lifecycle 410 (agent deleted or
+        # rebound) with its client-safe message instead of forwarding the
+        # runner's raw resolver text verbatim.
+        _raise_if_session_agent_missing_payload(payload)
         return JSONResponse(status_code=resp.status_code, content=payload)
 
     async def _proxy_get_to_runner(
@@ -388,7 +394,9 @@ def register_resources_routes(
         :param params: Optional query params forwarded to the runner,
             e.g. ``{"order": "asc"}``. ``None`` sends no query string.
         :returns: Parsed JSON response body.
-        :raises HTTPException: 502 on runner failure.
+        :raises OmnigentError: Typed ``not_found`` (404) or
+            ``session_agent_missing`` (410) re-derived from the runner body.
+        :raises HTTPException: 502 on any other runner failure.
         """
         runner_client = await _get_runner_client_for_resource_access(
             session_id,
@@ -423,6 +431,9 @@ def register_resources_routes(
                 code=ErrorCode.NOT_FOUND,
             )
         if resp.status_code != 200:
+            # Re-derive the typed session-lifecycle 410 (agent deleted or
+            # rebound) instead of flattening it to a generic 502.
+            _raise_if_runner_session_agent_missing(resp)
             if isinstance(response_payload, dict):
                 error = response_payload.get("error", {})
                 msg = error.get("message") or "runner resource endpoint failed"
@@ -1597,6 +1608,8 @@ def register_resources_routes(
             )
         read_limit = min(type_limit, MAX_ATTACHMENT_UPLOAD_BYTES)
         filename = file.filename
+        # Persist original dimensions only after a downscale.
+        source_dims: tuple[int, int] | None = None
         if content_type in _COMPRESSIBLE_IMAGE_MIMES:
             # Compressible images carry the large cap and the decode, so they are
             # the server's peak upload memory. The body is already spooled to
@@ -1610,7 +1623,7 @@ def register_resources_routes(
                 content = await _read_upload_capped(file, read_limit)
                 if image_needs_compression(len(content), content_type):
                     try:
-                        compressed, resolved_type = await asyncio.to_thread(
+                        compressed, resolved_type, source_dims = await asyncio.to_thread(
                             compress_image_attachment, content, content_type
                         )
                     except ImageCompressionError as exc:
@@ -1629,6 +1642,9 @@ def register_resources_routes(
             filename=filename,
             bytes=len(content),
             content_type=content_type,
+            source_metadata=(
+                {"width": source_dims[0], "height": source_dims[1]} if source_dims else None
+            ),
         )
         artifact_store.put(stored.id, content)
         resource = _stored_file_to_resource(session_id, stored)
@@ -1704,10 +1720,15 @@ def register_resources_routes(
                 "File not found",
                 code=ErrorCode.NOT_FOUND,
             )
-        # Content is immutable per file id, so a still-valid cached copy can be
-        # answered before ever touching the artifact store. Transcripts re-render
-        # the same attachments on every load, and the originals run to megabytes.
-        etag = _file_content_etag(stored.id)
+        # The bytes live under blob_key (== id for own uploads; the source's
+        # blob for a fork copy that shares it). Content is immutable per blob,
+        # so a still-valid cached copy can be answered before ever touching the
+        # artifact store — and keying the ETag on the blob lets a fork and its
+        # source share the browser cache for the same bytes. Transcripts
+        # re-render the same attachments on every load, and originals run to
+        # megabytes.
+        blob_key = stored.blob_key or stored.id
+        etag = _file_content_etag(blob_key)
         if _if_none_match_matches(request.headers.get("if-none-match"), etag):
             return Response(
                 status_code=304,
@@ -1716,7 +1737,7 @@ def register_resources_routes(
                     "Cache-Control": FILE_CONTENT_CACHE_CONTROL,
                 },
             )
-        content = await asyncio.to_thread(artifact_store.get, stored.id)
+        content = await asyncio.to_thread(artifact_store.get, blob_key)
         media_type = mimetypes.guess_type(stored.filename)[0] or "application/octet-stream"
         # The filename and bytes are fully user-controlled. Serving the
         # content inline lets a browser navigating directly to this URL
@@ -1759,12 +1780,26 @@ def register_resources_routes(
                 status_code=501,
                 detail="file store not configured",
             )
-        if not file_store.delete(file_id, session_id=session_id):
+        # Learn the blob this row points at BEFORE deleting the row — a fork
+        # copy shares the source's blob (blob_key != id), so we can't assume
+        # the blob lives under file_id.
+        stored = await asyncio.to_thread(file_store.get, file_id, session_id=session_id)
+        if stored is None:
             raise OmnigentError(
                 "File not found",
                 code=ErrorCode.NOT_FOUND,
             )
-        artifact_store.delete(file_id)
+        blob_key = stored.blob_key or stored.id
+        if not await asyncio.to_thread(file_store.delete, file_id, session_id=session_id):
+            raise OmnigentError(
+                "File not found",
+                code=ErrorCode.NOT_FOUND,
+            )
+        # Delete the bytes only once no surviving row (e.g. a fork sharing this
+        # blob) still references them — otherwise the fork's attachment would
+        # 404 after the source deletes its copy.
+        if await asyncio.to_thread(file_store.is_blob_key_orphaned, blob_key):
+            await asyncio.to_thread(artifact_store.delete, blob_key)
         _publish_and_persist_resource_event(
             session_id,
             "session.resource.deleted",
@@ -1861,7 +1896,9 @@ def register_resources_routes(
         total_bytes = 0
         for file_id in body.file_ids:
             stored = file_store.get(file_id, session_id=body.source_session_id)
-            if stored is None or not artifact_store.exists(stored.id):
+            # The source row may itself share a blob (blob_key != id), so probe
+            # existence under the effective blob key, not the row id.
+            if stored is None or not artifact_store.exists(stored.blob_key or stored.id):
                 raise OmnigentError(
                     f"File '{file_id}' not found in source session",
                     code=ErrorCode.NOT_FOUND,
@@ -1882,12 +1919,14 @@ def register_resources_routes(
         copied: list[StoredFile] = []
         try:
             for stored in sources:
-                content = artifact_store.get(stored.id)
+                content = artifact_store.get(stored.blob_key or stored.id)
                 new = file_store.create(
                     session_id=session_id,
                     filename=stored.filename,
                     bytes=stored.bytes,
                     content_type=stored.content_type,
+                    # Preserve transform metadata on copies.
+                    source_metadata=stored.source_metadata,
                 )
                 created.append(new.id)
                 artifact_store.put(new.id, content)
@@ -1982,6 +2021,18 @@ def register_resources_routes(
         if method == "GET":
             return await _proxy_get_to_runner(session_id, path, conv)
         if method == "PUT":
+            # Reads can use the host tunnel, but saving needs a runner to
+            # enforce the environment's write policy. Reconnect before saving
+            # and use the refreshed binding if recovery launched a new runner.
+            if request is not None:
+                _, conv = await ensure_runner_connected(
+                    session_id=session_id,
+                    conv=conv,
+                    app_state=request.app.state,
+                    conversation_store=conversation_store,
+                    runner_router=runner_router or get_server_runner_router(),
+                    raise_host_refusal=True,
+                )
             status, payload = await _proxy_put_to_runner(
                 session_id,
                 path,
@@ -2012,6 +2063,10 @@ def register_resources_routes(
             raise HTTPException(status_code=405)
 
         if status >= 400:
+            # Re-derive the typed session-lifecycle 410 (agent deleted or
+            # rebound) with its client-safe message instead of forwarding
+            # the runner's raw resolver text verbatim.
+            _raise_if_session_agent_missing_payload(payload)
             error = payload.get("error", {})
             message = error.get("message", "filesystem operation failed")
             if status == 404:
@@ -2619,6 +2674,12 @@ def register_resources_routes(
         """
         Execute a shell command in an environment.
 
+        Owner-only. A command has no path to inspect, so unlike the
+        filesystem proxy there is no workspace-relative form that could
+        be opened to collaborators: any command reaches the owner's own
+        machine, the same boundary ``_browse_level`` closes for absolute
+        paths, and it passes no policy or approval gate on the way.
+
         :param session_id: Session/conversation identifier.
         :param environment_id: Environment resource id.
         :param request: JSON body with ``command`` and optional
@@ -2633,6 +2694,7 @@ def register_resources_routes(
             path,
             body,
             request=request,
+            required_level=LEVEL_OWNER,
             environment_id=environment_id,
             publish_invalidation=False,
         )

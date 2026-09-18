@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import os
 import queue
@@ -15,6 +16,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from http.client import BadStatusLine, RemoteDisconnected
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from itertools import pairwise
@@ -27,6 +29,7 @@ from urllib.error import URLError
 import pytest
 
 from omnigent.harnesses.claude_native import bridge as claude_native_bridge
+from omnigent.harnesses.claude_native import hook as claude_native_hook
 from omnigent.harnesses.claude_native.bridge import (
     _BACKGROUND_TASK_FIELD_MAX_CHARS,
     _LOGIN_GUIDANCE,
@@ -610,6 +613,40 @@ def test_trusted_parent_accepts_kiro_native_bridge_dir(
 
     # Same anchor as cursor-native: the uid-scoped temp dir's parent.
     assert trusted == claude_native_bridge._absolute_syntactic_path(kiro_root.parent.parent)
+
+
+def test_trusted_parent_accepts_devin_native_bridge_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The relay's bridge-root allowlist accepts devin-native bridge dirs.
+
+    devin-native keeps its bridge files under its own uid-scoped temp root
+    (``$TMPDIR/omnigent-<uid>/devin-native``), the same shape as cursor-native.
+    Without the devin branch, the comment/tool relay's
+    ``start_tool_relay`` -> ``_ensure_secure_dir`` ->
+    ``_trusted_parent_for_bridge_dir`` raises ``not under an allowed bridge
+    root`` and the relay never starts for devin sessions. This pins the
+    devin-native branch.
+    """
+    from omnigent.harnesses.devin_native import bridge as devin_native_bridge
+
+    # Distinct claude root so the devin target can't match the claude branch
+    # first (the autouse fixture points the claude root at ``tmp_path``).
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "claude-native"
+    )
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    # devin root mirrors production shape: <uid-scoped temp>/devin-native.
+    devin_root = tmp_path / "omnigent-test" / "devin-native"
+    monkeypatch.setattr(devin_native_bridge, "_BRIDGE_ROOT", devin_root)
+
+    target = claude_native_bridge._absolute_syntactic_path(devin_root / "abc123")
+    trusted = claude_native_bridge._trusted_parent_for_bridge_dir(target)
+
+    # Same anchor as cursor-native: the uid-scoped temp dir's parent.
+    assert trusted == claude_native_bridge._absolute_syntactic_path(devin_root.parent.parent)
 
 
 def test_trusted_parent_rejects_path_outside_all_roots_and_names_qwen(
@@ -3066,6 +3103,8 @@ def test_augment_claude_args_injects_mcp_and_hooks(tmp_path: Path) -> None:
     # pass the development-channels flag.
     assert "--dangerously-load-development-channels" not in args
     settings = _load_invocation_settings(args)
+    prompt_hooks = settings["hooks"]["UserPromptSubmit"][0]["hooks"]
+    assert any("framework-context" in hook["command"] for hook in prompt_hooks)
     assert (
         "omnigent.harnesses.claude_native.hook"
         in settings["hooks"]["Stop"][0]["hooks"][0]["command"]
@@ -3085,6 +3124,45 @@ def test_augment_claude_args_injects_mcp_and_hooks(tmp_path: Path) -> None:
     # elicitation card (question answers ride back via ``updatedInput``),
     # so the wrapper must not inject a ``--disallowedTools`` flag of its own.
     assert "--disallowedTools" not in args
+
+
+def test_augment_claude_args_observes_worktree_moves(tmp_path: Path) -> None:
+    """
+    ``EnterWorktree`` / ``ExitWorktree`` PostToolUse events reach the observer hook.
+
+    Both tools move the session transcript into the new cwd's project dir, and
+    only the observer hook updates the bridge's ``transcript_path``. Without
+    this entry the forwarder tails the vanished pre-move file until the turn's
+    ``Stop``, so nothing the tool did (its own result included) is mirrored.
+    """
+    settings = _load_invocation_settings(augment_claude_args((), bridge_dir=tmp_path))
+    worktree_entries = [
+        entry
+        for entry in settings["hooks"]["PostToolUse"]
+        if entry.get("matcher") == "EnterWorktree|ExitWorktree"
+    ]
+    assert len(worktree_entries) == 1
+    assert (
+        "omnigent.harnesses.claude_native.hook --bridge-dir"
+        in worktree_entries[0]["hooks"][0]["command"]
+    )
+
+
+def test_framework_context_hook_consumes_hidden_notice(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    """The hook returns hidden context once, then removes it."""
+    path = tmp_path / "pending_framework_context.txt"
+    path.write_text("downscaled", encoding="utf-8")
+    monkeypatch.setattr(sys, "stdin", io.StringIO("{}"))
+
+    assert claude_native_hook.main(["framework-context", "--bridge-dir", str(tmp_path)]) == 0
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["hookSpecificOutput"]["additionalContext"] == "downscaled"
+    assert not path.exists()
 
 
 @pytest.mark.parametrize(
@@ -5472,6 +5550,32 @@ def test_post_tools_changed_normalizes_server_info_read_errors(
         post_tools_changed(tmp_path)
 
 
+def test_post_tools_changed_stops_waiting_when_cancelled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    read_started = threading.Event()
+    cancelled = threading.Event()
+    read_json = claude_native_bridge._read_json_file
+
+    def observe_read(path: Path) -> dict[str, Any]:
+        read_started.set()
+        return read_json(path)
+
+    monkeypatch.setattr(claude_native_bridge, "_read_json_file", observe_read)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        notification = executor.submit(
+            post_tools_changed, tmp_path, timeout_s=3.0, cancelled=cancelled
+        )
+        try:
+            assert read_started.wait(timeout=1.0)
+            assert not notification.done()
+            cancelled.set()
+            with pytest.raises(RuntimeError, match="notification was cancelled"):
+                notification.result(timeout=1.0)
+        finally:
+            cancelled.set()
+
+
 def test_post_tools_changed_preserves_programming_errors(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -5489,10 +5593,12 @@ def test_post_tools_changed_preserves_programming_errors(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("cancellable", [False, True])
 async def test_channel_server_relays_active_omnigent_tools(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     subprocess_bridge_root: Path,
+    cancellable: bool,
 ) -> None:
     """
     Active turn tools are advertised to Claude and dispatched through AP.
@@ -5562,7 +5668,7 @@ async def test_channel_server_relays_active_omnigent_tools(
             tool_executor=tool_executor,
             loop=asyncio.get_running_loop(),
         )
-        post_tools_changed(bridge_dir)
+        post_tools_changed(bridge_dir, cancelled=threading.Event() if cancellable else None)
         changed = await asyncio.to_thread(_read_json_line, proc.stdout, timeout_s=5.0)
         assert changed["method"] == "notifications/tools/list_changed"
 

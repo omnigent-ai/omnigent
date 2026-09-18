@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Mapping
 from contextlib import suppress
 from typing import Any, Protocol, cast
 
@@ -81,6 +82,7 @@ from omnigent.entities import (
     PagedList,
     parse_item_data,
 )
+from omnigent.errors import StaleCursorError
 from omnigent.native.native_coding_agents import native_coding_agent_for_wrapper_label
 from omnigent.native.session_todos import validate_session_todos
 from omnigent.session_import.models import IMPORT_SOURCE_LABEL_KEY
@@ -725,6 +727,47 @@ def _to_item(row: SqlConversationItem, data_json: str) -> ConversationItem:
         data=parse_item_data(item_type, json.loads(data_json)),
         created_by=row.created_by,
     )
+
+
+def _remap_item_file_references(
+    item_data: dict[str, Any],
+    file_id_map: Mapping[str, str],
+    fork_conversation_id: str,
+) -> bool:
+    """
+    Rewrite a copied item's file references to the fork's own file copies.
+
+    Handles the two payload shapes that reference session-scoped files:
+    message content blocks carrying a raw ``file_id`` (pre-resolution
+    attachments) and file ``resource_event`` payloads (``resource_id``
+    plus the embedded resource object).
+
+    :param item_data: Decoded item ``data`` JSON, mutated in place.
+    :param file_id_map: Source file id → fork-owned file id.
+    :param fork_conversation_id: The fork's conversation id, stamped into
+        a remapped resource object's ``session_id``.
+    :returns: Whether anything was rewritten.
+    """
+    changed = False
+    content = item_data.get("content")
+    if isinstance(content, list):
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            block_file_id = block.get("file_id")
+            if isinstance(block_file_id, str) and block_file_id in file_id_map:
+                block["file_id"] = file_id_map[block_file_id]
+                changed = True
+    if item_data.get("resource_type") == "file":
+        resource_id = item_data.get("resource_id")
+        if isinstance(resource_id, str) and resource_id in file_id_map:
+            item_data["resource_id"] = file_id_map[resource_id]
+            resource = item_data.get("resource")
+            if isinstance(resource, dict):
+                resource["id"] = file_id_map[resource_id]
+                resource["session_id"] = fork_conversation_id
+            changed = True
+    return changed
 
 
 def _ranked_latest_message_items(conversation_ids: list[str]) -> Subquery:
@@ -1819,36 +1862,32 @@ class SqlAlchemyConversationStore(ConversationStore):
             write,
         )
 
-    def get_session_owner(self, conversation_id: str) -> str | None:
+    def get_session_owner(self, conversation_id: str, *, owner_only: bool = False) -> str | None:
         """
-        Return the user id that owns a session (its creator).
+        Return the highest-privilege non-public grantee of a session.
 
-        Reads ``session_permissions`` and returns the
-        highest-``level`` grantee: the creator's ``LEVEL_OWNER``
-        (4) grant outranks any read (1) / edit (2) / manage (3)
-        grant, so ``ORDER BY level DESC LIMIT 1`` yields the owner
-        without hardcoding the owner-level integer. The
-        ``"__public__"`` public-access sentinel is excluded, so a
-        session that only carries a public grant (and no real
-        owner) returns ``None`` rather than the sentinel.
+        By default, lower-level grants are a fallback when no owner grant exists,
+        preserving cost attribution for shared sessions. Use ``owner_only=True``
+        for ownership checks; sharing alone does not establish ownership.
 
-        :param conversation_id: The session to look up, e.g.
-            ``"conv_abc123"``.
-        :returns: The owner's user id, e.g. ``"alice@example.com"``,
-            or ``None`` when the session has no real (non-public)
-            permission grants.
+        :param conversation_id: The session to look up, e.g. ``"conv_abc123"``.
+        :param owner_only: Require an explicit owner-level grant.
+        :returns: The grantee's user id, or ``None`` if no qualifying grant exists.
         """
-        from omnigent.server.auth import RESERVED_USER_PUBLIC
+        from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_PUBLIC
 
+        query = (
+            select(SqlSessionPermission.user_id)
+            .where(SqlSessionPermission.workspace_id == current_workspace_id())
+            .where(SqlSessionPermission.conversation_id == conversation_id)
+            .where(SqlSessionPermission.user_id != RESERVED_USER_PUBLIC)
+            .order_by(SqlSessionPermission.level.desc())
+            .limit(1)
+        )
+        if owner_only:
+            query = query.where(SqlSessionPermission.level >= LEVEL_OWNER)
         with self._session("select_session_owner") as session:
-            return session.execute(
-                select(SqlSessionPermission.user_id)
-                .where(SqlSessionPermission.workspace_id == current_workspace_id())
-                .where(SqlSessionPermission.conversation_id == conversation_id)
-                .where(SqlSessionPermission.user_id != RESERVED_USER_PUBLIC)
-                .order_by(SqlSessionPermission.level.desc())
-                .limit(1)
-            ).scalar_one_or_none()
+            return session.execute(query).scalar_one_or_none()
 
     def search(
         self,
@@ -2011,40 +2050,20 @@ class SqlAlchemyConversationStore(ConversationStore):
             if type is not None:
                 stmt = stmt.where(SqlConversationItem.type == encode_item_type(type))
             if after:
-                # Scope the cursor lookup to conversation_id so it lands on the
-                # (workspace_id, conversation_id, id) primary key as a point
-                # lookup. Without it, (workspace_id, id) leads no index and the
-                # subquery degrades to a workspace-wide scan every paginated page.
-                sub = (
-                    select(SqlConversationItem.position)
-                    .where(
-                        SqlConversationItem.workspace_id == current_workspace_id(),
-                        SqlConversationItem.conversation_id == conversation_id,
-                        SqlConversationItem.id == after,
-                    )
-                    .scalar_subquery()
-                )
+                after_pos = self._resolve_item_cursor_position(session, conversation_id, after)
                 # "after" = further in sort direction
                 stmt = stmt.where(
-                    SqlConversationItem.position > sub
+                    SqlConversationItem.position > after_pos
                     if is_asc
-                    else SqlConversationItem.position < sub
+                    else SqlConversationItem.position < after_pos
                 )
             if before:
-                sub = (
-                    select(SqlConversationItem.position)
-                    .where(
-                        SqlConversationItem.workspace_id == current_workspace_id(),
-                        SqlConversationItem.conversation_id == conversation_id,
-                        SqlConversationItem.id == before,
-                    )
-                    .scalar_subquery()
-                )
+                before_pos = self._resolve_item_cursor_position(session, conversation_id, before)
                 # "before" = opposite of sort direction
                 stmt = stmt.where(
-                    SqlConversationItem.position < sub
+                    SqlConversationItem.position < before_pos
                     if is_asc
-                    else SqlConversationItem.position > sub
+                    else SqlConversationItem.position > before_pos
                 )
             # Never ask the backend for more than the per-statement row cap:
             # deployed managed Postgres failed one oversized read of a large
@@ -2081,6 +2100,42 @@ class SqlAlchemyConversationStore(ConversationStore):
                 last_id=items[-1].id if items else None,
                 has_more=has_more,
             )
+
+    @staticmethod
+    def _resolve_item_cursor_position(
+        session: Session,
+        conversation_id: str,
+        cursor_id: str,
+    ) -> int:
+        """
+        Resolve an item cursor id to its ``position`` at read time.
+
+        Scoped to ``conversation_id`` so the lookup lands on the
+        ``(workspace_id, conversation_id, id)`` primary key as a point
+        lookup, and so another conversation's cursor id can never supply a
+        cutoff position. Resolving eagerly (instead of a correlated scalar
+        subquery, which yields NULL for a missing row) makes an
+        unresolvable cursor distinguishable from a completed enumeration
+        rather than silently truncating it.
+
+        :param session: Open conversation-DB session.
+        :param conversation_id: The conversation being listed.
+        :param cursor_id: The ``after``/``before`` item id.
+        :returns: The cursor item's position.
+        :raises StaleCursorError: If no such item exists in this
+            conversation — deleted between two page fetches, or a cursor
+            id from another conversation.
+        """
+        position = session.execute(
+            select(SqlConversationItem.position).where(
+                SqlConversationItem.workspace_id == current_workspace_id(),
+                SqlConversationItem.conversation_id == conversation_id,
+                SqlConversationItem.id == cursor_id,
+            )
+        ).scalar_one_or_none()
+        if position is None:
+            raise StaleCursorError(cursor_id)
+        return position
 
     def list_latest_message_items_for_conversations(
         self,
@@ -2917,6 +2972,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
             if after:
                 stmt = self._apply_cursor(
+                    session,
                     stmt,
                     after,
                     sort_col,
@@ -2926,6 +2982,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
             if before:
                 stmt = self._apply_cursor(
+                    session,
                     stmt,
                     before,
                     sort_col,
@@ -3009,6 +3066,7 @@ class SqlAlchemyConversationStore(ConversationStore):
 
     @staticmethod
     def _apply_cursor(
+        session: Session,
         stmt: Select[tuple[SqlConversation]],
         cursor_id: str,
         sort_col: QueryableAttribute[int],
@@ -3020,8 +3078,18 @@ class SqlAlchemyConversationStore(ConversationStore):
         Add a cursor-based WHERE clause to the query.
 
         Add a ``(sort_col, tiebreaker_col)`` composite WHERE clause so
-        that cursor pagination is consistent with the ORDER BY key.
+        that cursor pagination is consistent with the ORDER BY key. The
+        cursor row's position is resolved here with a point lookup and
+        embedded as literal bounds (a keyset cursor) rather than left as a
+        correlated scalar subquery: on a row deleted between two page
+        fetches the subquery yields NULL, every comparison evaluates to
+        NULL, and the page reads as empty with ``has_more=False`` — silent
+        truncation indistinguishable from a completed enumeration. A
+        vanished cursor row now raises instead, and a delete landing after
+        the lookup still pages from the resolved position.
 
+        :param session: Open conversation-DB session used to resolve the
+            cursor row's position.
         :param stmt: The current SELECT statement to augment.
         :param cursor_id: The conversation ID acting as the page cursor,
             e.g. ``"conv_abc123"``.
@@ -3033,29 +3101,20 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param forward: ``True`` for ``after`` cursors, ``False`` for
             ``before`` cursors.
         :returns: The statement with the cursor WHERE clause applied.
+        :raises StaleCursorError: If the cursor row no longer exists (it
+            was deleted between two page fetches).
         """
-        sub = (
-            select(sort_col)
-            .where(
+        # Point lookup on the (workspace_id, id) key. For the non-SQLite id
+        # tiebreaker this re-selects cursor_id; for SQLite it fetches rowid.
+        cursor_row = session.execute(
+            select(sort_col, tiebreaker_col).where(
                 SqlConversation.workspace_id == current_workspace_id(),
                 SqlConversation.id == cursor_id,
             )
-            .scalar_subquery()
-        )
-        # When tiebreaker_col is SqlConversation.id (non-SQLite), its value for
-        # the cursor row is cursor_id itself — no extra subquery needed.
-        # For SQLite rowid (a literal_column), we must query the DB.
-        if isinstance(tiebreaker_col, QueryableAttribute):
-            tiebreaker_val: Any = cursor_id
-        else:
-            tiebreaker_val = (
-                select(tiebreaker_col)
-                .where(
-                    SqlConversation.workspace_id == current_workspace_id(),
-                    SqlConversation.id == cursor_id,
-                )
-                .scalar_subquery()
-            )
+        ).first()
+        if cursor_row is None:
+            raise StaleCursorError(cursor_id)
+        sort_val, tiebreaker_val = cursor_row
         # "after" (forward=True) = further in sort direction;
         # "before" (forward=False) = opposite of sort direction.
         #
@@ -3072,15 +3131,16 @@ class SqlAlchemyConversationStore(ConversationStore):
         # Python value gets no type context, so the ``Uuid16`` decorator never
         # runs and PostgreSQL is handed a hex string against a ``bytea``
         # column ("operator does not exist: bytea < character varying"). The
-        # SQLite-rowid branch passes a scalar subquery, which is already typed.
+        # SQLite-rowid branch is an untyped ``literal_column``, whose plain int
+        # value SQLAlchemy already binds correctly.
         cursor_tiebreaker = (
             literal(tiebreaker_val, tiebreaker_col.type)
             if isinstance(tiebreaker_col, QueryableAttribute)
             else tiebreaker_val
         )
-        cursor_row = tuple_(sub, cursor_tiebreaker)
+        cursor_row_values = tuple_(literal(sort_val, sort_col.type), cursor_tiebreaker)
         descending_scan = is_desc if forward else not is_desc
-        return stmt.where(row < cursor_row if descending_scan else row > cursor_row)
+        return stmt.where(row < cursor_row_values if descending_scan else row > cursor_row_values)
 
     def update_conversation(
         self,
@@ -3550,7 +3610,9 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         run_write_transaction(self._session_immediate, "set_pending_elicitation_count", write)
 
-    def replace_runner_id(self, conversation_id: str, runner_id: str) -> Conversation:
+    def replace_runner_id(
+        self, conversation_id: str, runner_id: str, *, expected_runner_id: str | None = None
+    ) -> Conversation:
         """
         Atomically overwrite ``conversations.runner_id``.
 
@@ -3573,7 +3635,19 @@ class SqlAlchemyConversationStore(ConversationStore):
                 raise ConversationNotFoundError(
                     f"conversation {conversation_id!r} does not exist",
                 )
-            meta.runner_id = runner_id
+            if expected_runner_id is None:
+                meta.runner_id = runner_id
+            else:
+                session.execute(
+                    update(SqlConversationMetadata)
+                    .where(
+                        SqlConversationMetadata.workspace_id == current_workspace_id(),
+                        SqlConversationMetadata.id == conversation_id,
+                        SqlConversationMetadata.runner_id == expected_runner_id,
+                    )
+                    .values(runner_id=runner_id)
+                )
+                session.refresh(meta)
             return meta
 
         meta = run_write_transaction(self._session_immediate, "replace_runner_id", write)
@@ -4049,6 +4123,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         presentation_labels: dict[str, str] | None = None,
         up_to_response_id: str | None = None,
         project_id: str | None = None,
+        file_id_map: Mapping[str, str] | None = None,
     ) -> Conversation:
         """
         Deep-copy a conversation and its items into a new conversation.
@@ -4168,6 +4243,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             unfiled. The caller resolves whether the fork keeps the
             source's project — projects are owner-private, so the route
             passes the source's id only when the forker owns it.
+        :param file_id_map: Source file id → fork-owned file id for the
+            session-scoped file resources the caller copies into the fork.
+            Copied items referencing a mapped id are rewritten to the
+            fork's copy; ``None`` or empty copies every payload verbatim.
         :returns: The newly created :class:`Conversation`.
         :raises LookupError: If no conversation with
             *source_conversation_id* exists.
@@ -4197,6 +4276,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             presentation_labels=presentation_labels,
             up_to_response_id=up_to_response_id,
             project_id=project_id,
+            file_id_map=file_id_map,
         )
 
     def _fork_conversation_with_id(
@@ -4224,6 +4304,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         presentation_labels: dict[str, str] | None = None,
         up_to_response_id: str | None = None,
         project_id: str | None = None,
+        file_id_map: Mapping[str, str] | None = None,
     ) -> Conversation:
         """Body of :meth:`fork_conversation` under a caller-supplied
         ``conversation_id``. The public method generates a fresh id; this seam
@@ -4350,12 +4431,14 @@ class SqlAlchemyConversationStore(ConversationStore):
                 for src_item in source_items
             }
             # Copied rows reuse the source's already-encoded payload bytes (the
-            # encode transform depends only on item data); only compaction
-            # payloads change, remapped via one batch decode + one batch encode
-            # so a store whose encode is a per-call RPC never pays one
-            # round-trip per copied item. Preparation happens here, before the
-            # insert transaction, so a CockroachDB 40001 replay repeats SQL
-            # only — never ID generation or the encode/decode hooks.
+            # encode transform depends only on item data); only payloads that
+            # embed an id needing remapping change (compaction boundary item
+            # ids, session-scoped file references), each remapped via one
+            # batch decode + one batch encode so a store whose encode is a
+            # per-call RPC never pays one round-trip per copied item.
+            # Preparation happens here, before the insert transaction, so a
+            # CockroachDB 40001 replay repeats SQL only — never ID generation
+            # or the encode/decode hooks.
             compaction_positions = [
                 pos
                 for pos, src_item in enumerate(source_items)
@@ -4382,12 +4465,45 @@ class SqlAlchemyConversationStore(ConversationStore):
                     )
                 )
 
+            # Copied items reference session-scoped files by file_id
+            # (message attachment blocks, file resource events) that the
+            # fork does not own. When the caller copied those files into
+            # the fork, rewrite the references to the fork's own copies.
+            remapped_file_data: dict[int, str] = {}
+            if file_id_map:
+                file_ref_positions = [
+                    pos
+                    for pos, src_item in enumerate(source_items)
+                    if decode_item_type(src_item.type) in ("message", "resource_event")
+                ]
+                if file_ref_positions:
+                    decoded_payloads = self._decode_item_data_batch(
+                        [source_items[pos].data for pos in file_ref_positions]
+                    )
+                    changed_positions: list[int] = []
+                    changed_payloads: list[str] = []
+                    for ref_pos, decoded_payload in zip(
+                        file_ref_positions, decoded_payloads, strict=True
+                    ):
+                        item_data = json.loads(decoded_payload)
+                        if _remap_item_file_references(item_data, file_id_map, new_conv_id):
+                            changed_positions.append(ref_pos)
+                            changed_payloads.append(json.dumps(item_data))
+                    if changed_payloads:
+                        remapped_file_data = dict(
+                            zip(
+                                changed_positions,
+                                self._encode_item_data_batch(changed_payloads),
+                                strict=True,
+                            )
+                        )
+
             prepared_item_rows: list[dict[str, Any]] = []
             fts_rows: list[tuple[str, str, str]] = []
             for pos, src_item in enumerate(source_items):
                 # src_item.type/status/data are copied verbatim to the new row;
-                # compaction data alone is rewritten (the sole payload that
-                # contains an item ID).
+                # only compaction payloads (embedded item id) and file-
+                # referencing payloads (mapped file ids) are rewritten.
                 new_item_id = copied_item_ids[src_item.id]
                 # Forked items keep the source item's original timestamp
                 # (#6924); only the conversation row itself is stamped `now`.
@@ -4402,7 +4518,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                         "status": src_item.status,
                         "position": pos,
                         "type": src_item.type,
-                        "data": remapped_compaction_data.get(pos, src_item.data),
+                        "data": remapped_compaction_data.get(
+                            pos, remapped_file_data.get(pos, src_item.data)
+                        ),
                         "search_text": src_item.search_text,
                         "created_by": src_item.created_by,
                     }

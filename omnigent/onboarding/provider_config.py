@@ -352,6 +352,28 @@ class FamilyConfig:
         """
         return self.models.get("default")
 
+    def resolve_model_tier(self, model_id: str) -> str:
+        """Resolve a ``models:`` value that names another tier to its id.
+
+        Deployments alias tier names to ids (``deepseek-pro:
+        deepseek-v4-pro``) and reference those aliases from other keys
+        (``default: deepseek-pro``). Whatever reaches an endpoint — the
+        launch model, the picker's shortlist, the spawn env — must be the
+        concrete id, never the alias.
+
+        :param model_id: A ``models`` key or value, e.g. ``"deepseek-pro"``.
+        :returns: The concrete id the alias chain ends at, e.g.
+            ``"deepseek-v4-pro"``; *model_id* unchanged when it names no
+            other tier.
+        """
+        current = model_id
+        for _ in range(8):  # bounded: a cyclic alias map must terminate
+            alias = self.models.get(current)
+            if not isinstance(alias, str) or not alias or alias == current:
+                return current
+            current = alias
+        return model_id
+
 
 @dataclass(frozen=True)
 class ProviderEntry:

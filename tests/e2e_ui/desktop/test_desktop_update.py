@@ -112,7 +112,7 @@ def _bridge_calls(page: Page) -> list[str]:
 
 def test_settings_updates_section_check_and_mode(
     page: Page,
-    seeded_session: tuple[str, str],
+    live_server: str,
 ) -> None:
     """Settings -> Updates exposes the mode selector and a working Check button.
 
@@ -122,7 +122,7 @@ def test_settings_updates_section_check_and_mode(
     selector reflects the bridge config and ``Check for updates now`` calls the
     bridge's ``check()``.
     """
-    base_url, _session_id = seeded_session
+    base_url = live_server
 
     _install_update_stub(page, '{ state: "idle" }')
     page.goto(f"{base_url}/settings/updates")

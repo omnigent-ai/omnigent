@@ -275,6 +275,32 @@ describe("listSessionPage", () => {
     });
   });
 
+  it("maps the server's stale_cursor 400 to a distinguishable code", async () => {
+    // `sessions.listAll` restarts its walk on this code, so a plain
+    // `HostError` here would fail the whole call instead.
+    vi.mocked(authenticatedFetch).mockResolvedValue(
+      new Response(JSON.stringify({ error: { code: "stale_cursor", message: "cursor gone" } }), {
+        status: 400,
+      }),
+    );
+
+    await expect(listSessionPage({}, new AbortController().signal)).rejects.toMatchObject({
+      code: "StaleCursor",
+    });
+  });
+
+  it("leaves an unrelated 400 a plain host error", async () => {
+    vi.mocked(authenticatedFetch).mockResolvedValue(
+      new Response(JSON.stringify({ error: { code: "invalid_input", message: "bad" } }), {
+        status: 400,
+      }),
+    );
+
+    await expect(listSessionPage({}, new AbortController().signal)).rejects.toMatchObject({
+      code: "HostError",
+    });
+  });
+
   it("rejects non-JSON success responses", async () => {
     vi.mocked(authenticatedFetch).mockResolvedValue(new Response("not-json", { status: 200 }));
 

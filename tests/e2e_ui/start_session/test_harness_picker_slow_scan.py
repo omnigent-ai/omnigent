@@ -2,7 +2,7 @@
 
 The new-chat landing composer's agent/harness picker is fed by
 ``useAvailableAgents`` (``web/src/hooks/useAvailableAgents.ts``), which awaits
-``Promise.all([GET /v1/agents, GET /v1/sessions?limit=100&kind=any&…]])`` before
+``Promise.all([GET /v1/agents, GET /v1/sessions?limit=100&visibility=mine&…]])`` before
 returning ANY rows. The harness rows (Claude Code, Codex, …) come entirely from
 the ``/v1/agents`` catalog, yet they cannot render until the sessions discovery
 scan also resolves — so on a deployment where that scan is slow (managed
@@ -19,7 +19,7 @@ gated on the scan, the harnesses only appear after ``_SCAN_DELAY_S`` and the
 assertion fails; once the picker renders catalog rows without waiting for the
 discovery extension, it passes.
 
-The stubbing shape (hosts/agents faked, ``kind=any`` scan intercepted) and the
+The stubbing shape (hosts/agents faked, ``visibility=mine`` scan intercepted) and the
 async-in-a-fresh-thread drive mirror ``test_start_session.py`` /
 ``test_harness_install.py`` — see those modules for why the e2e harness needs
 the stub host and the fresh event loop.
@@ -40,9 +40,9 @@ from tests.e2e_ui.start_session.test_start_session import (
     _run_in_fresh_loop,
 )
 
-# Only the agent-discovery scan uses ``kind=any`` — the sidebar conversation
+# Only the agent-discovery scan uses ``visibility=mine`` — the sidebar conversation
 # list does not — so this pattern delays exactly the scan and nothing else.
-_SCAN_RE = re.compile(r"/v1/sessions\?.*kind=any")
+_SCAN_RE = re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine")
 # Bare catalog list (with optional query), NOT ``/v1/agents/{id}`` subpaths.
 _AGENTS_RE = re.compile(r"/v1/agents(\?.*)?$")
 
@@ -150,7 +150,7 @@ async def _seed_workspace(page) -> None:
 def test_harness_picker_not_blocked_by_slow_session_scan(live_server: str) -> None:
     """Harness rows must appear promptly even when the discovery scan is slow.
 
-    The catalog request resolves immediately; only the ``kind=any`` sessions
+    The catalog request resolves immediately; only the ``visibility=mine`` sessions
     scan lags. The picker must offer the catalog harnesses within
     ``_PICKER_BUDGET_S`` instead of sitting disabled ("No agents") until the
     scan returns.

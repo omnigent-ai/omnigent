@@ -6,6 +6,7 @@
 // the harness config controls, and the store can all depend on one source of
 // truth without a circular import.
 
+import { fusionModelLabel, isFusionModelUid } from "@/lib/devinFusion";
 import type { NativeModelOption } from "@/lib/types";
 
 /** The native-catalog fields a model label is built from. A superset like
@@ -36,6 +37,10 @@ export function formatStatusModelLabel(
 ): string | null {
   const raw = model?.trim();
   if (!raw) return null;
+  if (isFusionModelUid(raw)) {
+    const descriptor = codexModelOptions.find((candidate) => candidate.fusion)?.fusion;
+    if (descriptor) return fusionModelLabel(descriptor, raw);
+  }
   const option =
     codexModelOptions.find((candidate) => candidate.id === raw) ??
     codexModelOptions.find((candidate) => candidate.model === raw);

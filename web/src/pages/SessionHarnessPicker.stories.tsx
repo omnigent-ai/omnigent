@@ -64,3 +64,13 @@ export const Open: Story = {
     await userEvent.click(within(canvasElement).getByTestId("composer-config-gear"));
   },
 };
+
+export const SmartRouting: Story = {
+  args: { costRoutingEligible: true },
+  play: async ({ canvasElement }) => {
+    const page = within(canvasElement.ownerDocument.body);
+    await userEvent.click(within(canvasElement).getByTestId("composer-config-gear"));
+    await userEvent.click(await page.findByTestId("composer-agent-edit"));
+    await page.findByRole("menuitem", { name: "Smart Routing" });
+  },
+};

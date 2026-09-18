@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   ComposerHostTrigger,
@@ -143,6 +143,37 @@ describe("shared composer controls", () => {
     fireEvent.click(screen.getByRole("menuitem", { name: "Plan" }));
     expect(onSelect).toHaveBeenCalledWith("plan");
   });
+
+  it.each([false, true])(
+    "restores permission focus unless another menu has opened (next menu=%s)",
+    async (nextMenuOpen) => {
+      vi.useFakeTimers();
+      try {
+        render(
+          <>
+            <ComposerPermissionPicker
+              label="Permission mode"
+              value="Manual"
+              options={[{ value: "plan", label: "Plan" }]}
+              onSelect={vi.fn()}
+            />
+            <div role="menu" data-state="open" tabIndex={-1} data-testid="next-menu" />
+          </>,
+        );
+        const trigger = screen.getByRole("button", { name: "Permission mode: Manual" });
+        fireEvent.keyDown(trigger, { key: "ArrowDown" });
+        fireEvent.click(screen.getByRole("menuitem", { name: "Plan" }));
+        const nextMenu = screen.getByTestId("next-menu");
+        if (nextMenuOpen) nextMenu.focus();
+
+        await act(() => vi.runOnlyPendingTimersAsync());
+
+        expect(nextMenuOpen ? nextMenu : trigger).toHaveFocus();
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
 
   it("keeps cached permissions readable but inert while their live configuration loads", () => {
     const onSelect = vi.fn();
