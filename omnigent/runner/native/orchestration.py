@@ -3243,6 +3243,24 @@ async def _auto_create_hermes_terminal(
     # cursor (clear_hermes_bridge_state above) starts it at that row's first row.
     launch_epoch_s = time.time()
     hermes_args = [*(launch_config.terminal_launch_args or [])]
+    # The pre-launch picker's model and reasoning selections reach the TUI as
+    # launch flags (both are invocation-scoped in Hermes; the persistent
+    # choices stay in Hermes' own config). User pass-through args win: a
+    # bare `-m/--model/--reasoning` already in the args means the user pinned
+    # their own launch line.
+    _hermes_flag_args = {arg for arg in hermes_args if arg.startswith(("-", "--"))}
+    _user_pinned_model = any(
+        arg in {"-m", "--model"} or arg.startswith("--model=") for arg in hermes_args
+    )
+    _user_pinned_reasoning = any(
+        arg in {"--reasoning"} or arg.startswith("--reasoning=") for arg in hermes_args
+    )
+    _spec_model = launch_config.model_override
+    if _spec_model and not _user_pinned_model:
+        hermes_args.extend(["--model", str(_spec_model).split("/", 1)[-1]])
+    _spec_reasoning = launch_config.reasoning_effort
+    if _spec_reasoning and not _user_pinned_reasoning:
+        hermes_args.extend(["--reasoning", str(_spec_reasoning)])
     # Resolve the per-session HERMES_HOME early: the fork block below needs it
     # to place the cloned state.db, and the env block after needs it for the
     # HERMES_HOME env var.

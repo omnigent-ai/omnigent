@@ -138,16 +138,19 @@ export const NATIVE_CODING_AGENTS = [
     displayName: "OpenCode",
     iconKind: "opencode",
     sortRank: 25,
-    // No capabilities → no permission picker. OpenCode has no claude-style
-    // permission-mode surface to mirror: its native modes are the `build`
-    // (allow-by-default) and `plan` primary agents, switched at runtime via Tab
-    // inside the TUI — and `opencode attach` (how the runner launches it) has
-    // no `--agent` flag to preset one anyway. The runner already forces
-    // `permission: "ask"` so tools route through the Omnigent policy engine, so
-    // a launch-time picker would mirror nothing. (Previously declared Codex's
-    // `approvalMode`, whose `--sandbox`/`--ask-for-approval` presets aren't
-    // understood by `opencode attach` and crashed the TUI on any non-default
-    // pick.)
+    // `modelPicker` lists the host's `opencode models` catalog at launch and
+    // pins the pick as the session's `model_override`, which the runner already
+    // reads per prompt (`opencode serve` takes no model flag — the model is a
+    // per-prompt field on POST /session/{id}/message). OpenCode still gets no
+    // permission picker: it has no claude-style permission-mode surface to
+    // mirror — its native modes are the `build` (allow-by-default) and `plan`
+    // primary agents, switched at runtime via Tab inside the TUI, and
+    // `opencode attach` has no flag to preset one. The runner already forces
+    // `permission: "ask"` so tools route through the Omnigent policy engine.
+    // (Previously declared Codex's `approvalMode`, whose
+    // `--sandbox`/`--ask-for-approval` presets aren't understood by
+    // `opencode attach` and crashed the TUI on any non-default pick.)
+    capabilities: ["modelPicker"],
   },
   {
     // Devin's native TUI (Cognition). Replaced the built-in ACP row, removed in
@@ -263,7 +266,8 @@ export const NATIVE_CODING_AGENTS = [
     // hermes has no brand glyph yet, so it falls back to the generic bot icon
     // (see AgentCard.iconForAgent / SubagentsPanel) — the `iconKind: "hermes"`
     // intentionally matches no icon branch. Auth/approval surface in the
-    // embedded terminal, so no capability flags are declared here.
+    // embedded terminal. The model picker reads the config default plus
+    // Hermes' cached catalog (`hermes model`), so no CLI probe is needed.
     key: "hermes",
     agentName: "hermes-native-ui",
     harness: "hermes-native",
@@ -271,6 +275,7 @@ export const NATIVE_CODING_AGENTS = [
     displayName: "Hermes",
     iconKind: "hermes",
     sortRank: 80,
+    capabilities: ["modelPicker"],
   },
 ] as const satisfies readonly NativeCodingAgentSpec[];
 
