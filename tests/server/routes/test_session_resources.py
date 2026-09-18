@@ -5004,20 +5004,28 @@ async def test_native_dispatch_tunnel_close_is_definitive_ensure_error() -> None
     )
 
 
-class _DropOnceRunnerClient(_FakeRunnerClient):
-    """Fake runner whose first terminal-ensure POST dies with the tunnel."""
+class _FailingEnsureRunnerClient(_FakeRunnerClient):
+    """Fake runner whose terminal-ensure POSTs fail with a scripted sequence, then succeed."""
 
-    def __init__(self, drop_path: str) -> None:
+    def __init__(self, ensure_path: str, failures: list[Exception]) -> None:
         super().__init__()
-        self._drop_path = drop_path
+        self._ensure_path = ensure_path
+        self._failures = list(failures)
         self.drops = 0
 
     def _make_response(self, method: str, url: str) -> httpx.Response:
-        if url == self._drop_path and self.drops == 0:
+        if url == self._ensure_path and self._failures:
             self.drops += 1
             self.calls.append((method, url))
-            raise ConnectionError("tunnel closed before request completed")
+            raise self._failures.pop(0)
         return super()._make_response(method, url)
+
+
+def _ensure_request(path: str) -> httpx.Request:
+    return httpx.Request("POST", f"http://runner{path}")
+
+
+_TUNNEL_CLOSED = "tunnel closed before request completed"
 
 
 class _ReconnectWaitRouter:
@@ -5033,13 +5041,19 @@ class _ReconnectWaitRouter:
 
 
 @pytest.mark.asyncio
-async def test_native_dispatch_tunnel_drop_retries_ensure_after_runner_reconnects() -> None:
+@pytest.mark.parametrize("drop_kind", ["tunnel_closed", "runner_offline"])
+async def test_native_dispatch_tunnel_drop_retries_ensure_after_runner_reconnects(
+    drop_kind: str,
+) -> None:
     """A tunnel drop mid-ensure waits for the runner and asks again.
 
     The runner behind a dropped tunnel is usually alive but stalled; it
     re-registers and the terminal it was creating is still there. Failing
     the message on the drop threw the user's input away while the server
-    itself re-ran the ensure on reconnect moments later.
+    itself re-ran the ensure on reconnect moments later. Both shapes the
+    tunnel transport raises qualify: the bare ``ConnectionError`` of a drop
+    under an in-flight request and the ``httpx.ConnectError`` of a runner
+    already offline when the request is sent.
     """
     import dataclasses
 
@@ -5053,7 +5067,14 @@ async def test_native_dispatch_tunnel_drop_retries_ensure_after_runner_reconnect
     assert conv is not None
     conv = dataclasses.replace(conv, runner_id="runner_one")
     terminals_path = "/v1/sessions/64a784c3aa907d1774f44313546947c6/resources/terminals"
-    client = _DropOnceRunnerClient(terminals_path)
+    drop: Exception = (
+        ConnectionError(_TUNNEL_CLOSED)
+        if drop_kind == "tunnel_closed"
+        else httpx.ConnectError(
+            "runner 'runner_one' is offline", request=_ensure_request(terminals_path)
+        )
+    )
+    client = _FailingEnsureRunnerClient(terminals_path, [drop])
     router = _ReconnectWaitRouter(reconnects=True)
     body = SessionEventInput(
         type="message",
@@ -5102,7 +5123,7 @@ async def test_native_dispatch_tunnel_drop_fails_when_runner_stays_gone() -> Non
     assert conv is not None
     conv = dataclasses.replace(conv, runner_id="runner_one")
     terminals_path = "/v1/sessions/64a784c3aa907d1774f44313546947c6/resources/terminals"
-    client = _DropOnceRunnerClient(terminals_path)
+    client = _FailingEnsureRunnerClient(terminals_path, [ConnectionError(_TUNNEL_CLOSED)])
     router = _ReconnectWaitRouter(reconnects=False)
     body = SessionEventInput(
         type="message",
@@ -5132,6 +5153,106 @@ async def test_native_dispatch_tunnel_drop_fails_when_runner_stays_gone() -> Non
     assert (
         errors[0].data.message
         == "Native Claude terminal ensure request failed. tunnel closed before request completed"
+    )
+
+
+@pytest.mark.asyncio
+async def test_native_dispatch_unrelated_transport_error_fails_without_waiting() -> None:
+    """A transport error that is not a tunnel drop keeps the immediate durable failure."""
+    import dataclasses
+
+    from omnigent.server.routes.sessions import _dispatch_session_event_to_runner
+
+    store = _ConversationStore()
+    conv = store.get_conversation("64a784c3aa907d1774f44313546947c6")
+    assert conv is not None
+    conv = dataclasses.replace(conv, runner_id="runner_one")
+    terminals_path = "/v1/sessions/64a784c3aa907d1774f44313546947c6/resources/terminals"
+    client = _FailingEnsureRunnerClient(
+        terminals_path,
+        [httpx.ReadTimeout("read timed out", request=_ensure_request(terminals_path))],
+    )
+    router = _ReconnectWaitRouter(reconnects=True)
+    body = SessionEventInput(
+        type="message",
+        data={"role": "user", "content": [{"type": "input_text", "text": "retry"}]},
+    )
+
+    result = await _dispatch_session_event_to_runner(
+        "64a784c3aa907d1774f44313546947c6",
+        conv,
+        body,
+        store,  # type: ignore[arg-type]
+        client,  # type: ignore[arg-type]
+        agent_name="claude-native-ui",
+        file_store=None,
+        artifact_store=None,
+        created_by=None,
+        runner_router=router,  # type: ignore[arg-type]
+    )
+
+    assert router.waits == []
+    assert [call for call in client.calls if call[0] == "POST"] == [("POST", terminals_path)]
+    assert result.pending_id is None
+    errors = [i for i in store.appended_items if i.type == "error"]
+    assert len(errors) == 1
+    assert errors[0].data.code == "native_terminal_ensure_failed"
+    assert errors[0].data.message == "Native Claude terminal ensure request failed. read timed out"
+
+
+@pytest.mark.asyncio
+async def test_native_dispatch_tunnel_drop_retry_failure_is_durable_after_one_attempt() -> None:
+    """A retry that also fails stops there and reports the retry's error."""
+    import dataclasses
+
+    from omnigent.server.routes.sessions import _dispatch_session_event_to_runner
+
+    store = _ConversationStore()
+    conv = store.get_conversation("64a784c3aa907d1774f44313546947c6")
+    assert conv is not None
+    conv = dataclasses.replace(conv, runner_id="runner_one")
+    terminals_path = "/v1/sessions/64a784c3aa907d1774f44313546947c6/resources/terminals"
+    client = _FailingEnsureRunnerClient(
+        terminals_path,
+        [
+            ConnectionError(_TUNNEL_CLOSED),
+            httpx.ConnectError(
+                "runner 'runner_one' is offline", request=_ensure_request(terminals_path)
+            ),
+        ],
+    )
+    router = _ReconnectWaitRouter(reconnects=True)
+    body = SessionEventInput(
+        type="message",
+        data={"role": "user", "content": [{"type": "input_text", "text": "retry"}]},
+    )
+
+    result = await _dispatch_session_event_to_runner(
+        "64a784c3aa907d1774f44313546947c6",
+        conv,
+        body,
+        store,  # type: ignore[arg-type]
+        client,  # type: ignore[arg-type]
+        agent_name="claude-native-ui",
+        file_store=None,
+        artifact_store=None,
+        created_by=None,
+        runner_router=router,  # type: ignore[arg-type]
+    )
+
+    # One wait, two ensure attempts, no third; the message is not forwarded.
+    assert len(router.waits) == 1
+    assert [call for call in client.calls if call[0] == "POST"] == [
+        ("POST", terminals_path),
+        ("POST", terminals_path),
+    ]
+    assert result.pending_id is None
+    errors = [i for i in store.appended_items if i.type == "error"]
+    assert len(errors) == 1
+    assert errors[0].data.code == "native_terminal_ensure_failed"
+    assert (
+        errors[0].data.message
+        == "Native Claude terminal ensure request failed. runner 'runner_one' is offline"
     )
 
 
