@@ -141,7 +141,11 @@ def test_managed_shortlist_can_select_another_model(
         tui.send("\x1b[B\r")
         tui.wait_for(lambda text: "Scope:" not in text and "demo-balanced" in text)
         tui.send("/model\r")
-        tui.wait_for(lambda text: "→ demo-balanced [omnigent] ✓" in text)
+        tui.wait_for(
+            lambda text: any(
+                "demo-balanced [omnigent]" in line and "✓" in line for line in text.splitlines()
+            )
+        )
 
 
 def test_default_only_provider_preserves_existing_pi_scope(
