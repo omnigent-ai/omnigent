@@ -79,6 +79,12 @@ stores into ``create_app``):
            env: [OPENAI_API_KEY, GIT_TOKEN]  # SERVER env var NAMES whose
                                              # values are injected as
                                              # sandbox env
+           cpu: 4                 # optional; default: 2
+           memory: 8              # optional; GiB, default: 4
+           disk: 20               # optional; GiB, default: Daytona's
+           auto_delete_interval: 60  # optional; minutes a STOPPED sandbox
+                                     # lingers before Daytona deletes it
+                                     # (default: never)
          blaxel:                  # optional block (provider: blaxel)
            image: blaxel/omnigent-host:TAG  # optional fixed tag override
            env: [OPENAI_API_KEY, GIT_TOKEN]  # SERVER env var NAMES
@@ -1427,8 +1433,22 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
         )
         token_ttl_s = MODAL_MANAGED_TOKEN_TTL_S
     elif provider == "daytona":
+        section = _parse_provider_section(raw, "daytona")
+        if section is not None:
+            _reject_unknown_keys(
+                section,
+                {"image", "env", "cpu", "memory", "disk", "auto_delete_interval"},
+                "sandbox.daytona",
+            )
         launcher_factory = _daytona_launcher_factory(
-            _parse_daytona_image(raw), _parse_daytona_env(raw)
+            image=_parse_provider_image(raw, "daytona"),
+            env=_parse_provider_env(raw, "daytona"),
+            cpu=_parse_provider_positive_int(raw, "daytona", "cpu"),
+            memory=_parse_provider_positive_int(raw, "daytona", "memory"),
+            disk=_parse_provider_positive_int(raw, "daytona", "disk"),
+            auto_delete_interval=_parse_provider_nonnegative_int(
+                raw, "daytona", "auto_delete_interval"
+            ),
         )
         token_ttl_s = DAYTONA_MANAGED_TOKEN_TTL_S
     elif provider == "blaxel":
@@ -1718,8 +1738,13 @@ def _parse_modal_secrets(raw: dict[str, object]) -> list[str] | None:
 
 
 def _daytona_launcher_factory(
+    *,
     image: str | None,
     env: list[str] | None,
+    cpu: int | None,
+    memory: int | None,
+    disk: int | None,
+    auto_delete_interval: int | None,
 ) -> Callable[[], SandboxHostLauncher]:
     """
     Build the launcher factory for the YAML ``provider: daytona`` path.
@@ -1733,6 +1758,14 @@ def _daytona_launcher_factory(
         every sandbox, e.g. ``["OPENAI_API_KEY", "GIT_TOKEN"]``, or
         ``None`` to resolve from the launcher's env-var fallback /
         inject nothing.
+    :param cpu: vCPUs per sandbox, or ``None`` for the launcher default.
+    :param memory: Memory in GiB per sandbox, or ``None`` for the
+        launcher default.
+    :param disk: Disk in GiB per sandbox, or ``None`` for Daytona's own
+        default.
+    :param auto_delete_interval: Minutes a STOPPED sandbox lingers
+        before Daytona deletes it server-side, or ``None`` to leave
+        auto-delete disabled.
     :returns: A factory producing parameterized Daytona launchers.
     """
 
@@ -1740,7 +1773,14 @@ def _daytona_launcher_factory(
         """Construct the Daytona launcher (lazy SDK import inside)."""
         from omnigent.onboarding.sandboxes.daytona import DaytonaSandboxLauncher
 
-        return DaytonaSandboxLauncher(image=image, env=env)
+        return DaytonaSandboxLauncher(
+            image=image,
+            env=env,
+            cpu=cpu,
+            memory=memory,
+            disk=disk,
+            auto_delete_interval=auto_delete_interval,
+        )
 
     return _build
 
@@ -1785,82 +1825,6 @@ def _parse_blaxel_image(raw: dict[str, object]) -> str | None:
             "public image or OMNIGENT_BLAXEL_HOST_IMAGE override)"
         )
     return image.strip()
-
-
-def _parse_daytona_image(raw: dict[str, object]) -> str | None:
-    """
-    Extract and validate the daytona image from the ``sandbox`` dict.
-
-    The ``daytona`` section and its ``image`` field are OPTIONAL —
-    when absent, sandboxes boot from the official prebaked host image
-    (env-overridable; see
-    :mod:`omnigent.onboarding.sandboxes.daytona`). A
-    present-but-malformed value still fails loud.
-
-    :param raw: The raw ``sandbox`` mapping (provider already known to
-        be ``"daytona"``).
-    :returns: The validated image reference, or ``None`` to use the
-        official default.
-    :raises ValueError: When ``sandbox.daytona`` is present but not a
-        mapping, or ``sandbox.daytona.image`` is present but not a
-        non-empty string.
-    """
-    daytona_raw = raw.get("daytona")
-    if daytona_raw is None:
-        return None
-    if not isinstance(daytona_raw, dict):
-        raise ValueError("server config 'sandbox.daytona' must be a mapping")
-    image = daytona_raw.get("image")
-    if image is None:
-        return None
-    if not isinstance(image, str) or not image.strip():
-        raise ValueError(
-            "server config 'sandbox.daytona.image' must be a registry image "
-            "reference with omnigent pre-installed, e.g. "
-            "'docker.io/me/omnigent-host:latest' (omit it to use the "
-            "official image)"
-        )
-    return image.strip()
-
-
-def _parse_daytona_env(raw: dict[str, object]) -> list[str] | None:
-    """
-    Extract and validate the daytona env names from the ``sandbox`` dict.
-
-    ``sandbox.daytona.env`` names the SERVER-process environment
-    variables whose values (harness LLM credentials, gateway base
-    URLs, ``GIT_TOKEN``) are injected into every managed sandbox —
-    names only, so secret values never live in the config file.
-    OPTIONAL — absent means the launcher's env-var fallback applies
-    (or nothing is injected). A present-but-malformed value fails
-    loud.
-
-    :param raw: The raw ``sandbox`` mapping (provider already known to
-        be ``"daytona"``).
-    :returns: The validated env var names, e.g.
-        ``["OPENAI_API_KEY", "GIT_TOKEN"]``, or ``None`` when not
-        configured.
-    :raises ValueError: When ``sandbox.daytona`` is present but not a
-        mapping, or ``sandbox.daytona.env`` is present but not a list
-        of non-empty strings.
-    """
-    daytona_raw = raw.get("daytona")
-    if daytona_raw is None:
-        return None
-    if not isinstance(daytona_raw, dict):
-        raise ValueError("server config 'sandbox.daytona' must be a mapping")
-    env = daytona_raw.get("env")
-    if env is None:
-        return None
-    if not isinstance(env, list) or not all(
-        isinstance(name, str) and name.strip() for name in env
-    ):
-        raise ValueError(
-            "server config 'sandbox.daytona.env' must be a list of server "
-            "environment variable NAMES to inject, e.g. ['OPENAI_API_KEY', "
-            "'GIT_TOKEN']"
-        )
-    return [name.strip() for name in env]
 
 
 def _boxlite_launcher_factory(
