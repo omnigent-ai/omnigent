@@ -70,7 +70,7 @@ from omnigent.native.native_coding_agents import (
     native_coding_agent_for_wrapper_label,
 )
 from omnigent.native.session_todos import validate_session_todos
-from omnigent.policies.types import EvaluationContext, PolicyResult
+from omnigent.policies.types import EvaluationContext
 from omnigent.runner.identity import (
     token_bound_runner_id,
 )
@@ -95,7 +95,6 @@ from omnigent.server._elicitation_registry import (
     _PreResolvedHarnessElicitation,
 )
 from omnigent.server.auth import (
-    LEVEL_EDIT,
     LEVEL_OWNER,
     LEVEL_READ,
     RESERVED_USER_PUBLIC,
@@ -109,7 +108,6 @@ from omnigent.server.managed_hosts import (
     ManagedSandboxDeployment,
     RepoWorkspace,
 )
-from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import (
     require_access as _require_access,
 )
@@ -277,7 +275,6 @@ from omnigent.server.schemas import (
 )
 from omnigent.spec.types import (
     AgentSpec,
-    FunctionPolicySpec,
     Phase,
     PolicyAction,
 )
@@ -6619,101 +6616,6 @@ async def _forward_session_change_to_runner_impl(
             extra={"session_id": session_id},
         )
     return _RunnerForwardResult(status_code=resp.status_code, body=resp.text)
-
-
-async def _interrupt_subagents_on_cost_budget_deny(
-    session_id: str,
-    conv: Conversation,
-    conversation_store: ConversationStore,
-    runner_router: Any,
-    *,
-    engine: PolicyEngine,
-    result: PolicyResult,
-    user_id: str | None = None,
-    permission_store: PermissionStore | None = None,
-) -> None:
-    """
-    Interrupt sub-agents automatically when a session hard cost cap denies.
-
-    A tool denial can leave the child's model loop running, so include the
-    evaluated child as well as its siblings and descendants. Skip the root
-    and archived sessions. Downgrade gates still permit cheaper model work.
-    Runner forwards are concurrent and best-effort.
-
-    :param session_id: The session whose gate produced the DENY,
-        e.g. ``"conv_abc123"``.
-    :param conv: That session's :class:`Conversation` row (names the
-        verified tree root).
-    :param conversation_store: Store to load the spawn tree from.
-    :param runner_router: The server's ``RunnerRouter`` (may be ``None``
-        in tests / in-process setups; the forwarder falls back).
-    :param engine: Engine owning the evaluated policy specs.
-    :param result: Composed policy decision, including the deciding policy.
-    :param user_id: The caller, when the route admits read-level callers.
-        Interrupts then additionally require effective EDIT on the parent
-        chain. Omit (with ``permission_store``) when the route already
-        enforced effective EDIT.
-    :param permission_store: Store backing the effective-EDIT check, or
-        ``None`` to skip it.
-    """
-    from omnigent.runtime.policies.builder import load_session_tree
-
-    if result.action != PolicyAction.DENY:
-        return
-    spec = engine.denying_policy_spec
-    if (
-        not isinstance(spec, FunctionPolicySpec)
-        or spec.function is None
-        or spec.function.path != "omnigent.policies.builtins.cost.cost_budget"
-        or (spec.function.arguments or {}).get("expensive_models")
-    ):
-        return
-
-    # Tree-wide interrupts mutate sessions the caller may only be able to
-    # read: the direct grant alone (routes' ``is_read_only``) is not enough,
-    # because inherited sub-agent access carries no direct grant.
-    if permission_store is not None and not await asyncio.to_thread(
-        check_session_access,
-        user_id,
-        session_id,
-        LEVEL_EDIT,
-        permission_store,
-        conversation_store,
-    ):
-        return
-
-    # Discovery is best-effort like the forwards: a store failure must not
-    # replace the already-decided denial with an HTTP 500.
-    try:
-        tree = await asyncio.to_thread(
-            load_session_tree, session_id, conversation_store, conv.root_conversation_id
-        )
-    except Exception:  # noqa: BLE001
-        _logger.warning(
-            "policy_interrupt_subagents: session=%s failed to load the session tree; "
-            "returning the denial without interrupts",
-            session_id,
-            exc_info=True,
-            extra={"session_id": session_id},
-        )
-        return
-    targets = [c.id for c in tree if c.parent_conversation_id is not None and not c.archived]
-    if not targets:
-        return
-    _logger.info(
-        "policy_interrupt_subagents: session=%s interrupting %d running sub-agent(s): %s",
-        session_id,
-        len(targets),
-        targets,
-        extra={"session_id": session_id},
-    )
-    await asyncio.gather(
-        *(
-            _forward_session_change_to_runner(t, runner_router, {"type": "interrupt"})
-            for t in targets
-        ),
-        return_exceptions=True,
-    )
 
 
 async def _stop_session_via_runner(*args: Any, **kwargs: Any) -> bool:

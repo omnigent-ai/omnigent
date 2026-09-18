@@ -260,15 +260,13 @@ Scans user messages and LLM prompts for PII patterns (SSN, credit card, email, p
 
 #### `cost_budget`
 
-Gates a session on cumulative LLM spend across its spawn tree, at the **request** phase (before the LLM turn) and the **tool-call** phase. ASKs the first time spend crosses each soft warning threshold. By default, reaching the hard limit blocks all models. When either server gate denies for this hard cap, it automatically interrupts non-archived sub-agent sessions in the tree, including a child whose gate triggered the denial. No additional policy setting is needed. Interrupt delivery is best-effort; enforcement still depends on a gate evaluation.
-
-An explicit, non-empty `expensive_models` list makes the limit a **downgrade gate**: only the named model tiers are blocked, and sub-agents can continue on cheaper models without being interrupted.
+Gates a session on cumulative LLM spend, at the **request** phase (before the LLM turn, so text-only turns are budgeted too) and the **tool-call** phase. ASKs the first time spend crosses each soft warning threshold. At the hard limit it acts as a **downgrade gate**, not a hard stop: it DENYs (the whole turn on `request`, or each tool call on `tool_call`) only while the session is on an expensive model -- telling the user to switch to a cheaper one with `/model` -- and allows them again once the session has switched.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `max_cost_usd` | number | `null` | Hard spend limit in USD. Blocks all models by default, or the named tiers when `expensive_models` is non-empty. Required unless `ask_thresholds_usd` is set. |
+| `max_cost_usd` | number | (required) | Hard spend limit in USD. Once reached, the turn / tool calls are blocked while the session is on an expensive model. |
 | `ask_thresholds_usd` | number[] | `null` | Soft warning checkpoints that ASK the first time spend crosses each (each must be < `max_cost_usd`) |
-| `expensive_models` | string[] | `null` | `null` or `[]` blocks all models at the hard limit. A non-empty list contains case-insensitive substring tokens for the tiers to block (e.g. `"opus"` matches any Opus deployment), allowing other models to continue. |
+| `expensive_models` | string[] | Fable + Opus + GPT-5 (excl. `-mini`/`-nano`) | Case-insensitive substring tokens for the model tiers blocked once over budget (e.g. `"opus"` matches any Opus deployment). The default's broad `gpt-5` token matches the whole GPT-5 family except the cheap `-mini`/`-nano` variants; an explicit list is matched literally with no exclusions. `[]` disables the hard limit, leaving only the soft thresholds. |
 
 ```yaml
 budget:

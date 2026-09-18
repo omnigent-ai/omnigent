@@ -228,7 +228,7 @@ def any_policies_apply(
     tool_name: str | None = None,
     conversation: Conversation | None = None,
 ) -> bool:
-    """Return ``True`` when at least one policy would run for this evaluation.
+    """Return ``True`` when this evaluation may need to run policies.
 
     Cheaper than building a full :class:`PolicyEngine`: checks whether
     policies may apply. Used as a fast-path guard in

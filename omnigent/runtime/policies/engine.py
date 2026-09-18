@@ -162,19 +162,6 @@ class PolicyEngine:
         self._model = initial_model
         self._store = conversation_store
         self._llm_client = llm_client
-        self._denying_policy_spec: PolicySpec | None = None
-
-    @property
-    def denying_policy_spec(self) -> PolicySpec | None:
-        """Return the policy that denied the latest evaluation, if any.
-
-        Names can repeat across policy scopes, so enforcement must use the
-        actual evaluated spec rather than resolving the deny's display name.
-
-        :returns: The denying spec, or ``None`` before evaluation and after
-            an ALLOW or ASK result.
-        """
-        return self._denying_policy_spec
 
     @property
     def labels(self) -> dict[str, str]:
@@ -347,7 +334,6 @@ class PolicyEngine:
             result here — callers receive ALLOW / ASK / DENY
             directly.
         """
-        self._denying_policy_spec = None
         accumulated: dict[str, str] = {}
         accumulated_state: list[StateUpdate] = []
         ask_reasons: list[str] = []
@@ -383,7 +369,6 @@ class PolicyEngine:
             if result.state_updates:
                 accumulated_state.extend(result.state_updates)
             if result.action == PolicyAction.DENY:
-                self._denying_policy_spec = policy.spec
                 return self._compose_deny(
                     policy.spec.name,
                     result.reason,
