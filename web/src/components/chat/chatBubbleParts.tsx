@@ -91,6 +91,9 @@ import {
 // is the path. Global so all markers in a message are found / stripped.
 const ATTACHED_RE = /\[Attached(?: file)?:\s*([^\]]*)\]\s*/g;
 
+// Collapse user prompts longer than this (in chars) by default.
+const COLLAPSE_THRESHOLD = 8000;
+
 // Author labels render only in a shared session; ChatPage provides the
 // value and UserBubble reads it, so the gate lives in one place.
 export const SessionSharedContext = createContext(false);
@@ -692,6 +695,10 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   const { isLinkCopied, handleCopyLink } = useCopyMessageLink(
     bubble.pending ? null : bubble.itemId,
   );
+  // Collapse long prompts by default to avoid expensive Markdown parsing and
+  // a large DOM for text the user hasn't asked to read yet.
+  const isLong = text.length > COLLAPSE_THRESHOLD;
+  const [isCollapsed, setIsCollapsed] = useState(isLong);
   // Runtime-injected `[System: ...]` notifications ride in on role=user. When
   // the content is a pure system marker, swap in a muted centered indicator.
   if (images.length === 0 && fileChips.length === 0 && mentionedChips.length === 0) {
@@ -822,15 +829,37 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
             )}
             {/* Render user text as markdown, matching the assistant bubble.
               `breaks` keeps single newlines as line breaks. Empty text renders
-              nothing rather than an empty markdown block. */}
+              nothing rather than an empty markdown block.
+              For long prompts, only the visible slice is passed to the renderer
+              so the Markdown parser never processes hidden text. */}
             {text && (
-              <FilePathAwareMessageResponse
-                breaks
-                mode="static"
-                remarkRehypeOptions={USER_MESSAGE_REMARK_REHYPE_OPTIONS}
-              >
-                {text}
-              </FilePathAwareMessageResponse>
+              <>
+                <div className={cn("relative", isCollapsed && "max-h-64 overflow-hidden")}>
+                  <FilePathAwareMessageResponse
+                    breaks
+                    mode="static"
+                    remarkRehypeOptions={USER_MESSAGE_REMARK_REHYPE_OPTIONS}
+                  >
+                    {isCollapsed ? text.slice(0, COLLAPSE_THRESHOLD) : text}
+                  </FilePathAwareMessageResponse>
+                  {/* Gradient fade at the bottom of collapsed prompts to signal
+                      there is more content below. */}
+                  {isCollapsed && isLong && (
+                    <div className="pointer-events-none absolute inset-x-0 bottom-0 h-12 bg-gradient-to-t from-muted to-transparent" />
+                  )}
+                </div>
+                {isLong && (
+                  <button
+                    type="button"
+                    onClick={() => setIsCollapsed((c) => !c)}
+                    className="mt-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors"
+                  >
+                    {isCollapsed
+                      ? `Show full prompt (${text.length.toLocaleString()} chars)`
+                      : "Collapse prompt"}
+                  </button>
+                )}
+              </>
             )}
           </MessageContent>
         </div>
