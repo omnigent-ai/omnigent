@@ -415,6 +415,50 @@ describe("Composer send shortcut", () => {
     expect(onSend).toHaveBeenLastCalledWith("default shortcut", undefined);
   });
 
+  it("uses Command+Enter to submit the draft before steering the queued backlog", () => {
+    const onSend = vi.fn();
+    const sendQueued = vi.fn().mockResolvedValue(undefined);
+    const originalState = useChatStore.getState();
+    setComposerState({
+      boundAgentId: "agent_shortcut",
+      queuedMessages: [
+        { queueId: "q_1", text: "queued first", conversationId: "conv_shortcut" },
+        { queueId: "q_2", text: "queued second", conversationId: "conv_shortcut" },
+      ],
+      sessionStatus: "running",
+      send: sendQueued,
+      status: "streaming",
+    });
+
+    try {
+      renderWithTooltips(
+        <Composer {...composerProps({ isWorking: true, onSend, status: "streaming" })} />,
+      );
+      fireEvent.change(textarea(), { target: { value: "draft last" } });
+      fireEvent.keyDown(textarea(), { key: "Enter", metaKey: true });
+
+      expect(onSend).toHaveBeenCalledWith("draft last", undefined);
+      expect(sendQueued.mock.calls.map((call) => call.slice(0, 2))).toEqual([
+        ["queued first", "agent_shortcut"],
+        ["queued second", "agent_shortcut"],
+      ]);
+      expect(onSend.mock.invocationCallOrder[0]).toBeLessThan(
+        sendQueued.mock.invocationCallOrder[0]!,
+      );
+      expect(useChatStore.getState().queuedMessages).toEqual([]);
+    } finally {
+      act(() =>
+        useChatStore.setState({
+          boundAgentId: originalState.boundAgentId,
+          queuedMessages: [],
+          send: originalState.send,
+          sessionStatus: originalState.sessionStatus,
+          status: originalState.status,
+        }),
+      );
+    }
+  });
+
   it("uses Mod+Enter after the alternate preference is restored", () => {
     localStorage.setItem(COMPOSER_SEND_SHORTCUT_STORAGE_KEY, "true");
     const onSend = vi.fn();

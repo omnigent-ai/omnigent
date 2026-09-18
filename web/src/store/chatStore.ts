@@ -1048,6 +1048,13 @@ export interface ChatActions {
    */
   steerMessage: (queueId: string) => void;
   /**
+   * Steer EVERY queued message of a conversation, in queue (FIFO) order, so the
+   * whole backlog reaches the running turn now instead of draining one per
+   * idle. Sends chain per conversation, so order is preserved. No-op when the
+   * conversation has nothing queued or no agent to send to.
+   */
+  steerAllQueuedMessages: (conversationId: string) => void;
+  /**
    * Drop all queued messages for a conversation. Called when a conversation is
    * deleted so its queue can't linger in memory (it would never flush — you
    * can't be bound to a deleted session).
@@ -1791,6 +1798,21 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // Remove BEFORE the POST so a concurrent flush can't also send it.
     setActive({ queuedMessages: s.queuedMessages.filter((m) => m.queueId !== queueId) });
     void s.send(target.text, agentId, target.files, { replyDraft: target.replyDraft });
+  },
+
+  steerAllQueuedMessages: (conversationId) => {
+    const s = get();
+    const own = s.queuedMessages.filter((m) => m.conversationId === conversationId);
+    if (own.length === 0) return;
+    // Remove BEFORE the POSTs so a concurrent flush can't also send one.
+    setActive({
+      queuedMessages: s.queuedMessages.filter((m) => m.conversationId !== conversationId),
+    });
+    for (const m of own) {
+      const agentId = m.agentId ?? s.boundAgentId;
+      if (agentId === null) continue;
+      void s.send(m.text, agentId, m.files);
+    }
   },
 
   clearQueuedMessages: (conversationId) => {
