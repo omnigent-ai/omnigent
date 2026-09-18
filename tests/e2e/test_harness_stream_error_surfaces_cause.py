@@ -36,9 +36,15 @@ terminal sitting at ``Trust this folder?``, the failure event must surface that
 pane snapshot. Reproduces today (pane omitted); the fix flips it.
 
 Facet 3 (``test_stream_severed_by_required_terminal_exit_reports_the_exit``): the
-pane dies while the runner is still delivering the message, so the runner's own
-required-terminal exit handling releases the harness and severs the stream it is
-reading. The failure must report that exit, not a connection error.
+pane dies while the runner is still delivering the message and the harness never
+reports back, so the runner's own required-terminal exit handling eventually
+releases the harness and severs the stream it is reading. The failure must report
+that exit, not a connection error.
+
+Facet 4 (``test_required_terminal_exit_lets_the_harness_report_its_own_failure``):
+the harness reports the failure that killed its pane (a prompt-readiness timeout)
+on the very stream the exit would sever. The runner must let that stream converge
+before releasing the harness, so the user sees the readiness diagnosis.
 """
 
 from __future__ import annotations
@@ -53,6 +59,7 @@ from typing import Any
 import httpx
 import pytest
 
+from omnigent.runner import app as runner_app
 from omnigent.runner import create_runner_app
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.terminals.registry import TerminalRegistry
@@ -336,7 +343,7 @@ def _failed_statuses(conv_id: str) -> list[dict[str, Any]]:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("pane_status_before_exit", [None, "idle"])
 async def test_stream_severed_by_required_terminal_exit_reports_the_exit(
-    tmp_path: Path, pane_status_before_exit: str | None
+    tmp_path: Path, pane_status_before_exit: str | None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Facet 3: a stream severed by the runner's own harness release names the exit.
 
@@ -353,6 +360,9 @@ async def test_stream_severed_by_required_terminal_exit_reports_the_exit(
     """
     from omnigent.runner.app import _session_event_queues_ref
 
+    # The harness is parked on its readiness wait and never reports back, so the
+    # release proceeds once the (shortened) grace for the live stream expires.
+    monkeypatch.setattr(runner_app, "_TERMINAL_EXIT_RELEASE_GRACE_S", 0.2)
     conv_id = "5626dead245985f541fd686eb2a32b73"
     terminal_registry = TerminalRegistry()
     instance = make_test_terminal_instance("claude", "main", tmp_path)
@@ -396,10 +406,11 @@ async def test_stream_severed_by_required_terminal_exit_reports_the_exit(
             state["resource_registry"]._last_session_status[conv_id] = pane_status_before_exit
         callbacks["on_exit"]()
         await state["resource_registry"].wait_for_terminal_exit_cleanup()
-        for _ in range(500):
+        # The release waits out the (shortened) grace for this live stream first.
+        for _ in range(300):
             if state["pm"].released == [conv_id]:
                 return
-            await asyncio.sleep(0)
+            await asyncio.sleep(0.01)
         raise AssertionError("the required-terminal exit never released the harness")
 
     harness_client = _StreamErrorHarnessClient(
@@ -454,3 +465,184 @@ async def test_stream_severed_by_required_terminal_exit_reports_the_exit(
         # The exit handler itself stays quiet for an idle pane; the stream's
         # failure is the one and only failure the user sees.
         assert len(statuses) == 1, statuses
+
+
+class _ExitThenFailureHarnessClient(_ScriptedHarnessClient):
+    """Harness whose pane dies mid-delivery and which then reports why.
+
+    Emits ``response.created``, awaits *sever* (the pane exit reaching the
+    runner), then emits the executor's own ``response.failed`` and ends cleanly --
+    exactly what claude-native does when its prompt-readiness wait times out and
+    it kills the pane before reporting.
+    """
+
+    def __init__(
+        self,
+        frames_before: list[str],
+        *,
+        sever: Callable[[], Awaitable[None]],
+        frames_after: list[str],
+    ) -> None:
+        super().__init__(frames_before)
+        self._sever = sever
+        self._frames_after = frames_after
+
+    def stream(self, method: str, url: str, *, json: dict[str, Any], timeout: Any) -> Any:
+        """Return a context manager whose stream pauses for the pane exit mid-way."""
+        del method, url, timeout
+        self.posted_bodies.append(json)
+        frames_before = self._sse_frames
+        frames_after = self._frames_after
+        sever = self._sever
+
+        class _Handle:
+            status_code = 200
+
+            async def __aenter__(self) -> _Handle:
+                return self
+
+            async def __aexit__(self, *_: Any) -> None:
+                return None
+
+            async def aiter_text(self) -> AsyncIterator[str]:
+                for frame in frames_before:
+                    yield frame
+                await sever()
+                for frame in frames_after:
+                    yield frame
+
+        return _Handle()
+
+
+_READINESS_DIAGNOSIS = (
+    "inner executor error: Claude Code's input box never became ready within 30s "
+    "(200 polls, 0 empty captures); last capture: Loading MCP servers... (3/7)"
+)
+
+
+@pytest.mark.asyncio
+async def test_required_terminal_exit_lets_the_harness_report_its_own_failure(
+    tmp_path: Path,
+) -> None:
+    """Facet 4: the runner relays the harness's readiness diagnosis, then releases.
+
+    claude-native kills its pane when the prompt-readiness wait times out and
+    only then reports the failure on its turn stream. The runner sees the pane
+    exit first; releasing the harness at that point would sever the stream and
+    replace the diagnosis with a transport error. The exit handler must let the
+    live stream converge, so the one failure the user sees is the harness's own
+    readiness diagnosis, and the harness is released once the stream has ended.
+    """
+    from omnigent.runner.app import _session_event_queues_ref
+
+    conv_id = "5626ead1245985f541fd686eb2a32b73"
+    terminal_registry = TerminalRegistry()
+    instance = make_test_terminal_instance("claude", "main", tmp_path)
+    instance.command = "claude"
+    instance.launch_cwd = str(tmp_path)
+    instance._remember_pane_snapshot(_BOOTING_PANE)
+    terminal_registry._by_conversation.setdefault(conv_id, {})[("claude", "main")] = instance
+    callbacks: dict[str, Any] = {}
+
+    def _capture_watcher(
+        on_idle: object | None = None,
+        *,
+        on_activity: object | None = None,
+        on_exit: object | None = None,
+        on_tick: object | None = None,
+        idle_threshold_s: float | None = None,
+        poll_interval_s: float | None = None,
+        replace: bool = False,
+    ) -> None:
+        del on_idle, on_activity, on_tick, idle_threshold_s, poll_interval_s, replace
+        callbacks["on_exit"] = on_exit
+
+    instance.start_idle_watcher_thread = _capture_watcher  # type: ignore[method-assign]
+
+    native_spec = AgentSpec(
+        spec_version=1,
+        name="claude-agent",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return native_spec
+
+    state: dict[str, Any] = {}
+
+    async def _pane_killed_by_the_harness() -> None:
+        """The exit reaches the runner before the harness's failure report does."""
+        # A pane that never ran a turn reads as idle to the PTY watcher.
+        state["resource_registry"]._last_session_status[conv_id] = "idle"
+        callbacks["on_exit"]()
+        await state["resource_registry"].wait_for_terminal_exit_cleanup()
+        # The exit handler has run; give its release task a chance to (wrongly)
+        # fire before the harness reports.
+        for _ in range(20):
+            await asyncio.sleep(0)
+        assert state["pm"].released == [], "the harness was released under a live stream"
+
+    failure = {
+        "code": "inner_executor_error",
+        "message": _READINESS_DIAGNOSIS,
+        "type": "RuntimeError",
+    }
+    harness_client = _ExitThenFailureHarnessClient(
+        [_sse({"type": "response.created", "response": {"id": "resp_ready"}})],
+        sever=_pane_killed_by_the_harness,
+        frames_after=[
+            _sse(
+                {
+                    "type": "response.failed",
+                    "response": {"id": "resp_ready", "status": "failed", "error": failure},
+                    "error": failure,
+                }
+            )
+        ],
+    )
+    pm = _FakeProcessManager(harness_client)
+    state["pm"] = pm
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        terminal_registry=terminal_registry,
+    )
+    resource_registry = app.state.session_resource_registry
+    state["resource_registry"] = resource_registry
+    _session_event_queues_ref.pop(conv_id, None)
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://runner") as client:
+            create_resp = await client.post(
+                "/v1/sessions",
+                json={"session_id": conv_id, "agent_id": _AGENT_ID},
+            )
+            assert create_resp.status_code == 201, create_resp.text
+        await resource_registry.observe_required_terminal(conv_id, "claude", "main", instance)
+        assert callable(callbacks.get("on_exit"))
+
+        events = await _drive_failing_turn(
+            app, conv_id, harness="claude-native", model="claude-agent"
+        )
+        # The stream has converged; the deferred release now goes through.
+        for _ in range(200):
+            if pm.released == [conv_id]:
+                break
+            await asyncio.sleep(0.01)
+        statuses = _failed_statuses(conv_id)
+    finally:
+        _session_event_queues_ref.pop(conv_id, None)
+
+    failed = _failed_event(events)
+    event_blob = json.dumps(failed)
+    # The user sees the harness's own diagnosis, not a symptom of the teardown.
+    assert _READINESS_DIAGNOSIS in event_blob, failed
+    assert "connection_error" not in event_blob, failed
+    assert "required_terminal_exited" not in event_blob, failed
+    assert pm.released == [conv_id]
+    assert terminal_registry.get(conv_id, "claude", "main") is None
+    # Exactly one failure reaches the session, and it carries the diagnosis.
+    assert len(statuses) == 1, statuses
+    assert _READINESS_DIAGNOSIS in statuses[0]["error"]["message"], statuses

@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
-import logging
 import threading
 from pathlib import Path
 from typing import Any
@@ -1423,49 +1422,38 @@ async def test_a_routed_first_message_switches_the_model_exactly_once(
 
 
 @pytest.mark.asyncio
-async def test_run_turn_reports_prompt_timeout_before_reaping_tmux(
+async def test_run_turn_reaps_tmux_before_reporting_prompt_timeout(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """A readiness timeout reports its failure first and still kills the pane.
-
-    The runner fails the turn and releases the harness as soon as the pane
-    exits, so a kill issued ahead of the failure event severs the stream before
-    the event reaches it. The kill runs from a worker thread once the event is
-    out -- and a failed turn's pane must still never be left alive.
-    """
+    """A readiness timeout cannot leave a failed turn's pane alive."""
     bridge_dir = tmp_path / "bridge"
-    order: list[str] = []
     killed: list[Path] = []
 
     def fail_inject(bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0) -> None:
         del bridge_dir_arg, content, timeout_s
         raise ClaudePromptTimeout("terminal did not become ready")
 
-    def kill(bridge_dir_arg: Path, *, timeout_s: float) -> None:
-        del timeout_s
-        order.append("kill")
-        killed.append(bridge_dir_arg)
-
     monkeypatch.setattr(claude_native_executor, "inject_user_message", fail_inject)
-    monkeypatch.setattr(claude_native_executor, "kill_session", kill)
+    monkeypatch.setattr(
+        claude_native_executor,
+        "kill_session",
+        lambda bridge_dir_arg, *, timeout_s: killed.append(bridge_dir_arg),
+    )
 
     executor = ClaudeNativeExecutor(bridge_dir)
-    events: list[Any] = []
-    async for event in executor.run_turn(
-        messages=[{"role": "user", "content": "hi"}],
-        tools=[],
-        system_prompt="",
-    ):
-        order.append("event")
-        events.append(event)
-    await asyncio.gather(*executor._reap_tasks)
+    events = [
+        event
+        async for event in executor.run_turn(
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[],
+            system_prompt="",
+        )
+    ]
 
+    assert killed == [bridge_dir]
     assert len(events) == 1
     assert isinstance(events[0], ExecutorError)
-    assert events[0].message == "terminal did not become ready"
-    assert killed == [bridge_dir]
-    assert order == ["event", "kill"]
 
 
 @pytest.mark.asyncio
@@ -1593,12 +1581,11 @@ async def test_run_turn_does_not_reap_unrelated_runtime_error(
 
 
 @pytest.mark.asyncio
-async def test_run_turn_logs_reap_failure_after_prompt_timeout(
+async def test_run_turn_reports_reap_failure_with_prompt_timeout(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
-    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A failed hard-stop is logged; the delivery error still reaches the turn."""
+    """A failed hard-stop remains visible beside the delivery error."""
 
     def fail_inject(bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0) -> None:
         del bridge_dir_arg, content, timeout_s
@@ -1612,21 +1599,18 @@ async def test_run_turn_logs_reap_failure_after_prompt_timeout(
     monkeypatch.setattr(claude_native_executor, "kill_session", fail_kill)
 
     executor = ClaudeNativeExecutor(tmp_path / "bridge")
-    with caplog.at_level(logging.WARNING, logger="omnigent.inner.claude_native_executor"):
-        events = [
-            event
-            async for event in executor.run_turn(
-                messages=[{"role": "user", "content": "hi"}],
-                tools=[],
-                system_prompt="",
-            )
-        ]
-        await asyncio.gather(*executor._reap_tasks)
+    events = [
+        event
+        async for event in executor.run_turn(
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[],
+            system_prompt="",
+        )
+    ]
 
     assert isinstance(events[0], ExecutorError)
-    assert events[0].message == "terminal did not become ready"
-    assert "claude-native: failed to reap timed-out session" in caplog.text
-    assert "tmux kill failed" in caplog.text
+    assert "terminal did not become ready" in events[0].message
+    assert "Cleanup also failed: tmux kill failed" in events[0].message
 
 
 @pytest.mark.asyncio
@@ -1656,7 +1640,6 @@ async def test_run_turn_ignores_missing_tmux_during_timeout_reap(
             system_prompt="",
         )
     ]
-    await asyncio.gather(*executor._reap_tasks)
 
     assert isinstance(events[0], ExecutorError)
     assert events[0].message == "terminal did not become ready"
