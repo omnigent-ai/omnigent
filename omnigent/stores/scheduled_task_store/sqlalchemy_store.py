@@ -271,7 +271,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         reasoning_effort: str | None = _UNSET,
         permission_mode: str | None = _UNSET,
         max_cost_usd: float | None = _UNSET,
-        workspace: str | None = None,
+        workspace: str | None = _UNSET,
         host_id: str | None = _UNSET,
         execution_target: str | None = None,
         state: str | None = None,
@@ -282,11 +282,13 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
 
         ``None`` leaves most fields unchanged. For the per-task overrides
         (``model_override``, ``reasoning_effort``, ``permission_mode``),
-        ``host_id``, ``max_cost_usd``, and ``last_run_conversation_id``, the
-        sentinel default means "not provided / leave unchanged"; passing
-        ``None`` explicitly sets the column to NULL — so resetting an override
-        to the agent default actually clears it (a set ``bypassPermissions``
-        can be turned back off). Passing ``rrule`` updates the recurring
+        ``workspace``, ``host_id``, ``max_cost_usd``, and
+        ``last_run_conversation_id``, the sentinel default means "not provided /
+        leave unchanged"; passing ``None`` explicitly sets the column to NULL —
+        so resetting an override to the agent default actually clears it (a set
+        ``bypassPermissions`` can be turned back off), and clearing both
+        ``host_id`` and ``workspace`` unpins a task (e.g. switching it to
+        managed-sandbox execution). Passing ``rrule`` updates the recurring
         trigger and ``agent_id`` rebinds the task to a different agent
         (switching the harness future firings run); ``None`` leaves either
         unchanged.
@@ -327,7 +329,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             if max_cost_usd is not _UNSET and row.max_cost_usd != max_cost_usd:
                 row.max_cost_usd = max_cost_usd
                 changed = True
-            if workspace is not None and row.workspace != workspace:
+            if workspace is not _UNSET and row.workspace != workspace:
                 row.workspace = workspace
                 changed = True
             if host_id is not _UNSET and row.host_id != host_id:

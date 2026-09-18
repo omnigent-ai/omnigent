@@ -615,10 +615,12 @@ def create_scheduled_tasks_router(
                 execution_target=target_execution,
             )
             if switching_to_managed:
-                # A managed-sandbox task carries no pinned host; clear a stale one
-                # so the fire never binds a dead machine (the fire also ignores a
-                # residual workspace, which update() cannot null).
+                # A managed-sandbox task carries no pinned host or workspace. Clear
+                # BOTH (workspace via the store's explicit-null) so a later switch
+                # back to connected execution isn't rejected for "workspace without
+                # host", and the fire never binds a dead pin.
                 fields["host_id"] = None
+                fields["workspace"] = None
             elif "workspace" in fields:
                 fields["workspace"] = workspace
         updated = store.update(scheduled_task_id, **fields)

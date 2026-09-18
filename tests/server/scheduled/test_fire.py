@@ -214,6 +214,8 @@ class _FakeHost:
     # Non-None marks a server-managed sandbox host; the unpinned connected-host
     # resolver skips these so an automation never reuses an existing sandbox.
     sandbox_provider: str | None = None
+    # Provider-assigned id of a live sandbox; drives the teardown gate.
+    sandbox_id: str | None = None
 
 
 class _FakeSandboxConfig:
@@ -1680,3 +1682,52 @@ async def test_policy_create_failure_does_not_fail_fire() -> None:
     assert len(conv_store.created) == 1
     assert len(launched) == 1
     assert store.runs[0]["status"] == "running"
+
+
+# ── Managed-sandbox teardown ─────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_terminate_managed_sandbox_only_when_bound_host_is_a_sandbox(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The teardown helper terminates a sandbox host and no-ops on anything else."""
+    calls: list[Any] = []
+
+    async def _fake_terminate(host: Any, host_store: Any, config: Any) -> None:
+        calls.append(host)
+
+    monkeypatch.setattr("omnigent.server.managed_hosts.terminate_managed_host", _fake_terminate)
+
+    class _ConvStore:
+        def __init__(self, host_id: str | None) -> None:
+            self._host_id = host_id
+
+        def get_conversation(self, _cid: str) -> Any:
+            return _FakeConversation(id="conv_1", agent_id="ag_1", host_id=self._host_id)
+
+    def _deps_for(host: _FakeHost | None, host_id: str | None) -> FireDeps:
+        hosts = {host.host_id: host} if host is not None else {}
+        return _deps(
+            FakeScheduledTaskStore(rows={}),
+            conversation_store=_ConvStore(host_id),
+            host_store=FakeHostStore(hosts),
+            sandbox_config=_FakeSandboxConfig(),
+        )
+
+    # Sandbox host (sandbox_id set) → torn down.
+    sandbox_host = _FakeHost("h1", "u", sandbox_provider="modal", sandbox_id="sbx_1")
+    await fire_mod._terminate_managed_sandbox_for_session(_deps_for(sandbox_host, "h1"), "conv_1")
+    assert calls == [sandbox_host]
+
+    # Plain connected host (no sandbox_id) → left alone.
+    calls.clear()
+    await fire_mod._terminate_managed_sandbox_for_session(
+        _deps_for(_FakeHost("h2", "u"), "h2"), "conv_1"
+    )
+    assert calls == []
+
+    # Hostless session → no-op.
+    calls.clear()
+    await fire_mod._terminate_managed_sandbox_for_session(_deps_for(None, None), "conv_1")
+    assert calls == []

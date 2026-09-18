@@ -1483,7 +1483,12 @@ def create_app(
         # the run — all fire-and-forget so the timer re-arms immediately.
         scheduled_task_scheduler: ScheduledTaskScheduler | None = None
         if scheduled_task_store is not None:
-            from omnigent.server.scheduled.fire import FireDeps, build_on_fire, build_run_now
+            from omnigent.server.scheduled.fire import (
+                FireDeps,
+                build_managed_sandbox_teardown_hook,
+                build_on_fire,
+                build_run_now,
+            )
 
             fire_deps = FireDeps(
                 scheduled_task_store=scheduled_task_store,
@@ -1504,6 +1509,15 @@ def create_app(
                 sandbox_config=sandbox_config,
                 managed_launches=app_inst.state.managed_launches,
             )
+            # "Shut down immediately": when a managed-sandbox automation's run
+            # reaches terminal, tear its sandbox down via the run-completion
+            # signal rather than waiting for the provider idle-reap. Needs the
+            # running loop (to schedule the async teardown off the live-state
+            # write worker), so it is wired here, not at construction.
+            if sandbox_config is not None and sandbox_config.managed_launch_supported:
+                session_live_state.set_managed_sandbox_run_terminal_hook(
+                    build_managed_sandbox_teardown_hook(asyncio.get_running_loop(), fire_deps)
+                )
             on_fire = build_on_fire(fire_deps)
             # The manual "run now" trigger reuses the same fire path (dispatch /
             # preflight / in-flight guard) as the scheduler; it only differs in

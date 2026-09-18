@@ -55,7 +55,7 @@ from enum import Enum
 from typing import Any
 
 from omnigent.db.account_authority import account_authority_scope
-from omnigent.db.db_models import workspace_scope
+from omnigent.db.db_models import current_workspace_id, workspace_scope
 from omnigent.entities import Conversation, ScheduledTask
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_LOCAL
@@ -663,6 +663,11 @@ async def _fire_managed_sandbox(
             error="managed sandbox launch/dispatch failed",
             error_code="launch_failed",
         )
+        # The launch may have provisioned a sandbox before failing (e.g. runner
+        # never connected). The completion hook won't fire for a run that never
+        # reached ``running``, so tear the sandbox down here rather than leaking
+        # it until the provider idle-reap.
+        await _terminate_managed_sandbox_for_session(deps, conv.id)
         return
 
     await _record_run(deps, task, conv.id, scheduled_at, status="running")
@@ -1338,3 +1343,59 @@ def _make_managed_sandbox_dispatch(deps: FireDeps) -> LaunchDispatch:
         )
 
     return _dispatch
+
+
+async def _terminate_managed_sandbox_for_session(deps: FireDeps, conversation_id: str) -> None:
+    """Terminate the managed sandbox host bound to a session (best-effort).
+
+    Looks up the session's bound host and, if it is a server-provisioned sandbox
+    (``sandbox_id`` set), tears it down — provider sandbox + host row + token.
+    A no-op when nothing is bound or the host is not a sandbox, so it is safe on
+    the connected-host path and in tests. Must run inside the session's
+    ``workspace_scope`` (the caller provides it).
+    """
+    from omnigent.server.managed_hosts import terminate_managed_host
+
+    if deps.host_store is None:
+        return
+    conv = await asyncio.to_thread(deps.conversation_store.get_conversation, conversation_id)
+    if conv is None or conv.host_id is None:
+        return
+    host = await asyncio.to_thread(deps.host_store.get_host, conv.host_id)
+    if host is None or getattr(host, "sandbox_id", None) is None:
+        return
+    try:
+        await terminate_managed_host(host, deps.host_store, deps.sandbox_config)
+        _logger.info("scheduled fire: tore down managed sandbox for session %s", conversation_id)
+    except Exception:  # noqa: BLE001
+        _logger.warning(
+            "scheduled fire: managed sandbox teardown failed for session %s",
+            conversation_id,
+            exc_info=True,
+        )
+
+
+def build_managed_sandbox_teardown_hook(
+    loop: asyncio.AbstractEventLoop,
+    deps: FireDeps,
+) -> Callable[[str], None]:
+    """Build the run-terminal callback that tears a managed sandbox down.
+
+    Wired into :func:`session_live_state.set_managed_sandbox_run_terminal_hook`,
+    which invokes it (on the live-state write worker, inside the run's
+    ``workspace_scope``) ONLY for a ``managed_sandbox`` run that just reached
+    terminal. It captures the worker's workspace and schedules the async
+    teardown onto the server ``loop``; the provider idle-reap remains the
+    backstop if this is ever missed.
+    """
+
+    def _on_terminal(conversation_id: str) -> None:
+        workspace_id = current_workspace_id()
+
+        async def _run() -> None:
+            with workspace_scope(workspace_id):
+                await _terminate_managed_sandbox_for_session(deps, conversation_id)
+
+        asyncio.run_coroutine_threadsafe(_run(), loop)
+
+    return _on_terminal

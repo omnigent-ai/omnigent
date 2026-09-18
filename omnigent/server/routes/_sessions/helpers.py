@@ -4683,7 +4683,14 @@ def _publish_status(
             error_code="incomplete",
             error="runner disappeared before the turn reached a terminal state",
         )
-    elif status == "idle":
+    elif status == "idle" and previous_status == "running":
+        # Only an idle that FOLLOWS a running edge is a real turn completion. A
+        # freshly launched session (esp. a native terminal on a managed sandbox)
+        # can emit a transient boot ``idle`` before the dispatched prompt's turn
+        # begins; completing on that would mark the run done — and, for a
+        # managed-sandbox automation, tear the sandbox down — mid-turn. Requiring
+        # a preceding ``running`` gates that out; a run whose terminal edge is
+        # genuinely missed is caught by the lazy-on-read stale backstop.
         session_live_state.persist_scheduled_run_completion(session_id, "succeeded")
     elif status == "failed":
         # Canonical server-side broken-turn signal: every server-originated

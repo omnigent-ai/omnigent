@@ -218,6 +218,52 @@ async def test_create_managed_sandbox_requires_configured_sandboxes(
     assert resp.status_code == 400, resp.text
 
 
+async def test_patch_execution_target_roundtrip_clears_host_and_workspace(
+    auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """A pinned task can switch to managed_sandbox and back without a 400.
+
+    Regression for the round-trip bug: switching to managed_sandbox must clear
+    BOTH host_id and workspace (via the store's explicit-null), otherwise a
+    retained workspace makes the switch back to connected_host fail validation
+    with "host_id required when workspace is set".
+    """
+    _make_user(db_uri)
+
+    # Configure managed sandboxes so the managed switch is accepted (the default
+    # test app has none). Validation only reads managed_launch_supported.
+    class _Cfg:
+        managed_launch_supported = True
+
+    auth_app.state.sandbox_config = _Cfg()
+    try:
+        created = (
+            await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+        ).json()
+        tid = created["id"]
+        assert created["host_id"] is not None and created["workspace"] is not None
+
+        to_managed = await auth_client.patch(
+            f"/v1/scheduled-tasks/{tid}",
+            json={"execution_target": "managed_sandbox"},
+            headers=_headers(),
+        )
+        assert to_managed.status_code == 200, to_managed.text
+        b = to_managed.json()
+        assert b["execution_target"] == "managed_sandbox"
+        assert b["host_id"] is None and b["workspace"] is None
+
+        back = await auth_client.patch(
+            f"/v1/scheduled-tasks/{tid}",
+            json={"execution_target": "connected_host"},
+            headers=_headers(),
+        )
+        assert back.status_code == 200, back.text
+        assert back.json()["execution_target"] == "connected_host"
+    finally:
+        auth_app.state.sandbox_config = None
+
+
 async def test_create_rejects_invalid_rrule(auth_client: httpx.AsyncClient, db_uri: str) -> None:
     _make_user(db_uri)
     # FREQ=SECONDLY fires far below the 1-hour floor.
@@ -1262,7 +1308,9 @@ async def test_publish_status_idle_edge_transitions_scheduled_run_to_succeeded(
     )
     try:
         # The relay publishes "running" as the turn starts, then "idle" at the
-        # terminal (completed) edge. Drive the terminal edge.
+        # terminal (completed) edge. Both are required: completion only fires on
+        # an idle that FOLLOWS a running (a boot idle before the turn is ignored).
+        _publish_status(conv_id, "running")
         _publish_status(conv_id, "idle")
         row = _wait_for_run_status(db_uri, task_id, run_id, "succeeded")
     finally:
@@ -1273,6 +1321,44 @@ async def test_publish_status_idle_edge_transitions_scheduled_run_to_succeeded(
     assert row.status == "succeeded"
     assert row.finished_at is not None
     assert row.error_code is None
+
+
+async def test_publish_status_boot_idle_without_running_does_not_complete_run(
+    db_uri: str,
+) -> None:
+    """A boot ``idle`` (no preceding ``running``) must NOT complete the run.
+
+    A freshly launched native-terminal session can emit a transient idle before
+    the dispatched turn begins; completing on it would (for a managed-sandbox
+    automation) tear the sandbox down mid-turn. The run must stay ``running``.
+    """
+    import time
+    import uuid
+
+    from omnigent.server import session_live_state
+    from omnigent.server.routes.sessions import _publish_status, _session_status_cache
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+    from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
+        SqlAlchemyScheduledTaskStore,
+    )
+
+    conv_id = uuid.uuid4().hex
+    _seed_running_run_for_conv(db_uri, conv_id)
+    session_live_state.configure(
+        SqlAlchemyConversationStore(db_uri), SqlAlchemyScheduledTaskStore(db_uri)
+    )
+    try:
+        # Idle with no prior running edge — the boot idle. Must be ignored.
+        _publish_status(conv_id, "idle")
+        time.sleep(0.5)  # let the ordered write worker drain
+        # Seed + read run at the default workspace (no scope) — same as the seed.
+        run = SqlAlchemyScheduledTaskStore(db_uri).get_running_run_by_conversation(conv_id)
+    finally:
+        session_live_state.configure(None)
+        _session_status_cache.pop(conv_id, None)
+
+    assert run is not None, "run was completed on a boot idle (should stay running)"
+    assert run.status == "running"
 
 
 async def test_publish_status_failed_edge_transitions_scheduled_run_to_failed(

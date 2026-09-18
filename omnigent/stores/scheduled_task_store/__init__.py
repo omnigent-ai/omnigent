@@ -142,7 +142,7 @@ class ScheduledTaskStore(ABC):
         reasoning_effort: str | None = _UNSET,
         permission_mode: str | None = _UNSET,
         max_cost_usd: float | None = _UNSET,
-        workspace: str | None = None,
+        workspace: str | None = _UNSET,
         host_id: str | None = _UNSET,
         execution_target: str | None = None,
         state: str | None = None,

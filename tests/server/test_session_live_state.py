@@ -252,9 +252,14 @@ def test_unencodable_status_is_dropped_before_enqueue(
 class _FakeScheduledTaskStore:
     """Scheduled-task-store stand-in recording the hook's lookup + update."""
 
-    def __init__(self, running_by_conv: dict[str, str] | None = None) -> None:
+    def __init__(
+        self,
+        running_by_conv: dict[str, str] | None = None,
+        execution_target: str = "connected_host",
+    ) -> None:
         # conversation_id -> run_id for conversations that have a running run.
         self._running_by_conv = running_by_conv or {}
+        self._execution_target = execution_target
         self.lookup_calls: list[str] = []
         self.update_calls: list[tuple[str, str, str | None, str | None]] = []
         self.lookup_workspaces: list[int] = []
@@ -267,8 +272,12 @@ class _FakeScheduledTaskStore:
         run_id = self._running_by_conv.get(conversation_id)
         if run_id is None:
             return None
-        # Minimal object carrying only the ``id`` the hook reads.
-        return type("_Run", (), {"id": run_id})()
+        # Minimal object carrying the ``id`` + the task id the hook reads.
+        return type("_Run", (), {"id": run_id, "scheduled_task_id": "task_1"})()
+
+    def get(self, scheduled_task_id: str):  # type: ignore[no-untyped-def]
+        # The teardown gate reads execution_target off the task.
+        return type("_Task", (), {"execution_target": self._execution_target})()
 
     def update_run(
         self,
@@ -364,6 +373,36 @@ def test_scheduled_run_completion_runs_in_callers_workspace_scope() -> None:
     finally:
         session_live_state.configure(None)
     assert sched.lookup_workspaces == [4242]
+
+
+def test_managed_sandbox_run_terminal_hook_fires_for_managed_run() -> None:
+    """A completing managed_sandbox run invokes the teardown hook with the conv id."""
+    sched = _FakeScheduledTaskStore({"conv_1": "run_1"}, execution_target="managed_sandbox")
+    seen: list[str] = []
+    session_live_state.configure(_RecordingStore(), sched)  # type: ignore[arg-type]
+    session_live_state.set_managed_sandbox_run_terminal_hook(seen.append)
+    try:
+        session_live_state.persist_scheduled_run_completion("conv_1", "succeeded")
+        _wait_until(lambda: bool(seen))
+    finally:
+        session_live_state.set_managed_sandbox_run_terminal_hook(None)
+        session_live_state.configure(None)
+    assert seen == ["conv_1"]
+
+
+def test_managed_sandbox_run_terminal_hook_skipped_for_connected_run() -> None:
+    """A connected-host run completing must NOT invoke the sandbox teardown hook."""
+    sched = _FakeScheduledTaskStore({"conv_1": "run_1"}, execution_target="connected_host")
+    seen: list[str] = []
+    session_live_state.configure(_RecordingStore(), sched)  # type: ignore[arg-type]
+    session_live_state.set_managed_sandbox_run_terminal_hook(seen.append)
+    try:
+        session_live_state.persist_scheduled_run_completion("conv_1", "succeeded")
+        _wait_until(lambda: bool(sched.update_calls))  # run transitioned
+    finally:
+        session_live_state.set_managed_sandbox_run_terminal_hook(None)
+        session_live_state.configure(None)
+    assert seen == []
 
 
 @pytest.mark.asyncio
