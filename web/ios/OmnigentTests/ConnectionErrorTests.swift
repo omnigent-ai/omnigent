@@ -6,13 +6,37 @@ import XCTest
 @MainActor
 final class ConnectionErrorTests: XCTestCase {
   private let jamfMessage =
-    "Couldn’t reach the server. Check your device’s compliance status in Jamf."
+    """
+    Couldn’t reach the server. Open JAMF Trust and check that your device is compliant \
+    (all checks green), then try again.
+    """
 
   func testDNSFailuresShowJAMFHintOnlyWhenEnabled() {
     for code in [URLError.cannotFindHost, .dnsLookupFailed] {
       let error = URLError(code)
       XCTAssertEqual(message(for: error, enabled: true), jamfMessage)
       XCTAssertEqual(message(for: error, enabled: false), error.localizedDescription)
+    }
+  }
+
+  func testManagedDatabricksServerRequiresExplicitInternalFeaturesOptIn() throws {
+    let error = URLError(.cannotFindHost)
+    let flags: [(value: Any?, enabled: Bool)] = [
+      (nil, false), (false, false), ("true", false), (1, false), (true, true),
+    ]
+    for (flag, enabled) in flags {
+      var payload: [String: Any] = [
+        "serverUrls": ["https://workspace.cloud.databricks.com"]
+      ]
+      payload["databricksInternalFeaturesEnabled"] = flag
+      let data = try PropertyListSerialization.data(
+        fromPropertyList: payload, format: .binary, options: 0)
+      let configuration = try PropertyListDecoder().decode(
+        OmnigentManagedConfiguration.self, from: data)
+
+      XCTAssertEqual(
+        message(for: error, enabled: configuration.databricksInternalFeaturesEnabled),
+        enabled ? jamfMessage : error.localizedDescription)
     }
   }
 

@@ -24,7 +24,10 @@ struct OmnigentWebView: UIViewRepresentable {
     if databricksInternalFeaturesEnabled, nsError.domain == NSURLErrorDomain,
       [NSURLErrorCannotFindHost, NSURLErrorDNSLookupFailed].contains(nsError.code)
     {
-      return "Couldn’t reach the server. Check your device’s compliance status in Jamf."
+      return """
+        Couldn’t reach the server. Open JAMF Trust and check that your device is compliant \
+        (all checks green), then try again.
+        """
     }
     return error.localizedDescription
   }

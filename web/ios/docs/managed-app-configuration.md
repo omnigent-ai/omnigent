@@ -66,9 +66,16 @@ while someone is using the app appears when they next return to it.
 
 ## Databricks-internal features
 
-Set `databricksInternalFeaturesEnabled` to a **boolean** `true` in either delivery
-channel. This is the same key as the Electron app's managed preference; it is not
-a build flag and works independently of `serverUrls`.
+For Databricks employees installing Omnigent through Self Service, IT must set
+`databricksInternalFeaturesEnabled` to a **boolean** `true` in the managed app
+configuration, using either delivery channel. Scope this configuration to
+Databricks employee devices; leave the flag unset for public and customer-managed
+installs, including those connecting to Databricks workspaces.
+
+This is the same key as the Electron app's managed preference; it is not a build
+flag and works independently of `serverUrls`. Providing Databricks server URLs
+alone does not enable the hint. The Self Service app must also be updated to a
+version that supports this key.
 
 ```xml
 <key>databricksInternalFeaturesEnabled</key>
@@ -78,10 +85,11 @@ a build flag and works independently of `serverUrls`.
 When enabled, a connection failure with `NSURLErrorCannotFindHost` or
 `NSURLErrorDNSLookupFailed` displays:
 
-> Couldn’t reach the server. Check your device’s compliance status in Jamf.
+> Couldn’t reach the server. Open JAMF Trust and check that your device is compliant
+> (all checks green), then try again.
 
 This applies to any server the user connects to in this install. It is a
-troubleshooting hint, not a check of the device's JAMF compliance status. Other
+troubleshooting hint, not a check of the device's JAMF Trust compliance status. Other
 errors (including timeouts, offline, connection refusal, and TLS failures) keep
 their original messages. When disabled, DNS failures also keep their original
 messages.
