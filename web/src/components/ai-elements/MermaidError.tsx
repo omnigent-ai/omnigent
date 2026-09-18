@@ -30,6 +30,14 @@ const TEXT_AFTER_COLON_RE = new RegExp(
   "i",
 );
 
+// A `;` closing a Mermaid entity code such as `#59;` or `#9829;` is already an
+// escape; only a bare semicolon needs one.
+const ENTITY_OR_SEMICOLON_RE = /#\w+;|;/g;
+
+function hasBareSemicolon(text: string): boolean {
+  return text.replace(/#\w+;/g, "").includes(";");
+}
+
 // `;` ends a statement in sequence diagrams, and prose in a Note or message
 // routinely carries one — the classic LLM slip.
 const SEMICOLON_HINT = (
@@ -42,36 +50,44 @@ const SEMICOLON_HINT = (
 export interface EscapedSemicolons {
   text: string;
   count: number;
+  /** 1-based line in the author's source holding the first escaped semicolon. */
+  firstLine: number;
 }
 
 /**
- * Escape every `;` inside the free text of a sequence diagram as `#59;`, the
- * form Mermaid documents for a literal semicolon. Null when nothing changed.
- * Only for a diagram that already failed to parse: in a valid one a `;` may be
- * a deliberate statement separator.
+ * Escape every bare `;` inside the free text of a sequence diagram as `#59;`,
+ * the form Mermaid documents for a literal semicolon. Existing entity codes and
+ * the YAML front matter are left alone. Null when nothing changed. Only for a
+ * diagram that already failed to parse: in a valid one a `;` may be a
+ * deliberate statement separator.
  */
 export function escapeSequenceTextSemicolons(chart: string): EscapedSemicolons | null {
+  const normalized = chart.replace(/\r\n?/g, "\n");
+  const frontMatter = FRONT_MATTER_RE.exec(normalized)?.[0] ?? "";
+  const frontMatterLines = frontMatter.split("\n").length - 1;
   let count = 0;
-  const escape = (text: string) => {
-    count += text.split(";").length - 1;
-    return text.replace(/;/g, "#59;");
-  };
-  // Front matter is YAML, not diagram text; leave it alone.
-  const frontMatter = FRONT_MATTER_RE.exec(chart)?.[0] ?? "";
-  const lines = chart
+  let firstLine = 0;
+  const escape = (text: string, lineIndex: number) =>
+    text.replace(ENTITY_OR_SEMICOLON_RE, (match) => {
+      if (match !== ";") return match;
+      count += 1;
+      if (firstLine === 0) firstLine = frontMatterLines + lineIndex + 1;
+      return "#59;";
+    });
+  const lines = normalized
     .slice(frontMatter.length)
     .split("\n")
-    .map((line) => {
-      if (!line.includes(";")) return line;
+    .map((line, index) => {
+      if (!hasBareSemicolon(line)) return line;
       const block = BLOCK_LABEL_RE.exec(line);
-      if (block) return block[1] + escape(block[2]);
+      if (block) return block[1] + escape(block[2], index);
       const alias = ALIAS_RE.exec(line);
-      if (alias) return alias[1] + escape(alias[2]);
+      if (alias) return alias[1] + escape(alias[2], index);
       const text = TEXT_AFTER_COLON_RE.exec(line);
-      if (text) return `${text[1]}:${escape(text[2])}`;
+      if (text) return `${text[1]}:${escape(text[2], index)}`;
       return line;
     });
-  return count === 0 ? null : { text: frontMatter + lines.join("\n"), count };
+  return count === 0 ? null : { text: frontMatter + lines.join("\n"), count, firstLine };
 }
 
 interface LocatedLine {
@@ -134,7 +150,7 @@ export function describeMermaidError(chart: string, error: string): MermaidError
   return {
     line: located.line,
     source: located.source,
-    hint: sequence && located.source.includes(";") ? SEMICOLON_HINT : null,
+    hint: sequence && hasBareSemicolon(located.source) ? SEMICOLON_HINT : null,
     escaped: sequence ? escapeSequenceTextSemicolons(chart) : null,
   };
 }
@@ -142,7 +158,7 @@ export function describeMermaidError(chart: string, error: string): MermaidError
 type EscapedRender =
   | { status: "skipped" }
   | { status: "rendering" }
-  | { status: "rendered"; svg: string; count: number }
+  | { status: "rendered"; svg: string; count: number; firstLine: number }
   | { status: "failed" };
 
 // Render the escaped diagram through the same mermaid instance Streamdown
@@ -162,7 +178,8 @@ function useEscapedRender(escaped: EscapedSemicolons | null): EscapedRender {
       .getMermaid()
       .render(id, escaped.text)
       .then(({ svg }) => {
-        if (!cancelled) setState({ status: "rendered", svg, count: escaped.count });
+        if (cancelled) return;
+        setState({ status: "rendered", svg, count: escaped.count, firstLine: escaped.firstLine });
       })
       .catch(() => {
         if (!cancelled) setState({ status: "failed" });
@@ -219,8 +236,7 @@ export function MermaidError({ chart, error }: MermaidErrorComponentProps) {
         />
         <p className="mt-2 text-muted-foreground text-xs">
           Rendered with {escaped.count === 1 ? "one semicolon" : `${escaped.count} semicolons`}{" "}
-          escaped as <code>#59;</code>
-          {details.line === null ? "" : ` (first on line ${details.line})`}. Mermaid reads{" "}
+          escaped as <code>#59;</code> (first on line {escaped.firstLine}). Mermaid reads{" "}
           <code>;</code> as the end of a statement in sequence diagrams, so the source will not
           render as written elsewhere.
         </p>

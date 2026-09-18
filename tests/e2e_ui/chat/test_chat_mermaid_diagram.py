@@ -50,13 +50,15 @@ _INVALID_MERMAID_MESSAGE = (
     "```\n"
 )
 
-# The same slip on its own: escaping the semicolons is enough to render it.
+# The same slip on its own, next to an already-escaped ``#59;`` that must survive:
+# escaping the bare semicolons is enough to render it.
 _SEMICOLON_MERMAID_MESSAGE = (
     "Here is the flow:\n\n"
     "```mermaid\n"
     "sequenceDiagram\n"
     "    O->>O: Bind initiating user/run; check session policy\n"
-    "    B->>B: Load grant; refresh if needed\n"
+    "    B->>B: Load grant#59; refresh if needed\n"
+    "    G->>G: Record actor; target and outcome\n"
     "```\n"
 )
 
@@ -166,6 +168,12 @@ def test_semicolon_diagram_renders_with_an_escape_note(
     page.goto(f"{base_url}/c/{session_id}")
 
     escaped = page.get_by_test_id("mermaid-escaped")
-    expect(escaped.locator("svg[aria-roledescription]")).to_be_visible(timeout=30_000)
+    diagram = escaped.locator("svg[aria-roledescription]")
+    expect(diagram).to_be_visible(timeout=30_000)
+    # Both the escaped punctuation and the author's own ``#59;`` read as literal semicolons.
+    expect(diagram).to_contain_text("user/run; check session policy")
+    expect(diagram).to_contain_text("Load grant; refresh if needed")
     expect(escaped).to_contain_text("2 semicolons escaped as #59; (first on line 2)")
+    # Details keeps the source as written, entity code included.
+    expect(escaped.locator("details")).to_contain_text("Load grant#59; refresh if needed")
     expect(page.get_by_test_id("mermaid-error")).to_have_count(0)

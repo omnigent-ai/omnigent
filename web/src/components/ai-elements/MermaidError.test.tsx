@@ -11,6 +11,7 @@ describe("escapeSequenceTextSemicolons", () => {
     expect(escapeSequenceTextSemicolons(chart)).toEqual({
       text: "sequenceDiagram\n    A->>B: bind user#59; check policy\n    Note over A,B: once#59; twice\n",
       count: 2,
+      firstLine: 2,
     });
   });
 
@@ -20,6 +21,25 @@ describe("escapeSequenceTextSemicolons", () => {
     expect(escapeSequenceTextSemicolons(chart)?.text).toBe(
       "sequenceDiagram\n    participant A as Agent#59; runtime\n    alt approved#59; logged\n        A->>B: go\n    end\n",
     );
+  });
+
+  it("preserves existing entity codes and counts only the bare semicolons", () => {
+    expect(escapeSequenceTextSemicolons("sequenceDiagram\n    A->>B: a#59; b; c\n")).toEqual({
+      text: "sequenceDiagram\n    A->>B: a#59; b#59; c\n",
+      count: 1,
+      firstLine: 2,
+    });
+    expect(
+      escapeSequenceTextSemicolons("sequenceDiagram\n    Note over A: love #9829; you\n"),
+    ).toBeNull();
+  });
+
+  it("normalizes CRLF line endings before matching", () => {
+    expect(escapeSequenceTextSemicolons("sequenceDiagram\r\n    A->>B: a; b\r\n")).toEqual({
+      text: "sequenceDiagram\n    A->>B: a#59; b\n",
+      count: 1,
+      firstLine: 2,
+    });
   });
 
   it("splits at the first colon only, so colons inside the text survive", () => {
@@ -38,6 +58,7 @@ describe("escapeSequenceTextSemicolons", () => {
     expect(escapeSequenceTextSemicolons(withFrontMatter)).toEqual({
       text: "---\ntitle: |\n  Note over A,B: once; twice\n---\nsequenceDiagram\n    Note over A,B: once#59; twice\n",
       count: 1,
+      firstLine: 6,
     });
   });
 });
@@ -50,13 +71,20 @@ describe("describeMermaidError", () => {
     expect(details.line).toBe(7);
     expect(details.source).toBe("  Note over A,B: once; twice");
     expect(details.hint).not.toBeNull();
-    expect(details.escaped?.count).toBe(1);
+    expect(details.escaped).toMatchObject({ count: 1, firstLine: 7 });
   });
 
   it("maps past directives and comment lines Mermaid strips", () => {
     const chart =
       '%%{init: {"theme": "dark"}}%%\n%% a comment\nsequenceDiagram\n  A->>B: once; twice\n';
     expect(describeMermaidError(chart, PARSE_ERROR_LINE_2).line).toBe(4);
+  });
+
+  it("offers the hint only for a bare semicolon, not an entity code", () => {
+    const chart = "sequenceDiagram\n  A->>B: a#59; b\n  A=>B: again\n";
+    const details = describeMermaidError(chart, PARSE_ERROR_LINE_2);
+    expect(details.hint).toBeNull();
+    expect(details.escaped).toBeNull();
   });
 
   it("offers neither the hint nor an escape outside sequence diagrams", () => {
