@@ -2082,8 +2082,47 @@ def _is_resumable_codex_rollout(path: Path, *, external_session_id: str) -> bool
     return False
 
 
+_CODEX_RESUME_ITEMS_PAGE_LIMIT = 1000
+_CODEX_RESUME_ITEMS_PAGE_LIMIT_FLOOR = 100
+
+
 class _CodexResumeHistoryUnavailableError(click.ClickException):
     """Server history is temporarily unavailable for Codex cold resume."""
+
+
+def _smaller_codex_resume_page_limit(
+    session_id: str,
+    limit: int,
+    *,
+    http_status: int | None = None,
+    exception_type: str | None = None,
+) -> int | None:
+    """Retry an oversized or interrupted page without advancing its cursor."""
+    from omnigent.debug_logging import debug_event
+
+    next_limit = (
+        max(limit // 2, _CODEX_RESUME_ITEMS_PAGE_LIMIT_FLOOR)
+        if limit > _CODEX_RESUME_ITEMS_PAGE_LIMIT_FLOOR
+        else None
+    )
+    _logger.warning(
+        "Codex resume history page failed: limit=%d status=%s exception=%s next_limit=%s",
+        limit,
+        http_status,
+        exception_type,
+        next_limit,
+        extra=debug_event(
+            "codex_resume_history_page_retry"
+            if next_limit
+            else "codex_resume_history_unavailable",
+            session_id=session_id,
+            page_limit=limit,
+            next_page_limit=next_limit,
+            http_status=http_status,
+            exception_type=exception_type,
+        ),
+    )
+    return next_limit
 
 
 async def _fetch_all_session_items_for_codex_resume(
@@ -2104,8 +2143,9 @@ async def _fetch_all_session_items_for_codex_resume(
     """
     items: list[_JsonObject] = []
     after: str | None = None
+    limit = _CODEX_RESUME_ITEMS_PAGE_LIMIT
     while True:
-        params: dict[str, str | int] = {"limit": 1000, "order": "asc"}
+        params: dict[str, str | int] = {"limit": limit, "order": "asc"}
         if after is not None:
             params["after"] = after
         try:
@@ -2114,10 +2154,22 @@ async def _fetch_all_session_items_for_codex_resume(
                 params=params,
             )
         except httpx.TransportError as exc:
+            next_limit = _smaller_codex_resume_page_limit(
+                session_id, limit, exception_type=type(exc).__name__
+            )
+            if next_limit is not None:
+                limit = next_limit
+                continue
             raise _CodexResumeHistoryUnavailableError(
                 f"Failed to fetch history for {session_id!r}: {exc}"
             ) from exc
         if resp.status_code >= 500:
+            next_limit = _smaller_codex_resume_page_limit(
+                session_id, limit, http_status=resp.status_code
+            )
+            if next_limit is not None:
+                limit = next_limit
+                continue
             raise _CodexResumeHistoryUnavailableError(
                 f"Failed to fetch history for {session_id!r} "
                 f"({resp.status_code}): {error_text(resp)}"
