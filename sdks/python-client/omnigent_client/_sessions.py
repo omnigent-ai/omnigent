@@ -379,6 +379,8 @@ class SessionsNamespace:
         workspace: str | None = None,
         host_type: str = "external",
         sandbox_provider: str | None = None,
+        terminal_launch_args: list[str] | None = None,
+        host_id: str | None = None,
     ) -> Session:
         """
         Create a new session from an uploaded agent bundle.
@@ -410,6 +412,18 @@ class SessionsNamespace:
         :param sandbox_provider: With ``host_type="managed"``, which
             configured sandbox provider to provision (e.g. ``"lakebox"``);
             ``None`` takes the server's first. Ignored for external hosts.
+        :param terminal_launch_args: Optional pass-through CLI args for a
+            native terminal wrapper (claude / codex), e.g.
+            ``["--disallowedTools", "AskUserQuestion", "--permission-mode",
+            "bypassPermissions"]``. Set at create-time so a headless
+            native TUI does not block on a permission card. ``None``
+            omits the field (non-native sessions). Bounds are validated
+            server-side.
+        :param host_id: Optional host to launch the runner on, e.g.
+            ``"host_abc123"``. When set, the server sends
+            ``host.launch_runner`` to that host. ``None`` for
+            caller-managed runner spawning. Must be ``None`` when
+            ``host_type`` is ``"managed"``.
         :returns: The newly created :class:`Session` snapshot.
         :raises OmnigentError: If the server returns a non-2xx
             status.
@@ -427,6 +441,10 @@ class SessionsNamespace:
             metadata["host_type"] = host_type
         if sandbox_provider is not None:
             metadata["sandbox_provider"] = sandbox_provider
+        if terminal_launch_args is not None:
+            metadata["terminal_launch_args"] = terminal_launch_args
+        if host_id is not None:
+            metadata["host_id"] = host_id
         resp = await self._http.post(
             f"{self._base}/v1/sessions",
             data={"metadata": json.dumps(metadata)},

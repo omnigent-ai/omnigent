@@ -288,6 +288,14 @@ class OmnigentClient:
         bundle: bytes,
         *,
         filename: str = "agent.tar.gz",
+        title: str | None = None,
+        labels: dict[str, str] | None = None,
+        reasoning_effort: str | None = None,
+        workspace: str | None = None,
+        host_type: str = "external",
+        sandbox_provider: str | None = None,
+        terminal_launch_args: list[str] | None = None,
+        host_id: str | None = None,
         tool_callables: dict[str, ToolCallable] | None = None,
         hooks: StreamHooks | None = None,
     ) -> SessionsChat:
@@ -301,6 +309,22 @@ class OmnigentClient:
             multipart ``POST /v1/sessions``.
         :param filename: Filename for the multipart upload, e.g.
             ``"agent.tar.gz"``.
+        :param title: Optional human-readable title forwarded to
+            session create.
+        :param labels: Initial guardrails labels forwarded to
+            session create. ``None`` starts with no labels.
+        :param reasoning_effort: Optional per-session reasoning
+            effort forwarded to session create.
+        :param workspace: Optional starting workspace forwarded to
+            session create.
+        :param host_type: ``"external"`` (default) or ``"managed"``.
+        :param sandbox_provider: With ``host_type="managed"``, which
+            sandbox provider to provision; ``None`` takes the
+            server's first.
+        :param terminal_launch_args: Optional native-terminal CLI
+            args forwarded to session create, e.g.
+            ``["--permission-mode", "bypassPermissions"]``.
+        :param host_id: Optional host id forwarded to session create.
         :param tool_callables: Optional mapping from tool name to
             an executable callable (sync or async) for client-side
             tool execution. Validated against the agent's
@@ -317,6 +341,14 @@ class OmnigentClient:
             namespace=self.sessions,
             bundle=bundle,
             filename=filename,
+            title=title,
+            labels=labels,
+            reasoning_effort=reasoning_effort,
+            workspace=workspace,
+            host_type=host_type,
+            sandbox_provider=sandbox_provider,
+            terminal_launch_args=terminal_launch_args,
+            host_id=host_id,
             files_namespace=self.files,
             tool_callables=tool_callables,
             agent_tools_getter=self._fetch_agent_tools,
