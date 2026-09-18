@@ -16,6 +16,7 @@ import json
 import re
 import subprocess
 import sys
+import textwrap
 import threading
 from collections.abc import Callable
 from pathlib import Path
@@ -245,15 +246,23 @@ def test_daemon_startup_preserves_runtime_identity_and_workspace(
         if name in {"PATH", "SYSTEMROOT", "WINDIR", "OMNIGENT_CONFIG_HOME", "OMNIGENT_DATA_DIR"}
     }
     probe_env.update(HOME=str(tmp_path), USERPROFILE=str(tmp_path))
+    probe = textwrap.dedent("""\
+        import json, os, sys
+
+        startup_path = list(sys.path)
+        import omnigent
+        from omnigent.host.identity import load_or_create_host_identity
+
+        print(json.dumps(dict(
+            safe_path=sys.flags.safe_path,
+            startup_path=startup_path,
+            cwd=os.getcwd(),
+            runtime=omnigent.__file__,
+            host_id=load_or_create_host_identity().host_id,
+        )))
+    """)
     result = subprocess.run(
-        [
-            *args[: args.index("-m")],
-            "-c",
-            "import json, os, sys, omnigent; "
-            "from omnigent.host.identity import load_or_create_host_identity; "
-            "print(json.dumps(dict(safe_path=sys.flags.safe_path, cwd=os.getcwd(), "
-            "runtime=omnigent.__file__, host_id=load_or_create_host_identity().host_id)))",
-        ],
+        [*args[: args.index("-m")], "-c", probe],
         env=probe_env,
         capture_output=True,
         text=True,
@@ -261,6 +270,8 @@ def test_daemon_startup_preserves_runtime_identity_and_workspace(
         timeout=30,
     )
     observed = json.loads(result.stdout)
+    assert "" not in observed["startup_path"]
+    assert workspace.resolve() not in {Path(entry).resolve() for entry in observed["startup_path"]}
     assert observed["safe_path"] is True
     assert Path(observed["cwd"]) == workspace.resolve()
     assert Path(observed["runtime"]).resolve() == Path(omnigent.__file__).resolve()
