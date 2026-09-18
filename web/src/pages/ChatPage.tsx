@@ -3008,12 +3008,15 @@ function ComposerImpl(
           const current = sessionModelOverride
             ? `${sessionModelOverride} (override)`
             : (llmModel ?? "agent default");
-          setCommandError(`Model: ${current}\nUsage: /model <name> · /model default to reset`);
+          setCommandError(`Model: ${current}\nUsage: /model <name>`);
           return true;
         }
-        // ``default | off | reset`` clear the override (REPL clear aliases);
-        // ``setModel(null)`` sends the server's "default" clear sentinel.
-        const clear = ["default", "off", "reset"].includes(target.toLowerCase());
+        if (["default", "off", "reset"].includes(target.toLowerCase())) {
+          setCommandError(
+            "Choose a model explicitly with /model <name>. Defaults apply to new sessions.",
+          );
+          return true;
+        }
         dirtyRef.current = true;
         setValue("");
         setCommandError(null);
@@ -3025,7 +3028,7 @@ function ComposerImpl(
         const harness = useChatStore.getState().sessionHarness;
         void useChatStore
           .getState()
-          .setModel(clear ? null : target, {
+          .setModel(target, {
             expectConfirmation: harness === "claude-native" || harness === "codex-native",
           })
           .catch((err: unknown) => {
@@ -4744,7 +4747,7 @@ function SessionHarnessPicker({
       setBusy(false);
     }
   };
-  const selectModel = (modelId: string | null) =>
+  const selectModel = (modelId: string) =>
     void apply(async () => {
       const store = useChatStore.getState();
       const sourceSessionId = store.conversationId;
@@ -4809,18 +4812,6 @@ function SessionHarnessPicker({
                     </div>
                   ) : undefined,
                 choices: [
-                  ...(!inferenceConfigured && !modelOptions.some((model) => model.isDefault)
-                    ? [
-                        {
-                          key: "__default__",
-                          label: "Default",
-                          checked: !routingOn && pickerSelectedModel === null,
-                          disabled: busy || pendingModelChange !== null,
-                          onSelect: () => selectModel(null),
-                          testId: "composer-agent-model-default",
-                        },
-                      ]
-                    : []),
                   ...modelOptions.map((model) => ({
                     key: model.id,
                     label: nativeModelLabel(model),
@@ -4828,13 +4819,12 @@ function SessionHarnessPicker({
                       !routingOn &&
                       (composerFusion !== undefined && model.id === composerFusionOption?.id
                         ? isFusionModelUid(pickerSelectedModel)
-                        : model.id === pickerSelectedModel ||
-                          (pickerSelectedModel === null && model.isDefault === true)),
+                        : model.id === pickerSelectedModel),
                     disabled: busy || pendingModelChange !== null,
                     onSelect: () =>
                       composerFusion !== undefined && model.id === composerFusionOption?.id
                         ? selectFusionModel(composerFusion.default)
-                        : selectModel(model.isDefault ? null : model.id),
+                        : selectModel(model.id),
                     testId: `composer-agent-model-${model.id}`,
                     className: "whitespace-normal break-words",
                     data: { "data-model-id": model.id },
@@ -5120,7 +5110,7 @@ function useResolvedComposerModel(
   // bound default.
   const pickerSelectedModel = isReportedModelPicker
     ? (reportedRowId ?? requestedRowId)
-    : sessionModelOverride;
+    : (sessionModelOverride ?? (modelPickerKind === "configured" ? llmModel : null));
   const effectiveModel = sessionModelSeeded
     ? (sessionModelOverride ?? llmModel)
     : nativeVendorOwnsModel
