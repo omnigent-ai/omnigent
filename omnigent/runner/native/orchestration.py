@@ -7773,6 +7773,7 @@ def _native_terminal_start_failure_cause(exc: BaseException) -> str:
         ``"RuntimeError (cause ReadTimeout)"``.
     """
     class_name = type(exc).__name__
+    configuration_error = isinstance(exc, OmnigentError) and exc.code == ErrorCode.HARNESS_NOT_CONFIGURED
     os_error = _os_error_with_errno(exc)
     if os_error is not None:
         assert os_error.errno is not None
@@ -7816,7 +7817,7 @@ def _native_terminal_start_error_payload(
         session_id=session_id,
         error_id=error_id,
         runtime=runtime_name,
-        code=lifecycle_code or _NATIVE_TERMINAL_START_FAILED_CODE,
+        code=ErrorCode.HARNESS_NOT_CONFIGURED if configuration_error else lifecycle_code or _NATIVE_TERMINAL_START_FAILED_CODE,
         exception_type=type(exc).__name__,
         exception_cause_type=type(exc.__cause__).__name__ if exc.__cause__ is not None else None,
         cause_code=exc.code if isinstance(exc, OmnigentError) else None,
@@ -7831,10 +7832,16 @@ def _native_terminal_start_error_payload(
         # The warning below carries no exc_info for a missing agent, so the
         # sink cannot derive its category.
         error_category=exc.category.value
-        if isinstance(exc, OmnigentError) and lifecycle_code is not None
+        if isinstance(exc, OmnigentError) and (lifecycle_code is not None or configuration_error)
         else None,
         error_impact=ErrorImpact.BLOCKING.value,
     )
+    if isinstance(exc, OmnigentError) and configuration_error:
+        _logger.warning(
+            "Native %s configuration needs attention; error_id=%s: %s",
+            runtime_name, error_id, exc.message, extra=extra,
+        )
+        return {"code": exc.code, "error_id": error_id, "message": exc.message}
     if lifecycle_code is not None:
         # Expected session-lifecycle condition: a required session resource was
         # removed. Log it without a stack and surface a distinct code plus a
@@ -7980,11 +7987,15 @@ def _native_terminal_start_error_response(
     :param exc: Exception raised by terminal auto-create.
     :param runtime_name: Human-readable runtime name, e.g. ``"Codex"``.
     :param session_id: Session whose terminal ensure failed.
-    :returns: The lifecycle status for a removed agent or workspace, else 500,
+    :returns: HTTP 412 for configuration errors, the lifecycle status for a removed
+        agent or workspace, else 500,
         with an ``error`` object carrying the real failure message.
     """
     status_code = 500
-    if isinstance(exc, OmnigentError) and exc.code in _NATIVE_TERMINAL_LIFECYCLE_ERROR_CODES:
+    if isinstance(exc, OmnigentError) and (
+        exc.code in _NATIVE_TERMINAL_LIFECYCLE_ERROR_CODES
+        or exc.code == ErrorCode.HARNESS_NOT_CONFIGURED
+    ):
         status_code = exc.http_status
     return JSONResponse(
         status_code=status_code,
@@ -9997,19 +10008,22 @@ async def _launch_native_terminal(
             )
             return True
         except Exception as exc:
-            _logger.exception(
-                "Failed to auto-create %s terminal for %s",
-                agent.terminal_name,
-                ctx.session_id,
-                extra=debug_event(
-                    "terminal_start_failed",
-                    session_id=ctx.session_id,
-                    harness=harness_name,
-                    stage="terminal_start",
-                    error_impact=ErrorImpact.BLOCKING.value,
-                    error_phase=ErrorPhase.HARNESS_STARTUP.value,
-                ),
-            )
+            if not (
+                isinstance(exc, OmnigentError) and exc.code == ErrorCode.HARNESS_NOT_CONFIGURED
+            ):
+                _logger.exception(
+                    "Failed to auto-create %s terminal for %s",
+                    agent.terminal_name,
+                    ctx.session_id,
+                    extra=debug_event(
+                        "terminal_start_failed",
+                        session_id=ctx.session_id,
+                        harness=harness_name,
+                        stage="terminal_start",
+                        error_impact=ErrorImpact.BLOCKING.value,
+                        error_phase=ErrorPhase.HARNESS_STARTUP.value,
+                    ),
+                )
             if reraise:
                 raise
             _publish_native_terminal_start_error(
@@ -10159,7 +10173,9 @@ async def _ensure_native_terminal(
                     exc,
                     extra={"session_id": ctx.session_id},
                 )
-            else:
+            elif not (
+                isinstance(exc, OmnigentError) and exc.code == ErrorCode.HARNESS_NOT_CONFIGURED
+            ):
                 _logger.exception(
                     "%s terminal ensure failed for session=%s",
                     agent.display_name,

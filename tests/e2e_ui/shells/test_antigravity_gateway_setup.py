@@ -346,3 +346,146 @@ def test_setup_gateway_reaches_real_agy_through_fresh_local_daemon(
                 shutil.rmtree(bridge_dir_for_bridge_id(session_id), ignore_errors=True)
             gateway.shutdown()
             thread.join(timeout=5)
+
+
+@pytest.mark.parametrize("failure", ["missing-secret", "incompatible-url", "malformed-profile"])
+def test_saved_credential_error_visible_through_fresh_daemon(tmp_path, page, built_spa, failure):
+    """A real host rejects invalid saved credentials with visible recovery guidance."""
+    from playwright.sync_api import expect
+
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    profile_file = tmp_path / "databrickscfg"
+    profile_file.write_text("")
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key
+        in {
+            "PATH",
+            "HOME",
+            "USER",
+            "SHELL",
+            "TMPDIR",
+            "LANG",
+        }
+    }
+    env.update(
+        {
+            "PYTHONPATH": str(_ROOT),
+            "OMNIGENT_CONFIG_HOME": str(config_dir),
+            "OMNIGENT_DATA_DIR": str(tmp_path / "data"),
+            "OMNIGENT_DISABLE_KEYRING": "1",
+            "OMNIGENT_AUTH_PROVIDER": "header",
+            "OMNIGENT_LOCAL_SINGLE_USER": "1",
+            "OMNIGENT_DISABLE_CATALOG_LOOKUP": "1",
+            "DATABRICKS_CONFIG_FILE": str(profile_file),
+        }
+    )
+    entry = {
+        "kind": "gateway",
+        "default": ["gemini"],
+        "gemini": {
+            "base_url": "https://gateway.example/gemini",
+            "api_key_ref": "keychain:missing",
+        },
+    }
+    expected = "no stored secret"
+    if failure == "incompatible-url":
+        entry["gemini"] = {"base_url": "https://api.openai.com/v1", "api_key": "fake"}
+        expected = "OpenAI Responses"
+    if failure == "malformed-profile":
+        entry = {
+            "kind": "databricks",
+            "profile": "broken",
+            "native_gemini": True,
+            "default": ["gemini"],
+        }
+        profile_file.write_text("token = private-malformed-secret\n")
+        expected = "Repair ~/.databrickscfg"
+    (config_dir / "config.yaml").write_text(yaml.safe_dump({"providers": {"selected": entry}}))
+    session_id = None
+    processes = []
+
+    def cli(*args):
+        return subprocess.run(
+            [sys.executable, "-m", "omnigent", *args],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+
+    try:
+        result = cli("host", "--background", "--non-interactive")
+        assert result.returncode == 0, result.stdout + result.stderr
+        pidfile = tmp_path / "data/local_server.pid"
+        _wait(pidfile.exists, "local daemon did not start")
+        pid, port = pidfile.read_text().splitlines()[:2]
+        processes.append(psutil.Process(int(pid)))
+        for record in (tmp_path / "data/daemons").glob("*.json"):
+            processes.append(psutil.Process(json.loads(record.read_text())["pid"]))
+        base_url = f"http://127.0.0.1:{port}"
+        with httpx.Client(base_url=base_url, timeout=30) as client:
+
+            def online_host():
+                response = client.get("/v1/hosts")
+                response.raise_for_status()
+                return next((h for h in response.json()["hosts"] if h["status"] == "online"), None)
+
+            host = _wait(online_host, "fresh host did not connect")
+            agents = client.get("/v1/agents")
+            agents.raise_for_status()
+            agent = next(a for a in agents.json()["data"] if a["name"] == "antigravity-native-ui")
+            response = client.post(
+                "/v1/sessions",
+                json={
+                    "agent_id": agent["id"],
+                    "host_id": host["host_id"],
+                    "workspace": str(tmp_path),
+                },
+                timeout=60,
+            )
+            response.raise_for_status()
+            session_id = response.json()["id"]
+            page.goto(f"{base_url}/c/{session_id}")
+            page.get_by_role("textbox", name="Message the agent").fill("Hello")
+            page.get_by_role("button", name="Send", exact=True).click()
+            error_pill = page.get_by_test_id("error-pill").first
+            expect(error_pill).to_be_visible(timeout=60_000)
+            error_pill.click()
+            expect(page.get_by_text(expected, exact=False).first).to_be_visible(timeout=60_000)
+            expect(
+                page.get_by_text("Run omni setup on the host", exact=False).first
+            ).to_be_visible()
+            body = page.locator("body").inner_text()
+            assert "see the runner log" not in body
+            assert "private-malformed-secret" not in body
+            assert not list((tmp_path / "data/crashes").glob("crash-*.md"))
+            for log in (tmp_path / "data/logs").rglob("*.log"):
+                assert "private-malformed-secret" not in log.read_text()
+    finally:
+        # Capture children even if background-host registration failed.
+        pidfile = tmp_path / "data/local_server.pid"
+        if pidfile.exists():
+            with contextlib.suppress(psutil.NoSuchProcess):
+                processes.append(psutil.Process(int(pidfile.read_text().splitlines()[0])))
+        for record in (tmp_path / "data/daemons").glob("*.json"):
+            with contextlib.suppress(psutil.NoSuchProcess):
+                processes.append(psutil.Process(json.loads(record.read_text())["pid"]))
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            cli("host", "stop", "--all", "--force")
+        for process in reversed(processes):
+            with contextlib.suppress(psutil.NoSuchProcess):
+                descendants = process.children(recursive=True)
+                for child in reversed(descendants):
+                    with contextlib.suppress(psutil.NoSuchProcess):
+                        child.terminate()
+                process.terminate()
+                _, alive = psutil.wait_procs([*descendants, process], timeout=5)
+                for child in alive:
+                    with contextlib.suppress(psutil.NoSuchProcess):
+                        child.kill()
+        if session_id is not None:
+            shutil.rmtree(bridge_dir_for_bridge_id(session_id), ignore_errors=True)

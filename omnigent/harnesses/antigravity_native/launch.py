@@ -41,6 +41,7 @@ import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.onboarding.gemini_auth import gemini_auth_has_credential
 
 _logger = logging.getLogger(__name__)
@@ -117,7 +118,15 @@ def resolve_native_antigravity_launch(
     """
     from omnigent.harnesses.antigravity_native.credentials import resolve_antigravity_credentials
 
-    credentials = resolve_antigravity_credentials()
+    try:
+        credentials = resolve_antigravity_credentials()
+    except OmnigentError as exc:
+        if exc.code != ErrorCode.INVALID_INPUT:
+            raise
+        raise OmnigentError(
+            exc.message + " Run omni setup on the host to repair the Gemini configuration.",
+            code=ErrorCode.HARNESS_NOT_CONFIGURED,
+        ) from None
     if credentials is not None:
         return NativeAntigravityLaunch(
             auth_mode="api-key",

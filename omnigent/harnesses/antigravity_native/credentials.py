@@ -1,5 +1,6 @@
 """Resolve setup credentials for the native agy process."""
 
+import configparser
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -35,7 +36,15 @@ def databricks_token_source(profile: str) -> "DatabricksProfileTokenProvider":
 
     if not profile.strip():
         raise OmnigentError("Enter a Databricks profile name.", code=ErrorCode.INVALID_INPUT)
-    host = _read_databrickscfg_host(profile)
+    try:
+        host = _read_databrickscfg_host(profile)
+    except (configparser.Error, OSError, UnicodeError):
+        # Parser errors can include entire lines containing credentials.
+        raise OmnigentError(
+            "Cannot read the Databricks profile file. Repair ~/.databrickscfg "
+            "(or the file selected by DATABRICKS_CONFIG_FILE), then run omni setup again.",
+            code=ErrorCode.INVALID_INPUT,
+        ) from None
     if not host:
         raise OmnigentError(
             f"Databricks profile {profile!r} has no workspace host.", code=ErrorCode.INVALID_INPUT

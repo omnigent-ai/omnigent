@@ -100,6 +100,19 @@ def test_missing_selected_secret_never_falls_back_to_ambient_or_oauth(
         build_agy_launch(conversation_id=None, model=None, resume=False)
 
 
+@pytest.mark.parametrize(
+    "harness", ["antigravity-native", "native-antigravity", "agy-native", "native-agy"]
+)
+def test_host_setup_hint_preserves_saved_credential_error(tmp_path, harness):
+    from omnigent.onboarding.harness_install import harness_setup_hint
+
+    save_provider(tmp_path)
+    hint = harness_setup_hint(harness)
+    assert "no stored secret" in hint
+    assert "Run omni setup on the host" in hint
+    assert "install.sh" not in hint
+
+
 def test_env_reference_resolved_at_launch(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     save_provider(tmp_path, ref="env:CORPORATE_GEMINI_KEY")
     monkeypatch.setenv("CORPORATE_GEMINI_KEY", "rotated-fake-key")
@@ -279,3 +292,52 @@ def test_upgrade_of_existing_gemini_block_preserves_other_defaults(
     path.write_text(yaml.safe_dump(config))
     assert build_agy_launch(conversation_id=None, model=None, resume=False)[1] == {}
     assert default_provider_for_harness(config, "native-codex").name == "existing"
+
+
+@pytest.mark.parametrize(
+    "profile_text",
+    [
+        "token = private-malformed-secret\n",
+        "[broken]\nhost = https://workspace.example\nprivate-malformed-secret\n",
+        "[broken]\nhost = https://one.example\nhost = https://two.example\n",
+    ],
+)
+def test_cli_and_readiness_handle_malformed_databricks_profile(
+    monkeypatch, tmp_path, profile_text
+):
+    from click.testing import CliRunner
+
+    from omnigent.cli import cli
+
+    profile = tmp_path / "databrickscfg"
+    profile.write_text(profile_text)
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(profile))
+    (tmp_path / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "providers": {
+                    "broken": {
+                        "kind": "databricks",
+                        "profile": "broken",
+                        "native_gemini": True,
+                        "default": ["gemini"],
+                    }
+                }
+            }
+        )
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.antigravity_native.main.agy_binary_path", lambda: "agy"
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.antigravity_native.main._preflight_local_tools", lambda: None
+    )
+    monkeypatch.setattr("omnigent.cli._ensure_backend", lambda _: "http://127.0.0.1:1")
+    result = CliRunner().invoke(cli, ["agy"])
+    assert result.exit_code == 1
+    assert "Repair" in result.output
+    assert "profile" in result.output
+    assert "Traceback" not in result.output
+    assert "private-malformed-secret" not in result.output
+    assert not isinstance(result.exception, OmnigentError)
+    assert not antigravity_credentials_ready()

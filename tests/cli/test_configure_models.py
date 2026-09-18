@@ -3904,3 +3904,32 @@ def test_detected_gemini_key_invalid_endpoint_returns_to_setup(isolated_config, 
     assert "Traceback" not in result.output
     assert "gemini" not in _config_yaml(isolated_config).get("providers", {})
     assert secrets.load_secret("gemini") is None
+
+
+@pytest.mark.parametrize(
+    "profile_text",
+    [
+        "token = private-malformed-secret\n",
+        "[broken]\nhost = https://workspace.example\nprivate-malformed-secret\n",
+        "[broken]\nhost = https://one.example\nhost = https://two.example\n",
+    ],
+)
+def test_databricks_setup_recovers_from_malformed_profile(
+    isolated_config, monkeypatch, profile_text
+):
+    profile = isolated_config / "databrickscfg"
+    profile.write_text(profile_text)
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(profile))
+    monkeypatch.setattr(
+        "omnigent.onboarding.databricks_config.databricks_sdk_installed", lambda: True
+    )
+    result = CliRunner().invoke(
+        cli,
+        ["setup", "--no-internal-beta"],
+        input="\n".join(["7", "3", "1", "3", "broken", "q", "q", "q"]) + "\n",
+    )
+    assert result.exit_code == 0, result.output
+    assert "profile configuration" in " ".join(result.output.split())
+    assert "Traceback" not in result.output
+    assert "private-malformed-secret" not in result.output
+    assert "databricks-gemini-broken" not in _config_yaml(isolated_config).get("providers", {})
