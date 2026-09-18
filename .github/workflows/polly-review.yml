@@ -423,9 +423,9 @@ jobs:
           # sections. Build the numbered list so the numbering stays contiguous
           # regardless of whether the visual item is present.
           standard_items = [
-              "**Blocking issues** — unrelated changes or unclear scope, correctness bugs, broken contracts, missing error handling on failure paths, data loss risks.",
+              "**Blocking issues** — clearly evidenced unrelated changes, correctness bugs, broken contracts, missing error handling on failure paths, data loss risks.",
               "**Security vulnerabilities** — injection (SQL, command, template), authentication/authorization bypasses, secret exposure, unsafe deserialization, path traversal, SSRF, and any change that weakens an existing security boundary. Flag even subtle issues.",
-              "**Non-blocking notes** — design concerns or edge cases worth flagging (brief).",
+              "**Non-blocking notes** — scope clarification questions, design concerns or edge cases worth flagging (brief).",
               "**Approach** — is there a materially simpler or more consistent way to reach the PR's stated goal, given existing patterns in the repo (config surfaces, variables, helpers, conventions)? Name the concrete alternative briefly, or say the approach is sound. Never blocking.",
               "**Summary** — one-paragraph overall assessment.",
           ]
@@ -495,7 +495,7 @@ jobs:
           - Do not assume the reader has prior knowledge. Explain and provide context when needed.
           - Format multiple sub-points as a list.
 
-          Before labeling anything **blocking**, double-check: does this issue actually exist in the diff? Verify the problem is real and present in the changed code — not inferred, speculative, or already handled elsewhere. If the issue exists, it is blocking only if it introduces a correctness bug, breaks an explicit contract, creates a real security risk, or includes unrelated changes or unresolved scope uncertainty; otherwise downgrade to non-blocking.
+          Before labeling anything **blocking**, double-check: does this issue actually exist in the diff? Verify the problem is real and present in the changed code — not inferred, speculative, or already handled elsewhere. If the issue exists, it is blocking only if it introduces a correctness bug, breaks an explicit contract, creates a real security risk, or includes changes clearly unrelated to the stated goal. Scope uncertainty belongs under Non-blocking notes as a clarification question; a missing linked issue alone is not a scope finding.
 
           **Lockfile pins** — review the "Changed lockfile pins" section above and flag
           as a **blocking security issue** any of:

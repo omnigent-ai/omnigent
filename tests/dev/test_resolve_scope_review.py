@@ -293,12 +293,31 @@ def test_comment_step_formats_scope_without_failing_on_findings(
     assert scope.render_review(raw) in posted
 
 
-@pytest.mark.parametrize("case", ["necessary", "unrelated", "missing", "changed"])
+@pytest.mark.parametrize(
+    "case",
+    [
+        "necessary",
+        "unrelated",
+        "missing",
+        "changed",
+        "no-issue",
+        "uncertain-change",
+        "uncertain-problem",
+    ],
+)
 def test_read_only_check_requires_a_current_passing_assessment(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, snapshot: dict, report: dict, case: str
 ) -> None:
     if case == "unrelated":
         report["files"][0]["changes"][0]["classification"] = "unrelated"
+    if case in {"no-issue", "uncertain-change", "uncertain-problem"}:
+        snapshot["issues"] = []
+        snapshot["body"] = "Show readable model names, retaining IDs as the fallback."
+        report["context_digest"] = scope.digest(snapshot)
+    if case == "uncertain-change":
+        report["files"][0]["changes"][0]["classification"] = "uncertain"
+    if case == "uncertain-problem":
+        report["scope"]["status"] = "uncertain"
     review = tmp_path / "review.txt"
     review.write_text(
         "Looks fine"
@@ -324,7 +343,7 @@ def test_read_only_check_requires_a_current_passing_assessment(
             str(review),
         ],
     )
-    assert scope.main() == (0 if case == "necessary" else 1)
+    assert scope.main() == (0 if case in {"necessary", "no-issue"} else 1)
 
 
 @pytest.mark.parametrize("complete", [True, False])
@@ -400,7 +419,7 @@ esac
         assert "duplicate=true" in output.read_text()
 
 
-def test_review_prompt_always_includes_scope(tmp_path: Path) -> None:
+def test_review_prompt_always_includes_scope(tmp_path: Path, snapshot: dict) -> None:
     workflow = yaml.safe_load((ROOT / ".github/workflows/polly-review.yml").read_text())
     step = next(s for s in workflow["jobs"]["review"]["steps"] if s.get("id") == "ctx")
     script = step["run"].split("python3 -u <<'PYEOF'\n")[1].rsplit("\nPYEOF", 1)[0]
@@ -423,8 +442,17 @@ def test_review_prompt_always_includes_scope(tmp_path: Path) -> None:
     (tmp_path / "pr_diff.txt").write_text("diff --git a/file.py b/file.py\n")
     (tmp_path / "lockfile_pins.txt").write_text("")
     (tmp_path / "pr_author_assoc.txt").write_text("MEMBER")
-    (tmp_path / "resolve_scope_prompt.txt").write_text("\nRequired scope assessment.\n")
+    scope_instructions = scope.scope_prompt(snapshot, tmp_path / "scope_context.json")
+    (tmp_path / "resolve_scope_prompt.txt").write_text(scope_instructions)
     subprocess.run([sys.executable, "-c", script], check=True, timeout=10)
     prompt = (tmp_path / "review_prompt.txt").read_text()
-    assert prompt.endswith("\nRequired scope assessment.\n")
-    assert "**Blocking issues** — unrelated changes or unclear scope" in prompt
+    assert prompt.endswith(scope_instructions)
+    assert "**Blocking issues** — clearly evidenced unrelated changes" in prompt
+    assert "**Non-blocking notes** — scope clarification questions" in prompt
+    assert "Scope uncertainty belongs under Non-blocking notes" in prompt
+    assert (
+        "Put `uncertain` findings and\nan unclear problem statement under Non-blocking notes"
+        in prompt
+    )
+    assert "A missing issue link alone is not a scope finding" in prompt
+    assert "both unrelated and uncertain findings block its approval" in prompt

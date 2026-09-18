@@ -12,8 +12,10 @@ test), then does one of two things:
   outcome may require changes across layers; independent fixes or features must
   be removed or split out. Every Polly review includes a structured scope
   assessment, which Resolve validates before approval or handoff.
-  Scope findings appear under Polly's blocking issues; the review workflow still
-  succeeds, and Resolve enforces the approval decision.
+  Polly reports clearly unrelated work as blocking and uncertain scope as
+  non-blocking clarification questions. A missing issue link alone is not a
+  scope finding. The workflow succeeds with findings, while Resolve requires a
+  clear assessment before approval.
   Resolve's validation applies to its existing-PR review path. Repository merge
   requirements are unchanged.
 - **If no fix exists yet**, it **authors the fix** in a fresh worktree, adds

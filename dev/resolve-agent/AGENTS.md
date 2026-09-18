@@ -1128,9 +1128,11 @@ gh workflow run polly-review.yml -R omnigent-ai/omnigent -f pr=<pr>
 Every Polly review assesses the full diff against the original problem, with
 a scope statement and classifications for each changed file. Manual dispatches
 request a fresh assessment even when the head is unchanged. Polly reports
-unrelated or uncertain changes under **Blocking issues**; those findings do not
-fail the review workflow. Resolve
-must run the read-only check in Step 4.5 on the existing-PR review path:
+clearly evidenced unrelated changes under **Blocking issues** and scope
+uncertainty under **Non-blocking notes** as clarification questions. A missing
+linked issue alone is not a scope finding. Neither category fails the review
+workflow. Resolve still requires certainty before approving an existing fix PR
+and must run the read-only check in Step 4.5 on the existing-PR review path:
 missing, malformed, stale, unrelated, or uncertain assessments block approval
 or handoff. A green workflow is not a passing scope assessment.
 
