@@ -49,9 +49,11 @@ function parseAccountFromToken(accessToken) {
  *
  * @param {{ accountOrigin: string, accountId: string }} account
  * @param {string} accessToken
+ * @param {{ signal?: AbortSignal }} [options]
  * @returns {Promise<Array<{ workspaceId: string, name: string, fqdn: string }>>}
  */
-async function listRunningWorkspaces(account, accessToken) {
+async function listRunningWorkspaces(account, accessToken, { signal } = {}) {
+  signal?.throwIfAborted();
   // Never send the bearer to a non-Databricks host. accountOrigin comes from the
   // token's own `iss`, but that claim isn't verified here, so gate it.
   if (!isTrustedDatabricksOrigin(account.accountOrigin)) {
@@ -62,15 +64,22 @@ async function listRunningWorkspaces(account, accessToken) {
   const url = `${account.accountOrigin}/api/2.0/accounts/${account.accountId}/workspaces`;
   const resp = await fetch(url, {
     headers: { Authorization: `Bearer ${accessToken}`, Accept: "application/json" },
-    signal: AbortSignal.timeout(NETWORK_TIMEOUT_MS),
+    // This API answers with JSON; a 3xx is a login bounce, not a destination to
+    // carry the bearer to. Fail below instead of following it.
+    redirect: "manual",
+    signal: signal
+      ? AbortSignal.any([signal, AbortSignal.timeout(NETWORK_TIMEOUT_MS)])
+      : AbortSignal.timeout(NETWORK_TIMEOUT_MS),
   });
   if (!resp.ok) {
     const body = await resp.text().catch(() => "");
+    signal?.throwIfAborted();
     throw new Error(
       `account workspaces lookup failed: ${resp.status} ${url} ${body.slice(0, 200)}`,
     );
   }
   const body = await resp.json();
+  signal?.throwIfAborted();
   // The API returns a bare array; accept an object wrapper defensively.
   const rows = Array.isArray(body) ? body : (body?.workspaces ?? []);
   return rows

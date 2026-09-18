@@ -94,6 +94,36 @@ describe("listRunningWorkspaces", () => {
     assert.equal(fetchMock.mock.callCount(), 0); // never hit the network
   });
 
+  it("rejects a redirect instead of carrying the bearer to its target", async () => {
+    const calls = [];
+    mock.method(globalThis, "fetch", async (url, init) => {
+      calls.push({ url, redirect: init?.redirect });
+      return { ok: false, status: 302, text: async () => "" };
+    });
+    await assert.rejects(listRunningWorkspaces(account, "tok"), /workspaces lookup failed: 302/);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].redirect, "manual");
+  });
+
+  it("cancels the workspace lookup without continuing the login", async () => {
+    const controller = new AbortController();
+    let requestSignal;
+    mock.method(
+      globalThis,
+      "fetch",
+      (_url, { signal }) =>
+        new Promise((_resolve, reject) => {
+          requestSignal = signal;
+          signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+        }),
+    );
+    const lookup = listRunningWorkspaces(account, "tok", { signal: controller.signal });
+    const rejected = assert.rejects(lookup, (error) => error.name === "AbortError");
+    controller.abort();
+    await rejected;
+    assert.equal(requestSignal.aborted, true);
+  });
+
   it("throws on a non-ok response", async () => {
     mock.method(globalThis, "fetch", async () => ({
       ok: false,
