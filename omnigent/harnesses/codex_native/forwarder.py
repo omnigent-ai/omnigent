@@ -2330,6 +2330,37 @@ async def _maybe_rotate_session_on_thread_started(
     # strands the real turn's output as stale. Ignore all ephemeral threads.
     if _thread_started_is_ephemeral(event):
         return False
+    # A native ``/clear`` is a between-turns human action. A ``thread/started``
+    # arriving while a turn is in flight therefore belongs to something else
+    # (e.g. an interactive TUI minting its own thread on connect). Rotating
+    # onto it repoints the forwarder away from the live conversation, and the
+    # real turn's ``turn/completed`` — the sole idle edge — is then discarded
+    # as a stale thread event.
+    bridge_state = read_bridge_state(bridge_dir)
+    if bridge_state is not None and bridge_state.active_turn_id is not None:
+        _logger.info(
+            "Codex forwarder declined thread rotation during an active turn: "
+            "session=%s active_turn=%s active_thread=%s new_thread=%s",
+            target.session_id,
+            bridge_state.active_turn_id,
+            target.thread_id,
+            new_thread_id,
+        )
+        return False
+    # A dispatched sub-agent's parent is parked on this specific conversation
+    # id. Rotating orphans it by construction: the parent's wake never fires
+    # and the child hangs at ``running`` forever. Sub-agent sessions are never
+    # the target of a human ``/clear``, so declining costs nothing.
+    snapshot = await _fetch_session_snapshot(ap_client, target.session_id)
+    if _session_snapshot_is_dispatched_subagent(snapshot):
+        _logger.info(
+            "Codex forwarder declined thread rotation for a dispatched sub-agent "
+            "session: session=%s active_thread=%s new_thread=%s",
+            target.session_id,
+            target.thread_id,
+            new_thread_id,
+        )
+        return False
     old_delta_coalescer = target.delta_coalescer
     await old_delta_coalescer.flush()
     old_usage_coalescer = target.usage_coalescer
@@ -2342,6 +2373,7 @@ async def _maybe_rotate_session_on_thread_started(
         bridge_dir=bridge_dir,
         app_server_url=app_server_url,
         new_thread_id=new_thread_id,
+        old_snapshot=snapshot,
     )
     target.session_id = new_session_id
     target.thread_id = new_thread_id
@@ -2368,6 +2400,7 @@ async def _create_thread_replacement_session(
     bridge_dir: Path,
     app_server_url: str,
     new_thread_id: str,
+    old_snapshot: _JsonObject | None = None,
 ) -> str:
     """
     Create and activate the Omnigent session for a new native Codex thread.
@@ -2382,13 +2415,19 @@ async def _create_thread_replacement_session(
         rotation (a unix path here would clobber the ws:// URL).
     :param new_thread_id: Newly started Codex thread id, e.g.
         ``"thread_new"``.
+    :param old_snapshot: Session snapshot of ``old_session_id`` already
+        fetched by the caller. ``None`` fetches it here.
     :returns: New Omnigent session id, e.g. ``"conv_new"``.
     :raises httpx.HTTPStatusError: If Omnigent rejects the create, bind,
         external-session update, or terminal transfer calls.
     :raises RuntimeError: If the old session snapshot or create
         response is malformed.
     """
-    old = await _fetch_session_snapshot(client, old_session_id)
+    old = (
+        await _fetch_session_snapshot(client, old_session_id)
+        if old_snapshot is None
+        else old_snapshot
+    )
     agent_id = old.get("agent_id")
     if not isinstance(agent_id, str) or not agent_id:
         raise RuntimeError(f"session {old_session_id!r} has no agent_id")
@@ -2488,6 +2527,24 @@ async def _fetch_session_snapshot(client: httpx.AsyncClient, session_id: str) ->
     if not isinstance(payload, dict):
         raise RuntimeError("Codex session snapshot response was not an object")
     return payload
+
+
+def _session_snapshot_is_dispatched_subagent(snapshot: _JsonObject) -> bool:
+    """
+    Return whether a session snapshot describes a dispatched sub-agent.
+
+    A sub-agent session created by ``sys_session_send`` carries both a
+    ``parent_session_id`` and the dispatching ``sub_agent_name``. Either
+    marker is enough to know a parent is awaiting this conversation id.
+
+    :param snapshot: Decoded ``GET /v1/sessions/{id}`` payload.
+    :returns: ``True`` when the session is a dispatched sub-agent.
+    """
+    for key in ("parent_session_id", "sub_agent_name"):
+        value = snapshot.get(key)
+        if isinstance(value, str) and value:
+            return True
+    return False
 
 
 async def _subscribe_until_ready(
