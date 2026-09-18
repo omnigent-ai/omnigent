@@ -80,7 +80,13 @@ CodexParams: TypeAlias = _JsonObject
 CodexRequestFn = Callable[[str, CodexParams], Awaitable[CodexMessage]]
 
 _CONNECT_RETRY_DELAY_SECONDS = 0.05
+# Model discovery is a best-effort side process whose callers fall back to a
+# cached or bundled catalog, so it keeps a short readiness budget.
 _CONNECT_TIMEOUT_SECONDS = 10.0
+# The session app-server has no fallback, and a loaded host can take well over
+# 10 s to start codex. Match the 60 s native-terminal readiness budget; a child
+# that exits early still fails at once.
+_APP_SERVER_READY_TIMEOUT_SECONDS = 60.0
 # Initialization and model/list can stall after the listener becomes ready.
 _MODEL_CATALOG_PROBE_TIMEOUT_SECONDS = 30.0
 _MODEL_DISCOVERY_CACHE_SECONDS = 300.0
@@ -1942,9 +1948,9 @@ class CodexNativeAppServer:
 
         :returns: Connected app-server client. The caller owns it.
         :raises RuntimeError: If the app-server exits or never
-            becomes ready before the timeout.
+            becomes ready within ``_APP_SERVER_READY_TIMEOUT_SECONDS``.
         """
-        deadline = asyncio.get_running_loop().time() + _CONNECT_TIMEOUT_SECONDS
+        deadline = asyncio.get_running_loop().time() + _APP_SERVER_READY_TIMEOUT_SECONDS
         last_error: Exception | None = None
         while asyncio.get_running_loop().time() < deadline:
             if self.proc is not None and self.proc.returncode is not None:
@@ -1976,9 +1982,10 @@ class CodexNativeAppServer:
                         await client.close()
                 await asyncio.sleep(_CONNECT_RETRY_DELAY_SECONDS)
         detail = " | ".join((self.recent_stderr or [])[-5:])
+        target = self.listen_url or f"unix://{self.socket_path}"
         raise RuntimeError(
-            f"Timed out waiting for Codex app-server socket {self.socket_path}: "
-            f"{last_error}; stderr={detail}"
+            f"Timed out after {_APP_SERVER_READY_TIMEOUT_SECONDS:g}s waiting for the "
+            f"Codex app-server at {target}: {last_error}; stderr={detail}"
         )
 
     async def _stderr_loop(self) -> None:

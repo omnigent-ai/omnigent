@@ -1553,6 +1553,54 @@ async def test_wait_until_ready_cancellation_closes_connecting_client(
     assert client.close_calls == 1
 
 
+async def test_wait_until_ready_timeout_reports_listen_target_and_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A listener that never accepts fails after the app-server budget, naming the target."""
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+
+    @dataclass
+    class _RefusingClient:
+        close_calls: int = 0
+
+        async def connect(self) -> None:
+            raise OSError("[Errno 111] Connect call failed ('127.0.0.1', 57045)")
+
+        async def close(self) -> None:
+            self.close_calls += 1
+
+    clients: list[_RefusingClient] = []
+
+    def _client(*_args: object, **_kwargs: object) -> _RefusingClient:
+        clients.append(_RefusingClient())
+        return clients[-1]
+
+    monkeypatch.setattr(codex_native_app_server, "CodexAppServerClient", _client)
+    monkeypatch.setattr(codex_native_app_server, "_APP_SERVER_READY_TIMEOUT_SECONDS", 0.2)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    server = _test_app_server(
+        tmp_path,
+        tmp_path / "codex-home",
+        tmp_path / "bridge",
+        workspace,
+    )
+    server.listen_url = "ws://127.0.0.1:57045"
+    server.proc = Mock(returncode=None)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        await server._wait_until_ready()
+
+    message = str(excinfo.value)
+    assert message.startswith(
+        "Timed out after 0.2s waiting for the Codex app-server at ws://127.0.0.1:57045: "
+    )
+    assert "Connect call failed" in message
+    assert str(server.socket_path) not in message
+    assert len(clients) > 1
+    assert all(client.close_calls == 1 for client in clients)
+
+
 async def test_standalone_hook_trust_closes_client_when_connect_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
