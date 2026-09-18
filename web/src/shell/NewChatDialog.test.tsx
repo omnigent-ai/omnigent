@@ -1279,7 +1279,8 @@ function remountLanding(infoOverrides: Partial<ServerInfo> = {}): void {
 describe("model picker hotkey", () => {
   beforeEach(setupLandingMocks);
 
-  it("drills into the selected harness's model submenu on Cmd/Ctrl+Shift+M", () => {
+  it("drills into the selected harness's model submenu on Ctrl+Shift+M and focuses its model", async () => {
+    const user = userEvent.setup();
     mockAgents(DEFAULT_LANDING_AGENTS);
     renderLanding();
     // Nothing open yet.
@@ -1290,7 +1291,28 @@ describe("model picker hotkey", () => {
 
     // Lands directly on the selected harness's edit submenu (Models / Effort),
     // not just the harness list.
-    expect(screen.getByTestId("new-chat-landing-agent-models")).toBeVisible();
+    expect(await screen.findByTestId("new-chat-landing-agent-models")).toBeVisible();
+    const selectedModel = screen.getByRole("menuitemcheckbox", { name: "Harness default" });
+    await waitFor(() => expect(selectedModel).toHaveFocus());
+    await user.keyboard("{ArrowDown}");
+    const nextModel = screen.getByRole("menuitemcheckbox", { name: "Opus 4.8" });
+    expect(nextModel).toHaveFocus();
+
+    // Focus remains where the user moved it, and the shortcut works again
+    // after returning to the already-open harness menu.
+    await act(
+      () =>
+        new Promise((resolve) => {
+          window.setTimeout(resolve, 200);
+        }),
+    );
+    expect(nextModel).toHaveFocus();
+    await user.keyboard("{ArrowLeft}");
+    expect(screen.getByRole("menuitem", { name: "Claude Code" })).toHaveFocus();
+    fireEvent.keyDown(window, { code: "KeyM", ctrlKey: true, shiftKey: true });
+    await waitFor(() =>
+      expect(screen.getByRole("menuitemcheckbox", { name: "Harness default" })).toHaveFocus(),
+    );
   });
 });
 

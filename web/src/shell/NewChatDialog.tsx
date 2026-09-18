@@ -1454,6 +1454,7 @@ export function AgentHarnessPicker({
   // Tracks the last-applied openNonce so the imperative-open effect (below,
   // after the drill-in state it drives) skips the initial value.
   const appliedOpenNonce = useRef(0);
+  const pendingConfigAgentId = useRef<string | null>(null);
   const queryClient = useQueryClient();
   const info = useServerInfo();
   // Feature ON → single "needs setup" badge; OFF → per-reason original text.
@@ -1506,8 +1507,10 @@ export function AgentHarnessPicker({
   }, [cacheKey, loading, resolvedPreview]);
 
   const isMobile = useIsMobileViewport();
+  const hasSelectedConfig = selectedConfigContent != null;
   const [menuPage, setMenuPage] = useState<"more" | "custom" | "config" | null>(null);
   const [configAgentId, setConfigAgentId] = useState<string | null>(null);
+  const [focusConfigAgentId, setFocusConfigAgentId] = useState<string | null>(null);
   const [inlineHarnessId, setInlineHarnessId] = useState(effectiveAgentId);
   // Keep desktop rows anchored while a config flyout is open; promote on reopen.
   useEffect(() => {
@@ -1535,12 +1538,22 @@ export function AgentHarnessPicker({
   useEffect(() => {
     if (!openNonce || openNonce === appliedOpenNonce.current) return;
     appliedOpenNonce.current = openNonce;
-    setOpen(true);
-    if (effectiveAgentId && selectedConfigContent != null) {
-      setConfigAgentId(effectiveAgentId);
-      if (isMobile) setMenuPage("config");
+    pendingConfigAgentId.current = null;
+    setFocusConfigAgentId(null);
+    if (effectiveAgentId && hasSelectedConfig) {
+      if (isMobile) {
+        setConfigAgentId(effectiveAgentId);
+        setMenuPage("config");
+      } else if (open) {
+        setFocusConfigAgentId(effectiveAgentId);
+        setConfigAgentId(effectiveAgentId);
+      } else {
+        setFocusConfigAgentId(effectiveAgentId);
+        pendingConfigAgentId.current = effectiveAgentId;
+      }
     }
-  }, [openNonce, effectiveAgentId, selectedConfigContent, isMobile]);
+    setOpen(true);
+  }, [openNonce, effectiveAgentId, hasSelectedConfig, isMobile, open]);
 
   const renderEntry = (agent: AvailableAgent): ReactNode => {
     const active = !autoHarnessActive && agent.id === effectiveAgentId;
@@ -1573,6 +1586,10 @@ export function AgentHarnessPicker({
         }}
         onSelect={() => onSelectAgent(agent)}
         configContent={active ? selectedConfigContent : null}
+        focusConfig={focusConfigAgentId === agent.id}
+        onConfigFocused={() => {
+          setFocusConfigAgentId((current) => (current === agent.id ? null : current));
+        }}
         testId={`new-chat-landing-agent-${agent.id}`}
         icon={<ComposerAgentIcon agent={agent} />}
         label={agent.display_name}
@@ -1722,6 +1739,10 @@ export function AgentHarnessPicker({
       modal={dropdownModal}
       open={open}
       onOpenChange={(next) => {
+        if (!next) {
+          pendingConfigAgentId.current = null;
+          setFocusConfigAgentId(null);
+        }
         setOpen(next);
         onOpenChange?.(next);
         if (next) {
@@ -1767,6 +1788,12 @@ export function AgentHarnessPicker({
       contentAlign={contentAlign}
       contentClassName={cn(showConfig && "composer-agent-config-menu", contentClassName)}
       configOpen={configAgentId !== null}
+      onInitialSelectionFocus={() => {
+        const agentId = pendingConfigAgentId.current;
+        if (!agentId) return;
+        pendingConfigAgentId.current = null;
+        setConfigAgentId(agentId);
+      }}
     >
       {showConfig ? (
         <HarnessPickerConfigPage
