@@ -644,33 +644,37 @@ async def _fire_managed_sandbox(
         )
         return
 
+    # Record the run as ``running`` BEFORE dispatch. The dispatched turn can reach
+    # a terminal edge (an immediate setup failure, or a fast finish) before a
+    # post-dispatch record would commit; recording first guarantees the completion
+    # hook finds a running row to settle — and, for a managed sandbox, to trigger
+    # teardown — instead of stranding the run (and leaking the sandbox).
+    run_id = await _record_run(deps, task, conv.id, scheduled_at, status="running")
+
     try:
         await dispatch(conv, task)
     except Exception:
-        # The session + grant are already persisted and owner-visible, so a
-        # launch/dispatch failure still records a run — just a failed one.
+        # Transition the already-recorded run to failed (not a second row), and
+        # tear down any sandbox the launch provisioned before failing (e.g. the
+        # runner never connected) — the completion hook won't fire for a run that
+        # never really ran, so clean up here rather than leaking to idle-reap.
         _logger.exception(
             "scheduled fire: managed-sandbox launch/dispatch failed for task %s (session %s)",
             task.id,
             conv.id,
         )
-        await _record_run(
+        await _update_run_terminal(
             deps,
-            task,
-            conv.id,
-            scheduled_at,
+            run_id,
             status="failed",
             error="managed sandbox launch/dispatch failed",
             error_code="launch_failed",
         )
-        # The launch may have provisioned a sandbox before failing (e.g. runner
-        # never connected). The completion hook won't fire for a run that never
-        # reached ``running``, so tear the sandbox down here rather than leaking
-        # it until the provider idle-reap.
         await _terminate_managed_sandbox_for_session(deps, conv.id)
         return
 
-    await _record_run(deps, task, conv.id, scheduled_at, status="running")
+    # Success: the run stays ``running`` until the turn's terminal edge flips it
+    # via the completion hook (which also tears the sandbox down).
     _logger.info("scheduled fire: task %s fired managed-sandbox session %s", task.id, conv.id)
 
 
@@ -1023,9 +1027,14 @@ async def _record_run(
     status: str,
     error: str | None = None,
     error_code: str | None = None,
-) -> None:
-    """Stamp last_run_* on the task and write a scheduled_task_runs row."""
-    await asyncio.to_thread(
+) -> str:
+    """Stamp last_run_* on the task and write a scheduled_task_runs row.
+
+    :returns: The new run's id, so a caller that records ``running`` before
+        dispatch can transition that same row on failure (see
+        :func:`_update_run_terminal`).
+    """
+    return await asyncio.to_thread(
         _record_run_sync,
         deps,
         task,
@@ -1046,20 +1055,46 @@ def _record_run_sync(
     *,
     error: str | None = None,
     error_code: str | None = None,
-) -> None:
+) -> str:
     """Synchronous run recording body for ``asyncio.to_thread`` callers."""
     now = int(time.time())
+    run_id = _new_id()
     update_fields: dict[str, Any] = {"last_run_at": now}
     if conversation_id is not None:
         update_fields["last_run_conversation_id"] = conversation_id
     deps.scheduled_task_store.update(task.id, **update_fields)
     deps.scheduled_task_store.create_run(
-        _new_id(),
+        run_id,
         task.id,
         status,
         scheduled_at,
         conversation_id=conversation_id,
         fired_at=now,
+        error=error,
+        error_code=error_code,
+    )
+    return run_id
+
+
+async def _update_run_terminal(
+    deps: FireDeps,
+    run_id: str,
+    *,
+    status: str,
+    error: str | None = None,
+    error_code: str | None = None,
+) -> None:
+    """Transition an already-recorded run to a terminal state (conditional).
+
+    The store's ``update_run`` is conditional on ``WHERE status = running``, so
+    if the completion hook already settled the run (a terminal edge that raced
+    the dispatch failure) this is a harmless no-op.
+    """
+    await asyncio.to_thread(
+        deps.scheduled_task_store.update_run,
+        run_id,
+        status=status,
+        finished_at=int(time.time()),
         error=error,
         error_code=error_code,
     )

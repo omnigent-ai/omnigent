@@ -126,6 +126,14 @@ class FakeScheduledTaskStore:
         )
         return None
 
+    def update_run(self, run_id: str, **kwargs: Any) -> Any:
+        # Transition an existing recorded run in place (record-before-dispatch).
+        for run in self.runs:
+            if run["run_id"] == run_id:
+                run.update(kwargs)
+                break
+        return None
+
 
 class SequencedScheduledTaskStore(FakeScheduledTaskStore):
     """Returns scripted rows for consecutive get() calls."""
@@ -1446,6 +1454,35 @@ async def test_managed_sandbox_fires_hostless_via_managed_dispatch() -> None:
     assert len(launched) == 1
     assert perm.grants and perm.grants[0][2] == LEVEL_OWNER
     assert store.runs[0]["status"] == "running"
+
+
+@pytest.mark.asyncio
+async def test_managed_sandbox_dispatch_failure_updates_single_run_to_failed() -> None:
+    """A managed dispatch failure transitions the pre-recorded run to failed.
+
+    The run is recorded ``running`` BEFORE dispatch (so a fast terminal event
+    can't strand it); a dispatch failure must transition that SAME row to failed,
+    not write a second run.
+    """
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task(execution_target="managed_sandbox")})
+
+    async def _boom(conv: Any, task: Any) -> None:
+        raise RuntimeError("launch failed")
+
+    on_fire = build_on_fire(
+        _deps(store, conversation_store=conv_store, sandbox_config=_FakeSandboxConfig()),
+        launch_dispatch=_boom,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert len(conv_store.created) == 1
+    # Exactly ONE run row — recorded running before dispatch, then updated in
+    # place to failed (not a second create_run).
+    assert len(store.runs) == 1
+    assert store.runs[0]["status"] == "failed"
+    assert store.runs[0]["error_code"] == "launch_failed"
 
 
 @pytest.mark.asyncio

@@ -1361,6 +1361,71 @@ async def test_publish_status_boot_idle_without_running_does_not_complete_run(
     assert run.status == "running"
 
 
+async def test_publish_status_idle_after_waiting_completes_run(db_uri: str) -> None:
+    """An idle that follows ``waiting`` (e.g. Stop while parked) completes the run.
+
+    A parent parked on sub-agents/approval publishes ``waiting``; a Stop then
+    disconnects the runner, emitting ``idle`` with no intervening ``running``.
+    That is still a real terminal edge and must settle the run (and, for a
+    managed sandbox, trigger teardown), unlike a pre-turn boot idle.
+    """
+    import uuid
+
+    from omnigent.server import session_live_state
+    from omnigent.server.routes.sessions import _publish_status, _session_status_cache
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+    from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
+        SqlAlchemyScheduledTaskStore,
+    )
+
+    conv_id = uuid.uuid4().hex
+    task_id, run_id = _seed_running_run_for_conv(db_uri, conv_id)
+    session_live_state.configure(
+        SqlAlchemyConversationStore(db_uri), SqlAlchemyScheduledTaskStore(db_uri)
+    )
+    try:
+        _publish_status(conv_id, "waiting")
+        _publish_status(conv_id, "idle")
+        row = _wait_for_run_status(db_uri, task_id, run_id, "succeeded")
+    finally:
+        session_live_state.configure(None)
+        _session_status_cache.pop(conv_id, None)
+
+    assert row is not None
+    assert row.status == "succeeded"
+
+
+async def test_patch_pinning_host_on_managed_task_is_rejected(
+    auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """Pinning host_id on an already-managed task is rejected, not silently dropped."""
+    _make_user(db_uri)
+
+    class _Cfg:
+        managed_launch_supported = True
+
+    auth_app.state.sandbox_config = _Cfg()
+    try:
+        body = _create_body(execution_target="managed_sandbox")
+        del body["host_id"]
+        del body["workspace"]
+        created = (
+            await auth_client.post("/v1/scheduled-tasks", json=body, headers=_headers())
+        ).json()
+        tid = created["id"]
+
+        # No execution_target in the PATCH, so the request model can't catch it;
+        # the handler must reject against the effective (managed) target.
+        resp = await auth_client.patch(
+            f"/v1/scheduled-tasks/{tid}",
+            json={"host_id": "4b653f6031f35d168cc0b37caa1306d1"},
+            headers=_headers(),
+        )
+        assert resp.status_code == 400, resp.text
+    finally:
+        auth_app.state.sandbox_config = None
+
+
 async def test_publish_status_failed_edge_transitions_scheduled_run_to_failed(
     db_uri: str,
 ) -> None:

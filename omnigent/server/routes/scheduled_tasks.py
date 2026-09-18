@@ -594,6 +594,18 @@ def create_scheduled_tasks_router(
                 )
         target_execution = fields.get("execution_target") or existing.execution_target
         switching_to_managed = target_execution == "managed_sandbox"
+        # Reject pinning a host/workspace on a managed-sandbox task rather than
+        # silently dropping it. The request model already rejects this when
+        # execution_target is explicitly in the PATCH; this also covers a PATCH
+        # that pins a field on an ALREADY-managed task (no execution_target sent),
+        # validating against the EFFECTIVE target.
+        if switching_to_managed and (
+            fields.get("host_id") is not None or fields.get("workspace") is not None
+        ):
+            raise OmnigentError(
+                _MANAGED_SANDBOX_WITH_HOST_MSG,
+                code=ErrorCode.INVALID_INPUT,
+            )
         if agent_changed or {"workspace", "host_id", "execution_target"}.intersection(fields):
             # On a switch this runs the full create-time gauntlet against the NEW
             # agent: existence + bindability, and the pinned workspace re-checked
