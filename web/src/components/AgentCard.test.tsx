@@ -19,6 +19,7 @@ vi.mock("@/components/icons/ClaudeIcon", () => ({ ClaudeIcon: stub("claude") }))
 vi.mock("@/components/icons/CodexIcon", () => ({ CodexIcon: stub("codex") }));
 vi.mock("@/components/icons/CursorIcon", () => ({ CursorIcon: stub("cursor") }));
 vi.mock("@/components/icons/GooseIcon", () => ({ GooseIcon: stub("goose") }));
+vi.mock("@/components/icons/GrokIcon", () => ({ GrokIcon: stub("grok") }));
 vi.mock("@/components/icons/KiroIcon", () => ({ KiroIcon: stub("kiro") }));
 vi.mock("@/components/icons/NessieIcon", () => ({ NessieIcon: stub("nessie") }));
 vi.mock("@/components/icons/OpenCodeIcon", () => ({ OpenCodeIcon: stub("opencode") }));
@@ -72,6 +73,8 @@ describe("AgentCard icon selection", () => {
     { name: "x", harness: "antigravity", expected: "antigravity" },
     { name: "x", harness: "claude-sdk", expected: "claude" },
     { name: "pi", harness: "pi", expected: "pi" },
+    { name: "x", harness: "grok", expected: "grok" },
+    { name: "x", harness: "grok-native", expected: "grok" },
     // The pi match is exact: a harness merely containing "pi" stays generic.
     { name: "spec-gen", harness: "openapi", expected: "bot" },
   ])("uses the $expected glyph for harness $harness", ({ name, harness, expected }) => {

@@ -5,6 +5,7 @@ import { CodexIcon } from "@/components/icons/CodexIcon";
 import { CursorIcon } from "@/components/icons/CursorIcon";
 import { DevinIcon } from "@/components/icons/DevinIcon";
 import { GooseIcon } from "@/components/icons/GooseIcon";
+import { GrokIcon } from "@/components/icons/GrokIcon";
 import { HermesIcon } from "@/components/icons/HermesIcon";
 import { KimiIcon } from "@/components/icons/KimiIcon";
 import { KiroIcon } from "@/components/icons/KiroIcon";
@@ -58,6 +59,7 @@ export function iconForAgent(
   if (agent.harness?.includes("devin")) return DevinIcon;
   // Both the SDK "kimi"/"kimi-code" harness and "kimi-native" get the Kimi glyph.
   if (agent.harness?.includes("kimi")) return KimiIcon;
+  if (agent.harness?.includes("grok")) return GrokIcon;
   // qwen falls back to generic BotIcon for now; see docs/QWEN_FOLLOWUPS.md
   // Exact match — a substring check would false-match e.g. "openapi".
   if (agent.harness === "pi") return PiIcon;
