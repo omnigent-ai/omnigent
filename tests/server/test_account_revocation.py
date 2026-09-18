@@ -596,8 +596,11 @@ async def test_stale_schedule_cannot_contact_replacement_host(
             deps,
             0,
             task.id,
-            unexpected_dispatch,
-            fire_module._make_connected_host_preflight(deps),
+            fire_module._FireDispatch(
+                connected=unexpected_dispatch,
+                connected_preflight=fire_module._make_connected_host_preflight(deps),
+                managed=unexpected_dispatch,
+            ),
         )
     )
     try:
@@ -642,7 +645,12 @@ async def test_scheduled_dispatch_obeys_revocation_boundary(setup_app, monkeypat
 
     from omnigent.host.frames import HostHelloFrame
     from omnigent.server.routes import _host_launch
-    from omnigent.server.scheduled.fire import FireDeps, _make_connected_host_dispatch, _run_fire
+    from omnigent.server.scheduled.fire import (
+        FireDeps,
+        _FireDispatch,
+        _make_connected_host_dispatch,
+        _run_fire,
+    )
     from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
 
     admin, alice, stores, _ = setup_app
@@ -702,7 +710,16 @@ async def test_scheduled_dispatch_obeys_revocation_boundary(setup_app, monkeypat
     else:
         monkeypatch.setattr(_host_launch, "resolve_host_launch", pause_after_resolution)
     fire = asyncio.create_task(
-        _run_fire(deps, 0, task.id, _make_connected_host_dispatch(deps), None)
+        _run_fire(
+            deps,
+            0,
+            task.id,
+            _FireDispatch(
+                connected=_make_connected_host_dispatch(deps),
+                connected_preflight=None,
+                managed=_make_connected_host_dispatch(deps),
+            ),
+        )
     )
     try:
         assert await asyncio.to_thread(reached.wait, 10)
