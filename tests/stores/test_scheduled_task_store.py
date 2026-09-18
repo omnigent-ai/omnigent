@@ -10,8 +10,14 @@ from __future__ import annotations
 import uuid
 
 import pytest
+import sqlalchemy as sa
 
-from omnigent.db.db_models import workspace_scope
+from omnigent.db.db_models import SqlScheduledTask, workspace_scope
+from omnigent.db.enum_codecs import (
+    encode_scheduled_task_execution_target,
+    encode_scheduled_task_state,
+)
+from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
 
 
@@ -97,6 +103,216 @@ def test_create_minimal_defaults(store: SqlAlchemyScheduledTaskStore) -> None:
     assert task.execution_target == "connected_host"
     assert task.host_id is None
     assert task.state == "active"
+    assert task.project_id is None
+
+
+def test_project_id_create_get_update_and_unfile_round_trip(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    first = _uid("project-first")
+    second = _uid("project-second")
+    task_id = _uid("project-task")
+    created = store.create(
+        scheduled_task_id=task_id,
+        name="filed",
+        prompt="p",
+        rrule="FREQ=DAILY",
+        user_id="alice@example.com",
+        agent_id=_uid("ag"),
+        timezone="UTC",
+        project_id=first,
+    )
+    assert created.project_id == first
+    assert store.get(task_id).project_id == first
+    assert store.update(task_id, project_id=second).project_id == second
+    assert store.update(task_id, project_id=None).project_id is None
+
+
+def test_list_filters_project_unfiled_and_all_before_ordering(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    projects = SqlAlchemyProjectStore(store.storage_location)
+    project_id = _uid("project")
+    projects.create(project_id, "Project", "alice@example.com")
+    filed_id = _uid("filed")
+    unfiled_id = _uid("unfiled")
+    for task_id, task_project in ((filed_id, project_id), (unfiled_id, None)):
+        store.create(
+            scheduled_task_id=task_id,
+            name=task_id,
+            prompt="p",
+            rrule="FREQ=DAILY",
+            user_id="alice@example.com",
+            agent_id=_uid("ag"),
+            timezone="UTC",
+            project_id=task_project,
+        )
+    assert [task.id for task in store.list(owner_user_id="alice@example.com")] == sorted(
+        [filed_id, unfiled_id]
+    )
+    assert [
+        task.id for task in store.list(owner_user_id="alice@example.com", project_id=project_id)
+    ] == [filed_id]
+    assert [
+        task.id for task in store.list(owner_user_id="alice@example.com", project_id=None)
+    ] == [unfiled_id]
+
+
+def test_list_explicit_none_owner_preserves_unfiltered_local_mode(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    local = store.create(_uid("local-task"), "local", "p", "FREQ=DAILY", None, _uid("ag"), "UTC")
+    authenticated = store.create(
+        _uid("auth-task"),
+        "auth",
+        "p",
+        "FREQ=DAILY",
+        "alice@example.com",
+        _uid("ag"),
+        "UTC",
+    )
+
+    assert {task.id for task in store.list(owner_user_id=None)} == {
+        local.id,
+        authenticated.id,
+    }
+
+
+def test_unfiled_filter_includes_directly_inserted_dangling_pointer_for_paused_task(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    task_id = _uid("dangling-paused")
+    dangling_id = _uid("missing-project")
+    with store._engine.begin() as conn:
+        conn.execute(
+            sa.insert(SqlScheduledTask).values(
+                id=task_id,
+                name="paused dangling",
+                prompt="p",
+                rrule="FREQ=DAILY",
+                user_id="alice@example.com",
+                agent_id=_uid("ag"),
+                timezone="UTC",
+                state=encode_scheduled_task_state("paused"),
+                execution_target=encode_scheduled_task_execution_target("connected_host"),
+                project_id=dangling_id,
+                created_at=1,
+            )
+        )
+    listed = store.list(owner_user_id="alice@example.com", project_id=None)
+    assert [(task.id, task.state, task.project_id) for task in listed] == [
+        (task_id, "paused", dangling_id)
+    ]
+    assert store.get(task_id).project_id == dangling_id
+
+
+def test_unfiled_filter_resolves_projects_within_the_task_owner(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    projects = SqlAlchemyProjectStore(store.storage_location)
+    foreign_project = projects.create(_uid("foreign-project"), "Foreign", "bob@example.com")
+    none_local_project = projects.create(_uid("none-local-project"), "None local", None)
+    reserved_local_project = projects.create(
+        _uid("reserved-local-project"), "Reserved local", "local"
+    )
+    foreign_pointer = store.create(
+        _uid("foreign-pointer-task"),
+        "foreign pointer",
+        "p",
+        "FREQ=DAILY",
+        "alice@example.com",
+        _uid("ag"),
+        "UTC",
+        project_id=foreign_project.id,
+    )
+    for seed, project_id in (
+        ("none-local-task", none_local_project.id),
+        ("reserved-local-task", reserved_local_project.id),
+    ):
+        store.create(
+            _uid(seed),
+            seed,
+            "p",
+            "FREQ=DAILY",
+            None,
+            _uid("ag"),
+            "UTC",
+            project_id=project_id,
+        )
+
+    assert [
+        task.id for task in store.list(owner_user_id="alice@example.com", project_id=None)
+    ] == [foreign_pointer.id]
+    assert store.list(owner_user_id=None, project_id=None) == [foreign_pointer]
+
+
+def test_project_filter_is_workspace_and_owner_scoped(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    project_id = _uid("shared-project-id")
+    with workspace_scope(1):
+        SqlAlchemyProjectStore(store.storage_location).create(project_id, "One", "alice")
+        store.create(
+            _uid("ws1-alice"),
+            "a",
+            "p",
+            "FREQ=DAILY",
+            "alice",
+            _uid("ag"),
+            "UTC",
+            project_id=project_id,
+        )
+        store.create(
+            _uid("ws1-bob"),
+            "b",
+            "p",
+            "FREQ=DAILY",
+            "bob",
+            _uid("ag"),
+            "UTC",
+            project_id=project_id,
+        )
+    with workspace_scope(2):
+        SqlAlchemyProjectStore(store.storage_location).create(project_id, "Two", "alice")
+        store.create(
+            _uid("ws2-alice"),
+            "c",
+            "p",
+            "FREQ=DAILY",
+            "alice",
+            _uid("ag"),
+            "UTC",
+            project_id=project_id,
+        )
+    with workspace_scope(1):
+        assert [task.id for task in store.list(owner_user_id="alice", project_id=project_id)] == [
+            _uid("ws1-alice")
+        ]
+
+
+def test_compare_and_set_project_does_not_clobber_concurrent_assignment(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    task_id = _uid("cas-task")
+    old = _uid("old-project")
+    newer = _uid("new-project")
+    store.create(task_id, "n", "p", "FREQ=DAILY", "alice", _uid("ag"), "UTC", project_id=old)
+    store.update(task_id, project_id=newer)
+    assert (
+        store.compare_and_set_project(
+            task_id,
+            expected_project_id=old,
+            project_id=None,
+        )
+        is False
+    )
+    assert store.get(task_id).project_id == newer
+    assert store.compare_and_set_project(
+        task_id,
+        expected_project_id=newer,
+        project_id=None,
+    )
+    assert store.get(task_id).project_id is None
 
 
 # ── state enum ────────────────────────────────────────────────────────────────
