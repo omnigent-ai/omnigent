@@ -415,48 +415,85 @@ describe("Composer send shortcut", () => {
     expect(onSend).toHaveBeenLastCalledWith("default shortcut", undefined);
   });
 
-  it("uses Command+Enter to submit the draft before steering the queued backlog", () => {
+  it.each([
+    [false, "metaKey"],
+    [false, "ctrlKey"],
+    [true, "metaKey"],
+    [true, "ctrlKey"],
+  ] as const)(
+    "steers the draft and backlog (alternate send: %s, modifier: %s)",
+    (alternate, modifier) => {
+      localStorage.setItem(COMPOSER_SEND_SHORTCUT_STORAGE_KEY, String(alternate));
+      const onSend = vi.fn((text: string, files?: File[]) => {
+        useChatStore.getState().enqueueMessage(text, files);
+      });
+      const sendQueued = vi.fn().mockResolvedValue(undefined);
+      const originalState = useChatStore.getState();
+      setComposerState({
+        boundAgentId: "agent_shortcut",
+        queuedMessages: [
+          { queueId: "q_1", text: "queued first", conversationId: "conv_shortcut" },
+          { queueId: "q_2", text: "queued second", conversationId: "conv_shortcut" },
+        ],
+        sessionStatus: "running",
+        send: sendQueued,
+        status: "streaming",
+      });
+
+      try {
+        renderWithTooltips(
+          <Composer {...composerProps({ isWorking: true, onSend, status: "streaming" })} />,
+        );
+        if (alternate) {
+          fireEvent.change(textarea(), { target: { value: "normal draft" } });
+          fireEvent.keyDown(textarea(), { key: "Enter", [modifier]: true });
+          expect(sendQueued).not.toHaveBeenCalled();
+          expect(useChatStore.getState().queuedMessages.map((message) => message.text)).toEqual([
+            "queued first",
+            "queued second",
+            "normal draft",
+          ]);
+        }
+        fireEvent.change(textarea(), { target: { value: "draft last" } });
+        fireEvent.keyDown(textarea(), { key: "Enter", [modifier]: true, shiftKey: alternate });
+
+        expect(onSend).toHaveBeenCalledWith("draft last", undefined);
+        expect(sendQueued.mock.calls.map((call) => call.slice(0, 2))).toEqual([
+          ["queued first", "agent_shortcut"],
+          ["queued second", "agent_shortcut"],
+          ...(alternate ? [["normal draft", "agent_shortcut"]] : []),
+          ["draft last", "agent_shortcut"],
+        ]);
+        expect(onSend.mock.invocationCallOrder[0]).toBeLessThan(
+          sendQueued.mock.invocationCallOrder[0]!,
+        );
+        expect(useChatStore.getState().queuedMessages).toEqual([]);
+      } finally {
+        act(() =>
+          useChatStore.setState({
+            boundAgentId: originalState.boundAgentId,
+            queuedMessages: [],
+            send: originalState.send,
+            sessionStatus: originalState.sessionStatus,
+            status: originalState.status,
+          }),
+        );
+      }
+    },
+  );
+
+  it.each([
+    [false, "{Shift>}{Enter}{/Shift}"],
+    [true, "{Enter}"],
+    [true, "{Shift>}{Enter}{/Shift}"],
+  ] as const)("preserves newline input (alternate send: %s, keys: %s)", async (alternate, keys) => {
+    localStorage.setItem(COMPOSER_SEND_SHORTCUT_STORAGE_KEY, String(alternate));
     const onSend = vi.fn();
-    const sendQueued = vi.fn().mockResolvedValue(undefined);
-    const originalState = useChatStore.getState();
-    setComposerState({
-      boundAgentId: "agent_shortcut",
-      queuedMessages: [
-        { queueId: "q_1", text: "queued first", conversationId: "conv_shortcut" },
-        { queueId: "q_2", text: "queued second", conversationId: "conv_shortcut" },
-      ],
-      sessionStatus: "running",
-      send: sendQueued,
-      status: "streaming",
-    });
-
-    try {
-      renderWithTooltips(
-        <Composer {...composerProps({ isWorking: true, onSend, status: "streaming" })} />,
-      );
-      fireEvent.change(textarea(), { target: { value: "draft last" } });
-      fireEvent.keyDown(textarea(), { key: "Enter", metaKey: true });
-
-      expect(onSend).toHaveBeenCalledWith("draft last", undefined);
-      expect(sendQueued.mock.calls.map((call) => call.slice(0, 2))).toEqual([
-        ["queued first", "agent_shortcut"],
-        ["queued second", "agent_shortcut"],
-      ]);
-      expect(onSend.mock.invocationCallOrder[0]).toBeLessThan(
-        sendQueued.mock.invocationCallOrder[0]!,
-      );
-      expect(useChatStore.getState().queuedMessages).toEqual([]);
-    } finally {
-      act(() =>
-        useChatStore.setState({
-          boundAgentId: originalState.boundAgentId,
-          queuedMessages: [],
-          send: originalState.send,
-          sessionStatus: originalState.sessionStatus,
-          status: originalState.status,
-        }),
-      );
-    }
+    const user = userEvent.setup();
+    render(<Composer {...composerProps({ onSend })} />);
+    await user.type(textarea(), "first" + keys + "second");
+    expect(textarea().value).toBe("first\nsecond");
+    expect(onSend).not.toHaveBeenCalled();
   });
 
   it("uses Mod+Enter after the alternate preference is restored", () => {
@@ -3601,7 +3638,7 @@ describe("Composer — queued-message flush gating", () => {
   });
 });
 
-describe("Composer — ArrowUp edit of a queued message", () => {
+describe("Composer — editing queued messages", () => {
   const CONV = "conv_uparrow_edit";
   const QUEUED_TEXT = "queued follow-up recalled for editing";
 
@@ -3690,6 +3727,43 @@ describe("Composer — ArrowUp edit of a queued message", () => {
     await waitFor(() => expect(textarea().value).toBe(QUEUED_TEXT));
     expect(screen.getByText("notes.txt")).toBeTruthy();
     expect(useChatStore.getState().queuedMessages).toHaveLength(0);
+  });
+
+  it.each([
+    ["", "screenshot.png"],
+    ["Look at this", "screenshot.png"],
+    ["", ""],
+    ["Look at this", ""],
+  ])("preserves queued text %j and screenshot %j when edited and re-sent", (text, name) => {
+    const file = new File([new Uint8Array(10)], name, { type: "image/png" });
+    const displayName = name || "image.png";
+    useChatStore.setState({
+      queuedMessages: [{ queueId: "q_image", text, conversationId: CONV, files: [file] }],
+    });
+    const onSend = vi.fn(useChatStore.getState().enqueueMessage);
+    renderWithTooltips(<Composer {...composerProps({ onSend })} />);
+
+    const strip = screen.getByTestId("composer-queued-strip");
+    expect(strip).toHaveTextContent(displayName);
+    if (text) expect(strip).toHaveTextContent(text);
+    expect(useChatStore.getState().queuedMessages[0]?.text).toBe(text);
+
+    fireEvent.click(screen.getByRole("button", { name: "Edit queued message" }));
+
+    expect(textarea()).toHaveValue(text);
+    expect(screen.getByAltText(displayName)).toBeInTheDocument();
+    expect(useChatStore.getState().queuedMessages).toHaveLength(0);
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+
+    expect(onSend).toHaveBeenCalledWith(text, [file]);
+    expect(onSend.mock.calls[0]?.[1]?.[0]).toBe(file);
+    expect(file.name).toBe(name);
+    expect(useChatStore.getState().queuedMessages).toEqual([
+      expect.objectContaining({ text, files: [file], conversationId: CONV }),
+    ]);
+    const requeuedStrip = screen.getByTestId("composer-queued-strip");
+    expect(requeuedStrip).toHaveTextContent(displayName);
+    if (text) expect(requeuedStrip).toHaveTextContent(text);
   });
 
   it("preserves a queued quoted reply and its attachments on re-send", () => {

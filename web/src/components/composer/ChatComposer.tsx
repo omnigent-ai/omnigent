@@ -330,7 +330,7 @@ export const ComposerSendButton = forwardRef<
       className={cn(
         "size-8 shrink-0 rounded-lg transition-opacity md:size-7",
         !interrupt &&
-          "bg-foreground hover:opacity-80 disabled:bg-muted disabled:text-muted-foreground disabled:opacity-100",
+          "hover:opacity-80 disabled:bg-muted disabled:text-muted-foreground disabled:opacity-100",
         className,
       )}
       aria-label={label}

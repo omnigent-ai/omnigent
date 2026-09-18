@@ -1047,6 +1047,102 @@ def test_read_transcript_items_since_skips_unreadable_thinking(tmp_path: Path) -
     assert [item.item_type for item in items] == ["message"]
 
 
+def test_unwrap_pasted_content_markers_strips_claude_paste_wrappers() -> None:
+    """
+    Paste wrappers Claude adds to bracketed-paste input are removed for display.
+
+    Omnigent injects every web-UI message as a bracketed paste, so Claude
+    records even a short typed line wrapped in ``<pasted_content id=…>``
+    markers. The mirrored user bubble must show the bare text.
+    """
+    unwrap = claude_native_bridge._unwrap_pasted_content_markers
+    # A bare paste (the omnigent-delivered shape) becomes clean text.
+    assert unwrap('\n\n<pasted_content id="a5f5">\nxyz\n</pasted_content id="a5f5">\n') == "xyz"
+    # Interior newlines in the pasted body are preserved.
+    assert (
+        unwrap('\n\n<pasted_content id="x">\nline1\nline2\n</pasted_content id="x">\n')
+        == "line1\nline2"
+    )
+    # Text the person typed with no paste is returned byte-for-byte.
+    assert unwrap("just a normal message") == "just a normal message"
+    assert unwrap("  keep leading/trailing spaces  ") == "  keep leading/trailing spaces  "
+    # Text typed around a paste keeps the surrounding words, drops the tags.
+    assert (
+        unwrap('before\n\n<pasted_content id="x">\nmid\n</pasted_content id="x">\nafter')
+        == "before\n\nmid\nafter"
+    )
+    # A closing tag that dropped the repeated id still unwraps.
+    assert unwrap('\n\n<pasted_content id="x">\nabc\n</pasted_content>\n') == "abc"
+
+
+def test_read_transcript_items_since_unwraps_pasted_content(tmp_path: Path) -> None:
+    """
+    A user message Claude wrapped as a paste mirrors to the UI as clean text.
+
+    Reproduces the reported bug: a plainly typed ``xyz`` sent through the
+    Omnigent web UI is delivered as a bracketed paste, so Claude persists it
+    wrapped in ``<pasted_content id=…>`` markers. The forwarded user bubble
+    must not carry the raw markers.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    wrapped = '\n\n<pasted_content id="a5f5">\nxyz\n</pasted_content id="a5f5">\n'
+    transcript_path.write_text(
+        json.dumps(
+            {"type": "user", "uuid": "user-1", "message": {"role": "user", "content": wrapped}}
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _cursor, _current_response_id, items = read_transcript_items_since(
+        transcript_path,
+        0,
+        agent_name="claude-native-ui",
+    )
+
+    assert [item.item_type for item in items] == ["message"]
+    assert items[0].data == {
+        "role": "user",
+        "content": [{"type": "input_text", "text": "xyz"}],
+    }
+
+
+def test_read_transcript_items_since_unwraps_pasted_content_in_list_blocks(
+    tmp_path: Path,
+) -> None:
+    """
+    List-form user text blocks are unwrapped too.
+
+    Claude ships user content as a string today, but the JSONL format is not
+    under our control; the defensive list-form path must strip paste markers
+    the same way so a format change can't regress the bug.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    wrapped = '\n\n<pasted_content id="x">\nhello\n</pasted_content id="x">\n'
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": "user-1",
+                "message": {"role": "user", "content": [{"type": "text", "text": wrapped}]},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _cursor, _current_response_id, items = read_transcript_items_since(
+        transcript_path,
+        0,
+        agent_name="claude-native-ui",
+    )
+
+    assert items[0].data == {
+        "role": "user",
+        "content": [{"type": "input_text", "text": "hello"}],
+    }
+
+
 def test_read_transcript_items_since_strips_inline_image_data(tmp_path: Path) -> None:
     """
     Reading an image file must not replay its base64 data as prompt text.
