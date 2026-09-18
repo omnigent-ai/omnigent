@@ -12,6 +12,7 @@ import uuid
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, TypeVar
@@ -258,6 +259,156 @@ _engine_cache: dict[str, Engine] = {}
 _engine_lock = threading.Lock()
 
 
+def cached_engines() -> list[Engine]:
+    """Return the engines created so far in this process.
+
+    Lets a caller inspect the live engines (e.g. to report pool capacity at
+    startup) without reaching into a store's private attribute.
+
+    :returns: A snapshot list, in creation order.
+    """
+    with _engine_lock:
+        return list(_engine_cache.values())
+
+
+# Pool defaults for every non-SQLite backend. The base pool is aligned with
+# the server's 200-token AnyIO thread limiter: a worker thread that can't get a
+# connection is a request that stalls.
+_DEFAULT_POOL_SIZE = 200
+_DEFAULT_MAX_OVERFLOW = 20
+
+
+def configured_pool_size() -> int:
+    """Return the configured base pool size for non-SQLite backends.
+
+    :returns: ``OMNIGENT_DB_POOL_SIZE`` when set, else the default.
+    """
+    return _env_int("OMNIGENT_DB_POOL_SIZE", _DEFAULT_POOL_SIZE, minimum=0)
+
+
+def configured_max_overflow() -> int:
+    """Return the configured pool overflow allowance for non-SQLite backends.
+
+    :returns: ``OMNIGENT_DB_MAX_OVERFLOW`` when set, else the default.
+        ``-1`` means unlimited overflow.
+    """
+    return _env_int("OMNIGENT_DB_MAX_OVERFLOW", _DEFAULT_MAX_OVERFLOW, minimum=-1)
+
+
+@dataclass(frozen=True)
+class PoolCapacity:
+    """How a database's connection limit constrains a deployment's replicas.
+
+    :param replicas: How many replicas the limit affords at this pool
+        ceiling, or ``None`` when the ceiling is unbounded.
+    :param message: The operator-facing sentence to log.
+    """
+
+    replicas: int | None
+    message: str
+
+    @property
+    def scales_out(self) -> bool:
+        """Whether the budget leaves room for more than one replica."""
+        return self.replicas is not None and self.replicas >= 2
+
+
+def pool_capacity_report(pool_ceiling: int | None, max_connections: int) -> PoolCapacity:
+    """Describe how many replicas a database's connection limit affords.
+
+    Each replica runs its own pool, and SQLAlchemy's ``QueuePool`` keeps its
+    base connections open once opened — so the budget a deployment consumes is
+    (replicas x per-replica ceiling), not (replicas x concurrent requests).
+    Scaling out with a pool sized for a single box is how a rollout turns into
+    ``FATAL: too many connections`` on every replica at once, which is why
+    this is reported at startup rather than discovered under load.
+
+    :param pool_ceiling: Connections one replica may hold — base pool plus
+        overflow — or ``None`` when overflow is unlimited.
+    :param max_connections: The database's own connection limit.
+    :returns: The affordable replica count and a sentence for the log. The
+        sentence names ``OMNIGENT_DB_POOL_SIZE`` /
+        ``OMNIGENT_DB_MAX_OVERFLOW`` whenever the budget is too tight to
+        scale out, so the fix travels with the warning.
+    """
+    if pool_ceiling is None:
+        return PoolCapacity(
+            replicas=None,
+            message=(
+                f"database pool overflow is unlimited (OMNIGENT_DB_MAX_OVERFLOW=-1) while "
+                f"the database allows {max_connections} connections: a load spike can "
+                f"exhaust it for every replica at once. Set a finite "
+                f"OMNIGENT_DB_MAX_OVERFLOW."
+            ),
+        )
+    replicas = max_connections // pool_ceiling if pool_ceiling > 0 else max_connections
+    if replicas >= 2:
+        message = (
+            f"database pool holds up to {pool_ceiling} connections per replica; the "
+            f"database allows {max_connections}, so up to {replicas} replicas fit."
+        )
+    elif replicas == 1:
+        message = (
+            f"database pool holds up to {pool_ceiling} connections per replica and the "
+            f"database allows only {max_connections}, so exactly one replica fits — "
+            f"scaling out will fail with 'too many connections'. Set "
+            f"OMNIGENT_DB_POOL_SIZE (and OMNIGENT_DB_MAX_OVERFLOW) to "
+            f"{max_connections} divided by the replica count you intend to run."
+        )
+    else:
+        message = (
+            f"database pool may hold up to {pool_ceiling} connections per replica but the "
+            f"database allows only {max_connections}, so even one replica can exhaust it "
+            f"under load. Lower OMNIGENT_DB_POOL_SIZE (and OMNIGENT_DB_MAX_OVERFLOW)."
+        )
+    return PoolCapacity(replicas=replicas, message=message)
+
+
+def _engine_pool_capacity(engine: Engine) -> PoolCapacity | None:
+    """Build the pool-capacity report for one engine, or ``None``.
+
+    ``None`` for SQLite (file-locked, with no connection limit to exhaust)
+    and for any backend that won't report ``max_connections``.
+
+    :param engine: An engine already connected to its database.
+    :returns: The capacity report, or ``None`` when there is nothing to say.
+    """
+    if engine.dialect.name != "postgresql":
+        return None
+    try:
+        with engine.connect() as conn:
+            max_connections = int(conn.execute(text("SHOW max_connections")).scalar_one())
+    except Exception:  # noqa: BLE001 — a diagnostic must never block startup
+        # A database that won't report its limit tells us nothing actionable.
+        _logger.debug("could not read max_connections for the pool report", exc_info=True)
+        return None
+    max_overflow = configured_max_overflow()
+    pool_ceiling = None if max_overflow < 0 else configured_pool_size() + max_overflow
+    return pool_capacity_report(pool_ceiling, max_connections)
+
+
+def report_pool_capacity() -> list[str]:
+    """Log, once per distinct database, how many replicas its limit affords.
+
+    Called at server startup: WARNING when the budget leaves room for fewer
+    than two replicas (the case that breaks a scale-out), INFO otherwise.
+
+    :returns: The messages logged, in engine-creation order, deduplicated.
+    """
+    reported: list[str] = []
+    for engine in cached_engines():
+        capacity = _engine_pool_capacity(engine)
+        if capacity is None or capacity.message in reported:
+            continue
+        reported.append(capacity.message)
+        _logger.log(
+            logging.INFO if capacity.scales_out else logging.WARNING,
+            "%s",
+            capacity.message,
+        )
+    return reported
+
+
 def _create_engine(db_uri: str) -> Engine:
     """
     Create a SQLAlchemy engine with connection pool configuration.
@@ -352,8 +503,8 @@ def _create_engine(db_uri: str) -> Engine:
         # thread limiter. The environment overrides are global for every
         # non-SQLite backend. SQLAlchemy permits a zero-sized base pool and
         # max_overflow=-1 for unlimited overflow.
-        "pool_size": _env_int("OMNIGENT_DB_POOL_SIZE", 200, minimum=0),
-        "max_overflow": _env_int("OMNIGENT_DB_MAX_OVERFLOW", 20, minimum=-1),
+        "pool_size": configured_pool_size(),
+        "max_overflow": configured_max_overflow(),
         # Bound the wait when the pool is exhausted instead of
         # blocking indefinitely; surfaces real saturation as an
         # error rather than a hang.

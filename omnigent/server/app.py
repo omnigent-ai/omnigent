@@ -1366,6 +1366,15 @@ def create_app(
 
         _to_thread.current_default_thread_limiter().total_tokens = 200
 
+        # Report the database's connection budget against this replica's pool
+        # ceiling. Every replica keeps its own pool open, so a deployment that
+        # scales out with a single-box pool size exhausts the database on all
+        # replicas at once — an operator needs that number before onboarding
+        # users, not after connections start failing.
+        from omnigent.db.utils import report_pool_capacity
+
+        report_pool_capacity()
+
         # Initialise usage telemetry (fire-and-forget; no-op when disabled).
         from omnigent.telemetry import init_client as _init_telemetry
 

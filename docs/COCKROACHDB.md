@@ -66,6 +66,16 @@ Blank values use the defaults. `OMNIGENT_DB_POOL_SIZE=0` removes the base-pool
 limit, `OMNIGENT_DB_MAX_OVERFLOW=-1` permits unlimited overflow, and the pool
 timeout accepts non-negative fractional seconds.
 
+**Sizing for more than one replica.** Every replica opens its own pool, and the
+base connections stay open once opened — so the budget a deployment consumes is
+(replicas x (pool size + overflow)), not (replicas x concurrent requests). The
+defaults reach 220 connections per replica, which is more than a managed
+Postgres commonly allows in total, so a scale-out fails with `FATAL: too many
+connections` on every replica at once. The server logs its own budget against
+the database's `max_connections` at startup, at WARNING when fewer than two
+replicas fit; divide `max_connections` by the replica count you intend to run
+and set `OMNIGENT_DB_POOL_SIZE` accordingly.
+
 ## Persistent local matrix
 
 OrbStack supports the Docker Compose commands used by these recipes:
