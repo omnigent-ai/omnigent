@@ -5,6 +5,7 @@ from __future__ import annotations
 import concurrent.futures
 import errno
 import io
+import logging
 import tarfile
 import threading
 from pathlib import Path
@@ -181,6 +182,136 @@ def test_load_disk_cache_hit(
     second = cache_2.load("agent-3", loc)
     assert second.spec.name == first.spec.name
     assert second.workdir == first.workdir
+
+
+def test_load_reextracts_when_disk_entry_lost_config(
+    artifact_store: LocalArtifactStore,
+    cache_dir: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    A disk entry whose ``config.yaml`` was wiped (e.g. by a tmp
+    cleaner) is a cache miss: ``load()`` re-extracts the bundle from
+    the artifact store instead of raising ``FileNotFoundError`` on
+    every request that resolves the spec.
+    """
+    loc = "agent-wiped/abc123"
+    _store_bundle(artifact_store, loc)
+
+    # First cache instance populates the disk tier.
+    cache_1 = AgentCache(artifact_store=artifact_store, cache_dir=cache_dir)
+    cache_1.load("agent-wiped", loc)
+
+    # The extracted entry loses config.yaml; a stale leftover remains.
+    workdir = cache_dir / "agent-wiped"
+    (workdir / "config.yaml").unlink()
+    (workdir / "stale-leftover").write_text("junk", encoding="utf-8")
+
+    # New cache instance simulates a server restart — empty memory tier,
+    # so the next load hits the poisoned disk tier.
+    cache_2 = AgentCache(artifact_store=artifact_store, cache_dir=cache_dir)
+    with caplog.at_level(logging.INFO, logger=agent_cache_module.__name__):
+        loaded = cache_2.load("agent-wiped", loc)
+
+    assert loaded.spec.name == "test-agent"
+    assert (workdir / "config.yaml").is_file()
+    # The poisoned entry was replaced wholesale, not overlaid.
+    assert not (workdir / "stale-leftover").exists()
+    assert [getattr(record, "event_name", None) for record in caplog.records] == [
+        "agent_cache_rebuild_started",
+        "agent_cache_rebuild_completed",
+    ]
+    assert str(workdir) not in caplog.text
+
+
+@pytest.mark.parametrize("config", ["", "spec_version: [unclosed"])
+def test_load_reextracts_when_disk_entry_config_corrupt(
+    artifact_store: LocalArtifactStore,
+    cache_dir: Path,
+    config: str,
+) -> None:
+    """A disk entry with an unparseable ``config.yaml`` is also a miss."""
+    loc = "agent-corrupt/abc123"
+    _store_bundle(artifact_store, loc)
+
+    cache_1 = AgentCache(artifact_store=artifact_store, cache_dir=cache_dir)
+    cache_1.load("agent-corrupt", loc)
+
+    # Truncated write leaves invalid YAML behind.
+    (cache_dir / "agent-corrupt" / "config.yaml").write_text(config, encoding="utf-8")
+
+    cache_2 = AgentCache(artifact_store=artifact_store, cache_dir=cache_dir)
+    loaded = cache_2.load("agent-corrupt", loc)
+
+    assert loaded.spec.name == "test-agent"
+
+
+def test_stale_disk_read_failure_keeps_another_readers_repair(
+    artifact_store: LocalArtifactStore,
+    cache_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A late read failure must not delete a cache another reader repaired."""
+    location = "agent-shared/version"
+    _store_bundle(artifact_store, location)
+    seed = AgentCache(artifact_store, cache_dir).load("agent-shared", location)
+    (seed.workdir / "config.yaml").unlink()
+    first_cache = AgentCache(artifact_store, cache_dir)
+    second_cache = AgentCache(artifact_store, cache_dir)
+    real_load_spec = agent_cache_module.load_spec
+    failure_observed = threading.Event()
+    release_failure = threading.Event()
+
+    def delayed_load_spec(source, **kwargs):
+        try:
+            return real_load_spec(source, **kwargs)
+        except FileNotFoundError:
+            if source == seed.workdir and not failure_observed.is_set():
+                failure_observed.set()
+                assert release_failure.wait(timeout=10)
+            raise
+
+    monkeypatch.setattr(agent_cache_module, "load_spec", delayed_load_spec)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        first = pool.submit(first_cache.load, "agent-shared", location)
+        try:
+            assert failure_observed.wait(timeout=10)
+            repaired = second_cache.load("agent-shared", location)
+            artifact_store.delete(location)
+        finally:
+            release_failure.set()
+        loaded = first.result(timeout=10)
+
+    assert loaded.spec == repaired.spec
+    assert loaded.workdir == repaired.workdir
+    assert (loaded.workdir / "config.yaml").read_text() == _MINIMAL_CONFIG
+
+
+def test_load_poisoned_disk_entry_with_missing_bundle_raises(
+    artifact_store: LocalArtifactStore,
+    cache_dir: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    When the disk entry is poisoned AND the bundle is gone from the
+    artifact store, the store miss surfaces as ``KeyError`` — the
+    fallback never invents a spec.
+    """
+    loc = "agent-gone/abc123"
+    _store_bundle(artifact_store, loc)
+
+    cache_1 = AgentCache(artifact_store=artifact_store, cache_dir=cache_dir)
+    cache_1.load("agent-gone", loc)
+
+    (cache_dir / "agent-gone" / "config.yaml").unlink()
+    artifact_store.delete(loc)
+
+    cache_2 = AgentCache(artifact_store=artifact_store, cache_dir=cache_dir)
+    with pytest.raises(KeyError):
+        cache_2.load("agent-gone", loc)
+    failure = caplog.records[-1]
+    assert getattr(failure, "event_name", None) == "agent_cache_rebuild_failed"
+    assert getattr(failure, "attributes", {})["exception_type"] == "KeyError"
 
 
 def test_load_missing_agent_raises_key_error(

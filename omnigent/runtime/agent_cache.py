@@ -11,6 +11,9 @@ import tempfile
 from collections.abc import Iterator
 from pathlib import Path
 
+from filelock import FileLock
+
+from omnigent.debug_logging import debug_event
 from omnigent.entities import LoadedAgent
 from omnigent.spec import AgentSpec
 from omnigent.spec import load as load_spec
@@ -125,15 +128,65 @@ class AgentCache:
         if agent_id in self._specs:
             return LoadedAgent(spec=self._specs[agent_id], workdir=workdir)
 
-        # Tier 2: disk cache (directory already extracted)
+        # Tier 2: recover missing or corrupt extracted specs from the stored bundle.
         if workdir.is_dir():
-            spec = load_spec(workdir, expand_env=expand_env, prune_invalid_sub_agents=True)
-            self._specs[agent_id] = spec
-            return LoadedAgent(spec=spec, workdir=workdir)
+            try:
+                spec = load_spec(workdir, expand_env=expand_env, prune_invalid_sub_agents=True)
+            except Exception:
+                return self._recover_disk_entry(agent_id, bundle_location, expand_env=expand_env)
+            else:
+                self._specs[agent_id] = spec
+                return LoadedAgent(spec=spec, workdir=workdir)
 
         # Cache miss — validate privately before publishing the disk entry.
         bundle_bytes = self._artifact_store.get(bundle_location)
         return self._extract_and_cache(agent_id, bundle_bytes, expand_env=expand_env)
+
+    def _recover_disk_entry(
+        self, agent_id: str, bundle_location: str, *, expand_env: bool
+    ) -> LoadedAgent:
+        """Recheck and rebuild under a shared lock so late failures cannot evict repairs."""
+        lock_path = self._staging_root() / "repair.lock"
+        if lock_path.resolve(strict=False) != lock_path:
+            raise ValueError(f"unsafe cache repair lock: {lock_path}")
+        with FileLock(lock_path, timeout=30):
+            workdir = self._cache_path(agent_id)
+            try:
+                spec = load_spec(workdir, expand_env=expand_env, prune_invalid_sub_agents=True)
+            except Exception as exc:
+                _logger.warning(
+                    "Rebuilding unreadable agent cache entry",
+                    extra=debug_event(
+                        "agent_cache_rebuild_started",
+                        agent_id=agent_id,
+                        exception_type=type(exc).__name__,
+                    ),
+                )
+            else:
+                self._specs[agent_id] = spec
+                return LoadedAgent(spec=spec, workdir=workdir)
+
+            try:
+                bundle_bytes = self._artifact_store.get(bundle_location)
+                workdir = self._cache_path(agent_id)
+                with contextlib.suppress(FileNotFoundError):
+                    shutil.rmtree(workdir)
+                loaded = self._extract_and_cache(agent_id, bundle_bytes, expand_env=expand_env)
+            except Exception as exc:
+                _logger.warning(
+                    "Agent cache rebuild failed",
+                    extra=debug_event(
+                        "agent_cache_rebuild_failed",
+                        agent_id=agent_id,
+                        exception_type=type(exc).__name__,
+                    ),
+                )
+                raise
+            _logger.info(
+                "Rebuilt agent cache entry",
+                extra=debug_event("agent_cache_rebuild_completed", agent_id=agent_id),
+            )
+            return loaded
 
     def replace(
         self,
@@ -221,16 +274,20 @@ class AgentCache:
         if workdir.is_dir():
             shutil.rmtree(workdir)
 
-    @contextlib.contextmanager
-    def _staging_dir(self) -> Iterator[Path]:
-        """Stage on the cache filesystem in a reserved, symlink-checked namespace."""
+    def _staging_root(self) -> Path:
+        """Return the reserved staging namespace on the cache filesystem."""
         cache_root = self._cache_dir.resolve(strict=False)
         cache_root.mkdir(parents=True, exist_ok=True)
         staging_root = cache_root / ".staging"
         if staging_root.resolve(strict=False) != staging_root:
             raise ValueError(f"unsafe staging root: {staging_root}")
         staging_root.mkdir(mode=0o700, exist_ok=True)
-        staging_dir = Path(tempfile.mkdtemp(prefix="bundle-", dir=staging_root))
+        return staging_root
+
+    @contextlib.contextmanager
+    def _staging_dir(self) -> Iterator[Path]:
+        """Stage on the cache filesystem in a reserved, symlink-checked namespace."""
+        staging_dir = Path(tempfile.mkdtemp(prefix="bundle-", dir=self._staging_root()))
         try:
             yield staging_dir
         finally:
