@@ -557,6 +557,9 @@ async def test_external_session_status_running_fans_out_child_busy_to_parent() -
         entry = runner_app.get_subagent_work(child_id)
         assert entry is not None
         assert entry.status == "running"
+        # A running native child pins the idle watchdog: reaping the runner
+        # mid-child-turn would lose the child's completion wake.
+        assert app.state.has_active_work() is True
 
         events = _drain_session_event_queue(runner_app._session_event_queues_ref.get(parent_id))
     finally:
@@ -581,6 +584,56 @@ async def test_external_session_status_running_fans_out_child_busy_to_parent() -
             },
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_external_session_status_edges_refresh_runner_idle_clock() -> None:
+    """
+    POSTed native status edges reset the runner-level idle clock.
+
+    Forwarder-driven harnesses (codex-native & co.) report status through
+    ``external_session_status`` rather than the PTY status publisher, so a
+    settling ``idle`` edge must restart the runner's idle window the same way
+    a PTY status edge does — otherwise the watchdog can reap the runner the
+    instant a long native turn finishes.
+    """
+    from omnigent.runner import app as runner_app
+
+    child_id = "9b1c04f7a2f4de08b35a6c1d97e02c11"
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    activity_marks: list[str] = []
+    app.state.mark_activity = lambda: activity_marks.append("activity")
+
+    runner_app._session_event_queues_ref.pop(child_id, None)
+    runner_app.register_child_session(
+        child_id,
+        parent_session_id="6f2a91d05c3be47a880fd12c4b9e75aa",
+        title="codex:impl",
+        tool="codex",
+        session_name="impl",
+    )
+
+    try:
+        async with _runner_client(app) as client:
+            for status, output in [("running", None), ("idle", "DONE")]:
+                data: dict[str, Any] = {"status": status}
+                if output is not None:
+                    data["output"] = output
+                resp = await client.post(
+                    f"/v1/sessions/{child_id}/events",
+                    json={"type": "external_session_status", "data": data},
+                )
+                assert resp.status_code == 204, resp.text
+    finally:
+        runner_app.unregister_subagent_work(child_id)
+        runner_app.unregister_child_session(child_id)
+        runner_app._session_event_queues_ref.pop(child_id, None)
+
+    assert activity_marks == ["activity"] * 2
 
 
 @pytest.mark.asyncio
