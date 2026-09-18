@@ -76,6 +76,11 @@ from omnigent.inner.hook_scripts.subagent_router import (
     AGENT_TOOL_MATCHER as CLAUDE_SUBAGENT_TOOL_MATCHER,
 )
 from omnigent.native import native_bridge_common
+from omnigent.native.child_interpreter import (
+    PYTHON_NO_CWD_FLAG,
+    omnigent_child_env,
+    omnigent_module_argv,
+)
 from omnigent.tools.base import Tool, ToolContext
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS
 
@@ -1936,7 +1941,7 @@ def build_mcp_config(bridge_dir: Path, *, python_executable: str | None = None) 
             _MCP_SERVER_NAME: {
                 "command": python,
                 "args": [
-                    "-I",
+                    PYTHON_NO_CWD_FLAG,
                     "-m",
                     "omnigent.harnesses.claude_native.bridge",
                     "serve-mcp",
@@ -1945,6 +1950,9 @@ def build_mcp_config(bridge_dir: Path, *, python_executable: str | None = None) 
                 ],
                 "env": {
                     "PYTHONUNBUFFERED": "1",
+                    # Claude spawns this directly, so the pin goes in env
+                    # rather than an ``env`` prefix; see omnigent_module_argv.
+                    **omnigent_child_env(),
                 },
             }
         }
@@ -2021,28 +2029,24 @@ def build_hook_settings(
     # omnigent package with a local checkout in the cwd (e.g. a
     # git worktree that has its own omnigent/ directory on a
     # different branch).
-    command_parts = [
+    command_parts = omnigent_module_argv(
         python,
-        "-I",
-        "-m",
         "omnigent.harnesses.claude_native.hook",
         "--bridge-dir",
         str(bridge_dir),
-    ]
+    )
     # Claude owns command-hook stderr, so it does not reach the runner logs.
     # Persist it for the forwarder to relay with the Omnigent session id.
     observer_stderr = shlex.quote(str(bridge_dir / OBSERVER_HOOK_STDERR_FILE))
     command = f"{shlex.join(command_parts)} 2>> {observer_stderr}"
     hook = {"type": "command", "command": command}
-    framework_context_parts = [
+    framework_context_parts = omnigent_module_argv(
         python,
-        "-I",
-        "-m",
         "omnigent.harnesses.claude_native.hook",
         "framework-context",
         "--bridge-dir",
         str(bridge_dir),
-    ]
+    )
     framework_context_hook = {
         "type": "command",
         "command": f"{shlex.join(framework_context_parts)} 2>> {observer_stderr}",
@@ -2139,15 +2143,13 @@ def build_hook_settings(
         # current active session from bridge.json for every permission
         # request, so approvals follow `/clear` rotations without
         # restarting Claude.
-        permission_command_parts = [
+        permission_command_parts = omnigent_module_argv(
             python,
-            "-I",
-            "-m",
             "omnigent.harnesses.claude_native.hook",
             "permission-request",
             "--bridge-dir",
             str(bridge_dir),
-        ]
+        )
         permission_hook: _JsonObject = {
             "type": "command",
             "command": shlex.join(permission_command_parts),
@@ -2175,15 +2177,13 @@ def build_hook_settings(
         # pre-curl behavior.
         relay_env_quoted = shlex.quote(str(bridge_dir / _TOOL_RELAY_ENV_FILE))
         evaluate_policy_python = shlex.join(
-            [
+            omnigent_module_argv(
                 python,
-                "-I",
-                "-m",
                 "omnigent.harnesses.claude_native.hook",
                 "evaluate-policy",
                 "--bridge-dir",
                 str(bridge_dir),
-            ]
+            )
         )
         evaluate_policy_command = (
             "p=$(cat); "
@@ -2225,16 +2225,14 @@ def build_hook_settings(
         # apply to nested spawns, so a routed subagent's own spawns are
         # routed too. The script fails open — an unreachable endpoint
         # emits no output and the spawn proceeds unchanged.
-        router_command_parts = [
+        router_command_parts = omnigent_module_argv(
             python,
-            "-I",
-            "-m",
             "omnigent.inner.hook_scripts.claude_router_hook",
             "--bridge-dir",
             str(bridge_dir),
             "--router-dir",
             str(subagent_router_dir),
-        ]
+        )
         from omnigent.inner.hook_scripts.subagent_router import HOOK_TIMEOUT_S
 
         router_hook: _JsonObject = {
@@ -2306,17 +2304,15 @@ def _claude_route_turn_hook(bridge_dir: Path, python: str) -> _JsonObject:
     return {
         "type": "command",
         "command": shlex.join(
-            [
+            omnigent_module_argv(
                 python,
-                "-I",
-                "-m",
                 "omnigent.harnesses.claude_native.hook",
                 "route-turn",
                 "--bridge-dir",
                 str(bridge_dir),
                 "--harness",
                 "claude-native",
-            ]
+            )
         ),
         # Outermost hop of the timeout ladder in ``omnigent.runner.turn_routing``:
         # it must exceed the hook script's own request budget so the script's
