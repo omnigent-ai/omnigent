@@ -276,3 +276,72 @@ describe("AssistantBubble error retry", () => {
     expect(JSON.parse(init.body as string)).toEqual({ type: "retry_session", data: {} });
   });
 });
+
+describe("UserBubble long-prompt collapse", () => {
+  const SHORT_TEXT = "Hello, world!";
+  // Generate text just over the 8 000-char threshold.
+  const LONG_TEXT = "a".repeat(8001);
+
+  function userBubble(text: string): Extract<Bubble, { kind: "user" }> {
+    return {
+      kind: "user",
+      itemId: "user_collapse_test",
+      content: [{ type: "input_text", text }],
+    };
+  }
+
+  it("renders a short prompt fully without a collapse button", () => {
+    render(<BubbleView bubble={userBubble(SHORT_TEXT)} isLastAssistant={false} />);
+
+    expect(screen.getByTestId("message-bubble")).toHaveTextContent(SHORT_TEXT);
+    expect(
+      screen.queryByRole("button", { name: /show full prompt/i }),
+    ).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: /collapse prompt/i }),
+    ).toBeNull();
+  });
+
+  it("collapses a long prompt by default and shows the expand button with char count", () => {
+    render(<BubbleView bubble={userBubble(LONG_TEXT)} isLastAssistant={false} />);
+
+    const expandBtn = screen.getByRole("button", { name: /show full prompt/i });
+    expect(expandBtn).toBeInTheDocument();
+    // Button label should include the formatted character count.
+    expect(expandBtn).toHaveTextContent("8,001");
+    // Collapse button must not be visible while collapsed.
+    expect(
+      screen.queryByRole("button", { name: /collapse prompt/i }),
+    ).toBeNull();
+  });
+
+  it("expands the prompt when the expand button is clicked", () => {
+    render(<BubbleView bubble={userBubble(LONG_TEXT)} isLastAssistant={false} />);
+
+    fireEvent.click(screen.getByRole("button", { name: /show full prompt/i }));
+
+    // Expand button should be gone; collapse button should appear.
+    expect(
+      screen.queryByRole("button", { name: /show full prompt/i }),
+    ).toBeNull();
+    expect(
+      screen.getByRole("button", { name: /collapse prompt/i }),
+    ).toBeInTheDocument();
+  });
+
+  it("collapses the prompt again when the collapse button is clicked", () => {
+    render(<BubbleView bubble={userBubble(LONG_TEXT)} isLastAssistant={false} />);
+
+    // Expand then collapse.
+    fireEvent.click(screen.getByRole("button", { name: /show full prompt/i }));
+    fireEvent.click(screen.getByRole("button", { name: /collapse prompt/i }));
+
+    expect(
+      screen.getByRole("button", { name: /show full prompt/i }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /collapse prompt/i }),
+    ).toBeNull();
+  });
+});
+
