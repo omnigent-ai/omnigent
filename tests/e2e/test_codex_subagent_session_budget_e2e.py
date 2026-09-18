@@ -191,7 +191,7 @@ def _wait_for(probe: Callable[[], Any], *, description: str, deadline: float) ->
         if result:
             return result
         time.sleep(0.5)
-    pytest.fail(f"Timed out waiting for {description}")
+    raise AssertionError(f"Timed out waiting for {description}")
 
 
 def _shell_response(call_id: str, command: str, **options: Any) -> dict[str, Any]:
