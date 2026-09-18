@@ -13,6 +13,8 @@ import {
   useWorkspaceEnvironment,
   useWorkspaceFileSearch,
 } from "@/hooks/useWorkspaceChangedFiles";
+import type * as ReactQueryModule from "@tanstack/react-query";
+import type * as SessionsApiModule from "@/lib/sessionsApi";
 import type * as WorkspaceChangedFilesModule from "@/hooks/useWorkspaceChangedFiles";
 import type * as WorkspacePickerModule from "./WorkspacePicker";
 
@@ -60,6 +62,17 @@ vi.mock("./WorkspacePicker", async (importOriginal) => ({
 }));
 
 // The panel reads the session's host to point the directory browser at it.
+// The panel resolves a QueryClient (workdir PATCHes refresh the session
+// snapshot) and PATCHes the session on re-root; neither needs a live
+// react-query provider or network in these component tests.
+vi.mock("@tanstack/react-query", async (importOriginal) => ({
+  ...(await importOriginal<typeof ReactQueryModule>()),
+  useQueryClient: () => ({ invalidateQueries: vi.fn() }),
+}));
+vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof SessionsApiModule>()),
+  updateSession: vi.fn(async () => ({}) as never),
+}));
 vi.mock("@/hooks/useSession", () => ({
   useSession: vi.fn(() => ({ session: { hostId: "host_test" } })),
 }));

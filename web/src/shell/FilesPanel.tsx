@@ -10,10 +10,12 @@ import {
   SlidersHorizontalIcon,
   XIcon,
 } from "lucide-react";
+import { useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useParams } from "@/lib/routing";
 import { useSession } from "@/hooks/useSession";
-import { isOwnerLevel } from "@/lib/permissionsApi";
+import { updateSession } from "@/lib/sessionsApi";
+import { isEditorLevel, isOwnerLevel } from "@/lib/permissionsApi";
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useChatStore } from "@/store/chatStore";
 import {
@@ -218,6 +220,14 @@ function SearchFilterInput({
 const browseLocationCache = new Map<string, string>();
 
 /**
+ * Workdir-sync failures that must survive a panel remount. A failed PATCH
+ * leaves the browsed folder showing while the session workdir stayed put;
+ * without this the error vanished on remount and the location read as
+ * applied. Cleared by the next successful sync (or a fresh navigation).
+ */
+const workdirSyncErrorCache = new Map<string, string>();
+
+/**
  * Right-side Files card. Always visible on desktop.
  *
  * - Flat view: changed files only (registry-backed, any depth).
@@ -282,14 +292,16 @@ export function FilesPanel({
   const workspaceRoot = envQuery.data?.root ?? null;
   // The picker browses the host's filesystem, the same source the new-session
   // workspace chip uses.
-  const { session } = useSession(conversationId);
+  const { session, isLoading: sessionLoading } = useSession(conversationId);
   // Absolute path currently browsed. Null tracks the workspace root. Seeded
   // from the per-conversation cache so the location survives the panel
   // unmounting while a file is open in the viewer.
   const [browseLocation, setBrowseLocation] = useState<string | null>(
     () => (conversationId && browseLocationCache.get(conversationId)) || null,
   );
-  const [browseError, setBrowseError] = useState<string | null>(null);
+  const [browseError, setBrowseError] = useState<string | null>(
+    () => (conversationId && workdirSyncErrorCache.get(conversationId)) || null,
+  );
   // On an in-place conversation switch (no remount), land on the NEW
   // session's own cached location or its root — never the previous
   // session's directory. The ref keeps mount itself from wiping the seed.
@@ -298,8 +310,37 @@ export function FilesPanel({
     if (browseForRef.current === conversationId) return;
     browseForRef.current = conversationId;
     setBrowseLocation((conversationId && browseLocationCache.get(conversationId)) || null);
-    setBrowseError(null);
+    setBrowseError((conversationId && workdirSyncErrorCache.get(conversationId)) || null);
   }, [conversationId]);
+  // After a reload the panel would otherwise open at the environment root even
+  // when a persisted re-root means turns and new shells run in a subfolder.
+  // Seed the browsed location from the saved workspace once per conversation,
+  // only while the user hasn't navigated, and only for a location inside the
+  // root (absolute outside-root browsing is owner-gated server-side).
+  const workspaceSeedRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!conversationId || workspaceSeedRef.current === conversationId) return;
+    if (!workspaceRoot || sessionLoading) return;
+    workspaceSeedRef.current = conversationId;
+    // The cache is the conversation-local "user browsed here" signal; the
+    // browseLocation STATE may still hold the previous conversation's value
+    // in the same effect pass as an in-place switch, so it must not gate
+    // this conversation's seed.
+    if (browseLocationCache.get(conversationId)) return;
+    const saved = session?.workspace?.replace(/[\\/]+$/, "") ?? "";
+    const root = workspaceRoot.replace(/[\\/]+$/, "");
+    if (!saved || saved === root) return;
+    // Windows hosts persist canonical backslash paths; containment must use
+    // the root's own separator or every child fails the check.
+    const sep = root.includes("\\") && !root.includes("/") ? "\\" : "/";
+    // An out-of-root workspace browses absolutely, which the server
+    // owner-gates — seeding it for a collaborator would 403 their tree.
+    if (!saved.startsWith(root + sep) && !isOwnerLevel(session?.permissionLevel ?? null)) {
+      return;
+    }
+    browseLocationCache.set(conversationId, saved);
+    setBrowseLocation(saved);
+  }, [conversationId, workspaceRoot, session, sessionLoading]);
   const workingDir = browseLocation ?? workspaceRoot;
   // The wire form: "" means the workspace root (the historical relative
   // contract). A location INSIDE the workspace is sent relative to it, and
@@ -309,17 +350,96 @@ export function FilesPanel({
   // workspace they can already read.
   const locationParam = relativizeToWorkspace(browseLocation, workspaceRoot);
 
+  // The session workdir tracks the browsed location with the LATEST intent
+  // winning: each PATCH resolves and persists server-side, so two in flight
+  // could land out of order. Keep one request in flight and let a newer
+  // navigation replace the queued target instead of racing it.
+  // Keyed per conversation: the panel survives session switches, and one
+  // shared slot would let session B's navigation overwrite session A's
+  // still-queued target. Each conversation queues and drains independently.
+  const workdirSyncRef = useRef(new Map<string, { inflight: boolean; queued: string | null }>());
+  const queryClient = useQueryClient();
+
+  const syncWorkdir = useCallback(
+    (cid: string, workspace: string) => {
+      const states = workdirSyncRef.current;
+      let state = states.get(cid);
+      if (!state) {
+        state = { inflight: false, queued: null };
+        states.set(cid, state);
+      }
+      state.queued = workspace;
+      if (state.inflight) return;
+      state.inflight = true;
+      void (async () => {
+        try {
+          // Sequential on purpose: serialization is what makes the latest
+          // navigation win over a still-in-flight one.
+          /* oxlint-disable no-await-in-loop */
+          while (state.queued !== null) {
+            const target = state.queued;
+            state.queued = null;
+            try {
+              await updateSession(cid, { workspace: target });
+              // Invalidate rather than write the PATCH response into the
+              // cache: this key's GET carries liveness/permission enrichment
+              // the PATCH projection lacks, and overwriting it degrades the
+              // shell's session-derived gates. The refetch reconciles a later
+              // remount from the workspace this PATCH just persisted.
+              void queryClient.invalidateQueries({ queryKey: ["session", cid] });
+              workdirSyncErrorCache.delete(cid);
+            } catch (err) {
+              // The header names the browsed folder the working folder, so a
+              // silent miss would lie. Only the newest intent's failure
+              // matters; it is cached so a remount keeps showing it (and
+              // keeps the same-location retry path open).
+              if (state.queued === null) {
+                const message = `The session's working directory could not follow this folder: ${
+                  err instanceof Error ? err.message : String(err)
+                }`;
+                workdirSyncErrorCache.set(cid, message);
+                if (browseForRef.current === cid) setBrowseError(message);
+              }
+            }
+          }
+          /* oxlint-enable no-await-in-loop */
+        } finally {
+          state.inflight = false;
+        }
+      })();
+    },
+    [queryClient],
+  );
+
   const navigateTo = useCallback(
     (absolutePath: string) => {
-      setBrowseError(null);
       const next = absolutePath === workspaceRoot ? null : absolutePath;
+      // The picker reports its current directory on mount, so an unchanged
+      // location must not re-root (or PATCH the workdir). A prior sync
+      // failure still lets a same-location click retry.
+      if (next === browseLocation && !browseError) return;
+      setBrowseError(null);
       if (conversationId) {
+        workdirSyncErrorCache.delete(conversationId);
         if (next === null) browseLocationCache.delete(conversationId);
         else browseLocationCache.set(conversationId, next);
       }
       setBrowseLocation(next);
+      // Re-rooting the browser also repoints the session's working directory so
+      // new shells and turns cd into the browsed folder (same wire form the
+      // tree uses). Viewers can't repoint, so their browsing stays panel-local.
+      if (conversationId && isEditorLevel(session?.permissionLevel ?? null)) {
+        syncWorkdir(conversationId, relativizeToWorkspace(next, workspaceRoot));
+      }
     },
-    [workspaceRoot, conversationId],
+    [
+      workspaceRoot,
+      browseLocation,
+      browseError,
+      conversationId,
+      session?.permissionLevel,
+      syncWorkdir,
+    ],
   );
 
   // Stable so memo(TreeNodeRow) isn't busted on every FilesPanel re-render.

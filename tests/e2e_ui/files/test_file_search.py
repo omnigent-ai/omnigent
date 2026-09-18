@@ -124,6 +124,45 @@ def test_search_filters_all_files(
 
 
 @pytest.mark.flaky(reruns=2, reruns_delay=5)
+def test_search_finds_a_file_by_pasted_path(
+    page: Page,
+    dir_search_session: tuple[str, str],
+) -> None:
+    """A path pasted into the search box finds the file it names.
+
+    Users paste paths from terminals and agent output: a workspace-relative
+    subpath (``widgets/gadget.py``) and an absolute path both name a file
+    that exists, so the search results must list it. The absolute form is
+    resolved from the server's own search envelope (its ``base`` is the
+    workspace root on disk) rather than assumed from fixture internals.
+    """
+    base_url, session_id = dir_search_session
+    # The workspace root, as the serving side reports it.
+    resp = httpx.get(
+        f"{base_url}/v1/sessions/{session_id}/resources/environments/default/search",
+        params={"q": "gadget"},
+        timeout=10.0,
+    )
+    resp.raise_for_status()
+    workspace_root = resp.json()["base"]
+
+    page.goto(f"{base_url}/c/{session_id}?view=explore")
+    rail = page.get_by_role("complementary", name="Workspace")
+    search = rail.get_by_role("searchbox", name="Search all files")
+    expect(search).to_be_visible(timeout=30_000)
+    # The seeded folder must be listed before searching so the panel has
+    # settled out of its mount-time re-render (see _search_for).
+    folder_row = rail.get_by_role("button", name=f"{_DIR_NAME}/", exact=True)
+    expect(folder_row).to_be_visible(timeout=30_000)
+
+    file_result = _row(rail, "gadget.py")
+    for query in (_DIR_FILE, f"{workspace_root}/{_DIR_FILE}"):
+        _search_for(search, query)
+        expect(file_result).to_be_visible(timeout=15_000)
+        _search_for(search, "")
+
+
+@pytest.mark.flaky(reruns=2, reruns_delay=5)
 def test_search_matches_and_reveals_a_directory(
     page: Page,
     dir_search_session: tuple[str, str],

@@ -9919,6 +9919,82 @@ def create_runner_app(
                 )
             return Response(status_code=204)
 
+        if body_type == "workspace_change":
+            # Repoint the session workdir onto a browsed folder. The runner owns
+            # its live env root and sandbox reach, so it resolves the wire form
+            # (relative/absolute/empty) exactly as the file browser does — a
+            # relative path is traversal-rejected and contained under the env
+            # root, an absolute one is reach-authorized — and it must name an
+            # existing directory. Returns the resolved path to persist.
+            from omnigent.inner.sandbox import (
+                is_unconfined,
+                reachable_roots,
+                resolve_sandbox,
+            )
+            from omnigent.runner.environment_filesystem import (
+                InvalidPath,
+                PathUnreachable,
+                resolve_workdir_target,
+            )
+
+            raw_workspace = body.get("workspace") if isinstance(body, dict) else None
+            if raw_workspace is not None and not isinstance(raw_workspace, str):
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": "invalid_input",
+                        "detail": "Body 'workspace' must be a string or null",
+                    },
+                )
+            agent_spec = await _resolve_session_agent_spec(conversation_id)
+            spec_os_env = getattr(agent_spec, "os_env", None) if agent_spec is not None else None
+            env_root = resource_registry.compute_default_env_root(conversation_id, agent_spec)
+            if env_root is None or spec_os_env is None:
+                # Headless (no-os_env) agents have no filesystem to root in.
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": "invalid_input",
+                        "detail": "session has no filesystem to set a working directory in",
+                    },
+                )
+            root_path = Path(env_root)
+            policy = resolve_sandbox(spec_os_env, root_path)
+            try:
+                resolved = resolve_workdir_target(
+                    raw_workspace or "",
+                    root_path,
+                    reachable_roots(root_path, policy),
+                    unconfined=is_unconfined(policy),
+                )
+            except InvalidPath as exc:
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "invalid_input", "detail": str(exc)},
+                )
+            except PathUnreachable as exc:
+                return JSONResponse(
+                    status_code=403,
+                    content={"error": "forbidden", "detail": str(exc)},
+                )
+            resolved_str = str(resolved)
+            # Authoritative override: the next _session_runtime_cwd reads this
+            # instead of re-fetching the (still-stale-until-persisted) snapshot.
+            _session_workspace_cache[conversation_id] = resolved_str
+            cached_snapshot = _session_snapshot_cache.get(conversation_id)
+            if cached_snapshot is not None:
+                _session_snapshot_cache[conversation_id] = dataclasses.replace(
+                    cached_snapshot,
+                    workspace=resolved_str,
+                )
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "object": "session.workspace_changed",
+                    "workspace": resolved_str,
+                },
+            )
+
         codex_goal_response = await codex_goal_runner.handle_event(
             conversation_id,
             body_type,
@@ -10445,20 +10521,31 @@ def create_runner_app(
                 },
             )
 
+        # New shells open where the session works: the session workspace (which
+        # workspace_change repoints, same value that roots each turn's cwd) wins
+        # over the static default env root. An explicit cwd override still wins
+        # downstream, and sessions without a workspace keep the default root's
+        # per-session containment.
+        session_workspace = await _session_workspace_value(session_id)
+        session_root = (
+            str(Path(session_workspace.strip()).expanduser().resolve())
+            if session_workspace and session_workspace.strip()
+            else resource_registry.compute_default_env_root(session_id, agent_spec)
+        )
+
         if declared_terminal is not None:
             from omnigent.tools.builtins.sys_terminal import (
                 _materialize_terminal_spec_for_launch,
                 _synthesize_parent_os_env,
             )
 
-            default_root = resource_registry.compute_default_env_root(session_id, agent_spec)
-            env_spec = _materialize_terminal_spec_for_launch(declared_terminal, default_root)
-            agent_os_env = _synthesize_parent_os_env(agent_os_env, default_root)
+            env_spec = _materialize_terminal_spec_for_launch(declared_terminal, session_root)
+            agent_os_env = _synthesize_parent_os_env(agent_os_env, session_root)
             cwd_override = cwd_override or spec.get("cwd")
         else:
             spec_cwd = spec.get("cwd")
             if spec_cwd is None or spec_cwd in (".", "./"):
-                spec_cwd = resource_registry.compute_default_env_root(session_id, agent_spec)
+                spec_cwd = session_root
             env_spec = TerminalEnvSpec(
                 os_env=OSEnvSpec(
                     type=spec.get("os_env_type", "caller_process"),

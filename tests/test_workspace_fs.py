@@ -292,6 +292,97 @@ def test_search_returns_matching_directories(tmp_path: Path) -> None:
     assert by_path["src"]["bytes"] is None
 
 
+def test_search_matches_path_shaped_queries(tmp_path: Path) -> None:
+    """Path-shaped queries (containing '/') also match the absolute path.
+
+    Same rule as the runner's matcher: an absolute path pasted from a
+    terminal, a ``./``-prefixed subpath, or a subpath that includes the
+    workspace directory's own name all name an existing file and must
+    find it whichever side serves the search.
+    """
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "main.py").write_text("x")
+    reader = WorkspaceReader(tmp_path)
+
+    for q in (
+        f"{tmp_path.resolve()}/src/main.py",
+        f"{tmp_path.name}/src/main.py",
+        "./src/main.py",
+    ):
+        paths = {e["path"] for e in reader.search(q)["data"]}
+        assert "src/main.py" in paths, f"Expected 'src/main.py' for q={q!r}, got: {paths}"
+
+
+def test_search_plain_word_does_not_match_the_root_prefix(tmp_path: Path) -> None:
+    """A slash-free query keeps name/relative-path semantics.
+
+    The workspace directory's own name appears in every entry's absolute
+    path; a plain-word query equal to it must still match nothing, or any
+    word from the root's prefix would match every file.
+    """
+    (tmp_path / "a.py").write_text("x")
+    reader = WorkspaceReader(tmp_path)
+
+    result = reader.search(tmp_path.name)
+
+    assert result["data"] == []
+
+
+def test_search_scopes_to_a_subdirectory(tmp_path: Path) -> None:
+    """``path`` confines the walk and results are relative to it.
+
+    Mirrors the runner's scoped ``/search/{path}`` so a host-served search
+    covers exactly what the re-rooted tree is showing, with paths the
+    client can join onto the browsed location.
+    """
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "main.py").write_text("x")
+    (tmp_path / "lib").mkdir()
+    (tmp_path / "lib" / "other.py").write_text("y")
+    reader = WorkspaceReader(tmp_path)
+
+    result = reader.search("py", path="src")
+
+    paths = {e["path"] for e in result["data"]}
+    assert paths == {"main.py"}, f"Expected only src-scoped results, got: {paths}"
+
+
+def test_search_scope_escaping_the_root_is_rejected(tmp_path: Path) -> None:
+    """A ``path`` scope that escapes the workspace root raises a 400."""
+    (tmp_path / "a.py").write_text("x")
+    reader = WorkspaceReader(tmp_path)
+
+    with pytest.raises(WorkspaceReaderError) as excinfo:
+        reader.search("a", path="../outside")
+
+    assert excinfo.value.status == 400
+
+
+def test_dispatch_fs_search_forwards_the_path_scope(tmp_path: Path) -> None:
+    """The host fs-op dispatcher passes the search's ``path`` scope through.
+
+    The server always sends ``path`` for a scoped search; dropping it would
+    silently search the whole workspace and return results rooted wrongly
+    for the client's browsed location.
+    """
+    from omnigent.host.connect import HostProcess
+
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "main.py").write_text("x")
+    (tmp_path / "other.py").write_text("y")
+    reader = WorkspaceReader(tmp_path)
+
+    payload = HostProcess._dispatch_fs_op(
+        reader,
+        "search",
+        "conv_test",
+        {"q": "py", "path": "src", "limit": 500},
+    )
+
+    paths = {e["path"] for e in payload["data"]}
+    assert paths == {"main.py"}, f"Expected the src-scoped result only, got: {paths}"
+
+
 def test_search_defers_deep_noise_subtree_to_reach_later_real_dir(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

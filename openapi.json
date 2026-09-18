@@ -8523,6 +8523,18 @@
             ],
             "description": "New title, e.g. `\"debugging auth flow\"`. `None` leaves unchanged.",
             "title": "Title"
+          },
+          "workspace": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Repoint the session's working directory (where turns run and new shells open) to a folder the file browser re-rooted onto. The wire form mirrors the browse APIs: `\"\"` is the environment root, a path with no leading `/` is resolved under it (viewer/edit level), and a leading-`/` absolute path is the owner's own machine (owner-gated, exactly like absolute browsing). The bound runner resolves the target against its live environment root and enforces the session's sandbox reach \u2014 a relative path is traversal-rejected and confined under that root, and the target must be an existing directory \u2014 then the server persists the resolved absolute path. Omitting the field leaves the workspace unchanged.",
+            "title": "Workspace"
           }
         },
         "title": "UpdateSessionRequest",

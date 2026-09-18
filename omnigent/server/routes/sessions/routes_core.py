@@ -5,8 +5,11 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import ntpath
+import posixpath
 import secrets
 import time
+import weakref
 from collections.abc import Callable
 from typing import Any
 
@@ -227,6 +230,22 @@ from omnigent.util.session_lifecycle import (
 from omnigent.version import VERSION
 
 
+def _is_absolute_workspace(path: str) -> bool:
+    """Whether a workspace wire-form names an absolute location on any platform.
+
+    Gates the owner-only tier for workspace changes, so it must fail closed:
+    ``ntpath.isabs`` alone stopped admitting rooted POSIX forms (``"/etc"``)
+    and rooted-backslash forms on Python 3.13, which would let an editor slip
+    an absolute path through the edit-tier check. Check the POSIX rule, the
+    Windows drive/UNC rule, and a rooted backslash explicitly.
+
+    :param path: Client-supplied workspace wire form, e.g. ``"src"`` or
+        ``"/etc"``.
+    :returns: ``True`` when the path is absolute under any platform's rules.
+    """
+    return posixpath.isabs(path) or ntpath.isabs(path) or path.startswith("\\")
+
+
 async def _reset_runner_and_clear_todos_after_switch(
     session_id: str, conversation_store: ConversationStore
 ) -> None:
@@ -264,6 +283,34 @@ def register_core_routes(
     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
 ) -> None:
     """Register the core session routes on router."""
+    # Closure-scoped (per registered app), so imported sessions with colliding
+    # ids on a multi-tenant pod share at most a lock, never a value.
+    _workspace_change_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+        weakref.WeakValueDictionary()
+    )
+
+    def _workspace_change_lock(session_id: str) -> asyncio.Lock:
+        """Per-session lock ordering a workspace change's forward + persist.
+
+        The runner forward and the workspace persist are two steps; two
+        concurrent PATCHes could interleave them and leave the runner's live
+        cwd permanently diverged from the stored workspace (runner applied B
+        last, store persisted A last). Serializing the pair per session makes
+        the last persisted value the last one the runner applied. In-process
+        only — coordinating cross-replica writers would need versioned
+        updates. Weak values let a session's lock vanish once no change holds
+        or awaits it.
+
+        :param session_id: Session whose workspace changes are ordered.
+        :returns: The session's lock.
+        """
+        lock = _workspace_change_locks.get(session_id)
+        if lock is None:
+            # No await between the miss and the store, so two coroutines on
+            # the event loop cannot both create a lock for the same session.
+            lock = asyncio.Lock()
+            _workspace_change_locks[session_id] = lock
+        return lock
 
     async def _schedule_managed_launch(
         request: Request,
@@ -2057,6 +2104,7 @@ def register_core_routes(
         # second permission-store read.
         set_project = "project_id" in body.model_fields_set
         set_share_workspace = "share_workspace_files" in body.model_fields_set
+        set_workspace = "workspace" in body.model_fields_set
         pin_only = body.model_fields_set == {"labels"} and set(body.labels or {}) == {
             PINNED_LABEL_KEY
         }
@@ -2068,6 +2116,17 @@ def register_core_routes(
             required_level = LEVEL_MANAGE
         else:
             required_level = LEVEL_EDIT
+        if set_workspace:
+            # Repointing the workspace defaults to EDIT (browsing inside the
+            # runner's env root, viewer/edit reach). An absolute wire-form path
+            # targets the owner's machine outside the sandboxed env root, so it
+            # is owner-gated. Tiers are monotonic, so compose with max().
+            workspace_level = (
+                LEVEL_OWNER
+                if (body.workspace is not None and _is_absolute_workspace(body.workspace))
+                else LEVEL_EDIT
+            )
+            required_level = max(required_level, workspace_level)
         await _require_access(
             user_id, session_id, required_level, permission_store, conversation_store
         )
@@ -2647,6 +2706,110 @@ def register_core_routes(
                 )
                 if not filed:
                     raise _session_not_found()
+        # Repoint the workspace last, after every other mutation. The browser
+        # browses relative to the RUNNER's live env root (unknown to the server
+        # for runner-only sessions), so only the runner can resolve the wire form
+        # and enforce reach; forward, then persist the absolute path it returns.
+        # Not silent-gated: this moves the runner's cwd, it adds no pane item.
+        if set_workspace:
+            async with _workspace_change_lock(session_id):
+                # Captured before the forward: if the persist below fails after the
+                # runner already applied the change, the runner is rolled back here.
+                _prior_conv = await asyncio.to_thread(
+                    conversation_store.get_conversation, session_id
+                )
+                _prior_workspace = _prior_conv.workspace if _prior_conv is not None else None
+                _workspace_forward = await _forward_session_change_to_runner(
+                    session_id,
+                    runner_router,
+                    {"type": "workspace_change", "workspace": body.workspace or ""},
+                )
+                _resolved_workspace: str | None = None
+                if _workspace_forward is not None and _workspace_forward.status_code == 200:
+                    try:
+                        _wf_body = json.loads(_workspace_forward.body)
+                    except (ValueError, TypeError):
+                        _wf_body = None
+                    if isinstance(_wf_body, dict) and isinstance(_wf_body.get("workspace"), str):
+                        _resolved_workspace = _wf_body["workspace"]
+                if _resolved_workspace is None:
+                    if _workspace_forward is not None and _workspace_forward.status_code >= 400:
+                        # Preserve the runner's verdict: out-of-reach (403) is a
+                        # permission refusal, a runner 5xx is infrastructure (so
+                        # the client can retry), anything else is bad input.
+                        if _workspace_forward.status_code == 403:
+                            _forward_code = ErrorCode.FORBIDDEN
+                        elif _workspace_forward.status_code >= 500:
+                            _forward_code = ErrorCode.RUNNER_UNAVAILABLE
+                        else:
+                            _forward_code = ErrorCode.INVALID_INPUT
+                        raise OmnigentError(
+                            "runner rejected the working-directory change: "
+                            f"{_workspace_forward.body}",
+                            code=_forward_code,
+                        )
+                    if body.workspace and _is_absolute_workspace(body.workspace):
+                        # No runner to resolve against. The same agent boundary
+                        # the create/relaunch paths enforce applies here: the
+                        # session's host validates existence, canonicalizes,
+                        # and checks the agent's os_env.cwd boundary. Runner
+                        # availability must not decide whether that boundary
+                        # holds — an unvalidated persist would become the
+                        # runner root (and sandbox base) on automatic relaunch.
+                        from omnigent.server.routes._sessions.helpers import (
+                            _validate_session_workspace,
+                        )
+
+                        if _prior_conv is None or _prior_conv.host_id is None:
+                            raise OmnigentError(
+                                "session runner is offline and no host is bound; "
+                                "cannot validate the working directory for this "
+                                "session",
+                                code=ErrorCode.RUNNER_UNAVAILABLE,
+                            )
+                        _agent_row = (
+                            await asyncio.to_thread(agent_store.get, _prior_conv.agent_id)
+                            if _prior_conv.agent_id is not None
+                            else None
+                        )
+                        _resolved_workspace = await _validate_session_workspace(
+                            user_id=user_id,
+                            host_id=_prior_conv.host_id,
+                            workspace=body.workspace,
+                            agent=_agent_row,
+                            agent_cache=agent_cache,
+                            request=request,
+                        )
+                    else:
+                        # A relative path only means something against the runner's
+                        # live env root; with no runner the server can't resolve it.
+                        raise OmnigentError(
+                            "session runner is offline; cannot resolve the working "
+                            "directory for this session",
+                            code=ErrorCode.RUNNER_UNAVAILABLE,
+                        )
+                try:
+                    await asyncio.to_thread(
+                        conversation_store.set_workspace, session_id, _resolved_workspace
+                    )
+                except Exception as exc:
+                    # The runner applied the change when it answered the forward; a
+                    # failed persist would leave its live cwd diverged from the
+                    # stored snapshot, so point it back at the previously persisted
+                    # workspace (best-effort) before surfacing the error.
+                    if _workspace_forward is not None and _workspace_forward.status_code == 200:
+                        with contextlib.suppress(Exception):
+                            await _forward_session_change_to_runner(
+                                session_id,
+                                runner_router,
+                                {
+                                    "type": "workspace_change",
+                                    "workspace": _prior_workspace or "",
+                                },
+                            )
+                    if isinstance(exc, ConversationNotFoundError):
+                        raise _session_not_found() from exc
+                    raise
         level = await _get_permission_level(user_id, session_id, permission_store)
         # PATCH callers consume only the snapshot's scalar fields (clients
         # hydrate transcripts via GET /sessions/{id}/items), so skip the

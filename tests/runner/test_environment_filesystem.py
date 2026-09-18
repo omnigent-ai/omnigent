@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import sys
+import urllib.parse
 from collections.abc import AsyncIterator
 from pathlib import Path
 from types import SimpleNamespace
@@ -1337,6 +1338,106 @@ async def test_search_matches(
     paths = {e["path"] for e in body["data"]}
     assert expected_path in paths, (
         f"Expected {expected_path!r} in search results for q={q!r}, got: {paths}. {failure_hint}"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "q_template,expected_path,failure_hint",
+    [
+        (
+            "{ws}/src/main.py",
+            "src/main.py",
+            "An absolute path pasted from a terminal names an existing file; "
+            "search must find it even though the relative path lacks the prefix.",
+        ),
+        (
+            "{ws}/src/",
+            "src",
+            "An absolute directory query (trailing slash) must surface the directory.",
+        ),
+        (
+            "workspace/src/main.py",
+            "src/main.py",
+            "A subpath that includes the workspace directory's own name must match.",
+        ),
+        (
+            "./src/main.py",
+            "src/main.py",
+            "A ./-prefixed subpath must match after normalization.",
+        ),
+    ],
+    ids=["absolute_file", "absolute_dir_trailing_slash", "crosses_root_name", "dot_slash"],
+)
+async def test_search_matches_path_shaped_queries(
+    client: httpx.AsyncClient,
+    workspace: Path,
+    q_template: str,
+    expected_path: str,
+    failure_hint: str,
+) -> None:
+    """Path-shaped queries (containing '/') also match the entry's absolute path.
+
+    Users paste paths from terminals and agent output: an absolute path, a
+    ``./``-prefixed one, or a subpath that starts above the workspace root.
+    All of these name a file that exists, so search must find it even though
+    the entry's workspace-relative path alone does not contain the query.
+
+    :param client: httpx client for the runner app.
+    :param workspace: The workspace directory the runner serves.
+    :param q_template: Query template; ``{ws}`` expands to the workspace path.
+    :param expected_path: Relative path that must appear in the results.
+    :param failure_hint: Explanation surfaced when the assertion fails.
+    """
+    q = urllib.parse.quote(q_template.format(ws=workspace))
+    resp = await client.get(
+        f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/search?q={q}"
+    )
+    assert resp.status_code == 200
+    paths = {e["path"] for e in resp.json()["data"]}
+    assert expected_path in paths, (
+        f"Expected {expected_path!r} in search results for q={q_template!r}, got: {paths}. "
+        f"{failure_hint}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_search_scoped_under_a_directory_matches_root_relative_query(
+    client: httpx.AsyncClient,
+    workspace: Path,
+) -> None:
+    """A search scoped under a directory still matches root-anchored queries.
+
+    With the tree browsed into ``src``, a query spelled from the workspace
+    root (``src/main.py``) or as an absolute path names a file inside the
+    scope; both must match even though the scoped relative path is just
+    ``main.py``.
+    """
+    base = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/search/src"
+    for q in ("src/main.py", f"{workspace}/src/main.py"):
+        resp = await client.get(f"{base}?q={urllib.parse.quote(q)}")
+        assert resp.status_code == 200
+        paths = {e["path"] for e in resp.json()["data"]}
+        assert "main.py" in paths, f"Expected 'main.py' for scoped q={q!r}, got: {paths}"
+
+
+@pytest.mark.asyncio
+async def test_search_plain_word_does_not_match_the_root_prefix(
+    client: httpx.AsyncClient,
+) -> None:
+    """A slash-free query never matches against the absolute-path prefix.
+
+    The workspace directory itself is named ``workspace``; if plain words were
+    compared against absolute paths, this query would match every file. It
+    must keep name/relative-path semantics and match nothing here.
+    """
+    resp = await client.get(
+        f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/search?q=workspace"
+    )
+    assert resp.status_code == 200
+    assert resp.json()["data"] == [], (
+        "A plain-word query matching only the root's own path prefix must return nothing; "
+        "matching it against absolute paths would make it match every file."
     )
 
 
