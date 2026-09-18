@@ -13213,10 +13213,8 @@ _register_native_commands(cli)
 
 
 if __name__ == "__main__":
-    # Match the console script's main(): when spawned with -P (e.g. the
-    # background local-server child), re-add the launch cwd now that the real
-    # omnigent is imported (it can no longer be shadowed) so spec-declared
-    # local tools living in the workspace still import.
+    # Omnigent is already loaded from the selected installation. Restore the
+    # workspace path for local tools, matching the console entry point.
     if (_cwd := os.getcwd()) not in sys.path:
         sys.path.insert(0, _cwd)
     cli()

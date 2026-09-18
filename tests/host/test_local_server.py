@@ -424,15 +424,7 @@ def test_spawn_local_server_preserves_runtime_and_workspace(
 def test_spawned_server_entry_keeps_workspace_tools_importable(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The safe-path child re-adds its launch cwd for spec-declared tools.
-
-    ``-P`` keeps the workspace off the child's startup import path, but agent
-    specs may declare function tools whose dotted ``callable:`` lives in the
-    launch directory. The ``-m omnigent.cli`` entry must re-add the cwd once
-    the real runtime is imported — mirroring the console script's ``main()``
-    — so those tools still resolve while a conflicting workspace ``omnigent``
-    package stays unimportable.
-    """
+    """Workspace tools import after startup without replacing the selected runtime."""
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     (workspace / "workspace_tool_module.py").write_text("def echo(message):\n    return message\n")
