@@ -56,6 +56,23 @@ async def _route_spawns(base_url: str, session_id: str, bridge_dir: Path) -> Non
             router.close()
 
 
+def _expect_task_attribution(page: Page) -> None:
+    """Each card names its task and exposes the matching raw verdict."""
+    cards = page.get_by_test_id("routing-decision-card")
+    expect(cards).to_have_count(len(_TASKS), timeout=15_000)
+    for description in _TASKS:
+        card = cards.filter(
+            has=page.get_by_test_id("routing-decision-task").filter(has_text=description)
+        )
+        expect(card).to_have_count(1)
+        expect(card.get_by_test_id("routing-decision-task")).to_have_text(description)
+        expect(card.get_by_test_id("routing-decision-scope")).to_contain_text(
+            "subagent: general-purpose"
+        )
+        card.get_by_role("button", name="Show raw routing verdict").click()
+        expect(card.locator("pre")).to_contain_text(f'"task_description": "{description}"')
+
+
 def test_fanout_routing_chips_are_individually_attributable(
     page: Page,
     seeded_session: tuple[str, str],
@@ -87,28 +104,13 @@ def test_fanout_routing_chips_are_individually_attributable(
             timeout=60
         )
 
-    cards = page.get_by_test_id("routing-decision-card")
-    expect(cards).to_have_count(3, timeout=15_000)
-    for description in _TASKS:
-        expect(
-            page.get_by_test_id("routing-decision-task").filter(has_text=description)
-        ).to_have_text(description)
+    _expect_task_attribution(page)
 
     items = httpx.get(f"{session_url}/items", timeout=10.0)
     items.raise_for_status()
     decisions = [i for i in items.json()["data"] if i["type"] == "routing_decision"]
     assert sorted(i["task_description"] for i in decisions) == sorted(_TASKS)
+    assert all(i["scope"] == "native_subagent" for i in decisions)
 
     page.reload()
-    expect(cards).to_have_count(3, timeout=15_000)
-    for description in _TASKS:
-        card = cards.filter(
-            has=page.get_by_test_id("routing-decision-task").filter(has_text=description)
-        )
-        expect(card).to_have_count(1)
-        expect(card.get_by_test_id("routing-decision-task")).to_have_text(description)
-        expect(card.get_by_test_id("routing-decision-scope")).to_contain_text(
-            "subagent: general-purpose"
-        )
-        card.get_by_role("button", name="Show raw routing verdict").click()
-        expect(card.locator("pre")).to_contain_text(f'"task_description": "{description}"')
+    _expect_task_attribution(page)
