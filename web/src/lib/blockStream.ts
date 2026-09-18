@@ -27,6 +27,7 @@ import {
   type RetryBlock,
   type RoutingDecisionBlock,
   type SlashCommandBlock,
+  type TeammateMessageBlock,
   type TerminalCommandBlock,
   type TextChunk,
   type TextDone,
@@ -692,6 +693,21 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
         stdout: event.stdout,
         stderr: event.stderr,
       } satisfies TerminalCommandBlock;
+      return;
+    }
+
+    // ── Teammate delivery (Claude Code agent teams) ──────
+    case "teammate_message": {
+      adoptResponseIdIfUnset(state, event.responseId);
+      yield {
+        type: "teammate_message",
+        ctx: ctx(state, event.itemId || null, event.responseId || null),
+        teammateId: event.teammateId,
+        kind: event.kind,
+        text: event.text,
+        summary: event.summary,
+        color: event.color,
+      } satisfies TeammateMessageBlock;
       return;
     }
 

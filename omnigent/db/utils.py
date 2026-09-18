@@ -1095,6 +1095,7 @@ _ITEM_TYPES: frozenset[str] = frozenset(
         "native_tool",
         "resource_event",
         "slash_command",
+        "teammate_message",
         "terminal_command",
         "routing_decision",
     }
@@ -1406,6 +1407,14 @@ def extract_search_text(item: NewConversationItem) -> str:
         # Index model + rationale so FTS can find a router verdict by
         # the model it picked or its one-line explanation.
         return " ".join(part for part in (data.get("model"), data.get("rationale")) if part)
+    if item.type == "teammate_message":
+        # Index the teammate's name + summary + prose so FTS can find a
+        # historical teammate delivery by who said it or what was said.
+        return " ".join(
+            part
+            for part in (data["teammate_id"], data.get("summary") or "", data.get("text") or "")
+            if part
+        )
     raise ValueError(f"unknown item type: {item.type!r}")
 
 

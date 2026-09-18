@@ -31,6 +31,7 @@ import {
   PlusIcon,
   ScanSearchIcon,
   SearchIcon,
+  UsersIcon,
 } from "lucide-react";
 import { Link, useLocation } from "@/lib/routing";
 import { Badge } from "@/components/ui/badge";
@@ -52,6 +53,7 @@ import { RunningDot } from "@/components/RunningDot";
 import { shortModelName } from "@/components/CostRoutingControl";
 import { MAX_TREE_DEPTH, useChildSessions, type ChildSessionInfo } from "@/hooks/useChildSessions";
 import { useSession } from "@/hooks/useSession";
+import { useTeammates, type TeammateInfo } from "@/hooks/useTeammates";
 import type { SessionItem } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
@@ -117,6 +119,7 @@ type ViewMode = "list" | "graph";
 
 export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanelProps) {
   const { children, isLoading, error } = useChildSessions(rootSessionId);
+  const { teammates } = useTeammates(rootSessionId);
   const [addOpen, setAddOpen] = useState(false);
   const [viewMode, setViewMode] = useState<ViewMode>("list");
   const [collapsedRows, setCollapsedRows] = useState<Record<string, boolean>>({});
@@ -181,6 +184,9 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
             collapsedRows={collapsedRows}
             onToggleCollapsed={toggleCollapsedRow}
           />
+        ))}
+        {teammates.map((teammate) => (
+          <TeammateRow key={teammate.teammate_id} teammate={teammate} />
         ))}
       </ul>
       {/* Mounted only while open so a closed rail issues no /v1/agents
@@ -702,5 +708,53 @@ function SubagentRow({
           />
         ))}
     </>
+  );
+}
+
+/**
+ * Row for a harness-internal teammate (today: Claude Code agent
+ * teams). Unlike a child session it has no conversation to navigate
+ * to, no cost/model row, and no session id — so the row is a plain
+ * (non-link) entry carrying a "Teammate" badge to keep it
+ * distinguishable from the sub-agent rows around it.
+ */
+function TeammateRow({ teammate }: { teammate: TeammateInfo }) {
+  const status: AgentStatus =
+    teammate.status === "idle"
+      ? { activity: "idle", label: "Idle" }
+      : { activity: "working", label: "Working" };
+  const preview = teammate.last_summary ?? teammate.last_message_preview;
+  const dim = SETTLED_STATE[status.activity];
+  return (
+    <li>
+      <div
+        data-testid="teammate-row"
+        data-teammate-id={teammate.teammate_id}
+        style={{ paddingLeft: rowPaddingLeft(1) }}
+        className={cn(
+          "flex w-full flex-col gap-0.5 py-2 pr-2.5 text-left",
+          dim && "opacity-60 hover:opacity-100",
+        )}
+      >
+        <div className="flex w-full items-center gap-1">
+          <CornerDownRightIcon
+            aria-hidden="true"
+            className="-ml-3 size-3 shrink-0 text-muted-foreground/60"
+          />
+          <UsersIcon className="size-3.5 shrink-0 text-muted-foreground" />
+          <span className="shrink-0 truncate text-sm font-medium">{teammate.teammate_id}</span>
+          <Badge
+            variant="outline"
+            title="Runs inside the harness process — no separate conversation to open"
+            className="shrink-0 px-1 py-0 text-[10px] text-muted-foreground"
+          >
+            Teammate
+          </Badge>
+          <span className="flex-1" />
+          <StatusIndicator {...status} />
+        </div>
+        {preview && <p className="truncate pl-[22px] text-sm text-muted-foreground">{preview}</p>}
+      </div>
+    </li>
   );
 }

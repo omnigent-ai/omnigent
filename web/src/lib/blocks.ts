@@ -322,6 +322,29 @@ export function slashCommandEchoItemId(slashItemId: string): string {
 }
 
 /**
+ * A harness-internal teammate delivery (today: Claude Code agent
+ * teams), parsed by the bridge from `<teammate-message>` markup on the
+ * transcript's user channel. `kind="message"` renders as one readable
+ * teammate item (prose + summary); `kind="idle"` and `kind="spawn"`
+ * render nothing — they exist so the Agents rail can list the teammate
+ * and its state.
+ */
+export interface TeammateMessageBlock {
+  type: "teammate_message";
+  ctx: BlockContext;
+  /** The teammate's name, e.g. `buddy`. */
+  teammateId: string;
+  /** `"message"` prose delivery; `"idle"` idle ping; `"spawn"` spawn call. */
+  kind: "message" | "idle" | "spawn";
+  /** Prose body; empty for idle/spawn blocks. */
+  text: string;
+  /** One-line summary attribute, or null. */
+  summary: string | null;
+  /** Teammate accent color, or null. */
+  color: string | null;
+}
+
+/**
  * An intelligent-model-router decision, rendered as a standalone muted
  * chip at its transcript position (turn start). Display-only — the
  * server keeps the matching `routing_decision` item out of the model's
@@ -652,6 +675,7 @@ export type AnyBlock =
   | SlashCommandBlock
   | RoutingDecisionBlock
   | TerminalCommandBlock
+  | TeammateMessageBlock
   | TextChunk
   | TextDone
   | ReasoningStartBlock

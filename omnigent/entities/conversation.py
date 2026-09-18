@@ -734,6 +734,41 @@ class SlashCommandData(BaseModel):
     output: str | None = None
 
 
+class TeammateMessageData(BaseModel):
+    """
+    Data payload for a harness-internal teammate delivery observed in a
+    harness transcript (today: Claude Code's in-process agent teams).
+
+    A teammate is spawned inside the harness process (Claude Code's
+    ``Agent`` tool with a ``name``) and is not an Omnigent session, so
+    its deliveries reach the parent transcript as ``<teammate-message>``
+    markup on the user channel. The bridge parses that markup into this
+    structured item so the web can render the prose readably, suppress
+    the machine-side idle ping, and list the teammate in the Agents
+    rail. Listed in :data:`NON_CONTENT_ITEM_TYPES` so the agent loop's
+    history filter skips it (native harnesses keep the original markup
+    in their own context).
+
+    :param teammate_id: The teammate's name, e.g. ``"buddy"``.
+    :param kind: ``"message"`` for a prose delivery, ``"idle"`` for the
+        machine-side idle notification twin (rendered as no chat
+        bubble), ``"spawn"`` for the parent's spawn call (no delivery
+        text yet — makes a still-working teammate visible in the rail).
+    :param text: Prose body of the delivery; empty for ``idle`` /
+        ``spawn`` items without one.
+    :param summary: One-line ``summary`` attribute when the delivery
+        carried one, else ``None``.
+    :param color: Teammate accent color from the markup (e.g.
+        ``"blue"``), else ``None``.
+    """
+
+    teammate_id: str
+    kind: Literal["message", "idle", "spawn"] = "message"
+    text: str = ""
+    summary: str | None = None
+    color: str | None = None
+
+
 ItemData = (
     MessageData
     | FunctionCallData
@@ -746,6 +781,7 @@ ItemData = (
     | RoutingDecisionData
     | SlashCommandData
     | TerminalCommandData
+    | TeammateMessageData
 )
 
 ITEM_TYPE_TO_DATA_CLS: dict[str, type[BaseModel]] = {
@@ -760,6 +796,7 @@ ITEM_TYPE_TO_DATA_CLS: dict[str, type[BaseModel]] = {
     "routing_decision": RoutingDecisionData,
     "slash_command": SlashCommandData,
     "terminal_command": TerminalCommandData,
+    "teammate_message": TeammateMessageData,
 }
 
 # Item types that are metadata / lifecycle events — not content
@@ -772,6 +809,7 @@ NON_CONTENT_ITEM_TYPES: frozenset[str] = frozenset(
         "resource_event",
         "routing_decision",
         "slash_command",
+        "teammate_message",
         "terminal_command",
     }
 )

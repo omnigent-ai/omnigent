@@ -2833,6 +2833,54 @@ class ChildSessionList(BaseModel):
     has_more: bool = False
 
 
+class TeammateSummary(BaseModel):
+    """
+    Summary of a harness-internal teammate under a session.
+
+    Powers ``GET /v1/sessions/{id}/teammates``. A teammate is an agent
+    spawned *inside* a native harness process (today: Claude Code agent
+    teams) — it has no Omnigent session, runner, or conversation, so it
+    cannot appear in ``child_sessions``. This summary is folded from the
+    session's ``teammate_message`` items (display-only), letting the
+    Agents rail show the teammate distinctly from real child sessions.
+
+    :param teammate_id: The teammate's name, e.g. ``"buddy"``.
+    :param object: Fixed resource type, always ``"teammate"``.
+    :param parent_session_id: Session whose transcript the teammate's
+        deliveries appear in (echo of the route's ``session_id``).
+    :param status: ``"idle"`` when the newest delivery is the
+        teammate's idle notification, else ``"active"`` (spawned or
+        mid-delivery). Coarse by construction — deliveries arrive at
+        turn boundaries, not live.
+    :param color: Teammate accent color from the newest delivery
+        carrying one, e.g. ``"blue"``. ``None`` when never provided.
+    :param last_summary: ``summary`` attribute of the newest prose
+        delivery, e.g. ``"All good over here"``. ``None`` when the
+        teammate has not delivered prose yet.
+    :param last_message_preview: Single-line preview of the newest
+        prose delivery's text, truncated like the child-session
+        preview. ``None`` before the first prose delivery.
+    :param last_activity_at: Unix epoch timestamp of the teammate's
+        newest ``teammate_message`` item.
+    """
+
+    teammate_id: str
+    object: str = "teammate"
+    parent_session_id: str
+    status: Literal["active", "idle"] = "active"
+    color: str | None = None
+    last_summary: str | None = None
+    last_message_preview: str | None = None
+    last_activity_at: int
+
+
+class TeammateList(BaseModel):
+    """List of teammates; ``data`` covers every teammate seen in the session."""
+
+    object: Literal["list"] = "list"
+    data: list[TeammateSummary] = Field(default_factory=list)
+
+
 class SessionUsage(BaseModel):
     """
     One session's rolled-up LLM spend for the ``GET /v1/usage`` report.

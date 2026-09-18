@@ -74,6 +74,9 @@ if TYPE_CHECKING:
 from omnigent.inner.hook_scripts.subagent_router import (
     AGENT_TOOL_MATCHER as CLAUDE_SUBAGENT_TOOL_MATCHER,
 )
+from omnigent.inner.hook_scripts.subagent_router import (
+    AGENT_TOOL_NAMES,
+)
 from omnigent.native import native_bridge_common
 from omnigent.tools.base import Tool, ToolContext
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS
@@ -7078,6 +7081,16 @@ _COMMAND_STDOUT_RE = re.compile(r"<local-command-stdout>(.*?)</local-command-std
 _BASH_INPUT_RE = re.compile(r"<bash-input>(.*?)</bash-input>", re.DOTALL)
 _BASH_STDOUT_RE = re.compile(r"<bash-stdout>(.*?)</bash-stdout>", re.DOTALL)
 _BASH_STDERR_RE = re.compile(r"<bash-stderr>(.*?)</bash-stderr>", re.DOTALL)
+# Teammate deliveries (Claude Code agent teams). An in-process
+# teammate's message to the lead lands on the user channel as one or
+# more ``<teammate-message>`` blocks inside CLI framing text; each
+# prose block pairs with a machine-side ``idle_notification`` JSON
+# twin on the same channel. Parsed into ``teammate_message`` items so
+# neither half renders verbatim as a user bubble.
+_TEAMMATE_MESSAGE_RE = re.compile(
+    r"<teammate-message\b([^>]*)>(.*?)</teammate-message>", re.DOTALL
+)
+_TEAMMATE_ATTR_RE = re.compile(r'([A-Za-z_][\w-]*)="([^"]*)"')
 _TASK_NOTIFICATION_REQUIRED_MARKERS: tuple[str, ...] = (
     "<task-notification>",
     "<task-id>",
@@ -7374,6 +7387,90 @@ def _is_task_notification_text(text: str) -> bool:
     )
 
 
+def _teammate_idle_result(body: str) -> str | None:
+    """
+    Return the idle notification's ``result`` text when *body* is one.
+
+    :param body: A ``<teammate-message>`` block body, stripped.
+    :returns: The ``result`` string (``""`` when the ping carries none)
+        for an ``idle_notification`` JSON twin, else ``None`` for prose.
+    """
+    if not body.startswith("{"):
+        return None
+    try:
+        decoded = json.loads(body)
+    except ValueError:
+        return None
+    if not isinstance(decoded, dict) or decoded.get("type") != "idle_notification":
+        return None
+    result = decoded.get("result")
+    return result if isinstance(result, str) else ""
+
+
+def _teammate_message_payloads(content: str) -> list[_JsonObject] | None:
+    """
+    Parse ``<teammate-message>`` blocks out of a user transcript record.
+
+    The surrounding CLI framing text ("Another Claude session sent a
+    message:" + the trailing peer-security notice) is dropped — it is
+    context for the model, not user content.
+
+    :param content: Raw ``role=user`` record content string.
+    :returns: One ``teammate_message`` data payload per parseable
+        block, or ``None`` when no complete block exists (not a
+        teammate delivery, or a markup drift — the caller then keeps
+        the record on the plain-message path).
+    """
+    payloads: list[_JsonObject] = []
+    for match in _TEAMMATE_MESSAGE_RE.finditer(content):
+        attrs = dict(_TEAMMATE_ATTR_RE.findall(match.group(1)))
+        teammate_id = attrs.get("teammate_id", "").strip()
+        if not teammate_id:
+            continue
+        data: _JsonObject = {"teammate_id": teammate_id}
+        color = attrs.get("color", "").strip()
+        if color:
+            data["color"] = color
+        summary = attrs.get("summary", "").strip()
+        if summary:
+            data["summary"] = summary
+        body = match.group(2).strip()
+        idle_result = _teammate_idle_result(body)
+        if idle_result is not None:
+            data["kind"] = "idle"
+            data["text"] = idle_result
+        else:
+            data["kind"] = "message"
+            data["text"] = body
+        payloads.append(data)
+    return payloads or None
+
+
+def _teammate_spawn_payload(tool_name: str, arguments: _JsonObject) -> _JsonObject | None:
+    """
+    Detect an in-process teammate spawn in an ``Agent``/``Task`` call.
+
+    A teammate spawn carries a ``name`` argument; classic Task-tool
+    sub-agents carry ``subagent_type`` instead (and surface as shadow
+    child sessions via their on-disk meta files). The spawn item makes
+    a still-working teammate visible in the rail before its first
+    delivery.
+
+    :param tool_name: The ``tool_use`` block's tool name.
+    :param arguments: The ``tool_use`` block's ``input`` dict.
+    :returns: A ``teammate_message`` data payload of kind ``"spawn"``,
+        or ``None`` when the call is not a teammate spawn.
+    """
+    if tool_name not in AGENT_TOOL_NAMES:
+        return None
+    if "subagent_type" in arguments:
+        return None
+    name = arguments.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return None
+    return {"teammate_id": name.strip(), "kind": "spawn"}
+
+
 def _local_command_transcript_items_from_entry(
     entry: _JsonObject,
     *,
@@ -7600,6 +7697,23 @@ def _user_transcript_items_from_entry(
             # assistant text must inherit this id so it clusters with
             # the indicator, not the prior bubble.
             return fallback_response_id, items
+        if "<teammate-message" in stripped:
+            teammate_payloads = _teammate_message_payloads(content)
+            # No complete block (markup drift / partial write): keep the
+            # record on the plain-message path rather than dropping it.
+            if teammate_payloads is not None:
+                for payload_index, payload in enumerate(teammate_payloads):
+                    items.append(
+                        ClaudeTranscriptItem(
+                            source_id=_source_id(source_key, payload_index, "teammate_message"),
+                            item_type="teammate_message",
+                            data=payload,
+                            response_id=fallback_response_id,
+                        )
+                    )
+                # A delivery wakes the parent; the wake's assistant output
+                # clusters with the delivery, not the prior bubble.
+                return fallback_response_id, items
         # ``!cmd`` terminal commands may arrive here in older Claude
         # builds; newer builds use top-level ``local_command`` records.
         # In both shapes, surface the command and result as their own
@@ -7675,6 +7789,20 @@ def _user_transcript_items_from_entry(
                 stripped.startswith(m) for m in _CLI_SCAFFOLDING_MARKERS
             ):
                 continue
+            if "<teammate-message" in stripped:
+                teammate_payloads = _teammate_message_payloads(text)
+                if teammate_payloads is not None:
+                    for payload in teammate_payloads:
+                        items.append(
+                            ClaudeTranscriptItem(
+                                source_id=_source_id(source_key, item_index, "teammate_message"),
+                                item_type="teammate_message",
+                                data=payload,
+                                response_id=fallback_response_id,
+                            )
+                        )
+                        item_index += 1
+                    continue
             if _is_task_notification_text(text):
                 items.append(
                     ClaudeTranscriptItem(
@@ -7855,6 +7983,16 @@ def _assistant_transcript_items_from_entry(
                     response_id=response_id,
                 )
             )
+            spawn_payload = _teammate_spawn_payload(name, arguments)
+            if spawn_payload is not None:
+                items.append(
+                    ClaudeTranscriptItem(
+                        source_id=_source_id(source_key, item_index, "teammate_message"),
+                        item_type="teammate_message",
+                        data=spawn_payload,
+                        response_id=response_id,
+                    )
+                )
     if waking and items:
         items.insert(0, _scheduled_wake_marker_item(source_key, response_id))
     return response_id if items else current_response_id, items

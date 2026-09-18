@@ -1970,6 +1970,57 @@ describe("buildBubbles — reasoning", () => {
   });
 });
 
+describe("buildBubbles — teammate_message items", () => {
+  it("prose delivery becomes a teammate_message RenderItem", () => {
+    const blocks: AnyBlock[] = [
+      {
+        type: "teammate_message",
+        ctx: ctx({ itemId: "tm_1", responseId: "resp_tm" }),
+        teammateId: "buddy",
+        kind: "message",
+        text: "All good here.",
+        summary: "All good over here",
+        color: "blue",
+      },
+    ];
+    const bubbles = buildBubbles(blocks, null);
+    expect(bubbles.length).toBe(1);
+    const items = (bubbles[0] as Extract<Bubble, { kind: "assistant" }>).items;
+    expect(items.length).toBe(1);
+    const teammate = items[0] as Extract<RenderItem, { kind: "teammate_message" }>;
+    expect(teammate.teammateId).toBe("buddy");
+    expect(teammate.text).toBe("All good here.");
+    expect(teammate.summary).toBe("All good over here");
+    expect(teammate.itemId).toBe("tm_1");
+  });
+
+  it("idle and spawn blocks render no item — the raw idle JSON was the bug", () => {
+    const blocks: AnyBlock[] = [
+      {
+        type: "teammate_message",
+        ctx: ctx({ itemId: "tm_idle", responseId: "resp_tm" }),
+        teammateId: "buddy",
+        kind: "idle",
+        text: "Waiting for your next message.",
+        summary: null,
+        color: null,
+      },
+      {
+        type: "teammate_message",
+        ctx: ctx({ itemId: "tm_spawn", responseId: "resp_tm" }),
+        teammateId: "scout",
+        kind: "spawn",
+        text: "",
+        summary: null,
+        color: null,
+      },
+    ];
+    const bubbles = buildBubbles(blocks, null);
+    const rendered = bubbles.flatMap((bubble) => (bubble.kind === "assistant" ? bubble.items : []));
+    expect(rendered).toHaveLength(0);
+  });
+});
+
 describe("buildBubbles — slash_command items", () => {
   it("slash_command block becomes a slash_command RenderItem inside its bubble", () => {
     const blocks: AnyBlock[] = [

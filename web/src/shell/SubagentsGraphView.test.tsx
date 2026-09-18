@@ -1,4 +1,5 @@
 import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
+import type * as UseTeammatesModule from "@/hooks/useTeammates";
 
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
@@ -6,10 +7,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { type ChildSessionInfo, useChildSessions } from "@/hooks/useChildSessions";
 import { useSession } from "@/hooks/useSession";
 import {
+  buildGraphLayout,
   buildTree,
   childActivity,
   computeSubtreeWidths,
   layoutTree,
+  TEAMMATE_NODE_PREFIX,
   type TreeNode,
 } from "./subagentGraphLayout";
 import { activityDotClassName, childStatus, sessionStatus } from "./subagentStatus";
@@ -39,6 +42,11 @@ vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
 
 vi.mock("@/hooks/useSession", () => ({
   useSession: vi.fn(),
+}));
+
+vi.mock("@/hooks/useTeammates", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseTeammatesModule>()),
+  useTeammates: vi.fn(() => ({ teammates: [] })),
 }));
 
 vi.mock("@/components/icons/ClaudeIcon", () => ({
@@ -617,6 +625,53 @@ describe("buildTree", () => {
     const tree = buildTree("root", "main", "idle", "Idle", null, map, 0);
 
     expect(tree.children[0].preview).toBe("Searching for auth...");
+  });
+});
+
+describe("buildGraphLayout — teammates", () => {
+  it("adds a harness-internal teammate as a leaf node under the root", () => {
+    const { nodes, edges } = buildGraphLayout(
+      "root",
+      "main",
+      "idle",
+      "Idle",
+      null,
+      new Map(),
+      "root",
+      [
+        {
+          teammate_id: "buddy",
+          status: "idle",
+          color: "blue",
+          last_summary: "All good over here",
+          last_message_preview: null,
+        },
+        {
+          teammate_id: "scout",
+          status: "active",
+          color: null,
+          last_summary: null,
+          last_message_preview: null,
+        },
+      ],
+    );
+
+    const buddy = nodes.find((n) => n.id === `${TEAMMATE_NODE_PREFIX}buddy`);
+    expect(buddy).toBeDefined();
+    expect(buddy!.data.label).toBe("buddy");
+    expect(buddy!.data.activity).toBe("idle");
+    expect(buddy!.data.preview).toBe("All good over here");
+
+    const scout = nodes.find((n) => n.id === `${TEAMMATE_NODE_PREFIX}scout`);
+    expect(scout!.data.activity).toBe("working");
+
+    // Each teammate hangs off the root.
+    expect(edges.map((e) => e.id)).toEqual(
+      expect.arrayContaining([
+        `root->${TEAMMATE_NODE_PREFIX}buddy`,
+        `root->${TEAMMATE_NODE_PREFIX}scout`,
+      ]),
+    );
   });
 });
 

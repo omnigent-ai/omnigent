@@ -410,6 +410,27 @@ export interface TerminalCommandEvent {
   responseId: string;
 }
 
+/**
+ * Harness-internal teammate delivery from `output_item.done` (type
+ * `teammate_message`). Lifted from `TeammateMessageItem`; the reducer
+ * produces a `TeammateMessageBlock`.
+ */
+export interface TeammateMessageEvent {
+  type: "teammate_message";
+  /** The teammate's name, e.g. `buddy`. */
+  teammateId: string;
+  /** `"message"` prose delivery; `"idle"` idle ping; `"spawn"` spawn call. */
+  kind: "message" | "idle" | "spawn";
+  /** Prose body; empty for idle/spawn events. */
+  text: string;
+  /** One-line summary attribute, or null. */
+  summary: string | null;
+  /** Teammate accent color, or null. */
+  color: string | null;
+  itemId: string;
+  responseId: string;
+}
+
 // ── File output ──────────────────────────────────────────
 
 /** `response.output_file.done` — file artifact produced. */
@@ -993,6 +1014,7 @@ export type StreamEvent =
   | SlashCommand
   | RoutingDecision
   | TerminalCommandEvent
+  | TeammateMessageEvent
   | MessageDone
   | ReasoningDone
   | OutputFileDone

@@ -92,6 +92,14 @@ export type RenderItem =
       stdout: string | null;
       stderr: string | null;
     }
+  | {
+      kind: "teammate_message";
+      itemId: string | null;
+      teammateId: string;
+      text: string;
+      summary: string | null;
+      color: string | null;
+    }
   | { kind: "policy_denied"; itemId: string | null; reason: string; phase: string }
   | {
       kind: "error";
@@ -1540,6 +1548,23 @@ function buildAssistantItems(
         stdout: b.stdout,
         stderr: b.stderr,
       });
+      i += 1;
+      continue;
+    }
+
+    if (b.type === "teammate_message") {
+      // Idle pings and spawn markers feed the Agents rail's roster
+      // only — never a chat bubble (the raw idle JSON was the bug).
+      if (b.kind === "message") {
+        items.push({
+          kind: "teammate_message",
+          itemId: b.ctx.itemId,
+          teammateId: b.teammateId,
+          text: b.text,
+          summary: b.summary,
+          color: b.color,
+        });
+      }
       i += 1;
       continue;
     }

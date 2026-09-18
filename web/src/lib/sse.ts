@@ -63,6 +63,7 @@ import type {
   SessionUsageEvent,
   SlashCommand,
   RoutingDecision,
+  TeammateMessageEvent,
   TerminalCommandEvent,
   StreamEvent,
   TextDelta,
@@ -1294,6 +1295,24 @@ function parseOutputItem(data: Record<string, unknown>): StreamEvent | null {
       itemId,
       responseId,
     } satisfies TerminalCommandEvent;
+  }
+
+  if (itemType === "teammate_message") {
+    const teammateId = typeof rec.teammate_id === "string" ? rec.teammate_id : "";
+    // Drop a malformed frame (no teammate) rather than rendering a broken item.
+    if (!teammateId) return null;
+    // Coerce missing optionals (server exclude_none); unknown kinds render as prose.
+    const kind = rec.kind === "idle" || rec.kind === "spawn" ? rec.kind : "message";
+    return {
+      type: "teammate_message",
+      teammateId,
+      kind,
+      text: typeof rec.text === "string" ? rec.text : "",
+      summary: typeof rec.summary === "string" && rec.summary ? rec.summary : null,
+      color: typeof rec.color === "string" && rec.color ? rec.color : null,
+      itemId,
+      responseId,
+    } satisfies TeammateMessageEvent;
   }
 
   if (NATIVE_TOOL_TYPES.has(itemType)) {

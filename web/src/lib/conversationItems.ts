@@ -157,6 +157,28 @@ export interface TerminalCommandItem extends BaseItem {
 }
 
 /**
+ * A harness-internal teammate delivery mirrored from a native
+ * transcript (today: Claude Code agent teams). Display-only
+ * (server-side NON_CONTENT_ITEM_TYPES). `kind="message"` renders as a
+ * readable teammate bubble; `kind="idle"` (the machine-side
+ * idle-notification twin) and `kind="spawn"` (the parent's spawn call)
+ * render nothing in chat and only feed the Agents rail's roster.
+ */
+export interface TeammateMessageItem extends BaseItem {
+  type: "teammate_message";
+  /** The teammate's name, e.g. `buddy`. */
+  teammate_id: string;
+  /** `"message"` prose delivery; `"idle"` idle ping; `"spawn"` spawn call. */
+  kind?: "message" | "idle" | "spawn";
+  /** Prose body; empty for idle/spawn items (server strips via exclude_none). */
+  text?: string;
+  /** One-line `summary` attribute when the delivery carried one. */
+  summary?: string;
+  /** Teammate accent color from the markup, e.g. `green`. */
+  color?: string;
+}
+
+/**
  * An intelligent-model-router decision item. Display-only (server-side
  * NON_CONTENT_ITEM_TYPES), so the model never sees it; the web UI renders
  * it as a muted chip at its transcript position.
@@ -184,6 +206,7 @@ export type ConversationItem =
   | SlashCommandItem
   | RoutingDecisionItem
   | TerminalCommandItem
+  | TeammateMessageItem
   | (BaseItem & Record<string, unknown>);
 
 export function isMessageItem(item: ConversationItem): item is MessageItem {
@@ -224,6 +247,10 @@ export function isRoutingDecisionItem(item: ConversationItem): item is RoutingDe
 
 export function isTerminalCommandItem(item: ConversationItem): item is TerminalCommandItem {
   return item.type === "terminal_command";
+}
+
+export function isTeammateMessageItem(item: ConversationItem): item is TeammateMessageItem {
+  return item.type === "teammate_message";
 }
 
 // Cursor-paginated history fetching lives in `sessionsApi.ts`

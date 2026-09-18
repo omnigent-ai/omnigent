@@ -11,6 +11,7 @@ import type {
   NativeToolBlock,
   ReasoningBlock,
   SlashCommandBlock,
+  TeammateMessageBlock,
   TextDone,
   ToolGroup,
   ToolResultBlock,
@@ -597,6 +598,50 @@ describe("itemsToBlocks — native tools and compaction", () => {
     expect(slash!.output).toBe("oncall: file-bug subcommand started");
     expect(slash!.ctx.itemId).toBe("sc_1");
     expect(slash!.ctx.responseId).toBe("resp_slash");
+  });
+
+  it("teammate_message item → TeammateMessageBlock with normalized optionals", () => {
+    const items: ConversationItem[] = [
+      {
+        id: "tm_1",
+        response_id: "resp_tm",
+        type: "teammate_message",
+        status: "completed",
+        teammate_id: "buddy",
+        kind: "message",
+        text: "All good here.",
+        summary: "All good over here",
+        color: "blue",
+      },
+      {
+        // Idle twin with server-stripped optionals — must still map,
+        // with kind preserved so the renderer can suppress it.
+        id: "tm_2",
+        response_id: "resp_tm",
+        type: "teammate_message",
+        status: "completed",
+        teammate_id: "buddy",
+        kind: "idle",
+      },
+    ];
+    const blocks = itemsToBlocks(items);
+    const teammate = blocks.filter((b): b is TeammateMessageBlock => b.type === "teammate_message");
+    expect(teammate).toHaveLength(2);
+    expect(teammate[0]).toMatchObject({
+      teammateId: "buddy",
+      kind: "message",
+      text: "All good here.",
+      summary: "All good over here",
+      color: "blue",
+    });
+    expect(teammate[0]!.ctx.itemId).toBe("tm_1");
+    expect(teammate[1]).toMatchObject({
+      teammateId: "buddy",
+      kind: "idle",
+      text: "",
+      summary: null,
+      color: null,
+    });
   });
 
   it("skill receipt also hydrates a user-echo bubble before the indicator", () => {

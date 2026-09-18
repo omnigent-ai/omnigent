@@ -1,4 +1,5 @@
 import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
+import type * as UseTeammatesModule from "@/hooks/useTeammates";
 
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import {
@@ -15,6 +16,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { OttoIcon } from "@/components/icons/OttoIcon";
 import { type ChildSessionInfo, useChildSessions } from "@/hooks/useChildSessions";
 import { useSession } from "@/hooks/useSession";
+import { type TeammateInfo, useTeammates } from "@/hooks/useTeammates";
 import { iconForAgentType, SubagentsPanel } from "./SubagentsPanel";
 
 vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
@@ -26,6 +28,11 @@ vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
 
 vi.mock("@/hooks/useSession", () => ({
   useSession: vi.fn(),
+}));
+
+vi.mock("@/hooks/useTeammates", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseTeammatesModule>()),
+  useTeammates: vi.fn(),
 }));
 
 // Stub the brand logos with plain SVGs so jsdom doesn't have to resolve
@@ -54,6 +61,7 @@ vi.mock("@/components/icons/OttoIcon", () => ({
 
 const useChildSessionsMock = vi.mocked(useChildSessions);
 const useSessionMock = vi.mocked(useSession);
+const useTeammatesMock = vi.mocked(useTeammates);
 
 interface RenderOptions {
   /** The conversation in main — used only for active-row highlighting. */
@@ -136,9 +144,22 @@ const ICON_CASES: [string | null, ReturnType<typeof iconForAgentType>][] = [
   [null, OttoIcon],
 ];
 
+/** Build a full TeammateInfo, defaulting fields a test doesn't exercise. */
+function teammateInfo(overrides: Partial<TeammateInfo> & { teammate_id: string }): TeammateInfo {
+  return {
+    status: "active",
+    color: null,
+    last_summary: null,
+    last_message_preview: null,
+    ...overrides,
+  };
+}
+
 beforeEach(() => {
   useChildSessionsMock.mockReset();
   useSessionMock.mockReset();
+  useTeammatesMock.mockReset();
+  useTeammatesMock.mockReturnValue({ teammates: [] });
   // Default: parent's status is idle. Tests override per-case.
   useSessionMock.mockReturnValue({
     session: {
@@ -1591,5 +1612,58 @@ describe("SubagentsPanel", () => {
 
     expect(childRow(container, "conv_grandchild").className.split(/\s+/)).toContain("bg-accent");
     expect(childRow(container, "conv_child").className.split(/\s+/)).not.toContain("bg-accent");
+  });
+
+  describe("teammate rows", () => {
+    it("lists a harness-internal teammate with a Teammate badge", () => {
+      useChildSessionsMock.mockReturnValue({ children: [], isLoading: false, error: null });
+      useTeammatesMock.mockReturnValue({
+        teammates: [
+          teammateInfo({
+            teammate_id: "buddy",
+            status: "idle",
+            last_summary: "All good over here",
+          }),
+        ],
+      });
+
+      const { container } = renderPanel({ rootSessionId: "conv_root" });
+
+      const row = container.querySelector<HTMLElement>('[data-teammate-id="buddy"]');
+      expect(row).not.toBeNull();
+      expect(within(row as HTMLElement).getByText("buddy")).toBeInTheDocument();
+      expect(within(row as HTMLElement).getByText("Teammate")).toBeInTheDocument();
+      expect(within(row as HTMLElement).getByText("All good over here")).toBeInTheDocument();
+      // No conversation exists for a teammate, so the row must not navigate.
+      expect(row?.closest("a")).toBeNull();
+    });
+
+    it("shows an active teammate's working state before its first delivery", () => {
+      useChildSessionsMock.mockReturnValue({ children: [], isLoading: false, error: null });
+      useTeammatesMock.mockReturnValue({
+        teammates: [teammateInfo({ teammate_id: "scout", status: "active" })],
+      });
+
+      const { container } = renderPanel({ rootSessionId: "conv_root" });
+
+      const row = container.querySelector<HTMLElement>('[data-teammate-id="scout"]');
+      expect(row).not.toBeNull();
+      const dot = within(row as HTMLElement).getByTestId("subagent-status-dot");
+      expect(dot.getAttribute("aria-label")).toBe("Working");
+    });
+
+    it("renders teammates alongside child-session rows", () => {
+      mockChildTree({
+        conv_root: [childInfo({ id: "conv_child", tool: "researcher" })],
+      });
+      useTeammatesMock.mockReturnValue({
+        teammates: [teammateInfo({ teammate_id: "buddy" })],
+      });
+
+      const { container } = renderPanel({ rootSessionId: "conv_root" });
+
+      expect(childRow(container, "conv_child")).toBeInTheDocument();
+      expect(container.querySelector('[data-teammate-id="buddy"]')).not.toBeNull();
+    });
   });
 });
