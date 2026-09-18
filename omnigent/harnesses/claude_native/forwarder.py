@@ -17,6 +17,7 @@ from pathlib import Path
 
 import httpx
 
+from omnigent.debug_logging import debug_event
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
@@ -3814,6 +3815,7 @@ async def _forward_available_status_events(
                 session_id=session_id,
                 status=status,
                 response_id=response_id,
+                output=record.failure_detail,
                 # Only the ``Stop`` (idle) edge carries an authoritative
                 # background-shell count — ``0`` clears the tally, ``N`` sets it.
                 # This is the one thing the status file cannot report: its
@@ -3868,6 +3870,20 @@ async def _forward_available_status_events(
             )
             return durable
         retry_tracker.clear(retry_key)
+        if status == "failed":
+            _logger.warning(
+                "Claude StopFailure forwarded; session=%s kind=%s response_id=%s",
+                session_id,
+                record.failure_kind,
+                response_id,
+                extra=debug_event(
+                    "claude_stop_failure_forwarded",
+                    session_id=session_id,
+                    failure_kind=record.failure_kind,
+                    response_id=response_id,
+                    event_cursor=record.event_cursor,
+                ),
+            )
         if response_id is not None:
             # The turn ended — record its id as a pending settle so a later
             # assistant entry still inheriting it is marked as a scheduled

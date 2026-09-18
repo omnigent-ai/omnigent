@@ -715,6 +715,20 @@ class TranscriptReadResult:
     record_items: tuple[TranscriptRecordItems, ...] = ()
 
 
+# Only recognized categories leave the hook journal; assistant text can contain
+# conversation content or credentials and is not diagnostic metadata.
+_STOP_FAILURE_DETAILS: dict[str, str] = {
+    "authentication_failed": "Claude Code authentication failed.",
+    "billing_error": "Claude Code reported a billing error.",
+    "rate_limit": "Claude Code reported a rate limit error.",
+    "invalid_request": "Claude Code reported an invalid request.",
+    "server_error": "Claude Code reported a provider server error.",
+    "model_not_found": "Claude Code's selected model is unavailable or inaccessible.",
+    "max_output_tokens": "Claude Code reached its output token limit.",
+    "unknown": "Claude Code reported an unknown turn error.",
+}
+
+
 @dataclass(frozen=True)
 class ClaudeHookRecord:
     """
@@ -782,6 +796,8 @@ class ClaudeHookRecord:
         each counted entry (see :func:`_normalize_background_task`), so the UI
         can name them. ``None`` for non-``Stop`` events, when the array is
         absent, or when no counted entry carried a usable field.
+    :param failure_kind: Recognized ``StopFailure`` category, ``"missing"`` or
+        ``"unrecognized"``; ``None`` for other hooks. Contains no raw hook text.
     """
 
     event_cursor: int
@@ -802,6 +818,13 @@ class ClaudeHookRecord:
     task_status: str | None = None
     background_task_count: int = 0
     background_tasks: list[_JsonObject] | None = None
+    failure_kind: str | None = None
+
+    @property
+    def failure_detail(self) -> str | None:
+        """Describe a recognized failure without copying the assistant's text."""
+        detail = _STOP_FAILURE_DETAILS.get(self.failure_kind or "")
+        return f"{detail} Check the Claude terminal for details." if detail else None
 
 
 @dataclass(frozen=True)
@@ -3524,6 +3547,13 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
         if isinstance(raw_task_id, str) and raw_task_id:
             task_id = raw_task_id
         task_status = "completed"
+    failure_kind: str | None = None
+    if event_name == "StopFailure" and isinstance(payload, dict):
+        raw_error = payload.get("error")
+        if isinstance(raw_error, str) and raw_error in _STOP_FAILURE_DETAILS:
+            failure_kind = raw_error
+        else:
+            failure_kind = "missing" if raw_error is None else "unrecognized"
     background_task_count = 0
     background_tasks: list[_JsonObject] | None = None
     if event_name == "Stop" and isinstance(payload, dict):
@@ -3555,6 +3585,7 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
         event_cursor=record.line_number,
         byte_offset=record.next_byte_offset,
         event_name=event_name,
+        failure_kind=failure_kind,
         recorded_at=raw_recorded_at
         if isinstance(raw_recorded_at, (int, float)) and not isinstance(raw_recorded_at, bool)
         else None,
