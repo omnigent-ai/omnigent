@@ -1612,11 +1612,19 @@ async def test_wait_until_ready_timeout_reports_listen_target_and_budget(
     """A listener that never accepts fails after the app-server budget, naming the target."""
     from omnigent.harnesses.codex_native import app_server as codex_native_app_server
 
+    loop = asyncio.get_running_loop()
+    real_time = loop.time
+    clock = {"offset": 0.0}
+    monkeypatch.setattr(loop, "time", lambda: real_time() + clock["offset"])
+
     @dataclass
     class _RefusingClient:
         close_calls: int = 0
 
         async def connect(self) -> None:
+            # Each refused probe costs 25 s of virtual time: three attempts
+            # exhaust the 60 s budget without a real wait.
+            clock["offset"] += 25.0
             raise OSError("[Errno 111] Connect call failed ('127.0.0.1', 57045)")
 
         async def close(self) -> None:
@@ -1629,7 +1637,6 @@ async def test_wait_until_ready_timeout_reports_listen_target_and_budget(
         return clients[-1]
 
     monkeypatch.setattr(codex_native_app_server, "CodexAppServerClient", _client)
-    monkeypatch.setattr(codex_native_app_server, "_APP_SERVER_READY_TIMEOUT_SECONDS", 0.2)
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     server = _test_app_server(
@@ -1645,12 +1652,13 @@ async def test_wait_until_ready_timeout_reports_listen_target_and_budget(
         await server._wait_until_ready()
 
     message = str(excinfo.value)
+    budget = codex_native_app_server._APP_SERVER_READY_TIMEOUT_SECONDS
     assert message.startswith(
-        "Timed out after 0.2s waiting for the Codex app-server at ws://127.0.0.1:57045: "
+        f"Timed out after {budget:g}s waiting for the Codex app-server at ws://127.0.0.1:57045: "
     )
     assert "Connect call failed" in message
     assert str(server.socket_path) not in message
-    assert len(clients) > 1
+    assert len(clients) == 3
     assert all(client.close_calls == 1 for client in clients)
 
 
