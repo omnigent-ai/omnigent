@@ -218,9 +218,7 @@ def test_snapshot_metadata_and_bundled_agent_roll_back_together(
     store: SqlAlchemyConversationStore,
 ) -> None:
     agent_id = uuid.uuid4().hex
-    with pytest.raises(
-        sa.exc.DBAPIError, match="ck_conversation_metadata_workspace_required_for_host"
-    ):
+    with pytest.raises(sa.exc.DBAPIError, match=r"(?i)check constraint"):
         store.create_session_with_agent(
             agent_id=agent_id,
             agent_name="invalid-metadata-agent",

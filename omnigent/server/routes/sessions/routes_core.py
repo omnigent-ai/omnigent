@@ -2545,21 +2545,27 @@ def register_core_routes(
                 # pane's model, so a forward its runner refused must not pass as
                 # applied. A stopped session reaches no runner and stays quiet —
                 # its relaunch reads the override off the row.
-                try:
-                    _surface_model_change_forward_failure(
+                forward_failed = _surface_model_change_forward_failure(
+                    session_id,
+                    updated.model_override,
+                    _model_forward,
+                )
+                if (
+                    forward_failed
+                    and conv is not None
+                    and configured_snapshot(conv.inference_snapshot)
+                ):
+                    await asyncio.to_thread(
+                        conversation_store.update_conversation,
                         session_id,
-                        updated.model_override,
-                        _model_forward,
+                        model_override=conv.model_override,
+                        _unset_model_override=conv.model_override is None,
                     )
-                except OmnigentError:
-                    if conv is not None and configured_snapshot(conv.inference_snapshot):
-                        await asyncio.to_thread(
-                            conversation_store.update_conversation,
-                            session_id,
-                            model_override=conv.model_override,
-                            _unset_model_override=conv.model_override is None,
-                        )
-                    raise
+                    raise OmnigentError(
+                        "The terminal did not apply the model change. "
+                        "The previous selection has been restored.",
+                        code=ErrorCode.RUNNER_UNAVAILABLE,
+                    )
             else:
                 await _persist_model_change_note(
                     session_id,

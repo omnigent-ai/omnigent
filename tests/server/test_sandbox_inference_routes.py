@@ -293,6 +293,77 @@ async def test_unlisted_patch_rejects_before_any_metadata_change(env: _Env):
     assert after.inference_snapshot == before.inference_snapshot
 
 
+@pytest.mark.parametrize(
+    "previous_model,selection,forwarded_model",
+    [
+        ("gateway/main", "gateway/fast", "gateway/fast"),
+        (None, "gateway/fast", "gateway/fast"),
+        ("gateway/fast", "default", "gateway/main"),
+    ],
+)
+async def test_rejected_native_switch_restores_saved_model(
+    env: _Env,
+    monkeypatch: pytest.MonkeyPatch,
+    previous_model: str | None,
+    selection: str,
+    forwarded_model: str,
+):
+    """An allowed selection must not persist when the live native runner rejects it."""
+    bindings = env.catalog.runtime_config["inference"]["harnesses"]
+    bindings["codex-native"] = copy.deepcopy(bindings["codex"])
+    agent = await create_test_agent(
+        env.client,
+        name="codex-native-ui",
+        executor={"type": "omnigent", "config": {"harness": "codex-native"}},
+        include_llm=False,
+    )
+    created = await env.client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "host_type": "managed",
+            "sandbox_provider": "agent_sandbox",
+            "model_override": previous_model,
+        },
+    )
+    assert created.status_code == 201, created.text
+    session_id = created.json()["id"]
+    if previous_model is None:
+        env.store.update_conversation(session_id, _unset_model_override=True)
+    original = env.store.get_conversation(session_id)
+    assert original is not None
+    assert original.model_override == previous_model
+    runner_post = AsyncMock(
+        return_value=Response(
+            503,
+            json={"detail": "The terminal did not confirm the model switch"},
+            request=Request("POST", f"/v1/sessions/{session_id}/events"),
+        )
+    )
+    monkeypatch.setattr(
+        sessions_module,
+        "_get_runner_client",
+        AsyncMock(return_value=SimpleNamespace(post=runner_post)),
+    )
+
+    response = await env.client.patch(
+        f"/v1/sessions/{session_id}", json={"model_override": selection}
+    )
+
+    assert response.status_code == 503, response.text
+    assert "previous selection has been restored" in response.text
+    runner_post.assert_awaited_once()
+    assert runner_post.call_args.args == (f"/v1/sessions/{session_id}/events",)
+    assert runner_post.call_args.kwargs["json"] == {
+        "type": "model_change",
+        "model": forwarded_model,
+    }
+    saved = env.store.get_conversation(session_id)
+    assert saved is not None
+    assert saved.model_override == previous_model
+    assert saved.inference_snapshot == original.inference_snapshot
+
+
 async def test_inherited_child_rejects_conflicting_auth_before_persistence(env: _Env):
     created = await _json_create(env)
     assert created.status_code == 201, created.text

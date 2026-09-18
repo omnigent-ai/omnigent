@@ -6385,7 +6385,7 @@ def _surface_model_change_forward_failure(
     session_id: str,
     model: str | None,
     runner_result: _RunnerForwardResult | None,
-) -> None:
+) -> bool:
     """
     Publish a visible notice when a native pane never took a model change.
 
@@ -6393,7 +6393,7 @@ def _surface_model_change_forward_failure(
     runner, which types ``/model`` into the terminal. On a native terminal that
     injection is the ONLY thing that moves the model, so a dropped forward left
     the row (and the picker) claiming a model the pane was never on, silently.
-    This does not roll the row back — it makes the divergence visible.
+    The return value lets the caller roll back bound model selections.
 
     Call only for native terminal sessions: every other harness re-reads the
     persisted value at its next turn boundary, so a dropped forward there is
@@ -6408,7 +6408,8 @@ def _surface_model_change_forward_failure(
     :param model: The model that was persisted, or ``None`` when cleared.
     :param runner_result: HTTP result from the forward, or ``None`` when no
         runner was reachable.
-    :returns: None.
+    :returns: ``True`` when the runner rejected the change; ``False`` when it
+        accepted the change or no runner answered.
     """
     if runner_result is None:
         _logger.info(
@@ -6418,9 +6419,9 @@ def _surface_model_change_forward_failure(
             model,
             extra={"session_id": session_id},
         )
-        return
+        return False
     if 200 <= runner_result.status_code < 300:
-        return
+        return False
     reason = f"the runner returned status {runner_result.status_code}"
     # The runner's own detail names the concrete cause (e.g. "a dialog may
     # be open in the pane"); carry it into the visible notice when present.
@@ -6449,6 +6450,7 @@ def _surface_model_change_forward_failure(
             ),
         ),
     )
+    return True
 
 
 async def _persist_native_policy_notice(

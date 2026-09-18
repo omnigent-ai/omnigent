@@ -129,7 +129,9 @@ entry rather than this connection shorthand. OpenCode and Jcode resolve their
 auth commands on process launch; restart/resume obtains a fresh token. They do
 not gain continuous credential refresh from this feature. Pi SDK uses one
 credential across both families; configure both gateway endpoints to accept
-that same credential.
+that same credential. When both families are configured, Pi identifies Anthropic
+models by `claude` in the model ID; opaque Anthropic IDs can be excluded even
+when the gateway advertises their wire protocol.
 
 ## Configuration lifetime
 
