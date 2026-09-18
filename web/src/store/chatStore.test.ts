@@ -7730,9 +7730,12 @@ describe("chatStore — bindStream sticky-pref handoff", () => {
       });
   }
 
-  it("applies sticky effort but never silently PATCHes the sticky model", async () => {
+  it("applies sticky effort silently and never PATCHes the sticky model", async () => {
     // The sticky model is a UI preference: it must not be written onto the
-    // session as a request the pane was never asked to honor.
+    // session as a request the pane was never asked to honor. The sticky
+    // effort must persist with silent: true — a non-silent PATCH live-forwards
+    // an effort_change that types /effort into the pane of a session the user
+    // merely opened.
     seedSession("conv_cn", []);
     withSnapshot("conv_cn", {
       labels: { "omnigent.wrapper": "claude-code-native-ui" },
@@ -7746,7 +7749,8 @@ describe("chatStore — bindStream sticky-pref handoff", () => {
     await useChatStore.getState().switchTo("conv_cn");
 
     const patches = patchCallsFor("conv_cn");
-    expect(patches).toEqual(expect.arrayContaining([{ reasoning_effort: "high" }]));
+    expect(patches).toEqual(expect.arrayContaining([{ reasoning_effort: "high", silent: true }]));
+    expect(patches.some((p) => "reasoning_effort" in p && p.silent !== true)).toBe(false);
     expect(patches.some((p) => "model_override" in p)).toBe(false);
 
     const state = useChatStore.getState();
@@ -8326,7 +8330,8 @@ describe("chatStore — bindStream sticky-pref handoff", () => {
     await useChatStore.getState().switchTo("conv_codex");
 
     const patches = patchCallsFor("conv_codex");
-    expect(patches).toEqual(expect.arrayContaining([{ reasoning_effort: "xhigh" }]));
+    expect(patches).toEqual(expect.arrayContaining([{ reasoning_effort: "xhigh", silent: true }]));
+    expect(patches.some((p) => "reasoning_effort" in p && p.silent !== true)).toBe(false);
     expect(patches.some((p) => "model_override" in p)).toBe(false);
 
     const state = useChatStore.getState();
