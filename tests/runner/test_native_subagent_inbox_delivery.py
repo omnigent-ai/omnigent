@@ -994,3 +994,73 @@ async def test_recovered_child_continues_same_dispatch_before_delivering_result(
             await turn
         await client.post("/v1/sessions", json=payload)
         assert len(harness.posted_bodies) == (0 if previous_execution == "active" else 1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_code", [None, "runner_disconnected", "runner_failed_to_start"])
+async def test_recovered_pending_child_outlives_launch_timeout_and_delivers_original_result(
+    _clean_subagent_registry: None, error_code: str | None
+) -> None:
+    """Recovery must await the original dispatch, including work on another live runner."""
+    from unittest.mock import AsyncMock
+
+    from omnigent.runner.tool_dispatch import _cleanup_drained_subagent_work, _drain_inbox
+
+    child = _child_summary(
+        runner_id="other-live-runner",
+        current_task_status="failed" if error_code else "in_progress",
+        last_task_error={"code": error_code, "message": "runner lost"},
+    )
+    server = _RecoveryServerClient([child])
+    server.patch = AsyncMock(return_value=server._Resp({}))
+    app = create_runner_app(server_client=server)  # type: ignore[arg-type]
+    await app.state.recover_undrained_subagent_results(PARENT_SESSION_ID)
+    entry = runner_app.get_subagent_work(CHILD_SESSION_ID)
+    assert entry is not None and entry.work_id == DISPATCH_ID
+    inbox = runner_app._session_inboxes_ref[PARENT_SESSION_ID]
+
+    assert (
+        runner_app.reap_stalled_subagent_launches(now=entry.created_at + 181, timeout_s=180) == []
+    )
+    assert inbox.empty()
+    await _drain_inbox(inbox, server_client=server, conversation_id=PARENT_SESSION_ID)
+    server.patch.assert_not_awaited()
+
+    # No local child running edge: the server later records completion elsewhere.
+    child.update(current_task_status="completed", last_task_error=None)
+    reconciled = asyncio.Event()
+
+    async def reconcile() -> None:
+        await app.state.reconcile_pending_subagent_results()
+        reconciled.set()
+
+    sweep = asyncio.create_task(
+        runner_app.run_subagent_launch_reaper(interval_s=0.001, reconcile_pending=reconcile)
+    )
+    try:
+        await asyncio.wait_for(reconciled.wait(), timeout=5)
+    finally:
+        sweep.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await sweep
+    assert inbox.qsize() == 1
+    payload = inbox.get_nowait()
+    assert payload["work_id"] == DISPATCH_ID
+    assert payload["conversation_id"] == CHILD_SESSION_ID
+    assert payload["status"] == "completed"
+    assert payload["output"] == "review complete: LGTM"
+    await _cleanup_drained_subagent_work(payload, server_client=server)
+    server.patch.assert_awaited_once_with(
+        f"/v1/sessions/{CHILD_SESSION_ID}",
+        json={"labels": {runner_app.SUBAGENT_DELIVERED_ID_LABEL_KEY: DISPATCH_ID}},
+        timeout=30.0,
+    )
+    await app.state.reconcile_pending_subagent_results()
+    await app.state.recover_undrained_subagent_results(PARENT_SESSION_ID)
+    assert inbox.empty()
+    late = runner_app.mark_subagent_work_terminal(
+        CHILD_SESSION_ID, status="completed", output="review complete: LGTM"
+    )
+    assert late.delivered and not late.delivered_now
+    assert inbox.empty()
+    assert child["runner_id"] == "other-live-runner"

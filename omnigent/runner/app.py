@@ -1771,7 +1771,7 @@ def mark_subagent_work_started(child_session_id: str) -> _SubagentWorkEntry | No
     entry = _subagent_work_by_child.get(child_session_id)
     if entry is None:
         return None
-    if entry.status == "launching":
+    if entry.status in {"launching", "waiting"}:
         entry.status = "running"
     return entry
 
@@ -2020,14 +2020,14 @@ async def _recover_subagent_results_from_server(
         )
         if status not in _SUBAGENT_TERMINAL_STATUSES and not interrupted:
             continue
-        if (
-            get_subagent_work(child_id) is not None
-            or child_id in _drained_delivered_subagent_children
+        existing = get_subagent_work(child_id)
+        if (existing is not None and existing.status != "waiting") or (
+            child_id in _drained_delivered_subagent_children
         ):
             continue
         labels = child.get("labels")
         dispatch_id = undelivered_subagent_dispatch_id(labels if isinstance(labels, dict) else {})
-        if dispatch_id is None:
+        if dispatch_id is None or (existing is not None and existing.work_id != dispatch_id):
             continue
         output: str | None = None
         if status == "failed":
@@ -2036,7 +2036,14 @@ async def _recover_subagent_results_from_server(
             output = message if isinstance(message, str) else None
         elif not interrupted:
             output = await _fetch_latest_assistant_text(server_client, child_id)
-        entry = register_subagent_work(
+        # A forwarded completion or newer dispatch may arrive during the history read.
+        if (
+            get_subagent_work(child_id) is not existing
+            or (existing is not None and existing.status != "waiting")
+            or child_id in _drained_delivered_subagent_children
+        ):
+            continue
+        entry = existing or register_subagent_work(
             parent_session_id=parent_id,
             child_session_id=child_id,
             agent=str(child.get("tool") or child.get("agent_name") or "sub-agent"),
@@ -2044,8 +2051,8 @@ async def _recover_subagent_results_from_server(
             work_id=dispatch_id,
         )
         if interrupted:
-            # A lost runner is not a completed child dispatch. Its replacement
-            # restores this same child, whose eventual result uses the same receipt.
+            # This dispatch already existed; a local launch timeout cannot judge it.
+            entry.status = "waiting"
             continue
         ack = mark_subagent_work_terminal(child_id, status=status, output=output)
         if ack.delivered_now:
@@ -2243,6 +2250,7 @@ async def run_subagent_launch_reaper(
     *,
     interval_s: float = SUBAGENT_LAUNCH_REAP_INTERVAL_S,
     mark_terminal: MarkSubagentTerminalAndWake | None = None,
+    reconcile_pending: Callable[[], Awaitable[None]] | None = None,
 ) -> None:
     """
     Periodically sweep for sub-agent dispatches wedged in ``launching``.
@@ -2254,12 +2262,15 @@ async def run_subagent_launch_reaper(
     :param mark_terminal: Terminal-delivery callback forwarded to each sweep;
         the entrypoint passes the app's wake-scheduling seam so a reaped
         failure wakes the parent, not just its inbox.
+    :param reconcile_pending: Refresh recovered work awaiting remote completion.
     :returns: None.
     """
     while True:
         await asyncio.sleep(interval_s)
         try:
             reap_stalled_subagent_launches(mark_terminal=mark_terminal)
+            if reconcile_pending is not None:
+                await reconcile_pending()
         except Exception:  # noqa: BLE001 — the sweep is a backstop; never die.
             _logger.warning("sub-agent launch reaper sweep failed", exc_info=True)
 
@@ -5317,10 +5328,11 @@ def create_runner_app(
 
         The parent inbox is a process-local queue, so a result queued before
         a restart but not yet drained would otherwise vanish. Runs once per
-        parent per process; a scan that fails on a server read is retried
-        before the next ``sys_read_inbox`` drain. The inbox is created here
-        when missing: after a reconnect the server can dispatch a pending
-        message before it re-initializes the session, and that turn's drain
+        parent per process; pending recovered work is refreshed by the periodic
+        sweep. A failed server read is retried before the next ``sys_read_inbox``
+        drain. The inbox is created here when missing: after a reconnect the
+        server can dispatch a pending message before it re-initializes the session,
+        and that turn's drain
         must still see the recovered results. Results acknowledged while this
         parent had no inbox here are handed over first, on every call.
 
@@ -5396,6 +5408,21 @@ def create_runner_app(
         await asyncio.shield(_start_subagent_recovery(parent_id))
 
     app.state.recover_undrained_subagent_results = _recover_undrained_subagent_results
+
+    async def _reconcile_pending_subagent_results() -> None:
+        """Refresh only recovered work with no local execution or completion edge."""
+        parents = {
+            entry.parent_session_id
+            for entry in list(_subagent_work_by_child.values())
+            if entry.status == "waiting"
+        }
+        for parent_id in parents:
+            if not any(entry.status == "waiting" for entry in list_subagent_work(parent_id)):
+                continue
+            _subagent_recovery_done.discard(parent_id)
+            await _recover_undrained_subagent_results(parent_id)
+
+    app.state.reconcile_pending_subagent_results = _reconcile_pending_subagent_results
 
     def _note_session_harness_override(conv_id: str, harness_override: str | None) -> None:
         """Record the harness a session was forwarded, so reads match the run.
