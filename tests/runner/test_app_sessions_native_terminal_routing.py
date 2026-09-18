@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import threading
 from dataclasses import dataclass
@@ -1101,3 +1102,91 @@ async def test_dead_registered_pane_close_does_not_restore_running(
     assert registry.get(sid, "claude", "main") is None, (
         "Stale entry must be removed from the registry"
     )
+
+
+@pytest.mark.asyncio
+async def test_auto_create_repl_terminal_survives_removed_process_cwd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    REPL terminal creation must not read the process cwd when a workspace is set.
+
+    A directly-spawned runner keeps its launch cwd; deleting that directory
+    while the runner stays alive makes ``os.getcwd()`` raise
+    ``FileNotFoundError``. With ``OMNIGENT_RUNNER_WORKSPACE`` naming a valid
+    workspace, (re)creating the REPL terminal must pin its cwd to that
+    workspace instead of failing on the removed process cwd.
+
+    :param tmp_path: Temporary directory for the fake runner workspace.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    session_id = "11c50cd73e9c32ccb0af5b9db291db8b"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(workspace))
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
+
+    def missing_cwd() -> str:
+        raise FileNotFoundError("process cwd was removed")
+
+    monkeypatch.setattr(os, "getcwd", missing_cwd)
+
+    launched_specs: list[Any] = []
+
+    class _FakeResourceRegistry:
+        """Resource registry that records the launched REPL terminal spec."""
+
+        async def launch_auxiliary_terminal(
+            self,
+            *,
+            session_id: str,
+            terminal_name: str,
+            session_key: str,
+            spec: Any,
+            resource_role: str | None = None,
+            parent_os_env: Any = None,
+        ) -> SessionResourceView:
+            """
+            Record the terminal launch request.
+
+            :param session_id: Session id being launched.
+            :param terminal_name: Terminal name, e.g. ``"tui"``.
+            :param session_key: Terminal session key, e.g. ``"main"``.
+            :param spec: Terminal launch spec.
+            :param resource_role: Private runner resource marker.
+            :param parent_os_env: Agent os_env the terminal inherits.
+            :returns: Terminal resource view.
+            """
+            launched_specs.append(spec)
+            return SessionResourceView(
+                id="terminal_tui_main",
+                type="terminal",
+                session_id=session_id,
+                name="tui",
+            )
+
+    class _NoopServerClient:
+        """Server client that accepts the presentation-label PATCH."""
+
+        async def patch(self, url: str, **kwargs: Any) -> httpx.Response:
+            """
+            Return a 200 for any PATCH.
+
+            :param url: Request path.
+            :param kwargs: Request keyword arguments.
+            :returns: HTTP 200 response.
+            """
+            return httpx.Response(200, json={}, request=httpx.Request("PATCH", url))
+
+    terminal_view = await _auto_create_repl_terminal(
+        session_id,
+        _FakeResourceRegistry(),  # type: ignore[arg-type]
+        lambda _sid, _event: None,
+        server_client=_NoopServerClient(),  # type: ignore[arg-type]
+    )
+
+    assert terminal_view.id == "terminal_tui_main"
+    assert len(launched_specs) == 1
+    assert launched_specs[0].os_env.cwd == str(workspace)

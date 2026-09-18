@@ -423,3 +423,90 @@ def test_shell_command_does_not_see_omnigent_project_root(
     out = result.get("stdout", "")
     assert project_entry in out
     assert str(_project_root()) not in out
+
+
+@pytest.mark.parametrize("spec_cwd", [None, "."])
+def test_create_os_environment_survives_removed_process_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, spec_cwd: str | None
+) -> None:
+    """
+    A removed process cwd falls back to the configured runner workspace.
+
+    A directly-spawned runner keeps its launch cwd; deleting that directory
+    while the runner stays alive makes ``os.getcwd()`` raise
+    ``FileNotFoundError``, and resolving a relative spec cwd (the wrapper
+    specs use ``cwd: .``) needs the process cwd too. With
+    ``OMNIGENT_RUNNER_WORKSPACE`` naming a valid workspace, the environment
+    must root there instead of failing every consumer (turn setup, native
+    tool relays).
+
+    :param tmp_path: Temporary directory for the fake runner workspace.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param spec_cwd: The spec's cwd value (unset, or the relative ``"."``).
+    :returns: None.
+    """
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(workspace))
+
+    def missing_cwd() -> str:
+        raise FileNotFoundError("process cwd was removed")
+
+    monkeypatch.setattr(os, "getcwd", missing_cwd)
+    env = create_os_environment(
+        OSEnvSpec(type="caller_process", cwd=spec_cwd, sandbox=OSEnvSandboxSpec(type="none"))
+    )
+    assert env is not None
+    try:
+        assert env.cwd == workspace.resolve()
+    finally:
+        env.close()
+
+
+def test_create_os_environment_removed_cwd_without_workspace_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Without a configured workspace, the removed-cwd failure stays loud.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    monkeypatch.delenv("OMNIGENT_RUNNER_WORKSPACE", raising=False)
+
+    def missing_cwd() -> str:
+        raise FileNotFoundError("process cwd was removed")
+
+    monkeypatch.setattr(os, "getcwd", missing_cwd)
+    with pytest.raises(FileNotFoundError):
+        create_os_environment(
+            OSEnvSpec(type="caller_process", cwd=None, sandbox=OSEnvSandboxSpec(type="none"))
+        )
+
+
+@pytest.mark.parametrize(
+    ("workspace_kind", "spec_cwd"),
+    [("missing", None), ("file", "."), ("directory", "missing-child")],
+)
+def test_create_os_environment_rejects_missing_recovery_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    workspace_kind: str,
+    spec_cwd: str | None,
+) -> None:
+    """Reject invalid recovery directories before constructing an environment."""
+    workspace = tmp_path / "workspace"
+    if workspace_kind == "file":
+        workspace.write_text("not a directory")
+    elif workspace_kind == "directory":
+        workspace.mkdir()
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(workspace))
+
+    def missing_cwd() -> str:
+        raise FileNotFoundError("process cwd was removed")
+
+    monkeypatch.setattr(os, "getcwd", missing_cwd)
+    with pytest.raises(FileNotFoundError, match="Recovery working directory"):
+        create_os_environment(
+            OSEnvSpec(type="caller_process", cwd=spec_cwd, sandbox=OSEnvSandboxSpec(type="none"))
+        )

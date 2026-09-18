@@ -605,13 +605,15 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
     from omnigent.inner.os_env import create_os_environment
 
-    _os_spec = OSEnvSpec(
-        type="caller_process",
-        cwd=str(Path.cwd()),
-        sandbox=OSEnvSandboxSpec(type="none"),
-        fork=False,
-    )
     try:
+        # Inside the guard, workspace first: Path.cwd() raises when the
+        # runner's launch cwd was removed, and OS tool schemas are best-effort.
+        _os_spec = OSEnvSpec(
+            type="caller_process",
+            cwd=os.environ.get("OMNIGENT_RUNNER_WORKSPACE") or str(Path.cwd()),
+            sandbox=OSEnvSandboxSpec(type="none"),
+            fork=False,
+        )
         _os_env = create_os_environment(_os_spec)
         if _os_env is None:
             raise RuntimeError("OSEnvironment factory returned None")

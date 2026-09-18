@@ -855,6 +855,29 @@ def _required_runner_env(name: str) -> str:
     return value
 
 
+def _claude_session_workspace(session_workspace: str | None) -> Path:
+    """Resolve and validate the intended workspace without an eager cwd lookup.
+
+    :param session_workspace: Workspace from the session initialization snapshot.
+    :returns: Existing workspace directory, preferring the snapshot to the runner
+        environment and consulting process cwd only when neither is provided.
+    :raises OmnigentError: If the selected workspace or implicit cwd is missing.
+    """
+    raw = session_workspace or os.environ.get("OMNIGENT_RUNNER_WORKSPACE")
+    try:
+        workspace = Path(raw).expanduser() if raw else Path.cwd()
+        workspace = workspace.absolute()
+    except (FileNotFoundError, NotADirectoryError) as exc:
+        raise OmnigentError(
+            "The session workspace is no longer available.", code=ErrorCode.WORKSPACE_MISSING
+        ) from exc
+    if not workspace.is_dir():
+        raise OmnigentError(
+            "The session workspace is not a directory.", code=ErrorCode.WORKSPACE_MISSING
+        )
+    return workspace
+
+
 def _codex_session_workspace(session_workspace: str | None) -> Path:
     """
     Resolve the cwd for a runner-owned Codex terminal.
@@ -6827,6 +6850,17 @@ def _native_terminal_start_error_payload(
     )
     from omnigent.harnesses.claude_native.bridge import ClaudeNativeHookInterpreterMismatchError
 
+    if isinstance(exc, OmnigentError) and exc.code == ErrorCode.WORKSPACE_MISSING:
+        return {
+            "code": ErrorCode.WORKSPACE_MISSING,
+            "error_id": error_id,
+            "message": (
+                "This session's workspace is no longer available. Restore the intended "
+                "workspace and restart the runner, or start a new session with an existing "
+                "workspace. Restarting alone does not restore the directory. "
+                f"Error ID: {error_id}."
+            ),
+        }
     if isinstance(exc, ClaudeNativeHookInterpreterMismatchError):
         message = (
             "Claude Code is Windows-native, but Omnigent is running under WSL. "
@@ -7309,10 +7343,10 @@ async def _auto_create_claude_terminal(
     from omnigent.harnesses.claude_native.forwarder import reset_transcript_forward_state
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
 
-    workspace = (
-        session_init.snapshot.workspace
-        if session_init is not None and session_init.snapshot.workspace
-        else os.environ.get("OMNIGENT_RUNNER_WORKSPACE", str(Path.cwd()))
+    workspace = str(
+        _claude_session_workspace(
+            session_init.snapshot.workspace if session_init is not None else None
+        )
     )
     started_at = time.monotonic()
     _logger.info(
@@ -7953,7 +7987,7 @@ async def _auto_create_claude_terminal(
         resolve_harness_command,
     )
 
-    _harness_cfg = load_effective_config()
+    _harness_cfg = load_effective_config(workspace=workspace)
     launch_command = resolve_harness_command("claude-native", default="claude", cfg=_harness_cfg)
     launch_args = resolve_harness_args("claude-native", tuple(claude_args), cfg=_harness_cfg)
     # Validate the binary this terminal will actually spawn: ``launch_command``
@@ -8199,7 +8233,9 @@ async def _auto_create_repl_terminal(
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
 
     started_at = time.monotonic()
-    workspace = os.environ.get("OMNIGENT_RUNNER_WORKSPACE", str(Path.cwd()))
+    # Lazy cwd fallback: a surviving runner may have lost its launch cwd, and
+    # an eager default would raise FileNotFoundError even with the env var set.
+    workspace = os.environ.get("OMNIGENT_RUNNER_WORKSPACE") or str(Path.cwd())
     server_url = os.environ.get("RUNNER_SERVER_URL", "http://localhost:6767")
     # Inherit the agent's os_env so its sandbox (e.g. ``type: none``) is honoured;
     # without sandbox= here and parent_os_env below, launch_terminal falls back to

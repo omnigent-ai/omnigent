@@ -89,6 +89,52 @@ def test_effective_config_merges_project_over_user(
     assert load_effective_config() == {"profile": "local", "model": "global-model"}
 
 
+@pytest.mark.parametrize("cwd_available", [False, True])
+def test_effective_config_uses_explicit_workspace(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, cwd_available: bool
+) -> None:
+    config_home = tmp_path / "home"
+    workspace = tmp_path / "project"
+    other_project = tmp_path / "other"
+    config_home.mkdir()
+    (workspace / ".omnigent").mkdir(parents=True)
+    (other_project / ".omnigent").mkdir(parents=True)
+    (config_home / "config.yaml").write_text(
+        "profile: global\nharness:\n  claude-native:\n    command: global-claude\n"
+        "    args: [--verbose]\n"
+    )
+    (workspace / ".omnigent" / "config.yaml").write_text(
+        "harness:\n  claude-native:\n    command: project-claude\n"
+    )
+    (other_project / ".omnigent" / "config.yaml").write_text("profile: wrong-project\n")
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+    monkeypatch.chdir(other_project)
+
+    def missing_cwd() -> Path:
+        raise FileNotFoundError("process cwd was removed")
+
+    if not cwd_available:
+        monkeypatch.setattr(Path, "cwd", missing_cwd)
+
+    assert load_effective_config(workspace=workspace) == {
+        "profile": "global",
+        "harness": {"claude-native": {"command": "project-claude", "args": ["--verbose"]}},
+    }
+
+
+def test_effective_config_workspace_without_project_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config_home = tmp_path / "home"
+    workspace = tmp_path / "project"
+    config_home.mkdir()
+    workspace.mkdir()
+    (config_home / "config.yaml").write_text("profile: global\n")
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+
+    assert load_effective_config(workspace=workspace) == {"profile": "global"}
+
+
 def test_github_account_preference_round_trip(tmp_path: Path) -> None:
     cfg = tmp_path / "config.yaml"
     key = "/Users/daniel.lok/omnigent"
