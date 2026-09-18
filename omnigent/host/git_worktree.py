@@ -12,6 +12,7 @@ import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit
 
 # fetch/add can be slow on large repos; bound it so git can't hang the
 # host's tunnel loop.
@@ -24,6 +25,22 @@ _MAX_DIR_COLLISION_SUFFIX: int = 50
 # (``..``, leading ``-``/``.``, ``/`` edges, ``.lock``, ``@{`` are
 # checked separately.)
 _INVALID_BRANCH_CHARS = re.compile(r"[\x00-\x20~^:?*\[\\\x7f]")
+
+# Provider classification is intentionally conservative. ``github.com`` is a
+# verified GitHub host; arbitrary enterprise domains and SSH aliases may point
+# anywhere, so they remain unknown rather than being guessed from their name.
+_GITHUB_REMOTE_HOSTS = frozenset({"github.com"})
+_KNOWN_NON_GITHUB_REMOTE_HOSTS = frozenset(
+    {
+        "bitbucket.org",
+        "codeberg.org",
+        "dev.azure.com",
+        "gitlab.com",
+        "ssh.dev.azure.com",
+    }
+)
+_SCP_REMOTE = re.compile(r"^(?:[^/@\s]+@)?(?P<host>[^/:\s]+):.+$")
+_WINDOWS_ABSOLUTE = re.compile(r"^[A-Za-z]:[\\/]")
 
 
 class WorktreeError(Exception):
@@ -185,12 +202,79 @@ class WorktreeInfo:
         worktrees.
     :param detached: ``True`` when the worktree has a detached HEAD
         (no branch checked out).
+    :param remote_provider: ``"github"`` only for a remote whose hostname is
+        verified as GitHub, ``"other"`` for a recognized non-GitHub or local
+        remote, and ``None`` when no usable remote or provider proof exists.
     """
 
     path: str
     branch: str | None
     is_main: bool
     detached: bool
+    remote_provider: str | None = None
+
+
+def _remote_hostname(remote_url: str) -> str | None:
+    """Return a remote URL's normalized hostname, local marker, or ``None``.
+
+    ``""`` represents a local path/file remote, which is definitively not a
+    GitHub-hosted remote. Unknown SSH aliases and unparseable values return
+    ``None`` so callers fail closed.
+
+    :param remote_url: Git remote URL read from local repository config.
+    :returns: Lowercase hostname, ``""`` for a local remote, or ``None``.
+    """
+    candidate = remote_url.strip()
+    if not candidate:
+        return None
+    if candidate.startswith(("/", "./", "../", "~/")) or _WINDOWS_ABSOLUTE.match(candidate):
+        return ""
+
+    if candidate.startswith("file:"):
+        return ""
+
+    if "://" not in candidate:
+        scp = _SCP_REMOTE.match(candidate)
+        if scp:
+            return scp.group("host").lower()
+
+    try:
+        parsed = urlsplit(candidate)
+    except ValueError:
+        return None
+    if parsed.scheme == "file":
+        return ""
+    if parsed.scheme:
+        return parsed.hostname.lower() if parsed.hostname else None
+    return None
+
+
+def _remote_provider(repo_root: str) -> str | None:
+    """Classify configured remotes without network or credential access.
+
+    One bounded, argv-only ``git config`` read collects local remote URLs. The
+    URLs are never returned or logged; only the coarse provider classification
+    leaves the host. GitHub Enterprise domains and SSH aliases intentionally
+    remain unknown because local URL text alone cannot prove their provider.
+
+    :param repo_root: Resolved main work tree path.
+    :returns: ``"github"``, ``"other"``, or ``None``.
+    """
+    result = _run_git(["config", "--get-regexp", r"^remote\..*\.url$"], cwd=repo_root)
+    if result.returncode not in (0, 1):
+        return None
+
+    saw_other = False
+    for line in result.stdout.splitlines():
+        parts = line.split(maxsplit=1)
+        if len(parts) != 2:
+            continue
+        hostname = _remote_hostname(parts[1])
+        if hostname in _GITHUB_REMOTE_HOSTS:
+            return "github"
+        if hostname == "" or hostname in _KNOWN_NON_GITHUB_REMOTE_HOSTS:
+            saw_other = True
+    return "other" if saw_other else None
 
 
 def list_worktrees(*, repo_path: str) -> list[WorktreeInfo]:
@@ -208,6 +292,10 @@ def list_worktrees(*, repo_path: str) -> list[WorktreeInfo]:
         inside a git work tree, or if ``git worktree list`` fails.
     """
     repo_root = _main_work_tree(repo_path)
+    try:
+        remote_provider = _remote_provider(repo_root)
+    except WorktreeError:
+        remote_provider = None
     result = _run_git(["worktree", "list", "--porcelain"], cwd=repo_root)
     if result.returncode != 0:
         raise _git_error("git worktree list failed", result)
@@ -234,13 +322,20 @@ def list_worktrees(*, repo_path: str) -> list[WorktreeInfo]:
                     branch=branch,
                     is_main=not worktrees,
                     detached=detached,
+                    remote_provider=remote_provider,
                 )
             )
             path = None
     # The porcelain output may omit a trailing blank line for the last record.
     if path is not None:
         worktrees.append(
-            WorktreeInfo(path=path, branch=branch, is_main=not worktrees, detached=detached)
+            WorktreeInfo(
+                path=path,
+                branch=branch,
+                is_main=not worktrees,
+                detached=detached,
+                remote_provider=remote_provider,
+            )
         )
     return worktrees
 

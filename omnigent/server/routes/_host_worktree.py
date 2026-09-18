@@ -252,7 +252,8 @@ async def list_worktrees_on_host(
         host — the canonical picked directory, e.g.
         ``"/Users/alice/myrepo"``.
     :returns: One dict per worktree with keys ``path``, ``branch``,
-        ``is_main``, ``detached`` (main first).
+        ``is_main``, ``detached``, and optional ``remote_provider``
+        (main first).
     :raises WorktreeHostUnavailableError: If the host connection drops
         or doesn't respond within :data:`_WORKTREE_TIMEOUT_S`.
     :raises WorktreeProxyError: If the host reports a listing failure.

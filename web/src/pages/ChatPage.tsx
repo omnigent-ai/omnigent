@@ -224,6 +224,7 @@ import { ComposerPrLink } from "@/components/composer/ComposerPrLink";
 import { ComposerContextRing } from "@/components/composer/ComposerContextRing";
 import { useComposerGitStatus } from "@/hooks/useComposerGitStatus";
 import {
+  compactModelTriggerLabel,
   formatStatusModelLabel,
   formatStatusEffortLabel,
   formatModelEffortStatusLabel,
@@ -2365,12 +2366,10 @@ function ComposerImpl(
     runnerStarting = false,
     showClaudeGoalControl = false,
     showPollyCodexGoalControl = false,
-    isTerminalFirst = false,
     isNativeWrapper = false,
     unreachable = false,
     onShowReconnectHelp,
     costRoutingEligible = false,
-    subagentRoutingEligible = false,
     subAgentLabel = null,
     wrapperLabel = null,
     onViewportShrinkPinScroll,
@@ -3542,10 +3541,7 @@ function ComposerImpl(
   return (
     <form
       onSubmit={handleSubmit}
-      className={cn(
-        "chat-composer-form relative px-4 md:px-6",
-        isTerminalFirst ? "pb-1.5" : "pb-3",
-      )}
+      className="chat-composer-form relative px-4 pb-[max(20px,env(safe-area-inset-bottom))] md:px-6"
     >
       {/* Hidden file input for the attach button */}
       <input
@@ -3603,6 +3599,12 @@ function ComposerImpl(
             label never peeks a nameless tray. */}
         {subAgentLabel ? <SubagentComposerTray label={subAgentLabel} /> : null}
         <ComposerWorkspaceBar data-testid="composer-workspace-controls">
+          <ComposerPrLink
+            state={composerGit.githubState}
+            prCount={composerGit.prCount}
+            prNumber={composerGit.prNumber}
+            onOpen={openComposerGithubTab}
+          />
           <ComposerWorkspaceStatus
             workspacePath={composerWorkspace ?? null}
             worktreePath={composerGit.worktreePath}
@@ -3610,23 +3612,15 @@ function ComposerImpl(
             branch={composerGit.branch}
             branchState={composerGit.branchState}
             creationBranch={composerGit.creationBranch}
-            onRefreshBranch={composerGit.refresh}
-            refreshing={composerGit.refreshing}
+            showWorktree={
+              composerGit.githubState === "ready" && composerGit.repoNameWithOwner !== null
+            }
           />
-          {/* Reserve two workspace triggers' icon-safe minima and two gaps;
-              only PR text truncates when the remaining status space runs out. */}
-          <div className="ml-auto flex min-w-0 max-w-[calc(100%-5.25rem)] shrink-0 items-center gap-1 md:max-w-[calc(100%-6.5rem)]">
-            <div className="flex min-w-0 items-center gap-2 empty:hidden">
-              <ComposerPrLink
-                prCount={composerGit.prCount}
-                prNumber={composerGit.prNumber}
-                onOpen={openComposerGithubTab}
-              />
-              <ComposerContextRing
-                contextWindow={composerContextWindow}
-                tokensUsed={composerTokensUsed}
-              />
-            </div>
+          <div className="ml-auto flex min-w-0 shrink-0 items-center gap-1">
+            <ComposerContextRing
+              contextWindow={composerContextWindow}
+              tokensUsed={composerTokensUsed}
+            />
             <BackgroundTaskIndicator />
           </div>
         </ComposerWorkspaceBar>
@@ -3944,15 +3938,12 @@ function ComposerImpl(
                   harnessLabel={harnessLabel}
                   showModels={showModels}
                   showEffort={showEffort}
-                  showClaudePermissionMode={showClaudePermissionMode}
-                  showCodexApprovalMode={showCodexApprovalMode}
                   effortLevels={effortLevels}
                   modelPickerKind={modelPickerKind}
                   codexModelOptions={codexModelOptions}
                   modelLabelOptions={modelLabelOptions}
                   modelLabelHostId={composerSession?.hostId}
                   costRoutingEligible={costRoutingEligible}
-                  subagentRoutingEligible={subagentRoutingEligible}
                   // Config changes persist server-side and apply on the next
                   // wake/turn (the runner forward is best-effort), so the gear
                   // stays live wherever a message could be sent — including
@@ -4544,16 +4535,11 @@ export function shouldShowPollyCodexGoalControl(
 function hasSessionConfig({
   showModels,
   showEffort,
-  costRoutingEligible,
 }: {
   showModels: boolean;
   showEffort: boolean;
-  costRoutingEligible: boolean;
-  subagentRoutingEligible: boolean;
-  showClaudePermissionMode: boolean;
-  showCodexApprovalMode: boolean;
 }): boolean {
-  return showModels || showEffort || costRoutingEligible;
+  return showModels || showEffort;
 }
 
 function SessionHarnessPicker({
@@ -4564,15 +4550,12 @@ function SessionHarnessPicker({
   harnessLabel,
   showModels,
   showEffort,
-  showClaudePermissionMode = false,
-  showCodexApprovalMode = false,
   effortLevels,
   modelPickerKind,
   codexModelOptions,
   modelLabelOptions,
   modelLabelHostId,
   costRoutingEligible,
-  subagentRoutingEligible,
   disabled,
   openNonce = 0,
 }: {
@@ -4583,15 +4566,12 @@ function SessionHarnessPicker({
   harnessLabel: string | null;
   showModels: boolean;
   showEffort: boolean;
-  showClaudePermissionMode?: boolean;
-  showCodexApprovalMode?: boolean;
   effortLevels: readonly string[];
   modelPickerKind: NativeModelPickerKind | null;
   codexModelOptions: readonly NativeModelOption[];
   modelLabelOptions: readonly NativeModelOption[];
   modelLabelHostId: string | null | undefined;
   costRoutingEligible: boolean;
-  subagentRoutingEligible: boolean;
   disabled: boolean;
   openNonce?: number;
 }) {
@@ -4645,17 +4625,15 @@ function SessionHarnessPicker({
   const configurable = hasSessionConfig({
     showModels,
     showEffort,
-    costRoutingEligible,
-    subagentRoutingEligible,
-    showClaudePermissionMode,
-    showCodexApprovalMode,
   });
   const effortLabel = showEffort && !routingOn ? formatStatusEffortLabel(selectedEffort) : null;
   const label = routingOn
     ? SMART_ROUTING_LABEL
     : modelLabelLoading
       ? ""
-      : (modelSummary ?? nativeAgent?.displayName ?? harnessLabel ?? "Session");
+      : compactModelTriggerLabel(
+          modelSummary ?? nativeAgent?.displayName ?? harnessLabel ?? "Session",
+        );
   const availableEfforts =
     modelPickerKind === "codex"
       ? codexEffortLevelsForModel(codexModelOptions, pickerSelectedModel)

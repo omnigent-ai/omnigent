@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 
+import omnigent.host.git_worktree as git_worktree_module
 from omnigent.host.git_worktree import (
     CreatedWorktree,
     WorktreeError,
@@ -376,6 +377,78 @@ def test_list_worktrees_returns_main_first(git_repo: Path) -> None:
     assert main.branch == "main"
     assert main.is_main is True
     assert main.detached is False
+    assert main.remote_provider is None
+
+
+@pytest.mark.parametrize(
+    "remote_url",
+    [
+        "https://github.com/omnigent-ai/omnigent.git",
+        "ssh://git@github.com/omnigent-ai/omnigent.git",
+        "git@github.com:omnigent-ai/omnigent.git",
+        "github.com:omnigent-ai/omnigent.git",
+    ],
+)
+def test_list_worktrees_classifies_verified_github_remotes(
+    git_repo: Path, remote_url: str
+) -> None:
+    """HTTPS, SSH, and scp-style github.com remotes are classified GitHub."""
+    _git(git_repo, "remote", "add", "origin", remote_url)
+    result = list_worktrees(repo_path=str(git_repo))
+    assert {worktree.remote_provider for worktree in result} == {"github"}
+
+
+def test_list_worktrees_classifies_known_non_github_remote(git_repo: Path) -> None:
+    """A recognized non-GitHub remote remains a usable ordinary folder."""
+    _git(git_repo, "remote", "add", "origin", "https://gitlab.com/acme/repo.git")
+    result = list_worktrees(repo_path=str(git_repo))
+    assert {worktree.remote_provider for worktree in result} == {"other"}
+
+
+@pytest.mark.parametrize(
+    "remote_url",
+    [
+        "git@github-personal:omnigent-ai/omnigent.git",
+        "ssh://git@github.enterprise.example/omnigent-ai/omnigent.git",
+    ],
+)
+def test_list_worktrees_keeps_unverified_github_like_hosts_unknown(
+    git_repo: Path, remote_url: str
+) -> None:
+    """SSH aliases and enterprise domains are not guessed to be GitHub."""
+    _git(git_repo, "remote", "add", "origin", remote_url)
+    result = list_worktrees(repo_path=str(git_repo))
+    assert {worktree.remote_provider for worktree in result} == {None}
+
+
+def test_list_worktrees_ignores_remote_metadata_read_failure(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Optional remote metadata failures do not hide usable worktrees."""
+    original_run_git = git_worktree_module._run_git
+
+    def run_git(args: list[str], *, cwd: str) -> subprocess.CompletedProcess[str]:
+        if args[:2] == ["config", "--get-regexp"]:
+            raise WorktreeError("remote metadata unavailable")
+        return original_run_git(args, cwd=cwd)
+
+    monkeypatch.setattr(git_worktree_module, "_run_git", run_git)
+
+    result = list_worktrees(repo_path=str(git_repo))
+    assert len(result) == 1
+    assert result[0].path == str(git_repo)
+    assert result[0].remote_provider is None
+
+
+def test_list_worktrees_skips_malformed_remote_before_valid_github(
+    git_repo: Path,
+) -> None:
+    """One malformed remote does not prevent classifying later remotes."""
+    _git(git_repo, "remote", "add", "broken", "https://[invalid/repo")
+    _git(git_repo, "remote", "add", "origin", "https://github.com/acme/repo.git")
+
+    result = list_worktrees(repo_path=str(git_repo))
+    assert {worktree.remote_provider for worktree in result} == {"github"}
 
 
 def test_list_worktrees_includes_linked(git_repo: Path) -> None:
@@ -392,12 +465,17 @@ def test_list_worktrees_includes_linked(git_repo: Path) -> None:
 
 def test_list_worktrees_from_linked_resolves_same_list(git_repo: Path) -> None:
     """Listing from inside a linked worktree resolves the main repo's full list."""
+    _git(git_repo, "remote", "add", "origin", "git@github.com:acme/repo.git")
     created = create_worktree(repo_path=str(git_repo), branch_name="feature/a")
-    # Query from the linked worktree — should still see BOTH worktrees.
-    result = list_worktrees(repo_path=created.worktree_path)
+    nested = Path(created.worktree_path) / "nested"
+    nested.mkdir()
+    # Query from a subdirectory of the linked worktree — should still see BOTH
+    # worktrees and the main repository's provider classification.
+    result = list_worktrees(repo_path=str(nested))
     paths = {w.path for w in result}
     assert str(git_repo) in paths
     assert created.worktree_path in paths
+    assert {worktree.remote_provider for worktree in result} == {"github"}
 
 
 def test_list_worktrees_reports_detached_head(git_repo: Path) -> None:

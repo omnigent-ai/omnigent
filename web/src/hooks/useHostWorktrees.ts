@@ -1,4 +1,4 @@
-import { useQuery } from "@tanstack/react-query";
+import { queryOptions, useQuery } from "@tanstack/react-query";
 
 import { authenticatedFetch } from "@/lib/identity";
 
@@ -26,6 +26,11 @@ export interface HostWorktree {
   is_main: boolean;
   /** ``true`` when the worktree has a detached HEAD (no branch). */
   detached: boolean;
+  /**
+   * Coarse provider proof derived from local git remote metadata. Missing on
+   * older hosts; ``null`` means no provider could be safely identified.
+   */
+  remote_provider?: "github" | "other" | null;
 }
 
 interface HostWorktreesResponse {
@@ -46,7 +51,10 @@ interface HostWorktreesResponse {
  * @returns The repository's worktrees (main first), or ``[]`` when the
  *   path is not a git repository.
  */
-async function fetchHostWorktrees(hostId: string, repoPath: string): Promise<HostWorktree[]> {
+export async function fetchHostWorktrees(
+  hostId: string,
+  repoPath: string,
+): Promise<HostWorktree[]> {
   const params = new URLSearchParams({ path: repoPath });
   const res = await authenticatedFetch(
     `/v1/hosts/${encodeURIComponent(hostId)}/worktrees?${params.toString()}`,
@@ -62,6 +70,15 @@ async function fetchHostWorktrees(hostId: string, repoPath: string): Promise<Hos
   return body.data;
 }
 
+/** Shared query options for single-path and batched recent-workspace reads. */
+export function hostWorktreesQueryOptions(hostId: string, repoPath: string) {
+  return queryOptions({
+    queryKey: ["host-worktrees", hostId, repoPath] as const,
+    queryFn: () => fetchHostWorktrees(hostId, repoPath),
+    staleTime: 5_000,
+  });
+}
+
 /**
  * React Query hook: list the git worktrees of a repository on a host.
  *
@@ -74,11 +91,9 @@ async function fetchHostWorktrees(hostId: string, repoPath: string): Promise<Hos
  * @returns React Query result with ``data: HostWorktree[]``.
  */
 export function useHostWorktrees(hostId: string | null, repoPath: string | null) {
+  const enabled = hostId !== null && repoPath !== null && repoPath !== "";
   return useQuery({
-    queryKey: ["host-worktrees", hostId, repoPath],
-    queryFn: () => fetchHostWorktrees(hostId as string, repoPath as string),
-    enabled: hostId !== null && repoPath !== null && repoPath !== "",
-    staleTime: 5_000,
-    placeholderData: (prev) => prev,
+    ...hostWorktreesQueryOptions(hostId ?? "", repoPath ?? ""),
+    enabled,
   });
 }

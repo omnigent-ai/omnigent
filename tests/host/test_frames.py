@@ -1291,7 +1291,13 @@ def test_list_worktrees_result_frame_round_trip() -> None:
         request_id="req_wt_ls_1",
         status="ok",
         worktrees=[
-            {"path": "/Users/alice/myrepo", "branch": "main", "is_main": True, "detached": False},
+            {
+                "path": "/Users/alice/myrepo",
+                "branch": "main",
+                "is_main": True,
+                "detached": False,
+                "remote_provider": "github",
+            },
             {
                 "path": "/Users/alice/myrepo-worktrees/feature-login",
                 "branch": "feature/login",
@@ -1303,6 +1309,19 @@ def test_list_worktrees_result_frame_round_trip() -> None:
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostListWorktreesResultFrame)
     assert decoded == original
+
+
+def test_list_worktrees_result_frame_accepts_legacy_entries_without_provider() -> None:
+    """Older hosts may omit remote_provider without breaking decoding."""
+    decoded = decode_host_frame(
+        '{"kind":"host.list_worktrees_result","request_id":"r","status":"ok",'
+        '"worktrees":[{"path":"/repo","branch":"main","is_main":true,'
+        '"detached":false}],"error":null}'
+    )
+    assert isinstance(decoded, HostListWorktreesResultFrame)
+    assert decoded.worktrees == [
+        {"path": "/repo", "branch": "main", "is_main": True, "detached": False}
+    ]
 
 
 def test_list_worktrees_result_frame_failure_round_trip() -> None:

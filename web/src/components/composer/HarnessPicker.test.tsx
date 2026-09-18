@@ -23,6 +23,7 @@ afterEach(() => {
 function PickerFixture({
   mobile = false,
   disabled = false,
+  tooltipVariant = "default",
   nested = false,
   active = true,
   modal,
@@ -30,6 +31,7 @@ function PickerFixture({
   modal?: boolean;
   mobile?: boolean;
   disabled?: boolean;
+  tooltipVariant?: "default" | "session-info";
   nested?: boolean;
   active?: boolean;
 }) {
@@ -67,6 +69,7 @@ function PickerFixture({
       trigger={{ label: "Harness", model: "Opus 4.8 (1M)", disabled }}
       tooltip="Current harness configuration"
       tooltipTestId="tooltip"
+      tooltipVariant={tooltipVariant}
       testId="menu"
       configOpen={configOpen}
     >
@@ -182,11 +185,12 @@ describe("HarnessPicker", () => {
   it.each([false, true])("shares row geometry and config navigation on mobile=%s", (mobile) => {
     render(<PickerFixture mobile={mobile} />);
     fireEvent.pointerDown(screen.getByRole("button", { name: "Harness" }), { button: 0 });
-    expect(screen.getByTestId("menu")).toHaveClass("w-max", "min-w-[17.5rem]", "p-2");
+    expect(screen.getByTestId("menu")).toHaveClass("w-[17.5rem]", "min-w-[17.5rem]", "p-2");
     expect(screen.getByTestId("entry").closest("[data-harness-menu-row]")).toHaveClass("min-h-8");
     expect(screen.getByTestId("entry")).toHaveAttribute("data-active", "true");
     expect(screen.getByTestId("model")).toHaveClass("text-right");
     expect(screen.getByTestId("edit")).toHaveTextContent("Edit");
+    expect(screen.getByTestId("edit")).toHaveClass("hover:underline");
     expect(screen.queryByTestId("tooltip")).not.toBeInTheDocument();
     fireEvent.click(screen.getByTestId("edit"));
     expect(screen.getByText("Model configuration")).toBeInTheDocument();
@@ -335,6 +339,20 @@ describe("HarnessPicker", () => {
     fireEvent.pointerDown(screen.getByRole("button", { name: "Harness" }), { button: 0 });
     expect(screen.queryByTestId("menu")).not.toBeInTheDocument();
   });
+
+  it("can use the light session-info tooltip surface without changing tooltip defaults", async () => {
+    render(<PickerFixture tooltipVariant="session-info" />);
+    fireEvent.focus(screen.getByRole("button", { name: "Harness" }));
+    expect(await screen.findByTestId("tooltip")).toHaveClass(
+      "w-64",
+      "rounded-lg",
+      "bg-popover",
+      "p-2.5",
+      "text-popover-foreground",
+      "shadow-menu",
+      "ring-1",
+    );
+  });
 });
 
 describe("HarnessPickerEntry Edit flyout dismissal (#7069)", () => {
@@ -344,6 +362,13 @@ describe("HarnessPickerEntry Edit flyout dismissal (#7069)", () => {
     fireEvent.click(screen.getByTestId("edit"));
     expect(screen.getByText("Model configuration")).toBeInTheDocument();
   }
+
+  it("keeps the config flyout closed when the row is clicked", () => {
+    render(<PickerFixture />);
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Harness" }), { button: 0 });
+    fireEvent.click(screen.getByTestId("entry"));
+    expect(screen.queryByText("Model configuration")).not.toBeInTheDocument();
+  });
 
   it("closes the config flyout on a second click of Edit (pointer toggle)", () => {
     openConfig();
