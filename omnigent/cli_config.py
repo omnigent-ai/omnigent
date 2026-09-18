@@ -1094,7 +1094,7 @@ def _adopt_detected_providers() -> list[str]:
     """Persist ambient-detected providers into the config, returning new names.
 
     Opening ``configure harnesses`` adopts any detected credential (env key,
-    CLI login, local Ollama) not already in ``providers:`` as a real,
+    CLI login, local Ollama or llama-server) not already in ``providers:`` as a real,
     editable entry — so the tree shows one uniform provider list with no
     "detected vs configured" split. Writes the merged view (explicit +
     detected, with detected auto-defaulting per family) wholesale, and only
@@ -1203,7 +1203,8 @@ def _compact_credential_label(det: DetectedProvider) -> str:
     ``"Claude Subscription"`` / ``"ChatGPT Subscription"`` — so a single
     comma-joined callout listing several credentials at once stays unambiguous
     without a per-line source. API keys and local endpoints reuse the shared
-    ``credential_label`` (``"Anthropic API Key"``, ``"Ollama"``).
+    ``credential_label`` (``"Anthropic API Key"``, ``"Ollama"``,
+    ``"llama-server"``).
 
     :param det: A credential found by
         :func:`omnigent.onboarding.ambient.detect_providers`.
@@ -1270,7 +1271,8 @@ def _adopt_ambient_credentials(progress: RunnerStartupProgress | None = None) ->
     (:func:`_run_configure_harnesses_interactive`): it (1) backfills a legacy
     databricks ``auth:`` block into a real provider, (2) adopts any
     ambient-detected credential (env API key, logged-in ``claude`` / ``codex``
-    CLI, local Ollama) not already configured as an ordinary provider entry,
+    CLI, local Ollama or llama-server) not already configured as an ordinary
+    provider entry,
     and (3) prints a callout naming exactly the credentials it just
     auto-configured. Idempotent: a second open adopts nothing, so no callout
     prints.

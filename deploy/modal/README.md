@@ -348,7 +348,7 @@ like [OpenRouter](https://openrouter.ai) and
 | `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL` | Anthropic-compatible gateways — point claude-code at a LiteLLM proxy, a Bedrock/Vertex bridge, or a corporate gateway |
 | `CLAUDE_CODE_OAUTH_TOKEN` | claude-code with a Claude subscription (no API key) |
 | `OPENAI_API_KEY` | OpenAI models on the OpenAI API (codex, openai-agents harnesses) |
-| `OPENAI_BASE_URL` | Any OpenAI-compatible endpoint — the de-facto standard API of the open-model ecosystem. Gateways (OpenRouter, LiteLLM), hosted open-weights providers (Together, Fireworks, Groq), or self-hosted vLLM / Ollama — this is how Llama, Qwen, DeepSeek, and friends plug in |
+| `OPENAI_BASE_URL` | Any OpenAI-compatible endpoint — the de-facto standard API of the open-model ecosystem. Gateways (OpenRouter, LiteLLM), hosted open-weights providers (Together, Fireworks, Groq), or self-hosted vLLM / Ollama / llama-server — this is how Llama, Qwen, DeepSeek, and friends plug in |
 | `CODEX_ACCESS_TOKEN` | codex with a ChatGPT Business/Enterprise workspace |
 | `GEMINI_API_KEY` | Gemini models on the Google AI API |
 
