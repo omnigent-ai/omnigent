@@ -64,6 +64,9 @@ from omnigent.errors import ErrorCode, OmnigentError, restart_on_stale_cursor
 from omnigent.harness_plugins import (
     NativeCodingAgent,
 )
+from omnigent.host.frames import (
+    SAFE_LAUNCH_REFUSAL_CODES as _SAFE_LAUNCH_REFUSAL_CODES,
+)
 from omnigent.models.model_metadata import concrete_reported_model
 from omnigent.native.native_coding_agents import (
     native_coding_agent_for_harness,
@@ -4625,7 +4628,8 @@ def _publish_status(
         edges, e.g. ``"codex_turn_abc123"``.
     :param failure_origin: Stable slug naming the publish path behind a
         ``"failed"`` edge, e.g. ``"runner_disconnected_mid_turn"``. Every
-        server-side failure logs one ERROR from here, so without it the
+        server-side failure logs one ERROR from here (expected categorical
+        launch refusals log a WARNING instead), so without it the
         dozen unrelated causes that reach this function are one
         undifferentiated signature. Ignored for non-failed edges.
     """
@@ -4688,22 +4692,41 @@ def _publish_status(
         # for <id>: <detail>" shape so existing detail-matching stays valid.
         origin = failure_origin or "unattributed"
         failure_code = error.code if error is not None else "none"
-        _logger.error(
-            "session turn failed for %s (origin=%s code=%s prev=%s): %s",
-            session_id,
-            origin,
-            failure_code,
-            previous_status or "unknown",
-            error.message if error is not None else "no detail",
-            extra=debug_event(
-                "session_turn_failed",
-                session_id=session_id,
-                origin=origin,
-                code=failure_code,
-                previous_status=previous_status or "unknown",
-                response_id=response_id,
-            ),
-        )
+        if error is not None and error.code in _SAFE_LAUNCH_REFUSAL_CODES:
+            # Expected user-remediable refusal (deleted workspace, unconfigured
+            # harness) — keep it out of the ERROR turn-failure funnel. Keys off
+            # the classified ErrorDetail.code, covering older hosts' fallback.
+            _logger.warning(
+                "session turn refused for %s (%s): %s",
+                session_id,
+                error.code,
+                error.message,
+                extra=debug_event(
+                    "session_turn_refused",
+                    session_id=session_id,
+                    origin=origin,
+                    code=failure_code,
+                    previous_status=previous_status or "unknown",
+                    response_id=response_id,
+                ),
+            )
+        else:
+            _logger.error(
+                "session turn failed for %s (origin=%s code=%s prev=%s): %s",
+                session_id,
+                origin,
+                failure_code,
+                previous_status or "unknown",
+                error.message if error is not None else "no detail",
+                extra=debug_event(
+                    "session_turn_failed",
+                    session_id=session_id,
+                    origin=origin,
+                    code=failure_code,
+                    previous_status=previous_status or "unknown",
+                    response_id=response_id,
+                ),
+            )
         session_live_state.persist_scheduled_run_completion(
             session_id,
             "failed",

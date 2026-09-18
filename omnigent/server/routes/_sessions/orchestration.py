@@ -57,6 +57,9 @@ from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE as _HARNESS_NOT_CONFIGURED_ERROR_CODE,
 )
 from omnigent.host.frames import (
+    SAFE_LAUNCH_REFUSAL_CODES as _SAFE_LAUNCH_REFUSAL_CODES,
+)
+from omnigent.host.frames import (
     WORKSPACE_MISSING_ERROR_CODE as _WORKSPACE_MISSING_ERROR_CODE,
 )
 from omnigent.host.frames import (
@@ -4529,10 +4532,7 @@ async def _persist_host_launch_failure_turn(
     :param host_error_code: Allowlisted structured host failure category.
     :returns: Store-assigned id of the consumed user message item.
     """
-    if host_error_code not in {
-        _HARNESS_NOT_CONFIGURED_ERROR_CODE,
-        _WORKSPACE_MISSING_ERROR_CODE,
-    }:
+    if host_error_code not in _SAFE_LAUNCH_REFUSAL_CODES:
         raise ValueError(f"unsafe host launch error code: {host_error_code!r}")
     fallback_message = (
         "the agent's harness is not configured on the selected host — "
