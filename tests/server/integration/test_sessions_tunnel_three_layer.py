@@ -1099,11 +1099,16 @@ async def _reconnect_fires_connect_hook(
     router.client_for_session_resources = _spy_resolver  # type: ignore[method-assign]
 
     real_ensure = sessions_routes._ensure_runner_relay
+    real_ensure_ready = sessions_routes._ensure_runner_relay_ready
 
     def _stub_ensure(sid, rid, client, store=None):  # type: ignore[no-untyped-def]
         return None
 
+    async def _stub_ensure_ready(*args: Any, **kwargs: Any) -> None:
+        return None
+
     sessions_routes._ensure_runner_relay = _stub_ensure  # type: ignore[assignment]
+    sessions_routes._ensure_runner_relay_ready = _stub_ensure_ready  # type: ignore[assignment]
 
     # Wrap (not replace) the real recovery helper so the narrowed
     # disconnect-vs-failure guard is exercised, and record completion so
@@ -1160,6 +1165,7 @@ async def _reconnect_fires_connect_hook(
     finally:
         router.client_for_session_resources = real_resolver  # type: ignore[method-assign]
         sessions_routes._ensure_runner_relay = real_ensure  # type: ignore[assignment]
+        sessions_routes._ensure_runner_relay_ready = real_ensure_ready  # type: ignore[assignment]
         sessions_routes._publish_runner_recovered_status = real_recover  # type: ignore[assignment]
         if forwarder_task is not None:
             forwarder_task.cancel()

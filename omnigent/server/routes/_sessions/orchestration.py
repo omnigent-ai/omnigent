@@ -4277,6 +4277,9 @@ async def _ensure_runner_session_initialized(
         if suppress_recovery_turn and not require_success:
             schedule_child_restoration(conv, runner_client, conversation_store, initializer)
         else:
+            await _ensure_runner_relay_ready(
+                session_id, conv.runner_id, runner_client, conversation_store
+            )
             await restore_active_children(conv, runner_client, conversation_store, initializer)
     try:
         payload = resp.json()

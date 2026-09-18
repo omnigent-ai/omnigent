@@ -2309,6 +2309,7 @@ def register_core_routes(
                 conv = conversation_store.get_conversation(
                     session_id,
                 )
+                parent_initialized = False
                 if _runner_client is not None and conv is not None and conv.agent_id is not None:
                     # The versioned payload's snapshot carries harness_override,
                     # so a rebind after a cross-harness create initializes the
@@ -2334,18 +2335,7 @@ def register_core_routes(
                             exc_info=True,
                         )
                     else:
-                        if runner_init_resp.status_code < 400:
-                            await _publish_runner_recovered_status(session_id, conversation_store)
-                            from omnigent.server.child_session_recovery import (
-                                restore_active_children,
-                            )
-
-                            await restore_active_children(
-                                conv,
-                                _runner_client,
-                                conversation_store,
-                                request.app.state.runner_session_initializer,
-                            )
+                        parent_initialized = runner_init_resp.status_code < 400
                 if _runner_client is None:
                     # Runner deregistered between validation and
                     # lookup; PATCH still returns 200 but no
@@ -2364,6 +2354,17 @@ def register_core_routes(
                     _runner_client,
                     conversation_store,
                 )
+                if parent_initialized:
+                    assert conv is not None and _runner_client is not None
+                    await _publish_runner_recovered_status(session_id, conversation_store)
+                    from omnigent.server.child_session_recovery import restore_active_children
+
+                    await restore_active_children(
+                        conv,
+                        _runner_client,
+                        conversation_store,
+                        request.app.state.runner_session_initializer,
+                    )
         else:
             conv = conv_for_collaboration_mode
             if conv is None:

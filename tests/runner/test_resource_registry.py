@@ -542,12 +542,13 @@ async def test_pane_publishes_no_status_while_the_file_owns_it(tmp_path: Path) -
     freshness window to arbitrate — so while the file is readable it decides,
     and the pane's edges are dropped.
     """
-    callbacks, statuses, pollers, _registry = await _observe_native_with_fake_poller(
+    callbacks, statuses, pollers, registry = await _observe_native_with_fake_poller(
         tmp_path, "conv_file_owns"
     )
     poller = pollers[0]
     poller.active = True
 
+    initial_activity = registry.session_activity_epoch("conv_file_owns")
     poller.emit("running")
     callbacks["on_activity"]()  # pane redraws mid-turn — no second edge
     await asyncio.sleep(0)
@@ -558,6 +559,8 @@ async def test_pane_publishes_no_status_while_the_file_owns_it(tmp_path: Path) -
     callbacks["on_idle"]()  # nor does a quiet pane re-assert idle
     await asyncio.sleep(0)
     assert statuses == ["running", "idle"]
+
+    assert registry.session_activity_epoch("conv_file_owns") > initial_activity
 
 
 @pytest.mark.asyncio
@@ -605,11 +608,16 @@ async def test_hook_status_resyncs_watcher_dedup(tmp_path: Path) -> None:
         tmp_path, "conv_resync"
     )
     poller = pollers[0]
+    on_activity = callbacks["on_activity"]
+    assert callable(on_activity)
+    on_activity()
+    assert registry.session_activity_epoch("conv_resync") == 0
     poller.active = True
 
     poller.emit("running")
     await asyncio.sleep(0)
     assert statuses == ["running"]
+    assert registry.session_activity_epoch("conv_resync") > 0
 
     # The forwarder posts Stop → idle straight to the server.
     registry.note_external_session_status("conv_resync", "idle")
@@ -747,7 +755,7 @@ async def test_required_terminal_exit_while_idle_is_clean_shutdown(
     assert len(exits) == 1
     assert exits[0].lifecycle == TerminalLifecycle.REQUIRED
     assert exits[0].session_was_idle is True
-    assert registry.session_activity_epoch("conv_idle") > initial_activity
+    assert registry.session_activity_epoch("conv_idle") == initial_activity
     record = next(
         record
         for record in caplog.records

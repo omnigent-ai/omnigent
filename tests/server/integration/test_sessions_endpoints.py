@@ -4902,7 +4902,9 @@ async def test_patch_runner_rebind_clears_stale_failed_status(
         :param _conversation_store: Conversation store from the route.
         :returns: None.
         """
+        relay_bindings.append((_session_id, _runner_id))
 
+    relay_bindings: list[tuple[str, str]] = []
     published: list[dict[str, Any]] = []
     runner_client = _RecoveringRunnerClient()
     monkeypatch.setattr(sessions_module, "_registered_runner_id", _registered_runner_id)
@@ -4918,11 +4920,13 @@ async def test_patch_runner_rebind_clears_stale_failed_status(
     # The monkeypatched runner client can see setup work during session
     # creation. This test targets the later PATCH rebind path only.
     runner_client.posts.clear()
+    relay_bindings.clear()
     if child_lookup_fails:
         from sqlalchemy.exc import OperationalError
 
         async def fail_child_restore(*_args: Any) -> None:
             assert sessions_module._session_status_cache.get(sid) == "idle"
+            assert relay_bindings == [(sid, "runner_recovered")]
             raise OperationalError("child lookup", {}, RuntimeError("database unavailable"))
 
         monkeypatch.setattr(
@@ -4960,6 +4964,7 @@ async def test_patch_runner_rebind_clears_stale_failed_status(
     assert init_post["json"]["session_init"]["snapshot"] is not None
     assert [event["status"] for event in published] == ["failed", "idle"]
     assert cache_after == "idle"
+    assert relay_bindings == [(sid, "runner_recovered")]
 
 
 async def test_post_external_session_status_idle_forwards_persisted_assistant_output(
@@ -9712,6 +9717,7 @@ async def test_retry_session_ensures_dead_required_native_terminal_once(
     monkeypatch.setattr(routes_events, "_get_runner_client", AsyncMock(return_value=runner_client))
     monkeypatch.setattr(routes_events, "_ensure_native_terminal_ready", ensure_terminal)
     monkeypatch.setattr(routes_events, "_ensure_runner_relay_ready", relay_ready)
+    monkeypatch.setattr("omnigent.server.routes.sessions._ensure_runner_relay_ready", AsyncMock())
 
     try:
         response = await client.post(

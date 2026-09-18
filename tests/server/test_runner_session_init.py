@@ -129,6 +129,7 @@ async def test_session_init_readiness_is_explicit_and_backward_compatible(
         return None
 
     monkeypatch.setattr(sessions_routes, "_publish_runner_recovered_status", _noop_recovered)
+    monkeypatch.setattr(sessions_routes, "_ensure_runner_relay_ready", _noop_recovered)
     monkeypatch.setattr(
         "omnigent.server.child_session_recovery.restore_active_children", _noop_recovered
     )

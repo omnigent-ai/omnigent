@@ -19,12 +19,14 @@ The race is exercised via two paths:
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from typing import Any
 
 import pytest
 from fastapi import FastAPI
 
 from omnigent.runner import create_runner_app
+from omnigent.runner.resource_registry import SessionResourceRegistry
 from omnigent.runner.session_init_protocol import (
     build_runner_session_init_payload,
 )
@@ -109,6 +111,7 @@ class _CatchUpServerClient(_HistoryServerClient):
 
 def _build_sdk_app(
     server_client: Any,
+    resource_registry: SessionResourceRegistry | None = None,
 ) -> tuple[FastAPI, _FakeProcessManager, _ScriptedHarnessClient]:
     spec = AgentSpec(spec_version=1, name="t")
     sse_frames = [
@@ -124,6 +127,7 @@ def _build_sdk_app(
         return spec
 
     app = create_runner_app(
+        resource_registry=resource_registry,
         process_manager=pm,  # type: ignore[arg-type]
         spec_resolver=_resolver,
         server_client=server_client,  # type: ignore[arg-type]
@@ -429,11 +433,17 @@ async def test_newer_turn_finishing_during_initialization_supersedes_recovery() 
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("statuses", [("running", "idle"), ("waiting", "idle")])
-async def test_completed_native_activity_during_initialization_supersedes_recovery(
-    monkeypatch: pytest.MonkeyPatch, statuses: tuple[str, str]
+@pytest.mark.parametrize(
+    "statuses, startup_repaint",
+    [(("running", "idle"), False), (("waiting", "idle"), False), (("running", "idle"), True)],
+)
+async def test_native_activity_during_initialization_distinguishes_turns_from_repaints(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    statuses: tuple[str, str],
+    startup_repaint: bool,
 ) -> None:
-    """Direct terminal activity remains visible after it returns to idle."""
+    """Explicit turns suppress recovery after returning to idle; startup repaints do not."""
     from unittest.mock import AsyncMock
 
     from omnigent.runner import app as runner_app
@@ -452,7 +462,13 @@ async def test_completed_native_activity_during_initialization_supersedes_recove
                 await release.wait()
             return response
 
-    app, _pm, harness = _build_sdk_app(PausedSeedServer())
+    resources = None
+    callbacks = {}
+    if startup_repaint:
+        from tests.runner.test_resource_registry import _observe_native_with_fake_poller
+
+        callbacks, _, _, resources = await _observe_native_with_fake_poller(tmp_path, SESSION_ID)
+    app, _pm, harness = _build_sdk_app(PausedSeedServer(), resources)
     payload = _session_init_payload(suppress_recovery_turn=False)
     payload["session_init"].update(resume_interrupted_turn=True, recovery_id="native-interrupted")
     payload["session_init"]["snapshot"]["harness_override"] = "cursor-native"
@@ -460,12 +476,18 @@ async def test_completed_native_activity_during_initialization_supersedes_recove
         recovery = asyncio.create_task(client.post("/v1/sessions", json=payload))
         await asyncio.wait_for(entered.wait(), timeout=5)
         try:
-            for status in statuses:
-                response = await client.post(
-                    f"/v1/sessions/{SESSION_ID}/events",
-                    json={"type": "external_session_status", "data": {"status": status}},
-                )
-                assert response.status_code == 204, response.text
+            if startup_repaint:
+                on_activity, on_idle = callbacks["on_activity"], callbacks["on_idle"]
+                assert callable(on_activity) and callable(on_idle)
+                on_activity()
+                on_idle()
+            else:
+                for status in statuses:
+                    response = await client.post(
+                        f"/v1/sessions/{SESSION_ID}/events",
+                        json={"type": "external_session_status", "data": {"status": status}},
+                    )
+                    assert response.status_code == 204, response.text
             assert SESSION_ID not in app.state.active_turns
         finally:
             release.set()
@@ -473,6 +495,6 @@ async def test_completed_native_activity_during_initialization_supersedes_recove
         turn = app.state.active_turns.get(SESSION_ID)
         if turn is not None:
             await asyncio.wait_for(turn, timeout=5)
-        assert not harness.posted_bodies, "recovery repeated completed native activity"
+        assert len(harness.posted_bodies) == int(startup_repaint)
         assert (await client.post("/v1/sessions", json=payload)).status_code == 201
-        assert not harness.posted_bodies
+        assert len(harness.posted_bodies) == int(startup_repaint)

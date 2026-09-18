@@ -495,10 +495,12 @@ class SessionResourceRegistry:
         if tasks:
             await asyncio.gather(*tasks)
 
-    def _set_session_status_memo(self, session_id: str, status: str) -> None:
+    def _set_session_status_memo(
+        self, session_id: str, status: str, *, record_activity: bool = True
+    ) -> None:
         """Record the session's latest PTY status for exit classification."""
         with self._lock:
-            if status in {"running", "waiting"}:
+            if record_activity and status in {"running", "waiting"}:
                 self._session_activity_epoch[session_id] = (
                     self._session_activity_epoch.get(session_id, 0) + 1
                 )
@@ -572,7 +574,7 @@ class SessionResourceRegistry:
             )
 
     def session_activity_epoch(self, session_id: str) -> int:
-        """Count observed native activity, retaining it after idle or terminal exit."""
+        """Count explicit turn activity, retaining it after idle or terminal exit."""
         with self._lock:
             return self._session_activity_epoch.get(session_id, 0)
 
@@ -1218,7 +1220,9 @@ class SessionResourceRegistry:
         # means "never emitted", so the first changed tick always fires.
         last_activity_emit: dict[str, float | None] = {"value": None}
 
-        def _publish_status(status: str, blocked_on: str | None = None) -> None:
+        def _publish_status(
+            status: str, blocked_on: str | None = None, *, record_activity: bool = False
+        ) -> None:
             # Publish one running/idle edge: dedup against the last value,
             # memo for exit classification, and hop to the loop (publishers
             # are loop-only). Shared by the PTY edges and the claude-native
@@ -1228,9 +1232,14 @@ class SessionResourceRegistry:
             # :meth:`note_external_session_status`).
             if status_publisher is None:
                 return
+            explicit_activity = record_activity and status in {"running", "waiting"}
+            if explicit_activity:
+                self._set_session_status_memo(session_id, status)
             if not self._claim_status_edge(session_id, status, blocked_on):
                 return
-            self._set_session_status_memo(session_id, status)
+            # Pane repaints can be startup output, not a new agent turn.
+            if not explicit_activity:
+                self._set_session_status_memo(session_id, status, record_activity=False)
             loop.call_soon_threadsafe(status_publisher, session_id, status, blocked_on)
 
         def _file_owns_status() -> bool:
@@ -1253,7 +1262,9 @@ class SessionResourceRegistry:
             self._build_claude_native_status_poller(
                 session_id=session_id,
                 instance=instance,
-                on_status=_publish_status,
+                on_status=lambda status, blocked_on=None: _publish_status(
+                    status, blocked_on, record_activity=True
+                ),
             )
             if emit_status and resource_role == CLAUDE_NATIVE_TERMINAL_ROLE
             else None

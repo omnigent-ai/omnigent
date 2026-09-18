@@ -36,6 +36,7 @@ def recovery_tree(
     parent = store.create_conversation(runner_id="new", agent_id=agent.id)
     relay, recovered = Mock(), AsyncMock()
     monkeypatch.setattr(sessions, "_ensure_runner_relay", relay)
+    monkeypatch.setattr(sessions, "_ensure_runner_relay_ready", AsyncMock())
     monkeypatch.setattr(sessions, "_publish_runner_recovered_status", recovered)
     monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
 
@@ -449,8 +450,12 @@ async def test_parent_recovery_published_before_descendant_store_failure(
         else OperationalError("child lookup", {}, RuntimeError("database unavailable"))
     )
 
+    ready = AsyncMock()
+    monkeypatch.setattr(sessions, "_ensure_runner_relay_ready", ready)
+
     def fail_lookup(*_args: Any) -> None:
         recovered.assert_awaited_once_with(parent.id, store)
+        ready.assert_awaited_once_with(parent.id, parent.runner_id, client, store)
         raise failure
 
     monkeypatch.setattr(store, "list_child_conversation_ids_by_parent", fail_lookup)
