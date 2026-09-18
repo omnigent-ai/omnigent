@@ -1820,36 +1820,32 @@ class SqlAlchemyConversationStore(ConversationStore):
             write,
         )
 
-    def get_session_owner(self, conversation_id: str) -> str | None:
+    def get_session_owner(self, conversation_id: str, *, owner_only: bool = False) -> str | None:
         """
-        Return the user id that owns a session (its creator).
+        Return the highest-privilege non-public grantee of a session.
 
-        Reads ``session_permissions`` and returns the
-        highest-``level`` grantee: the creator's ``LEVEL_OWNER``
-        (4) grant outranks any read (1) / edit (2) / manage (3)
-        grant, so ``ORDER BY level DESC LIMIT 1`` yields the owner
-        without hardcoding the owner-level integer. The
-        ``"__public__"`` public-access sentinel is excluded, so a
-        session that only carries a public grant (and no real
-        owner) returns ``None`` rather than the sentinel.
+        By default, lower-level grants are a fallback when no owner grant exists,
+        preserving cost attribution for shared sessions. Use ``owner_only=True``
+        for ownership checks; sharing alone does not establish ownership.
 
-        :param conversation_id: The session to look up, e.g.
-            ``"conv_abc123"``.
-        :returns: The owner's user id, e.g. ``"alice@example.com"``,
-            or ``None`` when the session has no real (non-public)
-            permission grants.
+        :param conversation_id: The session to look up, e.g. ``"conv_abc123"``.
+        :param owner_only: Require an explicit owner-level grant.
+        :returns: The grantee's user id, or ``None`` if no qualifying grant exists.
         """
-        from omnigent.server.auth import RESERVED_USER_PUBLIC
+        from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_PUBLIC
 
+        query = (
+            select(SqlSessionPermission.user_id)
+            .where(SqlSessionPermission.workspace_id == current_workspace_id())
+            .where(SqlSessionPermission.conversation_id == conversation_id)
+            .where(SqlSessionPermission.user_id != RESERVED_USER_PUBLIC)
+            .order_by(SqlSessionPermission.level.desc())
+            .limit(1)
+        )
+        if owner_only:
+            query = query.where(SqlSessionPermission.level >= LEVEL_OWNER)
         with self._session("select_session_owner") as session:
-            return session.execute(
-                select(SqlSessionPermission.user_id)
-                .where(SqlSessionPermission.workspace_id == current_workspace_id())
-                .where(SqlSessionPermission.conversation_id == conversation_id)
-                .where(SqlSessionPermission.user_id != RESERVED_USER_PUBLIC)
-                .order_by(SqlSessionPermission.level.desc())
-                .limit(1)
-            ).scalar_one_or_none()
+            return session.execute(query).scalar_one_or_none()
 
     def search(
         self,

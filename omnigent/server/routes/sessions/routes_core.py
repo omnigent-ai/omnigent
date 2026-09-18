@@ -2325,7 +2325,17 @@ def register_core_routes(
                             ),
                             timeout=10.0,
                         )
+                    except (httpx.HTTPError, ConnectionError):
+                        # ConnectionError covers a tunnel close mid-POST
+                        # (same source as the relay's except clause).
+                        _logger.warning(
+                            "Failed to notify runner about session %s",
+                            session_id,
+                            exc_info=True,
+                        )
+                    else:
                         if runner_init_resp.status_code < 400:
+                            await _publish_runner_recovered_status(session_id, conversation_store)
                             from omnigent.server.child_session_recovery import (
                                 restore_active_children,
                             )
@@ -2336,15 +2346,6 @@ def register_core_routes(
                                 conversation_store,
                                 request.app.state.runner_session_initializer,
                             )
-                            await _publish_runner_recovered_status(session_id, conversation_store)
-                    except (httpx.HTTPError, ConnectionError):
-                        # ConnectionError covers a tunnel close mid-POST
-                        # (same source as the relay's except clause).
-                        _logger.warning(
-                            "Failed to notify runner about session %s",
-                            session_id,
-                            exc_info=True,
-                        )
                 if _runner_client is None:
                     # Runner deregistered between validation and
                     # lookup; PATCH still returns 200 but no

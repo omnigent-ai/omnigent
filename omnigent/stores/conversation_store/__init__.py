@@ -1274,23 +1274,17 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
-    def get_session_owner(self, conversation_id: str) -> str | None:
+    def get_session_owner(self, conversation_id: str, *, owner_only: bool = False) -> str | None:
         """
-        Return the user id that owns a session (its creator).
+        Return the highest-privilege non-public grantee of a session.
 
-        The owner is the highest-privilege grantee in
-        ``session_permissions`` for this conversation — the
-        ``LEVEL_OWNER`` grant the creator receives at session
-        creation (the ``"__public__"`` read sentinel and any
-        read/edit grants are lower-level, so they are never
-        returned ahead of it). Used to attribute a session's LLM
-        spend to a single user for per-user daily cost rollups.
+        By default, lower-level grants are a fallback when no owner grant exists,
+        preserving cost attribution for shared sessions. Use ``owner_only=True``
+        for ownership checks; sharing alone does not establish ownership.
 
-        :param conversation_id: The session to look up, e.g.
-            ``"conv_abc123"``.
-        :returns: The owner's user id, e.g. ``"alice@example.com"``,
-            or ``None`` when the session has no permission grants
-            (e.g. single-user mode, where access is not tracked).
+        :param conversation_id: The session to look up, e.g. ``"conv_abc123"``.
+        :param owner_only: Require an explicit owner-level grant.
+        :returns: The grantee's user id, or ``None`` if no qualifying grant exists.
         """
         ...
 

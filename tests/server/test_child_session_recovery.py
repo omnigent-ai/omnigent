@@ -378,7 +378,7 @@ async def test_message_handshake_does_not_wait_for_child_initialization(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("child_owner", ["owner", "other", None])
+@pytest.mark.parametrize("child_owner", ["owner", "other", None, "read", "edit", "manage"])
 @pytest.mark.parametrize("same_binding", [False, True])
 async def test_restoration_respects_runner_ownership(
     recovery_tree: Any,
@@ -388,7 +388,7 @@ async def test_restoration_respects_runner_ownership(
     same_binding: bool,
 ) -> None:
     """A child's direct owner must match the destination runner's owner."""
-    from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ
+    from omnigent.server.auth import LEVEL_EDIT, LEVEL_MANAGE, LEVEL_OWNER, LEVEL_READ
     from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 
     store, parent, child, relay, _, initializer = recovery_tree
@@ -401,7 +401,11 @@ async def test_restoration_respects_runner_ownership(
         permissions.ensure_user(user)
     permissions.grant("owner", parent.id, LEVEL_OWNER)
     permissions.grant("other", parent.id, LEVEL_READ)
-    if child_owner is not None:
+    shared_levels = {"read": LEVEL_READ, "edit": LEVEL_EDIT, "manage": LEVEL_MANAGE}
+    if child_owner in shared_levels:
+        permissions.grant("other", row.id, shared_levels[child_owner])
+        assert store.get_session_owner(row.id) == "other"
+    elif child_owner is not None:
         permissions.grant(child_owner, row.id, LEVEL_OWNER)
     monkeypatch.setattr(
         "omnigent.runtime.get_runner_router",
@@ -425,3 +429,37 @@ async def test_restoration_respects_runner_ownership(
     else:
         assert initialized == [row.id, nested.id]
         assert store.get_conversation(nested.id).runner_id == "new"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport_error", [False, True])
+async def test_parent_recovery_published_before_descendant_store_failure(
+    recovery_tree: Any, monkeypatch: pytest.MonkeyPatch, transport_error: bool
+) -> None:
+    """A failed descendant lookup must not obscure a successful parent handshake."""
+    from sqlalchemy.exc import OperationalError
+
+    from omnigent.server.routes import sessions
+
+    store, parent, child, _, recovered, initializer = recovery_tree
+    child()
+    failure = (
+        ConnectionError("descendant lookup failed")
+        if transport_error
+        else OperationalError("child lookup", {}, RuntimeError("database unavailable"))
+    )
+
+    def fail_lookup(*_args: Any) -> None:
+        recovered.assert_awaited_once_with(parent.id, store)
+        raise failure
+
+    monkeypatch.setattr(store, "list_child_conversation_ids_by_parent", fail_lookup)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: httpx.Response(201, json={})),
+        base_url="http://runner",
+    ) as client:
+        with pytest.raises(type(failure)) as caught:
+            await sessions._ensure_runner_session_initialized(
+                parent.id, parent, client, store, initializer, require_success=True
+            )
+    assert caught.value is failure

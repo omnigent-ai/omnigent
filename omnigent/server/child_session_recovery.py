@@ -116,8 +116,8 @@ async def restore_active_children(
     async def ownership_allows(row: Conversation) -> bool:
         if runner_owner is None:
             return True
-        session_owner = await asyncio.to_thread(store.get_session_owner, row.id)
-        # Internal children without a direct grant inherit from their restored ancestor.
+        session_owner = await asyncio.to_thread(store.get_session_owner, row.id, owner_only=True)
+        # Internal children without an owner grant inherit from their restored ancestor.
         return session_owner is None or session_owner == runner_owner
 
     if not await ownership_allows(parent):

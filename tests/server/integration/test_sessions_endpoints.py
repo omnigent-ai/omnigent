@@ -4816,9 +4816,11 @@ async def test_publish_status_tracks_in_flight_response_id(
         sessions_module._session_active_response_cache.pop(sid, None)
 
 
+@pytest.mark.parametrize("child_lookup_fails", [False, True])
 async def test_patch_runner_rebind_clears_stale_failed_status(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    child_lookup_fails: bool,
 ) -> None:
     """
     CLI resume rebind clears a stale failed status after runner init.
@@ -4916,6 +4918,16 @@ async def test_patch_runner_rebind_clears_stale_failed_status(
     # The monkeypatched runner client can see setup work during session
     # creation. This test targets the later PATCH rebind path only.
     runner_client.posts.clear()
+    if child_lookup_fails:
+        from sqlalchemy.exc import OperationalError
+
+        async def fail_child_restore(*_args: Any) -> None:
+            assert sessions_module._session_status_cache.get(sid) == "idle"
+            raise OperationalError("child lookup", {}, RuntimeError("database unavailable"))
+
+        monkeypatch.setattr(
+            "omnigent.server.child_session_recovery.restore_active_children", fail_child_restore
+        )
     sessions_module._session_status_cache.pop(sid, None)
     try:
         sessions_module._publish_status(
@@ -4935,7 +4947,7 @@ async def test_patch_runner_rebind_clears_stale_failed_status(
     finally:
         sessions_module._session_status_cache.pop(sid, None)
 
-    assert resp.status_code == 200, resp.text
+    assert resp.status_code == (500 if child_lookup_fails else 200), resp.text
     assert len(runner_client.posts) == 1
     init_post = runner_client.posts[0]
     assert init_post["url"] == "/v1/sessions"
