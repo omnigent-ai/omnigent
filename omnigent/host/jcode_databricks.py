@@ -90,7 +90,15 @@ def _session_jcode_home(session_id: str | None) -> Path:
     return Path(home)
 
 
-def _write_session_config(jcode_home: Path, *, base_url: str, model: str) -> None:
+def _write_session_config(
+    jcode_home: Path,
+    *,
+    base_url: str,
+    model: str,
+    provider_id: str = _JCODE_PROVIDER_ID,
+    api_key_env: str = _JCODE_BEARER_ENV,
+    models: tuple[str, ...] = (),
+) -> None:
     """Write the session-private ``config.toml`` pinning jcode's ``dbx`` provider.
 
     Omnigent owns this file (0600, under the private ``JCODE_HOME``), so the bearer's
@@ -105,18 +113,18 @@ def _write_session_config(jcode_home: Path, *, base_url: str, model: str) -> Non
     q = json.dumps
     content = (
         "[provider]\n"
-        f"default_provider = {q(_JCODE_PROVIDER_ID)}\n"
+        f"default_provider = {q(provider_id)}\n"
         f"default_model = {q(model)}\n\n"
-        f"[providers.{_JCODE_PROVIDER_ID}]\n"
+        f"[providers.{q(provider_id)}]\n"
         f"type = {q('openai-compatible')}\n"
         f"base_url = {q(base_url)}\n"
         f"auth = {q('bearer')}\n"
-        f"api_key_env = {q(_JCODE_BEARER_ENV)}\n"
+        f"api_key_env = {q(api_key_env)}\n"
         f"default_model = {q(model)}\n"
         "requires_api_key = true\n\n"
-        f"[[providers.{_JCODE_PROVIDER_ID}.models]]\n"
-        f"id = {q(model)}\n"
     )
+    for model_id in models or (model,):
+        content += f"[[providers.{q(provider_id)}.models]]\nid = {q(model_id)}\n"
     # Atomic replace (write temp in the same dir, then rename) so a reader never sees a
     # partial file.
     config_path = jcode_home / "config.toml"
@@ -124,6 +132,30 @@ def _write_session_config(jcode_home: Path, *, base_url: str, model: str) -> Non
     tmp_path.write_text(content, encoding="utf-8")
     os.chmod(tmp_path, 0o600)
     os.replace(tmp_path, config_path)
+
+
+def configured_jcode_gateway_env(
+    *,
+    base_url: str,
+    api_key: str,
+    model: str,
+    models: tuple[str, ...] = (),
+    session_id: str | None = None,
+) -> dict[str, str]:
+    """Install the selected gateway in this session's private Jcode home."""
+    home = _session_jcode_home(session_id)
+    runtime_dir = home / "run"
+    runtime_dir.mkdir(mode=0o700, exist_ok=True)
+    key_env = "OMNIGENT_JCODE_GATEWAY_KEY"
+    _write_session_config(
+        home,
+        base_url=base_url,
+        model=model,
+        provider_id="omnigent",
+        api_key_env=key_env,
+        models=models,
+    )
+    return {key_env: api_key, _JCODE_HOME_ENV: str(home), _JCODE_RUNTIME_DIR_ENV: str(runtime_dir)}
 
 
 def connect_jcode_gateway_env(*, session_id: str | None = None) -> dict[str, str] | None:

@@ -4631,3 +4631,67 @@ function setComposerState(
     ...(skillsStatus === undefined ? {} : { skillsStatus }),
   });
 }
+
+describe("saved sandbox inference policy", () => {
+  let previous: ChatState;
+  beforeEach(() => {
+    previous = useChatStore.getState();
+    useChatStore.setState({
+      conversationId: "conv_policy",
+      sessionHarness: "claude-sdk",
+      sessionModelOverride: null,
+      sessionModelSeeded: false,
+      llmModel: "private/default",
+      costControlModeOverride: null,
+      pendingModelChange: null,
+      setModel: vi.fn().mockResolvedValue(undefined),
+    });
+  });
+  afterEach(() => {
+    cleanup();
+    useChatStore.setState(previous, true);
+  });
+
+  it("offers only the saved shortlist for a configured SDK session", async () => {
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          showModels: true,
+          showEffort: false,
+          modelPickerKind: "configured",
+          inferenceConfigured: true,
+          codexModelOptions: [
+            { id: "private/default", displayName: "Primary", isDefault: true },
+            { id: "private/fast", displayName: "Fast" },
+          ],
+        })}
+      />,
+    );
+    await openSessionModels();
+    expect(screen.queryByTestId("composer-agent-model-default")).toBeNull();
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Fast" }));
+    await waitFor(() =>
+      expect(useChatStore.getState().setModel).toHaveBeenCalledWith("private/fast", {
+        expectConfirmation: false,
+      }),
+    );
+  });
+
+  it("does not offer an unrestricted default when the saved catalog is unavailable", async () => {
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          showModels: true,
+          showEffort: false,
+          modelPickerKind: "configured",
+          inferenceConfigured: true,
+          inferenceError: "The gateway could not be reached.",
+          codexModelOptions: [],
+        })}
+      />,
+    );
+    await openSessionModels();
+    expect(screen.getByText("The gateway could not be reached.")).toBeVisible();
+    expect(screen.queryByTestId("composer-agent-model-default")).toBeNull();
+  });
+});

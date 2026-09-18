@@ -409,6 +409,8 @@ class ProviderEntry:
         ``None`` otherwise.
     :param profile: For ``kind="databricks"`` only: the Databricks profile
         name from ``~/.databrickscfg``, e.g. ``"oss"``. ``None`` otherwise.
+    :param connection: For managed ``kind="databricks"`` providers, ``"databricks"``
+        selects the session owner's connection. Mutually exclusive with ``profile``.
     :param model_provider: For ``kind="cli-config"`` only: the custom
         provider id in the CLI's config file that the launch pins, i.e. the
         ``X`` in ``[model_providers.X]``, e.g. ``"Databricks"``. ``None``
@@ -434,6 +436,7 @@ class ProviderEntry:
     families: dict[str, FamilyConfig] = field(default_factory=dict)
     cli: str | None = None
     profile: str | None = None
+    connection: str | None = None
     model_provider: str | None = None
     display_name: str | None = None
     default_families: frozenset[str] = frozenset()
@@ -1023,9 +1026,17 @@ def _parse_provider(name: str, raw: dict[str, object]) -> ProviderEntry:
 
     if kind == DATABRICKS_KIND:
         profile_raw = raw.get("profile")
-        if not isinstance(profile_raw, str) or not profile_raw:
+        connection_raw = raw.get("connection")
+        if connection_raw is not None and (
+            connection_raw != "databricks" or profile_raw is not None
+        ):
             raise OmnigentError(
-                f"provider {name!r}: a 'profile' is required when kind is 'databricks'.",
+                f"provider {name!r}: use exactly one of profile or connection: databricks.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if connection_raw is None and (not isinstance(profile_raw, str) or not profile_raw):
+            raise OmnigentError(
+                f"provider {name!r}: a profile or connection: databricks is required.",
                 code=ErrorCode.INVALID_INPUT,
             )
         # Databricks (ucode) routes the anthropic/openai surfaces + pi, but NOT
@@ -1035,7 +1046,8 @@ def _parse_provider(name: str, raw: dict[str, object]) -> ProviderEntry:
         return ProviderEntry(
             name=name,
             kind=kind,
-            profile=profile_raw,
+            profile=profile_raw if isinstance(profile_raw, str) else None,
+            connection=connection_raw,
             default_families=_parse_default_families(
                 name, default_raw, set(_VALID_FAMILIES) - {GEMINI_FAMILY}, pi_capable=True
             ),
@@ -1097,7 +1109,9 @@ def load_config() -> dict[str, object]:
         ``{"providers": {"openrouter": {"kind": "gateway", ...}}}``, or
         ``{}`` when the config file is missing, empty, or unreadable.
     """
-    return _load_config()
+    from omnigent.inference_config import load_runtime_inference_config
+
+    return load_runtime_inference_config()
 
 
 def load_providers(config: dict[str, object]) -> dict[str, ProviderEntry]:

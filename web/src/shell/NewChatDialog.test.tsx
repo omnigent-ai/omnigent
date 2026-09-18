@@ -1,3 +1,20 @@
+import type * as SandboxModelOptionsModule from "@/hooks/useSandboxModelOptions";
+
+vi.mock("@/hooks/useSandboxModelOptions", async (importOriginal) => ({
+  ...(await importOriginal<typeof SandboxModelOptionsModule>()),
+  useSandboxModelOptions: vi.fn(() => ({
+    data: {
+      configured: false,
+      status: "unconfigured",
+      models: [],
+      configuration_revision: null,
+      provider_label: null,
+      default_model: null,
+    },
+    isLoading: false,
+    error: null,
+  })),
+}));
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useConversations as useTestConversations } from "@/hooks/useConversations";
 
@@ -38,6 +55,7 @@ import {
   NewChatLandingScreen,
   resetLandingDraft,
 } from "./NewChatDialog";
+import { useSandboxModelOptions, type SandboxModelOptions } from "@/hooks/useSandboxModelOptions";
 import { ComposerAddMenu } from "@/components/composer/ComposerAddMenu";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
@@ -954,6 +972,18 @@ describe("describeCreateError", () => {
     expect(await describeCreateError(res)).toBe("bad workspace");
   });
 
+  it("shows a structured stale-configuration detail", async () => {
+    const res = fakeResponse(409, async () => ({
+      detail: {
+        code: "inference_configuration_changed",
+        message: "Harness configuration changed. Refresh the model choices.",
+      },
+    }));
+    expect(await describeCreateError(res)).toBe(
+      "Harness configuration changed. Refresh the model choices.",
+    );
+  });
+
   it("falls back to the status code for a non-JSON body", async () => {
     const res = fakeResponse(500, async () => {
       throw new Error("not json");
@@ -1138,6 +1168,18 @@ function setupLandingMocks() {
   useProjectConfigMock.mockReset();
   useProjectConfigMock.mockReturnValue(DISABLED_QUERY_RESULT);
   useHostModelOptionsMock.mockReset();
+  vi.mocked(useSandboxModelOptions).mockReturnValue({
+    data: {
+      configured: false,
+      status: "unconfigured",
+      models: [],
+      configuration_revision: null,
+      provider_label: null,
+      default_model: null,
+    },
+    isLoading: false,
+    error: null,
+  } as unknown as ReturnType<typeof useSandboxModelOptions>);
   vi.mocked(useSkills).mockReset();
   vi.mocked(useSkills).mockImplementation(
     ({ target, enabled = true, starting = false }) =>
@@ -9063,5 +9105,129 @@ describe("NewChatLandingScreen Smart Routing flavors are scoped separately", () 
     expect(screen.getByTestId("new-chat-landing-config-harness").textContent).toContain(
       "Smart Routing",
     );
+  });
+});
+
+describe("managed sandbox inference models", () => {
+  beforeEach(setupLandingMocks);
+
+  const models = [
+    { id: "private/default", displayName: "Gateway default", isDefault: true },
+    { id: "private/alternate", displayName: "Gateway alternate" },
+  ];
+  const catalog = {
+    configured: true,
+    status: "ready" as const,
+    models,
+    configuration_revision: "profile-revision-1",
+    provider_label: "Bifrost",
+    default_model: "private/default",
+  };
+
+  function preview(data: SandboxModelOptions = catalog, error: Error | null = null) {
+    vi.mocked(useSandboxModelOptions).mockReturnValue({
+      data,
+      isLoading: false,
+      error,
+    } as unknown as ReturnType<typeof useSandboxModelOptions>);
+  }
+
+  it("shows the future host's models and sends the previewed revision", async () => {
+    preview();
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as Response);
+    renderLanding({ managed_sandboxes_enabled: true, sandbox_provider: "agent_sandbox" });
+    openAgentModels("a1");
+    expect(screen.getByTestId("sandbox-model-provider")).toHaveTextContent("Bifrost");
+    expect(screen.queryByTestId("new-chat-landing-agent-model-opus")).toBeNull();
+    pickPrimaryOption("model", "Gateway alternate");
+    closeMenu();
+    const { body } = await submitAndReadBody();
+    expect(body.model_override).toBe("private/alternate");
+    expect(body.inference_configuration_revision).toBe("profile-revision-1");
+    expect(body.host_type).toBe("managed");
+    expect(useSandboxModelOptions).toHaveBeenLastCalledWith(
+      "agent_sandbox",
+      "claude-native",
+      "a1",
+      null,
+      true,
+    );
+  });
+
+  it("supports an ACP agent without native model-picker capabilities", async () => {
+    preview();
+    mockAgents([
+      {
+        id: "a_acp",
+        name: "Private ACP",
+        display_name: "Private ACP",
+        description: null,
+        harness: "acp:private",
+        skills: [],
+      },
+    ]);
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as Response);
+    renderLanding({ managed_sandboxes_enabled: true, sandbox_provider: "kubernetes" });
+    openAgentModels("a_acp");
+    pickPrimaryOption("model", "Gateway alternate");
+    closeMenu();
+    const { body } = await submitAndReadBody();
+    expect(body.model_override).toBe("private/alternate");
+    expect(useSandboxModelOptions).toHaveBeenLastCalledWith(
+      "kubernetes",
+      "acp:private",
+      "a_acp",
+      null,
+      true,
+    );
+  });
+
+  it.each(["empty", "unavailable"] as const)(
+    "blocks create when discovery is %s",
+    async (status) => {
+      preview({ ...catalog, models: [], status });
+      renderLanding({ managed_sandboxes_enabled: true, sandbox_provider: "kubernetes" });
+      fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+        target: { value: "start" },
+      });
+      expect(screen.getByRole("alert")).toHaveTextContent("No usable models");
+      expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+      expect(authenticatedFetchMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it("blocks stale cached choices when a catalog refresh fails", async () => {
+    preview(catalog, new Error("Gateway unavailable"));
+    renderLanding({ managed_sandboxes_enabled: true, sandbox_provider: "kubernetes" });
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), { target: { value: "start" } });
+    expect(screen.getByRole("alert")).toHaveTextContent("Gateway unavailable");
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+  });
+
+  it("discards a model removed by a provider profile change", async () => {
+    preview();
+    const mounted = renderLanding({
+      managed_sandboxes_enabled: true,
+      sandbox_provider: "kubernetes",
+    });
+    openAgentModels("a1");
+    pickPrimaryOption("model", "Gateway alternate");
+    closeMenu();
+    preview({ ...catalog, models: [models[0]], configuration_revision: "profile-revision-2" });
+    // A normal user interaction rerenders the mounted composer with the refreshed query.
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), { target: { value: "start" } });
+    openAgentModels("a1");
+    expect(screen.queryByTestId("new-chat-landing-agent-model-private/alternate")).toBeNull();
+    expect(screen.getByTestId("new-chat-landing-agent-model-private/default")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    mounted.unmount();
   });
 });

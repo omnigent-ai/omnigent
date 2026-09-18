@@ -1,0 +1,484 @@
+"""Verified sandbox catalogs and saved profiles remain scoped to owner and provider."""
+
+from __future__ import annotations
+
+import copy
+import json
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import httpx
+import pytest
+
+from omnigent.errors import OmnigentError
+from omnigent.models import model_catalog
+from omnigent.models.model_catalog import ModelEntry, ModelListing
+from omnigent.models.model_metadata import ModelMetadata, ModelReasoningMetadata, ModelWireAPI
+from omnigent.server.inference_catalog import SandboxInferenceService
+from omnigent.server.managed_hosts import ManagedSandboxConfig, ManagedSandboxDeployment
+from omnigent.spec.types import ProviderAuth
+
+
+@pytest.fixture(autouse=True)
+def credentials(monkeypatch):
+    monkeypatch.setenv("INFERENCE_CATALOG_KEY", "catalog-test-secret")
+    monkeypatch.delenv("POD_INFERENCE_KEY", raising=False)
+    with model_catalog._listing_cache_lock:
+        model_catalog._listing_cache.clear()
+
+
+def _state(
+    *, allowed=("gateway/fast", "gateway/main"), default="gateway/main", harness="codex-native"
+):
+    binding = {"provider": "bifrost"}
+    if allowed is not None:
+        binding["model_allowlist"] = list(allowed)
+    if default is not None:
+        binding["default_model"] = default
+    config = {
+        "providers": {
+            "bifrost": {
+                "kind": "gateway",
+                "openai": {
+                    "base_url": "https://inference.example/v1",
+                    "api_key_ref": "env:POD_INFERENCE_KEY",
+                    "wire_api": "responses",
+                },
+            }
+        },
+        "inference": {"harnesses": {harness: binding}},
+    }
+    target = ManagedSandboxConfig(
+        server_url="http://localhost:6767",
+        launcher_factory=lambda: None,
+        token_ttl_s=100,
+        provider="agent_sandbox",
+        host_config=config,
+        model_discovery={
+            "bifrost": {
+                "base_url": "https://catalog.example/v1",
+                "api_key_ref": "env:INFERENCE_CATALOG_KEY",
+            }
+        },
+    )
+    return SimpleNamespace(
+        sandbox_config=ManagedSandboxDeployment.single(target),
+        databricks_store=None,
+        databricks_client=None,
+    )
+
+
+def _transport(ids=("gateway/main", "gateway/fast", "gateway/noisy"), requests=None):
+    def respond(request):
+        if requests is not None:
+            requests.append(request)
+        return httpx.Response(200, json={"data": [{"id": model} for model in ids]})
+
+    return httpx.MockTransport(respond)
+
+
+@pytest.mark.asyncio
+async def test_preview_uses_server_discovery_and_never_resolves_pod_credentials():
+    state = _state()
+    requests = []
+    snapshot = await SandboxInferenceService(
+        state, transport=_transport(requests=requests)
+    ).prepare("agent_sandbox", "codex-native", "alice")
+    assert snapshot is not None
+    assert requests[0].url == "https://catalog.example/v1/models"
+    assert requests[0].headers["authorization"] == "Bearer catalog-test-secret"
+    preview = snapshot["catalog"]
+    assert preview["status"] == "ready"
+    assert [row["id"] for row in preview["models"]] == ["gateway/fast", "gateway/main"]
+    assert preview["models"][1]["isDefault"] is True
+    assert "catalog-test-secret" not in json.dumps(snapshot)
+    assert (
+        snapshot["runtime_config"]["providers"]["bifrost"]["openai"]["api_key_ref"]
+        == "env:POD_INFERENCE_KEY"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "allowed,expected",
+    [
+        ((), []),
+        (("gateway/main",), ["gateway/main"]),
+        (None, ["gateway/main", "gateway/fast", "gateway/noisy"]),
+    ],
+)
+async def test_empty_single_and_absent_allowlists_remain_distinct(allowed, expected):
+    snapshot = await SandboxInferenceService(
+        _state(allowed=allowed, default=None), transport=_transport()
+    ).prepare("agent_sandbox", "codex-native", "alice")
+    assert snapshot is not None
+    assert [row["id"] for row in snapshot["catalog"]["models"]] == expected
+    assert snapshot["catalog"]["status"] == ("ready" if expected else "empty")
+
+
+@pytest.mark.asyncio
+async def test_unavailable_default_is_not_inserted_into_live_catalog():
+    snapshot = await SandboxInferenceService(
+        _state(), transport=_transport(("gateway/fast",))
+    ).prepare("agent_sandbox", "codex-native", "alice")
+    assert snapshot is not None
+    assert snapshot["catalog"]["status"] == "unavailable"
+    assert snapshot["catalog"]["models"] == []
+    assert "default model" in snapshot["catalog"]["error"]
+
+
+@pytest.mark.asyncio
+async def test_saved_profile_ignores_later_target_edits_and_credential_rotation_uses_reference(
+    monkeypatch,
+):
+    state = _state()
+    requests = []
+    service = SandboxInferenceService(state, transport=_transport(requests=requests))
+    snapshot = await service.prepare("agent_sandbox", "codex-native", "alice")
+    assert snapshot is not None
+    original = copy.deepcopy(snapshot)
+    target = state.sandbox_config.default
+    target.host_config["inference"]["harnesses"]["codex-native"]["model_allowlist"] = ["other"]
+    target.model_discovery["bifrost"]["base_url"] = "https://new.example/v1"
+    monkeypatch.setenv("INFERENCE_CATALOG_KEY", "rotated-secret")
+    preview = await service.catalog(snapshot)
+    assert preview["status"] == "ready"
+    assert requests[-1].url.host == "catalog.example"
+    assert requests[-1].headers["authorization"] == "Bearer rotated-secret"
+    assert snapshot == original
+    assert "rotated-secret" not in json.dumps(snapshot)
+
+
+@pytest.mark.asyncio
+async def test_discovery_failure_is_redacted_and_distinct_from_empty():
+    def fail(request):
+        return httpx.Response(401, json={"message": "upstream-secret"})
+
+    snapshot = await SandboxInferenceService(
+        _state(), transport=httpx.MockTransport(fail)
+    ).prepare("agent_sandbox", "codex-native", "alice")
+    assert snapshot is not None
+    assert snapshot["catalog"]["status"] == "unavailable"
+    assert "upstream-secret" not in json.dumps(snapshot)
+
+
+@pytest.mark.asyncio
+async def test_missing_discovery_does_not_use_pod_key_or_a_public_catalog():
+    state = _state()
+    state.sandbox_config.default.model_discovery.clear()
+    snapshot = await SandboxInferenceService(state).prepare(
+        "agent_sandbox", "codex-native", "alice"
+    )
+    assert snapshot is not None
+    assert snapshot["catalog"]["status"] == "unavailable"
+    assert "sandbox.model_discovery.bifrost" in snapshot["catalog"]["error"]
+
+
+@pytest.mark.asyncio
+async def test_exact_acp_binding_and_literal_databricks_prefix_are_preserved():
+    state = _state(
+        allowed=("databricks-custom/model",),
+        default="databricks-custom/model",
+        harness="acp:custom",
+    )
+    snapshot = await SandboxInferenceService(
+        state, transport=_transport(("databricks-custom/model",))
+    ).prepare("agent_sandbox", "acp:custom", "alice")
+    assert snapshot is not None
+    assert snapshot["harness"] == "acp:custom"
+    assert snapshot["catalog"]["models"][0]["id"] == "databricks-custom/model"
+
+
+@pytest.mark.asyncio
+async def test_aliases_resolve_and_cycles_fail():
+    state = _state(allowed=("fast", "primary"), default="primary")
+    family = state.sandbox_config.default.host_config["providers"]["bifrost"]["openai"]
+    family["models"] = {"primary": "gateway/main", "fast": "gateway/fast"}
+    service = SandboxInferenceService(state, transport=_transport())
+    snapshot = await service.prepare("agent_sandbox", "codex-native", "alice")
+    assert snapshot is not None
+    assert snapshot["catalog"]["default_model"] == "gateway/main"
+    family["models"] = {"primary": "fast", "fast": "primary"}
+    with pytest.raises(OmnigentError, match="cycle"):
+        await service.prepare("agent_sandbox", "codex-native", "alice")
+
+
+@pytest.mark.asyncio
+async def test_conflicting_spec_auth_and_unsupported_transport_fail():
+    state = _state()
+    service = SandboxInferenceService(state, transport=_transport())
+    with pytest.raises(OmnigentError, match="conflicts"):
+        await service.prepare(
+            "agent_sandbox", "codex-native", "alice", ProviderAuth(type="provider", name="other")
+        )
+    state.sandbox_config.default.host_config["providers"]["bifrost"]["openai"]["wire_api"] = "chat"
+    snapshot = await service.prepare("agent_sandbox", "codex-native", "alice")
+    assert snapshot is not None
+    assert snapshot["catalog"]["status"] == "unavailable"
+    assert "Responses endpoint" in snapshot["catalog"]["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("harness", ["opencode-native", "jcode", "qwen"])
+async def test_chat_only_harnesses_require_a_chat_gateway(harness):
+    state = _state(harness=harness)
+    service = SandboxInferenceService(state, transport=_transport())
+    snapshot = await service.prepare("agent_sandbox", harness, "alice")
+    assert snapshot is not None
+    assert snapshot["catalog"]["status"] == "unavailable"
+    assert "Chat Completions gateway" in snapshot["catalog"]["error"]
+    state.sandbox_config.default.host_config["providers"]["bifrost"]["openai"]["wire_api"] = "chat"
+    snapshot = await service.prepare("agent_sandbox", harness, "alice")
+    assert snapshot is not None
+    assert snapshot["catalog"]["status"] == "ready"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("harness", ["openai-agents", "openai-agents-sdk"])
+async def test_openai_agents_sdk_alias_uses_openai_catalog(harness):
+    snapshot = await SandboxInferenceService(
+        _state(harness=harness), transport=_transport()
+    ).prepare("agent_sandbox", harness, "alice")
+    assert snapshot is not None
+    assert snapshot["catalog"]["status"] == "ready"
+    assert [row["id"] for row in snapshot["catalog"]["models"]] == [
+        "gateway/fast",
+        "gateway/main",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_metadata_filters_wrong_wire_but_preserves_unknown_private_aliases(monkeypatch):
+    entries = (
+        ModelEntry(
+            "gateway/main", "other", ModelMetadata(wire_apis=frozenset({ModelWireAPI.OPENAI_CHAT}))
+        ),
+        ModelEntry(
+            "gateway/fast",
+            "other",
+            ModelMetadata(reasoning=ModelReasoningMetadata(efforts=frozenset({"high", "low"}))),
+        ),
+    )
+    monkeypatch.setattr(
+        model_catalog,
+        "_listing_for_provider",
+        lambda *_args, **_kwargs: ModelListing("gateway", True, entries, ""),
+    )
+    snapshot = await SandboxInferenceService(_state(default=None)).prepare(
+        "agent_sandbox", "codex-native", "alice"
+    )
+    assert snapshot is not None
+    assert snapshot["catalog"]["status"] == "ready"
+    assert [row["id"] for row in snapshot["catalog"]["models"]] == ["gateway/fast"]
+    assert snapshot["catalog"]["models"][0]["supportedReasoningEfforts"] == [
+        {"reasoningEffort": "low"},
+        {"reasoningEffort": "high"},
+    ]
+
+
+def _unity_state():
+    state = _state(
+        allowed=("system.ai.private",), default="system.ai.private", harness="claude-native"
+    )
+    config = state.sandbox_config.default.host_config
+    config["providers"]["unity"] = {"kind": "databricks", "connection": "databricks"}
+    config["inference"]["harnesses"]["claude-native"]["provider"] = "unity"
+    state.databricks_store = object()
+    state.databricks_client = object()
+    return state
+
+
+@pytest.mark.asyncio
+async def test_unity_uses_owner_connection_and_pins_workspace_without_token(monkeypatch):
+    resolver = AsyncMock(return_value=("owner-token", "https://workspace.example"))
+    monkeypatch.setattr("omnigent.server.inference_catalog.resolve_databricks_token", resolver)
+    requests = []
+
+    def respond(request):
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "model_services": [
+                    {"name": "system.ai.private", "supported_api_types": ["anthropic/v1/messages"]}
+                ]
+            },
+        )
+
+    service = SandboxInferenceService(_unity_state(), transport=httpx.MockTransport(respond))
+    snapshot = await service.prepare("agent_sandbox", "claude-native", "alice")
+    assert snapshot is not None
+    assert snapshot["catalog"]["status"] == "ready"
+    assert all(call.args[0] == "alice" for call in resolver.call_args_list)
+    assert requests[0].headers["authorization"] == "Bearer owner-token"
+    assert snapshot["connections"] == {"unity": "https://workspace.example"}
+    assert "owner-token" not in json.dumps(snapshot)
+    command = snapshot["runtime_config"]["providers"]["unity"]["anthropic"]["auth_command"]
+    assert "--workspace https://workspace.example" in command
+    resolver.return_value = ("new-token", "https://other.example")
+    preview = await service.catalog(snapshot)
+    assert preview["status"] == "unavailable"
+    assert "workspace changed" in preview["error"]
+    assert len(requests) == 1
+    resolver.return_value = None
+    assert (await service.catalog(snapshot))["status"] == "unavailable"
+
+
+@pytest.mark.asyncio
+async def test_bifrost_does_not_require_unrelated_unity_connection(monkeypatch):
+    state = _state()
+    state.sandbox_config.default.host_config["providers"]["unity"] = {
+        "kind": "databricks",
+        "connection": "databricks",
+    }
+    state.databricks_store = object()
+    state.databricks_client = object()
+    resolver = AsyncMock(return_value=None)
+    monkeypatch.setattr("omnigent.server.inference_catalog.resolve_databricks_token", resolver)
+    snapshot = await SandboxInferenceService(state, transport=_transport()).prepare(
+        "agent_sandbox", "codex-native", "alice"
+    )
+    assert snapshot is not None
+    assert snapshot["catalog"]["status"] == "ready"
+    assert snapshot["connections"] == {}
+
+
+@pytest.mark.asyncio
+async def test_unbound_harness_keeps_its_baseline_when_a_binding_is_added_later():
+    from omnigent.inference_config import binding_for_harness
+    from omnigent.server.managed_hosts import deployment_with_inference_snapshot
+
+    state = _state()
+    service = SandboxInferenceService(state)
+    snapshot = await service.prepare("agent_sandbox", "claude-native", "alice")
+    assert snapshot is not None
+    assert snapshot["catalog"]["configured"] is False
+    assert snapshot["catalog"]["status"] == "unconfigured"
+    state.sandbox_config.default.host_config["inference"]["harnesses"]["claude-native"] = {
+        "provider": "bifrost"
+    }
+    restored = deployment_with_inference_snapshot(state.sandbox_config, snapshot)
+    assert binding_for_harness(restored.default.host_config, "claude-native") is None
+    assert (await service.catalog(snapshot))["configured"] is False
+
+
+def test_legacy_restore_does_not_adopt_new_inference_bindings():
+    from omnigent.server.managed_hosts import deployment_with_inference_snapshot
+
+    state = _state()
+    restored = deployment_with_inference_snapshot(state.sandbox_config, None)
+    assert restored.default.host_config["inference"] == {}
+    assert state.sandbox_config.default.host_config["inference"]["harnesses"]
+    assert (
+        restored.default.host_config["providers"]
+        == state.sandbox_config.default.host_config["providers"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_target_without_profiles_keeps_legacy_create_contract():
+    state = _state()
+    del state.sandbox_config.default.host_config["inference"]
+    assert (
+        await SandboxInferenceService(state).prepare("agent_sandbox", "claude-native", "alice")
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_generic_acp_intersects_all_configured_protocols(monkeypatch):
+    state = _state(harness="acp:custom", default=None)
+    state.sandbox_config.default.host_config["providers"]["bifrost"]["anthropic"] = {
+        "base_url": "https://anthropic.example",
+        "api_key_ref": "env:POD_INFERENCE_KEY",
+    }
+    entries = tuple(
+        ModelEntry(model, "other", ModelMetadata(wire_apis=frozenset({wire})))
+        for model, wire in [
+            ("gateway/main", ModelWireAPI.OPENAI_RESPONSES),
+            ("gateway/fast", ModelWireAPI.ANTHROPIC_MESSAGES),
+        ]
+    )
+    monkeypatch.setattr(
+        model_catalog,
+        "_listing_for_provider",
+        lambda *_args, **_kwargs: ModelListing("gateway", True, entries, ""),
+    )
+    snapshot = await SandboxInferenceService(state).prepare("agent_sandbox", "acp:custom", "alice")
+    assert snapshot is not None
+    assert [row["id"] for row in snapshot["catalog"]["models"]] == ["gateway/fast", "gateway/main"]
+
+
+@pytest.mark.asyncio
+async def test_all_child_bindings_are_normalized_in_saved_profile():
+    state = _state()
+    config = state.sandbox_config.default.host_config
+    config["providers"]["bifrost"]["openai"]["models"] = {"main": "gateway/main"}
+    config["inference"]["harnesses"]["acp:child"] = {
+        "provider": "bifrost",
+        "model_allowlist": ["main"],
+        "default_model": "main",
+    }
+    snapshot = await SandboxInferenceService(state, transport=_transport()).prepare(
+        "agent_sandbox", "codex-native", "alice"
+    )
+    assert snapshot is not None
+    saved = snapshot["runtime_config"]["inference"]["harnesses"]["acp:child"]
+    assert saved["model_allowlist"] == ["gateway/main"]
+    assert saved["default_model"] == "gateway/main"
+
+
+@pytest.mark.asyncio
+async def test_unity_materialization_retains_operator_models_and_label(monkeypatch):
+    state = _unity_state()
+    unity = state.sandbox_config.default.host_config["providers"]["unity"]
+    unity.update(
+        display_name="Caffeine Unity",
+        default="anthropic",
+        anthropic={"models": {"default": "system.ai.private", "fast": "system.ai.fast"}},
+    )
+    monkeypatch.setattr(
+        "omnigent.server.inference_catalog.resolve_databricks_token",
+        AsyncMock(return_value=("owner-token", "https://workspace.example")),
+    )
+    monkeypatch.setattr(
+        model_catalog,
+        "fetch_databricks_model_service_entries",
+        lambda *_args, **_kwargs: (
+            ModelEntry(
+                "system.ai.private",
+                "other",
+                ModelMetadata(wire_apis=frozenset({ModelWireAPI.ANTHROPIC_MESSAGES})),
+            ),
+        ),
+    )
+    snapshot = await SandboxInferenceService(state).prepare(
+        "agent_sandbox", "claude-native", "alice"
+    )
+    assert snapshot is not None
+    saved = snapshot["runtime_config"]["providers"]["unity"]
+    assert saved["default"] == "anthropic"
+    assert saved["anthropic"]["models"] == unity["anthropic"]["models"]
+    assert snapshot["catalog"]["provider_label"] == "Caffeine Unity"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "field,value",
+    [("api_key", "inline-test-secret"), ("base_url", "https://user:secret@private.example/v1")],
+)
+async def test_another_saved_binding_cannot_persist_embedded_credentials(field, value):
+    state = _state()
+    config = state.sandbox_config.default.host_config
+    family = {"base_url": "https://other.example/v1", "api_key_ref": "env:POD_INFERENCE_KEY"}
+    if field == "api_key":
+        family.pop("api_key_ref")
+    family[field] = value
+    config["providers"]["other"] = {"kind": "gateway", "openai": family}
+    config["inference"]["harnesses"]["acp:other"] = {"provider": "other"}
+    with pytest.raises(OmnigentError) as error:
+        await SandboxInferenceService(state, transport=_transport()).prepare(
+            "agent_sandbox", "codex-native", "alice"
+        )
+    assert "inline-test-secret" not in str(error.value)
+    assert "user:secret" not in str(error.value)

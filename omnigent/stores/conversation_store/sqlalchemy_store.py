@@ -174,6 +174,7 @@ class _RowCountResult(Protocol):
 # Per-session config overrides packed into the ``conversations.session_overrides``
 # JSON blob. Order is fixed so the encoded object is stable across writes.
 _SESSION_OVERRIDE_KEYS = (
+    "inference_snapshot",
     "reasoning_effort",
     "model_override",
     "reported_model",
@@ -270,6 +271,11 @@ def _to_conversation(
         session_todos=session_todos,
         reasoning_effort=overrides["reasoning_effort"],
         model_override=overrides["model_override"],
+        inference_snapshot=(
+            json.loads(overrides["inference_snapshot"])
+            if overrides["inference_snapshot"] is not None
+            else None
+        ),
         reported_model=overrides["reported_model"],
         cost_control_mode_override=overrides["cost_control_mode_override"],
         subagent_routing_override=overrides["subagent_routing_override"],
@@ -987,6 +993,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         terminal_launch_args: list[str] | None = None,
         conversation_id: str | None = None,
         project_id: str | None = None,
+        inference_snapshot: dict[str, Any] | None = None,
     ) -> Conversation:
         """
         Create a new conversation in the database.
@@ -1071,6 +1078,11 @@ class SqlAlchemyConversationStore(ConversationStore):
                             f"parent conversation {parent_conversation_id!r} does not exist"
                         )
                     root_id = parent_row.root_conversation_id
+                    if inference_snapshot is None:
+                        saved = _decode_session_overrides(parent_row.session_overrides)[
+                            "inference_snapshot"
+                        ]
+                        inference_snapshot = json.loads(saved) if saved else None
             if parent_conversation_id is not None and not title:
                 title = f"untitled:{new_id}"
 
@@ -1110,6 +1122,13 @@ class SqlAlchemyConversationStore(ConversationStore):
                     parent_conversation_id=parent_conversation_id,
                     root_conversation_id=root_id,
                     agent_id=agent_id,
+                    session_overrides=_encode_session_overrides(
+                        {
+                            "inference_snapshot": json.dumps(inference_snapshot)
+                            if inference_snapshot is not None
+                            else None
+                        }
+                    ),
                 )
                 ap_sess.add(row)
                 return row
@@ -3946,12 +3965,14 @@ class SqlAlchemyConversationStore(ConversationStore):
         title: str | None = None,
         labels: dict[str, str] | None = None,
         reasoning_effort: str | None = None,
+        model_override: str | None = None,
         workspace: str | None = None,
         terminal_launch_args: list[str] | None = None,
         parent_conversation_id: str | None = None,
         runner_id: str | None = None,
         project_id: str | None = None,
         host_id: str | None = None,
+        inference_snapshot: dict[str, Any] | None = None,
     ) -> CreatedSession:
         """
         Insert a conversation row and session-scoped agent.
@@ -4015,12 +4036,14 @@ class SqlAlchemyConversationStore(ConversationStore):
             title=title,
             labels=labels,
             reasoning_effort=reasoning_effort,
+            model_override=model_override,
             workspace=workspace,
             terminal_launch_args=terminal_launch_args,
             parent_conversation_id=parent_conversation_id,
             runner_id=runner_id,
             project_id=project_id,
             host_id=host_id,
+            inference_snapshot=inference_snapshot,
         )
 
     def _create_session_with_agent_with_id(
@@ -4034,12 +4057,14 @@ class SqlAlchemyConversationStore(ConversationStore):
         title: str | None = None,
         labels: dict[str, str] | None = None,
         reasoning_effort: str | None = None,
+        model_override: str | None = None,
         workspace: str | None = None,
         terminal_launch_args: list[str] | None = None,
         parent_conversation_id: str | None = None,
         runner_id: str | None = None,
         project_id: str | None = None,
         host_id: str | None = None,
+        inference_snapshot: dict[str, Any] | None = None,
     ) -> CreatedSession:
         """Body of :meth:`create_session_with_agent` under a caller-supplied
         ``conversation_id``. The public method generates a fresh id; this seam
@@ -4047,7 +4072,15 @@ class SqlAlchemyConversationStore(ConversationStore):
         from omnigent.stores.conversation_store import ConversationNotFoundError
 
         now = now_epoch()
-        encoded_overrides = _encode_session_overrides({"reasoning_effort": reasoning_effort})
+        encoded_overrides = _encode_session_overrides(
+            {
+                "reasoning_effort": reasoning_effort,
+                "model_override": model_override,
+                "inference_snapshot": json.dumps(inference_snapshot)
+                if inference_snapshot is not None
+                else None,
+            }
+        )
         prepared_labels = dict(labels) if labels else {}
 
         # Conversation + labels go to AP; agent + metadata go to Omnigent.
@@ -4063,6 +4096,17 @@ class SqlAlchemyConversationStore(ConversationStore):
                         f"parent conversation {parent_conversation_id!r} does not exist"
                     )
                 root_conversation_id = parent_row.root_conversation_id
+                if inference_snapshot is None:
+                    saved = _decode_session_overrides(parent_row.session_overrides)[
+                        "inference_snapshot"
+                    ]
+                    encoded_overrides = _encode_session_overrides(
+                        {
+                            "reasoning_effort": reasoning_effort,
+                            "model_override": model_override,
+                            "inference_snapshot": saved,
+                        }
+                    )
 
         def insert_ap(ap_sess: Session) -> SqlConversation:
             conversation_row = _new_session_conversation_row(
@@ -4379,6 +4423,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
             fork_overrides = _encode_session_overrides(
                 {
+                    "inference_snapshot": source_overrides["inference_snapshot"],
                     "reasoning_effort": fork_effort,
                     "model_override": fork_model,
                     "harness_override": (

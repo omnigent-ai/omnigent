@@ -3297,6 +3297,11 @@ def resolve_native_codex_launch(
         config (issue #2744 — parity with the in-process codex harness).
     :returns: The resolved :class:`NativeCodexLaunch`.
     """
+    from omnigent.inference_config import (
+        load_runtime_inference_config,
+        resolve_bound_model,
+        resolve_bound_provider,
+    )
     from omnigent.onboarding.ambient import codex_config_detection
     from omnigent.onboarding.detected import (
         dismissed_detection_names,
@@ -3314,7 +3319,19 @@ def resolve_native_codex_launch(
     )
     from omnigent.spec.types import DatabricksAuth
 
-    explicit = load_config()
+    explicit = load_runtime_inference_config(load_config())
+    bound = resolve_bound_provider(
+        explicit, "codex-native", spec.executor.auth if spec is not None else None
+    )
+    if bound is not None:
+        selected = resolve_bound_model(explicit, "codex-native", model)
+        bound_launch = _codex_provider_launch(bound, selected)
+        if bound_launch is None:
+            raise ValueError(
+                f"Configured provider {bound.name!r} cannot route Codex. "
+                "Check its OpenAI endpoint and credential reference."
+            )
+        return bound_launch
     config_detection = codex_config_detection()
     config_provider_dismissed = (
         config_detection is not None
@@ -3333,7 +3350,9 @@ def resolve_native_codex_launch(
     ):
         # Share credential resolution with the in-process harness so spec
         # auth, including inline keys, takes precedence over machine defaults.
-        spec_entry = _resolve_provider_for_build(spec, harness_type="codex", for_launch=True)
+        spec_entry = _resolve_provider_for_build(
+            spec, harness_type="codex", for_launch=True, actual_harness="codex-native"
+        )
         if spec_entry is not None:
             if spec_entry.kind == SUBSCRIPTION_KIND:
                 # A spec-named subscription defers to Codex's own login,

@@ -491,6 +491,19 @@ async def _register_common_routes(
         "**/v1/hosts/*/harnesses/*/model-options",
         lambda route: route.fulfill(json={"models": []}),
     )
+    await page.route(
+        "**/v1/sandbox-providers/*/harnesses/*/model-options*",
+        lambda route: route.fulfill(
+            json={
+                "configured": False,
+                "status": "unconfigured",
+                "models": [],
+                "configuration_revision": None,
+                "provider_label": None,
+                "default_model": None,
+            }
+        ),
+    )
     await page.route(_WORKTREES_RE, lambda route: route.fulfill(json={"data": []}))
     await page.route("**/v1/agents", handle_agents)
     await page.route("**/v1/sessions/*/events", handle_events)

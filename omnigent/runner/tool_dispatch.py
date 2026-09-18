@@ -1840,7 +1840,7 @@ async def _inherited_parent_model(
         parent_model = validate_model_override(raw_model)
     except ValueError:
         return None
-    if child_harness is not None and model_family_mismatch(child_harness, parent_model):
+    if child_harness is not None and _dispatch_model_mismatch(child_harness, parent_model):
         _logger.debug(
             "sys_session_send: not inheriting parent model %r for sub-agent %r "
             "(family mismatch with harness %s); child runs its default",
@@ -2277,6 +2277,25 @@ def _subagent_allowed_harnesses(
     )
 
 
+def _dispatch_model_mismatch(harness: str, model: str) -> str | None:
+    """Treat configured model IDs as opaque; legacy sessions retain family checks."""
+    from omnigent.errors import OmnigentError
+    from omnigent.inference_config import (
+        binding_for_harness,
+        load_runtime_inference_config,
+        resolve_bound_model,
+    )
+
+    config = load_runtime_inference_config()
+    if binding_for_harness(config, harness) is not None:
+        try:
+            resolve_bound_model(config, harness, model)
+        except OmnigentError as exc:
+            return str(exc)
+        return None
+    return model_family_mismatch(harness, model)
+
+
 def _normalize_subagent_model(
     model: str,
     *,
@@ -2302,10 +2321,14 @@ def _normalize_subagent_model(
     :param harness: The child's declared harness, e.g. ``"claude-native"``.
     :returns: The id to persist as ``model_override``.
     """
+    from omnigent.inference_config import binding_for_harness, load_runtime_inference_config
     from omnigent.models.model_catalog import resolve_model_provider
 
     # ACP commands own their model namespace, even when provider credentials are shared.
-    if canonicalize_harness(harness) == "acp":
+    if canonicalize_harness(harness) == "acp" or (
+        harness is not None
+        and binding_for_harness(load_runtime_inference_config(), harness) is not None
+    ):
         return model
     sub_spec = _find_subagent_spec(sub_agent_name, agent_spec)
     if sub_spec is None or harness is None:
@@ -2754,7 +2777,7 @@ async def _execute_subagent_tool(
                     f"{child_harness or 'unknown'!r} has no model-override "
                     "plumbing. Omit 'model' to use the harness default."
                 )
-            mismatch = model_family_mismatch(child_harness, model) if child_harness else None
+            mismatch = _dispatch_model_mismatch(child_harness, model) if child_harness else None
             if mismatch is not None:
                 return (
                     f"Error: sys_session_send 'model' rejected for sub-agent "

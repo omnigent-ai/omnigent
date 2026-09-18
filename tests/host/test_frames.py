@@ -368,6 +368,59 @@ def test_launch_runner_frame_round_trip() -> None:
     assert decoded.session_id == "conv_abc123"
 
 
+def test_launch_runner_preserves_the_full_saved_inference_profile() -> None:
+    config = {
+        "providers": {
+            "bifrost": {
+                "kind": "gateway",
+                "openai": {
+                    "base_url": "https://gateway.example/v1",
+                    "api_key_ref": "env:BIFROST_KEY",
+                },
+            },
+            "unity": {"kind": "databricks", "connection": "databricks"},
+        },
+        "inference": {
+            "harnesses": {
+                "codex-native": {
+                    "provider": "bifrost",
+                    "default_model": "private/model[large]",
+                    "model_allowlist": ["private/model[large]"],
+                },
+                "claude-native": {"provider": "unity"},
+            }
+        },
+    }
+    frame = HostLaunchRunnerFrame(
+        request_id="profile-launch",
+        binding_token="runner-binding",
+        workspace="/workspace",
+        session_id="profile-session",
+        harness="codex-native",
+        inference_config=config,
+    )
+    decoded = decode_host_frame(encode_host_frame(frame))
+    assert decoded == frame
+    assert isinstance(decoded, HostLaunchRunnerFrame)
+    assert decoded.inference_config == config
+
+
+@pytest.mark.parametrize("inference_config", [[], "invalid", False, 1])
+def test_launch_runner_rejects_malformed_inference_config(inference_config: object) -> None:
+    with pytest.raises(ValueError, match="inference_config"):
+        decode_host_frame(
+            json.dumps(
+                {
+                    "kind": "host.launch_runner",
+                    "request_id": "bad-profile",
+                    "binding_token": "runner-binding",
+                    "workspace": "/workspace",
+                    "inference_config": inference_config,
+                }
+            )
+        )
+
+
 def test_launch_runner_result_frame_success_round_trip() -> None:
     """
     Verify HostLaunchRunnerResultFrame (success) survives

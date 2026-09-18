@@ -2860,6 +2860,19 @@ def create_app(
         prefix="/v1",
         tags=["extensions"],
     )
+    from omnigent.server.routes.sandbox_inference import create_sandbox_inference_router
+
+    app.include_router(
+        create_sandbox_inference_router(
+            agent_store=agent_store,
+            agent_cache=agent_cache,
+            conversation_store=conversation_store,
+            permission_store=permission_store,
+            auth_provider=auth_provider,
+        ),
+        prefix="/v1",
+        tags=["sandbox inference"],
+    )
     # Server-side speech-to-text behind the composer mic button
     # (designs/server-dictation.md). Availability is probed lazily, so
     # registering unconditionally is free for servers without the extra.

@@ -6,6 +6,13 @@ Boxlite, Kubernetes, microsandbox)
 ship with the core package. Third-party packages can add new providers through
 the `omnigent.sandbox_providers` entrypoint group.
 
+## Harness providers and model lists
+
+Managed Kubernetes and Agent Sandbox deployments can bind individual harnesses
+to different inference gateways and curate the models shown in both composers.
+See [Model and provider selection](../../designs/MANAGED_SANDBOX_MODEL_SELECTION.md)
+for configuration, credential setup, session lifetime, and verification steps.
+
 ## How it works
 
 Each sandbox provider implements the
