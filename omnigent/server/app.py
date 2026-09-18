@@ -3139,6 +3139,10 @@ def create_app(
 
         :param runner_id: The reconnecting runner's id.
         """
+        from omnigent.server.child_session_recovery import (
+            is_parent_owned_subagent,
+            restore_active_children,
+        )
         from omnigent.server.routes._sessions.common import (
             _session_sandbox_status_cache,
         )
@@ -3165,6 +3169,10 @@ def create_app(
         convs = await asyncio.to_thread(
             conversation_store.list_conversations_by_runner_id, runner_id
         )
+        # Restore each tree from its root before ordinary child initialization
+        # can clear the interruption status or cache an init without continuation.
+        bound_ids = {conv.id for conv in convs}
+        convs.sort(key=lambda conv: conv.parent_conversation_id in bound_ids)
         _logger.info(
             "_on_runner_connect: runner=%s, %d bound session(s)",
             runner_id,
@@ -3195,12 +3203,18 @@ def create_app(
                     "_on_runner_connect: skipping session-init POST for %s (no agent_id)",
                     conv.id,
                 )
-            else:
+            elif not is_parent_owned_subagent(conv) and not (
+                conv.parent_conversation_id in bound_ids and conv.host_id is None
+            ):
                 try:
-                    await runner_session_initializer.initialize(
+                    init_response = await runner_session_initializer.initialize(
                         conv,
                         routed.client,
                         timeout=10.0,
+                    )
+                    init_response.raise_for_status()
+                    await restore_active_children(
+                        conv, routed.client, conversation_store, runner_session_initializer
                     )
                 except Exception:
                     _logger.exception(
@@ -3237,9 +3251,12 @@ def create_app(
             # is reachable again. The helper self-guards: it only clears a
             # session whose persisted failure is ``runner_disconnected``, so
             # a genuine task failure survives the reconnect untouched.
-            await _publish_runner_recovered_status(
-                conv.id, conversation_store, require_disconnect_code=True
-            )
+            if not is_parent_owned_subagent(conv) and not (
+                conv.parent_conversation_id in bound_ids and conv.host_id is None
+            ):
+                await _publish_runner_recovered_status(
+                    conv.id, conversation_store, require_disconnect_code=True
+                )
             # A managed launch that outlived its connect timeout cached
             # sandbox_status "failed"; this runner connecting proves the
             # sandbox is live, so drop the stale banner. Only "failed" is

@@ -501,7 +501,7 @@ def test_read_contained_file_windows_boundary(
     else:
         assert result == "Instruction file contents."
         path_factory.assert_called_once_with(resolved_candidate)
-        candidate.read_text.assert_called_once_with()
+        candidate.read_text.assert_called_once_with(encoding="utf-8")
 
 
 def test_parse_instructions_rejects_path_traversal(tmp_path: Path) -> None:

@@ -802,9 +802,11 @@ export async function forkSession(
       codexBypassSandbox?: boolean;
     };
     sandbox?: { provider?: string | null; workspace?: string | null };
+    /** Mark the fork as a side chat (hidden from the left sidebar). */
+    sideChat?: boolean;
   } = {},
 ): Promise<Session> {
-  const { title, agentId, upToResponseId, config, sandbox } = options;
+  const { title, agentId, upToResponseId, config, sandbox, sideChat } = options;
   const body: {
     title?: string;
     agent_id?: string;
@@ -816,7 +818,11 @@ export async function forkSession(
     host_type?: "managed";
     sandbox_provider?: string;
     workspace?: string | null;
+    side_chat?: boolean;
   } = {};
+  if (sideChat) {
+    body.side_chat = true;
+  }
   if (title !== undefined) {
     body.title = title;
   }
@@ -858,6 +864,41 @@ export async function forkSession(
     body: JSON.stringify(body),
   });
   return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
+}
+
+/**
+ * Open a generic side chat by forking the conversation and launching a runner
+ * for the fork on the SOURCE's own host — exactly what the per-message Fork
+ * button does. This is host-agnostic: it drives on a local host or a managed
+ * one, with no managed-sandbox requirement. Codex sessions do NOT use this —
+ * they fork in-process via their native `/side` path (prompt-cache-warm) — so
+ * this is the generic (non-Codex) create.
+ *
+ * When the source is on a git branch the fork launches in its OWN worktree
+ * (`side-chat/<id>`, based on the source branch) so the side chat stays off the
+ * parent's working tree; otherwise it launches in the source's workspace.
+ *
+ * @param sourceId - The parent conversation to fork, e.g. "conv_abc123".
+ * @returns The new side-chat session id.
+ * @throws Error when the source has no host/workspace to launch on, or when the
+ *   fork / runner launch fails, so the caller can surface it (a toast).
+ */
+export async function createSideChat(sourceId: string): Promise<{ childSessionId: string }> {
+  const source = await getSession(sourceId);
+  const { hostId, workspace, gitBranch } = source;
+  if (!hostId || !workspace) {
+    // No host/workspace to run on — fail before creating an orphan fork so the
+    // caller shows an error instead of opening a dead tab.
+    throw new Error("This session has no host to run a side chat on.");
+  }
+  const fork = await forkSession(sourceId, { title: "Side chat", sideChat: true });
+  await launchRunner(
+    hostId,
+    fork.id,
+    workspace,
+    gitBranch ? { branchName: `side-chat/${fork.id.slice(-8)}`, baseBranch: gitBranch } : undefined,
+  );
+  return { childSessionId: fork.id };
 }
 
 /**

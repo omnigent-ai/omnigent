@@ -2833,3 +2833,316 @@ def test_connect_broker_skipped_without_sidecar(monkeypatch: pytest.MonkeyPatch)
         "omnigent.host.databricks_credential.broker_token_command", lambda host, *a, **k: None
     )
     assert creds.resolve_pi_native_provider(config_loader=lambda: {"providers": {}}) is None
+
+
+def test_inline_family_registers_curated_shortlist_as_extra_models() -> None:
+    """The family's ``models:`` tier map registers as Pi ``extra_models``.
+
+    Pi then shows exactly the deployment's curated, verified set in /model
+    (verified empirically: Pi lists only the models its models.json
+    declares), instead of just the launch model. Duplicate ids collapse to
+    their first occurrence; the selected model is not registered twice.
+    """
+    config = {
+        "providers": {
+            "bifrost": {
+                "kind": "gateway",
+                "default": True,
+                "openai": {
+                    "base_url": "http://bifrost.example.com/v1",
+                    "api_key": "sk-test",
+                    "wire_api": "chat",
+                    "models": {
+                        "default": "GLM-5.3-Flash",
+                        "opus": "GLM-5.3",
+                        "fable": "claude-fable-5",
+                        "pro": "deepseek-v4-pro",
+                        "sonnet": "GLM-5.3-Flash",  # duplicate id of the default
+                    },
+                },
+            }
+        }
+    }
+    provider = creds.resolve_pi_native_provider(config_loader=lambda: config)
+    assert provider is not None
+
+    extra_ids = [entry["id"] for entry in provider.extra_models]
+    assert extra_ids == ["GLM-5.3-Flash", "GLM-5.3", "claude-fable-5", "deepseek-v4-pro"]
+    by_id = {entry["id"]: entry for entry in provider.extra_models}
+    # The gateway entry builder flags reasoning for DeepSeek (reasoning
+    # channel) and for Claude (thinking-level controls) on every surface;
+    # GLM gets neither.
+    assert by_id["deepseek-v4-pro"].get("reasoning") is True
+    assert by_id["claude-fable-5"].get("reasoning") is True
+    assert "reasoning" not in by_id["GLM-5.3"]
+
+    # The rendered models.json registers the shortlist alongside the launch
+    # model, each exactly once (the launch model is not re-appended).
+    rendered = provider.to_models_config()
+    registered = rendered["providers"][provider.provider_id]["models"]
+    assert [entry["id"] for entry in registered] == [
+        "GLM-5.3-Flash",
+        "GLM-5.3",
+        "claude-fable-5",
+        "deepseek-v4-pro",
+    ]
+
+
+def test_inline_family_without_models_map_registers_only_the_launch_model() -> None:
+    """No ``models:`` map → no shortlist, behaviour unchanged."""
+    config = {
+        "providers": {
+            "bifrost": {
+                "kind": "gateway",
+                "default": True,
+                "openai": {
+                    "base_url": "http://bifrost.example.com/v1",
+                    "api_key": "sk-test",
+                    "wire_api": "chat",
+                },
+            }
+        }
+    }
+    provider = creds.resolve_pi_native_provider(model="glm-5.3", config_loader=lambda: config)
+    assert provider is not None
+    assert [entry["id"] for entry in provider.extra_models] == ["glm-5.3"]
+
+
+def test_curated_tier_ids_strip_bracket_suffixes() -> None:
+    """Tier ids get the same bracket-suffix strip as the selected model.
+
+    A ``[1m]``-style operator id renders (and scopes) as the bare gateway
+    model id; a suffixed duplicate of the launch model collapses into the
+    launch model's existing entry.
+    """
+    config = {
+        "providers": {
+            "bifrost": {
+                "kind": "gateway",
+                "default": True,
+                "openai": {
+                    "base_url": "http://bifrost.example.com/v1",
+                    "api_key": "sk-test",
+                    "wire_api": "chat",
+                    "models": {
+                        "default": "GLM-5.3-Flash",
+                        "opus": "GLM-5.3[16m]",
+                        "sonnet": "GLM-5.3-Flash[16m]",  # same stripped id as default
+                    },
+                },
+            }
+        }
+    }
+    provider = creds.resolve_pi_native_provider(config_loader=lambda: config)
+    assert provider is not None
+    assert [entry["id"] for entry in provider.extra_models] == ["GLM-5.3-Flash", "GLM-5.3"]
+
+
+def test_provider_launch_scopes_picker_via_enabled_models(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The managed settings.json scopes the picker to the rendered catalog.
+
+    Provider-qualified refs distinguish managed models from built-in entries.
+    Users can still toggle the picker back to the full catalog.
+    """
+    monkeypatch.setattr(
+        "omnigent.inner.pi_settings.DEFAULT_PI_AGENT_DIR", tmp_path / "global-agent"
+    )
+    provider = creds.PiProviderConfig(
+        provider_id="omnigent",
+        base_url="https://api.anthropic.com",
+        api="anthropic-messages",
+        model="claude-sonnet-4-6",
+        api_key="sk-secret",
+        auth_header=False,
+        extra_models=[{"id": "GLM-5.3-Flash"}, {"id": "claude-fable-5"}],
+        curated_models=True,
+    )
+    agent_dir = tmp_path / "pi-agent"
+    creds.pi_native_provider_launch(agent_dir, provider)
+
+    settings = json.loads((agent_dir / "settings.json").read_text(encoding="utf-8"))
+    assert settings["enabledModels"] == [
+        "omnigent/GLM-5.3-Flash",
+        "omnigent/claude-fable-5",
+        "omnigent/claude-sonnet-4-6",
+    ]
+    assert settings["defaultThinkingLevel"] is None
+
+
+@pytest.mark.parametrize("kind", ["key", "gateway"])
+@pytest.mark.parametrize("duplicate_tiers", [False, True])
+@pytest.mark.parametrize("override", [None, "gpt-4.1"])
+@pytest.mark.parametrize("prior_scope", [None, ["openai/gpt-5", "anthropic/claude-sonnet-4-6"]])
+def test_setup_single_model_preserves_picker_scope(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+    duplicate_tiers: bool,
+    override: str | None,
+    prior_scope: list[str] | None,
+) -> None:
+    """Selecting a default in setup must not replace existing Pi picker preferences."""
+    from omnigent.inner import pi_settings
+    from omnigent.onboarding.configure_models import (
+        build_gateway_provider_entry,
+        build_key_provider_entry,
+    )
+
+    monkeypatch.setenv("PI_TEST_API_KEY", "fake-key")
+    if kind == "key":
+        entry = build_key_provider_entry(
+            "openai", "https://api.openai.com/v1", "env:PI_TEST_API_KEY", "gpt-5"
+        )
+    else:
+        entry = build_gateway_provider_entry(
+            "https://gateway.example/v1",
+            "env:PI_TEST_API_KEY",
+            families=["openai"],
+            models={"openai": "gpt-5"},
+        )
+    entry["default"] = True
+    if duplicate_tiers:
+        family = entry["openai"]
+        assert isinstance(family, dict)
+        family["models"] = {"default": "preferred", "preferred": "gpt-5", "fast": "gpt-5"}
+    config = {"providers": {"configured": entry}}
+
+    global_dir = tmp_path / "global-agent"
+    global_dir.mkdir()
+    global_settings: dict[str, object] = {"theme": "light"}
+    if prior_scope is not None:
+        global_settings["enabledModels"] = prior_scope
+    global_file = global_dir / "settings.json"
+    global_file.write_text(json.dumps(global_settings), encoding="utf-8")
+    monkeypatch.setattr(pi_settings, "DEFAULT_PI_AGENT_DIR", global_dir)
+
+    provider = creds.resolve_pi_native_provider(model=override, config_loader=lambda: config)
+    assert provider is not None
+    assert [model["id"] for model in provider.extra_models] == [override or "gpt-5"]
+    agent_dir = tmp_path / "pi-agent"
+    creds.pi_native_provider_launch(agent_dir, provider)
+
+    settings = json.loads((agent_dir / "settings.json").read_text(encoding="utf-8"))
+    if prior_scope is None:
+        assert "enabledModels" not in settings
+    else:
+        assert settings["enabledModels"] == prior_scope
+    assert settings["theme"] == "light"
+    assert settings["defaultThinkingLevel"] is None
+    assert json.loads(global_file.read_text(encoding="utf-8")) == global_settings
+
+
+@pytest.mark.parametrize("catalog", ["single", "multi_model", "multi_provider"])
+@pytest.mark.parametrize("prior_scope", [None, ["anthropic/claude-sonnet-4-6"]])
+def test_provider_launch_without_curated_set_does_not_scope(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    catalog: str,
+    prior_scope: list[str] | None,
+) -> None:
+    """Discovered catalogs preserve picker preferences regardless of model count."""
+    global_dir = tmp_path / "global-agent"
+    global_dir.mkdir()
+    global_settings = {"enabledModels": prior_scope} if prior_scope is not None else {}
+    global_file = global_dir / "settings.json"
+    global_file.write_text(json.dumps(global_settings), encoding="utf-8")
+    monkeypatch.setattr("omnigent.inner.pi_settings.DEFAULT_PI_AGENT_DIR", global_dir)
+    provider = creds.PiProviderConfig(
+        provider_id="omnigent",
+        base_url="https://gateway.example/anthropic",
+        api="anthropic-messages",
+        model="claude-sonnet-4-6",
+        api_key="sk-secret",
+        auth_header=False,
+        extra_models=[{"id": "claude-opus-4-7"}] if catalog == "multi_model" else [],
+        additional_providers={
+            "omnigent-openai": {
+                "baseUrl": "https://gateway.example/codex/v1",
+                "apiKey": "synthetic-api-key",
+                "api": "openai-responses",
+                "models": [{"id": "gpt-5"}],
+            }
+        }
+        if catalog == "multi_provider"
+        else {},
+    )
+    agent_dir = tmp_path / "pi-agent"
+    creds.pi_native_provider_launch(agent_dir, provider)
+
+    settings = json.loads((agent_dir / "settings.json").read_text(encoding="utf-8"))
+    if prior_scope is None:
+        assert "enabledModels" not in settings
+    else:
+        assert settings["enabledModels"] == prior_scope
+    assert settings["defaultThinkingLevel"] is None
+    assert json.loads(global_file.read_text(encoding="utf-8")) == global_settings
+
+
+def test_curated_tier_alias_resolves_to_concrete_id() -> None:
+    """A tier value naming another tier resolves to the concrete id.
+
+    Deployments alias tier names to ids (``deepseek-pro: deepseek-v4-pro``)
+    and reference the alias from elsewhere (``default: deepseek-pro``). The
+    alias must reach neither the launch model nor the picker's shortlist —
+    the gateway serves the id, not the tier name.
+    """
+    config = {
+        "providers": {
+            "bifrost": {
+                "kind": "gateway",
+                "default": True,
+                "openai": {
+                    "base_url": "http://bifrost.example.com/v1",
+                    "api_key": "sk-test",
+                    "wire_api": "chat",
+                    "models": {
+                        "default": "deepseek-pro",  # aliases the tier below
+                        "deepseek-pro": "deepseek-v4-pro",
+                        "glm": "GLM-5.3",
+                    },
+                },
+            }
+        }
+    }
+    provider = creds.resolve_pi_native_provider(config_loader=lambda: config)
+    assert provider is not None
+    # The launch model is the id, not the alias ...
+    assert provider.model == "deepseek-v4-pro"
+    # ... and the alias never renders as a picker row of its own.
+    assert [entry["id"] for entry in provider.extra_models] == [
+        "deepseek-v4-pro",
+        "GLM-5.3",
+    ]
+
+
+def test_curated_tier_alias_resolves_before_bracket_strip() -> None:
+    """An aliased tier resolves first, then gets the bracket-suffix strip.
+
+    The alias key is matched against the raw map, so a bracketed target
+    still collapses to its bare gateway id instead of rendering (or
+    launching) with the suffix.
+    """
+    config = {
+        "providers": {
+            "bifrost": {
+                "kind": "gateway",
+                "default": True,
+                "openai": {
+                    "base_url": "http://bifrost.example.com/v1",
+                    "api_key": "sk-test",
+                    "wire_api": "chat",
+                    "models": {
+                        "default": "long-context",  # aliases the tier below
+                        "long-context": "GLM-5.3[16m]",
+                        "glm": "GLM-5.3-Flash",
+                    },
+                },
+            }
+        }
+    }
+    provider = creds.resolve_pi_native_provider(config_loader=lambda: config)
+    assert provider is not None
+    assert provider.model == "GLM-5.3"
+    assert [entry["id"] for entry in provider.extra_models] == ["GLM-5.3", "GLM-5.3-Flash"]

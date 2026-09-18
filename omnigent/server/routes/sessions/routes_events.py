@@ -349,6 +349,7 @@ async def _recover_retry_session(
 
     original_runner_id = conv.runner_id
     runner_client = await _get_runner_client(session_id, runner_router)
+    was_connected = runner_client is not None
     runner_relaunched = False
     terminal_ready_from_init = False
     if runner_client is None:
@@ -366,18 +367,19 @@ async def _recover_retry_session(
                 code=ErrorCode.RUNNER_UNAVAILABLE,
             )
         runner_relaunched = conv.runner_id != original_runner_id
-        terminal_ready_from_init = await _ensure_runner_session_initialized(
-            session_id,
-            conv,
-            runner_client,
-            conversation_store,
-            initializer=getattr(request.app.state, "runner_session_initializer", None),
-            suppress_recovery_turn=False,
-            require_success=True,
-        )
+    terminal_ready_from_init = await _ensure_runner_session_initialized(
+        session_id,
+        conv,
+        runner_client,
+        conversation_store,
+        initializer=getattr(request.app.state, "runner_session_initializer", None),
+        suppress_recovery_turn=was_connected,
+        require_success=True,
+    )
 
     if _is_native_terminal_session(conv):
-        if not terminal_ready_from_init:
+        # A cached init response cannot prove that a connected runner's pane still exists.
+        if was_connected or not terminal_ready_from_init:
             terminal_outcome = await _ensure_native_terminal_ready(
                 runner_client,
                 session_id,

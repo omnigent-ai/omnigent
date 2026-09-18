@@ -3126,6 +3126,28 @@ def test_augment_claude_args_injects_mcp_and_hooks(tmp_path: Path) -> None:
     assert "--disallowedTools" not in args
 
 
+def test_augment_claude_args_observes_worktree_moves(tmp_path: Path) -> None:
+    """
+    ``EnterWorktree`` / ``ExitWorktree`` PostToolUse events reach the observer hook.
+
+    Both tools move the session transcript into the new cwd's project dir, and
+    only the observer hook updates the bridge's ``transcript_path``. Without
+    this entry the forwarder tails the vanished pre-move file until the turn's
+    ``Stop``, so nothing the tool did (its own result included) is mirrored.
+    """
+    settings = _load_invocation_settings(augment_claude_args((), bridge_dir=tmp_path))
+    worktree_entries = [
+        entry
+        for entry in settings["hooks"]["PostToolUse"]
+        if entry.get("matcher") == "EnterWorktree|ExitWorktree"
+    ]
+    assert len(worktree_entries) == 1
+    assert (
+        "omnigent.harnesses.claude_native.hook --bridge-dir"
+        in worktree_entries[0]["hooks"][0]["command"]
+    )
+
+
 def test_framework_context_hook_consumes_hidden_notice(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -7151,6 +7173,80 @@ def test_record_model_vocabulary_backfills_a_runner_prepared_bridge(
     assert read_model_env(bridge_dir) == {
         "ANTHROPIC_DEFAULT_OPUS_MODEL": "databricks-claude-opus-4-8",
     }
+
+
+def test_record_model_vocabulary_never_materializes_an_unprepared_bridge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Recording is a no-op until a prepared bridge config exists.
+
+    A model-options listing can race terminal creation; writing vocabulary
+    into a nonexistent bridge would materialize an incomplete dir with no
+    owner.pid, which orphan pruning then skips forever.
+    """
+    from omnigent.harnesses.claude_native.bridge import (
+        bridge_dir_for_bridge_id,
+        record_model_vocabulary,
+    )
+
+    root = tmp_path / "root"
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", root)
+
+    bridge_dir = bridge_dir_for_bridge_id("conv_unprepared")
+    record_model_vocabulary(
+        bridge_dir,
+        launch_env=None,
+        launch_model=None,
+        picker_values=["system.ai.glm-5-3"],
+    )
+    assert not bridge_dir.exists()
+
+
+def test_picker_values_round_trip_from_either_launch_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The pane's ``/model`` vocabulary includes the picker the launch saw.
+
+    A workspace-managed picker lists models of no Claude family, which no
+    alias pin spells, so the routed and mid-session switch paths translate
+    against these rows.
+    """
+    from omnigent.harnesses.claude_native.bridge import (
+        read_model_picker_values,
+        record_model_vocabulary,
+    )
+
+    root = tmp_path / "root"
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", root)
+
+    bridge_dir = prepare_bridge_dir(
+        "conv_abc",
+        workspace=tmp_path,
+        picker_values=["system.ai.claude-opus-4-8[1m]", "system.ai.glm-5-3"],
+    )
+    assert read_model_picker_values(bridge_dir) == [
+        "system.ai.claude-opus-4-8[1m]",
+        "system.ai.glm-5-3",
+    ]
+
+    # The runner path records the same values after preparing the bridge.
+    bridge_dir = prepare_bridge_dir("conv_def", workspace=tmp_path)
+    assert read_model_picker_values(bridge_dir) == []
+    record_model_vocabulary(
+        bridge_dir,
+        launch_env=None,
+        launch_model=None,
+        picker_values=["system.ai.glm-5-3"],
+    )
+    assert read_model_picker_values(bridge_dir) == ["system.ai.glm-5-3"]
+    # A launch that learned no catalog leaves the recorded picker alone.
+    record_model_vocabulary(bridge_dir, launch_env=None, launch_model=None)
+    assert read_model_picker_values(bridge_dir) == ["system.ai.glm-5-3"]
+    record_model_vocabulary(bridge_dir, launch_env=None, launch_model=None, picker_values=[])
+    assert read_model_picker_values(bridge_dir) == []
+    assert read_model_picker_values(tmp_path / "nonexistent") == []
 
 
 def test_model_env_is_empty_without_a_ucode_launch(

@@ -4266,16 +4266,6 @@ async def _ensure_runner_session_initialized(
         # via the same warning path rather than silently forwarding into a
         # half-initialized runner.
         resp.raise_for_status()
-        await _publish_runner_recovered_status(session_id, conversation_store)
-        try:
-            payload = resp.json()
-        except ValueError:
-            return False
-        return bool(
-            isinstance(payload, dict)
-            and payload.get("session_init_protocol_version") == 2
-            and payload.get("terminal_ready") is True
-        )
     except (httpx.HTTPError, ConnectionError) as exc:
         _logger.warning(
             "Session-init handshake to runner failed for session %s; "
@@ -4290,6 +4280,31 @@ async def _ensure_runner_session_initialized(
                 code=ErrorCode.RUNNER_UNAVAILABLE,
             ) from exc
         return False
+
+    await _publish_runner_recovered_status(session_id, conversation_store)
+    from omnigent.server.child_session_recovery import (
+        restore_active_children,
+        schedule_child_restoration,
+    )
+
+    # Legacy callers leave descendant restoration to the runner-connect hook.
+    if initializer is not None:
+        if suppress_recovery_turn and not require_success:
+            schedule_child_restoration(conv, runner_client, conversation_store, initializer)
+        else:
+            await _ensure_runner_relay_ready(
+                session_id, conv.runner_id, runner_client, conversation_store
+            )
+            await restore_active_children(conv, runner_client, conversation_store, initializer)
+    try:
+        payload = resp.json()
+    except ValueError:
+        return False
+    return bool(
+        isinstance(payload, dict)
+        and payload.get("session_init_protocol_version") == 2
+        and payload.get("terminal_ready") is True
+    )
 
 
 def _is_native_terminal_session(conv: Conversation) -> bool:
@@ -4991,8 +5006,8 @@ def _routed_turn_model_spelling(
     Translate a routed model into the spelling this pane can switch to.
 
     A mid-turn switch on a Claude Code pane is typed as ``/model``, which
-    takes only this session's own picker vocabulary — its family aliases
-    and its one custom slot. An id outside that vocabulary is skipped by
+    takes only this session's own picker vocabulary — its picker values,
+    its family aliases, its one custom slot. An id outside it is skipped by
     the executor (fail open, the turn runs on the current model), so it
     must be neither pinned on the row nor recorded as applied. Sessions
     that are not claude-native panes, and panes whose vocabulary is not
@@ -5014,8 +5029,17 @@ def _routed_turn_model_spelling(
     from omnigent.models.claude_model_vocabulary import (
         claude_model_command_arg,
         model_vocabulary_env,
+        picker_command_values,
+        picker_value_for_model,
     )
 
+    # Row ids are the pane's picker values, which ``/model`` takes verbatim —
+    # the only spelling a managed row of no Claude family has, and exact
+    # where a family alias would step onto the newest generation.
+    picker_values = picker_command_values(options)
+    picked = picker_value_for_model(model, picker_values)
+    if picked is not None:
+        return picked
     env = model_vocabulary_env(options)
     if not env:
         return model
@@ -5023,10 +5047,12 @@ def _routed_turn_model_spelling(
     if spelling is None:
         _logger.warning(
             "smart_routing: routed model %s has no spelling the claude-native pane "
-            "for session=%s accepts (vocabulary=%s); leaving the session's model alone",
+            "for session=%s accepts (vocabulary=%s, picker=%s); leaving the session's "
+            "model alone",
             model,
             session_id,
             sorted(env.values()),
+            picker_values,
             extra={"session_id": session_id},
         )
     return spelling
