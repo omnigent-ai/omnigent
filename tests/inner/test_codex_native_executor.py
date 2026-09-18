@@ -725,6 +725,209 @@ async def test_executor_reaches_app_server_over_ws_transport(
     ) in _FakeCodexNativeClient.requests
 
 
+def test_oversized_turn_start_materializes_large_text_and_retries_once(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A rejected start keeps small text and images inline, then succeeds."""
+
+    class _RejectFirstOversizedStartClient(_FakeCodexNativeClient):
+        """Reject the first start with Codex's structured size error."""
+
+        rejected = False
+
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            """Reject one start and accept its materialized retry."""
+            if method == "turn/start" and not type(self).rejected:
+                type(self).rejected = True
+                type(self).requests.append((method, params))
+                actual_chars = sum(
+                    len(item.get("text", "")) for item in params["input"] if isinstance(item, dict)
+                )
+                raise CodexAppServerResponseError(
+                    {
+                        "code": -32602,
+                        "data": {
+                            "input_error_code": "input_too_large",
+                            "max_chars": 500,
+                            "actual_chars": actual_chars,
+                        },
+                        "message": "Input exceeds the maximum length of 500 characters.",
+                    }
+                )
+            return await super().request(method, params)
+
+    _RejectFirstOversizedStartClient.requests = []
+    _RejectFirstOversizedStartClient.created = []
+    _RejectFirstOversizedStartClient.next_turn = 1
+    _RejectFirstOversizedStartClient.rejected = False
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _RejectFirstOversizedStartClient,
+    )
+    _seed_bridge(tmp_path)
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+    short_text = "Summarize the payload."
+    large_text = "payload line\n" * 200
+    caplog.set_level(logging.INFO, logger=codex_native_executor.__name__)
+
+    async def run() -> list[Any]:
+        events: list[Any] = []
+        async for event in executor.run_turn(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": short_text},
+                        {"type": "input_text", "text": large_text},
+                        {"type": "input_image", "image_url": _PNG_DATA_URI},
+                    ],
+                }
+            ],
+            [],
+            "",
+        ):
+            events.append(event)
+        return events
+
+    events = asyncio.run(run())
+
+    assert [type(event) for event in events] == [TurnComplete]
+    starts = [
+        params
+        for method, params in _RejectFirstOversizedStartClient.requests
+        if method == "turn/start"
+    ]
+    assert len(starts) == 2
+    assert starts[0]["input"][0] == {"type": "text", "text": short_text}
+    retried_items = starts[1]["input"]
+    assert retried_items[0] == {"type": "text", "text": short_text}
+    assert retried_items[2] == starts[0]["input"][2]
+    reference = retried_items[1]["text"]
+    marker = reference.splitlines()[0]
+    materialized_path = Path(marker.removeprefix("[Attached file: ").removesuffix("]"))
+    assert materialized_path.parent == tmp_path / "uploads"
+    assert materialized_path.read_text() == large_text
+    assert "Read this file in full" in reference
+    assert large_text not in json.dumps(retried_items)
+
+    from omnigent.debug_logging import record_to_row
+
+    record = next(
+        record
+        for record in caplog.records
+        if record.getMessage() == "Codex native recovered oversized turn input"
+    )
+    row = record_to_row(record, source="runner")
+    assert row["event_name"] == "codex_native_input_too_large_recovered"
+    assert row["session_id"] == "conv_123"
+    assert row["attributes"]["rpc_method"] == "turn/start"
+    assert row["attributes"]["materialized_text_items"] == "1"
+
+
+async def test_oversized_mid_session_steer_is_retried_on_the_active_turn(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """An oversized steering message becomes a file without failing the turn."""
+
+    class _RejectFirstOversizedSteerClient(_FakeCodexNativeClient):
+        """Reject the first steer with Codex's structured size error."""
+
+        rejected = False
+
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            """Reject one steer and accept its materialized retry."""
+            if method == "turn/steer" and not type(self).rejected:
+                type(self).rejected = True
+                type(self).requests.append((method, params))
+                text = params["input"][0]["text"]
+                raise CodexAppServerResponseError(
+                    {
+                        "code": -32602,
+                        "data": {
+                            "input_error_code": "input_too_large",
+                            "max_chars": 500,
+                            "actual_chars": len(text),
+                        },
+                        "message": "Input exceeds the maximum length of 500 characters.",
+                    }
+                )
+            return await super().request(method, params)
+
+    _RejectFirstOversizedSteerClient.requests = []
+    _RejectFirstOversizedSteerClient.created = []
+    _RejectFirstOversizedSteerClient.rejected = False
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _RejectFirstOversizedSteerClient,
+    )
+    _seed_bridge(tmp_path, active_turn_id="turn_active")
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+    large_text = "mid-session payload\n" * 200
+
+    accepted = await executor.enqueue_session_message("session", large_text)
+
+    assert accepted is True
+    steers = [
+        params
+        for method, params in _RejectFirstOversizedSteerClient.requests
+        if method == "turn/steer"
+    ]
+    assert len(steers) == 2
+    assert [params["expectedTurnId"] for params in steers] == ["turn_active", "turn_active"]
+    reference = steers[1]["input"][0]["text"]
+    marker = reference.splitlines()[0]
+    materialized_path = Path(marker.removeprefix("[Attached file: ").removesuffix("]"))
+    assert materialized_path.read_text() == large_text
+    assert large_text not in reference
+
+
+def test_oversized_input_recovery_does_not_retry_twice(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A second size rejection propagates instead of looping or duplicating turns."""
+
+    class _AlwaysRejectOversizedStartClient(_FakeCodexNativeClient):
+        """Reject every start with Codex's structured size error."""
+
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            """Reject starts and delegate unrelated methods."""
+            if method == "turn/start":
+                type(self).requests.append((method, params))
+                actual_chars = sum(len(item.get("text", "")) for item in params["input"])
+                raise CodexAppServerResponseError(
+                    {
+                        "code": -32602,
+                        "data": {
+                            "input_error_code": "input_too_large",
+                            "max_chars": 500,
+                            "actual_chars": actual_chars,
+                        },
+                    }
+                )
+            return await super().request(method, params)
+
+    _AlwaysRejectOversizedStartClient.requests = []
+    _AlwaysRejectOversizedStartClient.created = []
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _AlwaysRejectOversizedStartClient,
+    )
+    _seed_bridge(tmp_path)
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    events = _collect_turn_events(executor, "oversized\n" * 200)
+
+    assert [type(event) for event in events] == [ExecutorError]
+    assert [method for method, _params in _AlwaysRejectOversizedStartClient.requests] == [
+        "turn/start",
+        "turn/start",
+    ]
+
+
 def test_next_web_message_starts_new_codex_turn_after_forwarder_marks_idle(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
