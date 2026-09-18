@@ -263,6 +263,8 @@ class PiProviderConfig:
     listing_provider: model_catalog.ResolvedModelProvider | None = field(
         default=None, hash=False, compare=False
     )
+    # Only configured tier maps with multiple distinct models scope the picker.
+    curated_models: bool = False
 
     @property
     def _primary_claude_only(self) -> bool:
@@ -1439,7 +1441,8 @@ def _inline_family_pi_provider(
         )
         shortlist: list[_PiModelEntry] = [model_entry]
         # A session override must not turn a default-only setup into a shortlist.
-        if len(tier_ids) > 1:
+        curated_models = len(tier_ids) > 1
+        if curated_models:
             for tier_id in tier_ids:
                 if tier_id == resolved_model:
                     continue
@@ -1461,6 +1464,7 @@ def _inline_family_pi_provider(
             # passthrough endpoint rejects it, and silence reads as a hang.
             credential_warning=_cross_family_routing_warning(entry, family_name, resolved_model),
             extra_models=shortlist,
+            curated_models=curated_models,
             # Record the endpoint the pre-launch picker can enumerate live; no
             # I/O happens here so session launch stays off the network.
             listing_provider=model_catalog.ResolvedModelProvider(
@@ -1733,10 +1737,10 @@ def pi_native_provider_launch(
     from omnigent.inner.pi_settings import prepare_managed_pi_agent_dir
 
     overlay: dict[str, object] = {"defaultThinkingLevel": None}
-    # A default-only setup must preserve the user's existing picker scope.
-    # Multi-model catalogs use qualified refs to distinguish built-in providers.
+    # Only configured shortlists override the user's picker preferences.
+    # Qualified refs distinguish managed models from built-in providers.
     enabled_refs = _enabled_model_refs(rendered)
-    if len(enabled_refs) > 1:
+    if provider.curated_models and enabled_refs:
         overlay["enabledModels"] = enabled_refs
     prepare_managed_pi_agent_dir(agent_dir, overlay=overlay)
     env = {PI_CODING_AGENT_DIR_ENV_VAR: str(agent_dir)}

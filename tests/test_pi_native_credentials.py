@@ -2938,12 +2938,17 @@ def test_curated_tier_ids_strip_bracket_suffixes() -> None:
     assert [entry["id"] for entry in provider.extra_models] == ["GLM-5.3-Flash", "GLM-5.3"]
 
 
-def test_provider_launch_scopes_picker_via_enabled_models(tmp_path: Path) -> None:
+def test_provider_launch_scopes_picker_via_enabled_models(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """The managed settings.json scopes the picker to the rendered catalog.
 
     Provider-qualified refs distinguish managed models from built-in entries.
     Users can still toggle the picker back to the full catalog.
     """
+    monkeypatch.setattr(
+        "omnigent.inner.pi_settings.DEFAULT_PI_AGENT_DIR", tmp_path / "global-agent"
+    )
     provider = creds.PiProviderConfig(
         provider_id="omnigent",
         base_url="https://api.anthropic.com",
@@ -2952,6 +2957,7 @@ def test_provider_launch_scopes_picker_via_enabled_models(tmp_path: Path) -> Non
         api_key="sk-secret",
         auth_header=False,
         extra_models=[{"id": "GLM-5.3-Flash"}, {"id": "claude-fable-5"}],
+        curated_models=True,
     )
     agent_dir = tmp_path / "pi-agent"
     creds.pi_native_provider_launch(agent_dir, provider)
@@ -3028,24 +3034,50 @@ def test_setup_single_model_preserves_picker_scope(
     assert json.loads(global_file.read_text(encoding="utf-8")) == global_settings
 
 
-def test_provider_launch_without_curated_set_does_not_scope(tmp_path: Path) -> None:
-    """A single-model render writes no ``enabledModels`` — nothing was
-    curated, so the picker keeps its default behaviour (including working
-    built-ins activated by the user's real credentials)."""
+@pytest.mark.parametrize("catalog", ["single", "multi_model", "multi_provider"])
+@pytest.mark.parametrize("prior_scope", [None, ["anthropic/claude-sonnet-4-6"]])
+def test_provider_launch_without_curated_set_does_not_scope(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    catalog: str,
+    prior_scope: list[str] | None,
+) -> None:
+    """Discovered catalogs preserve picker preferences regardless of model count."""
+    global_dir = tmp_path / "global-agent"
+    global_dir.mkdir()
+    global_settings = {"enabledModels": prior_scope} if prior_scope is not None else {}
+    global_file = global_dir / "settings.json"
+    global_file.write_text(json.dumps(global_settings), encoding="utf-8")
+    monkeypatch.setattr("omnigent.inner.pi_settings.DEFAULT_PI_AGENT_DIR", global_dir)
     provider = creds.PiProviderConfig(
         provider_id="omnigent",
-        base_url="https://api.anthropic.com",
+        base_url="https://gateway.example/anthropic",
         api="anthropic-messages",
         model="claude-sonnet-4-6",
         api_key="sk-secret",
         auth_header=False,
+        extra_models=[{"id": "claude-opus-4-7"}] if catalog == "multi_model" else [],
+        additional_providers={
+            "omnigent-openai": {
+                "baseUrl": "https://gateway.example/codex/v1",
+                "apiKey": "synthetic-api-key",
+                "api": "openai-responses",
+                "models": [{"id": "gpt-5"}],
+            }
+        }
+        if catalog == "multi_provider"
+        else {},
     )
     agent_dir = tmp_path / "pi-agent"
     creds.pi_native_provider_launch(agent_dir, provider)
 
     settings = json.loads((agent_dir / "settings.json").read_text(encoding="utf-8"))
-    assert "enabledModels" not in settings
+    if prior_scope is None:
+        assert "enabledModels" not in settings
+    else:
+        assert settings["enabledModels"] == prior_scope
     assert settings["defaultThinkingLevel"] is None
+    assert json.loads(global_file.read_text(encoding="utf-8")) == global_settings
 
 
 def test_curated_tier_alias_resolves_to_concrete_id() -> None:
