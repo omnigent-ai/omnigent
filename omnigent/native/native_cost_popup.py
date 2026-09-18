@@ -12,7 +12,7 @@ clears).
 The process is launched by the runner-side popup helper (e.g.
 :func:`omnigent.harnesses.claude_native.bridge.display_cost_approval_popup`) as::
 
-    python -I -m omnigent.native.native_cost_popup \
+    python -P -m omnigent.native.native_cost_popup \
         --config-file <bridge_dir>/cost_popup.json \
         --session-id conv_abc123 \
         --elicitation-id elicit_deadbeef \
@@ -41,6 +41,8 @@ import threading
 import time
 from pathlib import Path
 from urllib import error, request
+
+from omnigent.util.hook_python import SAFE_PATH_FLAG
 
 # Timeout for the (fast, local) ``tmux list-clients`` lookup the launcher
 # runs before popping a modal.
@@ -216,7 +218,7 @@ def launch_cost_popup(
     python = python_executable or sys.executable
     argv = [
         python,
-        "-I",
+        SAFE_PATH_FLAG,
         "-m",
         "omnigent.native.native_cost_popup",
         "--config-file",
@@ -296,7 +298,7 @@ def launch_blocked_notice(
     python = python_executable or sys.executable
     argv = [
         python,
-        "-I",
+        SAFE_PATH_FLAG,
         "-m",
         "omnigent.native.native_cost_popup",
         "--notice",

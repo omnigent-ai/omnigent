@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING
 import click
 
 from omnigent._platform import stable_user_id
+from omnigent.util.hook_python import SAFE_PATH_FLAG
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
@@ -294,7 +295,7 @@ def build_mcp_config(
             _MCP_SERVER_NAME: {
                 "command": python,
                 "args": [
-                    "-I",
+                    SAFE_PATH_FLAG,
                     "-m",
                     "omnigent.harnesses.claude_native.bridge",
                     "serve-mcp",
@@ -384,7 +385,7 @@ def build_hooks_config(bridge_dir: Path, *, python_executable: str | None = None
         shlex.quote(part)
         for part in (
             python,
-            "-I",
+            SAFE_PATH_FLAG,
             "-m",
             _USAGE_HOOK_MODULE,
             "record-usage",

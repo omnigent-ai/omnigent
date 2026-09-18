@@ -517,7 +517,7 @@ def test_router_hook_commands_run_python_isolated(tmp_path: Path) -> None:
     assert commands, "no routing hook commands generated"
     for command in commands:
         argv = shlex.split(command)
-        assert argv[1:3] == ["-I", "-m"], f"expected isolated python in {command!r}"
+        assert argv[1:3] == ["-P", "-m"], f"expected safe-path python in {command!r}"
 
 
 def test_router_hook_survives_a_shadowing_workspace(tmp_path: Path) -> None:

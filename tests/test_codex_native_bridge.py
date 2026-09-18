@@ -80,7 +80,7 @@ def test_codex_mcp_config_overrides_isolate_the_bridge_interpreter(tmp_path: Pat
     prefix = "mcp_servers.omnigent.args="
     raw = next(o[len(prefix) :] for o in overrides if o.startswith(prefix))
     assert json.loads(raw)[:4] == [
-        "-I",
+        "-P",
         "-m",
         "omnigent.harnesses.claude_native.bridge",
         "serve-mcp",

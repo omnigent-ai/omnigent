@@ -509,7 +509,7 @@ def test_build_kiro_mcp_config_targets_serve_mcp(tmp_path: Path) -> None:
     ]["omnigent"]
     assert server["command"] == "/usr/bin/python3"
     assert server["args"] == [
-        "-I",
+        "-P",
         "-m",
         "omnigent.harnesses.claude_native.bridge",
         "serve-mcp",

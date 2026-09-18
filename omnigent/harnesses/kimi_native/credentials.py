@@ -27,6 +27,8 @@ import shlex
 import sys
 from pathlib import Path
 
+from omnigent.util.hook_python import SAFE_PATH_FLAG
+
 #: Env var Kimi Code reads to locate its data dir (config.toml + oauth + …).
 KIMI_CODE_HOME_ENV_VAR = "KIMI_CODE_HOME"
 _CONFIG_FILE = "config.toml"
@@ -63,15 +65,12 @@ def render_kimi_hooks_toml(*, bridge_dir: Path, python_executable: str | None = 
     :returns: TOML text starting with a leading newline, safe to append.
     """
     python = python_executable or sys.executable
-    # ``-I`` (isolated mode) is REQUIRED, not cosmetic: kimi runs the hook with
-    # ``cwd`` set to the session workspace, and ``python -m`` puts cwd on
-    # ``sys.path[0]``. A workspace that contains its own ``omnigent/`` directory
-    # (another checkout, a vendored copy) would otherwise shadow the installed
-    # package and the hook dies on ``ImportError`` before it can POST — so the
-    # approval card never publishes. ``-I`` drops cwd + PYTHONPATH + user-site
-    # from the path, importing only the interpreter's own omnigent. Mirrors
-    # claude-native's ``python -I -m omnigent.harnesses.claude_native.hook``.
-    base = f"{shlex.quote(python)} -I -m omnigent.harnesses.kimi_native.hook"
+    # The path flag is REQUIRED, not cosmetic: kimi runs the hook with ``cwd``
+    # set to the session workspace, and ``python -m`` puts cwd on
+    # ``sys.path[0]``. A workspace holding its own ``omnigent/`` would shadow the
+    # installed package, and the hook would die on ``ImportError`` before it can
+    # POST — so the approval card never publishes.
+    base = f"{shlex.quote(python)} {SAFE_PATH_FLAG} -m omnigent.harnesses.kimi_native.hook"
     bridge = shlex.quote(str(bridge_dir))
     pre = f"{base} evaluate-policy --bridge-dir {bridge}"
     perm = f"{base} permission-request --bridge-dir {bridge}"

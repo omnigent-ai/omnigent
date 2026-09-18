@@ -9,13 +9,15 @@ import sys
 import urllib.request
 from pathlib import Path
 
+from omnigent.util.hook_python import SAFE_PATH_FLAG
+
 
 def hook_settings(bridge_dir: Path, python: str, module: str) -> dict[str, object]:
     """Use each harness's existing owned hook module and trust registration."""
     return {
         "type": "command",
         "command": shlex.join(
-            [python, "-I", "-m", module, "observe-tool", "--bridge-dir", str(bridge_dir)]
+            [python, SAFE_PATH_FLAG, "-m", module, "observe-tool", "--bridge-dir", str(bridge_dir)]
         ),
         "timeout": 3,
     }

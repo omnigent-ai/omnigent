@@ -20,6 +20,7 @@ from pathlib import Path
 import tomllib
 
 from omnigent.native import native_bridge_common
+from omnigent.util.hook_python import SAFE_PATH_FLAG
 
 CODEX_NATIVE_BRIDGE_ID_LABEL_KEY = "omnigent.codex_native.bridge_id"
 CODEX_NATIVE_BRIDGE_DIR_ENV_VAR = "HARNESS_CODEX_NATIVE_BRIDGE_DIR"
@@ -330,7 +331,7 @@ def codex_mcp_config_overrides(
     # package. Matches every other bridge's serve-mcp invocation.
     args_toml = json.dumps(
         [
-            "-I",
+            SAFE_PATH_FLAG,
             "-m",
             "omnigent.harnesses.claude_native.bridge",
             "serve-mcp",

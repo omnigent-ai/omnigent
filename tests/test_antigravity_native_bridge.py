@@ -1433,7 +1433,7 @@ def test_build_mcp_config_registers_omnigent_relay(tmp_path: Path) -> None:
     server = config["mcpServers"]["omnigent"]
     assert server["command"] == "python-test"
     assert server["args"] == [
-        "-I",
+        "-P",
         "-m",
         "omnigent.harnesses.claude_native.bridge",
         "serve-mcp",

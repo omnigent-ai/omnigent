@@ -870,7 +870,7 @@ class TestMcpConfig:
         entry = json.loads(path.read_text(encoding="utf-8"))["mcpServers"]["omnigent"]
         assert entry["command"] == "/py"
         assert entry["transport"] == "stdio"
-        assert entry["args"][:2] == ["-I", "-m"]
+        assert entry["args"][:2] == ["-P", "-m"]
         assert "serve-mcp" in entry["args"]
         assert str(bridge) in entry["args"]
 

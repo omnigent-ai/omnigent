@@ -42,6 +42,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from omnigent._platform import stable_user_id
+from omnigent.util.hook_python import SAFE_PATH_FLAG
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 #: Env var carrying the bridge dir into the harness executor process.
@@ -512,7 +513,7 @@ def build_mcp_server_entry(
     return {
         "command": python,
         "args": [
-            "-I",
+            SAFE_PATH_FLAG,
             "-m",
             "omnigent.harnesses.claude_native.bridge",
             "serve-mcp",

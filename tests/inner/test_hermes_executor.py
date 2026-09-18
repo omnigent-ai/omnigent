@@ -185,7 +185,7 @@ class TestSetupHermesHome:
         home, bridge_dir = setup
         omnigent_mcp = json.loads((home / "config.yaml").read_text())["mcp_servers"]["omnigent"]
         assert omnigent_mcp["args"][:4] == [
-            "-I",
+            "-P",
             "-m",
             "omnigent.harnesses.claude_native.bridge",
             "serve-mcp",

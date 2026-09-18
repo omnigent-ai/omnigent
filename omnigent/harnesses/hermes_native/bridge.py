@@ -41,6 +41,7 @@ from pathlib import Path
 from typing import TypeAlias
 
 from omnigent._platform import stable_user_id
+from omnigent.util.hook_python import SAFE_PATH_FLAG
 
 _logger = logging.getLogger(__name__)
 
@@ -380,10 +381,10 @@ def write_policy_hook_config(
         "omnigent": {
             "command": sys.executable,
             "args": [
-                # hermes launches MCP servers in the workspace; -I keeps that
-                # cwd off sys.path so a workspace that is an omnigent checkout
-                # can't shadow the installed package (as every other bridge does).
-                "-I",
+                # hermes launches MCP servers in the workspace; the flag keeps
+                # that cwd off sys.path so a workspace that is an omnigent
+                # checkout can't shadow the installed package.
+                SAFE_PATH_FLAG,
                 "-m",
                 "omnigent.harnesses.claude_native.bridge",
                 "serve-mcp",

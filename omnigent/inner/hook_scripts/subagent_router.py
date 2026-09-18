@@ -2,7 +2,7 @@
 
 Stdlib-only on purpose (bar the equally light
 :mod:`omnigent.models.claude_model_vocabulary`): the Claude-native hook runs as
-a per-spawn subprocess (``python -I -m
+a per-spawn subprocess (``python -P -m
 omnigent.inner.hook_scripts.claude_router_hook``) and blocks the spawn,
 so importing anything heavier would show up as spawn latency. The
 claude-agent-sdk executor imports the same functions for its in-process

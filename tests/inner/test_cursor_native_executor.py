@@ -262,7 +262,7 @@ class TestBridge:
         server = config["mcpServers"]["omnigent"]
         assert server["command"] == "python-test"
         assert server["args"] == [
-            "-I",
+            "-P",
             "-m",
             "omnigent.harnesses.claude_native.bridge",
             "serve-mcp",

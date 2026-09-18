@@ -3032,7 +3032,7 @@ async def test_auto_create_antigravity_wires_omnigent_mcp_relay(
     payload = json.loads(mcp_config.read_text(encoding="utf-8"))
     server = payload["mcpServers"]["omnigent"]
     assert server["args"][:4] == [
-        "-I",
+        "-P",
         "-m",
         "omnigent.harnesses.claude_native.bridge",
         "serve-mcp",

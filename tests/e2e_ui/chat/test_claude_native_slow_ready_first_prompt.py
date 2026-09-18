@@ -211,20 +211,19 @@ def _write_slow_ready_claude_wrapper(bin_dir: Path, real_claude: str, gate_start
 
 
 def _rig_python(work: Path, gate_started: Path) -> str:
-    """Build an interpreter whose isolated mode can import this checkout.
+    """Build an interpreter that carries this test's readiness observer.
 
     The claude-native bridge invokes its hook scripts (the transcript
     forwarder that mirrors the TUI into the web session) as
-    ``<runner python> -I -m omnigent...``. ``-I`` drops ``PYTHONPATH``, so
-    when this checkout is importable only via ``PYTHONPATH`` (the CI
-    worktree layout) every hook dies with ``ModuleNotFoundError`` and the
-    web transcript never receives the delivered turn. A dedicated venv
-    whose ``site-packages`` carries a ``.pth`` naming the checkout (plus
-    the parent environment's site-packages for dependencies) survives
-    ``-I``, so the runner spawned from it produces working hooks.
+    ``<runner python> -P -m omnigent...``. The observer that gates readiness
+    is injected through a ``.pth`` in the rig venv's ``site-packages``, and
+    ``site`` only runs ``.pth`` hooks from a real site dir — so the rig needs
+    its own venv rather than a path entry. That same site dir names the
+    checkout and the parent environment's ``site-packages``, so the runner
+    spawned from it imports this tree and its dependencies.
 
     :param work: The rig's scratch directory.
-    :param gate_started: Marker for the test-only readiness observer, including under ``-I``.
+    :param gate_started: Marker for the test-only readiness observer.
     :returns: Absolute path of the rig venv's ``python``.
     """
     venv_dir = work / "rig-venv"
@@ -287,7 +286,7 @@ def test_slow_ready_wrapper_waits_for_delivery(
         subprocess.run(
             [
                 rig_python,
-                "-I",
+                "-P",
                 "-c",
                 "from pathlib import Path\n"
                 "from omnigent.harnesses.claude_native import bridge\n"

@@ -333,9 +333,9 @@ class TestHooksConfig:
         hooks = cfg["hooks"]["stop"]
         assert len(hooks) == 1
         command = hooks[0]["command"]
-        # The recorder is invoked isolated (-I) on the usage module, with the
+        # The recorder is invoked with cwd off sys.path (-P) on the usage module, with the
         # absolute bridge dir baked in so it writes where the forwarder reads.
-        assert "-I" in command
+        assert "-P" in command
         assert "omnigent.harnesses.cursor_native.usage" in command
         assert "record-usage" in command
         assert "/tmp/bridge" in command

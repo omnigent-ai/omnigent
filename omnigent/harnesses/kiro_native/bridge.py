@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import TypedDict
 
 from omnigent._platform import stable_user_id
+from omnigent.util.hook_python import SAFE_PATH_FLAG
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 
@@ -171,7 +172,7 @@ def build_kiro_mcp_config(
             _MCP_SERVER_NAME: {
                 "command": python,
                 "args": [
-                    "-I",
+                    SAFE_PATH_FLAG,
                     "-m",
                     "omnigent.harnesses.claude_native.bridge",
                     "serve-mcp",

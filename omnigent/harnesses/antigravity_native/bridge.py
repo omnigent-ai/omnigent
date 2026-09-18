@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from omnigent.native import native_bridge_common
+from omnigent.util.hook_python import SAFE_PATH_FLAG
 
 _logger = logging.getLogger(__name__)
 
@@ -434,7 +435,7 @@ def build_mcp_config(
     ``env`` keys plus ``enabledTools``, agy's auto-approve allowlist — verified
     against agy 1.0.12's config struct) under the top-level ``mcpServers`` key.
     The server command is the SAME shared relay claude/codex/cursor use:
-    ``<python> -I -m omnigent.harnesses.claude_native.bridge serve-mcp --bridge-dir <dir>``.
+    ``<python> -P -m omnigent.harnesses.claude_native.bridge serve-mcp --bridge-dir <dir>``.
 
     **HOME pinning.** agy spawns this relay as a child. The relay validates its
     ``--bridge-dir`` against ``bridge_root()`` (``$HOME/.omnigent/antigravity-native``),
@@ -455,7 +456,7 @@ def build_mcp_config(
             _MCP_SERVER_NAME: {
                 "command": python,
                 "args": [
-                    "-I",
+                    SAFE_PATH_FLAG,
                     "-m",
                     "omnigent.harnesses.claude_native.bridge",
                     "serve-mcp",

@@ -36,7 +36,7 @@ def test_write_mcp_config_writes_into_bridge_dir_not_workspace(bridge_dir: Path)
     server = data["mcpServers"]["omnigent"]
     # Points at the shared stdio relay implemented in claude_native_bridge.
     assert server["args"][:4] == [
-        "-I",
+        "-P",
         "-m",
         "omnigent.harnesses.claude_native.bridge",
         "serve-mcp",

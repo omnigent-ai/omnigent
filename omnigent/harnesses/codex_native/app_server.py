@@ -69,6 +69,7 @@ from omnigent.inner.databricks_executor import (
 )
 from omnigent.models.codex_model_vocabulary import codex_reachable_model_slug, codex_spawn_model
 from omnigent.process_logging import log_info_once, log_once, redact_log_text
+from omnigent.util.hook_python import SAFE_PATH_FLAG
 from omnigent.util.reasoning_effort import CODEX_NATIVE_EFFORTS
 
 _logger = logging.getLogger(__name__)
@@ -277,7 +278,7 @@ def _codex_mcp_server_config_section(
     """
     python = python_executable or sys.executable
     args = [
-        "-I",
+        SAFE_PATH_FLAG,
         "-m",
         "omnigent.harnesses.claude_native.bridge",
         "serve-mcp",
@@ -2029,14 +2030,14 @@ def _codex_policy_hook_command(bridge_dir: Path, python_executable: str | None) 
     :param python_executable: Python executable to run, e.g.
         ``"/path/to/python"``. ``None`` uses :data:`sys.executable`.
     :returns: A shell-escaped command string, e.g.
-        ``"/path/python -I -m omnigent.harnesses.codex_native.hook evaluate-policy
+        ``"/path/python -P -m omnigent.harnesses.codex_native.hook evaluate-policy
         --bridge-dir /home/u/.omnigent/codex-native/abc"``.
     """
     python = python_executable or sys.executable
     return shlex.join(
         [
             python,
-            "-I",
+            SAFE_PATH_FLAG,
             "-m",
             _POLICY_HOOK_MODULE,
             "evaluate-policy",
@@ -2131,7 +2132,7 @@ def _codex_route_turn_hook(bridge_dir: Path, python_executable: str | None) -> _
         "command": shlex.join(
             [
                 python_executable or sys.executable,
-                "-I",
+                SAFE_PATH_FLAG,
                 "-m",
                 _POLICY_HOOK_MODULE,
                 "route-turn",

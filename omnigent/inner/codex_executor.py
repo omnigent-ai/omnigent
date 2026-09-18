@@ -47,6 +47,7 @@ from omnigent.models.codex_model_vocabulary import (
 from omnigent.models.model_fallbacks import CODEX_CATALOG_CLONE_SOURCE_SLUG, CODEX_DEFAULT_MODEL
 from omnigent.native import _native_forwarder_health as native_forwarder_health
 from omnigent.spec.types import RetryPolicy
+from omnigent.util.hook_python import SAFE_PATH_FLAG
 from omnigent.util.reasoning_effort import CODEX_EFFORTS, EFFORT_ALIASES, validate_effort
 
 from . import _proc
@@ -1232,7 +1233,7 @@ def _codex_router_hook_command(
     """
     argv = [
         python_executable or sys.executable,
-        "-I",
+        SAFE_PATH_FLAG,
         "-m",
         _CODEX_ROUTER_HOOK_MODULE,
         subcommand,

@@ -129,7 +129,7 @@ def test_claude_terminal_request_pins_launch_cwd(tmp_path, monkeypatch) -> None:
     mcp_index = args.index("--mcp-config")
     mcp_config = json.loads(args[mcp_index + 1])
     assert mcp_config["mcpServers"]["omnigent"]["args"] == [
-        "-I",
+        "-P",
         "-m",
         "omnigent.harnesses.claude_native.bridge",
         "serve-mcp",

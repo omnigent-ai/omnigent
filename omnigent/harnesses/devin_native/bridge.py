@@ -41,6 +41,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
 
 from omnigent._platform import stable_user_id
+from omnigent.util.hook_python import SAFE_PATH_FLAG
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 DEVIN_NATIVE_BRIDGE_DIR_ENV_VAR = "HARNESS_DEVIN_NATIVE_BRIDGE_DIR"
@@ -452,7 +453,7 @@ def build_devin_mcp_server(
     return {
         "command": python_executable or sys.executable,
         "args": [
-            "-I",
+            SAFE_PATH_FLAG,
             "-m",
             "omnigent.harnesses.claude_native.bridge",
             "serve-mcp",

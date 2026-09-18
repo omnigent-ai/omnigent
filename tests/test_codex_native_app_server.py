@@ -1758,7 +1758,7 @@ args = []
     assert parsed["mcp_servers"]["omnigent"] == {
         "command": "/new/python",
         "args": [
-            "-I",
+            "-P",
             "-m",
             "omnigent.harnesses.claude_native.bridge",
             "serve-mcp",
@@ -1869,7 +1869,7 @@ async def test_start_writes_fresh_mcp_config_without_leading_blanks(
     assert parsed["mcp_servers"]["omnigent"] == {
         "command": "/new/python",
         "args": [
-            "-I",
+            "-P",
             "-m",
             "omnigent.harnesses.claude_native.bridge",
             "serve-mcp",
@@ -3049,7 +3049,7 @@ async def test_policy_hook_command_runs_python_isolated() -> None:
     from omnigent.harnesses.codex_native.app_server import _codex_policy_hook_command
 
     argv = shlex.split(_codex_policy_hook_command(Path("/b"), "/venv/bin/python"))
-    assert argv[1:3] == ["-I", "-m"]
+    assert argv[1:3] == ["-P", "-m"]
 
 
 def test_codex_model_upgrade_target_reads_catalog_migration() -> None:
