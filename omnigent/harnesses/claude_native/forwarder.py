@@ -2046,7 +2046,11 @@ async def _forward_one_subagent(
                         extra={"session_id": parent_session_id},
                     )
                     break
-                if not decision.permanent and not _is_subagent_delivery_not_confirmed(exc):
+                if (
+                    not decision.permanent
+                    and not _is_subagent_delivery_not_confirmed(exc)
+                    and not _batch_response_never_received(exc)
+                ):
                     _logger.error(
                         "Dropping claude-native sub-agent transcript batch after "
                         "transient delivery retries were exhausted; child=%s items=%s "
@@ -5885,6 +5889,23 @@ def _http_status_for_log(exc: httpx.HTTPError) -> int | None:
     if isinstance(exc, httpx.HTTPStatusError):
         return exc.response.status_code
     return None
+
+
+def _batch_response_never_received(exc: httpx.HTTPError) -> bool:
+    """
+    Return whether ``exc`` failed before any response reached the client.
+
+    A transport failure (read/connect/write timeout, read error, protocol
+    error) means the server never rendered a verdict on the batch, so the
+    payload is unproven rather than rejected. Splitting the batch is then
+    strictly better than discarding it: a whole-batch read timeout is usually
+    the batch's own size against the flat post timeout, and single items fit
+    where 100 do not.
+
+    :param exc: HTTP exception raised while posting an Omnigent event.
+    :returns: ``True`` when no HTTP response was received.
+    """
+    return not isinstance(exc, httpx.HTTPStatusError)
 
 
 def _read_hook_state(bridge_dir: Path) -> HookForwardState | None:
