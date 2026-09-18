@@ -10,6 +10,10 @@ from pathlib import Path
 
 import pytest
 
+from omnigent.harnesses.opencode_native.bridge import (
+    build_gateway_auth_plugin_js,
+    write_opencode_gateway_auth_plugin,
+)
 from omnigent.harnesses.opencode_native.provider import (
     OpenCodeGatewayResolution,
     _gateway_endpoint_for_model,
@@ -20,6 +24,7 @@ from omnigent.harnesses.opencode_native.provider import (
     build_opencode_provider_config,
     managed_connect_opencode_config,
     maybe_merge_user_provider_config,
+    resolve_config_gateway_providers,
     resolve_databricks_gateway,
     write_opencode_provider_config,
 )
@@ -828,3 +833,250 @@ def test_managed_connect_opencode_config_rejects_untrusted_base_url(
     )
 
     assert managed_connect_opencode_config(tmp_path / "session-xdg") is None
+
+
+# --- Config-driven gateway provider synthesis (Bedrock/OpenAI+Anthropic parity) ---
+
+_GATEWAY_CONFIG_YAML = """
+providers:
+  gateway:
+    kind: gateway
+    default: true
+    anthropic:
+      base_url: https://ws.example.com/ai-gateway/anthropic
+      auth_command: databricks-token --host ws.example.com
+      models:
+        default: eng_dev.ai_gateway.omni-claude
+    openai:
+      base_url: https://ws.example.com/ai-gateway/openai/v1
+      auth_command: databricks-token --host ws.example.com
+      wire_api: chat
+      models:
+        default: eng_dev.ai_gateway.omni-gpt
+"""
+
+
+def _write_gateway_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, body: str) -> None:
+    (tmp_path / "config.yaml").write_text(body, encoding="utf-8")
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+
+
+def test_config_gateway_synthesizes_both_family_blocks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A config.yaml gateway with anthropic+openai families → two provider blocks."""
+    _write_gateway_config(tmp_path, monkeypatch, _GATEWAY_CONFIG_YAML)
+
+    resolution = resolve_config_gateway_providers()
+
+    assert resolution is not None
+    providers = resolution.config["provider"]
+    assert set(providers) == {"gateway-anthropic", "gateway-openai"}
+
+    anthropic = providers["gateway-anthropic"]
+    assert anthropic["npm"] == "@ai-sdk/anthropic"
+    assert anthropic["options"]["baseURL"] == "https://ws.example.com/ai-gateway/anthropic"
+    assert anthropic["models"] == {
+        "eng_dev.ai_gateway.omni-claude": {"name": "eng_dev.ai_gateway.omni-claude"}
+    }
+
+    openai = providers["gateway-openai"]
+    assert openai["npm"] == "@ai-sdk/openai-compatible"
+    assert openai["options"]["baseURL"] == "https://ws.example.com/ai-gateway/openai/v1"
+    assert openai["models"] == {
+        "eng_dev.ai_gateway.omni-gpt": {"name": "eng_dev.ai_gateway.omni-gpt"}
+    }
+
+    # Anthropic is preferred as the pinned default.
+    assert resolution.config["model"] == "gateway-anthropic/eng_dev.ai_gateway.omni-claude"
+
+
+def test_config_gateway_enumerates_all_tier_models(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """All configured tiers (high/med/low/default) land in the models map."""
+    body = """
+providers:
+  gateway:
+    kind: gateway
+    default: true
+    anthropic:
+      base_url: https://ws.example.com/ai-gateway/anthropic
+      auth_command: databricks-token
+      models:
+        default: eng_dev.ai_gateway.omni-claude-high
+        high: eng_dev.ai_gateway.omni-claude-high
+        med: eng_dev.ai_gateway.omni-claude-med
+        low: eng_dev.ai_gateway.omni-claude-low
+"""
+    _write_gateway_config(tmp_path, monkeypatch, body)
+
+    resolution = resolve_config_gateway_providers()
+
+    assert resolution is not None
+    models = resolution.config["provider"]["gateway-anthropic"]["models"]
+    # Every distinct tier id is offered (default == high is not duplicated).
+    assert set(models) == {
+        "eng_dev.ai_gateway.omni-claude-high",
+        "eng_dev.ai_gateway.omni-claude-med",
+        "eng_dev.ai_gateway.omni-claude-low",
+    }
+    # The pinned default is still the family default, not a tier.
+    assert resolution.config["model"] == "gateway-anthropic/eng_dev.ai_gateway.omni-claude-high"
+
+
+def test_config_gateway_no_static_api_key_for_auth_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An auth_command family must NOT get a static options.apiKey; the plugin injects it."""
+    _write_gateway_config(tmp_path, monkeypatch, _GATEWAY_CONFIG_YAML)
+
+    resolution = resolve_config_gateway_providers()
+
+    assert resolution is not None
+    for block in resolution.config["provider"].values():
+        assert "apiKey" not in block["options"]
+    # Both families' commands are surfaced for the refresh plugin.
+    assert resolution.auth_commands == {
+        "gateway-anthropic": "databricks-token --host ws.example.com",
+        "gateway-openai": "databricks-token --host ws.example.com",
+    }
+
+
+def test_config_gateway_static_key_written_inline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A static api_key family writes options.apiKey inline (no auth_command)."""
+    body = """
+providers:
+  gateway:
+    kind: key
+    default: true
+    anthropic:
+      base_url: https://api.anthropic.com
+      api_key: sk-test-literal
+      models:
+        default: claude-sonnet-4-6
+"""
+    _write_gateway_config(tmp_path, monkeypatch, body)
+
+    resolution = resolve_config_gateway_providers()
+
+    assert resolution is not None
+    anthropic = resolution.config["provider"]["gateway-anthropic"]
+    assert anthropic["options"]["apiKey"] == "sk-test-literal"
+    assert resolution.auth_commands == {}
+
+
+def test_config_gateway_model_override_verbatim_and_pinned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A model override is added verbatim (bracket suffix stripped) and pinned."""
+    _write_gateway_config(tmp_path, monkeypatch, _GATEWAY_CONFIG_YAML)
+
+    resolution = resolve_config_gateway_providers(
+        model_override="eng_dev.ai_gateway.omni-claude-opus[1m]"
+    )
+
+    assert resolution is not None
+    anthropic_models = resolution.config["provider"]["gateway-anthropic"]["models"]
+    assert "eng_dev.ai_gateway.omni-claude-opus" in anthropic_models
+    assert resolution.config["model"] == "gateway-anthropic/eng_dev.ai_gateway.omni-claude-opus"
+
+
+def test_config_gateway_override_pins_the_family_that_lists_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An override the openai family lists pins that family, not anthropic."""
+    _write_gateway_config(tmp_path, monkeypatch, _GATEWAY_CONFIG_YAML)
+
+    resolution = resolve_config_gateway_providers(model_override="eng_dev.ai_gateway.omni-gpt")
+
+    assert resolution is not None
+    assert resolution.config["model"] == "gateway-openai/eng_dev.ai_gateway.omni-gpt"
+    providers = resolution.config["provider"]
+    # The GPT id must not leak into the Anthropic Messages surface's models.
+    assert "eng_dev.ai_gateway.omni-gpt" not in providers["gateway-anthropic"]["models"]
+    assert "eng_dev.ai_gateway.omni-claude" in providers["gateway-anthropic"]["models"]
+
+
+def test_config_gateway_unlisted_override_falls_back_to_first_family(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An override no family lists pins the first family (anthropic preferred)."""
+    _write_gateway_config(tmp_path, monkeypatch, _GATEWAY_CONFIG_YAML)
+
+    resolution = resolve_config_gateway_providers(model_override="an-id-no-family-lists")
+
+    assert resolution is not None
+    assert resolution.config["model"] == "gateway-anthropic/an-id-no-family-lists"
+    anthropic_models = resolution.config["provider"]["gateway-anthropic"]["models"]
+    assert "an-id-no-family-lists" in anthropic_models
+
+
+def test_config_gateway_skips_openai_responses_wire(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An openai family that is not Chat-Completions wire is skipped (not driveable)."""
+    body = """
+providers:
+  gateway:
+    kind: gateway
+    default: true
+    openai:
+      base_url: https://ws.example.com/ai-gateway/openai/v1
+      auth_command: databricks-token
+      wire_api: responses
+      models:
+        default: eng_dev.ai_gateway.omni-gpt
+"""
+    _write_gateway_config(tmp_path, monkeypatch, body)
+
+    assert resolve_config_gateway_providers() is None
+
+
+def test_config_gateway_returns_none_for_subscription(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A subscription default is not driveable here → None (fall back to other paths)."""
+    body = """
+providers:
+  claude:
+    kind: subscription
+    default: true
+    cli: claude
+"""
+    _write_gateway_config(tmp_path, monkeypatch, body)
+
+    assert resolve_config_gateway_providers() is None
+
+
+def test_config_gateway_returns_none_without_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No config.yaml at all → None."""
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    assert resolve_config_gateway_providers() is None
+
+
+def test_gateway_auth_plugin_registers_loader_per_provider() -> None:
+    """The generated plugin exports one auth loader per provider id, keyed correctly."""
+    js = build_gateway_auth_plugin_js(["gateway-anthropic", "gateway-openai"])
+
+    # Reads the per-provider command map from the stamped env.
+    assert "OMNIGENT_OPENCODE_AUTH_COMMAND" in js
+    # Injects a Bearer header (overriding the anthropic factory's x-api-key).
+    assert 'Authorization: "Bearer " + token' in js
+    # One export per provider, each bound to its provider id.
+    assert 'provider: "gateway-anthropic"' in js
+    assert 'provider: "gateway-openai"' in js
+    assert "OmnigentGatewayAuth_gateway_anthropic" in js
+    assert "OmnigentGatewayAuth_gateway_openai" in js
+
+
+def test_write_gateway_auth_plugin_creates_file(tmp_path: Path) -> None:
+    """The plugin writer materializes the JS module in the bridge dir."""
+    path = write_opencode_gateway_auth_plugin(tmp_path, ["gateway-anthropic"])
+    assert path.exists()
+    assert path.name == "omnigent-gateway-auth.js"
+    assert 'provider: "gateway-anthropic"' in path.read_text(encoding="utf-8")

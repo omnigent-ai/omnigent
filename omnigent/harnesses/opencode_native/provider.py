@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import subprocess
 import tempfile
 from collections.abc import Mapping, Sequence
@@ -120,6 +121,213 @@ def build_opencode_provider_config(resolution: OpenCodeGatewayResolution) -> dic
             }
         },
     }
+
+
+# Anthropic Messages surface → the AI SDK Anthropic factory. It defaults to an
+# ``x-api-key`` header, but a per-provider ``options.headers.Authorization``
+# overrides it (proven by ucode's shipping Databricks gateway config); the
+# gateway-auth plugin (Step 2) refreshes that Bearer per provider load.
+_AI_SDK_ANTHROPIC = "@ai-sdk/anthropic"
+# OpenAI Chat-Completions-compatible surface (e.g. the gateway's
+# ``/ai-gateway/openai/v1``) → the OpenAI-compatible factory.
+_AI_SDK_OPENAI_COMPATIBLE = "@ai-sdk/openai-compatible"
+
+
+@dataclass(frozen=True)
+class ConfigGatewayResolution:
+    """A resolved ``config.yaml`` gateway provider for the opencode harness.
+
+    Built by :func:`resolve_config_gateway_providers` from the ``providers:``
+    block in ``~/.omnigent/config.yaml`` — the config-driven parity path with
+    pi's ``_inline_family_pi_provider``. Carries the synthesized opencode
+    provider blocks (already including the pinned ``model``) plus, for any
+    family that authenticates with a dynamic ``auth_command``, the command the
+    per-request bearer-refresh plugin runs.
+
+    :param config: The synthesized ``opencode.json`` fragment — a ``provider``
+        map plus a top-level ``model`` (``"<provider_id>/<model_id>"``).
+    :param auth_commands: Map of synthesized provider id → the family's
+        ``auth_command`` (only for families that use one). Empty when every
+        family carries a static key. Stamped as ``OMNIGENT_OPENCODE_AUTH_COMMAND``
+        (JSON) so the gateway-auth plugin can mint a fresh Bearer per request.
+    :param model: The pinned default model id (``"<provider_id>/<model_id>"``).
+    """
+
+    config: dict[str, object]
+    auth_commands: dict[str, str]
+    model: str
+
+    @property
+    def provider_ids(self) -> tuple[str, ...]:
+        """:returns: The synthesized provider ids (for the auth plugin)."""
+        providers = self.config.get("provider")
+        return tuple(providers) if isinstance(providers, dict) else ()
+
+
+def _config_gateway_provider_id(entry_name: str, family: str) -> str:
+    """Build a stable, JSON/id-safe opencode provider id for a family block.
+
+    :param entry_name: The ``providers:`` entry name, e.g. ``"gateway"``.
+    :param family: ``"anthropic"`` or ``"openai"``.
+    :returns: e.g. ``"gateway-anthropic"``.
+    """
+    slug = re.sub(r"[^A-Za-z0-9_-]", "-", entry_name).strip("-") or "gateway"
+    return f"{slug}-{family}"
+
+
+def _strip_model_suffix(model_id: str) -> str:
+    """Strip a trailing ``[...]`` suffix (e.g. ``[1m]``) from a model id.
+
+    The direct Anthropic API accepts the bracket suffix, but the Databricks AI
+    Gateway rejects it — mirrors ``pi_native/credentials.py`` model handling.
+    """
+    return re.sub(r"\[.*?\]$", "", model_id)
+
+
+def _append_unique_model(model_ids: list[str], model_id: str) -> None:
+    """Append *model_id* (suffix-stripped) to *model_ids* if not already present.
+
+    :param model_ids: The accumulating list of model ids.
+    :param model_id: A raw model id, possibly with a trailing ``[...]`` suffix.
+    """
+    stripped = _strip_model_suffix(model_id)
+    if stripped and stripped not in model_ids:
+        model_ids.append(stripped)
+
+
+def resolve_config_gateway_providers(
+    model_override: str | None = None,
+) -> ConfigGatewayResolution | None:
+    """Resolve the ``~/.omnigent/config.yaml`` gateway provider for opencode.
+
+    The config-driven parity path with pi's ``_inline_family_pi_provider``:
+    reads the default provider for the opencode surface and, for a
+    key/gateway/local-kind entry, synthesizes an opencode ``provider`` block per
+    configured ``anthropic`` / ``openai`` family so opencode reaches the AI
+    Gateway's Anthropic surface and its ``/ai-gateway/openai/v1`` OpenAI surface.
+
+    Returns ``None`` for kinds this resolver cannot drive (subscription,
+    databricks, cli-config, bedrock) so the existing ``resolve_databricks_gateway``
+    / ``managed_connect_opencode_config`` / default paths still run.
+
+    :param model_override: A session model override (e.g. an
+        ``eng_dev.ai_gateway.omni-*`` id), passed through **verbatim** (only a
+        trailing ``[...]`` suffix is stripped). ``None`` uses the family default.
+    :returns: The resolution (provider blocks + pinned model + any auth
+        commands), or ``None`` when no config-gateway provider applies.
+    """
+    from omnigent.onboarding.provider_config import (
+        ANTHROPIC_FAMILY,
+        CHAT_WIRE_API,
+        GATEWAY_KIND,
+        KEY_KIND,
+        LOCAL_KIND,
+        OPENAI_FAMILY,
+        FamilyConfig,
+        default_provider_for_harness,
+        load_config,
+    )
+
+    try:
+        config = load_config()
+        entry = default_provider_for_harness(config, "opencode")
+    except Exception:  # noqa: BLE001 - a malformed config must not break launch.
+        _logger.warning(
+            "opencode config gateway: failed to resolve the configured provider; "
+            "falling back to the databricks/managed/default paths.",
+            exc_info=True,
+        )
+        return None
+    if entry is None or entry.kind not in (KEY_KIND, GATEWAY_KIND, LOCAL_KIND):
+        # subscription / databricks / cli-config / bedrock: not driveable here.
+        return None
+
+    override = _strip_model_suffix(model_override) if model_override else None
+    providers: dict[str, object] = {}
+    auth_commands: dict[str, str] = {}
+
+    # Resolve the driveable families up front so an override can pin the
+    # family that actually lists it (its wire protocol must match the model).
+    families: list[tuple[str, str, FamilyConfig]] = []
+    for family_name, npm in (
+        (ANTHROPIC_FAMILY, _AI_SDK_ANTHROPIC),
+        (OPENAI_FAMILY, _AI_SDK_OPENAI_COMPATIBLE),
+    ):
+        try:
+            family = entry.family(family_name)
+        except Exception:  # noqa: BLE001 - an unresolved $VAR in an unused family.
+            continue
+        if family is None or not family.base_url:
+            continue
+        # The OpenAI family is only opencode-driveable over Chat Completions
+        # (``@ai-sdk/openai-compatible``); a Responses-wire family is skipped.
+        if family_name == OPENAI_FAMILY and family.wire_api != CHAT_WIRE_API:
+            continue
+        families.append((family_name, npm, family))
+
+    def _lists_override(family_name: str, family: FamilyConfig) -> bool:
+        candidates = (entry.family_default_model(family_name), *family.models.values())
+        return any(c and _strip_model_suffix(c) == override for c in candidates)
+
+    # The override pins on the family that lists it (default or any tier);
+    # an unlisted override falls back to the first present family
+    # (anthropic preferred, matching pi).
+    override_family: str | None = None
+    if override and families:
+        override_family = next(
+            (name for name, _, fam in families if _lists_override(name, fam)),
+            families[0][0],
+        )
+
+    # Without an override, pin the default on anthropic when present
+    # (opencode/pi both prefer the Anthropic surface), else openai.
+    pinned: str | None = None
+
+    for family_name, npm, family in families:
+        provider_id = _config_gateway_provider_id(entry.name, family_name)
+        default_model = entry.family_default_model(family_name)
+        model_ids: list[str] = []
+        if override and family_name == override_family:
+            _append_unique_model(model_ids, override)
+            pinned = f"{provider_id}/{override}"
+        # Pin the family default (unless the override pins) so the default
+        # selection is the configured default, not a tier.
+        if default_model:
+            _append_unique_model(model_ids, default_model)
+            if pinned is None and override_family is None:
+                pinned = f"{provider_id}/{_strip_model_suffix(default_model)}"
+        # Enumerate every configured tier (high/med/low/…) so opencode's picker
+        # lists them all; de-duped against the default/override.
+        for tier_model in family.models.values():
+            _append_unique_model(model_ids, tier_model)
+        if not model_ids:
+            continue
+
+        options: dict[str, object] = {"baseURL": family.base_url}
+        # A static key (or $VAR / keychain, resolved by ``entry.family``) is
+        # written inline; a dynamic ``auth_command`` is NOT — the gateway-auth
+        # plugin injects a fresh Bearer per request instead (no stale token).
+        if family.auth_command:
+            auth_commands[provider_id] = family.auth_command
+        elif family.api_key:
+            options["apiKey"] = family.api_key
+        providers[provider_id] = {
+            "npm": npm,
+            "options": options,
+            "models": {mid: {"name": mid} for mid in model_ids},
+        }
+        if pinned is None and override_family is None:
+            pinned = f"{provider_id}/{model_ids[0]}"
+
+    if not providers or pinned is None:
+        return None
+
+    synthesized: dict[str, object] = {
+        "$schema": "https://opencode.ai/config.json",
+        "provider": providers,
+        "model": pinned,
+    }
+    return ConfigGatewayResolution(config=synthesized, auth_commands=auth_commands, model=pinned)
 
 
 def write_opencode_provider_config(xdg_config_home: Path, config: Mapping[str, object]) -> Path:

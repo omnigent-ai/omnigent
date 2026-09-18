@@ -1447,7 +1447,10 @@ async def _auto_create_opencode_terminal(
     # server boots. Best-effort: if the gateway can't be resolved (no profile,
     # databricks-sdk absent, auth failure), opencode falls back to whatever
     # provider config the ambient env/global config already gives it.
-    from omnigent.harnesses.opencode_native.bridge import xdg_config_home_for_bridge_dir
+    from omnigent.harnesses.opencode_native.bridge import (
+        write_opencode_gateway_auth_plugin,
+        xdg_config_home_for_bridge_dir,
+    )
     from omnigent.harnesses.opencode_native.provider import (
         build_opencode_mcp_block,
         build_opencode_model_default_config,
@@ -1455,6 +1458,7 @@ async def _auto_create_opencode_terminal(
         build_opencode_provider_config,
         managed_connect_opencode_config,
         maybe_merge_user_provider_config,
+        resolve_config_gateway_providers,
         resolve_databricks_gateway,
         write_opencode_provider_config,
     )
@@ -1464,24 +1468,50 @@ async def _auto_create_opencode_terminal(
     config: dict[str, object] = {}
     xdg_config_home = xdg_config_home_for_bridge_dir(bridge_dir)
     managed_opencode_broker_cmd: str | None = None
-    # A spec/CLI-selected Databricks gateway wins first (an explicit ``--model``
-    # that names a gateway endpoint, or a spec profile), exactly as claude/codex/pi
-    # resolve the spec provider before their broker fallback.
-    # ``resolve_databricks_gateway`` returns None when no profile is selected (the
-    # bare managed-connect host); the ucode-config path below is then the last
-    # resort. On that bare host it adopts ucode's pinned served model — replacing an
-    # unrecognized explicit ``--model`` (logged below), since the workspace gateway
-    # is the only working provider there.
-    gateway = resolve_databricks_gateway(
-        _opencode_native_profile_from_spec(agent_spec), model_id=model_override
-    )
+    # Per-provider auth_command map for the gateway-auth plugin (Step 2), stamped
+    # as OMNIGENT_OPENCODE_AUTH_COMMAND on the server below when non-empty.
+    config_gateway_auth_commands: dict[str, str] = {}
+    # A config.yaml gateway provider wins FIRST — parity with pi, where the
+    # config-configured provider precedes the broker/ucode fallback. This routes
+    # the AI Gateway's Anthropic surface and its /ai-gateway/openai/v1 OpenAI
+    # surface (which ``resolve_databricks_gateway`` cannot reach — it only
+    # accepts ``databricks-*`` serving-endpoint ids). ``None`` when no
+    # config-gateway provider applies, so the databricks/managed paths still run.
+    config_gateway = resolve_config_gateway_providers(model_override=model_override)
+    gateway = None
+    if config_gateway is not None:
+        config = dict(config_gateway.config)
+        model_override = config_gateway.model
+        config_gateway_auth_commands = dict(config_gateway.auth_commands)
+        if config_gateway_auth_commands:
+            # Register the per-request bearer-refresh plugin for the auth_command
+            # families; the command map is threaded into the server env below.
+            auth_plugin = write_opencode_gateway_auth_plugin(
+                bridge_dir, config_gateway.provider_ids
+            )
+            existing_plugins = config.get("plugin")
+            config["plugin"] = (
+                [*existing_plugins] if isinstance(existing_plugins, list) else []
+            ) + [str(auth_plugin)]
+    else:
+        # A spec/CLI-selected Databricks gateway wins next (an explicit ``--model``
+        # that names a gateway endpoint, or a spec profile), exactly as
+        # claude/codex/pi resolve the spec provider before their broker fallback.
+        # ``resolve_databricks_gateway`` returns None when no profile is selected
+        # (the bare managed-connect host); the ucode-config path below is then the
+        # last resort. On that bare host it adopts ucode's pinned served model —
+        # replacing an unrecognized explicit ``--model`` (logged below), since the
+        # workspace gateway is the only working provider there.
+        gateway = resolve_databricks_gateway(
+            _opencode_native_profile_from_spec(agent_spec), model_id=model_override
+        )
     if gateway is not None:
         # Pin the per-prompt model to the synthesized provider/endpoint id, and
         # write it as opencode's default model too so the TUI launches on it.
         model_override = gateway.qualified_model
         config = dict(build_opencode_provider_config(gateway))
         config["model"] = model_override
-    else:
+    elif config_gateway is None:
         # Managed connect host (last resort): reuse ucode's generated opencode
         # config (provider block + served model + refreshing auth plugin), the
         # same artifact lakebox and ucode itself use. The plugin mints per request
@@ -1563,6 +1593,10 @@ async def _auto_create_opencode_terminal(
         # ucode's auth plugin runs ``ucode auth-token`` → get_databricks_token,
         # which mints from this broker command (databricks/ucode#531).
         policy_env["DATABRICKS_BEARER_COMMAND"] = managed_opencode_broker_cmd
+    if config_gateway_auth_commands:
+        # The gateway-auth plugin reads this per-provider command map and mints a
+        # fresh Bearer per provider load (the auth_command refresh contract).
+        policy_env["OMNIGENT_OPENCODE_AUTH_COMMAND"] = json.dumps(config_gateway_auth_commands)
     runner_server_url = os.environ.get("RUNNER_SERVER_URL")
     if server_client is not None and runner_server_url:
         plugin_path = write_opencode_policy_plugin(bridge_dir)

@@ -27,9 +27,11 @@ import base64
 import hashlib
 import json
 import os
+import re
 import secrets
 import shutil
 import tempfile
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -188,6 +190,98 @@ export const OmnigentPolicyPlugin = async () => ({
   },
 });
 """
+
+
+# Filename of the opencode plugin that refreshes gateway bearer tokens.
+_GATEWAY_AUTH_PLUGIN_FILE = "omnigent-gateway-auth.js"
+
+# Per-request bearer refresh for config-gateway providers whose family
+# authenticates with an ``auth_command``. opencode's ``auth.loader`` hook
+# (``@opencode-ai/plugin``) is invoked when opencode instantiates a provider and
+# its returned record is merged into the AI SDK factory options — so a loader
+# that runs the family's command and returns ``{apiKey, headers.Authorization}``
+# supplies a fresh Bearer without a static token in ``opencode.json``. The
+# per-provider commands arrive as ``OMNIGENT_OPENCODE_AUTH_COMMAND`` (JSON map of
+# provider id → shell command) stamped on the ``opencode serve`` process. One
+# plugin function is exported per provider id (opencode iterates a module's
+# function exports as plugins). The ``Authorization`` header overrides the AI SDK
+# Anthropic factory's default ``x-api-key`` (proven by ucode's shipping config).
+_GATEWAY_AUTH_PLUGIN_PROLOGUE = r"""
+// Omnigent gateway bearer refresh for opencode-native (generated; do not edit).
+// Registers an auth loader per synthesized gateway provider that mints a fresh
+// token via the family's auth_command, so short-lived gateway tokens refresh
+// per provider load instead of a static apiKey baked into opencode.json.
+const { execSync } = require("child_process");
+let COMMANDS = {};
+try {
+  COMMANDS = JSON.parse(process.env.OMNIGENT_OPENCODE_AUTH_COMMAND || "{}") || {};
+} catch (e) {
+  COMMANDS = {};
+}
+
+function mintFor(providerId) {
+  const cmd = COMMANDS[providerId];
+  if (!cmd) return {};
+  let token = "";
+  try {
+    token = String(execSync(cmd, { encoding: "utf8", timeout: 15000 }) || "").trim();
+  } catch (e) {
+    return {};
+  }
+  if (!token) return {};
+  return { apiKey: token, headers: { Authorization: "Bearer " + token } };
+}
+"""
+
+_GATEWAY_AUTH_PLUGIN_EXPORT = (
+    "export const OmnigentGatewayAuth_{ident} = async () => ({{\n"
+    "  auth: {{\n"
+    "    provider: {provider_json},\n"
+    "    loader: async () => mintFor({provider_json}),\n"
+    '    methods: [{{ type: "api", label: "Omnigent gateway" }}],\n'
+    "  }},\n"
+    "}});\n"
+)
+
+
+def build_gateway_auth_plugin_js(provider_ids: Sequence[str]) -> str:
+    """Render the gateway-auth plugin source for *provider_ids*.
+
+    :param provider_ids: opencode provider ids that mint via an ``auth_command``.
+    :returns: JS module source with one auth-loader plugin export per provider.
+    """
+    parts = [_GATEWAY_AUTH_PLUGIN_PROLOGUE]
+    for provider_id in provider_ids:
+        ident = re.sub(r"[^A-Za-z0-9_]", "_", provider_id)
+        parts.append(
+            _GATEWAY_AUTH_PLUGIN_EXPORT.format(ident=ident, provider_json=json.dumps(provider_id))
+        )
+    return "\n".join(parts)
+
+
+def write_opencode_gateway_auth_plugin(bridge_dir: Path, provider_ids: Sequence[str]) -> Path:
+    """Write the gateway-auth refresh plugin into *bridge_dir*; return its path.
+
+    The runner registers the returned path in the synthesized ``opencode.json``
+    ``plugin`` field and stamps ``OMNIGENT_OPENCODE_AUTH_COMMAND`` on the
+    ``opencode serve`` process. Overwritten each launch so a code update ships
+    without stale plugin files.
+
+    :param bridge_dir: OpenCode-native bridge directory.
+    :param provider_ids: Provider ids whose family uses an ``auth_command``.
+    :returns: The written plugin file path (absolute).
+    """
+    bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path = bridge_dir / _GATEWAY_AUTH_PLUGIN_FILE
+    fd, tmp_name = tempfile.mkstemp(prefix=f"{_GATEWAY_AUTH_PLUGIN_FILE}.", dir=str(bridge_dir))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(build_gateway_auth_plugin_js(provider_ids))
+        os.replace(tmp_name, path)
+    finally:
+        if os.path.exists(tmp_name):
+            os.unlink(tmp_name)
+    return path
 
 
 def write_opencode_policy_plugin(bridge_dir: Path) -> Path:
