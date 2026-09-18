@@ -85,7 +85,14 @@ def _response_id() -> str:
     return f"resp_{_uuid_mod.uuid4().hex[:12]}"
 
 
-def sse_text_response(text: str, model: str = "mock-model") -> str:
+def _response_usage(output_tokens: int, overrides: dict | None = None) -> dict:
+    """Merge scripted token counts and derive the total when it is omitted."""
+    usage = {"input_tokens": 10, "output_tokens": output_tokens, **(overrides or {})}
+    usage.setdefault("total_tokens", usage["input_tokens"] + usage["output_tokens"])
+    return usage
+
+
+def sse_text_response(text: str, model: str = "mock-model", usage: dict | None = None) -> str:
     """
     Build a complete SSE stream for a simple text response.
 
@@ -96,6 +103,7 @@ def sse_text_response(text: str, model: str = "mock-model") -> str:
 
     :param text: The assistant response text.
     :param model: Model name to include in the response.
+    :param usage: Optional token-usage overrides.
     :returns: SSE-formatted string.
     """
     resp_id = _response_id()
@@ -119,11 +127,7 @@ def sse_text_response(text: str, model: str = "mock-model") -> str:
         "parallel_tool_calls": True,
         "tools": [],
         "tool_choice": "auto",
-        "usage": {
-            "input_tokens": 10,
-            "output_tokens": output_tokens,
-            "total_tokens": 10 + output_tokens,
-        },
+        "usage": _response_usage(output_tokens, usage),
         "created_at": now,
         "completed_at": now,
     }
@@ -164,7 +168,7 @@ def sse_text_response(text: str, model: str = "mock-model") -> str:
     return "".join(events)
 
 
-def json_text_response(text: str, model: str = "mock-model") -> dict:
+def json_text_response(text: str, model: str = "mock-model", usage: dict | None = None) -> dict:
     """
     Build a non-streaming Responses API JSON body for a text response.
 
@@ -174,6 +178,7 @@ def json_text_response(text: str, model: str = "mock-model") -> dict:
 
     :param text: The assistant response text.
     :param model: Model name to include in the response.
+    :param usage: Optional token-usage overrides.
     :returns: Responses API response dict.
     """
     resp_id = _response_id()
@@ -197,11 +202,7 @@ def json_text_response(text: str, model: str = "mock-model") -> dict:
         "parallel_tool_calls": True,
         "tools": [],
         "tool_choice": "auto",
-        "usage": {
-            "input_tokens": 10,
-            "output_tokens": output_tokens,
-            "total_tokens": 10 + output_tokens,
-        },
+        "usage": _response_usage(output_tokens, usage),
         "created_at": now,
         "completed_at": now,
     }
@@ -210,6 +211,7 @@ def json_text_response(text: str, model: str = "mock-model") -> dict:
 def sse_tool_call_response(
     tool_calls: list[dict[str, str]],
     model: str = "mock-model",
+    usage: dict | None = None,
 ) -> str:
     """
     Build a complete SSE stream for a function call response.
@@ -217,6 +219,7 @@ def sse_tool_call_response(
     :param tool_calls: List of tool call dicts, each with
         ``"call_id"``, ``"name"``, and ``"arguments"`` keys.
     :param model: Model name to include in the response.
+    :param usage: Optional token-usage overrides.
     :returns: SSE-formatted string.
     """
     resp_id = _response_id()
@@ -242,11 +245,7 @@ def sse_tool_call_response(
         "parallel_tool_calls": True,
         "tools": [],
         "tool_choice": "auto",
-        "usage": {
-            "input_tokens": 10,
-            "output_tokens": 5,
-            "total_tokens": 15,
-        },
+        "usage": _response_usage(5, usage),
         "created_at": now,
         "completed_at": now,
     }
@@ -295,19 +294,20 @@ def truncate_sse(body: str, keep_events: int) -> str:
     return "".join(f"{seg}\n\n" for seg in kept)
 
 
-def sse_streaming_text(text: str, model: str = "mock-model") -> str:
+def sse_streaming_text(text: str, model: str = "mock-model", usage: dict | None = None) -> str:
     """
     Build SSE with text deltas followed by a completed event.
 
     :param text: The assistant response text.
     :param model: Model name.
+    :param usage: Optional token-usage overrides.
     :returns: SSE-formatted string with delta events.
     """
     events = []
     for word in text.split():
         delta = {"delta": word + " "}
         events.append(f"event: response.output_text.delta\ndata: {json.dumps(delta)}\n\n")
-    events.append(sse_text_response(text, model))
+    events.append(sse_text_response(text, model, usage))
     return "".join(events)
 
 
@@ -315,6 +315,7 @@ def sse_text_with_native_items(
     text: str,
     native_items: list[dict],
     model: str = "mock-model",
+    usage: dict | None = None,
 ) -> str:
     """Build SSE with text + native tool output items (e.g. web_search_call).
 
@@ -343,11 +344,7 @@ def sse_text_with_native_items(
         "parallel_tool_calls": True,
         "tools": [],
         "tool_choice": "auto",
-        "usage": {
-            "input_tokens": 10,
-            "output_tokens": output_tokens,
-            "total_tokens": 10 + output_tokens,
-        },
+        "usage": _response_usage(output_tokens, usage),
         "created_at": now,
         "completed_at": now,
     }
@@ -740,7 +737,8 @@ class QueuedResponse:
     status_code: int = 500
     delay: float = 0.0
     truncate_after: int | None = None
-    # Usage overrides. On ``/v1/messages`` merged into the Anthropic
+    # Usage overrides. On ``/v1/responses`` merged into the response usage.
+    # On ``/v1/messages`` merged into the Anthropic
     # ``message_start`` event (e.g. {"input_tokens": 50000}) so a test can
     # script the context size a claude harness observes mid-turn. On
     # ``/v1/chat/completions`` returned verbatim as the OpenAI ``usage``
@@ -1023,17 +1021,19 @@ async def create_response(
         model_name = (
             parsed.get("model", "mock-model") if isinstance(parsed, dict) else "mock-model"
         )
-        return JSONResponse(content=json_text_response(qr.text or "", model=model_name))
+        return JSONResponse(
+            content=json_text_response(qr.text or "", model=model_name, usage=qr.usage)
+        )
 
     # Build SSE body
     if qr.tool_calls:
-        sse_body = sse_tool_call_response(qr.tool_calls)
+        sse_body = sse_tool_call_response(qr.tool_calls, usage=qr.usage)
     elif qr.stream:
-        sse_body = sse_streaming_text(qr.text)
+        sse_body = sse_streaming_text(qr.text, usage=qr.usage)
     elif qr.native_items:
-        sse_body = sse_text_with_native_items(qr.text, qr.native_items)
+        sse_body = sse_text_with_native_items(qr.text, qr.native_items, usage=qr.usage)
     else:
-        sse_body = sse_text_response(qr.text)
+        sse_body = sse_text_response(qr.text, usage=qr.usage)
 
     # Mid-stream fault: emit only a prefix and end, dropping the completion.
     if qr.truncate_after is not None:
