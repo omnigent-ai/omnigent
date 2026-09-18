@@ -1967,6 +1967,81 @@ describe("Composer shared visible controls", () => {
   });
 });
 
+describe("Composer background tasks", () => {
+  beforeEach(() => {
+    clearSessionDrafts();
+    setComposerState({
+      conversationId: "conv_background_tasks",
+      sessionHarness: "claude-native",
+      backgroundTaskCount: 0,
+      backgroundTasks: [],
+      skills: [],
+    });
+  });
+
+  afterEach(() => {
+    cleanup();
+    useChatStore.setState({ backgroundTaskCount: 0, backgroundTasks: [] });
+    clearSessionDrafts();
+  });
+
+  it("shows a running monitor in the workspace bar after foreground work ends", () => {
+    useChatStore.setState({
+      backgroundTaskCount: 1,
+      backgroundTasks: [
+        {
+          id: "monitor-ci",
+          type: "shell",
+          status: "running",
+          description: "Watch PR checks",
+          command: "gh pr checks 123 --watch",
+        },
+      ],
+    });
+    renderWithTooltips(<Composer {...composerProps()} />);
+
+    const workspace = screen.getByTestId("composer-workspace-controls");
+    const trigger = within(workspace).getByRole("button", {
+      name: "1 background task still running",
+    });
+    expect(trigger).toHaveTextContent("1");
+    expect(screen.queryByTestId("subagent-task-pill")).toBeNull();
+    fireEvent.click(trigger);
+    const dialog = screen.getByRole("dialog", { name: "1 background task" });
+    expect(dialog).toHaveTextContent("Watch PR checks");
+    expect(dialog).toHaveTextContent("gh pr checks 123 --watch");
+  });
+
+  it("shows live task counts and removes the control when all tasks finish", () => {
+    renderWithTooltips(<Composer {...composerProps()} />);
+    expect(screen.queryByTestId("background-task-pill")).toBeNull();
+
+    act(() => useChatStore.setState({ backgroundTaskCount: 2 }));
+    expect(
+      screen.getByRole("button", { name: "2 background tasks still running" }),
+    ).toHaveTextContent("2");
+
+    act(() => useChatStore.setState({ backgroundTaskCount: 0 }));
+    expect(screen.queryByTestId("background-task-pill")).toBeNull();
+  });
+
+  it("lets one outside click focus the composer and resume typing", async () => {
+    const user = userEvent.setup();
+    const props = composerProps();
+    useChatStore.setState({ backgroundTaskCount: 1 });
+    renderWithTooltips(<Composer {...props} />);
+
+    await user.click(screen.getByRole("button", { name: "1 background task still running" }));
+    expect(screen.getByRole("dialog", { name: "1 background task" })).toBeVisible();
+    await user.click(textarea());
+    expect(screen.queryByRole("dialog", { name: "1 background task" })).toBeNull();
+    expect(textarea()).toHaveFocus();
+    await user.keyboard("Keep monitoring");
+    expect(textarea()).toHaveValue("Keep monitoring");
+    expect(props.onSend).not.toHaveBeenCalled();
+  });
+});
+
 describe("Composer effort slash-command visibility", () => {
   beforeEach(() => {
     setComposerState({ conversationId: "conv_test", skills: [] });

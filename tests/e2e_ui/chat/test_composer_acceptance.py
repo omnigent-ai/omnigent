@@ -8,7 +8,10 @@ import pytest
 from playwright.sync_api import Page, expect
 
 from tests.e2e_ui.chat.test_claude_model_picker import _patch_session_as_claude_native
-from tests.e2e_ui.chat.test_working_indicator_background_tasks import _publish_status
+from tests.e2e_ui.chat.test_working_indicator_background_tasks import (
+    _MONITOR_TASK,
+    _publish_status,
+)
 from tests.e2e_ui.conftest import fetch_with_retry, workspace_bar_needs_collapse
 
 
@@ -51,7 +54,7 @@ from tests.e2e_ui.conftest import fetch_with_retry, workspace_bar_needs_collapse
         ),
     ],
 )
-def test_pr_and_context_share_workspace_bar_with_task_controls_hidden(
+def test_pr_context_and_background_tasks_share_workspace_bar(
     page: Page,
     seeded_session: tuple[str, str],
     tmp_path: Path,
@@ -129,7 +132,13 @@ def test_pr_and_context_share_workspace_bar_with_task_controls_hidden(
             f"localStorage.setItem('omnigent:ui-font-family', JSON.stringify('{font_family}'))"
         )
     page.set_viewport_size({"width": viewport_width, "height": 844 if is_mobile else 900})
-    _publish_status(base_url, session_id, "idle", background_task_count=2)
+    _publish_status(
+        base_url,
+        session_id,
+        "idle",
+        background_task_count=1,
+        background_tasks=[_MONITOR_TASK],
+    )
     page.goto(f"{base_url}/c/{session_id}")
     bar = page.get_by_test_id("composer-workspace-controls")
     pr_link = bar.get_by_test_id("composer-pr-link")
@@ -141,13 +150,13 @@ def test_pr_and_context_share_workspace_bar_with_task_controls_hidden(
     if font_family is not None:
         applied_family = context.evaluate("el => getComputedStyle(el).fontFamily")
         assert applied_family.split(",")[0].strip("\"' ") == font_family
-    expect(bar.get_by_test_id("background-task-pill")).to_have_count(0)
+    expect(bar.get_by_test_id("background-task-pill")).to_have_text("1")
     expect(bar.get_by_test_id("subagent-task-pill")).to_have_count(0)
     expect(bar).to_contain_text("live-branch")
     expect(bar).not_to_contain_text("pr-head-not-checkout")
     bounds = bar.bounding_box()
     assert bounds is not None
-    status_ids = ("composer-pr-link", "composer-context-ring")
+    status_ids = ("composer-pr-link", "composer-context-ring", "background-task-pill")
     control_bounds = {}
     icon_bounds = {}
     for test_id in ("composer-workspace-dir", "composer-git-branch", *status_ids):
