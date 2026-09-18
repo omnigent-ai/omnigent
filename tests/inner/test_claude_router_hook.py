@@ -645,6 +645,32 @@ async def test_sdk_callback_maps_rewrite(tmp_path: Path, monkeypatch: pytest.Mon
     assert bodies[0]["parent_model"] == "parent-model"
 
 
+async def test_sdk_callback_forwards_the_task_description(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The in-process SDK callback carries the spawn's label like the CLI hook."""
+    advertise_router(tmp_path)
+    monkeypatch.setenv(subagent_router.ROUTER_DIR_ENV_VAR, str(tmp_path))
+    bodies: list[dict[str, Any]] = []
+
+    def fake_request(
+        endpoint: subagent_router.RouterEndpoint,
+        session_id: str,
+        body: dict[str, Any],
+        *,
+        timeout: float = 0.0,
+    ) -> dict[str, Any]:
+        bodies.append(body)
+        return {"action": "allow", "rationale": "fine as-is"}
+
+    monkeypatch.setattr(subagent_router, "request_decision", fake_request)
+    options = _install()
+    assert options.hooks is not None
+    callback = options.hooks["PreToolUse"][0].hooks[0]
+    await callback(_payload(description="Research auth flows"), "toolu_1", {"signal": None})
+    assert bodies[0]["task_description"] == "Research auth flows"
+
+
 async def test_sdk_callback_allows_unchanged_when_router_down(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
