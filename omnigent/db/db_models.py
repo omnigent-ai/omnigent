@@ -269,6 +269,10 @@ class SqlAgent(OmnigentBase):
         purpose. ``None`` when not provided.
     :param updated_at: Unix epoch seconds of the last update, or
         ``None`` if the agent has never been updated.
+    :param created_by: Identity of the user who created a session-scoped
+        agent, used to restrict agent-code mutation to its owner. ``None``
+        for template agents, single-user mode, and rows created before this
+        column existed (those fall back to the owning session's owner).
     """
 
     __tablename__ = "agents"
@@ -292,6 +296,10 @@ class SqlAgent(OmnigentBase):
     kind: Mapped[int] = mapped_column(SmallInteger)
     description: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
     updated_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Owner of a session-scoped agent (the creating user). Gates agent-code
+    # mutation to the owner; NULL for template agents, single-user mode, and
+    # pre-migration rows (which fall back to the owning session's owner).
+    created_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
     __table_args__ = (
         CheckConstraint("kind IN (1, 2)", name="ck_agents_kind"),

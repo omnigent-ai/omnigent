@@ -25,11 +25,13 @@ from fastapi import Request
 
 from omnigent.db.utils import shared_read_scope
 from omnigent.entities import Conversation
+from omnigent.entities.agent import Agent
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import (
     LEVEL_OWNER,
     RESERVED_USER_LOCAL,
     AuthProvider,
+    local_single_user_enabled,
 )
 from omnigent.server.permissions import (
     check_session_access,
@@ -408,3 +410,60 @@ def get_session_owner_id(
         if g.level >= LEVEL_OWNER:
             return g.user_id
     return None
+
+
+def require_agent_owner(
+    user_id: str | None,
+    agent: Agent,
+    permission_store: PermissionStore | None,
+) -> None:
+    """Authorize mutation of a session-scoped agent: owner or admin only.
+
+    A session-scoped agent's bundle carries code that later runs with the
+    runner's authority, so only the user who created it (or a workspace
+    admin) may replace or edit it. A ``LEVEL_EDIT`` grant on the *request's*
+    session is deliberately insufficient: session sharing hands out EDIT to
+    collaborators, and agent reuse lets several sessions with different
+    owners reference one agent row, so neither the request's session nor the
+    reverse-looked-up owning session can be trusted for this decision.
+
+    Assumes the caller already rejected template agents (``session_id is
+    None``) as read-only, so this only sees session-scoped agents.
+
+    :param user_id: The authenticated caller, or ``None`` when auth is off.
+    :param agent: The session-scoped agent being mutated. Its ``created_by``
+        is the authoritative owner when set; a ``None`` value (template
+        agents aside, a row created before ``created_by`` existed) falls
+        back to the owning session's owner.
+    :param permission_store: Permission store, or ``None`` when auth is off.
+    :raises OmnigentError: 403 when the caller is neither the owner nor an
+        admin.
+    """
+    # Auth disabled entirely: no ownership model to enforce.
+    if permission_store is None:
+        return
+    # Local single-user (header auth): grants are keyed by the "local"
+    # sentinel and there is no second identity to forge against. Mirror
+    # validate_session_agent's local handling and allow.
+    if local_single_user_enabled():
+        return
+    # Workspace admins bypass, mirroring check_session_access / resolved_allows.
+    if user_id is not None and permission_store.is_admin(user_id):
+        return
+    # Explicit owner (rows created after created_by was introduced).
+    if agent.created_by is not None:
+        if user_id is not None and user_id == agent.created_by:
+            return
+        raise OmnigentError(
+            f"{user_id!r} is not the owner of agent {agent.id!r}",
+            code=ErrorCode.FORBIDDEN,
+        )
+    # Legacy row (created_by is None): fall back to the owning session's owner.
+    if agent.session_id is not None:
+        owner = get_session_owner_id(agent.session_id, permission_store)
+        if owner is not None and user_id == owner:
+            return
+    raise OmnigentError(
+        f"{user_id!r} is not the owner of agent {agent.id!r}",
+        code=ErrorCode.FORBIDDEN,
+    )
