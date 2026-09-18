@@ -237,6 +237,62 @@ def test_structured_output_survives_prose_and_rejects_ambiguity(report: dict) ->
             scope.assessment(invalid)
 
 
+@pytest.mark.parametrize("classification", ["necessary", "unrelated"])
+def test_render_collapses_data_without_changing_verdict(
+    snapshot: dict, report: dict, classification: str
+) -> None:
+    report["files"][0]["changes"][0]["classification"] = classification
+    report["scope"]["reason"] = "Text with ``` and </details> stays inside the JSON string."
+    summary = "## Summary\nRemove the independent feature.\n\n"
+    footer = "\n\nReview footer."
+    raw = f"{summary}{scope.START}\n{json.dumps(report)}\n{scope.END}{footer}"
+    rendered = scope.render_review(raw)
+    assert rendered.startswith(summary + "<details>\n")
+    assert "<summary>Scope assessment data</summary>\n\n" in rendered
+    assert f"{scope.START}\n```json\n" in rendered
+    assert rendered.endswith("</details>" + footer)
+    assert scope.assessment(rendered) == report
+    assert scope.verdict(scope.assessment(rendered), snapshot) == scope.verdict(report, snapshot)
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_comment_step_formats_scope_only_when_requested(
+    tmp_path: Path, report: dict, enabled: bool
+) -> None:
+    workflow = yaml.safe_load((ROOT / ".github/workflows/polly-review.yml").read_text())
+    step = next(
+        step
+        for step in workflow["jobs"]["review"]["steps"]
+        if step["name"] == "Post review comment"
+    )
+    raw = f"## Summary\nReview text.\n{scope.START}\n{json.dumps(report)}\n{scope.END}"
+    comment = tmp_path / "comment.md"
+    gh = tmp_path / "gh"
+    gh.write_text("#!/bin/sh\nexit 0\n")
+    gh.chmod(0o755)
+    subprocess.run(
+        ["bash", "-c", step["run"].replace("/tmp/comment.md", str(comment))],
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "PATH": f"{tmp_path}{os.pathsep}{os.environ['PATH']}",
+            "REVIEW_TEXT": raw,
+            "RESOLVE_SCOPE": str(enabled).lower(),
+            "HEAD_SHA": "a" * 40,
+            "REPO": "example/project",
+            "PR_NUMBER": "7",
+            "RUN_URL": "https://example.test/run",
+        },
+        check=True,
+        capture_output=True,
+        timeout=10,
+    )
+    posted = comment.read_text()
+    assert ("<details>" in posted) is enabled
+    assert scope.assessment(posted) == report
+    assert (scope.render_review(raw) if enabled else raw) in posted
+
+
 @pytest.mark.parametrize("case", ["necessary", "unrelated", "missing", "changed"])
 def test_read_only_check_requires_a_current_passing_assessment(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, snapshot: dict, report: dict, case: str

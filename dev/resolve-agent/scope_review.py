@@ -184,10 +184,27 @@ def assessment(text: str) -> dict:
     matches = re.findall(pattern, text, re.MULTILINE | re.DOTALL)
     if len(matches) != 1 or text.count(START) != 1 or text.count(END) != 1:
         raise ValueError("Missing or ambiguous structured scope assessment")
-    result = json.loads(matches[0])
+    payload = matches[0]
+    if payload.startswith("```json\n") and payload.endswith("\n```"):
+        payload = payload[len("```json\n") : -len("\n```")]
+    result = json.loads(payload)
     if not isinstance(result, dict):
         raise ValueError("Scope assessment must be an object")
     return result
+
+
+def render_review(text: str) -> str:
+    payload = json.dumps(assessment(text), indent=2)
+    block = (
+        "<details>\n<summary>Scope assessment data</summary>\n\n"
+        f"{START}\n```json\n{payload}\n```\n{END}\n\n</details>"
+    )
+    return re.sub(
+        rf"^{re.escape(START)}\n.*?\n{re.escape(END)}$",
+        lambda _: block,
+        text,
+        flags=re.MULTILINE | re.DOTALL,
+    )
 
 
 def verdict(report: dict, snapshot: dict) -> tuple[bool, str]:
@@ -232,18 +249,23 @@ def verdict(report: dict, snapshot: dict) -> tuple[bool, str]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["prepare", "check"])
-    parser.add_argument("--repo", required=True)
-    parser.add_argument("--pr", type=int, required=True)
+    parser.add_argument("command", choices=["prepare", "check", "render"])
+    parser.add_argument("--repo", default="")
+    parser.add_argument("--pr", type=int, default=0)
     parser.add_argument("--head-sha", default="")
     parser.add_argument("--base-sha", default="")
     parser.add_argument("--context", type=Path, default=Path("/tmp/resolve_scope_context.json"))
     parser.add_argument("--diff", type=Path, default=Path("/tmp/pr_diff.txt"))
     parser.add_argument("--review", type=Path, default=Path("/tmp/polly_review.txt"))
     args = parser.parse_args()
-    if not re.fullmatch(r"[\w.-]+/[\w.-]+", args.repo) or args.pr < 1:
+    if args.command != "render" and (
+        not re.fullmatch(r"[\w.-]+/[\w.-]+", args.repo) or args.pr < 1
+    ):
         parser.error("A repository and positive PR number are required")
     try:
+        if args.command == "render":
+            print(render_review(args.review.read_text()))
+            return 0
         snapshot = context(args.repo, args.pr, args.head_sha, args.base_sha)
         if args.command == "prepare":
             sections = sum(

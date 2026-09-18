@@ -650,6 +650,7 @@ jobs:
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
           REVIEW_TEXT: ${{ steps.polly.outputs.review_text }}
+          RESOLVE_SCOPE: ${{ github.event_name == 'workflow_dispatch' && inputs.resolve_scope }}
           HEAD_SHA: ${{ steps.ctx.outputs.head_sha }}
           RUN_URL: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
         run: |
@@ -657,6 +658,10 @@ jobs:
 
           # Build the comment body safely — REVIEW_TEXT is passed via env
           # (not expression interpolation) to avoid expression injection.
+          if [ "${RESOLVE_SCOPE:-false}" = true ]; then
+            REVIEW_TEXT="$(printf '%s\n' "$REVIEW_TEXT" | \
+              python3 dev/resolve-agent/scope_review.py render --review /dev/stdin)"
+          fi
           {
             echo "<!-- polly-review-bot -->"
             echo "<!-- polly-reviewed-sha: ${HEAD_SHA} -->"
