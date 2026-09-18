@@ -209,6 +209,13 @@ class ErrorCode:
         family the gRPC CANCELLED status conventionally maps to): a 4xx
         keeps this expected, retryable condition out of 5xx fault-rate
         signals, the same reasoning as ``WRONG_REPLICA``.
+    :cvar UPSTREAM_UNAVAILABLE: A backing upstream call failed because the
+        dependency is not accepting work — a rolling restart draining its
+        connections reports gRPC ``UNAVAILABLE`` with "Server is shutting
+        down.". Expected and retryable in exactly the way
+        ``UPSTREAM_CANCELLED`` is, so it maps to HTTP 503 (with a
+        ``Retry-After`` hint the caller can honour) rather than reading as
+        our own 500.
     :cvar STALE_CURSOR: A pagination cursor (``after``/``before``)
         references a row that no longer exists — typically deleted
         between two page fetches (HTTP 400). Without a distinct signal
@@ -235,6 +242,7 @@ class ErrorCode:
     WORKSPACE_MISSING = "workspace_missing"
     SESSION_AGENT_MISSING = "session_agent_missing"
     UPSTREAM_CANCELLED = "upstream_cancelled"
+    UPSTREAM_UNAVAILABLE = "upstream_unavailable"
     STALE_CURSOR = "stale_cursor"
 
 
@@ -272,6 +280,9 @@ _CODE_TO_HTTP_STATUS: dict[str, int] = {
     # 499, not 5xx: the peer cancelling an in-flight backing call is expected
     # and retryable, so it must not read as a server fault (see the cvar).
     ErrorCode.UPSTREAM_CANCELLED: 499,
+    # 503, not 500: the dependency is draining, so the request never reached a
+    # fault of ours and the same call succeeds against the next replica.
+    ErrorCode.UPSTREAM_UNAVAILABLE: 503,
     # 400: the referenced cursor row is gone, so this exact request can never
     # succeed — the fix is to restart the enumeration without the cursor. The
     # distinct code is what a paging client keys that restart off.
@@ -310,6 +321,8 @@ _CODE_TO_CATEGORY: dict[str, ErrorCategory] = {
     ErrorCode.SESSION_AGENT_MISSING: ErrorCategory.USER,
     # A dependency tore down the in-flight call; the fix (if any) is upstream.
     ErrorCode.UPSTREAM_CANCELLED: ErrorCategory.UPSTREAM,
+    # The dependency is refusing work while it drains; nothing to fix here.
+    ErrorCode.UPSTREAM_UNAVAILABLE: ErrorCategory.UPSTREAM,
     # A stale reference: the cursor row was deleted (often by the same user
     # in another client) between two page fetches.
     ErrorCode.STALE_CURSOR: ErrorCategory.USER,
@@ -348,6 +361,7 @@ _CODE_TO_IMPACT: dict[str, ErrorImpact] = {
     ErrorCode.RUNNER_UNAVAILABLE: ErrorImpact.TRANSIENT,
     ErrorCode.WRONG_REPLICA: ErrorImpact.TRANSIENT,
     ErrorCode.UPSTREAM_CANCELLED: ErrorImpact.TRANSIENT,
+    ErrorCode.UPSTREAM_UNAVAILABLE: ErrorImpact.TRANSIENT,
     # A single rejected request; the session stays healthy and usable.
     ErrorCode.FORBIDDEN: ErrorImpact.BENIGN,
     ErrorCode.NOT_FOUND: ErrorImpact.BENIGN,
@@ -391,6 +405,7 @@ _CODE_TO_PHASE: dict[str, ErrorPhase] = {
     ErrorCode.INTERNAL_ERROR: ErrorPhase.UNKNOWN,
     # Context-driven: a backing call can be cancelled while serving any stage.
     ErrorCode.UPSTREAM_CANCELLED: ErrorPhase.UNKNOWN,
+    ErrorCode.UPSTREAM_UNAVAILABLE: ErrorPhase.UNKNOWN,
     ErrorCode.STALE_CURSOR: ErrorPhase.REQUEST,
 }
 
@@ -593,27 +608,52 @@ _TRANSPORT_EXC_NAMES = frozenset(
 )
 
 
-def is_cancelled_rpc_error(exc: BaseException) -> bool:
-    """Whether *exc* is a gRPC call terminated by its peer with ``CANCELLED``.
+def rpc_status_name(exc: BaseException) -> str | None:
+    """The gRPC status name carried by *exc*, or ``None`` if it carries none.
 
     Matched structurally — an ``RpcError`` ancestor by class name plus a
-    ``code()`` whose status is named ``CANCELLED`` — so a vendored copy of
+    callable ``code()`` whose status exposes a ``name`` — so a vendored copy of
     grpc (a different class identity than pypi grpcio) still matches and this
     module imports no grpc.
 
     :param exc: The exception to inspect.
-    :returns: ``True`` only for a peer-cancelled RPC error.
+    :returns: The status name, e.g. ``"CANCELLED"`` or ``"UNAVAILABLE"``;
+        ``None`` when *exc* is not an RPC error or its status cannot be read.
     """
     if not any(klass.__name__ == "RpcError" for klass in type(exc).__mro__):
-        return False
+        return None
     code = getattr(exc, "code", None)
     if not callable(code):
-        return False
+        return None
     try:
         status = code()
-    except Exception:  # noqa: BLE001 — a status reader that itself fails is not a cancellation
-        return False
-    return getattr(status, "name", None) == "CANCELLED"
+    except Exception:  # noqa: BLE001 — a status reader that itself fails names no status
+        return None
+    name = getattr(status, "name", None)
+    return name if isinstance(name, str) else None
+
+
+def is_cancelled_rpc_error(exc: BaseException) -> bool:
+    """Whether *exc* is a gRPC call terminated by its peer with ``CANCELLED``.
+
+    :param exc: The exception to inspect.
+    :returns: ``True`` only for a peer-cancelled RPC error.
+    """
+    return rpc_status_name(exc) == "CANCELLED"
+
+
+def is_unavailable_rpc_error(exc: BaseException) -> bool:
+    """Whether *exc* is a gRPC call refused with ``UNAVAILABLE``.
+
+    A dependency draining for a rolling restart answers in-flight calls with
+    ``UNAVAILABLE`` ("Server is shutting down."). That is an upstream
+    lifecycle event the caller retries, not a fault of ours, so it is
+    classified alongside :func:`is_cancelled_rpc_error`.
+
+    :param exc: The exception to inspect.
+    :returns: ``True`` only for an ``UNAVAILABLE`` RPC error.
+    """
+    return rpc_status_name(exc) == "UNAVAILABLE"
 
 
 def classify_exception(exc: BaseException) -> tuple[ErrorCategory, ErrorImpact]:
@@ -626,8 +666,10 @@ def classify_exception(exc: BaseException) -> tuple[ErrorCategory, ErrorImpact]:
     - :class:`OmnigentError` (and its subclasses) keep their own axes.
     - Transport failures (connection/timeout, plus httpx / WebSocket disconnects
       matched by type name) read as a transient upstream blip.
-    - A peer-cancelled gRPC call (see :func:`is_cancelled_rpc_error`) reads the
-      same way: the dependency tore down the in-flight call, not our fault.
+    - A peer-cancelled or ``UNAVAILABLE`` gRPC call (see
+      :func:`is_cancelled_rpc_error`, :func:`is_unavailable_rpc_error`) reads
+      the same way: the dependency tore down or refused the in-flight call,
+      not our fault.
     - Anything else is genuinely unattributed: UNKNOWN on both axes rather than a
       guessed owner. The turn's terminal outcome remains the authoritative
       blocking signal.
@@ -644,6 +686,6 @@ def classify_exception(exc: BaseException) -> tuple[ErrorCategory, ErrorImpact]:
         return ErrorCategory.UPSTREAM, ErrorImpact.TRANSIENT
     if _TRANSPORT_EXC_NAMES.intersection(klass.__name__ for klass in type(exc).__mro__):
         return ErrorCategory.UPSTREAM, ErrorImpact.TRANSIENT
-    if is_cancelled_rpc_error(exc):
+    if is_cancelled_rpc_error(exc) or is_unavailable_rpc_error(exc):
         return ErrorCategory.UPSTREAM, ErrorImpact.TRANSIENT
     return ErrorCategory.UNKNOWN, ErrorImpact.UNKNOWN
