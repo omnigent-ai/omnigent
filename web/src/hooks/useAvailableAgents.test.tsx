@@ -91,6 +91,44 @@ function sessionResponse(
 const EMPTY_MINE = mockResponse({ object: "list", data: [], has_more: false });
 
 describe("useAvailableAgents", () => {
+  it.each([false, undefined])(
+    "keeps registered native agents distinct from their shared launcher (builtin=%s)",
+    async (builtin) => {
+      routeFetch({
+        [BUILTINS_URL]: mockResponse({
+          data: [
+            {
+              id: "ag_opencode",
+              name: "opencode-native-ui",
+              harness: "opencode-native",
+              builtin: true,
+            },
+            { id: "ag_score", name: "tg-thread-score-v1", harness: "opencode-native", builtin },
+            { id: "ag_summary", name: "tg-thread-summary-v1", harness: "opencode-native", builtin },
+          ],
+          has_more: false,
+        }),
+        [SCAN_URL]: EMPTY_SCAN,
+        [HARNESSES_URL]: mockResponse({ data: [] }),
+      });
+      const { result } = renderHook(() => useAvailableAgents(), { wrapper });
+      await waitFor(() => expect(result.current.isSuccess).toBe(true));
+      expect(result.current.data).toEqual([
+        expect.objectContaining({ id: "ag_opencode", display_name: "OpenCode" }),
+        expect.objectContaining({
+          id: "ag_score",
+          display_name: "tg-thread-score-v1",
+          harness: "opencode-native",
+        }),
+        expect.objectContaining({
+          id: "ag_summary",
+          display_name: "tg-thread-summary-v1",
+          harness: "opencode-native",
+        }),
+      ]);
+    },
+  );
+
   it("does not fetch while disabled", async () => {
     const { result } = renderHook(() => useAvailableAgents({ enabled: false }), { wrapper });
     await Promise.resolve();
@@ -886,6 +924,48 @@ describe("useAvailableAgents", () => {
 });
 
 describe("prefetchAvailableAgentDetails", () => {
+  it("keeps a named native agent after enrichment alongside its launcher", async () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const launcher = {
+      id: "ag_opencode",
+      name: "opencode-native-ui",
+      display_name: "OpenCode",
+      description: null,
+      harness: "opencode-native",
+      skills: [],
+      builtin: true,
+    };
+    const custom = {
+      id: "ag_score",
+      name: "tg-thread-score-v1",
+      display_name: "Tg-thread-score-v1",
+      description: null,
+      harness: null,
+      skills: [],
+      sessionId: "conv_score",
+    };
+    queryClient.setQueryData(["available-agents"], [launcher, custom]);
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({
+        id: "ag_score",
+        name: "tg-thread-score-v1",
+        harness: "opencode-native",
+        description: "Score Telegram threads",
+        skills: [],
+      }),
+    );
+    await prefetchAvailableAgentDetails(custom, queryClient);
+    expect(queryClient.getQueryData(["available-agents"])).toEqual([
+      launcher,
+      {
+        ...custom,
+        display_name: "tg-thread-score-v1",
+        harness: "opencode-native",
+        description: "Score Telegram threads",
+      },
+    ]);
+  });
+
   it("patches harness, description, and skills into the cache on success", async () => {
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const agent = {

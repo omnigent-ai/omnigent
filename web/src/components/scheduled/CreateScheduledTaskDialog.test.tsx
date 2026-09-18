@@ -55,6 +55,8 @@ vi.mock("@/shell/NewChatDialog", () => ({
     agentLabel,
     host,
     dropdownModal,
+    harnessEntries,
+    agentEntries,
   }: {
     onSelectAgent: (a: AvailableAgent) => void;
     onOpenChange?: (open: boolean) => void;
@@ -62,10 +64,14 @@ vi.mock("@/shell/NewChatDialog", () => ({
     agentLabel: string;
     host?: { host_id: string } | null;
     dropdownModal?: boolean;
+    harnessEntries: AvailableAgent[];
+    agentEntries: AvailableAgent[];
   }) => (
     <div
       data-testid="agent-picker-stub"
       data-effective={effectiveAgentId ?? ""}
+      data-harnesses={harnessEntries.map((a) => a.id).join(",")}
+      data-agents={agentEntries.map((a) => a.id).join(",")}
       // Surface the host the dialog feeds the picker for badge computation, so
       // a test can assert it's populated even when no host is pinned.
       data-badge-host={host?.host_id ?? ""}
@@ -120,7 +126,6 @@ vi.mock("@/lib/nativeCodingAgents", async (orig) => {
   const actual = await orig<typeof NativeCodingAgentsModule>();
   return {
     ...actual,
-    isNativeCodingAgent: (a: AvailableAgent) => a?.name === "claude-native-ui",
     nativeAgentHasCapability: (a: AvailableAgent | undefined | null, cap: string) =>
       a?.name === "claude-native-ui" && cap === "permissionMode",
   };
@@ -944,4 +949,30 @@ describe("shouldGuardDialogDismiss (backdrop click closes; dropdown-dismiss guar
       false,
     );
   });
+});
+
+it("groups a named native scheduled agent separately from its launcher", () => {
+  vi.mocked(agentsHook.useAvailableAgents).mockReturnValue({
+    data: [
+      {
+        ...AGENTS[1],
+        id: "ag_opencode",
+        name: "opencode-native-ui",
+        display_name: "OpenCode",
+        harness: "opencode-native",
+        builtin: true,
+      },
+      {
+        ...AGENTS[1],
+        id: "ag_score",
+        name: "tg-thread-score-v1",
+        display_name: "tg-thread-score-v1",
+        harness: "opencode-native",
+        builtin: false,
+      },
+    ],
+  } as ReturnType<typeof agentsHook.useAvailableAgents>);
+  renderDialog();
+  expect(screen.getByTestId("agent-picker-stub")).toHaveAttribute("data-harnesses", "ag_opencode");
+  expect(screen.getByTestId("agent-picker-stub")).toHaveAttribute("data-agents", "ag_score");
 });

@@ -3,6 +3,7 @@ import { useMemo } from "react";
 import { useSidebarData } from "./useSidebarData";
 import { authenticatedFetch } from "@/lib/identity";
 import { agentRootName } from "@/lib/forkHarness";
+import { isNativeHarnessLauncher } from "@/lib/agentGrouping";
 import { capitalizeAgentName, useAcpHarnessIds, useHarnessLabels } from "@/lib/agentLabels";
 import {
   nativeCodingAgentForAvailableAgent,
@@ -59,7 +60,13 @@ const DISPLAY_NAMES: Record<string, string> = {
   debby: "Debby",
 };
 
-function displayNameForAgent(name: string, harness?: string | null): string {
+function displayNameForAgent(name: string, harness?: string | null, builtin?: boolean): string {
+  if (
+    nativeCodingAgentForHarness(harness) &&
+    !isNativeHarnessLauncher({ name, harness: harness ?? null, builtin })
+  ) {
+    return name;
+  }
   return (
     nativeCodingAgentForHarness(harness)?.displayName ??
     nativeCodingAgentForAgentName(name)?.displayName ??
@@ -72,7 +79,9 @@ function dedupeNativeAgents(agents: AvailableAgent[]): AvailableAgent[] {
   const result: AvailableAgent[] = [];
   const nativeIndex = new Map<string, number>();
   for (const agent of agents) {
-    const nativeAgent = nativeCodingAgentForAvailableAgent(agent);
+    const nativeAgent = isNativeHarnessLauncher(agent)
+      ? nativeCodingAgentForAvailableAgent(agent)
+      : undefined;
     if (nativeAgent === undefined) {
       result.push(agent);
       continue;
@@ -134,7 +143,7 @@ export async function fetchAgentCatalog(): Promise<AvailableAgent[]> {
   return rows.map((a) => ({
     id: a.id,
     name: a.name,
-    display_name: displayNameForAgent(a.name, a.harness),
+    display_name: displayNameForAgent(a.name, a.harness, a.builtin),
     description: a.description ?? null,
     harness: a.harness ?? null,
     skills: a.skills ?? [],
@@ -214,23 +223,25 @@ export async function prefetchAvailableAgentDetails(
           ? a
           : {
               ...a,
-              display_name: displayNameForAgent(json.name, json.harness),
+              display_name: displayNameForAgent(json.name, json.harness, a.builtin),
               description: json.description ?? null,
               harness: json.harness ?? null,
               skills: json.skills ?? [],
             },
       );
-      // If enrichment reveals this agent is a native coding agent (e.g. a
-      // kiro-native session with a non-canonical name), remove it when a
-      // seeded built-in with the same native key already exists so it doesn't
-      // surface as a duplicate picker row.
+      // Only launcher aliases may collapse by harness. Named custom agents
+      // keep their own configuration even when they share a native harness.
       const enrichedAgent = enriched.find((a) => a.id === agent.id);
-      const enrichedKey = enrichedAgent
-        ? nativeCodingAgentForAvailableAgent(enrichedAgent)?.key
-        : undefined;
+      const enrichedKey =
+        enrichedAgent && isNativeHarnessLauncher(enrichedAgent)
+          ? nativeCodingAgentForAvailableAgent(enrichedAgent)?.key
+          : undefined;
       if (enrichedKey) {
         const builtinExists = enriched.some(
-          (a) => a.id !== agent.id && nativeCodingAgentForAvailableAgent(a)?.key === enrichedKey,
+          (a) =>
+            a.id !== agent.id &&
+            isNativeHarnessLauncher(a) &&
+            nativeCodingAgentForAvailableAgent(a)?.key === enrichedKey,
         );
         if (builtinExists) return enriched.filter((a) => a.id !== agent.id);
       }
@@ -280,7 +291,9 @@ function mergeAvailableAgents(
   const userTemplates = catalog.filter((a) => a.builtin === false);
   const catalogIds = new Set(catalog.map((a) => a.id));
   const seededNames = new Set(seeded.map((a) => agentRootName(a.name)));
-  const hasKiroBuiltin = seeded.some((a) => nativeCodingAgentForAvailableAgent(a)?.key === "kiro");
+  const hasKiroBuiltin = seeded.some(
+    (a) => isNativeHarnessLauncher(a) && nativeCodingAgentForAvailableAgent(a)?.key === "kiro",
+  );
   const kiroLegacyNames = new Set(["kiro"]);
 
   const recencyOf = (a: AvailableAgent): number => a.created_at ?? 0;
@@ -329,7 +342,7 @@ function mergeAvailableAgents(
     .map((c) => (c.template !== null ? c.template : sessionAgentFromDiscovery(c.discovered!)))
     .filter((agent) => {
       const nativeKey = nativeCodingAgentForAvailableAgent(agent)?.key;
-      return nativeKey !== "kiro" || !hasKiroBuiltin;
+      return !isNativeHarnessLauncher(agent) || nativeKey !== "kiro" || !hasKiroBuiltin;
     });
   // Seeded built-ins first; user templates / custom uploads follow, newest
   // first. NewChatDialog's display-order sort is stable, so unranked names

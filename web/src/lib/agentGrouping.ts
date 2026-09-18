@@ -5,7 +5,12 @@
  * two surfaces group and order agents identically.
  */
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
-import { nativeAgentSortRank } from "@/lib/nativeCodingAgents";
+import { agentRootName } from "@/lib/forkHarness";
+import {
+  isNativeCodingAgent,
+  nativeAgentSortRank,
+  nativeCodingAgentForAgentName,
+} from "@/lib/nativeCodingAgents";
 
 // Built-in agents (by name slug) — the long-lived agents the server ships
 // out of the box. Pickers group these first, then a divider, then custom
@@ -54,6 +59,25 @@ export function isAcpHarnessAgent(
   const harness = agent.harness;
   if (harness == null) return false;
   return harness.startsWith("acp:") || LEGACY_ACP_CLI_HARNESS_IDS.has(harness);
+}
+
+/** Identify a launcher row without changing the agent's native execution mode. */
+export function isNativeHarnessLauncher(
+  agent: Pick<AvailableAgent, "name" | "harness" | "builtin">,
+): boolean {
+  if (agent.builtin === false) return false;
+  if (agent.builtin === true) return isNativeCodingAgent(agent);
+  // Older servers and session-derived rows lack builtin metadata.
+  const rootName = agentRootName(agent.name);
+  return (
+    nativeCodingAgentForAgentName(rootName) !== undefined ||
+    // A legacy seeded Kiro row used this misspelled name.
+    (rootName === "kiro-naitive" && agent.harness === "kiro-native")
+  );
+}
+
+export function isHarnessPickerAgent(agent: AvailableAgent): boolean {
+  return isNativeHarnessLauncher(agent) || isAcpHarnessAgent(agent);
 }
 
 // Preferred display order for the built-in group. The server returns
