@@ -1946,6 +1946,9 @@ class CodexNativeAppServer:
         Wait until the app-server socket accepts an initialized
         client, and return that connection for startup RPCs.
 
+        The budget bounds the retry loop; a connect attempt already in
+        flight when it expires is not interrupted.
+
         :returns: Connected app-server client. The caller owns it.
         :raises RuntimeError: If the app-server exits or never
             becomes ready within ``_APP_SERVER_READY_TIMEOUT_SECONDS``.
