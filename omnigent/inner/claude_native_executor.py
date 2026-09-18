@@ -14,6 +14,7 @@ from pathlib import Path
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_DIR_ENV_VAR,
     CLAUDE_FRAMEWORK_CONTEXT_FILE,
+    PANE_STATE_AWAITING_USER_INPUT,
     REQUEST_SESSION_ID_ENV_VAR,
     SWITCH_MODEL_DIALOG_HINT,
     ClaudePromptTimeout,
@@ -247,8 +248,15 @@ class ClaudeNativeExecutor(Executor):
                 "claude-native: prompt delivery to harness timed out",
                 extra={"session_id": self._request_session_id},
             )
-            cleanup_error = self._reap_failed_turn()
             message = describe_exception(exc)
+            if exc.pane_state == PANE_STATE_AWAITING_USER_INPUT:
+                # Keep the pane: it is showing the interactive prompt the
+                # error tells the user to finish, and reaping it tears down
+                # the harness (required-terminal exit -> process release)
+                # before this diagnosis can reach the user.
+                yield ExecutorError(message=message)
+                return
+            cleanup_error = self._reap_failed_turn()
             if cleanup_error is not None:
                 message = f"{message} Cleanup also failed: {cleanup_error}"
             yield ExecutorError(message=message)

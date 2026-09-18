@@ -53,7 +53,7 @@ from http import HTTPStatus
 from http.client import HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Final, cast
 from urllib import request
 
 from omnigent._platform import is_wsl, stable_user_id
@@ -445,7 +445,17 @@ def validate_claude_hook_interpreter_compatibility(
 
 
 class ClaudePromptTimeout(RuntimeError):
-    """Claude Code's input box did not render before delivery timed out."""
+    """Claude Code's input box did not render before delivery timed out.
+
+    :param message: Human-readable diagnosis for the user.
+    :param pane_state: :func:`_stalled_pane_state` slug for the last
+        captured pane, e.g. ``"awaiting-user-input"``. Empty when the
+        pane was never classified.
+    """
+
+    def __init__(self, message: str, *, pane_state: str = "") -> None:
+        super().__init__(message)
+        self.pane_state = pane_state
 
 
 class ClaudeInjectionCancelled(RuntimeError):
@@ -5196,6 +5206,49 @@ def _format_terminal_failure_tail(pane: str) -> str:
     return f" Last terminal output:\n{tail}"
 
 
+# Pane parked on an interactive prompt (login, consent, y/n) the user must
+# finish in the terminal. The executor keeps such a pane alive on timeout:
+# reaping it would destroy the prompt the error directs the user to answer.
+PANE_STATE_AWAITING_USER_INPUT: Final = "awaiting-user-input"
+
+# Generic auth and consent prompts can prevent the composer from rendering.
+# These markers describe the visible state, not the terminal's health.
+_PANE_AWAITING_USER_MARKERS: Final[tuple[str, ...]] = (
+    "Logging in via SSO",
+    "If the browser does not open automatically",
+    "open the following URL",
+    "Select login method",
+    "Press Enter to continue",
+    "(y/n)",
+    "[Y/n]",
+    "[y/N]",
+    "Enter your password",
+    "Passcode or option",
+)
+
+
+def _stalled_pane_state(pane: str, *, polls: int, empty_polls: int) -> str:
+    """Name why the readiness poll never saw Claude Code's input prompt.
+
+    Groups the timeout by cause instead of leaving every occurrence to be read
+    from its own pane tail: without this every stall is one undifferentiated
+    signature whose only distinguishing text is the user's screen contents.
+
+    :param pane: Last non-empty captured pane text.
+    :param polls: Readiness polls performed before the deadline, e.g. ``198``.
+    :param empty_polls: How many of those captures came back blank.
+    :returns: A short state slug, e.g. ``"awaiting-user-input"``.
+    """
+    if any(marker in pane for marker in _PANE_AWAITING_USER_MARKERS):
+        return PANE_STATE_AWAITING_USER_INPUT
+    if not pane.strip():
+        return "pane-never-rendered"
+    # Separate intermittent empty captures from a pane that never rendered.
+    if polls and empty_polls >= polls / 2:
+        return "captures-mostly-empty"
+    return "prompt-absent-from-pane"
+
+
 def _wait_for_claude_prompt_ready(
     socket_path: str,
     tmux_target: str,
@@ -5273,11 +5326,22 @@ def _wait_for_claude_prompt_ready(
     # with no box point at Claude never rendering the prompt (a boot crash,
     # e.g. a ``JSON Parse error``, whose text the tail then surfaces).
     waited_s = time.monotonic() - started
+    state = _stalled_pane_state(last_nonempty, polls=polls, empty_polls=empty_polls)
+    if state == PANE_STATE_AWAITING_USER_INPUT:
+        # Name the step the user has to finish; the pane tail shows which one.
+        raise ClaudePromptTimeout(
+            f"The terminal is waiting on an interactive prompt, so Claude Code has "
+            f"not started yet (state={state}, waited {waited_s:.1f}s). Finish it in "
+            f"the terminal, then send the message again."
+            + _format_terminal_failure_tail(last_nonempty),
+            pane_state=state,
+        )
     raise ClaudePromptTimeout(
         f"Claude Code terminal did not become ready within {waited_s:.1f}s "
-        f"(input prompt never rendered in {polls} polls, "
+        f"(state={state}, input prompt never rendered in {polls} polls, "
         f"{empty_polls} empty captures). The message was not delivered."
-        + _format_terminal_failure_tail(last_nonempty)
+        + _format_terminal_failure_tail(last_nonempty),
+        pane_state=state,
     )
 
 

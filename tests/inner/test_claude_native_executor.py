@@ -13,6 +13,7 @@ import pytest
 
 from omnigent.harnesses.claude_native import bridge as claude_bridge
 from omnigent.harnesses.claude_native.bridge import (
+    PANE_STATE_AWAITING_USER_INPUT,
     REQUEST_SESSION_ID_ENV_VAR,
     ClaudePromptTimeout,
     TmuxSessionNotAdvertised,
@@ -1454,6 +1455,54 @@ async def test_run_turn_reaps_tmux_before_reporting_prompt_timeout(
     assert killed == [bridge_dir]
     assert len(events) == 1
     assert isinstance(events[0], ExecutorError)
+
+
+@pytest.mark.asyncio
+async def test_run_turn_keeps_interactive_prompt_pane_alive_on_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """An awaiting-user-input timeout must not kill the pane it points at.
+
+    The diagnosis directs the user to finish the pending prompt in the
+    terminal, so the pane must survive the failed turn — and the reap's
+    required-terminal teardown would kill the harness before the error
+    event reaches the user at all.
+    """
+    bridge_dir = tmp_path / "bridge"
+    killed: list[Path] = []
+
+    def fail_inject(bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0) -> None:
+        del bridge_dir_arg, content, timeout_s
+        raise ClaudePromptTimeout(
+            "The terminal is waiting on an interactive prompt, so Claude Code "
+            "has not started yet. Finish it in the terminal, then send the "
+            "message again.",
+            pane_state=PANE_STATE_AWAITING_USER_INPUT,
+        )
+
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", fail_inject)
+    monkeypatch.setattr(
+        claude_native_executor,
+        "kill_session",
+        lambda bridge_dir_arg, *, timeout_s: killed.append(bridge_dir_arg),
+    )
+
+    executor = ClaudeNativeExecutor(bridge_dir)
+    events = [
+        event
+        async for event in executor.run_turn(
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[],
+            system_prompt="",
+        )
+    ]
+
+    assert killed == []
+    assert len(events) == 1
+    assert isinstance(events[0], ExecutorError)
+    assert "interactive prompt" in events[0].message
+    assert "Finish it in the terminal" in events[0].message
 
 
 @pytest.mark.asyncio

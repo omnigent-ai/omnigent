@@ -8664,6 +8664,89 @@ def test_wait_for_claude_prompt_ready_fails_at_base_budget_when_pane_dead(
     assert "connecting to host" in message
 
 
+_LOGIN_PANE = (
+    "example-cli: Logging in via SSO...\n"
+    "If the browser does not open automatically, please open the following URL:\n"
+    "https://login.example.test/authorize?request=synthetic\n"
+)
+
+
+def test_stalled_pane_state_names_an_interactive_prompt() -> None:
+    """Generic login text identifies an interactive readiness gate."""
+    assert (
+        claude_native_bridge._stalled_pane_state(_LOGIN_PANE, polls=100, empty_polls=0)
+        == "awaiting-user-input"
+    )
+
+
+def test_stalled_pane_state_separates_torn_reads_from_a_missing_prompt() -> None:
+    """Empty captures and missing composer frames have distinct labels."""
+    assert (
+        claude_native_bridge._stalled_pane_state(_BOOTING_PANE, polls=100, empty_polls=90)
+        == "captures-mostly-empty"
+    )
+    assert (
+        claude_native_bridge._stalled_pane_state(_BOOTING_PANE, polls=100, empty_polls=0)
+        == "prompt-absent-from-pane"
+    )
+    assert (
+        claude_native_bridge._stalled_pane_state("", polls=100, empty_polls=100)
+        == "pane-never-rendered"
+    )
+
+
+def test_wait_for_claude_prompt_ready_blames_the_interactive_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The timeout points the user to the pending interactive prompt."""
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._capture_pane",
+        lambda socket_path, tmux_target: _LOGIN_PANE,
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._claude_pane_alive",
+        lambda socket_path, tmux_target: False,
+    )
+    with pytest.raises(claude_native_bridge.ClaudePromptTimeout) as excinfo:
+        claude_native_bridge._wait_for_claude_prompt_ready(
+            "/tmp/example/tmux.sock",
+            "claude:0.0",
+            timeout_s=0.0,
+        )
+    message = str(excinfo.value)
+    assert "waiting on an interactive prompt" in message
+    assert "state=awaiting-user-input" in message
+    assert "Finish it in the terminal" in message
+    # The pane tail still names which step.
+    assert "example-cli" in message
+    # The executor keys its keep-the-pane decision on this attribute.
+    assert excinfo.value.pane_state == claude_native_bridge.PANE_STATE_AWAITING_USER_INPUT
+
+
+def test_wait_for_claude_prompt_ready_reports_its_state_slug(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ordinary timeout carries a state so the mode groups in logs."""
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._capture_pane",
+        lambda socket_path, tmux_target: _BOOTING_PANE,
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._claude_pane_alive",
+        lambda socket_path, tmux_target: False,
+    )
+    with pytest.raises(claude_native_bridge.ClaudePromptTimeout) as excinfo:
+        claude_native_bridge._wait_for_claude_prompt_ready(
+            "/tmp/example/tmux.sock",
+            "claude:0.0",
+            timeout_s=0.0,
+        )
+    message = str(excinfo.value)
+    assert "did not become ready" in message
+    assert "state=prompt-absent-from-pane" in message
+    assert excinfo.value.pane_state == "prompt-absent-from-pane"
+
+
 def test_wait_for_claude_prompt_ready_slow_boot_wait_is_bounded(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
