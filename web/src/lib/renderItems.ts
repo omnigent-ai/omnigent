@@ -161,6 +161,13 @@ export type Bubble =
        * optimistic→committed swap (no remount/flink).
        */
       stableKey?: string;
+      /**
+       * True while the message is delivered into a running turn's buffer
+       * but not yet consumed by the agent loop (the steered-message
+       * intermediate state). Rendered grayed out with a `data-pending`
+       * hook; clears when the consumed event promotes the bubble.
+       */
+      pending?: boolean;
     }
   | {
       kind: "assistant";
@@ -1788,6 +1795,7 @@ export function bubblesEqual(a: Bubble, b: Bubble): boolean {
       a.createdBy !== b.createdBy ||
       a.createdAtS !== b.createdAtS ||
       a.stableKey !== b.stableKey ||
+      a.pending !== b.pending ||
       a.content.length !== b.content.length
     )
       return false;

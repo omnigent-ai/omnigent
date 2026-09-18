@@ -83,6 +83,7 @@ from omnigent.runtime import (
     inflight_text,
     pending_elicitations,
     pending_inputs,
+    unconsumed_inputs,
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.engine import PolicyEngine
@@ -255,6 +256,7 @@ from omnigent.server.schemas import (
     SessionGitOptions,
     SessionInputConsumedEvent,
     SessionInputConsumedPayload,
+    SessionInputDeliveredEvent,
     SessionInterruptedEvent,
     SessionInterruptedPayload,
     SessionListItem,
@@ -1658,6 +1660,39 @@ def _publish_input_consumed(
             data=item.data.model_dump() if item.data is not None else {},
             created_by=item.created_by,
             cleared_pending_id=cleared_pending_id,
+        ),
+    )
+    session_stream.publish(session_id, event.model_dump())
+
+
+def _publish_input_delivered(
+    session_id: str,
+    item: ConversationItem,
+) -> None:
+    """
+    Publish a ``session.input.delivered`` event for a steered item.
+
+    The intermediate sibling of :func:`_publish_input_consumed`: the
+    item is persisted and parked in the running turn's message buffer,
+    but the agent loop has NOT consumed it yet. Clients render the
+    message in a pending state until the matching
+    ``session.input.consumed`` arrives (published when the runner
+    reports the buffered message drained into a turn).
+
+    :param session_id: The session/conversation identifier whose
+        stream should receive the event.
+    :param item: The persisted :class:`ConversationItem` carrying
+        the canonical ``id`` / ``type`` / ``data`` fields.
+    """
+    if item.type == "message" and isinstance(item.data, MessageData) and item.data.is_meta:
+        return
+    event = SessionInputDeliveredEvent(
+        type="session.input.delivered",
+        data=SessionInputConsumedPayload(
+            item_id=item.id,
+            type=item.type,
+            data=item.data.model_dump() if item.data is not None else {},
+            created_by=item.created_by,
         ),
     )
     session_stream.publish(session_id, event.model_dump())
@@ -4641,6 +4676,15 @@ def _publish_status(
     # in-process flow performs a legitimate ``failed`` → ``idle``
     # transition (compaction failure publishes ``running`` → ``idle``, not
     # ``failed``), so this is a safe, harness-agnostic invariant.
+    if status in ("idle", "failed", "waiting"):
+        # No live turn is holding a buffered steered message any more —
+        # either it was consumed (its drain marker raced/was lost) or the
+        # turn that held it is gone. Clear the intermediate-state index so
+        # snapshots stop reporting those items as awaiting the harness.
+        # ``waiting`` is a turn-end edge too (only background work outlives
+        # it), and the web promotes pending bubbles on it — clearing here
+        # keeps cold-load snapshots consistent with that.
+        unconsumed_inputs.clear(session_id)
     if status == "idle" and _session_status_cache.get(session_id) == "failed":
         # Session stays ``failed`` (terminal); the turn is over, so drop any
         # tracked in-flight response id rather than leaving it for the
@@ -11048,6 +11092,7 @@ __all__ = [
     "_publish_external_output_text_delta",
     "_publish_external_tool_output_delta",
     "_publish_input_consumed",
+    "_publish_input_delivered",
     "_publish_input_deny_terminal",
     "_publish_interrupted",
     "_publish_mcp_startup",

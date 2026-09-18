@@ -45,6 +45,7 @@ from omnigent.runner.launch_failure import classify_native_turn_error
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runtime import (
     session_stream,
+    unconsumed_inputs,
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
@@ -2534,6 +2535,10 @@ def register_events_routes(
         # while the session exists (the extension only pushes on start), so a
         # deleted session would otherwise leak its entry for the process life.
         _pushed_model_options_cache.pop(session_id, None)
+        # Same for the delivered-but-unconsumed steered-message index: a
+        # deleted session's drain marker can never arrive, so a still-
+        # recorded entry would sit until its TTL.
+        unconsumed_inputs.clear(session_id)
         # Drop the deleted session's per-user read-state from every user's
         # caches so they don't accumulate orphan entries for the process
         # lifetime.
