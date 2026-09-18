@@ -11113,3 +11113,75 @@ async def test_forward_pane_signals_throttles_capture(tmp_path: Path) -> None:
 
     assert reads == 1
     assert dedupe.pane_next_read > 0.0
+
+
+def test_post_read_budget_grows_with_each_failed_attempt() -> None:
+    """A retry must not repeat the deadline that just expired.
+
+    Only the response phase grows: connect keeps the flat budget so an
+    unreachable server still fails fast, while a slow durable write gets more
+    room on each retry instead of being re-sent under the same doomed deadline.
+    """
+    budgets = [forwarder._post_timeout_for_attempt(n) for n in range(6)]
+    reads = [budget.read for budget in budgets]
+    assert reads == [10.0, 20.0, 40.0, 60.0, 60.0, 60.0]
+    assert reads[-1] == forwarder._POST_READ_TIMEOUT_CAP_S
+    for budget in budgets:
+        assert budget.connect == forwarder._POST_TIMEOUT_S
+
+
+def test_retry_tracker_reports_attempts_so_the_budget_can_escalate() -> None:
+    """The escalation is driven by the tracker's own attempt count."""
+    tracker = forwarder._PostRetryTracker(base_delay_s=0.0, max_delay_s=0.0)
+    key = "item:source-escalate"
+    assert tracker.attempts(key) == 0
+
+    reads: list[float | None] = []
+    for _ in range(3):
+        reads.append(forwarder._post_timeout_for_attempt(tracker.attempts(key)).read)
+        tracker.record_failure(key, httpx.ReadTimeout("read timed out"))
+
+    assert reads == [10.0, 20.0, 40.0]
+    tracker.clear(key)
+    assert tracker.attempts(key) == 0
+
+
+@pytest.mark.asyncio
+async def test_subagent_batch_post_applies_the_escalated_read_budget() -> None:
+    """The escalated budget reaches the wire for both batch and single posts."""
+    seen: list[float | None] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        seen.append(request.extensions["timeout"]["read"])
+        payload = json.loads(request.content.decode("utf-8"))
+        if isinstance(payload, list):
+            return httpx.Response(200, json=[{"item_id": "item_1"} for _ in payload])
+        return httpx.Response(202, json={})
+
+    item = forwarder._PendingSubagentItem(
+        item=ClaudeTranscriptItem(
+            source_id="source-budget",
+            item_type="function_call_output",
+            data={"call_id": "toolu_budget", "output": "ok"},
+            response_id="resp_budget",
+        ),
+    )
+    transport = httpx.MockTransport(_handle_request)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://test", timeout=httpx.Timeout(5.0)
+    ) as client:
+        await forwarder._post_external_conversation_items(
+            client,
+            session_id="conv_budget",
+            items=[item],
+            batch_capability=forwarder._SessionEventBatchCapability(),
+            timeout=forwarder._post_timeout_for_attempt(2),
+        )
+        await forwarder._post_external_conversation_item(
+            client,
+            session_id="conv_budget",
+            item=item.item,
+            timeout=forwarder._post_timeout_for_attempt(1),
+        )
+
+    assert seen == [40.0, 20.0]
