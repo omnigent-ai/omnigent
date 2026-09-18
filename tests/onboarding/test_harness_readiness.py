@@ -33,6 +33,30 @@ def _isolate_cli_credentials(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) ->
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     for var in ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
         monkeypatch.delenv(var, raising=False)
+    # SDK-harness readiness checks ambient credential sources (env API keys,
+    # Claude Code's login / managed settings, a Databricks workspace, GCP ADC).
+    # Isolate every one of them — a developer's or CI runner's real key,
+    # ~/.databrickscfg, or gcloud ADC would otherwise flip these verdicts.
+    for var in (
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "OPENROUTER_API_KEY",
+        "ANTIGRAVITY_API_KEY",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "DATABRICKS_HOST",
+        "DATABRICKS_CONFIG_FILE",
+    ):
+        monkeypatch.delenv(var, raising=False)
+        monkeypatch.delenv(f"OMNIGENT_{var}", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))  # ~/.databrickscfg, gcloud ADC, …
+    import omnigent.onboarding.ambient as _ambient
+    import omnigent.onboarding.databricks_config as _dbc
+
+    monkeypatch.setattr(_ambient, "_claude_login_detected", lambda: False)
+    monkeypatch.setattr(
+        _ambient, "CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (tmp_path / "managed-absent.json",)
+    )
+    monkeypatch.setattr(_dbc, "list_databricks_profiles", list)
     # Copilot also accepts a ``gh auth login`` session as a token, so a developer's
     # real gh login would otherwise flip their verdict here too.
     import omnigent.onboarding.copilot_auth as _ca
@@ -392,17 +416,19 @@ def test_configured_harness_map_covers_all_spellings(
 def test_configured_harness_map_gates_only_cli_harnesses(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """With no CLI installed, only CLI-wrapping spellings read False.
+    """With no CLI installed, spellings classify onto the right readiness axis.
 
-    SDK spellings (incl. the ``openai-agents-sdk`` workflow spelling and
-    the ``claude`` alias) stay True; the native + pi spellings flip to
-    False. A misclassified spelling would warn the wrong agents in the
-    picker — e.g. an SDK agent authenticating via a Databricks profile
-    flagged "needs setup" when it launches fine.
+    SDK spellings (incl. the ``openai-agents-sdk`` workflow spelling and the
+    ``claude`` alias) have no binary to miss — with no credential visible
+    either they read the credential axis (``needs-auth``), never a
+    binary-shaped ``False``. The native + pi spellings flip on the binary. A
+    misclassified spelling would warn the wrong agents in the picker.
     """
     _no_clis_installed(monkeypatch)
     result = configured_harness_map()
-    # SDK / alias spellings — never gated.
+    # SDK / alias spellings — no binary axis; with nothing configured they
+    # read the credential axis. (An SDK agent authenticating via a visible
+    # source — an env key, a Databricks profile — reads True; covered below.)
     for sdk in (
         "claude-sdk",
         "claude_sdk",
@@ -411,7 +437,7 @@ def test_configured_harness_map_gates_only_cli_harnesses(
         "openai-agents-sdk",
         "agents_sdk",
     ):
-        assert result[sdk] is True, f"{sdk} should never be gated"
+        assert result[sdk] == "needs-auth", f"{sdk} should read the credential axis"
     # CLI-wrapping spellings — gated, so False when the binary is absent.
     # (The SDK ``cursor`` harness is excluded: it runs via the ``cursor-sdk``
     # package and gates on a configured ``CURSOR_API_KEY``, not a binary —
@@ -507,8 +533,12 @@ def test_configured_harness_map_all_true_with_clis(
     # The generic ACP harness is config-gated (≥1 registered agent), not
     # CLI-gated — satisfy it so it isn't the lone unconfigured entry here.
     monkeypatch.setattr("omnigent.onboarding.acp_auth.acp_agents", lambda config=None: [object()])
+    # antigravity (SDK) needs a visible Gemini credential (not the openai
+    # family the other SDK harnesses share).
+    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
     result = configured_harness_map()
-    assert all(result.values())
+    not_ready = {k: v for k, v in result.items() if v is not True}
+    assert not not_ready, f"expected every spelling ready, got {not_ready}"
 
 
 def test_configured_harness_map_probes_codex_readiness_once(
@@ -725,3 +755,149 @@ def test_claude_needs_auth_without_gateway_provider_or_login(
     monkeypatch.setattr(ambient, "CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (tmp_path / "absent.json",))
 
     assert configured_harness_map()["claude-native"] == "needs-auth"
+
+
+def test_sdk_harness_needs_auth_with_no_visible_credential(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A credential-less host reports the SDK harnesses as ``needs-auth``.
+
+    The headline picker bug: the in-process SDK harnesses were hardcoded
+    ready, so a host with no resolvable credential offered them with no
+    warning and the launch died at the first turn. The map now reads the
+    credential axis — while the launch gate stays ungated (the warning
+    informs, it never blocks).
+    """
+    _no_clis_installed(monkeypatch)
+    result = configured_harness_map()
+    for sdk in (
+        "claude-sdk",
+        "claude_sdk",
+        "claude",
+        "openai-agents",
+        "openai-agents-sdk",
+        "agents_sdk",
+        "antigravity",
+    ):
+        assert result[sdk] == "needs-auth", f"{sdk} should read needs-auth"
+        assert harness_is_configured(sdk) is True, f"{sdk} launch gate must stay ungated"
+
+
+def test_sdk_harness_ready_via_configured_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A configured family provider entry alone makes the SDK harnesses ready."""
+    _no_clis_installed(monkeypatch)
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_readiness._family_provider_configured", lambda _h: True
+    )
+    result = configured_harness_map()
+    assert result["claude-sdk"] is True
+    assert result["openai-agents"] is True
+    assert result["openai-agents-sdk"] is True
+
+
+def test_sdk_harness_ready_via_family_env_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An ambient family API key readies only that family's SDK harnesses."""
+    _no_clis_installed(monkeypatch)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-anthropic-key")
+    result = configured_harness_map()
+    assert result["claude-sdk"] is True
+    assert result["openai-agents"] == "needs-auth"
+
+    monkeypatch.delenv("ANTHROPIC_API_KEY")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-openai-key")
+    result = configured_harness_map()
+    assert result["claude-sdk"] == "needs-auth"
+    assert result["openai-agents"] is True
+    assert result["openai-agents-sdk"] is True
+
+
+def test_claude_sdk_ready_via_claude_code_login(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Claude Code's own login serves claude-sdk (the SDK drives that CLI)."""
+    import omnigent.onboarding.ambient as ambient
+
+    _no_clis_installed(monkeypatch)
+    monkeypatch.setattr(ambient, "_claude_login_detected", lambda: True)
+    result = configured_harness_map()
+    assert result["claude-sdk"] is True
+    assert result["openai-agents"] == "needs-auth"
+
+
+def test_claude_sdk_ready_via_managed_gateway(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Claude Code's managed-settings gateway alone makes claude-sdk ready."""
+    import json
+
+    from omnigent.onboarding import ambient
+
+    _no_clis_installed(monkeypatch)
+    settings = tmp_path / "managed-settings.json"
+    settings.write_text(
+        json.dumps(
+            {
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://dbc.cloud.databricks.com/ai-gateway/anthropic"
+                },
+                "apiKeyHelper": "print-token",
+            }
+        )
+    )
+    monkeypatch.setattr(ambient, "CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (settings,))
+    assert configured_harness_map()["claude-sdk"] is True
+
+
+def test_sdk_harness_ready_via_databricks_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An ambient Databricks workspace counts as an SDK credential source.
+
+    The SDK executors mint a gateway bearer from ``~/.databrickscfg`` / the
+    Databricks env for ``databricks-*`` models even with no provider entry, so
+    a host configured only that way must not read ``needs-auth``.
+    """
+    import omnigent.onboarding.databricks_config as dbc
+
+    _no_clis_installed(monkeypatch)
+    monkeypatch.setattr(dbc, "list_databricks_profiles", lambda: ["DEFAULT"])
+    result = configured_harness_map()
+    assert result["claude-sdk"] is True
+    assert result["openai-agents"] is True
+
+    monkeypatch.setattr(dbc, "list_databricks_profiles", list)
+    monkeypatch.setenv("DATABRICKS_HOST", "https://example.cloud.databricks.com")
+    result = configured_harness_map()
+    assert result["claude-sdk"] is True
+    assert result["openai-agents"] is True
+
+
+def test_antigravity_sdk_readiness_keys_off_gemini_credential(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """antigravity (SDK) is ready only via a Gemini-native credential.
+
+    Its spawn env resolves a stored ``antigravity:`` key, an ambient
+    ``GEMINI_API_KEY`` / ``ANTIGRAVITY_API_KEY``, or Vertex AI (ADC) — never
+    the openai family the other SDK harnesses consume — so an openai key or
+    provider entry must not flip it.
+    """
+    _no_clis_installed(monkeypatch)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-openai-key")
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_readiness._family_provider_configured", lambda _h: True
+    )
+    assert configured_harness_map()["antigravity"] == "needs-auth"
+
+    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
+    assert configured_harness_map()["antigravity"] is True
+
+    monkeypatch.delenv("GEMINI_API_KEY")
+    adc = tmp_path / "adc.json"
+    adc.write_text("{}")
+    monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", str(adc))
+    assert configured_harness_map()["antigravity"] is True

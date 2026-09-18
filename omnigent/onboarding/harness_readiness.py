@@ -11,15 +11,17 @@ is on ``PATH``. That gates the native CLI harnesses (Claude Code / Codex
 via ``claude`` / ``codex``) and ``pi`` — the common "I picked Claude Code
 but never ran ``omnigent setup`` to install it" case.
 
-In-process SDK harnesses (``claude-sdk``, ``openai-agents``) run without
-any CLI and resolve their model credentials at runtime from sources the
-daemon cannot enumerate — environment API keys, a Databricks profile /
-gateway, or the spec's ``executor.auth`` with ``${ENV}`` expansion. The
-daemon has no way to know whether those will resolve, so it never gates
-them (a genuine auth failure surfaces at the first turn via the
-executor's own error). Unknown harnesses fail open for the same reason.
-This keeps the check free of false negatives that would block a launch
-that would actually work.
+In-process SDK harnesses (``claude-sdk``, ``openai-agents``,
+``antigravity``) run without any CLI and resolve their model credentials
+at runtime. The **launch gate** still never blocks them: the spec's
+``executor.auth`` (with ``${ENV}`` expansion) is invisible here, so a
+hard gate would break launches that actually work. The **picker map**,
+however, checks the credential sources the daemon *can* see locally —
+configured provider entries, ambient env API keys, Claude Code's own
+login / managed settings, an ambient Databricks workspace — and reports
+``"needs-auth"`` when none is visible, so a credential-less host warns
+before the first turn dies instead of after. Unknown harnesses fail
+open on both axes.
 """
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ from __future__ import annotations
 import logging
 import os
 from collections.abc import Callable
+from pathlib import Path
 
 import omnigent.onboarding.gemini_auth as _gemini_auth
 import omnigent.onboarding.kimi_auth as _kimi_auth
@@ -35,6 +38,7 @@ from omnigent.harness_aliases import HARNESS_ALIASES, canonicalize_harness
 from omnigent.harness_availability import (
     CODEX_CANONICAL_HARNESSES,
     HARNESS_BINARY_MISSING,
+    HARNESS_NEEDS_AUTH,
     HARNESS_VERSION_TOO_LOW,
     HarnessAvailability,
 )
@@ -67,8 +71,10 @@ from omnigent.onboarding.provider_config import (
     load_config,
 )
 
-# In-process SDK harnesses: no CLI binary, credentials resolved at runtime
-# from ambient/spec sources the daemon can't see. Never gated. Includes both
+# In-process SDK harnesses: no CLI binary to gate on. The launch gate never
+# blocks them (spec-level auth is invisible here), but the picker map reports
+# ``needs-auth`` when no locally visible credential source could serve them
+# (see :func:`_sdk_harness_availability`). Includes both
 # the canonical ``openai-agents`` and the ``openai-agents-sdk`` spelling the
 # workflow's ``AgentHarnessType`` uses; executor-type spellings (``claude_sdk``
 # / ``agents_sdk``) and the ``claude`` alias normalize onto these first.
@@ -228,6 +234,9 @@ def _harness_availability_core(harness: str) -> HarnessAvailability:
         except Exception:
             return False
     if canonical in _SDK_HARNESSES:
+        # Launch gate only: never block an SDK launch (spec-level auth is
+        # invisible here). The picker map's credential check lives in
+        # :func:`_sdk_harness_availability`.
         return True
     if canonical in _CURSOR_NATIVE_HARNESSES:
         # Native Cursor (``omni cursor``) wraps the ``cursor-agent`` CLI — gate
@@ -398,6 +407,151 @@ def _claude_managed_gateway_configured() -> bool:
         return False
 
 
+def _ambient_family_env_key_configured(family: str) -> bool:
+    """Whether an ambient env API key serving *family* is set.
+
+    Checks the same vendor env vars ambient detection adopts
+    (:data:`~omnigent.onboarding.ambient._ENV_KEY_FAMILY` over
+    :data:`~omnigent.onboarding.providers.PROVIDER_ENV_VARS`), including their
+    ``OMNIGENT_``-prefixed variants — e.g. ``ANTHROPIC_API_KEY`` for the
+    ``anthropic`` family, ``OPENAI_API_KEY`` / ``OPENROUTER_API_KEY`` for
+    ``openai``. The daemon spawns runners with its own environment, so a key
+    visible here is a key the harness will inherit.
+
+    :param family: A model family, e.g. ``"anthropic"`` or ``"openai"``.
+    :returns: ``True`` when any such variable is set and non-empty.
+    """
+    from omnigent.onboarding.ambient import _ENV_KEY_FAMILY
+    from omnigent.onboarding.providers import PROVIDER_ENV_VARS
+    from omnigent.util.env_credentials import getenv_nonempty_with_omnigent_prefix
+
+    for provider, env_var in PROVIDER_ENV_VARS.items():
+        if _ENV_KEY_FAMILY.get(provider) != family:
+            continue
+        if getenv_nonempty_with_omnigent_prefix(env_var) is not None:
+            return True
+    return False
+
+
+def _claude_code_login_configured() -> bool:
+    """Whether Claude Code's own subscription login is present on this machine.
+
+    The claude-sdk harness drives Claude Code, so the CLI's login is a
+    complete credential for it even with nothing in omnigent's config. Local
+    and never raises: any detection error reads as "no login".
+
+    :returns: ``True`` when a usable Claude Code login is detected.
+    """
+    try:
+        from omnigent.onboarding import ambient
+
+        return ambient._claude_login_detected()
+    except Exception:
+        _logger.debug("readiness: claude login check failed", exc_info=True)
+        return False
+
+
+def _databricks_workspace_configured() -> bool:
+    """Whether an ambient Databricks workspace is resolvable on this machine.
+
+    The SDK executors mint a gateway bearer from ambient Databricks
+    credentials (``DATABRICKS_HOST`` env, a ``~/.databrickscfg`` profile) for
+    ``databricks-*`` models even with no ``providers:`` entry, so a resolvable
+    workspace counts as a credential source. Local file/env reads only; never
+    raises.
+
+    :returns: ``True`` when a workspace host is ambiently resolvable.
+    """
+    if os.environ.get("DATABRICKS_HOST", "").strip():
+        return True
+    config_override = os.environ.get("DATABRICKS_CONFIG_FILE", "").strip()
+    if config_override and os.path.exists(config_override):
+        return True
+    try:
+        from omnigent.onboarding.databricks_config import list_databricks_profiles
+
+        return bool(list_databricks_profiles())
+    except Exception:
+        _logger.debug("readiness: databricks profile check failed", exc_info=True)
+        return False
+
+
+def _google_adc_configured() -> bool:
+    """Whether GCP Application Default Credentials are visible.
+
+    Antigravity's Vertex AI path authenticates via ADC; whether a spec opts
+    into Vertex is invisible here, so a present ADC file only ever moves the
+    signal toward ready (a false "ready" is the pre-warning status quo).
+
+    :returns: ``True`` when an ADC credential file is present.
+    """
+    try:
+        cred_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+        if cred_path and os.path.exists(cred_path):
+            return True
+        adc = Path.home() / ".config" / "gcloud" / "application_default_credentials.json"
+        return adc.exists()
+    except Exception:
+        _logger.debug("readiness: ADC check failed", exc_info=True)
+        return False
+
+
+def _antigravity_credential_configured() -> bool:
+    """Whether a credential the antigravity SDK harness can use is visible.
+
+    Mirrors the spawn-env resolution (``_build_antigravity_spawn_env``):
+    Antigravity is Gemini-native — a stored ``antigravity:`` config-block key,
+    an ambient ``GEMINI_API_KEY`` / ``ANTIGRAVITY_API_KEY``, or Vertex AI via
+    ADC. The ``openai``/``anthropic`` provider families are deliberately not
+    consulted (the spawn env never adopts them for this harness).
+
+    :returns: ``True`` when any such source is visible.
+    """
+    try:
+        from omnigent.onboarding.antigravity_auth import (
+            ANTIGRAVITY_ENV_VARS,
+            antigravity_api_key_configured,
+        )
+
+        if antigravity_api_key_configured():
+            return True
+        if any(os.environ.get(var) for var in ANTIGRAVITY_ENV_VARS):
+            return True
+    except Exception:
+        _logger.debug("readiness: antigravity credential check failed", exc_info=True)
+    return _google_adc_configured()
+
+
+def _sdk_harness_availability(canonical: str) -> HarnessAvailability:
+    """Picker-facing readiness for an in-process SDK harness.
+
+    ``True`` when any locally visible credential source could serve the
+    harness at run time, else ``"needs-auth"``. The check errs toward ready:
+    spec-level ``executor.auth`` and other runtime-only sources are invisible
+    here, so only a host where *nothing* local could authenticate reads
+    ``"needs-auth"`` — and that signal warns in the picker, it never blocks
+    the launch (:func:`harness_is_configured` stays ungated for SDK
+    harnesses).
+
+    :param canonical: A canonical SDK harness id from :data:`_SDK_HARNESSES`.
+    :returns: ``True`` or ``"needs-auth"``.
+    """
+    if canonical == "antigravity":
+        return True if _antigravity_credential_configured() else HARNESS_NEEDS_AUTH
+    if _family_provider_configured(canonical):
+        return True
+    family = _HARNESS_FAMILY.get(canonical)
+    if family is not None and _ambient_family_env_key_configured(family):
+        return True
+    if family == ANTHROPIC_FAMILY and (
+        _claude_managed_gateway_configured() or _claude_code_login_configured()
+    ):
+        return True
+    if _databricks_workspace_configured():
+        return True
+    return HARNESS_NEEDS_AUTH
+
+
 def _installer_only_availability(install_key: str) -> HarnessAvailability:
     """Return availability for a binary-gated harness without login commands.
 
@@ -506,6 +660,8 @@ def _harness_availability(canonical: str) -> HarnessAvailability:
         except Exception:
             pass
         return "needs-auth"
+    if canonical in _SDK_HARNESSES:
+        return _sdk_harness_availability(canonical)
     return _harness_availability_core(canonical)
 
 
@@ -516,9 +672,11 @@ def harness_is_configured(harness: str) -> bool:
     ``pi`` / ``pi-native``): they cannot run without their binary on
     ``PATH``, and that is the one thing the daemon can check reliably and
     locally. SDK harnesses and unknown harnesses always return ``True`` —
-    their readiness depends on runtime/ambient credentials the daemon
-    can't enumerate, so blocking them would risk false negatives that
-    break working launches.
+    spec-level credentials are invisible here, so blocking them would risk
+    false negatives that break working launches. (The picker map separately
+    reports ``"needs-auth"`` for an SDK harness with no locally visible
+    credential — see :func:`_sdk_harness_availability` — but that signal
+    warns, it never gates a launch.)
 
     The check is binary-only: an installed-but-not-logged-in CLI still
     returns ``True`` because auth failures surface at run time rather than
@@ -546,14 +704,16 @@ def configured_harness_map() -> dict[str, HarnessAvailability]:
 
     Built so the server/web UI can do a plain dict lookup with whatever
     spelling it holds — canonical ids, executor-type spellings, the
-    ``claude`` alias, and ``pi``. SDK and unknown harnesses map to
-    ``True`` (never gated); CLI-wrapping harnesses map to whether their
-    binary is on ``PATH``. Codex entries use a structured string reason when
-    unavailable: ``"binary-missing"`` or ``"needs-auth"``.
+    ``claude`` alias, and ``pi``. Unknown harnesses map to ``True`` (never
+    gated); CLI-wrapping harnesses map to whether their binary is on
+    ``PATH``; SDK harnesses map to ``True`` when a locally visible credential
+    source could serve them, else ``"needs-auth"``. Codex entries use a
+    structured string reason when unavailable: ``"binary-missing"`` or
+    ``"needs-auth"``.
 
     :returns: Mapping of harness spelling to readiness, e.g.
         ``{"claude-native": False, "codex-native": "needs-auth",
-        "claude-sdk": True, "openai-agents": True, "pi": True, "qwen": True}``.
+        "claude-sdk": "needs-auth", "pi": True, "qwen": True}``.
     """
     spellings: set[str] = set(_HARNESS_FAMILY)
     spellings.update(valid_harnesses())
