@@ -385,6 +385,7 @@ async def _recover_retry_session(
                 session_id,
                 conv,
                 persist_resource_event=False,
+                runner_router=runner_router,
             )
             if terminal_outcome.error is not None:
                 raise OmnigentError(
