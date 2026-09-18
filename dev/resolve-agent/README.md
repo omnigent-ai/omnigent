@@ -10,12 +10,12 @@ test), then does one of two things:
   PR, runs the repro test against it, and reviews the full diff for quality and
   scope — instead of writing a competing fix. One concrete failure or requested
   outcome may require changes across layers; independent fixes or features must
-  be removed or split out. Resolve requests a structured scope assessment from
-  Polly with `resolve_scope=true` and validates it before approval or handoff.
+  be removed or split out. Every Polly review includes a structured scope
+  assessment, which Resolve validates before approval or handoff.
   Scope findings appear under Polly's blocking issues; the review workflow still
   succeeds, and Resolve enforces the approval decision.
-  This applies only to Resolve's existing-PR review path; ordinary Polly reviews
-  and repository merge requirements are unchanged.
+  Resolve's validation applies to its existing-PR review path. Repository merge
+  requirements are unchanged.
 - **If no fix exists yet**, it **authors the fix** in a fresh worktree, adds
   targeted tests at the layer it changed, proves the set goes fail→pass, opens a
   ready-for-review PR, and then **drives that PR to a landable state** — a live

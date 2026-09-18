@@ -1,4 +1,4 @@
-"""Prepare and validate the scope review requested by Resolve for an existing PR."""
+"""Prepare Polly's PR scope assessment and validate it for Resolve approval."""
 
 from __future__ import annotations
 

@@ -180,7 +180,11 @@ def test_failure_diagnostics_preserves_logs_without_gateway_secrets(
 def test_review_diagnostics_retain_raw_stdout(tmp_path: Path, failure_step: str | None) -> None:
     workflow = yaml.safe_load(_WORKFLOW.read_text())
     steps = {step["name"]: step for step in workflow["jobs"]["review"]["steps"]}
-    review = _REVIEW + ("test-api-secret\n" if failure_step == "secret-scan" else "")
+    review = (
+        _REVIEW
+        + '<!-- POLLY_SCOPE_START -->\n{"version": 1}\n<!-- POLLY_SCOPE_END -->\n'
+        + ("test-api-secret\n" if failure_step == "secret-scan" else "")
+    )
     raw = f"Starting review: test-api-secret at https://gateway.test\n{_MARKER}\n{review}"
     (tmp_path / "stdout.txt").write_text(raw)
     (tmp_path / "review_prompt.txt").write_text("Synthetic review; no model calls.")
@@ -209,6 +213,10 @@ def test_review_diagnostics_retain_raw_stdout(tmp_path: Path, failure_step: str 
 
     def run_step(name: str) -> subprocess.CompletedProcess[str]:
         script = steps[name]["run"].replace("/tmp/", str(tmp_path) + "/")
+        script = script.replace(
+            "dev/resolve-agent/scope_review.py",
+            str(_WORKFLOW.parents[2] / "dev/resolve-agent/scope_review.py"),
+        )
         script = script.replace(
             "pathlib.Path.home() / '.omnigent' / 'logs'",
             f"pathlib.Path({str(tmp_path / 'logs')!r})",
@@ -240,7 +248,8 @@ def test_review_diagnostics_retain_raw_stdout(tmp_path: Path, failure_step: str 
         assert result.returncode == (42 if failure_step else 0)
         if failure_step:
             assert "Forced posting failure" in result.stderr
-        assert review in (tmp_path / "comment.md").read_text()
+        assert _REVIEW in (tmp_path / "comment.md").read_text()
+        assert "<summary>Scope assessment data</summary>" in (tmp_path / "comment.md").read_text()
         assert "Starting review" not in (tmp_path / "comment.md").read_text()
     result = run_step("Prepare Polly diagnostics")
     assert result.returncode == 0, result.stdout + result.stderr

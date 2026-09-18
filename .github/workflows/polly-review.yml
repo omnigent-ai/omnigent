@@ -15,7 +15,7 @@ name: Polly AI Review
 #
 # A head SHA is reviewed at most once: a trigger that lands on an
 # already-reviewed commit posts a short "skipped" note instead of a second
-# review. `/review force` overrides that.
+# review. `/review force` and manual dispatches request a fresh review.
 
 on:
   pull_request:
@@ -28,11 +28,6 @@ on:
         description: PR number to review.
         required: true
         type: string
-      resolve_scope:
-        description: Assess PR scope for Resolve's existing-PR review path.
-        required: false
-        type: boolean
-        default: false
 
 permissions:
   contents: read
@@ -128,7 +123,7 @@ jobs:
       # A commit needs reviewing once. Several triggers can fire for the same
       # head SHA (open then `/review`, or `/review` then maintainer approval),
       # which used to post two reviews of identical code. Skip the repeat and
-      # say so in one comment; `/review force` re-reviews anyway.
+      # say so in one comment; `/review force` and manual dispatches re-review.
       - name: Skip if this commit already has a review
         id: dupe
         env:
@@ -136,12 +131,12 @@ jobs:
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number || inputs.pr }}
           COMMENT_BODY: ${{ github.event.comment.body }}
-          RESOLVE_SCOPE: ${{ github.event_name == 'workflow_dispatch' && inputs.resolve_scope }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
 
-          # Resolve needs a fresh assessment, including changed issue context.
-          if [ "$RESOLVE_SCOPE" = true ]; then
+          # Explicit dispatches refresh the review, including changed issue context.
+          if [ "$EVENT_NAME" = workflow_dispatch ]; then
             exit 0
           fi
 
@@ -345,7 +340,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
-          RESOLVE_SCOPE: ${{ github.event_name == 'workflow_dispatch' && inputs.resolve_scope }}
         run: |
           set -euo pipefail
 
@@ -361,12 +355,10 @@ jobs:
           chmod 444 /tmp/pr_diff.txt
           echo "head_sha=${head_sha}" >> "$GITHUB_OUTPUT"
 
-          if [ "$RESOLVE_SCOPE" = true ]; then
-            python3 dev/resolve-agent/scope_review.py prepare \
-              --repo "$REPO" --pr "$PR_NUMBER" \
-              --head-sha "$head_sha" --base-sha "$base_sha" \
-              > /tmp/resolve_scope_prompt.txt
-          fi
+          python3 dev/resolve-agent/scope_review.py prepare \
+            --repo "$REPO" --pr "$PR_NUMBER" \
+            --head-sha "$head_sha" --base-sha "$base_sha" \
+            > /tmp/resolve_scope_prompt.txt
 
           # Extract lockfile pin changes from the diff.
           grep -E '^[+-]name = |^[+-]version = ' /tmp/pr_diff.txt \
@@ -381,7 +373,7 @@ jobs:
 
           # Reviewers read the shared snapshot; Polly passes only its path and identity.
           python3 -u <<'PYEOF'
-          import hashlib, json, os, pathlib, re
+          import hashlib, json, pathlib, re
 
           meta = json.loads(pathlib.Path("/tmp/pr_meta.json").read_text())
           diff_sha256 = hashlib.sha256(pathlib.Path("/tmp/pr_diff.txt").read_bytes()).hexdigest()
@@ -431,7 +423,7 @@ jobs:
           # sections. Build the numbered list so the numbering stays contiguous
           # regardless of whether the visual item is present.
           standard_items = [
-              "**Blocking issues** — correctness bugs, broken contracts, missing error handling on failure paths, data loss risks.",
+              "**Blocking issues** — unrelated changes or unclear scope, correctness bugs, broken contracts, missing error handling on failure paths, data loss risks.",
               "**Security vulnerabilities** — injection (SQL, command, template), authentication/authorization bypasses, secret exposure, unsafe deserialization, path traversal, SSRF, and any change that weakens an existing security boundary. Flag even subtle issues.",
               "**Non-blocking notes** — design concerns or edge cases worth flagging (brief).",
               "**Approach** — is there a materially simpler or more consistent way to reach the PR's stated goal, given existing patterns in the repo (config surfaces, variables, helpers, conventions)? Name the concrete alternative briefly, or say the approach is sound. Never blocking.",
@@ -503,7 +495,7 @@ jobs:
           - Do not assume the reader has prior knowledge. Explain and provide context when needed.
           - Format multiple sub-points as a list.
 
-          Before labeling anything **blocking**, double-check: does this issue actually exist in the diff? Verify the problem is real and present in the changed code — not inferred, speculative, or already handled elsewhere. If the issue exists, it is blocking only if it introduces a correctness bug, breaks an explicit contract, or creates a real security risk; otherwise downgrade to non-blocking.
+          Before labeling anything **blocking**, double-check: does this issue actually exist in the diff? Verify the problem is real and present in the changed code — not inferred, speculative, or already handled elsewhere. If the issue exists, it is blocking only if it introduces a correctness bug, breaks an explicit contract, creates a real security risk, or includes unrelated changes or unresolved scope uncertainty; otherwise downgrade to non-blocking.
 
           **Lockfile pins** — review the "Changed lockfile pins" section above and flag
           as a **blocking security issue** any of:
@@ -524,8 +516,7 @@ jobs:
           on its own line, then the review content. Nothing before the marker
           will be shown.
           """
-          if os.environ.get("RESOLVE_SCOPE") == "true":
-              prompt += pathlib.Path("/tmp/resolve_scope_prompt.txt").read_text()
+          prompt += pathlib.Path("/tmp/resolve_scope_prompt.txt").read_text()
           pathlib.Path("/tmp/review_prompt.txt").write_text(prompt)
           PYEOF
 
@@ -650,7 +641,6 @@ jobs:
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
           REVIEW_TEXT: ${{ steps.polly.outputs.review_text }}
-          RESOLVE_SCOPE: ${{ github.event_name == 'workflow_dispatch' && inputs.resolve_scope }}
           HEAD_SHA: ${{ steps.ctx.outputs.head_sha }}
           RUN_URL: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
         run: |
@@ -658,10 +648,8 @@ jobs:
 
           # Build the comment body safely — REVIEW_TEXT is passed via env
           # (not expression interpolation) to avoid expression injection.
-          if [ "${RESOLVE_SCOPE:-false}" = true ]; then
-            REVIEW_TEXT="$(printf '%s\n' "$REVIEW_TEXT" | \
-              python3 dev/resolve-agent/scope_review.py render --review /dev/stdin)"
-          fi
+          REVIEW_TEXT="$(printf '%s\n' "$REVIEW_TEXT" | \
+            python3 dev/resolve-agent/scope_review.py render --review /dev/stdin)"
           {
             echo "<!-- polly-review-bot -->"
             echo "<!-- polly-reviewed-sha: ${HEAD_SHA} -->"

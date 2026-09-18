@@ -255,10 +255,9 @@ def test_render_collapses_data_without_changing_verdict(
     assert scope.verdict(scope.assessment(rendered), snapshot) == scope.verdict(report, snapshot)
 
 
-@pytest.mark.parametrize("enabled", [True, False])
 @pytest.mark.parametrize("classification", ["necessary", "unrelated", "uncertain"])
-def test_comment_step_formats_scope_only_when_requested(
-    tmp_path: Path, report: dict, enabled: bool, classification: str
+def test_comment_step_formats_scope_without_failing_on_findings(
+    tmp_path: Path, report: dict, classification: str
 ) -> None:
     report["files"][0]["changes"][0]["classification"] = classification
     workflow = yaml.safe_load((ROOT / ".github/workflows/polly-review.yml").read_text())
@@ -279,7 +278,6 @@ def test_comment_step_formats_scope_only_when_requested(
             **os.environ,
             "PATH": f"{tmp_path}{os.pathsep}{os.environ['PATH']}",
             "REVIEW_TEXT": raw,
-            "RESOLVE_SCOPE": str(enabled).lower(),
             "HEAD_SHA": "a" * 40,
             "REPO": "example/project",
             "PR_NUMBER": "7",
@@ -290,9 +288,9 @@ def test_comment_step_formats_scope_only_when_requested(
         timeout=10,
     )
     posted = comment.read_text()
-    assert ("<details>" in posted) is enabled
+    assert "<details>" in posted
     assert scope.assessment(posted) == report
-    assert (scope.render_review(raw) if enabled else raw) in posted
+    assert scope.render_review(raw) in posted
 
 
 @pytest.mark.parametrize("case", ["necessary", "unrelated", "missing", "changed"])
@@ -358,13 +356,13 @@ def test_prepare_rejects_partial_diff(
     assert context_path.exists() is complete
 
 
-@pytest.mark.parametrize("enabled", [True, False])
-def test_scope_review_is_opt_in_and_bypasses_old_review_deduplication(
-    tmp_path: Path, enabled: bool
+@pytest.mark.parametrize("event", ["workflow_dispatch", "pull_request", "issue_comment"])
+def test_manual_dispatch_refreshes_scope_while_automatic_reviews_deduplicate(
+    tmp_path: Path, event: str
 ) -> None:
     workflow = yaml.safe_load((ROOT / ".github/workflows/polly-review.yml").read_text())
     inputs = workflow[True]["workflow_dispatch"]["inputs"]
-    assert inputs["resolve_scope"]["default"] is False
+    assert set(inputs) == {"pr"}
     steps = workflow["jobs"]["review"]["steps"]
     assert all("scope_review.py check" not in step.get("run", "") for step in steps)
     dupe = next(step for step in steps if step.get("id") == "dupe")
@@ -389,14 +387,44 @@ esac
             "PR_NUMBER": "7",
             "COMMENT_BODY": "",
             "GITHUB_OUTPUT": str(output),
-            "RESOLVE_SCOPE": str(enabled).lower(),
+            "EVENT_NAME": event,
         },
         check=True,
         capture_output=True,
         text=True,
         timeout=10,
     )
-    if enabled:
+    if event == "workflow_dispatch":
         assert not output.exists()
     else:
         assert "duplicate=true" in output.read_text()
+
+
+def test_review_prompt_always_includes_scope(tmp_path: Path) -> None:
+    workflow = yaml.safe_load((ROOT / ".github/workflows/polly-review.yml").read_text())
+    step = next(s for s in workflow["jobs"]["review"]["steps"] if s.get("id") == "ctx")
+    script = step["run"].split("python3 -u <<'PYEOF'\n")[1].rsplit("\nPYEOF", 1)[0]
+    script = script.replace("/tmp/", str(tmp_path) + "/")
+    (tmp_path / "pr_meta.json").write_text(
+        json.dumps(
+            {
+                "title": "Fix repair instructions",
+                "body": "Explain the exit code",
+                "baseRefName": "main",
+                "headRefName": "fix",
+                "baseRefOid": "a" * 40,
+                "headRefOid": "b" * 40,
+                "additions": 2,
+                "deletions": 1,
+                "changedFiles": 1,
+            }
+        )
+    )
+    (tmp_path / "pr_diff.txt").write_text("diff --git a/file.py b/file.py\n")
+    (tmp_path / "lockfile_pins.txt").write_text("")
+    (tmp_path / "pr_author_assoc.txt").write_text("MEMBER")
+    (tmp_path / "resolve_scope_prompt.txt").write_text("\nRequired scope assessment.\n")
+    subprocess.run([sys.executable, "-c", script], check=True, timeout=10)
+    prompt = (tmp_path / "review_prompt.txt").read_text()
+    assert prompt.endswith("\nRequired scope assessment.\n")
+    assert "**Blocking issues** — unrelated changes or unclear scope" in prompt

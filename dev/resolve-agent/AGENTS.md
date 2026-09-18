@@ -1125,16 +1125,14 @@ PR whose automatic run skipped:
 gh workflow run polly-review.yml -R omnigent-ai/omnigent -f pr=<pr>
 ```
 
-**Existing-PR review path only (Step 2A):** add `-f resolve_scope=true` to this
-dispatch and every retry. This requests a fresh Polly assessment of the full
-diff against the original problem, with a scope statement and classifications
-for each changed file. Polly reports unrelated or uncertain changes under
-**Blocking issues**; those findings do not fail the review workflow. Resolve
-must run the read-only check in Step 4.5: missing, malformed, stale, unrelated,
-or uncertain assessments block approval or handoff. A green workflow is not a
-passing scope assessment. A normal Polly review without a structured scope
-assessment does not satisfy this review-path requirement. The author path uses
-the normal dispatch above.
+Every Polly review assesses the full diff against the original problem, with
+a scope statement and classifications for each changed file. Manual dispatches
+request a fresh assessment even when the head is unchanged. Polly reports
+unrelated or uncertain changes under **Blocking issues**; those findings do not
+fail the review workflow. Resolve
+must run the read-only check in Step 4.5 on the existing-PR review path:
+missing, malformed, stale, unrelated, or uncertain assessments block approval
+or handoff. A green workflow is not a passing scope assessment.
 
 Your App token carries `actions: write`, so this dispatch is expected to succeed;
 a `403` means the App lost that permission — record `polly_review` as "could not
@@ -1242,7 +1240,7 @@ lives in the PR body and the maintainer comment.
 ### 4.5 — Submit the final review verdict, then tag the maintainer
 
 On the existing-PR review path, recheck the scope assessment from the successful
-scope-enabled Polly run before approving or handing off. Save that run's review
+Polly run before approving or handing off. Save that run's review
 comment to `.omnigent/resolve-scope-review.txt` and run:
 
 ```bash
@@ -1251,7 +1249,7 @@ python3 dev/resolve-agent/scope_review.py check --repo <owner/repo> --pr <pr> \
 ```
 
 This read-only check must exit zero against the current head and issue context.
-If stale, rerun Polly with `resolve_scope=true`. If unrelated or uncertain
+If stale, dispatch a fresh Polly review. If unrelated or uncertain
 changes remain, report `partially_fixed` / `not_fixed` with the scope findings
 and request changes instead of marking the PR ready. Do not rewrite Polly's
 assessment to make this check pass.
