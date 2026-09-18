@@ -157,9 +157,10 @@ artifacts are created. The composer refreshes choices and retains the draft;
 it requires the user to submit again.
 
 Creation saves the actual harness identity, target/revision, provider settings,
-model policy, credential references, and workspace identity in the existing
-session-overrides blob. Server-only discovery settings are also saved there.
-No database migration is needed. Children inherit the full configuration and
+model policy, credential references, and workspace identity in a dedicated
+text column on Omnigent's conversation metadata. Server-only discovery settings
+are also saved there. An additive database migration creates the nullable column;
+the compact AP-owned session-overrides field is unchanged. Children inherit the full configuration and
 resolve their own harness binding; forks retain it even when resetting model
 settings. Configured sessions cannot switch agents or fork into another harness
 or another owner's credential scope; create a new session for those changes.

@@ -96,7 +96,7 @@ def _write_session_config(
     base_url: str,
     model: str,
     provider_id: str = _JCODE_PROVIDER_ID,
-    api_key_env: str = _JCODE_BEARER_ENV,
+    credential_env_var: str = _JCODE_BEARER_ENV,
     models: tuple[str, ...] = (),
 ) -> None:
     """Write the session-private ``config.toml`` pinning jcode's ``dbx`` provider.
@@ -119,7 +119,7 @@ def _write_session_config(
         f"type = {q('openai-compatible')}\n"
         f"base_url = {q(base_url)}\n"
         f"auth = {q('bearer')}\n"
-        f"api_key_env = {q(api_key_env)}\n"
+        f"api_key_env = {q(credential_env_var)}\n"
         f"default_model = {q(model)}\n"
         "requires_api_key = true\n\n"
     )
@@ -152,7 +152,7 @@ def configured_jcode_gateway_env(
         base_url=base_url,
         model=model,
         provider_id="omnigent",
-        api_key_env=key_env,
+        credential_env_var=key_env,
         models=models,
     )
     return {key_env: api_key, _JCODE_HOME_ENV: str(home), _JCODE_RUNTIME_DIR_ENV: str(runtime_dir)}

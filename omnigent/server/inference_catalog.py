@@ -150,7 +150,11 @@ class SandboxInferenceService:
             return None
         target = deployment.for_provider(provider)
         if target is None:
-            raise _invalid("The selected sandbox provider is not configured.")
+            offered = ", ".join(deployment.launchable_providers()) or "none"
+            raise _invalid(
+                f"sandbox provider '{provider}' is not configured "
+                f"on this server — available: {offered}"
+            )
         raw: dict[str, Any] = copy.deepcopy(target.host_config or {})
         bound = resolve_bound_provider(raw, harness, agent_auth, allow_empty=True)
         if bound is None and not raw.get("inference"):

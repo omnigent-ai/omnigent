@@ -76,3 +76,43 @@ async def test_bound_runner_rejects_legacy_init_without_a_snapshot(
         )
     assert response.status_code == 409, response.text
     assert manager.get_client_calls == []
+
+
+@pytest.mark.asyncio
+async def test_inference_mismatch_response_does_not_expose_exception_details(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import Mock
+
+    from omnigent.runner.session_init_protocol import RunnerInferenceConfigMismatch
+
+    monkeypatch.setattr(
+        "omnigent.runner.session_init_protocol.validate_runner_inference_config",
+        Mock(side_effect=RunnerInferenceConfigMismatch("private-path/credential-sentinel")),
+    )
+    conversation = Conversation(
+        id="inference-session",
+        created_at=1,
+        updated_at=1,
+        agent_id="inference-agent",
+        root_conversation_id="inference-session",
+    )
+    manager = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=manager,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_client(app) as client:
+        response = await client.post(
+            "/v1/sessions",
+            json=build_runner_session_init_payload(conversation, server_version="0.6.0"),
+        )
+    assert response.status_code == 409, response.text
+    assert response.json() == {
+        "error": "inference_config_mismatch",
+        "detail": (
+            "This runner has a different saved provider configuration; launch a new runner."
+        ),
+    }
+    assert "credential-sentinel" not in response.text
+    assert manager.get_client_calls == []

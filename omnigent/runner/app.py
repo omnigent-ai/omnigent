@@ -3942,10 +3942,16 @@ def create_runner_app(
                 session_id=session_id,
                 agent_id=agent_id,
             )
-        except RunnerInferenceConfigMismatch as exc:
+        except RunnerInferenceConfigMismatch:
             return JSONResponse(
                 status_code=409,
-                content={"error": "inference_config_mismatch", "detail": str(exc)},
+                content={
+                    "error": "inference_config_mismatch",
+                    "detail": (
+                        "This runner has a different saved provider configuration; "
+                        "launch a new runner."
+                    ),
+                },
             )
         except ValueError:
             return JSONResponse(
