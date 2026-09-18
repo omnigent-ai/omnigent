@@ -1606,8 +1606,9 @@ async def test_wait_until_ready_deadline_is_the_app_server_budget(
     assert clock["offset"] < codex_native_app_server._APP_SERVER_READY_TIMEOUT_SECONDS
 
 
+@pytest.mark.parametrize("listen_url", ["ws://127.0.0.1:57045", None], ids=["ws", "unix"])
 async def test_wait_until_ready_timeout_reports_listen_target_and_budget(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, listen_url: str | None
 ) -> None:
     """A listener that never accepts fails after the app-server budget, naming the target."""
     from omnigent.harnesses.codex_native import app_server as codex_native_app_server
@@ -1645,7 +1646,7 @@ async def test_wait_until_ready_timeout_reports_listen_target_and_budget(
         tmp_path / "bridge",
         workspace,
     )
-    server.listen_url = "ws://127.0.0.1:57045"
+    server.listen_url = listen_url
     server.proc = Mock(returncode=None)
 
     with pytest.raises(RuntimeError) as excinfo:
@@ -1653,11 +1654,12 @@ async def test_wait_until_ready_timeout_reports_listen_target_and_budget(
 
     message = str(excinfo.value)
     budget = codex_native_app_server._APP_SERVER_READY_TIMEOUT_SECONDS
+    target = listen_url or f"unix://{server.socket_path}"
     assert message.startswith(
-        f"Timed out after {budget:g}s waiting for the Codex app-server at ws://127.0.0.1:57045: "
+        f"Timed out after {budget:g}s waiting for the Codex app-server at {target}: "
     )
     assert "Connect call failed" in message
-    assert str(server.socket_path) not in message
+    assert (str(server.socket_path) in message) is (listen_url is None)
     assert len(clients) == 3
     assert all(client.close_calls == 1 for client in clients)
 
