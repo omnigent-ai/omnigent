@@ -18,19 +18,17 @@ from pathlib import Path
 import yaml
 
 from omnigent.config import global_config_path
-from omnigent.host.identity_env import (
-    HOST_ID_ENV_VAR,
-    HOST_NAME_ENV_VAR,
-    HOST_TOKEN_ENV_VAR,  # noqa: F401  re-exported for existing omnigent.host.identity importers
-)
+from omnigent.host import identity_env
 
 CONFIG_PATH = Path.home() / ".omnigent" / "config.yaml"
 
-# The HOST_ID / HOST_NAME / HOST_TOKEN env-var names live in the leaf module
-# omnigent.host.identity_env so the warm-pool readiness probe can read them
-# without importing this module's YAML/config dependencies. They are re-exported
-# here (imported above) so existing ``omnigent.host.identity`` callers are
-# unaffected.
+# The HOST_ID / HOST_NAME / HOST_TOKEN env-var names live in the dependency-free
+# leaf module omnigent.host.identity_env so the warm-pool readiness probe can
+# read them without importing this module's YAML/config dependencies. Bind them
+# here too so existing ``omnigent.host.identity`` callers keep working.
+HOST_ID_ENV_VAR = identity_env.HOST_ID_ENV_VAR
+HOST_NAME_ENV_VAR = identity_env.HOST_NAME_ENV_VAR
+HOST_TOKEN_ENV_VAR = identity_env.HOST_TOKEN_ENV_VAR
 
 # WebSocket upgrade header carrying a managed host's launch token.
 # Mirrors the runner tunnel's X-Omnigent-Runner-Tunnel-Token pattern:

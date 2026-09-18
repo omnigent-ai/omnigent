@@ -405,17 +405,16 @@ def test_readiness_probe_import_avoids_heavy_dependencies() -> None:
     cost, so the probe reads the env-var names from the leaf
     ``omnigent.host.identity_env`` module instead.
     """
+    probe = """\
+import sys, omnigent.host.warm_bootstrap
+print(",".join(sorted(m for m in ("yaml", "omnigent.config") if m in sys.modules)))
+"""
     result = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            "import sys, omnigent.host.warm_bootstrap; "
-            "print(','.join(sorted(m for m in ('yaml', 'omnigent.config') "
-            "if m in sys.modules)))",
-        ],
+        [sys.executable, "-c", probe],
         capture_output=True,
         text=True,
         check=True,
+        timeout=60,
     )
     assert result.stdout.strip() == "", (
         f"warm_bootstrap import unexpectedly pulled in heavy modules: {result.stdout.strip()}"
