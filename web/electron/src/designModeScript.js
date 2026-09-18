@@ -1,6 +1,5 @@
 // Design-mode picker script — the in-page driver injected into a WebContentsView
-// via `executeJavaScript` to power point-and-prompt. Extracted from browserIpc.js
-// so it lints/highlights as its own module; behavior is unchanged.
+// via `executeJavaScript` to power point-and-prompt.
 //
 // Markers are prefixed with a per-enable `nonce`; the main-process handler
 // trusts only markers carrying this view's nonce — keep the interpolation,
@@ -14,25 +13,53 @@ function buildDesignModeScript(nonce) {
   const DISMISS = "__omni_" + nonce + "_element_dismiss__";
   return `
 (function() {
-  if (window.__omniDesignMode) return;
+  if (typeof window.__omniDisableDesignMode === 'function') window.__omniDisableDesignMode();
   window.__omniDesignMode = true;
   var __OMNI_SELECT = ${JSON.stringify(SELECT)};
   var __OMNI_SUBMIT = ${JSON.stringify(SUBMIT)};
   var __OMNI_DISMISS = ${JSON.stringify(DISMISS)};
 
+  const layer = document.createElement('div');
+  layer.id = '__omni-design-layer';
+  layer.setAttribute('popover', 'manual');
+  layer.style.cssText = 'position:fixed;inset:0;margin:0;width:100vw;height:100vh;max-width:none;max-height:none;border:0;padding:0;background:transparent;overflow:visible;pointer-events:none;';
+  const backdropStyle = document.createElement('style');
+  backdropStyle.textContent = '#__omni-design-layer::backdrop{display:none!important}';
+  document.head.appendChild(backdropStyle);
+  document.body.appendChild(layer);
+  const dialogSelector = 'dialog[open], [role="dialog"], [role="alertdialog"]';
+
+  function placeLayer(el) {
+    const host = el.closest(dialogSelector) || document.body;
+    if (layer.parentElement !== host) {
+      if (layer.matches(':popover-open')) layer.hidePopover();
+      host.appendChild(layer);
+    }
+    // Stay inside the modal's focus scope, but escape its transforms and clipping.
+    if (!layer.matches(':popover-open')) layer.showPopover();
+  }
+
+  function isActiveTarget(el) {
+    if (!el?.isConnected || !el.getClientRects().length) return false;
+    if (el.checkVisibility && !el.checkVisibility({ opacityProperty: true, visibilityProperty: true })) return false;
+    const dialog = el.closest(dialogSelector);
+    return !el.closest('[inert], [hidden], dialog:not([open])') &&
+      !dialog?.closest('[aria-hidden="true"], [role="dialog"][data-state="closed"], [role="alertdialog"][data-state="closed"]');
+  }
+
   const overlay = document.createElement('div');
   overlay.id = '__omni-highlight';
   overlay.style.cssText = 'position:fixed;pointer-events:none;z-index:2147483646;border:2px solid #c15f3c;background:rgba(193,95,60,0.08);transition:all 0.1s ease;display:none;';
-  document.body.appendChild(overlay);
+  layer.appendChild(overlay);
   const label = document.createElement('div');
   label.id = '__omni-label';
   label.style.cssText = 'position:fixed;z-index:2147483646;pointer-events:none;background:#c15f3c;color:#fff;font:11px/1.4 -apple-system,sans-serif;padding:2px 6px;border-radius:3px;display:none;white-space:nowrap;';
-  document.body.appendChild(label);
+  layer.appendChild(label);
 
   const popup = document.createElement('div');
   popup.id = '__omni-popup';
   popup.style.cssText = [
-    'position:fixed', 'display:none', 'z-index:2147483647',
+    'position:fixed', 'display:none', 'z-index:2147483647', 'pointer-events:auto',
     'background:rgba(28,28,30,0.96)', 'color:#f5f5f7',
     'border:1px solid rgba(255,255,255,0.12)', 'border-radius:12px',
     'box-shadow:0 10px 28px rgba(0,0,0,0.45)',
@@ -55,7 +82,7 @@ function buildDesignModeScript(nonce) {
     '</div>' +
     '<div id="__omni-popup-feedback" style="display:none;font-size:13px;font-weight:500;padding:4px 0;"></div>' +
     '<div id="__omni-popup-arrow" style="position:absolute;width:12px;height:12px;background:rgba(28,28,30,0.96);border:1px solid rgba(255,255,255,0.12);display:none;"></div>';
-  document.body.appendChild(popup);
+  layer.appendChild(popup);
 
   const popupTag = popup.querySelector('#__omni-popup-tag');
   const popupText = popup.querySelector('#__omni-popup-text');
@@ -70,6 +97,8 @@ function buildDesignModeScript(nonce) {
   let activeEl = null;
   let popupVisible = false;
   let sending = false;
+  let focusTimer = null;
+  let previousFocus = null;
 
   function getReactComponent(el) {
     let fiber = null;
@@ -135,12 +164,16 @@ function buildDesignModeScript(nonce) {
       popupArrow.style.bottom = '';
       popupArrow.style.borderRight = 'none';
       popupArrow.style.borderBottom = 'none';
+      popupArrow.style.borderLeft = '1px solid rgba(255,255,255,0.12)';
+      popupArrow.style.borderTop = '1px solid rgba(255,255,255,0.12)';
       popupArrow.style.transform = 'rotate(45deg)';
     } else {
       popupArrow.style.bottom = (-arrowSize / 2 - 1) + 'px';
       popupArrow.style.top = '';
       popupArrow.style.borderLeft = 'none';
       popupArrow.style.borderTop = 'none';
+      popupArrow.style.borderRight = '1px solid rgba(255,255,255,0.12)';
+      popupArrow.style.borderBottom = '1px solid rgba(255,255,255,0.12)';
       popupArrow.style.transform = 'rotate(45deg)';
     }
   }
@@ -161,7 +194,11 @@ function buildDesignModeScript(nonce) {
   }
 
   function showPopup(el, info) {
+    if (focusTimer) clearTimeout(focusTimer);
+    if (resultTimer) { clearTimeout(resultTimer); resultTimer = null; }
+    if (!popup.contains(document.activeElement)) previousFocus = document.activeElement;
     activeEl = el;
+    placeLayer(el);
     const niceTag = info.component ? '<' + info.component + '>' : '<' + info.tag + '>';
     popupTag.textContent = niceTag;
     popupText.textContent = info.text ? '\\u201c' + info.text.slice(0, 40) + '\\u201d' : '';
@@ -174,19 +211,31 @@ function buildDesignModeScript(nonce) {
     overlay.style.width = info.rect.width + 'px';
     overlay.style.height = info.rect.height + 'px';
     overlay.style.display = 'block';
-    setTimeout(function() { popupInput.focus(); popupInput.select(); }, 30);
+    focusTimer = setTimeout(function() {
+      focusTimer = null;
+      if (!popupVisible || !isActiveTarget(activeEl)) return;
+      popupInput.focus({ preventScroll: true });
+      popupInput.select();
+    }, 30);
   }
 
   function hidePopup(emitDismiss) {
+    if (focusTimer) { clearTimeout(focusTimer); focusTimer = null; }
     if (resultTimer) { clearTimeout(resultTimer); resultTimer = null; }
+    const restoreFocus = popup.contains(document.activeElement);
     popup.style.display = 'none';
     activeEl = null;
+    currentEl = null;
     popupVisible = false;
     sending = false;
     popupRow.style.display = 'flex';
     popupFeedback.style.display = 'none';
     popupInput.disabled = false;
     popupSend.disabled = false;
+    if (restoreFocus && isActiveTarget(previousFocus)) previousFocus.focus({ preventScroll: true });
+    previousFocus = null;
+    overlay.style.display = label.style.display = 'none';
+    if (layer.matches(':popover-open')) layer.hidePopover();
     if (emitDismiss) console.log(__OMNI_DISMISS);
   }
 
@@ -212,6 +261,8 @@ function buildDesignModeScript(nonce) {
     sending = true;
     submitId += 1;
     const id = submitId;
+    // Keep Escape in the popup while its editable controls are disabled.
+    popupClose.focus({ preventScroll: true });
     popupSend.textContent = 'Sending\\u2026';
     popupSend.disabled = true;
     popupSend.style.opacity = '0.6';
@@ -229,10 +280,22 @@ function buildDesignModeScript(nonce) {
 
   popupClose.addEventListener('click', function(e) { e.stopPropagation(); hidePopup(true); });
   popupSend.addEventListener('click', function(e) { e.stopPropagation(); submitPopup(); });
-  popupInput.addEventListener('keydown', function(e) {
-    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submitPopup(); return; }
-    if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); hidePopup(true); }
-  });
+  function onPopupKeyDown(e) {
+    if (!popupVisible || !popup.contains(e.target) || e.isComposing) return;
+    // Run before document-level Escape handlers in the page's modal library.
+    if (e.key === 'Escape') {
+      e.preventDefault(); e.stopImmediatePropagation(); hidePopup(true);
+    } else if (e.target === popupInput && e.key === 'Enter') {
+      e.preventDefault(); e.stopImmediatePropagation();
+      if (!e.shiftKey) submitPopup();
+    }
+  }
+  for (const type of ['keydown', 'keyup', 'keypress', 'input', 'change', 'click']) {
+    popup.addEventListener(type, function(e) {
+      if (type === 'keydown' && e.key === 'Tab') return;
+      e.stopPropagation();
+    });
+  }
 
   function onMouseMove(e) {
     if (popupVisible) return;
@@ -240,6 +303,7 @@ function buildDesignModeScript(nonce) {
     if (!el || el === overlay || el === label) return;
     if (popup.contains(el)) return;
     currentEl = el;
+    placeLayer(el);
     const rect = el.getBoundingClientRect();
     overlay.style.display = 'block';
     overlay.style.left = rect.left + 'px'; overlay.style.top = rect.top + 'px';
@@ -253,12 +317,8 @@ function buildDesignModeScript(nonce) {
   }
   function onClick(e) {
     if (popup.contains(e.target)) return;
-    let el = currentEl;
-    if (popupVisible) {
-      const hit = document.elementFromPoint(e.clientX, e.clientY);
-      if (hit && hit !== overlay && hit !== label && !popup.contains(hit)) el = hit;
-    }
-    if (!el) return;
+    const el = document.elementFromPoint(e.clientX, e.clientY);
+    if (!el || layer.contains(el)) return;
     e.preventDefault(); e.stopPropagation();
     currentEl = el;
     window.__omniSelectedEl = el;
@@ -266,14 +326,59 @@ function buildDesignModeScript(nonce) {
     console.log(__OMNI_SELECT + JSON.stringify(info));
     showPopup(el, info);
   }
+  function redraw() {
+    const el = activeEl || currentEl;
+    if (!isActiveTarget(el)) {
+      hidePopup(popupVisible);
+      return;
+    }
+    const rect = el.getBoundingClientRect();
+    overlay.style.left = rect.left + 'px'; overlay.style.top = rect.top + 'px';
+    overlay.style.width = rect.width + 'px'; overlay.style.height = rect.height + 'px';
+    label.style.left = rect.left + 'px'; label.style.top = Math.max(0, rect.top - 22) + 'px';
+    if (popupVisible) positionPopup(rect);
+  }
+  function onFocusIn(e) {
+    const dialog = e.target.closest?.(dialogSelector);
+    if (popupVisible && dialog && dialog !== layer.parentElement) hidePopup(true);
+  }
+  function onMotionEnd(e) {
+    const el = activeEl || currentEl;
+    if (el && e.target.contains?.(el)) redraw();
+  }
+  const observer = new MutationObserver(function(records) {
+    if (records.every(record => layer.contains(record.target))) return;
+    const el = activeEl || currentEl;
+    if (el && !isActiveTarget(el)) {
+      hidePopup(popupVisible);
+    }
+  });
+  observer.observe(document.documentElement, {
+    childList: true, subtree: true, attributes: true,
+    attributeFilter: ['open', 'hidden', 'inert', 'style', 'class', 'aria-hidden', 'data-state']
+  });
   document.addEventListener('mousemove', onMouseMove, true);
   document.addEventListener('click', onClick, true);
+  document.addEventListener('scroll', redraw, true);
+  document.addEventListener('focusin', onFocusIn, true);
+  document.addEventListener('transitionend', onMotionEnd, true);
+  document.addEventListener('animationend', onMotionEnd, true);
+  window.addEventListener('resize', redraw);
+  window.addEventListener('keydown', onPopupKeyDown, true);
 
   window.__omniDisableDesignMode = function() {
     document.removeEventListener('mousemove', onMouseMove, true);
     document.removeEventListener('click', onClick, true);
-    if (resultTimer) { clearTimeout(resultTimer); resultTimer = null; }
-    overlay.remove(); label.remove(); popup.remove();
+    document.removeEventListener('scroll', redraw, true);
+    document.removeEventListener('focusin', onFocusIn, true);
+    document.removeEventListener('transitionend', onMotionEnd, true);
+    document.removeEventListener('animationend', onMotionEnd, true);
+    window.removeEventListener('resize', redraw);
+    window.removeEventListener('keydown', onPopupKeyDown, true);
+    observer.disconnect();
+    hidePopup(false);
+    layer.remove(); backdropStyle.remove();
+    delete window.__omniSelectedEl;
     delete window.__omniDesignMode;
     delete window.__omniDisableDesignMode;
     delete window.__omniOnDesignResult;
