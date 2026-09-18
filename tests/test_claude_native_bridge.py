@@ -4428,23 +4428,25 @@ def test_inject_user_message_raises_when_prompt_never_renders(
 
     def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
         """
-        Always report an empty (never-ready) pane with a dead process.
+        Always report an empty (never-ready) pane, liveness unanswered.
 
         :param cmd: Argv list passed to subprocess.run.
         :param kwargs: Subprocess kwargs (ignored).
         :returns: Fake CompletedProcess; capture-pane returns "" and the
-            ``display-message`` liveness probe reports the pane dead, so
-            the readiness gate gets no slow-boot extension.
+            liveness probe answers without a ``#{pane_dead}`` flag, so the
+            wait runs to the (shortened) slow-boot cap rather than being
+            cut short by a pane the probe never affirmed dead.
         """
         del kwargs
         # Read-only queries (pane capture, liveness probe) are not
         # keystrokes — only writes must be absent on this path.
-        if "capture-pane" in cmd or "display-message" in cmd:
+        if "capture-pane" in cmd or "list-panes" in cmd:
             return SimpleNamespace(returncode=0, stdout="", stderr="")
         send_keys.append(cmd)
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("subprocess.run", _fake_run)
+    monkeypatch.setattr(claude_native_bridge, "_TMUX_READY_SLOW_BOOT_TIMEOUT_S", 0.5)
     with pytest.raises(RuntimeError, match="did not become ready"):
         inject_user_message(bridge_dir, content="hi", timeout_s=0.3)
     assert send_keys == [], "no keystrokes should be sent when the prompt never renders"
@@ -8875,8 +8877,8 @@ def test_wait_for_claude_prompt_ready_outlasts_base_budget_while_pane_alive(
         lambda socket_path, tmux_target: next(frames, _READY_PANE),
     )
     monkeypatch.setattr(
-        "omnigent.harnesses.claude_native.bridge._claude_pane_alive",
-        lambda socket_path, tmux_target: True,
+        "omnigent.harnesses.claude_native.bridge._claude_pane_state",
+        lambda socket_path, tmux_target: claude_native_bridge._ClaudePaneState(True),
     )
     # timeout_s=0.0 exhausts the base budget on the first poll, so any
     # successful return proves the liveness extension carried the wait.
@@ -8887,28 +8889,35 @@ def test_wait_for_claude_prompt_ready_outlasts_base_budget_while_pane_alive(
     )
 
 
-def test_wait_for_claude_prompt_ready_fails_at_base_budget_when_pane_dead(
+def test_wait_for_claude_prompt_ready_reports_the_exit_when_pane_dead(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    A dead pane gets no slow-boot extension: the base budget still rules.
+    A dead pane is reported as an exit, and gets no slow-boot extension.
 
     Guards the widening: the extension must key on an *affirmative*
     liveness signal, so a crashed boot (whose pane persists via
     ``keep_alive_after_exit``, final output still capturable) surfaces
     at the base budget exactly as fast as before — with the crash tail
     attached — rather than stalling to the slow-boot cap.
+
+    It must also say what happened. Reporting an exited terminal as
+    "did not become ready ... input prompt never rendered" describes a
+    box that never mounted, which reads as a rendering bug; the pane's
+    wait-status is what tells a clean quit from a crash.
     """
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.bridge._capture_pane",
         lambda socket_path, tmux_target: _BOOTING_PANE,
     )
     monkeypatch.setattr(
-        "omnigent.harnesses.claude_native.bridge._claude_pane_alive",
-        lambda socket_path, tmux_target: False,
+        "omnigent.harnesses.claude_native.bridge._claude_pane_state",
+        lambda socket_path, tmux_target: claude_native_bridge._ClaudePaneState(
+            False, exited=True, exit_status="0"
+        ),
     )
     started = time.monotonic()
-    with pytest.raises(claude_native_bridge.ClaudePromptTimeout) as excinfo:
+    with pytest.raises(claude_native_bridge.ClaudeTerminalExited) as excinfo:
         claude_native_bridge._wait_for_claude_prompt_ready(
             "/tmp/example/tmux.sock",
             "claude:0.0",
@@ -8917,8 +8926,10 @@ def test_wait_for_claude_prompt_ready_fails_at_base_budget_when_pane_dead(
     # Well under the slow-boot cap: no extension happened.
     assert time.monotonic() - started < 5.0
     message = str(excinfo.value)
-    assert "did not become ready" in message
+    assert "has exited (status 0)" in message
+    assert "did not become ready" not in message
     assert "connecting to host" in message
+    assert excinfo.value.exit_status == "0"
 
 
 def test_wait_for_claude_prompt_ready_slow_boot_wait_is_bounded(
@@ -8937,8 +8948,8 @@ def test_wait_for_claude_prompt_ready_slow_boot_wait_is_bounded(
         lambda socket_path, tmux_target: _BOOTING_PANE,
     )
     monkeypatch.setattr(
-        "omnigent.harnesses.claude_native.bridge._claude_pane_alive",
-        lambda socket_path, tmux_target: True,
+        "omnigent.harnesses.claude_native.bridge._claude_pane_state",
+        lambda socket_path, tmux_target: claude_native_bridge._ClaudePaneState(True),
     )
     monkeypatch.setattr(claude_native_bridge, "_TMUX_READY_SLOW_BOOT_TIMEOUT_S", 0.4)
     started = time.monotonic()
@@ -8966,16 +8977,16 @@ def test_readiness_throttles_liveness_without_delaying_ready_composer(
         captures.append(clock.monotonic())
         return _READY_PANE if clock.monotonic() >= 6.5 else _BOOTING_PANE
 
-    def probe(socket_path: str, tmux_target: str) -> bool | None:
+    def probe(socket_path: str, tmux_target: str) -> claude_native_bridge._ClaudePaneState:
         started = clock.monotonic()
         clock.sleep(probe_duration)
         probes.append((started, clock.monotonic()))
-        return alive
+        return claude_native_bridge._ClaudePaneState(alive)
 
     monkeypatch.setattr(claude_native_bridge, "time", clock)
     monkeypatch.setattr(claude_native_bridge, "_CLAUDE_READY_POLL_INTERVAL_S", 0.25)
     monkeypatch.setattr(claude_native_bridge, "_capture_pane", capture)
-    monkeypatch.setattr(claude_native_bridge, "_claude_pane_alive", probe)
+    monkeypatch.setattr(claude_native_bridge, "_claude_pane_state", probe)
 
     claude_native_bridge._wait_for_claude_prompt_ready("/tmp/sock", "main", timeout_s=1.0)
 
@@ -8992,12 +9003,12 @@ def test_readiness_stops_at_deadline_between_liveness_probes(
     monkeypatch: pytest.MonkeyPatch, alive: bool | None
 ) -> None:
     clock = _VirtualClock()
-    probe = Mock(return_value=alive)
+    probe = Mock(return_value=claude_native_bridge._ClaudePaneState(alive))
     monkeypatch.setattr(claude_native_bridge, "time", clock)
     monkeypatch.setattr(claude_native_bridge, "_CLAUDE_READY_POLL_INTERVAL_S", 0.25)
     monkeypatch.setattr(claude_native_bridge, "_TMUX_READY_SLOW_BOOT_TIMEOUT_S", 0.75)
     monkeypatch.setattr(claude_native_bridge, "_capture_pane", lambda *_: _BOOTING_PANE)
-    monkeypatch.setattr(claude_native_bridge, "_claude_pane_alive", probe)
+    monkeypatch.setattr(claude_native_bridge, "_claude_pane_state", probe)
 
     with pytest.raises(claude_native_bridge.ClaudePromptTimeout):
         claude_native_bridge._wait_for_claude_prompt_ready("/tmp/sock", "main", timeout_s=0.0)
@@ -9011,11 +9022,16 @@ def test_readiness_detects_dead_pane_on_next_liveness_probe(
     monkeypatch: pytest.MonkeyPatch, alive: bool | None
 ) -> None:
     clock = _VirtualClock()
-    probe = Mock(side_effect=[alive, False])
+    probe = Mock(
+        side_effect=[
+            claude_native_bridge._ClaudePaneState(alive),
+            claude_native_bridge._ClaudePaneState(False, exited=True, exit_status="0"),
+        ]
+    )
     monkeypatch.setattr(claude_native_bridge, "time", clock)
     monkeypatch.setattr(claude_native_bridge, "_CLAUDE_READY_POLL_INTERVAL_S", 0.25)
     monkeypatch.setattr(claude_native_bridge, "_capture_pane", lambda *_: _BOOTING_PANE)
-    monkeypatch.setattr(claude_native_bridge, "_claude_pane_alive", probe)
+    monkeypatch.setattr(claude_native_bridge, "_claude_pane_state", probe)
 
     with pytest.raises(claude_native_bridge.ClaudePromptTimeout):
         claude_native_bridge._wait_for_claude_prompt_ready("/tmp/sock", "main", timeout_s=0.5)
@@ -9024,23 +9040,33 @@ def test_readiness_detects_dead_pane_on_next_liveness_probe(
     assert probe.call_count == 2
 
 
-def test_claude_pane_alive_distinguishes_dead_pane_from_unanswered_probe(
+def test_claude_pane_state_distinguishes_dead_pane_from_unanswered_probe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    ``_claude_pane_alive`` answers only from a responsive tmux server.
+    ``_claude_pane_state`` answers only from a responsive tmux server.
 
-    An affirmed ``#{pane_dead}`` ``0`` is alive; an affirmed ``1`` or a
-    failed query (non-zero exit — unknown target, dead server) is dead.
-    A probe that gets no answer within its budget — a tmux server
-    starved by the same load that makes a boot slow — is inconclusive
-    (``None``), so it cannot cut a slow-boot wait short. The probe gets
-    the shared tmux budget, not a bespoke 1s a starved server outlasts.
+    An affirmed ``#{pane_dead}`` ``0`` is alive; an affirmed ``1`` is dead
+    and carries ``#{pane_dead_status}`` so a clean quit (``"0"``) is
+    distinguishable from a crash. A failed query (non-zero exit — unknown
+    target, dead server) is dead. A probe that gets no answer within its
+    budget — a tmux server starved by the same load that makes a boot
+    slow — is inconclusive (``None``), so it cannot cut a slow-boot wait
+    short. The probe gets the shared tmux budget, not a bespoke 1s a
+    starved server outlasts.
+
+    An answer carrying no usable flag is inconclusive too. This is why the
+    probe runs ``list-panes`` and not ``display-message``: the latter
+    prints an empty line and still exits 0 for a target it cannot
+    resolve, so "tmux told us nothing" would read as "the pane is dead"
+    and end a healthy slow boot at the base budget.
     """
     responses: dict[str, Any] = {}
 
     def fake_run(cmd: list[str], **kwargs: Any) -> SimpleNamespace:
         assert kwargs["timeout"] == claude_native_bridge._TMUX_SEND_TIMEOUT_S
+        assert "list-panes" in cmd
+        assert "#{pane_dead} #{pane_dead_status}" in cmd
         outcome = responses["outcome"]
         if isinstance(outcome, Exception):
             raise outcome
@@ -9048,20 +9074,34 @@ def test_claude_pane_alive_distinguishes_dead_pane_from_unanswered_probe(
 
     monkeypatch.setattr("subprocess.run", fake_run)
 
-    responses["outcome"] = SimpleNamespace(returncode=0, stdout="0\n", stderr="")
-    assert claude_native_bridge._claude_pane_alive("/tmp/sock", "claude:0.0") is True
+    def state(**kwargs: Any) -> claude_native_bridge._ClaudePaneState:
+        responses["outcome"] = SimpleNamespace(stderr="", **kwargs)
+        return claude_native_bridge._claude_pane_state("/tmp/sock", "claude:0.0")
 
-    responses["outcome"] = SimpleNamespace(returncode=0, stdout="1\n", stderr="")
-    assert claude_native_bridge._claude_pane_alive("/tmp/sock", "claude:0.0") is False
-
-    responses["outcome"] = SimpleNamespace(returncode=1, stdout="", stderr="no server")
-    assert claude_native_bridge._claude_pane_alive("/tmp/sock", "claude:0.0") is False
+    assert state(returncode=0, stdout="0 \n") == (True, False, None)
+    assert state(returncode=0, stdout="1 0\n") == (False, True, "0")
+    assert state(returncode=0, stdout="1 137\n") == (False, True, "137")
+    # Dead, but tmux has not recorded a wait-status yet.
+    assert state(returncode=0, stdout="1 \n") == (False, True, None)
+    # A rejected query ends the wait without claiming the process exited.
+    assert state(returncode=1, stdout="") == (False, False, None)
+    # Answered, but said nothing about the pane.
+    assert state(returncode=0, stdout="\n") == (None, False, None)
+    assert state(returncode=0, stdout="what\n") == (None, False, None)
 
     responses["outcome"] = subprocess.TimeoutExpired(cmd="tmux", timeout=1.0)
-    assert claude_native_bridge._claude_pane_alive("/tmp/sock", "claude:0.0") is None
+    assert claude_native_bridge._claude_pane_state("/tmp/sock", "claude:0.0") == (
+        None,
+        False,
+        None,
+    )
 
     responses["outcome"] = OSError("could not spawn tmux")
-    assert claude_native_bridge._claude_pane_alive("/tmp/sock", "claude:0.0") is None
+    assert claude_native_bridge._claude_pane_state("/tmp/sock", "claude:0.0") == (
+        None,
+        False,
+        None,
+    )
 
 
 def test_wait_for_claude_prompt_ready_survives_unanswered_liveness_probe(
@@ -9082,8 +9122,8 @@ def test_wait_for_claude_prompt_ready_survives_unanswered_liveness_probe(
         lambda socket_path, tmux_target: next(frames, _READY_PANE),
     )
     monkeypatch.setattr(
-        "omnigent.harnesses.claude_native.bridge._claude_pane_alive",
-        lambda socket_path, tmux_target: None,
+        "omnigent.harnesses.claude_native.bridge._claude_pane_state",
+        lambda socket_path, tmux_target: claude_native_bridge._ClaudePaneState(None),
     )
     # timeout_s=0.0 exhausts the base budget on the first poll, so a
     # successful return proves the inconclusive probe kept the wait going.

@@ -17,6 +17,7 @@ from omnigent.harnesses.claude_native.bridge import (
     REQUEST_SESSION_ID_ENV_VAR,
     SWITCH_MODEL_DIALOG_HINT,
     ClaudePromptTimeout,
+    ClaudeTerminalExited,
     TmuxSessionNotAdvertised,
     cancellable_injection,
     inject_slash_command,
@@ -243,6 +244,24 @@ class ClaudeNativeExecutor(Executor):
                         # comparison is against what routing asked for.
                         self._applied_model = wanted_model
                     await self._inject_prompt(text, notices)
+        except ClaudeTerminalExited as exc:
+            # Claude Code exits 0 on /quit or a closed window. The turn still
+            # fails, but the person's own teardown is not a defect; a pane that
+            # died on its own keeps the ERROR.
+            clean_exit = exc.exit_status == "0"
+            log = _logger.warning if clean_exit else _logger.error
+            log(
+                "claude-native: terminal exited before prompt delivery (status %s)",
+                exc.exit_status or "unknown",
+                exc_info=not clean_exit,
+                extra={"session_id": self._request_session_id},
+            )
+            cleanup_error = self._reap_failed_turn()
+            message = describe_exception(exc)
+            if cleanup_error is not None:
+                message = f"{message} Cleanup also failed: {cleanup_error}"
+            yield ExecutorError(message=message)
+            return
         except ClaudePromptTimeout as exc:
             _logger.exception(
                 "claude-native: prompt delivery to harness timed out",

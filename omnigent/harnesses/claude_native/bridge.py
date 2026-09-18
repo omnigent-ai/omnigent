@@ -54,7 +54,7 @@ from http import HTTPStatus
 from http.client import HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, TypeVar, cast
+from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, cast
 from urllib import request
 
 from omnigent._platform import is_wsl, stable_user_id
@@ -465,6 +465,21 @@ def validate_claude_hook_interpreter_compatibility(
 
 class ClaudePromptTimeout(RuntimeError):
     """Claude Code's input box did not render before delivery timed out."""
+
+
+class ClaudeTerminalExited(ClaudePromptTimeout):
+    """
+    Claude Code's pane process had already exited when delivery was attempted.
+
+    Subclasses :class:`ClaudePromptTimeout` so existing delivery handlers
+    keep catching it, while callers that care about severity can tell a
+    clean quit (``exit_status`` ``"0"`` — the person closed Claude Code)
+    from a crash.
+    """
+
+    def __init__(self, message: str, *, exit_status: str | None = None) -> None:
+        super().__init__(message)
+        self.exit_status = exit_status
 
 
 class ClaudeInjectionCancelled(RuntimeError):
@@ -4868,20 +4883,41 @@ def _capture_pane(socket_path: str, tmux_target: str) -> str:
     return proc.stdout if proc.returncode == 0 else ""
 
 
-def _claude_pane_alive(socket_path: str, tmux_target: str) -> bool | None:
+class _ClaudePaneState(NamedTuple):
+    """A liveness answer for the Claude pane, with the exit status when dead."""
+
+    alive: bool | None
+    # ``True`` only when tmux affirmed ``#{pane_dead}``. A rejected query
+    # also ends the wait, but it is not evidence the process exited, so it
+    # must not be reported as one.
+    exited: bool = False
+    exit_status: str | None = None
+
+
+def _claude_pane_state(socket_path: str, tmux_target: str) -> _ClaudePaneState:
     """
     Report whether the Claude pane's process is still running.
 
-    ``keep_alive_after_exit`` retains dead panes, so check ``#{pane_dead}``
-    rather than pane existence. An unanswered probe is inconclusive: a
-    busy tmux server must not prematurely end the slow-boot wait.
+    ``keep_alive_after_exit`` retains dead panes, so read ``#{pane_dead}``
+    rather than pane existence, and ``#{pane_dead_status}`` beside it so a
+    dead pane's exit code comes from the same answer — a second probe at
+    failure time can race the session's teardown and come back empty.
+
+    ``list-panes`` rather than ``display-message``: the latter prints an
+    empty line and still exits 0 for a target it cannot resolve, which is
+    indistinguishable from an answer of "alive". ``list-panes`` fails
+    outright, so a rejected query stays a rejected query.
 
     :param socket_path: Absolute path to the tmux socket, e.g.
         ``"/tmp/.../tmux.sock"``.
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
-    :returns: ``True`` when tmux affirms the pane's process is alive,
-        ``False`` when tmux affirms it exited or rejects the query, and
-        ``None`` when the probe went unanswered.
+    :returns: A :class:`_ClaudePaneState` whose ``alive`` is ``True`` when
+        tmux affirms the process is running, ``False`` when tmux affirms it
+        exited or rejects the query, and ``None`` when the probe went
+        unanswered or answered without a usable flag — a busy tmux server
+        must not prematurely end the slow-boot wait. ``exited`` is set only
+        for an affirmed ``#{pane_dead}``, with ``exit_status`` carrying the
+        pane's wait-status when tmux reported one.
     """
     import subprocess
 
@@ -4892,11 +4928,11 @@ def _claude_pane_alive(socket_path: str, tmux_target: str) -> bool | None:
                 "tmux",
                 "-S",
                 socket_path,
-                "display-message",
-                "-p",
+                "list-panes",
                 "-t",
                 tmux_target,
-                "#{pane_dead}",
+                "-F",
+                "#{pane_dead} #{pane_dead_status}",
             ],
             check=False,
             capture_output=True,
@@ -4904,8 +4940,22 @@ def _claude_pane_alive(socket_path: str, tmux_target: str) -> bool | None:
             timeout=_TMUX_SEND_TIMEOUT_S,
         )
     except (subprocess.SubprocessError, OSError):
-        return None
-    return proc.returncode == 0 and proc.stdout.strip() == "0"
+        return _ClaudePaneState(None)
+    if proc.returncode != 0:
+        # The target or the server is gone. That ends the wait, but tmux has
+        # told us nothing about how the process finished.
+        return _ClaudePaneState(False)
+    fields = proc.stdout.split()
+    if not fields:
+        # tmux answered without saying anything about the pane.
+        return _ClaudePaneState(None)
+    if fields[0] == "0":
+        return _ClaudePaneState(True)
+    if fields[0] == "1":
+        return _ClaudePaneState(
+            False, exited=True, exit_status=fields[1] if len(fields) > 1 else None
+        )
+    return _ClaudePaneState(None)
 
 
 def claude_pane_ready(bridge_dir: Path) -> bool:
@@ -5301,6 +5351,9 @@ def _wait_for_claude_prompt_ready(
         :data:`_TMUX_READY_SLOW_BOOT_TIMEOUT_S`; a dead pane or rejected
         query ends the wait at the next liveness check.
     :returns: None.
+    :raises ClaudeTerminalExited: If tmux affirms the pane's process has
+        exited, carrying the pane's wait-status so a clean quit is
+        distinguishable from a crash.
     :raises ClaudePromptTimeout: If the prompt never renders in time
         (Claude failed to boot, or a slow boot outlasted even the hard
         cap). The message carries the seconds actually waited, a poll
@@ -5322,6 +5375,8 @@ def _wait_for_claude_prompt_ready(
     # which misrepresents why the gate failed. Attaching what was observed
     # while it mattered keeps the error honest.
     last_nonempty = ""
+    exited_status: str | None = None
+    pane_exited = False
     # Poll at least once even at timeout_s=0: a single readiness check is
     # still meaningful, and it guarantees a capture to attach on failure.
     while True:
@@ -5338,7 +5393,10 @@ def _wait_for_claude_prompt_ready(
         if now >= hard_deadline:
             break
         if now >= next_liveness_probe:
-            if _claude_pane_alive(socket_path, tmux_target) is False:
+            state = _claude_pane_state(socket_path, tmux_target)
+            if state.alive is False:
+                pane_exited = state.exited
+                exited_status = state.exit_status
                 break
             next_liveness_probe = time.monotonic() + _CLAUDE_LIVENESS_POLL_INTERVAL_S
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
@@ -5348,6 +5406,17 @@ def _wait_for_claude_prompt_ready(
     # with no box point at Claude never rendering the prompt (a boot crash,
     # e.g. a ``JSON Parse error``, whose text the tail then surfaces).
     waited_s = time.monotonic() - started
+    if pane_exited:
+        # A readiness timeout's poll counts describe a box that never mounted,
+        # which reads as a rendering bug. An exited process is a different
+        # failure and its wait-status is what tells a quit from a crash.
+        status = "unknown" if exited_status is None else exited_status
+        raise ClaudeTerminalExited(
+            f"The Claude Code terminal has exited (status {status}), so the "
+            "message was not delivered. Relaunch the terminal to continue "
+            "this conversation." + _format_terminal_failure_tail(last_nonempty),
+            exit_status=exited_status,
+        )
     raise ClaudePromptTimeout(
         f"Claude Code terminal did not become ready within {waited_s:.1f}s "
         f"(input prompt never rendered in {polls} polls, "

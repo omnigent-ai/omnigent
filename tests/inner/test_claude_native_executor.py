@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import logging
 import threading
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,7 @@ from omnigent.harnesses.claude_native import bridge as claude_bridge
 from omnigent.harnesses.claude_native.bridge import (
     REQUEST_SESSION_ID_ENV_VAR,
     ClaudePromptTimeout,
+    ClaudeTerminalExited,
     TmuxSessionNotAdvertised,
 )
 from omnigent.inner import claude_native_executor
@@ -1515,6 +1517,62 @@ async def test_run_turn_reaps_tmux_before_reporting_prompt_timeout(
     assert killed == [bridge_dir]
     assert len(events) == 1
     assert isinstance(events[0], ExecutorError)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("exit_status", "expect_error_level"),
+    [("0", False), ("1", True), ("137", True), (None, True)],
+)
+async def test_run_turn_logs_a_closed_terminal_below_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    exit_status: str | None,
+    expect_error_level: bool,
+) -> None:
+    """
+    Closing Claude Code is not an Omnigent defect, so it is not an ERROR.
+
+    Claude Code exits 0 on ``/quit`` or a closed window. Every turn sent
+    afterwards must still fail — the pane is gone — but logging that as an
+    ERROR reports the person's own teardown as a mid-session failure. A
+    pane that died on its own (any other wait-status, or none recorded)
+    keeps the ERROR and its traceback.
+    """
+    bridge_dir = tmp_path / "bridge"
+
+    def fail_inject(bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0) -> None:
+        del bridge_dir_arg, content, timeout_s
+        raise ClaudeTerminalExited(
+            "The Claude Code terminal has exited, so the message was not delivered.",
+            exit_status=exit_status,
+        )
+
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", fail_inject)
+    monkeypatch.setattr(
+        claude_native_executor, "kill_session", lambda bridge_dir_arg, *, timeout_s: None
+    )
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.inner.claude_native_executor"):
+        events = [
+            event
+            async for event in ClaudeNativeExecutor(bridge_dir).run_turn(
+                messages=[{"role": "user", "content": "hi"}],
+                tools=[],
+                system_prompt="",
+            )
+        ]
+
+    # The turn still fails: the pane is gone either way.
+    assert len(events) == 1
+    assert isinstance(events[0], ExecutorError)
+
+    records = [r for r in caplog.records if "terminal exited" in r.getMessage()]
+    assert len(records) == 1
+    assert (records[0].levelno == logging.ERROR) is expect_error_level
+    # A traceback only earns its place when something actually broke.
+    assert bool(records[0].exc_info) is expect_error_level
 
 
 @pytest.mark.asyncio
