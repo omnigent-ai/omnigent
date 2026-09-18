@@ -383,6 +383,17 @@ def discover_databricks_codex_models(
     return tuple(sorted(codex_ids, key=_codex_preference_rank, reverse=True))
 
 
+def discover_databricks_gemini_models(
+    workspace_url: str, token: str, *, transport: httpx.BaseTransport | None = None
+) -> tuple[str, ...]:
+    """List Gemini model services accepted by the native Gemini gateway route."""
+    with httpx.Client(transport=transport, timeout=_HTTP_TIMEOUT_S) as client:
+        models = _list_model_service_ids(
+            client, workspace_url, {"Authorization": f"Bearer {token}"}
+        )
+    return tuple(model for model in models if _bare_model_id(model).startswith("gemini-"))
+
+
 def _codex_preference_rank(model_id: str) -> tuple[int, int, int, int, str]:
     """Order codex-servable ids so the best launch default sorts first.
 

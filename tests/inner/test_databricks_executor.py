@@ -801,6 +801,27 @@ def test_read_databrickscfg_pat_profile_returns_token_verbatim(
     assert creds.token == "dapi-fake-pat-token-for-unit-test"
 
 
+@pytest.mark.parametrize("reader", [_read_databrickscfg, _read_databrickscfg_file_fallback])
+@pytest.mark.parametrize(
+    "contents",
+    [
+        "token = private-malformed-secret\n",
+        "[broken]\nhost = https://workspace.example\nprivate-malformed-secret\n",
+        "[broken]\nhost = https://workspace.example\nhost = private-malformed-secret\n",
+    ],
+)
+def test_ambient_credential_probe_handles_malformed_profile(
+    tmp_path, monkeypatch, clean_databricks_env, caplog, reader, contents
+):
+    profile = tmp_path / "databrickscfg"
+    profile.write_text(contents)
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(profile))
+
+    assert reader("broken") is None
+    assert "private-malformed-secret" not in caplog.text
+    assert not any(record.exc_info for record in caplog.records)
+
+
 def test_read_databrickscfg_missing_profile_falls_back_to_file_reader(
     pat_only_cfg: _Path,
 ) -> None:

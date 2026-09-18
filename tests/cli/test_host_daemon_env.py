@@ -384,3 +384,21 @@ def test_runner_env_preserves_claude_telemetry_opt_in() -> None:
     # Then
     assert env.get("OTEL_METRICS_EXPORTER") == "otlp"
     assert env.get("CLAUDE_CODE_ENABLE_TELEMETRY") == "1"
+
+
+def test_gemini_gateway_survives_local_daemon_and_runner(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("GEMINI_API_KEY", "fake-gateway-key")
+    monkeypatch.setenv("GOOGLE_GEMINI_BASE_URL", "https://gateway.example/gemini")
+    daemon = _build_host_daemon_env(server_url=None)
+    runner = _build_runner_env(
+        daemon,
+        server_url="http://localhost:6767",
+        runner_id="test-gemini",
+        binding_token="fake-binding",
+        workspace=str(tmp_path),
+        parent_pid=os.getpid(),
+    )
+    for env in (daemon, runner):
+        assert env["GEMINI_API_KEY"] == "fake-gateway-key"
+        assert env["GOOGLE_GEMINI_BASE_URL"] == "https://gateway.example/gemini"

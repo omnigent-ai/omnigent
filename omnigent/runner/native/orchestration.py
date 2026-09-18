@@ -5713,7 +5713,8 @@ async def _auto_create_antigravity_terminal(
     # ``--gemini_dir``; seeding the real ``~/.gemini`` marker as well would write
     # the user's tree for a file this launch never reads.
 
-    argv, env_overrides = build_agy_launch(
+    argv, env_overrides = await asyncio.to_thread(
+        build_agy_launch,
         conversation_id=external_session_id if resume else None,
         model=model,
         resume=resume,
@@ -5755,8 +5756,15 @@ async def _auto_create_antigravity_terminal(
     # written into that isolated dir (ensure_agy_feedback_survey_disabled appends
     # /.gemini/antigravity-cli/settings.json to its arg), NOT the user's real
     # HOME — env_overrides no longer carries a HOME key.
-    await asyncio.to_thread(ensure_agy_feedback_survey_disabled, agy_home_dir(bridge_dir))
+    await asyncio.to_thread(
+        ensure_agy_feedback_survey_disabled,
+        agy_home_dir(bridge_dir),
+        launch_env={**os.environ, **env_overrides},
+    )
     argv = [argv[0], f"--gemini_dir={agy_gemini_dir(bridge_dir)}", *argv[1:]]
+    from omnigent.harnesses.antigravity_native.gateway import wrap_agy_gateway_launch
+
+    argv = wrap_agy_gateway_launch(argv, env_overrides)
     # Start the shared comment/sys_* relay against THIS session's bridge dir before
     # launch so its tool_relay.json is on disk when agy first scans the MCP server.
     # ``await_notify=False``: agy starts its MCP client lazily, so awaiting the
@@ -6814,13 +6822,23 @@ def _native_terminal_start_error_payload(
         session_id=session_id,
         error_id=error_id,
         runtime=runtime_name,
-        code=ErrorCode.SESSION_AGENT_MISSING
-        if missing_agent
+        code=exc.code
+        if isinstance(exc, OmnigentError)
+        and exc.code in {ErrorCode.SESSION_AGENT_MISSING, ErrorCode.HARNESS_NOT_CONFIGURED}
         else _NATIVE_TERMINAL_START_FAILED_CODE,
         exception_type=type(exc).__name__,
         exception_cause_type=type(exc.__cause__).__name__ if exc.__cause__ is not None else None,
         cause_code=exc.code if isinstance(exc, OmnigentError) else None,
     )
+    if isinstance(exc, OmnigentError) and exc.code == ErrorCode.HARNESS_NOT_CONFIGURED:
+        _logger.warning(
+            "Native %s configuration needs attention; error_id=%s: %s",
+            runtime_name,
+            error_id,
+            exc.message,
+            extra=extra,
+        )
+        return {"code": exc.code, "error_id": error_id, "message": exc.message}
     if missing_agent:
         # Expected session-lifecycle condition: the session's agent was deleted
         # or rebound, so its bundle no longer resolves. This is not a
@@ -6928,11 +6946,15 @@ def _native_terminal_start_error_response(
     :param exc: Exception raised by terminal auto-create.
     :param runtime_name: Human-readable runtime name, e.g. ``"Codex"``.
     :param session_id: Session whose terminal ensure failed.
-    :returns: HTTP 500 response with an ``error`` object carrying the
-        real failure message.
+    :returns: HTTP 412 for expected configuration failures, otherwise 500,
+        with a sanitized ``error`` object.
     """
     return JSONResponse(
-        status_code=500,
+        status_code=(
+            412
+            if isinstance(exc, OmnigentError) and exc.code == ErrorCode.HARNESS_NOT_CONFIGURED
+            else 500
+        ),
         content={
             "error": _native_terminal_start_error_payload(exc, runtime_name, session_id=session_id)
         },
@@ -8830,11 +8852,14 @@ async def _launch_native_terminal(
             await adapter(ctx)
             return True
         except Exception as exc:
-            _logger.exception(
-                "Failed to auto-create %s terminal for %s",
-                agent.terminal_name,
-                ctx.session_id,
-            )
+            if not (
+                isinstance(exc, OmnigentError) and exc.code == ErrorCode.HARNESS_NOT_CONFIGURED
+            ):
+                _logger.exception(
+                    "Failed to auto-create %s terminal for %s",
+                    agent.terminal_name,
+                    ctx.session_id,
+                )
             if reraise:
                 raise
             _publish_native_terminal_start_error(
@@ -8963,7 +8988,9 @@ async def _ensure_native_terminal(
                     exc,
                     extra={"session_id": ctx.session_id},
                 )
-            else:
+            elif not (
+                isinstance(exc, OmnigentError) and exc.code == ErrorCode.HARNESS_NOT_CONFIGURED
+            ):
                 _logger.exception(
                     "%s terminal ensure failed for session=%s",
                     agent.display_name,

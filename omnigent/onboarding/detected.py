@@ -22,6 +22,7 @@ Two surfaces:
 
 from __future__ import annotations
 
+from omnigent.errors import OmnigentError
 from omnigent.onboarding.ambient import DetectedProvider, detect_providers
 from omnigent.onboarding.configure_models import (
     build_cli_config_provider_entry,
@@ -196,6 +197,19 @@ def _synthesize_entry(det: DetectedProvider) -> dict[str, object] | None:
                 env_model = getenv_nonempty_with_omnigent_prefix("ANTHROPIC_MODEL")
                 if env_model is not None:
                     default_model = env_model[1]
+        if det.family == GEMINI_FAMILY:
+            from omnigent.onboarding.gemini_gateway import (
+                GEMINI_BASE_URL_ENV,
+                validate_gemini_base_url,
+            )
+
+            endpoint = getenv_nonempty_with_omnigent_prefix(GEMINI_BASE_URL_ENV)
+            if endpoint is not None:
+                # Keep a gateway token paired with its endpoint when adopting it.
+                try:
+                    base_url = validate_gemini_base_url(endpoint[1])
+                except OmnigentError:
+                    return None
         return build_key_provider_entry(
             det.family, base_url, api_key_ref, default_model, wire_api=wire_api
         )

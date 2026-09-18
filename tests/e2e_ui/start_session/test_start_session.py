@@ -1225,6 +1225,8 @@ async def _drive_landing_clears_after_navigating_away(
             # while the create is still bootstrapping.
             await page.locator(f'a[href="/c/{session_b}"]').click()
             await page.wait_for_url(re.compile(rf"/c/{re.escape(session_b)}$"))
+            # History updates before React commits the destination view.
+            await landing_input.wait_for(state="detached", timeout=30_000)
             await page.get_by_test_id("new-chat-button").click()
             await landing_input.wait_for(state="visible", timeout=30_000)
 

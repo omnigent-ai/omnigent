@@ -719,6 +719,18 @@ def harness_setup_hint(harness: str | None) -> str:
         login`"`` for native Cursor, or the ``omni setup`` hint otherwise.
     """
     spec = required_cli_for_harness(harness or "")
+    if spec is not None and spec.binary == "agy":
+        from omnigent.errors import ErrorCode, OmnigentError
+        from omnigent.harnesses.antigravity_native.credentials import (
+            resolve_antigravity_credentials,
+        )
+
+        try:
+            resolve_antigravity_credentials()
+        except OmnigentError as exc:
+            if exc.code != ErrorCode.INVALID_INPUT:
+                raise
+            return exc.message + " Run omni setup on the host to repair the Gemini configuration."
     if spec is not None and spec.package is None and spec.install_hint:
         login = ""
         if spec.login_args:

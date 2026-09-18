@@ -97,6 +97,10 @@ and can also drive Claude / GPT-OSS. Authenticate with an Antigravity /
 Gemini API key, or Vertex AI (`project` / `location`) — the SDK is
 Gemini-native and has no OpenAI-compatible gateway / Databricks path.
 
+For the native `omni agy` CLI, use the separate
+[native agy gateway guide](native-agy-gateways.md), which covers native Gemini
+gateways and Databricks profiles configured through `omni setup`.
+
 ```yaml
 executor:
   harness: antigravity         # aliases: agy, google-antigravity (native: antigravity-native, agy-native)

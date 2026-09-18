@@ -2,14 +2,12 @@
 
 This module assembles the ``agy`` command-line arguments and environment
 overrides needed to start or resume a native agy session.  It contains only
-pure functions and a frozen dataclass — no live agy calls are made here.
+argument builders and setup credential resolution.
 
 Key design points:
 
-* **Auth inheritance** — agy shares ``~/.gemini`` with the user's interactive
-  login; no credential seeding is required.  :func:`resolve_native_antigravity_launch`
-  verifies (informational only) that a credential exists but always returns
-  ``subscription`` mode regardless.
+* **Authentication** — an Omnigent Gemini provider selects the API key and
+  endpoint together. Otherwise agy inherits the user's existing login.
 
 * **Per-session identity is discovered, not assigned** — agy mints its own UUID
   conversation and ignores the ``ANTIGRAVITY_CONVERSATION_ID`` env var
@@ -43,6 +41,7 @@ import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.onboarding.gemini_auth import gemini_auth_has_credential
 
 _logger = logging.getLogger(__name__)
@@ -94,13 +93,8 @@ def agy_binary_path() -> str:
 class NativeAntigravityLaunch:
     """How a native Antigravity (agy) session should be launched.
 
-    Resolved by :func:`resolve_native_antigravity_launch`. ``auth_mode`` remains
-    ``"subscription"`` as an internal native-harness marker; agy itself chooses
-    OAuth or the ambient Gemini API key.
-
-    :param auth_mode: Authentication mode.  Always ``"subscription"`` for the
-        native harness; agy resolves either the ambient API key or the user's
-        existing login and no credential seeding is performed here.
+    :param auth_mode: "api-key" for a resolved Gemini credential, otherwise
+        "subscription" to let agy use its existing login.
     :param model: Optional model label to pass to agy via ``--model``, e.g.
         ``"gemini-2.5-pro"``.  ``None`` lets agy use its own default.
     :param extra_env: Additional environment variables to inject into the
@@ -110,29 +104,35 @@ class NativeAntigravityLaunch:
 
     auth_mode: str
     model: str | None
-    extra_env: dict[str, str] = field(default_factory=dict)
+    extra_env: dict[str, str] = field(default_factory=dict, repr=False)
 
 
 def resolve_native_antigravity_launch(
     *,
     model: str | None = None,
 ) -> NativeAntigravityLaunch:
-    """Resolve the native agy launch config for Phase 1 (subscription only).
+    """Resolve setup credentials and a model override for native agy.
 
-    Phase 1 always uses ``"subscription"`` auth mode: agy inherits the
-    user's Google login from ``~/.gemini`` automatically — no seeding is
-    needed.  :func:`gemini_auth_has_credential` is called only for an
-    informational check; the result never changes the returned mode.
-
-    If no credential is detected a warning is logged (agy will drive its
-    own OAuth flow on first run), but ``"subscription"`` mode is still
-    returned unconditionally.
-
-    :param model: Optional model label override, e.g. ``"gemini-2.5-pro"``.
-        ``None`` lets agy use its own default.
-    :returns: A :class:`NativeAntigravityLaunch` with
-        ``auth_mode="subscription"``.
+    Configured Gemini providers take precedence over legacy keys and ambient
+    credentials. With no API key, agy retains its existing OAuth/ADC behavior.
     """
+    from omnigent.harnesses.antigravity_native.credentials import resolve_antigravity_credentials
+
+    try:
+        credentials = resolve_antigravity_credentials()
+    except OmnigentError as exc:
+        if exc.code != ErrorCode.INVALID_INPUT:
+            raise
+        raise OmnigentError(
+            exc.message + " Run omni setup on the host to repair the Gemini configuration.",
+            code=ErrorCode.HARNESS_NOT_CONFIGURED,
+        ) from None
+    if credentials is not None:
+        return NativeAntigravityLaunch(
+            auth_mode="api-key",
+            model=model if model is not None else credentials.model,
+            extra_env=credentials.environment(),
+        )
     if not gemini_auth_has_credential():
         _logger.warning(
             "No agy credential found (checked GEMINI_API_KEY, ~/.gemini/oauth_creds.json "
@@ -231,11 +231,8 @@ def build_agy_launch(
     gate for this harness is post-hoc/audit-only). The flag is not duplicated
     when *extra_args* already carries it.
 
-    In both modes auth is inherited from the ambient environment / agy state,
-    and the workspace is the agy process cwd (set by the terminal spec), so no
-    ``--add-dir`` is emitted. No env overrides are produced: agy ignores
-    ``ANTIGRAVITY_SIDECAR_WEB_PORT`` / ``ANTIGRAVITY_CONVERSATION_ID`` /
-    ``ANTIGRAVITY_EXECUTABLE_DATA_DIR`` for the host process.
+    Both launch paths resolve setup credentials here and pass the resulting
+    environment to the child. The terminal spec supplies the workspace cwd.
 
     :param conversation_id: agy's real conversation id to resume, e.g.
         ``"68caaeac-..."``. Required (non-``None``) when ``resume=True``;
@@ -257,10 +254,12 @@ def build_agy_launch(
     :returns: A ``(argv, env_overrides)`` tuple where *argv* is the full
         command list starting with the agy binary path and *env_overrides*
         is a dict of env variables to layer on top of the process
-        environment (always empty for the agy host process).
+        environment.
     :raises ValueError: When ``resume=True`` but *conversation_id* is ``None``
         or empty (agy needs a real id to resume).
     """
+    launch = resolve_native_antigravity_launch(model=model)
+    model = launch.model
     argv: list[str] = [agy_binary_path()]
     if not any(arg == "--csrf_token" or arg.startswith("--csrf_token=") for arg in extra_args):
         argv.append(f"--csrf_token={secrets.token_urlsafe(32)}")
@@ -281,7 +280,4 @@ def build_agy_launch(
         argv.append(_SKIP_PERMISSIONS_FLAG)
     argv.extend(extra_args)
 
-    # agy ignores every env knob we tried (sidecar port, conversation id, data
-    # dir) for the host process, so there is nothing to inject.
-    env_overrides: dict[str, str] = {}
-    return argv, env_overrides
+    return argv, launch.extra_env

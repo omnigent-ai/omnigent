@@ -652,6 +652,27 @@ async def test_handle_launch_fails_for_bad_workspace(
     assert "/nonexistent/path/that/does/not/exist" in output
 
 
+async def test_host_boot_skips_managed_gateway_with_malformed_profile(
+    tmp_path, monkeypatch, caplog
+):
+    from omnigent.host.connect import _generate_ucode_configs
+
+    profile = tmp_path / "databrickscfg"
+    profile.write_text("token = private-malformed-secret\n")
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(profile))
+
+    def unexpected_configure(*args, **kwargs):
+        pytest.fail("Malformed profiles must not reach managed gateway setup")
+
+    monkeypatch.setattr(
+        "omnigent.onboarding.ucode_setup.configure_ucode_for_sandbox", unexpected_configure
+    )
+    _generate_ucode_configs()
+    assert "repair the Databricks profile file" in caplog.text
+    assert "private-malformed-secret" not in caplog.text
+    assert not any(record.exc_info for record in caplog.records)
+
+
 async def test_handle_launch_refuses_unconfigured_harness(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

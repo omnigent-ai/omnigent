@@ -410,47 +410,36 @@ def test_databricks_does_not_serve_gemini_surface() -> None:
 
 
 @pytest.mark.parametrize("kind", ["gateway", "local"])
-def test_gateway_local_does_not_serve_gemini_surface(kind: str) -> None:
-    """A gateway/local declaring a ``gemini:`` block does NOT claim the Gemini surface.
-
-    Invariant A: the Gemini surface is consumed by the antigravity flavors
-    (the antigravity SDK harness via a raw GEMINI_API_KEY, antigravity-native
-    via OAuth), neither of which can be driven by an OpenAI/Anthropic-compatible
-    proxy. So a ``gateway`` / ``local`` may carry a gemini block alongside a real
-    family but must NOT report ``gemini`` in ``provider_families`` — otherwise it
-    could silently become the gemini-surface default and wedge a launch the proxy
-    can't honor. Its legitimate anthropic surface is unaffected.
-    """
+def test_gateway_local_serves_declared_gemini_surface(kind: str) -> None:
     raw = {
         "kind": kind,
-        "anthropic": {"base_url": "https://gw", "api_key_ref": "env:K"},
-        "gemini": {"base_url": "https://gw/v1beta", "api_key_ref": "env:G"},
+        "anthropic": {"base_url": "https://gw/anthropic", "api_key_ref": "env:K"},
+        "gemini": {"base_url": "https://gw/gemini", "api_key_ref": "env:G"},
+        "default": ["gemini"],
     }
-    entry = load_providers({"providers": {"gw": raw}})["gw"]
-    served = provider_families(entry)
-    assert GEMINI_FAMILY not in served
-    # The real (anthropic) surface — and its pi capability — are untouched.
-    assert served == frozenset({ANTHROPIC_FAMILY, PI_SURFACE})
-    # And it can never become the gemini-surface default…
-    cfg = {"providers": {"gw": {**raw, "default": True}}}
-    assert default_provider_for_harness(cfg, "antigravity-native") is None
-    # …nor name the gemini scope explicitly at parse.
-    with pytest.raises(OmnigentError):
-        load_providers({"providers": {"gw": {**raw, "default": ["gemini"]}}})
+    config = {"providers": {"gw": raw}}
+    entry = load_providers(config)["gw"]
+    assert provider_families(entry) == frozenset({ANTHROPIC_FAMILY, GEMINI_FAMILY, PI_SURFACE})
+    assert default_provider_for_harness(config, "antigravity-native") == entry
+    assert default_provider_for_harness(config, "claude-native") is None
+    assert default_provider_for_harness(config, "pi") is None
 
 
 @pytest.mark.parametrize("kind", ["gateway", "local"])
-def test_gemini_only_gateway_local_rejected_at_parse(kind: str) -> None:
-    """A gateway/local whose ONLY family is gemini fails loud at parse.
-
-    Such an entry configures nothing it can serve (the Gemini surface is
-    key-only, and it declares no anthropic/openai family), so parsing it into a
-    silently-surfaceless provider would be a footgun. Reject it, steering the
-    author to ``kind: 'key'`` for a real GEMINI_API_KEY.
-    """
-    raw = {"kind": kind, "gemini": {"base_url": "https://x/v1beta", "api_key_ref": "env:G"}}
-    with pytest.raises(OmnigentError, match="Gemini surface"):
-        load_providers({"providers": {"gw": raw}})
+def test_gemini_only_gateway_local_defaults_native_agy_only(kind: str) -> None:
+    raw = {
+        "kind": kind,
+        "gemini": {"base_url": "https://gw/gemini", "api_key_ref": "env:G"},
+        "default": True,
+    }
+    config = {"providers": {"gw": raw}}
+    entry = load_providers(config)["gw"]
+    assert provider_families(entry) == frozenset({GEMINI_FAMILY})
+    assert default_provider_for_harness(config, "antigravity-native") == entry
+    for other in ("pi", "claude-native", "codex-native", "antigravity"):
+        assert default_provider_for_harness(config, other) is None
+    with pytest.raises(OmnigentError):
+        set_default_provider(config["providers"], "gw", PI_SURFACE)
 
 
 def test_gemini_auth_command_rejected_at_parse() -> None:
