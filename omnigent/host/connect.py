@@ -58,6 +58,7 @@ from omnigent.host.frames import (
     HostCreateWorktreeResultFrame,
     HostDetectCredentialsFrame,
     HostDetectCredentialsResultFrame,
+    HostFrameKind,
     HostFsRequestFrame,
     HostFsResultFrame,
     HostFsWriteFrame,
@@ -430,6 +431,31 @@ _SILENT_CONNECT_ESCALATE_ATTEMPTS = 10
 
 # Capability discovery is advisory and must not delay the host channel forever.
 _HOST_CAPABILITY_INIT_TIMEOUT_S = 15.0
+
+# Request-frame kinds ``_dispatch_host_frame`` serves, advertised in
+# ``host.hello`` so the server can reject a frame this daemon has no handler
+# for instead of forwarding it into a silent-drop timeout. Update alongside
+# the dispatcher when a new request frame gains a handler.
+ADVERTISED_FRAME_CAPABILITIES: tuple[HostFrameKind, ...] = (
+    HostFrameKind.LAUNCH_RUNNER,
+    HostFrameKind.STOP_RUNNER,
+    HostFrameKind.RUNNER_STATUS,
+    HostFrameKind.STAT,
+    HostFrameKind.LIST_DIR,
+    HostFrameKind.CREATE_DIR,
+    HostFrameKind.CREATE_WORKTREE,
+    HostFrameKind.REMOVE_WORKTREE,
+    HostFrameKind.LIST_WORKTREES,
+    HostFrameKind.INSTALL_HARNESS,
+    HostFrameKind.STORE_SECRET,
+    HostFrameKind.DETECT_CREDENTIALS,
+    HostFrameKind.FS_REQUEST,
+    HostFrameKind.FS_WRITE_REQUEST,
+    HostFrameKind.SKILLS,
+    HostFrameKind.MODEL_OPTIONS,
+    HostFrameKind.IMPORT_LOCAL,
+    HostFrameKind.IMPORT_LOCAL_BY_ID,
+)
 
 # Host-environment variables a spawned runner is allowed to inherit.
 # Deliberately an allowlist (not ``{**os.environ}``): the host runs as the
@@ -4054,6 +4080,7 @@ class HostProcess:
             interactive_shells=self._interactive_shells,
             telemetry_opt_out=_tel_opt_out,
             installation_id=_tel_install_id,
+            capabilities=[kind.value for kind in ADVERTISED_FRAME_CAPABILITIES],
         )
         try:
             encoded_hello = encode_host_frame(hello)
