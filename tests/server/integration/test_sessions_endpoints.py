@@ -9742,6 +9742,66 @@ async def test_retry_session_ensures_dead_required_native_terminal_once(
         await runner_client.aclose()
 
 
+async def test_retry_session_retries_native_terminal_ensure_after_runner_reconnects(
+    client: httpx.AsyncClient,
+    app: Any,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Retry-session recovery waits for a dropped runner and repeats the terminal ensure."""
+    from omnigent.runner.routing import RunnerRouter
+    from omnigent.server.routes._sessions import orchestration as orchestration_module
+    from omnigent.server.routes.sessions import routes_events
+
+    agent = await create_test_agent(
+        client,
+        executor={"type": "omnigent", "config": {"harness": "claude-native"}},
+    )
+    session = await _create_session(client, agent["id"], initial_message="Keep this once")
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.replace_runner_id(session["id"], "native-runner")
+    ensure_requests: list[httpx.Request] = []
+
+    def runner(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/resources/terminals"):
+            ensure_requests.append(request)
+            if len(ensure_requests) == 1:
+                # What WSTunnelTransport raises when the tunnel dies under the request.
+                raise ConnectionError("tunnel closed before request completed")
+            return httpx.Response(200, json={})
+        return httpx.Response(
+            201, json={"session_init_protocol_version": 2, "terminal_ready": True}
+        )
+
+    runner_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(runner), base_url="http://runner"
+    )
+    await app.state.runner_session_initializer.initialize(conv, runner_client, timeout=10)
+    wait_for_runner = AsyncMock(return_value=True)
+    monkeypatch.setattr(RunnerRouter, "wait_for_runner", wait_for_runner)
+    monkeypatch.setattr(routes_events, "_get_runner_client", AsyncMock(return_value=runner_client))
+    monkeypatch.setattr(routes_events, "_ensure_runner_relay_ready", AsyncMock(return_value=None))
+    monkeypatch.setattr("omnigent.server.routes.sessions._ensure_runner_relay_ready", AsyncMock())
+
+    try:
+        response = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={"type": "retry_session", "data": {}},
+        )
+
+        assert response.status_code == 202, response.text
+        assert response.json()["recovery"] == "native_terminal_ready"
+        # The retry path hands the real router to the probe, which waits for the
+        # session's runner and then repeats the ensure over the new tunnel.
+        wait_for_runner.assert_awaited_once_with(
+            "native-runner",
+            timeout_s=orchestration_module._NATIVE_TERMINAL_ENSURE_RECONNECT_GRACE_S,
+        )
+        assert len(ensure_requests) == 2
+    finally:
+        await runner_client.aclose()
+
+
 async def test_retry_session_keeps_error_actionable_when_runner_is_unavailable(
     client: httpx.AsyncClient,
 ) -> None:
