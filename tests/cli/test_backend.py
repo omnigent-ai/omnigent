@@ -14,6 +14,7 @@ import hashlib
 import io
 import json
 import re
+import subprocess
 import sys
 import threading
 from collections.abc import Callable
@@ -31,7 +32,7 @@ from rich.console import Console
 # the process-wide ``subprocess.Popen``. Running that import for the first
 # time *while* Popen is patched would evaluate ``subprocess.Popen[...]``
 # generic aliases in the import chain against the stub (not subscriptable).
-import omnigent.host.connect  # noqa: F401
+import omnigent.host.connect
 from omnigent import cli
 from omnigent.cli import (
     _build_host_daemon_env,
@@ -209,6 +210,61 @@ def test_ensure_host_daemon_local_spawns_local_flag(
     assert "--local" in args
     assert "--server" not in args
     assert (tmp_path / "host.pid").read_text().splitlines()[1] == "local"
+
+
+@pytest.mark.parametrize("server_url", [None, "https://server.example.com"])
+def test_daemon_startup_preserves_runtime_identity_and_workspace(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, server_url: str | None
+) -> None:
+    """Daemon interpreter options isolate imports without changing the workspace."""
+    from omnigent.host.identity import load_or_create_host_identity
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.chdir(workspace)
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    for name in ("PYTHONSAFEPATH", "PYTHONPATH", "OMNIGENT_HOST_ID", "OMNIGENT_HOST_NAME"):
+        monkeypatch.delenv(name, raising=False)
+    expected_identity = load_or_create_host_identity()
+
+    captured: dict[str, object] = {}
+    with monkeypatch.context() as spawn_patch:
+        _patch_daemon_spawn(spawn_patch, tmp_path, captured)
+        _ensure_host_daemon(server_url)
+
+    args = captured["args"]
+    env = captured["env"]
+    assert isinstance(args, list)
+    assert isinstance(env, dict)
+    # Run a diagnostic with the actual daemon interpreter options, without
+    # starting a server or inheriting the developer's credentials.
+    probe_env = {
+        name: value
+        for name, value in env.items()
+        if name in {"PATH", "SYSTEMROOT", "WINDIR", "OMNIGENT_CONFIG_HOME", "OMNIGENT_DATA_DIR"}
+    }
+    probe_env.update(HOME=str(tmp_path), USERPROFILE=str(tmp_path))
+    result = subprocess.run(
+        [
+            *args[: args.index("-m")],
+            "-c",
+            "import json, os, sys, omnigent; "
+            "from omnigent.host.identity import load_or_create_host_identity; "
+            "print(json.dumps(dict(safe_path=sys.flags.safe_path, cwd=os.getcwd(), "
+            "runtime=omnigent.__file__, host_id=load_or_create_host_identity().host_id)))",
+        ],
+        env=probe_env,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+    observed = json.loads(result.stdout)
+    assert observed["safe_path"] is True
+    assert Path(observed["cwd"]) == workspace.resolve()
+    assert Path(observed["runtime"]).resolve() == Path(omnigent.__file__).resolve()
+    assert observed["host_id"] == expected_identity.host_id
 
 
 def test_ensure_host_daemon_local_inherits_data_dir_and_db_uri(
