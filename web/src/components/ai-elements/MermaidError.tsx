@@ -38,6 +38,39 @@ function hasBareSemicolon(text: string): boolean {
   return text.replace(/#\w+;/g, "").includes(";");
 }
 
+// What follows a `;` decides its meaning: a segment that starts like another
+// statement (a message with an arrow and colon, or a keyword) marks a real
+// separator, anything else is punctuation. A punctuation segment that happens
+// to start with a keyword is left alone, so recovery declines rather than
+// merging or dropping an interaction.
+const STATEMENT_KEYWORDS =
+  "note|loop|alt|else|opt|par|par_over|and|end|critical|option|break|rect|box|participant|actor|create|destroy|activate|deactivate|autonumber|title|links|link|properties|details|accTitle|accDescr";
+const STATEMENT_START_RE = new RegExp(
+  String.raw`^\s*(?:(?:${STATEMENT_KEYWORDS})\b|[^:;]*?(?:${ARROW})[^:;]*:)`,
+  "i",
+);
+
+function escapeBareSemicolons(text: string, onEscape: () => void): string {
+  const bare: number[] = [];
+  for (const match of text.matchAll(ENTITY_OR_SEMICOLON_RE)) {
+    if (match[0] === ";") bare.push(match.index ?? 0);
+  }
+  let out = "";
+  let cursor = 0;
+  bare.forEach((position, i) => {
+    const segment = text.slice(position + 1, bare[i + 1] ?? text.length);
+    out += text.slice(cursor, position);
+    if (STATEMENT_START_RE.test(segment)) {
+      out += ";";
+    } else {
+      out += "#59;";
+      onEscape();
+    }
+    cursor = position + 1;
+  });
+  return out + text.slice(cursor);
+}
+
 // `;` ends a statement in sequence diagrams, and prose in a Note or message
 // routinely carries one — the classic LLM slip.
 const SEMICOLON_HINT = (
@@ -55,11 +88,11 @@ export interface EscapedSemicolons {
 }
 
 /**
- * Escape every bare `;` inside the free text of a sequence diagram as `#59;`,
- * the form Mermaid documents for a literal semicolon. Existing entity codes and
- * the YAML front matter are left alone. Null when nothing changed. Only for a
- * diagram that already failed to parse: in a valid one a `;` may be a
- * deliberate statement separator.
+ * Escape every punctuation `;` inside the free text of a sequence diagram as
+ * `#59;`, the form Mermaid documents for a literal semicolon. Semicolons that
+ * separate statements, existing entity codes, comment lines and the YAML front
+ * matter are left alone. Null when nothing changed. Only for a diagram that
+ * already failed to parse.
  */
 export function escapeSequenceTextSemicolons(chart: string): EscapedSemicolons | null {
   const normalized = chart.replace(/\r\n?/g, "\n");
@@ -67,24 +100,22 @@ export function escapeSequenceTextSemicolons(chart: string): EscapedSemicolons |
   const frontMatterLines = frontMatter.split("\n").length - 1;
   let count = 0;
   let firstLine = 0;
-  const escape = (text: string, lineIndex: number) =>
-    text.replace(ENTITY_OR_SEMICOLON_RE, (match) => {
-      if (match !== ";") return match;
-      count += 1;
-      if (firstLine === 0) firstLine = frontMatterLines + lineIndex + 1;
-      return "#59;";
-    });
   const lines = normalized
     .slice(frontMatter.length)
     .split("\n")
     .map((line, index) => {
-      if (!hasBareSemicolon(line)) return line;
+      if (!hasBareSemicolon(line) || /^\s*%%/.test(line)) return line;
+      const escape = (text: string) =>
+        escapeBareSemicolons(text, () => {
+          count += 1;
+          if (firstLine === 0) firstLine = frontMatterLines + index + 1;
+        });
       const block = BLOCK_LABEL_RE.exec(line);
-      if (block) return block[1] + escape(block[2], index);
+      if (block) return block[1] + escape(block[2]);
       const alias = ALIAS_RE.exec(line);
-      if (alias) return alias[1] + escape(alias[2], index);
+      if (alias) return alias[1] + escape(alias[2]);
       const text = TEXT_AFTER_COLON_RE.exec(line);
-      if (text) return `${text[1]}:${escape(text[2], index)}`;
+      if (text) return `${text[1]}:${escape(text[2])}`;
       return line;
     });
   return count === 0 ? null : { text: frontMatter + lines.join("\n"), count, firstLine };

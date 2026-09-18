@@ -34,6 +34,36 @@ describe("escapeSequenceTextSemicolons", () => {
     ).toBeNull();
   });
 
+  it("keeps semicolons that separate statements and escapes only punctuation", () => {
+    const chart =
+      "sequenceDiagram\n  A->>B: first; B->>C: second\n  C->>D: punctuation; retry me\n";
+    expect(escapeSequenceTextSemicolons(chart)).toEqual({
+      text: "sequenceDiagram\n  A->>B: first; B->>C: second\n  C->>D: punctuation#59; retry me\n",
+      count: 1,
+      firstLine: 3,
+    });
+    expect(
+      escapeSequenceTextSemicolons("sequenceDiagram\n  A->>B: hi; there; B->>C: yo\n")?.text,
+    ).toBe("sequenceDiagram\n  A->>B: hi#59; there; B->>C: yo\n");
+  });
+
+  it("declines a semicolon whose continuation could be a statement", () => {
+    expect(
+      escapeSequenceTextSemicolons("sequenceDiagram\n  A->>B: retry; end of story\n"),
+    ).toBeNull();
+    expect(escapeSequenceTextSemicolons("sequenceDiagram\n  A->>B: go; activate B\n")).toBeNull();
+  });
+
+  it("skips comment lines so they neither count nor set the first line", () => {
+    expect(
+      escapeSequenceTextSemicolons("%% A->>B: a; b\nsequenceDiagram\n  A->>B: c; d\n"),
+    ).toEqual({
+      text: "%% A->>B: a; b\nsequenceDiagram\n  A->>B: c#59; d\n",
+      count: 1,
+      firstLine: 3,
+    });
+  });
+
   it("normalizes CRLF line endings before matching", () => {
     expect(escapeSequenceTextSemicolons("sequenceDiagram\r\n    A->>B: a; b\r\n")).toEqual({
       text: "sequenceDiagram\n    A->>B: a#59; b\n",

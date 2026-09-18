@@ -143,6 +143,18 @@ def test_unparseable_diagram_names_the_failing_line(
     expect(card.locator("details")).to_contain_text("got 'NEWLINE'")
 
 
+# A legitimate ``;`` statement separator on one line, punctuation on the next:
+# recovery must keep all three interactions distinct.
+_SEPARATOR_MERMAID_MESSAGE = (
+    "Two styles:\n\n"
+    "```mermaid\n"
+    "sequenceDiagram\n"
+    "    A->>B: first; B->>C: second\n"
+    "    C->>D: punctuation; retry me\n"
+    "```\n"
+)
+
+
 @pytest.fixture
 def semicolon_mermaid_chat_session(
     seeded_session: tuple[str, str],
@@ -176,4 +188,38 @@ def test_semicolon_diagram_renders_with_an_escape_note(
     expect(escaped).to_contain_text("2 semicolons escaped as #59; (first on line 2)")
     # Details keeps the source as written, entity code included.
     expect(escaped.locator("details")).to_contain_text("Load grant#59; refresh if needed")
+    expect(page.get_by_test_id("mermaid-error")).to_have_count(0)
+
+
+@pytest.fixture
+def separator_mermaid_chat_session(
+    seeded_session: tuple[str, str],
+) -> Iterator[tuple[str, str]]:
+    """Seed a settled assistant bubble mixing a real separator with punctuation."""
+    base_url, session_id = seeded_session
+    httpx.post(
+        f"{base_url}/v1/sessions/{session_id}/events",
+        json={
+            "type": "external_assistant_message",
+            "data": {"agent": _AGENT_NAME, "text": _SEPARATOR_MERMAID_MESSAGE},
+        },
+        timeout=10.0,
+    ).raise_for_status()
+    yield (base_url, session_id)
+
+
+def test_escape_keeps_statement_separators(
+    page: Page, separator_mermaid_chat_session: tuple[str, str]
+) -> None:
+    """Only the punctuation semicolon is escaped; every interaction survives."""
+    base_url, session_id = separator_mermaid_chat_session
+    page.goto(f"{base_url}/c/{session_id}")
+
+    escaped = page.get_by_test_id("mermaid-escaped")
+    diagram = escaped.locator("svg[aria-roledescription]")
+    expect(diagram).to_be_visible(timeout=30_000)
+    expect(diagram.locator("text.messageText")).to_have_text(
+        ["first", "second", "punctuation; retry me"]
+    )
+    expect(escaped).to_contain_text("one semicolon escaped as #59; (first on line 3)")
     expect(page.get_by_test_id("mermaid-error")).to_have_count(0)
