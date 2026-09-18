@@ -10527,7 +10527,10 @@ async def _get_session_snapshot(
     runner_router = get_runner_router()
     if runner_router is not None:
         try:
-            routed = runner_router.client_for_session_resources(session_id)
+            # Pass the authorized row: the router's own point read would be a
+            # second read of the conversation this snapshot already holds, and on
+            # a split-DB deployment that is one round trip per backend.
+            routed = runner_router.client_for_session_resources(session_id, conversation=conv)
             runner_client = routed.client
         except (LookupError, httpx.HTTPError, OmnigentError):
             _logger.debug(

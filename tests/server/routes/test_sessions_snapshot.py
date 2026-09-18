@@ -807,7 +807,15 @@ async def test_session_snapshot_uses_router_when_singleton_unset(
         def __init__(self) -> None:
             self.resolved_for: list[str] = []
 
-        def client_for_session_resources(self, conversation_id: str) -> RoutedRunner:
+        def client_for_session_resources(
+            self,
+            conversation_id: str,
+            *,
+            conversation: Conversation | None = None,
+        ) -> RoutedRunner:
+            # Mirrors the real router: callers hand over the row they already
+            # authorized so it need not re-read the conversation.
+            del conversation
             self.resolved_for.append(conversation_id)
             return RoutedRunner(runner_id="runner_test", client=fake_client)  # type: ignore[arg-type]
 
@@ -1843,7 +1851,14 @@ async def test_session_snapshot_prefers_router_over_singleton(
     singleton_client = _Client("idle")
 
     class _FakeRouter:
-        def client_for_session_resources(self, conversation_id: str) -> RoutedRunner:
+        def client_for_session_resources(
+            self,
+            conversation_id: str,
+            *,
+            conversation: Conversation | None = None,
+        ) -> RoutedRunner:
+            """Mirrors the real router's already-authorized-row parameter."""
+            del conversation_id, conversation
             return RoutedRunner(runner_id="runner_test", client=router_client)  # type: ignore[arg-type]
 
     monkeypatch.setattr(
