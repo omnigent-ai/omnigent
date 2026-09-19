@@ -2,7 +2,8 @@
 
 > **IMPLEMENTED.** Config surface: `os_env.sandbox.credential_proxy`.
 > Code: `omnigent/inner/credential_proxy.py`,
-> `omnigent/inner/egress/proxy.py`, `omnigent/spec/parser.py`.
+> `omnigent/inner/egress/proxy.py`, `omnigent/inner/egress/aws_sigv4.py`,
+> `omnigent/spec/parser.py`.
 
 ## Problem
 
@@ -201,6 +202,134 @@ os_env:
         default: dbc-adb7b1a3-9097
 ```
 
+### `aws_sigv4` — full request re-signing, not header substitution
+
+AWS SigV4 can't use swap-on-access or placeholder substitution: the
+`Authorization` header is a signature *over the whole request* (method,
+canonical URI, canonical query string, a canonical header set, and the
+declared payload hash), not an opaque credential string. There is no
+single value to inject or swap — the signature has to be discarded and
+rebuilt from scratch with the real credential, over the literal bytes
+going upstream. `aws_sigv4` is therefore a structurally separate
+mechanism from the four types above, though it shares their `source` /
+`{env|file|command}` resolution model and their host-keyed, `egress_rules`
+-gated shape.
+
+**Always-on placeholder credential, not opt-in.** Every other type
+defaults to swap-on-access (nothing enters the sandbox) and only injects a
+placeholder for clients that refuse to make an unauthenticated request.
+`boto3` can't make a request at all without *some* configured credential,
+so `aws_sigv4` always injects placeholder `AWS_ACCESS_KEY_ID` /
+`AWS_SECRET_ACCESS_KEY` (plus `AWS_DEFAULT_REGION` / `AWS_REGION` /
+`AWS_EC2_METADATA_DISABLED=true`) into the sandbox env whenever any
+`aws_sigv4` entries are configured. The sandboxed `boto3` client signs its
+request with these placeholders — producing a well-formed but
+cryptographically garbage `Authorization: AWS4-HMAC-SHA256 ...` header —
+and the egress proxy discards that signature entirely and rebuilds it with
+the real credential before forwarding.
+
+**Always discard-and-rebuild, not inject-if-absent.** Because `boto3`
+always sends *some* SigV4 `Authorization` header, the proxy can't use the
+"inject only if the header is absent" swap-on-access rule the other types
+use. Instead: a request to a bound host whose `Authorization` value is
+SigV4-shaped (`AWS4-HMAC-SHA256 ...`) is always resigned; a request whose
+`Authorization` is absent or a different shape is left untouched —
+defense-in-depth against clobbering an unrelated credential a tool
+deliberately sent.
+
+**The body — and its `X-Amz-Content-Sha256` declaration — are never
+touched.** This matters more than it looks: as of the current `botocore`
+default (`request_checksum_calculation="when_supported"`), **every** S3
+upload (`PutObject`, `UploadPart`, …) is sent `aws-chunked` with
+`X-Amz-Content-Sha256: STREAMING-UNSIGNED-PAYLOAD-TRAILER`, regardless of
+body size — this is not a size threshold, and reads (`GetObject`,
+`HeadObject`, `ListObjectsV2`, …) are unaffected since they carry no body.
+It's tempting to assume "chunked" needs special handling — resigning a
+chain of per-chunk signatures, the classic SigV4 streaming mode — but that
+mode is gone from current `botocore` entirely (no `chunk-signature`/
+per-chunk HMAC chain exists in the installed package). The modern
+streaming-trailer mode carries **no** cryptographic signature over the
+payload at all: it's wire framing (`<hex-len>\r\n<data>\r\n` chunks) plus
+a trailing *non-cryptographic* checksum (CRC32 by default) — TLS plus that
+checksum cover integrity instead of the SigV4 signature. So the value
+already present in `X-Amz-Content-Sha256` — a real hex hash,
+`UNSIGNED-PAYLOAD`, or the streaming-trailer sentinel — depends only on
+body content, never on which credentials signed the request, and the
+client's own value (even though signed with the placeholder keys) is
+already correct. The proxy forwards the body completely unchanged and
+preserves this header verbatim in every case — chunked and non-chunked
+uploads need no special-casing and share the exact same resign code path.
+Only presigned query-string auth (`?X-Amz-Signature=...`, a different
+signing mode not produced by ordinary `boto3` API calls) is out of scope.
+
+**Three credential shapes**, mutually exclusive:
+
+```yaml
+os_env:
+  sandbox:
+    type: linux_bwrap  # aws_sigv4 also works on darwin_seatbelt — its
+                        # signing happens entirely in the parent process,
+                        # unlike the Go-CLI-backed types above.
+    egress_rules:
+      - "* mybucket.s3.us-east-1.amazonaws.com/**"
+    credential_proxy:
+      # Static credential — access key id + secret key (+ optional
+      # session token), each resolved the same {env|file|command} way as
+      # every other credential-proxy source.
+      - type: aws_sigv4
+        target: mybucket.s3.us-east-1.amazonaws.com
+        region: us-east-1
+        service: s3                                  # optional, default "s3"
+        credential:
+          access_key_id: {env: AWS_ACCESS_KEY_ID}
+          secret_access_key: {env: AWS_SECRET_ACCESS_KEY}
+          # session_token: {env: AWS_SESSION_TOKEN}   # optional
+
+      # profile — the parent resolves the full credential from a named
+      # profile in its own ~/.aws/config / ~/.aws/credentials, via boto3's
+      # Session(profile_name=...). One shared credentials file with many
+      # profiles (e.g. "prod", "staging") can back different aws_sigv4
+      # entries this way, including a profile that itself role-chains via
+      # source_profile or uses SSO — boto3 resolves and refreshes all of
+      # that, not omnigent.
+      - type: aws_sigv4
+        target: staging-bucket.s3.us-east-1.amazonaws.com
+        region: us-east-1
+        credential:
+          profile: staging
+
+      # assume_role (recommended) — the parent mints and auto-refreshes
+      # temporary credentials via an explicit STS call, using its OWN
+      # ambient AWS identity (env/config/instance-profile/SSO — whatever
+      # the omnigent server itself runs as, or a specific named `profile`
+      # below) as the caller. No long-lived IAM user key needs to be
+      # handed to omnigent when the server already has a role that can
+      # assume one.
+      - type: aws_sigv4
+        target: otherbucket.s3.us-west-2.amazonaws.com
+        region: us-west-2
+        credential:
+          assume_role:
+            role_arn: arn:aws:iam::123456789012:role/omnigent-agent-s3
+            duration_seconds: 3600
+            # profile: prod                           # optional caller identity
+```
+
+`region`/`service` are declared explicitly per binding, matching every
+other credential-proxy type's explicit-field style, rather than parsed
+from the host string. `target`/`targets` work the same as `https_bearer` —
+`aws_sigv4` is host-keyed (the bucket/region are known upfront in config),
+unlike `databricks_cli`'s runtime-resolved profile keying.
+
+**Multi-region caveat.** `AWS_DEFAULT_REGION`/`AWS_REGION` are single
+global env vars — with multiple `aws_sigv4` entries spanning regions, only
+the *first* entry's region becomes the sandbox's ambient default. An agent
+targeting more than one region should pass `region_name=` explicitly per
+`boto3.client(...)` call to hit each entry's exact bound host. A mismatch
+fails safe either way: the request lands on an unbound (or
+`egress_rules`-disallowed) host and either gets a `403` from the proxy or
+a `SignatureDoesNotMatch` from AWS — never a credential leak.
+
 ## Internal model
 
 `omnigent/inner/datamodel.py`:
@@ -216,6 +345,19 @@ os_env:
   `OSEnvSandboxSpec.credential_proxy`.
 - `DatabricksProxySpec` / `DatabricksProfileBinding` — the profile list
   (+ `default`, `config_env`) for the `databricks_cli` type.
+- `AwsAssumeRoleSpec` — STS `AssumeRole` parameters (`role_arn`,
+  `session_name`, `duration_seconds`, `external_id`, optional `profile`
+  for the caller identity) for a refreshing `aws_sigv4` credential.
+- `AwsSigV4CredentialSpec` — exactly one of: a static 3-part credential
+  (`access_key_id` / `secret_access_key` / optional `session_token`, each
+  a `CredentialSourceSpec`), `profile` (a named AWS profile resolved via
+  `boto3.Session(profile_name=...)`), or `assume_role` — mutually
+  exclusive.
+- `AwsSigV4ProxyEntry` — the host-keyed `aws_sigv4` binding: `host`,
+  `region`, `service`, `credential`. Carried on `CredentialProxySpec.
+  aws_sigv4` — a separate list from `entries`, since the proxy enforces it
+  through a wholly different mechanism (full re-signing, not header
+  substitution).
 
 The parser (`omnigent/spec/parser.py`, `_parse_credential_proxy`)
 validates each raw entry with a pydantic boundary model
@@ -261,6 +403,25 @@ non-secret `oa_cred_*` placeholder.
 > credential directly. The helper, its config-pipe payload, and the
 > `OMNIGENT_CREDENTIAL_PROXY_GIT_HTTPS` env var are gone.
 
+**`aws_sigv4` (a separate mechanism):** `prepare_credential_proxy_runtime`
+also resolves `spec.aws_sigv4` into `runtime.aws_sigv4_rewrites: list[
+AwsSigV4RewriteRule]`. Each rule carries either a static
+`AwsSigV4Credentials` (access key id + secret key + optional session
+token) or a refreshing `credential_provider` — `AwsSigV4CredentialProvider`
+for the `assume_role` shape, which mints temporary credentials via STS
+using the *parent's own ambient AWS identity* (or a named `profile`, when
+set) and re-mints when the cached credential is within a safety margin of
+its STS-declared `Expiration` (an explicit, authoritative expiry, unlike
+Databricks' opaque OAuth token — so no blind fixed-interval throttle is
+needed); or `AwsSigV4ProfileCredentialProvider` for the `profile` shape,
+which re-freezes `boto3.Session(profile_name=...).get_credentials()` on
+every call instead of tracking its own expiry — boto3 already refreshes a
+role-chained or SSO profile internally. Whenever `spec.aws_sigv4`
+is non-empty, placeholder `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` /
+`AWS_DEFAULT_REGION` / `AWS_REGION` / `AWS_EC2_METADATA_DISABLED` are
+always added to `helper_env_updates` (not opt-in, unlike `inject_env`) —
+`boto3` cannot build a request at all without some configured credential.
+
 ## Proxy rewrite
 
 `omnigent/inner/egress/proxy.py`: `EgressProxy` takes
@@ -296,6 +457,35 @@ keys so `git`/libcurl trusts the MITM CA when it connects to the bound
 host (the CA trust is what lets the proxy terminate TLS and inject the
 header — it is independent of how the credential is supplied).
 
+**`aws_sigv4` resigning (a separate, parallel path):** `EgressProxy` also
+takes `aws_sigv4_rewrites` and builds a third index, `_sigv4_by_host`
+(disjoint from `_cred_by_host` — the parser rejects a host bound by more
+than one credential-proxy type). `_resign_aws_sigv4` (called as a second,
+chained call right after `_rewrite_authorization` at both `_forward_https`
+and `_handle_http`, since only one of the two ever does real work per
+request):
+
+- Forwards unchanged on the loopback/diagnostic verbs
+  (`_CREDENTIAL_INJECTION_FORBIDDEN_METHODS`), same as the header-swap path.
+- Forwards unchanged if the bound host's request carries no
+  `Authorization`, or one that isn't SigV4-shaped (`is_sigv4_authorization`)
+  — defense-in-depth; unlike swap-on-access, `aws_sigv4` never *adds* a
+  missing header, only replaces an existing SigV4 one.
+- Otherwise calls `omnigent.inner.egress.aws_sigv4.resign_request` — which
+  discards `Authorization` / `X-Amz-Date` / `Date` / `X-Amz-Security-Token`
+  unconditionally, rebuilds them via `botocore.auth.S3SigV4Auth` (with one
+  override — see the module docstring — so `X-Amz-Content-Sha256` is never
+  recomputed from the forwarded body, since that value depends only on
+  body content and is already correct however it was set), and leaves
+  every other header (and the body, in whatever framing) untouched. Raises
+  `UnsupportedAwsSigV4RequestError` (→ 403) only for presigned
+  query-string auth.
+
+`botocore` is a lazy import inside `resign_request`, gated behind the `s3`
+extra (`pip install omnigent[s3]`) — importing `aws_sigv4.py` (and thus
+`proxy.py`) never requires it unless an `aws_sigv4` binding is actually
+configured and hit.
+
 ## Wiring
 
 - `omnigent/inner/os_env.py` — `_start_locked` builds a scoped parent
@@ -313,26 +503,50 @@ header — it is independent of how the credential is supplied).
 - The `resolve` methods of `bwrap_sandbox.py`, `seatbelt_sandbox.py`,
   and `landlock_sandbox.py` propagate
   `credential_proxy=sandbox_spec.credential_proxy`.
+- `aws_sigv4_rewrites` follows the identical path as `rewrites` end to
+  end: `_start_locked` → `_start_egress_proxy_locked` → `start_egress_proxy`
+  → `EgressProxy(aws_sigv4_rewrites=...)`. No `MaterializedFile`/config-file
+  step — `boto3` reads credentials from env directly.
 
 ## Tests
 
 - `tests/inner/test_credential_proxy.py` — source resolution
   (env/file/command), the swap-on-access default (nothing injected, no
   synthetic minted), opt-in synthetic minting, and the `gh_basic` shape
-  (git host swap-on-access, api host env injection).
+  (git host swap-on-access, api host env injection); `aws_sigv4` static
+  and `assume_role` credential resolution, placeholder-env behavior, and
+  the refreshing STS provider's cache/re-mint-near-expiry behavior.
 - `tests/inner/egress/test_proxy.py` — swap-on-access injection on a
   bare request, synthetic→real swap for basic/bearer/token against a
   real capturing upstream, the wrong-host 403 leak guard, and
-  non-synthetic pass-through.
+  non-synthetic pass-through; `aws_sigv4` resigning of both a non-chunked
+  and the default chunked-with-trailer-checksum `PutObject` shape,
+  verified by independently recomputing the expected signature over the
+  captured upstream bytes, plus the presigned-query-auth rejection and
+  non-SigV4/forbidden-method passthroughs.
+- `tests/inner/egress/test_aws_sigv4.py` — pure signer correctness: an
+  exact reproduction of AWS's published SigV4 test vector, and the
+  header-preservation/stripping rules `resign_request` enforces.
 - `tests/spec/test_parser.py` — round-trip + fail-loud for all four
-  types, plus `env`-optional (swap-on-access) parsing.
+  original types, plus `env`-optional (swap-on-access) parsing; `aws_sigv4`
+  round-trip for both credential shapes, fail-loud cases, the
+  macOS-allowed contrast with the Go-CLI types, and cross-type
+  duplicate-host rejection.
 - `tests/inner/sandbox/test_egress_e2e.py` — real-sandbox e2e:
   swap-on-access injects Basic auth on a bare request while the sandbox
   holds neither the secret nor a placeholder; `https_bearer` with `env`
   performs the full env-injection → proxy swap → upstream-sees-real-token
-  path.
+  path; `aws_sigv4` runs a real, unmodified `boto3.client("s3").
+  put_object(...)` call inside the sandbox (exercising the default
+  chunked+trailer shape) and verifies the upstream received a request
+  genuinely signed with the real credential while the sandbox env held
+  only the placeholder.
 
 ## Non-goals
 
 - **SSH.** This phase covers HTTP(S) Bearer/Basic only. SSH-based git
   remotes are out of scope.
+- **`aws_sigv4` presigned query-string auth and non-S3 SigV4 services
+  beyond what `service:` already allows.** Header-based signing for any
+  SigV4 service is supported (the `service` field is free-form), but this
+  phase has only been exercised against S3.

@@ -4233,6 +4233,359 @@ def test_parse_credential_proxy_databricks_cli_rejected_on_macos(tmp_path: Path)
         parse(tmp_path)
 
 
+def _aws_sigv4_config(entry: dict[str, object], *, sandbox_type: str = "linux_bwrap") -> dict:
+    return {
+        "spec_version": 1,
+        "name": "cred-proxy-aws-sigv4",
+        "os_env": {
+            "type": "caller_process",
+            "cwd": ".",
+            "sandbox": {
+                "type": sandbox_type,
+                "egress_rules": ["* mybucket.s3.us-east-1.amazonaws.com/**"],
+                "credential_proxy": [entry],
+            },
+        },
+    }
+
+
+def test_parse_credential_proxy_aws_sigv4_static(tmp_path: Path) -> None:
+    """A static-credential ``aws_sigv4`` entry round-trips into
+    ``credential_proxy.aws_sigv4``, host-keyed like ``https_bearer``."""
+    config = _aws_sigv4_config(
+        {
+            "type": "aws_sigv4",
+            "target": "mybucket.s3.us-east-1.amazonaws.com",
+            "region": "us-east-1",
+            "credential": {
+                "access_key_id": {"env": "AWS_ACCESS_KEY_ID"},
+                "secret_access_key": {"env": "AWS_SECRET_ACCESS_KEY"},
+            },
+        }
+    )
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    proxy = spec.os_env.sandbox.credential_proxy
+    assert proxy is not None
+    assert proxy.entries == []
+    assert len(proxy.aws_sigv4) == 1
+    entry = proxy.aws_sigv4[0]
+    assert entry.host == "mybucket.s3.us-east-1.amazonaws.com"
+    assert entry.region == "us-east-1"
+    assert entry.service == "s3"
+    assert entry.credential.access_key_id.kind == "env"
+    assert entry.credential.access_key_id.env == "AWS_ACCESS_KEY_ID"
+    assert entry.credential.assume_role is None
+
+
+def test_parse_credential_proxy_aws_sigv4_assume_role(tmp_path: Path) -> None:
+    """An ``assume_role`` credential round-trips onto ``AwsAssumeRoleSpec``."""
+    config = _aws_sigv4_config(
+        {
+            "type": "aws_sigv4",
+            "target": "mybucket.s3.us-east-1.amazonaws.com",
+            "region": "us-east-1",
+            "credential": {
+                "assume_role": {
+                    "role_arn": "arn:aws:iam::123456789012:role/omnigent-agent-s3",
+                    "duration_seconds": 900,
+                }
+            },
+        }
+    )
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    entry = spec.os_env.sandbox.credential_proxy.aws_sigv4[0]
+    assert entry.credential.access_key_id is None
+    assert entry.credential.assume_role is not None
+    assert entry.credential.assume_role.role_arn == (
+        "arn:aws:iam::123456789012:role/omnigent-agent-s3"
+    )
+    assert entry.credential.assume_role.duration_seconds == 900
+
+
+def test_parse_credential_proxy_aws_sigv4_assume_role_with_profile(tmp_path: Path) -> None:
+    """An ``assume_role`` credential can name a base-identity profile."""
+    config = _aws_sigv4_config(
+        {
+            "type": "aws_sigv4",
+            "target": "mybucket.s3.us-east-1.amazonaws.com",
+            "region": "us-east-1",
+            "credential": {
+                "assume_role": {
+                    "role_arn": "arn:aws:iam::123456789012:role/omnigent-agent-s3",
+                    "profile": "prod",
+                }
+            },
+        }
+    )
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    entry = spec.os_env.sandbox.credential_proxy.aws_sigv4[0]
+    assert entry.credential.assume_role.profile == "prod"
+
+
+def test_parse_credential_proxy_aws_sigv4_profile(tmp_path: Path) -> None:
+    """A ``profile`` credential round-trips onto ``AwsSigV4CredentialSpec``,
+    letting a multi-profile ``~/.aws/credentials`` back this entry without
+    naming ``access_key_id``/``secret_access_key`` sources at all."""
+    config = _aws_sigv4_config(
+        {
+            "type": "aws_sigv4",
+            "target": "mybucket.s3.us-east-1.amazonaws.com",
+            "region": "us-east-1",
+            "credential": {"profile": "prod"},
+        }
+    )
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    entry = spec.os_env.sandbox.credential_proxy.aws_sigv4[0]
+    assert entry.credential.profile == "prod"
+    assert entry.credential.access_key_id is None
+    assert entry.credential.assume_role is None
+
+
+def test_parse_credential_proxy_aws_sigv4_default_service_is_s3(tmp_path: Path) -> None:
+    config = _aws_sigv4_config(
+        {
+            "type": "aws_sigv4",
+            "target": "mybucket.s3.us-east-1.amazonaws.com",
+            "region": "us-east-1",
+            "credential": {
+                "access_key_id": {"env": "A"},
+                "secret_access_key": {"env": "B"},
+            },
+        }
+    )
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+    assert spec.os_env.sandbox.credential_proxy.aws_sigv4[0].service == "s3"
+
+
+def test_parse_credential_proxy_aws_sigv4_allowed_on_macos(tmp_path: Path) -> None:
+    """Unlike the Go-CLI-backed types, ``aws_sigv4`` signs entirely in the
+    parent process, so it is NOT rejected on ``darwin_seatbelt``."""
+    config = _aws_sigv4_config(
+        {
+            "type": "aws_sigv4",
+            "target": "mybucket.s3.us-east-1.amazonaws.com",
+            "region": "us-east-1",
+            "credential": {
+                "access_key_id": {"env": "A"},
+                "secret_access_key": {"env": "B"},
+            },
+        },
+        sandbox_type="darwin_seatbelt",
+    )
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)  # must not raise
+    assert spec.os_env.sandbox.credential_proxy.aws_sigv4[0].host == (
+        "mybucket.s3.us-east-1.amazonaws.com"
+    )
+
+
+@pytest.mark.parametrize(
+    "entry,match",
+    [
+        (
+            {
+                "type": "aws_sigv4",
+                "target": "mybucket.s3.us-east-1.amazonaws.com",
+                "credential": {
+                    "access_key_id": {"env": "A"},
+                    "secret_access_key": {"env": "B"},
+                },
+            },
+            r"non-empty 'region'",
+        ),
+        (
+            {
+                "type": "aws_sigv4",
+                "target": "mybucket.s3.us-east-1.amazonaws.com",
+                "region": "us-east-1",
+            },
+            r"aws_sigv4 requires 'credential'",
+        ),
+        (
+            {
+                "type": "aws_sigv4",
+                "region": "us-east-1",
+                "credential": {
+                    "access_key_id": {"env": "A"},
+                    "secret_access_key": {"env": "B"},
+                },
+            },
+            r"must declare exactly one of 'target' or 'targets'",
+        ),
+        (
+            {
+                "type": "aws_sigv4",
+                "target": "mybucket.s3.us-east-1.amazonaws.com",
+                "targets": ["other.s3.us-east-1.amazonaws.com"],
+                "region": "us-east-1",
+                "credential": {
+                    "access_key_id": {"env": "A"},
+                    "secret_access_key": {"env": "B"},
+                },
+            },
+            r"must declare exactly one of 'target' or 'targets'",
+        ),
+        (
+            {
+                "type": "aws_sigv4",
+                "target": "mybucket.s3.us-east-1.amazonaws.com",
+                "region": "us-east-1",
+                "source": {"env": "X"},
+                "credential": {
+                    "access_key_id": {"env": "A"},
+                    "secret_access_key": {"env": "B"},
+                },
+            },
+            r"aws_sigv4 does not accept 'source'",
+        ),
+        (
+            {
+                "type": "aws_sigv4",
+                "target": "mybucket.s3.us-east-1.amazonaws.com",
+                "region": "us-east-1",
+                "credential": {"access_key_id": {"env": "A"}},
+            },
+            r"requires both 'access_key_id' and 'secret_access_key'",
+        ),
+        (
+            {
+                "type": "aws_sigv4",
+                "target": "mybucket.s3.us-east-1.amazonaws.com",
+                "region": "us-east-1",
+                "credential": {
+                    "assume_role": {"role_arn": "arn:aws:iam::123:role/x"},
+                    "access_key_id": {"env": "A"},
+                    "secret_access_key": {"env": "B"},
+                },
+            },
+            r"exactly one of 'assume_role', 'profile', or",
+        ),
+        (
+            {
+                "type": "aws_sigv4",
+                "target": "mybucket.s3.us-east-1.amazonaws.com",
+                "region": "us-east-1",
+                "credential": {
+                    "profile": "prod",
+                    "access_key_id": {"env": "A"},
+                    "secret_access_key": {"env": "B"},
+                },
+            },
+            r"exactly one of 'assume_role', 'profile', or",
+        ),
+        (
+            {
+                "type": "aws_sigv4",
+                "target": "mybucket.s3.us-east-1.amazonaws.com",
+                "region": "us-east-1",
+                "credential": {
+                    "profile": "prod",
+                    "assume_role": {"role_arn": "arn:aws:iam::123:role/x"},
+                },
+            },
+            r"exactly one of 'assume_role', 'profile', or",
+        ),
+        (
+            {
+                "type": "aws_sigv4",
+                "target": "mybucket.s3.us-east-1.amazonaws.com",
+                "region": "us-east-1",
+                "credential": {"profile": "  "},
+            },
+            r"'profile' must be a non-empty string",
+        ),
+    ],
+)
+def test_parse_credential_proxy_aws_sigv4_fail_loud(
+    tmp_path: Path, entry: dict[str, object], match: str
+) -> None:
+    config = _aws_sigv4_config(entry)
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    with pytest.raises(OmnigentError, match=match):
+        parse(tmp_path)
+
+
+def test_parse_credential_proxy_aws_sigv4_rejects_duplicate_host_within_type(
+    tmp_path: Path,
+) -> None:
+    config = {
+        "spec_version": 1,
+        "name": "cred-proxy-aws-sigv4-dup",
+        "os_env": {
+            "type": "caller_process",
+            "cwd": ".",
+            "sandbox": {
+                "type": "linux_bwrap",
+                "egress_rules": ["* mybucket.s3.us-east-1.amazonaws.com/**"],
+                "credential_proxy": [
+                    {
+                        "type": "aws_sigv4",
+                        "target": "mybucket.s3.us-east-1.amazonaws.com",
+                        "region": "us-east-1",
+                        "credential": {
+                            "access_key_id": {"env": "A"},
+                            "secret_access_key": {"env": "B"},
+                        },
+                    },
+                    {
+                        "type": "aws_sigv4",
+                        "target": "mybucket.s3.us-east-1.amazonaws.com",
+                        "region": "us-east-1",
+                        "credential": {
+                            "access_key_id": {"env": "C"},
+                            "secret_access_key": {"env": "D"},
+                        },
+                    },
+                ],
+            },
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    with pytest.raises(OmnigentError, match=r"binds host .* more than once"):
+        parse(tmp_path)
+
+
+def test_parse_credential_proxy_aws_sigv4_rejects_duplicate_host_across_types(
+    tmp_path: Path,
+) -> None:
+    config = {
+        "spec_version": 1,
+        "name": "cred-proxy-aws-sigv4-dup-cross",
+        "os_env": {
+            "type": "caller_process",
+            "cwd": ".",
+            "sandbox": {
+                "type": "linux_bwrap",
+                "egress_rules": ["* mybucket.s3.us-east-1.amazonaws.com/**"],
+                "credential_proxy": [
+                    {
+                        "type": "https_bearer",
+                        "target": "mybucket.s3.us-east-1.amazonaws.com",
+                        "source": {"env": "X"},
+                    },
+                    {
+                        "type": "aws_sigv4",
+                        "target": "mybucket.s3.us-east-1.amazonaws.com",
+                        "region": "us-east-1",
+                        "credential": {
+                            "access_key_id": {"env": "A"},
+                            "secret_access_key": {"env": "B"},
+                        },
+                    },
+                ],
+            },
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    with pytest.raises(OmnigentError, match=r"binds host .* more than once"):
+        parse(tmp_path)
+
+
 @pytest.mark.parametrize(
     "entries,match",
     [
