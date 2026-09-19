@@ -456,25 +456,27 @@ def user_opencode_auth_path() -> Path:
     return base / "opencode" / "auth.json"
 
 
-def user_opencode_config_path() -> Path | None:
+def user_opencode_config_paths() -> list[Path]:
     """
-    Return the user's real OpenCode config path (not the per-session one).
+    Return the user's real OpenCode config paths (not the per-session ones).
 
     Honors ``XDG_CONFIG_HOME`` (the runner's own env, which is the user's real
     config home — the per-session override is set only on the spawned server),
-    defaulting to ``~/.config/opencode/opencode.jsonc``.
+    defaulting to ``~/.config/opencode``.
 
-    OpenCode accepts both ``.jsonc`` (with comments) and ``.json`` extensions;
-    the ``.jsonc`` variant is checked first.
+    OpenCode deep-merges its global config from ``config.json`` →
+    ``opencode.json`` → ``opencode.jsonc`` (later files win on conflicting
+    keys). Return every file that exists, in that merge order, so callers can
+    reproduce the same effective config the opencode CLI itself resolves.
     """
     xdg = os.environ.get("XDG_CONFIG_HOME", "").strip()
     base = Path(xdg) if xdg else Path.home() / ".config"
     cfg_dir = base / "opencode"
-    for name in ("opencode.jsonc", "opencode.json"):
-        path = cfg_dir / name
-        if path.is_file():
-            return path
-    return None
+    return [
+        path
+        for name in ("config.json", "opencode.json", "opencode.jsonc")
+        if (path := cfg_dir / name).is_file()
+    ]
 
 
 def seed_opencode_auth(bridge_dir: Path) -> Path | None:
