@@ -265,15 +265,16 @@ def test_classify_exception_arbitrary_is_unknown() -> None:
     )
 
 
-def _make_rpc_error(status_name: str | None) -> Exception:
+def _make_rpc_error(status_name: str | None, details: str | None = None) -> Exception:
     """Build a structural stand-in for a grpc ``RpcError``.
 
     The class is literally named ``RpcError`` (as in both pypi grpcio and a
     vendored copy — a different class identity) and exposes the ``code()``
-    accessor returning a status object with a ``name``, the shape
-    :func:`is_cancelled_rpc_error` matches on.
+    and ``details()`` accessors, the shape :func:`is_cancelled_rpc_error`
+    matches on.
 
     :param status_name: The status name ``code()`` reports, e.g. ``CANCELLED``.
+    :param details: The status details ``details()`` reports.
     :returns: The exception instance.
     """
 
@@ -283,6 +284,9 @@ def _make_rpc_error(status_name: str | None) -> Exception:
     class RpcError(Exception):
         def code(self) -> object:
             return _Status()
+
+        def details(self) -> str | None:
+            return details
 
     return RpcError("RPC terminated")
 
@@ -297,10 +301,54 @@ def test_is_cancelled_rpc_error_matches_by_shape_not_identity() -> None:
 
 
 def test_is_cancelled_rpc_error_ignores_other_statuses() -> None:
-    """Only CANCELLED is the expected peer-teardown condition; the rest keep
-    their existing (unhandled) treatment."""
+    """Statuses outside the cancellation shapes keep their existing
+    (unhandled) treatment."""
     assert is_cancelled_rpc_error(_make_rpc_error("UNAVAILABLE")) is False
     assert is_cancelled_rpc_error(_make_rpc_error(None)) is False
+    assert is_cancelled_rpc_error(_make_rpc_error("DEADLINE_EXCEEDED")) is False
+
+
+def test_is_cancelled_rpc_error_matches_endpoint_teardown_goaway() -> None:
+    """An endpoint teardown (e.g. a released channel lease) cancels in-flight
+    calls with UNAVAILABLE and the GOAWAY details; that shape is a
+    cancellation, not an unhandled fault."""
+    teardown = _make_rpc_error("UNAVAILABLE", details="Cancelling all calls")
+    assert is_cancelled_rpc_error(teardown) is True
+
+
+def test_is_cancelled_rpc_error_ignores_other_unavailable_details() -> None:
+    """UNAVAILABLE without the GOAWAY details (a plain outage) never matches."""
+    assert (
+        is_cancelled_rpc_error(_make_rpc_error("UNAVAILABLE", details="connection refused"))
+        is False
+    )
+    assert is_cancelled_rpc_error(_make_rpc_error("UNAVAILABLE", details=None)) is False
+
+
+def test_is_cancelled_rpc_error_tolerates_broken_details_readers() -> None:
+    """An UNAVAILABLE error whose details() raises, or whose details is a
+    field rather than the accessor, reads as not-cancelled."""
+
+    class _Status:
+        name = "UNAVAILABLE"
+
+    class RpcError(Exception):
+        def code(self) -> object:
+            return _Status()
+
+        def details(self) -> str:
+            raise RuntimeError("details unavailable")
+
+    assert is_cancelled_rpc_error(RpcError("broken")) is False
+
+    class RpcErrorWithField(Exception):
+        def code(self) -> object:
+            return _Status()
+
+    RpcErrorWithField.__name__ = "RpcError"
+    broken = RpcErrorWithField("no accessor")
+    broken.details = "Cancelling all calls"  # type: ignore[attr-defined]  # a field, not the accessor
+    assert is_cancelled_rpc_error(broken) is False
 
 
 def test_is_cancelled_rpc_error_requires_rpc_error_ancestry() -> None:
@@ -340,6 +388,11 @@ def test_classify_exception_cancelled_rpc_is_transient_upstream() -> None:
     code stays pinned (clients dispatch on the string)."""
     assert ErrorCode.UPSTREAM_CANCELLED == "upstream_cancelled"
     assert classify_exception(_make_rpc_error("CANCELLED")) == (
+        ErrorCategory.UPSTREAM,
+        ErrorImpact.TRANSIENT,
+    )
+    # The endpoint-teardown GOAWAY shape buckets the same way.
+    assert classify_exception(_make_rpc_error("UNAVAILABLE", details="Cancelling all calls")) == (
         ErrorCategory.UPSTREAM,
         ErrorImpact.TRANSIENT,
     )

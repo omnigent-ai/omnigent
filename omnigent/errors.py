@@ -594,15 +594,17 @@ _TRANSPORT_EXC_NAMES = frozenset(
 
 
 def is_cancelled_rpc_error(exc: BaseException) -> bool:
-    """Whether *exc* is a gRPC call terminated by its peer with ``CANCELLED``.
+    """Whether *exc* is a gRPC call cancelled by its peer or endpoint teardown.
 
     Matched structurally — an ``RpcError`` ancestor by class name plus a
-    ``code()`` whose status is named ``CANCELLED`` — so a vendored copy of
-    grpc (a different class identity than pypi grpcio) still matches and this
-    module imports no grpc.
+    ``code()`` whose status is named ``CANCELLED``, or ``UNAVAILABLE`` with
+    the GOAWAY details ``"Cancelling all calls"`` that an endpoint teardown
+    (e.g. a released channel lease) sends to in-flight calls — so a vendored
+    copy of grpc (a different class identity than pypi grpcio) still matches
+    and this module imports no grpc.
 
     :param exc: The exception to inspect.
-    :returns: ``True`` only for a peer-cancelled RPC error.
+    :returns: ``True`` only for a cancellation-shaped RPC error.
     """
     if not any(klass.__name__ == "RpcError" for klass in type(exc).__mro__):
         return False
@@ -613,7 +615,18 @@ def is_cancelled_rpc_error(exc: BaseException) -> bool:
         status = code()
     except Exception:  # noqa: BLE001 — a status reader that itself fails is not a cancellation
         return False
-    return getattr(status, "name", None) == "CANCELLED"
+    status_name = getattr(status, "name", None)
+    if status_name == "CANCELLED":
+        return True
+    if status_name != "UNAVAILABLE":
+        return False
+    details = getattr(exc, "details", None)
+    if not callable(details):
+        return False
+    try:
+        return details() == "Cancelling all calls"
+    except Exception:  # noqa: BLE001 — a details reader that itself fails is not a cancellation
+        return False
 
 
 def classify_exception(exc: BaseException) -> tuple[ErrorCategory, ErrorImpact]:
