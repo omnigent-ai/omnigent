@@ -29,13 +29,16 @@ struct AppRootView: View {
         WebShellView(
           initialURL: path.map { Self.conversationURL(for: serverURL, path: $0) } ?? serverURL,
           connectToNewServer: {
+            guard isCurrentServer(serverURL) else { return }
             mode = .setup(prefill: settings.serverURL, error: nil)
           },
           switchToServer: { nextURL in
+            guard isCurrentServer(serverURL) else { return }
             settings.serverURL = nextURL.absoluteString
             mode = .web(serverURL: nextURL, path: nil)
           },
-          loadFailed: { failedURL, message in
+          loadFailed: { _, message in
+            guard isCurrentServer(serverURL) else { return }
             mode = .setup(
               prefill: serverURL.absoluteString, error: message)
           },
@@ -43,9 +46,28 @@ struct AppRootView: View {
           // lives only in the load URL, never in recents, so a later deep link
           // resolves against an un-polluted server identity.
           loadSucceeded: {
+            guard isCurrentServer(serverURL) else { return }
             settings.rememberRecentServer(serverURL)
+          },
+          signedOut: { context, cleanup in
+            settings.stopAutoOpening(context)
+            guard case .web(let currentURL, _) = mode,
+              (try? DatabricksCredentialScope(
+                workspaceURL: currentURL, configuration: context.configuration)) == context.scope
+            else { return }
+            mode = .setup(prefill: serverURL.absoluteString, error: nil)
+            Task { @MainActor in
+              do { try await cleanup.value } catch {
+                if case .setup(let prefill, _) = mode, prefill == serverURL.absoluteString {
+                  mode = .setup(
+                    prefill: prefill,
+                    error: DatabricksSessionError.signOutIncomplete.localizedDescription)
+                }
+              }
+            }
           }
         )
+        .id(DatabricksWebContext.contextIdentity(for: serverURL))
       }
     }
     .environmentObject(theme)
@@ -59,6 +81,24 @@ struct AppRootView: View {
         let saved = settings.serverURL,
         let url = URL(string: saved)
       {
+        if let context = try? DatabricksWebContext.resolve(url),
+          DatabricksSignOutManager.shared.isPending(context.storeIdentifier)
+        {
+          settings.stopAutoOpening(context)
+          mode = .setup(prefill: saved, error: nil)
+          do {
+            let cleanup = try DatabricksSignOutManager.shared.begin(
+              context: context, store: DatabricksWebStore(identifier: context.storeIdentifier))
+            try await cleanup.value
+          } catch {
+            if case .setup(let prefill, _) = mode, prefill == saved {
+              mode = .setup(
+                prefill: saved, error: DatabricksSessionError.signOutIncomplete.localizedDescription
+              )
+            }
+          }
+          return
+        }
         mode = .web(serverURL: url, path: nil)
       }
     }
@@ -97,6 +137,11 @@ struct AppRootView: View {
         )
       }
     }
+  }
+
+  private func isCurrentServer(_ url: URL) -> Bool {
+    if case .web(let current, _) = mode { return current == url }
+    return false
   }
 
   private enum Mode: Equatable {

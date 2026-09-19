@@ -69,14 +69,30 @@ actor DatabricksTokenManager {
     return try store.load(for: scope) == tokens
   }
 
+  func refresh(rejected: DatabricksOAuthTokens, for scope: DatabricksCredentialScope) async throws
+    -> DatabricksOAuthTokens?
+  {
+    try Task.checkCancellation()
+    try flushPendingWrite(for: scope)
+    guard let current = try store.load(for: scope) else { return nil }
+    guard current == rejected else { throw DatabricksCredentialError.changed }
+    return try await lookup(for: scope, forceRefresh: true)
+  }
+
   /// Nil means no reusable grant. Network, configuration, and Keychain failures remain errors.
   func tokens(for scope: DatabricksCredentialScope) async throws -> DatabricksOAuthTokens? {
+    try await lookup(for: scope, forceRefresh: false)
+  }
+
+  private func lookup(for scope: DatabricksCredentialScope, forceRefresh: Bool) async throws
+    -> DatabricksOAuthTokens?
+  {
     try Task.checkCancellation()
     try flushPendingWrite(for: scope)
     if refreshes[scope] == nil {
       guard let saved = try store.load(for: scope) else { return nil }
       guard saved.isValid else { throw DatabricksCredentialError.invalidData }
-      if saved.expiresAt > now().addingTimeInterval(60) { return saved }
+      if !forceRefresh, saved.expiresAt > now().addingTimeInterval(60) { return saved }
       startRefresh(saved, for: scope)
     }
     let refreshID = refreshes[scope]!.id
@@ -161,6 +177,38 @@ actor DatabricksTokenManager {
     continuation?.resume(throwing: CancellationError())
     // Finish an issued refresh even without waiters so a rotated grant can still be saved.
   }
+
+  #if DEBUG
+    /// Overwrite the saved grant so the next use takes a recovery path. False when nothing is
+    /// stored for the scope. Debug builds only, for manual testing against a real workspace.
+    func inject(_ fault: DatabricksCredentialFault, for scope: DatabricksCredentialScope) throws
+      -> Bool
+    {
+      try flushPendingWrite(for: scope)
+      guard let saved = try store.load(for: scope) else { return false }
+      let cleared = "debug-cleared-by-tester"
+      let faulted: DatabricksOAuthTokens
+      switch fault {
+      case .clearedAccessToken:
+        faulted = DatabricksOAuthTokens(
+          accessToken: cleared, refreshToken: saved.refreshToken, expiresAt: .distantPast,
+          issuer: saved.issuer)
+      case .rejectedAccessToken:
+        // Stays unexpired so the token reaches the provider and comes back rejected.
+        faulted = DatabricksOAuthTokens(
+          accessToken: cleared,
+          refreshToken: saved.refreshToken,
+          expiresAt: max(saved.expiresAt, now().addingTimeInterval(600)),
+          issuer: saved.issuer)
+      case .clearedRefreshToken:
+        faulted = DatabricksOAuthTokens(
+          accessToken: cleared, refreshToken: cleared, expiresAt: .distantPast,
+          issuer: saved.issuer)
+      }
+      try save(faulted, for: scope)
+      return true
+    }
+  #endif
 
   private enum Write {
     case save(DatabricksOAuthTokens)

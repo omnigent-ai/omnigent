@@ -116,12 +116,14 @@ struct DatabricksCredentialStore: DatabricksCredentialStoring {
 enum DatabricksCredentialError: Error, Equatable, LocalizedError {
   case keychain(OSStatus)
   case invalidData
+  case changed
 
   var errorDescription: String? {
     switch self {
     case .keychain:
       "Could not access saved Databricks credentials. Unlock the device and try again."
     case .invalidData: "The saved Databricks credentials are invalid. Sign in again."
+    case .changed: "Workspace credentials changed. Reconnect to continue."
     }
   }
 }

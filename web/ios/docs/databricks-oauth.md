@@ -7,8 +7,8 @@ generic OIDC is unchanged.
 
 A workspace connection requires the build configuration and HTTPS callback
 association below. Missing configuration returns to setup with an error; it does
-not fall back to inline workspace login. Automatic mid-session recovery and the
-complete sign-out workflow remain separate lifecycle work.
+not fall back to inline workspace login. Expired sessions get bounded silent
+recovery; explicit sign-out clears only the selected workspace's local state.
 
 ## Build configuration
 
@@ -145,9 +145,11 @@ versions are not silently deleted.
 - Cancelling a waiter stops that caller promptly but lets an issued refresh finish
   and persist, even if no waiters remain. Clearing credentials or committing a newer
   login invalidates the old operation, so late results cannot overwrite or delete
-  the newer state. There are no timers, background polling, or automatic HTTP retries.
-- `clear(for:)` removes native credentials only. Cookie cleanup, provider logout,
-  and suppression of automatic re-login belong to the later WebView lifecycle work.
+  the newer state. There are no timers or background polling.
+- `refresh(rejected:for:)` can renew an unexpired access token rejected during
+  cookie bootstrap. It refuses to refresh a newer, unrelated credential snapshot.
+- `clear(for:)` is the native credential primitive. Use `DatabricksSignOutManager`
+  for complete local sign-out, including ordered web-data cleanup.
 
 Keychain storage uses a narrowly scoped generic-password item,
 `kSecAttrAccessibleWhenUnlockedThisDeviceOnly`, and no synchronization or shared
@@ -207,13 +209,53 @@ Before applying a new session, conflicting old cookie names are removed. The cal
 waits for writes and reads back the session cookie before loading the page, and checks
 that the grant is still current. Canceled/stale startup work cannot load another
 context's WebView. The connecting screen offers cancellation and the native server
-menu distinguishes workspace IDs on a shared host.
+menu distinguishes workspace IDs on a shared host. Cancellation returns quietly to
+setup with the entered URL preserved; configuration and session failures still show
+an error.
 
-Reconnecting or relaunching runs bootstrap again and reuses a valid grant without
-another browser prompt. A detected login/context change while browsing currently
-returns to setup for reconnect; bounded automatic cookie-expiry recovery and full
-logout cleanup are not implemented yet. WebKit clearing is local to the app and
-must not be described as ending provider/browser SSO.
+## Session recovery
+
+Reconnecting or relaunching runs bootstrap and reuses a valid grant. While connected,
+main-frame HTTP 401 responses and authentication navigation trigger silent recovery;
+ordinary tapped external links remain external. Foreground activation checks for a
+missing/expired session cookie without a timer. HTTP 403 is a permission error, not a
+reason to repeatedly sign in.
+
+Recovery recreates the WebView in the same logical store and preserves the last
+intended app page, query, and conversation. It never silently changes workspace.
+A subsequent automatic attempt requires both trusted app activity after the last
+attempt and a 60-second cooldown. Repeated failure returns to setup; explicit Reload
+starts a new user-requested attempt.
+
+If cookie creation rejects a cached access token with HTTP 401, bootstrap performs
+one forced refresh and retries cookie creation once. Other HTTP failures do not
+trigger this retry or delete a valid grant. Missing/revoked credentials during silent
+recovery show a native **Sign In** choice instead of automatically opening a browser.
+Accepting it preserves the return page; cancelling quietly returns to setup.
+
+## Local sign-out
+
+**Sign Out of Workspace** is available in the native server menu, which stays
+reachable for workspace connections. Trusted workspace pages can also call
+`window.omnigentNative.signOut()`. That capability is not exposed for other server
+types. Same-context logout navigation (`/auth/logout`, `/logout`, or an explicit
+`/login.html?logout=1`) is handled as local sign-out, not as a session-expiry loop.
+
+Sign-out invalidates pending authentication/recovery, removes that context's
+Keychain credentials, and clears its isolated WebKit data through the same serialized
+mutation queue used for cookie installation. It also removes the matching default
+server so relaunch does not immediately reconnect; recents remain available for an
+explicit future connection. Other workspaces' credentials, defaults, and stores are
+not cleared.
+
+A non-secret pending-cleanup marker is recorded before asynchronous cleanup starts.
+If cleanup is interrupted or fails, the next connection must finish it before using
+credentials or starting a new login. Cleanup survives view/caller cancellation;
+late cookie results remain invalid even after cleanup finishes. An error is shown if
+sign-out could not finish—there is no fallback to reusing the old credentials.
+
+This is local app sign-out. It does not revoke all provider sessions or sign the user
+out of Safari/IdP SSO, and a later explicit sign-in may reuse that browser SSO.
 
 ## Verification
 
@@ -229,6 +271,7 @@ Run these focused suites in Xcode's Test navigator:
 - `DatabricksSessionClientTests`
 - `DatabricksWebContextTests`
 - `DatabricksWorkspaceBootstrapTests`
+- `DatabricksLifecycleTests`
 - `DeepLinkTests` (conversation paths preserve existing workspace queries)
 
 They use synthetic tokens and fake browser sessions; they never log in to a live
@@ -252,7 +295,17 @@ are authorized to access:
    Switch back and verify sessions and web storage do not mix.
 5. Cancel sign-in, then retry; the original workspace URL/query should remain in
    the setup form. Open a conversation link and verify its path/context survive.
-6. Check a Databricks Apps URL and a generic OIDC server for unchanged behavior.
+6. In the disposable context, expire/remove its session cookie, then navigate or
+   foreground the app. Confirm silent recovery preserves the current conversation.
+   Test revoked credentials separately: the app should ask before opening sign-in.
+   Debug builds carry a floating **Debug** menu on workspace connections that
+   breaks one piece of the live session on demand—session cookie, access token,
+   an access token the workspace will reject, or the refresh token—and then
+   states the behavior to expect. It is compiled out of release builds.
+7. Sign out using the native menu, relaunch, and confirm setup remains visible.
+   Explicitly reconnect and verify a fresh native sign-in occurs without old web
+   state. Verify the other workspace still works.
+8. Check a Databricks Apps URL and a generic OIDC server for unchanged behavior.
 
 Do not put private hosts, IDs, tokens, cookies, callback URLs, or unredacted network
 captures in issues, PRs, screenshots, or maintained examples.

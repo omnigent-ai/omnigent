@@ -24,9 +24,10 @@ does not implement APNs, background polling, or localhost proxy/CORS behavior.
 
 ## Databricks OAuth
 
-The staged native OAuth implementation and its build-configurable client ID and
-HTTPS redirect URL are documented in [Databricks OAuth](docs/databricks-oauth.md).
-It is not yet connected to WebView login; existing sign-in behavior is unchanged.
+Workspace connections use native OAuth, isolated persistent WebKit stores, bounded
+session recovery, and local sign-out. Build-configurable client ID and HTTPS callback
+setup are documented in [Databricks OAuth](docs/databricks-oauth.md). Databricks Apps
+retain inline platform sign-in; generic OIDC is unchanged.
 
 ## Managed app configuration
 

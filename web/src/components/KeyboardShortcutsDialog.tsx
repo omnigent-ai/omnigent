@@ -15,6 +15,7 @@ import {
   ALT_KEY,
   composerNewLineShortcutKeys,
   composerSendShortcutKeys,
+  composerSteerAllShortcutKeys,
   CTRL_KEY,
   ENTER_KEY,
   Kbd,
@@ -136,6 +137,10 @@ function shortcutGroupsFor(
         ...group,
         items: [
           { label: "Send message", keys: composerSendShortcutKeys(submitWithModEnter) },
+          {
+            label: "Send now, with all queued messages",
+            keys: composerSteerAllShortcutKeys(submitWithModEnter),
+          },
           {
             label: "New line in message",
             keys: composerNewLineShortcutKeys(submitWithModEnter),

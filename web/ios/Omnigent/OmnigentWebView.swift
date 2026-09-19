@@ -7,7 +7,8 @@ struct OmnigentWebView: UIViewRepresentable {
   @ObservedObject var model: WebViewModel
   @ObservedObject var settings: SettingsStore
   let databricksInternalFeaturesEnabled: Bool
-  let loadFailed: (URL, String) -> Void
+  /// A nil message returns to setup after cancellation without showing an error.
+  let loadFailed: (URL, String?) -> Void
   let loadSucceeded: () -> Void
   /// Compose and push the current server-picker payload to the SPA.
   let pushServerPicker: () -> Void
@@ -16,6 +17,12 @@ struct OmnigentWebView: UIViewRepresentable {
   let requestSwitchServer: (String) -> Void
   /// Return the shell to its "connect to server" setup page.
   let openServerSetup: () -> Void
+  var connectionIntent: DatabricksConnectionIntent = .connect
+  var recoveryPageURL: URL?
+  var recoverWorkspace: ((URL) -> Void)?
+  var workspaceReady: (() -> Void)?
+  var reauthenticateWorkspace: ((URL) -> Void)?
+  var signedOut: ((DatabricksWebContext, Task<Void, Error>) -> Void)?
 
   static func connectionErrorMessage(
     for error: Error, databricksInternalFeaturesEnabled: Bool
@@ -38,7 +45,7 @@ struct OmnigentWebView: UIViewRepresentable {
     contentController.add(context.coordinator, name: "omnigentNative")
     contentController.addUserScript(
       WKUserScript(
-        source: Self.nativeBridgeScript,
+        source: Self.nativeBridgeScript(managesWorkspace: context.coordinator.webStore != nil),
         injectionTime: .atDocumentStart,
         forMainFrameOnly: true
       )
@@ -99,7 +106,8 @@ struct OmnigentWebView: UIViewRepresentable {
     coordinator.detach()
   }
 
-  private static let nativeBridgeScript = """
+  private static func nativeBridgeScript(managesWorkspace: Bool) -> String {
+    """
     (() => {
       if (window.omnigentNative && window.omnigentNative.kind === "ios") return;
       const ensureViewportFit = () => {
@@ -342,6 +350,7 @@ struct OmnigentWebView: UIViewRepresentable {
           }
           return Promise.resolve();
         },
+        \(managesWorkspace ? "signOut() { window.webkit.messageHandlers.omnigentNative.postMessage({ method: 'signOut' }); }," : "")
         openServerSetup() {
           window.webkit.messageHandlers.omnigentNative.postMessage({
             method: "openServerSetup",
@@ -350,6 +359,7 @@ struct OmnigentWebView: UIViewRepresentable {
       });
     })();
     """
+  }
 
   @MainActor
   final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler,
@@ -376,11 +386,15 @@ struct OmnigentWebView: UIViewRepresentable {
     private var oidcLoginManager = OidcLoginManager()
     let websiteDataStore: WKWebsiteDataStore
     private let contextResult: Result<DatabricksWebContext?, Error>
-    private let webStore: DatabricksWebStore?
+    fileprivate let webStore: DatabricksWebStore?
     private let workspaceBootstrap: DatabricksWorkspaceBootstrap
     private var workspaceSession: DatabricksWebSession?
     private var authenticationTask: Task<Void, Never>?
     private var navigationID = UUID()
+    private var lastWorkspacePageURL: URL?
+    private var activationObserver: NSObjectProtocol?
+    private var activationTask: Task<Void, Never>?
+    private var reportedWorkspaceReady = false
 
     init(
       _ parent: OmnigentWebView, context: DatabricksWebContext? = nil,
@@ -406,6 +420,13 @@ struct OmnigentWebView: UIViewRepresentable {
 
     func attach(_ webView: WKWebView) {
       self.webView = webView
+      if webStore != nil {
+        activationObserver = NotificationCenter.default.addObserver(
+          forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+          Task { @MainActor in self?.checkWorkspaceSessionOnActivation() }
+        }
+      }
       // In-page navigation: the SPA swapped the URL with pushState / replaceState,
       // or the user moved through history. No page is loaded, so no navigation
       // delegate callback runs — KVO on `url` is the only way to observe the user
@@ -413,11 +434,20 @@ struct OmnigentWebView: UIViewRepresentable {
       urlObservation = webView.observe(\.url) { [weak self] _, _ in
         Task { @MainActor in
           guard let self, let webView = self.webView else { return }
-          if let session = self.workspaceSession, let url = webView.url,
-            session.navigationURL(for: url) == nil
-          {
-            self.showWorkspaceFailure(DatabricksSessionError.workspaceChanged)
-            return
+          if let session = self.workspaceSession, let url = webView.url {
+            if session.isSignOutURL(url) {
+              self.requestSignOut()
+              return
+            }
+            if session.navigationURL(for: url) == nil {
+              if session.isAuthenticationURL(url) {
+                self.requestWorkspaceRecovery()
+              } else {
+                self.showWorkspaceFailure(DatabricksSessionError.workspaceChanged)
+              }
+              return
+            }
+            self.lastWorkspacePageURL = session.navigationURL(for: url)
           }
           self.bounceIfWorkspaceRoot(webView)
         }
@@ -426,6 +456,10 @@ struct OmnigentWebView: UIViewRepresentable {
 
     func detach() {
       navigationID = UUID()
+      activationTask?.cancel()
+      activationTask = nil
+      if let activationObserver { NotificationCenter.default.removeObserver(activationObserver) }
+      activationObserver = nil
       authenticationTask?.cancel()
       workspaceBootstrap.cancel()
       (webView as? AccessoryFreeWebView)?.onWindowAvailable = nil
@@ -435,6 +469,10 @@ struct OmnigentWebView: UIViewRepresentable {
       if parent.model.webView === webView {
         parent.model.cancelServerSwitcherWatchdog()
         parent.model.cancelAuthentication = nil
+        parent.model.signOut = nil
+        #if DEBUG
+          parent.model.injectDebugFault = nil
+        #endif
         parent.model.isAuthenticating = false
       }
       urlObservation = nil
@@ -514,6 +552,10 @@ struct OmnigentWebView: UIViewRepresentable {
 
     func load(_ url: URL, in webView: WKWebView) {
       navigationID = UUID()
+      activationTask?.cancel()
+      activationTask = nil
+      reportedWorkspaceReady = false
+      lastWorkspacePageURL = nil
       authenticationTask?.cancel()
       authenticationTask = nil
       workspaceBootstrap.cancel()
@@ -531,6 +573,16 @@ struct OmnigentWebView: UIViewRepresentable {
         model.serverSwitcherHidden = !model.isAuthenticating
         model.isLoading = true
         model.bottomBarVisible = false
+        model.signOut = self?.webStore == nil ? nil : { self?.requestSignOut() }
+        #if DEBUG
+          model.injectDebugFault =
+            self?.webStore == nil
+            ? nil
+            : { [weak self] fault in
+              guard let self else { return "This workspace view is no longer attached." }
+              return await injectDebugFault(fault)
+            }
+        #endif
         if model.isAuthenticating {
           model.cancelAuthentication = {
             self?.showWorkspaceFailure(DatabricksSessionError.cancelled)
@@ -576,11 +628,13 @@ struct OmnigentWebView: UIViewRepresentable {
         defer { if navigationID == id { authenticationTask = nil } }
         do {
           let session = try await workspaceBootstrap.prepare(
-            context: context, store: webStore, anchor: window)
+            context: context, store: webStore, anchor: window,
+            intent: parent.connectionIntent, pageURL: parent.recoveryPageURL)
           try Task.checkCancellation()
           guard navigationID == id, self.webView === webView, parent.model.webView === webView
           else { return }
           workspaceSession = session
+          lastWorkspacePageURL = session.pageURL
           effectiveOrigin = session.pageURL.omnigentOrigin
           parent.model.isAuthenticating = false
           parent.model.cancelAuthentication = nil
@@ -588,10 +642,97 @@ struct OmnigentWebView: UIViewRepresentable {
           webView.load(URLRequest(url: session.pageURL))
         } catch {
           guard navigationID == id, self.webView === webView else { return }
-          showWorkspaceFailure(
-            error is CancellationError ? DatabricksSessionError.cancelled : error)
+          if error as? DatabricksSessionError == .reauthenticationRequired,
+            let reauthenticate = parent.reauthenticateWorkspace
+          {
+            parent.model.isAuthenticating = false
+            parent.model.isLoading = false
+            parent.model.cancelAuthentication = nil
+            reauthenticate(parent.recoveryPageURL ?? context.pageURL)
+          } else {
+            showWorkspaceFailure(
+              error is CancellationError ? DatabricksSessionError.cancelled : error)
+          }
         }
       }
+    }
+
+    private func requestWorkspaceRecovery() {
+      guard let session = workspaceSession else { return }
+      let pageURL = lastWorkspacePageURL ?? session.pageURL
+      guard let recover = parent.recoverWorkspace else {
+        showWorkspaceFailure(DatabricksSessionError.recoveryExhausted)
+        return
+      }
+      navigationID = UUID()
+      activationTask?.cancel()
+      activationTask = nil
+      workspaceSession = nil
+      effectiveOrigin = nil
+      webView?.stopLoading()
+      recover(pageURL)
+    }
+
+    private func checkWorkspaceSessionOnActivation() {
+      guard activationTask == nil, authenticationTask == nil, let session = workspaceSession,
+        let webStore, let view = webView, isCurrent(view)
+      else { return }
+      let id = navigationID
+      let pageURL = lastWorkspacePageURL ?? session.pageURL
+      activationTask = Task { [weak self] in
+        let cookies = await webStore.cookies()
+        guard let self, !Task.isCancelled, navigationID == id, let view = webView, isCurrent(view)
+        else { return }
+        activationTask = nil
+        if !cookies.contains(where: {
+          $0.name == "DBAUTH" && !$0.value.isEmpty && $0.isSecure && $0.isHTTPOnly
+            && DatabricksSessionClient.cookie($0, appliesTo: pageURL)
+        }) {
+          requestWorkspaceRecovery()
+        }
+      }
+    }
+
+    private func requestSignOut() {
+      guard case .success(let context?) = contextResult, let webStore else { return }
+      do {
+        let cleanup = try workspaceBootstrap.beginSignOut(context: context, store: webStore)
+        let callback = parent.signedOut
+        effectiveOrigin = nil
+        workspaceSession = nil
+        detach()
+        if let callback {
+          callback(context, cleanup)
+        } else {
+          parent.loadFailed(parent.initialURL, nil)
+        }
+      } catch { showWorkspaceFailure(error) }
+    }
+
+    #if DEBUG
+      /// Break the live session on request so a tester can watch recovery, refresh, and the sign-in
+      /// prompt without waiting for a real expiry. Returns what to expect next. Debug builds only.
+      private func injectDebugFault(_ fault: DatabricksDebugFault) async -> String {
+        guard case .success(let context?) = contextResult, let webStore else {
+          return "This server does not use native workspace sign-in."
+        }
+        do {
+          guard try await workspaceBootstrap.inject(fault, context: context, store: webStore) else {
+            return "No saved credentials for this workspace. Sign in first."
+          }
+          return fault.expectation
+        } catch { return error.localizedDescription }
+      }
+    #endif
+
+    /// Nil stays silent after cancellation. Everything else shares the page-load wording, so an
+    /// unreachable managed host reads the same during native sign-in as during a page load.
+    static func workspaceErrorMessage(
+      _ error: Error, databricksInternalFeaturesEnabled: Bool = false
+    ) -> String? {
+      if error is CancellationError || error as? DatabricksSessionError == .cancelled { return nil }
+      return OmnigentWebView.connectionErrorMessage(
+        for: error, databricksInternalFeaturesEnabled: databricksInternalFeaturesEnabled)
     }
 
     private func showWorkspaceFailure(_ error: Error) {
@@ -610,7 +751,11 @@ struct OmnigentWebView: UIViewRepresentable {
         parent.model.cancelAuthentication = nil
         parent.model.isLoading = false
         parent.model.cancelServerSwitcherWatchdog()
-        parent.loadFailed(parent.initialURL, error.localizedDescription)
+        parent.loadFailed(
+          parent.initialURL,
+          Self.workspaceErrorMessage(
+            error,
+            databricksInternalFeaturesEnabled: parent.databricksInternalFeaturesEnabled))
       }
     }
 
@@ -626,11 +771,14 @@ struct OmnigentWebView: UIViewRepresentable {
       else { return }
 
       switch method {
+      case "signOut":
+        requestSignOut()
       case "setColorScheme":
         guard let scheme = body["scheme"] as? String,
           let source = ThemeSource(rawValue: scheme)
         else { return }
         ThemeController.shared.apply(source)
+        markWorkspaceReady()
       case "setBadgeCount":
         let count = (body["count"] as? NSNumber)?.intValue ?? 0
         NativeNotificationManager.shared.setBadgeCount(count)
@@ -649,6 +797,7 @@ struct OmnigentWebView: UIViewRepresentable {
       case "setSidebarOpen":
         parent.model.serverSwitcherHidden = (body["open"] as? NSNumber)?.boolValue ?? true
       case "requestServerPicker":
+        markWorkspaceReady()
         parent.pushServerPicker()
       case "switchServer":
         guard let urlString = body["url"] as? String else { return }
@@ -656,6 +805,7 @@ struct OmnigentWebView: UIViewRepresentable {
       case "openServerSetup":
         parent.openServerSetup()
       case "setViewMode":
+        markWorkspaceReady()
         let mode: WebViewMode = (body["mode"] as? String) == "terminal" ? .terminal : .chat
         parent.model.viewMode = mode
         parent.model.terminalEnabled = (body["terminalEnabled"] as? NSNumber)?.boolValue ?? false
@@ -667,8 +817,34 @@ struct OmnigentWebView: UIViewRepresentable {
       }
     }
 
+    private func markWorkspaceReady() {
+      guard workspaceSession != nil, !reportedWorkspaceReady else { return }
+      reportedWorkspaceReady = true
+      parent.workspaceReady?()
+    }
+
+    private func acceptWorkspaceNavigation(_ url: URL, in webView: WKWebView) -> Bool {
+      guard let session = workspaceSession,
+        ["http", "https"].contains(url.scheme?.lowercased() ?? "")
+      else { return true }
+      if session.isSignOutURL(url) {
+        webView.stopLoading()
+        requestSignOut()
+        return false
+      }
+      if session.navigationURL(for: url) != nil { return true }
+      webView.stopLoading()
+      if session.isAuthenticationURL(url) || url.omnigentOrigin != pinnedOrigin {
+        requestWorkspaceRecovery()
+      } else {
+        showWorkspaceFailure(DatabricksSessionError.workspaceChanged)
+      }
+      return false
+    }
+
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
       guard isCurrent(webView), webStore == nil || workspaceSession != nil else { return }
+      if let url = webView.url, !acceptWorkspaceNavigation(url, in: webView) { return }
       if let url = webView.url,
         ["http", "https"].contains(url.scheme?.lowercased() ?? ""),
         url.omnigentOrigin != pinnedOrigin,
@@ -692,10 +868,12 @@ struct OmnigentWebView: UIViewRepresentable {
 
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
       guard isCurrent(webView), webStore == nil || workspaceSession != nil else { return }
+      if let url = webView.url, !acceptWorkspaceNavigation(url, in: webView) { return }
       if let session = workspaceSession, let url = webView.url,
         session.navigationURL(for: url) != nil
       {
         effectiveOrigin = url.omnigentOrigin
+        lastWorkspacePageURL = session.navigationURL(for: url)
       }
       parent.model.currentURL = webView.url ?? parent.model.currentURL
       // Workspace roots are caught here too, not only in decidePolicyFor: that
@@ -772,11 +950,20 @@ struct OmnigentWebView: UIViewRepresentable {
       if webStore != nil, navigationAction.targetFrame?.isMainFrame == true,
         ["http", "https"].contains(scheme)
       {
+        if let session = workspaceSession, session.isSignOutURL(url) {
+          decisionHandler(.cancel)
+          requestSignOut()
+          return
+        }
         guard let session = workspaceSession, let destination = session.navigationURL(for: url)
         else {
           decisionHandler(.cancel)
-          if navigationAction.navigationType == .linkActivated {
+          if workspaceSession?.isAuthenticationURL(url) == true {
+            requestWorkspaceRecovery()
+          } else if navigationAction.navigationType == .linkActivated {
             openExternal(url)
+          } else if workspaceSession != nil, url.omnigentOrigin != pinnedOrigin {
+            requestWorkspaceRecovery()
           } else {
             showWorkspaceFailure(DatabricksSessionError.workspaceChanged)
           }
@@ -787,6 +974,7 @@ struct OmnigentWebView: UIViewRepresentable {
           bounce(webView, to: destination)
           return
         }
+        lastWorkspacePageURL = destination
         // Native bootstrap already established this workspace's allowed page origins.
         decisionHandler(.allow)
         return
@@ -841,6 +1029,36 @@ struct OmnigentWebView: UIViewRepresentable {
 
       promptForExternalURL(url, scheme: scheme)
       decisionHandler(.cancel)
+    }
+
+    func webView(
+      _ webView: WKWebView, decidePolicyFor response: WKNavigationResponse,
+      decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void
+    ) {
+      guard isCurrent(webView) else {
+        decisionHandler(.cancel)
+        return
+      }
+      if response.isForMainFrame, let http = response.response as? HTTPURLResponse,
+        handleWorkspaceHTTPStatus(http.statusCode)
+      {
+        decisionHandler(.cancel)
+        return
+      }
+      decisionHandler(.allow)
+    }
+
+    func handleWorkspaceHTTPStatus(_ status: Int) -> Bool {
+      guard webStore != nil else { return false }
+      if status == 401 {
+        requestWorkspaceRecovery()
+        return true
+      }
+      if status == 403 {
+        showWorkspaceFailure(DatabricksSessionError.rejected(status))
+        return true
+      }
+      return false
     }
 
     func webView(

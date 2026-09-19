@@ -2526,6 +2526,7 @@ function ComposerImpl(
   const maybeFlushQueuedHead = useChatStore((s) => s.maybeFlushQueuedHead);
   const dequeueMessage = useChatStore((s) => s.dequeueMessage);
   const steerMessage = useChatStore((s) => s.steerMessage);
+  const steerAllQueuedMessages = useChatStore((s) => s.steerAllQueuedMessages);
   const reorderQueuedMessage = useChatStore((s) => s.reorderQueuedMessage);
   // Drain the queue whenever idle with a waiting head — level-triggered so a
   // message queued right after the turn ended (or after an SSE reconnect that
@@ -3379,8 +3380,22 @@ function ComposerImpl(
 
   const handleKeyDown = (
     e: KeyboardEvent<HTMLTextAreaElement>,
-    { shouldSubmitFromKeyboard, shouldPreferSendOverCompletion }: ComposerKeyIntent,
+    {
+      shouldSubmitFromKeyboard,
+      shouldPreferSendOverCompletion,
+      shouldSteerAllFromKeyboard,
+    }: ComposerKeyIntent,
   ) => {
+    // Mod+Enter (Mod+Shift+Enter when Mod+Enter is already the send chord)
+    // steers everything: the draft, if any, is submitted first so it joins the
+    // queue tail (or sends directly when idle), then every queued message is
+    // sent into the running turn in FIFO order instead of draining one per idle.
+    if (conversationId !== null && !hasPendingElicitation && shouldSteerAllFromKeyboard) {
+      e.preventDefault();
+      if (!mentionListingPending) submit();
+      steerAllQueuedMessages(conversationId);
+      return;
+    }
     // "@"-mention menu navigation (shared useMentionBrowser) — mutually
     // exclusive with the slash menu below (a mention token can't also read as a
     // "/"-command). Takes priority over history recall and submission.

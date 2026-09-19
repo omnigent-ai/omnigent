@@ -1788,12 +1788,16 @@ export function AgentHarnessPicker({
       contentAlign={contentAlign}
       contentClassName={cn(showConfig && "composer-agent-config-menu", contentClassName)}
       configOpen={configAgentId !== null}
-      onInitialSelectionFocus={() => {
-        const agentId = pendingConfigAgentId.current;
-        if (!agentId) return;
-        pendingConfigAgentId.current = null;
-        setConfigAgentId(agentId);
-      }}
+      onInitialSelectionFocus={
+        focusConfigAgentId === null
+          ? undefined
+          : () => {
+              const agentId = pendingConfigAgentId.current;
+              if (!agentId) return;
+              pendingConfigAgentId.current = null;
+              setConfigAgentId(agentId);
+            }
+      }
     >
       {showConfig ? (
         <HarnessPickerConfigPage

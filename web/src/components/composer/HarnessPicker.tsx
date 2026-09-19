@@ -83,48 +83,33 @@ function HarnessPickerContent({
 }) {
   const interactionProps = useMenuInteractionProps(configOpen);
   const initialFocusHandled = useRef(false);
-  const [content, setContent] = useState<HTMLDivElement | null>(null);
   useEffect(() => {
     if (!menuOpen) initialFocusHandled.current = false;
   }, [menuOpen]);
-  // Let the menu's focus scope pause a parent dialog before focusing portalled rows.
-  useEffect(() => {
-    if (!menuOpen || !content || initialFocusHandled.current) return;
-    const selected = Array.from(
-      content.querySelectorAll<HTMLElement>(
-        '[role="menuitem"][data-active="true"]:not([data-disabled]):not([aria-disabled="true"])',
-      ),
-    ).find((item) => item.closest('[role="menu"]') === content);
-    if (!selected) return;
-    initialFocusHandled.current = true;
-    selected.focus();
-    onInitialSelectionFocus?.();
-  }, [content, menuOpen, onInitialSelectionFocus]);
   return (
     <DropdownMenuContent
       {...props}
       {...interactionProps}
-      ref={setContent}
       onFocus={(event) => {
         onFocus?.(event);
         if (
           event.defaultPrevented ||
           !menuOpen ||
           initialFocusHandled.current ||
-          event.target !== event.currentTarget
+          (event.target !== event.currentTarget && onInitialSelectionFocus == null)
         )
           return;
         initialFocusHandled.current = true;
-        const focusedContent = event.currentTarget;
+        const content = event.currentTarget;
         const selected = Array.from(
-          focusedContent.querySelectorAll<HTMLElement>(
+          content.querySelectorAll<HTMLElement>(
             '[role="menuitem"][data-active="true"]:not([data-disabled]):not([aria-disabled="true"])',
           ),
-        ).find((item) => item.closest('[role="menu"]') === focusedContent);
+        ).find((item) => item.closest('[role="menu"]') === content);
         if (!selected) return;
         selected.focus();
         // Keep Radix's entry-focus fallback from replacing the selected row.
-        if (focusedContent.ownerDocument.activeElement === selected) event.preventDefault();
+        if (content.ownerDocument.activeElement === selected) event.preventDefault();
         onInitialSelectionFocus?.();
       }}
     />

@@ -30,7 +30,7 @@ import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAge
 import { useHosts } from "@/hooks/useHosts";
 import { useCreateScheduledTask, useUpdateScheduledTask } from "@/hooks/useScheduledTasks";
 import { isNativeCodingAgent, nativeAgentHasCapability } from "@/lib/nativeCodingAgents";
-import { sortAgentsForDisplay } from "@/lib/agentGrouping";
+import { isAcpHarnessAgent, selectableSessionAgents } from "@/lib/agentGrouping";
 import {
   isBackdropOverlay,
   isInsidePopper,
@@ -45,10 +45,6 @@ import {
 } from "@/lib/scheduleBuilder";
 import { ScheduledTaskApiError, type ScheduledTask } from "@/lib/scheduledTasksApi";
 import { localTimezone } from "@/lib/timezones";
-
-// Agents hidden from the scheduled-task picker (mirrors NewChatDialog's set):
-// superseded / SDK-only harnesses that shouldn't be user-pickable here.
-const HIDDEN_PICKER_AGENTS = new Set(["nessie", "kimi", "kimi-code"]);
 
 export function CreateScheduledTaskDialog({
   open,
@@ -96,15 +92,15 @@ export function CreateScheduledTaskDialog({
   const [pickedEffort, setPickedEffort] = useState<string>("");
   const [pickedPermission, setPickedPermission] = useState<string>("");
 
-  const agentList = useMemo(
-    () => sortAgentsForDisplay((agents ?? []).filter((a) => !HIDDEN_PICKER_AGENTS.has(a.name))),
-    [agents],
-  );
+  const agentList = useMemo(() => selectableSessionAgents(agents ?? []), [agents]);
   const harnessEntries = useMemo(
-    () => agentList.filter((a) => isNativeCodingAgent(a)),
+    () => agentList.filter((a) => isNativeCodingAgent(a) || isAcpHarnessAgent(a)),
     [agentList],
   );
-  const agentEntries = useMemo(() => agentList.filter((a) => !isNativeCodingAgent(a)), [agentList]);
+  const agentEntries = useMemo(
+    () => agentList.filter((a) => !isNativeCodingAgent(a) && !isAcpHarnessAgent(a)),
+    [agentList],
+  );
   // Resolve the effective selection: the explicit pick if it's still in the
   // list, else the edited task's own agent (which may be hidden from the picker
   // — never silently retarget it), else the first agent (so a fresh picker
@@ -430,13 +426,9 @@ export function CreateScheduledTaskDialog({
                 // default modal mode can turn an inside-dialog click into a
                 // parent Dialog outside interaction while the menu dismisses.
                 dropdownModal={false}
-                // Bound the dropdown height so it scrolls in the modal instead
-                // of running off the bottom of the screen (the trigger sits near
-                // the top of a tall dialog, unlike the composer footer). Width
-                // matches the interactive picker so the "needs setup" pills +
-                // agent descriptions fit without cramping (the shared default is
-                // only min-w-64; pin a comfortable fixed width like interactive).
-                contentClassName="max-h-80 w-80"
+                // The shared menu caps against available viewport height, so
+                // constrained screens scroll without clipping taller screens.
+                contentClassName="w-80"
                 // Full-width trigger → left-align the menu's edge to it.
                 contentAlign="start"
                 // Match the sibling <Select> fields (Frequency / host): full
