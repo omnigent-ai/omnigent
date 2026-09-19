@@ -2324,6 +2324,7 @@ def register_events_routes(
                     page.data,
                     session_id,
                     conversation_store,
+                    agent_store,
                 )
                 for summary in summaries:
                     events.append(

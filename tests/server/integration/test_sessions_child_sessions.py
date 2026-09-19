@@ -9,11 +9,12 @@ through the spawn workflow) — the route depends only on
 and the relay-fed ``_session_status_cache``, so direct seeding gives
 fast, deterministic coverage of every response field.
 
-The tasks table has been removed. ``current_task_id`` and ``agent_name``
-(previously derived from task rows) are now always ``None``.
-``current_task_status`` is derived from session lifecycle state when
-available, and is otherwise ``None``. ``agent_id`` is populated from the
-conversation row's ``agent_id`` column.
+The tasks table has been removed. ``current_task_id`` (previously
+derived from task rows) is now always ``None``. ``current_task_status``
+is derived from session lifecycle state when available, and is otherwise
+``None``. ``agent_id`` is populated from the conversation row's
+``agent_id`` column, and ``agent_name`` is resolved from it against the
+agent store.
 """
 
 from __future__ import annotations
@@ -36,7 +37,12 @@ from omnigent.server.routes.sessions import routes_events as routes_events_modul
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
-from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
+from omnigent.util.session_lifecycle import (
+    CLOSED_LABEL_KEY,
+    CLOSED_LABEL_VALUE,
+    VERBATIM_TITLE_LABEL_KEY,
+    VERBATIM_TITLE_LABEL_VALUE,
+)
 from tests.server.helpers import build_agent_bundle, create_test_agent
 
 pytestmark = pytest.mark.asyncio
@@ -96,8 +102,8 @@ def _seed_child(
 
     Mirrors what :func:`omnigent.tools.builtins.spawn._spawn_one` does,
     minus the workflow start and SSE publish. The tasks table has been
-    removed — ``current_task_id``, ``current_task_status``, and
-    ``agent_name`` fields in the summary are always ``None``.
+    removed — the ``current_task_id`` and ``current_task_status`` fields
+    in the summary are always ``None``.
 
     :param conv_store: Store for the child conversation.
     :param parent_id: Parent conversation id, e.g. ``"0c4b962f26d3fb76dce69d9dade142f5"``.
@@ -165,11 +171,11 @@ async def test_child_sessions_returns_seeded_child_with_full_shape(
     """
     A single seeded child surfaces every documented summary field.
 
-    The tasks table has been removed — ``current_task_id``,
-    ``current_task_status``, and ``agent_name`` are always ``None``.
-    ``agent_id`` is populated from the conversation row's ``agent_id``
-    column. ``busy`` is derived from the relay-fed cache (defaults to
-    ``False`` with no cache entry).
+    The tasks table has been removed — ``current_task_id`` and
+    ``current_task_status`` are always ``None``. ``agent_id`` is
+    populated from the conversation row's ``agent_id`` column and
+    ``agent_name`` is resolved from it. ``busy`` is derived from the
+    relay-fed cache (defaults to ``False`` with no cache entry).
 
     :param client: The test HTTP client.
     :param db_uri: Per-test SQLite database URI.
@@ -203,10 +209,11 @@ async def test_child_sessions_returns_seeded_child_with_full_shape(
     assert row["tool"] == "researcher"
     assert row["session_name"] == "auth"
 
-    # agent_id comes from the conversation row (tasks table removed).
+    # agent_id comes from the conversation row, agent_name from the
+    # batched agent-store lookup keyed by that id.
     assert row["agent_id"] == session["agent_id"]
-    # agent_name and task fields are None (no tasks table).
-    assert row["agent_name"] is None
+    assert row["agent_name"] == "test-agent"
+    # Task fields are None (no tasks table).
     assert row["current_task_id"] is None
     assert row["current_task_status"] is None
     assert row["last_task_error"] is None
@@ -430,6 +437,7 @@ async def test_child_sessions_handles_child_without_agent_id(
     assert row["current_task_id"] is None
     assert row["current_task_status"] is None
     assert row["agent_id"] is None
+    # No agent binding means no name to resolve — and no lookup attempted.
     assert row["agent_name"] is None
     assert row["busy"] is False
 
@@ -801,6 +809,49 @@ async def test_child_sessions_handles_title_without_colon(
     # Defensive parse: whole title falls into `tool`, no session_name.
     assert row["tool"] == "legacy-untyped"
     assert row["session_name"] is None
+    # The agent binding is resolved independently of the title, so an
+    # unparseable title still yields an attributable row.
+    assert row["agent_name"] == "test-agent"
+
+
+# ── Verbatim title (sys_session_create) ────────────────────
+
+
+async def test_child_sessions_keeps_labeled_verbatim_colon_title_whole(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    A child stamped with the ``omnigent.title_verbatim`` label keeps a
+    colon-bearing title whole: no ``tool`` is derived from the title,
+    ``session_name`` carries the full verbatim string, and attribution
+    comes from the durable agent binding. Splitting here would report a
+    phantom agent named after the text before the first ``":"``.
+
+    :param client: The test HTTP client.
+    :param db_uri: Per-test SQLite database URI.
+    """
+    session = await _create_parent_session(client)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+
+    child = _seed_child(
+        conv_store=conv_store,
+        parent_id=session["id"],
+        title="probe:colon-title",
+        agent_id=session["agent_id"],
+    )
+    conv_store.set_labels(child.id, {VERBATIM_TITLE_LABEL_KEY: VERBATIM_TITLE_LABEL_VALUE})
+
+    resp = await client.get(f"/v1/sessions/{session['id']}/child_sessions")
+    rows = resp.json()["data"]
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["title"] == "probe:colon-title"
+    # Verbatim marker: the title is never split into an agent prefix.
+    assert row["tool"] is None
+    assert row["session_name"] == "probe:colon-title"
+    # Identity comes from the durable binding, not the title text.
+    assert row["agent_name"] == "test-agent"
 
 
 # ── Title with "ui:" prefix (user-added agent from Web UI) ─

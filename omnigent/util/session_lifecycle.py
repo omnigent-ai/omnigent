@@ -8,6 +8,28 @@ CLOSED_LABEL_KEY = "omnigent.closed"
 CLOSED_LABEL_VALUE = "true"
 CLOSED_TITLE_INFIX = ":closed:"
 
+VERBATIM_TITLE_LABEL_KEY = "omnigent.title_verbatim"
+VERBATIM_TITLE_LABEL_VALUE = "true"
+
+
+def is_title_verbatim(labels: Mapping[str, str] | None) -> bool:
+    """
+    Return whether a session's title is a caller-supplied verbatim string.
+
+    ``sys_session_create`` stamps :data:`VERBATIM_TITLE_LABEL_KEY` on the
+    child it creates because it stores the caller's ``title`` argument
+    verbatim. Framework-spawned children instead persist the generated
+    ``"<agent>:<title>"`` name and carry no marker. Readers use this to
+    keep a verbatim title such as ``"probe:colon-title"`` whole and take
+    the child's identity from its durable agent binding, instead of
+    misreading the text before the first ``":"`` as an agent name.
+
+    :param labels: Session labels, e.g.
+        ``{"omnigent.title_verbatim": "true"}``.
+    :returns: ``True`` when the verbatim-title marker is set.
+    """
+    return (labels or {}).get(VERBATIM_TITLE_LABEL_KEY) == VERBATIM_TITLE_LABEL_VALUE
+
 
 def title_without_closed_marker(title: str | None) -> str | None:
     """

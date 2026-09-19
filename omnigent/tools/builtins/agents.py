@@ -194,9 +194,10 @@ class SysAgentListTool(Tool):
     - **built-ins**: template agents registered on the server
       (``GET /v1/agents``);
     - **session-bound**: the agents bound to sessions the caller can
-      access (``GET /v1/sessions``), each with its ``agent_id`` (for a
-      direct ``sys_session_create`` launch) and its ``session_id`` (so
-      the caller can ``sys_agent_get`` / ``sys_agent_download`` it); and
+      access (``GET /v1/sessions``), sub-agent sessions included, each
+      with its ``agent_id`` (for a direct ``sys_session_create`` launch)
+      and its ``session_id`` (so the caller can ``sys_agent_get`` /
+      ``sys_agent_download`` it); and
     - **local configs**: agent config YAMLs authored locally with
       ``sys_os_write`` (e.g. following the ``build-omnigent`` skill) — a
       scan of the working directory's agent-config subdir.
@@ -221,7 +222,8 @@ class SysAgentListTool(Tool):
         """:returns: Human-readable description of the tool."""
         return (
             "List launchable agents across three sources: built-in / "
-            "template agents, agents bound to sessions you can access, "
+            "template agents, agents bound to sessions you can access "
+            "(sub-agent sessions included), "
             "and locally-authored agent config YAMLs. Returns "
             "{builtins: [...], session_agents: [...], local_configs: "
             "[...]}. Both builtins and session_agents rows carry an "
