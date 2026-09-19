@@ -3294,6 +3294,8 @@ async def test_post_answer_message_only_committed_is_not_dropped(tmp_path: Path)
         session_id=sid, elicitation_id=eid, verdict=Verdict(accepted=True, content={"store": "A"})
     )
     await _wait_for_resolved(omnigent)
+    # The verdict unblocks the answer stream; let it finish before cancelling tasks.
+    await asyncio.wait_for(asyncio.gather(*service._turn_tasks), timeout=5)
     await service.shutdown()
 
     # The post-answer text was delivered (in the post-seal segment), not dropped.
