@@ -237,3 +237,28 @@ def test_record_and_remove_launch_agent_preserves_other_entries(
     removed = install_ledger.load_ledger(install_ledger.ledger_path())
     assert removed is not None
     assert removed.entries.launch_agents == [unrelated]
+
+
+def test_deep_backfill_observes_claude_config_in_the_configured_claude_home(
+    tmp_path: Path, monkeypatch
+) -> None:
+    home = tmp_path / "home"
+    state = home / ".omnigent"
+    profile = tmp_path / "work-profile"
+    workspace = tmp_path / "workspace"
+    state.mkdir(parents=True)
+    profile.mkdir()
+    workspace.mkdir()
+    (state / "installation_id").write_text("install-123\n")
+    claude_config = profile / ".claude.json"
+    claude_config.write_text('{"mcpServers": {"omnigent": {"command": "python"}}}\n')
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(state))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(profile))
+    monkeypatch.chdir(workspace)
+
+    ledger = install_ledger.backfill_install_ledger(deep=True, apply=False)
+
+    assert ledger is not None
+    observed = [entry.path for entry in ledger.entries.injected_external_config]
+    assert observed == [str(claude_config)]
