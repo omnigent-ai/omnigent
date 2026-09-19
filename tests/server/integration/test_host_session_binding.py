@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,7 +16,7 @@ import pytest
 import pytest_asyncio
 from asgiref.testing import ApplicationCommunicator
 from fastapi import FastAPI
-from httpx import ASGITransport, AsyncClient
+from httpx import ASGITransport, AsyncClient, Response
 
 from omnigent.entities import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
@@ -42,6 +43,11 @@ from omnigent.server.routes.hosts import create_hosts_router
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
+from omnigent.stores.conversation_store import (
+    FORK_CARRY_HISTORY_LABEL_KEY,
+    FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
+    FORK_SOURCE_LABEL_KEY,
+)
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -58,6 +64,7 @@ from tests.server.helpers import (
 pytestmark = pytest.mark.asyncio
 
 _HOST_ID = "3f866cafac81246fb60ae6ceb1a738da"
+_HOST_B_ID = "9c1d22e07b53418e921f30cd88a51b02"
 
 
 def _websocket_scope(path: str) -> dict[str, object]:
@@ -269,6 +276,142 @@ async def test_host_id_in_session_response(
     fetched = conv_store.get_conversation(conv.id)
     assert fetched is not None
     assert fetched.host_id == _HOST_ID
+
+
+async def _bind_via_route(
+    app: FastAPI,
+    comm: ApplicationCommunicator,
+    host_id: str,
+    session_id: str,
+) -> Response:
+    """POST /hosts/{host_id}/runners while the mock host acks the launch."""
+
+    async def _respond_launched() -> None:
+        for _ in range(20):
+            output = await comm.receive_output(timeout=2.0)
+            if output["type"] != "websocket.send":
+                continue
+            frame = decode_host_frame(output["text"])
+            if isinstance(frame, HostLaunchRunnerFrame):
+                await comm.send_input(
+                    {
+                        "type": "websocket.receive",
+                        "text": encode_host_frame(
+                            HostLaunchRunnerResultFrame(
+                                request_id=frame.request_id,
+                                status="launched",
+                                runner_id="runner_token_test",
+                            )
+                        ),
+                    }
+                )
+                return
+
+    responder = asyncio.create_task(_respond_launched())
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            f"/v1/hosts/{host_id}/runners",
+            json={"session_id": session_id, "workspace": "/tmp"},
+        )
+    await responder
+    return resp
+
+
+def _fork_of(
+    conv_store: SqlAlchemyConversationStore,
+    source_id: str,
+) -> Conversation:
+    """Create an unbound fork carrying the native-resume fork labels."""
+    fork = conv_store.create_conversation(agent_id=None)
+    conv_store.set_labels(
+        fork.id,
+        {
+            FORK_SOURCE_LABEL_KEY: source_id,
+            FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY: "claude-source-transcript-id",
+            FORK_CARRY_HISTORY_LABEL_KEY: "1",
+        },
+    )
+    return fork
+
+
+async def test_cross_host_fork_bind_drops_host_local_resume_directive(
+    binding_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """Binding a fork to a host other than its source's must drop the
+    source-transcript resume directive.
+
+    The directive points at a transcript that exists only on the source's
+    host; carried across hosts it routes the runner into a doomed clone
+    (launches fresh, losing history) and blocks the rebuild-from-items
+    fallback. The carry-history marker and source pointer must survive so
+    the runner still rebuilds the history.
+    """
+    app, registry, _hs, conv_store = binding_app
+    await _connect_host(app, registry, host_id=_HOST_ID, name="host-a")
+    comm_b = await _connect_host(app, registry, host_id=_HOST_B_ID, name="host-b")
+    source = conv_store.create_conversation(agent_id=None, host_id=_HOST_ID, workspace="/tmp/src")
+    fork = _fork_of(conv_store, source.id)
+
+    resp = await _bind_via_route(app, comm_b, _HOST_B_ID, fork.id)
+    assert resp.status_code == 200
+
+    bound = conv_store.get_conversation(fork.id)
+    assert bound is not None
+    assert bound.host_id == _HOST_B_ID
+    assert FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY not in bound.labels
+    assert bound.labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1"
+    assert bound.labels.get(FORK_SOURCE_LABEL_KEY) == source.id
+
+
+async def test_same_host_fork_bind_keeps_resume_directive(
+    binding_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """Binding a fork to its source's own host keeps the resume directive:
+    the source transcript is local there, so the higher-fidelity clone
+    path stays available.
+    """
+    app, registry, _hs, conv_store = binding_app
+    comm_a = await _connect_host(app, registry, host_id=_HOST_ID, name="host-a")
+    source = conv_store.create_conversation(agent_id=None, host_id=_HOST_ID, workspace="/tmp/src")
+    fork = _fork_of(conv_store, source.id)
+
+    resp = await _bind_via_route(app, comm_a, _HOST_ID, fork.id)
+    assert resp.status_code == 200
+
+    bound = conv_store.get_conversation(fork.id)
+    assert bound is not None
+    assert (
+        bound.labels.get(FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY) == "claude-source-transcript-id"
+    )
+
+
+@pytest.mark.parametrize("source_state", ["unbound", "deleted", "malformed"])
+async def test_fork_bind_keeps_resume_directive_when_source_host_unknown(
+    binding_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    source_state: str,
+) -> None:
+    """When the source's host can't be determined (source unbound, deleted,
+    or an unresolvable pointer), the bind succeeds and leaves the directive
+    alone — only a positive host mismatch drops it.
+    """
+    app, registry, _hs, conv_store = binding_app
+    comm_b = await _connect_host(app, registry, host_id=_HOST_B_ID, name="host-b")
+    if source_state == "unbound":
+        source_id = conv_store.create_conversation(agent_id=None).id
+    elif source_state == "deleted":
+        source_id = uuid.uuid4().hex
+    else:
+        source_id = "not-a-conversation-id"
+    fork = _fork_of(conv_store, source_id)
+
+    resp = await _bind_via_route(app, comm_b, _HOST_B_ID, fork.id)
+    assert resp.status_code == 200
+
+    bound = conv_store.get_conversation(fork.id)
+    assert bound is not None
+    assert (
+        bound.labels.get(FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY) == "claude-source-transcript-id"
+    )
 
 
 # ── Managed (server-launched sandbox) host sessions ─────────

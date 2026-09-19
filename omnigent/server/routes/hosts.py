@@ -26,6 +26,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 
+from omnigent.db.db_models import InvalidUuidError, uuid_to_bytes
 from omnigent.db.utils import now_epoch
 from omnigent.debug_logging import add_audit_attrs
 from omnigent.entities import Conversation
@@ -63,6 +64,10 @@ from omnigent.server.routes._workspace_validation import (
 )
 from omnigent.server.schemas import SessionGitOptions
 from omnigent.stores import AgentStore, ConversationStore
+from omnigent.stores.conversation_store import (
+    FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
+    FORK_SOURCE_LABEL_KEY,
+)
 from omnigent.stores.host_store import HostStore, host_is_live
 from omnigent.stores.permission_store import PermissionStore
 
@@ -570,6 +575,59 @@ async def _resolve_agent_harness(
     return canonicalize_harness(loaded.spec.executor.harness_kind)
 
 
+def _drop_cross_host_fork_resume_directive(
+    conversation_store: ConversationStore,
+    conv: Conversation,
+    host_id: str,
+) -> None:
+    """Drop a fork's host-local native-resume directive on a cross-host bind.
+
+    The directive (:data:`FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY`) tells the
+    runner to clone the fork source's LOCAL native transcript — a file that
+    exists only on the source's host. An external fork is created unbound, so
+    the directive is stamped before the target host is known; when the fork
+    then binds to a DIFFERENT host, the clone is doomed (the runner finds no
+    transcript and launches fresh, silently losing all carried history) and
+    the directive's presence blocks the cross-host-safe rebuild-from-items
+    path. Re-evaluate it here, at bind time: a fork bound to a host other
+    than its source's drops the directive — mirroring the managed-fork skip
+    at fork time — so the runner rebuilds history from the copied items.
+
+    Conservative on unknowns: a same-host bind keeps the higher-fidelity
+    transcript clone, and a missing source session or unbound source host
+    leaves the directive untouched (the transcript may still be reachable).
+
+    :param conversation_store: Store holding the session rows and labels.
+    :param conv: The session being bound (labels as loaded at launch).
+    :param host_id: The host the session is being bound to.
+    """
+    if conv.labels.get(FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY) is None:
+        return
+    source_id = conv.labels.get(FORK_SOURCE_LABEL_KEY)
+    if source_id is None:
+        return
+    # A malformed source pointer can't locate the source's host; keep the
+    # directive rather than failing the launch (a Uuid16 bind would raise).
+    try:
+        uuid_to_bytes(source_id)
+    except InvalidUuidError:
+        return
+    source = conversation_store.get_conversation(source_id)
+    if source is None or source.host_id is None or source.host_id == host_id:
+        return
+    conversation_store.delete_label(conv.id, FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY)
+    _logger.info(
+        "Dropped host-local fork-resume directive for session %s: fork bound "
+        "to host %s but source %s is on host %s; runner will rebuild history "
+        "from the copied items",
+        conv.id,
+        host_id,
+        source_id,
+        source.host_id,
+        extra={"session_id": conv.id},
+    )
+
+
 def create_hosts_router(
     host_registry: HostRegistry,
     host_store: HostStore,
@@ -968,6 +1026,16 @@ def create_hosts_router(
                 else:
                     await _settle_and_rollback()
                 raise
+
+        # The target host is only known now (an external fork is created
+        # unbound), so re-evaluate the fork's native-resume directive before
+        # the launch frame lets the runner read the session snapshot.
+        await asyncio.to_thread(
+            _drop_cross_host_fork_resume_directive,
+            conversation_store,
+            target.conv,
+            host_id,
+        )
 
         request_id = secrets.token_hex(8)
         future: asyncio.Future[dict[str, str | None]] = asyncio.get_running_loop().create_future()
