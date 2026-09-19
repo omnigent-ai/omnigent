@@ -1598,6 +1598,7 @@ class ConversationStore(ABC):
         runner_id: str | None = None,
         project_id: str | None = None,
         host_id: str | None = None,
+        created_by: str | None = None,
     ) -> CreatedSession:
         """
         Atomically create a session and its session-scoped agent.
@@ -1639,6 +1640,9 @@ class ConversationStore(ABC):
         :param host_id: Optional external host the session binds to,
             e.g. ``"host_a1b2c3d4..."``. Requires a non-``None``
             ``workspace``. ``None`` leaves the session unbound.
+        :param created_by: Identity of the creating user, recorded on the
+            session-scoped agent so its code can only be mutated by the
+            owner. ``None`` in single-user mode.
         :returns: The committed conversation and agent entities.
         :raises ConversationNotFoundError: If
             ``parent_conversation_id`` is set but no such
@@ -1673,6 +1677,7 @@ class ConversationStore(ABC):
         up_to_response_id: str | None = None,
         project_id: str | None = None,
         file_id_map: Mapping[str, str] | None = None,
+        created_by: str | None = None,
     ) -> Conversation:
         """
         Deep-copy a conversation and its items into a new conversation.
@@ -1782,6 +1787,9 @@ class ConversationStore(ABC):
             blocks, file resource events) are rewritten to the fork's copy,
             so the fork never references files it does not own. ``None`` or
             empty leaves every copied payload verbatim.
+        :param created_by: Identity of the forking user, recorded on the
+            cloned session-scoped agent so its code can only be mutated by
+            the owner. ``None`` in single-user mode or when no clone is made.
         :returns: The newly created :class:`Conversation`.
         :raises LookupError: If no conversation with
             *source_conversation_id* exists.
@@ -1803,6 +1811,7 @@ class ConversationStore(ABC):
         carry_history_into_native: bool,
         presentation_labels: dict[str, str],
         previous_builtin_id: str | None,
+        created_by: str | None = None,
     ) -> Conversation:
         """
         Rebind a session in place to a different (cloned) agent.
@@ -1849,6 +1858,9 @@ class ConversationStore(ABC):
             switching away from, stamped as
             :data:`SWITCH_PREVIOUS_BUILTIN_LABEL_KEY` for a one-click
             "Switch back". ``None`` leaves it unset.
+        :param created_by: Identity of the switching user, recorded on the
+            new session-scoped agent so its code can only be mutated by the
+            owner. ``None`` in single-user mode.
         :returns: The updated :class:`Conversation`.
         :raises LookupError: If no conversation with *conversation_id*
             exists.

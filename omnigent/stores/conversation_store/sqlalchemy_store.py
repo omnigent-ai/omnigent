@@ -400,6 +400,7 @@ def _new_session_agent_row(
     agent_bundle_location: str,
     agent_description: str | None,
     now: int,
+    created_by: str | None = None,
 ) -> SqlAgent:
     """
     Build the session-scoped agent row for atomic creation.
@@ -409,6 +410,9 @@ def _new_session_agent_row(
     :param agent_bundle_location: Artifact-store key for the bundle.
     :param agent_description: Optional description from the spec.
     :param now: Unix epoch seconds used for the created field.
+    :param created_by: Identity of the creating user, recorded so
+        agent-code mutation can be restricted to the owner. ``None`` in
+        single-user mode.
     :returns: Unsaved :class:`SqlAgent` row.
     """
     return SqlAgent(
@@ -419,6 +423,7 @@ def _new_session_agent_row(
         version=1,
         kind=encode_agent_kind("session"),
         description=agent_description,
+        created_by=created_by,
     )
 
 
@@ -3952,6 +3957,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         runner_id: str | None = None,
         project_id: str | None = None,
         host_id: str | None = None,
+        created_by: str | None = None,
     ) -> CreatedSession:
         """
         Insert a conversation row and session-scoped agent.
@@ -4001,6 +4007,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             bundled create with a caller-supplied host can launch a
             runner on it, mirroring the JSON create path. Requires a
             non-``None`` ``workspace``.
+        :param created_by: Identity of the creating user, recorded on the
+            session-scoped agent so its code can only be mutated by the
+            owner. ``None`` in single-user mode.
         :returns: A :class:`CreatedSession` with both entities.
         :raises ConversationNotFoundError: If
             ``parent_conversation_id`` is set but no such
@@ -4021,6 +4030,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             runner_id=runner_id,
             project_id=project_id,
             host_id=host_id,
+            created_by=created_by,
         )
 
     def _create_session_with_agent_with_id(
@@ -4040,6 +4050,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         runner_id: str | None = None,
         project_id: str | None = None,
         host_id: str | None = None,
+        created_by: str | None = None,
     ) -> CreatedSession:
         """Body of :meth:`create_session_with_agent` under a caller-supplied
         ``conversation_id``. The public method generates a fresh id; this seam
@@ -4089,6 +4100,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             session: Session,
         ) -> tuple[SqlConversationMetadata, SqlAgent]:
             agent_row = _new_session_agent_row(
+                created_by=created_by,
                 agent_id=agent_id,
                 agent_name=agent_name,
                 agent_bundle_location=agent_bundle_location,
@@ -4146,6 +4158,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         up_to_response_id: str | None = None,
         project_id: str | None = None,
         file_id_map: Mapping[str, str] | None = None,
+        created_by: str | None = None,
     ) -> Conversation:
         """
         Deep-copy a conversation and its items into a new conversation.
@@ -4269,6 +4282,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             session-scoped file resources the caller copies into the fork.
             Copied items referencing a mapped id are rewritten to the
             fork's copy; ``None`` or empty copies every payload verbatim.
+        :param created_by: Identity of the forking user, recorded on the
+            cloned session-scoped agent (when a clone is created) so its
+            code can only be mutated by the owner. ``None`` in single-user
+            mode, or when the fork binds an existing agent (no clone).
         :returns: The newly created :class:`Conversation`.
         :raises LookupError: If no conversation with
             *source_conversation_id* exists.
@@ -4299,6 +4316,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             up_to_response_id=up_to_response_id,
             project_id=project_id,
             file_id_map=file_id_map,
+            created_by=created_by,
         )
 
     def _fork_conversation_with_id(
@@ -4327,6 +4345,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         up_to_response_id: str | None = None,
         project_id: str | None = None,
         file_id_map: Mapping[str, str] | None = None,
+        created_by: str | None = None,
     ) -> Conversation:
         """Body of :meth:`fork_conversation` under a caller-supplied
         ``conversation_id``. The public method generates a fresh id; this seam
@@ -4718,6 +4737,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                         version=1,
                         kind=encoded_session_agent_kind,
                         description=cloned_agent_description,
+                        created_by=created_by,
                     )
                 )
             return fork_meta
@@ -4742,6 +4762,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         carry_history_into_native: bool,
         presentation_labels: dict[str, str],
         previous_builtin_id: str | None,
+        created_by: str | None = None,
     ) -> Conversation:
         """
         Rebind a session in place to a different (cloned) agent.
@@ -4763,6 +4784,9 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param presentation_labels: Target-harness ui/wrapper labels.
         :param previous_builtin_id: Built-in switched away from, or
             ``None``.
+        :param created_by: Identity of the switching user, recorded on the
+            new session-scoped agent row so its code can only be mutated by
+            the owner. ``None`` in single-user mode.
         :returns: The updated :class:`Conversation`.
         :raises LookupError: If *conversation_id* does not exist.
         """
@@ -4848,6 +4872,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     version=1,
                     kind=encoded_agent_kind,
                     description=new_agent_description,
+                    created_by=created_by,
                 )
             )
 
