@@ -729,18 +729,24 @@ def test_summarize_checks_mixed() -> None:
         {"context": "legacy-ok", "state": "SUCCESS", "targetUrl": "t"},
         {"context": "legacy-wait", "state": "PENDING"},
         {"context": "legacy-err", "state": "ERROR"},
+        {"name": "cancelled job", "status": "COMPLETED", "conclusion": "CANCELLED"},
+        {"name": "skipped job", "status": "COMPLETED", "conclusion": "SKIPPED"},
     ]
     result = _summarize_checks(rollup)
     assert result["passing"] == 2
     assert result["failing"] == 2
     assert result["pending"] == 2
-    assert result["total"] == 6
+    assert result["cancelled"] == 1
+    assert result["skipped"] == 1
+    assert result["total"] == 8
     # Per-check details carry the job name, bucket, and link (name falls back to
     # context / workflowName; url falls back to targetUrl).
     assert {"name": "unit", "bucket": "passing", "url": "u"} in result["runs"]
     assert {"name": "e2e", "bucket": "failing", "url": None} in result["runs"]
     assert {"name": "bench", "bucket": "pending", "url": None} in result["runs"]
     assert {"name": "legacy-ok", "bucket": "passing", "url": "t"} in result["runs"]
+    assert {"name": "cancelled job", "bucket": "cancelled", "url": None} in result["runs"]
+    assert {"name": "skipped job", "bucket": "skipped", "url": None} in result["runs"]
 
 
 def test_summarize_checks_empty() -> None:
@@ -749,6 +755,8 @@ def test_summarize_checks_empty() -> None:
         "passing": 0,
         "failing": 0,
         "pending": 0,
+        "cancelled": 0,
+        "skipped": 0,
         "total": 0,
         "runs": [],
     }

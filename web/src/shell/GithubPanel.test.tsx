@@ -202,6 +202,33 @@ describe("GithubPanel", () => {
     expect(screen.getByText(/66\s*passed/)).toBeInTheDocument();
     expect(screen.getByText(/2\s*failed/)).toBeInTheDocument();
     expect(screen.queryByText(/pending/)).toBeNull();
+    expect(screen.queryByRole("button", { name: /cancelled|skipped/ })).toBeNull();
+  });
+
+  it("shows cancelled and skipped checks as separate grey pills", () => {
+    state.info!.data!.pr!.checks = {
+      passing: 0,
+      failing: 0,
+      pending: 0,
+      cancelled: 1,
+      skipped: 2,
+      total: 3,
+      runs: [
+        { name: "cancelled job", bucket: "cancelled", url: null },
+        { name: "skipped job", bucket: "skipped", url: null },
+        { name: "another skipped job", bucket: "skipped", url: null },
+      ],
+    };
+    renderPanel();
+
+    for (const label of ["1 cancelled", "2 skipped"]) {
+      expect(screen.getByRole("button", { name: label })).toHaveClass(
+        "bg-muted",
+        "text-muted-foreground",
+        "rounded-full",
+      );
+    }
+    expect(screen.queryByRole("button", { name: /passed|failed|pending/ })).toBeNull();
   });
 
   it.each([

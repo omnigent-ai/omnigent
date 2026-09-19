@@ -320,7 +320,7 @@ _MAX_CHECK_RUNS = 300
 
 
 def _classify_check(check: dict[str, Any]) -> str:
-    """Bucket a single ``statusCheckRollup`` entry: passing / failing / pending."""
+    """Bucket a single ``statusCheckRollup`` entry by its outcome."""
     # CheckRun carries status/conclusion; StatusContext carries state.
     state = check.get("state")
     if state is not None:
@@ -333,16 +333,18 @@ def _classify_check(check: dict[str, Any]) -> str:
     if str(check.get("status", "")).upper() != "COMPLETED":
         return "pending"
     conclusion = str(check.get("conclusion", "")).upper()
-    return "passing" if conclusion in ("SUCCESS", "NEUTRAL", "SKIPPED") else "failing"
+    if conclusion in ("CANCELLED", "SKIPPED"):
+        return conclusion.lower()
+    return "passing" if conclusion in ("SUCCESS", "NEUTRAL") else "failing"
 
 
 def _summarize_checks(rollup: Any) -> dict[str, Any]:
     """Summarize a ``statusCheckRollup`` into bucket counts + per-check details.
 
-    :returns: ``{passing, failing, pending, total, runs}`` where ``runs`` is a
-        list of ``{name, bucket, url}`` (the job names the UI shows on hover).
+    :returns: Outcome counts, a total, and ``runs`` containing
+        ``{name, bucket, url}`` (the job names the UI shows on hover).
     """
-    counts = {"passing": 0, "failing": 0, "pending": 0}
+    counts = {"passing": 0, "failing": 0, "pending": 0, "cancelled": 0, "skipped": 0}
     runs: list[dict[str, Any]] = []
     if isinstance(rollup, list):
         for check in rollup:
@@ -362,10 +364,8 @@ def _summarize_checks(rollup: Any) -> dict[str, Any]:
                     }
                 )
     return {
-        "passing": counts["passing"],
-        "failing": counts["failing"],
-        "pending": counts["pending"],
-        "total": counts["passing"] + counts["failing"] + counts["pending"],
+        **counts,
+        "total": sum(counts.values()),
         "runs": runs,
     }
 

@@ -30,7 +30,7 @@ import {
 /** One CI check the PR ran, bucketed for the checks summary. */
 export interface GithubCheckRun {
   name: string;
-  bucket: "passing" | "failing" | "pending";
+  bucket: "passing" | "failing" | "pending" | "cancelled" | "skipped";
   /** Link to the run on GitHub, or null when unknown. */
   url: string | null;
 }
@@ -39,6 +39,9 @@ export interface GithubChecks {
   passing: number;
   failing: number;
   pending: number;
+  /** Absent on older hosts. */
+  cancelled?: number;
+  skipped?: number;
   total: number;
   /** Per-check details (job names) for the hover breakdown. */
   runs: GithubCheckRun[];
