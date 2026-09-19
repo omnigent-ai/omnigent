@@ -193,6 +193,10 @@ resolve their own harness binding; forks retain it even when resetting model
 settings. Configured sessions cannot switch agents or fork into another harness
 or another owner's credential scope; create a new session for those changes.
 Same-harness forks validate their model against the saved policy before writes.
+Sessions with saved sandbox profiles can launch only on server-managed sandbox
+hosts, including when forked or restarted. Ordinary hosts keep their own provider
+configuration; start a new session to use one. Admission checks the actual
+destination host, so a fork can still reuse its original managed sandbox.
 
 Launch and wake overlay the saved providers and bindings onto current sandbox
 lifecycle settings. Unbound harnesses on a profile-enabled target save that

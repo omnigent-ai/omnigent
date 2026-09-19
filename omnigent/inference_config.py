@@ -73,7 +73,8 @@ def validate_inference_credentials(
             validate_fields(entry)
 
 
-def _harness_key(harness: str) -> str:
+def normalize_inference_harness(harness: str) -> str:
+    """Normalize supported harness aliases while preserving exact ACP identities."""
     if harness.startswith("native-"):
         harness = harness.removeprefix("native-") + "-native"
     return harness if harness.startswith("acp:") else (canonicalize_harness(harness) or harness)
@@ -112,7 +113,7 @@ def parse_inference_config(config: dict[str, object]) -> dict[str, HarnessInfere
             raise ValueError(f"Harness {name!r} model_allowlist must be a list of model IDs")
         if allowed is not None and default is not None and default not in allowed:
             raise ValueError(f"Harness {name!r} default_model must belong to model_allowlist")
-        key = _harness_key(name)
+        key = normalize_inference_harness(name)
         if key not in {
             "claude-sdk",
             "claude-native",
@@ -140,7 +141,7 @@ def parse_inference_config(config: dict[str, object]) -> dict[str, HarnessInfere
 def binding_for_harness(config: dict[str, object], harness: str) -> HarnessInferenceBinding | None:
     """Resolve exact ACP identities before an explicitly configured generic ACP fallback."""
     bindings = parse_inference_config(config)
-    key = _harness_key(harness)
+    key = normalize_inference_harness(harness)
     return bindings.get(key) or (bindings.get("acp") if key.startswith("acp:") else None)
 
 
@@ -193,7 +194,7 @@ def resolve_bound_model(config: dict[str, object], harness: str, model: str | No
     if selected is None:
         provider = resolve_bound_provider(config, harness)
         if provider is not None:
-            key = _harness_key(harness)
+            key = normalize_inference_harness(harness)
             preferred = (
                 "anthropic"
                 if key in {"claude-native", "claude-sdk"}

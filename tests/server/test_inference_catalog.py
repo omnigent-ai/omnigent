@@ -142,6 +142,47 @@ async def test_empty_single_and_absent_allowlists_remain_distinct(allowed, expec
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "harness,family", [("claude-native", "anthropic"), ("codex-native", "openai")]
+)
+@pytest.mark.parametrize("request_alias", [False, True])
+@pytest.mark.parametrize("mode", ["discovery", "filtered", "static"])
+async def test_native_aliases_share_catalog_and_saved_default(
+    harness, family, request_alias, mode
+):
+    alias = "native-" + harness.removesuffix("-native")
+    state = _state(
+        harness=alias,
+        allowed=None if mode == "discovery" else ("fast", "gateway/main"),
+        default=None,
+    )
+    target = state.sandbox_config.default
+    provider = target.host_config["providers"]["bifrost"]
+    provider[family] = provider.pop("openai")
+    provider[family]["models"] = {"fast": "gateway/fast"}
+    if mode == "static":
+        target.model_discovery.clear()
+    requests = []
+    service = SandboxInferenceService(state, transport=_transport(requests=requests))
+    snapshot = await service.prepare("agent_sandbox", alias if request_alias else harness, "alice")
+    assert snapshot is not None
+    catalog = snapshot["catalog"]
+    assert catalog["status"] == "ready", catalog
+    expected = (
+        ["gateway/main", "gateway/fast", "gateway/noisy"]
+        if mode == "discovery"
+        else ["gateway/fast", "gateway/main"]
+    )
+    assert [row["id"] for row in catalog["models"]] == expected
+    assert catalog["default_model"] == expected[0]
+    assert (
+        snapshot["runtime_config"]["inference"]["harnesses"][alias]["default_model"] == expected[0]
+    )
+    assert (await service.catalog(snapshot)) == catalog
+    assert bool(requests) is (mode != "static")
+
+
+@pytest.mark.asyncio
 async def test_unavailable_default_is_not_inserted_into_live_catalog():
     snapshot = await SandboxInferenceService(
         _state(), transport=_transport(("gateway/fast",))

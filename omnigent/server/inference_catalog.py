@@ -16,6 +16,7 @@ from omnigent.inference_config import (
     HarnessInferenceBinding,
     binding_for_harness,
     inference_revision,
+    normalize_inference_harness,
     parse_inference_config,
     resolve_bound_provider,
     validate_inference_credentials,
@@ -50,7 +51,7 @@ def _endpoint(value: object) -> str:
 
 
 def _family(provider: ProviderEntry, harness: str, model: str | None = None) -> str:
-    canonical = canonicalize_harness(harness)
+    canonical = canonicalize_harness(normalize_inference_harness(harness))
     if canonical in {"claude-native", "claude-sdk"}:
         family = "anthropic"
     elif canonical in {
@@ -81,7 +82,7 @@ def _wire(provider: ProviderEntry, harness: str, model: str | None = None) -> Mo
     if family == "anthropic":
         return ModelWireAPI.ANTHROPIC_MESSAGES
     protocol = provider.families[family].wire_api
-    canonical = canonicalize_harness(harness)
+    canonical = canonicalize_harness(normalize_inference_harness(harness))
     if canonical in {"codex", "codex-native"} and protocol == "chat":
         raise _invalid("Codex requires a Responses endpoint; configure wire_api: responses.")
     if canonical in {"opencode-native", "jcode", "qwen"}:
@@ -118,17 +119,16 @@ def _alias(model: str, tiers: dict[str, str]) -> str:
 
 
 def _binding_key(config: dict[str, Any], harness: str) -> str:
-    canonical = harness if harness.startswith("acp:") else canonicalize_harness(harness)
+    canonical = normalize_inference_harness(harness)
     for key in config["inference"]["harnesses"]:
-        normalized = key if key.startswith("acp:") else canonicalize_harness(key)
-        if normalized == canonical:
+        if normalize_inference_harness(key) == canonical:
             return key
     return "acp"
 
 
 def _resolve_alias(provider: ProviderEntry, harness: str, model: str) -> str:
     """Resolve across supported families, rejecting conflicting tier definitions."""
-    canonical = canonicalize_harness(harness)
+    canonical = canonicalize_harness(normalize_inference_harness(harness))
     families = (
         [name for name in ("anthropic", "openai") if name in provider.families]
         if canonical in {"pi", "pi-native", "acp"}
@@ -431,7 +431,7 @@ class SandboxInferenceService:
                     not entry.metadata.wire_apis
                     or (
                         bool(_configured_wires(provider) & entry.metadata.wire_apis)
-                        if canonicalize_harness(harness) == "acp"
+                        if canonicalize_harness(normalize_inference_harness(harness)) == "acp"
                         else _wire(provider, harness, entry.id) in entry.metadata.wire_apis
                     )
                 )

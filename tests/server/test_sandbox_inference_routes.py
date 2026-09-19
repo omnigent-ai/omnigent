@@ -15,7 +15,7 @@ from unittest.mock import AsyncMock
 import pytest
 import pytest_asyncio
 from fastapi import FastAPI
-from httpx import ASGITransport, AsyncClient, Request, Response
+from httpx import ASGITransport, AsyncClient, MockTransport, Request, Response
 
 from omnigent.db.utils import generate_agent_id
 from omnigent.runtime.agent_cache import AgentCache
@@ -238,6 +238,62 @@ async def test_preview_preserves_acp_slug_without_creating_session_or_sandbox(en
     assert env.catalog.calls == [("agent_sandbox", "acp:custom", None)]
     assert env.persisted() == before
     env.launch.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "harness,family", [("claude-native", "anthropic"), ("codex-native", "openai")]
+)
+async def test_native_alias_preview_and_create_use_canonical_harness(
+    env: _Env, harness, family, monkeypatch: pytest.MonkeyPatch
+):
+    from omnigent.server.inference_catalog import SandboxInferenceService
+
+    target = env.app.state.sandbox_config.default
+    config = target.host_config
+    alias = "native-" + harness.removesuffix("-native")
+    config["inference"]["harnesses"] = {alias: {"provider": "bifrost"}}
+    provider = config["providers"]["bifrost"]
+    provider[family] = provider.pop("openai")
+    monkeypatch.setenv("ALIAS_DISCOVERY_KEY", "test-catalog-key")
+    target.model_discovery["bifrost"] = {
+        "base_url": "https://catalog.example/v1",
+        "api_key_ref": "env:ALIAS_DISCOVERY_KEY",
+    }
+    env.app.state.inference_catalog = SandboxInferenceService(
+        env.app.state,
+        transport=MockTransport(
+            lambda request: Response(200, json={"data": [{"id": "gateway/main"}]})
+        ),
+    )
+    preview = await env.client.get(
+        f"/v1/sandbox-providers/agent_sandbox/harnesses/{harness}/model-options"
+    )
+    assert preview.status_code == 200, preview.text
+    assert preview.json()["status"] == "ready", preview.text
+    agent = await create_test_agent(
+        env.client,
+        executor={"type": "omnigent", "config": {"harness": harness}},
+        include_llm=False,
+    )
+    created = await env.client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "host_type": "managed",
+            "sandbox_provider": "agent_sandbox",
+            "inference_configuration_revision": preview.json()["configuration_revision"],
+        },
+    )
+    assert created.status_code == 201, created.text
+    saved = env.store.get_conversation(created.json()["id"])
+    assert saved is not None
+    assert saved.model_override == "gateway/main"
+    assert (
+        saved.inference_snapshot["runtime_config"]["inference"]["harnesses"][alias][
+            "default_model"
+        ]
+        == "gateway/main"
+    )
 
 
 @pytest.mark.parametrize("selected", [None, "gateway/fast"])
