@@ -34,6 +34,8 @@ if TYPE_CHECKING:
 
 #: Env var carrying the bridge dir into the harness executor process.
 BRIDGE_DIR_ENV_VAR = "HARNESS_CURSOR_NATIVE_BRIDGE_DIR"
+#: Session label naming the conversation whose launch created the bridge dir.
+CURSOR_NATIVE_BRIDGE_ID_LABEL_KEY = "omnigent.cursor_native.bridge_id"
 
 _BRIDGE_ROOT = Path(tempfile.gettempdir()) / f"omnigent-{stable_user_id()}" / "cursor-native"
 _TMUX_FILE = "tmux.json"
@@ -109,10 +111,19 @@ _COMPOSER_CLEAR_MAX_ROUNDS = 50
 _INTERRUPT_SETTLE_TIMEOUT_S = 2.0
 
 
-def bridge_dir_for_session_id(session_id: str) -> Path:
-    """Return the per-session bridge dir, e.g. ``/tmp/omnigent-<uid>/cursor-native/<hash>``."""
-    digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:32]
+def bridge_dir_for_bridge_id(bridge_id: str) -> Path:
+    """Return the bridge dir for *bridge_id*, e.g. ``/tmp/omnigent-<uid>/cursor-native/<hash>``.
+
+    A ``/clear`` rotation binds a fresh conversation to the pane the original
+    conversation launched, so the dir is keyed on the launching conversation.
+    """
+    digest = hashlib.sha256(bridge_id.encode("utf-8")).hexdigest()[:32]
     return _BRIDGE_ROOT / digest
+
+
+def bridge_dir_for_session_id(session_id: str) -> Path:
+    """Return the bridge dir for a conversation that owns its own pane."""
+    return bridge_dir_for_bridge_id(session_id)
 
 
 def bridge_root() -> Path:
@@ -265,9 +276,18 @@ def wrap_fork_preamble(preamble: str, user_text: str) -> str:
     )
 
 
-def build_cursor_native_spawn_env(session_id: str) -> dict[str, str]:
-    """Build the ``HARNESS_CURSOR_NATIVE_*`` env the harness executor reads."""
-    bridge_dir = bridge_dir_for_session_id(session_id)
+def build_cursor_native_spawn_env(
+    session_id: str,
+    *,
+    bridge_id: str | None = None,
+) -> dict[str, str]:
+    """Build the ``HARNESS_CURSOR_NATIVE_*`` env the harness executor reads.
+
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param bridge_id: Opaque bridge id from
+        :data:`CURSOR_NATIVE_BRIDGE_ID_LABEL_KEY`. ``None`` uses *session_id*.
+    """
+    bridge_dir = bridge_dir_for_bridge_id(bridge_id or session_id)
     _ensure_dir(bridge_dir)
     return {
         BRIDGE_DIR_ENV_VAR: str(bridge_dir),
@@ -324,6 +344,52 @@ def write_mcp_bridge_config(bridge_dir: Path) -> None:
     tmp = bridge_dir / (_BRIDGE_CONFIG_FILE + ".tmp")
     tmp.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
     os.replace(tmp, config_path)
+
+
+def _read_bridge_config(bridge_dir: Path) -> _JsonObject:
+    """Return the parsed ``bridge.json``, or ``{}`` when absent or malformed."""
+    try:
+        raw = (bridge_dir / _BRIDGE_CONFIG_FILE).read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def read_active_session_id(bridge_dir: Path) -> str | None:
+    """Return the Omnigent conversation currently bound to the pane, or ``None``.
+
+    The shared MCP bridge reads this same key out of this same file, so tool
+    calls made from the pane are attributed to whichever conversation is live.
+    """
+    config = _read_bridge_config(bridge_dir)
+    active = config.get("active_session_id")
+    if isinstance(active, str) and active:
+        return active
+    legacy = config.get("conversation_id")
+    return legacy if isinstance(legacy, str) and legacy else None
+
+
+def write_active_session_id(bridge_dir: Path, session_id: str) -> None:
+    """Atomically rebind the pane's bridge config onto *session_id*.
+
+    :raises RuntimeError: If the bridge config is absent (it carries the relay
+        token, so there is no safe way to create one here) or if the bridge dir
+        fails owner-only validation.
+    """
+    _ensure_secure_bridge_dir(bridge_dir)
+    config = _read_bridge_config(bridge_dir)
+    if not config:
+        raise RuntimeError(f"bridge config missing: {bridge_dir / _BRIDGE_CONFIG_FILE}")
+    config["active_session_id"] = session_id
+    config["conversation_id"] = session_id
+    config["updated_at"] = time.time()
+    tmp = bridge_dir / (_BRIDGE_CONFIG_FILE + ".tmp")
+    tmp.write_text(json.dumps(config, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(tmp, bridge_dir / _BRIDGE_CONFIG_FILE)
 
 
 def write_mcp_config(
