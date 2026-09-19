@@ -12,6 +12,7 @@ from omnigent.entities import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.inference_config import (
     binding_for_harness,
+    normalize_inference_harness,
     parse_inference_config,
     resolve_bound_provider,
 )
@@ -35,7 +36,7 @@ def actual_harness(spec: Any, override: str | None = None) -> str:
     declared = spec.executor.config.get("harness") or spec.executor.type
     if override == "acp" and declared.startswith("acp:"):
         return declared
-    return override or declared
+    return normalize_inference_harness(override or declared)
 
 
 def configured_snapshot(snapshot: dict[str, Any] | None) -> bool:

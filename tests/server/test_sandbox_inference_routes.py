@@ -241,10 +241,18 @@ async def test_preview_preserves_acp_slug_without_creating_session_or_sandbox(en
 
 
 @pytest.mark.parametrize(
-    "harness,family", [("claude-native", "anthropic"), ("codex-native", "openai")]
+    "harness,family,agent_harness",
+    [
+        ("claude-native", "anthropic", "claude-native"),
+        ("codex-native", "openai", "codex-native"),
+        ("pi-native", "openai", "pi-native"),
+        ("pi-native", "openai", "native-pi"),
+        ("opencode-native", "openai", "native-opencode"),
+    ],
 )
+@pytest.mark.parametrize("discovery", [False, True])
 async def test_native_alias_preview_and_create_use_canonical_harness(
-    env: _Env, harness, family, monkeypatch: pytest.MonkeyPatch
+    env: _Env, harness, family, agent_harness, discovery, monkeypatch: pytest.MonkeyPatch
 ):
     from omnigent.server.inference_catalog import SandboxInferenceService
 
@@ -254,27 +262,33 @@ async def test_native_alias_preview_and_create_use_canonical_harness(
     config["inference"]["harnesses"] = {alias: {"provider": "bifrost"}}
     provider = config["providers"]["bifrost"]
     provider[family] = provider.pop("openai")
+    if harness == "opencode-native":
+        provider[family]["wire_api"] = "chat"
     monkeypatch.setenv("ALIAS_DISCOVERY_KEY", "test-catalog-key")
-    target.model_discovery["bifrost"] = {
-        "base_url": "https://catalog.example/v1",
-        "api_key_ref": "env:ALIAS_DISCOVERY_KEY",
-    }
+    if discovery:
+        target.model_discovery["bifrost"] = {
+            "base_url": "https://catalog.example/v1",
+            "api_key_ref": "env:ALIAS_DISCOVERY_KEY",
+        }
+    else:
+        config["inference"]["harnesses"][alias]["model_allowlist"] = ["gateway/main"]
     env.app.state.inference_catalog = SandboxInferenceService(
         env.app.state,
         transport=MockTransport(
             lambda request: Response(200, json={"data": [{"id": "gateway/main"}]})
         ),
     )
+    agent = await create_test_agent(
+        env.client,
+        executor={"type": "omnigent", "config": {"harness": agent_harness}},
+        include_llm=False,
+    )
     preview = await env.client.get(
-        f"/v1/sandbox-providers/agent_sandbox/harnesses/{harness}/model-options"
+        f"/v1/sandbox-providers/agent_sandbox/harnesses/{harness}/model-options",
+        params={"agent_id": agent["id"]},
     )
     assert preview.status_code == 200, preview.text
     assert preview.json()["status"] == "ready", preview.text
-    agent = await create_test_agent(
-        env.client,
-        executor={"type": "omnigent", "config": {"harness": harness}},
-        include_llm=False,
-    )
     created = await env.client.post(
         "/v1/sessions",
         json={
@@ -288,6 +302,11 @@ async def test_native_alias_preview_and_create_use_canonical_harness(
     saved = env.store.get_conversation(created.json()["id"])
     assert saved is not None
     assert saved.model_override == "gateway/main"
+    assert saved.inference_snapshot["harness"] == harness
+    assert (
+        saved.inference_snapshot["configuration_revision"]
+        == preview.json()["configuration_revision"]
+    )
     assert (
         saved.inference_snapshot["runtime_config"]["inference"]["harnesses"][alias][
             "default_model"
@@ -634,6 +653,25 @@ async def _builtin(env: _Env, harness: str) -> str:
         generate_agent_id(), f"builtin-{harness}", stored.bundle_location
     )
     return builtin.id
+
+
+@pytest.mark.parametrize("source_harness", ["pi-native", "native-pi"])
+async def test_saved_profile_fork_accepts_an_alias_for_the_same_harness(env: _Env, source_harness):
+    env.catalog.runtime_config["inference"]["harnesses"][source_harness] = {
+        "provider": "bifrost",
+        "default_model": "gateway/main",
+        "model_allowlist": ["gateway/main"],
+    }
+    source_agent_id = await _builtin(env, source_harness)
+    target_agent_id = await _builtin(
+        env, "native-pi" if source_harness == "pi-native" else "pi-native"
+    )
+    snapshot = await env.catalog.prepare("agent_sandbox", source_harness, "local")
+    source = env.store.create_conversation(agent_id=source_agent_id, inference_snapshot=snapshot)
+    response = await env.client.post(
+        f"/v1/sessions/{source.id}/fork", json={"agent_id": target_agent_id}
+    )
+    assert response.status_code == 201, response.text
 
 
 @pytest.mark.parametrize("unbound_harness", [False, True])

@@ -143,7 +143,8 @@ async def test_empty_single_and_absent_allowlists_remain_distinct(allowed, expec
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "harness,family", [("claude-native", "anthropic"), ("codex-native", "openai")]
+    "harness,family",
+    [("claude-native", "anthropic"), ("codex-native", "openai"), ("pi-native", "openai")],
 )
 @pytest.mark.parametrize("request_alias", [False, True])
 @pytest.mark.parametrize("mode", ["discovery", "filtered", "static"])
@@ -179,7 +180,25 @@ async def test_native_aliases_share_catalog_and_saved_default(
         snapshot["runtime_config"]["inference"]["harnesses"][alias]["default_model"] == expected[0]
     )
     assert (await service.catalog(snapshot)) == catalog
+    assert snapshot["harness"] == harness
+    assert await service.prepare("agent_sandbox", harness, "alice") == snapshot
     assert bool(requests) is (mode != "static")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("harnesses", [("pi", "pi-native"), ("acp:first", "acp:second")])
+async def test_revision_distinguishes_native_sdk_and_exact_acp_identities(harnesses):
+    state = _state(harness=harnesses[0])
+    bindings = state.sandbox_config.default.host_config["inference"]["harnesses"]
+    bindings[harnesses[1]] = copy.deepcopy(bindings[harnesses[0]])
+    state.sandbox_config.default.model_discovery.clear()
+    service = SandboxInferenceService(state)
+    first, second = [
+        await service.prepare("agent_sandbox", harness, "alice") for harness in harnesses
+    ]
+    assert first["catalog"]["status"] == second["catalog"]["status"] == "ready"
+    assert first["configuration_revision"] != second["configuration_revision"]
+    assert (first["harness"], second["harness"]) == harnesses
 
 
 @pytest.mark.asyncio

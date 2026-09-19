@@ -181,6 +181,7 @@ class SandboxInferenceService:
         raw: dict[str, Any] = copy.deepcopy(target.host_config or {})
         if not parse_inference_config(raw):
             return None
+        harness = normalize_inference_harness(harness)
         discovery = copy.deepcopy(getattr(target, "model_discovery", None) or {})
         try:
             validate_inference_credentials(raw, discovery)
