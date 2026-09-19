@@ -52,16 +52,42 @@ def resolve_ca_file() -> str:
     return certifi.where()
 
 
+def resolve_ca_dir() -> str | None:
+    """Return a valid hashed-cert CA directory (capath), or ``None``.
+
+    Honors ``SSL_CERT_DIR`` (surfaced through ``ssl.get_default_verify_paths``)
+    so a corporate CA distributed only as an OpenSSL hashed-cert directory --
+    with no ``SSL_CERT_FILE`` -- is still trusted. This is the trust source
+    httpx's ``trust_env`` env loading used to provide; resolving it here keeps
+    that behavior for callers that build their own context. A missing or
+    non-directory path is ignored (never raises).
+
+    :returns: An existing capath directory, or ``None`` when none is configured.
+    """
+    capath = ssl.get_default_verify_paths().capath
+    if capath and Path(capath).is_dir():
+        logger.debug("Using system CA directory: %s", capath)
+        return capath
+    return None
+
+
 def client_ssl_context() -> ssl.SSLContext:
     """Return a cached verifying client SSL context.
 
     Built once (lazily) so a reconnect loop doesn't re-read the bundle on every
     attempt. Keeps the secure defaults of :func:`ssl.create_default_context`
-    (hostname checking enabled, ``verify_mode == CERT_REQUIRED``).
+    (hostname checking enabled, ``verify_mode == CERT_REQUIRED``). Trust is the
+    resolved CA bundle plus, when configured, the ``SSL_CERT_DIR`` hashed-cert
+    directory (:func:`resolve_ca_dir`), so a capath-only corporate CA is honored
+    exactly as httpx's ``trust_env`` loading did.
 
     :returns: A shared :class:`ssl.SSLContext` trusting the resolved CA bundle.
     """
     global _client_ssl_context
     if _client_ssl_context is None:
-        _client_ssl_context = ssl.create_default_context(cafile=resolve_ca_file())
+        context = ssl.create_default_context(cafile=resolve_ca_file())
+        capath = resolve_ca_dir()
+        if capath is not None:
+            context.load_verify_locations(capath=capath)
+        _client_ssl_context = context
     return _client_ssl_context

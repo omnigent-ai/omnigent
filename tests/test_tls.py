@@ -8,14 +8,16 @@ import certifi
 import pytest
 
 import omnigent.util.tls as tls_module
-from omnigent.util.tls import client_ssl_context, resolve_ca_file
+from omnigent.util.tls import client_ssl_context, resolve_ca_dir, resolve_ca_file
 
 
-def _verify_paths(cafile: str | None, openssl_cafile: str | None) -> ssl.DefaultVerifyPaths:
-    """Build a :class:`ssl.DefaultVerifyPaths` with the two fields we read."""
+def _verify_paths(
+    cafile: str | None, openssl_cafile: str | None, capath: str | None = None
+) -> ssl.DefaultVerifyPaths:
+    """Build a :class:`ssl.DefaultVerifyPaths` with the fields we read."""
     return ssl.DefaultVerifyPaths(
         cafile=cafile,
-        capath=None,
+        capath=capath,
         openssl_cafile_env="SSL_CERT_FILE",
         openssl_cafile=openssl_cafile,
         openssl_capath_env="SSL_CERT_DIR",
@@ -79,3 +81,63 @@ def test_client_ssl_context_is_cached(monkeypatch: pytest.MonkeyPatch) -> None:
     """The context is built once and reused across reconnect attempts."""
     monkeypatch.setattr(ssl, "get_default_verify_paths", lambda: _verify_paths(None, None))
     assert client_ssl_context() is client_ssl_context()
+
+
+def test_resolve_ca_dir_returns_existing_ssl_cert_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """A present ``SSL_CERT_DIR`` (capath) directory is surfaced."""
+    capath = tmp_path / "certs"
+    capath.mkdir()
+    monkeypatch.setattr(
+        ssl, "get_default_verify_paths", lambda: _verify_paths(None, None, capath=str(capath))
+    )
+    assert resolve_ca_dir() == str(capath)
+
+
+def test_resolve_ca_dir_ignores_missing_dir(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """A stale/missing capath is ignored (never raises), unlike a bare load."""
+    monkeypatch.setattr(
+        ssl,
+        "get_default_verify_paths",
+        lambda: _verify_paths(None, None, capath=str(tmp_path / "gone")),
+    )
+    assert resolve_ca_dir() is None
+
+
+def test_resolve_ca_dir_none_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No ``SSL_CERT_DIR`` configured -> no capath."""
+    monkeypatch.setattr(ssl, "get_default_verify_paths", lambda: _verify_paths(None, None))
+    assert resolve_ca_dir() is None
+
+
+def test_client_ssl_context_honors_ssl_cert_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """Capath trust (``SSL_CERT_DIR``) is loaded into the context.
+
+    A corporate CA distributed only as an OpenSSL hashed-cert directory (no
+    ``SSL_CERT_FILE``) was trusted by httpx's ``trust_env`` env loading. Routing
+    trust through :func:`client_ssl_context` must not silently drop it, or such
+    a deployment hits ``CERTIFICATE_VERIFY_FAILED``. Asserts the context calls
+    ``load_verify_locations(capath=...)`` with the configured directory.
+    """
+    capath = tmp_path / "certs"
+    capath.mkdir()
+    monkeypatch.setattr(
+        ssl, "get_default_verify_paths", lambda: _verify_paths(None, None, capath=str(capath))
+    )
+
+    seen: list[str | None] = []
+    real_load = ssl.SSLContext.load_verify_locations
+
+    def _spy(self, cafile=None, capath=None, cadata=None):
+        seen.append(capath)
+        return real_load(self, cafile=cafile, capath=capath, cadata=cadata)
+
+    monkeypatch.setattr(ssl.SSLContext, "load_verify_locations", _spy)
+    client_ssl_context()
+    assert str(capath) in seen, (
+        "SSL_CERT_DIR (capath) trust must be loaded into the client context; "
+        f"load_verify_locations was called with capath values {seen}"
+    )
