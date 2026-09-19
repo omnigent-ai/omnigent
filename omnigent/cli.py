@@ -2699,6 +2699,47 @@ def _normalize_daemon_target(server_url: str | None) -> str:
     return _normalize_daemon_target_impl(server_url)
 
 
+def _daemon_host_status_probe(
+    record: _HostDaemonRecord, *, timeout_s: float = 2.0
+) -> _HostHttpResult | None:
+    """
+    Fetch the server's view of a daemon's host row.
+
+    :param record: Daemon record to probe.
+    :param timeout_s: Per-request HTTP timeout in seconds, e.g. ``2.0``.
+    :returns: The HTTP result — status ``0`` means the request never got an
+        HTTP answer and the body carries the transport failure — or ``None``
+        when the record has no host id or no server URL to probe.
+    """
+    from omnigent.harnesses.claude_native.bridge import url_component
+
+    host_id = record.host_id or _load_existing_host_id()
+    if host_id is None:
+        return None
+    base_url = _daemon_base_url(record)
+    if base_url is None:
+        return None
+    return _host_http_json(
+        base_url=base_url,
+        method="GET",
+        path=f"/v1/hosts/{url_component(host_id)}",
+        timeout_s=timeout_s,
+        host_id=host_id,
+    )
+
+
+def _host_status_reports_online(result: _HostHttpResult | None) -> bool:
+    """
+    Report whether a host-row probe result says the host is online.
+
+    :param result: Probe result from :func:`_daemon_host_status_probe`.
+    :returns: ``True`` only on a 200 whose body reports ``"online"``.
+    """
+    if result is None or result.status_code != 200 or not isinstance(result.body, dict):
+        return False
+    return result.body.get("status") == "online"
+
+
 def _daemon_host_online(record: _HostDaemonRecord, *, timeout_s: float = 2.0) -> bool:
     """
     Probe whether a daemon's host is currently online on its server.
@@ -2717,24 +2758,7 @@ def _daemon_host_online(record: _HostDaemonRecord, *, timeout_s: float = 2.0) ->
         as ``"online"``; ``False`` if the host id is unknown, the server
         is unreachable, or the host reports offline.
     """
-    from omnigent.harnesses.claude_native.bridge import url_component
-
-    host_id = record.host_id or _load_existing_host_id()
-    if host_id is None:
-        return False
-    base_url = _daemon_base_url(record)
-    if base_url is None:
-        return False
-    result = _host_http_json(
-        base_url=base_url,
-        method="GET",
-        path=f"/v1/hosts/{url_component(host_id)}",
-        timeout_s=timeout_s,
-        host_id=host_id,
-    )
-    if result.status_code != 200 or not isinstance(result.body, dict):
-        return False
-    return result.body.get("status") == "online"
+    return _host_status_reports_online(_daemon_host_status_probe(record, timeout_s=timeout_s))
 
 
 def _daemon_registry_dir() -> Path:
@@ -8777,22 +8801,85 @@ def _background_host_log_detail(log_path: str | None) -> str:
     return detail
 
 
+def _registration_target_display(record: _HostDaemonRecord) -> str:
+    """Return the user-facing URL of the server a daemon must register with."""
+    from omnigent.util.server_url import display_server_url
+
+    base_url = _daemon_base_url(record)
+    return display_server_url(base_url) if base_url else "the configured server"
+
+
+def _background_registration_timeout(
+    record: _HostDaemonRecord,
+    *,
+    server_responded: bool,
+    transport_error: str | None,
+) -> click.ClickException:
+    """Build the error for a registration wait that exhausted its grace.
+
+    :param record: Registry record of the daemon that never registered.
+    :param server_responded: Whether any status probe got an HTTP answer.
+    :param transport_error: Last probe transport failure, e.g.
+        ``"ConnectError: [Errno 111] Connection refused"``.
+    :returns: The exception to raise — an unreachable server is named
+        together with its transport failure instead of the generic
+        registration-timeout wording.
+    """
+    from omnigent.cli_diagnostics import SUPPRESS_RECOVERY_HINT_ATTR
+
+    target = _registration_target_display(record)
+    log_detail = _background_host_log_detail(record.log_path)
+    if not server_responded and transport_error is not None:
+        exc = click.ClickException(
+            f"Could not reach the Omnigent server at {target} within "
+            f"{_BACKGROUND_HOST_REGISTRATION_GRACE_S:.0f}s ({transport_error}). "
+            "Check that the server is running and that your `server` config "
+            f"points at the right URL.{log_detail}"
+        )
+        # A server nothing answered at cannot be a stale-host HTTP 401
+        # tunnel rejection, so the recovery hint would mislead here.
+        setattr(exc, SUPPRESS_RECOVERY_HINT_ATTR, True)
+        return exc
+    return click.ClickException(
+        "The host daemon started but did not register with the server at "
+        f"{target} within {_BACKGROUND_HOST_REGISTRATION_GRACE_S:.0f}s."
+        f"{log_detail}"
+    )
+
+
 def _confirm_background_host_registered(record: _HostDaemonRecord) -> None:
     """Wait until the detached daemon completes server registration."""
     deadline = time.monotonic() + _BACKGROUND_HOST_REGISTRATION_GRACE_S
+    announced = False
+    server_responded = False
+    last_transport_error: str | None = None
     while True:
         if not _pid_alive(record.pid):
             raise click.ClickException(
                 "The host daemon exited before registering with the server."
                 f"{_background_host_log_detail(record.log_path)}"
             )
-        if _daemon_host_online(record, timeout_s=1.0):
+        result = _daemon_host_status_probe(record, timeout_s=1.0)
+        if result is not None and result.status_code == 0:
+            last_transport_error = str(result.body)
+        elif result is not None:
+            server_responded = True
+        if _host_status_reports_online(result):
             return
+        if not announced:
+            # Not registered on the first probe: name what the otherwise
+            # silent wait is for before polling out the grace period.
+            click.echo(
+                "Waiting for the host daemon to register with "
+                f"{_registration_target_display(record)} "
+                f"(up to {_BACKGROUND_HOST_REGISTRATION_GRACE_S:.0f}s)..."
+            )
+            announced = True
         if time.monotonic() >= deadline:
-            raise click.ClickException(
-                "The host daemon started but did not register with the server "
-                f"within {_BACKGROUND_HOST_REGISTRATION_GRACE_S:.0f}s."
-                f"{_background_host_log_detail(record.log_path)}"
+            raise _background_registration_timeout(
+                record,
+                server_responded=server_responded,
+                transport_error=last_transport_error,
             )
         time.sleep(0.2)
 
