@@ -14,7 +14,7 @@
 // shells are opened and created from the rail's tab strip ("+" menu).
 
 import { Loader2Icon, TerminalIcon, XIcon } from "lucide-react";
-import { lazy, Suspense, useCallback, useEffect, useMemo, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import {
   AGENT_TERMINAL_IDS,
@@ -78,7 +78,7 @@ export function MainTerminalView({
   onResume,
   onSurfaceElement,
 }: MainTerminalViewProps) {
-  const { terminals } = useTerminals(conversationId);
+  const { terminals, isLoading: terminalsLoading } = useTerminals(conversationId);
   const terminalFirstCtx = useTerminalFirst();
   // The agent's own terminal (SDK REPL / native vendor pane) — the
   // auto-selection target and the pane the pill's Terminal view shows.
@@ -116,6 +116,45 @@ export function MainTerminalView({
       setResumePending(false);
     }
   }, [onResume]);
+  // A native terminal-first session is driven entirely through its vendor
+  // pane, so it has no composer turn to trigger the turn-path pane
+  // recreation (`_ensure_native_terminal_for_turn`). When the idle reaper
+  // tears such a pane down while the runner stays online, reopening the
+  // Terminal view finds an empty inventory — and opening that view IS the
+  // request for the pane. The reaper recreates panes on next use by design,
+  // so re-ensure the pane automatically (idempotent server-side) instead of
+  // stranding the user on a manual Resume prompt. The runner-online guard
+  // keeps a genuinely stopped session (runner offline) on the manual prompt,
+  // where resuming relaunches the runner — a heavier, user-chosen action.
+  const isNativeTerminalFirst =
+    (terminalFirstCtx?.isTerminalFirst ?? false) && (terminalFirstCtx?.isNativeWrapper ?? false);
+  const paneReapedWhileOnline =
+    onResume !== undefined &&
+    !startingUp &&
+    !terminalsLoading &&
+    runnerOnline === true &&
+    terminals.length === 0 &&
+    isNativeTerminalFirst;
+  // Fire the re-ensure once per mount, not on every render while the pane is
+  // still absent — reset when a pane returns so a later reap heals again.
+  const autoRecoverAttemptedRef = useRef(false);
+  useEffect(() => {
+    if (agentTerminal) {
+      autoRecoverAttemptedRef.current = false;
+      setResumeError(null);
+    }
+  }, [agentTerminal]);
+  // While the reaped pane is being re-ensured (and no attempt has failed),
+  // render the passive startup spinner rather than the manual prompt. A
+  // failed attempt sets resumeError, which drops back to the manual prompt
+  // so the user can retry by hand.
+  const autoRecoveringReapedPane = paneReapedWhileOnline && resumeError === null;
+  useEffect(() => {
+    if (!visible || !autoRecoveringReapedPane || resumePending) return;
+    if (autoRecoverAttemptedRef.current) return;
+    autoRecoverAttemptedRef.current = true;
+    void handleResume().catch(() => {});
+  }, [visible, autoRecoveringReapedPane, resumePending, handleResume]);
   // No manual keyboard padding here: this view is flow content inside the
   // app-shell, which useIOSViewportLock sizes to the visual viewport, so the
   // terminal already sits above the keyboard. (Fixed overlays like the mobile
@@ -199,10 +238,11 @@ export function MainTerminalView({
     >
       <div className="flex min-h-0 w-full flex-1 flex-col overflow-hidden rounded-lg border border-border bg-card p-3 shadow-sm">
         {activeTerminal === null ? (
-          startingUp ? (
+          startingUp || autoRecoveringReapedPane ? (
             // Passive startup state: same centered geometry as the stopped
             // state so the swap doesn't jump, and nothing actionable — the
-            // terminal connects on its own. role=status announces the wait.
+            // terminal connects on its own (a fresh boot, or an idle-reaped
+            // native pane being re-ensured). role=status announces the wait.
             <div
               role="status"
               aria-live="polite"
