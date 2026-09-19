@@ -135,8 +135,11 @@ def origin_allowed(
       so page JS cannot strip or forge it), so its absence is not a
       browser CSRF / CSWSH vector.
     - In ``local_mode`` an ``Origin`` is allowed only when its hostname is
-      a loopback host — this is the CSRF / CSWSH guard for the
-      unauthenticated single-user local server.
+      a loopback host, or it is explicitly listed in ``extra_allowed``. A
+      mobile/LAN WebView origin (e.g. Android emulator ``http://10.0.2.2:8000``)
+      must be added to ``OMNIGENT_WS_ALLOWED_ORIGINS`` to be admitted — the
+      raw request ``Host`` header is client-controllable and is never trusted
+      for this decision (it would otherwise reopen DNS rebinding).
     - In non-local modes the connection is authenticated by cookie / proxy
       header, so any ``Origin`` is allowed unless ``extra_allowed`` is
       non-empty, in which case only the allowlist (matched above) passes.
@@ -176,9 +179,14 @@ def _origin_from_scope(scope: Scope) -> str | None:
     # Annotate the ASGI headers explicitly: ``Scope`` values are typed
     # ``Any``, so without this mypy infers ``value`` as ``Any`` and flags
     # the ``value.decode(...)`` return as an Any-return.
+    return _header_from_scope(scope, b"origin")
+
+
+def _header_from_scope(scope: Scope, name: bytes) -> str | None:
+    """Extract a decoded header from an ASGI connection scope."""
     headers: Iterable[tuple[bytes, bytes]] = scope.get("headers", [])
     for key, value in headers:
-        if key == b"origin":
+        if key == name:
             return value.decode("latin-1")
     return None
 
