@@ -14,6 +14,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import NotRequired, TypedDict, cast
 
+from omnigent.host.service import LAUNCHD_NAMESPACE, SYSTEMD_UNIT
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 SCHEMA_VERSION = 1
@@ -485,12 +486,17 @@ def observed_external_configs(*, deep: bool) -> list[ExternalConfigEntry]:
 
 
 def observed_launch_agents(*, deep: bool) -> list[LaunchAgentEntry]:
+    """Backfill only units Omnigent itself installs.
+
+    Uninstall unloads and deletes every ledger entry, so matching by name
+    substring would destroy third-party units that merely contain "omnigent".
+    """
     if not deep:
         return []
     entries: list[LaunchAgentEntry] = []
     launchd_dir = Path.home() / "Library" / "LaunchAgents"
     if launchd_dir.is_dir():
-        for path in sorted(launchd_dir.glob("*omnigent*.plist")):
+        for path in sorted(launchd_dir.glob(f"{LAUNCHD_NAMESPACE}*.plist")):
             entries.append(
                 LaunchAgentEntry(
                     kind="launchd",
@@ -501,18 +507,17 @@ def observed_launch_agents(*, deep: bool) -> list[LaunchAgentEntry]:
                 )
             )
     config_home = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
-    systemd_dir = config_home / "systemd" / "user"
-    if systemd_dir.is_dir():
-        for path in sorted(systemd_dir.glob("*omnigent*.service")):
-            entries.append(
-                LaunchAgentEntry(
-                    kind="systemd_user",
-                    path=str(path),
-                    label=path.name,
-                    source="observed",
-                    confidence="high",
-                )
+    systemd_unit = config_home / "systemd" / "user" / SYSTEMD_UNIT
+    if systemd_unit.is_file():
+        entries.append(
+            LaunchAgentEntry(
+                kind="systemd_user",
+                path=str(systemd_unit),
+                label=SYSTEMD_UNIT,
+                source="observed",
+                confidence="high",
             )
+        )
     return entries
 
 
