@@ -1607,6 +1607,18 @@ function createWindow(targetUrl, opts = {}) {
     // Per-conversation embedded-browser view registry for this window.
     browserRegistry: createBrowserRegistryForWindow(win),
   });
+  // Mirror native fullscreen into the renderer: macOS fullscreen removes the
+  // traffic lights, so the web layer must drop the clearance it reserves for
+  // them (the [data-electron-mac] rules). Wired on every platform — the
+  // renderer side is macOS-gated, and platform-neutral events keep the
+  // plumbing exercisable by the Linux-driven desktop e2e lane.
+  const sendFullScreenState = () => {
+    if (!win.isDestroyed()) {
+      win.webContents.send("omnigent:full-screen-changed", win.isFullScreen());
+    }
+  };
+  win.on("enter-full-screen", sendFullScreenState);
+  win.on("leave-full-screen", sendFullScreenState);
   registerWorkspaceRootBounce(win.webContents, () => pinnedOrigin(win));
   // Show the return banner when the window navigates away from its server
   // (e.g. SSO) and stays away. The watch's on-away URL is the last committed
@@ -2796,6 +2808,12 @@ function pickWorkspaceForBridge(parent, workspaces, { signal } = {}) {
 
 function registerIpc() {
   registerWorkspacePickerIpc();
+  // Initial fullscreen state for a renderer that loads while the window is
+  // already fullscreen; transitions arrive via omnigent:full-screen-changed.
+  ipcMain.handle("omnigent:window-is-full-screen", (event) => {
+    const win = BrowserWindow.fromWebContents(event.sender);
+    return win ? win.isFullScreen() : false;
+  });
   ipcMain.handle("omnigent:cancel-server-connection", (event, requestId) => {
     if (!isSetupPageSender(event))
       throw new Error("Connection cancellation is only available to the setup page");

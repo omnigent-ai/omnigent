@@ -822,6 +822,23 @@ aside[aria-label="Workspace"][data-maximized] {
   .workspace-tab-strip {
   padding-left: 10.5rem;
 }
+/* Native fullscreen removes the traffic lights (macOS slides them into the
+ * auto-hiding menu bar), so the clearances above would leave a dead strip at
+ * the window's top-left. AppShell mirrors the shell's fullscreen state into
+ * data-electron-fullscreen; while it is set, the cluster hugs the left edge
+ * (0.75rem matches the sidebar's own padding) and the slot clearances shrink
+ * by the same 4.75rem, preserving the gap past the Settings cog. */
+[data-electron-mac][data-electron-fullscreen] .electron-sidebar-header-actions {
+  left: 0.75rem;
+}
+[data-electron-mac][data-electron-fullscreen] .traffic-light-clearance {
+  padding-left: 5.75rem;
+}
+[data-electron-mac][data-electron-fullscreen]:not([data-sidebar-open])
+  aside[aria-label="Workspace"][data-maximized]
+  .workspace-tab-strip {
+  padding-left: 5.75rem;
+}
 /* Drag regions are geometric, not z-ordered: anything that overlaps the
  * strip (e.g. the mobile full-screen sidebar overlay) would lose clicks
  * without an explicit counter-region on interactive elements. */

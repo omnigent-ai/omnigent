@@ -174,6 +174,10 @@ interface ElectronDesktopApi extends NativeShellApi {
   controlHost?: (action: HostControlAction) => Promise<HostActionResult>;
   /** Subscribe to host status-change pings (re-read on fire); returns an unsubscribe. */
   onHostStatusChanged?: (callback: () => void) => () => void;
+  /** Whether the window is native-fullscreen; absent on older shells. */
+  isFullScreen?: () => Promise<boolean>;
+  /** Subscribe to native fullscreen transitions; returns an unsubscribe. */
+  onFullScreenChanged?: (callback: (fullScreen: boolean) => void) => () => void;
   /** Desktop feature gates (MDM-managed); absent on older shells. */
   getDesktopFeatures?: () => Promise<DesktopFeatures | null>;
   /** Connect the user's Arca instance to the window's server as a host. */
@@ -857,6 +861,37 @@ export function onHostStatusChanged(callback: () => void): () => void {
     return electron.onHostStatusChanged(callback);
   } catch (err) {
     console.warn("[nativeBridge] electron onHostStatusChanged failed:", err);
+    return () => {};
+  }
+}
+
+/**
+ * Whether the Electron shell's window is currently native-fullscreen.
+ * Resolves false outside the shell and on shells that predate the bridge —
+ * those keep the windowed (traffic-light clearance) layout.
+ */
+export async function getDesktopFullScreen(): Promise<boolean> {
+  const electron = electronApi();
+  if (!electron?.isFullScreen) return false;
+  try {
+    return (await electron.isFullScreen()) === true;
+  } catch (err) {
+    console.warn("[nativeBridge] electron isFullScreen failed:", err);
+    return false;
+  }
+}
+
+/**
+ * Subscribe to the desktop window's native fullscreen transitions. Returns a
+ * no-op unsubscribe outside the shell and on shells without the bridge.
+ */
+export function onDesktopFullScreenChanged(callback: (fullScreen: boolean) => void): () => void {
+  const electron = electronApi();
+  if (!electron?.onFullScreenChanged) return () => {};
+  try {
+    return electron.onFullScreenChanged(callback);
+  } catch (err) {
+    console.warn("[nativeBridge] electron onFullScreenChanged failed:", err);
     return () => {};
   }
 }
