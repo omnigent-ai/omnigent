@@ -130,6 +130,13 @@ protocol/capabilities, and the allowlist when present.
 - An explicit binding is authoritative. Conflicting agent authentication or a
   legacy executor Databricks profile is rejected. Smart Routing cannot replace
   the bound provider.
+- An agent's explicit `executor.model` must belong to its bound harness's
+  allowlist, even when the composer selects another allowed model. Incompatible
+  pins are rejected before session/artifact writes or sandbox provisioning and
+  checked again at launch. Remove the pin or change it to an allowed model.
+  Absent pins and omitted allowlists add no pin restriction; when both models
+  are allowed, existing selection precedence is unchanged. Children, forks,
+  and resumed sessions validate against their saved profile.
 - Unconfigured targets and harnesses retain existing behavior. These settings
   govern Omnigent model selection; they are not a network boundary for arbitrary
   code running in a sandbox.

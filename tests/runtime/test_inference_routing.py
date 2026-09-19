@@ -138,8 +138,11 @@ def test_unbound_host_keeps_its_explicit_provider_and_model(harness, tmp_path) -
     assert "HARNESS_PI_PRESERVE_MODEL_IDS" not in env
 
 
-@pytest.mark.parametrize("harness", ["codex", "claude-sdk", "pi", "qwen", "openai-agents"])
-def test_bound_sdk_selected_model_precedes_an_obsolete_spec_pin(harness: str) -> None:
+@pytest.mark.parametrize(
+    "harness", ["codex", "claude-sdk", "pi", "qwen", "openai-agents", "jcode", "acp:custom"]
+)
+@pytest.mark.parametrize("pin", [None, "model-b", "obsolete-spec-model"])
+def test_bound_sdk_validates_pin_before_applying_selection(harness: str, pin: str | None) -> None:
     from omnigent.runner.app import _HARNESS_MODEL_ENV_KEY, _build_spawn_env_from_spec
 
     profile = _profile()
@@ -148,16 +151,51 @@ def test_bound_sdk_selected_model_precedes_an_obsolete_spec_pin(harness: str) ->
             harness: {
                 "provider": "bifrost",
                 "default_model": "model-a",
-                "model_allowlist": ["model-a"],
+                "model_allowlist": ["model-a", "model-b"],
             }
         }
     }
     with inference_config_scope(profile):
-        env = _build_spawn_env_from_spec(
-            _spec(harness, "obsolete-spec-model"), harness, model_override="model-a"
-        )
+        if pin == "obsolete-spec-model":
+            with pytest.raises(OmnigentError, match=r"Remove executor\.model") as exc:
+                _build_spawn_env_from_spec(_spec(harness, pin), harness, model_override="model-a")
+            assert harness in str(exc.value)
+            assert pin in str(exc.value)
+            return
+        env = _build_spawn_env_from_spec(_spec(harness, pin), harness, model_override="model-a")
     assert env is not None
-    assert env[_HARNESS_MODEL_ENV_KEY[harness]] == "model-a"
+    key = (
+        "HARNESS_ACP_MODEL"
+        if harness in {"jcode", "acp:custom"}
+        else _HARNESS_MODEL_ENV_KEY[harness]
+    )
+    assert env[key] == "model-a"
+
+
+@pytest.mark.parametrize(
+    "harness", ["claude-native", "codex-native", "pi-native", "opencode-native"]
+)
+@pytest.mark.parametrize("pin", [None, "databricks-literal/model-b", "obsolete-spec-model"])
+async def test_native_launch_checks_original_pin_before_adapter(harness, pin, monkeypatch):
+    from omnigent.runner.native import NativeLaunchContext, _launch_native_terminal
+
+    adapter = AsyncMock()
+    monkeypatch.setattr("omnigent.runner.native.orchestration.resolve_hook", lambda *args: adapter)
+    registry = Mock(terminal_registry=None)
+    ctx = NativeLaunchContext(
+        session_id="pin-test",
+        resource_registry=registry,
+        publish_event=Mock(),
+        agent_spec=_spec(harness, pin),
+    )
+    with inference_config_scope(_profile()):
+        if pin == "obsolete-spec-model":
+            with pytest.raises(OmnigentError, match=r"Remove executor\.model"):
+                await _launch_native_terminal(harness, ctx, ensure_locks={}, reraise=True)
+            adapter.assert_not_awaited()
+        else:
+            assert await _launch_native_terminal(harness, ctx, ensure_locks={}, reraise=True)
+            adapter.assert_awaited_once()
 
 
 def test_sdk_harness_override_resolves_its_own_provider_binding() -> None:
@@ -537,3 +575,69 @@ def test_pi_mixed_shortlist_registers_each_models_wire() -> None:
     assert [row["id"] for row in rendered["omnigent"]["models"]] == ["claude-primary"]
     assert rendered["omnigent-openai"]["api"] == "openai-responses"
     assert [row["id"] for row in rendered["omnigent-openai"]["models"]] == ["gpt-primary"]
+
+
+@pytest.mark.parametrize("bound", [False, True])
+def test_sdk_pin_validation_uses_effective_harness_binding(bound):
+    from omnigent.runner.app import _build_spawn_env_from_spec
+
+    profile = _profile()
+    profile["inference"] = {
+        "harnesses": {
+            "codex" if bound else "claude-native": {
+                "provider": "bifrost",
+                "model_allowlist": ["model-a"],
+            },
+        },
+    }
+    with inference_config_scope(profile):
+        if bound:
+            with pytest.raises(OmnigentError, match="harness 'codex'"):
+                _build_spawn_env_from_spec(
+                    _spec("claude-native", "obsolete-model"),
+                    "codex",
+                    model_override="model-a",
+                )
+        else:
+            env = _build_spawn_env_from_spec(
+                _spec("claude-native", "obsolete-model"),
+                "codex",
+                model_override="model-a",
+            )
+            assert env["HARNESS_CODEX_MODEL"] == "model-a"
+
+
+@pytest.mark.parametrize("pin", [None, "databricks-literal/model-b", "obsolete-model"])
+def test_codex_provider_checks_pin_before_allowed_selection(pin):
+    with inference_config_scope(_profile()):
+        if pin == "obsolete-model":
+            with pytest.raises(OmnigentError, match=r"Remove executor\.model"):
+                resolve_native_codex_launch(model="model-a", spec=_spec("codex-native", pin))
+        else:
+            launch = resolve_native_codex_launch(model="model-a", spec=_spec("codex-native", pin))
+            assert launch.model == "model-a"
+
+
+@pytest.mark.parametrize("pin", [None, "databricks-literal/model-b", "obsolete-model"])
+def test_claude_provider_checks_explicit_pin(pin):
+    with inference_config_scope(_profile()):
+        if pin == "obsolete-model":
+            with pytest.raises(OmnigentError, match=r"Remove executor\.model"):
+                resolve_native_claude_config(spec=_spec("claude-native", pin))
+        else:
+            assert resolve_native_claude_config(spec=_spec("claude-native", pin)) is not None
+
+
+async def test_opencode_direct_relaunch_rejects_pin_before_bridge_or_server(monkeypatch):
+    from omnigent.runner.native.orchestration import _auto_create_opencode_terminal
+
+    prepare = Mock()
+    monkeypatch.setattr("omnigent.harnesses.opencode_native.bridge.prepare_bridge_dir", prepare)
+    with inference_config_scope(_profile()), pytest.raises(OmnigentError, match="obsolete-model"):
+        await _auto_create_opencode_terminal(
+            "pin-test",
+            Mock(),
+            Mock(),
+            agent_spec=_spec("opencode-native", "obsolete-model"),
+        )
+    prepare.assert_not_called()

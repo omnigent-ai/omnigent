@@ -2894,9 +2894,12 @@ def register_core_routes(
                 )
             base_agent = target_agent
 
-        if source.inference_snapshot is not None and switching_agent:
+        if source.inference_snapshot is not None and (switching_agent or source_configured):
             from omnigent.harness_aliases import canonicalize_harness
-            from omnigent.inference_config import resolve_bound_provider
+            from omnigent.inference_config import (
+                resolve_bound_provider,
+                validate_bound_agent_model,
+            )
             from omnigent.runtime import get_agent_cache
 
             assert source.inference_snapshot is not None
@@ -2911,18 +2914,25 @@ def register_core_routes(
                     code=ErrorCode.INVALID_INPUT,
                 ) from exc
             source_harness = source.inference_snapshot["harness"]
-            target_harness = actual_harness(target_spec)
-            same_harness = (
-                source_harness == target_harness
-                if source_harness.startswith("acp:") or target_harness.startswith("acp:")
-                else canonicalize_harness(source_harness) == canonicalize_harness(target_harness)
+            validate_bound_agent_model(
+                source.inference_snapshot["runtime_config"],
+                source_harness,
+                target_spec.executor.model,
             )
-            if not same_harness:
-                raise OmnigentError(
-                    "A configured session can only fork into the same harness. "
-                    "Start a new session to choose another harness and provider.",
-                    code=ErrorCode.INVALID_INPUT,
+            if switching_agent:
+                target_harness = actual_harness(target_spec)
+                same_harness = (
+                    source_harness == target_harness
+                    if source_harness.startswith("acp:") or target_harness.startswith("acp:")
+                    else canonicalize_harness(source_harness)
+                    == canonicalize_harness(target_harness)
                 )
+                if not same_harness:
+                    raise OmnigentError(
+                        "A configured session can only fork into the same harness. "
+                        "Start a new session to choose another harness and provider.",
+                        code=ErrorCode.INVALID_INPUT,
+                    )
             bound_provider = resolve_bound_provider(
                 source.inference_snapshot["runtime_config"],
                 source_harness,

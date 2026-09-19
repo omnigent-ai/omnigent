@@ -3403,6 +3403,7 @@ def resolve_native_claude_config(
         load_runtime_inference_config,
         resolve_bound_model,
         resolve_bound_provider,
+        validate_bound_agent_model,
     )
     from omnigent.onboarding.detected import effective_config_with_detected
     from omnigent.onboarding.provider_config import (
@@ -3419,6 +3420,9 @@ def resolve_native_claude_config(
             inference_config, "claude-native", spec.executor.auth if spec is not None else None
         )
         assert bound is not None
+        validate_bound_agent_model(
+            inference_config, "claude-native", spec.executor.model if spec is not None else None
+        )
         resolve_bound_model(
             inference_config, "claude-native", spec.executor.model if spec is not None else None
         )
