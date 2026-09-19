@@ -940,23 +940,81 @@ describe("Composer slash-command submit routing", () => {
     expect(onSend).not.toHaveBeenCalled();
   });
 
-  it.each(["default", "off", "reset", "DEFAULT"])(
-    "rejects /model %s without changing or sending",
-    (alias) => {
-      const setModel = vi.fn().mockResolvedValue(undefined);
-      useChatStore.setState({ setModel });
-      const onSend = vi.fn();
-      render(<Composer {...composerProps({ onSend })} />);
-      const ta = textarea();
+  it.each([
+    { kind: "claude", reset: false },
+    { kind: "opencode", reset: true },
+    { kind: "acp", reset: true },
+    { kind: "configured", reset: true },
+    { kind: null, reset: true },
+    { kind: null, reset: true, terminalFirst: true, harness: "claude-sdk" },
+    { kind: "codex", reset: false },
+    { kind: "pi", reset: false },
+    { kind: "cursor", reset: false },
+    { kind: "kiro", reset: false },
+    { kind: "devin", reset: false },
+    { kind: "codex", reset: true, configured: true },
+    { kind: "claude", reset: true, configured: true },
+  ] as const)("gates model reset consistently for $kind ($reset, $configured)", async (row) => {
+    const setModel = vi.fn().mockResolvedValue(undefined);
+    const onSend = vi.fn();
+    useChatStore.setState({ setModel, sessionHarness: "harness" in row ? row.harness : null });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          onSend,
+          showEffort: true,
+          showModels: row.kind !== null,
+          modelPickerKind: row.kind,
+          isTerminalFirst: "terminalFirst" in row && row.terminalFirst,
+          inferenceConfigured: "configured" in row && row.configured,
+          isNativeWrapper: row.kind !== null && row.kind !== "acp" && row.kind !== "configured",
+          codexModelOptions: [{ id: "primary", displayName: "Primary", isDefault: true }],
+        })}
+      />,
+    );
+    const ta = textarea();
+    fireEvent.change(ta, { target: { value: "/mod" } });
+    expect(screen.getByTestId("slash-menu-item-model").textContent?.includes("default")).toBe(
+      row.reset,
+    );
+
+    fireEvent.change(ta, { target: { value: "/help " } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+    const help = screen.getByText(/\/model — Switch the model/);
+    expect(help).toHaveTextContent("/model <name>");
+    expect(help.textContent?.includes("/model <name> | default")).toBe(row.reset);
+    expect(help).toHaveTextContent("/effort low | medium | high | default");
+
+    for (const alias of ["default", "off", "reset", "DEFAULT"]) {
+      setModel.mockClear();
       fireEvent.change(ta, { target: { value: `/model ${alias}` } });
       fireEvent.keyDown(ta, { key: "Enter" });
-
-      expect(setModel).not.toHaveBeenCalled();
       expect(onSend).not.toHaveBeenCalled();
-      expect(screen.getByText(/Choose a model explicitly/)).toBeVisible();
-      expect(ta).toHaveValue(`/model ${alias}`);
-    },
-  );
+      if (row.reset) {
+        expect(setModel).toHaveBeenCalledWith(null, expect.anything());
+        expect(ta).toHaveValue("");
+      } else {
+        expect(setModel).not.toHaveBeenCalled();
+        expect(screen.getByText(/This session does not support resetting/)).toBeVisible();
+        expect(ta).toHaveValue(`/model ${alias}`);
+      }
+    }
+    setModel.mockClear();
+    fireEvent.change(ta, { target: { value: "/model primary" } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+    expect(setModel).toHaveBeenCalledWith("primary", expect.anything());
+
+    if (row.kind !== null) {
+      await openSessionModels();
+      expect(screen.queryByRole("menuitem", { name: "Use default model" })).toBeNull();
+      expect(screen.queryByRole("menuitemcheckbox", { name: "Default" })).toBeNull();
+      setModel.mockClear();
+      fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Primary" }));
+      await waitFor(() =>
+        expect(setModel).toHaveBeenCalledWith(row.reset ? null : "primary", expect.anything()),
+      );
+    }
+  });
 
   it("treats /model as plaintext on native-wrapper sessions without a model picker", () => {
     // isNativeWrapper without showModels → showModel false: native wrappers
@@ -4171,6 +4229,41 @@ describe("Composer config gear", () => {
     expect(screen.queryByText("Advanced settings…")).toBeNull();
   });
 
+  it.each([null, "primary"])(
+    "explains an empty native catalog with current model %s and updates when choices arrive",
+    async (currentModel) => {
+      useChatStore.setState({ llmModel: currentModel });
+      const props = composerProps({
+        showEffort: false,
+        showModels: true,
+        modelPickerKind: "codex",
+        costRoutingEligible: true,
+        codexModelOptions: [],
+      });
+      const { rerender } = render(<Composer {...props} />, { wrapper: TooltipProvider });
+      await openSessionModels();
+      const models = screen.getByTestId("composer-agent-models");
+      expect(within(models).getByRole("status")).toHaveTextContent(
+        "No usable models are available for this session.",
+      );
+      expect(screen.getByRole("menuitem", { name: "Smart Routing" })).toBeVisible();
+      if (currentModel) {
+        expect(within(models).getByRole("menuitemcheckbox")).toHaveAttribute(
+          "aria-disabled",
+          "true",
+        );
+      } else {
+        expect(within(models).queryByRole("menuitemcheckbox")).toBeNull();
+      }
+
+      rerender(
+        <Composer {...props} codexModelOptions={[{ id: "primary", displayName: "Primary" }]} />,
+      );
+      expect(within(models).queryByRole("status")).toBeNull();
+      expect(within(models).getByRole("menuitemcheckbox", { name: "Primary" })).toBeVisible();
+    },
+  );
+
   it("offers only explicit models when Kiro marks no catalog row as default", async () => {
     const options = [
       { id: "auto", displayName: "Automatic", isDefault: false },
@@ -4194,54 +4287,49 @@ describe("Composer config gear", () => {
     expect(screen.getByRole("menuitemcheckbox", { name: "Latest" })).toBeVisible();
   });
 
-  it.each([
-    "claude",
-    "codex",
-    "cursor",
-    "kiro",
-    "pi",
-    "opencode",
-    "devin",
-    "acp",
-    "configured",
-  ] as const)("selects the default-marked %s row as an explicit model", async (modelPickerKind) => {
-    const options = [
-      { id: "primary", displayName: "Primary", isDefault: true },
-      { id: "alternate", displayName: "Alternate" },
-    ];
-    const setModel = vi.fn().mockResolvedValue(undefined);
-    useChatStore.setState({ setModel, codexModelOptions: options });
-    renderWithTooltips(
-      <Composer
-        {...composerProps({
-          showEffort: false,
-          showModels: true,
-          modelPickerKind,
-          codexModelOptions: options,
-        })}
-      />,
-    );
+  it.each(["claude", "codex", "cursor", "kiro", "pi", "devin"] as const)(
+    "selects the default-marked %s row as an explicit model",
+    async (modelPickerKind) => {
+      const options = [
+        { id: "primary", displayName: "Primary", isDefault: true },
+        { id: "alternate", displayName: "Alternate" },
+      ];
+      const setModel = vi.fn().mockResolvedValue(undefined);
+      useChatStore.setState({ setModel, codexModelOptions: options });
+      renderWithTooltips(
+        <Composer
+          {...composerProps({
+            showEffort: false,
+            showModels: true,
+            modelPickerKind,
+            codexModelOptions: options,
+          })}
+        />,
+      );
 
-    await openSessionModels();
-    // A catalog default alone is not evidence of the session's current model.
-    expect(screen.getByRole("menuitemcheckbox", { name: "Primary" })).toHaveAttribute(
-      "aria-checked",
-      "false",
-    );
-    expect(screen.queryByRole("menuitemcheckbox", { name: "Default" })).toBeNull();
-    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Alternate" }));
-    await waitFor(() => expect(setModel).toHaveBeenCalledWith("alternate", expect.anything()));
-    act(() => useChatStore.setState({ sessionModelOverride: "alternate", llmModel: "alternate" }));
+      await openSessionModels();
+      // A catalog default alone is not evidence of the session's current model.
+      expect(screen.getByRole("menuitemcheckbox", { name: "Primary" })).toHaveAttribute(
+        "aria-checked",
+        "false",
+      );
+      expect(screen.queryByRole("menuitemcheckbox", { name: "Default" })).toBeNull();
+      fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Alternate" }));
+      await waitFor(() => expect(setModel).toHaveBeenCalledWith("alternate", expect.anything()));
+      act(() =>
+        useChatStore.setState({ sessionModelOverride: "alternate", llmModel: "alternate" }),
+      );
 
-    await openSessionModels();
-    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Primary" }));
-    await waitFor(() =>
-      expect(setModel).toHaveBeenLastCalledWith("primary", {
-        expectConfirmation: modelPickerKind === "claude" || modelPickerKind === "codex",
-      }),
-    );
-    expect(setModel).toHaveBeenCalledTimes(2);
-  });
+      await openSessionModels();
+      fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Primary" }));
+      await waitFor(() =>
+        expect(setModel).toHaveBeenLastCalledWith("primary", {
+          expectConfirmation: modelPickerKind === "claude" || modelPickerKind === "codex",
+        }),
+      );
+      expect(setModel).toHaveBeenCalledTimes(2);
+    },
+  );
 
   it("names the model Codex's Default resolves to, like the new-session gear", async () => {
     const options = [
@@ -4741,21 +4829,40 @@ describe("saved sandbox inference policy", () => {
     },
   );
 
-  it("does not offer an unrestricted default when the saved catalog is unavailable", async () => {
-    renderWithTooltips(
-      <Composer
-        {...composerProps({
-          showModels: true,
-          showEffort: false,
-          modelPickerKind: "configured",
-          inferenceConfigured: true,
-          inferenceError: "The gateway could not be reached.",
-          codexModelOptions: [],
-        })}
-      />,
-    );
-    await openSessionModels();
-    expect(screen.getByText("The gateway could not be reached.")).toBeVisible();
-    expect(screen.queryByTestId("composer-agent-model-default")).toBeNull();
-  });
+  it.each([
+    { error: null, options: [] },
+    { error: "The gateway could not be reached.", options: [] },
+    {
+      error: "The gateway could not be reached.",
+      options: [{ id: "private/default", displayName: "Primary", isDefault: true }],
+    },
+  ])(
+    "disables reset when the saved catalog is unavailable ($error, $options)",
+    async ({ error, options }) => {
+      renderWithTooltips(
+        <Composer
+          {...composerProps({
+            showModels: true,
+            showEffort: false,
+            modelPickerKind: "configured",
+            inferenceConfigured: true,
+            inferenceError: error,
+            codexModelOptions: options,
+          })}
+        />,
+      );
+      await openSessionModels();
+      const models = within(screen.getByTestId("composer-agent-models"));
+      expect(models.getByRole("status")).toHaveTextContent(
+        error ?? "No usable models are available for this session.",
+      );
+      expect(screen.queryByRole("menuitem", { name: "Use default model" })).toBeNull();
+      expect(screen.queryByRole("menuitemcheckbox", { name: "Default" })).toBeNull();
+      for (const choice of screen.getAllByRole("menuitemcheckbox")) {
+        expect(choice).toHaveAttribute("aria-disabled", "true");
+        fireEvent.click(choice);
+      }
+      expect(useChatStore.getState().setModel).not.toHaveBeenCalled();
+    },
+  );
 });
