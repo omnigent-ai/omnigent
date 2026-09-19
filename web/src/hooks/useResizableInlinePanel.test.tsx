@@ -176,6 +176,27 @@ describe("useResizableInlinePanel reserved width (sidebar)", () => {
   });
 });
 
+describe("useResizableInlinePanel elevated content minimum (comments open)", () => {
+  // The file viewer raises minWidthPx to 720 while its comments panel is open.
+  // The comfort component above the rail's 240 base still yields to the chat's
+  // 480 floor, but the rail keeps its base minimum instead of collapsing to an
+  // unusable sliver — the chat shrinks below 480 only in this mode.
+  it("keeps the rail's 240 base minimum when the elevated-minimum content can't fit", () => {
+    setInnerWidth(900);
+    const reservedPx = 320; // open left sidebar
+    const elevated = renderHook(() => useResizableInlinePanel(SESSION, 720, reservedPx));
+    // The chat-preserving ceiling is 900 - 320 - 480 - 8 = 92; the rail's base
+    // minimum must win over it while the content declares an elevated minimum.
+    expect(elevated.result.current.panelWidth).toBe(240);
+    elevated.unmount();
+
+    // The default rail (no elevated minimum) still yields to the chat floor.
+    const plain = renderHook(() => useResizableInlinePanel(SESSION, undefined, reservedPx));
+    expect(plain.result.current.panelWidth).toBe(92);
+    plain.unmount();
+  });
+});
+
 describe("useResizableInlinePanel drag overlay", () => {
   const overlaySelector = () =>
     [...document.body.children].find(

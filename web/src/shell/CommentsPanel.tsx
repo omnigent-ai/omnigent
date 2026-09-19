@@ -26,9 +26,10 @@ function formatCommentTime(createdAt: number, now: Date): string {
 }
 
 // ---------------------------------------------------------------------------
-// CommentsPanel — right panel for adding and viewing comments. Resizable on
-// desktop via a left-edge drag handle (see useResizableCommentsPanel); the
-// chosen width persists across panel remounts within a session.
+// CommentsPanel — right panel for adding and viewing comments. Sits beside the
+// viewer when the viewer row is wide enough (resizable via a left-edge drag
+// handle — see useResizableCommentsPanel) and stacks full-width below it
+// otherwise; the chosen width persists across panel remounts within a session.
 // ---------------------------------------------------------------------------
 
 export type { ActiveSelection };
@@ -93,7 +94,7 @@ export function CommentsPanel({
   const addCommentTextareaRef = useRef<HTMLTextAreaElement>(null);
   const selectedCardRef = useRef<HTMLDivElement>(null);
   const autoRouteRef = useRef<{ selection: ActiveSelection; tab: Tab } | null>(null);
-  const { width, containerRef, isDesktop, handleProps } = useResizableCommentsPanel();
+  const { width, containerRef, sideBySide, handleProps } = useResizableCommentsPanel();
 
   // Editing or deleting a comment is author-only (the backend enforces this
   // too; this just hides the affordances). A comment with no recorded author
@@ -165,11 +166,11 @@ export function CommentsPanel({
   return (
     <div
       ref={containerRef}
-      style={isDesktop && width != null ? { width } : undefined}
-      className="relative flex shrink-0 flex-col overflow-hidden border-border w-full h-64 border-t md:h-auto md:border-t-0 md:border-l"
+      style={sideBySide ? { width } : undefined}
+      className="relative flex shrink-0 flex-col overflow-hidden border-border w-full h-64 border-t @md/viewer:h-auto @md/viewer:border-t-0 @md/viewer:border-l"
     >
-      {/* Resize handle — desktop only (mobile stacks the panel full-width below) */}
-      {isDesktop && (
+      {/* Resize handle — side-by-side only (a narrow viewer stacks the panel full-width below) */}
+      {sideBySide && (
         <div
           {...handleProps}
           className="absolute inset-y-0 left-0 z-10 w-1 cursor-col-resize hover:bg-primary/30 active:bg-primary/50 transition-colors"

@@ -1554,7 +1554,10 @@ function FileViewerBody({
         </div>
       </div>
 
-      <div className="min-h-0 flex-1 flex flex-col md:flex-row overflow-hidden">
+      {/* Editor + comments row — side-by-side only when the viewer itself is
+          wide enough (@md/viewer container query, not the viewport): inside a
+          narrow workspace rail the panel stacks below instead of overflowing. */}
+      <div className="min-h-0 flex-1 flex flex-col @md/viewer:flex-row overflow-hidden">
         <div
           ref={contentAreaRef}
           onScroll={handleContentScroll}
@@ -1755,7 +1758,7 @@ function FileViewerBody({
       <div
         ref={setViewerRoot}
         data-testid="file-viewer"
-        className="flex flex-col flex-1 min-h-0 overflow-hidden bg-card"
+        className="@container/viewer flex flex-col flex-1 min-h-0 overflow-hidden bg-card"
       >
         {innerContent}
       </div>
@@ -1768,7 +1771,7 @@ function FileViewerBody({
       data-testid="file-viewer"
       style={{ width: panelWidth, paddingBottom: keyboardInset || undefined }}
       className={cn(
-        "flex flex-col overflow-hidden bg-card transition-[translate,border-color,border-width] duration-150 ease-out",
+        "@container/viewer flex flex-col overflow-hidden bg-card transition-[translate,border-color,border-width] duration-150 ease-out",
         // Mobile (default): fixed full-screen overlay, slide via translate-x.
         "fixed inset-0 z-50 shadow-lg",
         open ? "translate-x-0" : "translate-x-full",

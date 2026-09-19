@@ -1028,10 +1028,12 @@ function WorkspacePanelImpl({
       {/* The default nav tab comes first; the remaining tabs keep their relative order. */}
       {/* Tab strip: the static nav tabs + divider stay pinned on the left at
           every rail width, and ONLY the file-tabs region scrolls (it owns the
-          horizontal scroller — see below). The outer row never scrolls
+          horizontal scroller — see below). The outer row itself doesn't scroll
           (overflow-x-hidden), so the divider is a fixed boundary that doesn't
-          drift when the tabs scroll. */}
-      <div className="workspace-tab-strip shrink-0 flex items-center overflow-x-hidden border-b border-border px-2 py-3">
+          drift when the tabs scroll — except on a narrow rail (@max-md/rail),
+          where even the static tabs can overflow and clipping them would leave
+          buttons unreachable, so the whole row scrolls instead. */}
+      <div className="workspace-tab-strip shrink-0 flex items-center overflow-x-hidden border-b border-border px-2 py-3 @max-md/rail:overflow-x-auto @max-md/rail:overflow-y-hidden @max-md/rail:[scrollbar-width:thin]">
         <Tabs
           // Static group — never compresses (shrink-0) and stays anchored on
           // the LEFT whether or not tabs are open. The open tabs render to its

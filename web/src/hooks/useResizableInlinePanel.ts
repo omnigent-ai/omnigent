@@ -57,7 +57,18 @@ function clamp(w: number, minPx = MIN_WIDTH_PX, reservedPx = 0): number {
   // yields below `minPx` rather than let the chat break its minimum. Clamping
   // the floor to the ceiling keeps the range valid so `Math.max` can't push the
   // width back up past the chat-preserving cap.
-  return Math.max(Math.min(minPx, ceiling), Math.min(w, ceiling));
+  //
+  // Exception: a caller-raised minimum (the file viewer passes 720 while its
+  // comments panel is open) marks the rail as the surface being worked in. The
+  // comfort component above the base minimum still yields to the chat, but the
+  // rail keeps its own base minimum: squeezed under ~240px its content (editor,
+  // comments, tab strip) has no usable layout at all, which is worse than a
+  // temporarily narrow chat.
+  const floor =
+    minPx > MIN_WIDTH_PX
+      ? Math.min(MIN_WIDTH_PX, Math.max(0, window.innerWidth - reservedPx - GAP_PX))
+      : 0;
+  return Math.max(floor, Math.min(minPx, ceiling), Math.min(w, ceiling));
 }
 
 // ---------------------------------------------------------------------------

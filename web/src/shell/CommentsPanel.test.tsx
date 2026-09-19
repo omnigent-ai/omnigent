@@ -404,15 +404,50 @@ describe("CommentsPanel show more / less", () => {
   });
 });
 
-// ── Resize affordance (desktop-only width handle) ───────────────────────────
+// ── Resize affordance (side-by-side width handle) ───────────────────────────
 //
-// The panel is resizable on desktop via a left-edge drag handle, and stacks
-// full-width (no inline width, no handle) on a narrow/mobile viewport. Desktop
-// vs mobile is decided from window.innerWidth (jsdom defaults to 1024 ≥ md).
+// The panel is resizable via a left-edge drag handle while it sits beside the
+// viewer, and stacks full-width (no inline width, no handle) when the viewer
+// row is too narrow to host both. The decision comes from the parent row's
+// measured width, not the viewport — inside a narrow workspace rail the row is
+// far narrower than the window.
+
+/** Render the panel inside a parent row that reports the given pixel width. */
+function renderPanelInRow(rowWidth: number) {
+  const row = document.createElement("div");
+  row.getBoundingClientRect = () =>
+    ({
+      width: rowWidth,
+      height: 600,
+      top: 0,
+      left: 0,
+      right: rowWidth,
+      bottom: 600,
+      x: 0,
+      y: 0,
+      toJSON: () => ({}),
+    }) as DOMRect;
+  document.body.appendChild(row);
+  return render(
+    <CommentsPanel
+      comments={[makeComment("c1")]}
+      addressedComments={[]}
+      activeSelection={null}
+      onAddComment={vi.fn()}
+      onAddressAll={vi.fn()}
+      onEditComment={vi.fn()}
+      onDeleteComment={vi.fn()}
+      onClickComment={vi.fn()}
+      canAddress={false}
+      addressPending={false}
+    />,
+    { container: row },
+  );
+}
 
 describe("CommentsPanel resize affordance", () => {
-  it("renders a resize handle and applies an inline width on desktop", () => {
-    renderPanel([makeComment("c1")], []);
+  it("renders a resize handle and applies an inline width beside a wide viewer row", () => {
+    renderPanelInRow(800);
 
     // The separator is the drag handle; its parent is the panel root, which
     // gets an explicit pixel width (default 240px) so it can be dragged wider.
@@ -420,18 +455,13 @@ describe("CommentsPanel resize affordance", () => {
     expect((handle.parentElement as HTMLElement).style.width).toBe("240px");
   });
 
-  it("omits the handle and inline width on a narrow (mobile) viewport", () => {
-    const orig = window.innerWidth;
-    Object.defineProperty(window, "innerWidth", { configurable: true, value: 500 });
-    try {
-      renderPanel([makeComment("c1")], []);
-      // No drag handle, and the panel falls back to the w-full class (no inline width).
-      expect(screen.queryByRole("separator", { name: "Resize comments panel" })).toBeNull();
-      const panel = screen.getByText("Comments").closest("div")?.parentElement as HTMLElement;
-      expect(panel.style.width).toBe("");
-    } finally {
-      Object.defineProperty(window, "innerWidth", { configurable: true, value: orig });
-    }
+  it("omits the handle and inline width when the viewer row is too narrow", () => {
+    // A rail-hosted row well under the side-by-side minimum: the panel must
+    // stack full-width instead of overflowing the rail and covering the editor.
+    renderPanelInRow(220);
+    expect(screen.queryByRole("separator", { name: "Resize comments panel" })).toBeNull();
+    const panel = screen.getByText("Comments").closest("div")?.parentElement as HTMLElement;
+    expect(panel.style.width).toBe("");
   });
 });
 
