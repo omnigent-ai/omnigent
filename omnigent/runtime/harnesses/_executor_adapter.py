@@ -76,6 +76,13 @@ _MCP_TOOL_NAME_PREFIX = "mcp__"
 INTERRUPT_TIMEOUT_S = 3.0
 _INTERRUPT_SLICE_S = 3.0
 
+# Interrupting an executor abandoned by an abnormal exit usually fails because the
+# harness is already gone -- that absence is what abandoned it. Its socket refuses or
+# resets the connection, or the slice expires with nothing left to answer. The reap
+# below still tears the subprocess down and reports its own failures, so these are
+# teardown facts rather than faults. Any other error keeps ERROR.
+_HARNESS_ALREADY_GONE_ERRORS = (TimeoutError, ConnectionError)
+
 # Consecutive orphaned tool callbacks (no active turn context) before forcing a Tier-1 SDK reset.
 # Reset to zero at each ``run_turn`` start so a single late straggler never trips it.
 _ORPHAN_RESYNC_THRESHOLD = 3
@@ -401,12 +408,23 @@ class ExecutorAdapter(HarnessApp):
         Scheduled from run_turn's finally and awaited before any recovery retry. The interrupt
         gets a short slice; the reap (close_session + close) always runs under its own budget so
         a wedged interrupt can never starve the subprocess reap.
+
+        An interrupt that only proves the harness is already gone
+        (:data:`_HARNESS_ALREADY_GONE_ERRORS`) logs a warning naming the cause; every other
+        failure stays at ERROR.
         """
         if executor is None:
             return True
         try:
             await asyncio.wait_for(
                 executor.interrupt_session(session_key), timeout=_INTERRUPT_SLICE_S
+            )
+        except _HARNESS_ALREADY_GONE_ERRORS as exc:
+            _logger.warning(
+                "abnormal-exit interrupt of inner session %s found the harness already gone (%s)",
+                session_key,
+                type(exc).__name__,
+                exc_info=True,
             )
         except Exception:  # best-effort: a failed/timed-out interrupt is logged, not raised
             _logger.error(

@@ -104,6 +104,7 @@ import {
 import { MOD_KEY } from "@/components/KeyboardShortcut";
 import { KeyboardShortcutsList } from "@/components/KeyboardShortcutsDialog";
 import { changePassword, logout } from "@/lib/accountsApi";
+import { withBasePath } from "@/lib/basePath";
 import {
   beginGithubConnect,
   disconnectGithub,
@@ -2256,14 +2257,14 @@ function AccountSection() {
       // the SPA login form.
       await logout();
       // Hard navigation so the chat store / react-query cache reset.
-      window.location.href = "/login";
+      window.location.href = withBasePath("/login");
       return;
     }
     // OIDC: logout is a server-side GET redirect at /auth/logout that clears
     // the session cookie (and honors the IdP end-session endpoint when
     // configured). A hard navigation lets the browser follow it and resets
     // client caches.
-    window.location.href = "/auth/logout";
+    window.location.href = withBasePath("/auth/logout");
   }, [accountsEnabled]);
 
   const resetPwForm = useCallback(() => {

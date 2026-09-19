@@ -27,15 +27,14 @@ function DropdownMenuTrigger({
   return <DropdownMenuPrimitive.Trigger data-slot="dropdown-menu-trigger" {...props} />;
 }
 
-function DropdownMenuContent({
-  className,
-  align = "start",
-  sideOffset = 4,
-  ...props
-}: React.ComponentProps<typeof DropdownMenuPrimitive.Content>) {
+const DropdownMenuContent = React.forwardRef<
+  React.ElementRef<typeof DropdownMenuPrimitive.Content>,
+  React.ComponentPropsWithoutRef<typeof DropdownMenuPrimitive.Content>
+>(function DropdownMenuContent({ className, align = "start", sideOffset = 4, ...props }, ref) {
   return (
     <DropdownMenuPrimitive.Portal container={getEmbedRoot() ?? undefined}>
       <DropdownMenuPrimitive.Content
+        ref={ref}
         data-slot="dropdown-menu-content"
         sideOffset={sideOffset}
         align={align}
@@ -47,7 +46,7 @@ function DropdownMenuContent({
       />
     </DropdownMenuPrimitive.Portal>
   );
-}
+});
 
 function DropdownMenuGroup({ ...props }: React.ComponentProps<typeof DropdownMenuPrimitive.Group>) {
   return <DropdownMenuPrimitive.Group data-slot="dropdown-menu-group" {...props} />;
@@ -220,12 +219,13 @@ function DropdownMenuSubTrigger({
   );
 }
 
-function DropdownMenuSubContent({
-  className,
-  sideOffset = 6,
-  collisionPadding = 8,
-  ...props
-}: React.ComponentProps<typeof DropdownMenuPrimitive.SubContent>) {
+const DropdownMenuSubContent = React.forwardRef<
+  React.ElementRef<typeof DropdownMenuPrimitive.SubContent>,
+  React.ComponentPropsWithoutRef<typeof DropdownMenuPrimitive.SubContent>
+>(function DropdownMenuSubContent(
+  { className, sideOffset = 6, collisionPadding = 8, ...props },
+  ref,
+) {
   // Portal the sub-flyout (Radix doesn't by default) for the same reason as
   // DropdownMenuContent. Without it, the sub-content's position:fixed popper
   // wrapper renders inside the parent menu's [role="menu"] box. The dark-mode
@@ -237,6 +237,7 @@ function DropdownMenuSubContent({
   return (
     <DropdownMenuPrimitive.Portal container={getEmbedRoot() ?? undefined}>
       <DropdownMenuPrimitive.SubContent
+        ref={ref}
         data-slot="dropdown-menu-sub-content"
         sideOffset={sideOffset}
         collisionPadding={collisionPadding}
@@ -248,7 +249,7 @@ function DropdownMenuSubContent({
       />
     </DropdownMenuPrimitive.Portal>
   );
-}
+});
 
 export {
   DropdownMenu,

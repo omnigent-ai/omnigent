@@ -80,7 +80,13 @@ CodexParams: TypeAlias = _JsonObject
 CodexRequestFn = Callable[[str, CodexParams], Awaitable[CodexMessage]]
 
 _CONNECT_RETRY_DELAY_SECONDS = 0.05
+# Model discovery is a best-effort side process whose callers fall back to a
+# cached or bundled catalog, so it keeps a short readiness budget.
 _CONNECT_TIMEOUT_SECONDS = 10.0
+# The session app-server has no fallback, and a loaded host can take well over
+# 10 s to start codex. Match the 60 s native-terminal readiness budget; a child
+# that exits early still fails at once.
+_APP_SERVER_READY_TIMEOUT_SECONDS = 60.0
 # Initialization and model/list can stall after the listener becomes ready.
 _MODEL_CATALOG_PROBE_TIMEOUT_SECONDS = 30.0
 _MODEL_DISCOVERY_CACHE_SECONDS = 300.0
@@ -1940,11 +1946,14 @@ class CodexNativeAppServer:
         Wait until the app-server socket accepts an initialized
         client, and return that connection for startup RPCs.
 
+        The budget bounds the retry loop; a connect attempt already in
+        flight when it expires is not interrupted.
+
         :returns: Connected app-server client. The caller owns it.
         :raises RuntimeError: If the app-server exits or never
-            becomes ready before the timeout.
+            becomes ready within ``_APP_SERVER_READY_TIMEOUT_SECONDS``.
         """
-        deadline = asyncio.get_running_loop().time() + _CONNECT_TIMEOUT_SECONDS
+        deadline = asyncio.get_running_loop().time() + _APP_SERVER_READY_TIMEOUT_SECONDS
         last_error: Exception | None = None
         while asyncio.get_running_loop().time() < deadline:
             if self.proc is not None and self.proc.returncode is not None:
@@ -1976,9 +1985,10 @@ class CodexNativeAppServer:
                         await client.close()
                 await asyncio.sleep(_CONNECT_RETRY_DELAY_SECONDS)
         detail = " | ".join((self.recent_stderr or [])[-5:])
+        target = self.listen_url or f"unix://{self.socket_path}"
         raise RuntimeError(
-            f"Timed out waiting for Codex app-server socket {self.socket_path}: "
-            f"{last_error}; stderr={detail}"
+            f"Timed out after {_APP_SERVER_READY_TIMEOUT_SECONDS:g}s waiting for the "
+            f"Codex app-server at {target}: {last_error}; stderr={detail}"
         )
 
     async def _stderr_loop(self) -> None:
@@ -3287,6 +3297,11 @@ def resolve_native_codex_launch(
         config (issue #2744 — parity with the in-process codex harness).
     :returns: The resolved :class:`NativeCodexLaunch`.
     """
+    from omnigent.inference_config import (
+        load_runtime_inference_config,
+        resolve_bound_model,
+        resolve_bound_provider,
+    )
     from omnigent.onboarding.ambient import codex_config_detection
     from omnigent.onboarding.detected import (
         dismissed_detection_names,
@@ -3304,7 +3319,19 @@ def resolve_native_codex_launch(
     )
     from omnigent.spec.types import DatabricksAuth
 
-    explicit = load_config()
+    explicit = load_runtime_inference_config(load_config())
+    bound = resolve_bound_provider(
+        explicit, "codex-native", spec.executor.auth if spec is not None else None
+    )
+    if bound is not None:
+        selected = resolve_bound_model(explicit, "codex-native", model)
+        bound_launch = _codex_provider_launch(bound, selected)
+        if bound_launch is None:
+            raise ValueError(
+                f"Configured provider {bound.name!r} cannot route Codex. "
+                "Check its OpenAI endpoint and credential reference."
+            )
+        return bound_launch
     config_detection = codex_config_detection()
     config_provider_dismissed = (
         config_detection is not None
@@ -3323,7 +3350,9 @@ def resolve_native_codex_launch(
     ):
         # Share credential resolution with the in-process harness so spec
         # auth, including inline keys, takes precedence over machine defaults.
-        spec_entry = _resolve_provider_for_build(spec, harness_type="codex", for_launch=True)
+        spec_entry = _resolve_provider_for_build(
+            spec, harness_type="codex", for_launch=True, actual_harness="codex-native"
+        )
         if spec_entry is not None:
             if spec_entry.kind == SUBSCRIPTION_KIND:
                 # A spec-named subscription defers to Codex's own login,

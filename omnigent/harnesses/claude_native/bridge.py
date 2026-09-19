@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import functools
 import hashlib
 import ipaddress
 import json
@@ -53,7 +54,7 @@ from http import HTTPStatus
 from http.client import HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 from urllib import request
 
 from omnigent._platform import is_wsl, stable_user_id
@@ -84,10 +85,28 @@ _logger = logging.getLogger(__name__)
 _INJECTION_CANCEL_EVENT: ContextVar[threading.Event | None] = ContextVar(
     "claude_native_injection_cancel_event", default=None
 )
+_INJECTION_LOCKS_GUARD = threading.Lock()
+_INJECTION_LOCKS: dict[str, threading.Lock] = {}
+_InjectionFunction = TypeVar("_InjectionFunction", bound=Callable[..., Any])
 
 BRIDGE_DIR_ENV_VAR = "HARNESS_CLAUDE_NATIVE_BRIDGE_DIR"
 REQUEST_SESSION_ID_ENV_VAR = "HARNESS_CLAUDE_NATIVE_REQUEST_SESSION_ID"
 BRIDGE_ID_LABEL_KEY = "omnigent.claude_native.bridge_id"
+
+
+def _serialize_bridge_injection(function: _InjectionFunction) -> _InjectionFunction:
+    """Serialize complete tmux injection operations for each bridge directory."""
+
+    @functools.wraps(function)
+    def wrapped(bridge_dir: Path, *args: Any, **kwargs: Any) -> Any:
+        key = os.path.normcase(os.path.abspath(os.fspath(bridge_dir)))
+        with _INJECTION_LOCKS_GUARD:
+            lock = _INJECTION_LOCKS.setdefault(key, threading.Lock())
+        with lock:
+            return function(bridge_dir, *args, **kwargs)
+
+    return cast(_InjectionFunction, wrapped)
+
 
 # Bind/advertise coordinates for the bridge's HTTP servers (the tool relay and
 # the MCP control ingress). These default to loopback (127.0.0.1) so an
@@ -3707,6 +3726,7 @@ def write_tmux_target(
     _write_json_file(bridge_dir / _TMUX_FILE, payload)
 
 
+@_serialize_bridge_injection
 def inject_user_message(
     bridge_dir: Path,
     *,
@@ -4130,6 +4150,7 @@ def kill_session(
         raise
 
 
+@_serialize_bridge_injection
 def inject_slash_command(
     bridge_dir: Path,
     *,
@@ -7053,7 +7074,7 @@ def _attachment_transcript_items_from_entry(
         item_type="message",
         data={
             "role": "user",
-            "content": [{"type": "input_text", "text": prompt}],
+            "content": [{"type": "input_text", "text": _unwrap_pasted_content_markers(prompt)}],
         },
         response_id=_response_id_from_source(source_key),
     )
@@ -7078,6 +7099,46 @@ _COMMAND_STDOUT_RE = re.compile(r"<local-command-stdout>(.*?)</local-command-std
 _BASH_INPUT_RE = re.compile(r"<bash-input>(.*?)</bash-input>", re.DOTALL)
 _BASH_STDOUT_RE = re.compile(r"<bash-stdout>(.*?)</bash-stdout>", re.DOTALL)
 _BASH_STDERR_RE = re.compile(r"<bash-stderr>(.*?)</bash-stderr>", re.DOTALL)
+# Claude Code wraps text pasted into its TUI in these markers (the id repeats
+# in the closing tag). Omnigent injects every web-UI message as one bracketed
+# paste (see ``inject_user_message``), so even a short typed line comes back
+# wrapped; strip the wrapper when mirroring the user bubble. Distinct from
+# ``_PASTED_PLACEHOLDER_PREFIX`` (the input-box draft glyph) — this is the
+# transcript-side wrapper Claude persists and sends to the model.
+_PASTED_CONTENT_RE = re.compile(
+    r'<pasted_content id="[^"]*">(?P<inner>.*?)</pasted_content(?: id="[^"]*")?>',
+    re.DOTALL,
+)
+
+
+def _unwrap_pasted_content_markers(text: str) -> str:
+    """
+    Strip Claude Code's ``<pasted_content id=…>`` wrappers from user text.
+
+    Claude wraps bracketed-paste input as
+    ``<pasted_content id="x">\\n…\\n</pasted_content id="x">`` and prefixes the
+    block with a blank line. Omnigent delivers every web-UI message as a
+    bracketed paste, so the markers otherwise leak into the mirrored chat even
+    for a plainly typed line. Each block is replaced by its body — dropping the
+    single newline the wrapper adds on each side — and the blank lines it
+    introduced around the block are trimmed. Text with no marker (or a
+    malformed one that never matches) is returned unchanged.
+
+    :param text: Raw user text from a Claude transcript record.
+    :returns: The text with any paste wrappers removed.
+    """
+    if "<pasted_content" not in text:
+        return text
+
+    def _strip_block(match: re.Match[str]) -> str:
+        return match.group("inner").removeprefix("\n").removesuffix("\n")
+
+    unwrapped = _PASTED_CONTENT_RE.sub(_strip_block, text)
+    if unwrapped == text:
+        return text
+    return unwrapped.strip("\n")
+
+
 _TASK_NOTIFICATION_REQUIRED_MARKERS: tuple[str, ...] = (
     "<task-notification>",
     "<task-id>",
@@ -7642,7 +7703,9 @@ def _user_transcript_items_from_entry(
                 item_type="message",
                 data={
                     "role": "user",
-                    "content": [{"type": "input_text", "text": content}],
+                    "content": [
+                        {"type": "input_text", "text": _unwrap_pasted_content_markers(content)}
+                    ],
                 },
                 response_id=fallback_response_id,
             )
@@ -7691,7 +7754,9 @@ def _user_transcript_items_from_entry(
                 item_index += 1
                 saw_user_text = True
                 continue
-            user_blocks.append({"type": "input_text", "text": text})
+            user_blocks.append(
+                {"type": "input_text", "text": _unwrap_pasted_content_markers(text)}
+            )
             saw_user_text = True
             continue
         if block_type != "tool_result":

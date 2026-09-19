@@ -6,6 +6,7 @@ import {
   createContext,
   useContext,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -72,9 +73,14 @@ function useMenuInteractionProps(configOpen = false) {
 function HarnessPickerContent({
   configOpen,
   menuOpen,
+  onInitialSelectionFocus,
   onFocus,
   ...props
-}: ComponentProps<typeof DropdownMenuContent> & { configOpen: boolean; menuOpen: boolean }) {
+}: ComponentProps<typeof DropdownMenuContent> & {
+  configOpen: boolean;
+  menuOpen: boolean;
+  onInitialSelectionFocus?: () => void;
+}) {
   const interactionProps = useMenuInteractionProps(configOpen);
   const initialFocusHandled = useRef(false);
   useEffect(() => {
@@ -90,7 +96,7 @@ function HarnessPickerContent({
           event.defaultPrevented ||
           !menuOpen ||
           initialFocusHandled.current ||
-          event.target !== event.currentTarget
+          (event.target !== event.currentTarget && onInitialSelectionFocus == null)
         )
           return;
         initialFocusHandled.current = true;
@@ -104,14 +110,41 @@ function HarnessPickerContent({
         selected.focus();
         // Keep Radix's entry-focus fallback from replacing the selected row.
         if (content.ownerDocument.activeElement === selected) event.preventDefault();
+        onInitialSelectionFocus?.();
       }}
     />
   );
 }
 
-export function HarnessPickerSubContent(props: ComponentProps<typeof DropdownMenuSubContent>) {
+function focusSelectedMenuItem(content: HTMLElement): void {
+  const items = Array.from(
+    content.querySelectorAll<HTMLElement>(
+      '[role="menuitemcheckbox"]:not([data-disabled]), [role="menuitem"]:not([data-disabled]):not([aria-disabled="true"])',
+    ),
+  ).filter((item) => item.closest('[role="menu"]') === content);
+  const selected =
+    items.find(
+      (item) => item.getAttribute("aria-checked") === "true" || item.dataset.active === "true",
+    ) ?? items[0];
+  selected?.focus();
+}
+
+export function HarnessPickerSubContent({
+  focusSelected = false,
+  onSelectedFocus,
+  ...props
+}: ComponentProps<typeof DropdownMenuSubContent> & {
+  focusSelected?: boolean;
+  onSelectedFocus?: () => void;
+}) {
   const interactionProps = useMenuInteractionProps();
-  return <DropdownMenuSubContent {...props} {...interactionProps} />;
+  const [content, setContent] = useState<HTMLDivElement | null>(null);
+  useLayoutEffect(() => {
+    if (!focusSelected || !content) return;
+    focusSelectedMenuItem(content);
+    if (content.contains(content.ownerDocument.activeElement)) onSelectedFocus?.();
+  }, [content, focusSelected, onSelectedFocus]);
+  return <DropdownMenuSubContent {...props} {...interactionProps} ref={setContent} />;
 }
 
 export function HarnessPicker({
@@ -125,6 +158,7 @@ export function HarnessPicker({
   contentAlign = "end",
   testId,
   configOpen = false,
+  onInitialSelectionFocus,
   children,
 }: {
   open: boolean;
@@ -137,6 +171,7 @@ export function HarnessPicker({
   contentAlign?: "start" | "center" | "end";
   testId?: string;
   configOpen?: boolean;
+  onInitialSelectionFocus?: () => void;
   children: ReactNode;
 }) {
   const guardedTooltip = useMenuGuardedTooltip(open);
@@ -236,6 +271,7 @@ export function HarnessPicker({
           className={cn(HARNESS_MENU_CLASS_NAME, COMPOSER_HARNESS_MENU_SIZE, contentClassName)}
           data-testid={testId}
           onPointerDownOutside={interaction.onPointerInteraction}
+          onInitialSelectionFocus={onInitialSelectionFocus}
         >
           {children}
         </HarnessPickerContent>
@@ -255,6 +291,8 @@ export function HarnessPickerEntry({
   testId,
   configTestId,
   editTestId,
+  focusConfig = false,
+  onConfigFocused,
   ...row
 }: ComponentProps<typeof HarnessMenuRowContent> & {
   open: boolean;
@@ -267,6 +305,8 @@ export function HarnessPickerEntry({
   testId?: string;
   configTestId?: string;
   editTestId?: string;
+  focusConfig?: boolean;
+  onConfigFocused?: () => void;
 }) {
   const { pointerInteraction, showInitialSelection, closeMenu } = usePickerInteraction();
   const allowConfigOpen = useRef(false);
@@ -367,6 +407,8 @@ export function HarnessPickerEntry({
             {content}
           </DropdownMenuSubTrigger>
           <HarnessPickerSubContent
+            focusSelected={focusConfig}
+            onSelectedFocus={onConfigFocused}
             className="composer-agent-menu composer-agent-config-menu max-h-[var(--radix-dropdown-menu-content-available-height)] w-[13.75rem] max-w-[calc(100vw-2rem)] overflow-y-auto p-2"
             data-testid={configTestId}
             onFocusOutside={(event) => {

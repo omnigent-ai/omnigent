@@ -2060,28 +2060,14 @@ def _record_daily_cost(
     """
     Add a turn's LLM cost to the session owner's daily rollup.
 
-    A no-op when *delta_usd* is not positive or the session has no
-    resolvable owner. Attributes the cost to the session creator
-    (:meth:`ConversationStore.get_session_owner`) and buckets it by the
-    current UTC day, so a session spanning midnight splits its spend
-    across both days. Recorded for every priced turn regardless of
-    whether the session runs under a policy — the daily rollup is the
-    backing store for the per-user daily cost-budget policy, and is now
-    populated universally. (This relies on the conversation store
-    implementing the daily-cost methods on every deployment that runs
-    this code; the earlier policy gate that kept the managed deployment
-    from touching an absent ``user_daily_cost`` table is no longer needed
-    now that the managed store backs it.)
+    Record every priced turn, including sessions without a budget policy.
+    Bucket spending by the current UTC day; nonpositive deltas and sessions
+    without a resolvable owner are no-ops.
 
-    Sub-agent conversations are created without a permission grant (the
-    internal runner POST carries no user context), so
-    ``get_session_owner(conv.id)`` returns ``None`` for them.  When
-    that happens, fall back to the spawn-tree root's owner: every
-    conversation carries ``root_conversation_id`` pointing to the
-    top-level session that *was* created with user context and therefore
-    always has an owner grant.  This ensures relay / SDK sub-agent spend
-    is attributed to the same user as the parent rather than silently
-    dropped from the daily rollup.
+    Read the owner's username and generation together, falling back to the
+    root session for a sub-agent without its own grant. Retain that snapshot
+    through the locked write so deletion or re-registration cannot transfer
+    old work's spending to a new account.
 
     :param conv: The conversation row for the session, or ``None``
         (a no-op — no owner to attribute to).
@@ -2091,16 +2077,18 @@ def _record_daily_cost(
     """
     if conv is None or delta_usd <= 0:
         return
-    owner = conversation_store.get_session_owner(conv.id)
+    owner = conversation_store.get_session_owner_authority(conv.id)
     if owner is None and conv.root_conversation_id != conv.id:
         # Sub-agent: no direct owner grant — fall back to the root session's
         # owner so sub-agent spend is attributed rather than silently dropped.
-        owner = conversation_store.get_session_owner(conv.root_conversation_id)
+        owner = conversation_store.get_session_owner_authority(conv.root_conversation_id)
     if owner is None:
         return
+    from omnigent.db.account_authority import target_account_scope
     from omnigent.db.utils import now_epoch
 
-    conversation_store.add_daily_cost(owner, _utc_day(now_epoch()), delta_usd)
+    with target_account_scope(owner.user_id, owner.generation):
+        conversation_store.add_daily_cost(owner.user_id, _utc_day(now_epoch()), delta_usd)
 
 
 def _priced_cost_for_display(usage: dict[str, Any]) -> float | None:
@@ -2301,6 +2289,25 @@ async def _persist_external_model_change(
             code=ErrorCode.INVALID_INPUT,
         )
     model = concrete_reported_model(raw_model)
+    if model is not None and conv.inference_snapshot is not None:
+        from omnigent.inference_config import binding_for_harness
+
+        snapshot = conv.inference_snapshot
+        binding = binding_for_harness(snapshot["runtime_config"], snapshot["harness"])
+        allowed = binding.model_allowlist if binding is not None else None
+        if allowed is not None and model not in allowed:
+            prefixes = {
+                "opencode-native": ("omnigent/",),
+                "pi-native": ("omnigent/", "omnigent-openai/", "omnigent-completions/"),
+            }.get(snapshot["harness"], ())
+            model = next(
+                (
+                    model.removeprefix(p)
+                    for p in prefixes
+                    if model.startswith(p) and model.removeprefix(p) in allowed
+                ),
+                model,
+            )
     if model is None or conv.reported_model == model:
         return
     await asyncio.to_thread(
@@ -5669,6 +5676,7 @@ async def _launch_runner_on_host_locked(
     from omnigent.host.frames import HostLaunchRunnerFrame, encode_host_frame
     from omnigent.runner.identity import token_bound_runner_id
 
+    await host_registry.admit_launch(host_conn, conv.id)
     superseded_runner_id = conv.runner_id
     binding_token = secrets.token_urlsafe(32)
     new_runner_id = token_bound_runner_id(binding_token)
@@ -5713,6 +5721,9 @@ async def _launch_runner_on_host_locked(
             # same configuration check it does at create-time launch. None
             # (agent not resolvable) skips the host-side check — fail open.
             harness=_resolve_harness(conv),
+            inference_config=(
+                conv.inference_snapshot["runtime_config"] if conv.inference_snapshot else None
+            ),
         )
     )
     try:
@@ -6374,7 +6385,7 @@ def _surface_model_change_forward_failure(
     session_id: str,
     model: str | None,
     runner_result: _RunnerForwardResult | None,
-) -> None:
+) -> bool:
     """
     Publish a visible notice when a native pane never took a model change.
 
@@ -6382,7 +6393,7 @@ def _surface_model_change_forward_failure(
     runner, which types ``/model`` into the terminal. On a native terminal that
     injection is the ONLY thing that moves the model, so a dropped forward left
     the row (and the picker) claiming a model the pane was never on, silently.
-    This does not roll the row back — it makes the divergence visible.
+    The return value lets the caller roll back bound model selections.
 
     Call only for native terminal sessions: every other harness re-reads the
     persisted value at its next turn boundary, so a dropped forward there is
@@ -6397,7 +6408,8 @@ def _surface_model_change_forward_failure(
     :param model: The model that was persisted, or ``None`` when cleared.
     :param runner_result: HTTP result from the forward, or ``None`` when no
         runner was reachable.
-    :returns: None.
+    :returns: ``True`` when the runner rejected the change; ``False`` when it
+        accepted the change or no runner answered.
     """
     if runner_result is None:
         _logger.info(
@@ -6407,9 +6419,9 @@ def _surface_model_change_forward_failure(
             model,
             extra={"session_id": session_id},
         )
-        return
+        return False
     if 200 <= runner_result.status_code < 300:
-        return
+        return False
     reason = f"the runner returned status {runner_result.status_code}"
     # The runner's own detail names the concrete cause (e.g. "a dialog may
     # be open in the pane"); carry it into the visible notice when present.
@@ -6438,6 +6450,7 @@ def _surface_model_change_forward_failure(
             ),
         ),
     )
+    return True
 
 
 async def _persist_native_policy_notice(
@@ -9763,6 +9776,8 @@ def _persist_stored_session_bundle(
     agent_bundle_location: str,
     agent_description: str | None,
     runner_id: str | None = None,
+    inference_snapshot: dict[str, Any] | None = None,
+    inference_model: str | None = None,
 ) -> CreatedSessionResponse:
     """
     Persist database rows for a bundle already written to artifacts.
@@ -9785,6 +9800,11 @@ def _persist_stored_session_bundle(
     :raises SQLAlchemyError: If the database transaction fails for
         any non-integrity reason.
     """
+    inference_kwargs: dict[str, Any] = {}
+    if inference_snapshot is not None:
+        inference_kwargs["inference_snapshot"] = inference_snapshot
+    if inference_model is not None:
+        inference_kwargs["model_override"] = inference_model
     try:
         created = conversation_store.create_session_with_agent(
             agent_id=agent_id,
@@ -9800,6 +9820,7 @@ def _persist_stored_session_bundle(
             runner_id=runner_id,
             project_id=metadata.project_id,
             host_id=metadata.host_id,
+            **inference_kwargs,
         )
     except ConversationNotFoundError as exc:
         # Parent was authorized by the caller but vanished (deleted)

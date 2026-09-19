@@ -939,6 +939,16 @@ async function triggerCompaction(config, ctx, customInstructions) {
  *   - Applied: return true. The paired ``model_select`` handler mirrors the
  *     resulting model back to Omnigent, so the web pill reflects the switch.
  */
+const inferenceProviderIds = new Set([
+  "omnigent",
+  "omnigent-openai",
+  "omnigent-completions",
+]);
+
+function hasInferenceBinding() {
+  return process.env.OMNIGENT_PI_INFERENCE_BOUND === "1";
+}
+
 async function applyModelChange(pi, config, ctx, modelId) {
   const id = typeof modelId === "string" ? modelId.trim() : "";
   if (!id) return false;
@@ -965,9 +975,24 @@ async function applyModelChange(pi, config, ctx, modelId) {
   }
   let model;
   try {
-    const models = listModels();
+    const models = listModels().filter(
+      (candidate) =>
+        !hasInferenceBinding() ||
+        (candidate && inferenceProviderIds.has(candidate.provider)),
+    );
     const separator = id.indexOf("/");
-    if (separator > 0) {
+    if (hasInferenceBinding()) {
+      // Profile IDs are literal, including slashes that resemble Pi providers.
+      model = models.find((candidate) => candidate && candidate.id === id);
+      if (!model && separator > 0 && inferenceProviderIds.has(id.slice(0, separator))) {
+        model = models.find(
+          (candidate) =>
+            candidate &&
+            candidate.provider === id.slice(0, separator) &&
+            candidate.id === id.slice(separator + 1),
+        );
+      }
+    } else if (separator > 0) {
       const provider = id.slice(0, separator);
       const bareId = id.slice(separator + 1);
       model = models.find(
@@ -1035,6 +1060,7 @@ function modelReference(model) {
   const modelId = model && typeof model.id === "string" ? model.id : "";
   if (!modelId) return "";
   const provider = model && typeof model.provider === "string" ? model.provider : "";
+  if (hasInferenceBinding() && inferenceProviderIds.has(provider)) return modelId;
   return provider ? `${provider}/${modelId}` : modelId;
 }
 
@@ -1075,6 +1101,7 @@ async function postModelOptions(config, ctx) {
   const options = [];
   const seen = new Set();
   for (const model of models) {
+    if (hasInferenceBinding() && (!model || !inferenceProviderIds.has(model.provider))) continue;
     const modelId = model && typeof model.id === "string" ? model.id : "";
     const id = modelReference(model);
     if (!id || seen.has(id)) continue;

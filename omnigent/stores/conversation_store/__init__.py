@@ -6,7 +6,7 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from omnigent.entities import (
     Agent,
@@ -16,6 +16,9 @@ from omnigent.entities import (
     PagedList,
 )
 from omnigent.session_import import IMPORT_PROVENANCE_LABEL_KEYS
+
+if TYPE_CHECKING:
+    from omnigent.db.account_authority import AccountAuthority
 
 # Label set on a fork of a session that had a working directory, or a
 # runner-bound native session whose working-directory metadata was lost.
@@ -407,6 +410,7 @@ class ConversationStore(ABC):
         terminal_launch_args: list[str] | None = None,
         conversation_id: str | None = None,
         project_id: str | None = None,
+        inference_snapshot: dict[str, Any] | None = None,
     ) -> Conversation:
         """
         Create a new conversation. Generates a unique
@@ -1183,9 +1187,8 @@ class ConversationStore(ABC):
         exists, otherwise increments the existing ``cost_usd`` by
         ``delta_usd`` in a single atomic statement (no
         read-modify-write, so concurrent turns and replicas don't lose
-        updates). Powers cost-aware policies' per-user daily budget
-        reads. Callers gate this on the session running under at least
-        one policy, so the table is untouched when no policy exists.
+        updates). Records every priced turn and powers per-user daily
+        budget reads, including sessions without a budget policy.
 
         :param user_id: The user the cost is attributed to (the session
             creator), e.g. ``"alice@example.com"``.
@@ -1292,6 +1295,18 @@ class ConversationStore(ABC):
         :param conversation_id: The session to look up, e.g. ``"conv_abc123"``.
         :param owner_only: Require an explicit owner-level grant.
         :returns: The grantee's user id, or ``None`` if no qualifying grant exists.
+        """
+        ...
+
+    @abstractmethod
+    def get_session_owner_authority(
+        self, conversation_id: str, *, owner_only: bool = False
+    ) -> "AccountAuthority | None":
+        """Capture the session owner's username and registration in one read.
+
+        Session-attributed writes must retain this snapshot in a target account
+        scope until the write validates it under the account lock. A null
+        generation represents an external identity, not a future registration.
         """
         ...
 
@@ -1578,12 +1593,14 @@ class ConversationStore(ABC):
         title: str | None = None,
         labels: dict[str, str] | None = None,
         reasoning_effort: str | None = None,
+        model_override: str | None = None,
         workspace: str | None = None,
         terminal_launch_args: list[str] | None = None,
         parent_conversation_id: str | None = None,
         runner_id: str | None = None,
         project_id: str | None = None,
         host_id: str | None = None,
+        inference_snapshot: dict[str, Any] | None = None,
     ) -> CreatedSession:
         """
         Atomically create a session and its session-scoped agent.

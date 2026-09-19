@@ -1047,6 +1047,102 @@ def test_read_transcript_items_since_skips_unreadable_thinking(tmp_path: Path) -
     assert [item.item_type for item in items] == ["message"]
 
 
+def test_unwrap_pasted_content_markers_strips_claude_paste_wrappers() -> None:
+    """
+    Paste wrappers Claude adds to bracketed-paste input are removed for display.
+
+    Omnigent injects every web-UI message as a bracketed paste, so Claude
+    records even a short typed line wrapped in ``<pasted_content id=…>``
+    markers. The mirrored user bubble must show the bare text.
+    """
+    unwrap = claude_native_bridge._unwrap_pasted_content_markers
+    # A bare paste (the omnigent-delivered shape) becomes clean text.
+    assert unwrap('\n\n<pasted_content id="a5f5">\nxyz\n</pasted_content id="a5f5">\n') == "xyz"
+    # Interior newlines in the pasted body are preserved.
+    assert (
+        unwrap('\n\n<pasted_content id="x">\nline1\nline2\n</pasted_content id="x">\n')
+        == "line1\nline2"
+    )
+    # Text the person typed with no paste is returned byte-for-byte.
+    assert unwrap("just a normal message") == "just a normal message"
+    assert unwrap("  keep leading/trailing spaces  ") == "  keep leading/trailing spaces  "
+    # Text typed around a paste keeps the surrounding words, drops the tags.
+    assert (
+        unwrap('before\n\n<pasted_content id="x">\nmid\n</pasted_content id="x">\nafter')
+        == "before\n\nmid\nafter"
+    )
+    # A closing tag that dropped the repeated id still unwraps.
+    assert unwrap('\n\n<pasted_content id="x">\nabc\n</pasted_content>\n') == "abc"
+
+
+def test_read_transcript_items_since_unwraps_pasted_content(tmp_path: Path) -> None:
+    """
+    A user message Claude wrapped as a paste mirrors to the UI as clean text.
+
+    Reproduces the reported bug: a plainly typed ``xyz`` sent through the
+    Omnigent web UI is delivered as a bracketed paste, so Claude persists it
+    wrapped in ``<pasted_content id=…>`` markers. The forwarded user bubble
+    must not carry the raw markers.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    wrapped = '\n\n<pasted_content id="a5f5">\nxyz\n</pasted_content id="a5f5">\n'
+    transcript_path.write_text(
+        json.dumps(
+            {"type": "user", "uuid": "user-1", "message": {"role": "user", "content": wrapped}}
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _cursor, _current_response_id, items = read_transcript_items_since(
+        transcript_path,
+        0,
+        agent_name="claude-native-ui",
+    )
+
+    assert [item.item_type for item in items] == ["message"]
+    assert items[0].data == {
+        "role": "user",
+        "content": [{"type": "input_text", "text": "xyz"}],
+    }
+
+
+def test_read_transcript_items_since_unwraps_pasted_content_in_list_blocks(
+    tmp_path: Path,
+) -> None:
+    """
+    List-form user text blocks are unwrapped too.
+
+    Claude ships user content as a string today, but the JSONL format is not
+    under our control; the defensive list-form path must strip paste markers
+    the same way so a format change can't regress the bug.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    wrapped = '\n\n<pasted_content id="x">\nhello\n</pasted_content id="x">\n'
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": "user-1",
+                "message": {"role": "user", "content": [{"type": "text", "text": wrapped}]},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _cursor, _current_response_id, items = read_transcript_items_since(
+        transcript_path,
+        0,
+        agent_name="claude-native-ui",
+    )
+
+    assert items[0].data == {
+        "role": "user",
+        "content": [{"type": "input_text", "text": "hello"}],
+    }
+
+
 def test_read_transcript_items_since_strips_inline_image_data(tmp_path: Path) -> None:
     """
     Reading an image file must not replay its base64 data as prompt text.
@@ -5039,6 +5135,93 @@ def test_inject_slash_command_clears_draft_pastes_literal_then_enter(
         "claude:0.0",
         "Enter",
     ]
+
+
+def test_tmux_injections_are_serialized_per_bridge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A slash command cannot overtake a user message on the same pane."""
+    bridge_dir = tmp_path / "bridge"
+    first_injection_entered = threading.Event()
+    release_first_injection = threading.Event()
+    second_lock_acquire_started = threading.Event()
+    wait_call_threads: list[str] = []
+    errors: list[BaseException] = []
+
+    class ObservedInjectionLock:
+        """Signal when a competing injection tries to acquire the pane lock."""
+
+        def __init__(self) -> None:
+            self._lock = threading.Lock()
+            self._counter_lock = threading.Lock()
+            self._acquire_count = 0
+
+        def __enter__(self) -> ObservedInjectionLock:
+            with self._counter_lock:
+                self._acquire_count += 1
+                if self._acquire_count == 2:
+                    second_lock_acquire_started.set()
+            self._lock.acquire()
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            self._lock.release()
+
+    lock_key = os.path.normcase(os.path.abspath(os.fspath(bridge_dir)))
+    monkeypatch.setitem(
+        claude_native_bridge._INJECTION_LOCKS,
+        lock_key,
+        ObservedInjectionLock(),
+    )
+
+    def wait_for_tmux_info(_bridge_dir: Path, *, timeout_s: float) -> dict[str, str]:
+        del timeout_s
+        wait_call_threads.append(threading.current_thread().name)
+        if len(wait_call_threads) == 1:
+            first_injection_entered.set()
+            assert release_first_injection.wait(timeout=2)
+        return {"socket_path": "/tmp/tmux.sock", "tmux_target": "claude:0.0"}
+
+    monkeypatch.setattr(claude_native_bridge, "_wait_for_tmux_info", wait_for_tmux_info)
+    monkeypatch.setattr(claude_native_bridge, "_restore_occupied_input", lambda *_args: None)
+    monkeypatch.setattr(
+        claude_native_bridge, "_wait_for_claude_prompt_ready", lambda *_a, **_k: None
+    )
+    monkeypatch.setattr(claude_native_bridge, "_paste_and_submit", lambda *_a, **_k: None)
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", lambda *_args: None)
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", lambda *_args: "")
+    monkeypatch.setattr(claude_native_bridge, "_PASTE_COMMIT_TIMEOUT_S", 0.0)
+    monkeypatch.setattr(claude_native_bridge, "_PASTE_SETTLE_S", 0.0)
+
+    def run_user_message() -> None:
+        try:
+            inject_user_message(bridge_dir, content="seed prompt")
+        except BaseException as exc:  # pragma: no cover - assertion aid
+            errors.append(exc)
+
+    def run_slash_command() -> None:
+        try:
+            claude_native_bridge.inject_slash_command(bridge_dir, command="/effort medium")
+        except BaseException as exc:  # pragma: no cover - assertion aid
+            errors.append(exc)
+
+    user_thread = threading.Thread(target=run_user_message, name="user-message")
+    slash_thread = threading.Thread(target=run_slash_command, name="slash-command")
+    user_thread.start()
+    assert first_injection_entered.wait(timeout=2)
+    slash_thread.start()
+
+    assert second_lock_acquire_started.wait(timeout=2)
+    assert wait_call_threads == ["user-message"]
+
+    release_first_injection.set()
+    user_thread.join(timeout=2)
+    slash_thread.join(timeout=2)
+
+    assert not user_thread.is_alive()
+    assert not slash_thread.is_alive()
+    assert errors == []
+    assert wait_call_threads == ["user-message", "slash-command"]
 
 
 @pytest.mark.parametrize(

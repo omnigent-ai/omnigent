@@ -11,6 +11,7 @@ from __future__ import annotations
 import subprocess
 from collections.abc import Iterator
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -417,8 +418,43 @@ def test_list_worktrees_non_git_path_fails(tmp_path: Path) -> None:
     """A non-git directory fails loud (the route maps this to 'no worktrees')."""
     plain = (tmp_path / "plain").resolve()
     plain.mkdir()
-    with pytest.raises(WorktreeError):
+    with pytest.raises(WorktreeError) as exc:
         list_worktrees(repo_path=str(plain))
+    assert exc.value.message == f"not a git repository: {plain}"
+
+
+def test_list_worktrees_preserves_invalid_config_error(git_repo: Path) -> None:
+    """A broken config is not evidence that an existing repository is non-Git."""
+    (git_repo / ".git" / "config").write_text("[broken\n")
+    with pytest.raises(WorktreeError, match=r"git worktree list failed.*bad config line"):
+        list_worktrees(repo_path=str(git_repo))
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "fatal: cannot access '.git/config': Permission denied",
+        "fatal: detected dubious ownership in repository at '/repo'",
+        "",
+    ],
+)
+def test_list_worktrees_preserves_probe_failure(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch, stderr: str
+) -> None:
+    """Unknown probe failures retain diagnostics instead of claiming non-Git."""
+    monkeypatch.setenv("LC_ALL", "fr_FR.UTF-8")
+    failed = subprocess.CompletedProcess(
+        args=["git", "worktree", "list", "--porcelain"],
+        returncode=128,
+        stdout="",
+        stderr=stderr,
+    )
+    with patch("omnigent.host.git_worktree.subprocess.run", return_value=failed) as run:
+        with pytest.raises(WorktreeError) as exc:
+            list_worktrees(repo_path=str(git_repo))
+    suffix = f": {stderr}" if stderr else ""
+    assert exc.value.message == f"git worktree list failed (exit 128){suffix}"
+    assert run.call_args.kwargs["env"]["LC_ALL"] == "C"
 
 
 @pytest.mark.parametrize(

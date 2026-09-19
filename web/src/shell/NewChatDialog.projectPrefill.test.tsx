@@ -1,3 +1,20 @@
+import type * as SandboxModelOptionsModule from "@/hooks/useSandboxModelOptions";
+
+vi.mock("@/hooks/useSandboxModelOptions", async (importOriginal) => ({
+  ...(await importOriginal<typeof SandboxModelOptionsModule>()),
+  useSandboxModelOptions: vi.fn(() => ({
+    data: {
+      configured: false,
+      status: "unconfigured",
+      models: [],
+      configuration_revision: null,
+      provider_label: null,
+      default_model: null,
+    },
+    isLoading: false,
+    error: null,
+  })),
+}));
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   useConversations as useTestConversations,
@@ -474,6 +491,38 @@ describe("NewChatLandingScreen project prefill", () => {
     expect(body.git).toBeUndefined();
   });
 
+  it("suppresses stored project git defaults after switching to a non-git workspace", async () => {
+    const config = {
+      host_id: "host_1",
+      workspace: REPO,
+      git: { branch_name: "feature/project-default" },
+    };
+    setProjectConfig(config);
+    renderLanding();
+
+    const worktree = screen.getByTestId("new-chat-landing-branch-chip");
+    await waitFor(() => expect(worktree).toBeEnabled());
+    fireEvent.click(worktree);
+    fireEvent.change(screen.getByTestId("new-chat-landing-branch-input"), {
+      target: { value: "feature/explicit-worktree" },
+    });
+    expect(worktree).toHaveTextContent("feature/explicit-worktree");
+
+    fireEvent.click(screen.getByTestId("new-chat-landing-workspace-chip"));
+    fireEvent.click(screen.getByRole("button", { name: RECENT_WORKSPACE }));
+    expect(screen.getByTestId("new-chat-landing-workspace-chip")).toHaveAttribute(
+      "title",
+      RECENT_WORKSPACE,
+    );
+    expect(worktree).toBeDisabled();
+
+    const body = await submitAndReadBody();
+    expect(body.project_id).toBe("proj_alpha");
+    expect(body.workspace).toBe(RECENT_WORKSPACE);
+    // Explicit null prevents the server from restoring the project's git default.
+    expect(body.git).toBeNull();
+  });
+
   it("falls back to the generic defaults when the project has no config", async () => {
     setProjectConfig({});
     renderLanding();
@@ -482,7 +531,7 @@ describe("NewChatLandingScreen project prefill", () => {
     expect(body.host_id).toBe("host_1");
     expect(body.workspace).toBe(RECENT_WORKSPACE);
     expect(body.agent_id).toBe("ag_hello");
-    expect(body.git).toBeUndefined();
+    expect(body.git).toBeNull();
   });
 
   it("seeds only the host from config, leaving the workspace to the generic default", async () => {

@@ -13,6 +13,7 @@ import {
   DropdownMenuSub,
   DropdownMenuSubTrigger,
 } from "@/components/ui/dropdown-menu";
+import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/components/ui/dialog";
 
 afterEach(() => {
   cleanup();
@@ -195,6 +196,24 @@ describe("HarnessPicker", () => {
       expect(screen.getByTestId("entry")).toBeInTheDocument();
       expect(screen.queryByText("Model configuration")).not.toBeInTheDocument();
     }
+  });
+
+  it("keeps a non-modal picker open while focusing its active row inside a dialog", async () => {
+    const user = userEvent.setup();
+    render(
+      <Dialog open>
+        <DialogContent>
+          <DialogTitle>Configure automation</DialogTitle>
+          <DialogDescription>Choose the harness for this automation.</DialogDescription>
+          <PickerFixture />
+        </DialogContent>
+      </Dialog>,
+    );
+
+    await user.click(screen.getByRole("button", { name: "Harness" }));
+
+    await waitFor(() => expect(screen.getByTestId("menu")).toBeInTheDocument());
+    expect(screen.getByTestId("entry")).toHaveFocus();
   });
 
   it.each([0, 1, 2])(

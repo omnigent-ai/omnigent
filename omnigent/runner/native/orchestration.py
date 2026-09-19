@@ -855,6 +855,33 @@ def _required_runner_env(name: str) -> str:
     return value
 
 
+def _runner_workspace_dir() -> str:
+    """
+    Resolve the runner's workspace for a native-terminal launch.
+
+    ``OMNIGENT_RUNNER_WORKSPACE`` is authoritative. The process cwd is only a
+    fallback for in-process setups that never export it, and reading it can
+    itself fail: a session whose worktree was removed under the runner makes
+    ``Path.cwd()`` raise ``FileNotFoundError``. So cwd is consulted only when
+    the variable is absent, and its failure is reported as the missing-workspace
+    condition it is rather than an opaque ``[Errno 2]`` from ``os.getcwd()``.
+
+    :returns: Absolute workspace path used as the terminal's cwd.
+    :raises RuntimeError: If neither the variable nor the process cwd resolves.
+    """
+    workspace = os.environ.get("OMNIGENT_RUNNER_WORKSPACE")
+    if workspace:
+        return workspace
+    try:
+        return str(Path.cwd())
+    except OSError as exc:
+        raise RuntimeError(
+            "Cannot resolve a workspace for the native terminal: "
+            "OMNIGENT_RUNNER_WORKSPACE is unset and the runner's working "
+            "directory no longer exists."
+        ) from exc
+
+
 def _codex_session_workspace(session_workspace: str | None) -> Path:
     """
     Resolve the cwd for a runner-owned Codex terminal.
@@ -1455,6 +1482,7 @@ async def _auto_create_opencode_terminal(
         build_opencode_provider_config,
         managed_connect_opencode_config,
         maybe_merge_user_provider_config,
+        resolve_bound_opencode_gateway,
         resolve_databricks_gateway,
         write_opencode_provider_config,
     )
@@ -1472,9 +1500,16 @@ async def _auto_create_opencode_terminal(
     # resort. On that bare host it adopts ucode's pinned served model — replacing an
     # unrecognized explicit ``--model`` (logged below), since the workspace gateway
     # is the only working provider there.
-    gateway = resolve_databricks_gateway(
-        _opencode_native_profile_from_spec(agent_spec), model_id=model_override
+    opencode_spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
+    gateway = await asyncio.to_thread(
+        resolve_bound_opencode_gateway,
+        model=model_override,
+        auth=opencode_spec.executor.auth if opencode_spec is not None else None,
     )
+    if gateway is None:
+        gateway = resolve_databricks_gateway(
+            _opencode_native_profile_from_spec(agent_spec), model_id=model_override
+        )
     if gateway is not None:
         # Pin the per-prompt model to the synthesized provider/endpoint id, and
         # write it as opencode's default model too so the TUI launches on it.
@@ -2464,6 +2499,14 @@ async def _auto_create_pi_terminal(
     # through as ``--model``. Writes a managed per-session Pi config dir,
     # never touching the user's global ``~/.pi/agent``.
     credential_warning: str | None = None
+    from omnigent.inference_config import binding_for_harness, load_runtime_inference_config
+
+    pi_binding = binding_for_harness(load_runtime_inference_config(), "pi-native")
+    if pi_binding is not None and _pi_args_have_provider(launch_config.terminal_launch_args or []):
+        raise ValueError(
+            "This session has a configured Pi provider. Select its model in the composer "
+            "and remove --provider, --model, and --api-key from terminal arguments."
+        )
     if not _pi_args_have_provider(launch_config.terminal_launch_args or []):
         from omnigent.harnesses.pi_native.credentials import (
             pi_native_provider_launch,
@@ -2474,7 +2517,11 @@ async def _auto_create_pi_terminal(
         # Provider-qualified picker values select one of the models rendered
         # from the provider configured through ``omni setup``.
         spec_model = launch_config.model_override or _pi_native_model_from_spec(agent_spec)
-        provider = resolve_pi_native_provider(model=spec_model)
+        pi_spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
+        if pi_binding is not None and pi_spec is not None:
+            provider = resolve_pi_native_provider(model=spec_model, auth=pi_spec.executor.auth)
+        else:
+            provider = resolve_pi_native_provider(model=spec_model)
         if provider is not None:
             launch = pi_native_provider_launch(
                 bridge_dir / "pi-agent",
@@ -4400,6 +4447,9 @@ async def _auto_create_codex_terminal(
     # machine-level config, parity with the in-process harness (#2744).
     _launch_spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
     _codex_launch = resolve_native_codex_launch(model=default_model, spec=_launch_spec)
+    from omnigent.inference_config import binding_for_harness, load_runtime_inference_config
+
+    codex_binding = binding_for_harness(load_runtime_inference_config(), "codex-native")
     from omnigent.inner.codex_executor import _find_codex_cli
 
     _codex_cli_path = _find_codex_cli()
@@ -4427,8 +4477,9 @@ async def _auto_create_codex_terminal(
     # the user's shared config can never govern a session (the stale-gpt-5.4
     # 400 class). Profile-backed shapes already resolve their default at
     # materialization time and are left alone.
-    if launch_config.model_override or (
-        _codex_launch.model is None and _codex_launch.profile is None
+    if codex_binding is None and (
+        launch_config.model_override
+        or (_codex_launch.model is None and _codex_launch.profile is None)
     ):
         from omnigent.harnesses.codex_native.app_server import (
             codex_launch_catalog,
@@ -7312,7 +7363,7 @@ async def _auto_create_claude_terminal(
     workspace = (
         session_init.snapshot.workspace
         if session_init is not None and session_init.snapshot.workspace
-        else os.environ.get("OMNIGENT_RUNNER_WORKSPACE", str(Path.cwd()))
+        else _runner_workspace_dir()
     )
     started_at = time.monotonic()
     _logger.info(
@@ -7639,6 +7690,14 @@ async def _auto_create_claude_terminal(
     # CLI path.
     claude_config: ClaudeNativeUcodeConfig | None = None
     _launch_config_resolution_failed = False
+    from omnigent.inference_config import (
+        binding_for_harness,
+        load_runtime_inference_config,
+        resolve_bound_model,
+    )
+
+    inference_config = load_runtime_inference_config()
+    claude_binding = binding_for_harness(inference_config, "claude-native")
     try:
         if resolve_launch_config is not None:
             claude_config = await resolve_launch_config()
@@ -7648,7 +7707,9 @@ async def _auto_create_claude_terminal(
         # An authoritative Databricks response with no Claude models is a
         # configuration failure, not permission to bypass the gateway.
         raise
-    except Exception:  # noqa: BLE001 — best-effort; fall back to native auth
+    except Exception:
+        if claude_binding is not None:
+            raise
         _logger.warning(
             "native-claude: could not derive a provider/ucode launch config "
             "— FALLING BACK to Claude Code's own login; "
@@ -7680,6 +7741,13 @@ async def _auto_create_claude_terminal(
         if session_model_override
         else unpinned_launch_model
     )
+    if claude_binding is not None:
+        unpinned_launch_model = resolve_bound_model(
+            inference_config, "claude-native", _claude_native_model_from_spec(agent_spec)
+        )
+        launch_model = resolve_bound_model(
+            inference_config, "claude-native", session_model_override or unpinned_launch_model
+        )
     # A pick the provider cannot serve is dropped only once the fallback
     # terminal is actually up, so a failed launch never loses it.
     reset_pick_after_launch = False
@@ -7690,7 +7758,7 @@ async def _auto_create_claude_terminal(
     # Bound here so the vocabulary record below reads the same rows the
     # launch validated against, whether or not that validation ran.
     launch_catalog: list[dict[str, object]] | None = None
-    if session_model_override or launch_model is None:
+    if claude_binding is None and (session_model_override or launch_model is None):
         from omnigent.harnesses.claude_native.main import (
             claude_catalog_launch_spelling,
             claude_catalog_serves_model,
@@ -8199,7 +8267,7 @@ async def _auto_create_repl_terminal(
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
 
     started_at = time.monotonic()
-    workspace = os.environ.get("OMNIGENT_RUNNER_WORKSPACE", str(Path.cwd()))
+    workspace = _runner_workspace_dir()
     server_url = os.environ.get("RUNNER_SERVER_URL", "http://localhost:6767")
     # Inherit the agent's os_env so its sandbox (e.g. ``type: none``) is honoured;
     # without sandbox= here and parent_os_env below, launch_terminal falls back to

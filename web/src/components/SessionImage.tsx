@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { ImageIcon } from "lucide-react";
 import { Spinner } from "@/components/ui/spinner";
 import { cn } from "@/lib/utils";
+import { withBasePath } from "@/lib/basePath";
 import { getOmnigentHostConfig } from "@/lib/host";
 import { authenticatedFetch } from "@/lib/identity";
 import { ZoomableImage } from "@/components/ImageLightbox";
@@ -72,7 +73,7 @@ export function SessionImage({ path, alt, className }: SessionImageProps) {
   if (!getOmnigentHostConfig().fetcher) {
     // Same reserved box and failure chip as a transcript-carried image; only the
     // source differs, so the two must not drift apart.
-    return <InlineImage src={path} alt={alt} className={className} />;
+    return <InlineImage src={path ? withBasePath(path) : path} alt={alt} className={className} />;
   }
   return <EmbeddedSessionImage path={path} alt={alt} className={className} />;
 }

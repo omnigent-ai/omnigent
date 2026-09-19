@@ -28,6 +28,7 @@ from sqlalchemy import (
     true,
 )
 from sqlalchemy.dialects.mysql import BINARY as MySQLBinary
+from sqlalchemy.dialects.mysql import LONGTEXT as MySQLLongText
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from omnigent.db.compression import CompressedLargeText, CompressedText
@@ -390,6 +391,7 @@ class SqlUser(OmnigentBase):
     """
 
     __tablename__ = "users"
+    account_generation: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
     # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
     workspace_id: Mapped[int] = mapped_column(
@@ -401,6 +403,7 @@ class SqlUser(OmnigentBase):
     )
     id: Mapped[str] = mapped_column(String(128), primary_key=True)
     is_admin: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=false())
+    deleted_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
     password_hash: Mapped[str | None] = mapped_column(String(256), nullable=True)
     created_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
     last_login_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -444,6 +447,7 @@ class SqlAccountToken(OmnigentBase):
     """
 
     __tablename__ = "account_tokens"
+    account_generation: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
     # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
     workspace_id: Mapped[int] = mapped_column(
@@ -573,6 +577,7 @@ class SqlDeviceGrant(OmnigentBase):
     """
 
     __tablename__ = "device_grants"
+    account_generation: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
     # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
     workspace_id: Mapped[int] = mapped_column(
@@ -699,6 +704,10 @@ class SqlConversationMetadata(OmnigentBase):
     external_session_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     session_state: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
     session_usage: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
+    # JSON-encoded provider binding and model catalog captured at session creation.
+    inference_snapshot: Mapped[str | None] = mapped_column(
+        Text().with_variant(MySQLLongText(), "mysql"), nullable=True
+    )
     # JSON-encoded list of strings. NULL for non-native sessions.
     terminal_launch_args: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
     # Required when host_id is set; enforced by check constraint below.
@@ -1357,6 +1366,7 @@ class SqlHost(OmnigentBase):
     """
 
     __tablename__ = "hosts"
+    account_generation: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
     # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
     workspace_id: Mapped[int] = mapped_column(
@@ -1528,6 +1538,7 @@ class SqlScheduledTask(OmnigentBase):
     """
 
     __tablename__ = "scheduled_tasks"
+    account_generation: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
     # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
     workspace_id: Mapped[int] = mapped_column(
