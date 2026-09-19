@@ -2,11 +2,8 @@
 
 Invoked by ``LocalPythonTool.invoke()`` as a child process.
 Reads a JSON request from stdin, dynamically imports the tool
-module, looks up the target ``@tool``-decorated function by name,
-calls it with the deserialized arguments (wrapping plain ``def``
-in ``asyncio.to_thread`` so it doesn't block the event loop),
-serializes the return value, and writes a JSON response to file
-descriptor 3.
+module, discovers or invokes ``@tool``-decorated functions, and
+writes a JSON response to file descriptor 3.
 
 The fd 3 protocol keeps stdout/stderr free for tool debugging
 (``print()`` statements in tool code). In Docker mode (where fd 3
@@ -21,6 +18,9 @@ Request format (stdin)::
         "tool_name": "word_count",
         "arguments": {"text": "..."}
     }
+
+Discovery requests omit ``tool_name`` and ``arguments`` and set
+``"mode": "discover"``.
 
 Response format (fd 3 or stdout)::
 
@@ -79,6 +79,13 @@ def main() -> None:
     # actually asked for tool_state in that case.
     state_root: str | None = request.get("state_root")
 
+    if request.get("mode") == "discover":
+        module = _load_module(module_path)
+        if module is None:
+            return
+        _write_response({"tools": _discover_tools(module)})
+        return
+
     if not tool_name:
         _write_error("Request missing 'tool_name' field — runner cannot dispatch.")
         return
@@ -126,6 +133,29 @@ def _load_module(path: str) -> ModuleType | None:
         _write_error(f"Import error: {type(exc).__name__}: {exc}")
         return None
     return module
+
+
+def _discover_tools(module: ModuleType) -> list[dict[str, Any]]:
+    """Return metadata for ``@tool`` functions defined by *module*."""
+    tools: list[dict[str, Any]] = []
+    for value in module.__dict__.values():
+        if not callable(value):
+            continue
+        if getattr(value, "__module__", None) != module.__name__:
+            continue
+        if not hasattr(value, _TOOL_MARKER_ATTR):
+            continue
+        metadata = getattr(value, _TOOL_MARKER_ATTR)
+        tools.append(
+            {
+                "name": metadata.name,
+                "description": metadata.description,
+                "json_schema": metadata.json_schema,
+                "strict": metadata.strict,
+                "uses_tool_state": metadata.uses_tool_state,
+            }
+        )
+    return tools
 
 
 def _resolve_tool_function(module: ModuleType, tool_name: str) -> Any:

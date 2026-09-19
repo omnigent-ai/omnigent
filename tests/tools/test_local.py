@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import subprocess
@@ -12,9 +13,11 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from omnigent_client.tools import ToolMetadata, get_tool_metadata
 
 from omnigent.runner.identity import RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR
 from omnigent.spec.types import LocalToolInfo, SandboxConfig, ToolRuntime
+from omnigent.tools import local as local_module
 from omnigent.tools.base import ToolContext
 from omnigent.tools.local import (
     LocalPythonTool,
@@ -481,6 +484,214 @@ def test_load_collision_with_builtin_fails_loud(tmp_path: Path) -> None:
     assert "builtin" in msg.lower() or "built-in" in msg.lower()
 
 
+# ─── Discovery isolation ────────────────────────────────────────────
+
+
+def test_discovery_does_not_execute_module_in_runner_process(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Module-level tool code executes only in the discovery child."""
+    marker = tmp_path / "marker"
+    py_dir = tmp_path / "tools" / "python"
+    py_dir.mkdir(parents=True)
+    (py_dir / "pwn.py").write_text(
+        textwrap.dedent(
+            """\
+            import builtins
+            import os
+            import sys
+
+            with open(os.environ["OMNIGENT_TEST_MARKER"], "w") as marker:
+                marker.write(str(os.getpid()))
+            os.environ["OMNIGENT_TEST_PWNED"] = "1"
+            builtins.OMNIGENT_TEST_PWNED = True
+            sys.modules["omnigent_test_pwned"] = sys
+
+            from omnigent_client import tool
+
+
+            @tool
+            def probe(value: str) -> str:
+                return value
+            """
+        )
+    )
+    monkeypatch.setenv("OMNIGENT_TEST_MARKER", str(marker))
+    info = LocalToolInfo(name="pwn", path="tools/python/pwn.py", language="python")
+
+    tools = load_local_python_tools([info], tmp_path, agent_name="isolated")
+
+    assert [tool.name() for tool in tools] == ["probe"]
+    assert marker.read_text() != str(os.getpid())
+    assert "OMNIGENT_TEST_PWNED" not in os.environ
+    assert not hasattr(__import__("builtins"), "OMNIGENT_TEST_PWNED")
+    assert "omnigent_test_pwned" not in sys.modules
+    assert not any(name.startswith("_agent_tool_") and "pwn" in name for name in sys.modules)
+
+
+def test_discovery_module_level_exception_is_load_error(tmp_path: Path) -> None:
+    """Module import failures are returned as load errors."""
+    py_dir = tmp_path / "tools" / "python"
+    py_dir.mkdir(parents=True)
+    (py_dir / "boom.py").write_text('raise RuntimeError("boom at import")\n')
+    info = LocalToolInfo(name="boom", path="tools/python/boom.py", language="python")
+
+    with pytest.raises(LocalToolLoadError, match="failed to import") as exc_info:
+        load_local_python_tools([info], tmp_path, agent_name="discovery-agent")
+
+    message = str(exc_info.value)
+    assert "boom at import" in message
+    assert "discovery-agent" in message
+    assert "boom.py" in message
+
+
+def test_discovery_metadata_matches_in_process_decoration(tmp_path: Path) -> None:
+    """Discovery preserves the metadata produced by the decorator."""
+    source = textwrap.dedent(
+        '''\
+        from typing import Annotated, Literal
+
+        from pydantic import Field
+
+        from omnigent_client import tool
+        from omnigent_client.tools import ToolState
+
+
+        @tool
+        def rich(
+            text: Annotated[str, Field(description="The text")],
+            tool_state: ToolState,
+            mode: Literal["a", "b"] = "a",
+            count: int = 1,
+        ) -> dict[str, int]:
+            """Rich tool."""
+            return {"length": len(text), "count": count}
+        '''
+    )
+    py_dir = tmp_path / "tools" / "python"
+    reference_dir = tmp_path / "reference"
+    py_dir.mkdir(parents=True)
+    reference_dir.mkdir()
+    tool_path = py_dir / "rich.py"
+    reference_path = reference_dir / "rich.py"
+    tool_path.write_text(source)
+    reference_path.write_text(source)
+    spec = importlib.util.spec_from_file_location("reference_rich", reference_path)
+    assert spec is not None and spec.loader is not None
+    reference_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(reference_module)
+    reference = get_tool_metadata(reference_module.rich)
+    assert reference is not None
+    info = LocalToolInfo(name="rich", path="tools/python/rich.py", language="python")
+
+    [discovered] = load_local_python_tools([info], tmp_path)
+
+    assert discovered.name() == reference.name
+    assert discovered._metadata.description == reference.description
+    assert discovered._metadata.json_schema == reference.json_schema
+    assert discovered._metadata.strict == reference.strict
+    assert discovered._uses_tool_state is True
+    assert discovered.get_schema()["function"]["parameters"] == reference.json_schema
+
+
+def test_discovery_strict_false_preserved(tmp_path: Path) -> None:
+    """Discovery preserves ``strict=False`` and its unnormalized schema."""
+    py_dir = tmp_path / "tools" / "python"
+    py_dir.mkdir(parents=True)
+    (py_dir / "loose.py").write_text(
+        textwrap.dedent(
+            """\
+            from omnigent_client import tool
+
+
+            @tool(strict=False)
+            def loose(value: str) -> str:
+                return value
+            """
+        )
+    )
+    info = LocalToolInfo(name="loose", path="tools/python/loose.py", language="python")
+
+    [discovered] = load_local_python_tools([info], tmp_path)
+
+    assert discovered._metadata.strict is False
+    assert discovered._metadata.json_schema.get("additionalProperties") is not False
+
+
+def test_discovery_timeout_is_load_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A hung discovery subprocess is surfaced as a load error."""
+    py_dir = tmp_path / "tools" / "python"
+    py_dir.mkdir(parents=True)
+    (py_dir / "slow.py").write_text("import time\ntime.sleep(30)\n")
+    info = LocalToolInfo(name="slow", path="tools/python/slow.py", language="python")
+    monkeypatch.setattr(local_module, "_DISCOVERY_TIMEOUT_SECONDS", 1.0)
+
+    with pytest.raises(LocalToolLoadError, match="did not finish importing"):
+        load_local_python_tools([info], tmp_path, agent_name="timeout-agent")
+
+
+def test_discovery_uses_srt_tier(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Discovery uses the same srt command tier as invocation."""
+    py_dir = tmp_path / "tools" / "python"
+    _write_decorated_tool(py_dir, "tier.py", func_name="tier")
+    info = LocalToolInfo(name="tier", path="tools/python/tier.py", language="python")
+    commands: list[list[str]] = []
+
+    def fail_popen(cmd: list[str], **kwargs: Any) -> None:
+        commands.append(cmd)
+        raise FileNotFoundError("srt")
+
+    monkeypatch.setattr("omnigent.tools.local.subprocess.Popen", fail_popen)
+
+    with pytest.raises(LocalToolLoadError, match="cannot start tool discovery subprocess"):
+        load_local_python_tools(
+            [info],
+            tmp_path,
+            srt_available=True,
+            sandbox_enabled=True,
+        )
+
+    assert commands[0][:2] == ["srt", "-c"]
+
+
+def test_discovery_container_uses_stdout_protocol(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Container discovery uses the stdout response protocol."""
+    py_dir = tmp_path / "tools" / "python"
+    _write_decorated_tool(py_dir, "tier.py", func_name="tier")
+    info = LocalToolInfo(name="tier", path="tools/python/tier.py", language="python")
+    commands: list[list[str]] = []
+    environments: list[dict[str, str]] = []
+
+    def fail_popen(cmd: list[str], **kwargs: Any) -> None:
+        commands.append(cmd)
+        environments.append(kwargs["env"])
+        raise FileNotFoundError("docker")
+
+    monkeypatch.setattr("omnigent.tools.local.subprocess.Popen", fail_popen)
+
+    with pytest.raises(LocalToolLoadError, match="cannot start tool discovery subprocess"):
+        load_local_python_tools(
+            [info],
+            tmp_path,
+            sandbox_config=SandboxConfig(container_image="python:3.12-slim"),
+            srt_available=False,
+        )
+
+    assert commands[0][0] == "docker"
+    assert "run" in commands[0]
+    assert environments[0]["_AP_RESPONSE_MODE"] == "stdout"
+
+
 # ─── Command building ───────────────────────────────────────────────
 
 
@@ -513,15 +724,26 @@ def _make_tool(
     if container_runtime is not None:
         sandbox_kwargs["container_runtime"] = container_runtime
     sandbox_config = SandboxConfig(**sandbox_kwargs)
-    tools = load_local_python_tools(
-        [info],
-        tmp_path,
+    return LocalPythonTool(
+        info=info,
+        metadata=ToolMetadata(
+            name="demo",
+            description="A test tool.",
+            json_schema={
+                "type": "object",
+                "properties": {"value": {"type": "string"}},
+                "required": ["value"],
+                "additionalProperties": False,
+            },
+            strict=True,
+            return_annotation=None,
+        ),
+        module_path=(py_dir / "demo.py").resolve(),
         sandbox_config=sandbox_config,
         srt_available=srt_available,
         uv_available=uv_available,
         sandbox_enabled=sandbox_enabled,
     )
-    return tools[0]
 
 
 def test_build_command_plain(tmp_path: Path) -> None:
@@ -712,7 +934,13 @@ def test_pep723_scanning_at_load_time(tmp_path: Path) -> None:
 # ─── Runner integration (subprocess execution end-to-end) ───────────
 
 
-def _run_runner_with_request(tool_path: Path, tool_name: str, arguments: dict) -> dict:
+def _run_runner_with_request(
+    tool_path: Path,
+    tool_name: str,
+    arguments: dict,
+    *,
+    mode: str | None = None,
+) -> dict:
     """
     Spawn the runner subprocess and return its parsed JSON response.
 
@@ -720,13 +948,14 @@ def _run_runner_with_request(tool_path: Path, tool_name: str, arguments: dict) -
     invocation path, not the Docker fallback.
     """
     runner = Path(__file__).parent.parent.parent / "omnigent" / "tools" / "_runner.py"
-    request = json.dumps(
-        {
-            "module_path": str(tool_path),
-            "tool_name": tool_name,
-            "arguments": arguments,
-        }
-    ).encode()
+    request_data = {
+        "module_path": str(tool_path),
+        "tool_name": tool_name,
+        "arguments": arguments,
+    }
+    if mode is not None:
+        request_data["mode"] = mode
+    request = json.dumps(request_data).encode()
 
     read_fd, write_fd = os.pipe()
     try:
@@ -815,6 +1044,61 @@ def test_runner_import_error(tmp_path: Path) -> None:
     response = _run_runner_with_request(py_dir / "bad.py", "any_name", {})
     assert "error" in response
     assert "Import error" in response["error"]
+
+
+def test_runner_discover_mode_lists_tools(tmp_path: Path) -> None:
+    """The runner discovery mode returns metadata for each tool."""
+    py_dir = tmp_path / "tools" / "python"
+    py_dir.mkdir(parents=True)
+    (py_dir / "multi.py").write_text(
+        textwrap.dedent(
+            '''\
+            from omnigent_client import tool
+
+
+            @tool
+            def first(value: str) -> str:
+                """First."""
+                return value
+
+
+            @tool(strict=False)
+            def second(value: int) -> int:
+                """Second."""
+                return value
+            '''
+        )
+    )
+
+    response = _run_runner_with_request(
+        py_dir / "multi.py",
+        "",
+        {},
+        mode="discover",
+    )
+
+    assert sorted(tool["name"] for tool in response["tools"]) == ["first", "second"]
+    for tool in response["tools"]:
+        assert set(tool) == {
+            "name",
+            "description",
+            "json_schema",
+            "strict",
+            "uses_tool_state",
+        }
+
+
+def test_runner_discover_mode_import_error(tmp_path: Path) -> None:
+    """Discovery mode returns import errors without dispatching."""
+    py_dir = tmp_path / "tools" / "python"
+    py_dir.mkdir(parents=True)
+    tool_path = py_dir / "bad.py"
+    tool_path.write_text("raise RuntimeError('discovery boom')\n")
+
+    response = _run_runner_with_request(tool_path, "", {}, mode="discover")
+
+    assert response["error"].startswith("Import error:")
+    assert "discovery boom" in response["error"]
 
 
 def test_runner_runtime_error(tmp_path: Path) -> None:

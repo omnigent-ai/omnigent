@@ -3,8 +3,9 @@
 Loads ``@tool``-decorated functions from the agent's
 ``tools/python/`` directory and exposes each as a
 :class:`LocalPythonTool` instance. A single Python file may
-export multiple tools (one per ``@tool`` function); the loader
-expands one :class:`LocalToolInfo` (file-level) into N
+export multiple tools (one per ``@tool`` function); discovery runs
+in the subprocess and the loader expands one
+:class:`LocalToolInfo` (file-level) into N
 ``LocalPythonTool`` instances.
 
 Tool code runs in a **subprocess** (not in-process) for crash
@@ -31,7 +32,6 @@ Execution tiers (in priority order):
 from __future__ import annotations
 
 import contextlib
-import importlib.util
 import json
 import logging
 import os
@@ -41,13 +41,12 @@ import subprocess
 import sys
 import threading
 from pathlib import Path
-from types import ModuleType
 
 # Any: OpenAI function schemas contain heterogeneous values
 # (strings, ints, nested objects, arrays) — no specific type fits.
 from typing import Any
 
-from omnigent_client.tools import ToolMetadata, get_tool_metadata
+from omnigent_client.tools import ToolMetadata
 
 from omnigent.runner.identity import strip_runner_auth_secrets
 from omnigent.spec.types import LocalToolInfo, SandboxConfig, ToolRuntime
@@ -66,6 +65,8 @@ _MAX_RESPONSE_BYTES = 1024 * 1024
 
 # Prefix used by the runner in Docker/stdout mode.
 _STDOUT_RESPONSE_PREFIX = "__AP_RESPONSE__:"
+
+_DISCOVERY_TIMEOUT_SECONDS = 60.0
 
 
 class LocalToolLoadError(Exception):
@@ -91,7 +92,7 @@ class LocalPythonTool(Tool):
     :param info: The discovered :class:`LocalToolInfo` for the
         file this tool lives in.
     :param metadata: The :class:`ToolMetadata` extracted from the
-        ``@tool``-decorated function at agent-image load time.
+        ``@tool``-decorated function in the discovery subprocess.
     :param module_path: Absolute path to the tool Python file.
     :param sandbox_config: Sandbox settings from the agent spec.
     :param srt_available: Whether ``srt`` is on PATH.
@@ -245,8 +246,11 @@ class LocalPythonTool(Tool):
         # srt and Docker both wrap the command in their own process
         # chain, so the fd 3 pipe doesn't survive to the inner
         # Python process. Use the stdout protocol instead.
-        srt_active = self._srt_available and self._sandbox_enabled
-        use_stdout = self._sandbox_config.container_image is not None or srt_active
+        use_stdout = _uses_stdout_protocol(
+            self._sandbox_config,
+            self._srt_available,
+            self._sandbox_enabled,
+        )
         cmd = self._build_command(state_root=state_root)
         if use_stdout:
             return self._invoke_stdout(cmd, request, workspace=ctx.workspace)
@@ -353,134 +357,14 @@ class LocalPythonTool(Tool):
             concurrent ``invoke()`` calls.
         :returns: The command list for ``subprocess.Popen``.
         """
-        if self._sandbox_config.container_image is not None:
-            return self._build_container_command()
-
-        base = [sys.executable, _RUNNER_PATH]
-        # When both uv and srt are active, uv must run OUTSIDE
-        # srt (it needs network access to pypi and write access
-        # to its cache). srt wraps only the inner python command.
-        if self._info.has_inline_deps and self._uv_available:
-            return self._build_uv_command(base)
-        return self._prepend_srt(base, state_root=state_root)
-
-    def _build_uv_command(self, base: list[str]) -> list[str]:
-        """
-        Build a ``uv run --with`` command for tools with PEP 723 deps.
-
-        When srt is also active, uv runs OUTSIDE srt (it needs
-        network for pypi and write access to its cache). srt wraps
-        only the inner ``python _runner.py`` via uv's ``--``
-        separator. Without srt, uv wraps the plain python command.
-
-        Uses ``python`` (not ``sys.executable``) so uv's ephemeral
-        venv Python is used and can see installed deps.
-
-        :param base: The base command ``[sys.executable, _runner]``
-            (unused — replaced with ``python`` for uv).
-        :returns: The uv command list.
-        """
-        uv_args: list[str] = ["uv", "run"]
-        for dep in self._info.inline_deps or []:
-            uv_args.extend(["--with", dep])
-        if self._srt_available and self._sandbox_enabled:
-            # uv runs outside srt; srt wraps the inner python.
-            # srt -c receives the python command as a quoted string.
-            inner = shlex.join(["python", _RUNNER_PATH])
-            uv_args.extend(["--", "srt", "-c", inner])
-        else:
-            uv_args.extend(["--", "python", _RUNNER_PATH])
-        return uv_args
-
-    def _prepend_srt(
-        self,
-        cmd: list[str],
-        *,
-        state_root: str | None,
-    ) -> list[str]:
-        """
-        Prepend ``srt`` if sandbox is enabled and available.
-
-        Stateless tools use plain ``srt -c`` — srt's default
-        bubblewrap sandbox is permissive enough for pure reads
-        (the venv python remains executable, $PATH resolves,
-        etc.).
-
-        Stateful tools (those with a ``tool_state`` parameter)
-        additionally need one writable path: ``{workspace}/.tool_state/
-        {agent_id}/``. We achieve that with an ``-s`` settings
-        file that keeps srt's permissive defaults for reads but
-        whitelists exactly that directory for writes. This is
-        NOT the same ``_srt_wrap.mjs``-based setup
-        ``code_sandbox`` uses — that config restricts reads too,
-        which would hide the venv python from the runner.
-
-        The core enabled-and-available wrap is delegated to the
-        shared :func:`~omnigent.tools._srt.wrap_with_srt` helper
-        so the MCP stdio path shares the exact same on/off
-        semantics; this method only builds the per-call
-        ``settings_file`` for stateful tools and hands it in.
-
-        :param cmd: The base command to wrap.
-        :param state_root: Per-call ToolState directory, or ``None``
-            for stateless invocations. A stateless call skips the
-            ``-s`` settings file entirely.
-        :returns: The wrapped command.
-        """
-        settings_file = _write_srt_settings_file(state_root) if state_root is not None else None
-        return wrap_with_srt(
-            cmd,
-            sandbox_enabled=self._sandbox_enabled,
+        return _build_runner_command(
+            info=self._info,
+            sandbox_config=self._sandbox_config,
             srt_available=self._srt_available,
-            settings_file=settings_file,
+            uv_available=self._uv_available,
+            sandbox_enabled=self._sandbox_enabled,
+            state_root=state_root,
         )
-
-    def _build_container_command(self) -> list[str]:
-        """
-        Build a container ``run`` command (Docker or Podman).
-
-        The container runs with network disabled, stdin piped,
-        and ``_AP_RESPONSE_MODE=stdout`` so the runner writes
-        the response to stdout instead of fd 3.
-
-        Only called from :meth:`_build_command` under the
-        ``container_image is not None`` branch, so the assert
-        documents a caller-enforced invariant — a fail-loud
-        check if that invariant ever drifts, rather than the
-        previous ``image or ""`` fallback which would have
-        silently passed an empty string as the image name to
-        the container runtime.
-
-        :returns: The container run command list.
-        """
-        image = self._sandbox_config.container_image
-        assert image is not None, (
-            "_build_container_command called without a container_image — "
-            "caller (_build_command) must gate on "
-            "``self._sandbox_config.container_image is not None``"
-        )
-        runtime = self._sandbox_config.container_runtime
-        assert runtime is not None, "SandboxConfig must resolve container_runtime"
-        return [
-            runtime,
-            "run",
-            "--rm",
-            "-i",
-            "--network",
-            "none",
-            "-e",
-            "_AP_RESPONSE_MODE=stdout",
-            image,
-            "python",
-            "-c",
-            # Inline the runner as a one-liner because the full
-            # _runner.py is not available inside the container.
-            (
-                "import sys,json,importlib.util,asyncio,os;"
-                "os.environ['_AP_RESPONSE_MODE']='stdout';"
-                f"exec(open('{_RUNNER_PATH}').read())"
-            ),
-        ]
 
     def cancel(self) -> None:
         """
@@ -501,6 +385,158 @@ class LocalPythonTool(Tool):
     def shutdown(self) -> None:
         """Kill any remaining in-flight subprocesses on teardown."""
         self.cancel()
+
+
+def _uses_stdout_protocol(
+    sandbox_config: SandboxConfig,
+    srt_available: bool,
+    sandbox_enabled: bool,
+) -> bool:
+    """Return whether the command wrapper requires stdout responses."""
+    return sandbox_config.container_image is not None or (srt_available and sandbox_enabled)
+
+
+def _build_runner_command(
+    *,
+    info: LocalToolInfo,
+    sandbox_config: SandboxConfig,
+    srt_available: bool,
+    uv_available: bool,
+    sandbox_enabled: bool,
+    state_root: str | None,
+) -> list[str]:
+    """
+    Build the subprocess command based on execution tier.
+
+    Priority: Docker > srt+uv > srt > uv > plain.
+
+    :param info: Local tool file metadata.
+    :param sandbox_config: Agent-level sandbox settings.
+    :param srt_available: Whether ``srt`` is on PATH.
+    :param uv_available: Whether ``uv`` is on PATH.
+    :param sandbox_enabled: Runtime policy for srt sandboxing.
+    :param state_root: Per-call ToolState directory (or ``None``
+        for stateless tools).
+    :returns: The command list for ``subprocess.Popen``.
+    """
+    if sandbox_config.container_image is not None:
+        return _build_container_command(sandbox_config)
+    base = [sys.executable, _RUNNER_PATH]
+    if info.has_inline_deps and uv_available:
+        return _build_uv_command(info, srt_available, sandbox_enabled)
+    return _prepend_srt(base, srt_available, sandbox_enabled, state_root)
+
+
+def _build_uv_command(
+    info: LocalToolInfo,
+    srt_available: bool,
+    sandbox_enabled: bool,
+) -> list[str]:
+    """
+    Build a ``uv run --with`` command for tools with PEP 723 deps.
+
+    When srt is also active, uv runs OUTSIDE srt (it needs
+    network for pypi and write access to its cache). srt wraps
+    only the inner ``python _runner.py`` via uv's ``--``
+    separator. Without srt, uv wraps the plain python command.
+
+    Uses ``python`` (not ``sys.executable``) so uv's ephemeral
+    venv Python is used and can see installed deps.
+
+    :param info: Local tool file metadata.
+    :param srt_available: Whether ``srt`` is on PATH.
+    :param sandbox_enabled: Runtime policy for srt sandboxing.
+    :returns: The uv command list.
+    """
+    uv_args: list[str] = ["uv", "run"]
+    for dep in info.inline_deps or []:
+        uv_args.extend(["--with", dep])
+    if srt_available and sandbox_enabled:
+        inner = shlex.join(["python", _RUNNER_PATH])
+        uv_args.extend(["--", "srt", "-c", inner])
+    else:
+        uv_args.extend(["--", "python", _RUNNER_PATH])
+    return uv_args
+
+
+def _prepend_srt(
+    cmd: list[str],
+    srt_available: bool,
+    sandbox_enabled: bool,
+    state_root: str | None,
+) -> list[str]:
+    """
+    Prepend ``srt`` if sandbox is enabled and available.
+
+    Stateless tools use plain ``srt -c`` — srt's default
+    bubblewrap sandbox is permissive enough for pure reads
+    (the venv python remains executable, $PATH resolves,
+    etc.).
+
+    Stateful tools (those with a ``tool_state`` parameter)
+    additionally need one writable path: ``{workspace}/.tool_state/
+    {agent_id}/``. We achieve that with an ``-s`` settings
+    file that keeps srt's permissive defaults for reads but
+    whitelists exactly that directory for writes. This is
+    NOT the same ``_srt_wrap.mjs``-based setup
+    ``code_sandbox`` uses — that config restricts reads too,
+    which would hide the venv python from the runner.
+
+    The core enabled-and-available wrap is delegated to the
+    shared :func:`~omnigent.tools._srt.wrap_with_srt` helper
+    so the MCP stdio path shares the exact same on/off
+    semantics; this method only builds the per-call
+    ``settings_file`` for stateful tools and hands it in.
+
+    :param cmd: The base command to wrap.
+    :param srt_available: Whether ``srt`` is on PATH.
+    :param sandbox_enabled: Runtime policy for srt sandboxing.
+    :param state_root: Per-call ToolState directory, or ``None``
+        for stateless invocations.
+    :returns: The wrapped command.
+    """
+    settings_file = _write_srt_settings_file(state_root) if state_root is not None else None
+    return wrap_with_srt(
+        cmd,
+        sandbox_enabled=sandbox_enabled,
+        srt_available=srt_available,
+        settings_file=settings_file,
+    )
+
+
+def _build_container_command(sandbox_config: SandboxConfig) -> list[str]:
+    """
+    Build a container ``run`` command (Docker or Podman).
+
+    The container runs with network disabled, stdin piped,
+    and ``_AP_RESPONSE_MODE=stdout`` so the runner writes
+    the response to stdout instead of fd 3.
+
+    :param sandbox_config: Agent-level sandbox settings.
+    :returns: The container run command list.
+    """
+    image = sandbox_config.container_image
+    assert image is not None, "container_image is required"
+    runtime = sandbox_config.container_runtime
+    assert runtime is not None, "SandboxConfig must resolve container_runtime"
+    return [
+        runtime,
+        "run",
+        "--rm",
+        "-i",
+        "--network",
+        "none",
+        "-e",
+        "_AP_RESPONSE_MODE=stdout",
+        image,
+        "python",
+        "-c",
+        (
+            "import sys,json,importlib.util,asyncio,os;"
+            "os.environ['_AP_RESPONSE_MODE']='stdout';"
+            f"exec(open('{_RUNNER_PATH}').read())"
+        ),
+    ]
 
 
 def _write_srt_settings_file(state_root: str) -> str:
@@ -613,6 +649,200 @@ def _read_stdout_response(
     )
 
 
+def _discover_tool_metadata(
+    *,
+    agent_name: str,
+    info: LocalToolInfo,
+    tool_path: Path,
+    sandbox_config: SandboxConfig,
+    srt_available: bool,
+    uv_available: bool,
+    sandbox_enabled: bool,
+) -> list[tuple[str, ToolMetadata, bool]]:
+    """Discover tool metadata in the same sandbox tier used for invocation."""
+    request = json.dumps({"mode": "discover", "module_path": str(tool_path)}).encode()
+    cmd = _build_runner_command(
+        info=info,
+        sandbox_config=sandbox_config,
+        srt_available=srt_available,
+        uv_available=uv_available,
+        sandbox_enabled=sandbox_enabled,
+        state_root=None,
+    )
+    use_stdout = _uses_stdout_protocol(
+        sandbox_config,
+        srt_available,
+        sandbox_enabled,
+    )
+    try:
+        payload, returncode, stderr = _run_discovery_subprocess(
+            cmd,
+            request,
+            use_stdout=use_stdout,
+        )
+    except subprocess.TimeoutExpired:
+        raise LocalToolLoadError(
+            f"Agent {agent_name!r}: tool file {tool_path} did not finish "
+            f"importing within {int(_DISCOVERY_TIMEOUT_SECONDS)}s during discovery."
+        ) from None
+    except OSError as exc:
+        raise LocalToolLoadError(
+            f"Agent {agent_name!r}: cannot start tool discovery subprocess for {tool_path}: {exc}"
+        ) from exc
+    data = _parse_discovery_payload(
+        payload,
+        returncode,
+        stderr,
+        agent_name=agent_name,
+        tool_path=tool_path,
+    )
+    if "error" in data:
+        raise LocalToolLoadError(
+            f"Agent {agent_name!r}: failed to import tool file {tool_path}: {data['error']}"
+        )
+    tools = data.get("tools")
+    if not isinstance(tools, list):
+        raise LocalToolLoadError(
+            f"Agent {agent_name!r}: failed to import tool file {tool_path}: "
+            "invalid discovery response: missing tools list"
+        )
+    discovered = [
+        (
+            tool["name"],
+            ToolMetadata(
+                name=tool["name"],
+                description=tool["description"],
+                json_schema=tool["json_schema"],
+                strict=tool["strict"],
+                return_annotation=None,
+                uses_tool_state=tool["uses_tool_state"],
+            ),
+            tool["uses_tool_state"],
+        )
+        for tool in tools
+    ]
+    if discovered:
+        return discovered
+    raise LocalToolLoadError(
+        f"Agent {agent_name!r}: tool file {tool_path} exports no "
+        f"@tool-decorated functions. Decorate at least one module-level "
+        f"function with @tool from omnigent.tools."
+    )
+
+
+def _run_discovery_subprocess(
+    cmd: list[str],
+    request: bytes,
+    *,
+    use_stdout: bool,
+) -> tuple[bytes | None, int, bytes]:
+    """Run a discovery request using the selected response protocol."""
+    env = dict(strip_runner_auth_secrets(os.environ))
+    if use_stdout:
+        env["_AP_RESPONSE_MODE"] = "stdout"
+        return _run_discovery_stdout(cmd, request, env)
+    return _run_discovery_fd3(cmd, request, env)
+
+
+def _run_discovery_stdout(
+    cmd: list[str],
+    request: bytes,
+    env: dict[str, str],
+) -> tuple[bytes | None, int, bytes]:
+    """Run discovery through the stdout response protocol."""
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+    )
+    try:
+        stdout, stderr = proc.communicate(
+            input=request,
+            timeout=_DISCOVERY_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.communicate()
+        raise
+    return _read_discovery_stdout_payload(stdout), proc.returncode, stderr
+
+
+def _run_discovery_fd3(
+    cmd: list[str],
+    request: bytes,
+    env: dict[str, str],
+) -> tuple[bytes | None, int, bytes]:
+    """Run discovery through the fd 3 response protocol."""
+    read_fd, write_fd = os.pipe()
+    env["_AP_RESPONSE_FD"] = str(write_fd)
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            pass_fds=(write_fd,),
+            env=env,
+        )
+        os.close(write_fd)
+        write_fd = -1
+        try:
+            _stdout, stderr = proc.communicate(
+                input=request,
+                timeout=_DISCOVERY_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            raise
+        return os.read(read_fd, _MAX_RESPONSE_BYTES) or None, proc.returncode, stderr
+    finally:
+        if write_fd != -1:
+            os.close(write_fd)
+        os.close(read_fd)
+
+
+def _read_discovery_stdout_payload(stdout: bytes) -> bytes | None:
+    """Extract a runner response from stdout mixed with tool output."""
+    for line in stdout.decode(errors="replace").splitlines():
+        if line.startswith(_STDOUT_RESPONSE_PREFIX):
+            return line[len(_STDOUT_RESPONSE_PREFIX) :].encode()
+    return None
+
+
+def _parse_discovery_payload(
+    payload: bytes | None,
+    returncode: int,
+    stderr: bytes,
+    *,
+    agent_name: str,
+    tool_path: Path,
+) -> dict[str, Any]:
+    """Parse a discovery response and turn transport failures into load errors."""
+    if not payload:
+        stderr_text = stderr.decode(errors="replace").strip()
+        raise LocalToolLoadError(
+            f"Agent {agent_name!r}: failed to import tool file {tool_path}: "
+            f"tool discovery subprocess exited with code {returncode}: "
+            f"{stderr_text}"
+        )
+    try:
+        data = json.loads(payload)
+    except json.JSONDecodeError as exc:
+        raise LocalToolLoadError(
+            f"Agent {agent_name!r}: failed to import tool file {tool_path}: "
+            f"invalid discovery response: {exc}"
+        ) from exc
+    if not isinstance(data, dict):
+        raise LocalToolLoadError(
+            f"Agent {agent_name!r}: failed to import tool file {tool_path}: "
+            "invalid discovery response: expected an object"
+        )
+    return data
+
+
 def load_local_python_tools(
     local_tools: list[LocalToolInfo],
     workdir: Path,
@@ -627,8 +857,8 @@ def load_local_python_tools(
     """
     Load and validate local Python tools from the agent image.
 
-    Each file is imported once at agent-image load time. Every
-    ``@tool``-decorated function in the module produces one
+    Each file is imported once in a sandboxed subprocess during
+    agent-image load time. Every ``@tool``-decorated function in the module produces one
     :class:`LocalPythonTool`. Names are validated against any
     builtin names provided (collisions fail loud per G27) and
     against each other (two custom tools sharing a name across
@@ -684,14 +914,14 @@ def load_local_python_tools(
         # Scan for PEP 723 inline metadata before loading the module.
         _scan_inline_metadata(info, tool_path)
 
-        module = _import_tool_module(
+        functions = _discover_tool_metadata(
             agent_name=effective_agent_name,
+            info=info,
             tool_path=tool_path,
-        )
-        functions = _extract_decorated_functions(
-            agent_name=effective_agent_name,
-            tool_path=tool_path,
-            module=module,
+            sandbox_config=effective_sandbox,
+            srt_available=effective_srt,
+            uv_available=effective_uv,
+            sandbox_enabled=sandbox_enabled,
         )
 
         for tool_name, metadata, uses_tool_state in functions:
@@ -782,88 +1012,3 @@ def _scan_inline_metadata(info: LocalToolInfo, path: Path) -> None:
     if metadata is not None:
         info.has_inline_deps = True
         info.inline_deps = metadata.dependencies
-
-
-def _import_tool_module(
-    *,
-    agent_name: str,
-    tool_path: Path,
-) -> ModuleType:
-    """
-    Import a tool file as a standalone module.
-
-    The module is held only long enough to discover decorated
-    functions; subsequent invocations re-import in the subprocess
-    runner. Failures raise :class:`LocalToolLoadError` with full
-    context (agent name, file path, cause).
-
-    :param agent_name: The agent's name, for error messages.
-    :param tool_path: Absolute path to the Python file.
-    :returns: The loaded module.
-    :raises LocalToolLoadError: If the module fails to import.
-    """
-    module_name = f"_agent_tool_{tool_path.stem}"
-    spec = importlib.util.spec_from_file_location(module_name, tool_path)
-    if spec is None or spec.loader is None:
-        raise LocalToolLoadError(
-            f"Agent {agent_name!r}: cannot create module spec for {tool_path}."
-        )
-    module = importlib.util.module_from_spec(spec)
-    try:
-        spec.loader.exec_module(module)
-    except Exception as exc:
-        raise LocalToolLoadError(
-            f"Agent {agent_name!r}: failed to import tool file {tool_path}: "
-            f"{type(exc).__name__}: {exc}"
-        ) from exc
-    return module
-
-
-def _extract_decorated_functions(
-    *,
-    agent_name: str,
-    tool_path: Path,
-    module: ModuleType,
-) -> list[tuple[str, ToolMetadata, bool]]:
-    """
-    Find every ``@tool``-decorated function defined in ``module``.
-
-    Iterates ``module.__dict__`` looking for callables carrying
-    the ``TOOL_MARKER_ATTR`` attribute. Filters to functions
-    actually defined IN the module (not re-imported from elsewhere)
-    by checking ``__module__`` matches the loaded module's name.
-
-    :param agent_name: The agent's name, for error messages.
-    :param tool_path: Path to the tool file (used in errors).
-    :param module: The loaded Python module to scan.
-    :returns: List of ``(tool_name, ToolMetadata)`` tuples, one
-        per decorated function. Empty if none found, in which case
-        this function raises (a tool file with no decorated
-        functions is a load error).
-    :raises LocalToolLoadError: If the module exports no
-        ``@tool``-decorated functions.
-    """
-    found: list[tuple[str, ToolMetadata, bool]] = []
-    for value in module.__dict__.values():
-        # Only consider objects defined in THIS module (not imports).
-        # Re-imported decorated functions would otherwise be doubly
-        # registered.
-        if not callable(value):
-            continue
-        if getattr(value, "__module__", None) != module.__name__:
-            continue
-        metadata = get_tool_metadata(value)
-        if metadata is None:
-            continue
-        found.append((metadata.name, metadata, metadata.uses_tool_state))
-
-    if found:
-        return found
-
-    # No decorated functions found. Surface an actionable error so the
-    # author knows the file needs to use @tool from omnigent.tools.
-    raise LocalToolLoadError(
-        f"Agent {agent_name!r}: tool file {tool_path} exports no "
-        f"@tool-decorated functions. Decorate at least one module-level "
-        f"function with @tool from omnigent.tools."
-    )
