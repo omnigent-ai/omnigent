@@ -95,7 +95,7 @@ file, not a fork.
    installed and authenticated against your workspace. Either a CLI
    profile (`DATABRICKS_CONFIG_PROFILE=<profile>`) or env-based auth
    (`DATABRICKS_HOST` + `DATABRICKS_CLIENT_ID` + `DATABRICKS_CLIENT_SECRET`).
-3. **Python 3.11+** locally with `uv` installed (the omnigent project
+3. **Python 3.12+** locally with `uv` installed (the omnigent project
    standard).
 4. **Workspace permissions** to:
    - Create or use a Unity Catalog catalog and schema for trace
