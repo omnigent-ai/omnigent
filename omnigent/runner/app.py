@@ -7490,7 +7490,7 @@ def create_runner_app(
                 )
         return True
 
-    async def _forward_harness_interrupt(conv_id: str) -> None:
+    async def _forward_harness_interrupt(conv_id: str) -> bool:
         """Best-effort POST ``{"type":"interrupt"}`` to a conversation's harness.
 
         Releases the harness's parked policy/tool future so its ``run_turn``
@@ -7498,23 +7498,27 @@ def create_runner_app(
         runner-side floor does not depend on this succeeding.
 
         :param conv_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+        :returns: Whether interruption was acknowledged or no live harness remains.
         """
         if process_manager is None:
-            return
+            return True
         try:
             harness_client = await process_manager.get_client(conv_id, "any")
-            await harness_client.post(
+            response = await harness_client.post(
                 f"/v1/sessions/{conv_id}/events",
                 json={"type": "interrupt"},
                 # Bounded under the Omnigent server's 5s stop deadline.
                 timeout=3.0,
             )
+            response.raise_for_status()
+            return True
         except NoLiveHarnessError:
             _logger.debug(
                 "Interrupt forward skipped for %s: no live harness",
                 conv_id,
                 extra={"session_id": conv_id},
             )
+            return True
         except Exception:  # noqa: BLE001 — best-effort: harness may have exited
             _logger.warning(
                 "Interrupt forward to harness failed for %s",
@@ -7522,6 +7526,25 @@ def create_runner_app(
                 exc_info=True,
                 extra={"session_id": conv_id},
             )
+            return False
+
+    async def _reconcile_desynced_harness(conv_id: str) -> dict[str, Any] | None:
+        """Clear the previous harness turn before a fresh delivery.
+
+        :param conv_id: Session whose previous runner stream disconnected.
+        :returns: A retryable error when interruption could not be confirmed.
+        """
+        if conv_id not in _desynced_sessions:
+            return None
+        if not await _forward_harness_interrupt(conv_id):
+            return {
+                "code": "harness_reconciliation_failed",
+                "message": (
+                    "The previous agent turn could not be interrupted. Please retry your message."
+                ),
+            }
+        _desynced_sessions.discard(conv_id)
+        return None
 
     async def _cancel_inprocess_turn(conv_id: str) -> None:
         # Distinguish "no live turn" (absent) from a stream-mode turn (present as
@@ -8174,16 +8197,15 @@ def create_runner_app(
         # Capture our own task so the finally floor can identity-compare before
         # clearing the slot (see below).
         _own_task = asyncio.current_task()
-        # A fresh turn is binding: whatever desync the previous turn ended on is
-        # resolved now. Also clear a stale publish-once token (e.g. left set by a
-        # wedged stream that never reached its own _on_proxy_stream_end) so it
-        # can't suppress this turn's legitimate terminal publish.
-        _desynced_sessions.discard(conv)
-        _desync_terminalized.pop(conv, None)
         # Locate any uncoded exception logged below in the turn phase (this task's
         # context carries it for its lifetime). Coded errors keep their own phase.
         with phase_scope(ErrorPhase.TURN):
             try:
+                # Cancellation during reconciliation must still release our turn slot.
+                if recovery_error := await _reconcile_desynced_harness(conv):
+                    _on_proxy_stream_end(conv, error=recovery_error)
+                    return
+                _desync_terminalized.pop(conv, None)
                 await _run_turn_bg_setup_and_stream(msg_body, conv)
             except _ContextWindowOverflow:
                 # Re-raise so the streaming-phase handler (which publishes the
@@ -8700,6 +8722,10 @@ def create_runner_app(
         dispatch: TurnDispatch | None = None,
     ) -> Response:
         manager = cast(HarnessProcessManager, process_manager)
+        # Direct-stream turns don't pass through _run_turn_bg — reconcile a
+        # desynced harness here so the fresh delivery isn't 204-rejected.
+        if recovery_error := await _reconcile_desynced_harness(conv_id):
+            return JSONResponse(status_code=503, content={"error": recovery_error})
         harness_name = dispatch.harness if dispatch else cast(str | None, body.get("harness"))
         spawn_env = (
             dispatch.spawn_env if dispatch else cast(dict[str, str] | None, body.get("spawn_env"))
