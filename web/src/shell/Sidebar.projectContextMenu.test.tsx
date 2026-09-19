@@ -227,6 +227,18 @@ describe("project folder header context menu", () => {
     expect(screen.getByTestId("rename-project-confirm")).toBeInTheDocument();
   });
 
+  it("focuses and selects the project name when the rename dialog opens", async () => {
+    renderSidebar();
+
+    fireEvent.contextMenu(folderHeader());
+    fireEvent.click(screen.getByTestId("rename-project"));
+
+    const input = screen.getByDisplayValue(PROJECT_NAME) as HTMLInputElement;
+    await waitFor(() => expect(input).toHaveFocus());
+    expect(input.selectionStart).toBe(0);
+    expect(input.selectionEnd).toBe(PROJECT_NAME.length);
+  });
+
   it("drives Rename into the shared dialog and mutation", async () => {
     renderSidebar();
 
