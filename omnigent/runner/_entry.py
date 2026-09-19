@@ -513,11 +513,25 @@ class _InitialAuthTokenFactory:
             self._retry_discovery_at = time.monotonic() + _AUTH_DISCOVERY_RETRY_INTERVAL_S
             if not self._no_credential_logged:
                 self._no_credential_logged = True
-                _logger.error(
-                    "host bootstrap bearer expired and no SDK/OIDC credential is available "
-                    "to renew it; run `databricks auth login` to re-authenticate",
-                    extra={"session_id": runner_primary_session_id()},
-                )
+                from omnigent.cli_auth import stored_login_renewal_refusal
+
+                refusal = stored_login_renewal_refusal(self._server_url)
+                if refusal:
+                    from omnigent.util.server_url import display_server_url
+
+                    _logger.error(
+                        "host bootstrap bearer expired and the stored login could not "
+                        "renew it (%s); run `omnigent login %s` to re-authenticate",
+                        refusal,
+                        display_server_url(self._server_url),
+                        extra={"session_id": runner_primary_session_id()},
+                    )
+                else:
+                    _logger.error(
+                        "host bootstrap bearer expired and no SDK/OIDC credential is available "
+                        "to renew it; run `databricks auth login` to re-authenticate",
+                        extra={"session_id": runner_primary_session_id()},
+                    )
         elif token:
             self._no_credential_logged = False
         return token
@@ -713,8 +727,15 @@ def _make_auth_token_factory(
                     sdk_auth, _host = _resolve_databricks_auth(host=workspace_host)
                 else:
                     sdk_auth, _host = _resolve_databricks_auth()
-            except (DatabricksAuthError, ImportError, ValueError):
+            except (DatabricksAuthError, ImportError, ValueError) as exc:
                 sdk_auth = None
+                # Keep the underlying reason visible; it is otherwise lost and
+                # the runner can only report "no credential".
+                _logger.info(
+                    "Databricks SDK credential resolution failed: %s",
+                    exc,
+                    extra={"session_id": runner_primary_session_id()},
+                )
             sdk_auth_resolved = True
         if sdk_auth is None:
             return None

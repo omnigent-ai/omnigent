@@ -213,6 +213,7 @@ def store_token(
     existing_org_id = load_databricks_org_id(server_url)
     if existing_org_id is not None:
         entry["org_id"] = existing_org_id
+    _renewal_refusals.pop(_normalize_server_url(server_url), None)
     _store_entry(server_url, entry)
 
 
@@ -346,6 +347,25 @@ def load_token(server_url: str, *, min_remaining_seconds: float = 0.0) -> str | 
 # Servers already warned about an expired stored token, so a poll/retry
 # loop doesn't repeat the warning every few seconds.
 _warned_expired_servers: set[str] = set()
+
+# Last definitive renewal refusal per normalized server URL. Cleared when a
+# fresh credential is stored for that server.
+_renewal_refusals: dict[str, str] = {}
+
+
+def stored_login_renewal_refusal(server_url: str) -> str | None:
+    """Return why the stored login's last renewal was refused, or ``None``.
+
+    Set when ``/oauth/token`` definitively refuses the stored refresh grant
+    (e.g. HTTP 403 on a revoked or aged-out grant); cleared when a fresh
+    credential is stored. Lets callers distinguish "no credential existed"
+    from "a stored credential existed but its renewal was rejected" in their
+    own failure diagnostics.
+
+    :param server_url: The server URL, e.g. ``"http://localhost:6767"``.
+    :returns: A short, token-free reason string, or ``None``.
+    """
+    return _renewal_refusals.get(_normalize_server_url(server_url))
 
 
 def _warn_expired_once(server_url: str, expires_at: float, *, has_refresh: bool) -> None:
@@ -523,6 +543,7 @@ def _refresh_locked(server_url: str, normalized: str, timeout: float) -> str | N
             )
         return None
     if resp.status_code != 200:
+        _renewal_refusals[normalized] = f"refresh refused with HTTP {resp.status_code}"
         _logger.warning(
             "Token refresh against %s refused (HTTP %d) — run `omnigent login %s` "
             "to re-authenticate.",

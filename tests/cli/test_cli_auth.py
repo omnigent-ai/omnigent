@@ -786,6 +786,80 @@ def test_refresh_stored_token_refused_leaves_entry(token_dir, monkeypatch) -> No
     assert entry["refresh_token"] == "refresh-1"
 
 
+def test_refused_refresh_records_renewal_refusal(token_dir, monkeypatch) -> None:
+    """A definitive /oauth/token refusal is queryable afterwards, and a
+    freshly stored credential clears it — so a caller's failure diagnosis can
+    say a stored login existed and its renewal was refused, instead of
+    claiming no credential was available."""
+    import httpx
+
+    from omnigent import cli_auth
+    from omnigent.cli_auth import (
+        refresh_stored_token,
+        store_token,
+        stored_login_renewal_refusal,
+    )
+
+    monkeypatch.setattr(cli_auth, "_renewal_refusals", {})
+    store_token(
+        "http://localhost:6767",
+        token="stale",
+        user_id="a@x",
+        expires_at=time.time() - 10,
+        refresh_token="refresh-1",
+    )
+    assert stored_login_renewal_refusal("http://localhost:6767") is None
+
+    def _fake_post(url, *, data=None, timeout=None):
+        return httpx.Response(
+            403, json={"error": "invalid_grant"}, request=httpx.Request("POST", url)
+        )
+
+    monkeypatch.setattr(httpx, "post", _fake_post)
+    assert refresh_stored_token("http://localhost:6767") is None
+    # Lookups normalize the URL, so a trailing-slash variant matches too.
+    assert (
+        stored_login_renewal_refusal("http://localhost:6767/") == "refresh refused with HTTP 403"
+    )
+
+    store_token(
+        "http://localhost:6767",
+        token="fresh",
+        user_id="a@x",
+        expires_at=time.time() + 3600,
+    )
+    assert stored_login_renewal_refusal("http://localhost:6767") is None
+
+
+def test_missing_refresh_endpoint_records_no_renewal_refusal(token_dir, monkeypatch) -> None:
+    """A 404 (server without /oauth/token) is not a credential refusal, so it
+    must not make later diagnostics blame the stored login."""
+    import httpx
+
+    from omnigent import cli_auth
+    from omnigent.cli_auth import (
+        refresh_stored_token,
+        store_token,
+        stored_login_renewal_refusal,
+    )
+
+    monkeypatch.setattr(cli_auth, "_renewal_refusals", {})
+    store_token(
+        "http://localhost:6767",
+        token="stale",
+        user_id="a@x",
+        expires_at=time.time() - 10,
+        refresh_token="refresh-1",
+    )
+
+    def _fake_post(url, *, data=None, timeout=None):
+        return httpx.Response(404, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(httpx, "post", _fake_post)
+    assert refresh_stored_token("http://localhost:6767") is None
+    assert stored_login_renewal_refusal("http://localhost:6767") is None
+
+
 def test_refresh_404_on_loopback_is_quiet(token_dir, monkeypatch, caplog) -> None:
     """A loopback server without /oauth/token is expected and must stay quiet.
 
