@@ -1457,7 +1457,9 @@ def _build_pi_spawn_env(
     :param workdir: The bundle's on-disk path (extracted by the
         agent cache). Threaded through as ``HARNESS_PI_BUNDLE_DIR``
         so the harness wrap's executor can source bundled skills
-        from ``<bundle>/skills/<dir>/``.
+        from ``<bundle>/skills/<dir>/``, extensions from
+        ``<bundle>/.pi/extensions``, and a bundle-root context
+        file (``AGENTS.md`` et al.).
     :returns: A dict of env-var overrides for
         :meth:`HarnessProcessManager.get_client(env=...)`.
     """

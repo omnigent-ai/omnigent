@@ -59,8 +59,10 @@ Env vars read at startup:
 - ``HARNESS_PI_BUNDLE_DIR``: Absolute path to the agent
   bundle's extracted root. When set, the executor sources
   bundled skills from ``<bundle>/skills/<dir>/`` for the
-  ``"all"`` and named-list cases. Unset for agents without a
-  bundled-skill directory.
+  ``"all"`` and named-list cases, loads ``<bundle>/.pi/extensions``
+  via ``--extension``, and appends a bundle-root context file
+  (``AGENTS.md`` et al.) to the system prompt. Unset for agents
+  without a bundle directory.
 - ``HARNESS_PI_AGENT_NAME``: Agent display name. Reserved for
   future use; currently unused by Pi.
 """
