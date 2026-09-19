@@ -1656,12 +1656,15 @@ def run_claude_native(
             # The daemon-spawned runner launches ``claude`` itself and
             # derives the ucode config from the provider config, so the
             # remote path takes neither ``command`` nor ``claude_config``.
+            # ``use_claude_config`` therefore rides on the session (as a
+            # label) so the runner knows to skip that derivation.
             _run_with_remote_server(
                 server.rstrip("/"),
                 spec_path,
                 session_id=session_id,
                 resume_picker=resume_picker,
                 claude_args=sanitized_args,
+                use_claude_config=use_claude_config,
                 auto_open_conversation=auto_open_conversation,
                 startup_profiler=startup_profiler,
             )
@@ -4484,6 +4487,7 @@ async def _prepare_claude_terminal_via_daemon(
     session_id: str | None,
     session_bundle: bytes | None,
     claude_args: tuple[str, ...],
+    use_claude_config: bool = False,
     host_id: str,
     workspace: str,
     startup_profiler: StartupProfiler | None = None,
@@ -4513,6 +4517,11 @@ async def _prepare_claude_terminal_via_daemon(
         session's ``terminal_launch_args`` so the runner launches with
         them. On resume, non-empty args replace the stored set
         (last-write-wins); empty reuses the stored set.
+    :param use_claude_config: When ``True``, persist the
+        ``--use-native-config`` intent as a session label so the
+        daemon-spawned runner launches Claude on its own ``~/.claude``
+        config. On resume, ``True`` stamps the label; ``False`` leaves
+        any stored label in place (like the launch-args reuse above).
     :param host_id: This machine's host id, e.g. ``"host_abc123"``.
     :param workspace: Absolute host path for the runner cwd, e.g.
         ``"/Users/me/proj"``.
@@ -4556,6 +4565,7 @@ async def _prepare_claude_terminal_via_daemon(
                     session_bundle,
                     bridge_id=None,
                     terminal_launch_args=persist_args or None,
+                    use_claude_config=use_claude_config,
                 ),
                 wait_for_host_online(client, host_id, timeout_s=_DAEMON_HOST_ONLINE_TIMEOUT_S),
             )
@@ -4564,10 +4574,20 @@ async def _prepare_claude_terminal_via_daemon(
                 "daemon claude session created and host online",
                 startup_progress=startup_progress,
             )
-        elif persist_args:
+        elif persist_args or use_claude_config:
             # Resume with new flags: replace the stored args
-            # (last-write-wins). No new flags → leave the stored set so
-            # the runner reuses them.
+            # (last-write-wins) and/or stamp the native-config label
+            # (labels upsert-merge, so other labels are untouched). No
+            # new flags → leave the stored state so the runner reuses it.
+            resume_patch: _JsonObject = {}
+            if persist_args:
+                resume_patch["terminal_launch_args"] = persist_args
+            if use_claude_config:
+                from omnigent.stores.conversation_store import (
+                    CLAUDE_NATIVE_USE_NATIVE_CONFIG_LABEL_KEY,
+                )
+
+                resume_patch["labels"] = {CLAUDE_NATIVE_USE_NATIVE_CONFIG_LABEL_KEY: "1"}
             _mark_startup_step(
                 startup_profiler,
                 "persisting resume launch args",
@@ -4576,7 +4596,7 @@ async def _prepare_claude_terminal_via_daemon(
             )
             await client.patch(
                 f"/v1/sessions/{url_component(session_id)}",
-                json={"terminal_launch_args": persist_args},
+                json=resume_patch,
             )
             _mark_startup_step(
                 startup_profiler,
@@ -4721,6 +4741,7 @@ def _run_with_remote_server(
     session_id: str | None,
     resume_picker: bool,
     claude_args: tuple[str, ...],
+    use_claude_config: bool = False,
     auto_open_conversation: bool = False,
     startup_profiler: StartupProfiler | None = None,
 ) -> None:
@@ -4747,6 +4768,10 @@ def _run_with_remote_server(
         launches ``claude`` itself and derives the ucode config from the
         provider config, so this path takes neither a ``command`` nor a
         ``claude_config``.)
+    :param use_claude_config: When ``True``, persist the
+        ``--use-native-config`` intent on the session so the
+        daemon-spawned runner launches Claude on its own ``~/.claude``
+        config instead of deriving the provider/ucode config.
     :param auto_open_conversation: When ``True``, open the browser
         conversation URL after the session is prepared.
     :param startup_profiler: Optional startup profiler for timing
@@ -4842,6 +4867,7 @@ def _run_with_remote_server(
                         session_id=resolved_session_id,
                         session_bundle=bundle,
                         claude_args=claude_args,
+                        use_claude_config=use_claude_config,
                         host_id=host_id,
                         workspace=str(Path.cwd().resolve()),
                         startup_profiler=startup_profiler,
@@ -6150,6 +6176,7 @@ async def _create_claude_session(
     *,
     bridge_id: str | None,
     terminal_launch_args: list[str] | None = None,
+    use_claude_config: bool = False,
 ) -> str:
     """
     Create a bundled terminal-first Claude session.
@@ -6175,12 +6202,21 @@ async def _create_claude_session(
         and applies them when it auto-launches the terminal. ``None``
         (the CLI-direct path, which passes args via the live terminal
         POST instead) persists nothing.
+    :param use_claude_config: When ``True``, label the session so the
+        daemon-spawned runner launches Claude on its own ``~/.claude``
+        config instead of deriving the provider/ucode config.
     :returns: New session id, e.g. ``"conv_abc123"``.
     :raises click.ClickException: If creation fails.
     """
     labels = dict(_SESSION_LABELS)
     if bridge_id is not None:
         labels[BRIDGE_ID_LABEL_KEY] = bridge_id
+    if use_claude_config:
+        from omnigent.stores.conversation_store import (
+            CLAUDE_NATIVE_USE_NATIVE_CONFIG_LABEL_KEY,
+        )
+
+        labels[CLAUDE_NATIVE_USE_NATIVE_CONFIG_LABEL_KEY] = "1"
     metadata: _JsonObject = {"labels": labels}
     if terminal_launch_args:
         metadata["terminal_launch_args"] = terminal_launch_args

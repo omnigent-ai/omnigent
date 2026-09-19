@@ -432,3 +432,126 @@ def test_run_with_remote_server_unreachable_server_raises_clean_error(
     assert "Could not reach the omnigent server at https://unreachable.example" in str(
         exc_info.value
     )
+
+
+async def test_create_claude_session_labels_native_config_intent() -> None:
+    """
+    ``--use-native-config`` rides the daemon-flow create as a session label.
+
+    The daemon-spawned runner, not the CLI, launches Claude, so the intent
+    to skip provider/ucode config resolution can only travel on the session.
+    Without the label the runner routes Claude at the configured gateway
+    provider and the flag is silently ignored.
+    """
+    from omnigent.stores.conversation_store import CLAUDE_NATIVE_USE_NATIVE_CONFIG_LABEL_KEY
+
+    captured: dict[str, bytes] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Capture the multipart create body."""
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            captured["body"] = request.content
+            return httpx.Response(201, json={"session_id": "conv_new"})
+        return httpx.Response(404, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://e.com"
+    ) as client:
+        await claude_native._create_claude_session(
+            client,
+            b"bundle",
+            bridge_id=None,
+            use_claude_config=True,
+        )
+
+    assert CLAUDE_NATIVE_USE_NATIVE_CONFIG_LABEL_KEY.encode() in captured["body"]
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://e.com"
+    ) as client:
+        await claude_native._create_claude_session(
+            client,
+            b"bundle",
+            bridge_id=None,
+        )
+
+    assert CLAUDE_NATIVE_USE_NATIVE_CONFIG_LABEL_KEY.encode() not in captured["body"]
+
+
+async def test_prepare_daemon_terminal_resume_stamps_native_config_label(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    Resuming with ``--use-native-config`` stamps the label on the session.
+
+    A session created before the flag (or by another launcher) carries no
+    label; the resume PATCH is the only chance to persist the intent before
+    the daemon-spawned runner brings the terminal up.
+    """
+    from contextlib import asynccontextmanager
+
+    from omnigent.stores.conversation_store import CLAUDE_NATIVE_USE_NATIVE_CONFIG_LABEL_KEY
+
+    patches: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_resume":
+            patches.append(json.loads(request.content))
+            return httpx.Response(200, json={})
+        return httpx.Response(404, json={})
+
+    @asynccontextmanager
+    async def fake_client(*args: object, **kwargs: object) -> Any:
+        del args, kwargs
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), base_url="https://e.com"
+        ) as client:
+            yield client
+
+    monkeypatch.setattr(claude_native, "open_daemon_client", fake_client)
+    monkeypatch.setattr(claude_native, "record_startup_event", lambda *a, **k: None)
+
+    async def _noop_wait(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+
+    monkeypatch.setattr(claude_native, "wait_for_host_online", _noop_wait)
+
+    async def fake_launch_or_reuse_runner(*args: object, **kwargs: object) -> str:
+        del args, kwargs
+        return "runner_resume"
+
+    monkeypatch.setattr(
+        claude_native, "launch_or_reuse_daemon_runner", fake_launch_or_reuse_runner
+    )
+    monkeypatch.setattr(claude_native, "_wait_for_runner_online_with_startup_event", _noop_wait)
+    monkeypatch.setattr(claude_native, "_ensure_claude_terminal_on_runner", _noop_wait)
+
+    async def fake_wait_for_terminal_ready(*args: object, **kwargs: object) -> str:
+        del args, kwargs
+        return claude_native.claude_terminal_resource_id()
+
+    monkeypatch.setattr(
+        claude_native, "_wait_for_claude_terminal_ready", fake_wait_for_terminal_ready
+    )
+
+    async def fake_read_tmux(*args: object, **kwargs: object) -> Any:
+        del args, kwargs
+        return claude_native._ClaudeTerminalTmux(
+            socket=tmp_path / "tmux.sock", target="claude:main"
+        )
+
+    monkeypatch.setattr(claude_native, "_read_claude_terminal_tmux", fake_read_tmux)
+
+    await claude_native._prepare_claude_terminal_via_daemon(
+        base_url="https://e.com",
+        headers={},
+        session_id="conv_resume",
+        session_bundle=None,
+        claude_args=(),
+        use_claude_config=True,
+        host_id="host_resume",
+        workspace="/workspace",
+    )
+
+    assert patches == [{"labels": {CLAUDE_NATIVE_USE_NATIVE_CONFIG_LABEL_KEY: "1"}}]

@@ -1895,6 +1895,7 @@ async def test_prepare_daemon_terminal_reports_progress_steps(
         *,
         bridge_id: str | None,
         terminal_launch_args: list[str] | None = None,
+        use_claude_config: bool = False,
     ) -> str:
         """
         Return a fresh session id and assert persisted launch args.
@@ -1904,12 +1905,15 @@ async def test_prepare_daemon_terminal_reports_progress_steps(
         :param bridge_id: Bridge label requested by the caller.
         :param terminal_launch_args: Claude launch args persisted on
             the session for the runner to apply.
+        :param use_claude_config: Native-config intent forwarded by the
+            prepare helper.
         :returns: Fixed conversation id.
         """
         del client
         assert bundle == b"bundle"
         assert bridge_id is None
         assert terminal_launch_args == ["--print", "hi"]
+        assert use_claude_config is False
         return "conv_daemon_progress"
 
     async def fake_wait_for_host_online(

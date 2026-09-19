@@ -83,6 +83,15 @@ SWITCH_PREVIOUS_BUILTIN_LABEL_KEY = "omnigent.switch.previous_builtin_id"
 # normal approval/sandbox stance.
 CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY = "omnigent.codex_native.bypass_sandbox"
 
+# Launch directive for a claude-native session: when set to ``"1"`` the runner
+# launches Claude Code on its own native ``~/.claude`` configuration — skipping
+# provider/ucode config resolution (no gateway env, no catalog-derived
+# ``--model``). Persisted by ``omnigent claude --use-native-config``, whose
+# launch is daemon-routed: the runner, not the CLI, brings the terminal up, so
+# the intent must ride on the session. Stored as a plain conversation label
+# (cheap thread metadata, no schema migration) like the codex directive above.
+CLAUDE_NATIVE_USE_NATIVE_CONFIG_LABEL_KEY = "omnigent.claude_native.use_native_config"
+
 # Reserved label key that stores a session's sidebar "project" membership
 # (implicit collections — a project exists while ≥1 session carries this key).
 # Namespaced so it never collides with the user-facing "project" term or other

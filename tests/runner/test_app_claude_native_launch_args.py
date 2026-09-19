@@ -28,6 +28,7 @@ from omnigent.runner.native.orchestration import (
     _routed_spawn_launch_args,
 )
 from omnigent.runner.subagent_routing import AUTO_HARNESS_LABEL_KEY
+from omnigent.stores.conversation_store import CLAUDE_NATIVE_USE_NATIVE_CONFIG_LABEL_KEY
 
 
 @pytest.mark.parametrize(
@@ -523,3 +524,67 @@ async def test_legacy_metadata_loader_reads_the_auto_harness_flag(
         metadata = await _load_legacy_claude_launch_metadata(client, "conv_abc")
 
     assert metadata.auto_harness is expected
+
+
+@pytest.mark.parametrize(
+    ("labels", "expected"),
+    [
+        ({CLAUDE_NATIVE_USE_NATIVE_CONFIG_LABEL_KEY: "1"}, True),
+        ({CLAUDE_NATIVE_USE_NATIVE_CONFIG_LABEL_KEY: "0"}, False),
+        ({}, False),
+    ],
+    ids=["set", "off", "absent"],
+)
+def test_envelope_metadata_reads_the_native_config_flag(
+    labels: dict[str, str],
+    expected: bool,
+) -> None:
+    """The label a `--use-native-config` launch stamps reaches the runner.
+
+    The daemon-spawned runner, not the CLI, launches Claude, so the intent
+    to skip provider/ucode resolution can only travel on the session.
+    """
+    from omnigent.runner.session_init_protocol import (
+        SESSION_INIT_PROTOCOL_VERSION,
+        RunnerSessionInitEnvelope,
+    )
+
+    envelope = RunnerSessionInitEnvelope(
+        protocol_version=SESSION_INIT_PROTOCOL_VERSION,
+        server_version="test",
+        session_id="conv_abc",
+        agent_id="agent",
+        snapshot={
+            "created_at": 0,
+            "updated_at": 0,
+            "labels": labels,
+        },
+    )
+
+    assert _claude_launch_metadata_from_envelope(envelope).use_native_config is expected
+
+
+@pytest.mark.parametrize(
+    ("labels", "expected"),
+    [
+        ({CLAUDE_NATIVE_USE_NATIVE_CONFIG_LABEL_KEY: "1"}, True),
+        ({}, False),
+    ],
+    ids=["set", "absent"],
+)
+async def test_legacy_metadata_loader_reads_the_native_config_flag(
+    labels: dict[str, str],
+    expected: bool,
+) -> None:
+    """The removable legacy snapshot path must parse the flag too."""
+    import httpx
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"labels": labels})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://runner"
+    ) as client:
+        metadata = await _load_legacy_claude_launch_metadata(client, "conv_abc")
+
+    assert metadata.use_native_config is expected
