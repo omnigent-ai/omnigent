@@ -47,8 +47,6 @@ from omnigent.db.enum_codecs import SESSION_LIVE_STATUS
 from omnigent.db.workspace_cache import WorkspaceScopedCache
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
-
     from omnigent.stores import ConversationStore
     from omnigent.stores.scheduled_task_store import ScheduledTaskStore
 
@@ -66,13 +64,6 @@ _store: ConversationStore | None = None
 # alongside ``_store`` by :func:`configure`; ``None`` disables the hook (the
 # runner process and unit tests that never configure it are unaffected).
 _scheduled_task_store: ScheduledTaskStore | None = None
-# Fired (on the write worker, inside the run's ``workspace_scope``) with the
-# conversation id the instant a MANAGED-SANDBOX scheduled run reaches terminal —
-# so its sandbox is torn down immediately instead of waiting for the provider
-# idle-reap. Wired by :func:`configure`; ``None`` disables it (kept a plain
-# callback so this module stays ignorant of hosts/sandboxes — app.py owns the
-# teardown). Connected-host runs never fire it (gated on execution_target).
-_on_managed_sandbox_run_terminal: Callable[[str], None] | None = None
 # Single worker => writes apply in submission order (see module docstring).
 _executor: ThreadPoolExecutor | None = None
 # Last status seen per session, for dedupe — the value whose write was
@@ -102,20 +93,6 @@ def configure(
     _scheduled_task_store = scheduled_task_store
     _last_status.clear()
     _last_pending.clear()
-
-
-def set_managed_sandbox_run_terminal_hook(hook: Callable[[str], None] | None) -> None:
-    """Wire the callback that tears a managed-sandbox automation's sandbox down.
-
-    Mirrors ``pending_elicitations.set_count_persist_hook``: set at server startup
-    (where the running loop is available), separate from :func:`configure` so it
-    can capture that loop. Invoked from :func:`persist_scheduled_run_completion`
-    with the conversation id, but ONLY for a run whose task is a
-    ``managed_sandbox`` execution — so it can never touch a connected host or a
-    pinned interactive sandbox. ``None`` clears it.
-    """
-    global _on_managed_sandbox_run_terminal
-    _on_managed_sandbox_run_terminal = hook
 
 
 def conversation_store() -> ConversationStore | None:
@@ -267,23 +244,6 @@ def persist_scheduled_run_completion(
             error=error,
             error_code=error_code,
         )
-        # This call (and only this one) transitioned a still-running run to
-        # terminal. If that run is a managed-sandbox automation, tear its sandbox
-        # down now rather than waiting for the provider idle-reap. Gated on the
-        # task's execution_target so a connected-host run — or a task that pinned
-        # an interactive sandbox — never triggers teardown. Best-effort.
-        hook = _on_managed_sandbox_run_terminal
-        if hook is not None:
-            task = store.get(run.scheduled_task_id)
-            if task is not None and task.execution_target == "managed_sandbox":
-                try:
-                    hook(conversation_id)
-                except Exception:  # noqa: BLE001
-                    _logger.warning(
-                        "managed-sandbox teardown hook failed for %s",
-                        conversation_id,
-                        exc_info=True,
-                    )
 
     submit("scheduled_run_completion", _transition)
 

@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -40,6 +41,7 @@ class _FakeConversation:
     host_id: str | None = None
     git_branch: str | None = None
     labels: dict[str, str] = field(default_factory=dict)
+    runner_id: str | None = None
 
 
 @dataclass
@@ -124,14 +126,6 @@ class FakeScheduledTaskStore:
                 **kwargs,
             }
         )
-        return None
-
-    def update_run(self, run_id: str, **kwargs: Any) -> Any:
-        # Transition an existing recorded run in place (record-before-dispatch).
-        for run in self.runs:
-            if run["run_id"] == run_id:
-                run.update(kwargs)
-                break
         return None
 
 
@@ -222,7 +216,7 @@ class _FakeHost:
     # Non-None marks a server-managed sandbox host; the unpinned connected-host
     # resolver skips these so an automation never reuses an existing sandbox.
     sandbox_provider: str | None = None
-    # Provider-assigned id of a live sandbox; drives the teardown gate.
+    # A dormant managed host still has its provider, even without a sandbox id.
     sandbox_id: str | None = None
 
 
@@ -1457,13 +1451,8 @@ async def test_managed_sandbox_fires_hostless_via_managed_dispatch() -> None:
 
 
 @pytest.mark.asyncio
-async def test_managed_sandbox_dispatch_failure_updates_single_run_to_failed() -> None:
-    """A managed dispatch failure transitions the pre-recorded run to failed.
-
-    The run is recorded ``running`` BEFORE dispatch (so a fast terminal event
-    can't strand it); a dispatch failure must transition that SAME row to failed,
-    not write a second run.
-    """
+async def test_managed_sandbox_dispatch_failure_records_one_failed_run() -> None:
+    """A managed dispatch failure records exactly one failed run."""
     conv_store = FakeConversationStore()
     store = FakeScheduledTaskStore(rows={"task_1": _task(execution_target="managed_sandbox")})
 
@@ -1478,11 +1467,133 @@ async def test_managed_sandbox_dispatch_failure_updates_single_run_to_failed() -
     await _drain()
 
     assert len(conv_store.created) == 1
-    # Exactly ONE run row — recorded running before dispatch, then updated in
-    # place to failed (not a second create_run).
     assert len(store.runs) == 1
     assert store.runs[0]["status"] == "failed"
     assert store.runs[0]["error_code"] == "launch_failed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dispatch_fails", [False, True])
+async def test_managed_fires_use_regular_launch_with_unchanged_server_config(
+    monkeypatch: pytest.MonkeyPatch, dispatch_fails: bool
+) -> None:
+    """Each fire uses a fresh managed launch with the server's lifecycle settings."""
+    from omnigent.server.managed_hosts import (
+        ManagedLaunchTracker,
+        ManagedSandboxConfig,
+        ManagedSandboxDeployment,
+    )
+    from omnigent.server.routes import sessions
+
+    config = ManagedSandboxDeployment.single(
+        ManagedSandboxConfig(
+            server_url="https://server.example.com",
+            launcher_factory=lambda: pytest.fail("managed launch is stubbed"),
+            token_ttl_s=90000,
+            provider="agent_sandbox",
+            host_config={"runner": {"idle_timeout_s": 7200}},
+        )
+    )
+    conversations = FakeConversationStore()
+    hosts = FakeHostStore()
+    bound: dict[str, _FakeConversation] = {}
+
+    async def launch(**kwargs: Any) -> None:
+        session_id = kwargs["session_id"]
+        host_id = f"sandbox_host_{session_id}"
+        hosts.hosts[host_id] = _FakeHost(
+            host_id,
+            RESERVED_USER_LOCAL,
+            sandbox_provider="agent_sandbox",
+            sandbox_id=f"sandbox_{session_id}",
+        )
+        bound[session_id] = _FakeConversation(
+            id=session_id,
+            agent_id="ag_1",
+            host_id=host_id,
+            workspace="/home/omnigent/workspace",
+            runner_id=f"runner_{session_id}",
+        )
+        kwargs["tracker"].finish(session_id)
+
+    managed_launch = AsyncMock(side_effect=launch)
+    runner_client = object()
+    dispatch = AsyncMock(side_effect=RuntimeError("dispatch failed") if dispatch_fails else None)
+    terminate = AsyncMock()
+    monkeypatch.setattr(conversations, "get_conversation", bound.get)
+    monkeypatch.setattr(sessions, "_run_managed_launch", managed_launch)
+    monkeypatch.setattr(sessions, "_wait_for_runner_client", AsyncMock(return_value=runner_client))
+    monkeypatch.setattr(sessions, "_ensure_runner_session_initialized", AsyncMock())
+    monkeypatch.setattr(sessions, "_dispatch_session_event_to_runner", dispatch)
+    monkeypatch.setattr("omnigent.server.managed_hosts.terminate_managed_host", terminate)
+    store = FakeScheduledTaskStore(rows={"task_1": _task(execution_target="managed_sandbox")})
+    on_fire = build_on_fire(
+        _deps(
+            store,
+            conversation_store=conversations,
+            host_store=hosts,
+            sandbox_config=config,
+            managed_launches=ManagedLaunchTracker(),
+        )
+    )
+
+    for _ in range(2):
+        await on_fire(0, "task_1")
+        await _drain()
+
+    assert managed_launch.await_count == 2
+    assert len(bound) == 2
+    assert len({conv.host_id for conv in bound.values()}) == 2
+    for call in managed_launch.await_args_list:
+        assert call.kwargs["sandbox_config"] is config
+        assert call.kwargs["owner"] == RESERVED_USER_LOCAL
+        assert call.kwargs.get("relaunch_host") is None
+        assert call.kwargs["repos"] == ()
+    assert config.default.host_config == {"runner": {"idle_timeout_s": 7200}}
+    assert dispatch.await_count == 2
+    for call in dispatch.await_args_list:
+        assert call.args[1] is bound[call.args[0]]
+        assert call.args[2].data["content"] == [{"type": "input_text", "text": "do the thing"}]
+        assert call.args[4] is runner_client
+    assert [run["status"] for run in store.runs] == ["failed" if dispatch_fails else "running"] * 2
+    terminate.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("workspace", [None, "/repo"])
+@pytest.mark.parametrize("sandbox_id", [None, "sandbox_1"])
+async def test_legacy_pinned_sandbox_fails_before_host_rpc(
+    monkeypatch: pytest.MonkeyPatch, workspace: str | None, sandbox_id: str | None
+) -> None:
+    """Stored connected-host tasks cannot reuse a live or dormant managed sandbox."""
+    conversations = FakeConversationStore()
+    host = _FakeHost(
+        "host_1",
+        "alice@example.com",
+        sandbox_provider="agent_sandbox",
+        sandbox_id=sandbox_id,
+    )
+    store = FakeScheduledTaskStore(
+        rows={"task_1": _task(user_id=host.user_id, workspace=workspace)}
+    )
+    resolve_workspace = AsyncMock()
+    monkeypatch.setattr(fire_mod, "_resolve_default_workspace", resolve_workspace)
+    on_fire = build_on_fire(
+        _deps(
+            store,
+            conversation_store=conversations,
+            host_store=FakeHostStore({host.host_id: host}),
+            host_registry=FakeHostRegistry(online={host.host_id}),
+        )
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    resolve_workspace.assert_not_awaited()
+    assert conversations.created == []
+    assert len(store.runs) == 1
+    assert store.runs[0]["status"] == "failed"
+    assert store.runs[0]["error_code"] == "existing_sandbox_not_allowed"
 
 
 @pytest.mark.asyncio
@@ -1719,52 +1830,3 @@ async def test_policy_create_failure_does_not_fail_fire() -> None:
     assert len(conv_store.created) == 1
     assert len(launched) == 1
     assert store.runs[0]["status"] == "running"
-
-
-# ── Managed-sandbox teardown ─────────────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_terminate_managed_sandbox_only_when_bound_host_is_a_sandbox(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The teardown helper terminates a sandbox host and no-ops on anything else."""
-    calls: list[Any] = []
-
-    async def _fake_terminate(host: Any, host_store: Any, config: Any) -> None:
-        calls.append(host)
-
-    monkeypatch.setattr("omnigent.server.managed_hosts.terminate_managed_host", _fake_terminate)
-
-    class _ConvStore:
-        def __init__(self, host_id: str | None) -> None:
-            self._host_id = host_id
-
-        def get_conversation(self, _cid: str) -> Any:
-            return _FakeConversation(id="conv_1", agent_id="ag_1", host_id=self._host_id)
-
-    def _deps_for(host: _FakeHost | None, host_id: str | None) -> FireDeps:
-        hosts = {host.host_id: host} if host is not None else {}
-        return _deps(
-            FakeScheduledTaskStore(rows={}),
-            conversation_store=_ConvStore(host_id),
-            host_store=FakeHostStore(hosts),
-            sandbox_config=_FakeSandboxConfig(),
-        )
-
-    # Sandbox host (sandbox_id set) → torn down.
-    sandbox_host = _FakeHost("h1", "u", sandbox_provider="modal", sandbox_id="sbx_1")
-    await fire_mod._terminate_managed_sandbox_for_session(_deps_for(sandbox_host, "h1"), "conv_1")
-    assert calls == [sandbox_host]
-
-    # Plain connected host (no sandbox_id) → left alone.
-    calls.clear()
-    await fire_mod._terminate_managed_sandbox_for_session(
-        _deps_for(_FakeHost("h2", "u"), "h2"), "conv_1"
-    )
-    assert calls == []
-
-    # Hostless session → no-op.
-    calls.clear()
-    await fire_mod._terminate_managed_sandbox_for_session(_deps_for(None, None), "conv_1")
-    assert calls == []

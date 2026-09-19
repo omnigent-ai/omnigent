@@ -44,7 +44,7 @@ _logger = logging.getLogger(__name__)
 
 # Execution targets a task may run on. ``connected_host`` pins/resolves the
 # owner's own machine; ``managed_sandbox`` provisions a FRESH server-managed
-# sandbox per fire (and tears it down when the run completes).
+# sandbox per fire, using the server's normal sandbox lifecycle.
 _VALID_EXECUTION_TARGETS = frozenset({"connected_host", "managed_sandbox"})
 _MANAGED_SANDBOX_WITH_HOST_MSG = (
     "a managed_sandbox task runs in a fresh sandbox each fire; do not set host_id or workspace"
@@ -302,30 +302,23 @@ def create_scheduled_tasks_router(
                     code=ErrorCode.INVALID_INPUT,
                 )
             return None, validated_model, validated_effort
-        if workspace is None:
-            # No pinned workspace: the fire path defaults it to the launch host's
-            # HOME, so there is nothing to validate against the host boundary
-            # here (a bare host with no workspace is allowed). But a PINNED host
-            # must still be authorized at create — existence + ownership — even
-            # without a workspace, so a non-owned / nonexistent host reference
-            # fails fast with a clean 4xx instead of persisting and only
-            # surfacing as a failed run at fire time. This is a LOCAL store read
-            # (no host.stat / workspace RPC), via the same resolve_host_owner the
-            # workspace-present branch below uses inside
-            # validate_existing_host_workspace — and whose semantics
-            # fire.py:_authorize_pinned_host mirrors — so create-time and
-            # fire-time host authorization cannot drift. When user_id is None
-            # (single-user / auth disabled) resolve_host_owner skips the owner
-            # check, matching the fire path and the rest of the server.
-            if host_id is not None:
-                host_store = getattr(request.app.state, "host_store", None)
-                if host_store is not None:
-                    await asyncio.to_thread(
-                        resolve_host_owner,
-                        user_id=user_id,
-                        host_id=host_id,
-                        host_store=host_store,
+        if host_id is not None:
+            host_store = getattr(request.app.state, "host_store", None)
+            if host_store is not None:
+                host = await asyncio.to_thread(
+                    resolve_host_owner,
+                    user_id=user_id,
+                    host_id=host_id,
+                    host_store=host_store,
+                )
+                if host.sandbox_provider is not None:
+                    raise OmnigentError(
+                        "automations cannot use an existing sandbox; "
+                        "select a new sandbox for each run",
+                        code=ErrorCode.INVALID_INPUT,
                     )
+        if workspace is None:
+            # The fire resolves an omitted workspace to the authorized host's HOME.
             return None, validated_model, validated_effort
         if host_id is None:
             raise OmnigentError(

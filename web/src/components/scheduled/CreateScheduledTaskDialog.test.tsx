@@ -477,7 +477,11 @@ describe("CreateScheduledTaskDialog sandbox mode", () => {
     fireEvent.click(screen.getByTestId("task-host-sandbox-option"));
     // Sandbox mode swaps the helper text to the fresh-sandbox copy (no separate
     // checkbox), and the connected-host workspace picker never appears.
-    expect(screen.getByText(/Provisions a fresh sandbox for each run/i)).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "Provisions a fresh sandbox for each run. Shutdown follows the server’s sandbox configuration.",
+      ),
+    ).toBeInTheDocument();
     expect(screen.queryByText("pick-workspace")).not.toBeInTheDocument();
   });
 

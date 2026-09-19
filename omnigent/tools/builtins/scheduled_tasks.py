@@ -126,7 +126,7 @@ class SysScheduledTaskCreateTool(Tool):
                                 "Optional PIN of a connected host to run on, from the "
                                 "current workspace's host list. Omit to run on the owner's "
                                 "online host at fire time; a failed run is recorded if none "
-                                "is online."
+                                "is online. Existing managed sandbox hosts cannot be pinned."
                             ),
                         },
                         "execution_target": {
@@ -135,9 +135,9 @@ class SysScheduledTaskCreateTool(Tool):
                             "description": (
                                 "Where each firing runs. 'connected_host' (default) uses a "
                                 "pinned/resolved connected host. 'managed_sandbox' provisions "
-                                "a FRESH server-managed sandbox per firing and tears it down "
-                                "when the run completes — do not set host_id or workspace with "
-                                "it. Requires the server to have managed sandboxes configured."
+                                "a fresh server-managed sandbox per firing, using the server's "
+                                "sandbox lifecycle settings. Do not set host_id or workspace "
+                                "with it. Requires managed sandboxes configured on the server."
                             ),
                         },
                     },

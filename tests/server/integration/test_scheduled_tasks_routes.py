@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -59,7 +60,7 @@ def auth_app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
     from omnigent.stores.host_store import HostStore
 
     artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
-    return create_app(
+    app = create_app(
         agent_store=SqlAlchemyAgentStore(db_uri),
         file_store=SqlAlchemyFileStore(db_uri),
         conversation_store=SqlAlchemyConversationStore(db_uri),
@@ -73,6 +74,9 @@ def auth_app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
         host_store=HostStore(db_uri),
         auth_provider=UnifiedAuthProvider(source="header"),
     )
+    _make_user(db_uri)
+    _register_host(app, "4b653f6031f35d168cc0b37caa1306d1", "alice@example.com")
+    return app
 
 
 def _register_host(app: FastAPI, host_id: str, owner: str) -> None:
@@ -384,9 +388,9 @@ async def test_create_pinned_host_without_workspace_rejects_nonexistent_host(
 ) -> None:
     """A pinned host with NO workspace that references a NONEXISTENT host is
     rejected at create (404) instead of persisting an unvalidated host that only
-    fails at fire time. No host was registered, so the owner check 404s."""
+    fails at fire time."""
     _make_user(db_uri)
-    body = _create_body()
+    body = _create_body(host_id="dead1111beef2222dead3333beef4444")
     del body["workspace"]  # host_id set, no workspace → the fixed authz gap
     resp = await auth_client.post("/v1/scheduled-tasks", json=body, headers=_headers())
     assert resp.status_code == 404, resp.text
@@ -401,8 +405,8 @@ async def test_create_pinned_host_without_workspace_rejects_nonowned_host(
     _make_user(db_uri, email="alice@example.com")
     _make_user(db_uri, email="bob@example.com")
     # The host belongs to bob; alice pins it with no workspace.
-    _register_host(auth_app, "4b653f6031f35d168cc0b37caa1306d1", "bob@example.com")
-    body = _create_body()
+    _register_host(auth_app, "eeee5555ffff6666aaaa7777bbbb8888", "bob@example.com")
+    body = _create_body(host_id="eeee5555ffff6666aaaa7777bbbb8888")
     del body["workspace"]
     resp = await auth_client.post(
         "/v1/scheduled-tasks", json=body, headers=_headers("alice@example.com")
@@ -444,6 +448,95 @@ async def test_patch_add_host_without_workspace_authorizes_owner(
         headers=_headers("alice@example.com"),
     )
     assert denied.status_code == 403, denied.text
+
+
+@pytest.mark.parametrize("method", ["create", "patch"])
+@pytest.mark.parametrize("workspace", [None, "/repo"])
+@pytest.mark.parametrize("detached", [False, True])
+async def test_rejects_existing_sandbox_before_workspace_rpc(
+    auth_app: FastAPI,
+    auth_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    method: str,
+    workspace: str | None,
+    detached: bool,
+) -> None:
+    """Managed host pins are invalid even after their sandbox has been detached."""
+    host = auth_app.state.host_store.register_managed_host(
+        host_id="aaaa1111bbbb2222cccc3333dddd4444",
+        name="existing-sandbox",
+        user_id="alice@example.com",
+        token="test-launch-token",
+        provider="agent_sandbox",
+        sandbox_id="sandbox-existing",
+        token_expires_at=2_000_000_000,
+    )
+    if detached:
+        assert auth_app.state.host_store.detach_stale_managed_sandbox(
+            host.host_id,
+            sandbox_id=host.sandbox_id,
+            expected_updated_at=host.updated_at,
+        )
+    workspace_probe = AsyncMock(side_effect=AssertionError("must reject before host RPC"))
+    monkeypatch.setattr(
+        scheduled_tasks_routes, "validate_existing_host_workspace", workspace_probe
+    )
+
+    if method == "create":
+        response = await auth_client.post(
+            "/v1/scheduled-tasks",
+            json=_create_body(host_id=host.host_id, workspace=workspace),
+            headers=_headers(),
+        )
+    else:
+        created = await auth_client.post(
+            "/v1/scheduled-tasks",
+            json=_create_body(host_id=None, workspace=None),
+            headers=_headers(),
+        )
+        assert created.status_code == 200, created.text
+        response = await auth_client.patch(
+            f"/v1/scheduled-tasks/{created.json()['id']}",
+            json={
+                "host_id": host.host_id,
+                **({"workspace": workspace} if workspace is not None else {}),
+            },
+            headers=_headers(),
+        )
+        unchanged = await auth_client.get(
+            f"/v1/scheduled-tasks/{created.json()['id']}", headers=_headers()
+        )
+        assert unchanged.json()["host_id"] is None
+        assert unchanged.json()["workspace"] is None
+
+    assert response.status_code == 400, response.text
+    assert "select a new sandbox for each run" in response.text
+    workspace_probe.assert_not_awaited()
+
+
+@pytest.mark.parametrize("workspace", [None, "/repo"])
+async def test_existing_sandbox_pin_checks_ownership_first(
+    auth_app: FastAPI,
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    workspace: str | None,
+) -> None:
+    _make_user(db_uri, email="bob@example.com")
+    host = auth_app.state.host_store.register_managed_host(
+        host_id="aaaa1111bbbb2222cccc3333dddd4444",
+        name="bobs-sandbox",
+        user_id="bob@example.com",
+        token="test-launch-token",
+        provider="agent_sandbox",
+        sandbox_id="sandbox-bob",
+        token_expires_at=2_000_000_000,
+    )
+    response = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(host_id=host.host_id, workspace=workspace),
+        headers=_headers(),
+    )
+    assert response.status_code == 403, response.text
 
 
 async def test_create_rejects_unsupported_public_fields(
@@ -1307,9 +1400,6 @@ async def test_publish_status_idle_edge_transitions_scheduled_run_to_succeeded(
         SqlAlchemyConversationStore(db_uri), SqlAlchemyScheduledTaskStore(db_uri)
     )
     try:
-        # The relay publishes "running" as the turn starts, then "idle" at the
-        # terminal (completed) edge. Both are required: completion only fires on
-        # an idle that FOLLOWS a running (a boot idle before the turn is ignored).
         _publish_status(conv_id, "running")
         _publish_status(conv_id, "idle")
         row = _wait_for_run_status(db_uri, task_id, run_id, "succeeded")
@@ -1323,16 +1413,10 @@ async def test_publish_status_idle_edge_transitions_scheduled_run_to_succeeded(
     assert row.error_code is None
 
 
-async def test_publish_status_boot_idle_without_running_does_not_complete_run(
+async def test_publish_status_idle_after_cache_loss_completes_run(
     db_uri: str,
 ) -> None:
-    """A boot ``idle`` (no preceding ``running``) must NOT complete the run.
-
-    A freshly launched native-terminal session can emit a transient idle before
-    the dispatched turn begins; completing on it would (for a managed-sandbox
-    automation) tear the sandbox down mid-turn. The run must stay ``running``.
-    """
-    import time
+    """Run completion still works after a restart loses cached session status."""
     import uuid
 
     from omnigent.server import session_live_state
@@ -1343,32 +1427,24 @@ async def test_publish_status_boot_idle_without_running_does_not_complete_run(
     )
 
     conv_id = uuid.uuid4().hex
-    _seed_running_run_for_conv(db_uri, conv_id)
+    task_id, run_id = _seed_running_run_for_conv(db_uri, conv_id)
     session_live_state.configure(
         SqlAlchemyConversationStore(db_uri), SqlAlchemyScheduledTaskStore(db_uri)
     )
     try:
-        # Idle with no prior running edge — the boot idle. Must be ignored.
+        _session_status_cache.pop(conv_id, None)
         _publish_status(conv_id, "idle")
-        time.sleep(0.5)  # let the ordered write worker drain
-        # Seed + read run at the default workspace (no scope) — same as the seed.
-        run = SqlAlchemyScheduledTaskStore(db_uri).get_running_run_by_conversation(conv_id)
+        run = _wait_for_run_status(db_uri, task_id, run_id, "succeeded")
     finally:
         session_live_state.configure(None)
         _session_status_cache.pop(conv_id, None)
 
-    assert run is not None, "run was completed on a boot idle (should stay running)"
-    assert run.status == "running"
+    assert run is not None
+    assert run.status == "succeeded"
 
 
 async def test_publish_status_idle_after_waiting_completes_run(db_uri: str) -> None:
-    """An idle that follows ``waiting`` (e.g. Stop while parked) completes the run.
-
-    A parent parked on sub-agents/approval publishes ``waiting``; a Stop then
-    disconnects the runner, emitting ``idle`` with no intervening ``running``.
-    That is still a real terminal edge and must settle the run (and, for a
-    managed sandbox, trigger teardown), unlike a pre-turn boot idle.
-    """
+    """An idle that follows ``waiting`` (e.g. Stop while parked) completes the run."""
     import uuid
 
     from omnigent.server import session_live_state

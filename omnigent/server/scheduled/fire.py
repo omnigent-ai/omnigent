@@ -37,8 +37,8 @@ normally".
 
 **Execution target.** Scheduled tasks run on a ``connected_host`` (pin/resolve
 the owner's own machine) or in a ``managed_sandbox`` — a FRESH server-provisioned
-sandbox minted per fire and torn down when the run completes (never reusing an
-existing sandbox). Future execution modes include branch selection,
+sandbox minted per fire, using the normal runner-idle and provider keepalive
+lifecycle. Future execution modes include branch selection,
 replay/backfill, and multi-replica leasing through shared session-create
 orchestration rather than this direct fire path.
 """
@@ -55,7 +55,7 @@ from enum import Enum
 from typing import Any
 
 from omnigent.db.account_authority import account_authority_scope
-from omnigent.db.db_models import current_workspace_id, workspace_scope
+from omnigent.db.db_models import workspace_scope
 from omnigent.entities import Conversation, ScheduledTask
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_LOCAL
@@ -111,7 +111,7 @@ class _FireResult(Enum):
 
 
 class _CannotLaunchScheduledFire(RuntimeError):
-    """A fire cannot start because the connected-host target is not usable."""
+    """A fire cannot start because its execution target is not usable."""
 
     def __init__(self, message: str, *, error_code: str) -> None:
         super().__init__(message)
@@ -381,10 +381,8 @@ async def _run_fire_for_task(
                 error_code="owner_deleted",
             )
             return
-        if task.execution_target == "managed_sandbox":
-            await _fire_managed_sandbox(deps, task, fire_dispatch.managed, scheduled_at)
-            return
-        if task.execution_target != "connected_host":
+        managed = task.execution_target == "managed_sandbox"
+        if not managed and task.execution_target != "connected_host":
             _logger.info(
                 "scheduled fire: task %s target %r is not supported — skipping",
                 task.id,
@@ -402,21 +400,11 @@ async def _run_fire_for_task(
             )
             return
 
-        # Connected-host flow: the seams the body below launches through.
-        dispatch = fire_dispatch.connected
-        preflight = fire_dispatch.connected_preflight
+        dispatch = fire_dispatch.managed if managed else fire_dispatch.connected
+        preflight = None if managed else fire_dispatch.connected_preflight
 
-        # Resolve the effective launch target. An unset ``host_id`` means "you
-        # didn't pin WHICH host", not "run hostless": resolve the owner's live
-        # host at fire time. An unset ``workspace`` (research / summaries /
-        # chat-only) defaults to the host's home directory so the runner still
-        # has a real cwd. If no live host can be resolved, this records a
-        # failed run — the same honest behavior as a pinned host that is offline.
-        #
-        # ``task`` stays the source of truth for the persisted row; ``effective``
-        # carries the resolved host_id / defaulted workspace through preflight,
-        # validation, create, and dispatch WITHOUT writing them back to the row
-        # (the next fire re-resolves the live host).
+        # Resolve this fire's host/workspace without changing the stored task.
+        # A managed launch starts hostless and binds a fresh sandbox afterward.
         try:
             effective = await _resolve_effective_task(deps, task)
         except _CannotLaunchScheduledFire as exc:
@@ -432,7 +420,7 @@ async def _run_fire_for_task(
             )
             return
 
-        input_error = _validate_connected_host_inputs(effective)
+        input_error = None if managed else _validate_connected_host_inputs(effective)
         if input_error is not None:
             error, error_code = input_error
             _logger.warning("scheduled fire: task %s cannot run: %s", task.id, error)
@@ -463,17 +451,8 @@ async def _run_fire_for_task(
                 )
                 return
 
-        # Validate the RESOLVED host/workspace. ``effective.workspace`` is always
-        # an absolute realpath by this point — a caller-supplied path or the
-        # canonicalized default (HOME). Gating on ``effective.workspace`` (not the
-        # stored ``task.workspace``) means the agent's ``os_env.cwd`` boundary is
-        # enforced even for a defaulted workspace, exactly as ``POST /v1/sessions``
-        # does — an agent that pins an absolute cwd outside HOME records a failed
-        # run instead of silently launching outside its declared boundary.
-        # Scheduled tasks have no project field, so there is nothing for the
-        # project-aware create resolver to do here. If tasks ever grow one,
-        # the create below must route through resolve_project_session_create
-        # so ownership/default-fill semantics match POST /v1/sessions.
+        # Check connected-host workspaces, including the resolved HOME default,
+        # against the agent's cwd boundary. A new sandbox has no workspace yet.
         validate_workspace = preflight is not None and effective.workspace is not None
         validation_error = await _validate_fire_session_inputs(
             deps, effective, validate_workspace=validate_workspace
@@ -568,122 +547,13 @@ async def _owner_is_deleted(deps: FireDeps, task: ScheduledTask) -> bool:
     return owner is None or owner.account_generation != task.account_generation
 
 
-async def _fire_managed_sandbox(
-    deps: FireDeps,
-    task: ScheduledTask,
-    dispatch: LaunchDispatch,
-    scheduled_at: int,
-) -> None:
-    """Fire a managed-sandbox task: provision a FRESH sandbox, run, record.
-
-    Unlike the connected-host flow there is no host to resolve and no workspace
-    to validate — the launch (``dispatch``) mints a NEW sandbox host and binds a
-    clean ``$HOME/workspace`` for this one run, so an automation never reuses a
-    sandbox the owner already has. The sandbox is torn down when the run's turn
-    reaches a terminal edge (the scheduled-run completion hook wired in
-    ``app.py`` — "shut down immediately").
-    """
-    if deps.sandbox_config is None or not getattr(
-        deps.sandbox_config, "managed_launch_supported", False
-    ):
-        _logger.warning(
-            "scheduled fire: task %s wants a managed sandbox but none is configured", task.id
-        )
-        await _record_run(
-            deps,
-            task,
-            None,
-            scheduled_at,
-            status="failed",
-            error="managed sandboxes are not configured on this server",
-            error_code="managed_sandbox_unavailable",
-        )
-        return
-
-    # Validate agent/model/permission_mode; there is no host/workspace to check.
-    validation_error = await _validate_fire_session_inputs(deps, task, validate_workspace=False)
-    if validation_error is not None:
-        error, error_code = validation_error
-        _logger.warning("scheduled fire: task %s failed validation: %s", task.id, error)
-        await _record_run(
-            deps, task, None, scheduled_at, status="failed", error=error, error_code=error_code
-        )
-        return
-
-    try:
-        conv = await _create_session(deps, task)
-    except Exception:
-        _logger.exception("scheduled fire: failed to create session for task %s", task.id)
-        await _record_run(
-            deps,
-            task,
-            None,
-            scheduled_at,
-            status="failed",
-            error="session creation failed",
-            error_code="session_create_failed",
-        )
-        return
-
-    await _attach_cost_budget(deps, task, conv.id)
-
-    try:
-        await _grant_owner(deps, task, conv.id)
-    except Exception:
-        _logger.exception(
-            "scheduled fire: owner grant failed for task %s (session %s)", task.id, conv.id
-        )
-        await _record_run(
-            deps,
-            task,
-            conv.id,
-            scheduled_at,
-            status="failed",
-            error="owner grant failed",
-            error_code="owner_grant_failed",
-        )
-        return
-
-    # Record the run as ``running`` BEFORE dispatch. The dispatched turn can reach
-    # a terminal edge (an immediate setup failure, or a fast finish) before a
-    # post-dispatch record would commit; recording first guarantees the completion
-    # hook finds a running row to settle — and, for a managed sandbox, to trigger
-    # teardown — instead of stranding the run (and leaking the sandbox).
-    run_id = await _record_run(deps, task, conv.id, scheduled_at, status="running")
-
-    try:
-        await dispatch(conv, task)
-    except Exception:
-        # Transition the already-recorded run to failed (not a second row), and
-        # tear down any sandbox the launch provisioned before failing (e.g. the
-        # runner never connected) — the completion hook won't fire for a run that
-        # never really ran, so clean up here rather than leaking to idle-reap.
-        _logger.exception(
-            "scheduled fire: managed-sandbox launch/dispatch failed for task %s (session %s)",
-            task.id,
-            conv.id,
-        )
-        await _update_run_terminal(
-            deps,
-            run_id,
-            status="failed",
-            error="managed sandbox launch/dispatch failed",
-            error_code="launch_failed",
-        )
-        await _terminate_managed_sandbox_for_session(deps, conv.id)
-        return
-
-    # Success: the run stays ``running`` until the turn's terminal edge flips it
-    # via the completion hook (which also tears the sandbox down).
-    _logger.info("scheduled fire: task %s fired managed-sandbox session %s", task.id, conv.id)
-
-
 async def _resolve_effective_task(deps: FireDeps, task: ScheduledTask) -> ScheduledTask:
     """Resolve the host/workspace the fire actually launches against.
 
-    A task may omit ``host_id`` (run on the owner's live host, whichever it is)
-    and/or ``workspace`` (a task that does no code work — e.g. an MCP-only task).
-    This returns a copy of *task* with those holes filled for this one fire:
+    A managed-sandbox task starts hostless, even if a legacy row has a stale
+    host/workspace. The regular managed launch binds a fresh sandbox afterward.
+
+    For connected-host tasks, this fills omitted values for this one fire:
 
     * ``host_id`` unset → the owner's most-recently-active ONLINE host. No live
       host (or no host store/registry) raises :class:`_CannotLaunchScheduledFire`
@@ -697,6 +567,14 @@ async def _resolve_effective_task(deps: FireDeps, task: ScheduledTask) -> Schedu
     enforced by the existing preflight, not here. The resolved values are never
     written back to the stored row; the next fire re-resolves the live host.
     """
+    if task.execution_target == "managed_sandbox":
+        if deps.sandbox_config is None or not deps.sandbox_config.managed_launch_supported:
+            raise _CannotLaunchScheduledFire(
+                "managed sandboxes are not configured on this server",
+                error_code="managed_sandbox_unavailable",
+            )
+        return replace(task, host_id=None, workspace=None)
+
     host_id = task.host_id
     if host_id is None:
         host_id = await _resolve_owner_host(deps, task)
@@ -928,19 +806,12 @@ async def _presentation_labels(deps: FireDeps, task: ScheduledTask) -> dict[str,
 
 async def _create_session(deps: FireDeps, task: ScheduledTask) -> Conversation:
     """Create a conversation bound to the task's agent, carrying the stored spec."""
-    # A managed-sandbox task creates the session HOSTLESS: the launch provisions
-    # a fresh sandbox and binds host + ``$HOME/workspace`` afterward. Force
-    # host_id/workspace null even if a stale row still carries them (e.g. a task
-    # switched from connected_host), so a dead pinned host can never be bound.
-    managed = task.execution_target == "managed_sandbox"
-    host_id = None if managed else task.host_id
-    workspace = None if managed else task.workspace
     conv: Conversation = await asyncio.to_thread(
         deps.conversation_store.create_conversation,
         agent_id=task.agent_id,
         title=task.name,
-        host_id=host_id,
-        workspace=workspace,
+        host_id=task.host_id,
+        workspace=task.workspace,
         terminal_launch_args=await _permission_mode_launch_args(deps, task),
     )
     reasoning_effort = task.reasoning_effort
@@ -1027,14 +898,9 @@ async def _record_run(
     status: str,
     error: str | None = None,
     error_code: str | None = None,
-) -> str:
-    """Stamp last_run_* on the task and write a scheduled_task_runs row.
-
-    :returns: The new run's id, so a caller that records ``running`` before
-        dispatch can transition that same row on failure (see
-        :func:`_update_run_terminal`).
-    """
-    return await asyncio.to_thread(
+) -> None:
+    """Stamp last_run_* on the task and write a scheduled_task_runs row."""
+    await asyncio.to_thread(
         _record_run_sync,
         deps,
         task,
@@ -1055,46 +921,20 @@ def _record_run_sync(
     *,
     error: str | None = None,
     error_code: str | None = None,
-) -> str:
+) -> None:
     """Synchronous run recording body for ``asyncio.to_thread`` callers."""
     now = int(time.time())
-    run_id = _new_id()
     update_fields: dict[str, Any] = {"last_run_at": now}
     if conversation_id is not None:
         update_fields["last_run_conversation_id"] = conversation_id
     deps.scheduled_task_store.update(task.id, **update_fields)
     deps.scheduled_task_store.create_run(
-        run_id,
+        _new_id(),
         task.id,
         status,
         scheduled_at,
         conversation_id=conversation_id,
         fired_at=now,
-        error=error,
-        error_code=error_code,
-    )
-    return run_id
-
-
-async def _update_run_terminal(
-    deps: FireDeps,
-    run_id: str,
-    *,
-    status: str,
-    error: str | None = None,
-    error_code: str | None = None,
-) -> None:
-    """Transition an already-recorded run to a terminal state (conditional).
-
-    The store's ``update_run`` is conditional on ``WHERE status = running``, so
-    if the completion hook already settled the run (a terminal edge that raced
-    the dispatch failure) this is a harmless no-op.
-    """
-    await asyncio.to_thread(
-        deps.scheduled_task_store.update_run,
-        run_id,
-        status=status,
-        finished_at=int(time.time()),
         error=error,
         error_code=error_code,
     )
@@ -1189,6 +1029,11 @@ async def _authorize_pinned_host(deps: FireDeps, task: ScheduledTask, host_id: s
         raise _CannotLaunchScheduledFire(
             f"connected host {host_id!r} belongs to a different account registration",
             error_code="host_authority_revoked",
+        )
+    if host.sandbox_provider is not None:
+        raise _CannotLaunchScheduledFire(
+            "automations cannot use an existing sandbox; select a new sandbox for each run",
+            error_code="existing_sandbox_not_allowed",
         )
 
 
@@ -1378,59 +1223,3 @@ def _make_managed_sandbox_dispatch(deps: FireDeps) -> LaunchDispatch:
         )
 
     return _dispatch
-
-
-async def _terminate_managed_sandbox_for_session(deps: FireDeps, conversation_id: str) -> None:
-    """Terminate the managed sandbox host bound to a session (best-effort).
-
-    Looks up the session's bound host and, if it is a server-provisioned sandbox
-    (``sandbox_id`` set), tears it down — provider sandbox + host row + token.
-    A no-op when nothing is bound or the host is not a sandbox, so it is safe on
-    the connected-host path and in tests. Must run inside the session's
-    ``workspace_scope`` (the caller provides it).
-    """
-    from omnigent.server.managed_hosts import terminate_managed_host
-
-    if deps.host_store is None:
-        return
-    conv = await asyncio.to_thread(deps.conversation_store.get_conversation, conversation_id)
-    if conv is None or conv.host_id is None:
-        return
-    host = await asyncio.to_thread(deps.host_store.get_host, conv.host_id)
-    if host is None or getattr(host, "sandbox_id", None) is None:
-        return
-    try:
-        await terminate_managed_host(host, deps.host_store, deps.sandbox_config)
-        _logger.info("scheduled fire: tore down managed sandbox for session %s", conversation_id)
-    except Exception:  # noqa: BLE001
-        _logger.warning(
-            "scheduled fire: managed sandbox teardown failed for session %s",
-            conversation_id,
-            exc_info=True,
-        )
-
-
-def build_managed_sandbox_teardown_hook(
-    loop: asyncio.AbstractEventLoop,
-    deps: FireDeps,
-) -> Callable[[str], None]:
-    """Build the run-terminal callback that tears a managed sandbox down.
-
-    Wired into :func:`session_live_state.set_managed_sandbox_run_terminal_hook`,
-    which invokes it (on the live-state write worker, inside the run's
-    ``workspace_scope``) ONLY for a ``managed_sandbox`` run that just reached
-    terminal. It captures the worker's workspace and schedules the async
-    teardown onto the server ``loop``; the provider idle-reap remains the
-    backstop if this is ever missed.
-    """
-
-    def _on_terminal(conversation_id: str) -> None:
-        workspace_id = current_workspace_id()
-
-        async def _run() -> None:
-            with workspace_scope(workspace_id):
-                await _terminate_managed_sandbox_for_session(deps, conversation_id)
-
-        asyncio.run_coroutine_threadsafe(_run(), loop)
-
-    return _on_terminal

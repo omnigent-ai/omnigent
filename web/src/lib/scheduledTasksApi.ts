@@ -17,7 +17,7 @@ export type ScheduledTaskState = "active" | "paused";
 /**
  * Where each firing runs. `connected_host` pins/resolves the owner's own
  * machine; `managed_sandbox` provisions a FRESH server-managed sandbox per
- * firing (no host/workspace) and tears it down when the run completes.
+ * firing (no host/workspace), using the server's normal sandbox lifecycle.
  */
 export type ScheduledTaskExecutionTarget = "connected_host" | "managed_sandbox";
 

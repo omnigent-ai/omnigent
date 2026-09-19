@@ -141,6 +141,19 @@ The server resolves the provider through the registry and calls
 `prepare()` → `provision()` → `start_host()` → wait for online registration.
 Each managed sandbox authenticates back with a server-minted per-launch token.
 
+Sandbox automations use this same launch path and create a fresh sandbox for
+each run. Existing managed sandbox hosts cannot be pinned as automation targets.
+Their lifecycle follows the server's sandbox configuration, just like ordinary
+chats: automations do not override timeouts or terminate a sandbox when a run
+finishes. Server owners must choose provider lifetime, idle, and cleanup settings
+appropriate for their automation frequency and resource budget.
+
+For `agent_sandbox`, `sandbox.keep_warm_s` controls the runner idle timeout;
+the existing keepalive renews the sandbox deadline while the runner is alive.
+Once renewal stops, expiry suspends compute while retaining storage. Other
+providers have different lifetime behavior, so enabling managed sandboxes alone
+does not guarantee a short shutdown time.
+
 `sandbox.reaper` is deployment-wide: configure it next to `provider` or
 `providers`, never inside one provider entry. One configurable loop covers every
 configured provider and dispatches termination through the provider recorded on

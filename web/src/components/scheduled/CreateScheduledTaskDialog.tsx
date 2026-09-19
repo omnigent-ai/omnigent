@@ -582,7 +582,7 @@ export function CreateScheduledTaskDialog({
             </Select>
             <p className="text-sm text-muted-foreground">
               {sandboxMode
-                ? "Provisions a fresh sandbox for each run and shuts it down when the run finishes."
+                ? "Provisions a fresh sandbox for each run. Shutdown follows the server’s sandbox configuration."
                 : "Leave unset to run on your connected host when the task fires."}
             </p>
           </div>
