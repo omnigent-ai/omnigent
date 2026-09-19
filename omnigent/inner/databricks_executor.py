@@ -22,14 +22,17 @@ import os
 import shlex
 import shutil
 import subprocess
+import threading
 import time
-from collections.abc import AsyncIterator, Generator
+from collections.abc import AsyncIterator, Callable, Generator
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol, TypeAlias
+from urllib.parse import SplitResult, urlsplit
 
 import httpx
 
 from omnigent.models import model_catalog
+from omnigent.util.threaded_auth import ThreadedAuth
 
 if TYPE_CHECKING:
     import configparser
@@ -558,7 +561,7 @@ def _databricks_cli_token_expires_at(
     return base + _CLI_TOKEN_DEFAULT_TTL_SECONDS
 
 
-class _DatabricksBearerAuth(httpx.Auth):
+class _DatabricksBearerAuth(ThreadedAuth):
     """httpx Auth that calls ``Config.authenticate()`` on every HTTP request.
 
     Unlike the snapshot approach (read a token once, set ``api_key``),
@@ -596,6 +599,8 @@ class _DatabricksBearerAuth(httpx.Auth):
 
     @property
     def profile_name(self) -> str | None:
+        if isinstance(self._config, _DeferredHostAuthConfig):
+            return self._config.profile_name
         return self._profile_name
 
     def _authenticate_headers(self) -> dict[str, str]:
@@ -661,10 +666,11 @@ def _resolve_databricks_auth(
     profile: str | None = None,
     *,
     host: str | None = None,
+    defer_auth: bool = False,
 ) -> tuple[_DatabricksBearerAuth, str]:
     """Resolve Databricks credentials and return per-request auth + host.
 
-    Validates that authentication succeeds at call time. On success,
+    By default, validates that authentication succeeds at call time. On success,
     returns an httpx Auth that re-authenticates on every HTTP request
     (surviving OAuth access-token expiry transparently) and the
     workspace host URL.
@@ -680,6 +686,13 @@ def _resolve_databricks_auth(
         profile/env fallback is NOT attempted in this mode — the
         record asked for a specific workspace, so a credential miss
         fails loud.
+    :param defer_auth: Opt in to configuration-only resolution for callers
+        composing a separate credential provider ahead of SDK authentication.
+        Token initialization then occurs on first use, with the destination
+        bound to the resolved host. The default remains eager for inference
+        callers that rely on resolution-time failures for provider fallback.
+        Deferred resolution requires valid SDK configuration and does not
+        attempt the legacy credential-reading fallback.
     :returns: ``(auth, host)`` — an httpx Auth for injection into
         ``httpx.Client``/``httpx.AsyncClient`` and the workspace URL,
         e.g. ``"https://example.cloud.databricks.com"``.
@@ -700,14 +713,24 @@ def _resolve_databricks_auth(
     if host is not None:
         if profile is not None:
             raise ValueError("_resolve_databricks_auth takes profile or host, not both")
+        if defer_auth:
+            host_failure = (
+                f"Databricks authentication failed for workspace {host}. "
+                f"Run: databricks auth login --host {host}"
+            )
+            return _DatabricksBearerAuth(
+                _DeferredHostAuthConfig(host), failure_message=host_failure
+            ), host
         return _resolve_databricks_auth_for_host(host)
 
     sdk_profile = profile or os.environ.get("DATABRICKS_CONFIG_PROFILE")
     cfg = None
+    config_factory = _lazy_sdk_config if defer_auth else Config
 
     try:
-        cfg = Config(profile=sdk_profile)
-        cfg.authenticate()
+        cfg = config_factory(profile=sdk_profile)
+        if not defer_auth:
+            cfg.authenticate()
     except ValueError:
         if profile is None and sdk_profile is not None:
             # Profile name came from the DATABRICKS_CONFIG_PROFILE env var,
@@ -726,8 +749,9 @@ def _resolve_databricks_auth(
                 sdk_profile,
             )
             try:
-                cfg = Config()
-                cfg.authenticate()
+                cfg = config_factory()
+                if not defer_auth:
+                    cfg.authenticate()
             except ValueError:
                 cfg = None
         else:
@@ -745,7 +769,7 @@ def _resolve_databricks_auth(
     # SDK-based resolution failed (simple PAT profile, missing auth_type,
     # etc.). Fall back to reading ~/.databrickscfg directly — static PATs
     # don't need per-request refresh.
-    creds = _read_databrickscfg(profile)
+    creds = None if defer_auth else _read_databrickscfg(profile)
     if creds is not None:
         static_cfg = type(
             "_StaticAuth",
@@ -763,7 +787,89 @@ def _resolve_databricks_auth(
     )
 
 
-def _sdk_config(**kwargs: str) -> Any:  # type: ignore[explicit-any]  # SDK Config, imported lazily
+def _normalized_databricks_host(host: str) -> SplitResult:
+    """Normalize workspace URL spelling while preserving destination components."""
+    host = host.strip()
+    parsed = urlsplit(host if "://" in host else f"https://{host}")
+    hostname = parsed.hostname or ""
+    if ":" in hostname:
+        hostname = f"[{hostname}]"
+    port = parsed.port
+    if port is not None and port != {"http": 80, "https": 443}.get(parsed.scheme):
+        hostname = f"{hostname}:{port}"
+    userinfo, separator, _authority = parsed.netloc.rpartition("@")
+    return parsed._replace(netloc=f"{userinfo}{separator}{hostname}", path=parsed.path or "/")
+
+
+class _DeferredHostAuthConfig:
+    """Defer host-specific credential selection without losing the winning profile."""
+
+    def __init__(self, host: str) -> None:
+        self._host = host
+        self._auth: _DatabricksBearerAuth | None = None
+        self._lock = threading.Lock()
+
+    @property
+    def profile_name(self) -> str | None:
+        return self._auth.profile_name if self._auth is not None else None
+
+    def authenticate(self) -> dict[str, str]:
+        with self._lock:
+            if self._auth is None:
+                auth, resolved_host = _resolve_databricks_auth_for_host(
+                    self._host, strict_host_match=True
+                )
+                if _normalized_databricks_host(resolved_host) != _normalized_databricks_host(
+                    self._host
+                ):
+                    raise DatabricksAuthError(
+                        "Databricks workspace changed before authentication; "
+                        "resolve credentials again."
+                    )
+                self._auth = auth
+            return self._auth._authenticate_headers()
+
+
+def _lazy_sdk_config(**kwargs: str | None) -> Any:  # type: ignore[explicit-any]  # SDK Config, imported lazily
+    """Resolve SDK settings now and initialize destination-bound credentials on demand.
+
+    A custom strategy prevents Config construction from eagerly refreshing
+    CLI credentials. First use constructs the real Config under a lock and
+    rejects a changed workspace before returning any authorization headers.
+    Failed initialization is retried on the next call.
+    """
+    from databricks.sdk.config import Config
+    from databricks.sdk.credentials_provider import credentials_strategy
+
+    legacy_config: Config | None = None
+    lock = threading.Lock()
+
+    def authenticate() -> dict[str, str]:
+        nonlocal legacy_config
+        with lock:
+            if legacy_config is None:
+                candidate = _sdk_config(**kwargs)
+                if _normalized_databricks_host(candidate.host) != _normalized_databricks_host(
+                    metadata_config.host
+                ):
+                    raise DatabricksAuthError(
+                        "Databricks workspace changed before authentication; "
+                        "resolve credentials again."
+                    )
+                headers = candidate.authenticate()
+                legacy_config = candidate
+                return headers
+            return legacy_config.authenticate()
+
+    @credentials_strategy("omnigent-deferred", [])
+    def deferred_auth(_config: Config) -> Callable[[], dict[str, str]]:
+        return authenticate
+
+    metadata_config = Config(credentials_strategy=deferred_auth, **kwargs)  # type: ignore[arg-type]
+    return metadata_config
+
+
+def _sdk_config(**kwargs: str | None) -> Any:  # type: ignore[explicit-any]  # SDK Config, imported lazily
     """Construct a databricks-sdk ``Config`` (test indirection point).
 
     The SDK probes host metadata at construction time, which makes
@@ -782,7 +888,9 @@ def _sdk_config(**kwargs: str) -> Any:  # type: ignore[explicit-any]  # SDK Conf
     return Config(**kwargs)  # type: ignore[arg-type]
 
 
-def _resolve_databricks_auth_for_host(host: str) -> tuple[_DatabricksBearerAuth, str]:
+def _resolve_databricks_auth_for_host(
+    host: str, *, strict_host_match: bool = False
+) -> tuple[_DatabricksBearerAuth, str]:
     """Resolve per-request auth for a specific workspace host.
 
     Prefers a ``~/.databrickscfg`` profile pinned to *host*:
@@ -804,6 +912,8 @@ def _resolve_databricks_auth_for_host(host: str) -> tuple[_DatabricksBearerAuth,
 
     :param host: Workspace host, e.g.
         ``"https://example.databricks.com"``.
+    :param strict_host_match: Restrict candidate profiles to the same canonical
+        destination required by deferred authentication.
     :returns: ``(auth, host)`` — an httpx Auth and the workspace URL.
     :raises DatabricksAuthError: When no credential source resolves
         for the host.
@@ -814,7 +924,9 @@ def _resolve_databricks_auth_for_host(host: str) -> tuple[_DatabricksBearerAuth,
     )
     # One parse of ~/.databrickscfg yields both the host-matching profiles and
     # which of them are service principals; ordering then works off those sets.
-    matches, sp_sections = _databrickscfg_host_matches_and_sp_sections(host)
+    matches, sp_sections = _databrickscfg_host_matches_and_sp_sections(
+        host, strict_host_match=strict_host_match
+    )
     # User profiles that matched the host but failed to authenticate (e.g. an
     # expired OAuth grant). Tracked so we can warn if a lower-priority service
     # principal is then selected — otherwise the host would silently register
@@ -932,7 +1044,9 @@ def _section_is_service_principal(options: configparser.SectionProxy) -> bool:
     return auth_type in machine_auth_types or has_client_secret_pair
 
 
-def _databrickscfg_host_matches_and_sp_sections(host: str) -> tuple[list[str], set[str]]:
+def _databrickscfg_host_matches_and_sp_sections(
+    host: str, *, strict_host_match: bool = False
+) -> tuple[list[str], set[str]]:
     """Host-matching profiles and which of them are service principals.
 
     Parses ``~/.databrickscfg`` once and derives both, so the resolver
@@ -943,6 +1057,8 @@ def _databrickscfg_host_matches_and_sp_sections(host: str) -> tuple[list[str], s
 
     :param host: Workspace host to match, e.g.
         ``"https://example.databricks.com"``.
+    :param strict_host_match: Preserve destination-significant URL components
+        instead of using the legacy scheme-insensitive comparison.
     :returns: ``(matches, sp_sections)`` — matching section names in file
         order (``"DEFAULT"`` included when it carries a matching host) and
         the subset of *all* section names that are service principals.
@@ -956,7 +1072,15 @@ def _databrickscfg_host_matches_and_sp_sections(host: str) -> tuple[list[str], s
     config = _read_databrickscfg_no_inheritance()
     if config is None:
         return [], set()
-    wanted = _norm(host)
+    wanted = _normalized_databricks_host(host) if strict_host_match else _norm(host)
+
+    def _matches_host(value: str) -> bool:
+        try:
+            candidate = _normalized_databricks_host(value) if strict_host_match else _norm(value)
+        except ValueError:
+            return False
+        return candidate == wanted
+
     # With the sentinel default_section, the file's [DEFAULT] is a plain
     # section named "DEFAULT"; its host is what named sections inherit.
     default_host = config["DEFAULT"].get("host", "") if config.has_section("DEFAULT") else ""
@@ -975,9 +1099,9 @@ def _databrickscfg_host_matches_and_sp_sections(host: str) -> tuple[list[str], s
         # overrides inheritance to no host, matching ConfigParser semantics —
         # so an empty host does not fall back and does not match.
         section_host = options.get("host", default_host)
-        if _norm(section_host) == wanted:
+        if _matches_host(section_host):
             matches.append(section)
-    if default_host and _norm(default_host) == wanted:
+    if default_host and _matches_host(default_host):
         matches.append("DEFAULT")
     return matches, sp_sections
 

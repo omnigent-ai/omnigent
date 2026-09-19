@@ -1902,6 +1902,26 @@ def test_get_openai_client_invalid_profile_raises_auth_error(monkeypatch):
         _get_openai_async_client(profile="dogfood")
 
 
+def test_get_openai_client_token_failure_preserves_env_fallback(monkeypatch, caplog):
+    from omnigent.inner.openai_agents_sdk_executor import _get_openai_async_client
+
+    class BrokenCredentials:
+        host = "https://workspace.example.com"
+
+        def authenticate(self):
+            raise RuntimeError("synthetic credential initialization failure")
+
+    monkeypatch.setattr(_sdk_config_mod, "Config", lambda **_kwargs: BrokenCredentials())
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://gateway.example.com/v1")
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic-key")
+
+    client = _get_openai_async_client(profile="example-profile")
+
+    assert client.base_url.host == "gateway.example.com"
+    assert client.api_key == "synthetic-key"
+    assert "falling back" in caplog.text
+
+
 def test_get_openai_client_invalid_profile_with_env_fallback_warns(monkeypatch, caplog):
     """Profile auth failure with OPENAI_BASE_URL available warns and falls through.
 
