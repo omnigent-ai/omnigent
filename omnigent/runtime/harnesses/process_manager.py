@@ -53,6 +53,7 @@ from omnigent.runtime.harnesses.paths import (
     HARNESS_TMP_PARENT_ENV_VAR,
     harness_tmp_parent,
 )
+from omnigent.util.socket_teardown_guard import install_socket_teardown_guard
 
 _logger = logging.getLogger(__name__)
 
@@ -409,6 +410,7 @@ class _HarnessEndpoint:
     def make_transport(self) -> httpx.AsyncBaseTransport:
         """An httpx transport routed at this endpoint."""
         if self.socket_path is not None:
+            install_socket_teardown_guard()
             return httpx.AsyncHTTPTransport(uds=str(self.socket_path))
         return httpx.AsyncHTTPTransport()
 
