@@ -1299,6 +1299,18 @@ class SessionEventInput(BaseModel):
         return data
 
 
+class SessionStopResponse(BaseModel):
+    """Acknowledgement for a non-destructive session stop request.
+
+    :param session_id: Session whose live execution was stopped.
+    :param stopped: ``True`` when the request has been accepted. Repeating
+        the request for a session with no live runner is also successful.
+    """
+
+    session_id: str
+    stopped: Literal[True] = True
+
+
 class SessionGitOptions(BaseModel):
     """
     Git worktree options for ``POST /v1/sessions``.
