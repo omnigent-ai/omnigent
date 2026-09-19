@@ -772,6 +772,55 @@ describe("BlockRenderer dispatch", () => {
       expect(screen.getByText("Relayed.")).toBeDefined();
     });
 
+    const terminal = (terminalKind: "input" | "output", value: string, id: string): RenderItem => ({
+      kind: "terminal_command",
+      itemId: id,
+      terminalKind,
+      input: terminalKind === "input" ? value : null,
+      stdout: terminalKind === "output" ? value : null,
+      stderr: terminalKind === "output" ? "" : null,
+    });
+
+    it("keeps user shell-exec cards visible outside the fold", () => {
+      // A `!` exec's terminal cards mirror the user's own action and its
+      // output — folding them behind the Worked row hides what the user
+      // just ran (the corrupted-timeline shape after a composer bang).
+      const items: RenderItem[] = [
+        { kind: "text", itemId: "m0", text: "Looking around.", final: true },
+        terminal("input", "echo probe", "tc_in"),
+        terminal("output", "probe", "tc_out"),
+        { kind: "text", itemId: "m1", text: "The output says probe.", final: true },
+      ];
+      render(
+        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+          <BlockRenderer items={items} sessionStatus="idle" />
+        </FileViewerContext.Provider>,
+      );
+      expect(screen.getByTestId("turn-worked-fold")).toBeDefined();
+      expect(screen.queryByText("Looking around.")).toBeNull();
+      expect(screen.getAllByTestId("terminal-command-card")).toHaveLength(2);
+      expect(screen.getByText("echo probe")).toBeDefined();
+      expect(screen.getByText("The output says probe.")).toBeDefined();
+    });
+
+    it("renders a bang-exec turn (cards + reply) with no fold at all", () => {
+      // The whole turn is the user's exec plus the model's reply — there
+      // is no process trace left to demarcate, so no Worked row appears.
+      const items: RenderItem[] = [
+        terminal("input", "echo probe", "tc_in"),
+        terminal("output", "probe", "tc_out"),
+        { kind: "text", itemId: "m1", text: "Ran it.", final: true },
+      ];
+      render(
+        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+          <BlockRenderer items={items} sessionStatus="idle" />
+        </FileViewerContext.Provider>,
+      );
+      expect(screen.queryByTestId("turn-worked-fold")).toBeNull();
+      expect(screen.getAllByTestId("terminal-command-card")).toHaveLength(2);
+      expect(screen.getByText("Ran it.")).toBeDefined();
+    });
+
     const elicitation = (
       status: "pending" | "responded",
       response: { action: "accept" } | null,

@@ -2656,9 +2656,11 @@ def test_read_transcript_items_since_surfaces_bash_input_as_terminal_command(
 ) -> None:
     """
     A ``role=user`` record starting with ``<bash-input>`` is emitted by
-    Claude Code when the user types ``!cmd``. It must surface as a
-    ``terminal_command`` item with ``kind="input"`` instead of being
-    dropped or rendered as raw markup.
+    Claude Code when the user types ``!cmd``. It must surface as a user
+    message echoing the ``!`` send (the record is the only transcript
+    trace of it — without the echo the feed has no turn boundary and no
+    persisted message for the composer's optimistic bubble) followed by
+    a ``terminal_command`` item with ``kind="input"``.
     """
     transcript_path = tmp_path / "session.jsonl"
     transcript_path.write_text(
@@ -2677,11 +2679,14 @@ def test_read_transcript_items_since_surfaces_bash_input_as_terminal_command(
         transcript_path, 0, agent_name="claude-native-ui"
     )
 
-    assert len(items) == 1
-    assert items[0].item_type == "terminal_command"
-    assert items[0].data == {"kind": "input", "input": "pwd"}
-    assert isinstance(items[0].response_id, str)
-    assert items[0].response_id.startswith("resp_claude_")
+    assert [item.item_type for item in items] == ["message", "terminal_command"]
+    assert items[0].data == {
+        "role": "user",
+        "content": [{"type": "input_text", "text": "!pwd"}],
+    }
+    assert items[1].data == {"kind": "input", "input": "pwd"}
+    assert items[0].response_id == items[1].response_id
+    assert items[1].response_id.startswith("resp_claude_")
 
 
 def test_read_transcript_items_since_surfaces_bash_output_as_terminal_command(
@@ -2763,12 +2768,17 @@ def test_read_transcript_items_since_surfaces_top_level_local_command(
         transcript_path, 0, agent_name="claude-native-ui"
     )
 
-    assert [item.item_type for item in items] == ["terminal_command", "terminal_command"]
+    assert [item.item_type for item in items] == [
+        "message",
+        "terminal_command",
+        "terminal_command",
+    ]
     assert [item.data for item in items] == [
+        {"role": "user", "content": [{"type": "input_text", "text": "!pwd"}]},
         {"kind": "input", "input": "pwd"},
         {"kind": "output", "stdout": "/home/user", "stderr": ""},
     ]
-    assert items[0].response_id == items[1].response_id
+    assert items[0].response_id == items[1].response_id == items[2].response_id
     assert items[0].response_id.startswith("resp_claude_")
 
 
@@ -2800,12 +2810,116 @@ def test_read_transcript_items_since_surfaces_combined_shell_record(
         transcript_path, 0, agent_name="claude-native-ui"
     )
 
-    assert [item.item_type for item in items] == ["terminal_command", "terminal_command"]
+    assert [item.item_type for item in items] == [
+        "message",
+        "terminal_command",
+        "terminal_command",
+    ]
     assert [item.data for item in items] == [
+        {"role": "user", "content": [{"type": "input_text", "text": "!printf hi"}]},
         {"kind": "input", "input": "printf hi"},
         {"kind": "output", "stdout": "hi", "stderr": None},
     ]
-    assert items[0].response_id == items[1].response_id
+    assert items[0].response_id == items[1].response_id == items[2].response_id
+
+
+def test_read_transcript_items_since_bang_exec_opens_its_own_turn(
+    tmp_path: Path,
+) -> None:
+    """
+    A bang exec after a settled reply mirrors as its own user turn.
+
+    Claude Code persists a web-composer ``! cmd`` only as ``<bash-*>``
+    records and then starts a model turn on the output. The mirrored
+    user echo must carry the composer's exact text (``!`` + the
+    recorded input, leading space included), sit before the terminal
+    cards, and take a response id distinct from the prior reply's — so
+    the web feed keeps the prior reply as its own turn instead of
+    folding it, the exec cards, and the follow-up reply into one
+    bubble.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "user",
+                        "uuid": "user-1",
+                        "message": {"role": "user", "content": "say hi"},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "uuid": "assistant-1",
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "hi"}],
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "user",
+                        "uuid": "bash-in",
+                        "message": {
+                            "role": "user",
+                            "content": "<bash-input> echo probe</bash-input>",
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "user",
+                        "uuid": "bash-out",
+                        "message": {
+                            "role": "user",
+                            "content": (
+                                "<bash-stdout>probe</bash-stdout><bash-stderr></bash-stderr>"
+                            ),
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "uuid": "assistant-2",
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "ran it"}],
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _cursor, _response_id, items = read_transcript_items_since(
+        transcript_path, 0, agent_name="claude-native-ui"
+    )
+
+    assert [item.item_type for item in items] == [
+        "message",
+        "message",
+        "message",
+        "terminal_command",
+        "terminal_command",
+        "message",
+    ]
+    echo = items[2]
+    assert echo.data == {
+        "role": "user",
+        "content": [{"type": "input_text", "text": "! echo probe"}],
+    }
+    prior_reply = items[1]
+    assert echo.response_id != prior_reply.response_id
+    assert echo.response_id == items[3].response_id == items[4].response_id
+    follow_up = items[5]
+    assert follow_up.data["role"] == "assistant"
+    assert follow_up.response_id != prior_reply.response_id
 
 
 def test_read_transcript_items_since_surfaces_skill_when_command_name_is_not_first_tag(

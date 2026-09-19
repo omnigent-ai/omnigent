@@ -473,7 +473,10 @@ function isTrailingWrapup(item: RenderItem): boolean {
  * keep seeing without an extra click: still-PENDING elicitations
  * (normally floated out of the bubble by ChatPage, exempted here
  * defensively so an actionable card can never be hidden), persistent
- * routing/dispatch cards, and (defensively) tools still in progress.
+ * routing/dispatch cards, (defensively) tools still in progress, and
+ * terminal-command cards — those mirror the user's own `!` shell exec
+ * and its output, not the model's work, so folding them hides the
+ * action the user just took.
  * Errors, retries and policy denials DO fold — when the turn still
  * produced an answer they're recovered noise, and a turn that ended
  * on one has no trailing text so it never folds in the first place.
@@ -491,7 +494,12 @@ function partitionTurn(items: RenderItem[]): TurnPartition {
   const exempt: { item: RenderItem; index: number }[] = [];
   for (let i = 0; i < finalStart; i += 1) {
     const item = items[i]!;
-    if (isPendingElicitation(item) || isPersistentToolCard(item) || isInProgressTool(item)) {
+    if (
+      isPendingElicitation(item) ||
+      isPersistentToolCard(item) ||
+      isInProgressTool(item) ||
+      item.kind === "terminal_command"
+    ) {
       exempt.push({ item, index: i });
     } else {
       process.push(item);

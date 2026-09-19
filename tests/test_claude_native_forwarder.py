@@ -1316,11 +1316,11 @@ async def test_forwarder_posts_visible_transcript_items(tmp_path: Path) -> None:
         )
     )
     try:
-        # Collect the seven transcript items. The transcript path publishes no
+        # Collect the eight transcript items. The transcript path publishes no
         # session status at all — Claude's status file owns the badge — which
         # ``test_forwarder_publishes_no_status_for_assistant_output`` asserts
         # directly.
-        requests = [await _get_recorded_item_request(server) for _index in range(7)]
+        requests = [await _get_recorded_item_request(server) for _index in range(8)]
     finally:
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -1329,13 +1329,14 @@ async def test_forwarder_posts_visible_transcript_items(tmp_path: Path) -> None:
         server.server_close()
         thread.join(timeout=5.0)
 
-    assert [request["path"] for request in requests] == ["/v1/sessions/conv_abc/events"] * 7
-    assert [request["body"]["type"] for request in requests] == ["external_conversation_item"] * 7
+    assert [request["path"] for request in requests] == ["/v1/sessions/conv_abc/events"] * 8
+    assert [request["body"]["type"] for request in requests] == ["external_conversation_item"] * 8
     posted = [request["body"]["data"] for request in requests]
     assert [item["item_type"] for item in posted] == [
         "message",
         "function_call",
         "function_call_output",
+        "message",
         "message",
         "message",
         "terminal_command",
@@ -1360,8 +1361,12 @@ async def test_forwarder_posts_visible_transcript_items(tmp_path: Path) -> None:
         "agent": "claude-native-ui",
         "content": [{"type": "output_text", "text": "hello from transcript"}],
     }
-    assert posted[5]["item_data"] == {"kind": "input", "input": "pwd"}
-    assert posted[6]["item_data"] == {
+    assert posted[5]["item_data"] == {
+        "role": "user",
+        "content": [{"type": "input_text", "text": "!pwd"}],
+    }
+    assert posted[6]["item_data"] == {"kind": "input", "input": "pwd"}
+    assert posted[7]["item_data"] == {
         "kind": "output",
         "stdout": "/tmp/project",
         "stderr": "",
@@ -1369,7 +1374,7 @@ async def test_forwarder_posts_visible_transcript_items(tmp_path: Path) -> None:
     assert posted[1]["response_id"] == posted[2]["response_id"]
     assert posted[3]["response_id"] != posted[2]["response_id"]
     assert posted[4]["response_id"] != posted[2]["response_id"]
-    assert posted[5]["response_id"] == posted[6]["response_id"]
+    assert posted[5]["response_id"] == posted[6]["response_id"] == posted[7]["response_id"]
     assert posted[5]["response_id"] != posted[4]["response_id"]
     assert posted[1]["response_id"].startswith("resp_claude_")
 

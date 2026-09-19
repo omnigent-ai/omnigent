@@ -7504,7 +7504,48 @@ def _local_command_transcript_items_from_entry(
     )
     if not items:
         return current_response_id, []
+    echo = _bang_echo_item(content, source_key=source_key, response_id=response_id)
+    if echo is not None:
+        items.insert(0, echo)
     return response_id, items
+
+
+def _bang_echo_item(
+    content: str,
+    *,
+    source_key: str,
+    response_id: str,
+) -> ClaudeTranscriptItem | None:
+    """
+    Build the user-message echo of a shell-mode exec, e.g. ``"! pwd"``.
+
+    The ``<bash-input>`` record is the only transcript trace of the
+    user's ``!`` send: Claude never writes a plain user message for it,
+    and after the exec it starts a model turn on the output. Without a
+    user item between them, the web feed has no turn boundary — the
+    previous reply, the exec cards, and the follow-up reply all merge
+    into one assistant bubble, and a web-composer bang's optimistic
+    bubble has no persisted message to reconcile against (its
+    pending-input entry is drained by this echo's persist).
+
+    :param content: Transcript markup carrying ``<bash-input>``.
+    :param source_key: Base transcript record key used for source ids.
+    :param response_id: The exec's terminal-command group response id.
+    :returns: The echo item, or ``None`` when *content* has no
+        ``<bash-input>`` tag (an output-only record).
+    """
+    input_match = _BASH_INPUT_RE.search(content)
+    if input_match is None:
+        return None
+    return ClaudeTranscriptItem(
+        source_id=_source_id(source_key, 0, "message"),
+        item_type="message",
+        data={
+            "role": "user",
+            "content": [{"type": "input_text", "text": f"!{input_match.group(1)}"}],
+        },
+        response_id=response_id,
+    )
 
 
 def _terminal_command_items_from_content(
@@ -7677,6 +7718,11 @@ def _user_transcript_items_from_entry(
             response_id=terminal_response_id,
         )
         if terminal_items:
+            echo = _bang_echo_item(
+                content, source_key=source_key, response_id=terminal_response_id
+            )
+            if echo is not None:
+                terminal_items.insert(0, echo)
             return terminal_response_id, terminal_items
         # Other CLI-scaffolding records (stdout/stderr from /effort, etc.)
         # arrive as standalone ``role=user`` records and must drop instead
