@@ -442,6 +442,40 @@ _SUBAGENT_LAUNCH_TIMEOUT_S_ENV = "OMNIGENT_SUBAGENT_LAUNCH_TIMEOUT_S"
 _DEFAULT_SUBAGENT_LAUNCH_TIMEOUT_S = 180.0
 # Interval for the background sweep in the runner entrypoint.
 SUBAGENT_LAUNCH_REAP_INTERVAL_S = 30.0
+# Liveness budget for a sub-agent dispatch that DID start: a child that has
+# produced no runner-visible activity at all (no status edge, no published
+# event) for this long is wedged. Without this backstop every harness-drift
+# bug presents as a silent infinite hang with the parent's inbox empty.
+_SUBAGENT_STALL_TIMEOUT_S_ENV = "OMNIGENT_SUBAGENT_STALL_TIMEOUT_S"
+_DEFAULT_SUBAGENT_STALL_TIMEOUT_S = 900.0
+
+
+def _resolve_timeout_env_s(env_var: str, default_s: float) -> float:
+    """
+    Resolve a seconds-valued liveness budget from the environment.
+
+    Values ``<= 0`` disable the corresponding reaper. A non-numeric or
+    non-finite override is rejected with a warning and falls back to
+    *default_s*.
+
+    :param env_var: Environment variable name, e.g.
+        ``"OMNIGENT_SUBAGENT_LAUNCH_TIMEOUT_S"``.
+    :param default_s: Fallback budget in seconds, e.g. ``180.0``.
+    :returns: The budget in seconds, e.g. ``180.0``.
+    """
+    raw = os.environ.get(env_var, "").strip()
+    if not raw:
+        return default_s
+    try:
+        value = float(raw)
+    except ValueError:
+        value = None
+    # Non-finite values (nan/inf) would silently disable reaping without the
+    # explicit ``<= 0`` "disabled" intent — reject them like non-numeric input.
+    if value is None or not math.isfinite(value):
+        _logger.warning("Invalid %s=%r; using default %ss", env_var, raw, default_s)
+        return default_s
+    return value
 
 
 def resolve_subagent_launch_timeout_s() -> float:
@@ -453,24 +487,21 @@ def resolve_subagent_launch_timeout_s() -> float:
 
     :returns: The budget in seconds, e.g. ``180.0``.
     """
-    raw = os.environ.get(_SUBAGENT_LAUNCH_TIMEOUT_S_ENV, "").strip()
-    if not raw:
-        return _DEFAULT_SUBAGENT_LAUNCH_TIMEOUT_S
-    try:
-        value = float(raw)
-    except ValueError:
-        value = None
-    # Non-finite values (nan/inf) would silently disable reaping without the
-    # explicit ``<= 0`` "disabled" intent — reject them like non-numeric input.
-    if value is None or not math.isfinite(value):
-        _logger.warning(
-            "Invalid %s=%r; using default %ss",
-            _SUBAGENT_LAUNCH_TIMEOUT_S_ENV,
-            raw,
-            _DEFAULT_SUBAGENT_LAUNCH_TIMEOUT_S,
-        )
-        return _DEFAULT_SUBAGENT_LAUNCH_TIMEOUT_S
-    return value
+    return _resolve_timeout_env_s(
+        _SUBAGENT_LAUNCH_TIMEOUT_S_ENV, _DEFAULT_SUBAGENT_LAUNCH_TIMEOUT_S
+    )
+
+
+def resolve_subagent_stall_timeout_s() -> float:
+    """
+    Resolve the liveness budget for a started-but-silent sub-agent dispatch.
+
+    Values ``<= 0`` disable the stall sweep. A non-numeric override is
+    rejected with a warning and falls back to the default.
+
+    :returns: The budget in seconds, e.g. ``900.0``.
+    """
+    return _resolve_timeout_env_s(_SUBAGENT_STALL_TIMEOUT_S_ENV, _DEFAULT_SUBAGENT_STALL_TIMEOUT_S)
 
 
 _SUBAGENT_DELIVERY_DELIVERED = "delivered"
@@ -1601,6 +1632,9 @@ class _SubagentWorkEntry:
         terminal status, or ``None`` while running.
     :param delivered: Whether the terminal payload has been pushed to
         the parent's inbox.
+    :param last_activity_at: Unix timestamp of the most recent
+        runner-visible edge for this child (status edge or published
+        event). Seeds to the dispatch time; drives the stall sweep.
     """
 
     parent_session_id: str
@@ -1615,6 +1649,7 @@ class _SubagentWorkEntry:
     created_at: float = dataclasses.field(default_factory=time.time)
     completed_at: float | None = None
     delivered: bool = False
+    last_activity_at: float = dataclasses.field(default_factory=time.time)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1775,6 +1810,21 @@ def get_subagent_work(child_session_id: str) -> _SubagentWorkEntry | None:
     :returns: The work entry, or ``None`` if the child is not tracked.
     """
     return _subagent_work_by_child.get(child_session_id)
+
+
+def note_subagent_activity(child_session_id: str) -> None:
+    """
+    Record that a dispatched sub-agent produced a runner-visible edge.
+
+    Keeps the stall sweep keyed on silence rather than on wall-clock since
+    dispatch, so a healthy long-running child is never reaped.
+
+    :param child_session_id: Child session id, e.g. ``"conv_child456"``.
+    :returns: None.
+    """
+    entry = _subagent_work_by_child.get(child_session_id)
+    if entry is not None:
+        entry.last_activity_at = time.time()
 
 
 def mark_subagent_work_started(child_session_id: str) -> _SubagentWorkEntry | None:
@@ -2266,6 +2316,66 @@ def reap_stalled_subagent_launches(
     return reaped
 
 
+def reap_stalled_subagent_dispatches(
+    *,
+    now: float | None = None,
+    timeout_s: float | None = None,
+    mark_terminal: MarkSubagentTerminalAndWake | None = None,
+) -> list[_SubagentWorkEntry]:
+    """
+    Fail sub-agent dispatches that started and then went silent.
+
+    Complements :func:`reap_stalled_subagent_launches`, which only covers a
+    child wedged before its first edge. Once a child reaches ``running`` /
+    ``waiting`` nothing else bounds its lifetime, so any harness drift that
+    loses the child's terminal edge presents as a silent infinite hang with
+    the parent's inbox empty. This sweep is keyed on the absence of edges,
+    not on wall-clock since dispatch: a child still emitting activity keeps
+    refreshing ``last_activity_at`` and is never reaped.
+
+    :param now: Clock override for tests, e.g. ``time.time()``.
+    :param timeout_s: Budget override for tests; defaults to
+        :func:`resolve_subagent_stall_timeout_s`.
+    :param mark_terminal: Terminal-delivery callback. Production passes the
+        app's ``mark_subagent_terminal_and_wake`` seam so the reaped failure
+        also schedules the parent wake POST. Defaults to the inbox-only
+        :func:`mark_subagent_work_terminal`.
+    :returns: The entries that were failed by this sweep.
+    """
+    budget = resolve_subagent_stall_timeout_s() if timeout_s is None else timeout_s
+    if budget <= 0:
+        return []
+    deliver = mark_subagent_work_terminal if mark_terminal is None else mark_terminal
+    current = time.time() if now is None else now
+    reaped: list[_SubagentWorkEntry] = []
+    for entry in list(_subagent_work_by_child.values()):
+        # ``launching`` belongs to the launch sweep; terminal entries are done.
+        if entry.status not in ("running", "waiting"):
+            continue
+        silent_for = current - entry.last_activity_at
+        if silent_for < budget:
+            continue
+        _logger.warning(
+            "Sub-agent dispatch silent for %.0fs; failing it: parent=%s child=%s status=%s",
+            silent_for,
+            entry.parent_session_id,
+            entry.child_session_id,
+            entry.status,
+        )
+        deliver(
+            entry.child_session_id,
+            status="failed",
+            output=(
+                f"Error: sub-agent {entry.agent!r} title {entry.title!r} produced no "
+                f"activity for {budget:.0f}s while {entry.status!r}; the dispatch is "
+                "wedged and its result will never arrive. Re-dispatch if the work is "
+                "still needed."
+            ),
+        )
+        reaped.append(entry)
+    return reaped
+
+
 async def run_subagent_launch_reaper(
     *,
     interval_s: float = SUBAGENT_LAUNCH_REAP_INTERVAL_S,
@@ -2273,7 +2383,10 @@ async def run_subagent_launch_reaper(
     reconcile_pending: Callable[[], Awaitable[None]] | None = None,
 ) -> None:
     """
-    Periodically sweep for sub-agent dispatches wedged in ``launching``.
+    Periodically sweep for wedged sub-agent dispatches.
+
+    Covers both children stuck in ``launching`` (never started) and started
+    children that have gone silent past the stall budget.
 
     Runs until cancelled; started by the runner entrypoint alongside the
     process manager. Sweep errors are logged and never end the loop.
@@ -2289,6 +2402,7 @@ async def run_subagent_launch_reaper(
         await asyncio.sleep(interval_s)
         try:
             reap_stalled_subagent_launches(mark_terminal=mark_terminal)
+            reap_stalled_subagent_dispatches(mark_terminal=mark_terminal)
             if reconcile_pending is not None:
                 await reconcile_pending()
         except Exception:  # noqa: BLE001 — the sweep is a backstop; never die.
@@ -3254,6 +3368,11 @@ def create_runner_app(
         latest_assistant_text: str | None = None,
         allow_history_preview_fallback: bool = True,
     ) -> None:
+        # Every runner-visible edge for a session funnels through here (via
+        # ``_publish_event`` and the ``external_session_status`` ingest
+        # branch). Stamp dispatched children here so the stall sweep keys on
+        # real silence, before the non-child early return.
+        note_subagent_activity(session_id)
         meta = _child_session_parents.get(session_id)
         if meta is None:
             return

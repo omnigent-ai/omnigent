@@ -2682,7 +2682,16 @@ def test_forwarder_rotation_failure_preserves_old_target(
 
         :returns: Forwarder target after the failed rotation attempt.
         """
-        async with httpx.AsyncClient(base_url="http://127.0.0.1:8000") as client:
+        # The rotation check reads the session snapshot before it touches
+        # the coalescers, to decline rotation for a dispatched sub-agent.
+        # Serve a plain top-level snapshot so rotation proceeds to the
+        # (patched, failing) replacement call this test is about.
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000",
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(200, json={"id": "conv_old", "labels": {}})
+            ),
+        ) as client:
             target = codex_native_forwarder._ForwarderTarget(
                 session_id="conv_old",
                 thread_id="thread_old",
@@ -12345,3 +12354,213 @@ def test_codex_discover_thread_login_required_clears_error_on_thread_start(
     state = read_bridge_state(bridge_dir)
     assert state is not None
     assert state.thread_id == "thread_after_signin"
+
+
+def _subagent_session_handler(
+    posted: list[tuple[str, dict[str, Any]]],
+    *,
+    subagent_session_id: str,
+) -> Callable[[httpx.Request], httpx.Response]:
+    """
+    Build an Omnigent handler whose session snapshot is a dispatched sub-agent.
+
+    ``GET /v1/sessions/{id}`` answers with the ``parent_session_id`` /
+    ``sub_agent_name`` markers the runner stamps on a ``sys_session_send``
+    child. Every other request is captured and acknowledged.
+
+    :param posted: Mutable list collecting captured POST paths and bodies.
+    :param subagent_session_id: Session id that should read as a sub-agent.
+    :returns: Request handler for ``httpx.MockTransport``.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """
+        Answer session snapshots and capture writes.
+
+        :param request: Incoming HTTP request.
+        :returns: Mock Omnigent response.
+        """
+        if request.method == "GET":
+            session_id = request.url.path.removeprefix("/v1/sessions/")
+            snapshot: dict[str, Any] = {
+                "id": session_id,
+                "agent_id": "agent_worker",
+                "labels": {},
+            }
+            if session_id == subagent_session_id:
+                # Markers the runner stamps on a ``sys_session_send`` child.
+                snapshot["parent_session_id"] = "conv_parent"
+                snapshot["sub_agent_name"] = "worker"
+            return httpx.Response(200, json=snapshot)
+        posted.append((request.url.path, json.loads(request.content)))
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            # Let an unguarded rotation actually SUCCEED, so a regression
+            # fails on the rotation assertion rather than on a stub gap.
+            return httpx.Response(201, json={"id": "conv_rotated"})
+        return httpx.Response(202, json={"queued": False})
+
+    return handler
+
+
+def test_forwarder_keeps_dispatched_subagent_session_through_tui_thread_started(
+    tmp_path: Path,
+) -> None:
+    """
+    A ``thread/started`` for an unrelated thread must not orphan a sub-agent.
+
+    A dispatched sub-agent's parent is parked on one specific conversation
+    id. When the interactive TUI mints its own thread on connect, the old
+    code rotated the forwarder onto a brand-new Omnigent session, and the
+    real turn's ``turn/completed`` — the sole idle edge that marks the child
+    terminal and wakes the parent — was then dropped as a stale thread
+    event. The parent hung forever with an empty inbox.
+
+    The test fails if rotation occurs, or if the subsequent
+    ``turn/completed`` on the original thread does not still post an
+    ``external_session_status: idle`` edge to the original session.
+    """
+    subagent_session_id = "conv_child_worker"
+    subagent_thread_id = "thread_subagent"
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id=subagent_session_id,
+            socket_path=str(tmp_path / "sock"),
+            thread_id=subagent_thread_id,
+            codex_home=str(tmp_path / "home"),
+        ),
+    )
+
+    tui_thread_started_event: dict[str, Any] = {
+        "method": "thread/started",
+        "params": {"thread": {"id": "thread_tui_connect"}},
+    }
+    turn_completed_event: dict[str, Any] = {
+        "method": "turn/completed",
+        "params": {
+            "threadId": subagent_thread_id,
+            "turn": {"id": "turn_1", "items": [{"id": "item_1", "type": "agentMessage"}]},
+        },
+    }
+    ap_posts: list[tuple[str, dict[str, Any]]] = []
+
+    async def run() -> bool:
+        """
+        Drive the TUI thread-started event, then the real turn's completion.
+
+        :returns: Whether a session rotation occurred.
+        """
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000",
+            transport=httpx.MockTransport(
+                _subagent_session_handler(ap_posts, subagent_session_id=subagent_session_id)
+            ),
+        ) as ap_client:
+            target = codex_native_forwarder._ForwarderTarget(
+                session_id=subagent_session_id,
+                thread_id=subagent_thread_id,
+                delta_coalescer=codex_native_forwarder._OutputTextDeltaCoalescer(
+                    ap_client, subagent_session_id
+                ),
+                usage_coalescer=codex_native_forwarder._SessionUsageCoalescer(
+                    ap_client, subagent_session_id
+                ),
+                elicitation_tracker=_elicitation_tracker(),
+            )
+            rotated = await codex_native_forwarder._maybe_rotate_session_on_thread_started(
+                ap_client=ap_client,
+                target=target,
+                bridge_dir=tmp_path,
+                app_server_url=str(tmp_path / "sock"),
+                event=tui_thread_started_event,
+            )
+            await codex_native_forwarder._handle_event(
+                ap_client,
+                session_id=target.session_id,
+                bridge_dir=tmp_path,
+                event=turn_completed_event,
+                usage_coalescer=target.usage_coalescer,
+                elicitation_tracker=target.elicitation_tracker,
+                delta_coalescer=target.delta_coalescer,
+                expected_thread_id=target.thread_id,
+            )
+            return rotated
+
+    rotated = asyncio.run(run())
+    assert rotated is False, (
+        "Expected a dispatched sub-agent session to survive an unrelated "
+        "thread/started; it rotated and orphaned the waiting parent."
+    )
+    idle_edges = [
+        (path, body)
+        for path, body in ap_posts
+        if body.get("type") == "external_session_status"
+        and (body.get("data") or {}).get("status") == "idle"
+    ]
+    assert idle_edges, (
+        f"Expected turn/completed to post an idle external_session_status; got {ap_posts}"
+    )
+    assert all(path == f"/v1/sessions/{subagent_session_id}/events" for path, _ in idle_edges), (
+        f"Idle edge went to the wrong session: {idle_edges}"
+    )
+
+
+def test_forwarder_declines_thread_rotation_while_a_turn_is_in_flight(
+    tmp_path: Path,
+) -> None:
+    """
+    A ``thread/started`` arriving mid-turn must not rotate the session.
+
+    Native ``/clear`` is a between-turns human action, so a new thread
+    announced while a turn is in flight belongs to something else. Rotating
+    onto it repoints the forwarder away from the live conversation and
+    strands that turn's output as stale.
+    """
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_top_level",
+            socket_path=str(tmp_path / "sock"),
+            thread_id="thread_live",
+            codex_home=str(tmp_path / "home"),
+            active_turn_id="turn_in_flight",
+        ),
+    )
+    ap_posts: list[tuple[str, dict[str, Any]]] = []
+
+    async def run() -> bool:
+        """
+        Drive a mid-turn thread-started event through the rotation check.
+
+        :returns: Whether a session rotation occurred.
+        """
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000",
+            transport=httpx.MockTransport(
+                # Not a sub-agent: only the in-flight turn should stop rotation.
+                _subagent_session_handler(ap_posts, subagent_session_id="conv_other")
+            ),
+        ) as ap_client:
+            target = codex_native_forwarder._ForwarderTarget(
+                session_id="conv_top_level",
+                thread_id="thread_live",
+                delta_coalescer=codex_native_forwarder._OutputTextDeltaCoalescer(
+                    ap_client, "conv_top_level"
+                ),
+                usage_coalescer=codex_native_forwarder._SessionUsageCoalescer(
+                    ap_client, "conv_top_level"
+                ),
+                elicitation_tracker=_elicitation_tracker(),
+            )
+            return await codex_native_forwarder._maybe_rotate_session_on_thread_started(
+                ap_client=ap_client,
+                target=target,
+                bridge_dir=tmp_path,
+                app_server_url=str(tmp_path / "sock"),
+                event={"method": "thread/started", "params": {"thread": {"id": "thread_other"}}},
+            )
+
+    assert asyncio.run(run()) is False, (
+        "Expected a mid-turn thread/started to be declined; it rotated."
+    )
+    assert ap_posts == []
