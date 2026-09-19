@@ -2194,6 +2194,20 @@ REQUIRE_WRAPPER_ENV = "OMNIGENT_REQUIRE_WRAPPER"
 WRAPPER_BYPASS_ENV = "OMNIGENT_WRAPPER_BYPASS"
 
 
+def _wrapper_managed_deployment(env: Mapping[str, str] | None = None) -> bool:
+    """Report whether a deployment wrapper (e.g. ``isaac omni``) drives the CLI.
+
+    Wrapped deployments rewrite invocations to add their managed ``--server``,
+    so a ``--server`` that conflicts with an explicit user flag may be
+    wrapper-injected rather than user intent.
+    """
+    if env is None:
+        env = os.environ
+    if (env.get(WRAPPER_COMMAND_ENV) or "").strip():
+        return True
+    return env_truthy(env.get(REQUIRE_WRAPPER_ENV))
+
+
 def _wrapper_guard_error(env: Mapping[str, str], prog: str) -> str | None:
     """Return the block message when a naked ``omni`` call is refused, else ``None``.
 
@@ -9170,9 +9184,13 @@ def _selected_daemon_records(
     :param all_targets: Whether ``--all`` was passed.
     :param default_all: Whether no selector should mean all records.
     :returns: Matching daemon records.
-    :raises click.ClickException: If ``--server`` and ``--all`` conflict.
+    :raises click.ClickException: If ``--server`` and ``--all`` conflict
+        outside a wrapper-managed deployment.
     """
-    if all_targets and server is not None:
+    # A deployment wrapper (e.g. `isaac omni`) rewrites every invocation to add
+    # its managed --server, so under a wrapper the conflict is an injected
+    # flag, not user intent: --all wins for every consumer of this selector.
+    if all_targets and server is not None and not _wrapper_managed_deployment():
         raise click.ClickException("Use either --server or --all, not both.")
     if all_targets or (server is None and default_all):
         return _list_daemon_records()
