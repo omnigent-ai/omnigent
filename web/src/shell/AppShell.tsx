@@ -2308,6 +2308,7 @@ export function AppShell() {
               )}
               {conversationId && showFilesPanel && (
                 <FilesPanelDrawer
+                  conversationId={conversationId}
                   open={filesPanelOpen}
                   onClose={() => setFilesPanelOpen(false)}
                   onFileSelect={openFileViewer}
