@@ -223,6 +223,119 @@ def test_full_tool_roundtrip_chains_correctly() -> None:
         assert cur["parentId"] == prev["id"]
 
 
+def test_parallel_tool_calls_merge_into_one_assistant_message() -> None:
+    # One model response makes two parallel calls plus its text; both results
+    # follow. Anthropic replay requires the results to sit adjacent to the ONE
+    # assistant message holding both calls -- separate single-call messages
+    # orphan the results behind the response text.
+    items = [
+        _user_item("read both files", item_id="u1", response_id="pi-user-1"),
+        _function_call_item(
+            name="read",
+            call_id="call_a",
+            arguments='{"path": "alpha.txt"}',
+            item_id="fc_a",
+            response_id="r-tools",
+        ),
+        _function_call_item(
+            name="read",
+            call_id="call_b",
+            arguments='{"path": "beta.txt"}',
+            item_id="fc_b",
+            response_id="r-tools",
+        ),
+        _assistant_item("Reading both files.", item_id="a1", response_id="r-tools"),
+        _function_output_item(
+            call_id="call_a", output="alpha", item_id="fo_a", response_id="r-tools"
+        ),
+        _function_output_item(
+            call_id="call_b", output="beta", item_id="fo_b", response_id="r-tools"
+        ),
+        _assistant_item("Both files read.", item_id="a2", response_id="r-final"),
+    ]
+    records = pi_session_records_from_session_items(
+        items, session_id="conv_abc", external_session_id=_EXTERNAL_ID, cwd=Path("/repo")
+    )
+    entries = records[1:]
+    assert [e["message"]["role"] for e in entries] == [
+        "user",
+        "assistant",
+        "toolResult",
+        "toolResult",
+        "assistant",
+    ]
+    merged = entries[1]["message"]
+    assert [(b["type"], b.get("id")) for b in merged["content"]] == [
+        ("toolCall", "call_a"),
+        ("toolCall", "call_b"),
+        ("text", None),
+    ]
+    # Both results directly follow the assistant message holding their calls.
+    assert {entries[2]["message"]["toolCallId"], entries[3]["message"]["toolCallId"]} == {
+        "call_a",
+        "call_b",
+    }
+    assert entries[0]["parentId"] is None
+    for prev, cur in itertools.pairwise(entries):
+        assert cur["parentId"] == prev["id"]
+    # Merged entries keep deterministic ids across re-synthesis.
+    again = pi_session_records_from_session_items(
+        items, session_id="conv_abc", external_session_id=_EXTERNAL_ID, cwd=Path("/repo")
+    )
+    assert [r["id"] for r in records[1:]] == [r["id"] for r in again[1:]]
+
+
+def test_response_text_between_call_and_result_stays_with_the_call() -> None:
+    # A single call whose response text is stored between the call and its
+    # output: the text must merge into the call's assistant message rather
+    # than becoming a separate message that orphans the result.
+    items = [
+        _user_item("run it", item_id="u1", response_id="pi-user-1"),
+        _function_call_item(
+            name="bash", call_id="c1", arguments='{"cmd": "ls"}', item_id="fc1", response_id="r1"
+        ),
+        _assistant_item("Running the command.", item_id="a1", response_id="r1"),
+        _function_output_item(call_id="c1", output="a.txt", item_id="fo1", response_id="r1"),
+    ]
+    records = pi_session_records_from_session_items(
+        items, session_id="conv_abc", external_session_id=_EXTERNAL_ID, cwd=Path("/repo")
+    )
+    entries = records[1:]
+    assert [e["message"]["role"] for e in entries] == ["user", "assistant", "toolResult"]
+    merged = entries[1]["message"]
+    assert [b["type"] for b in merged["content"]] == ["toolCall", "text"]
+    # The group inherits the first non-empty per-item model.
+    assert merged["model"] == "claude-opus-4-8"
+
+
+def test_distinct_responses_keep_separate_assistant_messages() -> None:
+    # Different response ids -- or no response id at all -- never merge.
+    items = [
+        _assistant_item("first answer", item_id="a1", response_id="r1"),
+        _assistant_item("second answer", item_id="a2", response_id="r2"),
+        _function_call_item(
+            name="bash", call_id="c1", arguments="{}", item_id="fc1", response_id=""
+        ),
+        _assistant_item("no response id", item_id="a3", response_id=""),
+    ]
+    records = pi_session_records_from_session_items(
+        items, session_id="conv_abc", external_session_id=_EXTERNAL_ID, cwd=Path("/repo")
+    )
+    entries = records[1:]
+    assert [e["message"]["role"] for e in entries] == [
+        "assistant",
+        "assistant",
+        "assistant",
+        "assistant",
+    ]
+    assert [[b["type"] for b in e["message"]["content"]] for e in entries] == [
+        ["text"],
+        ["text"],
+        ["toolCall"],
+        ["text"],
+    ]
+
+
 def test_empty_text_items_are_dropped() -> None:
     items = [
         {"id": "u1", "type": "message", "role": "user", "content": []},
