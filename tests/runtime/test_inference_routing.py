@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 from pathlib import Path
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 import pytest
@@ -21,7 +22,7 @@ from omnigent.harnesses.pi_native.credentials import (
     resolve_pi_native_provider,
 )
 from omnigent.host.connect import _build_runner_env, _write_runner_inference_config
-from omnigent.inference_config import inference_config_scope
+from omnigent.inference_config import inference_config_scope, validate_inference_credentials
 from omnigent.models.model_catalog import (
     _acp_launch_model,
     acp_curated_models,
@@ -383,18 +384,65 @@ def test_saved_runner_config_keeps_old_route_after_host_profile_edit(
     assert saved.stat().st_mode & 0o777 == 0o600
 
 
-def test_saved_credential_reference_is_forwarded_even_after_removed_from_host_config() -> None:
+@pytest.mark.parametrize(
+    "reference", ["env:CUSTOM_GATEWAY_KEY", "$CUSTOM_GATEWAY_KEY", "${CUSTOM_GATEWAY_KEY}"]
+)
+@pytest.mark.parametrize("host_config_unreadable", [False, True])
+def test_saved_credential_references_survive_runner_launch(
+    reference, host_config_unreadable, tmp_path, monkeypatch
+) -> None:
+    profile = _profile()
+    for provider in profile["providers"].values():
+        for family in ("anthropic", "openai"):
+            provider[family]["api_key_ref"] = reference
+    validate_inference_credentials(profile)
+    with monkeypatch.context() as host:
+        host.setattr(
+            "omnigent.onboarding.provider_config.load_config",
+            Mock(side_effect=OSError("unreadable"))
+            if host_config_unreadable
+            else Mock(return_value={}),
+        )
+        env = _build_runner_env(
+            {
+                "CUSTOM_GATEWAY_KEY": "saved-test-token",
+                "UNRELATED_SECRET": "private",
+                "HOME": str(tmp_path),
+                "OMNIGENT_CONFIG_HOME": str(tmp_path),
+            },
+            server_url="https://omnigent.example",
+            runner_id="runner",
+            binding_token="binding",
+            workspace="/tmp",
+            parent_pid=1,
+            inference_config=profile,
+        )
+    assert env["CUSTOM_GATEWAY_KEY"] == "saved-test-token"
+    assert "UNRELATED_SECRET" not in env
+    with patch.dict(os.environ, env, clear=True), inference_config_scope(profile):
+        claude = resolve_native_claude_config(spec=_spec("claude-native"))
+        codex = resolve_native_codex_launch(model=None, spec=_spec("codex-native"))
+        opencode = resolve_bound_opencode_gateway(model=None)
+    assert claude is not None and "saved-test-token" in claude.api_key_helper
+    assert "saved-test-token" in " ".join(codex.config_overrides)
+    assert opencode is not None and opencode.api_key == "saved-test-token"
+
+
+def test_ordinary_host_keeps_legacy_credential_forwarding(monkeypatch) -> None:
+    config = _profile()
+    config.pop("inference")
+    config["providers"]["bifrost"]["openai"]["api_key_ref"] = "$CUSTOM_GATEWAY_KEY"
+    monkeypatch.setattr("omnigent.onboarding.provider_config.load_config", lambda: config)
     env = _build_runner_env(
-        {"BIFROST_TEST_KEY": "old-secret", "UNRELATED_SECRET": "private"},
+        {"CUSTOM_GATEWAY_KEY": "private", "UNITY_TEST_KEY": "legacy-token"},
         server_url="https://omnigent.example",
         runner_id="runner",
         binding_token="binding",
         workspace="/tmp",
         parent_pid=1,
-        inference_config=_profile(),
     )
-    assert env["BIFROST_TEST_KEY"] == "old-secret"
-    assert "UNRELATED_SECRET" not in env
+    assert "CUSTOM_GATEWAY_KEY" not in env
+    assert env["UNITY_TEST_KEY"] == "legacy-token"
 
 
 def test_host_ucode_configures_only_connected_harness_bindings(

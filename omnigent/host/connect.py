@@ -827,18 +827,19 @@ def _build_runner_env(
     # OMNIGENT_RUNNER_ENV_PASSTHROUGH — their credential resolves fine in
     # the CLI/daemon but silently drops before reaching the runner subprocess.
     from omnigent.errors import OmnigentError as _OmnigentError
+    from omnigent.onboarding.provider_config import (
+        load_config,
+        provider_credential_env_vars,
+    )
 
     try:
-        from omnigent.onboarding.provider_config import (
-            load_config,
-            provider_credential_env_vars,
-        )
-
         config_env_vars = provider_credential_env_vars(load_config())
-        if inference_config is not None:
-            config_env_vars |= provider_credential_env_vars(inference_config)
     except (OSError, _OmnigentError):
         config_env_vars = frozenset()
+    if inference_config is not None:
+        config_env_vars |= provider_credential_env_vars(
+            inference_config, include_dollar_key_refs=True
+        )
     forwarded = HARNESS_CREDENTIAL_ENV_VARS | extra_names | config_env_vars
     env = {
         key: value

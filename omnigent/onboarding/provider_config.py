@@ -1156,7 +1156,9 @@ def load_providers(config: dict[str, object]) -> dict[str, ProviderEntry]:
     return result
 
 
-def provider_credential_env_vars(config: dict[str, object]) -> frozenset[str]:
+def provider_credential_env_vars(
+    config: dict[str, object], *, include_dollar_key_refs: bool = False
+) -> frozenset[str]:
     """Return the env var names referenced by provider ``api_key_ref`` entries.
 
     Scans all inline-family providers (``key`` / ``gateway`` / ``local``) in
@@ -1172,12 +1174,15 @@ def provider_credential_env_vars(config: dict[str, object]) -> frozenset[str]:
     credential env vars into the runner subprocess without requiring the user
     to list them in ``OMNIGENT_RUNNER_ENV_PASSTHROUGH`` by hand.
 
-    Only ``env:``-style references are included.  ``keychain:`` refs resolve
+    Saved sandbox profiles also include dollar references in ``api_key_ref``
+    when ``include_dollar_key_refs`` is enabled. ``keychain:`` refs resolve
     through the secret store and are never env vars.  ``auth_command`` is a
     shell command, not a static env var.  ``base_url`` env-refs are omitted
     because the URL is not a credential.
 
     :param config: The parsed ``~/.omnigent/config.yaml`` mapping.
+    :param include_dollar_key_refs: Forward dollar-style ``api_key_ref`` entries
+        from a saved sandbox profile; defaults to legacy forwarding behavior.
     :returns: Env var names (and their ``OMNIGENT_`` aliases) that provider
         credential fields reference, e.g.
         ``frozenset({"MY_TOKEN", "OMNIGENT_MY_TOKEN"})``.
@@ -1192,8 +1197,17 @@ def provider_credential_env_vars(config: dict[str, object]) -> frozenset[str]:
                     names.add(n)
             # api_key: $VAR or ${VAR} — inline $VAR reference (unresolved at
             # parse time; expanded lazily by _expand_family).
-            if family.api_key is not None:
-                for match in _ENV_REF_RE.finditer(family.api_key):
+            dollar_refs = [family.api_key]
+            if (
+                include_dollar_key_refs
+                and family.api_key_ref is not None
+                and family.api_key_ref.startswith("$")
+            ):
+                dollar_refs.append(family.api_key_ref)
+            for reference in dollar_refs:
+                if reference is None:
+                    continue
+                for match in _ENV_REF_RE.finditer(reference):
                     var = match.group(1) or match.group(2)
                     for n in env_names_with_omnigent_prefix(var):
                         names.add(n)
