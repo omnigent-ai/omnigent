@@ -589,6 +589,32 @@ async def _create_subprocess_exec(
     )
 
 
+def _codex_config_declared_env_key_allowance() -> tuple[str, ...]:
+    """Allowance for the env var codex's own config declares via ``env_key``.
+
+    The user's ``config.toml`` can select a custom provider that
+    authenticates from a variable it names in ``env_key``. That variable is
+    the credential of the provider codex itself resolves, so the scrubbed
+    launch env must carry it — otherwise an omnigent-managed codex fails auth
+    on a config a bare ``codex`` runs fine with. Names in
+    :data:`_CODEX_ENV_DENY_EXACT` still lose (the deny set wins in
+    :func:`clean_agent_env`). Never raises: env construction must survive a
+    broken config.
+
+    :returns: A tuple with the declared variable name, or empty when the
+        effective provider declares none.
+    """
+    from omnigent.onboarding.codex_auth_readiness import codex_config_declared_env_key
+
+    try:
+        env_key = codex_config_declared_env_key(
+            _codex_home_config_source_from_env() / "config.toml"
+        )
+    except Exception:  # noqa: BLE001 - env building must never fail on config reads.
+        return ()
+    return () if env_key is None else (env_key,)
+
+
 def _clean_codex_env(extra_allow: Iterable[str] = ()) -> dict[str, str]:
     """
     Build a filtered copy of ``os.environ`` for the codex subprocess.
@@ -598,7 +624,9 @@ def _clean_codex_env(extra_allow: Iterable[str] = ()) -> dict[str, str]:
     :data:`_CODEX_ENV_DENY_EXACT` are excluded even when their prefix matches;
     ``OPENAI_API_KEY`` is stripped so the codex CLI falls back to subscription
     auth (``auth.json``) rather than a developer API key that would charge
-    separately.
+    separately. A variable the user's own ``config.toml`` declares as its
+    effective provider's ``env_key`` credential is forwarded (see
+    :func:`_codex_config_declared_env_key_allowance`).
 
     The filtered dict is also the executor's own view of its launch, not just
     the subprocess env: the app-server session reads Omnigent's per-session
@@ -627,6 +655,7 @@ def _clean_codex_env(extra_allow: Iterable[str] = ()) -> dict[str, str]:
             # here (they stay host secrets, gated behind env_passthrough).
             "DATABRICKS_CLIENT_ID",
             "DATABRICKS_CLIENT_SECRET",
+            *_codex_config_declared_env_key_allowance(),
             *_CODEX_OMNIGENT_LAUNCH_ENV_VARS,
         ),
         deny_exact=_CODEX_ENV_DENY_EXACT,
@@ -2558,7 +2587,7 @@ class _CodexAppServerSession:
 
                 try:
                     await trust_codex_router_hooks(self._request, cwd=self._cwd or os.getcwd())
-                except Exception:  # noqa: BLE001 - never block session startup
+                except Exception:
                     logger.warning(
                         "codex subagent-routing hook trust failed; "
                         "routing will not be enforced for this session",

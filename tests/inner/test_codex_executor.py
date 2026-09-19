@@ -3984,6 +3984,67 @@ def test_clean_codex_env_includes_databricks_bearer(monkeypatch) -> None:
     assert "DATABRICKS_TOKEN" not in env
 
 
+def _write_codex_env_key_config(home: Path, env_key: str) -> None:
+    """Write a ``~/.codex/config.toml`` selecting a custom env_key provider."""
+    codex_dir = home / ".codex"
+    codex_dir.mkdir(parents=True, exist_ok=True)
+    (codex_dir / "config.toml").write_text(
+        'model_provider = "myproxy"\n'
+        "[model_providers.myproxy]\n"
+        'name = "My Proxy"\n'
+        'base_url = "https://myproxy.example.com/v1"\n'
+        f'env_key = "{env_key}"\n',
+        encoding="utf-8",
+    )
+
+
+def test_clean_codex_env_forwards_config_declared_env_key(tmp_path, monkeypatch) -> None:
+    """The env var codex's own config declares via ``env_key`` survives the scrub.
+
+    A custom ``[model_providers.X]`` authenticating from ``env_key`` is the
+    credential of the provider codex itself resolves; stripping it made an
+    omnigent-managed codex fail auth on a config a bare ``codex`` runs fine
+    with (and made readiness/setup report it as needing auth).
+    """
+    from omnigent.inner.codex_executor import _clean_codex_env
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    _write_codex_env_key_config(tmp_path, "MYPROXY_API_KEY")
+    monkeypatch.setenv("MYPROXY_API_KEY", "populated-proxy-token")
+
+    env = _clean_codex_env()
+
+    assert env.get("MYPROXY_API_KEY") == "populated-proxy-token"
+
+
+def test_clean_codex_env_without_config_strips_unrelated_vars(tmp_path, monkeypatch) -> None:
+    """With no codex config, an out-of-family var stays stripped."""
+    from omnigent.inner.codex_executor import _clean_codex_env
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    monkeypatch.setenv("MYPROXY_API_KEY", "populated-proxy-token")
+
+    env = _clean_codex_env()
+
+    assert "MYPROXY_API_KEY" not in env
+
+
+def test_clean_codex_env_declared_env_key_never_overrides_deny(tmp_path, monkeypatch) -> None:
+    """A config declaring ``env_key = "OPENAI_API_KEY"`` cannot undo the deny rule."""
+    from omnigent.inner.codex_executor import _clean_codex_env
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    _write_codex_env_key_config(tmp_path, "OPENAI_API_KEY")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-secret")
+
+    env = _clean_codex_env()
+
+    assert "OPENAI_API_KEY" not in env
+
+
 def test_clean_codex_env_includes_omnigent_session_marker(monkeypatch) -> None:
     """The ``OMNIGENT`` session marker survives the codex env scrub.
 

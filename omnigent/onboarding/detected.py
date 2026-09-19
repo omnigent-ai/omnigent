@@ -35,7 +35,9 @@ from omnigent.onboarding.provider_config import (
     GEMINI_FAMILY,
     LOCAL_KIND,
     OPENAI_FAMILY,
+    PI_SURFACE,
     SUBSCRIPTION_KIND,
+    default_provider_for_harness,
     get_default_provider,
     load_providers,
     provider_families,
@@ -344,6 +346,21 @@ def effective_config_with_detected(
             entry = merged_parsed.get(name)
             if entry is not None and family in provider_families(entry):
                 merged = set_default_provider(merged, name, family)
+                break
+
+    # The pi scope auto-defaults only as a gap-filler, and only to pi's own
+    # login: when the cross-family fallback already routes pi (an anthropic /
+    # openai default a pi launch can consume), that routing is preserved.
+    # Only when nothing serves pi does a detected pi login become its explicit
+    # default — the "Pi original auth" state, under which a pi launch uses
+    # ``~/.pi/agent`` as-is.
+    if default_provider_for_harness({**config, "providers": merged}, PI_SURFACE) is None:
+        for det in detected:
+            if det.name not in synthesized or det.name in explicit:
+                continue
+            entry = merged_parsed.get(det.name)
+            if entry is not None and entry.kind == SUBSCRIPTION_KIND and entry.cli == "pi":
+                merged = set_default_provider(merged, det.name, PI_SURFACE)
                 break
 
     return {**config, "providers": merged}

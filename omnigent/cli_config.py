@@ -1194,6 +1194,62 @@ def _claude_managed_gateway_label() -> str | None:
     return claude_managed_gateway_display_name()
 
 
+def _codex_own_config_status(config: dict[str, Any]) -> str | None:  # type: ignore[explicit-any]  # config is a yaml-boundary mapping
+    """Status label for a Codex whose own config authenticates its provider.
+
+    The harness overview reads omnigent's ``providers:`` config, but codex's
+    effective provider can be configured — and authenticated — entirely by the
+    user's own ``config.toml``: an ``env_key`` provider, which ambient adoption
+    deliberately skips (see ``provider_table_has_self_contained_auth``). A bare
+    ``codex`` is ready there, so the overview must not report "Not configured".
+    Asks the question host readiness asks (:func:`codex_config_effective_auth`
+    against the env the launch actually receives), so the row and the picker
+    agree.
+
+    :param config: The parsed global config mapping (for the dismissal check —
+        a Removed config provider is pinned away at launch, so its config no
+        longer routes and must not read as configured).
+    :returns: A ready-row label naming the config's effective provider, e.g.
+        ``"My Proxy (Codex config)"``, or ``None`` when codex's own config does
+        not authenticate its effective provider.
+    """
+    from omnigent.inner.codex_executor import (
+        _clean_codex_env,
+        _codex_home_config_source_from_env,
+    )
+    from omnigent.onboarding.codex_auth_readiness import (
+        codex_config_effective_auth,
+        effective_codex_model_provider,
+        effective_custom_provider_table,
+        load_codex_config,
+    )
+    from omnigent.onboarding.detected import codex_config_provider_dismissed
+
+    try:
+        if codex_config_provider_dismissed(config):
+            return None
+        config_path = _codex_home_config_source_from_env() / "config.toml"
+        if codex_config_effective_auth(config_path, env=_clean_codex_env()) != "provider-ready":
+            return None
+        codex_config = load_codex_config(config_path)
+    except Exception:  # noqa: BLE001 - a status readout must never crash the menu.
+        return None
+    if codex_config is None:
+        return None
+    pair = effective_custom_provider_table(codex_config)
+    if pair is not None:
+        provider_id, table = pair
+        name = table.get("name")
+        display = name if isinstance(name, str) and name.strip() else provider_id
+    else:
+        # A built-in non-OpenAI provider (ollama, lmstudio, …) that needs no
+        # credential — codex_config_effective_auth reported it ready.
+        display = effective_codex_model_provider(codex_config)
+    if display is None:
+        return None
+    return f"{display} (Codex config)"
+
+
 def _compact_credential_label(det: DetectedProvider) -> str:
     """A short, brand-qualified label for an auto-configured credential.
 
@@ -1220,6 +1276,10 @@ def _compact_credential_label(det: DetectedProvider) -> str:
             gateway = _claude_managed_gateway_label()
             if gateway is not None:
                 return gateway
+        # Pi manages its own auth (no plan/brand omnigent drives), so the
+        # callout matches the credential label, not "pi Subscription".
+        if det.name == "pi":
+            return "Pi original auth"
         # Fallback to the raw CLI name is unreachable for today's detections
         # (see _CLI_LOGIN_BRAND) but keeps an added CLI readable, not crashing.
         brand = _CLI_LOGIN_BRAND.get(det.name, det.name)
@@ -1270,7 +1330,7 @@ def _adopt_ambient_credentials(progress: RunnerStartupProgress | None = None) ->
     (:func:`_run_configure_harnesses_interactive`): it (1) backfills a legacy
     databricks ``auth:`` block into a real provider, (2) adopts any
     ambient-detected credential (env API key, logged-in ``claude`` / ``codex``
-    CLI, local Ollama) not already configured as an ordinary provider entry,
+    / ``pi`` CLI, local Ollama) not already configured as an ordinary provider entry,
     and (3) prints a callout naming exactly the credentials it just
     auto-configured. Idempotent: a second open adopts nothing, so no callout
     prints.
@@ -3156,11 +3216,26 @@ def _remove_subscription(provider: str, family: str) -> str | None:
 
     spec = harness_install_spec(family)
     disp = spec.display if spec is not None else family
-    logout_cmd = (
-        f"{spec.binary} {' '.join(spec.logout_args)}"
-        if spec is not None and spec.logout_args is not None
-        else "logout"
-    )
+    if spec is None or spec.logout_args is None:
+        # No logout command to drive (pi's login lives in its own
+        # ``~/.pi/agent``): removal can't sign the CLI out, so
+        # ``_remove_credential`` records a dismissal instead — otherwise the
+        # next configure open re-adopts the unchanged login.
+        choice = select(
+            f"Remove {disp} credential?",
+            [f"Yes — remove it here (keeps {disp}'s own login)", "No — keep it"],
+            descriptions=[
+                f"{disp}'s own login stays on this machine; omnigent stops "
+                "auto-configuring it until you add it back.",
+                "Leave the credential configured.",
+            ],
+            default=1,  # default to the non-destructive choice
+            clear_on_exit=True,
+        )
+        if choice != 0:
+            return None
+        return _remove_credential(provider)
+    logout_cmd = f"{spec.binary} {' '.join(spec.logout_args)}"
     choice = select(
         f"Remove {disp} subscription?",
         [f"Yes — sign out of {disp} and remove", "No — keep it"],
@@ -3280,6 +3355,30 @@ def _clear_detection_dismissal(name: str) -> None:
     _save_global_config({DISMISSED_DETECTIONS_KEY: sorted(dismissed - {name})})
 
 
+def _removal_signs_out(det: DetectedProvider) -> bool:
+    """Whether removing an entry backed by *det* signs the credential out.
+
+    Only a subscription whose CLI has a logout command omnigent can drive
+    (``claude auth logout`` / ``codex logout``) is signed out by the removal
+    flow. Pi's login lives in its own ``~/.pi/agent`` with no logout command,
+    so its removal cannot sign out — it needs the dismissal treatment or the
+    next configure open silently re-adopts it.
+
+    :param det: The live ambient detection backing the entry being removed.
+    :returns: ``True`` when the removal flow runs a real CLI logout for it.
+    """
+    from omnigent.onboarding.harness_install import harness_install_spec
+    from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, OPENAI_FAMILY, PI_SURFACE
+
+    if det.kind != "subscription":
+        return False
+    # Subscription detections are named after their CLI; map to the install
+    # key harness_install_spec understands.
+    cli_family = {"claude": ANTHROPIC_FAMILY, "codex": OPENAI_FAMILY, "pi": PI_SURFACE}
+    spec = harness_install_spec(cli_family.get(det.name, det.name))
+    return spec is not None and spec.logout_args is not None
+
+
 def _remove_credential(provider: str) -> str | None:
     """Remove the *provider* credential and persist wholesale.
 
@@ -3299,7 +3398,7 @@ def _remove_credential(provider: str) -> str | None:
         DISMISSED_DETECTIONS_KEY,
         dismissed_detection_names,
     )
-    from omnigent.onboarding.provider_config import load_providers
+    from omnigent.onboarding.provider_config import SUBSCRIPTION_KIND, load_providers
 
     config = _load_global_config()
     block = config.get("providers")
@@ -3309,19 +3408,36 @@ def _remove_credential(provider: str) -> str | None:
     label = _credential_label(provider, entry) if entry is not None else provider
     remaining = {k: v for k, v in block.items() if k != provider}
     settings: dict[str, Any] = {"providers": remaining}  # type: ignore[explicit-any]  # yaml-boundary mapping
+
+    def _backs_entry(det: DetectedProvider) -> bool:
+        # A subscription detection is named after its CLI while the entry may
+        # carry another name ("pi" vs a manually added "pi-subscription"), so
+        # subscriptions also match by CLI.
+        if det.name == provider:
+            return True
+        return (
+            entry is not None
+            and entry.kind == SUBSCRIPTION_KIND
+            and det.kind == "subscription"
+            and det.name == entry.cli
+        )
+
     # If a live ambient detection backs this entry, removing the entry alone
     # is a no-op: the next configure open re-detects and re-adopts it (the
-    # "Remove doesn't remove" bug). Subscriptions are exempt — their removal
-    # path signs out of the CLI instead, and a future re-login SHOULD
-    # re-adopt. Everything else (env API key, codex config.toml provider,
-    # local Ollama) gets a persisted dismissal that the add menu's detected
-    # option clears on re-add.
+    # "Remove doesn't remove" bug). A subscription whose CLI has a logout
+    # command is exempt — its removal path signs out of the CLI instead, and
+    # a future re-login SHOULD re-adopt. Everything else (env API key, codex
+    # config.toml provider, local Ollama, a pi login omnigent can't sign out)
+    # gets a persisted dismissal that the add menu's detected option clears
+    # on re-add.
     backing = next(
-        (d for d in detect_providers() if d.name == provider and d.kind != "subscription"),
+        (d for d in detect_providers() if _backs_entry(d) and not _removal_signs_out(d)),
         None,
     )
     if backing is not None:
-        settings[DISMISSED_DETECTIONS_KEY] = sorted(dismissed_detection_names(config) | {provider})
+        settings[DISMISSED_DETECTIONS_KEY] = sorted(
+            dismissed_detection_names(config) | {backing.name}
+        )
     _save_global_config(settings)  # wholesale replace per key
     if backing is not None:
         return f"✓ Removed {label} — it stays on your machine but won't be auto-configured again"
@@ -3758,6 +3874,13 @@ def _run_configure_harnesses_interactive() -> None:
             )
         default = surface_default_provider(config, fam)
         if default is None:
+            # No omnigent-managed provider — but codex's own config.toml can
+            # still authenticate its effective provider (env_key auth, which
+            # adoption deliberately skips). Credit it like the picker does.
+            if fam == OPENAI_FAMILY:
+                codex_status = _codex_own_config_status(config)
+                if codex_status is not None:
+                    return (fam, name, codex_status, "ready", "")
             return (fam, name, "Not configured", "warn", "Open to add a credential.")
         label = _family_credential_label(config, fam, default.name, default)
         return (fam, name, label, "ready", "")

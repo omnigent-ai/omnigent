@@ -501,3 +501,71 @@ def test_malformed_dismissed_detections_treated_as_empty() -> None:
     assert dismissed_detection_names({"dismissed_detections": [3, "codex-databricks"]}) == (
         frozenset({"codex-databricks"})
     )
+
+
+def _pi_login() -> DetectedProvider:
+    """An ambient pi CLI login detection (pi's own ``~/.pi/agent/auth.json``)."""
+    return DetectedProvider(name="pi", kind="subscription", family="pi", source="pi CLI login")
+
+
+def test_pi_login_adopted_and_defaults_pi_scope_when_nothing_serves_pi() -> None:
+    """With only a pi login detected, it is adopted and defaults the pi scope.
+
+    The bug's shape: a user signed in to pi natively (a bare ``pi`` runs) but
+    with nothing else configured, ``omni setup`` read Pi as "Not configured"
+    because nothing served the pi surface. The detection must be adopted as
+    the "Pi original auth" subscription AND claim the pi-scope default so the
+    overview and readiness resolve it.
+    """
+    adopt = providers_to_adopt({}, [_pi_login()])
+    assert adopt == {"pi": {"kind": "subscription", "cli": "pi"}}
+    merged = effective_config_with_detected({}, [_pi_login()])
+    resolved = default_provider_for_harness(merged, "pi")
+    assert resolved is not None and resolved.name == "pi"
+    assert resolved.kind == "subscription" and resolved.cli == "pi"
+
+
+def test_pi_login_does_not_hijack_working_cross_family_fallback() -> None:
+    """A pi login must not override a pi-consumable family default.
+
+    Pi's cross-family fallback routes it through a detected anthropic key;
+    adopting pi's own login must preserve that routing (the gap-filler only
+    fires when nothing serves pi), or opening setup would silently flip a
+    working key-routed pi onto its native login.
+    """
+    merged = effective_config_with_detected({}, [_anthropic_key(), _pi_login()])
+    resolved = default_provider_for_harness(merged, "pi")
+    assert resolved is not None and resolved.name == "anthropic"
+    # The pi login is still adopted as an ordinary (non-default) entry.
+    assert load_providers(merged)["pi"].kind == "subscription"
+
+
+def test_pi_login_defaults_pi_scope_when_only_subscriptions_serve_families() -> None:
+    """A claude/codex login can't drive pi, so the pi login still gap-fills.
+
+    Subscription defaults are skipped by pi's fallback (a CLI login is
+    unusable outside its own CLI), so with only CLI logins detected the pi
+    scope is genuinely unserved — pi's own login must claim it.
+    """
+    claude = DetectedProvider(
+        name="claude", kind="subscription", family=ANTHROPIC_FAMILY, source="claude CLI login"
+    )
+    merged = effective_config_with_detected({}, [claude, _codex_login(), _pi_login()])
+    resolved = default_provider_for_harness(merged, "pi")
+    assert resolved is not None and resolved.name == "pi"
+
+
+def test_pi_login_not_adopted_over_explicit_pi_subscription() -> None:
+    """An explicit "Pi original auth" entry covers the detection (no duplicate)."""
+    config = {"providers": {"pi-subscription": {"kind": "subscription", "cli": "pi"}}}
+    assert providers_to_adopt(config, [_pi_login()]) == {}
+    merged = effective_config_with_detected(config, [_pi_login()])
+    assert set(load_providers(merged)) == {"pi-subscription"}
+
+
+def test_dismissed_pi_login_stays_unadopted() -> None:
+    """A dismissed pi detection is not re-adopted and claims no default."""
+    config = {"dismissed_detections": ["pi"]}
+    assert providers_to_adopt(config, [_pi_login()]) == {}
+    merged = effective_config_with_detected(config, [_pi_login()])
+    assert default_provider_for_harness(merged, "pi") is None

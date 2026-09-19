@@ -105,6 +105,37 @@ def provider_table_has_self_contained_auth(table: dict[str, object]) -> bool:
     return False
 
 
+def codex_config_declared_env_key(config_path: Path) -> str | None:
+    """Return the env var codex's effective provider declares via ``env_key``.
+
+    A custom ``[model_providers.X]`` table may authenticate from an
+    environment variable it names in ``env_key``. That variable is the
+    provider's declared credential, so a scrubbed codex launch environment
+    must forward it (see ``_clean_codex_env``) for the provider codex itself
+    selects to authenticate — the launch-side counterpart of the
+    ``env_key`` branch in :func:`codex_config_effective_auth`.
+
+    :param config_path: Path to the Codex ``config.toml`` to inspect.
+    :returns: The declared variable name, e.g. ``\"MYPROXY_API_KEY\"``, or
+        ``None`` when the config is missing/malformed, the effective provider
+        is built-in or rides Codex login (``requires_openai_auth``), or the
+        table declares no ``env_key``.
+    """
+    config = load_codex_config(config_path)
+    if config is None:
+        return None
+    pair = effective_custom_provider_table(config)
+    if pair is None:
+        return None
+    _provider_id, table = pair
+    if table.get("requires_openai_auth") is True:
+        return None
+    env_key = table.get("env_key")
+    if isinstance(env_key, str) and env_key.strip():
+        return env_key.strip()
+    return None
+
+
 def codex_config_effective_auth(
     config_path: Path,
     *,
