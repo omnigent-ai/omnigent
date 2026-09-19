@@ -274,6 +274,20 @@ describe("dialog-hosted design popup", () => {
     assert.equal(picker.input.disabled, false);
   });
 
+  it("cancels held Enter after submission moves focus to Close", (t) => {
+    const picker = createPicker(t);
+    picker.select();
+    picker.clock.tick(30);
+    picker.input.value = "Keep the form unchanged";
+    picker.key(picker.document.activeElement, "Enter");
+    assert.equal(picker.document.activeElement, picker.get("__omni-popup-close"));
+    const repeat = picker.key(picker.document.activeElement, "Enter", { repeat: true });
+    assert.equal(repeat.defaultPrevented, true);
+    assert.equal(picker.payloads("prompt_submit").length, 1);
+    assert.equal(picker.popup.style.display, "block");
+    assert.equal(picker.get("period").value, "W41");
+  });
+
   it("lets Tab and Shift+Tab reach the parent modal's focus scope", (t) => {
     const tabs = [];
     const picker = createPicker(t, MODAL_FORM, ({ document }) => {

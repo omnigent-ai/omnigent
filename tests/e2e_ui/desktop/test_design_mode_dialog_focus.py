@@ -118,8 +118,13 @@ def test_floating_editor_owns_modal_typing(
     with page.expect_console_message(
         predicate=lambda message: message.text.startswith(submit_prefix)
     ):
-        page.keyboard.press("Enter")
+        page.keyboard.down("Enter")
     expect(editor).to_be_disabled()
+    expect(page.locator("#__omni-popup-close")).to_be_focused()
+    # Holding Enter repeats on Close after submission transfers keyboard focus.
+    page.keyboard.down("Enter")
+    page.keyboard.up("Enter")
+    expect(popup).to_be_visible()
     submissions = [
         json.loads(message.removeprefix(submit_prefix))
         for message in messages

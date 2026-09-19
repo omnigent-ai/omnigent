@@ -282,6 +282,10 @@ function buildDesignModeScript(nonce) {
   popupSend.addEventListener('click', function(e) { e.stopPropagation(); submitPopup(); });
   function onPopupKeyDown(e) {
     if (!popupVisible || !popup.contains(e.target) || e.isComposing) return;
+    // A held Enter follows focus from the submitted input to Close.
+    if (sending && e.key === 'Enter' && e.repeat) {
+      e.preventDefault(); e.stopImmediatePropagation(); return;
+    }
     // Run before document-level Escape handlers in the page's modal library.
     if (e.key === 'Escape') {
       e.preventDefault(); e.stopImmediatePropagation(); hidePopup(true);
