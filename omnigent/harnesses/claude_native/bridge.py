@@ -5431,6 +5431,7 @@ def start_tool_relay(
     loop: asyncio.AbstractEventLoop,
     policy_client: httpx.AsyncClient | None = None,
     session_id: str | None = None,
+    file_change_observer: Callable[[_JsonObject], Awaitable[None]] | None = None,
 ) -> ClaudeNativeToolRelay:
     """
     Start a relay for Omnigent tool calls from Claude.
@@ -5453,6 +5454,10 @@ def start_tool_relay(
     :param policy_client: Runner's async httpx client for policy eval proxy.
     :param session_id: Session id written into ``tool_relay.json`` so hook
         subprocesses can construct the correct ``/policies/evaluate`` URL.
+    :param file_change_observer: Optional coroutine callback run on *loop*
+        for each ``/hook/observe-tool`` payload; the runner uses it to
+        record native file-mutating tool calls in the session's filesystem
+        registry.
     :returns: Started relay handle. Call :meth:`close` when done.
     """
     token = secrets.token_urlsafe(32)
@@ -5463,6 +5468,7 @@ def start_tool_relay(
         policy_client=policy_client,
         session_id=session_id,
         bridge_dir=bridge_dir,
+        file_change_observer=file_change_observer,
     )
     httpd, advertised_url = _start_bridge_http_server(handler_cls)
     relay_info: _JsonObject = {
@@ -5673,6 +5679,12 @@ def _handler_factory(
 # never cut mid-reason by the truncation.
 _POLICY_PROXY_ERROR_DETAIL_MAX = 400
 
+# How long /hook/observe-tool waits for the file-change observer before
+# answering. Generous enough for a first-call registry resolution (one server
+# round trip); each request runs on its own ThreadingHTTPServer thread, so
+# waiting never stalls other relay traffic.
+_FILE_CHANGE_OBSERVER_TIMEOUT_S = 10.0
+
 
 def _tool_relay_handler_factory(
     token: str,
@@ -5682,6 +5694,7 @@ def _tool_relay_handler_factory(
     policy_client: httpx.AsyncClient | None = None,
     session_id: str | None = None,
     bridge_dir: Path | None = None,
+    file_change_observer: Callable[[_JsonObject], Awaitable[None]] | None = None,
 ) -> type[BaseHTTPRequestHandler]:
     """
     Create an HTTP handler class for active-turn tool calls.
@@ -5693,6 +5706,10 @@ def _tool_relay_handler_factory(
     :param policy_client: Optional async httpx client for proxying
         ``/policies/evaluate`` to the Omnigent server.
     :param session_id: Session id for the ``/policies/evaluate`` path.
+    :param file_change_observer: Optional coroutine callback run on *loop*
+        for each ``/hook/observe-tool`` payload, so the runner can record
+        native file-mutating tool calls in the session's filesystem
+        registry.
     :returns: A concrete :class:`BaseHTTPRequestHandler` subclass.
     """
 
@@ -5736,6 +5753,16 @@ def _tool_relay_handler_factory(
 
                 if session_id is not None:
                     observe_hook(session_id, payload)
+                    if file_change_observer is not None:
+                        # Wait so the record lands before the hook returns and
+                        # the panel's next fetch can see it; the observer owns
+                        # its own error handling, so a timeout only means the
+                        # recording finishes in the background.
+                        future = asyncio.run_coroutine_threadsafe(
+                            _await_tool_result(file_change_observer(payload)), loop
+                        )
+                        with contextlib.suppress(Exception):
+                            future.result(timeout=_FILE_CHANGE_OBSERVER_TIMEOUT_S)
                 self._send_json({})
                 return
             if self.path == "/hook/claude/evaluate-policy":

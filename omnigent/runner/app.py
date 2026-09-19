@@ -8106,6 +8106,51 @@ def create_runner_app(
             except _json.JSONDecodeError:
                 return {"result": result_str}
 
+        async def _observe_native_file_changes(payload: _JsonObject) -> None:
+            """Record native file-mutating tool calls in the session's registry.
+
+            Non-git workspaces track changes only through
+            ``FilesystemRegistry.record_change``, which the runner's
+            ``sys_os_write``/``sys_os_edit`` dispatch calls; a native harness
+            writing through its own tools (Claude Code's ``Write``/``Edit``)
+            never reaches it, so ``GET .../changes`` stayed empty. The relay's
+            ``/hook/observe-tool`` delivers every PostToolUse event here so
+            those writes are recorded too. Best-effort: failures are logged
+            and never surface to the hook.
+
+            :param payload: Hook JSON object from ``/hook/observe-tool``.
+            """
+            from omnigent.runner.native_file_observer import native_file_changes
+            from omnigent.runner.tool_dispatch import _maybe_signal_changed_files
+
+            try:
+                changes = native_file_changes(payload)
+                if not changes:
+                    return
+                registry = await _resolve_session_fs_registry(_captured_session_id)
+                if registry is None:
+                    return
+                for change in changes:
+                    if change.baseline is not None:
+                        registry.seed_snapshot(
+                            change.path,
+                            change.baseline,
+                            session_id=_captured_session_id,
+                        )
+                    registry.record_change(change.path, change.operation, _captured_session_id)
+                _maybe_signal_changed_files(
+                    _captured_session_id,
+                    _publish_event,
+                    now=asyncio.get_running_loop().time(),
+                )
+            except Exception:  # noqa: BLE001 — best-effort observer; never fail the hook
+                _logger.warning(
+                    "native file-change recording failed for session=%s",
+                    _captured_session_id,
+                    exc_info=True,
+                    extra={"session_id": _captured_session_id},
+                )
+
         try:
             relay: ClaudeNativeToolRelay = start_tool_relay(
                 bridge_dir=bridge_dir,
@@ -8114,6 +8159,7 @@ def create_runner_app(
                 loop=asyncio.get_running_loop(),
                 policy_client=server_client,
                 session_id=session_id,
+                file_change_observer=_observe_native_file_changes,
             )
         except (OSError, RuntimeError):
             _logger.warning(
