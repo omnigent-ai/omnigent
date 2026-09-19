@@ -1633,6 +1633,14 @@ def test_client_server_attachment_extension_parity() -> None:
     ]
     assert not rejected, f"client accepts but server would 415: {rejected}"
 
+    # And the other direction: a type only the server knows is one the composer
+    # refuses before upload, so the user cannot attach a file that would store
+    # fine. Checking one direction only is how .tsv drifted out of the client.
+    from omnigent.runtime.content_resolver import _TEXT_CODE_EXTENSIONS
+
+    server_only = sorted(_TEXT_CODE_EXTENSIONS - set(client_exts))
+    assert not server_only, f"server accepts but the client gate rejects: {server_only}"
+
 
 # ── extract_text_attachments (request-phase PII scanning) ─────────
 

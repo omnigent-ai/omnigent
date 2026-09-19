@@ -56,6 +56,11 @@ _PPTX_NAME = "deck.pptx"
 _JSON_NAME = "attach_sample.json"
 _JSON_BODY = '{"composer": "attachment", "e2e": true}\n'
 
+# A .tsv: the server resolves it to text/tab-separated-values, and browsers
+# often report no MIME for it, so the extension allowlist decides.
+_TSV_NAME = "rows.tsv"
+_TSV_BODY = "a\tb\n1\t2\n"
+
 # A zip is the case users actually hit (dragging an iCloud Photos export).
 _ZIP_NAME = "photos.zip"
 
@@ -156,6 +161,38 @@ def test_reject_unsupported_type(
     expect(page.get_by_role("button", name=f"Remove {_PPTX_NAME}")).to_have_count(0)
     # And the inline rejection error is shown.
     expect(page.get_by_text("can't be attached", exact=False)).to_be_visible(timeout=10_000)
+
+
+def test_attach_tsv_the_server_accepts(
+    page: Page, seeded_session: tuple[str, str], tmp_path: Path
+) -> None:
+    """A .tsv attaches, because the server stores it as text/tab-separated-values.
+
+    The OS reports no MIME for this extension on some platforms, which is the
+    case ``TEXT_CODE_EXTENSIONS`` in lib/attachments.ts exists to cover. Missing
+    the entry left the composer refusing a file the upload route accepts, and no
+    test below the browser drives a real file through the hidden input.
+    """
+    del tmp_path
+    base_url, session_id = seeded_session
+
+    page.goto(f"{base_url}/c/{session_id}")
+    expect(page.get_by_placeholder(_COMPOSER)).to_be_visible(timeout=30_000)
+
+    file_input = page.locator('input[type="file"][accept*="image/"]')
+    # The MIME is supplied explicitly: an OS that maps .tsv to a text type hides
+    # the bug, since classifyAttachment takes the MIME first. The extension list
+    # is what has to admit the file when the OS reports a binary type instead.
+    file_input.set_input_files(
+        {
+            "name": _TSV_NAME,
+            "mimeType": "application/octet-stream",
+            "buffer": _TSV_BODY.encode(),
+        }
+    )
+
+    expect(page.get_by_role("button", name=f"Remove {_TSV_NAME}")).to_be_visible(timeout=10_000)
+    expect(page.get_by_text("can't be attached", exact=False)).to_have_count(0)
 
 
 def test_landing_rejects_unsupported_type_and_keeps_message(

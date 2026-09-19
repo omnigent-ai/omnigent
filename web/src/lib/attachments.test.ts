@@ -54,6 +54,9 @@ describe("classifyAttachment", () => {
     expect(classifyAttachment(makeFile("a.ts", "video/mp2t"))).toBe("text");
     expect(classifyAttachment(makeFile("main.rs", ""))).toBe("text");
     expect(classifyAttachment(makeFile("notebook.ipynb", ""))).toBe("text");
+    // The server resolves .tsv to text/tab-separated-values whatever the
+    // browser reports, so the composer must offer it either way.
+    expect(classifyAttachment(makeFile("data.tsv", ""))).toBe("text");
     // Windows/Excel tags .csv as application/vnd.ms-excel — extension wins.
     expect(classifyAttachment(makeFile("data.csv", "application/vnd.ms-excel"))).toBe("text");
   });
