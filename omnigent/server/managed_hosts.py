@@ -189,7 +189,7 @@ from omnigent.onboarding.sandboxes.base import SandboxGoneError
 # RepoWorkspace lives in the launcher's own package so a launcher can accept it
 # without importing omnigent.server; re-exported here (its parser is here) so
 # existing `from omnigent.server.managed_hosts import RepoWorkspace` keeps working.
-from omnigent.onboarding.sandboxes.types import RepoWorkspace
+from omnigent.onboarding.sandboxes.types import RepoWorkspace, SandboxLaunchRequest
 from omnigent.stores.host_store import Host, HostStore
 
 if TYPE_CHECKING:
@@ -3485,7 +3485,10 @@ async def launch_managed_host(
     # across a user's managed sandboxes.
     host_name = f"managed-{host_id[:8]}"
     try:
-        await asyncio.to_thread(launcher.prepare_for_launch, agent_name=agent_name)
+        await asyncio.to_thread(
+            launcher.prepare_launch_request,
+            SandboxLaunchRequest(owner=owner, repos=tuple(repos), agent_name=agent_name),
+        )
         await asyncio.to_thread(launcher.prepare)
         sandbox_id = await asyncio.to_thread(launcher.provision, host_name)
     except click.ClickException as exc:
@@ -3576,7 +3579,10 @@ async def relaunch_managed_host(
             provider=host.sandbox_provider,
         )
     try:
-        await asyncio.to_thread(launcher.prepare_for_launch, agent_name=agent_name)
+        await asyncio.to_thread(
+            launcher.prepare_launch_request,
+            SandboxLaunchRequest(owner=host.user_id, repos=tuple(repos), agent_name=agent_name),
+        )
         await asyncio.to_thread(launcher.prepare)
         sandbox_id = await asyncio.to_thread(launcher.provision, host.name)
     except click.ClickException as exc:
@@ -4036,7 +4042,12 @@ async def resume_managed_host(
             launcher.provider,
         )
         try:
-            await asyncio.to_thread(launcher.prepare_for_launch, agent_name=agent_name)
+            await asyncio.to_thread(
+                launcher.prepare_launch_request,
+                SandboxLaunchRequest(
+                    owner=host.user_id, repos=tuple(workspace_repos), agent_name=agent_name
+                ),
+            )
             await asyncio.to_thread(launcher.resume, sandbox_id)
             token = secrets.token_urlsafe(32)
             armed = await asyncio.to_thread(

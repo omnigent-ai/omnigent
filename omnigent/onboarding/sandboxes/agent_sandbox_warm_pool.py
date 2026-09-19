@@ -170,6 +170,22 @@ class AgentSandboxWarmPoolLauncher(AgentSandboxLauncher):
     def prepare_for_launch(self, *, agent_name: str | None = None) -> None:
         self._agent_name = agent_name
 
+    def _bootstrap_command(self, mode: str) -> list[str]:
+        return _bootstrap_command(mode)
+
+    def _workspace_preparation_stage(self) -> str:
+        return "cloning"
+
+    def _workspace_prep_command(
+        self,
+        workspace: str,
+        repos: Sequence[RepoWorkspace],
+        server_url: str,
+        host_id: str,
+        host_config: dict[str, object] | None = None,
+    ) -> list[str]:
+        return _render_workspace_prep_command(workspace, repos, server_url, host_id, host_config)
+
     def template_spec(
         self,
         *,
@@ -213,9 +229,9 @@ class AgentSandboxWarmPoolLauncher(AgentSandboxLauncher):
         pod = spec["podTemplate"]["spec"]
         bootstrap = pod.pop("initContainers")[0]
         bootstrap["name"] = BOOTSTRAP_CONTAINER
-        bootstrap["command"] = _bootstrap_command("prepare")
+        bootstrap["command"] = self._bootstrap_command("prepare")
         host = pod["containers"][0]
-        host["command"] = _bootstrap_command("host")
+        host["command"] = self._bootstrap_command("host")
         host["env"] = [
             item
             for item in host["env"]
@@ -240,7 +256,7 @@ class AgentSandboxWarmPoolLauncher(AgentSandboxLauncher):
                 }
             )
             container["readinessProbe"] = {
-                "exec": {"command": _bootstrap_command("ready")},
+                "exec": {"command": self._bootstrap_command("ready")},
                 "periodSeconds": 1,
             }
         pod["containers"] = [bootstrap, host]
@@ -553,7 +569,7 @@ class AgentSandboxWarmPoolLauncher(AgentSandboxLauncher):
                 pod_name,
                 handle.namespace,
                 container=BOOTSTRAP_CONTAINER,
-                command=["python3", "-m", "omnigent.host.warm_bootstrap", mode],
+                command=self._bootstrap_command(mode),
                 stdin=payload is not None,
                 stdout=True,
                 stderr=True,
@@ -681,7 +697,7 @@ class AgentSandboxWarmPoolLauncher(AgentSandboxLauncher):
                         "host_name": host_name,
                         "token": token,
                         "server_url": server_url,
-                        "prepare_command": _render_workspace_prep_command(
+                        "prepare_command": self._workspace_prep_command(
                             workspace, repos, server_url, host_id, host_config
                         ),
                     }
@@ -694,7 +710,7 @@ class AgentSandboxWarmPoolLauncher(AgentSandboxLauncher):
                         if observed.get("generation") != generation:
                             raise
                     if on_stage and repos:
-                        on_stage("cloning")
+                        on_stage(self._workspace_preparation_stage())
                 elif status.get("generation") != generation:
                     raise click.ClickException(
                         "Warm Sandbox is already activated for another host generation."

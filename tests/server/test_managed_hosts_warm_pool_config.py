@@ -10,6 +10,7 @@ from fastapi import HTTPException
 
 from omnigent.db.utils import now_epoch
 from omnigent.onboarding.sandboxes.agent_sandbox import AgentSandboxLauncher
+from omnigent.onboarding.sandboxes.types import RepoWorkspace, SandboxLaunchRequest
 from omnigent.server.managed_hosts import (
     ManagedSandboxConfig,
     ManagedSandboxDeployment,
@@ -186,6 +187,65 @@ async def test_request_context_precedes_launch_relaunch_and_resume(db_uri: str) 
     calls.clear()
     await resume_managed_host(first.host_id, host_store, deployment, force=True, agent_name="code")
     assert calls == [("context", "code"), ("resume", None)]
+
+
+async def test_workspace_request_context_tracks_owner_and_repos_on_each_lifecycle(
+    db_uri: str,
+) -> None:
+    host_store = HostStore(db_uri)
+    requests: list[SandboxLaunchRequest] = []
+    repo = RepoWorkspace("https://github.com/example/private.git", "main", "private")
+
+    class ProfileLauncher(FakeSandboxLauncher):
+        provider = "agent_sandbox"
+
+        def prepare_launch_request(self, request: SandboxLaunchRequest) -> None:
+            requests.append(request)
+            super().prepare_launch_request(request)
+
+    def register(invocation: HostStartInvocation) -> None:
+        host_store.upsert_on_connect(
+            host_id=invocation.host_id, name=invocation.host_name, user_id="profile-owner"
+        )
+
+    launcher = ProfileLauncher(on_host_start=register, can_resume=True)
+    deployment = ManagedSandboxDeployment.single(
+        ManagedSandboxConfig(
+            server_url="https://server.example.com",
+            launcher_factory=lambda: launcher,
+            token_ttl_s=3600,
+            provider="agent_sandbox",
+        )
+    )
+    first = await launch_managed_host(
+        config=deployment,
+        owner="profile-owner",
+        host_store=host_store,
+        repos=[repo],
+        agent_name="claude-native-ui",
+    )
+    host = host_store.get_host(first.host_id)
+    assert host is not None
+    await relaunch_managed_host(
+        config=deployment,
+        host=host,
+        host_store=host_store,
+        repos=[repo],
+        agent_name="codex-native-ui",
+    )
+    await resume_managed_host(
+        first.host_id,
+        host_store,
+        deployment,
+        force=True,
+        repos=[repo],
+        agent_name="codex-native-ui",
+    )
+    assert requests == [
+        SandboxLaunchRequest("profile-owner", (repo,), "claude-native-ui"),
+        SandboxLaunchRequest("profile-owner", (repo,), "codex-native-ui"),
+        SandboxLaunchRequest("profile-owner", (repo,), "codex-native-ui"),
+    ]
 
 
 async def test_rejected_launch_context_does_not_allocate(db_uri: str) -> None:

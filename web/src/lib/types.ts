@@ -522,13 +522,19 @@ export interface Session {
 }
 
 /**
- * Stages of a managed-sandbox launch, in pipeline order. `cloning`
- * only occurs when the session requested a repository workspace;
+ * Stages of a managed-sandbox launch. Repository setup uses `cloning`
+ * or `preparing_workspace` when activating a prepared workspace;
  * `ready` and `failed` are terminal (`ready` is delivered via SSE
  * only — the snapshot field clears to null on success).
  */
 export type SandboxLaunchStage =
-  "provisioning" | "cloning" | "starting" | "connecting" | "ready" | "failed";
+  | "provisioning"
+  | "cloning"
+  | "preparing_workspace"
+  | "starting"
+  | "connecting"
+  | "ready"
+  | "failed";
 
 /**
  * Managed-sandbox launch progress — mirrors

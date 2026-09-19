@@ -1815,14 +1815,12 @@ class SessionLabelsResponse(BaseModel):
     labels: dict[str, str] = Field(default_factory=dict)
 
 
-# Stages of a managed-sandbox launch, in pipeline order: the sandbox
-# is provisioned, the repository workspace is cloned into it (skipped
-# when the session has no repo workspace), the in-sandbox host starts
-# and registers, and the agent runner is launched on it. ``ready`` and
-# ``failed`` are terminal.
+# Repository setup either clones repositories or activates a prepared workspace.
+# ``ready`` and ``failed`` are terminal launch stages.
 SandboxLaunchStage = Literal[
     "provisioning",
     "cloning",
+    "preparing_workspace",
     "starting",
     "connecting",
     "ready",
@@ -1841,9 +1839,9 @@ class SandboxStatus(BaseModel):
 
     :param stage: Current launch stage, e.g. ``"provisioning"`` —
         one of :data:`SandboxLaunchStage`, in pipeline order:
-        ``provisioning`` (creating the sandbox) → ``cloning``
-        (cloning the repository workspace; skipped when the session
-        has none) → ``starting`` (starting the in-sandbox host) →
+        ``provisioning`` (creating the sandbox) → ``cloning`` or
+        ``preparing_workspace`` (setting up repositories; skipped when the
+        session has none) → ``starting`` (starting the in-sandbox host) →
         ``connecting`` (launching the agent runner) → ``ready`` /
         ``failed``.
     :param error: Failure detail when ``stage == "failed"``, e.g.

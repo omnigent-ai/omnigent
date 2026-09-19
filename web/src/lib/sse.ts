@@ -765,6 +765,7 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
     if (
       stage !== "provisioning" &&
       stage !== "cloning" &&
+      stage !== "preparing_workspace" &&
       stage !== "starting" &&
       stage !== "connecting" &&
       stage !== "ready" &&
