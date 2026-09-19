@@ -6875,8 +6875,21 @@ export function NewChatLandingScreen() {
           )}
 
           {sandboxCatalogError && (
-            <p className="text-sm text-destructive" role="alert">
-              {sandboxCatalogError}
+            <p
+              className="flex flex-wrap items-center gap-x-1.5 text-sm text-destructive"
+              role="alert"
+            >
+              <span>{sandboxCatalogError}</span>
+              {sandboxCatalogError.includes("Connect Databricks") && (
+                <button
+                  type="button"
+                  className="underline underline-offset-2 hover:no-underline"
+                  onClick={() => navigate("/settings/integrations")}
+                  data-testid="sandbox-catalog-error-integrations-link"
+                >
+                  Go to Integrations
+                </button>
+              )}
             </p>
           )}
           {pickerSelectionError && (
