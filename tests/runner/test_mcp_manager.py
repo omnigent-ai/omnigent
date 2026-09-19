@@ -250,6 +250,17 @@ async def test_pool_separate_entries_for_different_specs(
     )
 
 
+def test_compute_server_hash_distinguishes_oauth() -> None:
+    """Two otherwise-identical configs that differ only in ``oauth`` must
+    not share a pooled connection — an OAuth-authenticated connection and
+    an unauthenticated one to the same URL are not interchangeable."""
+    cfg_plain = _make_config("svc")
+    cfg_oauth = _make_config("svc")
+    cfg_oauth.oauth = True
+
+    assert compute_server_hash(cfg_plain) != compute_server_hash(cfg_oauth)
+
+
 @pytest.mark.asyncio
 async def test_shared_server_reused_across_different_specs(
     patch_connection: dict[str, Any],
