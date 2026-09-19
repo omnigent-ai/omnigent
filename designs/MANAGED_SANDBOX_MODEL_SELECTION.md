@@ -10,6 +10,14 @@ keep their accepted configuration across model changes, runner restarts,
 sandbox wake/replacement, and server restarts. Credentials are refreshed through
 saved references; tokens are never part of the snapshot.
 
+This is opt-in per sandbox target: a nonempty
+`sandbox.host_config.inference.harnesses` mapping enables it. Ordinary hosts and
+sandbox targets without bindings retain their existing authentication, provider
+defaults, and model selection. `/v1/info` advertises `inference_models` only for
+configured targets; other targets do not request preview catalogs or wait on
+discovery. The new credential-reference restrictions apply to saved inference
+profiles and explicitly configured discovery credentials, not legacy host configs.
+
 ## Configuration
 
 Add providers and harness bindings to the existing `sandbox.host_config`.

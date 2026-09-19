@@ -3149,7 +3149,11 @@ export function NewChatLandingScreen() {
   const previewSandboxProvider =
     sandboxProvider ?? (info !== "loading" ? info.sandbox_provider : null);
   const sandboxPreviewEnabled =
-    sandboxSelected && previewSandboxProvider !== null && previewHarness !== null;
+    sandboxSelected &&
+    previewSandboxProvider !== null &&
+    previewHarness !== null &&
+    info !== "loading" &&
+    info.sandbox_provider_capabilities?.[previewSandboxProvider]?.inference_models === true;
   const sandboxModels = useSandboxModelOptions(
     previewSandboxProvider,
     previewHarness,
@@ -3157,7 +3161,8 @@ export function NewChatLandingScreen() {
     cacheUser,
     sandboxPreviewEnabled,
   );
-  const sandboxInferenceConfigured = sandboxSelected && sandboxModels.data?.configured === true;
+  const sandboxInferenceConfigured =
+    sandboxPreviewEnabled && sandboxModels.data?.configured === true;
   const sandboxCatalogPending =
     sandboxPreviewEnabled && sandboxModels.data === undefined && sandboxModels.isLoading;
   const sandboxCatalogError = sandboxPreviewEnabled
@@ -3492,8 +3497,8 @@ export function NewChatLandingScreen() {
     projectParam,
     selectedHostId,
     sandboxSelected,
-    sandboxSelected ? previewSandboxProvider : null,
-    sandboxSelected ? previewHarness : null,
+    sandboxPreviewEnabled ? previewSandboxProvider : null,
+    sandboxPreviewEnabled ? previewHarness : null,
   ]);
   const [pickerReadyTarget, setPickerReadyTarget] = useState<string | null>(null);
   // Keep one placeholder through host selection and saved-model restoration.
@@ -3847,7 +3852,7 @@ export function NewChatLandingScreen() {
       const saved = readHarnessOptions(native.harness);
       if (saved.routing === "on") return [agent.id, SMART_ROUTING_LABEL];
       const catalog =
-        sandboxSelected && native.harness !== previewHarness
+        sandboxInferenceConfigured && native.harness !== previewHarness
           ? []
           : native.iconKind === "claude"
             ? claudeModelOptions
@@ -5413,7 +5418,7 @@ export function NewChatLandingScreen() {
                   ...(createProjectId !== null ? { workspace: null, git: null } : {}),
                   // Omitted when null so a default create is unchanged.
                   ...(sandboxProvider !== null ? { sandbox_provider: sandboxProvider } : {}),
-                  ...(sandboxModels.data?.configuration_revision
+                  ...(sandboxPreviewEnabled && sandboxModels.data?.configuration_revision
                     ? {
                         inference_configuration_revision: sandboxModels.data.configuration_revision,
                       }
@@ -5494,7 +5499,7 @@ export function NewChatLandingScreen() {
         const confirmed = (async (): Promise<{ id: string } | { error: string }> => {
           const response = await createRequest;
           if (!response.ok) {
-            if (sandboxSelected && response.status === 409) {
+            if (sandboxPreviewEnabled && response.status === 409) {
               void queryClient.invalidateQueries({
                 queryKey: sandboxModelOptionsKey(
                   previewSandboxProvider,

@@ -10,7 +10,11 @@ from fastapi import APIRouter, HTTPException, Request
 
 from omnigent.entities import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.inference_config import binding_for_harness, resolve_bound_provider
+from omnigent.inference_config import (
+    binding_for_harness,
+    parse_inference_config,
+    resolve_bound_provider,
+)
 from omnigent.server.auth import LEVEL_READ, AuthProvider
 from omnigent.server.routes._auth_helpers import require_access_and_level, require_user
 
@@ -46,7 +50,7 @@ def managed_inference_configured(request: Request, provider: str | None) -> bool
     """Whether a managed target requires an identifiable harness before creation."""
     deployment = getattr(request.app.state, "sandbox_config", None)
     target = deployment.for_provider(provider) if deployment is not None else None
-    return bool(target and (target.host_config or {}).get("inference"))
+    return bool(target and parse_inference_config(target.host_config or {}))
 
 
 def selected_catalog_model(catalog: dict[str, Any], model: str | None) -> str:

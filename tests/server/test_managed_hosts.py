@@ -2169,6 +2169,35 @@ def test_provider_ui_capabilities_reports_multi_repo_per_provider() -> None:
     }
 
 
+def test_provider_ui_capabilities_enable_inference_only_on_configured_target() -> None:
+    launcher = FakeSandboxLauncher()
+    profile = {
+        "providers": {"gateway": {"kind": "gateway"}},
+        "inference": {"harnesses": {"pi-native": {"provider": "gateway"}}},
+    }
+    deployment = ManagedSandboxDeployment(
+        configs=tuple(
+            ManagedSandboxConfig(
+                server_url="https://s",
+                provider=provider,
+                token_ttl_s=3600,
+                launcher_factory=lambda: launcher,
+                host_config=config,
+            )
+            for provider, config in (
+                ("kubernetes", None),
+                ("modal", {"inference": {"harnesses": {}}}),
+                ("agent_sandbox", profile),
+            )
+        )
+    )
+    assert deployment.provider_ui_capabilities() == {
+        "kubernetes": {"multi_repo": False},
+        "modal": {"multi_repo": False},
+        "agent_sandbox": {"multi_repo": False, "inference_models": True},
+    }
+
+
 # ── GET /v1/info: managed_sandboxes_enabled ─────────────────
 
 

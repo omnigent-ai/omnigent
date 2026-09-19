@@ -790,14 +790,17 @@ class ManagedSandboxDeployment:
         ponytail: builds launchers on each call; memoize on the deployment only
         if /v1/info shows up hot (provider count is tiny, __init__ does no I/O).
 
-        :returns: ``{provider: {"multi_repo": bool}}`` for each launchable
-            provider, in configured order.
+        :returns: Capability flags for each launchable provider, in configured order.
         """
         caps: dict[str, dict[str, bool]] = {}
         for config in self.configs:
             if config.managed_launch_supported and config.provider is not None:
                 launcher = config.launcher_factory()
                 caps[config.provider] = {"multi_repo": launcher.capabilities.multi_repo}
+                from omnigent.inference_config import parse_inference_config
+
+                if parse_inference_config(config.host_config or {}):
+                    caps[config.provider]["inference_models"] = True
         return caps
 
 
@@ -1222,9 +1225,10 @@ def _parse_host_config(raw: dict[str, object]) -> dict[str, object] | None:
     # validation here yet still ride to the sandbox, where the merge writes
     # `providers: null` over any existing block — the silent degradation this
     # parse exists to prevent.
-    from omnigent.inference_config import validate_inference_credentials
+    from omnigent.inference_config import parse_inference_config, validate_inference_credentials
 
-    validate_inference_credentials(host_config)
+    if parse_inference_config(host_config):
+        validate_inference_credentials(host_config)
     if "providers" in host_config:
         providers = host_config["providers"]
         # load_providers silently ignores a non-mapping providers value, so
@@ -1258,9 +1262,6 @@ def _parse_host_config(raw: dict[str, object]) -> dict[str, object] | None:
                         f"{family_name}.api_key' must not contain an inline API key — "
                         "use api_key_ref: env:VAR instead"
                     )
-    from omnigent.inference_config import parse_inference_config
-
-    parse_inference_config(host_config)
     # The block rides json.dumps to the sandbox on every launch, and
     # yaml.safe_load produces values json can't take (an unquoted date
     # becomes datetime.date) — round-trip now so that fails startup, not
@@ -1466,7 +1467,7 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
             raise ValueError(f"sandbox.model_discovery.{name} requires a credential reference")
     from omnigent.inference_config import validate_inference_credentials
 
-    validate_inference_credentials(host_config or {}, model_discovery)
+    validate_inference_credentials({}, model_discovery)
     if provider == "agent_sandbox":
         host_config = _apply_keep_warm(host_config, _parse_keep_warm_s(raw))
     if provider == "modal":

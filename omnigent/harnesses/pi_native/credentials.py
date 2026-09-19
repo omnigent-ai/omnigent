@@ -1514,10 +1514,13 @@ def resolve_pi_native_provider(
     )
 
     try:
-        base_config = config_loader()
-    except Exception:
         if config_loader is load_config:
-            raise
+            from omnigent.onboarding.provider_config import _load_config
+
+            base_config = _load_config()
+        else:
+            base_config = config_loader()
+    except Exception:  # noqa: BLE001 — legacy config failures fall back to Pi's own login
         _LOGGER.warning("pi-native: failed to read provider configuration", exc_info=True)
         return None
     config = load_runtime_inference_config(base_config)

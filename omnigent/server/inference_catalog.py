@@ -16,6 +16,7 @@ from omnigent.inference_config import (
     HarnessInferenceBinding,
     binding_for_harness,
     inference_revision,
+    parse_inference_config,
     resolve_bound_provider,
     validate_inference_credentials,
 )
@@ -178,6 +179,8 @@ class SandboxInferenceService:
                 f"on this server — available: {offered}"
             )
         raw: dict[str, Any] = copy.deepcopy(target.host_config or {})
+        if not parse_inference_config(raw):
+            return None
         discovery = copy.deepcopy(getattr(target, "model_discovery", None) or {})
         try:
             validate_inference_credentials(raw, discovery)
@@ -191,8 +194,6 @@ class SandboxInferenceService:
                 raise _invalid("Model discovery entries must be mappings.")
             _endpoint(discovery_entry.get("base_url"))
         bound = resolve_bound_provider(raw, harness, agent_auth, allow_empty=True)
-        if bound is None and not raw.get("inference"):
-            return None
         owner = user_id or RESERVED_USER_LOCAL
         runtime: dict[str, Any] = {
             "providers": copy.deepcopy(raw.get("providers", {})),

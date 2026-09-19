@@ -254,6 +254,26 @@ async def test_json_create_captures_selected_model_and_configuration(env: _Env, 
     env.launch.assert_awaited_once()
 
 
+@pytest.mark.parametrize("multipart", [False, True])
+async def test_external_create_on_configured_server_does_not_capture_sandbox_policy(
+    env, multipart
+):
+    create = _multipart_create if multipart else _json_create
+    response = await create(
+        env,
+        host_type="external",
+        sandbox_provider=None,
+        inference_configuration_revision=None,
+        **({} if multipart else {"model_override": "gpt-legacy"}),
+    )
+    assert response.status_code == 201, response.text
+    saved = env.store.get_conversation(response.json()["session_id" if multipart else "id"])
+    assert saved.inference_snapshot is None
+    assert saved.model_override == (None if multipart else "gpt-legacy")
+    assert env.catalog.calls == []
+    env.launch.assert_not_awaited()
+
+
 @pytest.mark.parametrize("explicit_policy", [True, False])
 async def test_multipart_create_captures_default_model_in_saved_configuration(
     env: _Env, explicit_policy: bool

@@ -82,6 +82,27 @@ def _transport(ids=("gateway/main", "gateway/fast", "gateway/noisy"), requests=N
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["lakebox", "kubernetes", "agent_sandbox", "modal"])
+@pytest.mark.parametrize("inference", [None, {}, {"harnesses": {}}])
+async def test_unconfigured_sandboxes_preserve_legacy_credentials(provider, inference):
+    config = copy.deepcopy(_state().sandbox_config.default.host_config)
+    config.pop("inference")
+    if inference is not None:
+        config["inference"] = inference
+    family = config["providers"]["bifrost"]["openai"]
+    family["api_key_ref"] = "legacy-test-key"
+    family["base_url"] = "${LEGACY_GATEWAY_URL}"
+    deployment = parse_sandbox_config(
+        {"provider": provider, "server_url": "https://server.example", "host_config": config}
+    )
+    service = SandboxInferenceService(SimpleNamespace(sandbox_config=deployment))
+    service._connection = AsyncMock(side_effect=AssertionError("Unexpected OAuth lookup"))
+    assert await service.prepare(provider, "codex-native", "alice") is None
+    assert deployment.default.host_config == config
+    service._connection.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_preview_uses_server_discovery_and_never_resolves_pod_credentials():
     state = _state()
     requests = []

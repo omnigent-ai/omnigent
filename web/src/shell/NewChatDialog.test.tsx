@@ -9124,6 +9124,55 @@ describe("managed sandbox inference models", () => {
     default_model: "private/default",
   };
 
+  function renderConfiguredSandbox(overrides: Partial<ServerInfo>) {
+    return renderLanding({
+      ...overrides,
+      sandbox_provider_capabilities: {
+        [overrides.sandbox_provider!]: { inference_models: true },
+      },
+    });
+  }
+
+  it.each(["lakebox", "kubernetes", "agent_sandbox", "modal"])(
+    "keeps %s without bindings independent of the preview service",
+    async (provider) => {
+      preview(catalog, new Error("Gateway unavailable"));
+      authenticatedFetchMock.mockResolvedValue({
+        ok: true,
+        json: async () => ({ id: "conv_new" }),
+      } as Response);
+      renderLanding({
+        managed_sandboxes_enabled: true,
+        sandbox_provider: provider,
+        sandbox_provider_capabilities: { another_provider: { inference_models: true } },
+      });
+      expect(useSandboxModelOptions).toHaveBeenLastCalledWith(
+        provider,
+        "claude-native",
+        "a1",
+        null,
+        false,
+      );
+      expect(screen.queryByTestId("sandbox-model-provider")).toBeNull();
+      expect(screen.queryByRole("alert")).toBeNull();
+      const { body } = await submitAndReadBody();
+      expect(body.host_type).toBe("managed");
+      expect(body.inference_configuration_revision).toBeUndefined();
+    },
+  );
+
+  it("does not preview inference for an ordinary host on an opted-in server", () => {
+    preview(catalog, new Error("Gateway unavailable"));
+    mockHosts([host("online")]);
+    renderConfiguredSandbox({
+      managed_sandboxes_enabled: false,
+      sandbox_provider: "agent_sandbox",
+    });
+    expect(vi.mocked(useSandboxModelOptions).mock.lastCall?.[4]).toBe(false);
+    expect(screen.queryByTestId("sandbox-model-provider")).toBeNull();
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
   function preview(data: SandboxModelOptions = catalog, error: Error | null = null) {
     vi.mocked(useSandboxModelOptions).mockReturnValue({
       data,
@@ -9138,7 +9187,7 @@ describe("managed sandbox inference models", () => {
       ok: true,
       json: async () => ({ id: "conv_new" }),
     } as Response);
-    renderLanding({ managed_sandboxes_enabled: true, sandbox_provider: "agent_sandbox" });
+    renderConfiguredSandbox({ managed_sandboxes_enabled: true, sandbox_provider: "agent_sandbox" });
     openAgentModels("a1");
     expect(screen.getByTestId("sandbox-model-provider")).toHaveTextContent("Bifrost");
     expect(screen.queryByTestId("new-chat-landing-agent-model-opus")).toBeNull();
@@ -9173,7 +9222,7 @@ describe("managed sandbox inference models", () => {
       ok: true,
       json: async () => ({ id: "conv_new" }),
     } as Response);
-    renderLanding({ managed_sandboxes_enabled: true, sandbox_provider: "kubernetes" });
+    renderConfiguredSandbox({ managed_sandboxes_enabled: true, sandbox_provider: "kubernetes" });
     openAgentModels("a_acp");
     pickPrimaryOption("model", "Gateway alternate");
     closeMenu();
@@ -9192,7 +9241,7 @@ describe("managed sandbox inference models", () => {
     "blocks create when discovery is %s",
     async (status) => {
       preview({ ...catalog, models: [], status });
-      renderLanding({ managed_sandboxes_enabled: true, sandbox_provider: "kubernetes" });
+      renderConfiguredSandbox({ managed_sandboxes_enabled: true, sandbox_provider: "kubernetes" });
       fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
         target: { value: "start" },
       });
@@ -9204,7 +9253,7 @@ describe("managed sandbox inference models", () => {
 
   it("blocks stale cached choices when a catalog refresh fails", async () => {
     preview(catalog, new Error("Gateway unavailable"));
-    renderLanding({ managed_sandboxes_enabled: true, sandbox_provider: "kubernetes" });
+    renderConfiguredSandbox({ managed_sandboxes_enabled: true, sandbox_provider: "kubernetes" });
     fireEvent.change(screen.getByTestId("new-chat-landing-input"), { target: { value: "start" } });
     expect(screen.getByRole("alert")).toHaveTextContent("Gateway unavailable");
     expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
@@ -9218,7 +9267,7 @@ describe("managed sandbox inference models", () => {
       status: "unavailable",
       error: "Connect Databricks before using this harness's Unity Gateway provider.",
     });
-    renderLanding({ managed_sandboxes_enabled: true, sandbox_provider: "agent_sandbox" });
+    renderConfiguredSandbox({ managed_sandboxes_enabled: true, sandbox_provider: "agent_sandbox" });
     fireEvent.change(screen.getByTestId("new-chat-landing-input"), { target: { value: "start" } });
     expect(screen.getByRole("alert")).toHaveTextContent("Connect Databricks");
     expect(screen.getByTestId("sandbox-catalog-error-integrations-link")).toHaveTextContent(
@@ -9230,7 +9279,7 @@ describe("managed sandbox inference models", () => {
 
   it("discards a model removed by a provider profile change", async () => {
     preview();
-    const mounted = renderLanding({
+    const mounted = renderConfiguredSandbox({
       managed_sandboxes_enabled: true,
       sandbox_provider: "kubernetes",
     });

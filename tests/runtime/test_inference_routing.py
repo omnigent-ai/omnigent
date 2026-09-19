@@ -107,6 +107,36 @@ def test_native_and_sdk_claude_keep_distinct_bindings() -> None:
     assert sdk["HARNESS_CLAUDE_SDK_GATEWAY_BASE_URL"] == "https://bifrost.example/anthropic"
 
 
+def test_pi_legacy_config_error_keeps_native_login_fallback(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "omnigent.onboarding.provider_config._load_config", Mock(side_effect=OSError("unreadable"))
+    )
+    assert resolve_pi_native_provider() is None
+
+
+def test_pi_invalid_saved_profile_does_not_fall_back_to_native_login(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setenv("OMNIGENT_INFERENCE_CONFIG", str(tmp_path / "missing-profile.json"))
+    with pytest.raises(OmnigentError, match="saved inference configuration"):
+        resolve_pi_native_provider()
+
+
+@pytest.mark.parametrize("harness", ["claude-sdk", "codex", "pi", "qwen", "openai-agents"])
+def test_unbound_host_keeps_its_explicit_provider_and_model(harness, tmp_path) -> None:
+    from omnigent.runner.app import _HARNESS_MODEL_ENV_KEY, _build_spawn_env_from_spec
+
+    config = _profile()
+    config.pop("inference")
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump(config))
+    spec = _spec(harness, "gpt-legacy", provider="bifrost")
+    provider = _resolve_provider_for_build(spec, harness_type=harness)
+    assert provider is not None and provider.name == "bifrost"
+    env = _build_spawn_env_from_spec(spec, harness)
+    assert env[_HARNESS_MODEL_ENV_KEY[harness]] == "gpt-legacy"
+    assert "HARNESS_PI_PRESERVE_MODEL_IDS" not in env
+
+
 @pytest.mark.parametrize("harness", ["codex", "claude-sdk", "pi", "qwen", "openai-agents"])
 def test_bound_sdk_selected_model_precedes_an_obsolete_spec_pin(harness: str) -> None:
     from omnigent.runner.app import _HARNESS_MODEL_ENV_KEY, _build_spawn_env_from_spec

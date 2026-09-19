@@ -47,7 +47,11 @@ async def _drive(
                 page, created_session_id=session_id, create_bodies=creates
             )
             info = json.loads(_managed_info_body())
-            info.update(sandbox_provider="agent_sandbox", databricks_features=needs_connection)
+            info.update(
+                sandbox_provider="agent_sandbox",
+                databricks_features=needs_connection,
+                sandbox_provider_capabilities={"agent_sandbox": {"inference_models": True}},
+            )
             await page.route("**/v1/info", lambda route: route.fulfill(json=info))
 
             async def models(route: Route) -> None:
