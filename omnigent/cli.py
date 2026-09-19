@@ -6421,7 +6421,7 @@ class _SessionImportResult:
 @click.option(
     "--harness",
     type=click.Choice(
-        ["all", "claude", "codex", "kimi", "kiro", "opencode", "pi", "qwen"],
+        ["all", "claude", "codex", "hermes", "kimi", "kiro", "opencode", "pi", "qwen"],
         case_sensitive=False,
     ),
     required=True,
