@@ -27,9 +27,10 @@ REPORTED=0
 EXIT_CODE=0
 ACTIONS_FILE="$(mktemp "${TMPDIR:-/tmp}/omnigent-uninstall-actions.XXXXXX")" || exit 1
 BACKUPS_FILE="$(mktemp "${TMPDIR:-/tmp}/omnigent-uninstall-backups.XXXXXX")" || exit 1
+SECRETS_FILE="$(mktemp "${TMPDIR:-/tmp}/omnigent-uninstall-secrets.XXXXXX")" || exit 1
 
 cleanup() {
-  rm -f "$ACTIONS_FILE" "$BACKUPS_FILE"
+  rm -f "$ACTIONS_FILE" "$BACKUPS_FILE" "$SECRETS_FILE"
 }
 trap cleanup EXIT HUP INT TERM
 
@@ -38,7 +39,7 @@ usage() {
 Usage: uninstall_oss.sh [cli|state|desktop-data|all ...] [flags]
 
 Flags:
-  --purge                    Remove state data (backs up first)
+  --purge                    Remove state data and OS-keychain secrets (backs up state first)
   --purge-workspace          With --purge, also remove ~/omnigent non-interactively
   --dry-run                  Print planned actions only
   --yes                      Non-interactive for auto-removable artifacts
@@ -597,7 +598,41 @@ desktop_paths() {
   esac
 }
 
+collect_keychain_secret_names() {
+  # Runs before the state dir is removed: a standalone run (no CLI manifest)
+  # reads the names out of config.yaml, which purge_state deletes.
+  if [ -n "${OMNIGENT_UNINSTALL_LEDGER_MANIFEST:-}" ] && [ -f "$OMNIGENT_UNINSTALL_LEDGER_MANIFEST" ]; then
+    while IFS="$TAB" read -r artifact name rest; do
+      [ "$artifact" = keychain_secret ] || continue
+      [ -n "$name" ] || continue
+      printf '%s\n' "$name" >>"$SECRETS_FILE"
+    done <"$OMNIGENT_UNINSTALL_LEDGER_MANIFEST"
+  elif [ -f "$(state_home)/config.yaml" ]; then
+    grep -o 'keychain:[A-Za-z0-9._-]\{1,\}' "$(state_home)/config.yaml" 2>/dev/null |
+      sed 's/^keychain://' | sort -u >>"$SECRETS_FILE" || true
+  fi
+}
+
+purge_keychain_secrets() {
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    if [ "$DRY_RUN" = true ]; then
+      record_action keychain_secret "$name" remove reported "" "would remove from the OS keychain (service omnigent)"
+    elif [ -z "${OMNIGENT_UNINSTALL_PYTHON:-}" ]; then
+      record_action keychain_secret "$name" remove reported "" "left in the OS keychain (service omnigent); remove it manually"
+    elif "$OMNIGENT_UNINSTALL_PYTHON" -m omnigent _internal delete-keychain-secret "$name" >/dev/null 2>&1; then
+      record_action keychain_secret "$name" remove done "" "removed from the OS keychain (service omnigent)"
+    else
+      record_action keychain_secret "$name" remove failed "" "failed to remove from the OS keychain (service omnigent)"
+    fi
+  done <"$SECRETS_FILE"
+}
+
 purge_state() {
+  collect_keychain_secret_names
+  # Delete secrets before the state tree: the Python helper's CLI startup
+  # recreates log dirs under the state home, which the removal then sweeps.
+  purge_keychain_secrets
   remove_tree state "$(state_home)" ""
   workspace="$HOME/omnigent"
   if [ -e "$workspace" ]; then
