@@ -498,6 +498,15 @@ describe("resolveThisMachineHostId", () => {
 // either let through requests the server rejects (opaque 400) or
 // block requests the server would accept (button stuck disabled).
 describe("isValidWorkspace", () => {
+  it.each(["C:\\Users\\alice\\work", "D:/projects/app", "C:\\", "\\\\server\\share\\repo"])(
+    "accepts the absolute Windows path %s",
+    (path) => expect(isValidWorkspace(path)).toBe(true),
+  );
+
+  it.each(["C:", "C:repo", "\\repo"])("rejects the relative Windows path %s", (path) =>
+    expect(isValidWorkspace(path)).toBe(false),
+  );
+
   it("accepts a fully absolute path", () => {
     expect(isValidWorkspace("/Users/corey/projects/myapp")).toBe(true);
   });
