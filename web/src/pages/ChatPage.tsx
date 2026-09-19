@@ -2125,6 +2125,7 @@ export function buildSlashCommandMap(
   showBtw = false,
   showSide = false,
   skillPrefix: "/" | "$" = "/",
+  supportsModelReset = false,
 ): Record<string, string> {
   const m: Record<string, string> = {};
   for (const [name, description] of Object.entries(BUILTIN_SLASH_COMMANDS)) {
@@ -2135,7 +2136,7 @@ export function buildSlashCommandMap(
     if (name === "/btw" && !showBtw) continue;
     // /side is a Codex CLI built-in (ephemeral fork) — only offer it on codex-native.
     if (name === "/side" && !showSide) continue;
-    m[name] = description;
+    m[name] = name === "/model" && supportsModelReset ? `${description} | default` : description;
   }
   for (const skill of skills) {
     m[`${skillPrefix}${skill.name}`] = skill.description;
@@ -2736,6 +2737,13 @@ function ComposerImpl(
   // it each turn; native wrappers expose it only when they have a picker
   // path that the runner can propagate without blocking the vendor TUI.
   const showModel = !isNativeWrapper || showModels;
+  // Configured sessions reset through their saved policy; native resets
+  // otherwise require a harness that can clear its live model override.
+  const supportsModelReset =
+    !!inferenceConfigured ||
+    (modelPickerKind
+      ? ["opencode", "acp", "configured"].includes(modelPickerKind)
+      : !isNativeWrapper);
   // /compact is functional for native wrappers (claude-native,
   // codex-native), which inject the slash command into the terminal, and
   // for claude-sdk, whose runner sends /compact to the live SDK client to
@@ -2760,8 +2768,18 @@ function ComposerImpl(
         showBtw,
         showSide,
         skillPrefix,
+        supportsModelReset,
       ),
-    [skills, showEffort, showModel, showCompact, showBtw, showSide, skillPrefix],
+    [
+      skills,
+      showEffort,
+      showModel,
+      showCompact,
+      showBtw,
+      showSide,
+      skillPrefix,
+      supportsModelReset,
+    ],
   );
   // Skills always need an optional argument fill-in so the user can
   // type extra context after the name; built-in commands keep their
@@ -3008,12 +3026,18 @@ function ComposerImpl(
           const current = sessionModelOverride
             ? `${sessionModelOverride} (override)`
             : (llmModel ?? "agent default");
-          setCommandError(`Model: ${current}\nUsage: /model <name> · /model default to reset`);
+          setCommandError(
+            `Model: ${current}\nUsage: /model <name>${supportsModelReset ? " | default" : ""}`,
+          );
           return true;
         }
-        // ``default | off | reset`` clear the override (REPL clear aliases);
-        // ``setModel(null)`` sends the server's "default" clear sentinel.
-        const clear = ["default", "off", "reset"].includes(target.toLowerCase());
+        const reset = ["default", "off", "reset"].includes(target.toLowerCase());
+        if (reset && !supportsModelReset) {
+          setCommandError(
+            "This session does not support resetting the model. Choose a model with /model <name>.",
+          );
+          return true;
+        }
         dirtyRef.current = true;
         setValue("");
         setCommandError(null);
@@ -3025,7 +3049,7 @@ function ComposerImpl(
         const harness = useChatStore.getState().sessionHarness;
         void useChatStore
           .getState()
-          .setModel(clear ? null : target, {
+          .setModel(reset ? null : target, {
             expectConfirmation: harness === "claude-native" || harness === "codex-native",
           })
           .catch((err: unknown) => {
@@ -3981,6 +4005,7 @@ function ComposerImpl(
                   showCodexApprovalMode={showCodexApprovalMode}
                   effortLevels={effortLevels}
                   modelPickerKind={modelPickerKind}
+                  supportsModelReset={supportsModelReset}
                   codexModelOptions={codexModelOptions}
                   inferenceConfigured={inferenceConfigured}
                   inferenceError={inferenceError}
@@ -4617,6 +4642,7 @@ function SessionHarnessPicker({
   showCodexApprovalMode = false,
   effortLevels,
   modelPickerKind,
+  supportsModelReset,
   codexModelOptions,
   inferenceConfigured,
   inferenceError,
@@ -4638,6 +4664,7 @@ function SessionHarnessPicker({
   showCodexApprovalMode?: boolean;
   effortLevels: readonly string[];
   modelPickerKind: NativeModelPickerKind | null;
+  supportsModelReset: boolean;
   codexModelOptions: readonly NativeModelOption[];
   inferenceConfigured?: boolean;
   inferenceError?: string | null;
@@ -4803,24 +4830,14 @@ function SessionHarnessPicker({
                 testId: "composer-agent-models",
                 header: "Models",
                 leading:
-                  inferenceConfigured && (inferenceError || modelOptions.length === 0) ? (
+                  (inferenceConfigured && inferenceError) || modelOptions.length === 0 ? (
                     <div className="px-2 py-1 text-xs text-muted-foreground" role="status">
-                      {inferenceError ?? "No usable models are available for this session."}
+                      {inferenceConfigured
+                        ? (inferenceError ?? "No usable models are available for this session.")
+                        : "Model choices aren't available right now."}
                     </div>
                   ) : undefined,
                 choices: [
-                  ...(!inferenceConfigured && !modelOptions.some((model) => model.isDefault)
-                    ? [
-                        {
-                          key: "__default__",
-                          label: "Default",
-                          checked: !routingOn && pickerSelectedModel === null,
-                          disabled: busy || pendingModelChange !== null,
-                          onSelect: () => selectModel(null),
-                          testId: "composer-agent-model-default",
-                        },
-                      ]
-                    : []),
                   ...modelOptions.map((model) => ({
                     key: model.id,
                     label: nativeModelLabel(model),
@@ -4828,13 +4845,12 @@ function SessionHarnessPicker({
                       !routingOn &&
                       (composerFusion !== undefined && model.id === composerFusionOption?.id
                         ? isFusionModelUid(pickerSelectedModel)
-                        : model.id === pickerSelectedModel ||
-                          (pickerSelectedModel === null && model.isDefault === true)),
+                        : model.id === pickerSelectedModel),
                     disabled: busy || pendingModelChange !== null,
                     onSelect: () =>
                       composerFusion !== undefined && model.id === composerFusionOption?.id
                         ? selectFusionModel(composerFusion.default)
-                        : selectModel(model.isDefault ? null : model.id),
+                        : selectModel(model.id),
                     testId: `composer-agent-model-${model.id}`,
                     className: "whitespace-normal break-words",
                     data: { "data-model-id": model.id },
@@ -4869,6 +4885,17 @@ function SessionHarnessPicker({
             : undefined
         }
       />
+      {supportsModelReset && showModels && (
+        <>
+          <DropdownMenuSeparator />
+          <DropdownMenuItem
+            disabled={busy || pendingModelChange !== null || !!inferenceError}
+            onSelect={() => selectModel(null)}
+          >
+            Use default model
+          </DropdownMenuItem>
+        </>
+      )}
     </>
   );
   const effortContent = (
@@ -5083,7 +5110,6 @@ function useResolvedComposerModel(
     model?: string;
     label?: string;
     displayName?: string;
-    isDefault?: boolean;
   }[] = usesServerModelOptions ? codexModelOptions : [];
   const isNativeModelPicker = modelPickerKind !== null;
 
@@ -5120,7 +5146,7 @@ function useResolvedComposerModel(
   // bound default.
   const pickerSelectedModel = isReportedModelPicker
     ? (reportedRowId ?? requestedRowId)
-    : sessionModelOverride;
+    : (sessionModelOverride ?? (modelPickerKind === "configured" ? llmModel : null));
   const effectiveModel = sessionModelSeeded
     ? (sessionModelOverride ?? llmModel)
     : nativeVendorOwnsModel
