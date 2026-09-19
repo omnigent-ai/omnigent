@@ -13,6 +13,7 @@ import httpx
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.inference_config import (
+    HarnessInferenceBinding,
     binding_for_harness,
     inference_revision,
     resolve_bound_provider,
@@ -300,6 +301,48 @@ class SandboxInferenceService:
             )
         return listing.models
 
+    def _static_catalog(
+        self,
+        result: dict[str, Any],
+        binding: HarnessInferenceBinding,
+        provider: ProviderEntry,
+    ) -> dict[str, Any]:
+        """Serve the operator's curated list when no server discovery is configured.
+
+        Trusts ``model_allowlist`` instead of listing the gateway: no server-side
+        credential is resolved and no public catalog is consulted. The harness
+        validates the model against the live gateway when it launches.
+        """
+        if binding.model_allowlist is None:
+            result["error"] = (
+                "Configure sandbox.model_discovery for this provider "
+                "or a model_allowlist for this harness."
+            )
+            return result
+        ids = list(binding.model_allowlist)
+        if not ids:
+            result.update(status="empty", error="No models are permitted for this harness.")
+            return result
+        default = binding.default_model or ids[0]
+        if default not in ids:
+            raise _invalid("The configured default model is not in the harness model list.")
+        source = {"kind": provider.kind, "label": result["provider_label"], "name": provider.name}
+        result.update(
+            status="ready",
+            default_model=default,
+            models=[
+                {
+                    "id": model,
+                    "model": model,
+                    "displayName": model,
+                    "isDefault": model == default,
+                    "source": source,
+                }
+                for model in ids
+            ],
+        )
+        return result
+
     async def catalog(self, snapshot: dict[str, Any]) -> dict[str, Any]:
         """Recheck saved owner/endpoint/model policy without reading the latest target."""
         result: dict[str, Any] = {
@@ -324,6 +367,10 @@ class SandboxInferenceService:
             )
             result["default_model"] = binding.default_model
             _wire(provider, harness)
+            if not workspace and not isinstance(
+                snapshot.get("model_discovery", {}).get(provider.name), dict
+            ):
+                return self._static_catalog(result, binding, provider)
             if workspace:
                 connection = await self._connection(snapshot["owner_id"])
                 if connection is None:

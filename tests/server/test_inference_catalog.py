@@ -163,15 +163,39 @@ async def test_discovery_failure_is_redacted_and_distinct_from_empty():
 
 
 @pytest.mark.asyncio
-async def test_missing_discovery_does_not_use_pod_key_or_a_public_catalog():
+async def test_missing_discovery_serves_static_allowlist_without_pod_key_or_public_catalog():
+    # No server discovery: fall back to the operator's curated list verbatim. The service has
+    # no transport, so any attempt to list the gateway would fail -- a "ready" result proves
+    # no gateway call was made and no pod credential was resolved.
     state = _state()
     state.sandbox_config.default.model_discovery.clear()
     snapshot = await SandboxInferenceService(state).prepare(
         "agent_sandbox", "codex-native", "alice"
     )
     assert snapshot is not None
+    catalog = snapshot["catalog"]
+    assert catalog["status"] == "ready"
+    assert [row["id"] for row in catalog["models"]] == ["gateway/fast", "gateway/main"]
+    assert catalog["default_model"] == "gateway/main"
+    assert catalog["models"][1]["isDefault"] is True
+    assert "catalog-test-secret" not in json.dumps(snapshot)
+    assert (
+        snapshot["runtime_config"]["providers"]["bifrost"]["openai"]["api_key_ref"]
+        == "env:POD_INFERENCE_KEY"
+    )
+
+
+@pytest.mark.asyncio
+async def test_missing_discovery_without_allowlist_reports_configuration_error():
+    # Without discovery AND without an allowlist there is nothing to enumerate.
+    state = _state(allowed=None, default=None)
+    state.sandbox_config.default.model_discovery.clear()
+    snapshot = await SandboxInferenceService(state).prepare(
+        "agent_sandbox", "codex-native", "alice"
+    )
+    assert snapshot is not None
     assert snapshot["catalog"]["status"] == "unavailable"
-    assert "sandbox.model_discovery.bifrost" in snapshot["catalog"]["error"]
+    assert "model_allowlist" in snapshot["catalog"]["error"]
 
 
 @pytest.mark.asyncio
