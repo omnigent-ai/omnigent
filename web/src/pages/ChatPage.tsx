@@ -2125,6 +2125,7 @@ export function buildSlashCommandMap(
   showBtw = false,
   showSide = false,
   skillPrefix: "/" | "$" = "/",
+  supportsModelReset = false,
 ): Record<string, string> {
   const m: Record<string, string> = {};
   for (const [name, description] of Object.entries(BUILTIN_SLASH_COMMANDS)) {
@@ -2135,7 +2136,7 @@ export function buildSlashCommandMap(
     if (name === "/btw" && !showBtw) continue;
     // /side is a Codex CLI built-in (ephemeral fork) — only offer it on codex-native.
     if (name === "/side" && !showSide) continue;
-    m[name] = description;
+    m[name] = name === "/model" && supportsModelReset ? `${description} | default` : description;
   }
   for (const skill of skills) {
     m[`${skillPrefix}${skill.name}`] = skill.description;
@@ -2736,6 +2737,13 @@ function ComposerImpl(
   // it each turn; native wrappers expose it only when they have a picker
   // path that the runner can propagate without blocking the vendor TUI.
   const showModel = !isNativeWrapper || showModels;
+  // Configured sessions reset through their saved policy; native resets
+  // otherwise require a harness that can clear its live model override.
+  const supportsModelReset =
+    !!inferenceConfigured ||
+    (modelPickerKind
+      ? ["opencode", "acp", "configured"].includes(modelPickerKind)
+      : !isNativeWrapper);
   // /compact is functional for native wrappers (claude-native,
   // codex-native), which inject the slash command into the terminal, and
   // for claude-sdk, whose runner sends /compact to the live SDK client to
@@ -2760,8 +2768,18 @@ function ComposerImpl(
         showBtw,
         showSide,
         skillPrefix,
+        supportsModelReset,
       ),
-    [skills, showEffort, showModel, showCompact, showBtw, showSide, skillPrefix],
+    [
+      skills,
+      showEffort,
+      showModel,
+      showCompact,
+      showBtw,
+      showSide,
+      skillPrefix,
+      supportsModelReset,
+    ],
   );
   // Skills always need an optional argument fill-in so the user can
   // type extra context after the name; built-in commands keep their
@@ -3008,12 +3026,15 @@ function ComposerImpl(
           const current = sessionModelOverride
             ? `${sessionModelOverride} (override)`
             : (llmModel ?? "agent default");
-          setCommandError(`Model: ${current}\nUsage: /model <name>`);
+          setCommandError(
+            `Model: ${current}\nUsage: /model <name>${supportsModelReset ? " | default" : ""}`,
+          );
           return true;
         }
-        if (["default", "off", "reset"].includes(target.toLowerCase())) {
+        const reset = ["default", "off", "reset"].includes(target.toLowerCase());
+        if (reset && !supportsModelReset) {
           setCommandError(
-            "Choose a model explicitly with /model <name>. Defaults apply to new sessions.",
+            "This session does not support resetting the model. Choose a model with /model <name>.",
           );
           return true;
         }
@@ -3028,7 +3049,7 @@ function ComposerImpl(
         const harness = useChatStore.getState().sessionHarness;
         void useChatStore
           .getState()
-          .setModel(target, {
+          .setModel(reset ? null : target, {
             expectConfirmation: harness === "claude-native" || harness === "codex-native",
           })
           .catch((err: unknown) => {
@@ -3984,6 +4005,7 @@ function ComposerImpl(
                   showCodexApprovalMode={showCodexApprovalMode}
                   effortLevels={effortLevels}
                   modelPickerKind={modelPickerKind}
+                  supportsModelReset={supportsModelReset}
                   codexModelOptions={codexModelOptions}
                   inferenceConfigured={inferenceConfigured}
                   inferenceError={inferenceError}
@@ -4620,6 +4642,7 @@ function SessionHarnessPicker({
   showCodexApprovalMode = false,
   effortLevels,
   modelPickerKind,
+  supportsModelReset,
   codexModelOptions,
   inferenceConfigured,
   inferenceError,
@@ -4641,6 +4664,7 @@ function SessionHarnessPicker({
   showCodexApprovalMode?: boolean;
   effortLevels: readonly string[];
   modelPickerKind: NativeModelPickerKind | null;
+  supportsModelReset: boolean;
   codexModelOptions: readonly NativeModelOption[];
   inferenceConfigured?: boolean;
   inferenceError?: string | null;
@@ -4747,7 +4771,7 @@ function SessionHarnessPicker({
       setBusy(false);
     }
   };
-  const selectModel = (modelId: string) =>
+  const selectModel = (modelId: string | null) =>
     void apply(async () => {
       const store = useChatStore.getState();
       const sourceSessionId = store.conversationId;
@@ -4806,9 +4830,11 @@ function SessionHarnessPicker({
                 testId: "composer-agent-models",
                 header: "Models",
                 leading:
-                  inferenceConfigured && (inferenceError || modelOptions.length === 0) ? (
+                  (inferenceConfigured && inferenceError) || modelOptions.length === 0 ? (
                     <div className="px-2 py-1 text-xs text-muted-foreground" role="status">
-                      {inferenceError ?? "No usable models are available for this session."}
+                      {inferenceConfigured
+                        ? (inferenceError ?? "No usable models are available for this session.")
+                        : "Model choices aren't available right now."}
                     </div>
                   ) : undefined,
                 choices: [
@@ -4859,6 +4885,17 @@ function SessionHarnessPicker({
             : undefined
         }
       />
+      {supportsModelReset && showModels && (
+        <>
+          <DropdownMenuSeparator />
+          <DropdownMenuItem
+            disabled={busy || pendingModelChange !== null || !!inferenceError}
+            onSelect={() => selectModel(null)}
+          >
+            Use default model
+          </DropdownMenuItem>
+        </>
+      )}
     </>
   );
   const effortContent = (
@@ -5073,7 +5110,6 @@ function useResolvedComposerModel(
     model?: string;
     label?: string;
     displayName?: string;
-    isDefault?: boolean;
   }[] = usesServerModelOptions ? codexModelOptions : [];
   const isNativeModelPicker = modelPickerKind !== null;
 

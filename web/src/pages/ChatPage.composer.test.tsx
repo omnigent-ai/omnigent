@@ -940,23 +940,78 @@ describe("Composer slash-command submit routing", () => {
     expect(onSend).not.toHaveBeenCalled();
   });
 
-  it.each(["default", "off", "reset", "DEFAULT"])(
-    "rejects /model %s without changing or sending",
-    (alias) => {
-      const setModel = vi.fn().mockResolvedValue(undefined);
-      useChatStore.setState({ setModel });
-      const onSend = vi.fn();
-      render(<Composer {...composerProps({ onSend })} />);
-      const ta = textarea();
+  it.each([
+    { kind: "claude", reset: false },
+    { kind: "opencode", reset: true },
+    { kind: "acp", reset: true },
+    { kind: "configured", reset: true },
+    { kind: null, reset: true },
+    { kind: null, reset: true, terminalFirst: true, harness: "claude-sdk" },
+    { kind: "codex", reset: false },
+    { kind: "pi", reset: false },
+    { kind: "cursor", reset: false },
+    { kind: "kiro", reset: false },
+    { kind: "devin", reset: false },
+    { kind: "codex", reset: true, configured: true },
+    { kind: "claude", reset: true, configured: true },
+  ] as const)("gates model reset consistently for $kind ($reset, $configured)", async (row) => {
+    const setModel = vi.fn().mockResolvedValue(undefined);
+    const onSend = vi.fn();
+    useChatStore.setState({ setModel, sessionHarness: "harness" in row ? row.harness : null });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          onSend,
+          showEffort: true,
+          showModels: row.kind !== null,
+          modelPickerKind: row.kind,
+          isTerminalFirst: "terminalFirst" in row && row.terminalFirst,
+          inferenceConfigured: "configured" in row && row.configured,
+          isNativeWrapper: row.kind !== null && row.kind !== "acp" && row.kind !== "configured",
+          codexModelOptions: [{ id: "primary", displayName: "Primary" }],
+        })}
+      />,
+    );
+    const ta = textarea();
+    fireEvent.change(ta, { target: { value: "/mod" } });
+    expect(screen.getByTestId("slash-menu-item-model").textContent?.includes("default")).toBe(
+      row.reset,
+    );
+
+    fireEvent.change(ta, { target: { value: "/help " } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+    const help = screen.getByText(/\/model — Switch the model/);
+    expect(help).toHaveTextContent("/model <name>");
+    expect(help.textContent?.includes("/model <name> | default")).toBe(row.reset);
+    expect(help).toHaveTextContent("/effort low | medium | high | default");
+
+    for (const alias of ["default", "off", "reset", "DEFAULT"]) {
+      setModel.mockClear();
       fireEvent.change(ta, { target: { value: `/model ${alias}` } });
       fireEvent.keyDown(ta, { key: "Enter" });
-
-      expect(setModel).not.toHaveBeenCalled();
       expect(onSend).not.toHaveBeenCalled();
-      expect(screen.getByText(/Choose a model explicitly/)).toBeVisible();
-      expect(ta).toHaveValue(`/model ${alias}`);
-    },
-  );
+      if (row.reset) {
+        expect(setModel).toHaveBeenCalledWith(null, expect.anything());
+        expect(ta).toHaveValue("");
+      } else {
+        expect(setModel).not.toHaveBeenCalled();
+        expect(screen.getByText(/This session does not support resetting/)).toBeVisible();
+        expect(ta).toHaveValue(`/model ${alias}`);
+      }
+    }
+    if (row.kind !== null) {
+      await openSessionModels();
+      const reset = screen.queryByRole("menuitem", { name: "Use default model" });
+      if (row.reset) {
+        expect(reset).toBeVisible();
+        setModel.mockClear();
+        fireEvent.click(reset!);
+        await waitFor(() => expect(setModel).toHaveBeenCalledWith(null, expect.anything()));
+      } else {
+        expect(reset).toBeNull();
+      }
+    }
+  });
 
   it("treats /model as plaintext on native-wrapper sessions without a model picker", () => {
     // isNativeWrapper without showModels → showModel false: native wrappers
@@ -4171,6 +4226,41 @@ describe("Composer config gear", () => {
     expect(screen.queryByText("Advanced settings…")).toBeNull();
   });
 
+  it.each([null, "primary"])(
+    "explains an empty native catalog with current model %s and updates when choices arrive",
+    async (currentModel) => {
+      useChatStore.setState({ llmModel: currentModel });
+      const props = composerProps({
+        showEffort: false,
+        showModels: true,
+        modelPickerKind: "codex",
+        costRoutingEligible: true,
+        codexModelOptions: [],
+      });
+      const { rerender } = render(<Composer {...props} />, { wrapper: TooltipProvider });
+      await openSessionModels();
+      const models = screen.getByTestId("composer-agent-models");
+      expect(within(models).getByRole("status")).toHaveTextContent(
+        "Model choices aren't available right now.",
+      );
+      expect(screen.getByRole("menuitem", { name: "Smart Routing" })).toBeVisible();
+      if (currentModel) {
+        expect(within(models).getByRole("menuitemcheckbox")).toHaveAttribute(
+          "aria-disabled",
+          "true",
+        );
+      } else {
+        expect(within(models).queryByRole("menuitemcheckbox")).toBeNull();
+      }
+
+      rerender(
+        <Composer {...props} codexModelOptions={[{ id: "primary", displayName: "Primary" }]} />,
+      );
+      expect(within(models).queryByRole("status")).toBeNull();
+      expect(within(models).getByRole("menuitemcheckbox", { name: "Primary" })).toBeVisible();
+    },
+  );
+
   it("offers only explicit models when Kiro marks no catalog row as default", async () => {
     const options = [
       { id: "auto", displayName: "Automatic", isDefault: false },
@@ -4756,6 +4846,9 @@ describe("saved sandbox inference policy", () => {
     );
     await openSessionModels();
     expect(screen.getByText("The gateway could not be reached.")).toBeVisible();
-    expect(screen.queryByTestId("composer-agent-model-default")).toBeNull();
+    const reset = screen.getByRole("menuitem", { name: "Use default model" });
+    expect(reset).toHaveAttribute("aria-disabled", "true");
+    fireEvent.click(reset);
+    expect(useChatStore.getState().setModel).not.toHaveBeenCalled();
   });
 });

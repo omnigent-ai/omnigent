@@ -26,8 +26,9 @@ from tests.e2e_ui.conftest import fetch_with_retry
         ("codex", "codex-native-ui", "gpt-5.6-sol", "gpt-6-astra"),
         ("claude", "claude-code-native-ui", "haiku", "sonnet"),
         ("pi", "pi-native-ui", "anthropic/claude-opus-5", "anthropic/claude-opus-4-7"),
+        ("opencode", "opencode-native-ui", "anthropic/claude-opus-5", "anthropic/claude-sonnet-5"),
     ],
-    ids=["codex", "claude", "pi"],
+    ids=["codex", "claude", "pi", "opencode"],
 )
 def test_switch_back_to_default_marked_model_persists_explicit_id(
     page: Page,
@@ -42,6 +43,7 @@ def test_switch_back_to_default_marked_model_persists_explicit_id(
     session_path = f"/v1/sessions/{session_id}"
     patch_bodies: list[dict] = []
     reported_model = primary
+    supports_reset = harness == "opencode"
     _install_stream_controller(page, session_id)
     page.route_web_socket("**/v1/sessions/updates*", lambda _: None)
 
@@ -67,6 +69,23 @@ def test_switch_back_to_default_marked_model_persists_explicit_id(
     page.route(f"**{session_path}*", snapshot)
     try:
         page.goto(f"{base_url}/c/{session_id}")
+        composer = page.get_by_role("textbox", name="Message the agent")
+        composer.fill("/mod")
+        hint = page.get_by_test_id("slash-menu-item-model")
+        expect(hint).to_contain_text("/model <name>")
+        if supports_reset:
+            expect(hint).to_contain_text("| default")
+        else:
+            expect(hint).not_to_contain_text("default")
+        composer.fill("/help ")
+        composer.press("Enter")
+        help_text = page.get_by_text("/model — Switch the model", exact=False)
+        expect(help_text).to_contain_text("/model <name>")
+        if supports_reset:
+            expect(help_text).to_contain_text("/model <name> | default")
+        else:
+            expect(help_text).not_to_contain_text("/model <name> | default")
+        composer.fill("")
         _open_gear_model_dropdown(page)
         for model, name in ((alternate, "Alternate"), (primary, "Primary")):
             expect(page.get_by_role("menuitemcheckbox", name="Default", exact=True)).to_have_count(
@@ -96,5 +115,72 @@ def test_switch_back_to_default_marked_model_persists_explicit_id(
         expect(page.get_by_role("menuitemcheckbox", name="Primary", exact=True)).to_have_attribute(
             "aria-checked", "true"
         )
+        reset_action = page.get_by_role("menuitem", name="Use default model", exact=True)
+        if supports_reset:
+            with page.expect_response(
+                lambda response: (
+                    response.request.method == "PATCH"
+                    and urlparse(response.url).path == session_path
+                )
+            ):
+                reset_action.click()
+            assert patch_bodies[-1] == {"model_override": "default"}
+            persisted = httpx.get(f"{base_url}{session_path}", timeout=10)
+            persisted.raise_for_status()
+            assert persisted.json()["model_override"] is None
+        else:
+            expect(reset_action).to_have_count(0)
+            page.keyboard.press("Escape")
+            page.keyboard.press("Escape")
+            composer.fill("/model default")
+            composer.press("Enter")
+            expect(
+                page.get_by_text("This session does not support resetting", exact=False)
+            ).to_be_visible()
+            assert patch_bodies == [{"model_override": alternate}, {"model_override": primary}]
+    finally:
+        page.unroute_all(behavior="wait")
+
+
+@pytest.mark.parametrize("current_model", [None, "primary"])
+def test_empty_native_catalog_explains_missing_choices(
+    page: Page,
+    seeded_session: tuple[str, str],
+    current_model: str | None,
+) -> None:
+    """An unavailable catalog explains missing choices without offering reset."""
+    base_url, session_id = seeded_session
+    session_path = f"/v1/sessions/{session_id}"
+    _install_stream_controller(page, session_id)
+    page.route_web_socket("**/v1/sessions/updates*", lambda _: None)
+
+    def snapshot(route: Route) -> None:
+        if urlparse(route.request.url).path != session_path:
+            route.continue_()
+            return
+        response = fetch_with_retry(route)
+        payload = response.json()
+        payload.update(
+            harness="codex",
+            llm_model=current_model,
+            model_override=None,
+            labels={**payload.get("labels", {}), "omnigent.wrapper": "codex-native-ui"},
+            model_options=[],
+        )
+        route.fulfill(response=response, json=payload)
+
+    page.route(f"**{session_path}*", snapshot)
+    try:
+        page.goto(f"{base_url}/c/{session_id}")
+        _open_gear_model_dropdown(page)
+        models = page.get_by_test_id("composer-agent-models")
+        expect(models.get_by_role("status")).to_have_text(
+            "Model choices aren't available right now."
+        )
+        expect(models.get_by_role("menuitemcheckbox", name="Default", exact=True)).to_have_count(0)
+        if current_model:
+            expect(models.get_by_role("menuitemcheckbox")).to_be_disabled()
+        else:
+            expect(models.get_by_role("menuitemcheckbox")).to_have_count(0)
     finally:
         page.unroute_all(behavior="wait")
