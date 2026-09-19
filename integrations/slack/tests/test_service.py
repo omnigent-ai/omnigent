@@ -1268,10 +1268,7 @@ async def test_turn_error_posts_separate_reply_and_keeps_answer(tmp_path: Path) 
         context={"bot_user_id": "B1"},
     )
     stream = await _wait_for_stream_stop(slack)
-    for _ in range(50):
-        if slack.posts:
-            break
-        await asyncio.sleep(0.02)
+    await asyncio.wait_for(asyncio.gather(*service._turn_tasks), timeout=5)
     await service.shutdown()
 
     # The stream delivered the real answer, not the error.
@@ -1464,7 +1461,8 @@ async def test_stream_closed_then_error_continues_and_posts_failure(tmp_path: Pa
         client=slack,
         context={"bot_user_id": "B1"},
     )
-    await _wait_for_posts(slack, 1)
+    # The initial session-info post can arrive before the answer even starts.
+    await asyncio.wait_for(asyncio.gather(*service._turn_tasks), timeout=5)
     await service.shutdown()
 
     # Both deltas streamed live (across the reopened stream); nothing was lost.
