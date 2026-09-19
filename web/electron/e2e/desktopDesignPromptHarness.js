@@ -327,6 +327,7 @@ async function startMacCapture(electronApp, windowId, recordDir) {
 }
 
 module.exports = {
+  NATIVE_DIALOG_PAGE,
   MOCK_REPLY,
   eventually,
   startDesignBackend,

@@ -5,7 +5,7 @@ const http = require("node:http");
 const { createRequire } = require("node:module");
 const path = require("node:path");
 
-async function startRadixFormFixture() {
+async function buildRadixFormFixture() {
   const webRoot = path.resolve(__dirname, "../../..");
   const webRequire = createRequire(path.join(webRoot, "package.json"));
   const viteRequire = createRequire(webRequire.resolve("vite"));
@@ -19,12 +19,19 @@ async function startRadixFormFixture() {
     jsx: "automatic",
     define: { "process.env.NODE_ENV": '"development"' },
   });
-  const html = fs.readFileSync(path.join(__dirname, "designModalFixture.html"));
+  return {
+    html: fs.readFileSync(path.join(__dirname, "designModalFixture.html"), "utf8"),
+    script: outputFiles[0].text,
+  };
+}
+
+async function startRadixFormFixture() {
+  const { html, script } = await buildRadixFormFixture();
   const server = http.createServer((request, response) => {
     response.setHeader("Cache-Control", "no-store");
     if (request.url === "/app.js") {
       response.setHeader("Content-Type", "application/javascript; charset=utf-8");
-      response.end(outputFiles[0].contents);
+      response.end(script);
     } else if (request.url === "/modal") {
       response.setHeader("Content-Type", "text/html; charset=utf-8");
       response.end(html);
@@ -46,4 +53,4 @@ async function startRadixFormFixture() {
   };
 }
 
-module.exports = { startRadixFormFixture };
+module.exports = { buildRadixFormFixture, startRadixFormFixture };

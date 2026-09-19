@@ -89,6 +89,8 @@ form editing, native keyboard focus, floating-editor typing, Escape/close,
 normal chat submission, and returning to form editing after Design mode exits.
 The Radix fixture is a transformed, scrollable form; the test also checks popup
 positioning, clipping, scrolling, resizing, zooming, and accidental form submission.
+The same picker and fixtures run in headless Chromium in the regular UI CI suite:
+`uv run --no-sync pytest tests/e2e_ui/desktop/test_design_mode_dialog_focus.py`.
 
 ```bash
 # From the repository root after installing dependencies:
