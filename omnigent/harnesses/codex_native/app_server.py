@@ -34,6 +34,15 @@ if TYPE_CHECKING:
 
 from omnigent.cli_invocation import cli_invocation
 from omnigent.harnesses.codex_native.bridge import write_policy_hook_config
+from omnigent.harnesses.codex_native.launch_args import (
+    _write_private_config,
+    absolute_codex_path,
+    canonical_codex_launch_args,
+    codex_config_profile,
+    materialize_codex_config_profile,
+    validate_codex_config_profile_state,
+    without_codex_config_profile,
+)
 from omnigent.harnesses.codex_native.process_registry import (
     CodexNativeProcessOwnerLock,
     acquire_codex_native_process_owner_lock,
@@ -411,9 +420,17 @@ def _materialize_config_symlink(config_path: Path) -> None:
         shutil.copy2(target, config_path)
 
 
+_NO_INSTRUCTION_BASE_OVERRIDE = object()
+
+
 def _sync_codex_developer_instructions(
     codex_home: Path,
     instructions: str | None,
+    *,
+    use_current_base: bool = False,
+    preserve_current_edit: bool = False,
+    base_override: object = _NO_INSTRUCTION_BASE_OVERRIDE,
+    previous_instructions: str | None = None,
 ) -> None:
     """Synchronize the agent's authored instructions in the private Codex config.
 
@@ -428,11 +445,23 @@ def _sync_codex_developer_instructions(
     :param codex_home: Private per-session ``CODEX_HOME`` directory.
     :param instructions: The agent's raw authored instructions
         (``AgentSpec.instructions``) for this launch, or ``None``.
+    :param use_current_base: Compose from the current config value without
+        replacing the saved user base. Profile startup uses this after
+        materializing the selected profile layer.
+    :param preserve_current_edit: If the current value differs from the last
+        value written by this helper, promote it to the saved user base before
+        restoring that base. Profile startup uses this before changing layers.
+    :param base_override: Migrated user base to journal atomically with the
+        config update. Ignored once an instruction journal exists.
+    :param previous_instructions: Agent instructions expected in a legacy
+        pre-journal value while restoring its user base.
     :returns: None.
     """
     addition = instructions.strip() if instructions else ""
+    previous_addition = previous_instructions.strip() if previous_instructions else addition
     config_path = codex_home / "config.toml"
-    base_path = codex_home / ".omnigent-developer-instructions-base"
+    state_path = codex_home / ".omnigent-developer-instructions-state.toml"
+    legacy_base_path = codex_home / ".omnigent-developer-instructions-base"
     if config_path.is_symlink():
         target = config_path.resolve()
         config_path.unlink()
@@ -456,10 +485,49 @@ def _sync_codex_developer_instructions(
             "developer_instructions is not a string"
         )
         return
-    if base_path.exists():
-        base = base_path.read_text(encoding="utf-8")
+    current_base = current.strip() if isinstance(current, str) else ""
+    if state_path.exists():
+        try:
+            state = tomlkit.parse(state_path.read_text()).unwrap()
+        except tomlkit.exceptions.TOMLKitError as error:
+            raise ValueError(f"Invalid Codex developer-instruction state: {state_path}") from error
+        if not all(isinstance(state.get(key), str) for key in ("base", "applied")):
+            raise ValueError(f"Invalid Codex developer-instruction state: {state_path}")
+        base = state["base"]
+        if "pending" in state:
+            if not isinstance(state["pending"], str):
+                raise ValueError(f"Invalid Codex developer-instruction state: {state_path}")
+            if current_base not in (state["applied"], state["pending"]):
+                raise ValueError(
+                    "Codex developer instructions changed during an incomplete update: "
+                    f"{state_path}"
+                )
+        elif preserve_current_edit and current_base != state["applied"]:
+            applied = state["applied"]
+            if applied and current_base.startswith(f"{applied}\n\n"):
+                appended = current_base[len(applied) :].strip()
+                base = f"{base}\n\n{appended}" if base else appended
+            else:
+                base = current_base
+    elif base_override is not _NO_INSTRUCTION_BASE_OVERRIDE:
+        if not isinstance(base_override, str):
+            raise TypeError("Codex developer-instruction base override must be a string")
+        base = base_override
+    elif legacy_base_path.exists():
+        base = legacy_base_path.read_text(encoding="utf-8")
+        if preserve_current_edit:
+            generated_active = (
+                f"{base}\n\n{previous_addition}"
+                if base and previous_addition
+                else base or previous_addition
+            )
+            if generated_active and current_base.startswith(f"{generated_active}\n\n"):
+                appended = current_base[len(generated_active) :].strip()
+                base = f"{base}\n\n{appended}" if base else appended
+            elif current_base not in {base, generated_active}:
+                base = current_base
     else:
-        base = current.strip() if isinstance(current, str) else ""
+        base = current_base
         # A previous Omnigent build may have appended the same instructions
         # without writing the sidecar. Recover the user-authored
         # prefix instead of permanently capturing the combined value as base.
@@ -467,13 +535,176 @@ def _sync_codex_developer_instructions(
             base = ""
         elif addition and base.endswith(f"\n\n{addition}"):
             base = base[: -len(addition)].rstrip()
-        base_path.write_text(base, encoding="utf-8")
-    active = f"{base}\n\n{addition}" if base and addition else base or addition
+    composition_base = current_base if use_current_base else base
+    active = (
+        f"{composition_base}\n\n{addition}"
+        if composition_base and addition
+        else composition_base or addition
+    )
     if active:
         document["developer_instructions"] = active
     elif "developer_instructions" in document:
         del document["developer_instructions"]
-    config_path.write_text(tomlkit.dumps(document), encoding="utf-8")
+    pending_state = tomlkit.dumps({"base": base, "applied": current_base, "pending": active})
+    final_state = tomlkit.dumps({"base": base, "applied": active})
+    _write_private_config(state_path, pending_state)
+    _write_private_config(config_path, tomlkit.dumps(document))
+    _write_private_config(state_path, final_state)
+
+
+def _migrate_profile_instruction_base(
+    codex_home: Path,
+    source_home: Path,
+    state: dict[str, object],
+    agent_instructions: str | None,
+) -> object:
+    """Move developer instructions out of profile state written by older builds."""
+    base = state.get("base")
+    applied = state.get("applied")
+    if not isinstance(base, dict) or not isinstance(applied, dict):
+        return _NO_INSTRUCTION_BASE_OVERRIDE
+    old_base = base.get("developer_instructions")
+    old_applied = applied.get("developer_instructions")
+    if "developer_instructions" not in applied:
+        return _NO_INSTRUCTION_BASE_OVERRIDE
+    base_path = codex_home / ".omnigent-developer-instructions-base"
+    saved_base = base_path.read_text(encoding="utf-8") if base_path.exists() else ""
+    config_path = codex_home / "config.toml"
+    document = tomlkit.parse(config_path.read_text()) if config_path.exists() else {}
+    current = document.get("developer_instructions")
+    current_instructions = current.strip() if isinstance(current, str) else ""
+    candidate = old_base.strip() if isinstance(old_base, str) else ""
+    applied_instructions = old_applied.strip() if isinstance(old_applied, str) else ""
+    addition = agent_instructions.strip() if agent_instructions else ""
+    generated_values = {applied_instructions, saved_base}
+    generated_active_values: set[str] = set()
+    if addition:
+        generated_active_values = {
+            f"{value}\n\n{addition}" if value else addition
+            for value in (applied_instructions, saved_base)
+        }
+        generated_values.update(generated_active_values)
+    generated = current_instructions in generated_values
+    appended_edit = next(
+        (
+            current_instructions[len(value) :].strip()
+            for value in generated_active_values
+            if value and current_instructions.startswith(f"{value}\n\n")
+        ),
+        "",
+    )
+    if (
+        (generated or appended_edit)
+        and saved_base
+        and (candidate == saved_base or candidate.startswith(f"{saved_base}\n\n"))
+    ):
+        source_path = source_home / "config.toml"
+        try:
+            source = tomlkit.parse(source_path.read_text()) if source_path.exists() else {}
+        except (OSError, tomlkit.exceptions.TOMLKitError) as error:
+            raise ValueError(
+                f"Cannot migrate Codex profile instructions from {source_path}"
+            ) from error
+        else:
+            source_instructions = source.get("developer_instructions")
+            candidate = source_instructions.strip() if isinstance(source_instructions, str) else ""
+    if appended_edit:
+        candidate = f"{candidate}\n\n{appended_edit}" if candidate else appended_edit
+    elif not generated:
+        candidate = current_instructions
+    return candidate
+
+
+_NO_PROFILE_INSTRUCTIONS = object()
+
+
+def _selected_profile_instructions(
+    source_home: Path,
+    profile: str | None,
+    codex_version: tuple[int, int, int] | None,
+) -> object:
+    """Read a selected profile's instruction value for interrupted-start recovery."""
+    if profile is None:
+        return _NO_PROFILE_INSTRUCTIONS
+    if codex_version is None or codex_version >= (0, 134, 0):
+        document = tomlkit.parse((source_home / f"{profile}.config.toml").read_text()).unwrap()
+    else:
+        source_path = source_home / "config.toml"
+        source = tomlkit.parse(source_path.read_text()).unwrap() if source_path.exists() else {}
+        profiles = source.get("profiles")
+        document = profiles.get(profile) if isinstance(profiles, dict) else None
+        if not isinstance(document, dict):
+            raise ValueError(f"Codex config profile {profile!r} does not exist")
+    if not isinstance(document, dict):
+        return _NO_PROFILE_INSTRUCTIONS
+    value = document.get("developer_instructions", _NO_PROFILE_INSTRUCTIONS)
+    return value.strip() if isinstance(value, str) else value
+
+
+def _materialize_codex_profile_for_start(
+    codex_home: Path,
+    source_home: Path,
+    profile: str | None,
+    *,
+    codex_version: tuple[int, int, int] | None,
+    agent_instructions: str | None = None,
+) -> bool:
+    """Materialize one profile after restoring the prior instruction base.
+
+    The profile and developer-instruction sidecars both derive ``config.toml``.
+    Restore the previous instruction base before changing profile layers, then
+    tell the caller to capture the newly selected layer before appending this
+    launch's agent instructions.
+
+    :returns: Whether agent instructions should compose from the materialized
+        profile layer while retaining the separately saved user base.
+    """
+    profile_state_path = codex_home / ".omnigent-config-profile.toml"
+    profile_state_exists = profile_state_path.exists()
+    compose_profile_instructions = profile is not None or profile_state_exists
+    selected_instructions = _selected_profile_instructions(source_home, profile, codex_version)
+    migrated_instruction_base: object = _NO_INSTRUCTION_BASE_OVERRIDE
+    if profile_state_exists:
+        validate_codex_config_profile_state(codex_home)
+        try:
+            state = tomlkit.parse(profile_state_path.read_text()).unwrap()
+        except tomlkit.exceptions.TOMLKitError:
+            state = None
+        if isinstance(state, dict):
+            state_is_valid = all(
+                isinstance(state.get(key), dict) for key in ("base", "applied")
+            ) and ("pending" not in state or isinstance(state["pending"], dict))
+            if state_is_valid:
+                migrated_instruction_base = _migrate_profile_instruction_base(
+                    codex_home, source_home, state, agent_instructions
+                )
+    if compose_profile_instructions:
+        config_path = codex_home / "config.toml"
+        try:
+            current_config = tomlkit.parse(config_path.read_text()) if config_path.exists() else {}
+        except tomlkit.exceptions.TOMLKitError:
+            current_config = {}
+        current_instructions = current_config.get("developer_instructions")
+        current_matches_profile = isinstance(current_instructions, str) and (
+            current_instructions.strip() == selected_instructions
+        )
+        _sync_codex_developer_instructions(
+            codex_home,
+            None,
+            preserve_current_edit=(
+                migrated_instruction_base is _NO_INSTRUCTION_BASE_OVERRIDE
+                and not current_matches_profile
+            ),
+            base_override=migrated_instruction_base,
+            previous_instructions=agent_instructions,
+        )
+    materialize_codex_config_profile(
+        codex_home,
+        source_home,
+        profile,
+        codex_version=codex_version,
+    )
+    return compose_profile_instructions
 
 
 def _codex_model_catalog_entry(catalog: object, model: str) -> dict[str, object] | None:
@@ -1538,6 +1769,8 @@ class CodexNativeAppServer:
     :param reconcile_process_registry: Whether startup synchronously performs
         host-global crash registry maintenance. Runner-owned launches delegate
         it to the host janitor; standalone callers keep the safe default.
+    :param config_profile: Codex user config-file profile materialized into
+        the private user layer before app-server and terminal startup.
     """
 
     codex_path: str
@@ -1567,6 +1800,7 @@ class CodexNativeAppServer:
     trust_all_hooks: bool = False
     router_hooks_registered: bool = False
     reconcile_process_registry: bool = True
+    config_profile: str | None = None
 
     async def start(self) -> None:
         """
@@ -1639,6 +1873,13 @@ class CodexNativeAppServer:
             extend_model_catalog=codex_extended_catalog_requested(self.env),
             supported_efforts=CODEX_NATIVE_EFFORTS,
         )
+        compose_profile_instructions = _materialize_codex_profile_for_start(
+            self.codex_home,
+            config_source,
+            self.config_profile,
+            codex_version=codex_version,
+            agent_instructions=self.developer_instructions,
+        )
         if self.trust_project:
             _trust_codex_project(self.codex_home, self.cwd)
         # Write the MCP server config into config.toml so the app-server
@@ -1663,6 +1904,7 @@ class CodexNativeAppServer:
         _sync_codex_developer_instructions(
             self.codex_home,
             self.developer_instructions,
+            use_current_base=compose_profile_instructions,
         )
         self.config_overrides = materialize_codex_provider_config(
             self.codex_home,
@@ -2704,6 +2946,7 @@ def build_codex_native_server(
     reasoning_effort: str | None = None,
     model_catalog_rows: list[_JsonObject] | None = None,
     reconcile_process_registry: bool = True,
+    terminal_launch_args: Sequence[str] = (),
 ) -> CodexNativeAppServer:
     """
     Build a configured native Codex app-server process wrapper.
@@ -2758,6 +3001,8 @@ def build_codex_native_server(
         crash registry sweep. Runner-owned launches disable this because the
         host janitor owns it; standalone callers keep the
         synchronous safety default.
+    :param terminal_launch_args: Original CLI options used to select the Codex
+        config-file profile (distinct from the Databricks routing profile).
     :returns: Configured app-server process wrapper.
     :raises ImportError: If no Codex CLI is available.
     :raises OSError: If Databricks routing was requested but no
@@ -2814,6 +3059,7 @@ def build_codex_native_server(
         codex_home=codex_home,
         env=env,
         config_overrides=config_overrides,
+        config_profile=codex_config_profile(terminal_launch_args),
         cwd=cwd,
         bridge_dir=bridge_dir,
         developer_instructions=developer_instructions,
@@ -3579,9 +3825,9 @@ def normalize_codex_permission_launch_args(
       automatic reviewer settle eligible requests instead of prompting.
       Any explicit approval/sandbox/reviewer/profile choice wins untouched.
     """
-    args = list(terminal_launch_args or ())
+    args = canonical_codex_launch_args(terminal_launch_args or ())
     full_access = False
-    has_permission_profile = False
+    has_permission_profile = codex_config_profile(args) is not None
     has_reviewer = False
     has_sandbox = False
     has_approval_policy = "--dangerously-bypass-approvals-and-sandbox" in args
@@ -3589,8 +3835,12 @@ def normalize_codex_permission_launch_args(
     index = 0
     while index < len(args):
         arg = args[index]
+        if arg == "--":
+            break
         assignment: str | None = None
-        if arg in {"--ask-for-approval", "-a"} or arg.startswith(("--ask-for-approval=", "-a=")):
+        if arg == "--approve-for-me":
+            has_reviewer = True
+        elif arg in {"--ask-for-approval", "-a"} or arg.startswith(("--ask-for-approval=", "-a=")):
             has_approval_policy = True
         elif arg in {"--sandbox", "-s"} or arg.startswith(("--sandbox=", "-s=")):
             has_sandbox = True
@@ -3637,24 +3887,27 @@ def _codex_config_string(raw_value: str) -> str:
 def _codex_resume_permission_params(terminal_launch_args: Sequence[str] | None) -> CodexParams:
     """Convert persisted Codex permission args into thread-resume overrides."""
     params: CodexParams = {}
+    typed_params: CodexParams = {}
     args = normalize_codex_permission_launch_args(terminal_launch_args)
     index = 0
     while index < len(args):
         arg = args[index]
+        if arg == "--":
+            break
         value: str | None = None
         if arg == "--dangerously-bypass-approvals-and-sandbox":
-            params.update(approvalPolicy="never", sandbox="danger-full-access")
+            typed_params.update(approvalPolicy="never", sandbox="danger-full-access")
         elif arg in {"--ask-for-approval", "-a", "--sandbox", "-s"}:
             if index + 1 < len(args):
                 value = args[index + 1]
                 index += 1
             if value is not None:
                 field = "approvalPolicy" if arg in {"--ask-for-approval", "-a"} else "sandbox"
-                params[field] = value
+                typed_params[field] = value
         elif arg.startswith(("--ask-for-approval=", "-a=")):
-            params["approvalPolicy"] = arg.split("=", 1)[1]
+            typed_params["approvalPolicy"] = arg.split("=", 1)[1]
         elif arg.startswith(("--sandbox=", "-s=")):
-            params["sandbox"] = arg.split("=", 1)[1]
+            typed_params["sandbox"] = arg.split("=", 1)[1]
         elif arg in {"--config", "-c"} and index + 1 < len(args):
             index += 1
             key, _, value = args[index].partition("=")
@@ -3663,6 +3916,13 @@ def _codex_resume_permission_params(terminal_launch_args: Sequence[str] | None) 
             key, _, value = arg.split("=", 1)[1].partition("=")
             _set_codex_resume_config_param(params, key, value)
         index += 1
+    if "--approve-for-me" in args:
+        if "sandbox" in typed_params:
+            raise ValueError("--approve-for-me conflicts with sandbox and bypass flags")
+        params.update(
+            approvalsReviewer="auto_review", approvalPolicy="on-request", sandbox="workspace-write"
+        )
+    params.update(typed_params)
     if "permissions" in params:
         params.pop("sandbox", None)
     return params
@@ -3676,13 +3936,48 @@ _CODEX_RESUME_PERMISSION_CONFIG_FIELDS = {
 }
 
 
-def _set_codex_resume_config_param(params: CodexParams, key: str, raw_value: str) -> None:
-    field = _CODEX_RESUME_PERMISSION_CONFIG_FIELDS.get(key.strip())
-    if field is None:
-        return
-    value = _codex_config_string(raw_value)
-    if value:
+def _set_codex_resume_config_param(params: CodexParams, key: str, raw_value: str) -> bool:
+    key = key.strip()
+    field = _CODEX_RESUME_PERMISSION_CONFIG_FIELDS.get(key)
+    if field is not None:
+        value = _codex_config_string(raw_value)
+        if not value:
+            return False
         params[field] = value
+        return True
+    if key.split(".", 1)[0] not in {"sandbox_workspace_write", "network", "permissions"}:
+        return False
+    try:
+        config_value = tomlkit.parse(f"value = {raw_value}").unwrap()["value"]
+    except tomlkit.exceptions.TOMLKitError:
+        config_value = raw_value.strip().strip("\"'")
+    try:
+        json.dumps(config_value, allow_nan=False)
+    except (TypeError, ValueError):
+        return False
+    config = cast(CodexParams, params.setdefault("config", {}))
+    _set_codex_resume_config_value(config, key, config_value)
+    return True
+
+
+def _set_codex_resume_config_value(config: CodexParams, key: str, value: object) -> None:
+    """Preserve CLI order without overlapping keys in the app-server's unordered config map."""
+    for existing_key in list(config):
+        if existing_key.startswith(f"{key}."):
+            del config[existing_key]
+    segments = key.split(".")
+    for prefix_length in range(1, len(segments)):
+        ancestor = ".".join(segments[:prefix_length])
+        if ancestor not in config:
+            continue
+        target = config
+        for segment in (ancestor, *segments[prefix_length:-1]):
+            if not isinstance(target.get(segment), dict):
+                target[segment] = {}
+            target = cast(CodexParams, target[segment])
+        target[segments[-1]] = value
+        return
+    config[key] = value
 
 
 async def preload_codex_thread_for_resume(
@@ -3691,6 +3986,7 @@ async def preload_codex_thread_for_resume(
     *,
     terminal_launch_args: Sequence[str] | None = None,
     retain_client: bool = False,
+    cwd: Path | None = None,
 ) -> CodexAppServerClient | None:
     """
     Load an existing Codex thread into a freshly started app-server.
@@ -3708,6 +4004,7 @@ async def preload_codex_thread_for_resume(
     :param terminal_launch_args: Persisted permission overrides for the resumed thread.
     :param retain_client: Keep the thread subscribed through terminal attachment.
         The caller must pass the returned client to the forwarder and close it.
+    :param cwd: Session working directory for resolving additional writable roots.
     :returns: The subscribed client when retained, otherwise None.
     :raises RuntimeError: If the app-server rejects the resume.
     """
@@ -3718,12 +4015,76 @@ async def preload_codex_thread_for_resume(
     retained = False
     try:
         await client.connect()
+        params = _codex_resume_permission_params(terminal_launch_args)
+        args = canonical_codex_launch_args(terminal_launch_args or ())
+        additional_roots: list[str] = []
+        effective_cwd = cwd or Path.cwd()
+        index = 0
+        while index < len(args):
+            arg = args[index]
+            if arg == "--":
+                break
+            if arg in {"--add-dir", "--cd", "-C"}:
+                if index + 1 == len(args) or args[index + 1].startswith("-"):
+                    raise ValueError(f"Codex requires a directory for {arg}")
+                index += 1
+                if arg == "--add-dir":
+                    additional_roots.append(args[index])
+                else:
+                    effective_cwd = Path(absolute_codex_path(args[index], effective_cwd))
+            elif arg in {
+                "-c",
+                "--config",
+                "-m",
+                "--model",
+                "-s",
+                "--sandbox",
+                "-a",
+                "--ask-for-approval",
+                "-p",
+                "--profile",
+            }:
+                index += 1
+            index += 1
+        if additional_roots:
+            response = await client.request(
+                "config/read", {"includeLayers": False, "cwd": str(effective_cwd)}
+            )
+            result = response.get("result")
+            loaded_config = result.get("config") if isinstance(result, dict) else None
+            if not isinstance(loaded_config, dict):
+                raise ValueError("Codex config/read returned an invalid config")
+            sandbox_config = loaded_config.get("sandbox_workspace_write") or {}
+            roots = sandbox_config.get("writable_roots") or []
+            config = cast(CodexParams, params.setdefault("config", {}))
+            if "sandbox_workspace_write" in config:
+                configured = config["sandbox_workspace_write"]
+                if not isinstance(configured, dict):
+                    raise ValueError("sandbox_workspace_write must be a table")
+                roots = configured.get("writable_roots", roots)
+            roots = config.get("sandbox_workspace_write.writable_roots", roots)
+            if not isinstance(roots, list) or not all(isinstance(root, str) for root in roots):
+                raise ValueError(
+                    "sandbox_workspace_write.writable_roots must be an array of paths"
+                )
+            if params.get("permissions") or loaded_config.get("default_permissions"):
+                roots = []
+            params["runtimeWorkspaceRoots"] = list(
+                dict.fromkeys(
+                    [
+                        str(effective_cwd),
+                        *(absolute_codex_path(root, effective_cwd) for root in additional_roots),
+                        *(absolute_codex_path(root, effective_cwd) for root in roots),
+                    ]
+                )
+            )
+            params["cwd"] = str(effective_cwd)
         await client.request(
             "thread/resume",
             {
                 "threadId": thread_id,
                 "excludeTurns": True,
-                **_codex_resume_permission_params(terminal_launch_args),
+                **params,
             },
         )
         if retain_client:
@@ -3841,11 +4202,15 @@ def _strip_approval_sandbox_flags(codex_args: tuple[str, ...]) -> list[str]:
     :returns: ``codex_args`` with the conflicting flags removed, e.g.
         ``["--model", "gpt-5.4-mini"]``.
     """
+    codex_args = tuple(canonical_codex_launch_args(codex_args))
     cleaned: list[str] = []
     i = 0
     n = len(codex_args)
     while i < n:
         arg = codex_args[i]
+        if arg == "--":
+            cleaned.extend(codex_args[i:])
+            break
         if arg in _CODEX_APPROVAL_SANDBOX_FLAGS:
             # ``--flag value``: drop the flag, and consume the NEXT token as
             # its value ONLY when that token is a real value — it exists and
@@ -3861,7 +4226,7 @@ def _strip_approval_sandbox_flags(codex_args: tuple[str, ...]) -> list[str]:
             # ``--flag=value`` single token: drop it whole, consume nothing.
             i += 1
             continue
-        if arg == _CODEX_BYPASS_SANDBOX_FLAG:
+        if arg in {_CODEX_BYPASS_SANDBOX_FLAG, "--approve-for-me"}:
             # Drop any pre-existing bypass flag; a single canonical copy is
             # re-added by the caller so it is never duplicated.
             i += 1
@@ -3878,6 +4243,12 @@ def _strip_codex_resume_permission_args(codex_args: tuple[str, ...]) -> list[str
     index = 0
     while index < len(args):
         arg = args[index]
+        if arg == "--":
+            cleaned.extend(args[index:])
+            break
+        if arg == "--add-dir":
+            index += 2
+            continue
         assignment: str | None = None
         width = 1
         if arg in {"-c", "--config"} and index + 1 < len(args):
@@ -3889,11 +4260,7 @@ def _strip_codex_resume_permission_args(codex_args: tuple[str, ...]) -> list[str
             key, separator, raw_value = assignment.partition("=")
             # Leave unsupported settings for Codex to validate, rather than
             # silently dropping a policy that preload does not apply.
-            if (
-                separator
-                and key.strip() in _CODEX_RESUME_PERMISSION_CONFIG_FIELDS
-                and _codex_config_string(raw_value)
-            ):
+            if separator and _set_codex_resume_config_param({}, key, raw_value):
                 index += width
                 continue
         cleaned.append(arg)
@@ -3998,6 +4365,7 @@ def build_codex_remote_args(
         passthrough = [_CODEX_BYPASS_SANDBOX_FLAG, *_strip_approval_sandbox_flags(codex_args)]
     else:
         passthrough = normalize_codex_permission_launch_args(codex_args)
+    passthrough = without_codex_config_profile(passthrough)
     if bypass_hook_trust:
         passthrough = [_CODEX_BYPASS_HOOK_TRUST_FLAG, *passthrough]
     if thread_id is None:

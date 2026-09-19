@@ -4860,6 +4860,7 @@ async def _auto_create_codex_terminal(
         ap_auth_headers=policy_headers,
         bypass_sandbox=launch_config.bypass_sandbox,
         developer_instructions=_codex_developer_instructions,
+        terminal_launch_args=launch_config.terminal_launch_args or (),
         reasoning_effort=launch_config.reasoning_effort,
         model_catalog_rows=_fresh_codex_catalog,
         # Codex can show project-trust and legacy-model migration prompts before
@@ -4926,6 +4927,7 @@ async def _auto_create_codex_terminal(
                 codex_ws_url,
                 launch_config.external_session_id,
                 terminal_launch_args=launch_config.terminal_launch_args,
+                cwd=Path(workspace),
                 retain_client=codex_remote_resume_omits_permission_args(
                     app_server.codex_cli_version
                 ),
