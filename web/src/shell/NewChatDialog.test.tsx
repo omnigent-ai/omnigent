@@ -514,6 +514,18 @@ describe("isValidWorkspace", () => {
     expect(isValidWorkspace("  /Users/corey  ")).toBe(true);
   });
 
+  it("accepts a Windows drive-letter path", () => {
+    // Windows hosts report `C:\...` workspaces; without this the submit
+    // button silently stays disabled on native Windows.
+    expect(isValidWorkspace("C:\\Users\\corey\\projects")).toBe(true);
+    expect(isValidWorkspace("d:/work/repo")).toBe(true);
+  });
+
+  it("rejects a bare drive letter or drive-relative path", () => {
+    expect(isValidWorkspace("C:")).toBe(false);
+    expect(isValidWorkspace("C:relative")).toBe(false);
+  });
+
   it("rejects empty string", () => {
     // Disabled-by-default state. Without this rejection, the submit
     // button would enable as soon as the user clicks the input.

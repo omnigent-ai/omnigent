@@ -518,13 +518,15 @@ export function ConnectHostInstructions({
  * — that's the host's job, and the workspace request body must be
  * an unambiguous absolute path. Empty / whitespace-only input is
  * also rejected so the submit button is disabled until the user
- * has typed something usable.
+ * has typed something usable. Windows hosts report drive-letter paths
+ * (``C:\Users\me``), which are equally absolute, so those are accepted too.
  *
  * @param workspace Value the user typed in the workspace input.
- * @returns true when ``workspace.trim()`` starts with ``/``.
+ * @returns true when ``workspace.trim()`` starts with ``/`` or a Windows
+ *   drive prefix such as ``C:\`` / ``C:/``.
  */
 export function isValidWorkspace(workspace: string): boolean {
-  return workspace.trim().startsWith("/");
+  return /^(\/|[A-Za-z]:[\\/])/.test(workspace.trim());
 }
 
 /**
