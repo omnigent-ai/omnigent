@@ -29,7 +29,13 @@ def test_stale_model_preview_keeps_draft(seeded_session: tuple[str, str]) -> Non
     _run_in_fresh_loop(_drive(*seeded_session, stale=True))
 
 
-async def _drive(base_url: str, session_id: str, *, stale: bool) -> None:
+def test_unconnected_unity_links_to_integrations(seeded_session: tuple[str, str]) -> None:
+    _run_in_fresh_loop(_drive(*seeded_session, stale=False, needs_connection=True))
+
+
+async def _drive(
+    base_url: str, session_id: str, *, stale: bool, needs_connection: bool = False
+) -> None:
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch()
         page = await browser.new_page(viewport={"width": 1440, "height": 960})
@@ -41,11 +47,27 @@ async def _drive(base_url: str, session_id: str, *, stale: bool) -> None:
                 page, created_session_id=session_id, create_bodies=creates
             )
             info = json.loads(_managed_info_body())
-            info.update(sandbox_provider="agent_sandbox", databricks_features=False)
+            info.update(sandbox_provider="agent_sandbox", databricks_features=needs_connection)
             await page.route("**/v1/info", lambda route: route.fulfill(json=info))
 
             async def models(route: Route) -> None:
                 catalog_requests.append(route.request.url)
+                if needs_connection:
+                    await route.fulfill(
+                        json={
+                            "configured": True,
+                            "status": "unavailable",
+                            "models": [],
+                            "configuration_revision": None,
+                            "provider_label": None,
+                            "default_model": None,
+                            "error": (
+                                "Connect Databricks before using this harness's "
+                                "Unity Gateway provider."
+                            ),
+                        }
+                    )
+                    return
                 await route.fulfill(
                     json={
                         "configured": True,
@@ -82,6 +104,14 @@ async def _drive(base_url: str, session_id: str, *, stale: bool) -> None:
                 await page.route(re.compile(r"/v1/sessions(?:\?.*)?$"), reject_create)
 
             await page.goto(base_url)
+            if needs_connection:
+                await page.get_by_test_id("new-chat-landing-input").fill("Reply with READY.")
+                await expect(page.get_by_test_id("new-chat-landing-submit")).to_be_disabled()
+                await page.get_by_test_id("sandbox-catalog-error-integrations-link").click()
+                await expect(page).to_have_url(re.compile(r"/settings/integrations$"))
+                assert catalog_requests
+                assert creates == []
+                return
             await _open_entry_models(page, "ag_claude_e2e")
             await expect(page.get_by_test_id("sandbox-model-provider")).to_have_text("Bifrost")
             await expect(

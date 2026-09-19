@@ -17,6 +17,7 @@ from omnigent.inference_config import (
     binding_for_harness,
     inference_revision,
     resolve_bound_provider,
+    validate_inference_credentials,
 )
 from omnigent.models import model_catalog
 from omnigent.models.model_catalog import ModelEntry, ResolvedModelProvider
@@ -124,6 +125,26 @@ def _binding_key(config: dict[str, Any], harness: str) -> str:
     return "acp"
 
 
+def _resolve_alias(provider: ProviderEntry, harness: str, model: str) -> str:
+    """Resolve across supported families, rejecting conflicting tier definitions."""
+    canonical = canonicalize_harness(harness)
+    families = (
+        [name for name in ("anthropic", "openai") if name in provider.families]
+        if canonical in {"pi", "pi-native", "acp"}
+        else [_family(provider, harness)]
+    )
+    resolved = {
+        _alias(model, provider.families[name].models)
+        for name in families
+        if model in provider.families[name].models
+    }
+    if len(resolved) > 1:
+        raise _invalid(
+            f"Model alias {model!r} is ambiguous across provider families. Use an exact model ID."
+        )
+    return next(iter(resolved), model)
+
+
 class SandboxInferenceService:
     """Load a static target once, then discover through its saved configuration."""
 
@@ -157,6 +178,18 @@ class SandboxInferenceService:
                 f"on this server — available: {offered}"
             )
         raw: dict[str, Any] = copy.deepcopy(target.host_config or {})
+        discovery = copy.deepcopy(getattr(target, "model_discovery", None) or {})
+        try:
+            validate_inference_credentials(raw, discovery)
+        except ValueError:
+            raise _invalid(
+                "Inference credentials must use supported api_key_ref references or "
+                "auth_command; inline keys are not allowed."
+            ) from None
+        for discovery_entry in discovery.values():
+            if not isinstance(discovery_entry, dict):
+                raise _invalid("Model discovery entries must be mappings.")
+            _endpoint(discovery_entry.get("base_url"))
         bound = resolve_bound_provider(raw, harness, agent_auth, allow_empty=True)
         if bound is None and not raw.get("inference"):
             return None
@@ -165,7 +198,6 @@ class SandboxInferenceService:
             "providers": copy.deepcopy(raw.get("providers", {})),
             "inference": copy.deepcopy(raw.get("inference", {})),
         }
-        discovery = copy.deepcopy(getattr(target, "model_discovery", None) or {})
         connections: dict[str, str] = {}
         connected_names = [
             name
@@ -225,8 +257,7 @@ class SandboxInferenceService:
             raise _invalid(
                 "Managed inference requires a gateway, API key, or connected Unity provider."
             )
-        referenced = {value["provider"] for value in runtime["inference"]["harnesses"].values()}
-        for name in referenced:
+        for name in providers:
             for family_name in ("anthropic", "openai", "gemini"):
                 original_family = raw["providers"][name].get(family_name, {})
                 if original_family.get("api_key") is not None:
@@ -240,14 +271,17 @@ class SandboxInferenceService:
             # An unconnected Unity reference remains unusable, never late-bound.
             if not entry.families:
                 continue
-            family_name = _family(entry, saved_harness)
-            tiers = entry.families[family_name].models
             if saved.get("model_allowlist") is not None:
                 saved["model_allowlist"] = list(
-                    dict.fromkeys(_alias(model, tiers) for model in saved["model_allowlist"])
+                    dict.fromkeys(
+                        _resolve_alias(entry, saved_harness, model)
+                        for model in saved["model_allowlist"]
+                    )
                 )
             if saved.get("default_model"):
-                saved["default_model"] = _alias(saved["default_model"], tiers)
+                saved["default_model"] = _resolve_alias(
+                    entry, saved_harness, saved["default_model"]
+                )
         target_id = f"sandbox:{target.provider or 'default'}"
         snapshot: dict[str, Any] = {
             "version": 1,
@@ -310,8 +344,8 @@ class SandboxInferenceService:
         """Serve the operator's curated list when no server discovery is configured.
 
         Trusts ``model_allowlist`` instead of listing the gateway: no server-side
-        credential is resolved and no public catalog is consulted. The harness
-        validates the model against the live gateway when it launches.
+        credential is resolved and no public catalog is consulted. Availability
+        errors surface when the harness uses the selected model.
         """
         if binding.model_allowlist is None:
             result["error"] = (

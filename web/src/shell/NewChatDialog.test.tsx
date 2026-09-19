@@ -9208,6 +9208,24 @@ describe("managed sandbox inference models", () => {
     fireEvent.change(screen.getByTestId("new-chat-landing-input"), { target: { value: "start" } });
     expect(screen.getByRole("alert")).toHaveTextContent("Gateway unavailable");
     expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+    expect(screen.queryByTestId("sandbox-catalog-error-integrations-link")).toBeNull();
+  });
+
+  it("offers Integrations when Unity requires an account connection", () => {
+    preview({
+      ...catalog,
+      models: [],
+      status: "unavailable",
+      error: "Connect Databricks before using this harness's Unity Gateway provider.",
+    });
+    renderLanding({ managed_sandboxes_enabled: true, sandbox_provider: "agent_sandbox" });
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), { target: { value: "start" } });
+    expect(screen.getByRole("alert")).toHaveTextContent("Connect Databricks");
+    expect(screen.getByTestId("sandbox-catalog-error-integrations-link")).toHaveTextContent(
+      "Go to Integrations",
+    );
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+    expect(authenticatedFetchMock).not.toHaveBeenCalled();
   });
 
   it("discards a model removed by a provider profile change", async () => {

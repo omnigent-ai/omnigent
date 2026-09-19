@@ -15,7 +15,11 @@ from omnigent.models import model_catalog
 from omnigent.models.model_catalog import ModelEntry, ModelListing
 from omnigent.models.model_metadata import ModelMetadata, ModelReasoningMetadata, ModelWireAPI
 from omnigent.server.inference_catalog import SandboxInferenceService
-from omnigent.server.managed_hosts import ManagedSandboxConfig, ManagedSandboxDeployment
+from omnigent.server.managed_hosts import (
+    ManagedSandboxConfig,
+    ManagedSandboxDeployment,
+    parse_sandbox_config,
+)
 from omnigent.spec.types import ProviderAuth
 
 
@@ -199,6 +203,84 @@ async def test_missing_discovery_without_allowlist_reports_configuration_error()
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("allowed", [(), ("gateway/main",)])
+async def test_static_catalog_preserves_empty_and_singleton_allowlists(allowed):
+    state = _state(allowed=allowed, default=None)
+    state.sandbox_config.default.model_discovery.clear()
+    requests = []
+    snapshot = await SandboxInferenceService(
+        state, transport=_transport(requests=requests)
+    ).prepare("agent_sandbox", "codex-native", "alice")
+    assert requests == []
+    assert [row["id"] for row in snapshot["catalog"]["models"]] == list(allowed)
+    assert snapshot["catalog"]["status"] == ("ready" if allowed else "empty")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "location", ["provider", "unbound_provider", "discovery", "unused_discovery"]
+)
+@pytest.mark.parametrize("reference", ["literal-test-token", "prefix-${TOKEN}", "env:", 42])
+async def test_literal_credentials_rejected_at_startup_and_before_snapshot(location, reference):
+    state = _state()
+    target = state.sandbox_config.default
+    if location in {"provider", "unbound_provider"}:
+        name = "bifrost" if location == "provider" else "unbound"
+        target.host_config["providers"][name] = copy.deepcopy(
+            target.host_config["providers"]["bifrost"]
+        )
+        target.host_config["providers"][name]["openai"]["api_key_ref"] = reference
+    else:
+        name = "bifrost" if location == "discovery" else "unused"
+        target.model_discovery[name] = {
+            "base_url": "https://catalog.example/v1",
+            "api_key_ref": reference,
+        }
+    with pytest.raises(ValueError, match="api_key_ref") as error:
+        parse_sandbox_config(
+            {
+                "provider": "modal",
+                "server_url": "https://server.example",
+                "host_config": target.host_config,
+                "model_discovery": target.model_discovery,
+            }
+        )
+    assert "literal-test-token" not in str(error.value)
+    requests = []
+    with pytest.raises(OmnigentError, match="api_key_ref") as error:
+        await SandboxInferenceService(state, transport=_transport(requests=requests)).prepare(
+            "agent_sandbox", "codex-native", "alice"
+        )
+    assert "literal-test-token" not in str(error.value)
+    assert requests == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reference",
+    ["env:POD_INFERENCE_KEY", "$POD_INFERENCE_KEY", "${POD_INFERENCE_KEY}", "keychain:pod-key"],
+)
+async def test_pod_references_are_validated_without_resolution(reference):
+    state = _state()
+    target = state.sandbox_config.default
+    target.host_config["providers"]["bifrost"]["openai"]["api_key_ref"] = reference
+    parsed = parse_sandbox_config(
+        {
+            "provider": "modal",
+            "server_url": "https://server.example",
+            "host_config": target.host_config,
+            "model_discovery": target.model_discovery,
+        }
+    )
+    assert parsed is not None
+    snapshot = await SandboxInferenceService(state, transport=_transport()).prepare(
+        "agent_sandbox", "codex-native", "alice"
+    )
+    assert snapshot["catalog"]["status"] == "ready"
+    assert snapshot["runtime_config"]["providers"]["bifrost"]["openai"]["api_key_ref"] == reference
+
+
+@pytest.mark.asyncio
 async def test_exact_acp_binding_and_literal_databricks_prefix_are_preserved():
     state = _state(
         allowed=("databricks-custom/model",),
@@ -225,6 +307,71 @@ async def test_aliases_resolve_and_cycles_fail():
     family["models"] = {"primary": "fast", "fast": "primary"}
     with pytest.raises(OmnigentError, match="cycle"):
         await service.prepare("agent_sandbox", "codex-native", "alice")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("harness", ["pi-native", "pi", "acp:custom"])
+@pytest.mark.parametrize("discovery", [False, True])
+async def test_dual_family_aliases_resolve_for_live_and_static_catalogs(harness, discovery):
+    state = _state(allowed=("fast", "primary", "gateway/literal"), default="fast", harness=harness)
+    provider = state.sandbox_config.default.host_config["providers"]["bifrost"]
+    provider["openai"]["models"] = {"fast": "nested", "nested": "gateway/gpt-fast"}
+    provider["anthropic"] = {
+        "base_url": "https://anthropic.example",
+        "api_key_ref": "env:POD_INFERENCE_KEY",
+        "models": {"primary": "gateway/claude-primary"},
+    }
+    if not discovery:
+        state.sandbox_config.default.model_discovery.clear()
+    requests = []
+    expected = ["gateway/gpt-fast", "gateway/claude-primary", "gateway/literal"]
+    snapshot = await SandboxInferenceService(
+        state, transport=_transport(expected, requests=requests)
+    ).prepare("agent_sandbox", harness, "alice")
+    assert snapshot is not None
+    assert snapshot["catalog"]["status"] == "ready"
+    assert [row["id"] for row in snapshot["catalog"]["models"]] == expected
+    assert snapshot["catalog"]["default_model"] == "gateway/gpt-fast"
+    assert bool(requests) is discovery
+    saved = snapshot["runtime_config"]["inference"]["harnesses"][harness]
+    assert saved["model_allowlist"] == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("harness", ["pi-native", "acp:custom"])
+@pytest.mark.parametrize("same_target", [False, True])
+async def test_duplicate_family_aliases_must_agree(harness, same_target):
+    state = _state(allowed=("fast",), default="fast", harness=harness)
+    provider = state.sandbox_config.default.host_config["providers"]["bifrost"]
+    provider["openai"]["models"] = {"fast": "gateway/fast"}
+    provider["anthropic"] = {
+        "base_url": "https://anthropic.example",
+        "api_key_ref": "env:POD_INFERENCE_KEY",
+        "models": {"fast": "gateway/fast" if same_target else "gateway/claude-fast"},
+    }
+    service = SandboxInferenceService(state, transport=_transport())
+    if same_target:
+        snapshot = await service.prepare("agent_sandbox", harness, "alice")
+        assert snapshot["catalog"]["default_model"] == "gateway/fast"
+    else:
+        with pytest.raises(OmnigentError, match="ambiguous"):
+            await service.prepare("agent_sandbox", harness, "alice")
+
+
+@pytest.mark.asyncio
+async def test_fixed_family_alias_ignores_other_family_definition():
+    state = _state(allowed=("fast",), default="fast")
+    provider = state.sandbox_config.default.host_config["providers"]["bifrost"]
+    provider["openai"]["models"] = {"fast": "gateway/fast"}
+    provider["anthropic"] = {
+        "base_url": "https://anthropic.example",
+        "api_key_ref": "env:POD_INFERENCE_KEY",
+        "models": {"fast": "gateway/claude-fast"},
+    }
+    snapshot = await SandboxInferenceService(state, transport=_transport()).prepare(
+        "agent_sandbox", "codex-native", "alice"
+    )
+    assert snapshot["catalog"]["default_model"] == "gateway/fast"
 
 
 @pytest.mark.asyncio

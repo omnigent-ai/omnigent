@@ -1222,6 +1222,9 @@ def _parse_host_config(raw: dict[str, object]) -> dict[str, object] | None:
     # validation here yet still ride to the sandbox, where the merge writes
     # `providers: null` over any existing block — the silent degradation this
     # parse exists to prevent.
+    from omnigent.inference_config import validate_inference_credentials
+
+    validate_inference_credentials(host_config)
     if "providers" in host_config:
         providers = host_config["providers"]
         # load_providers silently ignores a non-mapping providers value, so
@@ -1461,6 +1464,9 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
             raise ValueError(f"sandbox.model_discovery.{name} requires base_url")
         if not (discovery.get("api_key_ref") or discovery.get("auth_command")):
             raise ValueError(f"sandbox.model_discovery.{name} requires a credential reference")
+    from omnigent.inference_config import validate_inference_credentials
+
+    validate_inference_credentials(host_config or {}, model_discovery)
     if provider == "agent_sandbox":
         host_config = _apply_keep_warm(host_config, _parse_keep_warm_s(raw))
     if provider == "modal":

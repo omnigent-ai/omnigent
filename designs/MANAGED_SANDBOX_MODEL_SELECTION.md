@@ -13,9 +13,11 @@ saved references; tokens are never part of the snapshot.
 ## Configuration
 
 Add providers and harness bindings to the existing `sandbox.host_config`.
-Configure server-side gateway inventory access in `sandbox.model_discovery`.
-The catalog credential must represent the same model entitlement as the Pod's
-inference credential. Both the server and Pod must reach their respective URLs.
+For gateways, `sandbox.model_discovery` is optional when each bound harness has
+an explicit `model_allowlist`. This mode trusts the operator's list and needs no
+server catalog key or inventory request. With discovery enabled, the catalog
+credential must represent the same model entitlement as the Pod's inference
+credential, and both the server and Pod must reach their respective URLs.
 
 The model names below are placeholders for exact IDs returned by your gateway.
 Use a sandbox image containing the same inference-profile support as the server.
@@ -27,7 +29,7 @@ sandbox:
   kubernetes:
     secret_name: harness-credentials
 
-  # Resolved on the server; never installed in the sandbox.
+  # Optional with a curated allowlist; resolved only on the server.
   model_discovery:
     bifrost:
       base_url: https://bifrost.example.com/v1
@@ -71,7 +73,9 @@ sandbox:
 
 `BIFROST_CATALOG_KEY` belongs in the server environment.
 `BIFROST_INFERENCE_KEY` belongs in the Kubernetes Secret projected into the Pod.
-Use `api_key_ref` or `auth_command`; inline keys are rejected. Endpoints must be
+Use `api_key_ref` (`env:VAR`, `$VAR`, `${VAR}`, or `keychain:name`) or an
+`auth_command` that retrieves a credential; literal keys in `api_key` or
+`api_key_ref` are rejected before snapshots are created. Endpoints must be
 literal HTTP(S) URLs without embedded credentials, query strings, fragments, or
 environment substitutions, so the accepted endpoint can be saved reliably.
 
@@ -89,16 +93,30 @@ has its own target identity and configuration revision.
 
 ## Model policy and transport
 
-The visible catalog is the intersection of gateway availability, the harness's
-supported protocol/capabilities, and `model_allowlist` when present.
+Gateway catalogs have three modes:
+
+| Allowlist | Discovery | Composer choices |
+| --- | --- | --- |
+| Present | Absent | Operator's curated IDs, in order |
+| Present | Present | Allowlist intersected with the compatible live catalog |
+| Absent | Present | Full compatible live catalog |
+
+Without discovery, Omnigent enforces the saved allowlist but cannot confirm
+availability or model capabilities in advance; errors surface when the harness
+uses the model. A gateway with neither setting is rejected. Connected Unity
+always uses its owner's live catalog, independently of `model_discovery`.
+With discovery, the visible catalog intersects gateway availability, supported
+protocol/capabilities, and the allowlist when present.
 
 - An omitted allowlist adds no restriction. An empty list permits no models.
   A singleton list stays restricted and visible as such.
 - An explicit list preserves operator order. Its default must belong to the
-  compatible live catalog. An unavailable default blocks creation or switching
+  selected catalog. With discovery, an unavailable default blocks creation or switching
   instead of silently choosing a different model.
 - Provider tier aliases resolve to exact IDs, with cycle detection. Literal
-  slashes and dots in gateway IDs remain intact.
+  slashes and dots in gateway IDs remain intact. Pi and ACP resolve aliases
+  across both configured families; an alias pointing to different IDs is
+  rejected as ambiguous. Use exact IDs to disambiguate.
 - Discovery failure and a successful empty intersection have distinct error
   states. Neither falls back to public models or the server's ambient providers.
 - An explicit binding is authoritative. Conflicting agent authentication or a
@@ -179,7 +197,7 @@ process configuration matches the session; assigning a session to a different
 profile's runner is rejected.
 
 Existing-session catalogs resolve against this snapshot and current gateway
-availability. Create, model PATCH, and prompt dispatch all validate the same
+availability when discovery is enabled. Create, model PATCH, and prompt dispatch all validate the same
 policy. Model reset chooses the saved default. Rejected native model changes
 restore the previous stored selection. Native adapters retain their actual
 harness identity and translate only their own framework provider prefixes.
@@ -239,10 +257,12 @@ To verify with a configured OSS deployment:
 4. Change one harness's provider/default/list and restart the server. The old
    session should retain its choices; a new session should use the edited list.
    Stop/wake or replace the old sandbox and confirm its original route remains.
-5. Remove an allowed model from the gateway inventory or revoke access. The
+5. With discovery enabled, remove an allowed model from the gateway inventory or revoke access. The
    composer should show an availability error and sending a new prompt should
    fail without rerouting.
 
-Synthetic gateways verify routing and lifecycle behavior. Real Unity OAuth,
-customer-specific Bifrost entitlements, and arbitrary ACP CLI authentication
-require validation in the operator's deployment.
+Synthetic gateways verify routing and lifecycle behavior. Additional live
+validation on this PR used Unity OAuth for Claude native and OpenRouter for Pi
+and OpenCode in an Agent Sandbox lab, across the three catalog modes. Validate
+customer-specific Bifrost entitlements and arbitrary ACP CLI authentication in
+the operator's deployment.

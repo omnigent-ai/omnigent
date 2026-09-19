@@ -6,6 +6,7 @@ import copy
 import hashlib
 import json
 import os
+import re
 from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -31,6 +32,45 @@ class HarnessInferenceBinding:
     provider: str
     default_model: str | None = None
     model_allowlist: tuple[str, ...] | None = None
+
+
+def validate_inference_credentials(
+    config: dict[str, object], discovery: dict[str, object] | None = None
+) -> None:
+    """Reject literal credentials before managed configuration is copied or persisted."""
+
+    def validate_fields(fields: dict[str, Any]) -> None:
+        if fields.get("api_key") is not None:
+            raise ValueError(
+                "Inline api_key is not allowed; use api_key_ref: env:VAR or auth_command."
+            )
+        reference = fields.get("api_key_ref")
+        if reference is not None and (
+            not isinstance(reference, str)
+            or re.fullmatch(
+                r"(?:env:[A-Za-z_][A-Za-z0-9_]*|\$[A-Za-z_][A-Za-z0-9_]*|"
+                r"\$\{[A-Za-z_][A-Za-z0-9_]*\}|keychain:[^\s]+)",
+                reference,
+            )
+            is None
+        ):
+            raise ValueError(
+                "api_key_ref must be an env:VAR, $VAR, ${VAR}, or keychain:name reference."
+            )
+
+    providers = config.get("providers", {})
+    if isinstance(providers, dict):
+        for provider in providers.values():
+            if not isinstance(provider, dict):
+                continue
+            validate_fields(provider)
+            for name in ("anthropic", "openai", "gemini"):
+                family = provider.get(name)
+                if isinstance(family, dict):
+                    validate_fields(family)
+    for entry in (discovery or {}).values():
+        if isinstance(entry, dict):
+            validate_fields(entry)
 
 
 def _harness_key(harness: str) -> str:

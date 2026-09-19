@@ -1,7 +1,7 @@
 """Add saved inference configuration to Omnigent conversation metadata.
 
 Revision ID: hi1b2c3d4e5f
-Revises: hh1b2c3d4e5f
+Revises: ar1b2c3d4e5f
 Create Date: 2026-09-18 00:00:00.000000
 
 Existing conversations retain NULL and their existing provider behavior.
@@ -17,7 +17,7 @@ from alembic import op
 from sqlalchemy.dialects.mysql import LONGTEXT
 
 revision: str = "hi1b2c3d4e5f"
-down_revision: str | None = "hh1b2c3d4e5f"
+down_revision: str | None = "ar1b2c3d4e5f"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

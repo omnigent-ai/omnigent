@@ -18,7 +18,7 @@ from omnigent.db.db_models import (
 )
 from omnigent.db.utils import _build_alembic_config
 
-_PREVIOUS_REVISION = "hh1b2c3d4e5f"
+_PREVIOUS_REVISION = "ar1b2c3d4e5f"
 _REVISION = "hi1b2c3d4e5f"
 _TABLE = "omnigent_conversation_metadata"
 

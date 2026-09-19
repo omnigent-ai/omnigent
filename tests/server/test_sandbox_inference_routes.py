@@ -166,6 +166,40 @@ async def _json_create(env: _Env, **overrides: Any):
     )
 
 
+@pytest.mark.parametrize("location", ["provider", "discovery"])
+async def test_literal_credentials_rejected_before_session_or_artifact_writes(env: _Env, location):
+    from omnigent.server.inference_catalog import SandboxInferenceService
+
+    target = env.app.state.sandbox_config.default
+    if location == "provider":
+        target.host_config["providers"]["bifrost"]["openai"]["api_key_ref"] = "literal-test-token"
+    else:
+        target.model_discovery["bifrost"] = {
+            "base_url": "https://catalog.example/v1",
+            "api_key_ref": "literal-test-token",
+        }
+    env.app.state.inference_catalog = SandboxInferenceService(env.app.state)
+    agent = await create_test_agent(
+        env.client,
+        executor={"type": "omnigent", "config": {"harness": "codex"}},
+        include_llm=False,
+    )
+    before = env.persisted()
+    response = await env.client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "host_type": "managed",
+            "sandbox_provider": "agent_sandbox",
+        },
+    )
+    assert response.status_code == 400, response.text
+    assert "api_key_ref" in response.text
+    assert "literal-test-token" not in response.text
+    assert env.persisted() == before
+    env.launch.assert_not_awaited()
+
+
 async def _multipart_create(env: _Env, **metadata: Any):
     return await env.client.post(
         "/v1/sessions",
