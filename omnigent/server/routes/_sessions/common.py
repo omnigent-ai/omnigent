@@ -550,6 +550,15 @@ _WATCHER_TASKS: set[asyncio.Task[None]] = set()
 
 _session_status_cache: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
 
+# Monotonic deadline before which a session's runner status probe is skipped,
+# set when a probe timed out, failed, or returned a non-200.
+_runner_status_probe_backoff: WorkspaceScopedCache[str, float] = WorkspaceScopedCache()
+
+# The one runner status probe in flight per session; concurrent snapshots await it.
+_runner_status_probe_inflight: WorkspaceScopedCache[str, asyncio.Task[str | None]] = (
+    WorkspaceScopedCache()
+)
+
 
 _session_active_response_cache: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
 
@@ -1116,6 +1125,8 @@ __all__ = [
     "_read_last_seen",
     "_recent_mirrored_tool_calls",
     "_runner_relay_tasks",
+    "_runner_status_probe_backoff",
+    "_runner_status_probe_inflight",
     "_server_host_registry",
     "_server_runner_router",
     "_session_active_response_cache",

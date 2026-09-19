@@ -201,6 +201,8 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _recent_mirrored_tool_calls,
     _RelayHandle,
     _runner_relay_tasks,
+    _runner_status_probe_backoff,
+    _runner_status_probe_inflight,
     _session_active_response_cache,
     _session_background_task_count_cache,
     _session_background_tasks_cache,
@@ -10552,6 +10554,98 @@ async def _load_acp_model_options(
     return options
 
 
+# The tunnel transport does not enforce httpx timeouts, so the runner status
+# probe below is bounded here. A healthy runner answers from memory in tens of
+# milliseconds; one that cannot answer in this budget is stalled, and the relay
+# publishes the real status once it can.
+_RUNNER_STATUS_PROBE_TIMEOUT_S: float = 2.0
+# A probe that timed out or failed in transport is not repeated for this long,
+# so a slow runner costs each snapshot of its session at most one probe per
+# window instead of one per request. A non-200 answer is cheap and is asked
+# again on the next snapshot: a runner that has not registered the session
+# yet answers 404 until session init lands.
+_RUNNER_STATUS_PROBE_BACKOFF_S: float = 30.0
+
+
+async def _probe_runner_live_status(
+    runner_client: httpx.AsyncClient, session_id: str
+) -> str | None:
+    """
+    Ask a session's bound runner for its live status, bounded, shared, and backed off.
+
+    Concurrent snapshots of one session await the same in-flight probe. A 200
+    records the status in ``_session_status_cache``; a probe that timed out or
+    failed in transport puts the session in backoff instead.
+
+    :param runner_client: HTTP client pointed at the session's runner.
+    :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+    :returns: The runner's raw status, e.g. ``"running"``, or ``None`` when the
+        probe is in backoff, timed out, failed, or returned a non-200.
+    """
+    probe = _runner_status_probe_inflight.get(session_id)
+    if probe is None:
+        skip_until = _runner_status_probe_backoff.get(session_id)
+        if skip_until is not None and time.monotonic() < skip_until:
+            return None
+        _runner_status_probe_backoff.pop(session_id, None)
+        probe = asyncio.create_task(_run_runner_status_probe(runner_client, session_id))
+        _runner_status_probe_inflight[session_id] = probe
+    # Shielded so one cancelled snapshot request does not abort the probe the
+    # other waiters share.
+    return await asyncio.shield(probe)
+
+
+async def _run_runner_status_probe(
+    runner_client: httpx.AsyncClient, session_id: str
+) -> str | None:
+    """
+    Run one bounded runner status probe and record its outcome.
+
+    :param runner_client: HTTP client pointed at the session's runner.
+    :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+    :returns: The runner's raw status on a 200, else ``None``.
+    """
+    try:
+        try:
+            resp = await asyncio.wait_for(
+                runner_client.get(
+                    f"/v1/sessions/{session_id}", timeout=_RUNNER_STATUS_PROBE_TIMEOUT_S
+                ),
+                timeout=_RUNNER_STATUS_PROBE_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError:
+            failure = f"no answer within {_RUNNER_STATUS_PROBE_TIMEOUT_S:g}s"
+        except (httpx.HTTPError, ConnectionError) as exc:
+            failure = f"{type(exc).__name__}: {exc}"
+        else:
+            if resp.status_code == 200:
+                raw = str(resp.json().get("status", "idle"))
+                _session_status_cache[session_id] = raw
+                if raw in ("idle", "running", "waiting", "failed"):
+                    session_live_state.persist_live_status(session_id, raw)
+                return raw
+            _logger.debug(
+                "Runner status probe for session=%s answered HTTP %s",
+                session_id,
+                resp.status_code,
+                extra={"session_id": session_id},
+            )
+            return None
+        _runner_status_probe_backoff[session_id] = (
+            time.monotonic() + _RUNNER_STATUS_PROBE_BACKOFF_S
+        )
+        _logger.warning(
+            "Runner status probe for session=%s failed (%s); skipping it for %.0fs",
+            session_id,
+            failure,
+            _RUNNER_STATUS_PROBE_BACKOFF_S,
+            extra={"session_id": session_id},
+        )
+        return None
+    finally:
+        _runner_status_probe_inflight.pop(session_id, None)
+
+
 async def _get_session_snapshot(
     conv_store: ConversationStore,
     session_id: str,
@@ -10680,23 +10774,8 @@ async def _get_session_snapshot(
         # relay values (``"waiting"`` → ``"running"``), so the raw cache value
         # is only needed here when it is actually missing (None).
         if _session_status_cache.get(session_id) is None and runner_client is not None:
-            try:
-                resp = await runner_client.get(
-                    f"/v1/sessions/{session_id}",
-                    timeout=5.0,
-                )
-                if resp.status_code == 200:
-                    raw = resp.json().get("status", "idle")
-                    _session_status_cache[session_id] = raw
-                    if raw in ("idle", "running", "waiting", "failed"):
-                        session_live_state.persist_live_status(session_id, raw)
-                    status = _session_status_from_cache(session_id)
-            except (httpx.HTTPError, ConnectionError):
-                _logger.debug(
-                    "Runner status query failed for %s",
-                    session_id,
-                    extra={"session_id": session_id},
-                )
+            if await _probe_runner_live_status(runner_client, session_id) is not None:
+                status = _session_status_from_cache(session_id)
     # last_total_tokens and last_task_error come from the context-tokens
     # label written by the forwarder (tasks table has been removed).
     last_total_tokens: int | None = None
