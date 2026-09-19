@@ -49,6 +49,7 @@ from omnigent.errors import (
     ErrorPhase,
     OmnigentError,
     is_cancelled_rpc_error,
+    is_permission_denied_rpc_error,
 )
 from omnigent.extensions import ExtensionPluginState
 from omnigent.extensions.assets import (
@@ -2364,6 +2365,35 @@ def create_app(
                 ),
             )
             return await _handle_omnigent_error(request, cancelled)
+        if is_permission_denied_rpc_error(exc):
+            # A backing service refused the call (e.g. a workspace-hierarchy
+            # 403 surfacing as gRPC PERMISSION_DENIED through a channel
+            # proxy): an access outcome, not a fault. Answer the coded 403
+            # naming the resource instead of an unhandled 500 whose traceback
+            # repeats on every client retry. Matched structurally, like the
+            # cancellation above, because the deployed build vendors grpc.
+            denied = OmnigentError(
+                f"Access to {request.url.path} was denied by a backing "
+                "service. Verify you still have access to the underlying "
+                "workspace resource, or ask a workspace admin to grant it.",
+                code=ErrorCode.UPSTREAM_PERMISSION_DENIED,
+            )
+            _logger.warning(
+                "Upstream call denied by a backing service: %s",
+                exc,
+                exc_info=exc,
+                extra=_error_audit_extra(
+                    request,
+                    phase="denied",
+                    code=str(denied.code),
+                    http_status=str(denied.http_status),
+                    error_category=denied.category.value,
+                    error_impact=denied.impact.value,
+                    error_phase=denied.phase.value,
+                    error_type=type(exc).__name__,
+                ),
+            )
+            return await _handle_omnigent_error(request, denied)
         # UNKNOWN, not SERVER: an uncaught exception has no code that confirms the
         # fault is ours. Booking it as server would inflate our fault rate; the
         # exception type is logged as a signature to rank for promotion to a real

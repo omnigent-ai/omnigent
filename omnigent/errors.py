@@ -209,6 +209,14 @@ class ErrorCode:
         family the gRPC CANCELLED status conventionally maps to): a 4xx
         keeps this expected, retryable condition out of 5xx fault-rate
         signals, the same reasoning as ``WRONG_REPLICA``.
+    :cvar UPSTREAM_PERMISSION_DENIED: A backing upstream call (e.g. a
+        workspace-hierarchy gRPC dependency behind an embedding route)
+        refused the call with ``PERMISSION_DENIED`` — an access outcome,
+        not a fault. HTTP 403, but distinct from ``FORBIDDEN``: the
+        denial is issued by the dependency, and whether the user lacks
+        access there or the service dropped its auth context is decided
+        upstream, so it must not read as our own authorization layer
+        rejecting the request.
     :cvar STALE_CURSOR: A pagination cursor (``after``/``before``)
         references a row that no longer exists — typically deleted
         between two page fetches (HTTP 400). Without a distinct signal
@@ -235,6 +243,7 @@ class ErrorCode:
     WORKSPACE_MISSING = "workspace_missing"
     SESSION_AGENT_MISSING = "session_agent_missing"
     UPSTREAM_CANCELLED = "upstream_cancelled"
+    UPSTREAM_PERMISSION_DENIED = "upstream_permission_denied"
     STALE_CURSOR = "stale_cursor"
 
 
@@ -272,6 +281,10 @@ _CODE_TO_HTTP_STATUS: dict[str, int] = {
     # 499, not 5xx: the peer cancelling an in-flight backing call is expected
     # and retryable, so it must not read as a server fault (see the cvar).
     ErrorCode.UPSTREAM_CANCELLED: 499,
+    # 403: the upstream denial is an access outcome for this one request, not
+    # a server fault; the distinct code keeps it separable from our own authz
+    # FORBIDDEN in dashboards and client handling.
+    ErrorCode.UPSTREAM_PERMISSION_DENIED: 403,
     # 400: the referenced cursor row is gone, so this exact request can never
     # succeed — the fix is to restart the enumeration without the cursor. The
     # distinct code is what a paging client keys that restart off.
@@ -310,6 +323,9 @@ _CODE_TO_CATEGORY: dict[str, ErrorCategory] = {
     ErrorCode.SESSION_AGENT_MISSING: ErrorCategory.USER,
     # A dependency tore down the in-flight call; the fix (if any) is upstream.
     ErrorCode.UPSTREAM_CANCELLED: ErrorCategory.UPSTREAM,
+    # A dependency refused the call; whether the user lacks access there or
+    # the service lost its auth context is decided upstream, not here.
+    ErrorCode.UPSTREAM_PERMISSION_DENIED: ErrorCategory.UPSTREAM,
     # A stale reference: the cursor row was deleted (often by the same user
     # in another client) between two page fetches.
     ErrorCode.STALE_CURSOR: ErrorCategory.USER,
@@ -350,6 +366,7 @@ _CODE_TO_IMPACT: dict[str, ErrorImpact] = {
     ErrorCode.UPSTREAM_CANCELLED: ErrorImpact.TRANSIENT,
     # A single rejected request; the session stays healthy and usable.
     ErrorCode.FORBIDDEN: ErrorImpact.BENIGN,
+    ErrorCode.UPSTREAM_PERMISSION_DENIED: ErrorImpact.BENIGN,
     ErrorCode.NOT_FOUND: ErrorImpact.BENIGN,
     ErrorCode.INVALID_INPUT: ErrorImpact.BENIGN,
     ErrorCode.ALREADY_EXISTS: ErrorImpact.BENIGN,
@@ -389,8 +406,10 @@ _CODE_TO_PHASE: dict[str, ErrorPhase] = {
     ErrorCode.SESSION_AGENT_MISSING: ErrorPhase.HARNESS_SETUP,
     ErrorCode.HARNESS_PROTOCOL_VIOLATION: ErrorPhase.TURN,
     ErrorCode.INTERNAL_ERROR: ErrorPhase.UNKNOWN,
-    # Context-driven: a backing call can be cancelled while serving any stage.
+    # Context-driven: a backing call can be cancelled or denied while serving
+    # any stage.
     ErrorCode.UPSTREAM_CANCELLED: ErrorPhase.UNKNOWN,
+    ErrorCode.UPSTREAM_PERMISSION_DENIED: ErrorPhase.UNKNOWN,
     ErrorCode.STALE_CURSOR: ErrorPhase.REQUEST,
 }
 
@@ -593,27 +612,52 @@ _TRANSPORT_EXC_NAMES = frozenset(
 )
 
 
+def _rpc_error_status_name(exc: BaseException) -> str | None:
+    """Return the gRPC status name a failed call carries, or ``None``.
+
+    Matched structurally — an ``RpcError`` ancestor by class name plus a
+    callable ``code()`` returning a status object with a ``name`` — so a
+    vendored copy of grpc (a different class identity than pypi grpcio) still
+    matches and this module imports no grpc.
+
+    :param exc: The exception to inspect.
+    :returns: The status name (e.g. ``"CANCELLED"``), or ``None`` when *exc*
+        is not an RPC error or its status is unreadable.
+    """
+    if not any(klass.__name__ == "RpcError" for klass in type(exc).__mro__):
+        return None
+    code = getattr(exc, "code", None)
+    if not callable(code):
+        return None
+    try:
+        status = code()
+    except Exception:  # noqa: BLE001 — a status reader that itself fails carries no status
+        return None
+    name = getattr(status, "name", None)
+    return name if isinstance(name, str) else None
+
+
 def is_cancelled_rpc_error(exc: BaseException) -> bool:
     """Whether *exc* is a gRPC call terminated by its peer with ``CANCELLED``.
 
-    Matched structurally — an ``RpcError`` ancestor by class name plus a
-    ``code()`` whose status is named ``CANCELLED`` — so a vendored copy of
-    grpc (a different class identity than pypi grpcio) still matches and this
-    module imports no grpc.
+    :param exc: The exception to inspect.
+    :returns: ``True`` only for a peer-cancelled RPC error (matched
+        structurally, see :func:`_rpc_error_status_name`).
+    """
+    return _rpc_error_status_name(exc) == "CANCELLED"
+
+
+def is_permission_denied_rpc_error(exc: BaseException) -> bool:
+    """Whether *exc* is a gRPC call refused with ``PERMISSION_DENIED``.
+
+    E.g. an upstream service answering HTTP 403 through a gRPC channel proxy
+    (``details = "Received http2 header with status: 403"``).
 
     :param exc: The exception to inspect.
-    :returns: ``True`` only for a peer-cancelled RPC error.
+    :returns: ``True`` only for a permission-denied RPC error (matched
+        structurally, see :func:`_rpc_error_status_name`).
     """
-    if not any(klass.__name__ == "RpcError" for klass in type(exc).__mro__):
-        return False
-    code = getattr(exc, "code", None)
-    if not callable(code):
-        return False
-    try:
-        status = code()
-    except Exception:  # noqa: BLE001 — a status reader that itself fails is not a cancellation
-        return False
-    return getattr(status, "name", None) == "CANCELLED"
+    return _rpc_error_status_name(exc) == "PERMISSION_DENIED"
 
 
 def classify_exception(exc: BaseException) -> tuple[ErrorCategory, ErrorImpact]:
@@ -628,6 +672,9 @@ def classify_exception(exc: BaseException) -> tuple[ErrorCategory, ErrorImpact]:
       matched by type name) read as a transient upstream blip.
     - A peer-cancelled gRPC call (see :func:`is_cancelled_rpc_error`) reads the
       same way: the dependency tore down the in-flight call, not our fault.
+    - A permission-denied gRPC call (see :func:`is_permission_denied_rpc_error`)
+      is upstream-owned too, but benign rather than transient: the dependency
+      refused one call, and a bare retry does not self-heal a denial.
     - Anything else is genuinely unattributed: UNKNOWN on both axes rather than a
       guessed owner. The turn's terminal outcome remains the authoritative
       blocking signal.
@@ -646,4 +693,6 @@ def classify_exception(exc: BaseException) -> tuple[ErrorCategory, ErrorImpact]:
         return ErrorCategory.UPSTREAM, ErrorImpact.TRANSIENT
     if is_cancelled_rpc_error(exc):
         return ErrorCategory.UPSTREAM, ErrorImpact.TRANSIENT
+    if is_permission_denied_rpc_error(exc):
+        return ErrorCategory.UPSTREAM, ErrorImpact.BENIGN
     return ErrorCategory.UNKNOWN, ErrorImpact.UNKNOWN
