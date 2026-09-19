@@ -1464,7 +1464,14 @@ async def test_stream_closed_then_error_continues_and_posts_failure(tmp_path: Pa
         client=slack,
         context={"bot_user_id": "B1"},
     )
-    await _wait_for_posts(slack, 1)
+    # Wait until both the ack is deleted AND a durable post exists (the failure
+    # notice). _wait_for_posts(slack, 1) fires too early: it can return as soon as
+    # the transient "Working on it…" ack lands in posts, before streaming starts.
+    # Shutdown immediately after would cancel the in-flight turn, leaving
+    # slack.streamed_text empty. _wait_for_ack_deleted returns only after the ack
+    # has been deleted (which happens after streaming + reply.finalize completes)
+    # and the failure post is present, guaranteeing streamed_text is fully populated.
+    await _wait_for_ack_deleted(slack)
     await service.shutdown()
 
     # Both deltas streamed live (across the reopened stream); nothing was lost.
