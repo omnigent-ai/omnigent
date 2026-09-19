@@ -55,6 +55,9 @@ vi.mock("@/shell/NewChatDialog", () => ({
     agentLabel,
     host,
     dropdownModal,
+    contentClassName,
+    harnessEntries,
+    agentEntries,
   }: {
     onSelectAgent: (a: AvailableAgent) => void;
     onOpenChange?: (open: boolean) => void;
@@ -62,6 +65,9 @@ vi.mock("@/shell/NewChatDialog", () => ({
     agentLabel: string;
     host?: { host_id: string } | null;
     dropdownModal?: boolean;
+    contentClassName?: string;
+    harnessEntries: AvailableAgent[];
+    agentEntries: AvailableAgent[];
   }) => (
     <div
       data-testid="agent-picker-stub"
@@ -70,6 +76,9 @@ vi.mock("@/shell/NewChatDialog", () => ({
       // a test can assert it's populated even when no host is pinned.
       data-badge-host={host?.host_id ?? ""}
       data-dropdown-modal={dropdownModal === false ? "false" : "true"}
+      data-content-class={contentClassName}
+      data-harness-entries={harnessEntries.map((agent) => agent.name).join(",")}
+      data-agent-entries={agentEntries.map((agent) => agent.name).join(",")}
     >
       <span>{agentLabel}</span>
       <button
@@ -224,6 +233,43 @@ describe("agent picker readiness (needs-setup badges)", () => {
   it("embeds the agent dropdown in non-modal mode so inside-dialog clicks only close the menu", () => {
     renderDialog();
     expect(screen.getByTestId("agent-picker-stub")).toHaveAttribute("data-dropdown-modal", "false");
+  });
+
+  it("uses the shared viewport-aware menu height instead of a fixed scroll cap", () => {
+    renderDialog();
+    expect(screen.getByTestId("agent-picker-stub")).toHaveAttribute("data-content-class", "w-80");
+  });
+
+  it("groups generic ACP choices with harnesses like the main composer", () => {
+    vi.mocked(agentsHook.useAvailableAgents).mockReturnValue({
+      data: [
+        ...AGENTS,
+        {
+          id: "ag_jcode",
+          name: "jcode",
+          display_name: "Jcode",
+          description: null,
+          harness: "jcode",
+          skills: [],
+          acpHarness: true,
+        },
+        {
+          id: "ag_grok",
+          name: "grok",
+          display_name: "Grok Build",
+          description: null,
+          harness: "grok",
+          skills: [],
+          acpHarness: true,
+        },
+      ],
+    } as unknown as ReturnType<typeof agentsHook.useAvailableAgents>);
+
+    renderDialog();
+
+    const picker = screen.getByTestId("agent-picker-stub");
+    expect(picker).toHaveAttribute("data-harness-entries", "claude-native-ui,jcode,grok");
+    expect(picker).toHaveAttribute("data-agent-entries", "polly");
   });
 });
 
