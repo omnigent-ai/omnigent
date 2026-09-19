@@ -720,6 +720,16 @@ def register_events_routes(
                     f"Invalid data payload for event type {body.type!r}: {exc}",
                     code=ErrorCode.INVALID_INPUT,
                 ) from exc
+        if body.type == "message":
+            from omnigent.inner.native_attachments import inline_workspace_attachment_name
+
+            inline_name = inline_workspace_attachment_name(body.data.get("content"))
+            if inline_name is not None:
+                raise OmnigentError(
+                    f"Attachment {inline_name!r} must be uploaded to the session's "
+                    "files and referenced by file_id.",
+                    code=ErrorCode.INVALID_INPUT,
+                )
         # Fail fast on malformed tools at the boundary. The raw dicts
         # (not the parsed objects) are what the runner stores — the
         # parse call is purely a validator.

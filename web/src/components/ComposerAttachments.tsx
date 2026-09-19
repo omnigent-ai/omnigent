@@ -16,7 +16,7 @@ import {
   type LucideIcon,
 } from "lucide-react";
 
-import { attachmentFilename, attachmentKey } from "@/lib/attachments";
+import { attachmentFilename, attachmentKey, classifyAttachment } from "@/lib/attachments";
 import { ZoomableImage } from "@/components/ImageLightbox";
 import { cn } from "@/lib/utils";
 
@@ -158,15 +158,32 @@ function AttachmentTile({ file, onRemove }: { file: File; onRemove: () => void }
   const ext = dot >= 0 ? name.slice(dot + 1).toUpperCase() : "";
   const meta = ext ? `${ext} · ${formatFileSize(file.size)}` : formatFileSize(file.size);
   const Icon = iconForFile(file);
+  // Archives, office documents and databases go to the session workspace for
+  // the agent to open rather than into the model context; say so on the card.
+  const toWorkspace = classifyAttachment(file) === "workspace";
   return (
     <div className="relative shrink-0">
-      <div className="flex h-14 w-[180px] items-center gap-2 rounded-xl border border-border bg-background p-2">
+      <div
+        className="flex h-14 w-[180px] items-center gap-2 rounded-xl border border-border bg-background p-2"
+        title={
+          toWorkspace
+            ? `${name} will be placed in the session workspace for the agent to open`
+            : undefined
+        }
+      >
         <span className="grid size-9 shrink-0 place-items-center rounded-lg bg-muted text-muted-foreground">
           <Icon className="size-5" />
         </span>
         <span className="flex min-w-0 flex-col">
           <span className="truncate text-sm font-medium text-foreground">{name}</span>
-          <span className="truncate text-xs text-muted-foreground">{meta}</span>
+          <span className="flex min-w-0 items-center gap-1 text-xs text-muted-foreground">
+            <span className="truncate">{meta}</span>
+            {toWorkspace && (
+              <span className="shrink-0 rounded-sm bg-muted px-1 text-[10px] leading-4">
+                workspace
+              </span>
+            )}
+          </span>
         </span>
       </div>
       <RemoveButton name={name} onRemove={onRemove} />

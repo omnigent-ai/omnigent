@@ -51,6 +51,19 @@ describe("ComposerAttachments", () => {
     expect(screen.queryByRole("img")).toBeNull();
   });
 
+  it("labels a workspace-delivered file and names its destination", () => {
+    renderList([new File([new Uint8Array(4)], "bundle.zip", { type: "application/zip" })]);
+    expect(screen.getByText("workspace")).toBeInTheDocument();
+    expect(
+      screen.getByTitle(/bundle\.zip will be placed in the session workspace/),
+    ).toBeInTheDocument();
+  });
+
+  it("leaves an inlined file unlabelled", () => {
+    renderList([new File([new Uint8Array(4)], "notes.txt", { type: "text/plain" })]);
+    expect(screen.queryByText("workspace")).toBeNull();
+  });
+
   it("removes the clicked attachment by index", () => {
     const { onRemove } = renderList([
       new File([new Uint8Array(4)], "a.png", { type: "image/png" }),

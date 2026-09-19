@@ -3403,6 +3403,148 @@ async def test_ensure_local_claude_resume_transcript_rematerializes_image_blocks
     assert "file_id" not in written.read_text(encoding="utf-8")
 
 
+def test_resume_rebuild_delivers_a_zip_to_the_launch_workspace(tmp_path: Path) -> None:
+    """
+    A zip in resumed history lands in the workspace the caller is launching in.
+
+    After runner replacement the transcript is rebuilt from stored items before
+    that launch writes its bridge config, so the destination has to come from
+    the caller. The bridge dir also sits outside the tree Claude's tools can
+    reach, so routing the archive there would leave it unopenable.
+    """
+    from omnigent.harnesses.claude_native.bridge import _CONFIG_FILE
+    from omnigent.inner.native_attachments import WORKSPACE_ATTACHMENTS_DIRNAME
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    # No bridge config yet, and a stale one would name the previous workspace.
+    assert not (bridge_dir / _CONFIG_FILE).exists()
+    zip_bytes = b"PK\x03\x04 resumed zip"
+    content = [
+        {
+            "type": "input_file",
+            "filename": "bundle.zip",
+            "file_data": "data:application/zip;base64," + base64.b64encode(zip_bytes).decode(),
+        }
+    ]
+
+    blocks = claude_native._claude_attachment_text_blocks_from_api_content(
+        content, bridge_dir, workspace
+    )
+
+    expected = workspace / WORKSPACE_ATTACHMENTS_DIRNAME / "bundle.zip"
+    assert blocks == [{"type": "text", "text": f"[Attached file: {expected}]"}]
+    assert expected.read_bytes() == zip_bytes
+    assert not (bridge_dir / "uploads").exists()
+
+
+@pytest.mark.asyncio
+async def test_resume_transcript_rebuild_places_a_zip_without_bridge_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The whole rebuild, not just the helper, honours the launch workspace.
+
+    A replacement runner rebuilds the transcript before writing its bridge
+    config, so a rebuild that rediscovered the workspace from that config
+    would drop the archive or send it to the previous workspace.
+    """
+    from omnigent.harnesses.claude_native import bridge as claude_native_bridge
+    from omnigent.harnesses.claude_native.bridge import _CONFIG_FILE
+    from omnigent.inner.native_attachments import WORKSPACE_ATTACHMENTS_DIRNAME
+
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
+    bridge_dir = tmp_path / "bridge"
+    monkeypatch.setattr(
+        claude_native_bridge, "bridge_dir_for_conversation_id", lambda _conv: bridge_dir
+    )
+    workspace = tmp_path / "replacement-repo"
+    workspace.mkdir()
+    zip_bytes = b"PK\x03\x04 resumed zip"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/resources/files/file_zip/content"):
+            return httpx.Response(200, content=zip_bytes)
+        if path.endswith("/resources/files/file_zip"):
+            return httpx.Response(
+                200,
+                json={
+                    "id": "file_zip",
+                    "name": "bundle.zip",
+                    "content_type": "application/zip",
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_file",
+                                "file_id": "file_zip",
+                                "filename": "bundle.zip",
+                            },
+                            {"type": "input_text", "text": "unpack this"},
+                        ],
+                    }
+                ],
+                "has_more": False,
+            },
+        )
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="https://example.com") as client:
+        written = await claude_native._ensure_local_claude_resume_transcript(
+            client,
+            session_id="conv_abc",
+            external_session_id="sid123",
+            workspace=workspace,
+        )
+
+    assert not (bridge_dir / _CONFIG_FILE).exists()
+    expected = workspace / WORKSPACE_ATTACHMENTS_DIRNAME / "bundle.zip"
+    assert expected.read_bytes() == zip_bytes
+    assert written is not None
+    assert f"[Attached file: {expected}]" in written.read_text(encoding="utf-8")
+
+
+def test_resume_rebuild_ignores_a_stale_bridge_workspace(tmp_path: Path) -> None:
+    """A config left by the previous launch must not redirect the rebuild."""
+    from omnigent.harnesses.claude_native.bridge import _CONFIG_FILE
+    from omnigent.inner.native_attachments import WORKSPACE_ATTACHMENTS_DIRNAME
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    stale = tmp_path / "old-repo"
+    stale.mkdir()
+    (bridge_dir / _CONFIG_FILE).write_text(json.dumps({"workspace": str(stale)}))
+    replacement = tmp_path / "new-repo"
+    replacement.mkdir()
+    content = [
+        {
+            "type": "input_file",
+            "filename": "bundle.zip",
+            "file_data": "data:application/zip;base64," + base64.b64encode(b"PK zip").decode(),
+        }
+    ]
+
+    blocks = claude_native._claude_attachment_text_blocks_from_api_content(
+        content, bridge_dir, replacement
+    )
+
+    expected = replacement / WORKSPACE_ATTACHMENTS_DIRNAME / "bundle.zip"
+    assert blocks == [{"type": "text", "text": f"[Attached file: {expected}]"}]
+    assert not (stale / WORKSPACE_ATTACHMENTS_DIRNAME).exists()
+
+
 @pytest.mark.asyncio
 async def test_ensure_local_claude_resume_transcript_marks_unresolvable_attachment(
     tmp_path: Path,

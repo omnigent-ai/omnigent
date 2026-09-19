@@ -670,6 +670,71 @@ def test_deleted_file_raises_clear_error(
         )
 
 
+def test_workspace_materialize_file_rejected_by_generic_resolver() -> None:
+    """A generic (non-native) model can't be handed a workspace-materialize
+    type: it would either fail provider-side or garble as text, so the
+    resolver must raise a clear, actionable error instead of inlining it."""
+    zip_store = FakeFileStore(
+        files={
+            "file_zip": StoredFile(
+                id="file_zip",
+                created_at=1000,
+                filename="archive.zip",
+                bytes=4,
+                content_type="application/zip",
+            ),
+        }
+    )
+    item = _make_conversation_item(
+        [{"type": "input_file", "file_id": "file_zip", "filename": "archive.zip"}]
+    )
+
+    with pytest.raises(ValueError, match="filesystem-capable harness"):
+        resolve_content_references(
+            [item],
+            zip_store,
+            FakeArtifactStore(blobs={}),  # type: ignore[arg-type]
+        )
+
+
+def test_native_forward_defers_workspace_files_and_resolves_the_rest() -> None:
+    """The native runner fetches workspace files itself, so forwarding leaves
+    them as file_id references rather than failing the whole message."""
+    from omnigent.runtime.content_resolver import _resolve_message_content
+
+    store = FakeFileStore(
+        files={
+            "file_zip": StoredFile(
+                id="file_zip",
+                created_at=1000,
+                filename="archive.zip",
+                bytes=4,
+                content_type="application/zip",
+            ),
+            "file_txt": StoredFile(
+                id="file_txt",
+                created_at=1000,
+                filename="notes.txt",
+                bytes=5,
+                content_type="text/plain",
+            ),
+        }
+    )
+    zip_block = {"type": "input_file", "file_id": "file_zip", "filename": "archive.zip"}
+    content = [zip_block, {"type": "input_file", "file_id": "file_txt", "filename": "notes.txt"}]
+
+    resolved = _resolve_message_content(
+        content,
+        store,
+        FakeArtifactStore(blobs={"file_txt": b"hello"}),  # type: ignore[arg-type]
+        defer_workspace_files=True,
+    )
+
+    assert resolved[0] == zip_block
+    assert resolved[1]["file_data"].startswith("data:text/plain;base64,")
+    assert "file_id" not in resolved[1]
+
+
 # ── _resolve_content_type tests ───────────────────────────────────────
 
 
@@ -1681,6 +1746,102 @@ def test_extracts_text_from_csv_attachment() -> None:
     assert out[0]["filename"] == "data.csv"
     assert out[0]["content_type"] == "text/csv"
     assert "4111 1111 1111 1111" in out[0]["text"]
+
+
+def test_workspace_attachment_is_announced_to_policy_without_text() -> None:
+    """
+    A workspace-delivered file is listed for policy, with no text.
+
+    Its bytes are not scannable, but the file does land on the agent's
+    filesystem, so a policy needs to see that it was attached and be able to
+    refuse it by name. Omitting it entirely would make the request look like
+    it carried no attachment at all.
+    """
+    fs, arts = _stores_with("file_zip", "bundle.zip", "application/zip", b"PK\x03\x04data")
+    content = [
+        {"type": "input_text", "text": "unpack this"},
+        {"type": "input_file", "file_id": "file_zip"},
+    ]
+
+    out = extract_text_attachments(content, fs, arts)  # type: ignore[arg-type]
+
+    assert len(out) == 1
+    assert out[0]["filename"] == "bundle.zip"
+    assert out[0]["delivery"] == "workspace"
+    assert out[0]["text"] == ""
+
+
+def test_inlined_attachment_is_marked_as_inline_delivery() -> None:
+    """Inline entries say so, so a policy can tell the two apart."""
+    fs, arts = _stores_with("file_csv", "data.csv", "text/csv", b"a,b\n1,2\n")
+    content = [{"type": "input_file", "file_id": "file_csv"}]
+
+    out = extract_text_attachments(content, fs, arts)  # type: ignore[arg-type]
+
+    assert len(out) == 1
+    assert out[0]["delivery"] == "inline"
+
+
+def test_archive_stored_under_a_text_mime_is_announced_as_workspace() -> None:
+    """
+    An archive stored as ``text/plain`` is still announced as workspace delivery.
+
+    Delivery follows the filename, so the file reaches the agent's filesystem
+    either way. Classifying it by MIME would decode the archive as inline text
+    and hide from policy that a binary was written to disk.
+    """
+    fs, arts = _stores_with("file_zip", "bundle.zip", "text/plain", b"PK\x03\x04data")
+    content = [{"type": "input_file", "file_id": "file_zip"}]
+
+    out = extract_text_attachments(content, fs, arts)  # type: ignore[arg-type]
+
+    assert len(out) == 1
+    assert out[0]["delivery"] == "workspace"
+    assert out[0]["text"] == ""
+
+
+def test_workspace_attachment_sent_as_an_image_is_still_announced() -> None:
+    """
+    A workspace file a client sent as an image block is announced too.
+
+    An archive uploaded under an image MIME comes back as an ``input_image``
+    block, and delivery follows the stored filename, so it reaches the
+    filesystem. Scanning only ``input_file`` blocks would hide it from policy.
+    """
+    fs, arts = _stores_with("file_zip", "bundle.zip", "image/png", b"PK\x03\x04data")
+    content = [{"type": "input_image", "file_id": "file_zip"}]
+
+    out = extract_text_attachments(content, fs, arts)  # type: ignore[arg-type]
+
+    assert len(out) == 1
+    assert out[0]["filename"] == "bundle.zip"
+    assert out[0]["delivery"] == "workspace"
+
+
+def test_an_image_attachment_is_not_announced_to_policy() -> None:
+    """Images carry no scannable text and never reach the filesystem."""
+    fs, arts = _stores_with("file_png", "shot.png", "image/png", b"\x89PNG data")
+    content = [{"type": "input_image", "file_id": "file_png"}]
+
+    assert extract_text_attachments(content, fs, arts) == []  # type: ignore[arg-type]
+
+
+def test_resolved_block_takes_its_filename_from_the_stored_file() -> None:
+    """
+    A message cannot relabel an upload by naming it differently.
+
+    The stored name decides delivery; a client-supplied ``payload.db`` on a
+    block pointing at ``payload.txt`` must not route the file to the workspace.
+    """
+    fs, arts = _stores_with("file_txt", "payload.txt", "text/plain", b"hello")
+    item = _make_conversation_item(
+        [{"type": "input_file", "file_id": "file_txt", "filename": "payload.db"}]
+    )
+
+    result = resolve_content_references([item], fs, arts)  # type: ignore[arg-type]
+
+    assert isinstance(result[0].data, MessageData)
+    assert result[0].data.content[0]["filename"] == "payload.txt"
 
 
 def test_skips_binary_attachments() -> None:

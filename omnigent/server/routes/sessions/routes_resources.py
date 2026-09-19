@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import functools
 import mimetypes
 import ntpath
 import urllib.parse
+import weakref
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import Annotated, Any, cast
@@ -73,10 +75,12 @@ from omnigent.server.routes._sessions.helpers import (
     FILE_CONTENT_CACHE_CONTROL,
     _ancestor_session_ids,
     _attachment_disposition,
+    _enforce_workspace_attachment_policy,
     _file_content_etag,
     _get_runner_client_for_resource_access,
     _if_none_match_matches,
     _load_agent_spec_for_session,
+    _native_coding_agent_for_session,
     _proxy_get_session_resources_to_runner,
     _publish_and_persist_resource_event,
     _publish_changed_files_invalidated,
@@ -141,6 +145,45 @@ def _get_image_compression_gate() -> asyncio.Semaphore:
 
         _image_compression_gate = asyncio.Semaphore(image_compression_concurrency())
     return _image_compression_gate
+
+
+# custom-lint: disable-next=workspace-scoped-cache -- lock; collision only serializes
+_workspace_upload_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+    weakref.WeakValueDictionary()
+)
+
+
+def _workspace_upload_lock(session_id: str) -> asyncio.Lock:
+    """Return the lock serializing one session's workspace quota check and store."""
+    lock = _workspace_upload_locks.get(session_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _workspace_upload_locks[session_id] = lock
+    return lock
+
+
+async def _require_workspace_attachment_harness(conv: Conversation, filename: str) -> None:
+    """
+    Refuse a workspace file for a session whose harness can't open it.
+
+    Only Claude Code and Codex materialize these files; any other harness would
+    receive the bytes inlined and drop them.
+
+    :param conv: Destination session.
+    :param filename: The workspace-delivered file, named in the error.
+    :raises HTTPException: 415 when the session's harness has no workspace.
+    """
+    from omnigent.inner.native_attachments import WORKSPACE_ATTACHMENT_HARNESSES
+
+    native = await asyncio.to_thread(_native_coding_agent_for_session, conv)
+    if native is None or native.harness not in WORKSPACE_ATTACHMENT_HARNESSES:
+        raise HTTPException(
+            status_code=415,
+            detail=(
+                f"'{filename}' can only be attached to a Claude Code or Codex "
+                "session, which opens it from the workspace."
+            ),
+        )
 
 
 def register_resources_routes(
@@ -1555,7 +1598,7 @@ def register_resources_routes(
         :param file: The uploaded file (multipart form data).
         :returns: The session file resource object.
         """
-        await _validate_session(session_id, request, LEVEL_EDIT)
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
         if file_store is None or artifact_store is None:
             raise HTTPException(
                 status_code=501,
@@ -1566,6 +1609,7 @@ def register_resources_routes(
                 "filename is required",
                 code=ErrorCode.INVALID_INPUT,
             )
+        from omnigent.inner.native_attachments import workspace_materialize_upload_limit
         from omnigent.runtime.content_resolver import (
             _COMPRESSIBLE_IMAGE_MIMES,
             MAX_ATTACHMENT_UPLOAD_BYTES,
@@ -1588,17 +1632,33 @@ def register_resources_routes(
             file.content_type,
             file.filename,
         )
-        type_limit = attachment_upload_limit(content_type)
-        if type_limit is None:
-            # The browser/OS can mislabel a text/code file as binary (e.g. a
-            # .csv reported as application/vnd.ms-excel on Windows). Fall back
-            # to the extension — matching the web client's allowlist — and
-            # normalize the type so the resolver inlines it as text.
-            ext_type = attachment_text_type_for_extension(file.filename)
-            if ext_type is not None:
-                content_type = ext_type
-                type_limit = attachment_upload_limit(content_type)
-        if type_limit is None:
+        # Office documents, archives, and databases aren't inlinable, but a
+        # filesystem-capable harness reads them off disk (see
+        # native_attachments.materialize_attachment_to_workspace). Delivery
+        # follows the filename, so decide it before the declared MIME: a zip
+        # sent as text/plain must not slip onto the inline path and skip the
+        # workspace policy. The global ceiling only backstops base64 request
+        # inflation, which this path never incurs.
+        upload_cap = workspace_materialize_upload_limit(file.filename)
+        to_workspace = upload_cap is not None
+        if to_workspace:
+            # Drop the declared type so the file is never stored as text.
+            content_type = _resolve_content_type("application/octet-stream", file.filename)
+        else:
+            type_limit = attachment_upload_limit(content_type)
+            if type_limit is None:
+                # The browser/OS can mislabel a text/code file as binary (e.g. a
+                # .csv reported as application/vnd.ms-excel on Windows). Fall back
+                # to the extension — matching the web client's allowlist — and
+                # normalize the type so the resolver inlines it as text.
+                ext_type = attachment_text_type_for_extension(file.filename)
+                if ext_type is not None:
+                    content_type = ext_type
+                    type_limit = attachment_upload_limit(content_type)
+            upload_cap = (
+                None if type_limit is None else min(type_limit, MAX_ATTACHMENT_UPLOAD_BYTES)
+            )
+        if upload_cap is None:
             raise HTTPException(
                 status_code=415,
                 detail=(
@@ -1606,47 +1666,63 @@ def register_resources_routes(
                     "PDF, and text/code files can be attached."
                 ),
             )
-        read_limit = min(type_limit, MAX_ATTACHMENT_UPLOAD_BYTES)
-        filename = file.filename
-        # Persist original dimensions only after a downscale.
-        source_dims: tuple[int, int] | None = None
-        if content_type in _COMPRESSIBLE_IMAGE_MIMES:
-            # Compressible images carry the large cap and the decode, so they are
-            # the server's peak upload memory. The body is already spooled to
-            # disk by the multipart parser, so gate the in-memory read + the
-            # decode/re-encode behind the admission semaphore: a burst of
-            # concurrent uploads waits (each holding only a disk-backed temp
-            # file), instead of every one buffering the full image in RAM and
-            # decoding at once. This bounds peak memory to the gate size × the
-            # per-upload cost, without serializing the network transfer.
-            async with _get_image_compression_gate():
-                content = await _read_upload_capped(file, read_limit)
-                if image_needs_compression(len(content), content_type):
-                    try:
-                        compressed, resolved_type, source_dims = await asyncio.to_thread(
-                            compress_image_attachment, content, content_type
-                        )
-                    except ImageCompressionError as exc:
-                        raise HTTPException(status_code=413, detail=str(exc)) from exc
-                    # A re-encode (e.g. PNG → JPEG) changes the type; realign the
-                    # filename extension so name, bytes, and MIME stay consistent.
-                    if resolved_type != content_type:
-                        filename = image_filename_for_content_type(file.filename, resolved_type)
-                    content, content_type = compressed, resolved_type
-        else:
-            # PDF/text/SVG and other non-compressed types use their smaller
-            # per-type caps and aren't decoded, so they read outside the gate.
-            content = await _read_upload_capped(file, read_limit)
-        stored = file_store.create(
-            session_id=session_id,
-            filename=filename,
-            bytes=len(content),
-            content_type=content_type,
-            source_metadata=(
-                {"width": source_dims[0], "height": source_dims[1]} if source_dims else None
-            ),
+        if to_workspace:
+            await _require_workspace_attachment_harness(conv, file.filename)
+        # Hold the quota check through the store below, so parallel uploads can't
+        # all spend the same remaining allowance.
+        workspace_lock = (
+            _workspace_upload_lock(session_id) if to_workspace else contextlib.nullcontext()
         )
-        artifact_store.put(stored.id, content)
+        async with workspace_lock:
+            if to_workspace:
+                upload_cap = _enforce_workspace_attachment_policy(
+                    [file.filename],
+                    session_id=session_id,
+                    file_store=file_store,
+                )
+            read_limit = upload_cap
+            filename = file.filename
+            # Persist original dimensions only after a downscale.
+            source_dims: tuple[int, int] | None = None
+            if content_type in _COMPRESSIBLE_IMAGE_MIMES:
+                # Compressible images carry the large cap and the decode, so they are
+                # the server's peak upload memory. The body is already spooled to
+                # disk by the multipart parser, so gate the in-memory read + the
+                # decode/re-encode behind the admission semaphore: a burst of
+                # concurrent uploads waits (each holding only a disk-backed temp
+                # file), instead of every one buffering the full image in RAM and
+                # decoding at once. This bounds peak memory to the gate size × the
+                # per-upload cost, without serializing the network transfer.
+                async with _get_image_compression_gate():
+                    content = await _read_upload_capped(file, read_limit)
+                    if image_needs_compression(len(content), content_type):
+                        try:
+                            compressed, resolved_type, source_dims = await asyncio.to_thread(
+                                compress_image_attachment, content, content_type
+                            )
+                        except ImageCompressionError as exc:
+                            raise HTTPException(status_code=413, detail=str(exc)) from exc
+                        # A re-encode (e.g. PNG → JPEG) changes the type; realign the
+                        # filename extension so name, bytes, and MIME stay consistent.
+                        if resolved_type != content_type:
+                            filename = image_filename_for_content_type(
+                                file.filename, resolved_type
+                            )
+                        content, content_type = compressed, resolved_type
+            else:
+                # PDF/text/SVG and other non-compressed types use their smaller
+                # per-type caps and aren't decoded, so they read outside the gate.
+                content = await _read_upload_capped(file, read_limit)
+            stored = file_store.create(
+                session_id=session_id,
+                filename=filename,
+                bytes=len(content),
+                content_type=content_type,
+                source_metadata=(
+                    {"width": source_dims[0], "height": source_dims[1]} if source_dims else None
+                ),
+            )
+            artifact_store.put(stored.id, content)
         resource = _stored_file_to_resource(session_id, stored)
         _publish_and_persist_resource_event(
             session_id,
@@ -1852,7 +1928,7 @@ def register_resources_routes(
             copy_total_bytes_limit,
         )
 
-        await _validate_session(session_id, request, LEVEL_EDIT)
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
         if file_store is None or artifact_store is None:
             raise HTTPException(
                 status_code=501,
@@ -1911,57 +1987,79 @@ def register_resources_routes(
                 )
             sources.append(stored)
 
-        # Commit the copies one file at a time (read → create → put) so peak
-        # memory is a single blob, not the whole batch. If any step fails
-        # mid-batch, roll back the rows/blobs already created.
-        mapping: dict[str, CopiedFile] = {}
-        created: list[str] = []
-        copied: list[StoredFile] = []
-        try:
-            for stored in sources:
-                content = artifact_store.get(stored.blob_key or stored.id)
-                new = file_store.create(
+        # Workspace files entering a session pass the same checks as an upload,
+        # held under the same lock, so a copy can't skip the harness or quotas.
+        from omnigent.inner.native_attachments import workspace_materialize_upload_limit
+
+        workspace_sources = [
+            stored
+            for stored in sources
+            if stored.filename and workspace_materialize_upload_limit(stored.filename) is not None
+        ]
+        if workspace_sources:
+            await _require_workspace_attachment_harness(conv, workspace_sources[0].filename or "")
+        workspace_lock = (
+            _workspace_upload_lock(session_id) if workspace_sources else contextlib.nullcontext()
+        )
+        async with workspace_lock:
+            if workspace_sources:
+                _enforce_workspace_attachment_policy(
+                    [stored.filename or "" for stored in workspace_sources],
                     session_id=session_id,
-                    filename=stored.filename,
-                    bytes=stored.bytes,
-                    content_type=stored.content_type,
-                    # Preserve transform metadata on copies.
-                    source_metadata=stored.source_metadata,
+                    file_store=file_store,
+                    sizes=[stored.bytes for stored in workspace_sources],
                 )
-                created.append(new.id)
-                artifact_store.put(new.id, content)
-                # Carry the preserved filename + content_type back so the
-                # caller can attach the copy without a follow-up metadata GET.
-                mapping[stored.id] = CopiedFile(
-                    new_id=new.id,
-                    filename=new.filename,
-                    content_type=new.content_type,
-                )
-                copied.append(new)
-        except Exception as exc:
-            for new_id in created:
-                try:
-                    file_store.delete(new_id, session_id=session_id)
-                except Exception:
-                    _logger.warning(
-                        "Failed to delete copied file row during rollback: session=%s file_id=%s",
-                        session_id,
-                        new_id,
-                        exc_info=True,
+            # Commit the copies one file at a time (read → create → put) so peak
+            # memory is a single blob, not the whole batch. If any step fails
+            # mid-batch, roll back the rows/blobs already created.
+            mapping: dict[str, CopiedFile] = {}
+            created: list[str] = []
+            copied: list[StoredFile] = []
+            try:
+                for stored in sources:
+                    content = artifact_store.get(stored.blob_key or stored.id)
+                    new = file_store.create(
+                        session_id=session_id,
+                        filename=stored.filename,
+                        bytes=stored.bytes,
+                        content_type=stored.content_type,
+                        # Preserve transform metadata on copies.
+                        source_metadata=stored.source_metadata,
                     )
-                try:
-                    artifact_store.delete(new_id)
-                except Exception:
-                    _logger.warning(
-                        "Failed to delete copied file blob during rollback: session=%s file_id=%s",
-                        session_id,
-                        new_id,
-                        exc_info=True,
+                    created.append(new.id)
+                    artifact_store.put(new.id, content)
+                    # Carry the preserved filename + content_type back so the
+                    # caller can attach the copy without a follow-up metadata GET.
+                    mapping[stored.id] = CopiedFile(
+                        new_id=new.id,
+                        filename=new.filename,
+                        content_type=new.content_type,
                     )
-            raise OmnigentError(
-                "Failed to copy files into destination session",
-                code=ErrorCode.INTERNAL_ERROR,
-            ) from exc
+                    copied.append(new)
+            except Exception as exc:
+                for new_id in created:
+                    try:
+                        file_store.delete(new_id, session_id=session_id)
+                    except Exception:
+                        _logger.warning(
+                            "Failed to delete copied file row during rollback: session=%s file_id=%s",
+                            session_id,
+                            new_id,
+                            exc_info=True,
+                        )
+                    try:
+                        artifact_store.delete(new_id)
+                    except Exception:
+                        _logger.warning(
+                            "Failed to delete copied file blob during rollback: session=%s file_id=%s",
+                            session_id,
+                            new_id,
+                            exc_info=True,
+                        )
+                raise OmnigentError(
+                    "Failed to copy files into destination session",
+                    code=ErrorCode.INTERNAL_ERROR,
+                ) from exc
 
         # Resource events fire only after every write lands. Publishing them
         # inside the copy loop would emit (and persist as transcript items)

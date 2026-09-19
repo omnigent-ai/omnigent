@@ -4632,6 +4632,21 @@ function setComposerState(
   });
 }
 
+describe("Composer attachment picker", () => {
+  afterEach(() => {
+    cleanup();
+  });
+
+  it("accepts the workspace types in the file picker filter", () => {
+    render(<Composer {...composerProps()} />);
+
+    const input = document.querySelector('input[type="file"]') as HTMLInputElement;
+    // Without these the OS picker hides the very files the server now accepts.
+    expect(input.accept).toContain(".zip");
+    expect(input.accept).toContain(".docx");
+  });
+});
+
 describe("saved sandbox inference policy", () => {
   let previous: ChatState;
   beforeEach(() => {

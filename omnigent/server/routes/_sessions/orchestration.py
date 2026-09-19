@@ -4826,6 +4826,8 @@ async def _forward_native_terminal_message(
                 file_store,
                 artifact_store,
                 session_id=session_id,
+                # The native runner materializes workspace files itself.
+                defer_workspace_files=True,
             )
         except (ValueError, KeyError):
             _logger.warning(

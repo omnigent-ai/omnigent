@@ -27,6 +27,7 @@ from collections.abc import (
     Sequence,
 )
 from dataclasses import dataclass
+from pathlib import PurePath
 from typing import Any, Final, Literal, cast
 
 import httpx
@@ -286,6 +287,7 @@ from omnigent.stores.conversation_store import (
     ConversationNotFoundError,
     NameAlreadyExistsError,
 )
+from omnigent.stores.file_store import FileStore
 from omnigent.stores.host_store import Host, HostStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.util.cost_plan import (
@@ -10641,6 +10643,109 @@ async def _read_upload_capped(file: UploadFile, limit_bytes: int) -> bytes:
             )
         chunks.append(chunk)
     return b"".join(chunks)
+
+
+# Page size for walking a session's files when totalling its workspace attachments.
+_WORKSPACE_QUOTA_PAGE_SIZE = 100
+
+
+def _enforce_workspace_attachment_policy(
+    filenames: Sequence[str],
+    *,
+    session_id: str,
+    file_store: FileStore,
+    sizes: Sequence[int] | None = None,
+) -> int:
+    """
+    Apply deployment policy to workspace-materialized files entering a session.
+
+    Enforces the operator denylist and the per-session file-count and total-byte
+    quotas before any bytes are read, so a rejected upload or copy never
+    buffers. This is the only quota gate: the runner can't enforce one, because
+    a workspace is shared by many sessions.
+
+    :param filenames: The incoming files' names, e.g. ``["bundle.zip"]``.
+    :param session_id: Destination session, whose existing attachments are counted.
+    :param file_store: Store used to total the session's current usage.
+    :param sizes: The incoming files' byte sizes when already known (a copy),
+        checked against the per-file and remaining-session limits. ``None``
+        for an upload, whose size is enforced by the returned read cap.
+    :returns: The byte cap a single upload must stay within.
+    :raises HTTPException: 415 when an extension is denied by configuration,
+        or 413 when the files would exceed a per-file or per-session quota.
+    """
+    from omnigent.inner.native_attachments import workspace_materialize_upload_limit
+    from omnigent.server.server_config import (
+        workspace_attachment_denied_extensions,
+        workspace_attachment_file_limit,
+        workspace_attachment_total_bytes_limit,
+        workspace_attachment_upload_limit,
+    )
+
+    denied = workspace_attachment_denied_extensions()
+    for filename in filenames:
+        suffix = PurePath(filename).suffix.lower()
+        if suffix in denied:
+            raise HTTPException(
+                status_code=415,
+                detail=f"Attachments of type '{suffix}' are not accepted by this deployment.",
+            )
+
+    max_files = workspace_attachment_file_limit()
+    max_total_bytes = workspace_attachment_total_bytes_limit()
+    per_file = workspace_attachment_upload_limit()
+
+    used_files = 0
+    used_bytes = 0
+    after: str | None = None
+    # Walk every page: stopping at a fixed page count would let a session hide
+    # workspace files behind enough inline ones. The walk ends early once the
+    # quota is already exhausted, since the answer can't change after that.
+    while used_files + len(filenames) <= max_files and used_bytes < max_total_bytes:
+        page = file_store.list(
+            session_id=session_id,
+            limit=_WORKSPACE_QUOTA_PAGE_SIZE,
+            after=after,
+            order="asc",
+        )
+        for stored in page.data:
+            # Count only the workspace-delivered files: inlined attachments
+            # never reach the sandbox filesystem and so spend none of this quota.
+            if workspace_materialize_upload_limit(stored.filename) is not None:
+                used_files += 1
+                used_bytes += stored.bytes
+        if not page.has_more or page.last_id is None:
+            break
+        after = page.last_id
+
+    if used_files + len(filenames) > max_files:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"This session already holds {used_files} workspace attachments "
+                f"(limit {max_files}). Remove one before attaching another."
+            ),
+        )
+    remaining = max_total_bytes - used_bytes
+    if remaining <= 0 or (sizes is not None and sum(sizes) > remaining):
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"This session's workspace attachments would exceed the "
+                f"{max_total_bytes // (1024 * 1024)} MB limit "
+                f"({used_bytes // (1024 * 1024)} MB already used)."
+            ),
+        )
+    if sizes is not None and any(size > per_file for size in sizes):
+        raise HTTPException(
+            status_code=413,
+            detail=(f"Workspace attachments are limited to {per_file // (1024 * 1024)} MB each."),
+        )
+
+    # Cap an upload at whichever is smaller: the per-file limit, or the
+    # session's remaining budget. Without the second term a single upload could
+    # overshoot the session total by nearly a whole file.
+    return min(per_file, remaining)
 
 
 def _model_options_from_wire(raw_models: Any) -> list[dict[str, Any]]:

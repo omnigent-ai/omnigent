@@ -18,11 +18,16 @@
  * before storing it, so screenshots and retina captures no longer need to be
  * shrunk by hand. Other image types (SVG, …) can't be shrunk, so they keep the
  * smaller `UNCOMPRESSED_IMAGE_LIMIT_MB` cap (see `validateAttachments`).
+ *
+ * These are fixed client-side ceilings, so a deployment that raises a server
+ * limit (e.g. `workspace_attachment_max_bytes`) also needs these raised for the
+ * extra allowance to be usable from the web UI.
  */
 export const ATTACHMENT_SIZE_LIMITS_MB = {
   image: 50,
   pdf: 20,
   text: 10,
+  workspace: 50,
 } as const;
 
 // Raster image types the server can compress under the model limit; only these
@@ -133,6 +138,22 @@ const TEXT_CODE_EXTENSIONS = new Set([
   ".ipynb",
 ]);
 
+// Archives, office documents and databases a filesystem-capable harness
+// opens from the workspace rather than the model context. Extension-based
+// because these are zip containers the browser routinely mislabels as
+// application/zip or application/octet-stream. Mirrors
+// _WORKSPACE_MATERIALIZE_EXTENSIONS in omnigent/inner/native_attachments.py;
+// keep in sync.
+const WORKSPACE_MATERIALIZE_EXTENSIONS = new Set([
+  ".zip",
+  ".docx",
+  ".xlsx",
+  ".pptx",
+  ".db",
+  ".sqlite",
+  ".sqlite3",
+]);
+
 function extensionOf(filename: string): string {
   const dot = filename.lastIndexOf(".");
   return dot >= 0 ? filename.slice(dot).toLowerCase() : "";
@@ -140,7 +161,7 @@ function extensionOf(filename: string): string {
 
 /**
  * Classify a file into an attachment category, or `null` if its type is not
- * supported (e.g. pptx, docx, xlsx, zip, binaries). Uses the browser MIME
+ * supported (e.g. audio, video, unrecognised binaries). Uses the browser MIME
  * type first, falling back to the filename extension for code/text files
  * whose MIME is unreliable.
  */
@@ -148,6 +169,9 @@ export function classifyAttachment(file: File): AttachmentCategory | null {
   const type = file.type || "";
   const ext = extensionOf(file.name || "");
 
+  // Checked first, like the server: delivery follows the extension, so a zip
+  // the browser reports as text/plain still goes to the workspace.
+  if (WORKSPACE_MATERIALIZE_EXTENSIONS.has(ext)) return "workspace";
   if (type.startsWith("image/")) return "image";
   if (type === "application/pdf" || ext === ".pdf") return "pdf";
   if (
@@ -181,7 +205,8 @@ export function validateAttachments(files: File[]): AttachmentValidation {
     const category = classifyAttachment(file);
     if (category === null) {
       errors.push(
-        `"${name}" can't be attached — only images, PDF, and text/code files are supported.`,
+        `"${name}" can't be attached: only images, PDF, text/code, archives, ` +
+          `office documents, and databases are supported.`,
       );
       continue;
     }

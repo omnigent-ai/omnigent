@@ -1974,6 +1974,14 @@ async def _ensure_local_codex_resume_rollout(
             )
             return existing
         raise
+    from omnigent.inner.native_attachments import resolve_session_item_file_references
+
+    # History stores attachments as raw file_ids; restore the files so the
+    # rebuilt thread can open them in this workspace, as on a live turn.
+    items = await resolve_session_item_file_references(client, session_id=session_id, items=items)
+    items = _codex_items_with_attachment_references(
+        items, bridge_dir=codex_home.parent, workspace=workspace
+    )
     target = _codex_resume_rollout_path(codex_home, external_session_id)
     cli_version = None
     if codex_path is not None:
@@ -2574,6 +2582,42 @@ def _codex_function_call_output_payload_from_session_item(
         "call_id": call_id,
         "output": output,
     }
+
+
+def _codex_items_with_attachment_references(
+    items: list[_JsonObject],
+    *,
+    bridge_dir: Path,
+    workspace: Path,
+) -> list[_JsonObject]:
+    """
+    Replace user attachment blocks with the reference lines a live turn sends.
+
+    Rollout history only carries text, so each attachment is written back to
+    disk (archives and documents into *workspace*) and referenced by path. A
+    block whose bytes never arrived becomes the could-not-load marker.
+
+    :param items: Flat Omnigent item dicts with file_ids already resolved.
+    :param bridge_dir: Session bridge directory for inlinable attachments.
+    :param workspace: Directory Codex will run in.
+    :returns: The same items with attachment blocks turned into ``input_text``.
+    """
+    from omnigent.inner.native_attachments import routed_attachment_reference_line
+
+    for item in items:
+        content = item.get("content")
+        if item.get("role") != "user" or not isinstance(content, list):
+            continue
+        item["content"] = [
+            {
+                "type": "input_text",
+                "text": routed_attachment_reference_line(block, bridge_dir, workspace),
+            }
+            if isinstance(block, dict) and block.get("type") in ("input_image", "input_file")
+            else block
+            for block in content
+        ]
+    return items
 
 
 def _codex_content_blocks_from_api_content(

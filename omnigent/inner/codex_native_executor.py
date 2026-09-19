@@ -55,7 +55,9 @@ from omnigent.inner.native_attachments import (
     codex_resize_metadata_path,
     materialize_attachment,
     parse_data_uri,
+    routed_attachment_reference_line,
     unresolved_attachment_marker,
+    workspace_materialize_upload_limit,
 )
 from omnigent.util.reasoning_effort import (
     CODEX_NATIVE_EFFORTS,
@@ -299,7 +301,9 @@ class CodexNativeExecutor(Executor):
         :returns: ``True`` when Codex accepted the steering message.
         """
         del session_key
-        input_items = _content_to_input_items(content, self._bridge_dir)
+        input_items = _content_to_input_items(
+            content, self._bridge_dir, _workspace_from_state(read_bridge_state(self._bridge_dir))
+        )
         if not input_items:
             return False
         # Serialized against run_turn so the read-decide-RPC-write below
@@ -439,14 +443,6 @@ class CodexNativeExecutor(Executor):
             if length_error is not None:
                 yield ExecutorError(message=length_error)
                 return
-        input_items: list[dict[str, object]] = (
-            [{"type": "text", "text": goal_objective}]
-            if goal_objective is not None
-            else _content_to_input_items(latest_user_content, self._bridge_dir)
-        )
-        if not input_items:
-            yield ExecutorError(message="Codex native turn had no user input to send")
-            return
         # Wait for the bridge to boot OUTSIDE the injection lock: this is a
         # one-time poll for the state file to appear (first turn, app-server
         # starting), with no shared-state mutation, so holding the lock
@@ -497,6 +493,19 @@ class CodexNativeExecutor(Executor):
                         )
                         max_poll_count = extended_poll_count
                         startup_timeout_observed = True
+
+            # Built after the state wait: materializing an attachment needs the
+            # workspace, which state.cwd carries once the thread exists.
+            input_items: list[dict[str, object]] = (
+                [{"type": "text", "text": goal_objective}]
+                if goal_objective is not None
+                else _content_to_input_items(
+                    latest_user_content, self._bridge_dir, _workspace_from_state(state)
+                )
+            )
+            if not input_items:
+                yield ExecutorError(message="Codex native turn had no user input to send")
+                return
 
             # No client-side wait for Codex MCP startup: the app-server accepts
             # ``turn/start`` mid-startup and defers execution until the round
@@ -673,6 +682,19 @@ def _request_session_id_from_env() -> str | None:
     return raw or None
 
 
+def _workspace_from_state(state: CodexNativeBridgeState | None) -> Path | None:
+    """
+    Resolve the workspace non-inlinable attachments materialize into.
+
+    :param state: Bridge state, whose ``cwd`` is the directory the Codex
+        thread runs in.
+    :returns: Workspace path, or ``None`` when state records no cwd.
+    """
+    if state is None or not state.cwd:
+        return None
+    return Path(state.cwd)
+
+
 def _session_is_active(session_id: str, request_session_id: str | None) -> bool:
     """
     Return whether this harness may inject into the native thread.
@@ -697,7 +719,9 @@ def _latest_user_content(messages: list[Message]) -> object:
     return None
 
 
-def _content_to_input_items(content: object, bridge_dir: Path) -> list[dict[str, object]]:
+def _content_to_input_items(
+    content: object, bridge_dir: Path, workspace: Path | None = None
+) -> list[dict[str, object]]:
     """
     Normalize executor content into Codex app-server input items.
 
@@ -713,6 +737,7 @@ def _content_to_input_items(content: object, bridge_dir: Path) -> list[dict[str,
         blocks like ``{"type": "input_text", "text": "..."}`` and
         ``{"type": "input_image", "image_url": "data:image/png;base64,..."}``.
     :param bridge_dir: Bridge directory for materializing attachments.
+    :param workspace: Workspace root for non-inlinable attachment types.
     :returns: Codex input item dicts.
     """
     if isinstance(content, str):
@@ -731,6 +756,16 @@ def _content_to_input_items(content: object, bridge_dir: Path) -> list[dict[str,
                 text = block.get("text")
                 if isinstance(text, str) and text:
                     items.append({"type": "text", "text": text})
+            elif _is_workspace_attachment(block):
+                # Delivery follows the stored filename, whichever block type the
+                # client chose: a zip declared image/png is still a workspace file,
+                # never a localImage codex would fail to open.
+                items.append(
+                    {
+                        "type": "text",
+                        "text": routed_attachment_reference_line(block, bridge_dir, workspace),
+                    }
+                )
             elif block_type == "input_image":
                 path = materialize_attachment(block, bridge_dir)
                 if path is not None:
@@ -738,13 +773,22 @@ def _content_to_input_items(content: object, bridge_dir: Path) -> list[dict[str,
                 else:
                     items.append({"type": "text", "text": unresolved_attachment_marker(block)})
             elif block_type == "input_file":
-                file_item = _file_block_to_input_item(block, bridge_dir)
+                file_item = _file_block_to_input_item(block, bridge_dir, workspace)
                 if file_item is not None:
                     items.append(file_item)
         return items
     if content is None:
         return []
     return [{"type": "text", "text": json.dumps(content, ensure_ascii=True)}]
+
+
+def _is_workspace_attachment(block: Mapping[str, object]) -> bool:
+    """Whether *block* names a file delivered by materializing it into the workspace."""
+    filename = block.get("filename")
+    return (
+        workspace_materialize_upload_limit(filename if isinstance(filename, str) else None)
+        is not None
+    )
 
 
 def _apply_resize_notice_to_latest_image(
@@ -762,6 +806,7 @@ def _apply_resize_notice_to_latest_image(
 def _file_block_to_input_item(
     block: Mapping[str, object],
     bridge_dir: Path,
+    workspace: Path | None = None,
 ) -> dict[str, object] | None:
     """
     Convert an ``input_file`` block into a Codex input item.
@@ -776,10 +821,18 @@ def _file_block_to_input_item(
         ``file_data`` data URI, e.g.
         ``"data:text/plain;base64,aGVsbG8="``.
     :param bridge_dir: Bridge directory for materializing the file.
+    :param workspace: Workspace root for types delivered by
+        materialization rather than inlining. ``None`` (no workspace at
+        launch) yields the could-not-load marker.
     :returns: A Codex ``text`` input item; a visible could-not-load
         marker item when the file failed to materialize; or ``None``
         for an empty text file.
     """
+    if _is_workspace_attachment(block):
+        return {
+            "type": "text",
+            "text": routed_attachment_reference_line(block, bridge_dir, workspace),
+        }
     file_data = block.get("file_data")
     if isinstance(file_data, str) and file_data.startswith("data:"):
         try:

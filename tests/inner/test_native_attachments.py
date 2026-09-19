@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import logging
 import re
 from pathlib import Path
@@ -13,14 +14,20 @@ import pytest
 from omnigent.inner.native_attachments import (
     ATTACHMENT_MARKER_STRIP_PATTERN,
     UNRESOLVED_ATTACHMENT_MARKER_PATTERN,
+    WORKSPACE_ATTACHMENTS_DIRNAME,
     DataUri,
     attachment_reference_line,
     codex_resize_metadata_path,
+    has_unresolved_file_id,
     materialize_attachment,
+    materialize_attachment_to_workspace,
     parse_data_uri,
     resize_notice,
     resolve_file_id_block,
+    routed_attachment_reference_line,
     unresolved_attachment_marker,
+    workspace_attachment_reference_line,
+    workspace_materialize_upload_limit,
 )
 
 # A 1x1 transparent PNG, base64-encoded — small but a real decodable image.
@@ -313,6 +320,339 @@ def test_attachment_reference_line_covers_both_outcomes(tmp_path: Path) -> None:
     assert unresolved_line == "[Attachment photo.png could not be loaded]"
     assert re.fullmatch(ATTACHMENT_MARKER_STRIP_PATTERN, resolved_line)
     assert re.fullmatch(ATTACHMENT_MARKER_STRIP_PATTERN, unresolved_line)
+
+
+# ── Workspace materialization ────────────────────────────────────────
+
+
+_ZIP_BYTES = b"PK\x03\x04 not really a zip"
+_ZIP_DATA_URI = f"data:application/zip;base64,{base64.b64encode(_ZIP_BYTES).decode()}"
+
+
+def _zip_block(filename: str = "archive.zip") -> dict[str, object]:
+    """Build a resolved input_file block for a zip attachment."""
+    return {"type": "input_file", "file_data": _ZIP_DATA_URI, "filename": filename}
+
+
+def test_materialize_to_workspace_writes_under_attachments_dir(tmp_path: Path) -> None:
+    """
+    The decoded bytes land in the workspace's session-attachments directory.
+
+    This is what makes the file reachable by the harness's own Read/Bash
+    tools: the workspace is its cwd, so no sandbox exception is needed.
+    """
+    path = materialize_attachment_to_workspace(_zip_block(), tmp_path)
+
+    assert path == tmp_path / WORKSPACE_ATTACHMENTS_DIRNAME / "archive.zip"
+    assert path.read_bytes() == _ZIP_BYTES
+
+
+def test_materialize_to_workspace_strips_executable_bits(tmp_path: Path) -> None:
+    """
+    A materialized file is never executable.
+
+    Uploads are untrusted input; leaving the execute bit set (from a
+    permissive umask) would let an attached binary be run directly in the
+    sandbox rather than merely read.
+    """
+    path = materialize_attachment_to_workspace(_zip_block("payload.zip"), tmp_path)
+
+    assert path is not None
+    assert path.stat().st_mode & 0o111 == 0
+
+
+def test_materialize_to_workspace_contains_path_traversal(tmp_path: Path) -> None:
+    """
+    A traversal filename is written inside the attachments dir, not above it.
+
+    Failure would let an upload overwrite arbitrary files in the workspace
+    (or outside it) by name alone.
+    """
+    path = materialize_attachment_to_workspace(_zip_block("../../escaped.zip"), tmp_path)
+
+    assert path is not None
+    assert path.parent == tmp_path / WORKSPACE_ATTACHMENTS_DIRNAME
+    assert not (tmp_path.parent / "escaped.zip").exists()
+
+
+def test_materialize_to_workspace_refuses_symlinked_destination(tmp_path: Path) -> None:
+    """
+    An existing symlink at the destination is refused, not followed.
+
+    Writing through it would land the bytes wherever the link points,
+    outside the workspace if an earlier turn planted the link.
+    """
+    attachments_dir = tmp_path / WORKSPACE_ATTACHMENTS_DIRNAME
+    attachments_dir.mkdir()
+    outside = tmp_path.parent / "outside-target.zip"
+    (attachments_dir / "archive.zip").symlink_to(outside)
+
+    assert materialize_attachment_to_workspace(_zip_block(), tmp_path) is None
+    assert not outside.exists()
+
+
+def test_materialize_to_workspace_refuses_symlink_at_collision_name(tmp_path: Path) -> None:
+    """
+    A symlink planted at the digest-suffixed collision name is refused.
+
+    The original name is taken by other content, which diverts the write to
+    ``<stem>_<sha12><suffix>``. That name is predictable, so a link placed
+    there must not redirect the write onto a file outside the workspace.
+    """
+    attachments_dir = tmp_path / WORKSPACE_ATTACHMENTS_DIRNAME
+    attachments_dir.mkdir()
+    (attachments_dir / "archive.zip").write_bytes(b"different content")
+    outside = tmp_path.parent / f"{tmp_path.name}-outside.zip"
+    outside.write_bytes(b"precious")
+    digest = hashlib.sha256(_ZIP_BYTES).hexdigest()[:12]
+    (attachments_dir / f"archive_{digest}.zip").symlink_to(outside)
+
+    assert materialize_attachment_to_workspace(_zip_block(), tmp_path) is None
+    assert outside.read_bytes() == b"precious"
+
+
+def test_materialize_to_workspace_refuses_symlinked_attachments_dir(tmp_path: Path) -> None:
+    """A symlinked attachments directory is refused rather than written through."""
+    elsewhere = tmp_path.parent / f"{tmp_path.name}-elsewhere"
+    elsewhere.mkdir()
+    (tmp_path / WORKSPACE_ATTACHMENTS_DIRNAME).symlink_to(elsewhere, target_is_directory=True)
+
+    assert materialize_attachment_to_workspace(_zip_block(), tmp_path) is None
+    assert list(elsewhere.iterdir()) == []
+
+
+def test_materialize_to_workspace_does_not_overwrite_when_both_names_taken(
+    tmp_path: Path,
+) -> None:
+    """With the original and collision names holding other content, nothing is overwritten."""
+    attachments_dir = tmp_path / WORKSPACE_ATTACHMENTS_DIRNAME
+    attachments_dir.mkdir()
+    digest = hashlib.sha256(_ZIP_BYTES).hexdigest()[:12]
+    (attachments_dir / "archive.zip").write_bytes(b"first")
+    (attachments_dir / f"archive_{digest}.zip").write_bytes(b"second")
+
+    assert materialize_attachment_to_workspace(_zip_block(), tmp_path) is None
+    assert (attachments_dir / "archive.zip").read_bytes() == b"first"
+    assert (attachments_dir / f"archive_{digest}.zip").read_bytes() == b"second"
+
+
+def test_materialize_to_workspace_reuses_identical_file(tmp_path: Path) -> None:
+    """
+    Re-materializing the same block reuses the file. The runner re-resolves
+    history blocks after a relaunch, so a restart must not multiply copies.
+    """
+    first = materialize_attachment_to_workspace(_zip_block(), tmp_path)
+    second = materialize_attachment_to_workspace(_zip_block(), tmp_path)
+
+    assert first == second
+    assert len(list((tmp_path / WORKSPACE_ATTACHMENTS_DIRNAME).iterdir())) == 1
+
+
+def test_materialize_to_workspace_clears_executable_bits_on_reuse(tmp_path: Path) -> None:
+    """
+    An identical file already present with execute bits is reused non-executable.
+
+    Reuse returns early, so without clearing the bits there a pre-placed
+    executable copy would stay runnable despite the attachment contract.
+    """
+    attachments_dir = tmp_path / WORKSPACE_ATTACHMENTS_DIRNAME
+    attachments_dir.mkdir()
+    existing = attachments_dir / "archive.zip"
+    existing.write_bytes(_ZIP_BYTES)
+    existing.chmod(0o755)
+
+    path = materialize_attachment_to_workspace(_zip_block(), tmp_path)
+
+    assert path == existing
+    assert path.stat().st_mode & 0o111 == 0
+
+
+def test_materialize_to_workspace_ignores_files_left_by_other_sessions(tmp_path: Path) -> None:
+    """
+    Files other sessions left in a shared workspace do not block a new upload.
+
+    One checkout serves many sessions, so the runner cannot tell whose files
+    these are; per-session quotas are enforced by the server at upload.
+    """
+    attachments_dir = tmp_path / WORKSPACE_ATTACHMENTS_DIRNAME
+    attachments_dir.mkdir()
+    for index in range(50):
+        (attachments_dir / f"left_behind_{index}.zip").write_bytes(b"x" * 1024)
+
+    path = materialize_attachment_to_workspace(_zip_block(), tmp_path)
+
+    assert path == attachments_dir / "archive.zip"
+
+
+def test_routed_reference_line_sends_each_type_to_its_destination(tmp_path: Path) -> None:
+    """
+    Live turns and transcript rebuilds share one router, so a zip goes to the
+    workspace and an image to the bridge dir on both paths.
+    """
+    bridge_dir = tmp_path / "bridge"
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    image = {"type": "input_image", "image_url": _PNG_DATA_URI, "filename": "photo.png"}
+
+    zip_line = routed_attachment_reference_line(_zip_block(), bridge_dir, workspace)
+    image_line = routed_attachment_reference_line(image, bridge_dir, workspace)
+    no_workspace = routed_attachment_reference_line(_zip_block(), bridge_dir, None)
+
+    assert (
+        zip_line == f"[Attached file: {workspace / WORKSPACE_ATTACHMENTS_DIRNAME / 'archive.zip'}]"
+    )
+    assert image_line == f"[Attached: {bridge_dir / 'uploads' / 'photo.png'}]"
+    assert no_workspace == "[Attachment archive.zip could not be loaded]"
+
+
+def test_workspace_reference_line_covers_both_outcomes(tmp_path: Path) -> None:
+    """
+    The workspace line uses the "[Attached file: ...]" shape and, like the
+    bridge-dir line, both outcomes stay strippable by TUI forwarders.
+    """
+    unresolved = {"type": "input_file", "file_id": "file_x", "filename": "archive.zip"}
+
+    resolved_line = workspace_attachment_reference_line(_zip_block(), tmp_path)
+    unresolved_line = workspace_attachment_reference_line(unresolved, tmp_path)
+
+    expected = tmp_path / WORKSPACE_ATTACHMENTS_DIRNAME / "archive.zip"
+    assert resolved_line == f"[Attached file: {expected}]"
+    assert unresolved_line == "[Attachment archive.zip could not be loaded]"
+    assert re.fullmatch(ATTACHMENT_MARKER_STRIP_PATTERN, resolved_line)
+    assert re.fullmatch(ATTACHMENT_MARKER_STRIP_PATTERN, unresolved_line)
+
+
+def test_workspace_reference_line_matches_title_seeding_regex(tmp_path: Path) -> None:
+    """
+    The emitted line matches conversation.py's marker regex, so a session
+    started with an attachment is titled by what the user typed rather than
+    by a workspace path echoed back through the harness transcript.
+    """
+    from omnigent.entities.conversation import _ATTACHMENT_MARKER_RE
+
+    line = workspace_attachment_reference_line(_zip_block(), tmp_path)
+
+    assert _ATTACHMENT_MARKER_RE.fullmatch(line)
+
+
+@pytest.mark.parametrize(
+    "filename", ["archive.zip", "report.docx", "sheet.xlsx", "deck.pptx", "app.sqlite3"]
+)
+def test_workspace_materialize_upload_limit_allowed(filename: str) -> None:
+    """Archives, office documents, and databases are workspace-delivered."""
+    assert workspace_materialize_upload_limit(filename) is not None
+
+
+@pytest.mark.parametrize("filename", ["photo.png", "report.pdf", "notes.txt", "blob", None])
+def test_workspace_materialize_upload_limit_rejects_inlinable(filename: str | None) -> None:
+    """Inlinable and unrecognised types keep the existing inline delivery."""
+    assert workspace_materialize_upload_limit(filename) is None
+
+
+async def test_relaunch_re_resolution_keeps_a_zip_routable_to_the_workspace() -> None:
+    """
+    After a runner relaunch, history is reloaded pre-resolution and each
+    ``file_id`` block is fetched again. The rebuilt block must keep the
+    filename, or the executor loses the signal that routes it to the
+    workspace and would stage it in the bridge dir instead.
+    """
+
+    class _Resp:
+        """Minimal httpx-Response stand-in for metadata and content."""
+
+        def __init__(self, *, body: bytes = b"", payload: dict[str, object] | None = None) -> None:
+            self.content = body
+            self._payload = payload or {}
+            self.headers = {"content-type": "application/zip"}
+
+        def json(self) -> dict[str, object]:
+            return self._payload
+
+        def raise_for_status(self) -> None:
+            return
+
+    class _Client:
+        """Serves the two GETs re-resolution makes per attachment."""
+
+        async def get(self, url: str, **kwargs: object) -> _Resp:
+            del kwargs
+            if url.endswith("/content"):
+                return _Resp(body=_ZIP_BYTES)
+            return _Resp(payload={"filename": "bundle.zip", "content_type": "application/zip"})
+
+    block = {"type": "input_file", "file_id": "file_zip", "filename": "bundle.zip"}
+    assert has_unresolved_file_id(block)
+
+    result = await resolve_file_id_block(block, session_id="conv_1", client=_Client())
+
+    assert result is not None
+    resolved, _notice = result
+    assert resolved["file_data"] == _ZIP_DATA_URI
+    assert workspace_materialize_upload_limit(str(resolved["filename"])) is not None
+
+
+async def test_re_resolution_takes_the_filename_from_stored_metadata() -> None:
+    """
+    A client cannot relabel an uploaded file by naming it differently in the message.
+
+    ``payload.txt`` passed the upload gate as inline text. Referencing it as
+    ``payload.db`` would otherwise route it to the workspace, skipping the
+    denylist and quota that apply to workspace uploads.
+    """
+
+    class _Resp:
+        """Minimal httpx-Response stand-in for metadata and content."""
+
+        def __init__(self, *, body: bytes = b"", payload: dict[str, object] | None = None) -> None:
+            self.content = body or b"{}"
+            self._payload = payload or {}
+            self.headers = {"content-type": "text/plain"}
+
+        def json(self) -> dict[str, object]:
+            return self._payload
+
+        def raise_for_status(self) -> None:
+            return
+
+    class _Client:
+        """Serves the stored metadata and bytes for one text upload."""
+
+        async def get(self, url: str, **kwargs: object) -> _Resp:
+            del kwargs
+            if url.endswith("/content"):
+                return _Resp(body=b"hello")
+            return _Resp(payload={"name": "payload.txt", "content_type": "text/plain"})
+
+    block = {"type": "input_file", "file_id": "file_txt", "filename": "payload.db"}
+
+    result = await resolve_file_id_block(block, session_id="conv_1", client=_Client())
+
+    assert result is not None
+    resolved, _notice = result
+    assert resolved["filename"] == "payload.txt"
+    assert workspace_materialize_upload_limit(str(resolved["filename"])) is None
+
+
+def test_client_server_workspace_extension_parity() -> None:
+    """
+    The two workspace-materialize allowlists must name the same extensions.
+
+    The client gate runs before upload, so a type the server accepts but the
+    client omits is unreachable from the web UI: the file is rejected at
+    paste/drop time and the server code never runs. The existing text/code
+    parity test only covers the client-to-server direction, which leaves that
+    failure silent.
+    """
+    from omnigent.inner.native_attachments import _WORKSPACE_MATERIALIZE_EXTENSIONS
+
+    ts_path = Path(__file__).resolve().parents[2] / "web" / "src" / "lib" / "attachments.ts"
+    if not ts_path.exists():
+        pytest.skip("web/src/lib/attachments.ts not present (server-only checkout)")
+    block = ts_path.read_text().split("WORKSPACE_MATERIALIZE_EXTENSIONS = new Set([")[1]
+    client_exts = set(re.findall(r'"(\.[a-z0-9]+)"', block.split("]")[0]))
+
+    assert client_exts, "could not parse client WORKSPACE_MATERIALIZE_EXTENSIONS"
+    assert client_exts == set(_WORKSPACE_MATERIALIZE_EXTENSIONS)
 
 
 # ── resize notice ────────────────────────────────────────────────────

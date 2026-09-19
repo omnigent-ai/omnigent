@@ -11120,6 +11120,66 @@ async def test_ensure_local_codex_resume_rollout_replays_before_history_fetch(
 
 
 @pytest.mark.asyncio
+async def test_ensure_local_codex_resume_rollout_restores_a_zip_into_the_workspace(
+    tmp_path: Path,
+) -> None:
+    """
+    A zip from history is written into the replacement workspace on resume.
+
+    Stored items only carry the upload's file_id, so without fetching it back
+    the rebuilt thread would mention nothing and the file would be gone.
+    """
+    from omnigent.inner.native_attachments import WORKSPACE_ATTACHMENTS_DIRNAME
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    codex_home = tmp_path / "bridge" / "codex-home"
+    zip_bytes = b"PK\x03\x04 resumed zip"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/resources/files/file_zip/content"):
+            return httpx.Response(200, content=zip_bytes)
+        if path.endswith("/resources/files/file_zip"):
+            return httpx.Response(
+                200,
+                json={"id": "file_zip", "name": "bundle.zip", "content_type": "application/zip"},
+            )
+        item = {
+            "id": "msg_user_1",
+            "response_id": "codex_turn_1",
+            "type": "message",
+            "role": "user",
+            "content": [
+                {"type": "input_file", "file_id": "file_zip", "filename": "bundle.zip"},
+                {"type": "input_text", "text": "unpack this"},
+            ],
+        }
+        return httpx.Response(200, json={"data": [item], "has_more": False})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        rollout = await codex_native._ensure_local_codex_resume_rollout(
+            client,
+            session_id="conv_codex",
+            external_session_id="019e96aa-0be2-7343-8d3b-6f914d60936b",
+            codex_home=codex_home,
+            workspace=workspace,
+            model_provider="omnigent_databricks",
+            codex_path=None,
+        )
+
+    expected = workspace / WORKSPACE_ATTACHMENTS_DIRNAME / "bundle.zip"
+    assert expected.read_bytes() == zip_bytes
+    records = [json.loads(line) for line in rollout.read_text(encoding="utf-8").splitlines()]
+    user_item = next(r["payload"] for r in records if r["type"] == "response_item")
+    assert user_item["content"] == [
+        {"type": "input_text", "text": f"[Attached file: {expected}]"},
+        {"type": "input_text", "text": "unpack this"},
+    ]
+
+
+@pytest.mark.asyncio
 async def test_ensure_local_codex_resume_rollout_synthesizes_omnigent_history(
     tmp_path: Path,
 ) -> None:

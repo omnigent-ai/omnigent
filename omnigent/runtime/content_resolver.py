@@ -651,22 +651,31 @@ def extract_text_attachments(
     message. Attachments arrive as ``input_file`` blocks that are base64-
     inlined straight to the model (see :func:`resolve_content_references`),
     so without this an attached CSV of card numbers reaches the LLM
-    unscanned. Non-text attachments (images, PDFs, binaries) are skipped;
-    text files are decoded in full (uploads are already bounded — text ≤
-    :data:`MAX_TEXT_UPLOAD_BYTES`, 10 MB). Best-effort: a missing/foreign file
-    or a fetch error is skipped, never raised, so a scan failure can't break
-    message delivery.
+    unscanned. Images and PDFs are skipped; text files are decoded in full
+    (uploads are already bounded — text ≤ :data:`MAX_TEXT_UPLOAD_BYTES`,
+    10 MB). Workspace-delivered files carry no scannable text but are listed by
+    name, since they reach the agent's filesystem and a policy may want to
+    refuse one on its extension. Best-effort: a missing/foreign file or a fetch
+    error is skipped, never raised, so a scan failure can't break message
+    delivery.
 
     :param content: The message's content blocks (``body.data["content"]``).
     :param file_store: Store for file metadata (``content_type`` / ``filename``).
     :param artifact_store: Store for the file's binary content.
     :param session_id: Owning session id, to enforce file ownership.
-    :returns: A list of ``{"filename", "content_type", "text"}`` entries — one
-        per scannable text attachment, in order — or ``[]`` when there are none.
+    :returns: A list of ``{"filename", "content_type", "delivery", "text"}``
+        entries, in order, where ``delivery`` is ``"inline"`` or
+        ``"workspace"`` and workspace entries carry an empty ``text``, or
+        ``[]`` when there are none.
     """
+    from omnigent.inner.native_attachments import workspace_materialize_upload_limit
+
     attachments: list[dict[str, str]] = []
     for block in content:
-        if not isinstance(block, dict) or block.get("type") != "input_file":
+        # Both block types are considered: delivery follows the stored filename,
+        # so a workspace file a client sent as an image still reaches the
+        # sandbox and must be announced. Images stay skipped by the text test.
+        if not isinstance(block, dict) or block.get("type") not in ("input_file", "input_image"):
             continue
         file_id = block.get("file_id")
         if not isinstance(file_id, str):
@@ -684,6 +693,19 @@ def extract_text_attachments(
         ):
             continue
         content_type = _resolve_content_type(file_meta.content_type, file_meta.filename)
+        # Checked before the text-like test: delivery follows the filename, so an
+        # archive stored under a text MIME still reaches the filesystem. It has no
+        # scannable text, but is announced by name so a policy can refuse it.
+        if workspace_materialize_upload_limit(file_meta.filename) is not None:
+            attachments.append(
+                {
+                    "filename": file_meta.filename or "",
+                    "content_type": content_type,
+                    "delivery": "workspace",
+                    "text": "",
+                }
+            )
+            continue
         if not _is_text_like_attachment(content_type, file_meta.filename):
             continue
         try:
@@ -697,6 +719,7 @@ def extract_text_attachments(
             {
                 "filename": file_meta.filename or "",
                 "content_type": content_type,
+                "delivery": "inline",
                 "text": raw.decode("utf-8", errors="replace"),
             }
         )
@@ -773,6 +796,7 @@ def _resolve_message_content(
     cache: dict[str, str] | None = None,
     *,
     session_id: str | None = None,
+    defer_workspace_files: bool = False,
 ) -> list[dict[str, Any]]:
     """
     Resolve ``file_id`` references in a list of content blocks.
@@ -788,6 +812,8 @@ def _resolve_message_content(
         :func:`resolve_content_references`).
     :param session_id: Optional owning session id used to verify
         session-scoped file ownership, e.g. ``"conv_abc123"``.
+    :param defer_workspace_files: Leave workspace-materialize files as
+        ``file_id`` references for a native runner to fetch, instead of raising.
     :returns: The original list (unchanged) or a new list with
         ``file_id`` references resolved to inline content.
     """
@@ -801,6 +827,7 @@ def _resolve_message_content(
                 artifact_store,
                 cache,
                 session_id=session_id,
+                defer_workspace_files=defer_workspace_files,
             )
             resolved.append(resolved_block)
             if notice is not None:
@@ -835,6 +862,7 @@ def _resolve_file_id_block(
     cache: dict[str, str] | None = None,
     *,
     session_id: str | None = None,
+    defer_workspace_files: bool = False,
 ) -> tuple[dict[str, Any], dict[str, int] | None]:
     """
     Resolve a single content block's ``file_id`` to inline content.
@@ -855,12 +883,16 @@ def _resolve_file_id_block(
         :func:`resolve_content_references`).
     :param session_id: Optional owning session id used to verify
         session-scoped file ownership, e.g. ``"conv_abc123"``.
+    :param defer_workspace_files: Return a workspace-materialize block
+        unchanged, ``file_id`` kept, for a native runner to fetch.
     :returns: ``(block, notice)`` — a new dict with ``file_id`` replaced by
         inline content (all other fields preserved), and an optional resize
         source dimensions to emit alongside a downscaled image (``None`` otherwise).
     :raises ValueError: If ``file_id`` is not found in the file
         store — the file was deleted between request validation
-        and agent loop execution.
+        and agent loop execution. Also raised when the referenced file is a
+        workspace-materialize type this (non-native) adapter can't inline,
+        unless *defer_workspace_files* is set.
     """
     file_id = block["file_id"]
     owner_session_id = session_id or _session_id_from_block(block)
@@ -871,6 +903,18 @@ def _resolve_file_id_block(
         raise ValueError(
             f"Referenced file '{file_id}' no longer exists — "
             f"it may have been deleted after the request was accepted"
+        )
+    # Workspace-materialize types never reach a model as bytes (a native
+    # harness reads them off disk instead), so inlining one here would send
+    # a payload the provider can't interpret. Fail with an actionable error.
+    from omnigent.inner.native_attachments import workspace_materialize_upload_limit
+
+    if workspace_materialize_upload_limit(file_meta.filename) is not None:
+        if defer_workspace_files:
+            return dict(block), None
+        raise ValueError(
+            f"Attachment '{file_meta.filename}' requires a filesystem-capable "
+            "harness (e.g. Claude Code, Codex) and cannot be used with this model."
         )
 
     # Use cached base64 if available; otherwise fetch, encode, and cache.
@@ -886,6 +930,10 @@ def _resolve_file_id_block(
 
     # Copy all fields except file_id.
     resolved: dict[str, Any] = {k: v for k, v in block.items() if k != "file_id"}
+    if file_meta.filename:
+        # The stored name decides delivery; the block's own filename is
+        # client-supplied and must not be able to relabel the file.
+        resolved["filename"] = file_meta.filename
 
     content_type = _resolve_content_type(file_meta.content_type, file_meta.filename)
 

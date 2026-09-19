@@ -24,6 +24,7 @@ from omnigent.harnesses.claude_native.bridge import (
     is_auth_slash_command,
     kill_session,
     read_active_session_id,
+    read_bridge_workspace,
     read_claude_status_model,
     read_launch_model,
     read_model_env,
@@ -42,8 +43,8 @@ from omnigent.inner.executor import (
 )
 from omnigent.inner.native_attachments import (
     FRAMEWORK_NOTICE_BLOCK_TYPE,
-    attachment_reference_line,
     framework_notices,
+    routed_attachment_reference_line,
 )
 from omnigent.models.claude_model_vocabulary import claude_model_command_arg, normalized_model_id
 
@@ -107,7 +108,7 @@ class ClaudeNativeExecutor(Executor):
         del session_key
         if not _session_is_active(self._bridge_dir, self._request_session_id):
             return False
-        text = _content_to_text(content, self._bridge_dir)
+        text = _content_to_text(content, self._bridge_dir, read_bridge_workspace(self._bridge_dir))
         if not text:
             return False
         if is_auth_slash_command(text):
@@ -176,7 +177,9 @@ class ClaudeNativeExecutor(Executor):
                 )
             )
             return
-        text = _latest_user_text(messages, self._bridge_dir)
+        text = _latest_user_text(
+            messages, self._bridge_dir, read_bridge_workspace(self._bridge_dir)
+        )
         notices = _latest_framework_notices(messages)
         if not text:
             yield ExecutorError(message="Claude native turn had no user text to send")
@@ -444,7 +447,9 @@ def _session_is_active(bridge_dir: Path, request_session_id: str | None) -> bool
     return active_session_id is None or active_session_id == request_session_id
 
 
-def _latest_user_text(messages: list[Message], bridge_dir: Path) -> str:
+def _latest_user_text(
+    messages: list[Message], bridge_dir: Path, workspace: Path | None = None
+) -> str:
     """
     Return the latest user text from executor messages.
 
@@ -455,23 +460,28 @@ def _latest_user_text(messages: list[Message], bridge_dir: Path) -> str:
     :param messages: Conversation history in executor message shape.
     :param bridge_dir: Bridge directory path for writing attachment
         files, e.g. ``Path("/tmp/omnigent/claude-native/<digest>")``.
+    :param workspace: Workspace root for materialized attachments.
     :returns: Concatenated latest user message text, or ``""`` when
         no user text is present.
     """
     for message in reversed(messages):
         if message.get("role") == "user":
-            return _content_to_text(message.get("content"), bridge_dir)
+            return _content_to_text(message.get("content"), bridge_dir, workspace)
     return ""
 
 
-def _content_to_text(content: EnqueuedContent, bridge_dir: Path) -> str:
+def _content_to_text(
+    content: EnqueuedContent, bridge_dir: Path, workspace: Path | None = None
+) -> str:
     """
     Normalize executor content into plain text.
 
     Text blocks are extracted directly. Multimodal blocks
     (``input_image``, ``input_file``) that carry resolved base64 data
     URIs are decoded to files in the bridge directory and referenced
-    by path so Claude Code can view them with its Read tool.
+    by path so Claude Code can view them with its Read tool. Types that
+    are never inlined (archives, office documents, databases) go to the
+    workspace instead, where Claude's own tools already have access.
 
     :param content: Message content, e.g. a string or a list of
         ``{"type": "input_text", "text": "..."}`` blocks. May also
@@ -479,6 +489,9 @@ def _content_to_text(content: EnqueuedContent, bridge_dir: Path) -> str:
         or ``input_file`` blocks with a ``file_data`` data URI.
     :param bridge_dir: Bridge directory path for writing attachment
         files, e.g. ``Path("/tmp/omnigent/claude-native/<digest>")``.
+    :param workspace: Workspace root for materialized attachments.
+        ``None`` (no workspace recorded at launch) surfaces a visible
+        marker rather than dropping the attachment silently.
     :returns: Plain text content with file-path references prepended
         for any materialized attachments.
     """
@@ -498,7 +511,9 @@ def _content_to_text(content: EnqueuedContent, bridge_dir: Path) -> str:
                 if isinstance(text, str):
                     text_parts.append(text)
             elif block_type in ("input_image", "input_file"):
-                attachment_lines.append(attachment_reference_line(block, bridge_dir))
+                attachment_lines.append(
+                    routed_attachment_reference_line(block, bridge_dir, workspace)
+                )
         parts = attachment_lines + text_parts
         return "\n\n".join(parts)
     return ""

@@ -1957,6 +1957,14 @@ def artifact_store() -> _InMemoryArtifactStore:
     return _InMemoryArtifactStore()
 
 
+class _NoAgentStore:
+    """Agent store stub for file tests: holds no agents."""
+
+    def get(self, agent_id: str) -> None:
+        """Return no agent for *agent_id*."""
+        del agent_id
+
+
 @pytest.fixture
 def file_app(
     runner_globals_reset: None,
@@ -1985,7 +1993,7 @@ def file_app(
     test_app.include_router(
         create_sessions_router(
             file_conv_store,  # type: ignore[arg-type]
-            object(),  # type: ignore[arg-type]  — stub agent store
+            _NoAgentStore(),  # type: ignore[arg-type]
             file_store=file_store,  # type: ignore[arg-type]
             artifact_store=artifact_store,  # type: ignore[arg-type]
         ),
@@ -2295,6 +2303,101 @@ async def test_copy_files_carries_source_metadata(
     copied = file_store.get(new_id, session_id="405bfe154d5c0e795a2b87021bc897bf")
     assert copied is not None
     assert copied.source_metadata == {"width": 6000, "height": 4000}
+
+
+def _seed_parent_zip(file_store: Any, artifact_store: _InMemoryArtifactStore, name: str) -> str:
+    """Store a zip in the parent session directly, bypassing the upload route."""
+    stored = file_store.create(
+        session_id="b460374fc8e697b296708f52dc9d8179",
+        filename=name,
+        bytes=4,
+        content_type="application/zip",
+    )
+    artifact_store.put(stored.id, b"PK\x03\x04")
+    return stored.id
+
+
+@pytest.mark.asyncio
+async def test_copy_refuses_a_workspace_file_for_a_harness_without_a_workspace(
+    file_client: httpx.AsyncClient,
+    file_store: Any,
+    artifact_store: _InMemoryArtifactStore,
+) -> None:
+    """A copied zip would be dropped by an SDK child, as an uploaded one would."""
+    zip_id = _seed_parent_zip(file_store, artifact_store, "bundle.zip")
+
+    resp = await file_client.post(
+        "/v1/sessions/405bfe154d5c0e795a2b87021bc897bf/resources/files:copy",
+        json={"source_session_id": "b460374fc8e697b296708f52dc9d8179", "file_ids": [zip_id]},
+    )
+
+    assert resp.status_code == 415, resp.text
+    assert "Claude Code or Codex" in resp.text
+    listed = file_store.list(session_id="405bfe154d5c0e795a2b87021bc897bf", limit=10)
+    assert listed.data == []
+
+
+@pytest.mark.asyncio
+async def test_copy_spends_the_child_workspace_quota(
+    file_client: httpx.AsyncClient,
+    file_conv_store: _ConversationStore,
+    file_store: Any,
+    artifact_store: _InMemoryArtifactStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Copies count against the child's workspace quota, like uploads."""
+    from omnigent.harness_plugins import CLAUDE_NATIVE_CODING_AGENT
+
+    monkeypatch.setattr(
+        "omnigent.server.server_config.workspace_attachment_file_limit",
+        lambda: 1,
+    )
+    file_conv_store._conversations["405bfe154d5c0e795a2b87021bc897bf"].labels.update(
+        CLAUDE_NATIVE_CODING_AGENT.presentation_labels
+    )
+    first = _seed_parent_zip(file_store, artifact_store, "first.zip")
+    second = _seed_parent_zip(file_store, artifact_store, "second.zip")
+    url = "/v1/sessions/405bfe154d5c0e795a2b87021bc897bf/resources/files:copy"
+    source = "b460374fc8e697b296708f52dc9d8179"
+
+    ok = await file_client.post(url, json={"source_session_id": source, "file_ids": [first]})
+    assert ok.status_code == 200, ok.text
+    over = await file_client.post(url, json={"source_session_id": source, "file_ids": [second]})
+
+    assert over.status_code == 413, over.text
+    listed = file_store.list(session_id="405bfe154d5c0e795a2b87021bc897bf", limit=10)
+    assert [f.filename for f in listed.data] == ["first.zip"]
+
+
+@pytest.mark.asyncio
+async def test_native_forward_leaves_a_workspace_file_for_the_runner(
+    file_client: httpx.AsyncClient,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A zip reaches the native runner as a file_id, with no resolution warning."""
+    session_id = "64a784c3aa907d1774f44313546947c6"
+    fake_runner = _FakeRunnerClient(payload={})
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+    set_runner_client(fake_runner)  # type: ignore[arg-type]
+    upload = await file_client.post(
+        f"/v1/sessions/{session_id}/resources/files",
+        files={"file": ("bundle.zip", b"PK\x03\x04", "application/zip")},
+    )
+    assert upload.status_code == 201, upload.text
+    zip_block = {"type": "input_file", "file_id": upload.json()["id"], "filename": "bundle.zip"}
+
+    with caplog.at_level(logging.WARNING):
+        resp = await file_client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={"type": "message", "data": {"role": "user", "content": [zip_block]}},
+        )
+
+    assert resp.status_code == 202, resp.text
+    forwarded = next(
+        body for path, body in fake_runner.post_json_calls if path.endswith("/events")
+    )
+    assert forwarded["content"] == [zip_block]
+    assert "File reference resolution failed" not in caplog.text
 
 
 @pytest.mark.asyncio

@@ -15,16 +15,20 @@ from __future__ import annotations
 
 import base64
 import binascii
+import contextlib
+import errno
 import hashlib
 import logging
+import os
 import re
 import shutil
+import stat
 import urllib.parse
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any
+from pathlib import Path, PurePath
+from typing import Any, Literal
 
 import httpx
 
@@ -82,6 +86,78 @@ def parse_data_uri(uri: str) -> DataUri:
     return DataUri(mime_type=mime_part, base64_payload=payload)
 
 
+# Subdirectory of the harness workspace that user-attached files land in.
+WORKSPACE_ATTACHMENTS_DIRNAME = "session-attachments"
+
+# Default per-file cap and per-session quotas for workspace-materialized
+# attachments. They bound sandbox disk usage rather than a base64 request
+# payload, so they sit well above the inline caps. The server enforces them per
+# session at upload (see omnigent/server/server_config.py for the overrides);
+# the runner cannot, because one workspace is shared by many sessions.
+MAX_WORKSPACE_ATTACHMENT_UPLOAD_BYTES: int = 50 * 1024 * 1024
+MAX_SESSION_WORKSPACE_ATTACHMENTS: int = 20
+MAX_SESSION_WORKSPACE_ATTACHMENT_BYTES: int = 200 * 1024 * 1024
+
+# Extensions delivered by materializing to the workspace instead of inlining.
+# Office formats and archives are zip containers that browsers and OSes
+# routinely mislabel as application/zip or application/octet-stream, so the
+# check is extension-based rather than content-type-based. Kept a fixed
+# allowlist rather than "any binary": until deployments can configure a
+# denylist, an open default would let arbitrary executables into the sandbox.
+_WORKSPACE_MATERIALIZE_EXTENSIONS: frozenset[str] = frozenset(
+    {".zip", ".docx", ".xlsx", ".pptx", ".db", ".sqlite", ".sqlite3"}
+)
+
+# Harnesses whose executors materialize workspace attachments. Any other harness
+# would receive the file inlined and drop it, so the upload is refused instead.
+WORKSPACE_ATTACHMENT_HARNESSES: frozenset[str] = frozenset({"claude-native", "codex-native"})
+
+
+def workspace_materialize_upload_limit(filename: str | None) -> int | None:
+    """
+    Max size (bytes) for a workspace-materialized attachment, or ``None``
+    when *filename*'s extension is not one.
+
+    These types are never inlined into the model context: a filesystem-capable
+    harness (Claude Code, Codex) writes them into its workspace and references
+    them by path, so adapters without a filesystem must reject them rather
+    than send bytes the provider cannot interpret.
+
+    :param filename: The original filename, e.g. ``"report.docx"``.
+    :returns: :data:`MAX_WORKSPACE_ATTACHMENT_UPLOAD_BYTES`, or ``None`` when
+        the extension is not a workspace-materialize type.
+    """
+    if not filename:
+        return None
+    if PurePath(filename).suffix.lower() not in _WORKSPACE_MATERIALIZE_EXTENSIONS:
+        return None
+    return MAX_WORKSPACE_ATTACHMENT_UPLOAD_BYTES
+
+
+def inline_workspace_attachment_name(content: object) -> str | None:
+    """
+    Filename of the first workspace-type attachment that carries inline bytes.
+
+    Workspace files must arrive as uploaded ``file_id`` references, so the
+    upload route's harness, denylist, and quota checks run before any bytes
+    reach the sandbox.
+
+    :param content: A message's content blocks.
+    :returns: The offending filename, e.g. ``"payload.zip"``, or ``None``.
+    """
+    if not isinstance(content, list):
+        return None
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        filename = block.get("filename")
+        if not isinstance(filename, str) or workspace_materialize_upload_limit(filename) is None:
+            continue
+        if block.get("file_data") or block.get("image_url"):
+            return filename
+    return None
+
+
 def materialize_attachment(block: Mapping[str, object], bridge_dir: Path) -> Path | None:
     """
     Decode a base64 data URI from a content block and write it to disk.
@@ -96,6 +172,34 @@ def materialize_attachment(block: Mapping[str, object], bridge_dir: Path) -> Pat
         e.g. ``Path("/tmp/omnigent/codex-native/<digest>")``.
     :returns: Path to the written file, or ``None`` if the block could
         not be materialized (missing data URI, decode error).
+    """
+    decoded = _decode_attachment_block(block)
+    if decoded is None:
+        return None
+    raw_bytes, filename = decoded
+
+    uploads_dir = bridge_dir / "uploads"
+    uploads_dir.mkdir(parents=True, exist_ok=True)
+    dest = uploads_dir / filename
+    if dest.exists() and not _holds_bytes(dest, raw_bytes):
+        # Same name, different bytes. Deriving the suffix from the content keeps
+        # one file per payload, where a random one grew a copy per rebuild.
+        digest = hashlib.sha256(raw_bytes).hexdigest()[:12]
+        dest = dest.with_stem(f"{dest.stem}_{digest}")
+    if not _holds_bytes(dest, raw_bytes):
+        dest.write_bytes(raw_bytes)
+    return dest
+
+
+def _decode_attachment_block(block: Mapping[str, object]) -> tuple[bytes, str] | None:
+    """
+    Decode a block's data URI and derive a safe base filename for it.
+
+    :param block: Attachment content block (see
+        :func:`materialize_attachment`).
+    :returns: ``(raw_bytes, filename)`` where *filename* carries no
+        directory components and no marker-breaking characters, or ``None``
+        when the block has no usable data URI.
     """
     data_uri = block.get("image_url") or block.get("file_data")
     if not isinstance(data_uri, str) or not data_uri.startswith("data:"):
@@ -119,20 +223,163 @@ def materialize_attachment(block: Mapping[str, object], bridge_dir: Path) -> Pat
     if not isinstance(filename, str) or not filename:
         filename = f"attachment_{uuid.uuid4().hex[:8]}{ext}"
     else:
+        # ``.name`` drops any directory part, so "../../etc/passwd" becomes
+        # "passwd" and a traversal attempt can't escape the destination dir.
         filename = Path(filename).name or f"attachment_{uuid.uuid4().hex[:8]}{ext}"
-    filename = _MARKER_UNSAFE.sub("_", filename)
+    return raw_bytes, _MARKER_UNSAFE.sub("_", filename)
 
-    uploads_dir = bridge_dir / "uploads"
-    uploads_dir.mkdir(parents=True, exist_ok=True)
-    dest = uploads_dir / filename
-    if dest.exists() and not _holds_bytes(dest, raw_bytes):
-        # Same name, different bytes. Deriving the suffix from the content keeps
-        # one file per payload, where a random one grew a copy per rebuild.
+
+def materialize_attachment_to_workspace(
+    block: Mapping[str, object], workspace: Path
+) -> Path | None:
+    """
+    Write an attachment into the harness workspace for the agent to open.
+
+    Unlike :func:`materialize_attachment`, which stages inlinable files in
+    the bridge directory, this places the file under the workspace the
+    harness already runs in, so its own Read/Bash tools reach it without a
+    sandbox exception. The bytes are written verbatim: archives are never
+    extracted, and the execute bits are always cleared so a materialized
+    file can't be run.
+
+    The workspace may hold files someone else prepared, so every open is
+    relative to a no-follow handle on the attachments directory and new files
+    are created exclusively. A symlink planted at the destination, or at the
+    collision name, fails the open instead of redirecting the write.
+
+    :param block: Attachment content block (see
+        :func:`materialize_attachment`).
+    :param workspace: Harness workspace root, e.g. ``Path("/home/me/repo")``.
+    :returns: Path to the materialized file, or ``None`` when the block could
+        not be materialized: undecodable, a symlink in the way, or both the
+        original and collision names already holding other content.
+    """
+    decoded = _decode_attachment_block(block)
+    if decoded is None:
+        return None
+    raw_bytes, filename = decoded
+    if filename in (".", "..") or os.sep in filename:
+        return None
+
+    attachments_dir = workspace.resolve() / WORKSPACE_ATTACHMENTS_DIRNAME
+    try:
+        attachments_dir.mkdir(parents=True, exist_ok=True)
+        # O_NOFOLLOW refuses a symlinked attachments directory outright.
+        dir_fd = os.open(attachments_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        _logger.warning("Refusing to materialize into %s", attachments_dir, exc_info=True)
+        return None
+    try:
+        stem, suffix = os.path.splitext(filename)
         digest = hashlib.sha256(raw_bytes).hexdigest()[:12]
-        dest = dest.with_stem(f"{dest.stem}_{digest}")
-    if not _holds_bytes(dest, raw_bytes):
-        dest.write_bytes(raw_bytes)
-    return dest
+        for name in (filename, f"{stem}_{digest}{suffix}"):
+            outcome = _place_no_follow(dir_fd, name, raw_bytes)
+            if outcome == "symlink":
+                _logger.warning("Refusing to write through symlink %s", attachments_dir / name)
+                return None
+            if outcome == "placed":
+                return attachments_dir / name
+        _logger.warning("Attachment names for %s already hold other content", filename)
+        return None
+    except OSError:
+        _logger.warning("Failed to materialize attachment %s", filename, exc_info=True)
+        return None
+    finally:
+        os.close(dir_fd)
+
+
+def _place_no_follow(
+    dir_fd: int, name: str, raw_bytes: bytes
+) -> Literal["placed", "taken", "symlink"]:
+    """
+    Reuse or create *name* under *dir_fd* without following symlinks.
+
+    :param dir_fd: No-follow descriptor for the attachments directory.
+    :param name: Base filename, no directory components.
+    :param raw_bytes: Decoded attachment payload.
+    :returns: ``"placed"`` when the name now holds *raw_bytes* (freshly
+        created, or an identical regular file reused with its execute bits
+        cleared); ``"taken"`` when it holds other content or is not a regular
+        file; ``"symlink"`` when it is a symlink.
+    :raises OSError: When writing a new file fails part-way.
+    """
+    try:
+        # O_NONBLOCK keeps a FIFO planted at the name from hanging the open.
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
+    except FileNotFoundError:
+        return _create_no_follow(dir_fd, name, raw_bytes)
+    except OSError as exc:
+        return "symlink" if exc.errno == errno.ELOOP else "taken"
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size != len(raw_bytes):
+            return "taken"
+        if _read_fd(fd, info.st_size) != raw_bytes:
+            return "taken"
+        try:
+            os.fchmod(fd, stat.S_IMODE(info.st_mode) & ~0o111)
+        except OSError:
+            # A reused file must not stay executable; if the bits can't be
+            # cleared, fall through to the collision name instead.
+            return "taken"
+        return "placed"
+    finally:
+        os.close(fd)
+
+
+def _create_no_follow(
+    dir_fd: int, name: str, raw_bytes: bytes
+) -> Literal["placed", "taken", "symlink"]:
+    """
+    Create *name* exclusively under *dir_fd* and write *raw_bytes* to it.
+
+    :param dir_fd: No-follow descriptor for the attachments directory.
+    :param name: Base filename, no directory components.
+    :param raw_bytes: Decoded attachment payload.
+    :returns: ``"placed"`` on success; ``"taken"`` when something appeared at
+        the name first; ``"symlink"`` when that something is a symlink.
+    :raises OSError: When the write fails; the partial file is removed.
+    """
+    try:
+        # Mode 0o644 carries no execute bits, and O_EXCL never follows or
+        # reuses an existing entry, a dangling symlink included.
+        fd = os.open(
+            name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644, dir_fd=dir_fd
+        )
+    except FileExistsError:
+        return "taken"
+    except OSError as exc:
+        return "symlink" if exc.errno == errno.ELOOP else "taken"
+    try:
+        view = memoryview(raw_bytes)
+        while view:
+            view = view[os.write(fd, view) :]
+    except OSError:
+        os.close(fd)
+        with contextlib.suppress(OSError):
+            os.unlink(name, dir_fd=dir_fd)
+        raise
+    os.close(fd)
+    return "placed"
+
+
+def _read_fd(fd: int, size: int) -> bytes:
+    """
+    Read exactly *size* bytes from *fd*, stopping early at end of file.
+
+    :param fd: Open file descriptor positioned at the start.
+    :param size: Number of bytes to read.
+    :returns: The bytes read.
+    """
+    chunks: list[bytes] = []
+    remaining = size
+    while remaining > 0:
+        chunk = os.read(fd, min(remaining, 1024 * 1024))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
 
 
 def _holds_bytes(path: Path, raw_bytes: bytes) -> bool:
@@ -155,10 +402,13 @@ def _holds_bytes(path: Path, raw_bytes: bytes) -> bool:
 UNRESOLVED_ATTACHMENT_MARKER_PATTERN = r"\[Attachment [^\]]+ could not be loaded\]"
 
 # Matches any attachment reference line this module emits — the success-path
-# "[Attached: <path>]" from attachment_reference_line() and the unresolved
-# marker. TUI forwarders strip these from mirrored bubbles (internal bridge
-# details that must not leak into the chat transcript).
-ATTACHMENT_MARKER_STRIP_PATTERN = rf"\[Attached:[^\]]*\]|{UNRESOLVED_ATTACHMENT_MARKER_PATTERN}"
+# "[Attached: <path>]" from attachment_reference_line(), the workspace
+# "[Attached file: <path>]" from workspace_attachment_reference_line(), and
+# the unresolved marker. TUI forwarders strip these from mirrored bubbles
+# (internal bridge details that must not leak into the chat transcript).
+ATTACHMENT_MARKER_STRIP_PATTERN = (
+    rf"\[Attached(?: file)?:[^\]]*\]|{UNRESOLVED_ATTACHMENT_MARKER_PATTERN}"
+)
 
 
 def unresolved_attachment_marker(block: Mapping[str, object]) -> str:
@@ -199,6 +449,50 @@ def attachment_reference_line(block: Mapping[str, object], bridge_dir: Path) -> 
     if path is not None:
         return f"[Attached: {path}]"
     return unresolved_attachment_marker(block)
+
+
+def workspace_attachment_reference_line(block: Mapping[str, object], workspace: Path) -> str:
+    """
+    Materialize *block* into *workspace* and return its transcript line.
+
+    Uses the ``"[Attached file: <path>]"`` shape codex-native already emits,
+    which the harness echoes back and title seeding strips (see
+    :data:`ATTACHMENT_MARKER_STRIP_PATTERN`).
+
+    :param block: Attachment content block (see
+        :func:`materialize_attachment_to_workspace`).
+    :param workspace: Harness workspace root the file is written under.
+    :returns: ``"[Attached file: <path>]"`` on success, else the visible
+        marker from :func:`unresolved_attachment_marker`.
+    """
+    path = materialize_attachment_to_workspace(block, workspace)
+    if path is not None:
+        return f"[Attached file: {path}]"
+    return unresolved_attachment_marker(block)
+
+
+def routed_attachment_reference_line(
+    block: Mapping[str, object], bridge_dir: Path, workspace: Path | None
+) -> str:
+    """
+    Reference line for one attachment, routed by its delivery mode.
+
+    Shared by live turns and transcript rebuilds so both deliver an attachment
+    the same way.
+
+    :param block: Attachment content block.
+    :param bridge_dir: Bridge directory for inlinable types.
+    :param workspace: Workspace root for materialized types, or ``None`` when
+        the launch recorded none.
+    :returns: The line referencing the materialized file, or a visible marker
+        when it could not be placed.
+    """
+    filename = block.get("filename")
+    if workspace_materialize_upload_limit(filename if isinstance(filename, str) else None) is None:
+        return attachment_reference_line(block, bridge_dir)
+    if workspace is None:
+        return unresolved_attachment_marker(block)
+    return workspace_attachment_reference_line(block, workspace)
 
 
 def has_unresolved_file_id(block: Mapping[str, object]) -> bool:
@@ -398,6 +692,11 @@ async def resolve_file_id_block(
     content_type = content_type.split(";", 1)[0]
     encoded = base64.b64encode(content_resp.content).decode("ascii")
     new_block = {k: v for k, v in block.items() if k != "file_id"}
+    stored_name = meta.get("name")
+    if isinstance(stored_name, str) and stored_name:
+        # The stored name decides delivery. The block's own filename comes from
+        # the client and could steer an upload past the workspace checks.
+        new_block["filename"] = stored_name
     notice: dict[str, int] | None = None
     if block.get("type") == "input_image":
         new_block["image_url"] = f"data:{content_type};base64,{encoded}"
@@ -407,3 +706,44 @@ async def resolve_file_id_block(
     else:
         new_block["file_data"] = f"data:{content_type};base64,{encoded}"
     return new_block, notice
+
+
+async def resolve_session_item_file_references(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """
+    Inline ``file_id`` attachment blocks in rebuilt history as base64 data URIs.
+
+    Message items come back from the server with the upload's raw ``file_id``.
+    A cold-resume rebuild runs where no file/artifact stores exist, so bytes are
+    fetched back through the session file endpoints, as for a live turn. A failed
+    fetch is non-fatal: the block stays unresolved and surfaces a visible marker.
+
+    :param client: HTTP client pointed at the Omnigent server.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param items: Flat API item dicts from ``GET /v1/sessions/{id}/items``.
+    :returns: The same items with resolvable attachment blocks rewritten
+        to carry ``image_url`` / ``file_data`` data URIs.
+    """
+    for item in items:
+        content = item.get("content")
+        if item.get("type") != "message" or not isinstance(content, list):
+            continue
+        resolved_content: list[object] = []
+        for block in content:
+            if not (isinstance(block, dict) and has_unresolved_file_id(block)):
+                resolved_content.append(block)
+                continue
+            result = await resolve_file_id_block(block, session_id=session_id, client=client)
+            if result is None:
+                resolved_content.append(block)
+                continue
+            new_block, notice = result
+            resolved_content.append(new_block)
+            if notice is not None:
+                resolved_content.append(framework_notice_block(notice))
+        item["content"] = resolved_content
+    return items
