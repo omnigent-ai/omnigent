@@ -87,7 +87,8 @@ function HarnessPickerContent({
   useEffect(() => {
     if (!menuOpen) initialFocusHandled.current = false;
   }, [menuOpen]);
-  useLayoutEffect(() => {
+  // Let the menu's focus scope pause a parent dialog before focusing portalled rows.
+  useEffect(() => {
     if (!menuOpen || !content || initialFocusHandled.current) return;
     const selected = Array.from(
       content.querySelectorAll<HTMLElement>(

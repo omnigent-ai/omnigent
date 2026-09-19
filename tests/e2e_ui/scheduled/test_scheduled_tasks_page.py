@@ -636,6 +636,7 @@ def test_scheduled_task_edit_prefills_model_and_effort(
 def test_scheduled_task_edit_switches_the_harness(
     page: Page,
     live_server: str,
+    scheduled_task_cleanup: list[str],
 ) -> None:
     """The edit dialog can rebind an existing automation to another harness.
 
@@ -647,15 +648,17 @@ def test_scheduled_task_edit_switches_the_harness(
     """
     codex_agent_id = _builtin_agent_id(live_server, "codex-native-ui")
     claude_agent_id = _builtin_agent_id(live_server, "claude-native-ui")
+    task_name = f"Switch me {uuid.uuid4().hex[:8]}"
     task_id = _create_task(
         live_server,
         codex_agent_id,
-        "Switch me",
+        task_name,
         "FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
     )
+    scheduled_task_cleanup.append(task_id)
 
     page.goto(f"{live_server}/tasks")
-    row = _row_by_name(page, "Switch me")
+    row = _row_by_name(page, task_name)
     expect(row).to_be_visible(timeout=30_000)
     row.hover()
     row.get_by_test_id("task-row-menu").click()
@@ -669,6 +672,8 @@ def test_scheduled_task_edit_switches_the_harness(
     # Seeded from the task's own agent, not the first listed one.
     expect(agent_trigger).to_contain_text("Codex", timeout=30_000)
     agent_trigger.click()
+    expect(agent_trigger).to_have_attribute("aria-expanded", "true")
+    expect(page.get_by_role("menuitem", name="Codex", exact=True)).to_be_focused()
     page.get_by_role("menuitem").filter(has_text="Claude Code").click()
     expect(agent_trigger).to_contain_text("Claude Code")
     page.get_by_test_id("create-scheduled-task-submit").click()
