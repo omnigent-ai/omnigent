@@ -1298,6 +1298,10 @@ class McpServerConnection:
         baseline. Per-MCP sandboxing — if reintroduced — should
         flow through the ``omnigent/environments/`` primitive
         with explicit outbound-host allowlists, not srt-defaults.
+        Because the spawn is unsandboxed, untrusted (session-agent)
+        uploads may only declare stdio servers whose command the
+        operator allowlisted — see
+        ``omnigent.server.bundles.validate_agent_bundle``.
 
         :param stack: The lifecycle task's exit stack.
         :returns: A ``(read_stream, write_stream)`` tuple of

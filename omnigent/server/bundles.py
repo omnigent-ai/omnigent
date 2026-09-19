@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import tempfile
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
@@ -53,6 +54,62 @@ def _reject_uploaded_callable_tools(spec: AgentSpec) -> None:
             )
     for sub in spec.sub_agents:
         _reject_uploaded_callable_tools(sub)
+
+
+SESSION_STDIO_MCP_COMMANDS_ENV = "OMNIGENT_SESSION_STDIO_MCP_COMMANDS"
+"""Operator allowlist of ``command`` values session agents may spawn as stdio MCPs.
+
+Comma-separated executable names or paths, compared verbatim against the
+declared ``command``; ``*`` permits every command. Unset (the default)
+permits none on a multi-user server.
+"""
+
+
+def session_stdio_mcp_command_allowed(command: str) -> bool:
+    """Whether an operator allowlisted *command* for session-agent stdio MCPs.
+
+    :param command: The declared executable, e.g. ``"npx"``.
+    :returns: ``True`` if :data:`SESSION_STDIO_MCP_COMMANDS_ENV` lists
+        *command* or ``*``.
+    """
+    raw = os.environ.get(SESSION_STDIO_MCP_COMMANDS_ENV, "")
+    allowed = {item.strip() for item in raw.split(",") if item.strip()}
+    return "*" in allowed or command.strip() in allowed
+
+
+def session_stdio_mcp_rejection(server_name: str, command: str) -> OmnigentError:
+    """Build the error for a session agent declaring a non-allowlisted stdio MCP.
+
+    :param server_name: The MCP server's declared name, e.g. ``"echo"``.
+    :param command: The executable it asked the runner to spawn.
+    :returns: An ``INVALID_INPUT`` error telling the caller what to do instead.
+    """
+    return OmnigentError(
+        f"MCP server {server_name!r} uses transport 'stdio' with command "
+        f"{command!r}. stdio MCP servers are not allowed for session agents: "
+        "the command would run unsandboxed on the runner host. Use an HTTP "
+        "transport (url: https://...) instead, or ask your administrator to "
+        f"allowlist the command via {SESSION_STDIO_MCP_COMMANDS_ENV}.",
+        code=ErrorCode.INVALID_INPUT,
+    )
+
+
+def _reject_uploaded_stdio_mcp_servers(spec: AgentSpec) -> None:
+    """Reject non-allowlisted stdio MCP servers in an untrusted upload.
+
+    Recurses into sub-agents, each of which carries its own ``mcp_servers``.
+
+    :param spec: The parsed (sub-)agent spec to scan.
+    :raises OmnigentError: If any (sub-)agent declares a ``transport: stdio``
+        MCP server whose command is not operator-allowlisted.
+    """
+    for server in spec.mcp_servers:
+        if server.transport == "stdio" and not session_stdio_mcp_command_allowed(
+            server.command or ""
+        ):
+            raise session_stdio_mcp_rejection(server.name, server.command or "")
+    for sub in spec.sub_agents:
+        _reject_uploaded_stdio_mcp_servers(sub)
 
 
 def _cwd_escapes_workspace(spec_cwd: str) -> bool:
@@ -123,7 +180,8 @@ def validate_agent_bundle(
     :raises OmnigentError: If the bundle is invalid, the spec is
         missing a name, or (when *enforce_handler_allowlist*) a policy
         names an unregistered handler, ``os_env.cwd`` is an absolute or
-        escaping path, or a tool declares a server-side Python ``callable:``.
+        escaping path, a tool declares a server-side Python ``callable:``,
+        or an MCP server uses a non-allowlisted ``stdio`` command.
     """
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -167,6 +225,11 @@ def validate_agent_bundle(
         # *files* (``tools/python/*.py``) are unaffected: they ship the agent's
         # own code, not an arbitrary server-installed module.
         _reject_uploaded_callable_tools(spec)
+
+        # A ``transport: stdio`` MCP server makes the runner spawn an
+        # arbitrary command unsandboxed, so a session editor could start any
+        # executable on the host. Only operator-allowlisted commands pass.
+        _reject_uploaded_stdio_mcp_servers(spec)
 
     return spec
 

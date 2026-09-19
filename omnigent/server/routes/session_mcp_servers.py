@@ -23,7 +23,12 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runtime import session_stream
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ, AuthProvider, local_single_user_enabled
-from omnigent.server.bundles import bundle_location, validate_agent_bundle
+from omnigent.server.bundles import (
+    bundle_location,
+    session_stdio_mcp_command_allowed,
+    session_stdio_mcp_rejection,
+    validate_agent_bundle,
+)
 from omnigent.server.routes._auth_helpers import get_user_id, require_access
 from omnigent.server.routes._errors import session_not_found
 from omnigent.server.schemas import (
@@ -116,6 +121,7 @@ def create_session_mcp_servers_router(
     ) -> MCPServerSummary:
         """Create one MCP server declaration on a session-scoped agent."""
         agent = await _editable_agent(request, session_id)
+        _reject_session_stdio(body)
         spec = await asyncio.to_thread(
             _mutate_bundle,
             agent,
@@ -137,6 +143,7 @@ def create_session_mcp_servers_router(
     ) -> MCPServerSummary:
         """Replace one MCP server declaration on a session-scoped agent."""
         agent = await _editable_agent(request, session_id)
+        _reject_session_stdio(body)
         spec = await asyncio.to_thread(
             _mutate_bundle,
             agent,
@@ -186,6 +193,13 @@ def create_session_mcp_servers_router(
                 code=ErrorCode.INTERNAL_ERROR,
             )
         return agent
+
+    def _reject_session_stdio(body: UpsertMCPServerRequest) -> None:
+        """Refuse a stdio declaration unless the deployment trusts the caller."""
+        if body.transport != "stdio" or local_single_user_enabled():
+            return
+        if not session_stdio_mcp_command_allowed(body.command or ""):
+            raise session_stdio_mcp_rejection(body.name, body.command or "")
 
     def _mutate_bundle(
         agent: Agent,
