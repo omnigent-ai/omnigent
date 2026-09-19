@@ -124,6 +124,84 @@ def test_headers_with_api_key() -> None:
     assert headers["Authorization"] == "Bearer sk-test-123"
 
 
+def test_headers_merge_extra_headers() -> None:
+    """
+    Caller-supplied ``extra_headers`` (e.g. proxy ``host`` + s2s auth) are
+    merged into the built headers; non-string entries are dropped.
+    """
+    adapter = OpenAICompatibleAdapter(base_url="https://localhost")
+    headers = adapter._build_headers(
+        extra_headers={
+            "Authorization": "Bearer s2s-token",
+            "host": "serving.internal",
+            "x-num": 7,  # non-string value: dropped
+            3: "three",  # non-string key: dropped
+        },
+    )
+    assert headers["Authorization"] == "Bearer s2s-token"
+    assert headers["host"] == "serving.internal"
+    assert "x-num" not in headers
+    assert 3 not in headers
+
+
+def test_headers_extra_headers_override_api_key() -> None:
+    """``extra_headers`` win over the ``api_key``-derived Authorization."""
+    adapter = OpenAICompatibleAdapter(base_url="https://localhost")
+    headers = adapter._build_headers(
+        api_key_override="sk-test-123",
+        extra_headers={"Authorization": "Bearer s2s-token"},
+    )
+    assert headers["Authorization"] == "Bearer s2s-token"
+
+
+async def test_responses_create_sends_extra_headers_non_streaming() -> None:
+    """
+    ``responses_create`` must forward ``connection_params["extra_headers"]``
+    — a caller whose endpoint auth rides extra headers (no ``api_key``)
+    otherwise sends unauthenticated ``/v1/responses`` requests that the
+    provider rejects with 401.
+    """
+    adapter = OpenAIAdapter(base_url="https://fake-host/v1")
+    send = AsyncMock(return_value={"model": "gpt-5", "output": []})
+    with patch.object(adapter, "_send_request", send):
+        await adapter.responses_create(
+            input=[{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+            instructions=None,
+            model="gpt-5",
+            tools=None,
+            reasoning=None,
+            stream=False,
+            connection_params={"extra_headers": {"Authorization": "Bearer s2s-token"}},  # type: ignore[dict-item]
+        )
+    headers = send.call_args.args[1]
+    assert headers["Authorization"] == "Bearer s2s-token"
+
+
+async def test_responses_create_sends_extra_headers_streaming() -> None:
+    """The streaming ``/v1/responses`` path carries the same headers."""
+    adapter = OpenAIAdapter(base_url="https://fake-host/v1")
+    captured: dict[str, str] = {}
+
+    async def _fake_stream(url: str, headers: dict[str, str], *args: object, **kwargs: object):
+        captured.update(headers)
+        return
+        yield  # makes this an async generator
+
+    with patch.object(adapter, "_stream_responses", _fake_stream):
+        stream = await adapter.responses_create(
+            input=[{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+            instructions=None,
+            model="gpt-5",
+            tools=None,
+            reasoning=None,
+            stream=True,
+            connection_params={"extra_headers": {"Authorization": "Bearer s2s-token"}},  # type: ignore[dict-item]
+        )
+        async for _ in stream:  # drive the generator so headers are captured
+            pass
+    assert captured["Authorization"] == "Bearer s2s-token"
+
+
 # ── SSE parsing ──────────────────────────────────────────
 
 
