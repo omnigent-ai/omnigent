@@ -46,8 +46,11 @@ import { getSessionSlim, launchRunner } from "@/lib/sessionsApi";
  *   *source* session — its host is the default, its workspace the default
  *   directory, and when it used a git worktree a branch is suggested so the
  *   clone diverges onto its own worktree. When the source's host is offline
- *   there's nothing to launch on, so it falls back to the CLI reconnect
- *   command — the escape hatch ``ResumeChatDialog`` shows.
+ *   but the caller's own, there's nothing to launch on, so it falls back to
+ *   the CLI reconnect command — the escape hatch ``ResumeChatDialog`` shows.
+ *   A source host the caller cannot see at all (a cross-user fork; the hosts
+ *   list is owner-scoped) is unreachable rather than offline, so the dialog
+ *   offers the caller's own machines instead.
  *
  * - **Host-less session** (no ``sourceSessionId``): an imported session with
  *   no host/runner of its own. Prefills from ``prefill`` (the session's own
@@ -111,19 +114,26 @@ export function ResumeWithDirectoryDialog({
   );
   const sourceHostOnline = sourceHost?.status === "online";
   const onlineHosts = useMemo(() => (hosts ?? []).filter((h) => h.status === "online"), [hosts]);
+  const hostsLoaded = hosts !== undefined;
+  // GET /v1/hosts is owner-scoped, so a cross-user fork's source host is
+  // never in the caller's list. That host is unreachable for them — not
+  // "offline" — and reconnect guidance would point at a machine they can't
+  // touch, so route them to their own machines instead.
+  const sourceHostForeign = hostsLoaded && sourceHostId !== null && sourceHost === null;
 
   // Unified prefill: a fork reads its source session; a host-less session
   // reads the ``prefill`` its own snapshot supplied.
   const prefillWorkspace = hasSource ? source?.workspace : prefill?.workspace;
   const prefillBranch = hasSource ? source?.gitBranch : prefill?.gitBranch;
   // Default host: the source's host (fork, only if online — otherwise the CLI
-  // fallback fires) or, for a host-less session, its own recorded host when
-  // still online, else the caller's current (most-recent) online machine.
+  // fallback fires), unless that host is foreign — then, like a host-less
+  // session, prefer the recorded host when still online, else the caller's
+  // current (most-recent) online machine.
   const defaultHostId = useMemo(() => {
-    if (hasSource) return sourceHostOnline ? sourceHostId : null;
+    if (hasSource && !sourceHostForeign) return sourceHostOnline ? sourceHostId : null;
     const preferred = onlineHosts.find((h) => h.host_id === prefill?.hostId);
     return (preferred ?? onlineHosts[0])?.host_id ?? null;
-  }, [hasSource, sourceHostOnline, sourceHostId, onlineHosts, prefill?.hostId]);
+  }, [hasSource, sourceHostForeign, sourceHostOnline, sourceHostId, onlineHosts, prefill?.hostId]);
 
   const [selectedHostId, setSelectedHostId] = useState<string | null>(null);
   const [workspace, setWorkspace] = useState("");
@@ -252,18 +262,22 @@ export function ResumeWithDirectoryDialog({
     }
   }
 
-  // No runner can be launched when the source's host is offline (CUJ 1
-  // same-user resumes on the original host). Surface the reconnect
-  // command instead — once the host is back, retrying opens the picker.
+  // No runner can be launched when the source's host is the caller's own
+  // and offline (CUJ 1 same-user resumes on the original host). Surface the
+  // reconnect command instead — once the host is back, retrying opens the
+  // picker. A foreign source host is excluded: the caller can't reconnect a
+  // machine they don't own, so they get their own machines below instead.
   // Gate on the hosts list having loaded: until then `sourceHostOnline`
   // is falsy only because we don't KNOW the host's status yet, and
   // flashing the CLI fallback for an online source host would be wrong.
-  const hostsLoaded = hosts !== undefined;
-  const showCliFallback = !sourceLoading && hostsLoaded && source != null && !sourceHostOnline;
+  const showCliFallback =
+    !sourceLoading && hostsLoaded && source != null && !sourceHostOnline && !sourceHostForeign;
   const loading = (hasSource && sourceLoading) || !hostsLoaded;
-  // Host-less sessions have no source host to reconnect, so there's no CLI
-  // fallback: when the caller owns no online machine, say so plainly.
-  const noOnlineHosts = !hasSource && hostsLoaded && onlineHosts.length === 0;
+  // Host-less sessions and foreign-source forks have no source host the
+  // caller could reconnect, so there's no CLI fallback: when they own no
+  // online machine, say so plainly.
+  const noOnlineHosts =
+    (!hasSource || sourceHostForeign) && hostsLoaded && onlineHosts.length === 0;
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
