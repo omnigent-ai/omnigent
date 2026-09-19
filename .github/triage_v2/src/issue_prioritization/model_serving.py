@@ -12,6 +12,8 @@ def serving_endpoint_classifier(
     areas: AreaCatalog,
     workspace: WorkspaceClient | None = None,
     duplicate_candidates: tuple[dict[str, object], ...] = (),
+    *,
+    review_bugs: bool = False,
 ) -> PromptClassifier:
     if not endpoint:
         raise ValueError("model_endpoint is required when issue classifications are missing")
@@ -21,7 +23,7 @@ def serving_endpoint_classifier(
         response = workspace.serving_endpoints.query(
             endpoint,
             messages=[ChatMessage(role=ChatMessageRole.USER, content=prompt)],
-            max_tokens=2048,
+            max_tokens=4096 if review_bugs else 2048,
         )
         if not response.choices:
             raise RuntimeError("model endpoint returned no choices")
@@ -32,4 +34,4 @@ def serving_endpoint_classifier(
             return choice.text
         raise RuntimeError("model endpoint returned an empty response")
 
-    return PromptClassifier(query, areas, duplicate_candidates)
+    return PromptClassifier(query, areas, duplicate_candidates, review_bugs=review_bugs)

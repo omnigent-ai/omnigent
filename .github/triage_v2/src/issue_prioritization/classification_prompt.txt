@@ -29,14 +29,13 @@ investigate the claimed failure through any one of:
 - direct steps that exercise the failure;
 - a specific intermittent observation with useful context;
 - a controlled test or comparison that isolates the behavior;
-- diagnostic evidence such as logs, errors, session IDs, or screenshots; or
-- code analysis naming a reachable path and its concrete incorrect impact.
+- diagnostic evidence such as logs, errors, session IDs, or screenshots.
+
+$code_analysis_guidance
 
 Mark a bug needs_info only when the report lacks enough evidence to investigate.
-For example, a code-quality concern that does not claim incorrect behavior is
-usually a Feature, not an incomplete Bug. A defensive code-path report can be
-sufficient when it explains reachability and impact; never reject it merely
-because nobody ran the path end to end. Populate missing_information with every
+$bug_type_guidance
+Populate missing_information with every
 concrete category the author needs to add.
 
 Impact rubric:
@@ -90,3 +89,5 @@ $body
 
 Candidate duplicates:
 $duplicate_candidates
+
+$bug_review_rubric

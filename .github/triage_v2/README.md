@@ -116,6 +116,27 @@ later author comment reopens the issue and, while V2 is enabled, runs it again.
 Reopening remains available during a V2 rollback so closed reports are not
 trapped behind the classifier switch.
 
+## Optional bug review
+
+The issue-event workflow can apply three decisions to Bugs: keep observed failures
+open (adding a concise summary and grounded reproduction steps when hard to read),
+request clarification through the existing `needs-info` process when observation
+is unclear, or explain and close clearly speculative/unexecuted findings.
+
+Enable it locally with `issue-priority-event --review-bugs --mode dry_run` and the
+arguments above. Inspect the decision and proposed comment in `event.json`.
+Automatic event runs use
+`ISSUE_TRIAGE_BUG_REVIEW_ENABLED` (default `false`). Feature/Docs and the periodic
+job keep their existing assessment.
+
+One model call assesses the full report and author follow-ups. Closure requires
+an exact supporting quote and live content checks. Security/duplicate/pinned issues
+remain exempt. Reports over 100,000 characters are skipped for manual review.
+If a reproduction quote cannot be verified, omit the rewritten steps and keep
+the valid assessment and summary; closure quotes still require an exact match.
+Immediate closures remove `needs-info` and ask reporters to open a new issue if
+they observe the failure. Model assessment does not reproduce or verify the bug.
+
 ## Databricks dry-run
 
 The bundle defines a paused trigger on updates to `github_issues_bronze`. It

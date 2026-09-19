@@ -171,6 +171,9 @@ def write_event_status(
             "evidence_kind": classification.evidence_kind.value,
             "information_status": classification.information_status.value,
             "missing_information": [item.value for item in classification.missing_information],
+            "bug_review": classification.bug_review.as_dict()
+            if classification.bug_review
+            else None,
         },
         "score": _score_payload(decision),
         "mutation": _mutation_payload(plan),
@@ -231,7 +234,9 @@ def _mutation_payload(plan: MutationPlan) -> dict[str, object]:
             "components": list(plan.target.components),
             "issue_type": plan.target.issue_type,
             "needs_info": plan.target.needs_info,
+            "close_as_non_actionable": plan.target.close_as_non_actionable,
         },
+        "close_as_non_actionable": plan.close_as_non_actionable,
         "labels_add": list(plan.labels_add),
         "labels_remove": list(plan.labels_remove),
         "blocked": list(plan.blocked),
@@ -288,6 +293,9 @@ def main() -> None:
     parser.add_argument("--maintainers", type=Path)
     parser.add_argument("--close-duplicates", action="store_true")
     parser.add_argument("--post-duplicate-comments", action="store_true")
+    parser.add_argument(
+        "--review-bugs", action="store_true", help="Enable the bug review prototype"
+    )
     args = parser.parse_args()
     if args.issue_number <= 0:
         raise ValueError("issue_number must be positive")
@@ -322,6 +330,7 @@ def main() -> None:
             args.model_endpoint,
             areas,
             duplicate_candidates=duplicate_candidates,
+            review_bugs=args.review_bugs,
         ),
         config,
         areas,
@@ -330,7 +339,7 @@ def main() -> None:
         mode,
     )
     intake_plan = None
-    if args.intake:
+    if args.intake and not run.mutations[0].close_as_non_actionable:
         live_issue = client.issue_data(issue.number)
         intake_plan = plan_intake(
             issue,
@@ -413,7 +422,11 @@ def main() -> None:
             args.model_endpoint,
             args.source_revision,
             issue.labels,
-            status="applied",
+            status=(
+                "skipped_stale"
+                if "non_actionable_stale_assessment" in applied_plans[0].blocked
+                else "applied"
+            ),
             labels_after=labels_after,
             plan=applied_plans[0],
             decision=decision,

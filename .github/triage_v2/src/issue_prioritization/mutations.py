@@ -4,7 +4,8 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from issue_prioritization.artifacts import RankedIssue
-from issue_prioritization.domain import InformationStatus, Priority
+from issue_prioritization.bug_review import BugActionability
+from issue_prioritization.domain import InformationStatus, IssueType, Priority
 from issue_prioritization.labels import LEGACY_SEVERITY_LABELS, LabelManifest
 
 
@@ -36,6 +37,7 @@ class MutationTarget:
     components: tuple[str, ...]
     issue_type: str | None = None
     needs_info: bool | None = None
+    close_as_non_actionable: bool = False
 
 
 @dataclass(frozen=True)
@@ -45,6 +47,12 @@ class MutationPlan:
     labels_remove: tuple[str, ...]
     blocked: tuple[str, ...]
     next_state: BotState
+
+    @property
+    def close_as_non_actionable(self) -> bool:
+        return self.target.close_as_non_actionable and not any(
+            reason.startswith("non_actionable_") for reason in self.blocked
+        )
 
 
 class MutationPlanner:
@@ -102,6 +110,15 @@ class MutationPlanner:
         labels_add: set[str] = set()
         labels_remove = existing & LEGACY_SEVERITY_LABELS
         blocked: list[str] = []
+        if target.close_as_non_actionable:
+            if target.issue_type != "Bug":
+                raise ValueError("non-actionable closure applies only to bugs")
+            lifecycle_labels = {label.casefold() for label in existing}
+            blocked.extend(
+                f"non_actionable_{label}_exempt"
+                for label in ("security", "duplicate", "pinned")
+                if label in lifecycle_labels
+            )
 
         if target.issue_type is not None:
             type_labels = {"Bug", "Feature", "Docs"}
@@ -169,12 +186,22 @@ class MutationPlanner:
 
 
 def target_from_ranked(item: RankedIssue) -> MutationTarget:
+    review = item.issue.bug_review
+    close_as_non_actionable = (
+        item.issue.issue_type == IssueType.BUG
+        and review is not None
+        and review.actionability == BugActionability.NON_ACTIONABLE
+    )
     return MutationTarget(
         issue_number=item.issue.number,
         priority=item.result.priority.value,
         components=item.issue.component_labels,
         issue_type=item.issue.issue_type.label,
-        needs_info=item.issue.information_status == InformationStatus.NEEDS_INFO,
+        needs_info=(
+            item.issue.information_status == InformationStatus.NEEDS_INFO
+            and not close_as_non_actionable
+        ),
+        close_as_non_actionable=close_as_non_actionable,
     )
 
 

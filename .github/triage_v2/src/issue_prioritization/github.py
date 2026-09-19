@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from dataclasses import replace
 from typing import Protocol
 from urllib.error import HTTPError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
+from issue_prioritization.artifacts import RankedIssue
 from issue_prioritization.bronze import BronzeIssue
 from issue_prioritization.comments import (
     COMMENT_MARKER,
@@ -20,8 +22,9 @@ from issue_prioritization.mutations import (
     MutationPlan,
     MutationPlanner,
     MutationTarget,
+    target_from_ranked,
 )
-from issue_prioritization.pipeline import PipelineRun
+from issue_prioritization.pipeline import PipelineMode, PipelineRun
 
 DUPLICATE_COMMENT_MARKER = "<!-- omnigent-duplicate-check -->"
 
@@ -29,6 +32,10 @@ DUPLICATE_COMMENT_MARKER = "<!-- omnigent-duplicate-check -->"
 class GitHubNotFound(RuntimeError):
     """A GitHub resource returned 404 — e.g. an issue deleted or transferred out
     of the repo since the bronze snapshot. Callers may skip it, not fail."""
+
+
+class StaleBugAssessment(RuntimeError):
+    """The report changed or closed after its bug assessment."""
 
 
 class GitHubLabels(Protocol):
@@ -44,6 +51,12 @@ class GitHubLabels(Protocol):
     ) -> None: ...
 
     def upsert_issue_comment(self, issue_number: int, body: str) -> int: ...
+
+    def open_issue(self, issue_number: int) -> BronzeIssue | None:
+        """Return an open issue with its author's follow-ups, or None."""
+
+    def close_issue(self, issue_number: int) -> None:
+        """Close the issue as not planned."""
 
 
 class PriorityLabelHistory(Protocol):
@@ -219,7 +232,7 @@ class GitHubClient:
 
     def open_issue(self, issue_number: int) -> BronzeIssue | None:
         value = self.issue_data(issue_number)
-        if value.get("state") != "open" or "pull_request" in value:
+        if "pull_request" in value or value.get("state") != "open":
             return None
         author = value.get("user")
         author_login = str(author.get("login", "")) if isinstance(author, dict) else ""
@@ -253,9 +266,9 @@ class GitHubClient:
                 login = str(user.get("login", "")) if isinstance(user, dict) else ""
                 body = str(comment.get("body") or "").strip()
                 if login.casefold() == author_login.casefold() and body:
-                    comments.append(body[:4000])
+                    comments.append(body)
             if len(value) < 100:
-                return tuple(comments[-5:])
+                return tuple(comments)
             page += 1
 
     def apply_labels(
@@ -414,15 +427,19 @@ class GitHubMutationSink:
         self.apply_with_plans(run)
 
     def apply_with_plans(self, run: PipelineRun) -> tuple[MutationPlan, ...]:
+        if run.mode != PipelineMode.APPLY:
+            raise ValueError("GitHub mutations require apply mode")
         self.client.sync_missing_labels(self.manifest)
         ranked = {item.issue.number: item for item in run.ranked}
         states = self.states.load()
         updated = []
         applied = []
         skipped: list[int] = []
+        stale: list[int] = []
         try:
             for proposed in run.mutations:
                 issue_number = proposed.target.issue_number
+                labels_written = False
                 try:
                     current_labels = self.client.issue_labels(issue_number)
                     state = self.planner.resolve_state(
@@ -434,9 +451,12 @@ class GitHubMutationSink:
                     if self.target_resolver is not None:
                         target = self.target_resolver(target, current_labels, state)
                     plan = self.planner.plan_one(target, current_labels, state)
+                    item = ranked.get(issue_number)
+                    if plan.close_as_non_actionable:
+                        self._check_non_actionable_closure(item)
                     if plan.labels_add or plan.labels_remove:
                         self.client.apply_labels(issue_number, plan.labels_add, plan.labels_remove)
-                    applied.append(plan)
+                    labels_written = True
                     previous = states.get(issue_number)
                     if plan.next_state != previous and (
                         previous is not None or plan.next_state.has_ownership
@@ -444,11 +464,27 @@ class GitHubMutationSink:
                         updated.append(plan.next_state)
                     states[issue_number] = plan.next_state
                     labels_after = _labels_after(current_labels, plan)
-                    if item := ranked.get(issue_number):
+                    if item is not None:
                         self.client.upsert_issue_comment(
                             issue_number,
                             build_triage_comment(item, plan, labels_after, run.scored_at),
                         )
+                        if plan.close_as_non_actionable:
+                            # Recheck edits and author replies after posting the explanation.
+                            self._check_non_actionable_closure(item)
+                            self.client.close_issue(issue_number)
+                    applied.append(plan)
+                except StaleBugAssessment:
+                    stale.append(issue_number)
+                    applied.append(
+                        replace(
+                            plan,
+                            labels_add=plan.labels_add if labels_written else (),
+                            labels_remove=plan.labels_remove if labels_written else (),
+                            blocked=(*plan.blocked, "non_actionable_stale_assessment"),
+                            next_state=states.get(issue_number, BotState(issue_number, None, ())),
+                        )
+                    )
                 except GitHubNotFound:
                     # The bronze snapshot lags GitHub: an issue deleted or
                     # transferred since ingestion 404s on this live re-check.
@@ -460,7 +496,18 @@ class GitHubMutationSink:
             print(
                 f"Skipped {len(skipped)} issue(s) gone from GitHub (deleted/transferred): {skipped}"
             )
+        if stale:
+            print(f"Skipped automatic closure for changed or closed issues; rerun triage: {stale}")
         return tuple(applied)
+
+    def _check_non_actionable_closure(self, item: RankedIssue | None) -> None:
+        if item is None or not target_from_ranked(item).close_as_non_actionable:
+            raise ValueError("closure requires a current non-actionable bug assessment")
+        live = self.client.open_issue(item.issue.number)
+        if live is None or live.content().content_hash != item.issue.classification_content_hash:
+            raise StaleBugAssessment(
+                f"Issue #{item.issue.number} changed or closed since classification; rerun triage"
+            )
 
 
 def _labels_after(current: tuple[str, ...], plan: MutationPlan) -> tuple[str, ...]:

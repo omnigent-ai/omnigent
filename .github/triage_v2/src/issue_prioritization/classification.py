@@ -3,12 +3,13 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from importlib.resources import files
 from string import Template
 from typing import Protocol
 
 from issue_prioritization.areas import AreaCatalog
+from issue_prioritization.bug_review import BugActionability, BugReview
 from issue_prioritization.domain import (
     EvidenceKind,
     Impact,
@@ -19,6 +20,7 @@ from issue_prioritization.domain import (
 )
 
 _PRIORITY_LABELS = {priority.value for priority in Priority}
+MAX_BUG_REVIEW_CHARACTERS = 100_000
 _TYPE_LABELS = {
     "bug": IssueType.BUG,
     "feature": IssueType.ENHANCEMENT,
@@ -72,6 +74,7 @@ class Classification:
     similar_issues: tuple[int, ...] = ()
     duplicate_confidence: float = 0.0
     duplicate_reasoning: str = ""
+    bug_review: BugReview | None = None
 
 
 class Classifier(Protocol):
@@ -84,13 +87,18 @@ class PromptClassifier:
         query: Callable[[str], str],
         areas: AreaCatalog,
         duplicate_candidates: tuple[dict[str, object], ...] = (),
+        *,
+        review_bugs: bool = False,
     ) -> None:
         self.query = query
         self.areas = areas
         self.duplicate_candidates = duplicate_candidates
+        self.review_bugs = review_bugs
 
     def classify(self, issue: IssueContent) -> Classification:
-        response = self.query(build_prompt(issue, self.areas, self.duplicate_candidates))
+        response = self.query(
+            build_prompt(issue, self.areas, self.duplicate_candidates, review_bugs=self.review_bugs)
+        )
         value = _parse_json_object(response)
         area_keys = tuple(
             key for key in _string_list(value.get("area_keys")) if key in self.areas.by_key
@@ -102,13 +110,46 @@ class PromptClassifier:
         evidence_kind, information_status, missing_information = _information_assessment(
             issue_type, value
         )
+        bug_review = None
+        reasoning = str(value.get("reasoning", ""))
+        if self.review_bugs and issue_type == IssueType.BUG:
+            bug_review = BugReview.from_mapping(value.get("bug_review"))
+            actionable = bug_review.actionability == BugActionability.ACTIONABLE
+            if actionable != (information_status == InformationStatus.SUFFICIENT):
+                raise ValueError("bug actionability disagrees with information status")
+            if actionable and missing_information:
+                raise ValueError("an actionable bug cannot require missing information")
+            non_actionable = bug_review.actionability == BugActionability.NON_ACTIONABLE
+            if evidence_kind == EvidenceKind.CODE_ANALYSIS and actionable:
+                raise ValueError("code-only evidence cannot establish an actionable bug")
+            if non_actionable and evidence_kind not in (
+                EvidenceKind.CODE_ANALYSIS,
+                EvidenceKind.NONE,
+            ):
+                raise ValueError("a non_actionable bug cannot claim observed failure evidence")
+            bug_review = bug_review.validate_source(issue.body)
+            if non_actionable and bug_review.source_only_quote is None:
+                bug_review = replace(
+                    bug_review,
+                    actionability=BugActionability.NEEDS_INFO,
+                    reason="Did the described failure actually occur, or was it inferred from "
+                    "source code? Please describe what you did and what happened.",
+                    source_only_quote=None,
+                )
+                reasoning = (
+                    "The report needs clarification about the observed behavior "
+                    "before its impact can be assessed."
+                )
+                missing_information = tuple(
+                    dict.fromkeys((*missing_information, MissingInformation.OBSERVED_BEHAVIOR))
+                )
         return Classification(
             issue_number=issue.number,
             issue_type=issue_type,
             impact=Impact.parse(value.get("impact", value.get("severity"))),
             area_keys=area_keys,
             component_labels=component_labels,
-            reasoning=str(value.get("reasoning", "")),
+            reasoning=reasoning,
             content_hash=issue.content_hash,
             reported_type=reported_issue_type(issue.labels),
             evidence_kind=evidence_kind,
@@ -120,6 +161,7 @@ class PromptClassifier:
             similar_issues=tuple(_int_list(value.get("similar_issues"))),
             duplicate_confidence=_confidence(value.get("duplicate_confidence")),
             duplicate_reasoning=str(value.get("duplicate_reasoning") or ""),
+            bug_review=bug_review,
         )
 
 
@@ -127,7 +169,13 @@ def build_prompt(
     issue: IssueContent,
     areas: AreaCatalog,
     duplicate_candidates: tuple[dict[str, object], ...] = (),
+    *,
+    review_bugs: bool = False,
 ) -> str:
+    if review_bugs and len(issue.title) + len(issue.body) > MAX_BUG_REVIEW_CHARACTERS:
+        raise ValueError(
+            "Report exceeds the complete-evidence review limit; manual review required"
+        )
     area_lines = [
         f"- {area.key}: label={area.issue_label}. {area.definition}"
         for area in sorted(areas.by_key.values(), key=lambda item: item.key)
@@ -138,7 +186,33 @@ def build_prompt(
         title=issue.title,
         labels=", ".join(issue.labels) if issue.labels else "none",
         author=issue.author,
-        body=issue.body[:12000],
+        body=issue.body if review_bugs else issue.body[:12000],
+        code_analysis_guidance=(
+            "Code analysis alone is not usable evidence of an observed user-facing failure. "
+            "Apply the bug review below: close clearly source-only concerns as non_actionable, "
+            "even when they predict a concrete consequence. If a concrete failure report "
+            "leaves it unclear whether the symptom was observed, use needs_info; missing "
+            "logs or a reproduction statement alone do not establish speculation."
+            if review_bugs
+            else "Code analysis naming a reachable path and its concrete incorrect impact "
+            "can also be sufficient. A defensive code-path report can be sufficient when "
+            "it explains reachability and impact; never reject it merely because nobody "
+            "ran the path end to end."
+        ),
+        bug_type_guidance=(
+            "An alleged failure remains a Bug even when its trigger or impact is speculative "
+            "or unsupported; use the bug review below to assess it. Reclassify as Feature "
+            "only when the author actually requests a new capability or refactoring, rather "
+            "than merely alleging a possible failure. Missing evidence is not a feature request."
+            if review_bugs
+            else "For example, a code-quality concern that does not claim incorrect behavior "
+            "is usually a Feature, not an incomplete Bug."
+        ),
+        bug_review_rubric=(
+            files("issue_prioritization").joinpath("bug_review_prompt.txt").read_text()
+            if review_bugs
+            else ""
+        ),
         duplicate_candidates=(
             json.dumps(duplicate_candidates, ensure_ascii=False, indent=2)
             if duplicate_candidates
@@ -148,18 +222,25 @@ def build_prompt(
 
 
 def _parse_json_object(value: str) -> Mapping[str, object]:
-    cleaned = value.replace("```json", "").replace("```", "").strip()
-    decoder = json.JSONDecoder()
-    for index, character in enumerate(cleaned):
-        if character != "{":
-            continue
+    cleaned = value.strip()
+    if cleaned.startswith("```"):
+        lines = cleaned.splitlines()
+        if lines[0].strip() not in ("```", "```json") or lines[-1].strip() != "```":
+            raise ValueError("classifier returned an invalid JSON code fence")
+        cleaned = "\n".join(lines[1:-1])
+    while True:
         try:
-            parsed, _ = decoder.raw_decode(cleaned, index)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(parsed, Mapping):
-            return parsed
-    raise ValueError("classifier did not return a JSON object")
+            parsed = json.loads(cleaned)
+            break
+        except json.JSONDecodeError as error:
+            prefix = cleaned[: error.pos].rstrip()
+            if cleaned[error.pos : error.pos + 1] not in ("}", "]") or not prefix.endswith(","):
+                raise ValueError("classifier returned invalid JSON") from error
+            # Repair only the trailing comma identified by the decoder, outside strings.
+            cleaned = prefix[:-1] + cleaned[error.pos :]
+    if not isinstance(parsed, Mapping):
+        raise ValueError("classifier did not return a JSON object")
+    return parsed
 
 
 def _issue_type(value: object) -> IssueType:
