@@ -185,6 +185,23 @@ def resolve_bound_provider(
     return replace(provider, families=families)
 
 
+def validate_bound_agent_model(config: dict[str, object], harness: str, model: str | None) -> None:
+    """Reject an incompatible explicit pin independently of the session selection."""
+    if model is None:
+        return
+    harness = normalize_inference_harness(harness)
+    binding = binding_for_harness(config, harness)
+    if binding is None or binding.model_allowlist is None:
+        return
+    if model not in binding.model_allowlist:
+        raise OmnigentError(
+            f"Agent executor.model {model!r} is not allowed for harness {harness!r}. "
+            "Remove executor.model or change it to a model in "
+            "this harness's configured allowlist.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+
+
 def resolve_bound_model(config: dict[str, object], harness: str, model: str | None) -> str | None:
     """Choose and validate a literal model ID within the saved harness policy."""
     binding = binding_for_harness(config, harness)

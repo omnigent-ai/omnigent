@@ -13133,10 +13133,15 @@ def _build_spawn_env_from_spec(
     requested_harness = harness
     harness = canonicalize_harness(harness) or harness
     effective_spec = spec
-    from omnigent.inference_config import load_runtime_inference_config, parse_inference_config
+    from omnigent.inference_config import (
+        load_runtime_inference_config,
+        parse_inference_config,
+        validate_bound_agent_model,
+    )
 
-    has_inference_bindings = bool(parse_inference_config(load_runtime_inference_config()))
-    if has_inference_bindings and dataclasses.is_dataclass(spec):
+    inference_config = load_runtime_inference_config()
+    has_inference_bindings = bool(parse_inference_config(inference_config))
+    if has_inference_bindings:
         declared_harness = str(spec.executor.config.get("harness") or "")
         identity = (
             requested_harness
@@ -13145,14 +13150,16 @@ def _build_spawn_env_from_spec(
             if harness == "acp" and declared_harness.startswith("acp:")
             else harness
         )
-        effective_spec = dataclasses.replace(
-            spec,
-            executor=dataclasses.replace(
-                spec.executor,
-                config={**spec.executor.config, "harness": identity},
-                model=model_override if model_override is not None else spec.executor.model,
-            ),
-        )
+        validate_bound_agent_model(inference_config, identity, spec.executor.model)
+        if dataclasses.is_dataclass(spec):
+            effective_spec = dataclasses.replace(
+                spec,
+                executor=dataclasses.replace(
+                    spec.executor,
+                    config={**spec.executor.config, "harness": identity},
+                    model=model_override if model_override is not None else spec.executor.model,
+                ),
+            )
     if model_override is not None:
         executor = getattr(spec, "executor", None)
         if (
