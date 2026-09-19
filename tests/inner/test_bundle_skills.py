@@ -75,52 +75,94 @@ def _make_bundle_with_skill(root: Path) -> Path:
 
 
 @pytest.mark.parametrize(
-    "skills_filter, expect_setting_sources",
+    "skills_filter, include_workspace_settings, expect_setting_sources",
     [
-        # "all" → host skills via the CLI default; no explicit override.
-        pytest.param("all", False, id="all"),
-        # "none" → suppress host skills with empty setting-sources.
-        pytest.param("none", True, id="none"),
+        # "none" → suppress host skills with empty setting-sources, whatever
+        # the workspace-settings gate says (the "none" branch wins).
+        pytest.param("none", False, "", id="none-default"),
+        pytest.param("none", True, "", id="none-workspace"),
+        # "all" with the workspace-settings gate open → the CLI's default
+        # sources; no explicit --setting-sources override.
+        pytest.param("all", True, None, id="all-workspace"),
+        # "all" with the gate closed (the default) → workspace-scoped sources
+        # are dropped, keeping only the user scope.
+        pytest.param("all", False, "user", id="all-default"),
         # list → like "all" for host sources (no per-name CLI allowlist);
         # bundle skills still load via --plugin-dir.
-        pytest.param(["only"], False, id="list"),
+        pytest.param(["only"], True, None, id="list-workspace"),
+        pytest.param(["only"], False, "user", id="list-default"),
     ],
 )
 def test_claude_native_skill_args_with_bundle(
     tmp_path: Path,
     skills_filter: str | list[str],
-    expect_setting_sources: bool,
+    include_workspace_settings: bool,
+    expect_setting_sources: str | None,
 ) -> None:
     """
     A bundle with ``skills/`` yields ``--plugin-dir <bundle>`` (the CLI
     plugin convention loads ``<bundle>/skills/<dir>/SKILL.md``) and a
-    written manifest. ``--setting-sources ""`` appears only for ``"none"``
-    — the SDK-parity gate on host skills.
+    written manifest. ``--setting-sources`` follows the SDK-parity host-skill
+    gate *and* the workspace-settings gate: ``""`` suppresses host skills for
+    ``"none"``; otherwise the default (``include_workspace_settings=False``)
+    restricts sources to ``user`` and only ``include_workspace_settings=True``
+    keeps the CLI's default sources.
 
     :param tmp_path: Pytest temp dir.
     :param skills_filter: The spec's ``skills_filter`` under test.
-    :param expect_setting_sources: Whether ``--setting-sources`` should be
-        emitted (only the ``"none"`` filter suppresses host skills).
+    :param include_workspace_settings: Whether workspace-scoped sources load.
+    :param expect_setting_sources: Expected ``--setting-sources`` value, or
+        ``None`` when the flag should be absent (the CLI's default sources).
     """
     bundle = _make_bundle_with_skill(tmp_path)
-    args = claude_native_skill_args(bundle, agent_name="researcher", skills_filter=skills_filter)
+    args = claude_native_skill_args(
+        bundle,
+        agent_name="researcher",
+        skills_filter=skills_filter,
+        include_workspace_settings=include_workspace_settings,
+    )
 
     assert "--plugin-dir" in args
     assert args[args.index("--plugin-dir") + 1] == str(bundle)
     assert (tmp_path / "bundle" / ".claude-plugin" / "plugin.json").is_file()
-    if expect_setting_sources:
-        assert args[args.index("--setting-sources") + 1] == ""
-    else:
+    if expect_setting_sources is None:
         assert "--setting-sources" not in args
+    else:
+        assert args[args.index("--setting-sources") + 1] == expect_setting_sources
+
+
+def test_claude_native_skill_args_default_drops_workspace_settings(tmp_path: Path) -> None:
+    """
+    Security regression: with its default arguments (``skills_filter="all"``,
+    ``include_workspace_settings=False``) the native launch restricts Claude's
+    setting sources to ``user`` — never the workspace scope.
+
+    A launch that pre-accepts Claude's workspace-trust dialog
+    (``ensure_claude_workspace_trusted``) must not also let an unreviewed
+    workspace's ``.claude/settings.json`` (e.g. a ``SessionStart`` hook) run
+    at startup. Dropping the workspace-scoped sources is what prevents that,
+    so this must hold for the *default* argument shape, not only when a caller
+    opts in.
+    """
+    bundle = _make_bundle_with_skill(tmp_path)
+
+    args = claude_native_skill_args(bundle, agent_name="researcher")
+
+    assert "--setting-sources" in args
+    assert args[args.index("--setting-sources") + 1] == "user"
+    # No-bundle default path is likewise scoped to user only.
+    assert claude_native_skill_args(None) == ["--setting-sources", "user"]
 
 
 def test_claude_native_skill_args_no_bundle_is_empty() -> None:
     """
-    With no bundle (the ``omnigent claude`` CLI path), no plugin args are
+    With no bundle (the ``omnigent claude`` CLI path) and the workspace-trust
+    gate intact (``include_workspace_settings=True``), no plugin args are
     produced under the default ``"all"`` filter — Claude launches with its
-    own host config untouched.
+    own host config untouched, its own trust dialog still gating workspace
+    settings. This is the local wrapper's contract.
     """
-    assert claude_native_skill_args(None) == []
+    assert claude_native_skill_args(None, include_workspace_settings=True) == []
 
 
 def test_claude_native_skill_args_bundle_without_skills_dir(tmp_path: Path) -> None:
