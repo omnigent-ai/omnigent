@@ -7,8 +7,17 @@ reproduction verdict, the per-facet breakdown, the journey, and the authored e2e
 test), then does one of two things:
 
 - **If an open PR already fixes the bug**, it **reviews that PR** — checks out the
-  PR, runs the repro test against it, and reviews the diff — instead of writing a
-  competing fix.
+  PR, runs the repro test against it, and reviews the full diff for quality and
+  scope — instead of writing a competing fix. One concrete failure or requested
+  outcome may require changes across layers; independent fixes or features must
+  be removed or split out. Every Polly review includes a structured scope
+  assessment, which Resolve validates before approval or handoff.
+  Polly reports clearly unrelated work as blocking and uncertain scope as
+  non-blocking clarification questions. A missing issue link alone is not a
+  scope finding. The workflow succeeds with findings, while Resolve requires a
+  clear assessment before approval.
+  Resolve's validation applies to its existing-PR review path. Repository merge
+  requirements are unchanged.
 - **If no fix exists yet**, it **authors the fix** in a fresh worktree, adds
   targeted tests at the layer it changed, proves the set goes fail→pass, opens a
   ready-for-review PR, and then **drives that PR to a landable state** — a live

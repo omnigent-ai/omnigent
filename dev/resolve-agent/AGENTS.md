@@ -452,10 +452,32 @@ reproduction test is your objective instrument.
    "Best" means the strongest maintainable fit for this codebase and bug, not a
    license to replace a sound, idiomatic contribution with a theoretically purer
    rewrite or a personal style preference.
+
+   **Check the full PR for scope**, including changes made before you arrived.
+   Establish one concrete reported failure or requested outcome and its
+   acceptance criteria from `bug_url` and the PR's linked issue. Different
+   layers or root causes can contribute to that outcome. If the issue bundles
+   independent problems, ask the author to split them or track them separately;
+   stop with `needs_more_info` if the intended scope is unclear.
+
+   For each change, ask whether removing it would leave the intended fix
+   incomplete, incorrect, unsafe, or inadequately tested or documented.
+   Necessary refactors and repairs for regressions introduced by this PR belong
+   with the fix. Independent features, bug fixes, cleanup, and upgrades do not,
+   even in the same file or when tests pass. Identify the unrelated files/hunks
+   and remove clearly separable changes when branch edits are permitted;
+   otherwise ask the author to split or remove them. Do not guess when changes
+   are entangled. Carry only in-scope work into any fork takeover.
+
+   Require the independent, structured scope assessment in Step 4.3 before
+   approving or handing off this existing PR. While iterating on its CI or review
+   findings, keep your own edits within the same scope. Unresolved unrelated or
+   uncertain changes block approval; record them in the review and `fix_summary`.
 5. **Report on the existing PR.** Post your fail→pass (or fail→still-fails) result
    and any diff concerns now as a `gh pr comment` / `gh pr review --comment`, and
    record its `pr_url` in your output. The `outcome` reflects what you found
-   (`fixed` when the PR resolves every live facet and the diff is sound;
+   (`fixed` when the PR resolves every live facet, the diff is sound, and the
+   scope assessment passes;
    `partially_fixed` / `not_fixed` otherwise, with specifics). **Default to
    commenting, not competing** — if the PR is close and its approach is sound,
    review it and let the author iterate; don't open a rival PR over fixable nits.
@@ -470,7 +492,8 @@ reproduction test is your objective instrument.
    *indicator* for that maintainer. Choose:
    - **`fixed` and you never pushed to or authored this code** (pure reviewer: the
      repro test passes against the PR as-is, CI green, Polly clean, **the branch is
-     mergeable** — not `CONFLICTING`/`DIRTY` — and no fix from you was needed) →
+     mergeable** — not `CONFLICTING`/`DIRTY` — the scope assessment passes for the
+     current PR, and no fix from you was needed) →
      submit an **approving** review: `gh pr review <pr> --approve
      --body '…'`. A genuine independent verification — the "someone checked it, take
      your pass" signal a maintainer wants. Note in the body that it's an automated
@@ -484,7 +507,8 @@ reproduction test is your objective instrument.
      that states the fail→pass evidence *and* that a Polly review could not be
      obtained, and let a maintainer take over the review from there.
    - **`not_fixed` / `partially_fixed`** → `gh pr review <pr> --request-changes
-     --body '…'` naming what still fails.
+     --body '…'` naming what still fails or which unrelated changes must be
+     removed or split out, even if the reproduction passes.
    - **You pushed fixes to this PR** (in-repo branch) **or took it over** (fork) →
      do **not** approve: that's self-approval of your own commits (branch
      protection rejects it anyway). Leave a `--comment` review and let a human
@@ -1101,6 +1125,17 @@ PR whose automatic run skipped:
 gh workflow run polly-review.yml -R omnigent-ai/omnigent -f pr=<pr>
 ```
 
+Every Polly review assesses the full diff against the original problem, with
+a scope statement and classifications for each changed file. Manual dispatches
+request a fresh assessment even when the head is unchanged. Polly reports
+clearly evidenced unrelated changes under **Blocking issues** and scope
+uncertainty under **Non-blocking notes** as clarification questions. A missing
+linked issue alone is not a scope finding. Neither category fails the review
+workflow. Resolve still requires certainty before approving an existing fix PR
+and must run the read-only check in Step 4.5 on the existing-PR review path:
+missing, malformed, stale, unrelated, or uncertain assessments block approval
+or handoff. A green workflow is not a passing scope assessment.
+
 Your App token carries `actions: write`, so this dispatch is expected to succeed;
 a `403` means the App lost that permission — record `polly_review` as "could not
 dispatch — App lacks actions:write" and flag it, rather than falling back to the
@@ -1205,6 +1240,21 @@ what you post. Keep the `validation_prompt` handoff field as the bare prompt tex
 lives in the PR body and the maintainer comment.
 
 ### 4.5 — Submit the final review verdict, then tag the maintainer
+
+On the existing-PR review path, recheck the scope assessment from the successful
+Polly run before approving or handing off. Save that run's review
+comment to `.omnigent/resolve-scope-review.txt` and run:
+
+```bash
+python3 dev/resolve-agent/scope_review.py check --repo <owner/repo> --pr <pr> \
+  --review .omnigent/resolve-scope-review.txt
+```
+
+This read-only check must exit zero against the current head and issue context.
+If stale, dispatch a fresh Polly review. If unrelated or uncertain
+changes remain, report `partially_fixed` / `not_fixed` with the scope findings
+and request changes instead of marking the PR ready. Do not rewrite Polly's
+assessment to make this check pass.
 
 When the branch is **mergeable** (4.2 — re-check `mergeable` now; `main` may have
 moved again since your last push), CI is green (4.2), **and** the automated review
