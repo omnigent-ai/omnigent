@@ -1453,7 +1453,17 @@ async def _auto_create_opencode_terminal(
         write_relay_bridge_config,
     )
     from omnigent.harnesses.opencode_native.forwarder import OpenCodeNativeForwarder
+    from omnigent.inference_config import (
+        binding_for_harness,
+        load_runtime_inference_config,
+        validate_bound_agent_model,
+    )
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
+
+    spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
+    config = load_runtime_inference_config()
+    if spec is not None and binding_for_harness(config, "opencode-native") is not None:
+        validate_bound_agent_model(config, "opencode-native", spec.executor.model)
 
     launch_config = await _opencode_native_launch_config(
         session_id=session_id,
@@ -2403,6 +2413,7 @@ async def _auto_create_pi_terminal(
         spec; callers must not pass ``None`` to paper over a resolution error.
     :returns: Created terminal resource view.
     """
+    _validate_native_agent_pin("pi-native", agent_spec)
     await _cancel_auto_forwarder_task(session_id)
     from omnigent.conversation_browser import conversation_url
     from omnigent.harnesses.pi_native.bridge import (
@@ -4439,6 +4450,7 @@ async def _auto_create_codex_terminal(
     from omnigent.inner.codex_executor import codex_extended_catalog_env
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
 
+    _validate_native_agent_pin("codex-native", agent_spec)
     launch_config = await _codex_native_launch_config(
         session_id=session_id,
         server_client=server_client,
@@ -6507,6 +6519,22 @@ def _pi_native_model_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) -> s
     return model if isinstance(model, str) and model else None
 
 
+def _validate_native_agent_pin(harness: str, agent_spec: AgentSpec | ResolvedSpec | None) -> None:
+    """Validate the original native agent pin before adapter side effects."""
+    if agent_spec is None:
+        return
+    from omnigent.inference_config import (
+        binding_for_harness,
+        load_runtime_inference_config,
+        validate_bound_agent_model,
+    )
+
+    spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
+    config = load_runtime_inference_config()
+    if binding_for_harness(config, harness) is not None:
+        validate_bound_agent_model(config, harness, spec.executor.model)
+
+
 def _cursor_native_resume_args(chat_id: str | None, existing_args: list[str]) -> list[str]:
     """Return ``["--resume", chat_id]`` for a cursor-native cold resume, or ``[]``.
 
@@ -7369,6 +7397,7 @@ async def _auto_create_claude_terminal(
         callers that create it on demand (the resume "ensure" path in
         :func:`create_session_terminal`) can return the resource.
     """
+    _validate_native_agent_pin("claude-native", agent_spec)
     from pathlib import Path
 
     from omnigent.harnesses.claude_native.bridge import (
@@ -7718,6 +7747,7 @@ async def _auto_create_claude_terminal(
         binding_for_harness,
         load_runtime_inference_config,
         resolve_bound_model,
+        validate_bound_agent_model,
     )
 
     inference_config = load_runtime_inference_config()
@@ -7766,6 +7796,9 @@ async def _auto_create_claude_terminal(
         else unpinned_launch_model
     )
     if claude_binding is not None:
+        validate_bound_agent_model(
+            inference_config, "claude-native", _claude_native_model_from_spec(agent_spec)
+        )
         unpinned_launch_model = resolve_bound_model(
             inference_config, "claude-native", _claude_native_model_from_spec(agent_spec)
         )
@@ -8893,6 +8926,18 @@ async def _launch_native_terminal(
                 ctx = await build_context(ctx)
             elif resolve_agent_spec is not None:
                 ctx = dataclasses.replace(ctx, agent_spec=await resolve_agent_spec())
+            from omnigent.inference_config import (
+                binding_for_harness,
+                load_runtime_inference_config,
+                validate_bound_agent_model,
+            )
+
+            spec = (
+                ctx.agent_spec.spec if isinstance(ctx.agent_spec, ResolvedSpec) else ctx.agent_spec
+            )
+            config = load_runtime_inference_config()
+            if spec is not None and binding_for_harness(config, harness_name) is not None:
+                validate_bound_agent_model(config, harness_name, spec.executor.model)
             await adapter(ctx)
             return True
         except Exception as exc:
@@ -9016,6 +9061,28 @@ async def _ensure_native_terminal(
         try:
             if build_context is not None:
                 ctx = await build_context(ctx)
+            from omnigent.inference_config import (
+                binding_for_harness,
+                load_runtime_inference_config,
+                validate_bound_agent_model,
+            )
+
+            spec = (
+                ctx.agent_spec.spec if isinstance(ctx.agent_spec, ResolvedSpec) else ctx.agent_spec
+            )
+            config = load_runtime_inference_config()
+            if spec is not None:
+                harness_candidates = (f"{agent.key}-native",)
+                bound_harness = next(
+                    (
+                        candidate
+                        for candidate in harness_candidates
+                        if binding_for_harness(config, candidate) is not None
+                    ),
+                    None,
+                )
+                if bound_harness is not None:
+                    validate_bound_agent_model(config, bound_harness, spec.executor.model)
             view = await adapter(ctx)
         except Exception as exc:
             if isinstance(exc, OmnigentError) and exc.code == ErrorCode.SESSION_AGENT_MISSING:

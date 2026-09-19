@@ -3578,6 +3578,7 @@ def resolve_native_codex_launch(
         load_runtime_inference_config,
         resolve_bound_model,
         resolve_bound_provider,
+        validate_bound_agent_model,
     )
     from omnigent.onboarding.ambient import codex_config_detection
     from omnigent.onboarding.detected import (
@@ -3601,6 +3602,9 @@ def resolve_native_codex_launch(
         explicit, "codex-native", spec.executor.auth if spec is not None else None
     )
     if bound is not None:
+        validate_bound_agent_model(
+            explicit, "codex-native", spec.executor.model if spec is not None else None
+        )
         selected = resolve_bound_model(explicit, "codex-native", model)
         bound_launch = _codex_provider_launch(bound, selected)
         if bound_launch is None:
