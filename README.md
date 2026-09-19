@@ -330,6 +330,18 @@ declares the passthrough.
 
 </details>
 
+#### Reopen a stored session
+
+```bash
+omnigent open <session-id> --server <server-url>
+```
+
+`open` recovers the session on its original host and attaches its native terminal
+or transcript REPL. If the host is offline, it waits for it to reconnect; add
+`--no-wait` to exit instead. Omit `--server` to use your configured server or an
+already-running local server. Writable native terminals require ownership;
+collaborators can use `omnigent attach <session-id>` for attributed chat.
+
 #### 🐙 Polly and 🟠🔵 Debby
 
 Two example agents ship with the repo, and they make good first sessions:

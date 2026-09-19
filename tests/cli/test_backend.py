@@ -469,6 +469,153 @@ def test_ensure_host_daemon_local_daemon_serves_requested_url_is_noop(
     assert "args" not in captured  # reused, not respawned
 
 
+def test_ensure_host_daemon_concrete_local_url_heals_offline_tunnel(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A discovered local URL still enters local-mode tunnel healing."""
+    captured: dict[str, object] = {}
+    _patch_daemon_spawn(monkeypatch, tmp_path, captured)
+    _write_daemon_registry_record(
+        tmp_path,
+        pid=4242,
+        target="local",
+        mode="local",
+        server_url=None,
+        log_path=str(tmp_path / "daemon.log"),
+        started_at=1_000_000,
+        config_sig=cli.server_config_signature(),
+        resolved_server_url="http://127.0.0.1:8123",
+    )
+    monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(cli, "_pid_is_recorded_daemon", lambda record: cli._pid_alive(record.pid))
+    monkeypatch.setattr(cli, "local_server_url_if_healthy", lambda: "http://127.0.0.1:8123")
+    monkeypatch.setattr(cli.time, "time", lambda: 1_000_100.0)
+    monkeypatch.setattr(cli, "_daemon_tunnel_recovers", lambda record, **_kw: False)
+    torn_down: list[tuple[str, bool]] = []
+    monkeypatch.setattr(
+        cli,
+        "_terminate_host_unit",
+        lambda record, *, reason, keep_local_server=False: torn_down.append(
+            (reason, keep_local_server)
+        ),
+    )
+
+    _ensure_host_daemon("http://127.0.0.1:8123")
+
+    assert len(torn_down) == 1 and "offline" in torn_down[0][0]
+    assert torn_down[0][1] is True
+    args = captured["args"]
+    assert isinstance(args, list)
+    assert "--local" in args
+    assert "--server" not in args
+
+
+@pytest.mark.parametrize("through_backend", [False, True])
+@pytest.mark.parametrize("concurrent_local_claim", [False, True])
+def test_explicit_local_url_config_drift_waits_and_exits(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    through_backend: bool,
+    concurrent_local_claim: bool,
+) -> None:
+    """Explicit URLs cannot continue across a restart, even when the port changes."""
+    captured: dict[str, object] = {}
+    _patch_daemon_spawn(monkeypatch, tmp_path, captured)
+    _write_daemon_registry_record(
+        tmp_path,
+        pid=4242,
+        target="local",
+        mode="local",
+        server_url=None,
+        log_path=str(tmp_path / "daemon.log"),
+        config_sig="stale-auth-signature",
+        resolved_server_url="http://127.0.0.1:8123",
+    )
+    monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(cli, "_pid_is_recorded_daemon", lambda record: True)
+    monkeypatch.setattr(cli, "_terminate_daemon", lambda record, *, force: None)
+    monkeypatch.setattr(cli, "_ensure_databricks_server_auth", lambda server: None)
+    restarted = False
+    ready = False
+    startup_polls = 0
+    new_url = "http://127.0.0.1:8124"
+
+    def stop_server() -> None:
+        nonlocal restarted
+        restarted = True
+
+    def healthy_url() -> str | None:
+        nonlocal concurrent_local_claim, startup_polls, ready
+        if concurrent_local_claim:
+            concurrent_local_claim = False
+            return None
+        if not restarted:
+            return "http://127.0.0.1:8123"
+        startup_polls += 1
+        ready = startup_polls > 1
+        return new_url if ready else None
+
+    def server_info(**kwargs: object) -> cli._HostHttpResult:
+        assert ready
+        assert kwargs["base_url"] == new_url
+        assert kwargs["path"] == "/v1/info"
+        return cli._HostHttpResult(200, {"accounts_enabled": True, "needs_setup": True})
+
+    monkeypatch.setattr(cli, "stop_local_omnigent_server", stop_server)
+    monkeypatch.setattr(cli, "local_server_url_if_healthy", healthy_url)
+    monkeypatch.setattr(cli, "_host_http_json", server_info)
+
+    ensure = _ensure_backend if through_backend else _ensure_host_daemon
+    with pytest.raises(SystemExit) as exc:
+        ensure("http://127.0.0.1:8123")
+
+    assert exc.value.code == 0
+    assert restarted and ready
+    assert startup_polls == 2
+    record = cli._find_daemon_record("local")
+    assert record is not None and record.resolved_server_url == new_url
+    output = capsys.readouterr().err
+    assert "Auth mode changed" in output
+    assert new_url in output
+    assert "re-run" in output
+
+
+def test_terminate_host_unit_preserves_server_for_tunnel_heal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tunnel-only restart leaves the local AP server at its current URL."""
+    record = cli._HostDaemonRecord(
+        pid=4242,
+        target="local",
+        mode="local",
+        server_url=None,
+        log_path="/tmp/host.log",
+        started_at=1_000_000,
+    )
+    terminated: list[tuple[int, bool]] = []
+    stopped_servers: list[bool] = []
+    monkeypatch.setattr(
+        cli,
+        "_terminate_daemon",
+        lambda daemon, *, force: terminated.append((daemon.pid, force)),
+    )
+    monkeypatch.setattr(
+        cli,
+        "stop_local_omnigent_server",
+        lambda: stopped_servers.append(True),
+    )
+
+    cli._terminate_host_unit(
+        record,
+        reason="host tunnel is offline",
+        keep_local_server=True,
+    )
+
+    assert terminated == [(4242, True)]
+    assert stopped_servers == []
+
+
 def test_ensure_host_daemon_reuses_healthy_background_daemon(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -496,9 +643,13 @@ def test_ensure_host_daemon_reuses_healthy_background_daemon(
     # Old enough to be eligible for the tunnel-health check, and online.
     monkeypatch.setattr(cli.time, "time", lambda: 1_000_100.0)
     monkeypatch.setattr(cli, "_daemon_host_online", lambda record, **_kw: True)
-    torn_down: list[str] = []
+    torn_down: list[tuple[str, bool]] = []
     monkeypatch.setattr(
-        cli, "_terminate_host_unit", lambda record, *, reason: torn_down.append(reason)
+        cli,
+        "_terminate_host_unit",
+        lambda record, *, reason, keep_local_server=False: torn_down.append(
+            (reason, keep_local_server)
+        ),
     )
 
     _ensure_host_daemon(None)
@@ -533,14 +684,18 @@ def test_ensure_host_daemon_respawns_on_host_identity_change(
     monkeypatch.setattr(cli, "_pid_is_recorded_daemon", lambda record: cli._pid_alive(record.pid))
     monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
     monkeypatch.setattr(cli, "_load_existing_host_id", lambda: "host_new")
-    torn_down: list[str] = []
+    torn_down: list[tuple[str, bool]] = []
     monkeypatch.setattr(
-        cli, "_terminate_host_unit", lambda record, *, reason: torn_down.append(reason)
+        cli,
+        "_terminate_host_unit",
+        lambda record, *, reason, keep_local_server=False: torn_down.append(
+            (reason, keep_local_server)
+        ),
     )
 
     _ensure_host_daemon(None)
 
-    assert len(torn_down) == 1 and "identity" in torn_down[0]
+    assert len(torn_down) == 1 and "identity" in torn_down[0][0]
     assert "args" in captured
 
 
@@ -648,14 +803,19 @@ def test_ensure_host_daemon_heals_offline_tunnel(
     # Old enough to be past the min-age grace; tunnel does not recover.
     monkeypatch.setattr(cli.time, "time", lambda: 1_000_100.0)
     monkeypatch.setattr(cli, "_daemon_tunnel_recovers", lambda record, **_kw: False)
-    torn_down: list[str] = []
+    torn_down: list[tuple[str, bool]] = []
     monkeypatch.setattr(
-        cli, "_terminate_host_unit", lambda record, *, reason: torn_down.append(reason)
+        cli,
+        "_terminate_host_unit",
+        lambda record, *, reason, keep_local_server=False: torn_down.append(
+            (reason, keep_local_server)
+        ),
     )
 
     _ensure_host_daemon(None)
 
-    assert len(torn_down) == 1 and "offline" in torn_down[0]
+    assert len(torn_down) == 1 and "offline" in torn_down[0][0]
+    assert torn_down[0][1] is True
     assert "args" in captured  # fresh daemon spawned
 
 
@@ -2250,6 +2410,7 @@ def test_host_http_json_loopback_http_error_is_not_unreachable(
 
     class _Response:
         status_code = 500
+        headers: dict[str, str] = {}
 
         @staticmethod
         def json() -> dict[str, str]:

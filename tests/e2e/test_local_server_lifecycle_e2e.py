@@ -556,3 +556,86 @@ def test_explicit_port_servers_run_side_by_side(
     assert not _pidfile_path(home).exists(), (
         "an explicit-port server wrote the canonical pidfile — it must stay dedicated"
     )
+
+
+def test_explicit_local_url_stops_after_auth_config_restart(tmp_path: Path) -> None:
+    """The shared CLI resolver waits for a replacement server and ends this launch."""
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith(
+            ("OMNIGENT_", "RUNNER_", "DATABRICKS_", "ANTHROPIC_", "OPENAI_", "CLAUDE_", "CODEX_")
+        )
+        and key not in {"TMUX", "TMUX_PANE"}
+    }
+    env.update(
+        {
+            "OMNIGENT_CONFIG_HOME": str(tmp_path / "config"),
+            "OMNIGENT_DATA_DIR": str(tmp_path / "data"),
+            "OMNIGENT_AUTH_ENABLED": "0",
+            "OMNIGENT_SKIP_ONBOARD": "1",
+            "OMNIGENT_NO_UPDATE_CHECK": "1",
+            "OMNIGENT_DISABLE_CATALOG_LOOKUP": "1",
+            "DATABRICKS_CONFIG_FILE": str(tmp_path / "no-databricks-config"),
+            "PYTHONPATH": str(_REPO_ROOT),
+        }
+    )
+    pidfile = tmp_path / "data" / "local_server.pid"
+
+    def run_resolver(server: str | None) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from omnigent.cli import _ensure_backend; "
+                f"url = _ensure_backend({server!r}); print('CONTINUED', url)",
+            ],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=90,
+        )
+
+    try:
+        initial = run_resolver(None)
+        assert initial.returncode == 0, initial.stderr
+        original = _read_pidfile(pidfile)
+        assert original is not None, initial.stderr
+        original_pid, original_port = original
+        assert f"CONTINUED http://127.0.0.1:{original_port}" in initial.stdout
+
+        env["OMNIGENT_AUTH_ENABLED"] = "1"
+        changed = run_resolver(f"http://127.0.0.1:{original_port}")
+
+        assert changed.returncode == 0, changed.stderr
+        assert "CONTINUED" not in changed.stdout
+        assert "Auth mode changed" in changed.stderr
+        assert "re-run" in changed.stderr
+        replacement = _read_pidfile(pidfile)
+        assert replacement is not None, changed.stderr
+        replacement_pid, replacement_port = replacement
+        assert replacement_pid != original_pid
+        assert _health_ok(replacement_port)
+        with httpx.Client(base_url=f"http://127.0.0.1:{replacement_port}", trust_env=False) as c:
+            info = c.get("/v1/info")
+        info.raise_for_status()
+        assert info.json()["accounts_enabled"] is True
+        assert info.json()["needs_setup"] is True
+        assert f"http://127.0.0.1:{replacement_port}" in changed.stderr
+    finally:
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from omnigent.cli import _list_daemon_records, _terminate_daemon; "
+                "from omnigent.host.local_server import stop_local_omnigent_server; "
+                "[_terminate_daemon(r, force=True) for r in _list_daemon_records()]; "
+                "stop_local_omnigent_server()",
+            ],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            timeout=60,
+            check=True,
+        )
