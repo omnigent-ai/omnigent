@@ -370,3 +370,22 @@ def test_hermes_and_hermes_native_deliver_differently() -> None:
 def test_kiro_native_is_not_delivered() -> None:
     caps = harness_capabilities()
     assert caps["kiro-native"].instruction_delivery is InstructionDelivery.NOT_DELIVERED
+
+
+def test_databricks_genie_declarations_match_the_executor() -> None:
+    """Genie's declared capabilities match what DatabricksGenieExecutor implements.
+
+    ``resume`` must stay NONE until the conversation id is persisted or history
+    is replayed (neither happens today: one user message per turn, id lives on
+    the in-process executor). ``interrupt`` is True because interrupt_session()
+    closes the live response stream; ``streaming`` is True because output items
+    arrive progressively over SSE. The executor drops the composed system
+    prompt — the Genie space carries its own instructions — so delivery is
+    NOT_DELIVERED.
+    """
+    caps = harness_capabilities()["databricks-genie"]
+    assert caps.integration_mode is IntegrationMode.SDK_IN_PROCESS
+    assert caps.resume is Resume.NONE
+    assert caps.interrupt is True
+    assert caps.streaming is True
+    assert caps.instruction_delivery is InstructionDelivery.NOT_DELIVERED

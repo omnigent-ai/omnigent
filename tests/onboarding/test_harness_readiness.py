@@ -381,6 +381,9 @@ def test_configured_harness_map_covers_all_spellings(
         # Generic ACP harness — config-gated (≥1 agent in the acp: block), no CLI
         # binary of its own; the acp:<slug> picks are config-derived, not keyed here.
         "acp",
+        # Databricks Genie Spaces SDK harness + its short alias.
+        "databricks-genie",
+        "genie",
         # Builtin ACP CLI harnesses: every catalog row + alias, derived so a new
         # row never needs to touch this list.
         *(

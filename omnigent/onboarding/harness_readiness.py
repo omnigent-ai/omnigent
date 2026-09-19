@@ -84,7 +84,7 @@ _logger = logging.getLogger(__name__)
 _READINESS_PROBE_MAX_WORKERS = 4
 
 _SDK_HARNESSES: frozenset[str] = frozenset(
-    {"claude-sdk", "openai-agents", "openai-agents-sdk", "antigravity"}
+    {"claude-sdk", "openai-agents", "openai-agents-sdk", "antigravity", "databricks-genie"}
 )
 
 # Families/harnesses whose CLIs authenticate via file-based credentials rather
