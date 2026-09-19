@@ -21,7 +21,8 @@ import {
 import { CanvasPage } from "./CanvasPage";
 
 const { flowProps, flowFitView, flowSetViewport, flowApi, viewerIdRef } = vi.hoisted(() => {
-  const fitViewMock = vi.fn();
+  // Like the real fitView, resolves once the fitted viewport is applied.
+  const fitViewMock = vi.fn(async () => true);
   const setViewportMock = vi.fn(async () => true);
   return {
     flowProps: { current: null as Record<string, unknown> | null },
@@ -236,6 +237,34 @@ describe("CanvasPage", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Reset layout" }));
     await waitFor(() => expect(flowFitView).toHaveBeenCalledTimes(3));
+  });
+
+  it("keeps the flow surface hidden until the restored view is fitted", async () => {
+    let applyFit = (_fitted: boolean) => {};
+    flowFitView.mockImplementationOnce(
+      () =>
+        new Promise<boolean>((resolve) => {
+          applyFit = resolve;
+        }),
+    );
+    vi.mocked(canvasSessions.useCanvasSessions).mockReturnValue(
+      sessionsStub([conversation("conv_1", 2), conversation("conv_2", 1)]),
+    );
+    renderPage();
+
+    // Cards are already built, but nothing may paint under the default
+    // viewport: the surface stays hidden until the fitted view is in place.
+    expect(screen.getByTestId("flow-node-conv_1")).toBeInTheDocument();
+    expect(screen.getByTestId("canvas-flow")).toHaveClass("opacity-0");
+
+    await act(async () => applyFit(true));
+    expect(screen.getByTestId("canvas-flow")).not.toHaveClass("opacity-0");
+  });
+
+  it("shows an empty canvas right away: there is no layout to restore", () => {
+    renderPage();
+    expect(screen.getByTestId("canvas-flow")).not.toHaveClass("opacity-0");
+    expect(flowFitView).not.toHaveBeenCalled();
   });
 
   it("groups sessions into Main and project canvases and switches between them", () => {
