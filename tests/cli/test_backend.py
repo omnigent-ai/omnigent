@@ -1251,6 +1251,12 @@ def test_host_reset_id_mints_fresh_id_when_no_daemon_runs(
     config_path = tmp_path / "config.yaml"
     config_path.write_text(yaml.safe_dump({"host": {"host_id": "a" * 32, "name": "my-laptop"}}))
     monkeypatch.setattr("omnigent.host.identity.CONFIG_PATH", config_path)
+    # This test pins the legacy (default) identity path; both overrides would
+    # redirect the reset elsewhere, and an ambient env identity refuses it.
+    monkeypatch.delenv("OMNIGENT_DATA_DIR", raising=False)
+    monkeypatch.delenv("OMNIGENT_CONFIG_HOME", raising=False)
+    monkeypatch.delenv("OMNIGENT_HOST_ID", raising=False)
+    monkeypatch.delenv("OMNIGENT_HOST_NAME", raising=False)
     monkeypatch.setattr(cli, "_list_daemon_records", lambda **_kw: [])
 
     result = CliRunner().invoke(cli_group, ["host", "reset-id", "--yes"])
@@ -1279,6 +1285,11 @@ def test_host_reset_id_honors_config_home(monkeypatch: pytest.MonkeyPatch, tmp_p
     )
     monkeypatch.setattr("omnigent.host.identity.CONFIG_PATH", fallback_path)
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+    # The config-home fallback only applies without a data-dir override, and
+    # an ambient env identity refuses the reset.
+    monkeypatch.delenv("OMNIGENT_DATA_DIR", raising=False)
+    monkeypatch.delenv("OMNIGENT_HOST_ID", raising=False)
+    monkeypatch.delenv("OMNIGENT_HOST_NAME", raising=False)
     monkeypatch.setattr(cli, "_list_daemon_records", lambda **_kw: [])
 
     result = CliRunner().invoke(cli_group, ["host", "reset-id", "--yes"])

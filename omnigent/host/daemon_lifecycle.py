@@ -66,11 +66,19 @@ class HostDaemonRecord:
     config_sig: str | None = None
 
 
-def normalize_daemon_target(server_url: str | None) -> str:
+def normalize_daemon_target(server_url: str | None, *, base_dir: Path | None = None) -> str:
     """Return the registry key for a daemon target.
 
+    A local server instance is identified by its data dir, so a loopback URL
+    naming the port tracked in that dir's ``local_server.pid`` addresses the
+    same instance as local mode: both collapse to ``"local"``. One instance
+    therefore keeps one record (and one daemon) across ``--server`` spellings
+    such as ``http://127.0.0.1:6767`` vs ``http://localhost:6767``.
+
     :param server_url: Requested server URL, or ``None`` / empty for local mode.
-    :returns: ``"local"`` for local mode, else a canonical server URL.
+    :param base_dir: Data-directory override; defaults to :func:`data_dir`.
+    :returns: ``"local"`` for local mode or a loopback spelling of the data
+        dir's tracked server, else a canonical server URL.
     """
     if not server_url:
         return _LOCAL_DAEMON_MARKER
@@ -87,6 +95,8 @@ def normalize_daemon_target(server_url: str | None) -> str:
 
     scheme = parsed.scheme.lower()
     hostname = hostname.lower()
+    if _is_tracked_local_server(scheme, hostname, port, base_dir=base_dir):
+        return _LOCAL_DAEMON_MARKER
     if ":" in hostname:
         hostname = f"[{hostname}]"
     if port is None or (scheme, port) in {("http", 80), ("https", 443)}:
@@ -99,6 +109,58 @@ def normalize_daemon_target(server_url: str | None) -> str:
     netloc = f"{userinfo}{hostname}{port_suffix}"
     path = parsed.path.rstrip("/")
     return urlunsplit((scheme, netloc, path, parsed.query, parsed.fragment))
+
+
+_LOOPBACK_HOSTNAMES = frozenset({"127.0.0.1", "localhost", "::1"})
+_DEFAULT_SCHEME_PORTS = {"http": 80, "https": 443}
+
+
+def _is_tracked_local_server(
+    scheme: str,
+    hostname: str,
+    port: int | None,
+    *,
+    base_dir: Path | None = None,
+) -> bool:
+    """Whether the URL parts name a loopback spelling of the tracked server.
+
+    The pidfile is the data dir's declaration of which port its local server
+    owns. Liveness and health are deliberately not probed here so a target's
+    registry key stays stable instead of flapping with server health.
+
+    :param scheme: Lowercased URL scheme, e.g. ``"http"``.
+    :param hostname: Lowercased URL hostname, e.g. ``"localhost"``.
+    :param port: Explicit URL port, or ``None`` for the scheme default.
+    :param base_dir: Data-directory override; defaults to :func:`data_dir`.
+    :returns: ``True`` when the host is loopback and the effective port
+        matches the tracked local server port.
+    """
+    if hostname not in _LOOPBACK_HOSTNAMES:
+        return False
+    effective_port = port if port is not None else _DEFAULT_SCHEME_PORTS.get(scheme)
+    if effective_port is None:
+        return False
+    return effective_port == _tracked_local_server_port(base_dir=base_dir)
+
+
+def _tracked_local_server_port(*, base_dir: Path | None = None) -> int | None:
+    """Return the port recorded in the data dir's ``local_server.pid``, if any.
+
+    :param base_dir: Data-directory override; defaults to :func:`data_dir`.
+    :returns: The tracked port, or ``None`` when the pidfile is absent or
+        malformed.
+    """
+    pid_path = (base_dir if base_dir is not None else data_dir()) / "local_server.pid"
+    try:
+        lines = pid_path.read_text().strip().splitlines()
+    except OSError:
+        return None
+    if len(lines) < 2:
+        return None
+    try:
+        return int(lines[1])
+    except ValueError:
+        return None
 
 
 def _target_digest(target: str) -> str:

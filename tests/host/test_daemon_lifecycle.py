@@ -50,6 +50,59 @@ def test_normalize_daemon_target(server_url: str | None, expected: str) -> None:
     assert normalize_daemon_target(server_url) == expected
 
 
+def _track_local_server(base: Path, port: int) -> None:
+    """Write a data-dir pidfile declaring *port* as the tracked local server."""
+    (base / "local_server.pid").write_text(f"4242\n{port}\n")
+
+
+def test_normalize_collapses_tracked_loopback_spellings(tmp_path: Path) -> None:
+    """Every loopback spelling of the tracked server keys to the local record."""
+    _track_local_server(tmp_path, 6767)
+    for spelling in (
+        "http://127.0.0.1:6767",
+        "http://localhost:6767",
+        "http://[::1]:6767",
+        "http://localhost:6767/",
+        "HTTP://LocalHost:6767/",
+    ):
+        assert normalize_daemon_target(spelling, base_dir=tmp_path) == "local"
+
+
+def test_normalize_collapses_tracked_default_port_spelling(tmp_path: Path) -> None:
+    """A loopback URL eliding the scheme-default port still names the instance."""
+    _track_local_server(tmp_path, 80)
+    assert normalize_daemon_target("http://localhost", base_dir=tmp_path) == "local"
+
+
+def test_normalize_keeps_urls_of_other_servers(tmp_path: Path) -> None:
+    """URLs that do not name the tracked instance keep their own key."""
+    _track_local_server(tmp_path, 6767)
+    # Another loopback port may be a forwarded tunnel to a different server.
+    assert (
+        normalize_daemon_target("http://127.0.0.1:9999", base_dir=tmp_path)
+        == "http://127.0.0.1:9999"
+    )
+    assert (
+        normalize_daemon_target("https://x.example.com:6767", base_dir=tmp_path)
+        == "https://x.example.com:6767"
+    )
+
+
+def test_normalize_keeps_loopback_urls_without_a_tracked_server(tmp_path: Path) -> None:
+    assert (
+        normalize_daemon_target("http://127.0.0.1:6767", base_dir=tmp_path)
+        == "http://127.0.0.1:6767"
+    )
+
+
+def test_normalize_tolerates_a_malformed_pidfile(tmp_path: Path) -> None:
+    (tmp_path / "local_server.pid").write_text("pid-and-port-missing\n")
+    assert (
+        normalize_daemon_target("http://127.0.0.1:6767", base_dir=tmp_path)
+        == "http://127.0.0.1:6767"
+    )
+
+
 def test_equivalent_server_urls_share_record_path(tmp_path: Path) -> None:
     canonical = normalize_daemon_target("https://x.example.com/api")
     equivalent = normalize_daemon_target("HTTPS://X.EXAMPLE.COM:443/api/")

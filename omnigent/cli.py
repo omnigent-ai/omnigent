@@ -2550,8 +2550,9 @@ _HOST_PID_PATH = data_dir() / "host.pid"
 
 # host.pid records the daemon PID + the "target" it serves: a normalized
 # server URL for remote/explicit targets, or the literal marker ``"local"``
-# for a daemon that owns a local Omnigent server. Daemon reuse is keyed on this
-# target (real URLs never collide with the marker).
+# for a daemon serving this data dir's own instance. Daemon reuse is keyed on
+# this target; loopback spellings of the tracked local server normalize to the
+# marker, so one instance never accrues per-spelling duplicate daemons.
 _LOCAL_DAEMON_MARKER = "local"
 
 # ``--server`` values that mean "run against a local server" rather than naming a
@@ -2690,13 +2691,17 @@ def _normalize_daemon_target(server_url: str | None) -> str:
     """
     Normalize a daemon target key.
 
+    A loopback URL naming the port tracked by this data dir's
+    ``local_server.pid`` collapses to ``"local"``: it addresses the data
+    dir's own server instance, so every spelling shares one record.
+
     :param server_url: Requested Omnigent server URL, e.g.
         ``"https://example.databricksapps.com/"``. ``None`` or empty
         string selects local mode.
-    :returns: ``"local"`` for local mode, otherwise the URL without a
-        trailing slash.
+    :returns: ``"local"`` for local mode or a loopback spelling of the
+        tracked local server, otherwise the canonical URL.
     """
-    return _normalize_daemon_target_impl(server_url)
+    return _normalize_daemon_target_impl(server_url, base_dir=_HOST_PID_PATH.parent)
 
 
 def _daemon_host_online(record: _HostDaemonRecord, *, timeout_s: float = 2.0) -> bool:
@@ -3460,6 +3465,10 @@ def _ensure_host_daemon(server_url: str | None) -> bool:
     """
     ensure_started_at = time.monotonic()
     target = _normalize_daemon_target(server_url)
+    if target == _LOCAL_DAEMON_MARKER:
+        # A loopback spelling of the tracked local server addresses this data
+        # dir's own instance, so run it as the single local-mode daemon.
+        server_url = None
     existing_before = _find_daemon_record(target)
     process_was_running = existing_before is not None and _daemon_owner_is_live(existing_before)
 
