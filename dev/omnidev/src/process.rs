@@ -1,6 +1,10 @@
 //! Concrete command specs for the three supervised processes.
 
+use std::ffi::OsStr;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
+
+use anyhow::{bail, Result};
 
 use crate::install::PYTHON_VERSION;
 use crate::pod::Pod;
@@ -12,6 +16,57 @@ pub struct ProcSpec {
     pub args: Vec<String>,
     pub cwd: PathBuf,
     pub extra_env: Vec<(String, String)>,
+}
+
+/// Web commands resolved before the supervisor starts any children.
+pub struct WebCommands {
+    pub vite: ProcSpec,
+    pub prepare: Option<ProcSpec>,
+}
+
+impl WebCommands {
+    pub fn resolve(pod: &Pod) -> Result<Self> {
+        Self::resolve_on_path(pod, std::env::var_os("PATH").as_deref())
+    }
+
+    fn resolve_on_path(pod: &Pod, path: Option<&OsStr>) -> Result<Self> {
+        let mut commands = Self {
+            vite: ProcSpec::vite(pod),
+            prepare: if pod.profile.as_ref().is_some_and(|p| p.prepare.is_none()) {
+                None
+            } else {
+                Some(ProcSpec::web_prepare(pod))
+            },
+        };
+        if pod.profile.is_some() {
+            return Ok(commands);
+        }
+
+        let available = |program: &str| {
+            path.is_some_and(|path| {
+                std::env::split_paths(path).any(|dir| {
+                    std::fs::metadata(pod.web_dir().join(dir).join(program))
+                        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+                })
+            })
+        };
+        if available("pnpm") {
+            return Ok(commands);
+        }
+        if !available("corepack") {
+            bail!(
+                "Neither `pnpm` nor `corepack` is on PATH. The dev UI requires Node 22+ \
+                 and pnpm. Install pnpm (`npm install -g pnpm`), or install Corepack \
+                 (`npm install -g corepack`), then retry. Use --no-vite for backend-only development."
+            );
+        }
+        // Corepack can run the repository's pinned pnpm without installing global shims.
+        for spec in std::iter::once(&mut commands.vite).chain(commands.prepare.iter_mut()) {
+            spec.program = "corepack".into();
+            spec.args.insert(0, "pnpm".into());
+        }
+        Ok(commands)
+    }
 }
 
 impl ProcSpec {
@@ -150,6 +205,98 @@ mod tests {
     use crate::ports::Ports;
     use crate::profile::{ProcessProfile, Profile};
 
+    fn web_pod(repo: PathBuf) -> Pod {
+        std::fs::create_dir_all(repo.join("web")).unwrap();
+        Pod {
+            dir: repo.join("pod"),
+            repo_root: repo,
+            ports: Ports {
+                server: 19191,
+                vite: 19292,
+            },
+            vite_host: "127.0.0.1".into(),
+            trusted_origins: Vec::new(),
+            profile: None,
+        }
+    }
+
+    fn fake_executable(dir: &std::path::Path, name: &str) {
+        let path = dir.join(name);
+        std::fs::write(&path, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n").unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn corepack_fallback_runs_install_and_vite_with_original_arguments() {
+        let repo = tempdir();
+        let bin = repo.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        fake_executable(&bin, "corepack");
+        let pod = web_pod(repo.clone());
+
+        let commands = WebCommands::resolve_on_path(&pod, Some(bin.as_os_str())).unwrap();
+        for (spec, expected) in [
+            (commands.prepare.unwrap(), "pnpm\ninstall\n"),
+            (
+                commands.vite,
+                "pnpm\nrun\ndev\n--host\n127.0.0.1\n--port\n19292\n--strictPort\n",
+            ),
+        ] {
+            assert_eq!(spec.program, "corepack");
+            let output = std::process::Command::new(bin.join(&spec.program))
+                .args(&spec.args)
+                .current_dir(&spec.cwd)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
+            assert_eq!(spec.cwd, pod.web_dir());
+        }
+        std::fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn standalone_pnpm_is_preferred_over_corepack() {
+        let repo = tempdir();
+        fake_executable(&repo, "pnpm");
+        fake_executable(&repo, "corepack");
+        let pod = web_pod(repo.clone());
+        let commands = WebCommands::resolve_on_path(&pod, Some(repo.as_os_str())).unwrap();
+
+        assert_eq!(commands.vite.program, "pnpm");
+        assert_eq!(commands.vite.args[0], "run");
+        let prepare = commands.prepare.unwrap();
+        assert_eq!(prepare.program, "pnpm");
+        assert_eq!(prepare.args, ["install"]);
+        std::fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn missing_web_tools_report_setup_instructions() {
+        let repo = tempdir();
+        let pod = web_pod(repo.clone());
+        for path in [None, Some(repo.as_os_str())] {
+            let error = WebCommands::resolve_on_path(&pod, path).err().unwrap();
+            let message = error.to_string();
+            assert!(message.contains("Neither `pnpm` nor `corepack` is on PATH"));
+            assert!(message.contains("npm install -g pnpm"));
+            assert!(message.contains("--no-vite"));
+        }
+        std::fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn nonexecutable_pnpm_does_not_hide_corepack() {
+        let repo = tempdir();
+        let pod = web_pod(repo.clone());
+        std::fs::write(repo.join("pnpm"), "not executable").unwrap();
+        fake_executable(&repo, "corepack");
+
+        let commands = WebCommands::resolve_on_path(&pod, Some(repo.as_os_str())).unwrap();
+        assert_eq!(commands.vite.program, "corepack");
+        std::fs::remove_dir_all(repo).unwrap();
+    }
+
     #[test]
     fn vite_forwards_configured_host_and_port_but_backend_url_stays_loopback() {
         let repo = tempdir();
@@ -278,6 +425,21 @@ mod tests {
         );
         assert_eq!(spec.cwd, repo.join("service"));
         assert!(!pod.host_enabled());
+
+        let web = WebCommands::resolve_on_path(&pod, None).unwrap();
+        assert_eq!(web.vite.program, "server");
+        assert_eq!(web.vite.args, spec.args);
+        assert!(web.prepare.is_none());
+
+        pod.profile.as_mut().unwrap().prepare = Some(ProcessProfile {
+            command: vec!["custom-install".into(), "--offline".into()],
+            cwd: "ui".into(),
+        });
+        let web = WebCommands::resolve_on_path(&pod, None).unwrap();
+        let prepare = web.prepare.unwrap();
+        assert_eq!(prepare.program, "custom-install");
+        assert_eq!(prepare.args, ["--offline"]);
+        assert_eq!(prepare.cwd, repo.join("ui"));
     }
 
     fn tempdir() -> std::path::PathBuf {

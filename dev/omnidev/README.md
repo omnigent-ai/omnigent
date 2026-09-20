@@ -34,13 +34,15 @@ replaces the three-terminal local dev flow (`omnigent server`, `omnigent host`,
 
 ## Build & run
 
-Requires the repo's usual dev prerequisites (`uv` for Python, `pnpm` for the
-web UI) plus a Rust toolchain.
+Requires the repo's usual dev prerequisites (`uv` for Python, Node 22+ and
+either `pnpm` or Corepack for the web UI) plus a Rust toolchain.
 
 ```bash
 cd dev/omnidev
 cargo run            # launches the TUI for the surrounding checkout
 ```
+
+If `pnpm` is missing from `PATH`, omnidev automatically uses `corepack pnpm`.
 
 Run it from anywhere inside the checkout — it walks up to the repo root
 (the `.jj`/`.git` marker) and requires `omnigent/` and
