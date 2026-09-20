@@ -17,7 +17,7 @@ import {
   type SidebarConfig,
 } from "@/lib/sidebarConfig";
 import { filterSessionScope, sessionVisibility } from "@/lib/sessionVisibility";
-import { useViewerId } from "./useViewerId";
+import { useIdentityReady, useViewerId } from "./useViewerId";
 import { sumPendingApprovals } from "@/lib/inbox";
 import { useCommentInbox } from "./useCommentInbox";
 import {
@@ -32,7 +32,7 @@ export type SidebarListQuery = Pick<
   "data" | "error" | "isError" | "isLoading" | "isFetching" | "isFetchingNextPage" | "hasNextPage"
 > & { fetchNextPage: () => unknown; refetch?: () => unknown };
 
-function useSidebarSources(config: SidebarConfig) {
+function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
   const [selectedView, registerView] = useState<SessionFilter | null>(null);
   const viewNeedsShared = selectedView === "all" || selectedView === "shared";
   const sharedActive = config.sharedAvailable && (viewNeedsShared || config.inboxIncludesShared);
@@ -155,6 +155,7 @@ function useSidebarSources(config: SidebarConfig) {
   );
   return {
     config,
+    identityReady,
     sharedAvailable: config.sharedAvailable,
     sharedActive,
     selectedView,
@@ -181,11 +182,13 @@ export const SidebarDataContext = createContext<ReturnType<typeof useSidebarSour
 export function SidebarDataProvider({
   children,
   config = sidebarConfig,
+  identityReady = true,
 }: {
   children: ReactNode;
   config?: SidebarConfig;
+  identityReady?: boolean;
 }) {
-  const data = useSidebarSources(config);
+  const data = useSidebarSources(config, identityReady);
   return (
     <SidebarConfigContext.Provider value={config}>
       <SidebarDataContext.Provider value={data}>
@@ -196,6 +199,21 @@ export function SidebarDataProvider({
         </PinCapacityContext.Provider>
       </SidebarDataContext.Provider>
     </SidebarConfigContext.Provider>
+  );
+}
+
+export function IdentityAwareSidebarDataProvider({
+  children,
+  config = sidebarConfig,
+}: {
+  children: ReactNode;
+  config?: SidebarConfig;
+}) {
+  const identityReady = useIdentityReady();
+  return (
+    <SidebarDataProvider config={config} identityReady={identityReady}>
+      {children}
+    </SidebarDataProvider>
   );
 }
 

@@ -667,17 +667,21 @@ function SidebarImpl({
     [selectionMode, exitSelectionMode],
   );
 
-  useSidebarView(activeTab);
-  const archivedQuery = useArchivedSessions(activeTab === "archived");
+  const availableTab =
+    activeTab === "shared" && !sidebarData.sharedAvailable ? "mine" : activeTab;
+  useLayoutEffect(() => {
+    if (availableTab !== activeTab) switchTab(availableTab);
+  }, [activeTab, availableTab, switchTab]);
+
+  useSidebarView(availableTab);
+  const archivedQuery = useArchivedSessions(availableTab === "archived");
   const displayQuery: SidebarListQuery =
-    activeTab === "archived"
+    availableTab === "archived"
       ? archivedQuery
-      : activeTab === "mine"
+      : availableTab === "mine"
         ? sidebarData.mine
-        : activeTab === "shared"
-          ? sidebarData.sharedAvailable
-            ? sidebarData.shared
-            : { ...sidebarData.all, data: undefined, isLoading: false, hasNextPage: false }
+        : availableTab === "shared"
+          ? sidebarData.shared
           : sidebarData.all;
   const inboxCount = sidebarData.inboxCount;
 
@@ -1219,27 +1223,33 @@ function SidebarImpl({
                     : "[scrollbar-color:transparent_transparent] [&::-webkit-scrollbar-thumb]:bg-transparent",
                 )}
               >
-                <ConversationList
-                  conversationsQuery={displayQuery}
-                  scrollContainerRef={scrollContainerRef}
-                  onRowClick={onNavClick}
-                  searchQuery=""
-                  newSessionProjectName={newSessionProjectName}
-                  activeTab={activeTab}
-                  onActiveTabChange={switchTab}
-                  multiUser={multiUser}
-                  pinnedConversationIds={pinnedConversationIds}
-                  pinnedConversations={pinnedConversations}
-                  onTogglePinned={togglePinnedConversation}
-                  onEnterSelectionMode={enterSelectionMode}
-                  selectionMode={selectionMode}
-                  selectionScope={selectionScope}
-                  selectedIds={selectedIds}
-                  onToggleSelected={toggleSelected}
-                  onDeselectAll={deselectAll}
-                  onExitSelectionMode={exitSelectionMode}
-                  getVisibleIdsRef={getVisibleIdsRef}
-                />
+                {sidebarData.identityReady ? (
+                  <ConversationList
+                    conversationsQuery={displayQuery}
+                    scrollContainerRef={scrollContainerRef}
+                    onRowClick={onNavClick}
+                    searchQuery=""
+                    newSessionProjectName={newSessionProjectName}
+                    activeTab={availableTab}
+                    onActiveTabChange={switchTab}
+                    multiUser={multiUser}
+                    pinnedConversationIds={pinnedConversationIds}
+                    pinnedConversations={pinnedConversations}
+                    onTogglePinned={togglePinnedConversation}
+                    onEnterSelectionMode={enterSelectionMode}
+                    selectionMode={selectionMode}
+                    selectionScope={selectionScope}
+                    selectedIds={selectedIds}
+                    onToggleSelected={toggleSelected}
+                    onDeselectAll={deselectAll}
+                    onExitSelectionMode={exitSelectionMode}
+                    getVisibleIdsRef={getVisibleIdsRef}
+                  />
+                ) : (
+                  <p role="status" className="px-2 py-1 text-muted-foreground text-sm">
+                    Loading sessions…
+                  </p>
+                )}
               </nav>
               {/* Mobile: Settings floats over the bottom of the session list, with
           Search floating at the top of the header row — the two icons the

@@ -749,6 +749,69 @@ describe("Sidebar session list", () => {
     expect(screen.getByTestId("session-filter-shared")).toHaveAttribute("aria-checked", "true");
   });
 
+  it("withholds the conversation list until identity is ready", () => {
+    mockConversations([conv("conv_mine", "Claude Code")]);
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const tree = (identityReady: boolean) => (
+      <QueryClientProvider client={qc}>
+        <SidebarDataProvider identityReady={identityReady}>
+          <ExtensionCatalogProvider extensions={[]}>
+            <TooltipProvider>
+              <MemoryRouter>
+                <Sidebar open onClose={vi.fn()} />
+              </MemoryRouter>
+            </TooltipProvider>
+          </ExtensionCatalogProvider>
+        </SidebarDataProvider>
+      </QueryClientProvider>
+    );
+    const { rerender } = render(tree(false));
+
+    expect(screen.queryByTestId("sidebar-conversation-list")).toBeNull();
+    expect(screen.getByRole("status")).toHaveTextContent("Loading sessions");
+
+    rerender(tree(true));
+    expect(screen.getByTestId("sidebar-conversation-list")).toBeInTheDocument();
+    expect(screen.getByText("conv_mine")).toBeInTheDocument();
+  });
+
+  it("leaves Shared when runtime policy makes it unavailable", () => {
+    localStorage.setItem("omnigent:session-filter", "shared");
+    mockConversations([
+      conv("conv_mine", "Claude Code"),
+      conv("conv_shared", "Claude Code", { owner: "other@example.com" }),
+    ]);
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const tree = (config: SidebarConfig) => (
+      <QueryClientProvider client={qc}>
+        <SidebarDataProvider config={config}>
+          <ExtensionCatalogProvider extensions={[]}>
+            <TooltipProvider>
+              <MemoryRouter>
+                <Sidebar open onClose={vi.fn()} />
+              </MemoryRouter>
+            </TooltipProvider>
+          </ExtensionCatalogProvider>
+        </SidebarDataProvider>
+      </QueryClientProvider>
+    );
+    const { rerender } = render(tree(sidebarConfig));
+    expect(screen.getByText("conv_shared")).toBeInTheDocument();
+
+    rerender(tree({ ...sidebarConfig, sharedAvailable: false }));
+
+    expect(screen.getByText("conv_mine")).toBeInTheDocument();
+    expect(screen.queryByText("conv_shared")).toBeNull();
+    expect(localStorage.getItem("omnigent:session-filter")).toBe("mine");
+    fireEvent.pointerDown(screen.getByTestId("session-filter"), {
+      button: 0,
+      ctrlKey: false,
+      pointerType: "mouse",
+    });
+    expect(screen.getByTestId("session-filter-mine")).toHaveAttribute("aria-checked", "true");
+    expect(screen.queryByTestId("session-filter-shared")).toBeNull();
+  });
+
   it("drops a persisted Shared filter on a single-user server", () => {
     // "Shared sessions" isn't in the menu on a loopback-only server, so honoring
     // a value stored against a multi-user one would scope the list to a slice
