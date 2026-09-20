@@ -461,6 +461,13 @@ class ClaudeNativeUcodeConfig:
         equivalence information.
     :param subscription_auth: Use the selected claude.ai login without inherited
         API keys or bearer tokens. Claude still owns its model configuration.
+    :param listing_provider: The endpoint the pre-launch picker may enumerate
+        live (a model-catalog :class:`ResolvedModelProvider`), set for
+        key/gateway/local anthropic providers. Metadata only — recording it
+        does no I/O, so launch/resume stay offline; the catalog build is what
+        fetches ``<base>/v1/models``. Excluded from equality/hash: two configs
+        that render the same launch env are the same config regardless of how
+        the picker discovers ids (mirrors pi's ``PiProviderConfig``).
     """
 
     env: dict[str, str]
@@ -469,6 +476,9 @@ class ClaudeNativeUcodeConfig:
     routable_models: tuple[str, ...] = ()
     model_overrides: dict[str, str] = field(default_factory=dict)
     subscription_auth: bool = False
+    listing_provider: model_catalog.ResolvedModelProvider | None = field(
+        default=None, compare=False, hash=False
+    )
 
 
 def _serves_canonical_anthropic_ids(claude_config: ClaudeNativeUcodeConfig) -> bool:
@@ -508,6 +518,47 @@ def _ambient_env_is_non_anthropic_gateway(configured_base_url: str | None = None
         return False
     host = (urlparse(base_url).hostname or "").lower()
     return host != "anthropic.com" and not host.endswith(".anthropic.com")
+
+
+def _gateway_claude_listing(
+    listing_provider: model_catalog.ResolvedModelProvider,
+    *,
+    transport: httpx.BaseTransport | None = None,
+) -> tuple[bool, tuple[str, ...]]:
+    """Enumerate a gateway's live ``/v1/models`` for Claude servability.
+
+    Mirrors pi's ``_live_family_model_entries`` (#7007): a real anthropic key
+    speaks the Anthropic models API; any gateway is read through the
+    OpenAI-compatible ``/v1/models``.
+
+    :returns: ``(serves_canonical, concrete_ids)``. ``serves_canonical`` is
+        ``True`` when the listing reports any bare ``claude-*`` id — concrete or
+        a ``claude-*`` / ``*`` wildcard — so the endpoint accepts canonical
+        Claude ids (a LiteLLM passthrough lists ``claude-*``; OpenRouter lists
+        ``anthropic/claude-*`` and so does not). ``concrete_ids`` are the
+        literal, non-wildcard ``claude-*`` ids listed. Fails open to
+        ``(False, ())`` so an unreachable endpoint degrades to the probe rows.
+    """
+    from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, KEY_KIND
+
+    try:
+        if listing_provider.kind == KEY_KIND and listing_provider.family == ANTHROPIC_FAMILY:
+            listing = model_catalog._fetch_anthropic_listing(listing_provider, transport=transport)
+        else:
+            listing = model_catalog._fetch_openai_compatible_listing(
+                listing_provider, transport=transport
+            )
+    except (httpx.HTTPError, OSError, ValueError, subprocess.SubprocessError):
+        _logger.debug(
+            "claude gateway model listing failed for %s",
+            listing_provider.detail or listing_provider.base_url,
+            exc_info=True,
+        )
+        return (False, ())
+    ids = [entry.id for entry in listing.models]
+    serves = any(mid == "*" or mid.lower().startswith("claude-") for mid in ids)
+    concrete = tuple(mid for mid in ids if mid.lower().startswith("claude-") and "*" not in mid)
+    return (serves, concrete)
 
 
 def _claude_family(token: str) -> str | None:
@@ -1435,6 +1486,14 @@ def claude_catalog_fingerprint(claude_config: ClaudeNativeUcodeConfig | None) ->
     # cloud transport is never read again once that setting is removed.
     uses_cli_settings = claude_config is None or claude_config.subscription_auth
     ambient_transport = claude_ambient_transport() if uses_cli_settings else None
+    # A live-enumerated gateway now shapes the catalog rows, so key it on the
+    # listing endpoint (never the credential — the fingerprint is not a secret).
+    listing_provider = claude_config.listing_provider if claude_config is not None else None
+    listing_endpoint = (
+        (listing_provider.kind, listing_provider.family, listing_provider.base_url)
+        if listing_provider is not None
+        else None
+    )
     return fingerprint_of(
         "claude-native",
         "control-picker-v3",
@@ -1448,6 +1507,7 @@ def claude_catalog_fingerprint(claude_config: ClaudeNativeUcodeConfig | None) ->
         binary_identity(command),
         binary_identity("claude"),
         ambient_transport,
+        listing_endpoint,
         claude_managed_model_picker() if uses_cli_settings else None,
     )
 
@@ -1479,9 +1539,22 @@ async def claude_model_catalog(
         return []
     rows = list(probe.alias_rows)
     declared_models = set(claude_config.routable_models) if claude_config is not None else set()
-    _non_canonical = (
-        claude_config is not None and not _serves_canonical_anthropic_ids(claude_config)
-    ) or (claude_config is None and _ambient_env_is_non_anthropic_gateway())
+    # A configured gateway provider's live /v1/models is the source of truth for
+    # what it serves (mirrors pi #7007): it overrides the hostname heuristic, so a
+    # bare-canonical passthrough (LiteLLM lists ``claude-*``) keeps its claude-*
+    # rows while a namespaced gateway (OpenRouter lists ``anthropic/claude-*``)
+    # does not. Fetched off-thread and fail-open — the fetchers are sync httpx.
+    listing_provider = claude_config.listing_provider if claude_config is not None else None
+    gateway_serves_canonical = False
+    gateway_concrete_ids: tuple[str, ...] = ()
+    if listing_provider is not None:
+        gateway_serves_canonical, gateway_concrete_ids = await asyncio.to_thread(
+            _gateway_claude_listing, listing_provider
+        )
+    _non_canonical = not gateway_serves_canonical and (
+        (claude_config is not None and not _serves_canonical_anthropic_ids(claude_config))
+        or (claude_config is None and _ambient_env_is_non_anthropic_gateway())
+    )
     if _non_canonical:
         rows = [
             row
@@ -1489,6 +1562,16 @@ async def claude_model_catalog(
             if not str(row.get("model", "")).startswith("claude-")
             or str(row.get("model", "")) in declared_models
         ]
+    # Surface concrete claude ids the gateway lists that the probe did not offer.
+    if gateway_concrete_ids:
+        known = {str(row.get("model", "")) for row in rows} | {
+            str(row.get("id", "")) for row in rows
+        }
+        rows.extend(
+            {"id": mid, "model": mid, "displayName": mid}
+            for mid in gateway_concrete_ids
+            if mid not in known
+        )
 
     configured_pin = claude_config.model if claude_config is not None else None
     default_model = configured_pin or probe.default_model
@@ -1510,8 +1593,10 @@ async def claude_model_catalog(
         # claim a bare Anthropic id is launchable on an endpoint that
         # rejects that spelling.
         _canonical_ids_ok = (
-            claude_config is None and not _ambient_env_is_non_anthropic_gateway()
-        ) or (claude_config is not None and _serves_canonical_anthropic_ids(claude_config))
+            gateway_serves_canonical
+            or (claude_config is None and not _ambient_env_is_non_anthropic_gateway())
+            or (claude_config is not None and _serves_canonical_anthropic_ids(claude_config))
+        )
         servable = (
             _canonical_ids_ok
             or not default_model.startswith("claude-")
@@ -3386,6 +3471,16 @@ def _provider_config_for_native_claude(entry: ProviderEntry) -> ClaudeNativeUcod
                     *([family.default_model] if family.default_model else []),
                 ]
             )
+        ),
+        # Record the endpoint the pre-launch picker can enumerate live; no I/O
+        # happens here so session launch/resume stay off the network.
+        listing_provider=model_catalog.ResolvedModelProvider(
+            kind=entry.kind,
+            family=ANTHROPIC_FAMILY,
+            base_url=family.base_url,
+            api_key=family.api_key,
+            auth_command=family.auth_command,
+            detail=f"provider {entry.name!r}",
         ),
     )
 
