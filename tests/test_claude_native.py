@@ -62,6 +62,17 @@ def _stub_catalog_default(monkeypatch: pytest.MonkeyPatch) -> None:
             model_id=f"catalog-{provider_name}-{family}-default"
         ),
     )
+    # The endpoint-classification env vars are real host vars (a gateway-fronted
+    # host exports them), so clear them by default: tests asserting canonical /
+    # non-canonical / gateway behaviour must not inherit the operator env, which
+    # would make them pass in CI but break on the very hosts this harness serves.
+    # Tests that need a value set it explicitly.
+    for _endpoint_env in (
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_BEDROCK_BASE_URL",
+        "OMNIGENT_ANTHROPIC_GATEWAY_CANONICAL",
+    ):
+        monkeypatch.delenv(_endpoint_env, raising=False)
 
 
 def _test_bridge_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
@@ -8251,6 +8262,40 @@ def test_provider_config_for_native_claude_keeps_betas_under_use_gateway(
     assert "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS" not in cfg.env
 
 
+def test_provider_config_for_native_claude_propagates_canonical_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A host-exported canonical flag is carried into the managed gateway config.
+
+    Only key/gateway/local anthropic providers reach this builder, so the
+    catalog gate then keeps the provider's bare claude-* rows instead of
+    dropping them (the "Models unavailable" regression on a passthrough host).
+    """
+    from omnigent.onboarding.provider_config import load_providers
+
+    monkeypatch.setenv("OMNIGENT_ANTHROPIC_GATEWAY_CANONICAL", "1")
+    monkeypatch.setenv("CLAUDE_CODE_USE_GATEWAY", "1")
+
+    entry = load_providers(
+        {
+            "providers": {
+                "gw": {
+                    "kind": "gateway",
+                    "anthropic": {
+                        "base_url": "https://litellm.example",
+                        "auth_command": "my-cli print-token",
+                    },
+                }
+            }
+        }
+    )["gw"]
+
+    cfg = claude_native._provider_config_for_native_claude(entry)
+    assert cfg is not None
+    assert cfg.env.get("OMNIGENT_ANTHROPIC_GATEWAY_CANONICAL") == "1"
+    assert claude_native._serves_canonical_anthropic_ids(cfg) is True
+
+
 def test_bedrock_config_for_native_claude_static_key(monkeypatch: pytest.MonkeyPatch) -> None:
     """A ``bedrock`` provider sets the Bedrock env trio and no apiKeyHelper.
 
@@ -11079,6 +11124,28 @@ def test_ambient_env_is_non_anthropic_gateway_returns_false_when_unset(
     assert claude_native._ambient_env_is_non_anthropic_gateway() is False
 
 
+def test_ambient_env_is_non_anthropic_gateway_honors_canonical_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A gateway explicitly flagged canonical is NOT treated as non-anthropic.
+
+    A LiteLLM Anthropic-passthrough serves bare canonical claude-* ids, so the
+    host marks it canonical and its alias rows must survive the catalog filter.
+    """
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://litellm.example/anthropic")
+    monkeypatch.setenv("OMNIGENT_ANTHROPIC_GATEWAY_CANONICAL", "1")
+    assert claude_native._ambient_env_is_non_anthropic_gateway() is False
+
+
+def test_ambient_env_is_non_anthropic_gateway_ignores_falsey_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A falsey canonical flag leaves gateway detection unchanged."""
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://litellm.example/anthropic")
+    monkeypatch.setenv("OMNIGENT_ANTHROPIC_GATEWAY_CANONICAL", "0")
+    assert claude_native._ambient_env_is_non_anthropic_gateway() is True
+
+
 def test_catalog_fingerprint_includes_ambient_gateway_url(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -11170,6 +11237,163 @@ async def test_claude_model_catalog_keeps_canonical_ids_without_ambient_gateway(
 
     assert rows is not None
     # Both canonical models should be present
+    assert [row["id"] for row in rows] == ["sonnet", "opus"]
+    assert rows[1]["isDefault"] is True
+
+
+def test_serves_canonical_anthropic_ids_honors_gateway_override() -> None:
+    """A gateway config flagged canonical serves canonical ids."""
+    config = _gateway_probe_config(OMNIGENT_ANTHROPIC_GATEWAY_CANONICAL="1")
+    assert claude_native._serves_canonical_anthropic_ids(config) is True
+
+
+def test_serves_canonical_anthropic_ids_gateway_without_flag_is_non_canonical() -> None:
+    """Absent the flag, a gateway host is still treated as non-canonical."""
+    assert claude_native._serves_canonical_anthropic_ids(_gateway_probe_config()) is False
+
+
+def test_serves_canonical_anthropic_ids_override_does_not_rescue_bedrock() -> None:
+    """Bedrock routes its own ids even when the canonical flag is set."""
+    config = claude_native.ClaudeNativeUcodeConfig(
+        env={
+            "ANTHROPIC_BEDROCK_BASE_URL": "https://bedrock.example",
+            "OMNIGENT_ANTHROPIC_GATEWAY_CANONICAL": "1",
+        },
+    )
+    assert claude_native._serves_canonical_anthropic_ids(config) is False
+
+
+async def test_claude_model_catalog_keeps_canonical_ids_when_gateway_marked_canonical(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A gateway flagged canonical (LiteLLM passthrough) keeps its claude-* rows.
+
+    Without the flag every alias row is dropped and the picker reads "Models
+    unavailable"; the flag is the operator's assertion that the endpoint serves
+    bare canonical Anthropic ids.
+    """
+
+    async def _fake_probe(config: object) -> claude_native.ClaudeModelProbe:
+        del config
+        return claude_native.ClaudeModelProbe(
+            alias_rows=[
+                {"id": "sonnet", "model": "claude-sonnet-4-5", "displayName": "Sonnet 4.5"},
+                {"id": "opus", "model": "claude-opus-4-8", "displayName": "Opus 4.8"},
+            ],
+            default_model="claude-opus-4-8",
+            default_label="Opus 4.8",
+        )
+
+    monkeypatch.setattr(claude_native, "probe_claude_model_options", _fake_probe)
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://litellm.example/anthropic")
+    monkeypatch.setenv("OMNIGENT_ANTHROPIC_GATEWAY_CANONICAL", "1")
+
+    rows = await claude_native.claude_model_catalog(None)
+
+    assert rows is not None
+    assert [row["id"] for row in rows] == ["sonnet", "opus"]
+    assert rows[1]["isDefault"] is True
+
+
+def test_catalog_fingerprint_distinguishes_canonical_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Toggling the canonical flag yields a distinct ambient-gateway fingerprint.
+
+    The flag flips whether canonical claude-* rows survive, so two otherwise
+    identical envs must not share a catalog cache entry.
+    """
+    _point_claude_at(monkeypatch, tmp_path / "claude")
+    (tmp_path / "claude").write_text("binary")
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://litellm.example/anthropic")
+
+    monkeypatch.delenv("OMNIGENT_ANTHROPIC_GATEWAY_CANONICAL", raising=False)
+    fp_plain = claude_native.claude_catalog_fingerprint(None)
+
+    monkeypatch.setenv("OMNIGENT_ANTHROPIC_GATEWAY_CANONICAL", "1")
+    fp_canonical = claude_native.claude_catalog_fingerprint(None)
+
+    assert fp_plain != fp_canonical
+
+
+def test_catalog_fingerprint_distinguishes_ambient_bedrock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Adding ANTHROPIC_BEDROCK_BASE_URL changes the ambient fingerprint.
+
+    With the canonical flag on, Bedrock overrides it and flips keep-vs-drop of
+    claude-* rows, so a flagged env with vs without Bedrock must not share a
+    catalog cache entry.
+    """
+    _point_claude_at(monkeypatch, tmp_path / "claude")
+    (tmp_path / "claude").write_text("binary")
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://litellm.example/anthropic")
+    monkeypatch.setenv("OMNIGENT_ANTHROPIC_GATEWAY_CANONICAL", "1")
+
+    monkeypatch.delenv("ANTHROPIC_BEDROCK_BASE_URL", raising=False)
+    fp_no_bedrock = claude_native.claude_catalog_fingerprint(None)
+
+    monkeypatch.setenv("ANTHROPIC_BEDROCK_BASE_URL", "https://bedrock.example")
+    fp_bedrock = claude_native.claude_catalog_fingerprint(None)
+
+    assert fp_no_bedrock != fp_bedrock
+
+
+def test_ambient_env_is_non_anthropic_gateway_flag_does_not_rescue_bedrock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ambient Bedrock stays non-canonical even with the canonical flag set.
+
+    Bedrock routes its own model ids, so the flag must not mark it canonical and
+    offer bare claude-* rows the endpoint would reject.
+    """
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://litellm.example/anthropic")
+    monkeypatch.setenv("ANTHROPIC_BEDROCK_BASE_URL", "https://bedrock.example")
+    monkeypatch.setenv("OMNIGENT_ANTHROPIC_GATEWAY_CANONICAL", "1")
+    assert claude_native._ambient_env_is_non_anthropic_gateway() is True
+
+
+def test_ambient_env_is_non_anthropic_gateway_flag_does_not_rescue_bedrock_without_base(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Real Bedrock layout (ANTHROPIC_BASE_URL unset) stays non-canonical with the flag.
+
+    Regression: a Bedrock guard placed after the empty-base early return would be
+    dead for this layout — the actual Claude Code Bedrock env, where
+    ANTHROPIC_BASE_URL is unset — and keep bare claude-* rows Bedrock rejects.
+    """
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    monkeypatch.setenv("ANTHROPIC_BEDROCK_BASE_URL", "https://bedrock.example")
+    monkeypatch.setenv("OMNIGENT_ANTHROPIC_GATEWAY_CANONICAL", "1")
+    assert claude_native._ambient_env_is_non_anthropic_gateway() is True
+
+
+async def test_claude_model_catalog_keeps_canonical_ids_on_flagged_managed_gateway(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A managed gateway config carrying the flag keeps its canonical rows.
+
+    The managed (claude_config is not None) counterpart to the ambient
+    keeps-canonical test: the flag lives in claude_config.env.
+    """
+
+    async def _fake_probe(config: object) -> claude_native.ClaudeModelProbe:
+        del config
+        return claude_native.ClaudeModelProbe(
+            alias_rows=[
+                {"id": "sonnet", "model": "claude-sonnet-4-5", "displayName": "Sonnet 4.5"},
+                {"id": "opus", "model": "claude-opus-4-8", "displayName": "Opus 4.8"},
+            ],
+            default_model="claude-opus-4-8",
+            default_label="Opus 4.8",
+        )
+
+    monkeypatch.setattr(claude_native, "probe_claude_model_options", _fake_probe)
+    config = _gateway_probe_config(OMNIGENT_ANTHROPIC_GATEWAY_CANONICAL="1")
+
+    rows = await claude_native.claude_model_catalog(config)
+
+    assert rows is not None
     assert [row["id"] for row in rows] == ["sonnet", "opus"]
     assert rows[1]["isDefault"] is True
 

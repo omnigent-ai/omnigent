@@ -140,7 +140,7 @@ from omnigent.native.native_terminal import (
 from omnigent.native.native_terminal import (
     terminal_attach_url as _attach_url,
 )
-from omnigent.process_logging import log_info_once
+from omnigent.process_logging import env_truthy, log_info_once
 from omnigent.terminals.ws_common import (
     WS_CLOSE_TERMINAL_DETACHED,
     WS_CLOSE_TERMINAL_NOT_FOUND,
@@ -192,6 +192,12 @@ _UCODE_CLAUDE_BASE_URL_ENV = "ANTHROPIC_BASE_URL"
 _ANTHROPIC_MODEL_ENV = "ANTHROPIC_MODEL"
 _ANTHROPIC_API_KEY_ENV = "ANTHROPIC_API_KEY"
 _ANTHROPIC_BEDROCK_BASE_URL_ENV = "ANTHROPIC_BEDROCK_BASE_URL"
+# Opt-in signal that the ANTHROPIC_BASE_URL gateway serves *canonical* Anthropic
+# model ids (a LiteLLM Anthropic-passthrough does), so the catalog must keep bare
+# ``claude-*`` alias rows instead of dropping them the way it does for a gateway
+# that only routes its own namespaced ids (Bedrock, Databricks). A host that
+# fronts Claude through such a gateway exports this alongside ANTHROPIC_BASE_URL.
+_ANTHROPIC_GATEWAY_CANONICAL_ENV = "OMNIGENT_ANTHROPIC_GATEWAY_CANONICAL"
 _AWS_BEARER_TOKEN_BEDROCK_ENV = "AWS_BEARER_TOKEN_BEDROCK"
 _CLAUDE_CODE_USE_BEDROCK_ENV = "CLAUDE_CODE_USE_BEDROCK"
 # Bedrock mode reads the token from the env (not an apiKeyHelper), so a
@@ -435,12 +441,16 @@ def _serves_canonical_anthropic_ids(claude_config: ClaudeNativeUcodeConfig) -> b
 
     Bedrock and custom gateways route their own model ids only; the Anthropic
     API (and a config with no endpoint override) resolves family aliases
-    natively, so aliases must not be rewritten for it.
+    natively, so aliases must not be rewritten for it. An Anthropic-passthrough
+    gateway (LiteLLM) also serves canonical ids and opts in via
+    ``OMNIGENT_ANTHROPIC_GATEWAY_CANONICAL`` on the config env.
     """
     if claude_config.env.get(_ANTHROPIC_BEDROCK_BASE_URL_ENV):
         return False
     base_url = claude_config.env.get(_UCODE_CLAUDE_BASE_URL_ENV)
     if not base_url:
+        return True
+    if env_truthy(claude_config.env.get(_ANTHROPIC_GATEWAY_CANONICAL_ENV)):
         return True
     host = (urlparse(base_url).hostname or "").lower()
     return host == "anthropic.com" or host.endswith(".anthropic.com")
@@ -452,12 +462,22 @@ def _ambient_env_is_non_anthropic_gateway() -> bool:
     Used as the ``claude_config is None`` counterpart to
     :func:`_serves_canonical_anthropic_ids`: when managed settings (e.g. Isaac)
     set ``ANTHROPIC_BASE_URL`` to a Databricks gateway, the catalog and its
-    fingerprint must treat the env as a non-canonical endpoint.
+    fingerprint must treat the env as a non-canonical endpoint. An
+    Anthropic-passthrough gateway (LiteLLM) serves canonical ids and opts out of
+    this treatment via ``OMNIGENT_ANTHROPIC_GATEWAY_CANONICAL`` in the env.
     """
     from urllib.parse import urlparse
 
+    if os.environ.get(_ANTHROPIC_BEDROCK_BASE_URL_ENV):
+        # Bedrock routes its own model ids; classify it non-canonical FIRST (as
+        # _serves_canonical_anthropic_ids does), before the empty-base return or
+        # the canonical flag — so the flag can never rescue Bedrock, including
+        # its real layout where ANTHROPIC_BASE_URL is unset.
+        return True
     base_url = os.environ.get(_UCODE_CLAUDE_BASE_URL_ENV, "")
     if not base_url:
+        return False
+    if env_truthy(os.environ.get(_ANTHROPIC_GATEWAY_CANONICAL_ENV)):
         return False
     host = (urlparse(base_url).hostname or "").lower()
     return host != "anthropic.com" and not host.endswith(".anthropic.com")
@@ -1233,7 +1253,17 @@ def claude_catalog_fingerprint(claude_config: ClaudeNativeUcodeConfig | None) ->
     from omnigent.onboarding.ambient import claude_managed_model_picker
 
     command, _ = resolve_claude_launch("claude", [])
-    ambient_gateway = os.environ.get(_UCODE_CLAUDE_BASE_URL_ENV) if claude_config is None else None
+    # Every ambient input to _ambient_env_is_non_anthropic_gateway() must key the
+    # catalog, since each flips whether canonical claude-* rows survive: the base
+    # URL, the Bedrock URL (which overrides the flag), and the canonical flag.
+    # Keep them distinct components (not folded into the URL) so a base URL that
+    # literally ends in a marker cannot collide with a flagged/Bedrock state.
+    ambient = claude_config is None
+    ambient_gateway = os.environ.get(_UCODE_CLAUDE_BASE_URL_ENV) if ambient else None
+    ambient_bedrock = os.environ.get(_ANTHROPIC_BEDROCK_BASE_URL_ENV) if ambient else None
+    ambient_gateway_canonical = ambient and env_truthy(
+        os.environ.get(_ANTHROPIC_GATEWAY_CANONICAL_ENV)
+    )
     return fingerprint_of(
         "claude-native",
         sorted(claude_config.env.items()) if claude_config is not None else None,
@@ -1241,6 +1271,8 @@ def claude_catalog_fingerprint(claude_config: ClaudeNativeUcodeConfig | None) ->
         claude_config.model if claude_config is not None else None,
         binary_identity(command),
         ambient_gateway,
+        ambient_bedrock,
+        ambient_gateway_canonical,
         claude_managed_model_picker() if claude_config is None else None,
     )
 
@@ -2953,6 +2985,17 @@ def _provider_config_for_native_claude(entry: ProviderEntry) -> ClaudeNativeUcod
         env={
             _UCODE_CLAUDE_BASE_URL_ENV: family.base_url,
             **pin_env,
+            # A host that fronts its Anthropic passthrough as canonical (LiteLLM)
+            # exports OMNIGENT_ANTHROPIC_GATEWAY_CANONICAL; carry that assertion
+            # into the managed config so the catalog gate keeps this provider's
+            # bare claude-* rows instead of dropping them. Only key/gateway/local
+            # anthropic providers reach here, so a namespaced-only gateway
+            # (Bedrock/Databricks) is never falsely marked canonical.
+            **(
+                {_ANTHROPIC_GATEWAY_CANONICAL_ENV: "1"}
+                if env_truthy(os.environ.get(_ANTHROPIC_GATEWAY_CANONICAL_ENV))
+                else {}
+            ),
             # Disable beta flags gateways reject (400 "invalid beta flag");
             # skip when CLAUDE_CODE_USE_GATEWAY=1 to keep tool search enabled.
             **(
