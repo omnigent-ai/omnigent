@@ -667,8 +667,7 @@ function SidebarImpl({
     [selectionMode, exitSelectionMode],
   );
 
-  const availableTab =
-    activeTab === "shared" && !sidebarData.sharedAvailable ? "mine" : activeTab;
+  const availableTab = activeTab === "shared" && !sidebarData.sharedAvailable ? "mine" : activeTab;
   useLayoutEffect(() => {
     if (availableTab !== activeTab) switchTab(availableTab);
   }, [activeTab, availableTab, switchTab]);
