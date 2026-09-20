@@ -313,46 +313,21 @@ def test_observer_hook_stderr_is_logged_incrementally(
     assert len(caplog.records) == record_count
 
 
-def test_missing_transcript_logs_actionable_snapshot_once(
+def test_missing_transcript_warns_then_escalates_once(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A silent observer failure becomes a bounded, session-scoped error."""
+    """A slow observer warns; only a stuck one becomes a session-scoped error."""
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
     record_hook_event(bridge_dir, {"hook_event_name": "UserPromptSubmit"})
     (bridge_dir / "claude-settings.json").write_text("{}", encoding="utf-8")
     diagnostics = forwarder._TranscriptDiscoveryDiagnostics(started_at=100.0)
     warning_at = diagnostics.started_at + forwarder._TRANSCRIPT_DISCOVERY_WARNING_S
+    error_at = diagnostics.started_at + forwarder._TRANSCRIPT_DISCOVERY_ERROR_S
     caplog.set_level(logging.INFO, logger=forwarder.__name__)
 
-    forwarder._observe_transcript_discovery(
-        bridge_dir=bridge_dir,
-        session_id="conv_abc",
-        transcript_path=None,
-        diagnostics=diagnostics,
-        now=warning_at - 0.1,
-    )
-    assert "has not started" not in caplog.text
-
-    for now in (warning_at, warning_at + 30.0):
-        forwarder._observe_transcript_discovery(
-            bridge_dir=bridge_dir,
-            session_id="conv_abc",
-            transcript_path=None,
-            diagnostics=diagnostics,
-            now=now,
-        )
-
-    failures = [record for record in caplog.records if "has not started" in record.getMessage()]
-    assert len(failures) == 1
-    assert failures[0].session_id == "conv_abc"
-    assert "last_hook=UserPromptSubmit" in failures[0].getMessage()
-    assert "observer_stderr_bytes=missing" in failures[0].getMessage()
-    assert "hook_settings=present" in failures[0].getMessage()
-
-    transcript_path = tmp_path / "claude-session.jsonl"
-    for now in (warning_at + 31.0, warning_at + 32.0):
+    def observe(now: float, transcript_path: Path | None = None) -> None:
         forwarder._observe_transcript_discovery(
             bridge_dir=bridge_dir,
             session_id="conv_abc",
@@ -360,8 +335,69 @@ def test_missing_transcript_logs_actionable_snapshot_once(
             diagnostics=diagnostics,
             now=now,
         )
-    discoveries = [record for record in caplog.records if "path discovered" in record.getMessage()]
-    assert len(discoveries) == 1
+
+    def matching(needle: str) -> list[logging.LogRecord]:
+        return [record for record in caplog.records if needle in record.getMessage()]
+
+    observe(warning_at - 0.1)
+    assert not matching("still waiting")
+    assert not matching("has not started")
+
+    # A slow start warns once and stays a warning, however long it is polled.
+    for now in (warning_at, warning_at + 30.0, error_at - 0.1):
+        observe(now)
+    warnings = matching("still waiting")
+    assert len(warnings) == 1
+    assert warnings[0].levelno == logging.WARNING
+    assert "last_hook=UserPromptSubmit" in warnings[0].getMessage()
+    assert "observer_stderr_bytes=missing" in warnings[0].getMessage()
+    assert "hook_settings=present" in warnings[0].getMessage()
+    assert not matching("has not started")
+
+    # Past the escalation deadline it is stuck, not slow: one error, then quiet.
+    for now in (error_at, error_at + 60.0):
+        observe(now)
+    failures = matching("has not started")
+    assert len(failures) == 1
+    assert failures[0].levelno == logging.ERROR
+    assert failures[0].session_id == "conv_abc"
+    assert "last_hook=UserPromptSubmit" in failures[0].getMessage()
+
+    transcript_path = tmp_path / "claude-session.jsonl"
+    for now in (error_at + 61.0, error_at + 62.0):
+        observe(now, transcript_path)
+    assert len(matching("path discovered")) == 1
+
+
+def test_missing_transcript_discovered_after_warning_never_errors(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A hook that reports late is a warning the whole way, never an error."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    (bridge_dir / "claude-settings.json").write_text("{}", encoding="utf-8")
+    diagnostics = forwarder._TranscriptDiscoveryDiagnostics(started_at=0.0)
+    caplog.set_level(logging.INFO, logger=forwarder.__name__)
+
+    for now in (forwarder._TRANSCRIPT_DISCOVERY_WARNING_S, 100.0):
+        forwarder._observe_transcript_discovery(
+            bridge_dir=bridge_dir,
+            session_id="conv_slow",
+            transcript_path=None,
+            diagnostics=diagnostics,
+            now=now,
+        )
+    forwarder._observe_transcript_discovery(
+        bridge_dir=bridge_dir,
+        session_id="conv_slow",
+        transcript_path=tmp_path / "claude-session.jsonl",
+        diagnostics=diagnostics,
+        now=106.0,
+    )
+
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert len([r for r in caplog.records if "path discovered" in r.getMessage()]) == 1
 
 
 @pytest.mark.asyncio

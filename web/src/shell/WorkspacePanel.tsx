@@ -825,12 +825,28 @@ function WorkspacePanelImpl({
       if (parentAgentId === null) return Promise.reject(new Error("no agent"));
       // The child arrives asynchronously via session_created with no id to pair
       // on, so queue this tab to be rekeyed FIFO. The question goes to the
-      // PARENT as `/side`; the native fork seeds the child's first turn.
+      // PARENT as `/side`; the native fork seeds the child's first turn. `send`
+      // resolves after its internal catch, so a failure (e.g. the host is too
+      // old to fork — the server refuses) has set `sendFailed` by the time the
+      // await returns; reject then so the pending pane resets and drop the
+      // queued tab so it never waits for a child that isn't coming.
       awaitingPendingIdsRef.current.push(pendingId);
-      void useChatStore.getState().send(SIDE_CHAT_COMMAND_PREFIX + text, parentAgentId, undefined, {
-        pinnedConversationId: conversationId,
-      });
-      return Promise.resolve();
+      let sendFailed = false;
+      return useChatStore
+        .getState()
+        .send(SIDE_CHAT_COMMAND_PREFIX + text, parentAgentId, undefined, {
+          pinnedConversationId: conversationId,
+          onError: (message) => {
+            sendFailed = true;
+            awaitingPendingIdsRef.current = awaitingPendingIdsRef.current.filter(
+              (id) => id !== pendingId,
+            );
+            toast.error(message);
+          },
+        })
+        .then(() => {
+          if (sendFailed) throw new Error("side chat send failed");
+        });
     }
     return createSideChat(conversationId).then(
       ({ childSessionId }) => {

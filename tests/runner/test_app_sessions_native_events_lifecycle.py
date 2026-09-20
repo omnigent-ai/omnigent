@@ -747,6 +747,57 @@ async def test_opencode_native_model_options_uses_cli_catalog(
 
 
 @pytest.mark.asyncio
+async def test_bound_opencode_switch_qualifies_the_literal_gateway_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import Mock
+
+    from omnigent.inference_config import inference_config_scope
+    from omnigent.spec.types import ExecutorSpec
+
+    update = Mock(return_value=True)
+    monkeypatch.setattr("omnigent.harnesses.opencode_native.bridge.update_model_override", update)
+    spec = AgentSpec(
+        spec_version=1,
+        name="bound-opencode",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "opencode-native"}),
+    )
+
+    async def resolve(_agent: str, session_id: str | None = None) -> AgentSpec:
+        return spec
+
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=resolve,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    profile = {
+        "providers": {"gateway": {"kind": "gateway"}},
+        "inference": {
+            "harnesses": {
+                "opencode-native": {
+                    "provider": "gateway",
+                    "default_model": "omnigent/literal",
+                    "model_allowlist": ["omnigent/literal"],
+                }
+            }
+        },
+    }
+    async with _runner_client(app) as client:
+        response = await client.post(
+            "/v1/sessions", json={"session_id": "bound-opencode", "agent_id": "agent-1"}
+        )
+        assert response.status_code == 201, response.text
+        with inference_config_scope(profile):
+            response = await client.post(
+                "/v1/sessions/bound-opencode/events",
+                json={"type": "model_change", "model": "omnigent/literal"},
+            )
+    assert response.status_code == 200, response.text
+    assert update.call_args.args[1] == "omnigent/omnigent/literal"
+
+
+@pytest.mark.asyncio
 async def test_codex_native_model_options_returns_503_until_bridge_state_exists(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -852,6 +903,10 @@ async def test_codex_native_model_options_query_model_list(
     from omnigent.harnesses.codex_native import app_server as codex_native_app_server
     from omnigent.spec.types import ExecutorSpec
 
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setattr(
+        "omnigent.runtime.workflow._resolve_provider_for_build", lambda *_args, **_kwargs: None
+    )
     conv_id = "68ba0a62ebe928d26adf37c8974ce1eb"
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
     bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(conv_id)
@@ -1184,8 +1239,10 @@ async def test_codex_model_catalog_writeback_uses_session_provider(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("empty", [False, True])
 async def test_claude_native_model_options_use_session_launch_catalog(
     monkeypatch: pytest.MonkeyPatch,
+    empty: bool,
 ) -> None:
     """The session listing is the launch catalog from one cached Claude config.
 
@@ -1232,6 +1289,10 @@ async def test_claude_native_model_options_use_session_launch_catalog(
     async def _probe(claude_config: object) -> ClaudeModelProbe:
         del claude_config
         probe_calls.append(1)
+        if empty:
+            return ClaudeModelProbe(
+                alias_rows=[], disabled_models=frozenset({"system.ai.claude-opus-4-10"})
+            )
         return ClaudeModelProbe(
             alias_rows=[
                 {
@@ -1304,6 +1365,8 @@ async def test_claude_native_model_options_use_session_launch_catalog(
             },
         ]
     }
+    if empty:
+        expected = {"models": []}
     assert first.status_code == 200
     assert first.json() == expected
     assert second.json() == expected
@@ -1311,6 +1374,110 @@ async def test_claude_native_model_options_use_session_launch_catalog(
     # the store's fingerprint cache kept the probe to a single boot.
     assert resolved_specs == [claude_spec]
     assert probe_calls == [1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("empty", [False, True])
+async def test_claude_native_model_options_refresh_the_bridge_vocabulary(
+    monkeypatch: pytest.MonkeyPatch,
+    empty: bool,
+) -> None:
+    """Serving the session listing rewrites the bridge's picker vocabulary.
+
+    A cold launch can record no picker values (the store held no catalog
+    yet) while routed picks are accepted against this listing, so the
+    executor's launch snapshot must be refreshed to the served vocabulary --
+    and an authoritative empty catalog clears stale launch values instead
+    of leaving them to spell switches the pane cannot make.
+    """
+    from omnigent.harnesses.claude_native import bridge as claude_bridge
+    from omnigent.harnesses.claude_native.main import ClaudeModelProbe, ClaudeNativeUcodeConfig
+    from tests.runner.conftest import REAL_CLAUDE_LAUNCH_CATALOG
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main.claude_launch_catalog", REAL_CLAUDE_LAUNCH_CATALOG
+    )
+    conv_id = "7b527915981fe729dd9a19a6dfcbc048"
+    claude_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return claude_spec
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main.resolve_native_claude_config",
+        lambda *, spec: ClaudeNativeUcodeConfig(env={}, api_key_helper="printf token", model=None),
+    )
+
+    async def _probe(claude_config: object) -> ClaudeModelProbe:
+        del claude_config
+        if empty:
+            return ClaudeModelProbe(alias_rows=[], disabled_models=frozenset())
+        return ClaudeModelProbe(
+            alias_rows=[
+                {"id": "opus", "model": "claude-opus-4-10", "displayName": "Opus 4.10"},
+                {"id": "system.ai.glm-5-3", "model": "system.ai.glm-5-3", "displayName": "GLM"},
+            ],
+            disabled_models=frozenset(),
+        )
+
+    monkeypatch.setattr("omnigent.harnesses.claude_native.main.probe_claude_model_options", _probe)
+    recorded: list[tuple[Any, Any, Any, list[str]]] = []
+
+    def _record(
+        bridge_dir: Any,
+        *,
+        launch_env: Any,
+        launch_model: Any,
+        picker_values: Any = None,
+    ) -> None:
+        recorded.append((bridge_dir, launch_env, launch_model, list(picker_values or [])))
+
+    monkeypatch.setattr(claude_bridge, "record_model_vocabulary", _record)
+
+    async def _fake_auto_create(
+        session_id: str,
+        resource_registry: Any,
+        publish_event: Any,
+        **kwargs: Any,
+    ) -> SessionResourceView:
+        del resource_registry, publish_event, kwargs
+        return SessionResourceView(
+            id="terminal_claude_main",
+            type="terminal",
+            session_id=session_id,
+            name="claude:main",
+            metadata={"terminal_name": "claude", "session_key": "main", "running": True},
+        )
+
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_claude_terminal", _fake_auto_create
+    )
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        listing = await client.get(f"/v1/sessions/{conv_id}/claude-model-options")
+
+    assert listing.status_code == 200, listing.text
+    assert recorded, "the listing must refresh the bridge vocabulary"
+    bridge_dir, launch_env, launch_model, picker_values = recorded[-1]
+    assert bridge_dir == claude_bridge.bridge_dir_for_bridge_id(conv_id)
+    assert launch_env is None
+    assert launch_model is None
+    assert picker_values == ([] if empty else ["opus", "system.ai.glm-5-3"])
 
 
 @pytest.mark.asyncio
@@ -1515,8 +1682,10 @@ async def test_claude_native_model_options_config_error_is_not_retryable(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("empty", [False, True])
 async def test_claude_native_model_options_expire_and_reread_the_store(
     monkeypatch: pytest.MonkeyPatch,
+    empty: bool,
 ) -> None:
     """The session listing follows the store once its cache TTL passes.
 
@@ -1606,6 +1775,8 @@ async def test_claude_native_model_options_expire_and_reread_the_store(
             "isDefault": True,
         }
     ]
+    if empty:
+        refreshed = []
 
     async with _runner_client(app) as client:
         create_resp = await client.post(
@@ -1624,7 +1795,7 @@ async def test_claude_native_model_options_expire_and_reread_the_store(
     assert first.status_code == 200
     assert [row["model"] for row in first.json()["models"]] == ["system.ai.claude-opus-4-10"]
     assert second.status_code == 200
-    assert [row["model"] for row in second.json()["models"]] == ["system.ai.claude-opus-5"]
+    assert [row["model"] for row in second.json()["models"]] == [row["model"] for row in refreshed]
     # A warm store re-read costs no new harness probe.
     assert probe_calls == [1]
 

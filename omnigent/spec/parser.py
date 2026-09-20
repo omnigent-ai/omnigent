@@ -171,6 +171,27 @@ def _parse_float_field(raw: object, field_name: str) -> float:
         ) from exc
 
 
+class AgentImageConfigMissingError(OmnigentError, FileNotFoundError):
+    """An agent image directory that carries no ``config.yaml``.
+
+    Every other structural problem in :func:`parse` raises a coded
+    :class:`~omnigent.errors.OmnigentError`; a missing ``config.yaml`` used to
+    raise a bare :class:`FileNotFoundError`, which reached the server's
+    catch-all and was booked as an unhandled internal error. It is really a
+    404: the referenced image has no spec to read, which is what an agent cache
+    entry whose directory outlived its contents looks like.
+
+    Subclasses :class:`FileNotFoundError` as well, so callers that already
+    catch that — the documented contract of :func:`parse` — keep working.
+    """
+
+    def __init__(self, root: Path) -> None:
+        """
+        :param root: Agent image directory that has no ``config.yaml``.
+        """
+        super().__init__(f"config.yaml not found in {root}", code=ErrorCode.NOT_FOUND)
+
+
 def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
     """
     Parse an agent image directory into an :class:`AgentSpec`.
@@ -186,11 +207,12 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
     :raises OmnigentError: If ``config.yaml`` is not valid YAML,
         has structural issues, or (when *expand_env* is ``True``)
         contains unresolved env vars.
-    :raises FileNotFoundError: If ``config.yaml`` is missing.
+    :raises AgentImageConfigMissingError: If ``config.yaml`` is missing. Also
+        a :class:`FileNotFoundError`, so existing handlers still catch it.
     """
     config_path = root / "config.yaml"
     if not config_path.exists():
-        raise FileNotFoundError(f"config.yaml not found in {root}")
+        raise AgentImageConfigMissingError(root)
 
     raw = yaml.load(config_path.read_text(encoding="utf-8"), Loader=_ConfigYamlLoader)
     if not isinstance(raw, dict):

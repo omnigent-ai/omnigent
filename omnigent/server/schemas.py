@@ -1511,6 +1511,8 @@ class _SessionCreateRequestBase(BaseModel):
         message event instead.
     """
 
+    inference_configuration_revision: str | None = None
+
     # Declared here, in the legacy field position, so validation errors keep
     # main's ordering. Concrete public models narrow the wire type below.
     agent_id: Any
@@ -1714,6 +1716,8 @@ class SessionCreateMetadata(BaseModel):
         ``sandbox_providers``); ``None`` takes the server's first. Only
         valid with ``host_type: "managed"``.
     """
+
+    inference_configuration_revision: str | None = None
 
     title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
     project_id: str | None = None
@@ -2209,6 +2213,8 @@ class SessionResponse(BaseModel):
     archived: bool = False
     todos: list[dict[str, Any]] = Field(default_factory=list)
     model_options: list[NativeModelOption] = Field(default_factory=list)
+    inference_configured: bool = False
+    inference_error: str | None = None
     terminal_pending: bool = False
     sandbox_status: SandboxStatus | None = None
     # Per-MCP-server startup state for native harness sessions

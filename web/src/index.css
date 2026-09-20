@@ -1350,7 +1350,28 @@ aside[aria-label="Workspace"][data-maximized] {
   vertical-align: -0.075em;
 }
 
-/* Flash highlight on nav jump. Duration must match FLASH_DURATION_MS in chatStore.ts. */
+/* Message highlights must match FLASH_DURATION_MS in chatStore.ts. */
+@keyframes message-highlight {
+  0%,
+  40% {
+    background-color: var(--message-highlight);
+  }
+  100% {
+    background-color: transparent;
+  }
+}
+
+.animate-message-highlight {
+  --message-highlight: color-mix(in oklch, var(--warning) 16%, transparent);
+  animation: message-highlight 1500ms ease-out;
+  border-radius: var(--radius-lg);
+}
+
+.dark .animate-message-highlight {
+  --message-highlight: color-mix(in oklch, var(--warning) 24%, transparent);
+}
+
+/* Workspace navigation keeps its compact outline highlight. */
 @keyframes user-msg-flash {
   0% {
     box-shadow: 0 0 0 0 var(--ring);
@@ -1368,8 +1389,13 @@ aside[aria-label="Workspace"][data-maximized] {
   border-radius: var(--radius-2xl);
 }
 
-/* Reduced-motion: static outline still signals the target. */
+/* Reduced-motion: static highlights still signal the target. */
 @media (prefers-reduced-motion: reduce) {
+  .animate-message-highlight {
+    animation: none;
+    background-color: var(--message-highlight);
+  }
+
   .animate-user-msg-flash {
     animation: none;
     box-shadow: 0 0 0 2px var(--ring);

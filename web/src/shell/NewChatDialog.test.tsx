@@ -1,3 +1,20 @@
+import type * as SandboxModelOptionsModule from "@/hooks/useSandboxModelOptions";
+
+vi.mock("@/hooks/useSandboxModelOptions", async (importOriginal) => ({
+  ...(await importOriginal<typeof SandboxModelOptionsModule>()),
+  useSandboxModelOptions: vi.fn(() => ({
+    data: {
+      configured: false,
+      status: "unconfigured",
+      models: [],
+      configuration_revision: null,
+      provider_label: null,
+      default_model: null,
+    },
+    isLoading: false,
+    error: null,
+  })),
+}));
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useConversations as useTestConversations } from "@/hooks/useConversations";
 
@@ -38,6 +55,7 @@ import {
   NewChatLandingScreen,
   resetLandingDraft,
 } from "./NewChatDialog";
+import { useSandboxModelOptions, type SandboxModelOptions } from "@/hooks/useSandboxModelOptions";
 import { ComposerAddMenu } from "@/components/composer/ComposerAddMenu";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
@@ -960,6 +978,18 @@ describe("describeCreateError", () => {
     expect(await describeCreateError(res)).toBe("bad workspace");
   });
 
+  it("shows a structured stale-configuration detail", async () => {
+    const res = fakeResponse(409, async () => ({
+      detail: {
+        code: "inference_configuration_changed",
+        message: "Harness configuration changed. Refresh the model choices.",
+      },
+    }));
+    expect(await describeCreateError(res)).toBe(
+      "Harness configuration changed. Refresh the model choices.",
+    );
+  });
+
   it("falls back to the status code for a non-JSON body", async () => {
     const res = fakeResponse(500, async () => {
       throw new Error("not json");
@@ -1144,6 +1174,18 @@ function setupLandingMocks() {
   useProjectConfigMock.mockReset();
   useProjectConfigMock.mockReturnValue(DISABLED_QUERY_RESULT);
   useHostModelOptionsMock.mockReset();
+  vi.mocked(useSandboxModelOptions).mockReturnValue({
+    data: {
+      configured: false,
+      status: "unconfigured",
+      models: [],
+      configuration_revision: null,
+      provider_label: null,
+      default_model: null,
+    },
+    isLoading: false,
+    error: null,
+  } as unknown as ReturnType<typeof useSandboxModelOptions>);
   vi.mocked(useSkills).mockReset();
   vi.mocked(useSkills).mockImplementation(
     ({ target, enabled = true, starting = false }) =>
@@ -1299,7 +1341,8 @@ function remountLanding(infoOverrides: Partial<ServerInfo> = {}): void {
 describe("model picker hotkey", () => {
   beforeEach(setupLandingMocks);
 
-  it("drills into the selected harness's model submenu on Cmd/Ctrl+Shift+M", () => {
+  it("drills into the selected harness's model submenu on Ctrl+Shift+M and focuses its model", async () => {
+    const user = userEvent.setup();
     mockAgents(DEFAULT_LANDING_AGENTS);
     renderLanding();
     // Nothing open yet.
@@ -1310,7 +1353,28 @@ describe("model picker hotkey", () => {
 
     // Lands directly on the selected harness's edit submenu (Models / Effort),
     // not just the harness list.
-    expect(screen.getByTestId("new-chat-landing-agent-models")).toBeVisible();
+    expect(await screen.findByTestId("new-chat-landing-agent-models")).toBeVisible();
+    const selectedModel = screen.getByRole("menuitemcheckbox", { name: "Harness default" });
+    await waitFor(() => expect(selectedModel).toHaveFocus());
+    await user.keyboard("{ArrowDown}");
+    const nextModel = screen.getByRole("menuitemcheckbox", { name: "Opus 4.8" });
+    expect(nextModel).toHaveFocus();
+
+    // Focus remains where the user moved it, and the shortcut works again
+    // after returning to the already-open harness menu.
+    await act(
+      () =>
+        new Promise((resolve) => {
+          window.setTimeout(resolve, 200);
+        }),
+    );
+    expect(nextModel).toHaveFocus();
+    await user.keyboard("{ArrowLeft}");
+    expect(screen.getByRole("menuitem", { name: "Claude Code" })).toHaveFocus();
+    fireEvent.keyDown(window, { code: "KeyM", ctrlKey: true, shiftKey: true });
+    await waitFor(() =>
+      expect(screen.getByRole("menuitemcheckbox", { name: "Harness default" })).toHaveFocus(),
+    );
   });
 });
 
@@ -3197,6 +3261,197 @@ describe("NewChatLandingScreen", () => {
     },
   );
 
+  describe("worktree choices after workspace changes", () => {
+    const gitWorkspace = "/Users/corey/repo";
+    const nextWorkspace = "/Users/corey/next-workspace";
+    const branchName = "feature/workspace-switch";
+    const mainWorktree = {
+      path: gitWorkspace,
+      branch: "main",
+      is_main: true,
+      detached: false,
+      remote_provider: "github" as const,
+    };
+
+    beforeEach(() => {
+      localStorage.setItem(RECENT_KEY, JSON.stringify({ host_1: [gitWorkspace, nextWorkspace] }));
+      useHostWorktreesMock.mockImplementation(
+        (_host, path) =>
+          ({
+            ...SUCCESS_QUERY_STATE,
+            data: path === gitWorkspace ? [mainWorktree] : [],
+            isPlaceholderData: false,
+          }) as ReturnType<typeof useHostWorktrees>,
+      );
+      authenticatedFetchMock.mockResolvedValue(new Response(JSON.stringify({ id: "conv_new" })));
+    });
+
+    function selectWorkspace(path: string) {
+      fireEvent.click(screen.getByTestId("new-chat-landing-workspace-chip"));
+      fireEvent.click(screen.getByRole("button", { name: path }));
+      expect(screen.getByTestId("new-chat-landing-workspace-chip")).toHaveAttribute("title", path);
+    }
+
+    async function selectNewWorktree(autoSeeded = false) {
+      if (autoSeeded) localStorage.setItem("omnigent:always-use-worktree", "true");
+      renderLanding();
+      const worktree = screen.getByTestId("new-chat-landing-branch-chip");
+      await waitFor(() =>
+        expect(worktree).toHaveTextContent(
+          autoSeeded ? /^worktree-[0-9a-f]{8}$/ : /^New worktree$/,
+        ),
+      );
+      fireEvent.click(worktree);
+      if (!autoSeeded) {
+        fireEvent.change(screen.getByTestId("new-chat-landing-branch-input"), {
+          target: { value: branchName },
+        });
+      }
+      fireEvent.change(screen.getByTestId("new-chat-landing-base-branch-input"), {
+        target: { value: "release" },
+      });
+      return worktree;
+    }
+
+    it.each([false, true])(
+      "clears a named worktree when the new workspace is confirmed non-git (auto-seeded: %s)",
+      async (autoSeeded) => {
+        const worktree = await selectNewWorktree(autoSeeded);
+        selectWorkspace(nextWorkspace);
+
+        expect(worktree).toBeDisabled();
+        expect(worktree).toHaveTextContent(/^Worktree$/);
+        expect(worktree).toHaveAttribute(
+          "title",
+          "Choose a Git working directory to use worktrees",
+        );
+        fireEvent.click(worktree);
+        expect(screen.queryByTestId("new-chat-landing-branch-input")).toBeNull();
+
+        selectWorkspace(gitWorkspace);
+        expect(worktree).toBeEnabled();
+        if (autoSeeded) {
+          await waitFor(() => expect(worktree).toHaveTextContent(/^worktree-[0-9a-f]{8}$/));
+        }
+        fireEvent.click(worktree);
+        if (!autoSeeded) {
+          expect(screen.getByTestId("new-chat-landing-branch-input")).toHaveValue("");
+          fireEvent.change(screen.getByTestId("new-chat-landing-branch-input"), {
+            target: { value: "feature/fresh-choice" },
+          });
+        }
+        expect(screen.getByTestId("new-chat-landing-base-branch-input")).toHaveValue("");
+      },
+    );
+
+    it("closes the worktree popover when a delayed probe confirms a non-git workspace", async () => {
+      let probeResolved = false;
+      useHostWorktreesMock.mockImplementation(
+        (_host, path) =>
+          ({
+            ...SUCCESS_QUERY_STATE,
+            data: path === nextWorkspace && probeResolved ? [] : [mainWorktree],
+            isPlaceholderData: path === nextWorkspace && !probeResolved,
+            isFetching: path === nextWorkspace && !probeResolved,
+            fetchStatus: path === nextWorkspace && !probeResolved ? "fetching" : "idle",
+          }) as ReturnType<typeof useHostWorktrees>,
+      );
+      const worktree = await selectNewWorktree();
+      selectWorkspace(nextWorkspace);
+      expect(worktree).toBeEnabled();
+      expect(worktree).toHaveTextContent(branchName);
+      fireEvent.click(worktree);
+      expect(screen.getByTestId("new-chat-landing-branch-input")).toHaveValue(branchName);
+
+      probeResolved = true;
+      fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+        target: { value: "Use the resolved working directory" },
+      });
+      expect(worktree).toBeDisabled();
+      expect(worktree).toHaveTextContent(/^Worktree$/);
+      expect(screen.queryByTestId("new-chat-landing-branch-input")).toBeNull();
+      expect(screen.queryByTestId("new-chat-landing-base-branch-input")).toBeNull();
+      fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+      const { body } = await readCreateBody();
+      expect(body.workspace).toBe(nextWorkspace);
+      expect(body.git).toBeUndefined();
+    });
+
+    it.each([false, true])(
+      "omits stale git options when submitting a non-git workspace (auto-seeded: %s)",
+      async (autoSeeded) => {
+        await selectNewWorktree(autoSeeded);
+        selectWorkspace(nextWorkspace);
+        fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+          target: { value: "Work in this plain folder" },
+        });
+        expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled();
+        fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+        const { body } = await readCreateBody();
+        expect(body.workspace).toBe(nextWorkspace);
+        expect(body.git).toBeUndefined();
+      },
+    );
+
+    it.each(["loading", "placeholder", "error", "ready"] as const)(
+      "preserves a named worktree while switching to another git workspace (%s)",
+      async (state) => {
+        let nextResult = {
+          ...(state === "loading" ? PENDING_QUERY_STATE : SUCCESS_QUERY_STATE),
+          ...(state === "error"
+            ? {
+                status: "error",
+                isError: true,
+                isSuccess: false,
+                error: new Error("host worktrees fetch failed: HTTP 400"),
+              }
+            : {}),
+          data:
+            state === "loading" || state === "error"
+              ? undefined
+              : state === "placeholder"
+                ? []
+                : [{ ...mainWorktree, path: nextWorkspace }],
+          isFetching: state === "loading" || state === "placeholder",
+          fetchStatus: state === "loading" || state === "placeholder" ? "fetching" : "idle",
+          isPlaceholderData: state === "placeholder",
+        } as ReturnType<typeof useHostWorktrees>;
+        useHostWorktreesMock.mockImplementation(
+          (_host, path) =>
+            (path === nextWorkspace
+              ? nextResult
+              : {
+                  ...SUCCESS_QUERY_STATE,
+                  data: [mainWorktree],
+                  isPlaceholderData: false,
+                }) as ReturnType<typeof useHostWorktrees>,
+        );
+        const worktree = await selectNewWorktree();
+        selectWorkspace(nextWorkspace);
+        expect(worktree).toHaveTextContent(branchName);
+
+        nextResult = {
+          ...SUCCESS_QUERY_STATE,
+          data: [{ ...mainWorktree, path: nextWorkspace }],
+          isPlaceholderData: false,
+        } as ReturnType<typeof useHostWorktrees>;
+        fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+          target: { value: "Keep my worktree in the next repository" },
+        });
+        expect(worktree).toBeEnabled();
+        fireEvent.click(worktree);
+        expect(screen.getByTestId("new-chat-landing-branch-input")).toHaveValue(branchName);
+        expect(screen.getByTestId("new-chat-landing-base-branch-input")).toHaveValue("release");
+        fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+
+        const { body } = await readCreateBody();
+        expect(body.workspace).toBe(nextWorkspace);
+        expect(body.git).toEqual({ branch_name: branchName, base_branch: "release" });
+      },
+    );
+  });
+
   it("uses the host's advertised display name in the landing picker", () => {
     mockClaudeModels([
       { id: "opus", model: "system.ai.claude-opus-4-6", displayName: "Opus", isDefault: true },
@@ -3500,7 +3755,10 @@ describe("NewChatLandingScreen", () => {
     expect(screen.getByTestId("new-chat-landing-agent-effort-value")).toHaveTextContent("xHigh");
     expect(screen.getByTestId("new-chat-landing-agent-summary-a2")).toHaveTextContent("xHigh");
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-model-databricks-gpt-5-5"));
-    expect(screen.queryByTestId("new-chat-landing-agent-effort-default")).toBeNull();
+    expect(screen.getByTestId("new-chat-landing-agent-effort-default")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
     expect(screen.queryByTestId("new-chat-landing-agent-effort-value")).toBeNull();
     closeMenu();
     selectAgent("a1");
@@ -4745,11 +5003,7 @@ describe("NewChatLandingScreen", () => {
     // Back to GPT-5.5, whose ladder has no xhigh: the stale rung
     // resets so Save can't commit a level the model rejects.
     fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "GPT-5.5" }));
-    expect(
-      within(screen.getByTestId("new-chat-landing-agent-efforts")).queryByRole("menuitemcheckbox", {
-        checked: true,
-      }),
-    ).toBeNull();
+    expect(selectedPickerEffort().textContent).toContain("Default");
     closePrimaryPicker();
 
     fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
@@ -4771,11 +5025,7 @@ describe("NewChatLandingScreen", () => {
     // Claude's row reopens on its own remembered effort (nothing stored →
     // Default) — the Codex pick must not ride the shared state across.
     openAgentModels("a1");
-    expect(
-      within(screen.getByTestId("new-chat-landing-agent-efforts")).queryByRole("menuitemcheckbox", {
-        checked: true,
-      }),
-    ).toBeNull();
+    expect(selectedPickerEffort().textContent).toContain("Default");
     closePrimaryPicker();
 
     // Codex reopens on the remembered pick, still valid for its ladder.
@@ -7019,6 +7269,36 @@ describe("NewChatLandingScreen agent picker + Edit settings", () => {
     );
   });
 
+  it("hides Codex's transport namespace in the new-session model label", () => {
+    const wireModel = "system.ai.gpt-6-astra";
+    useHostModelOptionsMock.mockImplementation(
+      (_hostId, harness) =>
+        (harness === "codex-native"
+          ? {
+              ...CODEX_MODEL_OPTIONS_RESULT,
+              data: [
+                {
+                  id: wireModel,
+                  model: wireModel,
+                  displayName: wireModel,
+                  isDefault: true,
+                  supportedReasoningEfforts: [{ reasoningEffort: "xhigh" }],
+                },
+              ],
+            }
+          : CLAUDE_MODEL_OPTIONS_RESULT) as unknown as ReturnType<typeof useHostModelOptions>,
+    );
+
+    renderLanding();
+    selectAgent("a2");
+
+    const picker = screen.getByTestId("new-chat-landing-agent-select");
+    expect(picker).toHaveAccessibleName("Codex, Model gpt-6-astra");
+    expect(picker).not.toHaveTextContent("system.ai");
+    openAgentModels("a2");
+    expect(screen.getByRole("menuitemcheckbox", { name: "gpt-6-astra" })).toBeVisible();
+  });
+
   it("edits Claude models without opening a permissions modal", () => {
     renderLanding();
     openAgentModels("a1");
@@ -9011,5 +9291,196 @@ describe("NewChatLandingScreen Smart Routing flavors are scoped separately", () 
     expect(screen.getByTestId("new-chat-landing-config-harness").textContent).toContain(
       "Smart Routing",
     );
+  });
+});
+
+describe("managed sandbox inference models", () => {
+  beforeEach(setupLandingMocks);
+
+  const models = [
+    { id: "private/default", displayName: "Gateway default", isDefault: true },
+    { id: "private/alternate", displayName: "Gateway alternate" },
+  ];
+  const catalog = {
+    configured: true,
+    status: "ready" as const,
+    models,
+    configuration_revision: "profile-revision-1",
+    provider_label: "Bifrost",
+    default_model: "private/default",
+  };
+
+  function renderConfiguredSandbox(overrides: Partial<ServerInfo>) {
+    return renderLanding({
+      ...overrides,
+      sandbox_provider_capabilities: {
+        [overrides.sandbox_provider!]: { inference_models: true },
+      },
+    });
+  }
+
+  it.each(["lakebox", "kubernetes", "agent_sandbox", "modal"])(
+    "keeps %s without bindings independent of the preview service",
+    async (provider) => {
+      preview(catalog, new Error("Gateway unavailable"));
+      authenticatedFetchMock.mockResolvedValue({
+        ok: true,
+        json: async () => ({ id: "conv_new" }),
+      } as Response);
+      renderLanding({
+        managed_sandboxes_enabled: true,
+        sandbox_provider: provider,
+        sandbox_provider_capabilities: { another_provider: { inference_models: true } },
+      });
+      expect(useSandboxModelOptions).toHaveBeenLastCalledWith(
+        provider,
+        "claude-native",
+        "a1",
+        null,
+        false,
+      );
+      expect(screen.queryByTestId("sandbox-model-provider")).toBeNull();
+      expect(screen.queryByRole("alert")).toBeNull();
+      const { body } = await submitAndReadBody();
+      expect(body.host_type).toBe("managed");
+      expect(body.inference_configuration_revision).toBeUndefined();
+    },
+  );
+
+  it("does not preview inference for an ordinary host on an opted-in server", () => {
+    preview(catalog, new Error("Gateway unavailable"));
+    mockHosts([host("online")]);
+    renderConfiguredSandbox({
+      managed_sandboxes_enabled: false,
+      sandbox_provider: "agent_sandbox",
+    });
+    expect(vi.mocked(useSandboxModelOptions).mock.lastCall?.[4]).toBe(false);
+    expect(screen.queryByTestId("sandbox-model-provider")).toBeNull();
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  function preview(data: SandboxModelOptions = catalog, error: Error | null = null) {
+    vi.mocked(useSandboxModelOptions).mockReturnValue({
+      data,
+      isLoading: false,
+      error,
+    } as unknown as ReturnType<typeof useSandboxModelOptions>);
+  }
+
+  it("shows the future host's models and sends the previewed revision", async () => {
+    preview();
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as Response);
+    renderConfiguredSandbox({ managed_sandboxes_enabled: true, sandbox_provider: "agent_sandbox" });
+    openAgentModels("a1");
+    expect(screen.getByTestId("sandbox-model-provider")).toHaveTextContent("Bifrost");
+    expect(screen.queryByTestId("new-chat-landing-agent-model-opus")).toBeNull();
+    pickPrimaryOption("model", "Gateway alternate");
+    closeMenu();
+    const { body } = await submitAndReadBody();
+    expect(body.model_override).toBe("private/alternate");
+    expect(body.inference_configuration_revision).toBe("profile-revision-1");
+    expect(body.host_type).toBe("managed");
+    expect(useSandboxModelOptions).toHaveBeenLastCalledWith(
+      "agent_sandbox",
+      "claude-native",
+      "a1",
+      null,
+      true,
+    );
+  });
+
+  it("supports an ACP agent without native model-picker capabilities", async () => {
+    preview();
+    mockAgents([
+      {
+        id: "a_acp",
+        name: "Private ACP",
+        display_name: "Private ACP",
+        description: null,
+        harness: "acp:private",
+        skills: [],
+      },
+    ]);
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as Response);
+    renderConfiguredSandbox({ managed_sandboxes_enabled: true, sandbox_provider: "kubernetes" });
+    openAgentModels("a_acp");
+    pickPrimaryOption("model", "Gateway alternate");
+    closeMenu();
+    const { body } = await submitAndReadBody();
+    expect(body.model_override).toBe("private/alternate");
+    expect(useSandboxModelOptions).toHaveBeenLastCalledWith(
+      "kubernetes",
+      "acp:private",
+      "a_acp",
+      null,
+      true,
+    );
+  });
+
+  it.each(["empty", "unavailable"] as const)(
+    "blocks create when discovery is %s",
+    async (status) => {
+      preview({ ...catalog, models: [], status });
+      renderConfiguredSandbox({ managed_sandboxes_enabled: true, sandbox_provider: "kubernetes" });
+      fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+        target: { value: "start" },
+      });
+      expect(screen.getByRole("alert")).toHaveTextContent("No usable models");
+      expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+      expect(authenticatedFetchMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it("blocks stale cached choices when a catalog refresh fails", async () => {
+    preview(catalog, new Error("Gateway unavailable"));
+    renderConfiguredSandbox({ managed_sandboxes_enabled: true, sandbox_provider: "kubernetes" });
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), { target: { value: "start" } });
+    expect(screen.getByRole("alert")).toHaveTextContent("Gateway unavailable");
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+    expect(screen.queryByTestId("sandbox-catalog-error-integrations-link")).toBeNull();
+  });
+
+  it("offers Integrations when Unity requires an account connection", () => {
+    preview({
+      ...catalog,
+      models: [],
+      status: "unavailable",
+      error: "Connect Databricks before using this harness's Unity Gateway provider.",
+    });
+    renderConfiguredSandbox({ managed_sandboxes_enabled: true, sandbox_provider: "agent_sandbox" });
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), { target: { value: "start" } });
+    expect(screen.getByRole("alert")).toHaveTextContent("Connect Databricks");
+    expect(screen.getByTestId("sandbox-catalog-error-integrations-link")).toHaveTextContent(
+      "Go to Integrations",
+    );
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+    expect(authenticatedFetchMock).not.toHaveBeenCalled();
+  });
+
+  it("discards a model removed by a provider profile change", async () => {
+    preview();
+    const mounted = renderConfiguredSandbox({
+      managed_sandboxes_enabled: true,
+      sandbox_provider: "kubernetes",
+    });
+    openAgentModels("a1");
+    pickPrimaryOption("model", "Gateway alternate");
+    closeMenu();
+    preview({ ...catalog, models: [models[0]], configuration_revision: "profile-revision-2" });
+    // A normal user interaction rerenders the mounted composer with the refreshed query.
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), { target: { value: "start" } });
+    openAgentModels("a1");
+    expect(screen.queryByTestId("new-chat-landing-agent-model-private/alternate")).toBeNull();
+    expect(screen.getByTestId("new-chat-landing-agent-model-private/default")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    mounted.unmount();
   });
 });

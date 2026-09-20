@@ -349,6 +349,7 @@ async def _recover_retry_session(
 
     original_runner_id = conv.runner_id
     runner_client = await _get_runner_client(session_id, runner_router)
+    was_connected = runner_client is not None
     runner_relaunched = False
     terminal_ready_from_init = False
     if runner_client is None:
@@ -366,23 +367,25 @@ async def _recover_retry_session(
                 code=ErrorCode.RUNNER_UNAVAILABLE,
             )
         runner_relaunched = conv.runner_id != original_runner_id
-        terminal_ready_from_init = await _ensure_runner_session_initialized(
-            session_id,
-            conv,
-            runner_client,
-            conversation_store,
-            initializer=getattr(request.app.state, "runner_session_initializer", None),
-            suppress_recovery_turn=False,
-            require_success=True,
-        )
+    terminal_ready_from_init = await _ensure_runner_session_initialized(
+        session_id,
+        conv,
+        runner_client,
+        conversation_store,
+        initializer=getattr(request.app.state, "runner_session_initializer", None),
+        suppress_recovery_turn=was_connected,
+        require_success=True,
+    )
 
     if _is_native_terminal_session(conv):
-        if not terminal_ready_from_init:
+        # A cached init response cannot prove that a connected runner's pane still exists.
+        if was_connected or not terminal_ready_from_init:
             terminal_outcome = await _ensure_native_terminal_ready(
                 runner_client,
                 session_id,
                 conv,
                 persist_resource_event=False,
+                runner_router=runner_router,
             )
             if terminal_outcome.error is not None:
                 raise OmnigentError(
@@ -740,6 +743,13 @@ def register_events_routes(
         # fall through to the normal persist/forward path.
         _policy_body = body  # may be replaced by OUTPUT deny
         _actor = _build_actor(user_id)
+        if (
+            body.type == "message" and body.data.get("role", "user") == "user"
+        ) or body.type == _SLASH_COMMAND_TYPE:
+            from omnigent.server.routes.sandbox_inference import validate_saved_selection
+
+            await validate_saved_selection(request, conv, conv.model_override)
+
         # A closed sub-agent session (sys_session_close) rejects new user
         # input — the orchestrator must spawn a fresh session to continue.
         if (
@@ -2170,6 +2180,9 @@ def register_events_routes(
             # Read only for the gateway-backing check that decides which router
             # serves this turn; absent, routing keeps its default posture.
             host_store=getattr(request.app.state, "host_store", None),
+            # Read only to refuse a codex `/side` when the host is too old to fork
+            # one; absent, the dispatch forwards as before.
+            host_registry=getattr(request.app.state, "host_registry", None),
         )
         if pending_background_title is not None:
             pending_background_title.schedule(expected_seed_title=conv.title)

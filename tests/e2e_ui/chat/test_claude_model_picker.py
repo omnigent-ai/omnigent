@@ -557,9 +557,9 @@ def test_claude_native_unpinned_gateway_catalog_offers_only_the_routable_default
 
     page.goto(f"{base_url}/c/{session_id}")
 
-    # The composer names the routable model using its advertised label.
-    expect(page.get_by_test_id("composer-agent-config-value")).to_contain_text(
-        "databricks-claude-sonnet-4-5", timeout=15_000
+    # Visible labels omit the catalog prefix; routing keeps the full model id.
+    expect(page.get_by_test_id("composer-agent-config-value")).to_have_text(
+        "claude-sonnet-4-5", timeout=15_000
     )
     _screenshot(page, "unpinned-gateway-composer")
 
@@ -573,6 +573,7 @@ def test_claude_native_unpinned_gateway_catalog_offers_only_the_routable_default
     # resolver passes through verbatim.
     rows = page.locator('[role="menuitemcheckbox"][data-model-id]')
     expect(rows).to_have_count(1)
+    expect(rows.first).to_have_text("claude-sonnet-4-5")
     expect(rows.first).to_have_attribute("data-model-id", default_model)
     expect(rows.first).to_have_attribute("aria-checked", "true")
     _screenshot(page, "unpinned-gateway-picker")

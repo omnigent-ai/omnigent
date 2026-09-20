@@ -5004,6 +5004,340 @@ async def test_native_dispatch_tunnel_close_is_definitive_ensure_error() -> None
     )
 
 
+class _FailingEnsureRunnerClient(_FakeRunnerClient):
+    """Fake runner whose terminal-ensure POSTs fail with a scripted sequence, then succeed."""
+
+    def __init__(self, ensure_path: str, failures: list[Exception]) -> None:
+        super().__init__()
+        self._ensure_path = ensure_path
+        self._failures = list(failures)
+        self.drops = 0
+
+    def _make_response(self, method: str, url: str) -> httpx.Response:
+        if url == self._ensure_path and self._failures:
+            self.drops += 1
+            self.calls.append((method, url))
+            raise self._failures.pop(0)
+        return super()._make_response(method, url)
+
+
+def _ensure_request(path: str) -> httpx.Request:
+    return httpx.Request("POST", f"http://runner{path}")
+
+
+_TUNNEL_CLOSED = "tunnel closed before request completed"
+
+
+class _ReconnectWaitRouter:
+    """Fake router recording reconnect waits and answering them canned."""
+
+    def __init__(self, *, reconnects: bool) -> None:
+        self._reconnects = reconnects
+        self.waits: list[tuple[str, float]] = []
+
+    async def wait_for_runner(self, runner_id: str, *, timeout_s: float) -> bool:
+        self.waits.append((runner_id, timeout_s))
+        return self._reconnects
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("drop_kind", ["tunnel_closed", "runner_offline"])
+async def test_native_dispatch_tunnel_drop_retries_ensure_after_runner_reconnects(
+    drop_kind: str,
+) -> None:
+    """A tunnel drop mid-ensure waits for the runner and asks again.
+
+    The runner behind a dropped tunnel is usually alive but stalled; it
+    re-registers and the terminal it was creating is still there. Failing
+    the message on the drop threw the user's input away while the server
+    itself re-ran the ensure on reconnect moments later. Both shapes the
+    tunnel transport raises qualify: the bare ``ConnectionError`` of a drop
+    under an in-flight request and the ``httpx.ConnectError`` of a runner
+    already offline when the request is sent.
+    """
+    import dataclasses
+
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes._sessions import orchestration as orchestration_module
+    from omnigent.server.routes.sessions import _dispatch_session_event_to_runner
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    conv = store.get_conversation("64a784c3aa907d1774f44313546947c6")
+    assert conv is not None
+    conv = dataclasses.replace(conv, runner_id="runner_one")
+    terminals_path = "/v1/sessions/64a784c3aa907d1774f44313546947c6/resources/terminals"
+    drop: Exception = (
+        ConnectionError(_TUNNEL_CLOSED)
+        if drop_kind == "tunnel_closed"
+        else httpx.ConnectError(
+            "runner 'runner_one' is offline", request=_ensure_request(terminals_path)
+        )
+    )
+    client = _FailingEnsureRunnerClient(terminals_path, [drop])
+    router = _ReconnectWaitRouter(reconnects=True)
+    body = SessionEventInput(
+        type="message",
+        data={"role": "user", "content": [{"type": "input_text", "text": "retry"}]},
+    )
+
+    try:
+        result = await _dispatch_session_event_to_runner(
+            "64a784c3aa907d1774f44313546947c6",
+            conv,
+            body,
+            store,  # type: ignore[arg-type]
+            client,  # type: ignore[arg-type]
+            agent_name="claude-native-ui",
+            file_store=None,
+            artifact_store=None,
+            created_by=None,
+            runner_router=router,  # type: ignore[arg-type]
+        )
+
+        assert router.waits == [
+            ("runner_one", orchestration_module._NATIVE_TERMINAL_ENSURE_RECONNECT_GRACE_S)
+        ]
+        assert client.drops == 1
+        # Two ensure attempts, then the message forwards as usual.
+        assert [call for call in client.calls if call[0] == "POST"] == [
+            ("POST", terminals_path),
+            ("POST", terminals_path),
+            ("POST", "/v1/sessions/64a784c3aa907d1774f44313546947c6/events"),
+        ]
+        assert result.pending_id is not None
+        assert [i.type for i in store.appended_items if i.type == "error"] == []
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_native_dispatch_tunnel_drop_fails_when_runner_stays_gone() -> None:
+    """A runner that never re-registers within the grace fails the turn as before."""
+    import dataclasses
+
+    from omnigent.server.routes.sessions import _dispatch_session_event_to_runner
+
+    store = _ConversationStore()
+    conv = store.get_conversation("64a784c3aa907d1774f44313546947c6")
+    assert conv is not None
+    conv = dataclasses.replace(conv, runner_id="runner_one")
+    terminals_path = "/v1/sessions/64a784c3aa907d1774f44313546947c6/resources/terminals"
+    client = _FailingEnsureRunnerClient(terminals_path, [ConnectionError(_TUNNEL_CLOSED)])
+    router = _ReconnectWaitRouter(reconnects=False)
+    body = SessionEventInput(
+        type="message",
+        data={"role": "user", "content": [{"type": "input_text", "text": "retry"}]},
+    )
+
+    result = await _dispatch_session_event_to_runner(
+        "64a784c3aa907d1774f44313546947c6",
+        conv,
+        body,
+        store,  # type: ignore[arg-type]
+        client,  # type: ignore[arg-type]
+        agent_name="claude-native-ui",
+        file_store=None,
+        artifact_store=None,
+        created_by=None,
+        runner_router=router,  # type: ignore[arg-type]
+    )
+
+    assert len(router.waits) == 1
+    # No second ensure attempt against a runner that never came back.
+    assert [call for call in client.calls if call[0] == "POST"] == [("POST", terminals_path)]
+    assert result.pending_id is None
+    errors = [i for i in store.appended_items if i.type == "error"]
+    assert len(errors) == 1
+    assert errors[0].data.code == "native_terminal_ensure_failed"
+    assert (
+        errors[0].data.message
+        == "Native Claude terminal ensure request failed. tunnel closed before request completed"
+    )
+
+
+@pytest.mark.asyncio
+async def test_native_dispatch_unrelated_transport_error_fails_without_waiting() -> None:
+    """A transport error that is not a tunnel drop keeps the immediate durable failure."""
+    import dataclasses
+
+    from omnigent.server.routes.sessions import _dispatch_session_event_to_runner
+
+    store = _ConversationStore()
+    conv = store.get_conversation("64a784c3aa907d1774f44313546947c6")
+    assert conv is not None
+    conv = dataclasses.replace(conv, runner_id="runner_one")
+    terminals_path = "/v1/sessions/64a784c3aa907d1774f44313546947c6/resources/terminals"
+    client = _FailingEnsureRunnerClient(
+        terminals_path,
+        [httpx.ReadTimeout("read timed out", request=_ensure_request(terminals_path))],
+    )
+    router = _ReconnectWaitRouter(reconnects=True)
+    body = SessionEventInput(
+        type="message",
+        data={"role": "user", "content": [{"type": "input_text", "text": "retry"}]},
+    )
+
+    result = await _dispatch_session_event_to_runner(
+        "64a784c3aa907d1774f44313546947c6",
+        conv,
+        body,
+        store,  # type: ignore[arg-type]
+        client,  # type: ignore[arg-type]
+        agent_name="claude-native-ui",
+        file_store=None,
+        artifact_store=None,
+        created_by=None,
+        runner_router=router,  # type: ignore[arg-type]
+    )
+
+    assert router.waits == []
+    assert [call for call in client.calls if call[0] == "POST"] == [("POST", terminals_path)]
+    assert result.pending_id is None
+    errors = [i for i in store.appended_items if i.type == "error"]
+    assert len(errors) == 1
+    assert errors[0].data.code == "native_terminal_ensure_failed"
+    assert errors[0].data.message == "Native Claude terminal ensure request failed. read timed out"
+
+
+@pytest.mark.asyncio
+async def test_native_dispatch_tunnel_drop_retry_failure_is_durable_after_one_attempt() -> None:
+    """A retry that also fails stops there and reports the retry's error."""
+    import dataclasses
+
+    from omnigent.server.routes.sessions import _dispatch_session_event_to_runner
+
+    store = _ConversationStore()
+    conv = store.get_conversation("64a784c3aa907d1774f44313546947c6")
+    assert conv is not None
+    conv = dataclasses.replace(conv, runner_id="runner_one")
+    terminals_path = "/v1/sessions/64a784c3aa907d1774f44313546947c6/resources/terminals"
+    client = _FailingEnsureRunnerClient(
+        terminals_path,
+        [
+            ConnectionError(_TUNNEL_CLOSED),
+            httpx.ConnectError(
+                "runner 'runner_one' is offline", request=_ensure_request(terminals_path)
+            ),
+        ],
+    )
+    router = _ReconnectWaitRouter(reconnects=True)
+    body = SessionEventInput(
+        type="message",
+        data={"role": "user", "content": [{"type": "input_text", "text": "retry"}]},
+    )
+
+    result = await _dispatch_session_event_to_runner(
+        "64a784c3aa907d1774f44313546947c6",
+        conv,
+        body,
+        store,  # type: ignore[arg-type]
+        client,  # type: ignore[arg-type]
+        agent_name="claude-native-ui",
+        file_store=None,
+        artifact_store=None,
+        created_by=None,
+        runner_router=router,  # type: ignore[arg-type]
+    )
+
+    # One wait, two ensure attempts, no third; the message is not forwarded.
+    assert len(router.waits) == 1
+    assert [call for call in client.calls if call[0] == "POST"] == [
+        ("POST", terminals_path),
+        ("POST", terminals_path),
+    ]
+    assert result.pending_id is None
+    errors = [i for i in store.appended_items if i.type == "error"]
+    assert len(errors) == 1
+    assert errors[0].data.code == "native_terminal_ensure_failed"
+    assert (
+        errors[0].data.message
+        == "Native Claude terminal ensure request failed. runner 'runner_one' is offline"
+    )
+
+
+@pytest.mark.asyncio
+async def test_ensure_native_terminal_ready_retries_over_the_runners_new_tunnel() -> None:
+    """Over the real tunnel transport, a mid-request drop waits for re-registration and retries.
+
+    Uses the real ``TunnelRegistry``/``WSTunnelTransport``/``RunnerRouter``:
+    deregistering the runner aborts the in-flight ensure with the transport's
+    own ``ConnectionError``, and the probe must stay pending until the runner
+    registers a new tunnel, then repeat the request over it.
+    """
+    import dataclasses
+
+    from omnigent.runner.routing import RunnerRouter
+    from omnigent.runner.transports.ws_tunnel.frames import (
+        HelloFrame,
+        ResponseBodyFrame,
+        ResponseEndFrame,
+        ResponseHeadFrame,
+    )
+    from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
+    from omnigent.runner.transports.ws_tunnel.transport import WSTunnelTransport
+    from omnigent.server.routes.sessions import _ensure_native_terminal_ready
+
+    class _IdleWS:
+        async def send_text(self, data: str) -> None:
+            return None
+
+        async def receive_text(self) -> str:
+            return await asyncio.Future()
+
+    hello = HelloFrame(
+        runner_version="0.1.0", frame_protocol_version=1, harnesses=["claude-native"], envs=[]
+    )
+    registry = TunnelRegistry()
+    registry.register("runner_one", _IdleWS(), hello)
+    store = _ConversationStore()
+    conv = store.get_conversation("64a784c3aa907d1774f44313546947c6")
+    assert conv is not None
+    conv = dataclasses.replace(conv, runner_id="runner_one")
+    router = RunnerRouter(registry=registry, conversation_store=store)  # type: ignore[arg-type]
+    client = httpx.AsyncClient(
+        transport=WSTunnelTransport(registry, "runner_one"), base_url="http://runner"
+    )
+
+    async def _in_flight_request_id() -> str:
+        for _ in range(400):
+            session = registry.get("runner_one")
+            if session is not None and session.in_flight:
+                return next(iter(session.in_flight))
+            await asyncio.sleep(0.005)
+        raise AssertionError("ensure request never reached the tunnel")
+
+    try:
+        task = asyncio.create_task(
+            _ensure_native_terminal_ready(client, conv.id, conv, runner_router=router)
+        )
+        await _in_flight_request_id()
+        # The runner's tunnel dies under the in-flight ensure.
+        registry.deregister("runner_one")
+        await asyncio.sleep(0.02)
+        assert not task.done(), "the drop must park the ensure, not fail it"
+
+        # The runner re-registers; the ensure repeats over the new tunnel.
+        registry.register("runner_one", _IdleWS(), hello)
+        req_id = await _in_flight_request_id()
+        registry.route_response_frame(
+            "runner_one",
+            ResponseHeadFrame(
+                id=req_id, status=200, headers=[["content-type", "application/json"]]
+            ),
+        )
+        registry.route_response_frame(
+            "runner_one", ResponseBodyFrame(id=req_id, body="{}", encoding="utf-8")
+        )
+        registry.route_response_frame("runner_one", ResponseEndFrame(id=req_id))
+
+        outcome = await asyncio.wait_for(task, timeout=5.0)
+        assert outcome.error is None
+    finally:
+        await client.aclose()
+        await router.aclose()
+
+
 @pytest.mark.asyncio
 async def test_native_dispatch_persists_error_for_each_user_retry() -> None:
     """A fresh user retry gets its own durable terminal error.

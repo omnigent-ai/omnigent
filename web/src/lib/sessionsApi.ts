@@ -170,6 +170,8 @@ interface SessionResponseWire {
   /** Effective brain harness (override-aware), e.g. ``"claude-sdk"``. */
   harness?: string | null;
   model_override?: string | null;
+  inference_configured?: boolean;
+  inference_error?: string | null;
   /** Per-session cost-control switch; `null`/absent = spec default. */
   cost_control_mode_override?: "on" | "off" | null;
   /** Sub-agent routing switch; `null`/absent reads the same as `"off"` (Default). */
@@ -351,6 +353,12 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     kind: wire.kind === "sub_agent" ? "sub_agent" : "default",
     todos: wire.todos ?? [],
     codexModelOptions: wire.model_options ?? [],
+    ...(wire.inference_configured !== undefined
+      ? {
+          inferenceConfigured: wire.inference_configured,
+          inferenceError: wire.inference_error ?? null,
+        }
+      : {}),
     terminalPending: wire.terminal_pending ?? false,
     sandboxStatus: wire.sandbox_status ?? null,
     mcpStartup: wire.mcp_startup ?? null,
@@ -1019,11 +1027,9 @@ export async function launchRunner(
  * clear signal. Clearing sub-agent routing lands the session on Default,
  * the same place ``"off"`` does.
  *
- * `silent: true` persists without firing the claude-native tmux
- * forward — use for bind-time auto-apply (e.g. the sticky-pref
- * handoff in `bindStream`) where injecting a visible "/model X"
- * item into a fresh pane would look like an unexpected first
- * message in the chat.
+ * `silent: true` persists without forwarding a live command into a native
+ * harness. Use it only for persistence-only updates, such as detaching a
+ * runner while clearing its model override.
  */
 export async function updateSession(
   sessionId: string,

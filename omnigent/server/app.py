@@ -1,6 +1,8 @@
 """FastAPI application — main entry point for the omnigent server."""
 
 import asyncio
+import hashlib
+import json
 import logging
 import mimetypes
 import os
@@ -10,6 +12,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
+from functools import partial
 from importlib import import_module
 from pathlib import Path
 from typing import Any, Literal, Protocol
@@ -266,7 +269,202 @@ _API_ONLY_LANDING_HTML = Path(__file__).parent / "static" / "api_only_landing.ht
 _WEB_UI_HTML_CACHE_CONTROL = "no-cache"
 _WEB_UI_ASSET_CACHE_CONTROL = "public, max-age=31536000, immutable"
 _WEB_UI_STATIC_CACHE_CONTROL = "public, max-age=3600"
-_WEB_UI_API_FALLBACK_PREFIXES = frozenset({"api", "auth", "health", "v1", ".well-known"})
+# First-segment namespaces that must keep resolving at the origin root: the JSON
+# API (`api`, `v1`), auth flows (`auth`, `oauth`), health, `.well-known`,
+# FastAPI's built-in docs endpoints (`docs`, `redoc`, `openapi.json`), and the
+# SPA's own static-asset mount (`assets`) — a base path of `/assets` would be
+# indistinguishable from an already-destripped `/assets/<file>` request under a
+# prefix-stripping proxy, double-stripping it into a 404. Doubles as the
+# SPA-fallback allowlist and the base-path collision check (see
+# `_normalize_base_path` / `_is_web_ui_api_fallback_path`).
+_WEB_UI_API_FALLBACK_PREFIXES = frozenset(
+    {
+        "api",
+        "assets",
+        "auth",
+        "docs",
+        "health",
+        "oauth",
+        "openapi.json",
+        "redoc",
+        "v1",
+        ".well-known",
+    }
+)
+
+# First segments of the SPA's own top-level routes (web/src/App.tsx). A base
+# path colliding with one of these is ambiguous for the frontend's
+# `withBasePath` (web/src/lib/basePath.ts): it treats a path already starting
+# with the configured base as "already prefixed" to avoid double-prefixing a
+# redirect target that genuinely is one (e.g. an already-absolute return_to
+# read back from `window.location`). With `--base-path /c`, a share link for
+# session `<id>` — the unprefixed app path `/c/<id>` — is misread as already
+# under the `/c` base and left unprefixed, producing a dead link instead of
+# `/c/c/<id>`. Rejected here rather than made "smarter" client-side: the
+# ambiguity is unresolvable in general (a base of `/login` has the same
+# problem for the post-login redirect). NOT folded into
+# `_WEB_UI_API_FALLBACK_PREFIXES`: unlike that set, these ARE legitimate SPA
+# routes that must still fall back to `index.html` when unmatched by a
+# static file, just never as a base-path prefix.
+_WEB_UI_ROUTE_PREFIXES = frozenset(
+    {
+        "approve",
+        "c",
+        "canvas",
+        "extensions",
+        "inbox",
+        "login",
+        "members",
+        "policies",
+        "register",
+        "settings",
+        "tasks",
+        "usage",
+    }
+)
+
+
+# RFC 3986 unreserved + path separator. Percent is deliberately excluded:
+# BasePathMiddleware matches the configured prefix against ASGI's already
+# percent-decoded request path, so an encoded prefix would never match and
+# routing would break silently. Reject it at config time instead.
+_BASE_PATH_ALLOWED = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~/"
+)
+
+
+def _normalize_base_path(value: str | None) -> str:
+    """Normalize ``OMNIGENT_WEB_BASE_PATH`` to a leading-slash, no-trailing-slash string.
+
+    ``None``, ``""`` and ``"/"`` all map to ``""`` (root deployment, today's
+    behavior). Mirrors the frontend's ``getBasePath`` (``web/src/lib/basePath.ts``)
+    so the two agree on the prefix.
+
+    :param value: Raw base path, e.g. ``"/proxy/6767/"`` or ``"proxy/6767"``.
+    :returns: Normalized path (``"/proxy/6767"``) or ``""``.
+    :raises ValueError: If the path starts with ``//`` (protocol-relative, a
+        cross-origin asset/redirect risk) or contains characters outside
+        ``_BASE_PATH_ALLOWED`` — quotes, angle brackets, spaces, backslashes,
+        percent, etc. The value is spliced into ``index.html`` unescaped, and
+        percent-encoding would also fail the decoded-path match in
+        ``BasePathMiddleware``.
+    """
+    if not value:
+        return ""
+    trimmed = value.strip()
+    if trimmed in ("", "/"):
+        return ""
+    if not trimmed.startswith("/"):
+        trimmed = f"/{trimmed}"
+    if trimmed.startswith("//"):
+        # Protocol-relative (`//evil.example`) spliced into an asset ref would
+        # point at another origin; a slash-only value (`//`, `///`) would rstrip
+        # to empty and hit an IndexError at `segments[1]` below. Reject both here,
+        # before the trailing-slash strip, so misconfiguration fails loud.
+        raise ValueError(f"Invalid base path {value!r}: must not start with '//'.")
+    trimmed = trimmed.rstrip("/")
+    invalid = set(trimmed) - _BASE_PATH_ALLOWED
+    if invalid:
+        raise ValueError(
+            f"Invalid base path {value!r}: only URL path characters "
+            f"(letters, digits, '-._~/') are allowed, got {sorted(invalid)!r}."
+        )
+    segments = trimmed.split("/")
+    if "." in segments or ".." in segments:
+        # A `.`/`..` segment (`/proxy/../app`) is normalized away by the browser,
+        # so the sent path would disagree with the literal prefix the middleware
+        # strips. Reject it.
+        raise ValueError(f"Invalid base path {value!r}: '.'/'..' segments are not allowed.")
+    if segments[1] in _WEB_UI_API_FALLBACK_PREFIXES:
+        # A base path whose first segment is a reserved API namespace (`/v1`,
+        # `/v1/sessions`, `/auth/...`) makes the strip middleware eat canonical
+        # `/{seg}/...` requests, breaking the root-API compatibility guarantee.
+        raise ValueError(
+            f"Invalid base path {value!r}: first segment {segments[1]!r} collides "
+            "with a reserved API route namespace; choose a path outside it."
+        )
+    if segments[1] in _WEB_UI_ROUTE_PREFIXES:
+        # A base path whose first segment names one of the SPA's own routes
+        # (`/c`, `/login`, ...) is ambiguous for withBasePath's "already
+        # prefixed?" check on the frontend (web/src/lib/basePath.ts): an
+        # unprefixed app path like `/c/<id>` (a share link) is
+        # indistinguishable from an already-prefixed one under base `/c`, so
+        # it is left unprefixed instead of becoming `/c/c/<id>`.
+        raise ValueError(
+            f"Invalid base path {value!r}: first segment {segments[1]!r} collides "
+            "with a top-level app route; choose a path outside it."
+        )
+    return trimmed
+
+
+def _rewrite_web_ui_index(html: str, base_path: str) -> str:
+    """Rebase the built ``index.html`` for the configured deployment base path.
+
+    The standalone build emits relative asset references (``./assets/...``,
+    ``./favicon.svg``) so dynamic code-split chunks resolve via
+    ``import.meta.url`` under any path prefix. Relative references break on a
+    deep-link refresh, so they are rewritten here to absolute
+    ``{base}/assets/...``. With an empty base this yields root-absolute
+    ``/assets/...`` — byte-identical in spirit to a non-prefixed deployment.
+
+    When a base path is configured, a small inline script publishes it as
+    ``window.__OMNIGENT_BASE_PATH__`` ahead of the entry module so the SPA can
+    prefix its own API/WebSocket/navigation URLs (see ``basePath.ts``).
+
+    :param html: Raw built ``index.html`` contents.
+    :param base_path: Normalized base path (``""`` or ``"/proxy/6767"``).
+    :returns: Rewritten HTML.
+    """
+    rewritten = html.replace('="./', f'="{base_path}/')
+    # Drop the ``<base href="/">`` fallback whenever we rewrite. The asset refs
+    # are absolute now, so it is redundant, and keeping it would resolve fragment
+    # refs (inline SVG ``url(#id)``, footnote/heading anchors) against the origin
+    # root instead of the current document. At root this restores the exact
+    # pre-rewrite markup; the source tag stays as a safety net for an older
+    # server that serves index.html without this rewrite (version skew).
+    rewritten = re.sub(r"<base\b[^>]*>", "", rewritten)
+    if base_path:
+        # JSON-encode and neutralize any ``</`` so a hostile base path can't
+        # break out of the inline script element.
+        literal = json.dumps(base_path).replace("</", "<\\/")
+        injection = f"<script>window.__OMNIGENT_BASE_PATH__ = {literal};</script>"
+        rewritten = rewritten.replace("<head>", f"<head>{injection}", 1)
+    return rewritten
+
+
+class BasePathMiddleware:
+    """Strip a configured public base path prefix from incoming request paths.
+
+    Lets one server work whether the reverse proxy forwards the prefix
+    (code-server ``/absproxy/<port>/``, a plain nginx/Traefik subpath) or
+    strips it (code-server ``/proxy/<port>/``): when the prefix is present it
+    is removed so routing matches the canonical ``/v1/...`` paths, and
+    ``root_path`` is set so server-generated URLs stay under the mount. A
+    no-op when no base path is configured, or for a request that does not
+    carry the prefix (the stripping-proxy case).
+
+    :param app: The wrapped ASGI application.
+    :param base_path: Normalized base path (``""`` disables the middleware).
+    """
+
+    def __init__(self, app: ASGIApp, base_path: str) -> None:
+        self.app = app
+        self.base_path = base_path
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if self.base_path and scope["type"] in ("http", "websocket"):
+            path = scope.get("path", "")
+            if path == self.base_path or path.startswith(f"{self.base_path}/"):
+                scope = dict(scope)
+                scope["path"] = path[len(self.base_path) :] or "/"
+                raw_path = scope.get("raw_path")
+                if isinstance(raw_path, (bytes, bytearray)):
+                    prefix = self.base_path.encode()
+                    if raw_path.startswith(prefix):
+                        scope["raw_path"] = raw_path[len(prefix) :] or b"/"
+                scope["root_path"] = self.base_path
+        await self.app(scope, receive, send)
+
 
 # Envelope version of GET /.well-known/omnigent.json (see the route for the
 # full contract). Bump ONLY for a change a client cannot absorb by ignoring
@@ -1122,6 +1320,7 @@ def create_app(
     server_config: dict[str, Any] | None = None,
     feature_flags: FeatureFlags | None = None,
     extension_state: ExtensionPluginState | None = None,
+    base_path: str | None = None,
 ) -> FastAPI:
     """
     Build and return the FastAPI application with all routes mounted.
@@ -1242,12 +1441,23 @@ def create_app(
     :param server_config: Resolved non-secret server settings. The optional
         ``session_title_instructions`` string augments the isolated automatic
         title prompt. ``None`` loads the standard server config.
+    :param base_path: Public URL prefix the server is served under by a
+        reverse proxy, e.g. ``"/proxy/6767"`` (code-server port proxy).
+        ``None`` reads ``OMNIGENT_WEB_BASE_PATH``; empty/``"/"`` is a normal
+        root deployment.
     :returns: A fully configured :class:`FastAPI` application.
     :raises ValueError: If ``permission_store`` is provided
         without an ``auth_provider``.
     """
     if permission_store is not None and auth_provider is None:
         raise ValueError("auth_provider is required when permission_store is provided")
+
+    # Public base path for serving behind a subpath reverse proxy (issue
+    # #1031). Falls back to OMNIGENT_WEB_BASE_PATH so Docker/PaaS entrypoints
+    # pick it up without threading a kwarg. Empty → root deployment (default).
+    resolved_base_path = _normalize_base_path(
+        base_path if base_path is not None else os.environ.get("OMNIGENT_WEB_BASE_PATH")
+    )
 
     from omnigent.server.server_config import (
         load_branding_snapshot,
@@ -1497,6 +1707,11 @@ def create_app(
                 tunnel_registry=tunnel_registry,
                 file_store=file_store,
                 artifact_store=artifact_store,
+                # Managed-sandbox execution target: provision a fresh sandbox per
+                # fire. ``managed_launches`` is created during app construction
+                # (before this lifespan runs), so it is already on state here.
+                sandbox_config=sandbox_config,
+                managed_launches=app_inst.state.managed_launches,
             )
             on_fire = build_on_fire(fire_deps)
             # The manual "run now" trigger reuses the same fire path (dispatch /
@@ -1579,6 +1794,14 @@ def create_app(
             # inside shutdown_all().
             await _mcp_pool.shutdown_all()
 
+    from omnigent.server.auth import UnifiedAuthProvider
+
+    runner_account_store = (
+        account_store
+        if isinstance(auth_provider, UnifiedAuthProvider) and auth_provider._source == "accounts"
+        else None
+    )
+
     app = FastAPI(title="Omnigent Server", lifespan=_lifespan)
     from omnigent.runtime import telemetry
 
@@ -1592,10 +1815,18 @@ def create_app(
     app.state.background_title_coordinator = background_title_coordinator
     app.state.host_registry = host_registry
     app.state.host_store = host_store
+    if host_store is not None:
+        host_registry.launch_authorizer = partial(
+            host_store.admit_launch, require_account_owner=runner_account_store is not None
+        )
     app.state.agent_store = agent_store
     app.state.sandbox_config = sandbox_config
     app.state.branding_snapshot = branding_snapshot
     app.state.feature_flags = resolved_feature_flags
+    # Deployment base path (e.g. "/proxy/6767"), so route handlers that build
+    # a full-page redirect (not covered by BasePathMiddleware's inbound-only
+    # strip) can prefix it themselves. "" for a root deployment.
+    app.state.base_path = resolved_base_path
     # GitHub App integration: enabled only when both the config and the
     # connection store are wired. The client is stateless (holds config),
     # built once and reused for the connect flow.
@@ -2847,6 +3078,19 @@ def create_app(
         prefix="/v1",
         tags=["extensions"],
     )
+    from omnigent.server.routes.sandbox_inference import create_sandbox_inference_router
+
+    app.include_router(
+        create_sandbox_inference_router(
+            agent_store=agent_store,
+            agent_cache=agent_cache,
+            conversation_store=conversation_store,
+            permission_store=permission_store,
+            auth_provider=auth_provider,
+        ),
+        prefix="/v1",
+        tags=["sandbox inference"],
+    )
     # Server-side speech-to-text behind the composer mic button
     # (designs/server-dictation.md). Availability is probed lazily, so
     # registering unconditionally is free for servers without the extra.
@@ -3139,6 +3383,10 @@ def create_app(
 
         :param runner_id: The reconnecting runner's id.
         """
+        from omnigent.server.child_session_recovery import (
+            is_parent_owned_subagent,
+            restore_active_children,
+        )
         from omnigent.server.routes._sessions.common import (
             _session_sandbox_status_cache,
         )
@@ -3165,6 +3413,10 @@ def create_app(
         convs = await asyncio.to_thread(
             conversation_store.list_conversations_by_runner_id, runner_id
         )
+        # Restore each tree from its root before ordinary child initialization
+        # can clear the interruption status or cache an init without continuation.
+        bound_ids = {conv.id for conv in convs}
+        convs.sort(key=lambda conv: conv.parent_conversation_id in bound_ids)
         _logger.info(
             "_on_runner_connect: runner=%s, %d bound session(s)",
             runner_id,
@@ -3195,12 +3447,18 @@ def create_app(
                     "_on_runner_connect: skipping session-init POST for %s (no agent_id)",
                     conv.id,
                 )
-            else:
+            elif not is_parent_owned_subagent(conv) and not (
+                conv.parent_conversation_id in bound_ids and conv.host_id is None
+            ):
                 try:
-                    await runner_session_initializer.initialize(
+                    init_response = await runner_session_initializer.initialize(
                         conv,
                         routed.client,
                         timeout=10.0,
+                    )
+                    init_response.raise_for_status()
+                    await restore_active_children(
+                        conv, routed.client, conversation_store, runner_session_initializer
                     )
                 except Exception:
                     _logger.exception(
@@ -3237,9 +3495,12 @@ def create_app(
             # is reachable again. The helper self-guards: it only clears a
             # session whose persisted failure is ``runner_disconnected``, so
             # a genuine task failure survives the reconnect untouched.
-            await _publish_runner_recovered_status(
-                conv.id, conversation_store, require_disconnect_code=True
-            )
+            if not is_parent_owned_subagent(conv) and not (
+                conv.parent_conversation_id in bound_ids and conv.host_id is None
+            ):
+                await _publish_runner_recovered_status(
+                    conv.id, conversation_store, require_disconnect_code=True
+                )
             # A managed launch that outlived its connect timeout cached
             # sandbox_status "failed"; this runner connecting proves the
             # sandbox is live, so drop the stale banner. Only "failed" is
@@ -3248,6 +3509,12 @@ def create_app(
             cached_sandbox = _session_sandbox_status_cache.get(conv.id)
             if cached_sandbox is not None and cached_sandbox.stage == "failed":
                 _publish_sandbox_status(conv.id, "ready")
+
+    def _mint_managed_runner_token(runner_id: str, ttl_seconds: int) -> str | None:
+        assert runner_account_store is not None and auth_provider is not None
+        return runner_account_store.with_runner_authority(
+            runner_id, lambda owner: auth_provider.mint_runner_token(owner, ttl_seconds)
+        )
 
     def _resolve_managed_runner_owner(runner_id: str) -> str | None:
         """Owner for a delegated runner, by its bound session.
@@ -3261,6 +3528,11 @@ def create_app(
         :returns: The session owner's user id, or ``None`` when no session
             is bound to this runner (the handshake is then refused).
         """
+        if runner_account_store is not None:
+            try:
+                return runner_account_store.with_runner_authority(runner_id, lambda owner: owner)
+            except OmnigentError:
+                return None
         for conv in conversation_store.list_conversations_by_runner_id(runner_id):
             owner = conversation_store.get_session_owner(conv.id)
             if owner is not None:
@@ -3277,6 +3549,9 @@ def create_app(
             auth_provider=auth_provider,
             runner_exit_reports=runner_exit_reports,
             resolve_managed_runner_owner=_resolve_managed_runner_owner,
+            mint_managed_runner_token=(
+                _mint_managed_runner_token if runner_account_store is not None else None
+            ),
         ),
         prefix="/v1",
         tags=["runners"],
@@ -3411,10 +3686,15 @@ def create_app(
             and auth_provider._source == "accounts"
             and account_store is not None
         ):
+            from omnigent.server.auth import AccountAuthenticationMiddleware
             from omnigent.server.routes.accounts_auth import (
                 create_accounts_auth_router,
             )
 
+            # A deleted account's still-signed session JWTs must stop
+            # authenticating; every request checks the generation and tombstone.
+            auth_provider.set_account_check(account_store.accepts_generation)
+            app.add_middleware(AccountAuthenticationMiddleware, auth_provider=auth_provider)
             app.include_router(
                 create_accounts_auth_router(
                     auth_provider,
@@ -3422,6 +3702,7 @@ def create_app(
                     admin_list,
                     permission_store,
                     device_grant_store,
+                    scheduled_task_store,
                 ),
                 prefix="/auth",
                 tags=["auth"],
@@ -3574,8 +3855,13 @@ def create_app(
 
     # Mount the built web SPA at "/" if a build is present. The SPA is
     # built into ``omnigent/server/static/web-ui/`` by ``web/``'s Vite
-    # build (see ``web/vite.config.ts`` ``build.outDir``). The mount is
-    # registered AFTER all API routers so router routes win on overlap.
+    # build (see ``web/vite.config.ts`` ``build.outDir``). The mount stays
+    # at the domain root regardless of `resolved_base_path` — a configured
+    # base path is instead handled by rebasing the served HTML/asset refs
+    # (see `_rewrite_web_ui_index`) and by `BasePathMiddleware` stripping the
+    # prefix from incoming requests, which is what lets one server work
+    # whether the fronting proxy forwards the prefix or strips it. The mount
+    # is registered AFTER all API routers so router routes win on overlap.
     # Skipping the mount when no build is present keeps API-only
     # deployments working (and ``/`` 404s cleanly instead of exploding at
     # startup).
@@ -3601,7 +3887,7 @@ def create_app(
         app.mount(
             "/",
             _RangeAwareGZipMiddleware(
-                _SPAStaticFiles(directory=web_ui_dist, html=True),
+                _SPAStaticFiles(directory=web_ui_dist, html=True, base_path=resolved_base_path),
                 minimum_size=_WEB_UI_GZIP_MINIMUM_SIZE,
             ),
             name="web-ui",
@@ -3617,6 +3903,13 @@ def create_app(
         async def root() -> FileResponse:
             """Serve the API-only landing page (no web UI bundle present)."""
             return FileResponse(_API_ONLY_LANDING_HTML, media_type="text/html")
+
+    if resolved_base_path:
+        # Added last → outermost ASGI layer, so the prefix is stripped before
+        # routing and every other middleware sees canonical `/v1/...` paths.
+        # Only wired when a base path is configured: a root deployment pays
+        # no per-request cost.
+        app.add_middleware(BasePathMiddleware, base_path=resolved_base_path)
 
     return app
 
@@ -3636,7 +3929,33 @@ class _SPAStaticFiles(StaticFiles):
     and a path with a file extension (``.js``, ``.css``, ``.png``,
     ``.woff2``, …) returns the static 404 verbatim. Other extensionless
     paths fall back to ``index.html``.
+
+    The HTML shell is rebased for the deployment ``base_path`` once at
+    startup (see :func:`_rewrite_web_ui_index`) and served from memory with
+    a content ``etag`` so ``If-None-Match`` revalidation still yields ``304``.
     """
+
+    def __init__(self, *args: Any, base_path: str = "", **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._index_html: bytes | None = None
+        self._index_etag: str | None = None
+        index_file = Path(self.directory) / "index.html"  # type: ignore[arg-type]
+        if index_file.is_file():
+            html = _rewrite_web_ui_index(index_file.read_text(encoding="utf-8"), base_path)
+            self._index_html = html.encode("utf-8")
+            self._index_etag = f'"{hashlib.md5(self._index_html).hexdigest()}"'
+
+    def _shell_response(self, scope: Scope) -> Response:
+        """Serve the rebased HTML shell from memory, honoring ``If-None-Match``."""
+        assert self._index_html is not None
+        if_none_match = next(
+            (v.decode("latin-1") for k, v in scope.get("headers", []) if k == b"if-none-match"),
+            None,
+        )
+        if self._index_etag is not None and if_none_match == self._index_etag:
+            return Response(status_code=304, headers={"etag": self._index_etag})
+        headers = {"etag": self._index_etag} if self._index_etag else {}
+        return Response(self._index_html, media_type="text/html", headers=headers)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         # The mount is at "/" so it catches *every* unmatched path —
@@ -3653,6 +3972,11 @@ class _SPAStaticFiles(StaticFiles):
 
     async def get_response(self, path: str, scope: Scope) -> Response:
         served_path = path
+        # The HTML shell (root, directory, or SPA history fallback) is served
+        # from the rebased in-memory copy rather than the file on disk, so
+        # asset refs and the injected base-path global reflect `base_path`.
+        if self._index_html is not None and path in ("", ".", "index.html"):
+            return _apply_web_ui_cache_headers(self._shell_response(scope), "index.html")
         try:
             response = await super().get_response(path, scope)
         except StarletteHTTPException as exc:
@@ -3676,7 +4000,11 @@ class _SPAStaticFiles(StaticFiles):
                 )
             if exc.status_code == 404 and "." not in path.rsplit("/", 1)[-1]:
                 served_path = "index.html"
-                response = await super().get_response("index.html", scope)
+                response = (
+                    self._shell_response(scope)
+                    if self._index_html is not None
+                    else await super().get_response("index.html", scope)
+                )
             else:
                 raise
         return _apply_web_ui_cache_headers(response, served_path)

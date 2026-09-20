@@ -458,7 +458,9 @@ class _SubprocessEntry:
         model). Most harnesses fix the model at spawn, so
         :meth:`HarnessProcessManager.get_client` re-spawns on a
         later model change. Harnesses in
-        :data:`_LIVE_MODEL_CONFIG_HARNESSES` apply it in-process.
+        :data:`_LIVE_MODEL_CONFIG_HARNESSES` and explicitly curated ACP agents
+        apply it in-process.
+    :param acp_config: ACP startup options, excluding the live model selection.
     """
 
     def __init__(
@@ -468,12 +470,14 @@ class _SubprocessEntry:
         endpoint: _HarnessEndpoint,
         harness: str,
         model: str | None = None,
+        acp_config: dict[str, str] | None = None,
     ) -> None:
         self.process = process
         self.client = client
         self.endpoint = endpoint
         self.harness = harness
         self.model = model
+        self.acp_config = acp_config or {}
         self.last_used_at: float = 0.0
 
 
@@ -494,6 +498,15 @@ def _model_env_key(harness: str) -> str:
 
 
 _LIVE_MODEL_CONFIG_HARNESSES = frozenset({"qwen"})
+
+
+def _acp_startup_config(env: dict[str, str] | None) -> dict[str, str]:
+    """Keep ACP command, policy, and defaults stable while switching models live."""
+    return {
+        key: value
+        for key, value in (env or {}).items()
+        if key.startswith("HARNESS_ACP_") and key != "HARNESS_ACP_MODEL"
+    }
 
 
 def _build_harness_spawn_env(env: dict[str, str] | None) -> dict[str, str]:
@@ -704,8 +717,8 @@ class HarnessProcessManager:
         runner subprocess of the right harness type, waits for the
         Unix socket to appear, and constructs an
         :class:`httpx.AsyncClient` over it. Subsequent calls
-        return the cached client (``env`` is ignored on cache
-        hits — config is fixed at first-spawn time).
+        return the cached client. Model changes restart harnesses without live
+        switching support; changes to ACP startup options also require a restart.
 
         Crash detection: if the previously-spawned subprocess has
         exited (``returncode is not None``), the entry is dropped
@@ -822,10 +835,27 @@ class HarnessProcessManager:
                 await self._close_entry(entry)
                 entry = None
                 respawn_reason = "harness_respawn_agent_switch"
-            if entry is not None and harness not in _LIVE_MODEL_CONFIG_HARNESSES:
+            if (
+                entry is not None
+                and harness == "acp"
+                and env is not None
+                and entry.acp_config != _acp_startup_config(env)
+            ):
+                _logger.info(
+                    "ACP startup config changed for conversation %s; respawning",
+                    conversation_id,
+                )
+                replaced_response_id = self._in_flight_response_ids.get(conversation_id)
+                await self._close_entry(entry)
+                entry = None
+                respawn_reason = "harness_respawn_agent_switch"
+            if entry is not None and not (
+                harness in _LIVE_MODEL_CONFIG_HARNESSES
+                or (harness == "acp" and entry.acp_config.get("HARNESS_ACP_MODEL_LIST"))
+            ):
                 # Most harnesses bake the model into the subprocess env. A
-                # later concrete model change must respawn them; ACP harnesses
-                # in the live-config set instead apply the request in-session.
+                # later model change respawns them; curated ACP and harnesses
+                # in the live-config set instead apply it in-session.
                 requested_model = (env or {}).get(_model_env_key(harness))
                 if requested_model is not None and requested_model != entry.model:
                     _logger.info(
@@ -1310,6 +1340,7 @@ class HarnessProcessManager:
                 # triggers a respawn in ``get_client`` — the model is a fixed
                 # process env var, not re-read per turn.
                 model=(env or {}).get(_model_env_key(harness)),
+                acp_config=_acp_startup_config(env) if harness == "acp" else None,
             )
         except BaseException:
             # From spawn onward the process must have exactly one owner:

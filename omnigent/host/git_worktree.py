@@ -8,6 +8,7 @@ designs/SESSION_GIT_WORKTREE.md.
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 from dataclasses import dataclass
@@ -128,6 +129,8 @@ def _run_git(
         return subprocess.run(
             ["git", *args],
             cwd=cwd,
+            # Keep failure diagnostics stable for repository classification.
+            env={**os.environ, "LC_ALL": "C"},
             capture_output=True,
             text=True,
             timeout=_GIT_TIMEOUT_S,
@@ -173,13 +176,17 @@ def _main_work_tree(repo_path: str) -> str:
     :returns: Absolute path of the main work tree, e.g.
         ``"/Users/alice/myrepo"``.
     :raises WorktreeError: If ``repo_path`` is not a directory or not
-        inside a git work tree.
+        inside a git work tree, or the git command fails.
     """
     if not Path(repo_path).is_dir():
         raise WorktreeError(f"path is not a directory: {repo_path}")
     result = _run_git(["worktree", "list", "--porcelain"], cwd=repo_path)
     if result.returncode != 0:
-        raise WorktreeError(f"not a git repository: {repo_path}")
+        if any(
+            line.startswith("fatal: not a git repository") for line in result.stderr.splitlines()
+        ):
+            raise WorktreeError(f"not a git repository: {repo_path}")
+        raise _git_error("git worktree list failed", result)
     for line in result.stdout.splitlines():
         # Porcelain format: the first record's ``worktree <path>`` line is
         # the main work tree; linked worktrees follow.

@@ -525,9 +525,10 @@ jobs:
           echo "Combining ${#files[@]} shard data file(s)."
           coverage combine "${files[@]}"
           # --ignore-errors: a plain checkout lacks uv-sync-generated files.
-          { echo "## Coverage"; echo; coverage report --format=markdown --ignore-errors; } >> "$GITHUB_STEP_SUMMARY"
+          coverage report --format=markdown --ignore-errors > "$RUNNER_TEMP/coverage-report.md"
+          { echo "## Coverage"; echo; cat "$RUNNER_TEMP/coverage-report.md"; } >> "$GITHUB_STEP_SUMMARY"
           coverage xml -o coverage-summary/coverage.xml --ignore-errors
-          coverage report --format=total --ignore-errors > coverage-summary/total.txt
+          python .github/scripts/ci/coverage-total.py "$RUNNER_TEMP/coverage-report.md" > coverage-summary/total.txt
           echo "Total coverage: $(cat coverage-summary/total.txt)%"
 
       - name: Upload coverage summary

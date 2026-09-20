@@ -181,8 +181,8 @@ describe("Composer status line (branch + context ring)", () => {
       sessionCostUsd: null,
       gitBranch: null,
       llmModel: null,
-      selectedModel: null,
-      selectedEffort: null,
+      sessionModelOverride: null,
+      sessionReasoningEffort: null,
       codexModelOptions: [],
       codexPlanMode: false,
       nativeVendorOwnsModel: false,
@@ -245,7 +245,7 @@ describe("Composer status line (branch + context ring)", () => {
     // vendor-owned native session where the model used to be (wrongly) shown.
     useChatStore.setState({
       llmModel: "claude-sonnet-4-6",
-      selectedEffort: "medium",
+      sessionReasoningEffort: "medium",
       nativeVendorOwnsModel: true,
       contextWindow: 100_000,
       tokensUsed: 25_000,

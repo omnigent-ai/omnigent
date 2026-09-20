@@ -111,7 +111,12 @@ def _subagent_id_from_meta_path(meta_path: Path) -> str:
 
 
 _DEFAULT_POLL_INTERVAL_S = 0.25
+# An observer hook can legitimately report late — Claude Code's own startup and
+# first tool call sit in front of it — so a slow start is not a failure. Notice
+# it early at WARNING and only call it broken once the hook has stayed silent
+# well past any plausible startup.
 _TRANSCRIPT_DISCOVERY_WARNING_S = 30.0
+_TRANSCRIPT_DISCOVERY_ERROR_S = 180.0
 _OBSERVER_HOOK_STDERR_READ_BYTES = 64 * 1024
 # Minimum spacing between pane reads. One ``tmux capture-pane`` subprocess per
 # window feeds every footer-derived signal (permission mode + /btw overlay), so
@@ -194,6 +199,7 @@ class _TranscriptDiscoveryDiagnostics:
 
     started_at: float
     warning_logged: bool = False
+    error_logged: bool = False
     discovery_logged: bool = False
 
 
@@ -223,7 +229,7 @@ def _observe_transcript_discovery(
     diagnostics: _TranscriptDiscoveryDiagnostics,
     now: float | None = None,
 ) -> None:
-    """Log transcript discovery, or one actionable error when it never occurs."""
+    """Log transcript discovery, warning once it is slow and erroring once it is stuck."""
     elapsed_s = (time.monotonic() if now is None else now) - diagnostics.started_at
     if transcript_path is not None:
         if not diagnostics.discovery_logged:
@@ -235,22 +241,40 @@ def _observe_transcript_discovery(
             )
             diagnostics.discovery_logged = True
         return
-    if diagnostics.warning_logged or elapsed_s < _TRANSCRIPT_DISCOVERY_WARNING_S:
+    escalate = elapsed_s >= _TRANSCRIPT_DISCOVERY_ERROR_S
+    if escalate:
+        if diagnostics.error_logged:
+            return
+    elif diagnostics.warning_logged or elapsed_s < _TRANSCRIPT_DISCOVERY_WARNING_S:
         return
 
     hooks_size = _diagnostic_file_size(bridge_dir / _HOOKS_FILE)
     stderr_size = _diagnostic_file_size(bridge_dir / OBSERVER_HOOK_STDERR_FILE)
     settings_present = (bridge_dir / _INVOCATION_SETTINGS_FILE).is_file()
-    _logger.error(
-        "Claude transcript forwarding has not started: no observer hook reported a "
-        "transcript path after %.0fs; session=%s last_hook=%s hooks_bytes=%s "
-        "observer_stderr_bytes=%s hook_settings=%s",
+    args = (
         max(0.0, elapsed_s),
         session_id,
         _last_observer_hook_name(bridge_dir) or "none",
         hooks_size if hooks_size is not None else "missing",
         stderr_size if stderr_size is not None else "missing",
         "present" if settings_present else "missing",
+    )
+    detail = (
+        "transcript path after %.0fs; session=%s last_hook=%s hooks_bytes=%s "
+        "observer_stderr_bytes=%s hook_settings=%s"
+    )
+    if escalate:
+        _logger.error(
+            "Claude transcript forwarding has not started: no observer hook reported a " + detail,
+            *args,
+            extra={"session_id": session_id},
+        )
+        diagnostics.error_logged = True
+        diagnostics.warning_logged = True
+        return
+    _logger.warning(
+        "Claude transcript forwarding is still waiting: no observer hook has reported a " + detail,
+        *args,
         extra={"session_id": session_id},
     )
     diagnostics.warning_logged = True

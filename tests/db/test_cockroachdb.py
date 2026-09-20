@@ -113,3 +113,49 @@ def test_cockroachdb_resumes_empty_revision_and_repairs_indexes(db_uri: str) -> 
     assert _get_current_db_revision(engine) == head
     assert _CRDB_BOOTSTRAP_MARKER_TABLE not in inspect(engine).get_table_names()
     assert index_name in found
+
+
+def test_account_generation_backfill_resumes_after_schema_commit(db_uri) -> None:
+    from sqlalchemy import event
+
+    from omnigent.server.accounts_store import SqlAlchemyAccountStore
+    from omnigent.server.device_grant_store import DeviceGrantStore
+
+    engine = _crdb_engine(db_uri)
+    accounts = SqlAlchemyAccountStore(db_uri)
+    accounts.create_user_with_password("migration-user", "existing-password-hash")
+    grants = DeviceGrantStore(db_uri)
+    grants.create_redeemed_grant(
+        "migration-grant",
+        user_id="migration-user",
+        client_id="cli",
+        refresh_token_hash="existing-refresh-hash",
+        created_at=100,
+    )
+    config = _build_alembic_config(db_uri)
+    with engine.connect() as connection:
+        _prepare_crdb_schema_transaction(connection, _crdb_server_version(engine))
+        config.attributes["connection"] = connection
+        command.downgrade(config, "hh1b2c3d4e5f")
+        connection.commit()
+
+    def interrupt_backfill(conn, cursor, statement, parameters, context, executemany):
+        if statement.startswith("UPDATE users SET account_generation"):
+            raise RuntimeError("injected backfill interruption")
+
+    event.listen(engine, "before_cursor_execute", interrupt_backfill)
+    try:
+        with pytest.raises(RuntimeError, match="schema migration failed"):
+            _initialize_or_verify_schema(engine, db_uri)
+    finally:
+        event.remove(engine, "before_cursor_execute", interrupt_backfill)
+    assert _get_current_db_revision(engine) == "hh1b2c3d4e5f"
+    assert "account_generation" in {c["name"] for c in inspect(engine).get_columns("users")}
+
+    _initialize_or_verify_schema(engine, db_uri)
+    account = accounts.get_user("migration-user")
+    assert account is not None and len(account.account_generation) == 32
+    assert accounts.get_password_hash("migration-user") == "existing-password-hash"
+    grant = grants.authorize_access("migration-grant")
+    assert grant is not None and grant.account_generation == account.account_generation
+    assert _get_current_db_revision(engine) == _get_head_db_revision(db_uri)

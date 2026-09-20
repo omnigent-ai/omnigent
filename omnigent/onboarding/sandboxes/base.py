@@ -910,6 +910,13 @@ class SandboxHostLauncher(SandboxLifecycle):
     transport.
     """
 
+    def prepare_for_launch(self, *, agent_name: str | None = None) -> None:
+        """Set request context before provider preparation, allocation, or resume.
+
+        Providers with pre-created resources can use the resolved agent name
+        to select and validate compatible infrastructure before allocation.
+        """
+
     def reaper_identity(self, workspace_id: int) -> AbstractContextManager[None]:
         """Bind credentials needed for background cleanup in one workspace."""
         return nullcontext()
