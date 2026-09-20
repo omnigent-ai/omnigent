@@ -525,20 +525,28 @@ def _gateway_claude_listing(
     listing_provider: model_catalog.ResolvedModelProvider,
     *,
     transport: httpx.BaseTransport | None = None,
-) -> tuple[bool, tuple[str, ...]]:
+) -> tuple[bool | None, tuple[str, ...]]:
     """Enumerate a gateway's live ``/v1/models`` for Claude servability.
 
     Mirrors pi's ``_live_family_model_entries`` (#7007): a real anthropic key
     speaks the Anthropic models API; any gateway is read through the
-    OpenAI-compatible ``/v1/models``.
+    OpenAI-compatible ``/v1/models``. Case-sensitive on purpose — Claude Code and
+    Anthropic ids are lowercase, so a differently-cased id proves nothing about
+    the bare ``claude-*`` rows the probe offers.
 
-    :returns: ``(serves_canonical, concrete_ids)``. ``serves_canonical`` is
-        ``True`` when the listing reports any bare ``claude-*`` id — concrete or
-        a ``claude-*`` / ``*`` wildcard — so the endpoint accepts canonical
-        Claude ids (a LiteLLM passthrough lists ``claude-*``; OpenRouter lists
-        ``anthropic/claude-*`` and so does not). ``concrete_ids`` are the
-        literal, non-wildcard ``claude-*`` ids listed. Fails open to
-        ``(False, ())`` so an unreachable endpoint degrades to the probe rows.
+    :returns: ``(serves_canonical, concrete_ids)``:
+
+        - ``serves_canonical=True`` — the listing reports a bare ``claude-*`` id
+          (concrete or a ``claude-*`` / ``*`` wildcard); the endpoint accepts
+          canonical Claude ids (a LiteLLM passthrough lists ``claude-*``).
+        - ``serves_canonical=False`` — a non-empty listing with no bare
+          ``claude-*`` (OpenRouter's ``anthropic/claude-*``); authoritatively
+          namespaced.
+        - ``serves_canonical=None`` — unreachable, unparseable, or an empty
+          listing: undetermined, so the caller fails OPEN (keeps the probe rows)
+          rather than blanking the picker on a transient blip.
+
+        ``concrete_ids`` are the literal, non-wildcard ``claude-*`` ids listed.
     """
     from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, KEY_KIND
 
@@ -555,10 +563,14 @@ def _gateway_claude_listing(
             listing_provider.detail or listing_provider.base_url,
             exc_info=True,
         )
-        return (False, ())
+        return (None, ())
     ids = [entry.id for entry in listing.models]
-    serves = any(mid == "*" or mid.lower().startswith("claude-") for mid in ids)
-    concrete = tuple(mid for mid in ids if mid.lower().startswith("claude-") and "*" not in mid)
+    if not ids:
+        # A 200 with no models (empty ``data`` / unexpected shape) proves nothing
+        # about namespacing — treat it as undetermined, not authoritative.
+        return (None, ())
+    serves = any(mid == "*" or mid.startswith("claude-") for mid in ids)
+    concrete = tuple(mid for mid in ids if mid.startswith("claude-") and "*" not in mid)
     return (serves, concrete)
 
 
@@ -1545,21 +1557,30 @@ async def claude_model_catalog(
     rows = list(probe.alias_rows)
     declared_models = set(claude_config.routable_models) if claude_config is not None else set()
     # A configured gateway provider's live /v1/models is the source of truth for
-    # what it serves (mirrors pi #7007): it overrides the hostname heuristic, so a
-    # bare-canonical passthrough (LiteLLM lists ``claude-*``) keeps its claude-*
-    # rows while a namespaced gateway (OpenRouter lists ``anthropic/claude-*``)
-    # does not. Fetched off-thread and fail-open — the fetchers are sync httpx.
+    # what it serves (mirrors pi #7007), overriding the hostname heuristic. It is
+    # three-valued: True (a bare ``claude-*`` is listed → keep the canonical
+    # rows), False (a reachable listing with none → authoritatively namespaced,
+    # e.g. OpenRouter → drop), or None (unreachable/empty → fail OPEN, keep the
+    # probe rows rather than blank the picker on a blip). Fetched off-thread.
     listing_provider = claude_config.listing_provider if claude_config is not None else None
-    gateway_serves_canonical = False
+    gateway_serves_canonical: bool | None = None
     gateway_concrete_ids: tuple[str, ...] = ()
     if listing_provider is not None:
         gateway_serves_canonical, gateway_concrete_ids = await asyncio.to_thread(
             _gateway_claude_listing, listing_provider
         )
-    _non_canonical = not gateway_serves_canonical and (
-        (claude_config is not None and not _serves_canonical_anthropic_ids(claude_config))
-        or (claude_config is None and _ambient_env_is_non_anthropic_gateway())
-    )
+    if gateway_serves_canonical is True:
+        _non_canonical = False
+    elif gateway_serves_canonical is False:
+        _non_canonical = True
+    else:
+        # No listing provider, or the listing was undetermined: fall back to the
+        # hostname heuristic (which, for a configured gateway provider whose
+        # listing failed, keeps the probe rows — the fail-open path).
+        _non_canonical = listing_provider is None and (
+            (claude_config is not None and not _serves_canonical_anthropic_ids(claude_config))
+            or (claude_config is None and _ambient_env_is_non_anthropic_gateway())
+        )
     if _non_canonical:
         rows = [
             row
@@ -1567,16 +1588,16 @@ async def claude_model_catalog(
             if not str(row.get("model", "")).startswith("claude-")
             or str(row.get("model", "")) in declared_models
         ]
-    # Surface concrete claude ids the gateway lists that the probe did not offer.
+    # Surface concrete claude ids the gateway lists that the probe did not offer,
+    # deduped against both the probe rows and each other.
     if gateway_concrete_ids:
         known = {str(row.get("model", "")) for row in rows} | {
             str(row.get("id", "")) for row in rows
         }
-        rows.extend(
-            {"id": mid, "model": mid, "displayName": mid}
-            for mid in gateway_concrete_ids
-            if mid not in known
-        )
+        for mid in gateway_concrete_ids:
+            if mid not in known:
+                known.add(mid)
+                rows.append({"id": mid, "model": mid, "displayName": mid})
 
     configured_pin = claude_config.model if claude_config is not None else None
     default_model = configured_pin or probe.default_model
@@ -1594,16 +1615,12 @@ async def claude_model_catalog(
         else:
             out.append({key: value for key, value in row.items() if key != "isDefault"})
     if default_model and not marked and default_model not in probe.disabled_models:
-        # Append the observed default as its own honest row — but never
-        # claim a bare Anthropic id is launchable on an endpoint that
-        # rejects that spelling.
-        _canonical_ids_ok = (
-            gateway_serves_canonical
-            or (claude_config is None and not _ambient_env_is_non_anthropic_gateway())
-            or (claude_config is not None and _serves_canonical_anthropic_ids(claude_config))
-        )
+        # Append the observed default as its own honest row — but never claim a
+        # bare Anthropic id is launchable on an endpoint that rejects that
+        # spelling. Canonical ids are servable exactly when the rows above were
+        # NOT dropped as non-canonical.
         servable = (
-            _canonical_ids_ok
+            not _non_canonical
             or not default_model.startswith("claude-")
             or default_model in declared_models
         )
