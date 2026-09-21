@@ -2,6 +2,8 @@
 
 The `Open Code Review` workflow runs alongside Polly. It posts inline findings
 and a fresh summary for each review; low-severity findings go in the summary.
+These findings say “Shown here because this finding is low severity.” Actual
+inline-posting failures retain their warning and failure reason.
 Repeated runs preserve existing threads and avoid posting overlapping inline
 comments. It does not approve PRs or request changes.
 

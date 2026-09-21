@@ -217,6 +217,32 @@ jobs:
           upload_artifacts: 'false'
           stream_progress: 'true'
 
+      - name: Clarify low-severity summary findings
+        if: ${{ !cancelled() && steps.ocr.outputs.summary_comment_url != '' }}
+        continue-on-error: true
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          SUMMARY_URL: ${{ steps.ocr.outputs.summary_comment_url }}
+          PR_NUMBER: ${{ needs.request.outputs.pr }}
+          REVIEW_RUN: ${{ github.run_id }}-${{ github.run_attempt }}
+        with:
+          script: |
+            const match = new URL(process.env.SUMMARY_URL).hash.match(/^#issuecomment-(\d+)$/);
+            if (!match) throw new Error('OCR returned an invalid summary comment URL');
+            const args = { ...context.repo, comment_id: Number(match[1]) };
+            const { data: comment } = await github.rest.issues.getComment(args);
+            const marker = `<!-- ocr-summary-run:${process.env.REVIEW_RUN} -->`;
+            if (comment.user?.login !== 'github-actions[bot]' || comment.user.type !== 'Bot' ||
+                !comment.issue_url.endsWith(`/issues/${process.env.PR_NUMBER}`) ||
+                !(comment.body || '').split('\n').includes(marker)) {
+              throw new Error('Refusing to edit a summary not owned by this OCR run');
+            }
+            const body = comment.body.replace(
+              /^⚠️ GitHub could not post this as an inline comment: Routed to summary \(severity low(?: · category [^)\r\n]+)?\)$/gm,
+              'ℹ️ Shown here because this finding is low severity.',
+            );
+            if (body !== comment.body) await github.rest.issues.updateComment({ ...args, body });
+
       - name: Redact review diagnostics
         id: diagnostics
         if: ${{ !cancelled() && steps.ocr.outcome != '' && steps.ocr.outcome != 'skipped' }}
