@@ -198,8 +198,109 @@ function resolveExternalCjsRequire(externals: readonly string[]): Plugin {
       if (patchedCount !== 1) {
         throw new Error(
           `resolve-external-cjs-require: expected to patch rolldown's __require helper exactly once, but patched it ${patchedCount} times. ` +
-            `The runtime shim shape or chunking changed and the external CJS require fix would silently break. ` +
-            `Re-check locateHelper() against the current rolldown output.`,
+          `The runtime shim shape or chunking changed and the external CJS require fix would silently break. ` +
+          `Re-check locateHelper() against the current rolldown output.`,
+        );
+      }
+    },
+  };
+}
+
+// xterm.js (common/Platform.ts) sniffs Node with
+// `isNode = typeof process !== 'undefined' && 'title' in process`, then uses
+// `platform = isNode ? 'node' : navigator.platform` to derive `isMac`. When this
+// embed runs inside the host monolith, the host injects a browserify `process`
+// shim (which carries a `title`), so that check is TRUE in the browser → xterm
+// believes platform='node' → `isMac=false`. That silently disables
+// `macOptionClickForcesSelection`, so ⌥-drag no longer forces a text selection in
+// the web terminal and copy breaks (PROD-63388). We can't neutralize the shim
+// without a page-wide `process` mutation, so instead we force xterm's OWN isNode
+// expression to `false` in its bundled code — restoring navigator.platform-based
+// detection. This is scoped entirely to xterm's module (nothing else in the embed
+// or the host is touched) and fails the build loudly if xterm's source shape
+// changes, mirroring resolveExternalCjsRequire's assert-exactly-once contract.
+function forceXtermBrowserPlatform(): Plugin {
+  // Matches xterm's isNode: `typeof process < "u" && "title" in process`,
+  // tolerant of quote style and spacing across rolldown minification. The
+  // `"title" in process` tail is unique to xterm's Platform.ts isNode — the
+  // bundled vscode platform module keys on `process.versions?.node` instead, so
+  // this pattern never matches it.
+  const XTERM_ISNODE =
+    /typeof process\s*<\s*['"`]u['"`]\s*&&\s*['"`]title['"`]\s*in\s*process/g;
+  let patchedCount = 0;
+  return {
+    name: "force-xterm-browser-platform",
+    enforce: "post",
+    buildStart() {
+      patchedCount = 0;
+    },
+    renderChunk(code) {
+      let n = 0;
+      const next = code.replace(XTERM_ISNODE, () => {
+        n++;
+        return "false";
+      });
+      if (n === 0) return null;
+      patchedCount += n;
+      return { code: next, map: null };
+    },
+    generateBundle() {
+      // xterm's core AND its addons (addon-webgl / addon-fit) each inline a copy
+      // of common/Platform, so we expect >= 1 isNode expression. Fail loudly only
+      // on ZERO — that means xterm's source shape changed and the pattern rotted,
+      // which would silently reintroduce the ⌥-select bug.
+      if (patchedCount < 1) {
+        throw new Error(
+          `force-xterm-browser-platform: expected to neutralize xterm's isNode heuristic at least once, ` +
+          `but matched 0 times. xterm's common/Platform.ts shape changed — ` +
+          `re-check the XTERM_ISNODE pattern.`,
+        );
+      }
+    },
+  };
+}
+
+// The worker asset then inherits the regular CDN publicPath and `new Worker(<cross-origin URL>)` 
+// throws a SecurityError under managed omnigent — breaking BOTH the pdf.js and Monaco
+// module workers (pdf.js surfaced it first). Rewrite the construction back to the
+// literal `new Worker(new URL("./asset", import.meta.url), …)` so rspack treats it
+// as a worker chunk and serves it same-origin. Standalone Vite is unaffected (the
+// literal is what it resolves to anyway). Fails the build loudly if Vite's emitted
+// shape changes, mirroring resolveExternalCjsRequire's assert contract.
+function inlineWorkerUrlForHost(): Plugin {
+  // Vite injects the wrapper AFTER renderChunk, so we rewrite in generateBundle
+  // where the final chunk code exists. Captures the inner asset specifier ($1,
+  // quotes included). Anchored on `new Worker(` so plain asset `new URL(...)`
+  // references (e.g. wasm), which fetch fine cross-origin, are left untouched.
+  const VITE_WORKER_URL =
+    /new Worker\(\s*new URL\(\s*(?:\/\*\s*@vite-ignore\s*\*\/\s*)?""\s*\+\s*new URL\(\s*("(?:[^"\\]|\\.)*")\s*,\s*import\.meta\.url\s*\)\.href\s*,\s*""\s*\+\s*import\.meta\.url\s*\)/g;
+  return {
+    name: "inline-worker-url-for-host",
+    enforce: "post",
+    generateBundle(_options, bundle) {
+      let patchedCount = 0;
+      for (const file of Object.values(bundle)) {
+        if (file.type !== "chunk") continue;
+        file.code = file.code.replace(VITE_WORKER_URL, (_m, spec: string) => {
+          patchedCount++;
+          return `new Worker(new URL(${spec}, import.meta.url)`;
+        });
+      }
+      // The embed always builds the Monaco and pdf.js module workers through
+      // `new Worker(new URL(..., import.meta.url))`; both share this shape. Zero
+      // matches means Vite's worker emission changed and the rewrite rotted,
+      // silently reintroducing the cross-origin worker break.
+      if (patchedCount < 1) {
+        let sample: string | undefined;
+        for (const file of Object.values(bundle)) {
+          if (file.type !== "chunk") continue;
+          sample = file.code.match(/new Worker\([^;]{0,160}/)?.[0];
+          if (sample) break;
+        }
+        throw new Error(
+          "inline-worker-url-for-host: expected to rewrite Vite's worker-URL construction at least once, " +
+          "but matched 0 times. Vite's worker emission shape changed — re-check the VITE_WORKER_URL pattern. " +
+          `First 'new Worker(' seen: ${sample ?? "<none>"}`,
         );
       }
     },
@@ -250,6 +351,8 @@ export default defineConfig({
     tailwindcss(),
     scopeOmnigentCss(),
     resolveExternalCjsRequire(SHARED_EXTERNALS),
+    forceXtermBrowserPlatform(),
+    inlineWorkerUrlForHost(),
   ],
   resolve: {
     alias: {
