@@ -13,6 +13,7 @@ import yaml
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = yaml.safe_load((ROOT / ".github/workflows/open-code-review.yml").read_text())
 AUTHORIZE = WORKFLOW["jobs"]["request"]["steps"][0]["with"]["script"]
+ACKNOWLEDGE = WORKFLOW["jobs"]["request"]["steps"][1]
 RESOLVE = WORKFLOW["jobs"]["review"]["steps"][0]["with"]["script"]
 REPORT = next(s for s in WORKFLOW["jobs"]["review"]["steps"] if s.get("id") == "report")["run"]
 STEPS = {step.get("id"): step for step in WORKFLOW["jobs"]["review"]["steps"]}
@@ -32,6 +33,10 @@ const github = {rest: {
     return {data: {permission: input.permission}};
   }},
   pulls: {get: async () => ({data: input.pr})},
+  reactions: {createForIssueComment: async (args) => {
+    calls.push({reaction: args});
+    if (input.reaction_error) throw new Error('Reaction unavailable');
+  }},
   actions: {
     listArtifacts: () => {},
     getWorkflow: async () => ({data: {id: 42}}),
@@ -68,6 +73,7 @@ class OpenCodeReviewWorkflowTest(unittest.TestCase):
         comments=None,
         artifacts=None,
         runs=None,
+        reaction_error=False,
         extra_env=None,
     ):
         result = subprocess.run(
@@ -81,6 +87,7 @@ class OpenCodeReviewWorkflowTest(unittest.TestCase):
                     "comments": comments or [],
                     "artifacts": artifacts or [],
                     "runs": runs or {},
+                    "reaction_error": reaction_error,
                 }
             ),
             env={
@@ -108,7 +115,11 @@ class OpenCodeReviewWorkflowTest(unittest.TestCase):
             "payload": {
                 "repository": {"default_branch": "main"},
                 "issue": {"number": 7878, "pull_request": {"url": "pr"} if is_pr else None},
-                "comment": {"body": body, "user": {"login": "reviewer", "type": user_type}},
+                "comment": {
+                    "id": 123,
+                    "body": body,
+                    "user": {"login": "reviewer", "type": user_type},
+                },
             },
         }
 
@@ -176,6 +187,59 @@ class OpenCodeReviewWorkflowTest(unittest.TestCase):
         result = self.run_script(context)
         self.assertEqual(result["outputs"], {})
         self.assertIn("default branch", result["error"])
+
+    def acknowledge(self, context, **kwargs):
+        authorized = self.run_script(context, **kwargs)
+        self.assertNotIn("error", authorized)
+        steps = {"request": {"outputs": {"pr": "", **authorized["outputs"]}}}
+        script = (
+            f"const steps = {json.dumps(steps)}; github.event_name = context.eventName;"
+            f"if ({ACKNOWLEDGE['if']}) {{ {ACKNOWLEDGE['with']['script']} }}"
+        )
+        return self.run_script(context, script=script, **kwargs)
+
+    def test_only_authorized_comment_commands_receive_eyes(self):
+        for body, permission, allowlist, eligible in (
+            ("/ocr", "write", [], True),
+            ("/ocr force", "maintain", [], True),
+            ("/ocr", "read", ["reviewer"], True),
+            ("/ocr", "read", [], False),
+            ("/ocr force", "triage", [], False),
+            ("Try /ocr", "admin", [], False),
+        ):
+            with self.subTest(body=body, permission=permission, allowlist=allowlist):
+                context = self.comment(body)
+                result = self.acknowledge(context, permission=permission, allowlist=allowlist)
+                self.assertNotIn("error", result)
+                expected = (
+                    [
+                        {
+                            "reaction": {
+                                **context["repo"],
+                                "comment_id": 123,
+                                "content": "eyes",
+                            }
+                        }
+                    ]
+                    if eligible
+                    else []
+                )
+                self.assertEqual(result["calls"], expected)
+        dispatch = self.comment()
+        dispatch.update(eventName="workflow_dispatch", ref="refs/heads/main")
+        dispatch["payload"].pop("comment")
+        for context in (dispatch, self.comment(user_type="Bot"), self.comment(is_pr=False)):
+            result = self.acknowledge(context, permission="admin")
+            self.assertNotIn("error", result)
+            self.assertEqual(result["calls"], [])
+
+    def test_reaction_failure_does_not_fail_the_authorized_request(self):
+        result = self.acknowledge(self.comment(), permission="write", reaction_error=True)
+        self.assertEqual(result["error"], "Reaction unavailable")
+        self.assertTrue(ACKNOWLEDGE["continue-on-error"])
+        self.assertEqual(
+            WORKFLOW["jobs"]["request"]["outputs"]["pr"], "${{ steps.request.outputs.pr }}"
+        )
 
     def test_queued_review_resolves_fresh_head_and_skips_closed_or_draft_prs(self):
         for state, draft in (("open", False), ("closed", False), ("open", True)):

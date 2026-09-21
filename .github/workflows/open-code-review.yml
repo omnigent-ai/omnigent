@@ -27,6 +27,9 @@ jobs:
         contains(github.event.comment.body, '/ocr')))
     runs-on: ubuntu-latest
     timeout-minutes: 3
+    permissions:
+      contents: read
+      pull-requests: write
     outputs:
       pr: ${{ steps.request.outputs.pr }}
       force: ${{ steps.request.outputs.force }}
@@ -72,6 +75,18 @@ jobs:
             if (!/^[1-9][0-9]*$/.test(String(number))) throw new Error('Expected a positive PR number');
             core.setOutput('pr', String(number));
             if (force) core.setOutput('force', 'true');
+
+      - name: Acknowledge review request
+        if: steps.request.outputs.pr != '' && github.event_name == 'issue_comment'
+        continue-on-error: true
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            await github.rest.reactions.createForIssueComment({
+              ...context.repo,
+              comment_id: context.payload.comment.id,
+              content: 'eyes',
+            });
 
   review:
     name: Open Code Review
@@ -183,6 +198,8 @@ jobs:
           llm_auth_token: ${{ secrets.LLM_API_KEY }}
           llm_auth_header: Authorization
           llm_use_anthropic: 'true'
+          # The gateway model requires adaptive thinking; the action defaults to disabled.
+          llm_extra_body: '{"thinking":{"type":"adaptive"},"output_config":{"effort":"medium"}}'
           llm_model: ${{ vars.OMNIGENT_CI_REVIEW_ANTHROPIC_MODEL || vars.OMNIGENT_CI_ANTHROPIC_MODEL }}
           ocr_version: '1.12.0'
           rule: .github/open-code-review/rules.json

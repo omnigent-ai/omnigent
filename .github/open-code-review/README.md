@@ -9,6 +9,8 @@ comments. It does not approve PRs or request changes.
 
 - Comment `/ocr` on its own line. The commenter needs repository write access
   or an entry in the existing `REVIEW_ALLOWLIST` JSON-array repository variable.
+  Accepted commands receive an 👀 reaction before entering the review queue.
+  A reaction API failure does not prevent the review from starting.
   This also enables review of external/fork PRs.
 - Comment `/ocr force` to rerun a completed review of the same commit.
 - Actions → Open Code Review → Run workflow, using the default branch and a PR
@@ -39,6 +41,8 @@ The gateway URL uses the same Anthropic surface as Polly: append `/anthropic`
 unless it already ends in `/anthropic`. Authentication uses a bearer token.
 The model comes from `OMNIGENT_CI_REVIEW_ANTHROPIC_MODEL`, falling back to
 `OMNIGENT_CI_ANTHROPIC_MODEL`. No model identifier or credential is committed.
+Requests explicitly enable adaptive thinking with medium reasoning effort;
+the upstream action's default of disabled thinking is rejected by our model.
 
 The upstream action is pinned to a commit, the CLI to `1.12.0`, and automatic
 CLI updates are disabled. It uses medium effort, concurrency two, a 15-minute
@@ -65,6 +69,7 @@ the upstream action publishes PR comments before it runs.
 
 1. Run `gh workflow run open-code-review.yml --repo omnigent-ai/omnigent -f pr=7878`
    for an open, non-draft PR, or comment `/ocr` on one.
+   For comment triggers, confirm the bot adds 👀 after authorization.
 2. Use a PR with changed Python or frontend tests. Open the Actions run and
    confirm the action checks out the trusted default branch and loads
    `.github/open-code-review/rules.json` without an unreadable-rule error.
