@@ -335,6 +335,25 @@ def _run_keenable(query: str, config: dict[str, str]) -> str:
     return _search_keenable(query, config)
 
 
+def _run_you(query: str, config: dict[str, str]) -> str:
+    """
+    Run a You.com web search via its MCP endpoint.
+
+    Keyless by default: with no ``api_key`` the free MCP profile
+    (``?profile=free``) is used. With an ``api_key`` the authenticated
+    endpoint (Bearer auth) is used and rate limits are lifted.
+
+    :param query: The search query.
+    :param config: May contain ``api_key`` and ``max_results`` (both optional).
+    :returns: Formatted results or an error message.
+    """
+    from omnigent.tools.builtins.web_search_you import (
+        _search_you,
+    )
+
+    return _search_you(query, config)
+
+
 # Single source of truth for the selectable backends. To add an engine, write
 # its ``_run_*`` above and add one row here — the dispatch in ``_search`` and
 # the error hint below both derive from this map, so nothing else needs editing.
@@ -342,6 +361,7 @@ def _run_keenable(query: str, config: dict[str, str]) -> str:
 _BACKENDS: dict[str, _Backend] = {
     "duckduckgo": _Backend(_run_duckduckgo, keyless=True),
     "keenable": _Backend(_run_keenable, keyless=True),
+    "you": _Backend(_run_you, keyless=True),
     "google": _Backend(_run_google, keyless=False),
     "perplexity": _Backend(_run_perplexity, keyless=False),
     "nimble": _Backend(_run_nimble, keyless=False),

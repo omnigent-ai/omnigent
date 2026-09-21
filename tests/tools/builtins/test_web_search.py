@@ -21,6 +21,9 @@ from omnigent.tools.builtins.web_search_nimble import _resolve_max_results
 from omnigent.tools.builtins.web_search_tavily import (
     _resolve_max_results as _resolve_max_results_tavily,
 )
+from omnigent.tools.builtins.web_search_you import (
+    _resolve_max_results as _resolve_max_results_you,
+)
 
 # ── Registry ─────────────────────────────────────────
 
@@ -601,6 +604,7 @@ def test_no_search_provider_fails_loudly(
     assert "nimble" in result.lower()
     assert "tavily" in result.lower()
     assert "keenable" in result.lower()
+    assert "you" in result.lower()
 
 
 # ── search_provider: keenable ────────────────────────
@@ -804,6 +808,167 @@ def test_keenable_max_results_clamped() -> None:
     assert _resolve_max_results_keenable({"max_results": "0"}) == 1  # below min → clamped up
     assert _resolve_max_results_keenable({"max_results": "500"}) == 20  # above max → clamped down
     assert _resolve_max_results_keenable({"max_results": "abc"}) == 5  # non-numeric → default
+
+
+# ── search_provider: you ─────────────────────────────
+
+
+def _you_response(web_results: list) -> MagicMock:
+    """
+    A fake You.com MCP endpoint response wrapping ``you-search`` output.
+
+    The endpoint answers MCP JSON-RPC over SSE; the ``tools/call`` result
+    carries the tool output as ``content[0].text`` JSON.
+    """
+    tool_output = json.dumps({"results": {"web": web_results}})
+    message = json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"content": [{"type": "text", "text": tool_output}]},
+        }
+    )
+    fake_response = MagicMock()
+    fake_response.text = f"event: message\ndata: {message}\n"
+    return fake_response
+
+
+def test_you_backend_via_spec_config(tool_ctx: ToolContext) -> None:
+    """
+    With search_provider=you, the tool delegates to the You.com MCP
+    endpoint and the result list flows through the unified pipeline.
+    """
+    tool = WebSearchTool(
+        config={"search_provider": "you"},
+        llm_provider="anthropic",
+    )
+    with patch("omnigent.tools.builtins.web_search_you.httpx.post") as mock_post:
+        mock_post.return_value = _you_response(
+            [
+                {
+                    "title": "You.com",
+                    "url": "https://you.com",
+                    "description": "AI search engine.",
+                }
+            ]
+        )
+        result = tool.invoke(json.dumps({"query": "you.com"}), tool_ctx)
+
+    assert "1. You.com" in result
+    assert "https://you.com" in result
+    assert "AI search engine." in result
+    # One initialize handshake plus one tools/call.
+    assert mock_post.call_count == 2
+
+
+def test_you_keyless_by_default(tool_ctx: ToolContext) -> None:
+    """
+    Without api_key, You.com uses the keyless free profile and sends no
+    auth header — it must NOT error like the keyed backends do.
+    """
+    tool = WebSearchTool(
+        config={"search_provider": "you"},
+        llm_provider="anthropic",
+    )
+    with patch("omnigent.tools.builtins.web_search_you.httpx.post") as mock_post:
+        mock_post.return_value = _you_response([])
+        result = tool.invoke(json.dumps({"query": "test"}), tool_ctx)
+
+    url = mock_post.call_args.args[0]
+    headers = mock_post.call_args.kwargs["headers"]
+    assert url.endswith("?profile=free"), f"Expected keyless endpoint, got {url!r}"
+    assert "Authorization" not in headers
+    assert "api_key" not in result  # no "missing api_key" error
+
+
+def test_you_keyed_uses_bearer_and_authed_endpoint(tool_ctx: ToolContext) -> None:
+    """With an api_key, You.com drops the free profile and sends Bearer auth."""
+    tool = WebSearchTool(
+        config={"search_provider": "you", "api_key": "spec-you"},
+        llm_provider="anthropic",
+    )
+    with patch("omnigent.tools.builtins.web_search_you.httpx.post") as mock_post:
+        mock_post.return_value = _you_response([])
+        tool.invoke(json.dumps({"query": "test"}), tool_ctx)
+
+    url = mock_post.call_args.args[0]
+    headers = mock_post.call_args.kwargs["headers"]
+    body = mock_post.call_args.kwargs["json"]
+    assert url.endswith("/mcp"), f"Expected authenticated endpoint, got {url!r}"
+    assert "profile=free" not in url
+    assert headers["Authorization"] == "Bearer spec-you"
+    assert body["method"] == "tools/call"
+    assert body["params"]["name"] == "you-search"
+    assert body["params"]["arguments"]["query"] == "test"
+
+
+def test_you_passes_count_from_max_results(tool_ctx: ToolContext) -> None:
+    """``max_results`` maps to you-search's ``count`` argument."""
+    tool = WebSearchTool(
+        config={"search_provider": "you", "max_results": "3"},
+        llm_provider="anthropic",
+    )
+    with patch("omnigent.tools.builtins.web_search_you.httpx.post") as mock_post:
+        mock_post.return_value = _you_response([])
+        tool.invoke(json.dumps({"query": "test"}), tool_ctx)
+
+    args = mock_post.call_args.kwargs["json"]["params"]["arguments"]
+    assert args["count"] == 3
+
+
+def test_you_http_error_returns_error_string(tool_ctx: ToolContext) -> None:
+    """An HTTP error from You.com is returned as a readable string, not raised."""
+    fake_response = MagicMock()
+    fake_response.raise_for_status.side_effect = httpx.HTTPStatusError(
+        "boom", request=MagicMock(), response=MagicMock(status_code=500)
+    )
+
+    tool = WebSearchTool(
+        config={"search_provider": "you"},
+        llm_provider="anthropic",
+    )
+    with patch("omnigent.tools.builtins.web_search_you.httpx.post") as mock_post:
+        mock_post.return_value = fake_response
+        result = tool.invoke(json.dumps({"query": "test"}), tool_ctx)
+
+    assert "You.com search error" in result
+
+
+def test_you_unexpected_response_returns_error_string(tool_ctx: ToolContext) -> None:
+    """A response with no JSON-RPC result is an error, not a crash."""
+    fake_response = MagicMock()
+    fake_response.text = 'event: message\ndata: {"jsonrpc": "2.0", "id": 1}\n'
+
+    tool = WebSearchTool(
+        config={"search_provider": "you"},
+        llm_provider="anthropic",
+    )
+    with patch("omnigent.tools.builtins.web_search_you.httpx.post") as mock_post:
+        mock_post.return_value = fake_response
+        result = tool.invoke(json.dumps({"query": "test"}), tool_ctx)
+
+    assert "unexpected MCP response" in result
+
+
+def test_you_empty_results_returns_no_results(tool_ctx: ToolContext) -> None:
+    """An empty web result list yields the 'No results found.' message."""
+    tool = WebSearchTool(
+        config={"search_provider": "you"},
+        llm_provider="anthropic",
+    )
+    with patch("omnigent.tools.builtins.web_search_you.httpx.post") as mock_post:
+        mock_post.return_value = _you_response([])
+        result = tool.invoke(json.dumps({"query": "test"}), tool_ctx)
+
+    assert result == "No results found."
+
+
+def test_you_max_results_clamped() -> None:
+    """``max_results`` is coerced + clamped to a 1-20 range; junk → default."""
+    assert _resolve_max_results_you({}) == 5  # missing → default
+    assert _resolve_max_results_you({"max_results": "0"}) == 1  # below min → clamped up
+    assert _resolve_max_results_you({"max_results": "500"}) == 20  # above max → clamped down
+    assert _resolve_max_results_you({"max_results": "abc"}) == 5  # non-numeric → default
 
 
 # ── Spec config passed through ───────────────────────
