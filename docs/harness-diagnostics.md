@@ -34,8 +34,15 @@ diagnostics as potentially sensitive even after redaction.
 The captured text appears in the owning process's ordinary local logs, including
 runner logs under `~/.omnigent/logs/runner/`, and in structured event attributes.
 It also reaches any configured debug-log or OpenTelemetry exporter. This flag
-does not enable an exporter or select a destination. Existing DEBUG stderr
-logging and earlier readiness-error reporting retain their existing behavior.
+does not enable an exporter or select a destination. It also does not control
+existing DEBUG stderr logging or earlier readiness-error reporting.
+
+Shared credential-pattern improvements also affect ordinary logs with capture
+disabled: assignment labels can contain spaces, and assigned values can include
+a `Bearer` prefix. For example, `api key: is missing` now becomes
+`api key: [REDACTED] missing` because the colon indicates an assignment. Only
+whitespace-delimited label/value matching without `:` or `=` is confined to
+diagnostic sanitization.
 
 ## Codex startup failure snapshot
 
