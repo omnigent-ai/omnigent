@@ -142,15 +142,22 @@ def test_queued_strip_attaches_to_composer(
                     """element => {
                         const style = getComputedStyle(element);
                         return {
-                            left:
-                                parseFloat(style.paddingLeft) +
-                                parseFloat(style.borderLeftWidth),
                             right:
                                 parseFloat(style.paddingRight) +
                                 parseFloat(style.borderRightWidth),
                         };
                     }"""
                 )
+                drag_handle_box = (
+                    strip.get_by_role("button", name="Reorder queued message")
+                    .first.locator("svg")
+                    .bounding_box()
+                )
+                workspace_icon_box = bar.first.locator(
+                    '[data-testid="composer-workspace-dir"] svg'
+                ).bounding_box()
+                assert drag_handle_box is not None, "queued drag handle has no bounding box"
+                assert workspace_icon_box is not None, "workspace icon has no bounding box"
                 assert abs(strip_box["x"] - bar_box["x"]) <= _EPSILON
                 assert abs(strip_box["width"] - bar_box["width"]) <= _EPSILON
                 strip_surface = strip.evaluate(
@@ -168,18 +175,29 @@ def test_queued_strip_attaches_to_composer(
                 bar_top_radii = bar.first.evaluate(
                     """element => {
                         const style = getComputedStyle(element);
-                        return [style.borderTopLeftRadius, style.borderTopRightRadius];
+                        return {
+                            radii: [style.borderTopLeftRadius, style.borderTopRightRadius],
+                            dividerWidth: style.borderTopWidth,
+                        };
                     }"""
                 )
                 assert strip_surface == bar_surface, (
                     "light-theme queued rows and workspace metadata must share "
                     f"one surface: strip={strip_surface}, bar={bar_surface}"
                 )
-                assert bar_top_radii == ["0px", "0px"], (
+                assert bar_top_radii["radii"] == ["0px", "0px"], (
                     "the docked queue owns the outer rounded top; the workspace bar "
                     f"must not draw an inner arc: {bar_top_radii}"
                 )
-                assert abs(strip_list_box["x"] - (bar_box["x"] + bar_insets["left"])) <= _EPSILON
+                assert bar_top_radii["dividerWidth"] != "0px", (
+                    "the docked queue and workspace bar must keep a straight divider"
+                )
+                drag_handle_center = drag_handle_box["x"] + drag_handle_box["width"] / 2
+                workspace_icon_center = workspace_icon_box["x"] + workspace_icon_box["width"] / 2
+                assert abs((workspace_icon_center - drag_handle_center) - 2) <= _EPSILON, (
+                    "workspace icon needs the 2px optical offset from queued drag handles: "
+                    f"drag={drag_handle_center:.1f}, workspace={workspace_icon_center:.1f}"
+                )
                 assert (
                     abs(
                         strip_list_box["x"]

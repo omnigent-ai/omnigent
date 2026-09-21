@@ -3797,7 +3797,11 @@ describe("Composer sub-agent tray", () => {
       queuedMessages: [{ queueId: "q_1", text: "held follow-up", conversationId: "conv_test" }],
     });
     renderWithTooltips(<Composer {...composerProps()} />);
-    expect(screen.getByTestId("composer-workspace-controls")).toHaveClass("rounded-t-none");
+    expect(screen.getByTestId("composer-workspace-controls")).toHaveClass(
+      "rounded-t-none",
+      "pl-2.5",
+      "border",
+    );
   });
 });
 

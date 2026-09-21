@@ -2601,7 +2601,8 @@ function ComposerImpl(
   const composerQueuedMessages = queuedMessages.filter(
     (message) => message.conversationId === conversationId,
   );
-  const hasDockedComposerTray = composerQueuedMessages.length > 0 || Boolean(subAgentLabel);
+  const hasQueuedComposerMessages = composerQueuedMessages.length > 0;
+  const hasDockedComposerTray = hasQueuedComposerMessages || Boolean(subAgentLabel);
   const composerContextWindow = useChatStore((s) => s.contextWindow);
   const composerTokensUsed = useChatStore((s) => s.tokensUsed);
   const openComposerGithubTab = useOpenGithubTab();
@@ -3666,7 +3667,10 @@ function ComposerImpl(
         {subAgentLabel ? <SubagentComposerTray label={subAgentLabel} /> : null}
         <ComposerWorkspaceBar
           data-testid="composer-workspace-controls"
-          className={hasDockedComposerTray ? "rounded-t-none" : undefined}
+          className={cn(
+            hasDockedComposerTray && "rounded-t-none",
+            hasQueuedComposerMessages && "pl-2.5",
+          )}
         >
           <ComposerPrLink
             state={composerGit.githubState}
