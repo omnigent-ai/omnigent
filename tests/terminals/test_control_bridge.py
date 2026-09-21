@@ -935,14 +935,12 @@ async def test_native_pbcopy_uses_consent_transport_not_host_clipboard(
     read_paths = [str(Path(__file__).resolve().parents[2])]
     if sandbox != "none":
         # An isolated worktree may share an editable venv with another checkout.
+        source_query = (
+            "from pathlib import Path; import omnigent; "
+            "print(Path(omnigent.__file__).resolve().parent.parent)"
+        )
         installed_source = subprocess.check_output(
-            [
-                sys.executable,
-                "-I",
-                "-c",
-                "from pathlib import Path; import omnigent; "
-                "print(Path(omnigent.__file__).resolve().parent.parent)",
-            ],
+            [sys.executable, "-I", "-c", source_query],
             text=True,
             timeout=5,
         ).strip()

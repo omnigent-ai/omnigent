@@ -239,11 +239,11 @@ export function TerminalView({
         clipboardWorkerEpochRef.current += 1;
         clipboardAutoPendingRef.current = null;
         clipboardNeedsClickRef.current = false;
-        // Shared grants keep waiting selections visible; revocations discard them.
-        const keepPendingSelection =
+        // Shared grants keep waiting text visible; revocations discard it.
+        const keepPendingRequest =
           decision === "allow" && clipboardMountedRef.current && clipboardActiveRef.current;
         setClipboardPrompt((current) =>
-          keepPendingSelection &&
+          keepPendingRequest &&
           current?.scope === scope &&
           current.epoch === epoch &&
           current.generation === previousGeneration

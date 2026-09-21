@@ -361,27 +361,43 @@ describe("terminal clipboard", () => {
     },
   );
 
-  it("keeps an older in-flight program copy from overwriting a newer browser selection", async () => {
-    writeTerminalClipboardPreference("allow");
-    await renderClipboardView();
-    let finishOldCopy: (() => void) | undefined;
-    clipboardMock.copyText.mockImplementationOnce(
-      () =>
-        new Promise<void>((resolve) => {
-          finishOldCopy = resolve;
-        }),
-    );
-    await requestClipboard("older program copy");
-    const newer = await copySelection("newer browser selection");
+  it.each(["succeeds", "needs a retry"] as const)(
+    "orders a newer selection after an in-flight program copy when copying %s",
+    async (outcome) => {
+      writeTerminalClipboardPreference("allow");
+      await renderClipboardView();
+      let finishOldCopy: (() => void) | undefined;
+      clipboardMock.copyText.mockImplementationOnce(
+        () =>
+          new Promise<void>((resolve) => {
+            finishOldCopy = resolve;
+          }),
+      );
+      await requestClipboard("older program copy");
+      if (outcome === "needs a retry") {
+        clipboardMock.copyText.mockRejectedValueOnce(new Error("browser needs a gesture"));
+      }
+      const newer = await copySelection("newer browser selection");
 
-    expect(newer.setData).not.toHaveBeenCalled();
-    expect(clipboardMock.copyText).toHaveBeenCalledTimes(1);
-    await act(async () => finishOldCopy?.());
-    expect(clipboardMock.copyText.mock.calls).toEqual([
-      ["older program copy"],
-      ["newer browser selection"],
-    ]);
-  });
+      expect(newer.setData).not.toHaveBeenCalled();
+      expect(clipboardMock.copyText).toHaveBeenCalledTimes(1);
+      await act(async () => finishOldCopy?.());
+      expect(clipboardMock.copyText.mock.calls).toEqual([
+        ["older program copy"],
+        ["newer browser selection"],
+      ]);
+      if (outcome === "needs a retry") {
+        await waitFor(() =>
+          expect(visibleClipboardConsent()).toHaveTextContent("Copy needs a click"),
+        );
+        clickConsentButton("Copy now");
+        await waitFor(() => expect(clipboardMock.copyText).toHaveBeenCalledTimes(3));
+        expect(clipboardMock.copyText).toHaveBeenLastCalledWith("newer browser selection");
+        await waitFor(() => expect(visibleClipboardConsent()).toBeNull());
+        expect(readTerminalClipboardPreference()).toBe("allow");
+      }
+    },
+  );
 
   it("lets a native selection copy satisfy a pending browser retry", async () => {
     writeTerminalClipboardPreference("allow");
@@ -552,7 +568,7 @@ describe("terminal clipboard", () => {
     },
   );
 
-  it("keeps another terminal's pending selection available after remembered Allow", async () => {
+  it("keeps another terminal's pending program text available after remembered Allow", async () => {
     render(
       <>
         <TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />
@@ -571,8 +587,8 @@ describe("terminal clipboard", () => {
 
     fireEvent.click(within(firstPrompt).getByRole("button", { name: "Allow copying" }));
     await waitFor(() => expect(firstPrompt).not.toBeInTheDocument());
-    await waitFor(() => expect(secondPrompt).toHaveTextContent("Finish copying your selection"));
-    expect(secondPrompt).toHaveTextContent("Your selection hasn’t been copied yet.");
+    await waitFor(() => expect(secondPrompt).toHaveTextContent("Finish copying terminal text"));
+    expect(secondPrompt).toHaveTextContent("The requested text hasn’t been copied yet.");
     expect(within(secondPrompt).queryByRole("checkbox")).not.toBeInTheDocument();
     expect(clipboardMock.copyText.mock.calls).toEqual([["first terminal text"]]);
 
@@ -588,7 +604,7 @@ describe("terminal clipboard", () => {
     await requestClipboardConsent("older selection");
     act(() => writeTerminalClipboardPreference("allow"));
     await waitFor(() =>
-      expect(visibleClipboardConsent()).toHaveTextContent("Finish copying your selection"),
+      expect(visibleClipboardConsent()).toHaveTextContent("Finish copying terminal text"),
     );
     expect(clipboardMock.copyText).not.toHaveBeenCalled();
 
@@ -604,7 +620,7 @@ describe("terminal clipboard", () => {
       await requestClipboardConsent("pending selection");
       act(() => writeTerminalClipboardPreference("allow"));
       await waitFor(() =>
-        expect(visibleClipboardConsent()).toHaveTextContent("Finish copying your selection"),
+        expect(visibleClipboardConsent()).toHaveTextContent("Finish copying terminal text"),
       );
 
       act(() => writeTerminalClipboardPreference(decision));

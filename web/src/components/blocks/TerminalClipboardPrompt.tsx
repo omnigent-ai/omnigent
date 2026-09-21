@@ -87,13 +87,13 @@ function TerminalClipboardPromptContent({
     reason === "consent"
       ? "Allow copying from terminals?"
       : reason === "permission"
-        ? "Finish copying your selection"
+        ? "Finish copying terminal text"
         : "Copy needs a click";
   const description =
     reason === "consent"
       ? "Your selection hasn’t been copied yet. Allowing copying also lets terminal programs silently replace your clipboard with text or commands you didn’t intend to paste."
       : reason === "permission"
-        ? "Clipboard copying is now allowed. Your selection hasn’t been copied yet. Click Copy now to finish."
+        ? "Clipboard copying is now allowed. The requested text hasn’t been copied yet. Click Copy now to finish."
         : copyFailed
           ? "Your selection hasn’t been copied. Check your browser’s clipboard permissions and try again."
           : "Your browser needs a click to finish copying. Your saved clipboard preference hasn’t changed.";

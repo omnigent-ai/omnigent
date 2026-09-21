@@ -547,8 +547,8 @@ def test_terminal_clipboard_pending_selection_survives_a_cross_tab_grant(
         expect(preference).to_contain_text("Allow copying")
 
         ui.page.bring_to_front()
-        expect(ui.consent).to_contain_text("Finish copying your selection")
-        expect(ui.consent).to_contain_text("Your selection hasn’t been copied yet.")
+        expect(ui.consent).to_contain_text("Finish copying terminal text")
+        expect(ui.consent).to_contain_text("The requested text hasn’t been copied yet.")
         expect(ui.consent.get_by_role("checkbox")).to_have_count(0)
         ui.expect_no_copy()
 
