@@ -121,6 +121,8 @@ export class ConversationRegistry {
   private readonly disposeListeners = new Set<DisposeListener>();
   /** Conversation currently on screen; exempt from eviction. */
   private activeId: string | null = null;
+  /** Conversations rendered in visible split panes; exempt from eviction. */
+  private readonly pinnedIds = new Set<string>();
 
   /**
    * Subscribe to state changes across all entries.
@@ -280,9 +282,23 @@ export class ConversationRegistry {
    * user's message). When nothing is evictable, returns `null` and the caller
    * decides what to do with a saturated origin.
    */
+  /**
+   * Mark a conversation as rendered in a visible pane. Pinned entries are
+   * never eviction victims: a pane that loses its entry falls back to an
+   * empty transcript the user never asked for. Idempotent.
+   */
+  pin(id: string): void {
+    this.pinnedIds.add(id);
+  }
+
+  /** Remove a pane's hold on a conversation (pane closed / session replaced). */
+  unpin(id: string): void {
+    this.pinnedIds.delete(id);
+  }
+
   evictLruEvictable(exemptId?: string): string | null {
     for (const [id, entry] of this.entries) {
-      if (id === this.activeId || id === exemptId) continue;
+      if (id === this.activeId || id === exemptId || this.pinnedIds.has(id)) continue;
       if (hasUnsentWork(entry.getState())) continue;
       this.entries.delete(id);
       entry.dispose();

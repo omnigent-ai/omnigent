@@ -27,6 +27,7 @@ import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { clearOptimisticTitles, recordOptimisticTitle } from "@/lib/optimisticTitles";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import { writeWorkspacePanelDefault } from "@/lib/workspacePanelPreferences";
+import { useWorkspaceLayoutStore } from "@/store/workspaceLayout";
 
 const runnerHealthState = vi.hoisted(() => ({
   runnerOnline: undefined as boolean | undefined,
@@ -581,6 +582,22 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("AppShell header", () => {
+  it("hides the global chat header while the workspace is split", () => {
+    mockConversations([]);
+    useWorkspaceLayoutStore.getState().reset("conv_a");
+    const { container, unmount } = renderShell("/c/conv_b");
+    expect(container.querySelector("header.chat-header")).not.toBeNull();
+
+    const paneId = useWorkspaceLayoutStore.getState().root.id;
+    act(() => useWorkspaceLayoutStore.getState().splitPane(paneId, "conv_b", "right"));
+    expect(container.querySelector("header.chat-header")).toBeNull();
+
+    unmount();
+    const home = renderShell("/");
+    expect(home.container.querySelector("header.chat-header")).not.toBeNull();
+    useWorkspaceLayoutStore.getState().reset(null);
+  });
+
   it("renders the sidebar toggle on all pages", () => {
     mockConversations([]);
     renderShell("/");

@@ -81,6 +81,7 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isSingleUserMode } from "@/lib/capabilities";
 import { isCurrentServerLocal } from "@/lib/serverOrigin";
 import { isTempConvId, useChatStore } from "@/store/chatStore";
+import { useWorkspaceLayoutStore } from "@/store/workspaceLayout";
 import {
   STARTING_GRACE_S,
   livenessRowFromSession,
@@ -226,6 +227,7 @@ export function AppShell() {
     conversationId: string;
     extensionId: string;
   }>();
+  const workspaceSplit = useWorkspaceLayoutStore((state) => state.root.kind === "split");
   // A client-only temp id (`temp:*`, shown while `createSession` is in flight)
   // has no server session behind it. Feed every server-scoped hook this instead
   // of the raw route id so none of them fetch `/v1/sessions/temp:*` during the
@@ -2007,6 +2009,7 @@ export function AppShell() {
   );
   const workspacePanelVisible = Boolean(
     conversationId &&
+    !workspaceSplit &&
     hasRailContent &&
     rightPanelOpen &&
     (terminalFirst || !panelOpen) &&
@@ -2129,7 +2132,7 @@ export function AppShell() {
                   } as CSSProperties
                 }
               >
-                {!extensionOwnsHeader && (
+                {!extensionOwnsHeader && (!conversationId || !workspaceSplit) && (
                   <ChatHeader
                     // Real docked state — deliberately NOT `|| sidebarPeek`. Peek
                     // is a transient card floating over the collapsed layout (the

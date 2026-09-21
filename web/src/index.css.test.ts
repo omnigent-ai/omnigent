@@ -345,6 +345,7 @@ function assertNativePanelPadding(platform: "android" | "ios"): void {
   withNativeShell(platform, (shell) => {
     const rail = document.createElement("aside");
     rail.setAttribute("aria-label", "Workspace");
+    rail.setAttribute("data-workspace-panel", "");
     shell.appendChild(rail);
     expectSafeAreaPadding(rail);
     const sidebar = document.createElement("div");
@@ -412,12 +413,13 @@ describe("index.css native safe-area layout", () => {
     assertNativePanelPadding,
   );
 
-  it("keeps the Workspace aria-label on the rail component", () => {
+  it("keeps Workspace as the default rail aria-label", () => {
     // The stub <aside> in assertNativePanelPadding stands in for
-    // WorkspacePanel; this pins the real component to the label the CSS
-    // selector keys on.
+    // WorkspacePanel; pin both the default and its use on the real surface so
+    // per-session rails may provide a more specific accessible label.
     const source = readFileSync("src/shell/WorkspacePanel.tsx", "utf8");
-    expect(source).toMatch(/<aside[\s\S]{0,600}?aria-label="Workspace"/);
+    expect(source).toMatch(/ariaLabel = "Workspace"/);
+    expect(source).toMatch(/<aside[\s\S]{0,600}?aria-label=\{ariaLabel\}/);
   });
 
   it("leaves a collapsed rail unpadded, so its starved width stays zero", () => {
@@ -449,6 +451,7 @@ describe("index.css native safe-area layout", () => {
     withNativeShell("android", (shell) => {
       const rail = document.createElement("aside");
       rail.setAttribute("aria-label", "Workspace");
+      rail.setAttribute("data-workspace-panel", "");
       const panel = document.createElement("div");
       panel.dataset.testid = "file-viewer";
       rail.appendChild(panel);
@@ -1126,6 +1129,7 @@ describe("index.css maximized workspace rail traffic-light clearance", () => {
     for (const [k, v] of Object.entries(shellAttrs)) shell.setAttribute(k, v);
     const rail = document.createElement("aside");
     rail.setAttribute("aria-label", "Workspace");
+    rail.setAttribute("data-workspace-panel", "");
     rail.setAttribute("data-maximized", "true");
     const strip = document.createElement("div");
     strip.className = "workspace-tab-strip";

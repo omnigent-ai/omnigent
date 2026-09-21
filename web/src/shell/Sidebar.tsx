@@ -22,7 +22,6 @@ import {
   useRef,
   useState,
 } from "react";
-import { createPortal } from "react-dom";
 import {
   ArchiveIcon,
   ArchiveRestoreIcon,
@@ -67,26 +66,10 @@ import {
   WalletIcon,
   XIcon,
 } from "lucide-react";
-import {
-  DndContext,
-  closestCenter,
-  KeyboardSensor,
-  DragOverlay,
-  type DragEndEvent,
-  type DragStartEvent,
-  MeasuringStrategy,
-  MouseSensor,
-  pointerWithin,
-  TouchSensor,
-  useDraggable,
-  useDroppable,
-  useSensor,
-  useSensors,
-} from "@dnd-kit/core";
+import { useDraggable, useDroppable } from "@dnd-kit/core";
 import {
   arrayMove,
   SortableContext,
-  sortableKeyboardCoordinates,
   verticalListSortingStrategy,
   useSortable,
 } from "@dnd-kit/sortable";
@@ -94,6 +77,11 @@ import { useProjectOrder, useSaveProjectOrder } from "@/hooks/useProjectOrder";
 import { useQueryClient } from "@tanstack/react-query";
 import { Link, useLocation, useNavigate, useParams } from "@/lib/routing";
 import { SidebarHeaderActions, SidebarSettingsButton } from "./SidebarHeaderActions";
+import {
+  SessionDragDropBoundary,
+  useSessionDragDrop,
+  type SessionDragState,
+} from "./SessionDragDropProvider";
 import omnigentWordmark from "@/assets/omnigent-wordmark.svg";
 import { Button } from "@/components/ui/button";
 import {
@@ -225,7 +213,6 @@ import { SidebarServerPicker } from "./SidebarServerPicker";
 import { ForkSessionDialog } from "./ForkSessionDialog";
 import { SIDEBAR_ROW } from "./sidebarStyles";
 import { TooltipArrow } from "radix-ui/tooltip";
-import { getEmbedRoot } from "../lib/host";
 
 // Positioning for a row's trailing session-state badge. Anchored at the row's
 // trailing icon edge in every viewport: on desktop it fades on hover so the pin
@@ -1607,9 +1594,6 @@ function ConversationList({
   const { data: projects = [] } = useProjects();
   const projectOrder = useProjectOrder();
   const saveOrder = useSaveProjectOrder();
-  const [draggedProject, setDraggedProject] = useState<string | null>(null);
-  const dragOrigin = useRef<{ left: number; top: number; width: number } | undefined>(undefined);
-  const [overProject, setOverProject] = useState<string | null>(null);
   const moveProject = (name: string, destination: "up" | "down" | "top" | "bottom") => {
     if (saveOrder.isPending) return;
     const from = projects.findIndex((p) => p.name === name);
@@ -1896,67 +1880,15 @@ function ConversationList({
   // target — you can't file sessions there. The kebab "Move session" menu + the
   // pin button remain the keyboard-accessible session actions.
   const moveToProject = useMoveToProject();
-  // The session currently being dragged (id + source project + pinned state), or
-  // null. Set on drag start, cleared on end/cancel; drives the DragOverlay
-  // preview and which drop zones light up (ungroup only for a filed session, pin
-  // only for an unpinned one).
-  const [activeDrag, setActiveDrag] = useState<{
-    id: string;
-    label: string;
-    project: string | null;
-    isPinned: boolean;
-  } | null>(null);
-  // Mouse: a small drag threshold so a plain click still navigates / opens the
-  // kebab. Touch: a press-and-hold delay so scrolling the list isn't hijacked
-  // into a drag. Project headers also support keyboard sorting.
-  const sensors = useSensors(
-    useSensor(KeyboardSensor, {
-      coordinateGetter: sortableKeyboardCoordinates,
-      keyboardCodes: { start: ["Space"], cancel: ["Escape"], end: ["Space"] },
-    }),
-    useSensor(MouseSensor, { activationConstraint: { distance: 5 } }),
-    useSensor(TouchSensor, { activationConstraint: { delay: 250, tolerance: 8 } }),
-  );
-  const handleDragStart = useCallback((event: DragStartEvent) => {
-    const isProject = event.active.data.current?.type === "project-order";
-    // New drop zones can shift the source row; preserve its position before rendering them.
-    const target = event.activatorEvent.target;
-    const rect =
-      ("clientX" in event.activatorEvent || "touches" in event.activatorEvent) &&
-      target instanceof Element
-        ? target
-            .closest(isProject ? "[data-project-order-name]" : "[data-sidebar-session-id]")
-            ?.getBoundingClientRect()
-        : undefined;
-    dragOrigin.current = rect ? { left: rect.left, top: rect.top, width: rect.width } : undefined;
-    if (event.active.data.current?.type === "project-order") {
-      setDraggedProject(event.active.data.current.name as string);
-      return;
-    }
-    const data = event.active.data.current as
-      { label?: string; project?: string | null; isPinned?: boolean } | undefined;
-    setActiveDrag({
-      id: String(event.active.id),
-      label: data?.label ?? String(event.active.id),
-      project: data?.project ?? null,
-      isPinned: data?.isPinned ?? false,
-    });
-  }, []);
-  const handleDragEnd = useCallback(
-    (event: DragEndEvent) => {
-      if (event.active.data.current?.type === "project-order") {
-        setDraggedProject(null);
-        setOverProject(null);
-        if (event.over?.data.current?.type !== "project-order" || saveOrder.isPending) return;
-        const from = projects.findIndex((p) => p.name === event.active.data.current?.name);
-        const to = projects.findIndex((p) => p.name === event.over?.data.current?.name);
-        if (from >= 0 && to >= 0 && from !== to) saveOrder.mutate(arrayMove(projects, from, to));
-        return;
-      }
-      const dragged = activeDrag;
-      setActiveDrag(null);
-      if (!dragged) return;
-      const target = (event.over?.data.current as SidebarDropTarget | undefined) ?? null;
+  const {
+    activeDrag,
+    draggedProject,
+    overProject,
+    registerProjectOrderDropHandler,
+    registerSidebarDropHandler,
+  } = useSessionDragDrop();
+  const handleSidebarDrop = useCallback(
+    (dragged: SessionDragState, target: SidebarDropTarget) => {
       const action = resolveSidebarDrop(
         { id: dragged.id, project: dragged.project, isPinned: dragged.isPinned },
         target,
@@ -1984,7 +1916,24 @@ function ConversationList({
         if (action.unpin) onTogglePinned(dragged.id);
       }
     },
-    [activeDrag, moveToProject, expandProject, onTogglePinned, projects, saveOrder],
+    [moveToProject, expandProject, onTogglePinned],
+  );
+  const handleProjectOrderDrop = useCallback(
+    (fromName: string, toName: string) => {
+      if (saveOrder.isPending) return;
+      const from = projects.findIndex((project) => project.name === fromName);
+      const to = projects.findIndex((project) => project.name === toName);
+      if (from >= 0 && to >= 0 && from !== to) saveOrder.mutate(arrayMove(projects, from, to));
+    },
+    [projects, saveOrder],
+  );
+  useEffect(
+    () => registerSidebarDropHandler(handleSidebarDrop),
+    [handleSidebarDrop, registerSidebarDropHandler],
+  );
+  useEffect(
+    () => registerProjectOrderDropHandler(handleProjectOrderDrop),
+    [handleProjectOrderDrop, registerProjectOrderDropHandler],
   );
 
   const expandAllProjects = useCallback((allNames: string[]) => {
@@ -2186,50 +2135,7 @@ function ConversationList({
       serverInfo={serverInfo}
       onActivate={activateRow}
     >
-      <DndContext
-        sensors={sensors}
-        collisionDetection={(args) => {
-          const ordering = args.active.data.current?.type === "project-order";
-          const droppableContainers = args.droppableContainers.filter(
-            (container) => (container.data.current?.type === "project-order") === ordering,
-          );
-          if (!ordering) return pointerWithin({ ...args, droppableContainers });
-          // Restrict project drops to the project list inside the sidebar.
-          if (args.pointerCoordinates) {
-            const rects = droppableContainers
-              .map((c) => args.droppableRects.get(c.id))
-              .filter((r) => r != null);
-            const y = args.pointerCoordinates.y;
-            const x = args.pointerCoordinates.x;
-            const sidebar = scrollContainerRef.current?.getBoundingClientRect();
-            if (sidebar && (x < sidebar.left || x > sidebar.right)) return [];
-            if (
-              !rects.length ||
-              y < Math.min(...rects.map((r) => r.top)) - 10 ||
-              y > Math.max(...rects.map((r) => r.bottom)) + 10
-            )
-              return [];
-          }
-          return closestCenter({ ...args, droppableContainers });
-        }}
-        // Always-measure so the transient "remove from project" zone (mounted at
-        // drag start) is registered as a drop target without a stale layout cache.
-        measuring={{ droppable: { strategy: MeasuringStrategy.Always } }}
-        onDragStart={handleDragStart}
-        onDragEnd={handleDragEnd}
-        onDragOver={(event) =>
-          setOverProject(
-            event.over?.data.current?.type === "project-order"
-              ? (event.over.data.current.name as string)
-              : null,
-          )
-        }
-        onDragCancel={() => {
-          setActiveDrag(null);
-          setDraggedProject(null);
-          setOverProject(null);
-        }}
-      >
+      <SessionDragDropBoundary>
         <RowEditHoldContext.Provider value={reportRowEditing}>
           <div
             className="flex flex-col gap-4"
@@ -2493,30 +2399,7 @@ function ConversationList({
             )}
           </div>
         </RowEditHoldContext.Provider>
-        {/* The dragged row's preview follows the pointer: a compact card showing
-          the session's title. Portaled to <body>: the aside always carries a CSS
-          translate (the mobile slide-in), which makes it the containing block for
-          fixed descendants, so an inline overlay would resolve its viewport
-          coordinates against the aside's box and drift off the cursor whenever
-          the aside sits away from (0,0) — e.g. the floating peek card. */}
-        {createPortal(
-          <DragOverlay
-            dropAnimation={null}
-            className="pointer-events-none"
-            style={dragOrigin.current}
-          >
-            {activeDrag || draggedProject ? (
-              <div
-                className="pointer-events-none max-w-[16rem] truncate rounded-md border bg-card-solid px-3 py-2 text-ui shadow-tooltip"
-                style={dragOrigin.current ? { maxWidth: "none" } : undefined}
-              >
-                {draggedProject ?? activeDrag?.label}
-              </div>
-            ) : null}
-          </DragOverlay>,
-          getEmbedRoot() ?? document.body,
-        )}
-      </DndContext>
+      </SessionDragDropBoundary>
     </SidebarRowDataProvider>
   );
 }
@@ -3911,7 +3794,7 @@ function ConversationRowImpl({
   // Drag-and-drop: a row is grabbable when the viewer owns it (re-filing is
   // owner-only, like the Move-to-project kebab item), outside selection /
   // archive / rename modes. Dragging it onto a project folder files it there;
-  // onto "Chats" unfiles it; onto "Pinned" pins it. The list-level <DndContext>
+  // onto "Chats" unfiles it; onto "Pinned" pins it. The shared drag provider
   // routes the drop; the row only advertises itself and its source project +
   // pinned state via the draggable `data`.
   const {

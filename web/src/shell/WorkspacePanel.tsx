@@ -9,6 +9,7 @@ import {
   MaximizeIcon,
   MessagesSquareIcon,
   MinimizeIcon,
+  PanelRightCloseIcon,
   PlusIcon,
   TerminalIcon,
   XIcon,
@@ -596,6 +597,10 @@ interface WorkspacePanelProps {
   width: number;
   /** Whether the panel is closed/collapsed (hides it from keyboard nav + assistive tech). */
   inert?: boolean;
+  /** Layout geometry: the global AppShell rail or a per-session responsive dock. */
+  variant?: "global" | "session-column";
+  /** Accessible label for the workspace surface. */
+  ariaLabel?: string;
   /**
    * Props for the left-edge resize handle (onMouseDown/onKeyDown + ARIA),
    * from ``useResizableInlinePanel().handleProps``.
@@ -666,6 +671,8 @@ interface WorkspacePanelProps {
   maximized: boolean;
   /** Toggle the rail's maximized state. */
   onToggleMaximized: () => void;
+  /** Collapse this panel from within a per-session workspace dock. */
+  onCollapse?: () => void;
   /** Viewer's permission level (gates edit affordances). */
   permissionLevel: number | null;
   /** Changed-files sort order, shared with the viewer's prev/next order. */
@@ -709,6 +716,8 @@ function WorkspacePanelImpl({
   width,
   handleProps,
   inert,
+  variant = "global",
+  ariaLabel = "Workspace",
   rightRailTab,
   onRightRailTabChange,
   showFilesPanel,
@@ -733,6 +742,7 @@ function WorkspacePanelImpl({
   onCloseTerminal,
   maximized,
   onToggleMaximized,
+  onCollapse,
   permissionLevel,
   filesPanelSort,
   onSortChange,
@@ -981,7 +991,9 @@ function WorkspacePanelImpl({
   };
   return (
     <aside
-      aria-label="Workspace"
+      aria-label={ariaLabel}
+      data-workspace-panel=""
+      data-conversation-id={conversationId}
       inert={inert}
       // The resize hook can starve the rail to width 0 while it stays mounted;
       // marking it collapsed keeps index.css's safe-area padding off it so a
@@ -1003,20 +1015,24 @@ function WorkspacePanelImpl({
       // against.
       data-maximized={maximized || undefined}
       className={cn(
-        "@container/rail relative z-40 hidden md:flex md:min-h-0 md:flex-col md:overflow-hidden md:border-l md:border-border md:bg-card",
-        maximized ? "md:absolute md:inset-0" : "md:shrink-0",
+        "@container/rail relative z-40 hidden md:flex md:min-h-0 md:flex-col md:overflow-hidden md:border-border md:bg-card",
+        maximized
+          ? cn("md:absolute md:inset-0", variant === "global" && "md:border-l")
+          : variant === "session-column"
+            ? "md:h-auto md:w-full md:basis-[var(--session-workspace-basis,45%)] md:shrink-0 @min-[720px]/session-column:md:h-full @min-[720px]/session-column:md:w-auto"
+            : "md:shrink-0 md:border-l",
       )}
       // Width is fixed by the resize handle normally; maximized ignores it and
       // stretches to the absolute inset instead. The width doubles as the
       // reservation index.css caps the rail's lateral safe-area insets to.
       style={
-        maximized
+        maximized || variant === "session-column"
           ? undefined
           : ({ width, "--omnigent-reserved-width": `${width}px` } as CSSProperties)
       }
     >
       {/* Left-edge horizontal resize handle — suppressed while maximized. */}
-      {!maximized && (
+      {!maximized && variant === "global" && (
         <div
           {...effectiveHandleProps}
           className={cn(
@@ -1243,6 +1259,19 @@ function WorkspacePanelImpl({
             {maximized ? <MinimizeIcon className="size-4" /> : <MaximizeIcon className="size-4" />}
           </Button>
         </WorkspaceTabTooltip>
+        {variant === "session-column" && onCollapse && (
+          <WorkspaceTabTooltip label="Collapse workspace">
+            <Button
+              variant="ghost"
+              aria-label="Collapse workspace"
+              onClick={onCollapse}
+              size="icon-xs"
+              className="flex size-6"
+            >
+              <PanelRightCloseIcon className="size-4" />
+            </Button>
+          </WorkspaceTabTooltip>
+        )}
       </div>
       {/* Tab content — single slot. An open shell tab holds its xterm; a
           file tab holds FileViewer; the Files/Changes tabs show FilesPanel
@@ -1313,6 +1342,7 @@ function WorkspacePanelImpl({
         ) : (
           showFilesPanel && (
             <FilesPanel
+              conversationId={conversationId}
               frameless
               onFileSelect={openFileViewer}
               flatView={rightRailTab === "changes"}
