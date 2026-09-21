@@ -27,6 +27,10 @@ import {
   SESSION_HISTORY_PAGE_SIZE,
   stopSession,
   updateSession,
+  ApiError,
+  isDefinitiveRequestError,
+  isRetryableSessionLoadError,
+  sessionLoadErrorKind,
 } from "./sessionsApi";
 import { BACKGROUND_SESSION_TITLES_STORAGE_KEY } from "./backgroundSessionTitlesPreferences";
 
@@ -1532,5 +1536,37 @@ describe("importLocalSessions", () => {
     // First the stream endpoint (404), then the buffered fallback.
     expect(fetchMock.mock.calls[0][0]).toBe("/v1/imports/local/stream");
     expect(fetchMock.mock.calls[1][0]).toBe("/v1/imports/local");
+  });
+});
+
+describe("session load failure classification", () => {
+  const api = (status: number) => new ApiError(`${status}`, status, null);
+  const abort = Object.assign(new Error("aborted"), { name: "AbortError" });
+
+  it.each([500, 502, 503, 408, 429])("retries a transient %s", (status) => {
+    expect(isRetryableSessionLoadError(api(status))).toBe(true);
+    expect(isDefinitiveRequestError(api(status))).toBe(false);
+    expect(sessionLoadErrorKind(api(status))).toBe("transient");
+  });
+
+  it("retries a network failure but not an abort or a programming error", () => {
+    expect(isRetryableSessionLoadError(new TypeError("Failed to fetch"))).toBe(true);
+    expect(isRetryableSessionLoadError(abort)).toBe(false);
+    expect(isRetryableSessionLoadError(new SyntaxError("bad json"))).toBe(false);
+    // Neither is definitive: the page keeps the chat and marks history unavailable.
+    expect(isDefinitiveRequestError(new TypeError("Failed to fetch"))).toBe(false);
+    expect(isDefinitiveRequestError(abort)).toBe(false);
+  });
+
+  it.each([
+    [404, "not_found"],
+    [410, "not_found"],
+    [401, "unauthenticated"],
+    [403, "forbidden"],
+    [400, "invalid"],
+  ])("treats %s as definitive (%s)", (status, kind) => {
+    expect(isRetryableSessionLoadError(api(status))).toBe(false);
+    expect(isDefinitiveRequestError(api(status))).toBe(true);
+    expect(sessionLoadErrorKind(api(status))).toBe(kind);
   });
 });

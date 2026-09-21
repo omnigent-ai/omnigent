@@ -10,7 +10,7 @@ format — a minimal guard that the wiring from ``send()``/
 The server-side dedup (``pending_inputs.record()`` returning an existing
 entry for a matching ``stable_id``) is unit-tested in
 ``tests/runtime/test_pending_inputs.py``; the client-side retry
-preservation (``failedSendDraft.stableId`` → ``pendingRetryStableId``)
+preservation (``failedSendDraft.stableId`` → ``pendingRetry``)
 is unit-tested in ``tests/store/chatStore.test.ts``.  This e2e test
 closes the gap by proving the field reaches the wire through the full
 SPA path.

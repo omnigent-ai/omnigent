@@ -83,7 +83,12 @@ import {
 } from "@/lib/permissionsApi";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { toast } from "sonner";
-import { createSideChat, retrySession } from "@/lib/sessionsApi";
+import {
+  createSideChat,
+  isDefinitiveRequestError,
+  retrySession,
+  sessionLoadErrorKind,
+} from "@/lib/sessionsApi";
 import { codexEffortLevelsForModel, findNativeModelOption } from "@/lib/codexNativeModels";
 import { modelConfigurationSourceRows } from "@/lib/modelConfigurationSource";
 import {
@@ -93,6 +98,7 @@ import {
   isTempConvId,
   type PendingInitialPrompt,
   type QueuedMessage,
+  retryConversationHistory,
   useChatStore,
 } from "@/store/chatStore";
 import {
@@ -124,7 +130,14 @@ import {
   rankMentionEntries,
 } from "@/lib/composerMentions";
 import { useMentionBrowser } from "@/hooks/useMentionBrowser";
-import { getSessionDraft, promoteSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
+import {
+  getSessionDraft,
+  hasUnsentMessage,
+  markUnsentRecovered,
+  peekUnsentMessage,
+  promoteSessionDraft,
+  setSessionDraft,
+} from "@/lib/sessionDrafts";
 import {
   serializeReplyDraft,
   snapshotReplyDraft,
@@ -571,7 +584,10 @@ export function ChatPage() {
   // Picker selection. ChatPage stays mounted across `/` to `/c/:id`,
   // so the pick survives sidebar clicks; resets on full page reload.
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
-  const agentId = selectedAgentId ?? agents?.[0]?.id ?? null;
+  // The bound agent normally arrives with the snapshot (`boundAgentId`). When
+  // that load fails, the session-agent query is what still knows the agent, so
+  // the composer can send instead of sitting on "Waiting for agents…".
+  const agentId = selectedAgentId ?? boundAgentBySession?.id ?? agents?.[0]?.id ?? null;
 
   // Sync the picker to the conversation's bound agent when switching.
   // `boundAgentId` is `null` on `/`, during the snapshot fetch, and
@@ -1126,11 +1142,19 @@ export function ChatPage() {
     else setReconnectDialogOpen(true);
   }, [isUnboundFork, canResumeOnLocalHost]);
 
+  // Reload history in place — bubbles, streamed blocks and drafts survive; the
+  // notice clears when the store error does.
+  const onRetryHistory = useCallback(async () => {
+    if (urlConvId) await retryConversationHistory(urlConvId);
+  }, [urlConvId]);
+
   // Loading + error gates for `/c/:id` hydration. Placed after all hooks so the
-  // early return can't change the hook order between renders.
+  // early return can't change the hook order between renders. Only a definitive
+  // failure (missing, forbidden, malformed) replaces the page; a transient one
+  // renders the chat with its history marked unavailable, so a send still works.
   if (urlConvId) {
     if (loadingConversation || activeConversationId !== urlConvId) return <HydratingPlaceholder />;
-    if (conversationLoadError) {
+    if (conversationLoadError && isDefinitiveRequestError(conversationLoadError)) {
       return <ConversationLoadError conversationId={urlConvId} error={conversationLoadError} />;
     }
   }
@@ -1143,6 +1167,8 @@ export function ChatPage() {
       showsWorking={showsWorking}
       runnerOnline={runnerOnline}
       liveness={liveness}
+      historyUnavailable={conversationLoadError !== null}
+      onRetryHistory={onRetryHistory}
       agentsError={agentsError}
       disabled={!agentId || agentsError !== null}
       onSend={onSend}
@@ -1409,6 +1435,9 @@ interface MainAgentSurfaceProps {
   runnerOnline: boolean | undefined;
   /** Derived open-session liveness — drives the reconnect hint/banner. */
   liveness: SessionLiveness;
+  /** The snapshot failed transiently; the transcript may be missing history. */
+  historyUnavailable: boolean;
+  onRetryHistory: () => Promise<void>;
   agentsError: unknown;
   disabled: boolean;
   onSend: (text: string, files?: File[], replyDraft?: StoredReplyDraft) => void;
@@ -1574,6 +1603,8 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   showsWorking,
   runnerOnline,
   liveness,
+  historyUnavailable,
+  onRetryHistory,
   agentsError,
   disabled,
   onSend,
@@ -1881,6 +1912,8 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
             }
           />
 
+          {/* Docked above the composer: always on screen, never under the header. */}
+          {historyUnavailable && <HistoryUnavailableNotice onRetry={onRetryHistory} />}
           <Composer
             ref={composerRef}
             disabled={disabled}
@@ -1947,12 +1980,58 @@ function HydratingPlaceholder() {
 }
 
 /**
- * Error state for `/c/:id` when the items endpoint fails. Shown
- * verbatim instead of falling through to the chat surface so the user
- * sees the problem (instead of a blank chat that silently posts to a
- * non-existent conversation on next send). Most common cause: invalid
- * conversation id in the URL — surfaces quickly because the store's
- * items fetch disables retries.
+ * History could not be loaded (transient failure, retries exhausted) but the
+ * conversation is otherwise live. Driven by the store error, so a successful
+ * reload removes it; the button reflects the in-flight retry.
+ */
+function HistoryUnavailableNotice({ onRetry }: { onRetry: () => Promise<void> }) {
+  const [retrying, setRetrying] = useState(false);
+  const retry = async () => {
+    setRetrying(true);
+    try {
+      await onRetry();
+    } finally {
+      setRetrying(false);
+    }
+  };
+  return (
+    <div
+      role="status"
+      className="mx-auto mb-2 flex w-fit max-w-full items-center gap-3 rounded-xl border border-border bg-background px-4 py-2 text-muted-foreground text-sm"
+    >
+      <span>Conversation history is temporarily unavailable.</span>
+      <Button
+        type="button"
+        size="sm"
+        variant="outline"
+        disabled={retrying}
+        onClick={() => void retry()}
+      >
+        {retrying ? "Retrying…" : "Retry"}
+      </Button>
+    </div>
+  );
+}
+
+function conversationLoadTitle(error: Error): string {
+  switch (sessionLoadErrorKind(error)) {
+    case "not_found":
+      return "Conversation not found";
+    case "forbidden":
+      return "You don't have access to this conversation";
+    case "unauthenticated":
+      return "Sign in to open this conversation";
+    default:
+      return "Couldn't open this conversation";
+  }
+}
+
+/**
+ * Error state for `/c/:id` when the session load failed definitively (missing,
+ * forbidden or malformed conversation). Shown instead of the chat surface so
+ * the user sees the problem rather than a blank chat that would post into a
+ * conversation that cannot be opened. Transient failures never land here: the
+ * chat renders with a history notice instead.
  */
 function ConversationLoadError({
   conversationId,
@@ -1965,12 +2044,17 @@ function ConversationLoadError({
   return (
     <div className="flex flex-1 items-center justify-center px-6">
       <div className="flex max-w-md flex-col items-center gap-3 text-center">
-        <h1 className="font-medium text-foreground text-lg">Conversation not found</h1>
+        <h1 className="font-medium text-foreground text-lg">{conversationLoadTitle(error)}</h1>
         <p className="text-muted-foreground text-ui">
           Couldn't load{" "}
           <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-sm">{conversationId}</code>
           : {error.message}
         </p>
+        {sessionLoadErrorKind(error) === "unauthenticated" && (
+          <Button type="button" onClick={() => window.location.reload()}>
+            Reload
+          </Button>
+        )}
         {/* Route to the home composer ("/"), which owns session creation. */}
         <Button type="button" variant="outline" onClick={() => navigate("/")}>
           Start a new chat
@@ -2436,6 +2520,8 @@ function ComposerImpl(
   // Text + attachments handed back by a send that failed before the server
   // took ownership. Drained below so the message can be retried.
   const failedSendDraft = useChatStore((s) => s.failedSendDraft);
+  const loadingConversation = useChatStore((s) => s.loadingConversation);
+  const pendingRetry = useChatStore((s) => s.pendingRetry);
   // A settled /btw side-chat overlay is open, so Escape dismisses it here
   // (before the "Esc cancels turn" branch) rather than interrupting a turn.
   const btwSidechat = useChatStore((s) => s.btwSidechat);
@@ -2676,7 +2762,11 @@ function ComposerImpl(
       !isTempConvId(conversationId)
         ? promoteSessionDraft(previousConversationId, conversationId)
         : undefined;
-    const restored = promoted ?? (conversationId ? getSessionDraft(conversationId) : undefined);
+    const saved = promoted ?? (conversationId ? getSessionDraft(conversationId) : undefined);
+    // An untouched recovered copy is restored by the recovery effect below once
+    // history has loaded or failed, so one the snapshot shows delivered is
+    // dropped instead of coming back without its identity.
+    const restored = saved?.recoveredFrom === undefined ? saved : undefined;
     replaceText(restored?.text ?? "", restored?.replyDraft);
     textareaRef.current = tailTextareaRef.current;
     setFiles(restored?.files ?? []);
@@ -2943,21 +3033,98 @@ function ComposerImpl(
   // (a 415 on an unsupported type), re-arming the same file would only fail
   // again, so it's dropped with the same inline reason a fresh attach gives.
   useEffect(() => {
-    if (failedSendDraft === null) return;
-    if (failedSendDraft.conversationId !== conversationId) return;
     // Wait for the draft-restore effect to settle this conversation's text
     // into value/files. Reading the refs mid-switch would see the PREVIOUS
     // conversation's draft and wrongly conclude the user is mid-sentence,
     // dropping the failed message on the way back to the session it failed in.
     if (settledConversationId !== conversationId) return;
+    if (failedSendDraft === null) {
+      // A send the server never acknowledged before a reload: recover it into
+      // an empty composer with its identity, so a resend dedupes (the record id
+      // is the stable_id for a plain message, the record key for a command). If
+      // the composer already holds that same text (a recovery persisted as the
+      // draft, then reloaded again), only the identity is missing. Newer typed
+      // text wins and leaves the record unrecovered for a later visit; only an
+      // acknowledgment removes it.
+      // Not before history has loaded or definitively failed: the snapshot
+      // acknowledges a record whose message was delivered (its item is in the
+      // transcript), which must not be offered as unsent.
+      if (!conversationId || loadingConversation) return;
+      const unsent = peekUnsentMessage(conversationId);
+      if (unsent === undefined) {
+        // A recovered copy persisted as this conversation's draft: restore it
+        // while its record is still unacknowledged (a remount on this page), or
+        // drop it once the snapshot showed the message delivered — unless the
+        // user has typed since, in which case their text stays.
+        const copy = getSessionDraft(conversationId);
+        if (copy?.recoveredFrom === undefined) return;
+        if (hasUnsentMessage(copy.recoveredFrom)) {
+          if (valueRef.current.trim() !== "" || filesRef.current.length > 0) return;
+          // The identity may already be armed (a remount keeps conversation state,
+          // and this effect re-runs as the identity it arms lands); the text is
+          // restored either way.
+          if (useChatStore.getState().pendingRetry?.stableId !== copy.recoveredFrom) {
+            useChatStore.setState({
+              pendingRetry: { stableId: copy.recoveredFrom, text: copy.text, files: [] },
+            });
+          }
+          replaceText(copy.text, copy.replyDraft);
+          textareaRef.current = tailTextareaRef.current;
+          dirtyRef.current = false;
+          return;
+        }
+        if (valueRef.current === copy.text && filesRef.current.length === 0) {
+          replaceText("", undefined);
+        }
+        setSessionDraft(conversationId, { text: "", files: [] });
+        if (useChatStore.getState().pendingRetry?.stableId === copy.recoveredFrom) {
+          useChatStore.setState({ pendingRetry: null });
+        }
+        return;
+      }
+      const sameText =
+        valueRef.current.trim() === unsent.text.trim() && filesRef.current.length === 0;
+      if (!sameText && (valueRef.current.trim() !== "" || filesRef.current.length > 0)) return;
+      markUnsentRecovered(unsent.recordId);
+      useChatStore.setState({
+        pendingRetry: { stableId: unsent.recordId, text: unsent.text, files: [] },
+      });
+      if (sameText) return;
+      replaceText(unsent.text, unsent.replyDraft);
+      textareaRef.current = tailTextareaRef.current;
+      // Persist the copy tagged with its record, not as an ordinary draft: the
+      // first edit re-saves it untagged (`dirtyRef`, reset here so earlier
+      // typing that was cleared cannot overwrite the tag), and a copy still
+      // tagged when the record is acknowledged is dropped above instead of
+      // resent.
+      dirtyRef.current = false;
+      setSessionDraft(conversationId, {
+        text: unsent.text,
+        files: [],
+        replyDraft: unsent.replyDraft,
+        recoveredFrom: unsent.recordId,
+      });
+      if (!isMobileRef.current) textareaRef.current?.focus();
+      return;
+    }
+    if (failedSendDraft.conversationId !== conversationId) return;
     useChatStore.setState({
       failedSendDraft: null,
-      pendingRetryStableId: failedSendDraft.stableId ?? null,
+      pendingRetry:
+        failedSendDraft.stableId === undefined
+          ? null
+          : {
+              stableId: failedSendDraft.stableId,
+              text: failedSendDraft.text,
+              files: failedSendDraft.files,
+            },
     });
     // The user started something new while the send was in flight — their
-    // in-progress text wins over a clobbering restore.
+    // in-progress text wins over a clobbering restore. The durable copy stays
+    // either way: only the server's acknowledgment clears it, so a reload can
+    // still recover the message with its identity.
     if (valueRef.current.trim() !== "" || filesRef.current.length > 0) {
-      useChatStore.setState({ pendingRetryStableId: null });
+      useChatStore.setState({ pendingRetry: null });
       return;
     }
     replaceText(failedSendDraft.text, failedSendDraft.replyDraft);
@@ -2969,7 +3136,14 @@ function ComposerImpl(
       setAttachmentError(errors.length > 0 ? errors.join("\n") : null);
     }
     if (!isMobileRef.current) textareaRef.current?.focus();
-  }, [failedSendDraft, conversationId, settledConversationId, replaceText]);
+  }, [
+    failedSendDraft,
+    conversationId,
+    settledConversationId,
+    loadingConversation,
+    pendingRetry,
+    replaceText,
+  ]);
 
   /**
    * Execute a slash command by name + optional argument string.

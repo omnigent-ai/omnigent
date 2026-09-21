@@ -62,7 +62,9 @@ import {
   beginLocalConversation,
   consumePendingInitialPrompt,
   handleSessionEvent,
+  ensureConversationStreamed,
   hydrateLocalConversation,
+  retryConversationHistory,
   isStaleCompletedResponse,
   isStaleTempConvId,
   isTempConvId,
@@ -80,6 +82,7 @@ import {
 } from "./chatStore";
 import { conversationRegistry } from "./conversationRegistry";
 import { markSessionCreated, resetInteractionTelemetryForTests } from "./interactionTelemetry";
+import { clearSessionDrafts } from "@/lib/sessionDrafts";
 import {
   resetStreamSlotManager,
   setStreamSlotManagerForTest,
@@ -499,6 +502,7 @@ beforeEach(() => {
   // Generous, deterministic slots for tests that aren't about the cap; the
   // dedicated stream-slot tests install their own small-capacity manager.
   setStreamSlotManagerForTest(makeFakeSlotManager());
+  clearSessionDrafts();
   useChatStore.setState({
     conversationId: null,
     blocks: [],
@@ -1311,6 +1315,9 @@ describe("chatStore — switchTo", () => {
     // re-hydrates the window alongside the live blocks.
     useChatStore.setState({ abortController: null });
     await useChatStore.getState().send("thanks", "agent_xyz");
+    // The rebind's hydration runs alongside the send now; let it land.
+    await tick();
+    await tick();
 
     const cards = useChatStore
       .getState()
@@ -1451,6 +1458,9 @@ describe("chatStore — switchTo", () => {
     // the scrolled-up blocks stay rendered.
     useChatStore.setState({ abortController: null });
     await useChatStore.getState().send("hello again", "agent_xyz");
+    // The rebind's hydration runs alongside the send now; let it land.
+    await tick();
+    await tick();
     expect(useChatStore.getState().oldestItemId).toBe(items.at(-INITIAL_WINDOW_ITEMS)!.id);
 
     // This page (older than the rewound cursor) fully overlaps the blocks
@@ -1496,6 +1506,9 @@ describe("chatStore — switchTo", () => {
     // the in-flight page (generation bump) while it is still unresolved.
     useChatStore.setState({ abortController: null });
     await useChatStore.getState().send("hello again", "agent_xyz");
+    // The rebind's hydration runs alongside the send now; let it land.
+    await tick();
+    await tick();
     releaseStalePage!();
     await stalePage;
 
@@ -1918,54 +1931,23 @@ describe("chatStore — send (first-send ordering)", () => {
     });
     const textOf = (body: string): string =>
       (JSON.parse(body).data.content[0] as { text: string }).text;
-
-    // Hold the bind's snapshot GET so `ensureBoundSession` parks INSIDE
-    // `bindStream` — after it published the real id to the store, but before
-    // the first send reaches its POST. That is the window, and it lasts as long
-    // as the bind's network work does.
-    let releaseSnapshot: (() => void) | null = null;
-    const baseHandler = fetchMock.getMockImplementation()!;
-    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
-      const url = typeof input === "string" ? input : input.toString();
-      // Only the FIRST snapshot GET is held; later ones (the second send's
-      // rebind check) pass through, so the latch isolates the window under test.
-      if (
-        /^\/v1\/sessions\/conv_new(\?|$)/.test(url) &&
-        (init?.method ?? "GET") === "GET" &&
-        releaseSnapshot === null
-      ) {
-        return new Promise<Response>((resolve) => {
-          releaseSnapshot = () => resolve(baseHandler(input, init) as Promise<Response>);
-        });
-      }
-      return baseHandler(input, init);
-    });
-
-    // First send from the landing route (conversationId === null).
+    // The POST no longer waits for the snapshot, so the first send reaches the
+    // wire as soon as its pump is open. Its POST is held (`resolvers`), which is
+    // the prerequisite the second send has to queue behind: pre-fix it keyed an
+    // empty chain (the first send's slot was still under the new-session key)
+    // and fired at once, reaching the server before "first" had returned.
     const p1 = useChatStore.getState().send("first", "agent_xyz");
-    await tick();
-    await tick();
-    await tick();
-    // The id is visible to any other send, but the first send is still parked
-    // in its bind and has not reached `rekey` yet.
+    /* oxlint-disable no-await-in-loop */
+    for (let i = 0; i < 6; i++) await tick();
+    /* oxlint-enable no-await-in-loop */
+    // The id is visible to any other send; the first POST is out and held.
     expect(useChatStore.getState().conversationId).toBe("conv_new");
-    expect(releaseSnapshot).not.toBeNull();
-
+    expect(eventBodies.map(textOf)).toEqual(["first"]);
     // Second send now resolves `conv_new` as its own submit-time target.
     const p2 = useChatStore.getState().send("second", "agent_xyz");
     await tick();
     await tick();
-
-    // The first send is still parked in its bind, so ITS post hasn't fired.
-    // The second must not overtake it: pre-fix it keyed an empty chain (the
-    // first send's slot was still under the new-session key) and fired here,
-    // reaching the server before "first".
-    expect(eventBodies.map(textOf)).toEqual([]);
-
-    releaseSnapshot!();
-    await tick();
-    await tick();
-    // The bind finished; the first send's POST goes out first, alone.
+    // The second must not overtake the still-open first POST.
     expect(eventBodies.map(textOf)).toEqual(["first"]);
 
     // Releasing the first POST hands the chain to the second, which then runs
@@ -1998,7 +1980,6 @@ describe("chatStore — send (first-send ordering)", () => {
     const resolvers: (() => void)[] = [];
     seedSession("conv_new");
     const baseHandler = fetchMock.getMockImplementation()!;
-    let releaseSnapshot: (() => void) | null = null;
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
       if (url === "/v1/sessions/conv_new/events" && init?.method === "POST") {
@@ -2007,22 +1988,10 @@ describe("chatStore — send (first-send ordering)", () => {
           resolvers.push(() => resolve(mockResponse({ queued: true, item_id: "ci_mock" })));
         });
       }
-      // Hold the first bind's snapshot so send 1 parks inside `bindStream` with
-      // the id already published — the window both followers land in.
-      if (
-        /^\/v1\/sessions\/conv_new(\?|$)/.test(url) &&
-        (init?.method ?? "GET") === "GET" &&
-        releaseSnapshot === null
-      ) {
-        return new Promise<Response>((resolve) => {
-          releaseSnapshot = () => resolve(baseHandler(input, init) as Promise<Response>);
-        });
-      }
       return baseHandler(input, init);
     });
     const textOf = (body: string): string =>
       (JSON.parse(body).data.content[0] as { text: string }).text;
-
     // Sends 1 and 2 are submitted in the SAME tick, from the landing route: no
     // id exists yet, so both take slots under the new-session key. This has to
     // be synchronous — `rekey` fires as soon as `createSession` returns, so any
@@ -2030,22 +1999,17 @@ describe("chatStore — send (first-send ordering)", () => {
     const p1 = useChatStore.getState().send("1", "agent_xyz");
     const p2 = useChatStore.getState().send("2", "agent_xyz");
     /* oxlint-disable no-await-in-loop */
-    for (let i = 0; i < 3; i++) await tick();
+    for (let i = 0; i < 6; i++) await tick();
     /* oxlint-enable no-await-in-loop */
-    // The id is now visible, and send 1 is parked in its bind.
+    // The id is now visible; send 1's POST is out and held (`resolvers`), which
+    // is what the followers have to queue behind.
     expect(useChatStore.getState().conversationId).toBe("conv_new");
-    expect(releaseSnapshot).not.toBeNull();
+    expect(eventBodies.map(textOf)).toEqual(["1"]);
     // Send 3 resolves the real id and must queue behind send 2, not send 1.
     const p3 = useChatStore.getState().send("3", "agent_xyz");
     await tick();
     await tick();
-    expect(eventBodies.map(textOf)).toEqual([]);
-
-    releaseSnapshot!();
-    /* oxlint-disable no-await-in-loop */
-    for (let i = 0; i < 4; i++) await tick();
-    /* oxlint-enable no-await-in-loop */
-    // Send 1 posts alone — the followers are still chained behind it.
+    // Send 1 alone is on the wire — the followers are still chained behind it.
     expect(eventBodies.map(textOf)).toEqual(["1"]);
 
     // Release ONLY send 1. Send 2 may now post; send 3 must stay parked, because
@@ -2201,12 +2165,12 @@ describe("chatStore — send (first-send ordering)", () => {
     expect(useChatStore.getState().pendingUserMessages).toHaveLength(1);
   });
 
-  it("tears the old pump down before rebinding after a failed snapshot", async () => {
+  it("keeps the live pump and posts when only the history load failed", async () => {
     // A snapshot failure leaves `conversationLoadError` set while the pump it
-    // opened is STILL RUNNING — `bindStream` catches the error without aborting
-    // its controller. Rebinding blind then replaced the stored controller and
-    // left two subscribers on one entry, so any delta with no item id to dedupe
-    // on (live claude-native text) applied twice.
+    // opened is still running. History is retried on its own (Retry, reconnect),
+    // so a send must not tear that pump down: the message posts into the live
+    // stream, no second subscriber is opened, and the failure keeps surfacing as
+    // the history notice until a snapshot succeeds.
     seedSession("conv_two_subs", []);
     let failSnapshot = true;
     const openedStreams: AbortSignal[] = [];
@@ -2217,10 +2181,11 @@ describe("chatStore — send (first-send ordering)", () => {
         return mockResponse(null, { bodyStream: pushableStream().stream });
       }
       // Fail only the FIRST snapshot GET, so the bind errors with its pump live.
+      // A 404 is definitive (no retry), so the error lands before switchTo resolves.
       if (url.split("?")[0] === "/v1/sessions/conv_two_subs" && (init?.method ?? "GET") === "GET") {
         if (failSnapshot) {
           failSnapshot = false;
-          return mockResponse({}, { ok: false, status: 500 });
+          return mockResponse({}, { ok: false, status: 404 });
         }
       }
       return defaultFetchHandler(input, init);
@@ -2233,14 +2198,17 @@ describe("chatStore — send (first-send ordering)", () => {
     expect(openedStreams).toHaveLength(1);
     expect(openedStreams[0]!.aborted).toBe(false);
 
-    // Sending rebinds, because the entry is not stream-current.
     await useChatStore.getState().send("after a failed load", "agent_xyz");
 
-    // The first pump was aborted rather than orphaned — one live subscriber.
-    expect(openedStreams).toHaveLength(2);
-    expect(openedStreams[0]!.aborted).toBe(true);
-    expect(openedStreams[1]!.aborted).toBe(false);
-    expect(entry.getState().conversationLoadError).toBeNull();
+    // Posted through the live pump: still one subscriber, never aborted.
+    const eventPosts = fetchMock.mock.calls.filter(
+      ([u, init]) =>
+        String(u).endsWith("/events") && (init as RequestInit | undefined)?.method === "POST",
+    );
+    expect(eventPosts).toHaveLength(1);
+    expect(openedStreams).toHaveLength(1);
+    expect(openedStreams[0]!.aborted).toBe(false);
+    expect(entry.getState().conversationLoadError).not.toBeNull();
   });
 
   it("degrades gracefully when stream rebind fails — message still posts", async () => {
@@ -2267,6 +2235,487 @@ describe("chatStore — send (first-send ordering)", () => {
       return String(u).endsWith("/events") && (init as RequestInit | undefined)?.method === "POST";
     });
     expect(eventPosts).toHaveLength(1);
+  });
+
+  it("retries a transient snapshot failure and clears the load error once it succeeds", async () => {
+    vi.useFakeTimers();
+    seedSession("conv_retry", [assistantMessage("resp_1", "earlier")]);
+    let failures = 2;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.split("?")[0] === "/v1/sessions/conv_retry" && (init?.method ?? "GET") === "GET") {
+        if (failures > 0) {
+          failures -= 1;
+          return mockResponse({}, { ok: false, status: 500 });
+        }
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    const switched = useChatStore.getState().switchTo("conv_retry");
+    // First attempt fails, backoff 1 s; second fails, backoff 2 s; third succeeds.
+    await vi.advanceTimersByTimeAsync(1_000);
+    await vi.advanceTimersByTimeAsync(2_000);
+    await switched;
+
+    const state = useChatStore.getState();
+    expect(state.conversationLoadError).toBeNull();
+    expect(state.loadingConversation).toBe(false);
+    expect(state.blocks.map((b) => b.ctx.itemId)).toEqual(["msg_resp_1_asst"]);
+    const itemsGets = fetchMock.mock.calls.filter(([u]) => String(u).includes("/conv_retry/items"));
+    expect(itemsGets).toHaveLength(3);
+  });
+
+  it("does not retry a definitive snapshot failure", async () => {
+    seedSession("conv_gone");
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.split("?")[0] === "/v1/sessions/conv_gone" && (init?.method ?? "GET") === "GET") {
+        return mockResponse({}, { ok: false, status: 404 });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    await useChatStore.getState().switchTo("conv_gone");
+
+    expect(useChatStore.getState().conversationLoadError).not.toBeNull();
+    const sessionGets = fetchMock.mock.calls.filter(
+      ([u, init]) =>
+        String(u).split("?")[0] === "/v1/sessions/conv_gone" &&
+        ((init as RequestInit | undefined)?.method ?? "GET") === "GET",
+    );
+    expect(sessionGets).toHaveLength(1);
+  });
+
+  it("settles the loading gate when the pump closed before the snapshot answered", async () => {
+    // A stream the server refuses (403) closes the pump, which clears the
+    // controller without aborting it. The hydration it started must still
+    // publish, or the page stays behind "Loading conversation…" forever.
+    seedSession("conv_refused");
+    let releaseSnapshot: (() => void) | null = null;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/v1/sessions/conv_refused/stream")) {
+        return mockResponse({}, { ok: false, status: 403 });
+      }
+      if (url.split("?")[0] === "/v1/sessions/conv_refused" && (init?.method ?? "GET") === "GET") {
+        return new Promise<Response>((resolve) => {
+          releaseSnapshot = () => resolve(mockResponse({}, { ok: false, status: 404 }));
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    const switched = useChatStore.getState().switchTo("conv_refused");
+    /* oxlint-disable no-await-in-loop */
+    for (let i = 0; i < 6; i++) await tick();
+    /* oxlint-enable no-await-in-loop */
+    // The pump has given up on the refused stream.
+    expect(useChatStore.getState().abortController).toBeNull();
+    releaseSnapshot!();
+    await switched;
+
+    const state = useChatStore.getState();
+    expect(state.loadingConversation).toBe(false);
+    expect(state.conversationLoadError).not.toBeNull();
+  });
+
+  it("ensureConversationStreamed retries a live entry's failed history in place", async () => {
+    // A side-chat pane's mount and its Retry button both go through
+    // ensureConversationStreamed. With a live pump and a failed snapshot it must
+    // reload history without replacing that pump — or Retry would do nothing.
+    seedSession("conv_side", [assistantMessage("resp_s", "side reply")]);
+    let failSnapshot = true;
+    const openedStreams: AbortSignal[] = [];
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/v1/sessions/conv_side/stream")) {
+        if (init?.signal) openedStreams.push(init.signal);
+        return mockResponse(null, { bodyStream: pushableStream().stream });
+      }
+      if (url.split("?")[0] === "/v1/sessions/conv_side" && (init?.method ?? "GET") === "GET") {
+        if (failSnapshot) return mockResponse({}, { ok: false, status: 404 });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    await ensureConversationStreamed("conv_side");
+    const entry = conversationRegistry.peek("conv_side")!;
+    expect(entry.getState().conversationLoadError).not.toBeNull();
+    const controller = entry.getState().abortController;
+    expect(controller).not.toBeNull();
+
+    failSnapshot = false;
+    await ensureConversationStreamed("conv_side");
+
+    const state = entry.getState();
+    expect(state.conversationLoadError).toBeNull();
+    expect(state.blocks.map((b) => b.ctx.itemId)).toEqual(["msg_resp_s_asst"]);
+    expect(state.abortController).toBe(controller);
+    expect(openedStreams).toHaveLength(1);
+    expect(openedStreams[0]!.aborted).toBe(false);
+  });
+
+  it("retries history in place without disturbing the live pump or its bubbles", async () => {
+    seedSession("conv_hist", [assistantMessage("resp_1", "earlier")]);
+    let failSnapshot = true;
+    const openedStreams: AbortSignal[] = [];
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/v1/sessions/conv_hist/stream")) {
+        if (init?.signal) openedStreams.push(init.signal);
+        return mockResponse(null, { bodyStream: pushableStream().stream });
+      }
+      if (url.split("?")[0] === "/v1/sessions/conv_hist" && (init?.method ?? "GET") === "GET") {
+        if (failSnapshot) return mockResponse({}, { ok: false, status: 404 });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    await useChatStore.getState().switchTo("conv_hist");
+    const entry = conversationRegistry.peek("conv_hist")!;
+    expect(entry.getState().conversationLoadError).not.toBeNull();
+    const controller = entry.getState().abortController;
+    expect(controller).not.toBeNull();
+    entry.setState({
+      pendingUserMessages: [
+        {
+          tempId: "pend_kept",
+          content: [{ type: "input_text", text: "still here" }],
+          posted: true,
+        },
+      ],
+    });
+
+    failSnapshot = false;
+    await retryConversationHistory("conv_hist");
+
+    const state = entry.getState();
+    expect(state.conversationLoadError).toBeNull();
+    expect(state.blocks.map((b) => b.ctx.itemId)).toEqual(["msg_resp_1_asst"]);
+    expect(state.pendingUserMessages.map((p) => p.tempId)).toEqual(["pend_kept"]);
+    // Same pump: no second stream was opened and the controller is unchanged.
+    expect(state.abortController).toBe(controller);
+    expect(openedStreams).toHaveLength(1);
+  });
+
+  it("keeps a durable copy of an unacknowledged send and clears it on acknowledgment", async () => {
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+      pendingUserMessages: [],
+    });
+    const records = (): Record<
+      string,
+      { conversationId: string; text: string; stableId?: string }
+    > => JSON.parse(sessionStorage.getItem("omnigent.unsentMessages") ?? "{}");
+    let failPost = true;
+    fetchMock.mockImplementation((input, init) => {
+      const url = String(input);
+      if (url.endsWith("/v1/sessions/conv_existing/events") && failPost) {
+        return mockResponse({ error: "boom" }, { ok: false, status: 503 });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    await useChatStore.getState().send("lost?", "agent_xyz");
+    const failed = Object.entries(records());
+    expect(failed).toHaveLength(1);
+    const [failedId, failedRecord] = failed[0]!;
+    expect(failedRecord).toMatchObject({
+      conversationId: "conv_existing",
+      text: "lost?",
+      stableId: failedId,
+    });
+
+    failPost = false;
+    await useChatStore.getState().send("delivered", "agent_xyz");
+    // The delivered message's record is gone; the failed one is untouched.
+    expect(Object.keys(records())).toEqual([failedId]);
+  });
+
+  it("retires the durable copy on a definitive rejection but keeps it on a transient failure", async () => {
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+      pendingUserMessages: [],
+    });
+    const records = (): string[] =>
+      Object.keys(JSON.parse(sessionStorage.getItem("omnigent.unsentMessages") ?? "{}"));
+    let status = 413;
+    fetchMock.mockImplementation((input, init) => {
+      if (String(input).endsWith("/v1/sessions/conv_existing/events")) {
+        return mockResponse({ error: "no" }, { ok: false, status });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    await useChatStore.getState().send("too large", "agent_xyz");
+    expect(records()).toEqual([]);
+
+    status = 503;
+    await useChatStore.getState().send("try later", "agent_xyz");
+    expect(records()).toHaveLength(1);
+
+    // A 401 is final for the request but not for the text: the auth layer
+    // sends the user through login, and the copy must survive that.
+    status = 401;
+    await useChatStore.getState().send("after re-login", "agent_xyz");
+    expect(records()).toHaveLength(2);
+  });
+
+  it("acknowledges a durable record whose item the snapshot already holds", async () => {
+    // The POST landed but its response never reached the browser: the item is
+    // persisted under the send's stable_id, so hydration retires the record
+    // instead of offering an already-delivered message for recovery.
+    const delivered = userMessage("resp_d", "made it");
+    seedSession("conv_ack", [delivered]);
+    sessionStorage.setItem(
+      "omnigent.unsentMessages",
+      JSON.stringify({
+        [delivered.id]: { conversationId: "conv_ack", text: "made it", stableId: delivered.id },
+        sid_lost: { conversationId: "conv_ack", text: "never landed", stableId: "sid_lost" },
+      }),
+    );
+
+    let failSnapshot = true;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.split("?")[0] === "/v1/sessions/conv_ack" && (init?.method ?? "GET") === "GET") {
+        if (failSnapshot) return mockResponse({}, { ok: false, status: 404 });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    await useChatStore.getState().switchTo("conv_ack");
+    const entry = conversationRegistry.peek("conv_ack")!;
+    // Recovery armed the delivered message's identity while history was down.
+    entry.setState({ pendingRetry: { stableId: delivered.id, text: "made it", files: [] } });
+
+    failSnapshot = false;
+    await retryConversationHistory("conv_ack");
+
+    expect(Object.keys(JSON.parse(sessionStorage.getItem("omnigent.unsentMessages")!))).toEqual([
+      "sid_lost",
+    ]);
+    expect(entry.getState().pendingRetry).toBeNull();
+  });
+
+  it("resends a recovered slash command under its record id and clears it on acknowledgment", async () => {
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+      pendingUserMessages: [],
+      pendingRetry: { stableId: "rec_slash", text: "/review", files: [] },
+    });
+    const records = (): Record<string, unknown> =>
+      JSON.parse(sessionStorage.getItem("omnigent.unsentMessages") ?? "{}");
+    sessionStorage.setItem(
+      "omnigent.unsentMessages",
+      JSON.stringify({ rec_slash: { conversationId: "conv_existing", text: "/review" } }),
+    );
+
+    await useChatStore.getState().sendSlashCommand("review", "", "agent_xyz");
+
+    expect(records()).toEqual({});
+    expect(useChatStore.getState().pendingRetry).toBeNull();
+  });
+
+  it("does not resend a different slash command under a recovered record id", async () => {
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+      pendingUserMessages: [],
+      pendingRetry: { stableId: "rec_slash", text: "/review", files: [] },
+    });
+    sessionStorage.setItem(
+      "omnigent.unsentMessages",
+      JSON.stringify({ rec_slash: { conversationId: "conv_existing", text: "/review" } }),
+    );
+
+    await useChatStore.getState().sendSlashCommand("plan", "", "agent_xyz");
+
+    // The recovered command's record is untouched and its identity stays armed.
+    expect(Object.keys(JSON.parse(sessionStorage.getItem("omnigent.unsentMessages")!))).toEqual([
+      "rec_slash",
+    ]);
+    expect(useChatStore.getState().pendingRetry?.stableId).toBe("rec_slash");
+  });
+
+  it("records every send once its session id is known, not only the one that created the session", async () => {
+    seedSession("conv_new");
+    const resolvers: (() => void)[] = [];
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url === "/v1/sessions/conv_new/events" && init?.method === "POST") {
+        return new Promise<Response>((resolve) => {
+          resolvers.push(() => resolve(mockResponse({ queued: true, item_id: "ci_mock" })));
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const records = (): Record<string, { text: string }> =>
+      JSON.parse(sessionStorage.getItem("omnigent.unsentMessages") ?? "{}");
+
+    // Both sends are submitted before an id exists; only the first creates it.
+    const p1 = useChatStore.getState().send("1", "agent_xyz");
+    const p2 = useChatStore.getState().send("2", "agent_xyz");
+    /* oxlint-disable no-await-in-loop */
+    for (let i = 0; i < 6; i++) await tick();
+    /* oxlint-enable no-await-in-loop */
+    expect(Object.values(records()).map((r) => r.text)).toEqual(["1"]);
+    resolvers[0]!();
+    /* oxlint-disable no-await-in-loop */
+    for (let i = 0; i < 8; i++) await tick();
+    /* oxlint-enable no-await-in-loop */
+    // The follower recorded itself once the send chain handed it the id.
+    expect(Object.values(records()).map((r) => r.text)).toEqual(["2"]);
+    resolvers[1]!();
+    await Promise.all([p1, p2]);
+    expect(records()).toEqual({});
+  });
+
+  it("keeps snapshot order when retrying history over a transcript with a gap", async () => {
+    const [a, b, c] = [
+      assistantMessage("resp_a", "first"),
+      assistantMessage("resp_b", "second"),
+      assistantMessage("resp_c", "third"),
+    ];
+    seedSession("conv_gap", [a, b, c]);
+    let failSnapshot = true;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.split("?")[0] === "/v1/sessions/conv_gap" && (init?.method ?? "GET") === "GET") {
+        if (failSnapshot) return mockResponse({}, { ok: false, status: 404 });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    await useChatStore.getState().switchTo("conv_gap");
+    const entry = conversationRegistry.peek("conv_gap")!;
+    // Live events delivered the first and third items while history was missing.
+    entry.setState({ blocks: itemsToBlocks([a, c]) });
+
+    failSnapshot = false;
+    await retryConversationHistory("conv_gap");
+
+    expect(entry.getState().blocks.map((blk) => blk.ctx.itemId)).toEqual([a.id, b.id, c.id]);
+  });
+
+  it("switching back to an entry whose history never loaded uses the ordered merge", async () => {
+    // A live entry with a failed hydration is revalidated on switch-back. That
+    // must be the hydration merge (older history first), not the reconnect
+    // backfill, which appends unseen items after the live transcript.
+    const older = [
+      userMessage("resp_o1", "asked while history was down"),
+      assistantMessage("resp_o1", "older answer"),
+      userMessage("resp_o2", "please continue"),
+      assistantMessage("resp_o2", "older two"),
+    ];
+    const live = [
+      userMessage("resp_live", "asked while history was down"),
+      assistantMessage("resp_live", "answered"),
+    ];
+    seedSession("conv_order", [...older, ...live]);
+    seedSession("conv_other", []);
+    let failSnapshot = true;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.split("?")[0] === "/v1/sessions/conv_order" && (init?.method ?? "GET") === "GET") {
+        if (failSnapshot) return mockResponse({}, { ok: false, status: 404 });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    await useChatStore.getState().switchTo("conv_order");
+    const entry = conversationRegistry.peek("conv_order")!;
+    expect(entry.getState().conversationLoadError).not.toBeNull();
+    // The reply streamed live while history was unavailable; the question's
+    // committed item and its consumed event were missed, so its optimistic
+    // bubble is still up — next to in-flight sends whose text collides with
+    // old history (identical, or a suffix of it) and one without an id.
+    const asked = [{ type: "input_text" as const, text: "asked while history was down" }];
+    entry.setState({
+      blocks: itemsToBlocks([live[1]!]),
+      pendingUserMessages: [
+        { tempId: "pend_asked", stableId: live[0]!.id, content: asked, posted: true },
+        { tempId: "pend_dup", stableId: "sid_dup", content: asked, posted: true },
+        {
+          tempId: "pend_suffix",
+          stableId: "sid_suffix",
+          content: [{ type: "input_text", text: "continue" }],
+          posted: true,
+        },
+        {
+          tempId: "pend_noid",
+          content: [{ type: "input_text", text: "not committed yet" }],
+          posted: true,
+        },
+      ],
+    });
+
+    failSnapshot = false;
+    await useChatStore.getState().switchTo("conv_other");
+    await useChatStore.getState().switchTo("conv_order");
+    await vi.waitFor(() => expect(entry.getState().conversationLoadError).toBeNull());
+
+    expect(entry.getState().blocks.map((b) => b.ctx.itemId)).toEqual(
+      [...older, ...live].map((item) => item.id),
+    );
+    // Only the bubble whose own item is committed is acknowledged: identical or
+    // suffix-matching history and an id-less bubble are not evidence.
+    expect(entry.getState().pendingUserMessages.map((p) => p.tempId)).toEqual([
+      "pend_dup",
+      "pend_suffix",
+      "pend_noid",
+    ]);
+  });
+
+  it("a superseded stream open neither releases nor leaks the successor's slot", async () => {
+    let held = 0;
+    const grants: ((slot: StreamSlot | null) => void)[] = [];
+    setStreamSlotManagerForTest({
+      tryAcquire: () =>
+        new Promise<StreamSlot | null>((resolve) => {
+          grants.push(resolve);
+        }),
+    });
+    const grant = (): StreamSlot => {
+      held += 1;
+      return {
+        release: () => {
+          held -= 1;
+          return Promise.resolve();
+        },
+      };
+    };
+    seedSession("conv_slot");
+
+    const first = useChatStore.getState().switchTo("conv_slot");
+    await tick();
+    expect(grants).toHaveLength(1);
+    // The conversation is evicted and re-opened while the first open still waits.
+    conversationRegistry.release("conv_slot");
+    const second = ensureConversationStreamed("conv_slot");
+    await tick();
+    expect(grants).toHaveLength(2);
+    grants[1]!(grant()); // the successor's reservation
+    await tick();
+    await tick();
+    grants[0]!(grant()); // the stale open resumes: superseded, so it must give its own slot back
+    await Promise.all([first, second]);
+    await tick();
+    await tick();
+    expect(held).toBe(1);
+    expect(conversationRegistry.peek("conv_slot")!.getState().abortController).not.toBeNull();
+
+    // Ending the successor's pump releases the one reservation — nothing leaked.
+    // (The mocked stream body outlives an abort, so close it to let the pump exit.)
+    conversationRegistry.peek("conv_slot")!.getState().abortController!.abort();
+    conversationRegistry.release("conv_slot");
+    closeOpenEmptyStreams();
+    await vi.waitFor(() => {
+      expect(held).toBe(0);
+    });
   });
 
   it("pushes the optimistic message bubble before any await", async () => {
@@ -2672,15 +3121,16 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
     expect(real.pendingUserMessages).toEqual([]);
   });
 
-  it("B2: a bind failure after navigate-away settles the real session, not the visible one", async () => {
-    // The real session's snapshot fails, so ensureBoundSession rethrows the
-    // load error BEFORE postedSessionId is assigned — the catch's B2 path.
+  it("B2: a snapshot failure after navigate-away still posts to the real session, not the visible one", async () => {
+    // The real session's snapshot fails definitively. History is not a
+    // prerequisite for the POST, so the message still goes out — to the real
+    // (background) session, never the one the user is now looking at.
     seedSession("conv_visible");
     fetchMock.mockImplementation((input, init) => {
       const url = String(input);
       const path = url.split("?")[0];
       if (path === "/v1/sessions/conv_real" && (init?.method ?? "GET") === "GET") {
-        return mockResponse({}, { ok: false, status: 500 });
+        return mockResponse({}, { ok: false, status: 404 });
       }
       return defaultFetchHandler(input, init);
     });
@@ -2709,15 +3159,23 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
     await settle();
 
     const visible = useChatStore.getState();
-    // The visible conversation is untouched — no stray error block or status flip.
+    // The visible conversation is untouched — no stray bubble, error block or status flip.
     expect(visible.conversationId).toBe("conv_visible");
+    expect(visible.pendingUserMessages).toEqual([]);
     expect(visible.blocks.filter((b) => b.type === "error")).toHaveLength(0);
     expect(visible.status).toBe("idle");
-    // The real (background) session carried the failure and settled to idle.
+    // The real (background) session got the POST: its bubble is kept and marked
+    // posted, and only its history is flagged as unavailable.
+    const posts = fetchMock.mock.calls.filter(
+      ([u, init]) =>
+        String(u) === "/v1/sessions/conv_real/events" &&
+        (init as RequestInit | undefined)?.method === "POST",
+    );
+    expect(posts).toHaveLength(1);
     const real = conversationRegistry.peek("conv_real")!.getState();
-    expect(real.status).toBe("idle");
-    expect(real.pendingUserMessages).toEqual([]);
-    expect(real.blocks.filter((b) => b.type === "error")).toHaveLength(1);
+    expect(real.pendingUserMessages.map((p) => p.posted)).toEqual([true]);
+    expect(real.blocks.filter((b) => b.type === "error")).toHaveLength(0);
+    expect(real.conversationLoadError).not.toBeNull();
   });
 
   it("does not promote the visible store when the route already left the temp chat", () => {
@@ -2741,18 +3199,146 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
     expect(useChatStore.getState().conversationId).toBe(tempConvId);
   });
 
+  const postedStableIds = (): string[] =>
+    fetchMock.mock.calls
+      .filter(
+        ([u, init]) =>
+          String(u).endsWith("/events") && (init as RequestInit | undefined)?.method === "POST",
+      )
+      .map(([, init]) => JSON.parse((init as RequestInit).body as string).data.stable_id as string);
+
+  it("send reuses the pending retry identity only for the exact recorded message", async () => {
+    // Decided at the store's send boundary, so a design-mode message, a comment
+    // sent to the agent, or an edited composer draft can never inherit a
+    // recovered id (the server would dedupe the new message away), while the
+    // unchanged message keeps it. Inner whitespace counts: an indentation edit
+    // in a code prompt is a different message.
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+      pendingUserMessages: [],
+      pendingRetry: { stableId: "sid_exact", text: "exact words", files: [] },
+    });
+
+    await useChatStore.getState().send("exact words, edited", "agent_xyz");
+    await useChatStore.getState().send("exact  words", "agent_xyz");
+    expect(postedStableIds()).toHaveLength(2);
+    expect(postedStableIds()).not.toContain("sid_exact");
+    expect(useChatStore.getState().pendingRetry?.stableId).toBe("sid_exact");
+
+    await useChatStore.getState().send("exact words", "agent_xyz");
+    expect(postedStableIds()[2]).toBe("sid_exact");
+    expect(useChatStore.getState().pendingRetry).toBeNull();
+    // The optimistic bubble carries the id its committed item will have.
+    expect(useChatStore.getState().pendingUserMessages.at(-1)?.stableId).toBe("sid_exact");
+  });
+
+  it("send keeps the identity for a failed attachment message resent as restored, not for changed files", async () => {
+    // A failed in-page send hands the same File objects back to the composer;
+    // resending them unchanged is the same message and must dedupe. Any other
+    // set of attachments is a new message.
+    const shot = new File(["png!"], "shot.png", { type: "image/png" });
+    const other = new File(["png?"], "other.png", { type: "image/png" });
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/v1/sessions/conv_existing/resources/files") && init?.method === "POST") {
+        return mockResponse({
+          id: "file_1",
+          name: "shot.png",
+          metadata: { filename: "shot.png", bytes: 4, created_at: 0 },
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+      pendingUserMessages: [],
+      pendingRetry: { stableId: "sid_files", text: "see this", files: [shot] },
+    });
+
+    await useChatStore.getState().send("see this", "agent_xyz", [shot, other]);
+    expect(postedStableIds()).toHaveLength(1);
+    expect(postedStableIds()[0]).not.toBe("sid_files");
+    expect(useChatStore.getState().pendingRetry?.stableId).toBe("sid_files");
+
+    await useChatStore.getState().send("see this", "agent_xyz", [shot]);
+    expect(postedStableIds()[1]).toBe("sid_files");
+    expect(useChatStore.getState().pendingRetry).toBeNull();
+  });
+
+  it("a send that already carries its identity leaves an unrelated pending retry alone", async () => {
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+      pendingUserMessages: [],
+      pendingRetry: { stableId: "sid_keep", text: "still waiting in the composer", files: [] },
+    });
+
+    await useChatStore.getState().send("a queued message", "agent_xyz", undefined, {
+      stableId: "sid_queued",
+    });
+
+    expect(postedStableIds()).toEqual(["sid_queued"]);
+    expect(useChatStore.getState().pendingRetry?.stableId).toBe("sid_keep");
+  });
+
+  it("stamps a navigate-first send's identity on its pre-created bubble so hydration can acknowledge it", async () => {
+    // The landing composer creates the optimistic bubble before send() has an
+    // id (`reusePendingTempId`). Without the id, a recovery hydration could
+    // never acknowledge that bubble: the first prompt would render twice.
+    seedSession("conv_nf", []);
+    let failSnapshot = true;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.split("?")[0] === "/v1/sessions/conv_nf" && (init?.method ?? "GET") === "GET") {
+        if (failSnapshot) return mockResponse({}, { ok: false, status: 404 });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    await useChatStore.getState().switchTo("conv_nf");
+    const entry = conversationRegistry.peek("conv_nf")!;
+    entry.setState({
+      pendingUserMessages: [
+        { tempId: "pend_first", content: [{ type: "input_text", text: "first prompt" }] },
+        {
+          tempId: "pend_other",
+          stableId: "sid_other",
+          content: [{ type: "input_text", text: "later" }],
+          posted: true,
+        },
+      ],
+    });
+
+    await useChatStore.getState().send("first prompt", "agent_xyz", undefined, {
+      pinnedConversationId: "conv_nf",
+      reusePendingTempId: "pend_first",
+    });
+    const first = entry.getState().pendingUserMessages.find((p) => p.tempId === "pend_first")!;
+    expect(first.stableId).toBe(postedStableIds().at(-1));
+
+    // Its committed item lands in the snapshot while the consumed event was missed.
+    seedSession("conv_nf", [{ ...userMessage("resp_first", "first prompt"), id: first.stableId! }]);
+    failSnapshot = false;
+    await retryConversationHistory("conv_nf");
+
+    expect(entry.getState().pendingUserMessages.map((p) => p.tempId)).toEqual(["pend_other"]);
+  });
+
   it("a pinned background send does not consume the visible conversation's retry id", async () => {
     seedSession("conv_target");
     seedSession("conv_visible");
     await useChatStore.getState().switchTo("conv_target");
     await useChatStore.getState().switchTo("conv_visible");
-    useChatStore.setState({ pendingRetryStableId: "retry_visible" });
+    useChatStore.setState({
+      pendingRetry: { stableId: "retry_visible", text: "visible draft", files: [] },
+    });
 
     await useChatStore.getState().send("background first message", "agent_xyz", undefined, {
       pinnedConversationId: "conv_target",
     });
 
-    expect(useChatStore.getState().pendingRetryStableId).toBe("retry_visible");
+    expect(useChatStore.getState().pendingRetry?.stableId).toBe("retry_visible");
     const post = fetchMock.mock.calls.find(
       ([url, init]) =>
         String(url) === "/v1/sessions/conv_target/events" &&
@@ -3592,6 +4178,10 @@ describe("chatStore — background-shell tally (claude-native)", () => {
     // follow-up send below takes the already-bound path and does NOT re-hydrate
     // the count from the snapshot.
     await useChatStore.getState().send("first question", "agent_xyz");
+    // That first send's bind hydrates alongside it now; let the snapshot land
+    // before seeding the state under test, or it would overwrite the count.
+    await tick();
+    await tick();
     // A prior turn ended with a background shell still running.
     useChatStore.setState({
       sessionStatus: "waiting",
@@ -9795,6 +10385,70 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await loop;
   });
 
+  it("reconnecting a stream whose history never loaded uses the ordered merge", async () => {
+    // A live entry with a failed hydration reconnects after a transport drop.
+    // That must run the hydration merge (older history first), not the
+    // reconnect backfill, which appends unseen items after the live transcript.
+    const older = assistantMessage("resp_older", "older history");
+    const live = userMessage("resp_live", "streamed live");
+    seedSession("conv_reconnect_order", [older, live]);
+    const sinks: StreamSink[] = [];
+    let failSnapshot = true;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (/\/v1\/sessions\/[^/]+\/stream$/.test(url)) {
+        const sink = pushableStream();
+        sinks.push(sink);
+        return mockResponse(null, { bodyStream: sink.stream });
+      }
+      if (
+        url.split("?")[0] === "/v1/sessions/conv_reconnect_order" &&
+        (init?.method ?? "GET") === "GET"
+      ) {
+        if (failSnapshot) return mockResponse({}, { ok: false, status: 404 });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    await useChatStore.getState().switchTo("conv_reconnect_order");
+    await drainAsync();
+    const entry = conversationRegistry.peek("conv_reconnect_order")!;
+    expect(entry.getState().conversationLoadError).not.toBeNull();
+    expect(sinks).toHaveLength(1);
+    // The message was posted but the stream dropped before its consumed event:
+    // its bubble is still up, next to one whose POST is still in flight.
+    entry.setState({
+      pendingUserMessages: [
+        {
+          tempId: "pend_live",
+          stableId: live.id,
+          content: [{ type: "input_text", text: "streamed live" }],
+          posted: true,
+        },
+        {
+          tempId: "pend_inflight",
+          stableId: "sid_inflight",
+          content: [{ type: "input_text", text: "not committed yet" }],
+          posted: true,
+        },
+      ],
+    });
+
+    failSnapshot = false;
+    sinks[0]!.error();
+    await drainAsync();
+    expect(sinks).toHaveLength(2);
+    await vi.waitFor(() => expect(entry.getState().conversationLoadError).toBeNull());
+    expect(entry.getState().blocks.map((b) => b.ctx.itemId)).toEqual([older.id, live.id]);
+    // The recovered item acknowledged its bubble; the in-flight one is kept.
+    expect(entry.getState().pendingUserMessages.map((p) => p.tempId)).toEqual(["pend_inflight"]);
+
+    const last = sinks[1]!;
+    last.push("data: [DONE]\n\n");
+    last.close();
+    await drainAsync(2);
+  });
+
   it("clears the MCP startup band when its settle event fired into the reconnect gap", async () => {
     seedSession("conv_mcp_gap", []);
     sessionMcpStartup.set("conv_mcp_gap", { safe: { status: "starting", error: null } });
@@ -12314,6 +12968,32 @@ describe("chatStore — client-side message queue", () => {
     expect(useChatStore.getState().queuedMessages).toEqual([]);
   });
 
+  it("enqueueMessage carries a pending retry identity only for its own message, once", () => {
+    // A recovered or restored message submitted mid-turn must keep its send
+    // identity, so the flush dedupes on the server and its acknowledgment clears
+    // the same durable record instead of leaving it to be recovered again — while
+    // any other message leaves the identity armed.
+    const sendSpy = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      boundAgentId: "agent_xyz",
+      status: "streaming",
+      sessionStatus: "running",
+      send: sendSpy,
+      pendingRetry: { stableId: "sid_recovered", text: "resend me", files: [] },
+    });
+    useChatStore.getState().enqueueMessage("something else first", undefined);
+    expect(useChatStore.getState().pendingRetry?.stableId).toBe("sid_recovered");
+    useChatStore.getState().enqueueMessage("resend me", undefined);
+    useChatStore.getState().enqueueMessage("a fresh follow-up", undefined);
+
+    const [other, recovered, fresh] = useChatStore.getState().queuedMessages;
+    expect(other!.stableId).not.toBe("sid_recovered");
+    expect(recovered!.stableId).toBe("sid_recovered");
+    expect(fresh!.stableId).not.toBe("sid_recovered");
+    expect(useChatStore.getState().pendingRetry).toBeNull();
+  });
+
   it.each(["steer", "idle", "bulk"])("carries quote provenance from enqueue through %s", (mode) => {
     const replyDraft: StoredReplyDraft = {
       version: 1,
@@ -13048,6 +13728,73 @@ describe("chatStore — background cross-session flush", () => {
     // One POST to conv_bg (FIFO head only); its head left the queue, tail stays.
     expect(eventPosts()).toEqual([{ id: "conv_bg", text: "bg-first" }]);
     expect(useChatStore.getState().queuedMessages.map((m) => m.text)).toEqual(["bg-second"]);
+  });
+
+  it("clears a recovered message's durable record once its background flush is accepted", async () => {
+    // A recovered message queued behind a running turn keeps its record id. When
+    // the flush happens after the user switched away, the acknowledgment must
+    // still retire that record, or a later reload would recover it again.
+    seedConversationsCache([conv("conv_active", "running"), conv("conv_bg", "idle")]);
+    sessionStorage.setItem(
+      "omnigent.unsentMessages",
+      JSON.stringify({
+        sid_bg: { conversationId: "conv_bg", text: "recovered then queued", stableId: "sid_bg" },
+      }),
+    );
+    useChatStore.setState({
+      conversationId: "conv_active",
+      queuedMessages: [
+        {
+          queueId: "q_1",
+          text: "recovered then queued",
+          conversationId: "conv_bg",
+          stableId: "sid_bg",
+        },
+      ],
+    });
+
+    useChatStore.getState().flushBackgroundQueues();
+    await tick();
+
+    expect(eventPosts()).toEqual([{ id: "conv_bg", text: "recovered then queued" }]);
+    await vi.waitFor(() =>
+      expect(JSON.parse(sessionStorage.getItem("omnigent.unsentMessages") ?? "{}")).toEqual({}),
+    );
+  });
+
+  it("keeps a durable copy of a fresh queued message across a failed background flush", async () => {
+    // The queue itself is in memory only. Recording the message before the
+    // background POST means a reload during the POST, or after a failure, can
+    // still recover it — with the identity the retry will reuse.
+    seedConversationsCache([conv("conv_active", "running"), conv("conv_bg", "idle")]);
+    let failPost = true;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (/\/v1\/sessions\/conv_bg\/events$/.test(String(input)) && init?.method === "POST") {
+        if (failPost) return mockResponse({}, { ok: false, status: 503 });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    useChatStore.setState({
+      conversationId: "conv_active",
+      queuedMessages: [{ queueId: "q_1", text: "typed mid-turn", conversationId: "conv_bg" }],
+    });
+    const records = (): Record<string, { text: string; stableId?: string }> =>
+      JSON.parse(sessionStorage.getItem("omnigent.unsentMessages") ?? "{}");
+
+    useChatStore.getState().flushBackgroundQueues();
+    await tick();
+    await tick();
+    const [recordId, record] = Object.entries(records())[0]!;
+    expect(record).toMatchObject({ text: "typed mid-turn", stableId: recordId });
+    // Re-queued under the same identity, so the retry does not open a second record.
+    expect(useChatStore.getState().queuedMessages.map((m) => m.stableId)).toEqual([recordId]);
+
+    failPost = false;
+    initChatStore(client);
+    useChatStore.getState().flushBackgroundQueues();
+    await tick();
+    await tick();
+    expect(records()).toEqual({});
   });
 
   it("does not flush a non-active conversation that is not idle", async () => {
