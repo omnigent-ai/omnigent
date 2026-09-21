@@ -46,6 +46,11 @@ afterEach(() => {
 });
 
 describe("SubagentTaskIndicator", () => {
+  it("self-hides without requiring a router", () => {
+    const { container } = render(<SubagentTaskIndicator conversationId={null} />);
+    expect(container).toBeEmptyDOMElement();
+  });
+
   it("renders nothing without a conversation", () => {
     const { container } = renderIndicator(null);
     expect(container).toBeEmptyDOMElement();

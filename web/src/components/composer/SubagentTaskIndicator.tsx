@@ -103,13 +103,54 @@ function SubagentStateIndicator({ state, label }: { state: IndicatorState; label
   );
 }
 
+function SubagentNavigationRow({
+  item: { child, state, statusLabel },
+  onNavigate,
+}: {
+  item: IndicatorChild;
+  onNavigate: (event: MouseEvent<HTMLAnchorElement>) => void;
+}) {
+  const search = linkSearch(useLocation().search);
+  const label = subagentLabel(child);
+  const tool = child.tool?.trim();
+  const showTool = !!tool && tool !== label;
+
+  return (
+    <li>
+      <Link
+        to={{ pathname: `/c/${child.id}`, search }}
+        componentId="composer-subagent-indicator-row"
+        aria-label={`Open ${label} sub-agent`}
+        onClick={onNavigate}
+        className="flex items-start gap-2 rounded-lg px-1 py-2 hover:bg-accent/60 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+      >
+        <span className="flex h-5 w-5 shrink-0 items-center justify-center text-muted-foreground">
+          <BotIcon className="size-4" aria-hidden="true" />
+        </span>
+        <span className="flex min-w-0 flex-1 flex-col gap-1">
+          <span className="flex min-w-0 items-center gap-2">
+            <span className="min-w-0 flex-1 truncate text-sm text-foreground" title={label}>
+              {label}
+            </span>
+            <SubagentStateIndicator state={state} label={statusLabel} />
+          </span>
+          {showTool ? (
+            <span className="truncate font-mono text-xs text-muted-foreground" title={tool}>
+              {tool}
+            </span>
+          ) : null}
+        </span>
+      </Link>
+    </li>
+  );
+}
+
 export function SubagentTaskIndicator({ conversationId }: { conversationId: string | null }) {
   const { children } = useChildSessions(conversationId);
   const items = children
     .map(indicatorChild)
     .filter((item): item is IndicatorChild => item !== null);
   const count = items.length;
-  const search = linkSearch(useLocation().search);
 
   const [open, setOpen] = useState(false);
   // Why the popover closed last; only a session switch suppresses Radix's
@@ -194,45 +235,9 @@ export function SubagentTaskIndicator({ conversationId }: { conversationId: stri
           className="max-h-[min(24rem,var(--radix-popover-content-available-height))] w-[min(25rem,calc(100vw-2rem))] overflow-y-auto p-2"
         >
           <ul className="flex flex-col">
-            {items.map(({ child, state, statusLabel }) => {
-              const label = subagentLabel(child);
-              const tool = child.tool?.trim();
-              const showTool = !!tool && tool !== label;
-              return (
-                <li key={child.id}>
-                  <Link
-                    to={{ pathname: `/c/${child.id}`, search }}
-                    componentId="composer-subagent-indicator-row"
-                    aria-label={`Open ${label} sub-agent`}
-                    onClick={handleNavigate}
-                    className="flex items-start gap-2 rounded-lg px-1 py-2 hover:bg-accent/60 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-                  >
-                    <span className="flex h-5 w-5 shrink-0 items-center justify-center text-muted-foreground">
-                      <BotIcon className="size-4" aria-hidden="true" />
-                    </span>
-                    <span className="flex min-w-0 flex-1 flex-col gap-1">
-                      <span className="flex min-w-0 items-center gap-2">
-                        <span
-                          className="min-w-0 flex-1 truncate text-sm text-foreground"
-                          title={label}
-                        >
-                          {label}
-                        </span>
-                        <SubagentStateIndicator state={state} label={statusLabel} />
-                      </span>
-                      {showTool ? (
-                        <span
-                          className="truncate font-mono text-xs text-muted-foreground"
-                          title={tool}
-                        >
-                          {tool}
-                        </span>
-                      ) : null}
-                    </span>
-                  </Link>
-                </li>
-              );
-            })}
+            {items.map((item) => (
+              <SubagentNavigationRow key={item.child.id} item={item} onNavigate={handleNavigate} />
+            ))}
           </ul>
         </PopoverContent>
       </Popover>
