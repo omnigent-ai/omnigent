@@ -23,7 +23,7 @@ from fastapi import (
     WebSocketException,
     status,
 )
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 from pydantic import ValidationError
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
@@ -110,6 +110,8 @@ from omnigent.server.routes._sessions.common import (
     _CODEX_NATIVE_COLLABORATION_MODES,
     _CODEX_NATIVE_WRAPPER_LABEL_VALUE,
     _DEVIN_NATIVE_WRAPPER_LABEL_VALUE,
+    _fork_op_cache,
+    _fork_tasks,
     _logger,
     _managed_launch_tasks,
     get_server_runner_router,
@@ -138,6 +140,7 @@ from omnigent.server.routes._sessions.helpers import (
     _prune_session_read_state,
     _publish_codex_approval_mode,
     _publish_collaboration_mode,
+    _publish_fork_status,
     _publish_permission_mode,
     _publish_sandbox_status,
     _publish_terminal_pending,
@@ -186,6 +189,7 @@ from omnigent.server.schemas import (
     ResetSessionModelOverrideResponse,
     SessionAgentChangedEvent,
     SessionCreateRequest,
+    SessionForkAcceptedResponse,
     SessionForkRequest,
     SessionLabelsResponse,
     SessionList,
@@ -266,6 +270,52 @@ def register_core_routes(
 ) -> None:
     """Register the core session routes on router."""
 
+    def _validate_managed_launch_request(
+        request: Request,
+        *,
+        sandbox_provider: str | None,
+        workspaces: list[str],
+    ) -> None:
+        """
+        Synchronously reject a managed launch the server can't satisfy.
+
+        The cheap config/provider guards run before a caller is told the
+        request was accepted, so a misconfigured server (no sandbox config,
+        unknown provider, too many repos for the provider) is a clear 4xx —
+        deferring these to the background launch would instead leave a clone
+        stuck "provisioning" forever. Called both here (before scheduling) and
+        by the fork path before it returns its 202.
+
+        :raises OmnigentError: If managed hosts aren't configured, the
+            provider isn't offered, or several repos are asked of a
+            single-repo provider.
+        """
+        sandbox_config = getattr(request.app.state, "sandbox_config", None)
+        host_store_for_managed = getattr(request.app.state, "host_store", None)
+        managed_launches = getattr(request.app.state, "managed_launches", None)
+        if sandbox_config is None or host_store_for_managed is None or managed_launches is None:
+            raise OmnigentError(
+                "managed hosts are not configured on this server — add a "
+                "'sandbox:' section to the server config",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if sandbox_provider is not None and sandbox_config.for_provider(sandbox_provider) is None:
+            offered = ", ".join(sandbox_config.launchable_providers()) or "none"
+            raise OmnigentError(
+                f"sandbox provider '{sandbox_provider}' is not configured "
+                f"on this server — available: {offered}",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if len(workspaces) > 1:
+            resolved = sandbox_provider or sandbox_config.default.provider
+            caps = sandbox_config.provider_ui_capabilities().get(resolved or "", {})
+            if not caps.get("multi_repo", False):
+                raise OmnigentError(
+                    f"sandbox provider '{resolved}' clones only one repository; "
+                    "select a single repository or choose a provider that supports several",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+
     async def _schedule_managed_launch(
         request: Request,
         *,
@@ -310,42 +360,23 @@ def register_core_routes(
         :raises OmnigentError: If managed hosts aren't configured or the
             provider isn't offered.
         """
+        # Config/provider guards (idempotent with the fork path's synchronous
+        # pre-check). The web picker already caps multi-repo per provider; the
+        # provider guard also protects direct API callers.
+        _validate_managed_launch_request(
+            request, sandbox_provider=sandbox_provider, workspaces=workspaces
+        )
         sandbox_config = getattr(request.app.state, "sandbox_config", None)
         host_store_for_managed = getattr(request.app.state, "host_store", None)
         managed_launches = getattr(request.app.state, "managed_launches", None)
-        if sandbox_config is None or host_store_for_managed is None or managed_launches is None:
-            raise OmnigentError(
-                "managed hosts are not configured on this server — add a "
-                "'sandbox:' section to the server config",
-                code=ErrorCode.INVALID_INPUT,
-            )
+        assert sandbox_config is not None and host_store_for_managed is not None
+        assert managed_launches is not None
         from omnigent.server.auth import RESERVED_USER_LOCAL
         from omnigent.server.managed_hosts import (
             managed_repo_labels,
             parse_repo_workspace,
         )
 
-        # Reject an unconfigured provider on the POST rather than in the
-        # background launch.
-        if sandbox_provider is not None and sandbox_config.for_provider(sandbox_provider) is None:
-            offered = ", ".join(sandbox_config.launchable_providers()) or "none"
-            raise OmnigentError(
-                f"sandbox provider '{sandbox_provider}' is not configured "
-                f"on this server — available: {offered}",
-                code=ErrorCode.INVALID_INPUT,
-            )
-        # Reject several repos on a provider that clones only one, with a clear
-        # 4xx (the web picker already caps this per provider; this guards direct
-        # API callers). Resolve the provider the launch will actually use.
-        if len(workspaces) > 1:
-            resolved = sandbox_provider or sandbox_config.default.provider
-            caps = sandbox_config.provider_ui_capabilities().get(resolved or "", {})
-            if not caps.get("multi_repo", False):
-                raise OmnigentError(
-                    f"sandbox provider '{resolved}' clones only one repository; "
-                    "select a single repository or choose a provider that supports several",
-                    code=ErrorCode.INVALID_INPUT,
-                )
         # A managed workspace is a repository URL (schema-validated) the
         # launch clones inside the sandbox; parse each now so a malformed
         # URL is a synchronous 4xx, not a background failure.
@@ -1832,7 +1863,57 @@ def register_core_routes(
                                 "projects-changed push failed; client converges on next load",
                                 exc_info=True,
                             )
+                elif evt_type == "fork_status":
+                    # Background-fork progress. Pure passthrough: the client
+                    # drives its "Cloning…" toast off it, and the ready row
+                    # arrives via the session_added the fork publishes alongside.
+                    async with emit_lock:
+                        try:
+                            await _send(
+                                {
+                                    k: evt.get(k)
+                                    for k in (
+                                        "type",
+                                        "operation_id",
+                                        "source_id",
+                                        "status",
+                                        "fork_id",
+                                        "error",
+                                    )
+                                }
+                            )
+                        except WebSocketDisconnect:
+                            raise
+                        except Exception:
+                            _logger.warning(
+                                "fork-status push failed; client re-seeds on reconnect",
+                                exc_info=True,
+                            )
 
+        async def _replay_pending_forks() -> None:
+            """Re-send this user's in-flight/failed fork ops on (re)connect.
+
+            The discovery channel is live-only, so a client that refreshes or
+            reconnects mid-clone would otherwise lose its "Cloning…" state (and
+            a dead fork its failure reason). The op cache retains them until the
+            client acts, so replay them once before entering the live loop."""
+            for op_id, rec in _fork_op_cache.items():
+                if rec.get("owner") != user_id:
+                    continue
+                async with emit_lock:
+                    with contextlib.suppress(WebSocketDisconnect, Exception):
+                        await _send(
+                            {
+                                "type": "fork_status",
+                                "operation_id": op_id,
+                                "source_id": rec.get("source_id"),
+                                "status": rec.get("status"),
+                                "fork_id": rec.get("fork_id"),
+                                "error": rec.get("error"),
+                            }
+                        )
+
+        await _replay_pending_forks()
         reader_task = asyncio.create_task(_reader(), name="session-updates-reader")
         ticker_task = asyncio.create_task(_ticker(), name="session-updates-ticker")
         discovery_task = asyncio.create_task(_discovery(), name="session-updates-discovery")
@@ -2763,18 +2844,18 @@ def register_core_routes(
 
     @router.post(
         "/sessions/{source_id}/fork",
-        status_code=201,
+        status_code=202,
         # response_model=None keeps FastAPI from re-validating/serializing
-        # the handler's SessionResponse; responses= still advertises the
+        # the handler's JSONResponse; responses= still advertises the
         # body schema to docs/SDK tooling.
         response_model=None,
-        responses={201: {"model": SessionResponse}},
+        responses={202: {"model": SessionForkAcceptedResponse}},
     )
     async def fork_session(
         request: Request,
         source_id: str,
         body: SessionForkRequest,
-    ) -> SessionResponse:
+    ) -> JSONResponse:
         """
         Fork an existing session into a new session.
 
@@ -2825,8 +2906,12 @@ def register_core_routes(
         :param source_id: Session/conversation identifier of the
             source session to fork, e.g. ``"conv_abc123"``.
         :param body: The validated :class:`SessionForkRequest`.
-        :returns: A :class:`SessionResponse` describing the newly
-            created fork (status ``"idle"``).
+        :returns: A 202 :class:`SessionForkAcceptedResponse` with the
+            fork-operation id. Materialization (transcript copy, FTS
+            rebuild) runs in a background task; the destination session is
+            announced to the caller's session-updates stream — and a
+            ``fork_status`` event flips to ``"ready"``/``"failed"`` — only
+            once it completes, so no destination row appears before then.
         :raises OmnigentError: 404 if *source_id* does not exist
             or ``body.agent_id`` is not a bindable built-in agent;
             403 if the caller lacks read access; 400 if the source
@@ -3153,43 +3238,77 @@ def register_core_routes(
         else:
             fork_project_id = fork_resolution.project_id
 
-        # The deep-copied items reference the source's session-scoped file
-        # resources by raw file_id (attachment blocks are persisted
-        # pre-resolution), but a fork owns none of those rows — its own file
-        # endpoints would 404, so the web transcript shows broken
-        # attachments and a native transcript rebuild receives the file_id
-        # unresolved. Pre-allocate a fork-owned id per source file; the store
-        # rewrites the copied items to those ids, and a fork-owned row per id
-        # is created right after the fork commits. Each row points at the
-        # SOURCE's blob (blob_key), so the fork shares the bytes and copies
-        # nothing — reference-counted deletion keeps that blob alive until
-        # every referencing row is gone.
-        #
-        # This is pure metadata: we deliberately do NOT probe the artifact
-        # store for each blob (an S3 HEAD / Volumes stat per file is real
-        # per-fork latency). A file whose blob happens to be gone yields a
-        # fork row that 404s on read — exactly how the source itself already
-        # degrades — so a probe would only trade latency for the same outcome.
-        fork_file_id_map: dict[str, str] = {}
-        fork_source_files: list[StoredFile] = []
-        if file_store is not None and artifact_store is not None:
-            files_after: str | None = None
-            while True:
-                files_page = await asyncio.to_thread(
-                    file_store.list,
-                    source_id,
-                    limit=1000,
-                    after=files_after,
-                    order="asc",
-                )
-                for stored_file in files_page.data:
-                    fork_source_files.append(stored_file)
-                    fork_file_id_map[stored_file.id] = generate_file_id()
-                if not files_page.has_more or not files_page.data:
-                    break
-                files_after = files_page.last_id
+        # Resolve the managed workspaces (if any) synchronously and reject a
+        # misconfigured managed request NOW — a config/provider problem must be
+        # a clear 4xx on the POST, not a background failure that leaves a clone
+        # stuck "provisioning". An omitted workspace inherits ALL of the source's
+        # recorded repositories (read off the SOURCE — a fork never inherits the
+        # labels itself), so a multi-repo sandbox clone lands with every repo.
+        from omnigent.server.managed_hosts import read_managed_repo_workspaces
 
-        try:
+        fork_workspaces: list[str] = []
+        if body.host_type == "managed":
+            fork_workspaces = (
+                ([body.workspace] if body.workspace is not None else [])
+                if workspace_set
+                else read_managed_repo_workspaces(source.labels)
+            )
+            _validate_managed_launch_request(
+                request, sandbox_provider=body.sandbox_provider, workspaces=fork_workspaces
+            )
+
+        # Everything below — the transcript deep-copy, FTS rebuild, file-row
+        # creation — is the heavy work (a large source took 66s). Run it in a
+        # background task so the POST accepts immediately (Jira-style async),
+        # and surface progress via ``fork_status`` events on the caller's
+        # session-updates stream. The destination session is announced ONLY on
+        # success, so no ghost sidebar row appears while the copy is in flight.
+        op_id = f"forkop_{source_id}_{secrets.token_hex(4)}"
+
+        async def _materialize_fork() -> Conversation:
+            """Do the heavy fork work: deep-copy, file rows, grant, announce.
+
+            Returns the new conversation. Raises on failure — the caller (the
+            background task, or the synchronous side-chat path) decides how to
+            surface it."""
+            # The deep-copied items reference the source's session-scoped
+            # file resources by raw file_id (attachment blocks are persisted
+            # pre-resolution), but a fork owns none of those rows — its own
+            # file endpoints would 404, so the web transcript shows broken
+            # attachments and a native transcript rebuild receives the
+            # file_id unresolved. Pre-allocate a fork-owned id per source
+            # file; the store rewrites the copied items to those ids, and a
+            # fork-owned row per id is created right after the fork commits.
+            # Each row points at the SOURCE's blob (blob_key), so the fork
+            # shares the bytes and copies nothing — reference-counted
+            # deletion keeps that blob alive until every referencing row is
+            # gone.
+            #
+            # This is pure metadata: we deliberately do NOT probe the
+            # artifact store for each blob (an S3 HEAD / Volumes stat per
+            # file is real per-fork latency). A file whose blob happens to
+            # be gone yields a fork row that 404s on read — exactly how the
+            # source itself already degrades — so a probe would only trade
+            # latency for the same outcome.
+            fork_file_id_map: dict[str, str] = {}
+            fork_source_files: list[StoredFile] = []
+            if file_store is not None and artifact_store is not None:
+                files_after: str | None = None
+                while True:
+                    files_page = await asyncio.to_thread(
+                        file_store.list,
+                        source_id,
+                        limit=1000,
+                        after=files_after,
+                        order="asc",
+                    )
+                    for stored_file in files_page.data:
+                        fork_source_files.append(stored_file)
+                        fork_file_id_map[stored_file.id] = generate_file_id()
+                    if not files_page.has_more or not files_page.data:
+                        break
+                    files_after = files_page.last_id
+
             new_conv = await asyncio.to_thread(
                 conversation_store.fork_conversation,
                 source_id,
@@ -3199,10 +3318,11 @@ def register_core_routes(
                 cloned_agent_bundle_location=base_agent.bundle_location,
                 cloned_agent_description=base_agent.description,
                 copy_model_settings=copy_model_settings,
-                # Explicit run-config picks from the fork dialog. Each rides a
-                # (value, set-flag) pair so the store can tell "override to
+                # Explicit run-config picks from the fork dialog. Each rides
+                # a (value, set-flag) pair so the store can tell "override to
                 # None / clear" from "not chosen — inherit". When unset, the
-                # store falls back to copy_model_settings / copy_terminal_launch_args.
+                # store falls back to copy_model_settings /
+                # copy_terminal_launch_args.
                 override_model_override=None if clear_override_model else override_model,
                 override_model_override_set=model_override_set,
                 override_reasoning_effort=None if clear_override_effort else override_effort,
@@ -3211,12 +3331,13 @@ def register_core_routes(
                 override_terminal_launch_args_set=launch_args_set,
                 dropped_label_keys=dropped_label_keys,
                 extra_labels=extra_labels,
-                # Launch flags are CLI-specific. On an agent switch the fork may
-                # bind a different CLI (e.g. claude-code → pi), whose flag set
-                # differs — Claude Code's ``--permission-mode`` makes pi exit at
-                # launch (unknown option → ``required_terminal_exited``). Only
-                # carry the source's launch args on a same-agent fork. An
-                # explicit override above supersedes this.
+                # Launch flags are CLI-specific. On an agent switch the fork
+                # may bind a different CLI (e.g. claude-code → pi), whose
+                # flag set differs — Claude Code's ``--permission-mode``
+                # makes pi exit at launch (unknown option →
+                # ``required_terminal_exited``). Only carry the source's
+                # launch args on a same-agent fork. An explicit override
+                # above supersedes this.
                 copy_terminal_launch_args=not switching_agent,
                 carry_history_into_native=carry_history_into_native,
                 resume_source_native_session=resume_source_native_session,
@@ -3226,123 +3347,144 @@ def register_core_routes(
                 file_id_map=fork_file_id_map,
                 created_by=user_id,
             )
-        except LookupError as exc:
-            raise OmnigentError(
-                f"Session not found: {source_id!r}",
-                code=ErrorCode.NOT_FOUND,
-            ) from exc
-        except ValueError as exc:
-            # Store raises ValueError when up_to_response_id names no
-            # response in the source conversation (stale client state).
-            raise OmnigentError(
-                str(exc),
-                code=ErrorCode.INVALID_INPUT,
-            ) from exc
 
-        # Create the fork-owned rows the rewritten items now reference —
-        # before the fork is announced or returned, so no reader sees the ids
-        # dangling. Each row points at the SOURCE's blob (blob_key), so no
-        # bytes move: the fork shares the source's artifact and both sessions
-        # resolve the same content independently, and the source's
-        # source_metadata (e.g. an image's pre-downscale dimensions) is
-        # carried so the fork's copy is not left less descriptive than the
-        # original. Row creation is best-effort and touches no artifact store:
-        # a failed create is logged and skipped — nothing to roll back since
-        # no blob was written — so forking never fails on a deleted file, and
-        # a source file whose blob is already gone just yields a row that
-        # 404s on read, exactly as the source already does.
-        #
-        # Accepted residual race (not closed here): a source-file/session
-        # delete that runs fully concurrently with this fork can pass its
-        # own orphan check before the row below is inserted, then delete the
-        # shared blob after the fork completes, 404-ing the fork's attachment.
-        # Forking a session while deleting its attachments is unlikely enough
-        # that we accept it rather than add cross-operation locking or
-        # deferred blob GC; the copy-bytes alternative is the fallback if it
-        # ever proves to matter.
-        if file_store is not None and artifact_store is not None:
-            for stored_file in fork_source_files:
-                copied_file_id = fork_file_id_map[stored_file.id]
-                try:
-                    await asyncio.to_thread(
-                        file_store.create,
-                        filename=stored_file.filename,
-                        bytes=stored_file.bytes,
-                        content_type=stored_file.content_type,
-                        session_id=new_conv.id,
-                        file_id=copied_file_id,
-                        blob_key=stored_file.blob_key or stored_file.id,
-                        source_metadata=stored_file.source_metadata,
-                    )
-                except Exception:
-                    _logger.warning(
-                        "failed to create fork file row %s in fork %s of session %s",
-                        copied_file_id,
-                        new_conv.id,
-                        source_id,
-                        exc_info=True,
-                    )
+            # Create the fork-owned rows the rewritten items now reference —
+            # before the fork is announced, so no reader sees the ids
+            # dangling. Each row points at the SOURCE's blob (blob_key), so
+            # no bytes move: the fork shares the source's artifact and both
+            # sessions resolve the same content independently, and the
+            # source's source_metadata (e.g. an image's pre-downscale
+            # dimensions) is carried so the fork's copy is not left less
+            # descriptive than the original. Row creation is best-effort and
+            # touches no artifact store: a failed create is logged and
+            # skipped — nothing to roll back since no blob was written — so
+            # forking never fails on a deleted file, and a source file whose
+            # blob is already gone just yields a row that 404s on read,
+            # exactly as the source already does.
+            #
+            # Accepted residual race (not closed here): a source-file/session
+            # delete that runs fully concurrently with this fork can pass its
+            # own orphan check before the row below is inserted, then delete
+            # the shared blob after the fork completes, 404-ing the fork's
+            # attachment. Forking a session while deleting its attachments is
+            # unlikely enough that we accept it rather than add
+            # cross-operation locking or deferred blob GC; the copy-bytes
+            # alternative is the fallback if it ever proves to matter.
+            if file_store is not None and artifact_store is not None:
+                for stored_file in fork_source_files:
+                    copied_file_id = fork_file_id_map[stored_file.id]
+                    try:
+                        await asyncio.to_thread(
+                            file_store.create,
+                            filename=stored_file.filename,
+                            bytes=stored_file.bytes,
+                            content_type=stored_file.content_type,
+                            session_id=new_conv.id,
+                            file_id=copied_file_id,
+                            blob_key=stored_file.blob_key or stored_file.id,
+                            source_metadata=stored_file.source_metadata,
+                        )
+                    except Exception:
+                        _logger.warning(
+                            "failed to create fork file row %s in fork %s of session %s",
+                            copied_file_id,
+                            new_conv.id,
+                            source_id,
+                            exc_info=True,
+                        )
 
-        # Grant ownership BEFORE scheduling the managed launch, mirroring
-        # both create paths: a managed-guard failure (misconfigured server,
-        # unconfigured provider) must not leave the just-forked session
-        # unowned and thus invisible to the caller.
-        if permission_store is not None and user_id is not None:
-            await asyncio.to_thread(permission_store.ensure_user, user_id)
-            await asyncio.to_thread(permission_store.grant, user_id, new_conv.id, LEVEL_OWNER)
-        # Push the forked session to this user's other open tabs — but NOT a
-        # side chat: it surfaces only as a Workspace-rail tab, never a sidebar
-        # row, so announcing it would leak it into every open sidebar (the
-        # real-time path bypasses the list-endpoint's side-chat filter).
-        if not body.side_chat:
-            _announce_session_added(user_id, new_conv.id)
+            # Grant ownership BEFORE scheduling the managed launch, mirroring
+            # both create paths: a managed-guard failure (misconfigured
+            # server, unconfigured provider) must not leave the just-forked
+            # session unowned and thus invisible to the caller.
+            if permission_store is not None and user_id is not None:
+                await asyncio.to_thread(permission_store.ensure_user, user_id)
+                await asyncio.to_thread(permission_store.grant, user_id, new_conv.id, LEVEL_OWNER)
+            # Announce the finished fork to this user's open tabs so it
+            # enters the sidebar — but NOT a side chat: it surfaces only as a
+            # Workspace-rail tab, never a sidebar row, so announcing it would
+            # leak it into every open sidebar (the real-time path bypasses
+            # the list-endpoint's side-chat filter). This is the ONLY
+            # announce, and it fires only after the copy succeeds — the
+            # guarantee that no destination row appears before it is ready.
+            if not body.side_chat:
+                _announce_session_added(user_id, new_conv.id)
 
-        from omnigent.server.managed_hosts import read_managed_repo_workspaces
+            # Managed host: schedule the fork's own BACKGROUND sandbox
+            # provision, exactly like a managed create. The host is registered
+            # to the forking caller, so the sandbox resolves THEIR credentials,
+            # never the source owner's. Workspaces were resolved and validated
+            # synchronously above (a misconfig already 4xx'd the POST).
+            if body.host_type == "managed":
+                await _schedule_managed_launch(
+                    request,
+                    session_id=new_conv.id,
+                    # The fork's own session-scoped agent clone. Deliberately
+                    # not the built-in it derives from: only a genuine
+                    # built-in may classify a managed runner, and a clone
+                    # must not inherit that.
+                    agent_id=new_conv.agent_id,
+                    user_id=user_id,
+                    sandbox_provider=body.sandbox_provider,
+                    workspaces=fork_workspaces,
+                )
 
-        # Managed host: schedule the fork's own BACKGROUND sandbox provision
-        # and return immediately, exactly like a managed create. The host is
-        # registered to the forking caller, so the sandbox resolves THEIR
-        # credentials, never the source owner's. An omitted workspace inherits
-        # ALL of the repositories the source recorded (read off the SOURCE,
-        # since a fork never inherits the labels itself), so cloning a
-        # multi-repo sandbox session lands the fork with every repo.
-        if body.host_type == "managed":
-            fork_workspaces = (
-                ([body.workspace] if body.workspace is not None else [])
-                if workspace_set
-                else read_managed_repo_workspaces(source.labels)
+            return new_conv
+
+        # A side chat needs its fork id synchronously — it opens a
+        # Workspace-rail tab (never a sidebar row) whose whole point is to be
+        # navigable at once. It is hidden from the sidebar and typically small,
+        # so it keeps the historical synchronous contract: materialize inline
+        # and return the session (201). Everything else runs async.
+        if body.side_chat:
+            new_conv = await _materialize_fork()
+            fork_items = await asyncio.to_thread(
+                conversation_store.list_items, new_conv.id, limit=100, order="desc"
             )
-            await _schedule_managed_launch(
-                request,
-                session_id=new_conv.id,
-                # The fork's own session-scoped agent clone. Deliberately not
-                # the built-in it derives from: only a genuine built-in may
-                # classify a managed runner, and a clone must not inherit that.
-                agent_id=new_conv.agent_id,
-                user_id=user_id,
-                sandbox_provider=body.sandbox_provider,
-                workspaces=fork_workspaces,
+            level = await _get_permission_level(user_id, new_conv.id, permission_store)
+            return JSONResponse(
+                status_code=201,
+                content=_build_session_response(
+                    new_conv,
+                    list(reversed(fork_items.data)),
+                    "idle",
+                    permission_level=level,
+                    last_task_error=None,
+                    agent_name=base_agent.name,
+                ).model_dump(mode="json"),
             )
 
-        # Bound the response like the GET-session snapshot: newest item page,
-        # chronological. Clients navigate by the fork's id and hydrate the
-        # transcript via the paged items endpoint, so returning the whole
-        # copied history only made the user-blocked response scale with
-        # source size.
-        fork_items = await asyncio.to_thread(
-            conversation_store.list_items,
-            new_conv.id,
-            limit=100,
-            order="desc",
-        )
-        level = await _get_permission_level(user_id, new_conv.id, permission_store)
-        return _build_session_response(
-            new_conv,
-            list(reversed(fork_items.data)),
-            "idle",
-            permission_level=level,
-            last_task_error=None,
-            agent_name=base_agent.name,
+        async def _run_fork() -> None:
+            """Run the materialization off the request path; publish its status.
+
+            On success the fork is already announced (inside
+            :func:`_materialize_fork`) and we publish ``ready`` with the fork
+            id — back-to-back so the sidebar row and the "Cloning…" toast
+            dismissal converge, and so a coding-fork client can bind its runner.
+            On failure nothing was announced, so no ghost row is left; we
+            publish a durable ``failed`` the client can retry."""
+            try:
+                new_conv = await _materialize_fork()
+            except Exception as exc:
+                _logger.warning(
+                    "background fork of session %s failed (op %s)",
+                    source_id,
+                    op_id,
+                    exc_info=True,
+                )
+                _publish_fork_status(user_id, source_id, op_id, "failed", error=str(exc))
+                return
+            _publish_fork_status(user_id, source_id, op_id, "ready", fork_id=new_conv.id)
+
+        _publish_fork_status(user_id, source_id, op_id, "cloning")
+        fork_task = asyncio.create_task(_run_fork(), name=f"fork-{op_id}")
+        _fork_tasks.add(fork_task)
+        fork_task.add_done_callback(_fork_tasks.discard)
+        return JSONResponse(
+            status_code=202,
+            content=SessionForkAcceptedResponse(
+                operation_id=op_id, source_id=source_id, status="cloning"
+            ).model_dump(),
         )
 
     # ── POST /sessions/{session_id}/switch-agent ─────────────────

@@ -1,7 +1,8 @@
 import { useLoadedConversations } from "@/hooks/useSidebarData";
 import { type CSSProperties, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { Outlet, useParams, useSearchParams } from "@/lib/routing";
+import { Outlet, useNavigate, useParams, useSearchParams } from "@/lib/routing";
+import { setForkDialogReopener } from "@/lib/forkOperations";
 import { PROJECT_LABEL_KEY, type Conversation, useProjects } from "@/hooks/useConversations";
 import { conversationDisplayLabel, UNTITLED_CONVERSATION_LABEL } from "./sidebarNav";
 import { useSessionAgent } from "@/hooks/useAgents";
@@ -2005,6 +2006,32 @@ export function AppShell() {
     }),
     [canClone],
   );
+
+  // Let a failed-fork toast (raised anywhere by SessionUpdatesProvider) reopen
+  // this dialog for the source. The dialog forks the ACTIVE session, so first
+  // navigate to the source, then open once that route resolves — held in a ref
+  // and applied by the effect below.
+  const navigate = useNavigate();
+  const pendingForkReopenRef = useRef<string | null>(null);
+  useEffect(() => {
+    setForkDialogReopener((sourceId) => {
+      if (conversationId === sourceId) {
+        setForkUpToResponseId(null);
+        setForkOpen(true);
+        return;
+      }
+      pendingForkReopenRef.current = sourceId;
+      navigate(`/c/${sourceId}`);
+    });
+    return () => setForkDialogReopener(null);
+  }, [conversationId, navigate]);
+  useEffect(() => {
+    if (conversationId && pendingForkReopenRef.current === conversationId) {
+      pendingForkReopenRef.current = null;
+      setForkUpToResponseId(null);
+      setForkOpen(true);
+    }
+  }, [conversationId]);
   const workspacePanelVisible = Boolean(
     conversationId &&
     hasRailContent &&

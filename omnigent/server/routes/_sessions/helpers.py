@@ -201,6 +201,8 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     COST_CONTROL_OVERRIDE_VALUES,
     SUBAGENT_ROUTING_OVERRIDE_VALUES,
     _catalog_prefetch_tasks,
+    _fork_op_cache,
+    _fork_tasks,
     _logger,
     _managed_launch_tasks,
     _model_options_cache,
@@ -5021,6 +5023,59 @@ def _publish_sandbox_status_impl(session_id: str, stage: str, error: str | None 
     session_stream.publish(session_id, event.model_dump())
 
 
+def _publish_fork_status(
+    user_id: str | None,
+    source_id: str,
+    op_id: str,
+    status: str,
+    *,
+    fork_id: str | None = None,
+    error: str | None = None,
+) -> None:
+    """
+    Publish a fork-operation status to the caller's session-updates stream.
+
+    Fork materialization runs in the background, so the client tracks it off
+    ``fork_status`` events on the same discovery channel ``session_added``
+    uses (:func:`_announce_session_added`). ``"cloning"`` seeds the "Cloning…"
+    toast; ``"failed"`` surfaces an actionable error; ``"ready"`` is published
+    back-to-back with the ``session_added`` that reveals the finished row.
+
+    A pending/failed op is retained in :data:`_fork_op_cache` (keyed by
+    ``op_id``, tagged with its ``owner``) so a client that refreshes or
+    reconnects mid-clone re-seeds its state from the stream's reconnect
+    replay. ``"ready"`` evicts — from then on the announced session carries it.
+
+    :param user_id: The forking caller, or ``None`` in single-user mode.
+    :param source_id: The session being forked, e.g. ``"conv_abc123"``.
+    :param op_id: Fork-operation id, e.g. ``"forkop_conv_abc123_9f2c4a1b"``.
+    :param status: ``"cloning"``, ``"ready"``, or ``"failed"``.
+    :param fork_id: The destination session id, set on ``"ready"``.
+    :param error: Failure detail when *status* is ``"failed"``.
+    """
+    if status == "ready":
+        _fork_op_cache.pop(op_id, None)
+    else:
+        _fork_op_cache[op_id] = {
+            "owner": user_id,
+            "source_id": source_id,
+            "status": status,
+            "fork_id": fork_id,
+            "error": error,
+        }
+    user_session_stream.publish(
+        _discovery_key(user_id),
+        {
+            "type": "fork_status",
+            "operation_id": op_id,
+            "source_id": source_id,
+            "status": status,
+            "fork_id": fork_id,
+            "error": error,
+        },
+    )
+
+
 def _publish_mcp_startup(session_id: str, servers: dict[str, McpServerStartup]) -> None:
     """
     Publish a typed :class:`SessionMcpStartupEvent` to the live stream.
@@ -5772,6 +5827,25 @@ async def cancel_managed_launch_tasks() -> None:
         in-flight failures are absorbed via ``return_exceptions``).
     """
     tasks = list(_managed_launch_tasks)
+    if not tasks:
+        return
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def cancel_fork_tasks() -> None:
+    """
+    Cancel and await every in-flight background fork materialization.
+
+    Lifespan-teardown hook, mirroring :func:`cancel_managed_launch_tasks`: a
+    slow transcript copy must not outlive the ASGI shutdown. A fork cancelled
+    mid-copy simply never announces its destination — no partial row is
+    surfaced, so cancellation is safe deterministic teardown.
+
+    :returns: None once every task has settled.
+    """
+    tasks = list(_fork_tasks)
     if not tasks:
         return
     for task in tasks:
@@ -11095,6 +11169,7 @@ __all__ = [
     "_publish_external_output_reasoning_delta",
     "_publish_external_output_text_delta",
     "_publish_external_tool_output_delta",
+    "_publish_fork_status",
     "_publish_input_consumed",
     "_publish_input_deny_terminal",
     "_publish_interrupted",
@@ -11167,6 +11242,7 @@ __all__ = [
     "_wait_for_managed_runner_tunnel",
     "_wait_for_runner_client",
     "announce_hosts_changed",
+    "cancel_fork_tasks",
     "cancel_managed_launch_tasks",
     "prefetch_session_routing_catalogs",
 ]

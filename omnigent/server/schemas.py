@@ -2641,6 +2641,30 @@ class SessionForkRequest(BaseModel):
         return self
 
 
+class SessionForkAcceptedResponse(BaseModel):
+    """
+    Response body for ``POST /v1/sessions/{source_id}/fork`` (202 Accepted).
+
+    Fork materialization (transcript deep-copy + full-text-search rebuild)
+    is a background operation, so the POST returns immediately with a handle
+    instead of the finished session. The destination session is announced
+    to the caller's session-updates stream only once the copy completes; a
+    ``session.fork_status`` event on the same stream carries progress
+    (``"cloning"`` -> ``"ready"``/``"failed"``) keyed by ``operation_id``.
+
+    :param operation_id: Opaque fork-operation identifier, e.g.
+        ``"forkop_conv_abc123_9f2c4a1b"``. Correlates the accept with the
+        later ``fork_status`` events (and dedupes the client's optimistic
+        "Cloning…" state across refresh/reconnect).
+    :param source_id: The session that was forked, e.g. ``"conv_abc123"``.
+    :param status: Always ``"cloning"`` at accept time.
+    """
+
+    operation_id: str
+    source_id: str
+    status: Literal["cloning"]
+
+
 class ReadStatePutRequest(BaseModel):
     """
     Request body for ``PUT /v1/sessions/{session_id}/read-state``.

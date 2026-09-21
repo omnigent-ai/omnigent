@@ -475,6 +475,7 @@ from omnigent.server.routes._sessions.helpers import (
     _publish_external_output_reasoning_delta as _publish_external_output_reasoning_delta,
     _publish_external_output_text_delta as _publish_external_output_text_delta,
     _publish_external_tool_output_delta as _publish_external_tool_output_delta,
+    _publish_fork_status as _publish_fork_status,
     _publish_input_consumed as _publish_input_consumed,
     _publish_input_deny_terminal as _publish_input_deny_terminal,
     _publish_interrupted as _publish_interrupted,
@@ -538,6 +539,7 @@ from omnigent.server.routes._sessions.helpers import (
     _wait_for_managed_runner_tunnel as _wait_for_managed_runner_tunnel,
     announce_hosts_changed as announce_hosts_changed,
     announce_projects_changed as announce_projects_changed,
+    cancel_fork_tasks as cancel_fork_tasks,
     cancel_managed_launch_tasks as cancel_managed_launch_tasks,
     prefetch_session_routing_catalogs as prefetch_session_routing_catalogs,
 )
@@ -762,6 +764,7 @@ if TYPE_CHECKING:
         "_mark_runner_sessions_offline",
         "_poll_request_disconnect",
         "_presentation_labels_for_agent",
+        "_publish_fork_status",
         "_publish_runner_recovered_status",
         "_publish_sandbox_status",
         "_reset_runner_resources_after_switch",

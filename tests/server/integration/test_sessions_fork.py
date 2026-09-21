@@ -13,11 +13,14 @@ Uses the shared ``client`` fixture from ``tests/server/conftest.py``
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import httpx
 import pytest
 
+from omnigent.server.routes._sessions.common import _fork_tasks
+from omnigent.server.routes.sessions import routes_core
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -33,30 +36,74 @@ pytestmark = pytest.mark.asyncio
 # ── Helpers ──────────────────────────────────────────────
 
 
-async def _fork_session(
+async def _fork_raw(
     client: httpx.AsyncClient,
     source_id: str,
     *,
     title: str | None = None,
+    **extra: Any,
 ) -> httpx.Response:
     """
-    Fork a session and return the raw ``httpx.Response``.
+    POST the fork endpoint and return the raw ``httpx.Response``.
 
-    Returns the raw response (not just ``.json()``) so callers can
-    assert on status codes for both success and error cases.
+    For the synchronous validation paths (404/403/400): the route rejects
+    before spawning the background task, so the raw response carries the error.
 
     :param client: The test HTTP client.
     :param source_id: Session ID to fork.
     :param title: Optional title for the fork.
+    :param extra: Extra fork-request body fields (e.g. ``up_to_response_id``).
     :returns: The raw HTTP response.
     """
-    payload: dict[str, Any] = {}
+    payload: dict[str, Any] = dict(extra)
     if title is not None:
         payload["title"] = title
-    return await client.post(
-        f"/v1/sessions/{source_id}/fork",
-        json=payload,
-    )
+    return await client.post(f"/v1/sessions/{source_id}/fork", json=payload)
+
+
+async def _fork_session(
+    client: httpx.AsyncClient,
+    source_id: str,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    title: str | None = None,
+) -> dict[str, Any]:
+    """
+    Fork a session and return the RESOLVED fork session snapshot.
+
+    Fork materialization is asynchronous: the POST returns 202, the deep-copy
+    runs in a background task, and the fork id arrives on the ``ready``
+    ``fork_status`` event. This asserts the 202, drains the task, captures the
+    ready ``fork_id`` (spying ``_publish_fork_status``), then returns
+    ``GET /v1/sessions/{fork_id}`` so callers read the real fork.
+
+    :param client: The test HTTP client.
+    :param source_id: Session ID to fork.
+    :param monkeypatch: Pytest fixture, to spy the fork-status publisher.
+    :param title: Optional title for the fork.
+    :returns: The forked session's snapshot JSON.
+    """
+    captured: dict[str, Any] = {}
+    orig = routes_core._publish_fork_status
+
+    def _spy(user_id, src, op_id, status, *, fork_id=None, error=None):  # type: ignore[no-untyped-def]
+        if status == "ready":
+            captured["fork_id"] = fork_id
+        if status == "failed":
+            captured["error"] = error
+        return orig(user_id, src, op_id, status, fork_id=fork_id, error=error)
+
+    monkeypatch.setattr(routes_core, "_publish_fork_status", _spy)
+
+    before = set(_fork_tasks)
+    resp = await _fork_raw(client, source_id, title=title)
+    assert resp.status_code == 202, f"Expected 202 Accepted, got {resp.status_code}: {resp.text}"
+    await asyncio.gather(*(set(_fork_tasks) - before), return_exceptions=True)
+    assert "fork_id" in captured, f"fork did not complete: {captured}"
+
+    snap = await client.get(f"/v1/sessions/{captured['fork_id']}")
+    assert snap.status_code == 200, f"fork snapshot failed: {snap.status_code} {snap.text}"
+    return snap.json()
 
 
 async def _list_builtin_agent_ids(client: httpx.AsyncClient) -> set[str]:
@@ -156,6 +203,7 @@ async def _list_comments(
 
 async def test_fork_empty_session(
     client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
     Forking a session that has no items produces an empty idle fork.
@@ -163,9 +211,7 @@ async def test_fork_empty_session(
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
 
-    resp = await _fork_session(client, session["id"])
-    assert resp.status_code == 201
-    fork = resp.json()
+    fork = await _fork_session(client, session["id"], monkeypatch)
 
     assert fork["status"] == "idle"
 
@@ -179,6 +225,7 @@ async def test_fork_empty_session(
 
 async def test_fork_preserves_labels(
     client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
     Forking inherits the source session's labels.
@@ -191,9 +238,7 @@ async def test_fork_preserves_labels(
         labels={"env": "prod", "team": "ml"},
     )
 
-    resp = await _fork_session(client, session["id"], title="My Fork")
-    assert resp.status_code == 201
-    fork = resp.json()
+    fork = await _fork_session(client, session["id"], monkeypatch, title="My Fork")
 
     # Title should be the explicit override, not inherited.
     assert fork["title"] == "My Fork", (
@@ -211,6 +256,7 @@ async def test_fork_preserves_labels(
 
 async def test_fork_coding_session_stamps_fork_source_label(
     client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
     Forking a session that had a working directory stamps the
@@ -235,9 +281,7 @@ async def test_fork_coding_session_stamps_fork_source_label(
     assert create.status_code == 201, f"{create.status_code} {create.text}"
     source = create.json()
 
-    resp = await _fork_session(client, source["id"])
-    assert resp.status_code == 201
-    fork = resp.json()
+    fork = await _fork_session(client, source["id"], monkeypatch)
 
     # The label's presence marks "needs a directory before it can run";
     # its value points back at the source so the picker can prefill the
@@ -259,6 +303,7 @@ async def test_fork_coding_session_stamps_fork_source_label(
 async def test_fork_recovers_runner_bound_native_session_without_workspace(
     client: httpx.AsyncClient,
     db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
     Forking a runner-bound native session with lost workspace metadata still
@@ -282,9 +327,7 @@ async def test_fork_recovers_runner_bound_native_session_without_workspace(
     store = SqlAlchemyConversationStore(db_uri)
     assert store.set_runner_id(source["id"], "runner_legacy_clear")
 
-    resp = await _fork_session(client, source["id"])
-    assert resp.status_code == 201
-    fork = resp.json()
+    fork = await _fork_session(client, source["id"], monkeypatch)
 
     assert fork["labels"].get("omnigent.fork.source_id") == source["id"]
     assert fork.get("workspace") is None
@@ -293,6 +336,7 @@ async def test_fork_recovers_runner_bound_native_session_without_workspace(
 async def test_fork_chat_session_has_no_fork_source_label(
     client: httpx.AsyncClient,
     db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
     Forking a chat-only session (no working directory) adds no
@@ -309,9 +353,7 @@ async def test_fork_chat_session_has_no_fork_source_label(
     store = SqlAlchemyConversationStore(db_uri)
     assert store.set_runner_id(source["id"], "runner_chat_only")
 
-    resp = await _fork_session(client, source["id"])
-    assert resp.status_code == 201
-    fork = resp.json()
+    fork = await _fork_session(client, source["id"], monkeypatch)
 
     # Absent key — presence would route a chat-only clone into the
     # coding-resume path it doesn't belong in.
@@ -322,6 +364,7 @@ async def test_fork_chat_session_has_no_fork_source_label(
 
 async def test_fork_auto_derives_title(
     client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
     When no title is provided, the fork's title is derived as
@@ -334,9 +377,7 @@ async def test_fork_auto_derives_title(
         title="My Chat",
     )
 
-    resp = await _fork_session(client, session["id"])
-    assert resp.status_code == 201
-    fork = resp.json()
+    fork = await _fork_session(client, session["id"], monkeypatch)
 
     assert fork["title"] == "Fork of My Chat", (
         f"Auto-derived fork title should be 'Fork of My Chat', "
@@ -352,7 +393,7 @@ async def test_fork_nonexistent_session_returns_404(
     Forking a session that doesn't exist returns 404 with error
     code ``"not_found"``.
     """
-    resp = await _fork_session(client, "conv_does_not_exist")
+    resp = await _fork_raw(client, "conv_does_not_exist")
     assert resp.status_code == 404, (
         f"Fork of nonexistent session should return 404, got {resp.status_code}."
     )
@@ -364,6 +405,7 @@ async def test_fork_nonexistent_session_returns_404(
 
 async def test_failed_fork_leaves_no_ghost_in_builtin_agents(
     client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A fork that fails mid-flight adds nothing to ``GET /v1/agents``.
 
@@ -375,6 +417,10 @@ async def test_failed_fork_leaves_no_ghost_in_builtin_agents(
     failed fork thus leaked a phantom "Claude Code"/"Codex" entry into the
     picker. The clone is now created inside the fork transaction, so a
     failed fork rolls it back and the built-in agent list is unchanged.
+
+    Materialization is async now, so a stale ``up_to_response_id`` fails in
+    the background (202 accept, then a ``fork_status: failed`` event) rather
+    than a synchronous 400 — either way, no clone is committed.
     """
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"], initial_message="hi")
@@ -384,16 +430,24 @@ async def test_failed_fork_leaves_no_ghost_in_builtin_agents(
     # a leaked clone (session_id IS NULL) would be the only thing to appear.
     before = await _list_builtin_agent_ids(client)
 
-    # "Fork from this response" with a response id that doesn't exist: the
-    # store raises ValueError → the route returns 400, AFTER the point where
-    # the buggy route had already committed the clone.
+    captured: dict[str, Any] = {}
+    orig = routes_core._publish_fork_status
+
+    def _spy(user_id, src, op_id, status, *, fork_id=None, error=None):  # type: ignore[no-untyped-def]
+        if status == "failed":
+            captured["error"] = error
+        return orig(user_id, src, op_id, status, fork_id=fork_id, error=error)
+
+    monkeypatch.setattr(routes_core, "_publish_fork_status", _spy)
+
+    fork_before = set(_fork_tasks)
     resp = await client.post(
         f"/v1/sessions/{session['id']}/fork",
         json={"up_to_response_id": "resp_does_not_exist"},
     )
-    assert resp.status_code == 400, (
-        f"Stale up_to_response_id should 400, got {resp.status_code}: {resp.text}"
-    )
+    assert resp.status_code == 202, f"got {resp.status_code}: {resp.text}"
+    await asyncio.gather(*(set(_fork_tasks) - fork_before), return_exceptions=True)
+    assert "error" in captured, "stale up_to_response_id should fail the fork operation"
 
     after = await _list_builtin_agent_ids(client)
     assert after == before, (
@@ -403,6 +457,7 @@ async def test_failed_fork_leaves_no_ghost_in_builtin_agents(
 
 async def test_fork_a_fork(
     client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
     A fork can itself be forked (nested fork). All three sessions
@@ -417,14 +472,10 @@ async def test_fork_a_fork(
     await _wait_for_idle(client, session["id"])
 
     # First fork.
-    resp1 = await _fork_session(client, session["id"])
-    assert resp1.status_code == 201
-    fork1 = resp1.json()
+    fork1 = await _fork_session(client, session["id"], monkeypatch)
 
     # Second fork — forking the fork.
-    resp2 = await _fork_session(client, fork1["id"])
-    assert resp2.status_code == 201
-    fork2 = resp2.json()
+    fork2 = await _fork_session(client, fork1["id"], monkeypatch)
 
     # All three must have distinct IDs and agent IDs.
     ids = {session["id"], fork1["id"], fork2["id"]}
@@ -468,6 +519,7 @@ async def test_fork_a_fork(
 
 async def test_fork_copies_transcript_content_with_fresh_ids(
     client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Fork deep-copies item role+text verbatim, with fresh item IDs.
 
@@ -485,9 +537,8 @@ async def test_fork_copies_transcript_content_with_fresh_ids(
     source_items = await _get_session_items(client, session["id"])
     assert source_items[0]["content"][0]["text"] == "root message"
 
-    resp = await _fork_session(client, session["id"])
-    assert resp.status_code == 201
-    fork_items = await _get_session_items(client, resp.json()["id"])
+    fork = await _fork_session(client, session["id"], monkeypatch)
+    fork_items = await _get_session_items(client, fork["id"])
 
     assert [i["role"] for i in fork_items] == [i["role"] for i in source_items]
     assert [i["content"][0]["text"] for i in fork_items] == [
@@ -499,6 +550,7 @@ async def test_fork_copies_transcript_content_with_fresh_ids(
 
 async def test_fork_does_not_copy_comments(
     client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Fork copies the transcript but NOT file comments, and leaves the
     source's comments untouched."""
@@ -509,8 +561,7 @@ async def test_fork_does_not_copy_comments(
     await _add_comment(client, session["id"], path="designs/a.md", body="note two")
     assert len(await _list_comments(client, session["id"])) == 2
 
-    resp = await _fork_session(client, session["id"])
-    assert resp.status_code == 201
+    fork = await _fork_session(client, session["id"], monkeypatch)
 
-    assert await _list_comments(client, resp.json()["id"]) == []
+    assert await _list_comments(client, fork["id"]) == []
     assert len(await _list_comments(client, session["id"])) == 2
