@@ -20,31 +20,10 @@
 // stubbed so these tests pin the dialog's own contract: which tab is
 // default, what each tab shows, and what props reach the form.
 
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-
-import type * as NativeBridgeModule from "@/lib/nativeBridge";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ReconnectSessionDialog, buildReconnectCommand } from "./ReconnectSessionDialog";
-
-// Desktop-bridge mock: defaults to a plain browser (no Electron shell) so the
-// pre-existing tests keep their environment; the one-click describe below
-// switches it to an Electron shell per test.
-const bridge = vi.hoisted(() => ({
-  isElectronShell: vi.fn((): boolean => false),
-  getHostIdentity: vi.fn(
-    async (): Promise<{ cliInstalled: boolean; hostId: string | null } | null> => null,
-  ),
-  controlHost: vi.fn(async (): Promise<{ ok: boolean; error?: string; authError?: boolean }> => ({
-    ok: true,
-  })),
-}));
-vi.mock("@/lib/nativeBridge", async (importOriginal) => ({
-  ...(await importOriginal<typeof NativeBridgeModule>()),
-  isElectronShell: bridge.isElectronShell,
-  getHostIdentity: bridge.getHostIdentity,
-  controlHost: bridge.controlHost,
-}));
 
 vi.mock("./ForkSessionDialog", () => ({
   ForkSessionForm: (props: {
@@ -385,85 +364,27 @@ describe("<ReconnectSessionDialog />", () => {
     expect(screen.queryByTestId("reconnect-session-dialog")).toBeNull();
   });
 
-  describe("desktop one-click reconnect", () => {
-    beforeEach(() => {
-      bridge.isElectronShell.mockReturnValue(true);
-      bridge.getHostIdentity.mockResolvedValue({ cliInstalled: true, hostId: "host_dead" });
-      bridge.controlHost.mockResolvedValue({ ok: true });
+  it("shows the failed local reconnect with an accessible error and retry", () => {
+    const onReconnect = vi.fn();
+    renderDialog({
+      localReconnect: {
+        reconnecting: false,
+        error: "Finish signing in, then try again.",
+        onReconnect,
+      },
     });
+    expect(screen.getByRole("alert")).toHaveTextContent("Finish signing in");
+    expect(screen.getByTestId("reconnect-session-command")).toHaveTextContent("omnigent host");
+    fireEvent.click(screen.getByRole("button", { name: "Retry reconnect" }));
+    expect(onReconnect).toHaveBeenCalledOnce();
+  });
 
-    afterEach(() => {
-      bridge.isElectronShell.mockReset().mockReturnValue(false);
-      bridge.getHostIdentity.mockReset().mockResolvedValue(null);
-      bridge.controlHost.mockReset().mockResolvedValue({ ok: true });
+  it("disables retry while reconnecting", () => {
+    renderDialog({
+      localReconnect: { reconnecting: true, error: null, onReconnect: vi.fn() },
     });
-
-    it("performs the reconnect via the desktop bridge when the offline host is this machine", async () => {
-      const { onOpenChange } = renderDialog({
-        state: "host_offline",
-        isOwner: true,
-        sourceHostId: "host_dead",
-      });
-      const button = await screen.findByTestId("reconnect-session-this-machine");
-      // The terminal path stays available as the escape hatch.
-      expect(screen.getByTestId("reconnect-session-command").textContent).toContain(
-        "omnigent host",
-      );
-
-      fireEvent.click(button);
-
-      await waitFor(() => expect(bridge.controlHost).toHaveBeenCalledWith("start"));
-      // The host is back; the dialog gets out of the way and the session's
-      // liveness poll takes over.
-      await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false));
-    });
-
-    it("surfaces a bridge failure and keeps the dialog open for a retry", async () => {
-      bridge.controlHost.mockResolvedValue({ ok: false, authError: true });
-      const { onOpenChange } = renderDialog({
-        state: "host_offline",
-        isOwner: true,
-        sourceHostId: "host_dead",
-      });
-
-      fireEvent.click(await screen.findByTestId("reconnect-session-this-machine"));
-
-      const error = await screen.findByTestId("reconnect-session-reconnect-error");
-      expect(error.textContent).toMatch(/finish signing in/i);
-      expect(onOpenChange).not.toHaveBeenCalledWith(false);
-      // The button stays actionable so the user can retry after signing in.
-      expect(screen.getByTestId("reconnect-session-this-machine")).toBeEnabled();
-    });
-
-    it("withholds the one-click path when the offline host is another machine", async () => {
-      bridge.getHostIdentity.mockResolvedValue({ cliInstalled: true, hostId: "host_other" });
-      renderDialog({ state: "host_offline", isOwner: true, sourceHostId: "host_dead" });
-      await waitFor(() => expect(bridge.getHostIdentity).toHaveBeenCalled());
-      expect(screen.queryByTestId("reconnect-session-this-machine")).toBeNull();
-      expect(screen.getByTestId("reconnect-session-command")).toBeInTheDocument();
-    });
-
-    it("withholds the one-click path when the CLI is missing on this machine", async () => {
-      bridge.getHostIdentity.mockResolvedValue({ cliInstalled: false, hostId: "host_dead" });
-      renderDialog({ state: "host_offline", isOwner: true, sourceHostId: "host_dead" });
-      await waitFor(() => expect(bridge.getHostIdentity).toHaveBeenCalled());
-      expect(screen.queryByTestId("reconnect-session-this-machine")).toBeNull();
-    });
-
-    it("withholds the one-click path outside the desktop shell", () => {
-      bridge.isElectronShell.mockReturnValue(false);
-      renderDialog({ state: "host_offline", isOwner: true, sourceHostId: "host_dead" });
-      expect(bridge.getHostIdentity).not.toHaveBeenCalled();
-      expect(screen.queryByTestId("reconnect-session-this-machine")).toBeNull();
-    });
-
-    it("withholds the one-click path from a non-owner", () => {
-      renderDialog({ state: "host_offline", isOwner: false, sourceHostId: "host_dead" });
-      // The identity is never fetched for a viewer — they can't control the
-      // owner's machine even from the desktop shell.
-      switchToTab("reconnect-session-tab-reconnect");
-      expect(bridge.getHostIdentity).not.toHaveBeenCalled();
-      expect(screen.queryByTestId("reconnect-session-this-machine")).toBeNull();
-    });
+    const button = screen.getByRole("button", { name: "Reconnecting this machine…" });
+    expect(button).toBeDisabled();
+    expect(button).toHaveAttribute("aria-busy", "true");
   });
 });

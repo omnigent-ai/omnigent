@@ -224,6 +224,7 @@ import { MainTerminalView } from "@/shell/MainTerminalView";
 import { UNTITLED_CONVERSATION_LABEL } from "@/shell/sidebarNav";
 import { ComposerAgentIcon, NewChatLandingScreen } from "@/shell/NewChatDialog";
 import { ResumeWithDirectoryDialog } from "@/shell/ResumeWithDirectoryDialog";
+import { useSessionReconnect } from "@/hooks/useSessionReconnect";
 import { ReconnectSessionDialog } from "@/shell/ReconnectSessionDialog";
 import { useTerminalFirst } from "@/shell/TerminalFirstContext";
 import { supportsEffortControl } from "@/lib/sessionCapabilities";
@@ -657,10 +658,6 @@ export function ChatPage() {
     void useChatStore.getState().send(text, agentId, files, { replyDraft });
   }, [pendingResumePrompt, runnerOnline, agentId, urlConvId]);
 
-  // Opened when the user tries to interact with an unreachable session
-  // (host offline, or not host-bound with the runner down).
-  const [reconnectDialogOpen, setReconnectDialogOpen] = useState(false);
-
   // Pending elicitation = parked on user input — suppress shimmer. Must
   // sit before the early-return guards below (Rules of Hooks). Read through
   // a boolean selector (not the whole `blocks` array): Zustand bails out when
@@ -907,6 +904,23 @@ export function ChatPage() {
   const isUnreachable =
     !sandboxLaunching && (liveness.kind === "host_offline" || liveness.kind === "local_stranded");
 
+  // Sub-agent (child) sessions aren't returned by the sidebar list, so
+  // ``activeConv`` is null for them — the snapshot (fetched above as
+  // ``activeSession``) is the only place we can learn the user's
+  // effective permission level for a child.
+  const permissionLevel = derivePermissionLevel(
+    activeSession,
+    sessionLoading,
+    activeConv,
+    urlConvId,
+    conversationsData !== undefined,
+  );
+  const { reconnect, dialogOpen, setDialogOpen, localReconnect } = useSessionReconnect({
+    sessionId: urlConvId ?? null,
+    hostId: activeSession?.hostId ?? activeConv?.host_id ?? null,
+    isOwner: isOwnerLevel(permissionLevel),
+  });
+
   const onSend = useCallback(
     (text: string, files?: File[], replyDraft?: StoredReplyDraft) => {
       if (!agentId) return;
@@ -922,11 +936,9 @@ export function ChatPage() {
         setResumeDirDialogOpen(true);
         return;
       }
-      // Unreachable → no executor to dispatch this turn to, and no host to
-      // wake. Surface the reconnect dialog instead of POSTing into
-      // a void.
+      // Recover the unreachable host before dispatching another turn.
       if (urlConvId && isUnreachable) {
-        setReconnectDialogOpen(true);
+        void reconnect();
         return;
       }
       // Queue instead of POSTing now (see shouldQueueSend). enqueueMessage flushes
@@ -969,6 +981,7 @@ export function ChatPage() {
       isUnboundFork,
       canResumeOnLocalHost,
       isUnreachable,
+      reconnect,
       navigate,
     ],
   );
@@ -983,7 +996,7 @@ export function ChatPage() {
         return;
       }
       if (urlConvId && isUnreachable) {
-        setReconnectDialogOpen(true);
+        void reconnect();
         return;
       }
       void useChatStore.getState().sendSlashCommand(name, args, agentId, {
@@ -999,6 +1012,7 @@ export function ChatPage() {
       isUnboundFork,
       canResumeOnLocalHost,
       isUnreachable,
+      reconnect,
       navigate,
     ],
   );
@@ -1007,17 +1021,6 @@ export function ChatPage() {
     useChatStore.getState().stop();
   }, []);
 
-  // Sub-agent (child) sessions aren't returned by the sidebar list, so
-  // ``activeConv`` is null for them — the snapshot (fetched above as
-  // ``activeSession``) is the only place we can learn the user's
-  // effective permission level for a child.
-  const permissionLevel = derivePermissionLevel(
-    activeSession,
-    sessionLoading,
-    activeConv,
-    urlConvId,
-    conversationsData !== undefined,
-  );
   // A client-only conversation has no server session to POST to yet. Keep the
   // composer editable so the user can draft the next message during creation,
   // but gate submission until the temp id is promoted below.
@@ -1099,13 +1102,10 @@ export function ChatPage() {
   );
 
   const onShowReconnectHelp = useCallback(() => {
-    // Route the banner to the SAME dialog typing a message would: an
-    // unbound coding clone or a host-less session the caller can resume
-    // in-app opens the directory picker (bind + launch), everything else
-    // gets the reconnect dialog.
+    // Unbound sessions need a directory; a bound local host can reconnect directly.
     if (isUnboundFork || canResumeOnLocalHost) setResumeDirDialogOpen(true);
-    else setReconnectDialogOpen(true);
-  }, [isUnboundFork, canResumeOnLocalHost]);
+    else void reconnect();
+  }, [isUnboundFork, canResumeOnLocalHost, reconnect]);
 
   // Loading + error gates for `/c/:id` hydration. Placed after all hooks so the
   // early return can't change the hook order between renders.
@@ -1177,8 +1177,9 @@ export function ChatPage() {
     <SessionSharedContext.Provider value={isSessionShared}>
       <SessionLayout mainAgent={mainAgent} />
       <ReconnectSessionDialog
-        open={reconnectDialogOpen}
-        onOpenChange={setReconnectDialogOpen}
+        open={dialogOpen}
+        onOpenChange={setDialogOpen}
+        localReconnect={localReconnect}
         conversationId={urlConvId}
         serverUrl={getCliServerUrl()}
         wrapper={activeConv?.labels?.["omnigent.wrapper"]}

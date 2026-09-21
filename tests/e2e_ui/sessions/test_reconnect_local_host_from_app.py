@@ -1,31 +1,7 @@
-"""E2E: reconnect a disconnected LOCAL host from the desktop app.
+"""The initial reconnect action starts this desktop's host without a modal.
 
-When a session's host goes offline and that host is the user's own machine
-(the "This Mac" connection the desktop shell can start itself), the Reconnect
-action must PERFORM the reconnect in-app via the desktop bridge
-(``window.omnigentDesktop.controlHost("start")``) -- the same bridge
-``NewChatDialog``'s "Run on this machine" already drives -- rather than only
-handing the user a copy-paste ``omnigent host`` command.
-
-This drives the real user journey against a desktop-shell view: the SPA is the
-same bytes the Electron shell loads, and the reconnect dialog keys the one-click
-path off ``window.omnigentDesktop`` (kind ``electron`` + ``getHostIdentity`` +
-``controlHost``), so injecting that bridge -- the established pattern in
-``test_pinned_session_hotkeys.py`` / ``test_session_search.py`` -- reproduces the
-exact dialog a real desktop shell renders for a local offline host.
-
-The browser view is patched into a ``host_offline`` shape bound to THIS machine's
-host id (same route-interception approach as ``test_host_badge.py``):
-
-- ``GET /v1/sessions/{id}`` -> ``host_id`` set to this machine, ``host_resumable``
-  false (a real laptop, not a dormant sandbox), old ``created_at`` (past the
-  startup grace).
-- ``GET /v1/hosts`` -> returns the bound host so the badge resolves its name.
-- ``GET /health`` -> reports ``host_online`` false so the badge reads offline and
-  becomes reconnectable.
-- ``GET /v1/sessions`` (sidebar) -> drops the row so the open session resolves
-  off the patched snapshot.
-- ``WS /v1/sessions/updates`` -> blocked so a push can't revert liveness.
+The real SPA/server journey uses an injected desktop bridge and an offline
+host snapshot. Bridge completion is controlled to verify progress and failure.
 """
 
 from __future__ import annotations
@@ -66,7 +42,7 @@ window.omnigentDesktop = {{
   onHostStatusChanged: function () {{ return function () {{}}; }},
   controlHost: function (action) {{
     window.__controlHostCalls.push(action);
-    return Promise.resolve({{ ok: true }});
+    return new Promise(resolve => {{ window.__finishReconnect = resolve; }});
   }},
   getDesktopFeatures: function () {{ return Promise.resolve(null); }},
 }};
@@ -171,51 +147,61 @@ def _patch_local_offline_host(page: Page, session_id: str) -> None:
     page.route_web_socket(re.compile(r"/v1/sessions/updates"), lambda ws: None)
 
 
+def _open_offline_session(page: Page, seeded_session: tuple[str, str]) -> None:
+    """Open a session whose host is the desktop's offline local machine."""
+    base_url, session_id = seeded_session
+    page.add_init_script(_DESKTOP_BRIDGE_INIT_SCRIPT)
+    _patch_local_offline_host(page, session_id)
+    page.goto(f"{base_url}/c/{session_id}")
+    expect(page.get_by_test_id("composer-host-select")).to_be_visible(timeout=15_000)
+    page.evaluate(
+        """() => {
+          window.__reconnectDialogShown = false;
+          new MutationObserver(() => {
+            if (document.querySelector('[data-testid="reconnect-session-dialog"]')) {
+              window.__reconnectDialogShown = true;
+            }
+          }).observe(document.body, { childList: true, subtree: true });
+        }"""
+    )
+    page.get_by_test_id("composer-host-select").click()
+    page.get_by_role("menuitem", name="Reconnect host", exact=True).click()
+
+
 def test_desktop_reconnect_performs_local_host_reconnect(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """Reconnect on the desktop app must PERFORM the reconnect for a local host.
+    """One reconnect action shows progress, calls the bridge, and never opens a dialog."""
+    _open_offline_session(page, seeded_session)
+    page.wait_for_function("() => window.__controlHostCalls.length === 1")
+    assert page.evaluate("window.__controlHostCalls") == ["start"]
+    expect(page.get_by_text("Reconnecting this machine…", exact=True)).to_be_visible()
+    expect(page.get_by_test_id("reconnect-session-dialog")).not_to_be_visible()
+    expect(page.get_by_text("Host reconnected.", exact=True)).not_to_be_visible()
 
-    Guards against the dialog offering only a copy-paste ``omnigent host``
-    command for a ``host_offline`` session whose host is this machine: an
-    in-app control must exist and must call the desktop bridge
-    ``controlHost("start")``.
+    page.evaluate("window.__finishReconnect({ ok: true })")
+    expect(page.get_by_text("Host reconnected.", exact=True)).to_be_visible()
+    assert page.evaluate("window.__reconnectDialogShown") is False
 
-    :param page: Playwright page fixture.
-    :param seeded_session: ``(base_url, session_id)`` for a real server-backed
-        session; the browser view is patched to a local ``host_offline`` shape.
-    :returns: None.
-    """
-    base_url, session_id = seeded_session
-    page.add_init_script(_DESKTOP_BRIDGE_INIT_SCRIPT)
-    _patch_local_offline_host(page, session_id)
 
-    page.goto(f"{base_url}/c/{session_id}")
-
-    badge = page.get_by_test_id("composer-host-select")
-    expect(badge).to_be_visible(timeout=15_000)
-    badge.click()
-    page.get_by_role("menuitem", name="Reconnect host", exact=True).click()
-
+def test_desktop_reconnect_failure_offers_retry(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """A failed direct reconnect opens recovery, and retry can complete it."""
+    _open_offline_session(page, seeded_session)
+    page.wait_for_function("() => window.__controlHostCalls.length === 1")
+    page.evaluate("window.__finishReconnect({ ok: false, authError: true })")
     dialog = page.get_by_test_id("reconnect-session-dialog")
-    expect(dialog).to_be_visible(timeout=15_000)
-    expect(dialog).to_contain_text("Host is offline")
+    expect(dialog).to_be_visible()
+    expect(dialog.get_by_role("alert")).to_contain_text("finish signing in")
+    expect(page.get_by_text("Host reconnected.", exact=True)).not_to_be_visible()
+    expect(dialog.get_by_test_id("reconnect-session-command")).to_contain_text("omnigent host")
 
-    # The offline host is this machine, so Reconnect must offer an in-app
-    # control that PERFORMS the reconnect via the desktop bridge -- not just a
-    # command to copy. The locator excludes the "Reconnect" tab (role=tab).
-    perform = dialog.get_by_role(
-        "button", name=re.compile(r"reconnect|run on this", re.IGNORECASE)
-    )
-    expect(perform).to_be_visible(timeout=15_000)
-
-    perform.click()
-
-    # Activating it must drive the desktop shell's host daemon, exactly as
-    # NewChatDialog's "Run on this machine" does.
-    page.wait_for_function(
-        "() => Array.isArray(window.__controlHostCalls) "
-        "&& window.__controlHostCalls.includes('start')",
-        timeout=15_000,
-    )
+    dialog.get_by_role("button", name="Retry reconnect", exact=True).click()
+    page.wait_for_function("() => window.__controlHostCalls.length === 2")
+    expect(dialog.get_by_role("button", name="Reconnecting this machine…")).to_be_disabled()
+    page.evaluate("window.__finishReconnect({ ok: true })")
+    expect(dialog).not_to_be_visible()
+    expect(page.get_by_text("Host reconnected.", exact=True)).to_be_visible()

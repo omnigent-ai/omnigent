@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 
 import {
   Dialog,
@@ -10,12 +10,6 @@ import {
 import { Button } from "@/components/ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { quoteShellArgument } from "@/lib/shell";
-import {
-  controlHost,
-  getHostIdentity,
-  isElectronShell,
-  type HostIdentity,
-} from "@/lib/nativeBridge";
 import { CliCommandBlock } from "./CliCommandBlock";
 import { ForkSessionForm } from "./ForkSessionDialog";
 import { SwitchHostDialog } from "./SwitchHostDialog";
@@ -120,11 +114,8 @@ export function buildReconnectCommand({
  * - **Reconnect** — a one-line instruction plus the CLI command. For a
  *   non-owner of a `host_offline` session — who can't reach the host
  *   machine — the command is dropped and the text explains that only
- *   the owner can reconnect. Under the desktop shell, when the offline
- *   host IS this machine, a one-click button performs the reconnect
- *   in-app via the bridge's `controlHost("start")` — the same call
- *   NewChatDialog's "Run on this machine" drives — instead of sending
- *   the user to a terminal.
+ *   the owner can reconnect. If an in-app reconnect failed, the owner
+ *   can retry it here or use the terminal command.
  * - **Clone** — the same {@link ForkSessionForm} the header-menu Clone
  *   dialog uses (one fork implementation, two entry points), so the
  *   user can continue in a copy they own without leaving the dialog.
@@ -160,6 +151,7 @@ export function ReconnectSessionDialog({
   sourceWorkspace,
   sourceHostId,
   sourceGitBranch,
+  localReconnect,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -173,59 +165,16 @@ export function ReconnectSessionDialog({
   sourceWorkspace?: string | null;
   sourceHostId?: string | null;
   sourceGitBranch?: string | null;
+  localReconnect?: {
+    reconnecting: boolean;
+    error: string | null;
+    onReconnect: () => void;
+  };
 }) {
   const [switchOpen, setSwitchOpen] = useState(false);
-  const [desktopHost, setDesktopHost] = useState<HostIdentity | null>(null);
-  const [reconnecting, setReconnecting] = useState(false);
-  const [reconnectError, setReconnectError] = useState<string | null>(null);
   const isHostReconnect = state === "host_offline";
+  const canReconnectThisMachine = isHostReconnect && isOwner && localReconnect != null;
 
-  // Only the desktop shell can act on this machine; identify it while the
-  // dialog is open so the one-click path renders only when the offline host
-  // IS this machine.
-  useEffect(() => {
-    if (!open || !isHostReconnect || !isOwner || !isElectronShell()) return;
-    let cancelled = false;
-    setReconnectError(null);
-    void getHostIdentity().then((identity) => {
-      if (!cancelled) setDesktopHost(identity);
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, [open, isHostReconnect, isOwner]);
-
-  const canReconnectThisMachine =
-    isHostReconnect &&
-    isOwner &&
-    sourceHostId != null &&
-    desktopHost != null &&
-    desktopHost.cliInstalled &&
-    desktopHost.hostId === sourceHostId;
-
-  async function reconnectThisMachine() {
-    if (reconnecting) return;
-    setReconnecting(true);
-    setReconnectError(null);
-    try {
-      // A single controlHost("start") blocks through enrollment → sign-in →
-      // connect, so on success the host is already back; the session's
-      // liveness poll picks it up once the dialog is out of the way.
-      const res = await controlHost("start");
-      if (!res.ok) {
-        setReconnectError(
-          res.authError
-            ? (res.error ??
-                "Sign-in didn't complete. A browser should have opened — finish signing in, then try again.")
-            : (res.error ?? "Couldn't reconnect this machine."),
-        );
-        return;
-      }
-      onOpenChange(false);
-    } finally {
-      setReconnecting(false);
-    }
-  }
   // A non-owner can't reach the host machine to reconnect it, so the
   // CLI command is useless to them. Owners of both states, and anyone
   // on a local_stranded session, get a command.
@@ -276,22 +225,24 @@ export function ReconnectSessionDialog({
               >
                 {description}
               </p>
-              {canReconnectThisMachine && (
+              {canReconnectThisMachine && localReconnect && (
                 <div className="flex flex-col gap-2">
                   <Button
                     className="self-start"
                     data-testid="reconnect-session-this-machine"
-                    disabled={reconnecting}
-                    onClick={() => void reconnectThisMachine()}
+                    disabled={localReconnect.reconnecting}
+                    aria-busy={localReconnect.reconnecting}
+                    onClick={localReconnect.onReconnect}
                   >
-                    {reconnecting ? "Reconnecting this machine…" : "Reconnect this machine"}
+                    {localReconnect.reconnecting ? "Reconnecting this machine…" : "Retry reconnect"}
                   </Button>
-                  {reconnectError && (
+                  {localReconnect.error && (
                     <p
                       className="text-sm text-destructive select-text"
+                      role="alert"
                       data-testid="reconnect-session-reconnect-error"
                     >
-                      {reconnectError}
+                      {localReconnect.error}
                     </p>
                   )}
                 </div>
