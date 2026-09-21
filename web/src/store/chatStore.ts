@@ -4066,7 +4066,7 @@ async function bindStream(
   }
 }
 
-/** Hydrate display-only subtree totals without delaying bind or reconnect. */
+/** Hydrate display-only subtree totals without delaying session reconciliation. */
 async function hydrateSessionUsage(id: string): Promise<void> {
   const entry = conversationRegistry.peek(id);
   const before = entry?.getState();
@@ -4351,6 +4351,7 @@ async function reconcileActiveSessionStatus(
     return;
   }
   set((s) => reconnectStatusPatch(session, s, stateBeforeFetch.mcpStartupLaunch));
+  if (session.usageIncluded === false) void hydrateSessionUsage(id);
 }
 
 /**

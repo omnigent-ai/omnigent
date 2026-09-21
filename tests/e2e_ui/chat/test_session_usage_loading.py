@@ -10,6 +10,9 @@ import httpx
 import pytest
 from playwright.sync_api import Locator, Page, Route, expect
 
+from tests.e2e_ui.chat.test_working_indicator_snapshot_reconcile import (
+    _install_heartbeat_only_stream,
+)
 from tests.e2e_ui.conftest import fetch_with_retry, seed_committed_turn
 
 
@@ -279,6 +282,67 @@ def test_reconnect_hydrates_missed_usage_without_duplicate_pending_reads(
     pending_usage[0].fulfill(response=upstream)
     expect(panel.get_by_test_id("agent-info-session-cost")).to_have_text("$4.00")
     expect(composer).to_have_value("A draft while reconnect usage is pending")
+
+
+@pytest.mark.min_server_version("0.15.0")
+def test_periodic_refresh_recovers_missed_usage_on_a_healthy_stream(
+    page: Page, seeded_session: tuple[str, str]
+) -> None:
+    """A missed usage event recovers without reconnecting or blocking the chat."""
+    base_url, session_id = seeded_session
+    _publish_usage(base_url, session_id, 1.0, "session-model")
+    usage_url = f"{base_url}/v1/sessions/{session_id}/usage"
+    pending_usage: list[Route] = []
+    page.expose_function("periodicUsageReadCount", lambda: len(pending_usage))
+    page.clock.install()
+    _install_heartbeat_only_stream(page, session_id)
+    with page.expect_response(usage_url) as initial_usage:
+        page.goto(f"{base_url}/c/{session_id}")
+    assert initial_usage.value.ok
+    page.wait_for_function("window.__statusGapHeartbeats > 0")
+    panel = _usage_panel(page)
+    expect(panel.get_by_test_id("agent-info-session-cost")).to_have_text("$1.00")
+
+    # The persisted usage changes, but this connected tab sees only heartbeats.
+    page.route(usage_url, lambda route: pending_usage.append(route))
+    _publish_usage(base_url, session_id, 4.0, "session-model")
+    page.clock.run_for("00:50")
+    expect(panel.get_by_test_id("agent-info-session-cost")).to_have_text("$1.00")
+    assert not pending_usage
+    assert page.evaluate("window.__statusGapStreamOpens") == 1
+
+    with page.expect_request(usage_url):
+        page.clock.run_for("00:10")
+    page.wait_for_function("async () => await window.periodicUsageReadCount() === 1")
+    page.keyboard.press("Escape")
+    composer = page.get_by_placeholder("Send a message…")
+    expect(composer).to_be_editable()
+    composer.fill("An unsent draft while periodic usage is pending")
+
+    # Another status refresh must finish without awaiting or duplicating usage.
+    with page.expect_response(
+        lambda r: urlparse(r.url).path == f"/v1/sessions/{session_id}"
+    ) as metadata:
+        page.clock.run_for("01:00")
+    assert metadata.value.ok
+    assert metadata.value.json()["usage_included"] is False
+    metadata.value.finished()
+    _flush_browser_updates(page)
+    assert len(pending_usage) == 1
+    assert page.evaluate("window.__statusGapStreamOpens") == 1
+    assert page.evaluate("window.__statusGapHeartbeats") >= 12
+
+    upstream = fetch_with_retry(pending_usage[0])
+    assert upstream.status == 200, upstream.text()
+    assert upstream.json()["total_cost_usd"] == 4.0
+    pending_usage[0].fulfill(response=upstream)
+    panel = _usage_panel(page)
+    expect(panel.get_by_test_id("agent-info-session-cost")).to_have_text("$4.00")
+    breakdown = panel.get_by_test_id("agent-info-usage-by-model")
+    breakdown.locator("summary").press("Enter")
+    expect(breakdown.get_by_test_id("agent-info-model-session-model")).to_contain_text("$4.00")
+    expect(composer).to_have_value("An unsent draft while periodic usage is pending")
+    assert page.evaluate("window.__statusGapStreamOpens") == 1
 
 
 @pytest.mark.compat_smoke

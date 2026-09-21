@@ -250,7 +250,8 @@ def test_codex_multistep_turn_reports_cumulative_usage(
                 )
             ) as snapshot_response:
                 page.reload(wait_until="domcontentloaded")
-            expect(page.get_by_placeholder("Send a message…")).to_be_focused()
+            # Reload can enable the composer after its mount-time focus attempt.
+            expect(page.get_by_placeholder(_COMPOSER)).to_be_editable()
             _assert_cumulative_usage(page, model)
             expect(page.locator(_ASSISTANT).filter(has_text=_FINAL_TEXT).first).to_be_visible()
 

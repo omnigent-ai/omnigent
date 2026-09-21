@@ -303,7 +303,8 @@ def test_kimi_session_reports_token_usage_in_agent_info(
                 )
             ) as snapshot_response:
                 page.reload(wait_until="domcontentloaded")
-            expect(page.get_by_placeholder("Send a message…")).to_be_focused()
+            # Reload can enable the composer after its mount-time focus attempt.
+            expect(page.get_by_placeholder(_COMPOSER)).to_be_editable()
             hydrated_groups = _open_usage_breakdown(page).locator(
                 '[data-testid^="agent-info-model-"]'
             )
