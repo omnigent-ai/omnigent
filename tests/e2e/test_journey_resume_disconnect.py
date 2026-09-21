@@ -207,7 +207,7 @@ def test_session_list_shows_existing_sessions(
 
     # "Disconnect" — fresh client
     with httpx.Client(base_url=live_server, timeout=300) as new_client:
-        list_resp = new_client.get("/v1/sessions", params={"limit": 100})
+        list_resp = new_client.get("/v1/sessions", params={"visibility": "all", "limit": 100})
         list_resp.raise_for_status()
         sessions = list_resp.json()["data"]
 

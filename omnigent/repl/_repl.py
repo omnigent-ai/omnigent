@@ -5508,7 +5508,7 @@ async def _cmd_switch(
     from rich.text import Text
 
     if not arg:
-        sessions_list = await client.sessions.list(limit=20)
+        sessions_list = await client.sessions.list(limit=20, visibility="all")
         if sessions_list:
             table = Table(title="Switch to…")
             table.add_column("#", style="bold " + fmt.accent)
@@ -5531,7 +5531,7 @@ async def _cmd_switch(
             host.output(Text.from_markup(f"  [{fmt.muted}]No sessions.[/{fmt.muted}]"))
     else:
         if arg.isdigit():
-            sessions_list = await client.sessions.list(limit=20)
+            sessions_list = await client.sessions.list(limit=20, visibility="all")
             index = int(arg) - 1
             if index < 0 or index >= len(sessions_list):
                 host.output(

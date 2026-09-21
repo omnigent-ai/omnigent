@@ -61,8 +61,14 @@ class _Client:
     def __init__(self, resp: _Resp | None = None, raise_exc: Exception | None = None) -> None:
         self._resp = resp
         self._raise_exc = raise_exc
+        self.urls: list[str] = []
+        self.params: list[dict[str, str] | None] = []
 
-    async def get(self, url: str, timeout: float | None = None) -> _Resp:
+    async def get(
+        self, url: str, timeout: float | None = None, params: dict[str, str] | None = None
+    ) -> _Resp:
+        self.urls.append(url)
+        self.params.append(params)
         if self._raise_exc is not None:
             raise self._raise_exc
         assert self._resp is not None
@@ -81,7 +87,10 @@ class _SequenceClient:
         self._actions = list(actions)
         self.calls = 0
 
-    async def get(self, url: str, timeout: float | None = None) -> _Resp:
+    async def get(
+        self, url: str, timeout: float | None = None, params: dict[str, str] | None = None
+    ) -> _Resp:
+        del params
         self.calls += 1
         action = self._actions[self.calls - 1]
         if isinstance(action, Exception):
@@ -152,6 +161,23 @@ async def test_invalid_field_raises(field: str, value: Any, match: str) -> None:
 
 
 @pytest.mark.asyncio
+async def test_launch_config_reads_the_metadata_only_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The launch-config read opts out of the transcript page and the liveness lookup.
+
+    It reads stored-row fields only, so it must not download the latest 100
+    items to read eight of the session's settings.
+    """
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8123")
+    client = _Client(_Resp(200, {"workspace": "/tmp/repo"}))
+
+    await _run(client)
+
+    assert client.urls == ["/v1/sessions/conv_1"]
+    assert client.params == [{"include_items": "false", "include_liveness": "false"}]
+
+
 async def test_happy_path_parses_full_config(monkeypatch: pytest.MonkeyPatch) -> None:
     """A well-formed snapshot (with fork labels) parses into a launch config."""
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8123")

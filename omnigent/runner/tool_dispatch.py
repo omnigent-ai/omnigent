@@ -5347,6 +5347,8 @@ async def _agent_list_fetch(
     """
     try:
         params: dict[str, str | int] = {"limit": limit, "order": "desc"}
+        if path == "/v1/sessions":
+            params["visibility"] = "all"
         if after is not None:
             params["after"] = after
         resp = await server_client.get(path, params=params, timeout=30.0)
@@ -5926,7 +5928,7 @@ async def _collect_global_sessions(
     :param limit: Maximum number of source rows to fetch.
     :returns: Projected global session entries and continuation metadata.
     """
-    params: dict[str, str | int] = {"limit": limit, "order": "desc"}
+    params: dict[str, str | int] = {"limit": limit, "order": "desc", "visibility": "all"}
     if isinstance(agent_name, str) and agent_name:
         params["agent_name"] = agent_name
     if after is not None:

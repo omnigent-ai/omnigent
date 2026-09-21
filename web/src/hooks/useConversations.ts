@@ -527,6 +527,7 @@ export async function fetchConversationsPage({
     order: "desc",
     sort_by: "updated_at",
     limit: String(limit),
+    visibility: visibility ?? "all",
   });
   if (after) params.set("after", after);
   if (searchQuery) params.set("search_query", searchQuery);
@@ -539,10 +540,6 @@ export async function fetchConversationsPage({
   // query key (which drops `project`) and the cache-membership check. This
   // list never requests the server's "unfiled" (`project=`) slice.
   if (project) params.set("project", project);
-  // Server-side ownership filter for the sidebar's My/Shared split. Omitting
-  // the param keeps the legacy "all accessible" behaviour (no regression for
-  // callers that don't pass visibility).
-  if (visibility) params.set("visibility", visibility);
   // Bound search fetches with a client-side deadline (see
   // SEARCH_FETCH_TIMEOUT_MS): a search whose server-side index is missing can
   // hang, and the palette shows "Searching…" for the whole in-flight window.
@@ -2002,6 +1999,7 @@ export async function fetchAllArchivedProjectNames(): Promise<string[]> {
       order: "desc",
       sort_by: "updated_at",
       limit: "100",
+      visibility: "all",
       include_archived: "true",
     });
     if (after) params.set("after", after);
@@ -2301,6 +2299,7 @@ async function fetchAllProjectSessionIds(project: string): Promise<string[]> {
       order: "desc",
       sort_by: "updated_at",
       limit: "100",
+      visibility: "all",
       include_archived: "true",
       project,
     });
@@ -2332,6 +2331,7 @@ export async function fetchProjectSessionIds(project: string, limit = 2): Promis
     sort_by: "updated_at",
     limit: String(limit),
     include_archived: "true",
+    visibility: "all",
     project,
   });
   const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`);
@@ -2350,6 +2350,7 @@ async function fetchProjectSessionsPage(
     order: "desc",
     sort_by: "updated_at",
     limit: String(limit),
+    visibility: "all",
     project,
   });
   if (after) params.set("after", after);

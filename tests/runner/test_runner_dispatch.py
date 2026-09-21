@@ -7295,6 +7295,7 @@ async def test_session_list_global_sessions_filter_and_connectivity() -> None:
 
     # agent_name forwarded to the server-side filter.
     assert sessions_params.get("agent_name") == "researcher"
+    assert sessions_params.get("visibility") == "all"
     # Both sessions projected with status + connectivity from the single
     # shared-runner status lookup.
     assert out["sessions"] == [

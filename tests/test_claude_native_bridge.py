@@ -3409,6 +3409,28 @@ def test_augment_claude_args_leaves_bypass_consent_alone_otherwise(
     )
 
 
+def test_augment_claude_args_preapproves_project_mcp_servers(tmp_path: Path) -> None:
+    """
+    Every launch pre-approves the project's ``.mcp.json`` servers.
+
+    Claude shows a blocking "New MCP server found in this project" dialog the
+    first time it runs in a directory whose ``.mcp.json`` it has not approved,
+    and every per-session worktree is such a directory. Like the trust and
+    bypass gates it fires no hook, so a host-spawned terminal sits on it until
+    the readiness gate times out and reaps the pane. Setting
+    ``enableAllProjectMcpServers`` in the invocation-local settings sidecar
+    clears the gate without writing into the user's config or the repo.
+    """
+    args = augment_claude_args(
+        (),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+    )
+
+    settings = _load_invocation_settings(args)
+    assert settings.get("enableAllProjectMcpServers") is True
+
+
 def test_augment_claude_args_mirrors_joined_model_arg_into_settings(
     tmp_path: Path,
 ) -> None:

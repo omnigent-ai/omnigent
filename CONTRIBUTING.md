@@ -138,6 +138,17 @@ uv run --no-sync pyrefly check               # Python type checking (core and cl
 uv run --no-sync pre-commit run --all-files
 ```
 
+The `session-list-visibility` custom rule checks Python, JavaScript/TypeScript,
+and shell clients for explicit visibility on session-list requests. It follows
+local query builders and same-file helpers; direct server tests and mock
+fixtures are excluded so they can exercise the API's compatibility default.
+Install web dependencies (`pnpm install --frozen-lockfile --filter web`) before
+running the full custom lint, then use
+`uv run --no-sync python -m dev.lint.custom_lint`. A request built outside the
+checker's supported patterns needs a `custom-lint: disable=session-list-visibility
+-- <reason>` comment on its request line (or `disable-next` on the preceding
+line), after verifying that its query builder sends visibility.
+
 When touching `web/`:
 
 ```bash

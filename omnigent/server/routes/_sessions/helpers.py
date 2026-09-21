@@ -1810,6 +1810,9 @@ def _resolve_llm_model(
         OSError,
         RuntimeError,
         StatementError,
+        # A corrupt/unparseable cached bundle (e.g. a spec-load race) must
+        # degrade the same as a missing agent, not crash the caller.
+        OmnigentError,
     ):
         # ``RuntimeError`` covers ``get_agent_cache()`` before the runtime is
         # initialized: this is a best-effort display resolver (now also called
@@ -1902,6 +1905,9 @@ def _resolve_harness_impl(
         OSError,
         RuntimeError,
         StatementError,
+        # A corrupt/unparseable cached bundle (e.g. a spec-load race) must
+        # degrade the same as a missing agent, not crash the caller.
+        OmnigentError,
     ):
         return None
 

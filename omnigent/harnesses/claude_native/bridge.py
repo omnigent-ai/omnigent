@@ -1984,6 +1984,11 @@ def build_hook_settings(
     """
     Build invocation-local Claude Code hook settings.
 
+    Besides the hooks, the fragment pre-approves every project ``.mcp.json``
+    server (``enableAllProjectMcpServers``): the "New MCP server found"
+    dialog is another unhookable startup gate that a host-spawned terminal
+    can never answer.
+
     :param bridge_dir: Bridge directory path.
     :param python_executable: Python executable to run, e.g.
         ``"/path/to/.venv/bin/python"``. ``None`` uses
@@ -2277,6 +2282,10 @@ def build_hook_settings(
         # the org policy (``disableBypassPermissionsMode``) BEFORE this
         # consent gate, so a managed host still strips bypass regardless.
         settings["skipDangerousModePermissionPrompt"] = True
+    # Project ``.mcp.json`` servers raise a blocking "New MCP server found"
+    # approval dialog in every new directory (each worktree included). It
+    # fires no hook either, so pre-approve them like the other consent gates.
+    settings["enableAllProjectMcpServers"] = True
     if launch_effort and launch_effort in CLAUDE_EFFORTS:
         settings["effortLevel"] = launch_effort
     if api_key_helper:
