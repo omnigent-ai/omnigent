@@ -51,9 +51,15 @@ CLI updates are disabled. It uses medium effort, concurrency two, a 15-minute
 per-task timeout, and a 600,000-token stopping threshold. Final requests can
 exceed that threshold. The job has a 30-minute timeout.
 
-`rules.json` includes our Python and frontend tests, which OCR otherwise
-excludes by default, while retaining its built-in language rules. OCR's other
-file filters and size limits still apply; inspect the coverage artifact.
+`rules.json` includes GitHub automation (including prompts and documentation)
+and our Python and frontend tests, while retaining its built-in language rules.
+OCR's other file filters and size limits still apply; inspect the coverage artifact.
+
+OCR `1.12.0` ignores directory-only `.gitignore` exceptions such as `!.github/`.
+The root `.gitignore` also includes `!.github/**` so tracked automation reaches
+OCR's file selection. Generated-file exclusions follow that exception, and
+hidden directories inside `.github` remain ignored. Keep this ordering when
+editing the ignore rules.
 
 The workflow runs from trusted base/default-branch context. The upstream
 action reads the PR head through Git objects and does not run PR-authored code
@@ -114,4 +120,5 @@ OCR_NO_UPDATE=1 ocr review --from <base-sha> --to <head-sha> \
 ```
 
 Choose a diff containing Python or frontend tests and confirm they appear in
-the preview's review list.
+the preview's review list. Also verify a diff under `.github` includes workflow
+YAML, Python code, tests, and prompt text rather than reporting no selected files.
