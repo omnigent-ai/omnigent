@@ -5710,6 +5710,7 @@ def create_runner_app(
             try:
                 resp = await server_client.get(
                     f"/v1/sessions/{urllib.parse.quote(conv_id, safe='')}",
+                    params=_SESSION_METADATA_PARAMS,
                     timeout=10.0,
                 )
                 if resp.status_code == 200:
@@ -6817,6 +6818,7 @@ def create_runner_app(
                 await server_client.patch(
                     f"/v1/sessions/{urllib.parse.quote(conv_id, safe='')}",
                     json={"external_session_id": None},
+                    params={"include_usage": "false"},
                     timeout=10.0,
                 )
         try:
@@ -7286,7 +7288,9 @@ def create_runner_app(
         if not attached:
             return
         try:
-            resp = await server_client.get(f"/v1/sessions/{conv_id}", timeout=10.0)
+            resp = await server_client.get(
+                f"/v1/sessions/{conv_id}", params=_SESSION_METADATA_PARAMS, timeout=10.0
+            )
         except httpx.HTTPError:
             return
         if resp.status_code != 200:

@@ -325,7 +325,14 @@ async def test_codex_top_level_session_needs_runner_terminal_for_all_session_sha
     from omnigent.runner.app import _codex_session_needs_runner_terminal
 
     class _Client:
-        async def get(self, url: str, *, timeout: float, **_kwargs: Any) -> httpx.Response:
+        async def get(
+            self,
+            url: str,
+            *,
+            timeout: float,
+            params: dict[str, str] | None = None,
+        ) -> httpx.Response:
+            del timeout, params
             return httpx.Response(200, json=session_json, request=httpx.Request("GET", url))
 
     assert (
@@ -858,16 +865,28 @@ async def test_auto_create_codex_terminal_fork_clones_rollout_and_resumes(
     class _ForkSnapshotClient:
         """Server client returning a forked clone snapshot (no thread id)."""
 
-        async def get(self, url: str, *, timeout: float, **_kwargs: Any) -> httpx.Response:
+        async def get(
+            self,
+            url: str,
+            *,
+            timeout: float,
+            params: dict[str, str],
+        ) -> httpx.Response:
             """
             Return the clone's snapshot carrying fork labels but no thread id.
 
             :param url: Request path, e.g. ``"/v1/sessions/8aedf63f5e4046ae21b35fec5b35da50"``.
             :param timeout: Request timeout in seconds.
+            :param params: Snapshot metadata projection flags.
             :returns: HTTP 200 response with fork labels.
             """
             del timeout
             assert url == f"/v1/sessions/{session_id}"
+            assert params == {
+                "include_items": "false",
+                "include_liveness": "false",
+                "include_usage": "false",
+            }
             return httpx.Response(
                 200,
                 json={
@@ -880,16 +899,26 @@ async def test_auto_create_codex_terminal_fork_clones_rollout_and_resumes(
                 request=httpx.Request("GET", url),
             )
 
-        async def patch(self, url: str, *, json: dict[str, Any], timeout: float) -> httpx.Response:
+        async def patch(
+            self,
+            url: str,
+            *,
+            json: dict[str, Any],
+            timeout: float,
+            params: dict[str, str],
+        ) -> httpx.Response:
             """
             Record the pre-set external_session_id PATCH.
 
             :param url: Request path.
             :param json: PATCH body, e.g. ``{"external_session_id": "..."}``.
             :param timeout: Request timeout in seconds.
+            :param params: Snapshot response projection flags.
             :returns: HTTP 200 response.
             """
             del timeout
+            assert url == f"/v1/sessions/{session_id}"
+            assert params == {"include_usage": "false"}
             patched_external_ids.append(json["external_session_id"])
             return httpx.Response(200, json={}, request=httpx.Request("PATCH", url))
 
@@ -1129,11 +1158,16 @@ async def test_auto_create_codex_terminal_fork_builds_rollout_from_items_and_res
 
             :param url: Request path — the session snapshot or its items.
             :param timeout: Request timeout (snapshot fetch).
-            :param params: Query params (items fetch pagination).
+            :param params: Snapshot flags or items fetch pagination.
             :returns: HTTP 200 response.
             """
             del timeout
             if url == f"/v1/sessions/{session_id}":
+                assert params == {
+                    "include_items": "false",
+                    "include_liveness": "false",
+                    "include_usage": "false",
+                }
                 labels = {
                     FORK_SOURCE_LABEL_KEY: source_id,
                     FORK_CARRY_HISTORY_LABEL_KEY: "1",
@@ -1165,16 +1199,26 @@ async def test_auto_create_codex_terminal_fork_builds_rollout_from_items_and_res
                 request=httpx.Request("GET", url),
             )
 
-        async def patch(self, url: str, *, json: dict[str, Any], timeout: float) -> httpx.Response:
+        async def patch(
+            self,
+            url: str,
+            *,
+            json: dict[str, Any],
+            timeout: float,
+            params: dict[str, str],
+        ) -> httpx.Response:
             """
             Record the pre-set external_session_id PATCH.
 
             :param url: Request path.
             :param json: PATCH body, e.g. ``{"external_session_id": "..."}``.
             :param timeout: Request timeout in seconds.
+            :param params: Snapshot response projection flags.
             :returns: HTTP 200 response.
             """
             del timeout
+            assert url == f"/v1/sessions/{session_id}"
+            assert params == {"include_usage": "false"}
             patched_external_ids.append(json["external_session_id"])
             return httpx.Response(200, json={}, request=httpx.Request("PATCH", url))
 
@@ -1393,16 +1437,23 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
     class _WorktreeSnapshotClient:
         """Server client whose session snapshot carries a worktree workspace."""
 
-        async def get(self, url: str, *, timeout: float, **_kwargs: Any) -> httpx.Response:
+        async def get(
+            self,
+            url: str,
+            *,
+            timeout: float,
+            params: dict[str, str] | None = None,
+        ) -> httpx.Response:
             """
             Return the session snapshot with a worktree ``workspace``.
 
             :param url: Request path, e.g.
                 ``"/v1/sessions/54e4d4410c43954c11e702f5a8646483"``.
             :param timeout: Request timeout in seconds.
+            :param params: Snapshot metadata projection flags.
             :returns: HTTP 200 response carrying the worktree workspace.
             """
-            del timeout
+            del timeout, params
             assert url == f"/v1/sessions/{session_id}"
             return httpx.Response(
                 200,
@@ -1672,9 +1723,15 @@ async def test_auto_create_codex_terminal_starts_relay_at_session_creation(
     class _SnapshotClient:
         """Fresh-session snapshot (no external thread → discovery path)."""
 
-        async def get(self, url: str, *, timeout: float, **_kwargs: Any) -> httpx.Response:
+        async def get(
+            self,
+            url: str,
+            *,
+            timeout: float,
+            params: dict[str, str] | None = None,
+        ) -> httpx.Response:
             """:returns: HTTP 200 fresh-session snapshot."""
-            del timeout, url
+            del timeout, url, params
             return httpx.Response(
                 200,
                 json={
@@ -3205,15 +3262,22 @@ async def test_codex_subagent_always_needs_runner_terminal(
     from omnigent.runner.app import _codex_session_needs_runner_terminal
 
     class _Client:
-        async def get(self, url: str, *, timeout: float, **_kwargs: Any) -> httpx.Response:
+        async def get(
+            self,
+            url: str,
+            *,
+            timeout: float,
+            params: dict[str, str] | None = None,
+        ) -> httpx.Response:
             """
             Return child then parent session snapshots.
 
             :param url: Omnigent session snapshot URL.
             :param timeout: HTTP timeout in seconds.
+            :param params: Snapshot metadata projection flags.
             :returns: Fake Omnigent session response.
             """
-            del timeout
+            del timeout, params
             if url.endswith("/ff5cac23d0beb79fad914046049f32ff"):
                 return httpx.Response(
                     200,
@@ -3459,6 +3523,15 @@ async def test_codex_discover_thread_and_forward_persists_workspace_as_bridge_cw
     thread_id = "019e96aa-abcd-7343-8d3b-6f914d60936b"
     workspace = tmp_path / "selected-workspace"
     wait_calls: list[dict[str, object]] = []
+    patch_requests: list[httpx.Request] = []
+    real_async_client = httpx.AsyncClient
+
+    def _handle_patch(request: httpx.Request) -> httpx.Response:
+        patch_requests.append(request)
+        return httpx.Response(200, json={})
+
+    def _mock_client(**kwargs: Any) -> httpx.AsyncClient:
+        return real_async_client(transport=httpx.MockTransport(_handle_patch), **kwargs)
 
     async def _fake_wait(*_args: object, **kwargs: object) -> str:
         wait_calls.append(kwargs)
@@ -3479,6 +3552,7 @@ async def test_codex_discover_thread_and_forward_persists_workspace_as_bridge_cw
     monkeypatch.setattr(codex_native_forwarder, "supervise_forwarder", _fake_supervise)
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
     monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
+    monkeypatch.setattr(httpx, "AsyncClient", _mock_client)
 
     session_id = "9f1f7f7bd7f24f80a621d9a3ba3fbc10"
     codex_native_bridge.write_bridge_startup_timeout(tmp_path, 120.0)
@@ -3496,6 +3570,15 @@ async def test_codex_discover_thread_and_forward_persists_workspace_as_bridge_cw
         )
     finally:
         _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+
+    assert len(patch_requests) == 1
+    patch_request = patch_requests[0]
+    assert patch_request.method == "PATCH"
+    assert patch_request.url.copy_with(query=None) == httpx.URL(
+        f"http://ap.example/v1/sessions/{session_id}"
+    )
+    assert dict(patch_request.url.params) == {"include_usage": "false"}
+    assert json.loads(patch_request.content) == {"external_session_id": thread_id}
 
     state = codex_native_bridge.read_bridge_state(tmp_path)
     assert state is not None

@@ -691,7 +691,7 @@ When liveness is wired, each list item includes two orthogonal signals
 ### Get Session (Snapshot)
 
 ```
-GET /v1/sessions/{session_id}[?include_items=true&include_liveness=true&refresh_state=false]
+GET /v1/sessions/{session_id}[?include_items=true&include_liveness=true&include_usage=true&refresh_state=false]
 
 200 OK — body matches the `SessionResponse` shape above.
 404 Not Found — no session with that id
@@ -716,6 +716,14 @@ Contract" below.
     liveness from the `/health` poll and the live stream (the web
     chat surface), the snapshot's copy is redundant.
 
+  include_usage (query param, boolean, default `true`)
+    When `false`, skip the session/sub-agent usage tree read. The response
+    sets `usage_included=false`, `total_cost_usd=null`, and
+    `usage_by_model=null`: usage is unknown, not zero or the parent's own
+    spend. Runner metadata reads use this option. The web chat also opts
+    out and loads display usage separately, so a slow usage store does not
+    block opening the session. Budget enforcement is unchanged.
+
   refresh_state (query param, boolean, default `false`)
     When `true`, runner-derived snapshot overlays (for example skills
     and Codex-native model options) are refreshed from the bound runner
@@ -730,6 +738,27 @@ When runner liveness is wired (and not skipped via
     Whether the session's bound runner/host is reachable. This is
     session-scoped (authorized by access to the session), and matches
     `GET /health?session_id=...` for the same id.
+
+### Get Session Usage
+
+```
+GET /v1/sessions/{session_id}/usage
+
+200 OK — {"id": "conv_abc123", "total_cost_usd": 3.5, "usage_by_model": {...}}
+404 Not Found — no session with that id is visible to the caller
+```
+
+Returns the session's complete subtree cost and per-model usage, including
+archived sub-agents. Both fields use the snapshot's existing usage format;
+unpriced cost and unrecorded model usage remain `null`. The response is
+`Cache-Control: no-store`. Read failures return an error, never a zero total.
+
+Display clients fetch this independently of snapshot and transcript loading,
+keep usage unknown until it arrives, and must not overwrite newer streamed
+usage with an older in-flight response. This is a separate authorized request,
+not a detached worker using the snapshot request's authorization context.
+Older servers omit `usage_included` and ignore `include_usage`; their snapshot
+already includes usage, so clients should not issue the separate request.
 
 ### Delete Session
 
@@ -760,7 +789,7 @@ files, and the conversation row.
 ### Bind Session Runner
 
 ```
-PATCH /v1/sessions/{session_id}
+PATCH /v1/sessions/{session_id}[?include_usage=true]
 Content-Type: application/json
 
 {
@@ -773,6 +802,11 @@ Content-Type: application/json
   "external_session_id": "a1b2c3d4-1234-5678-9abc-def012345678"
 }
 ```
+
+The optional `include_usage=false` query parameter skips usage aggregation in
+the response, with the same unknown-usage contract as GET. It does not change
+the update or its authorization. Native launch metadata writes use it to
+avoid waiting for display costs after persisting a new native thread id.
 
 Request body:
 

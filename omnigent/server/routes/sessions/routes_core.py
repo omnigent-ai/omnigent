@@ -52,6 +52,7 @@ from omnigent.runtime import (
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
+from omnigent.runtime.policies.builder import load_session_usage
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
     _harness_elicitation_registry,
@@ -135,6 +136,7 @@ from omnigent.server.routes._sessions.helpers import (
     _permission_level_from_grants,
     _pin_claude_permission_launch_args,
     _presentation_labels_for_agent,
+    _priced_cost_for_display,
     _prune_session_read_state,
     _publish_codex_approval_mode,
     _publish_collaboration_mode,
@@ -154,6 +156,7 @@ from omnigent.server.routes._sessions.helpers import (
     _set_read_state,
     _surface_model_change_forward_failure,
     _title_content_from_item,
+    _usage_by_model_for_display,
     _validate_terminal_launch_args,
     _validated_cost_control_mode_override,
     _validated_subagent_routing_override,
@@ -194,6 +197,7 @@ from omnigent.server.schemas import (
     SessionResponse,
     SessionSwitchAgentRequest,
     SessionTodosEvent,
+    SessionUsageResponse,
     UpdateSessionRequest,
 )
 from omnigent.stores import AgentStore, ConversationStore
@@ -1042,6 +1046,7 @@ def register_core_routes(
         include_items: bool = Query(default=True),
         include_liveness: bool = Query(default=True),
         refresh_state: bool = Query(default=False),
+        include_usage: bool = Query(default=True),
     ) -> SessionResponse:
         """
         Return a session snapshot: identity, status, and committed
@@ -1062,6 +1067,9 @@ def register_core_routes(
             as ``None``. The web chat surface passes ``False`` because
             it sources liveness from the ``/health`` poll and the WS
             stream, not the snapshot.
+        :param include_usage: When ``False``, skip the subtree usage read and
+            return null usage fields with ``usage_included=False``. Display
+            clients can fetch ``GET /sessions/{id}/usage`` independently.
         :param refresh_state: When ``True``, refresh runner-derived
             snapshot overlays from the live session instead of serving
             stale AP-process caches. Browser reload/bind requests use
@@ -1089,12 +1097,49 @@ def register_core_routes(
             conversation=access.conversation,
             liveness_lookup=liveness_lookup if include_liveness else None,
             include_items=include_items,
+            include_usage=include_usage,
             runner_exit_reports=runner_exit_reports,
             refresh_state=refresh_state,
             host_store=getattr(request.app.state, "host_store", None),
             sandbox_config=getattr(request.app.state, "sandbox_config", None),
             viewer_id=user_id,
             request=request,
+        )
+
+    @router.get(
+        "/sessions/{session_id}/usage",
+        response_model=SessionUsageResponse,
+    )
+    async def get_session_usage(
+        request: Request,
+        response: Response,
+        session_id: str,
+    ) -> SessionUsageResponse:
+        """Read subtree display usage without holding up the session snapshot.
+
+        This request owns the authorization and lifetime of the tree read;
+        the snapshot never starts a detached usage worker.
+        """
+        response.headers["Cache-Control"] = "no-store"
+        user_id = _get_user_id(request, auth_provider)
+        access = await _require_access_and_level(
+            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        )
+        conv = access.conversation
+        if conv is None:
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conv is None:
+            raise _session_not_found()
+        usage = await asyncio.to_thread(
+            load_session_usage,
+            session_id,
+            conversation_store,
+            root_conversation_id=conv.root_conversation_id,
+        )
+        return SessionUsageResponse(
+            id=session_id,
+            total_cost_usd=_priced_cost_for_display(usage),
+            usage_by_model=_usage_by_model_for_display(usage),
         )
 
     @router.get(
@@ -2027,6 +2072,7 @@ def register_core_routes(
         request: Request,
         session_id: str,
         body: UpdateSessionRequest,
+        include_usage: bool = Query(default=True),
     ) -> SessionResponse:
         """
         Update a session's mutable fields. When ``runner_id`` is
@@ -2042,6 +2088,8 @@ def register_core_routes(
         :param session_id: Session/conversation identifier,
             e.g. ``"conv_abc123"``.
         :param body: The validated :class:`UpdateSessionRequest`.
+        :param include_usage: When ``False``, skip usage aggregation in the
+            response. Metadata writes during native launch do not need it.
         :returns: The updated :class:`SessionResponse` snapshot, with
             ``items`` always empty — PATCH callers use only scalar
             fields, and transcripts are served by
@@ -2754,6 +2802,7 @@ def register_core_routes(
             agent_cache,
             liveness_lookup=liveness_lookup,
             include_items=False,
+            include_usage=include_usage,
             runner_exit_reports=runner_exit_reports,
             viewer_id=user_id,
             request=request,

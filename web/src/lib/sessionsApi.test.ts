@@ -18,6 +18,7 @@ import {
   forkSession,
   getSession,
   getSessionSlim,
+  getSessionUsage,
   importLocalSessions,
   interrupt,
   listRunners,
@@ -150,6 +151,7 @@ describe("createSession", () => {
       labels: undefined,
       lastTaskError: undefined,
       lastTotalTokens: undefined,
+      usageIncluded: true,
       totalCostUsd: undefined,
       usageByModel: null,
       llmModel: undefined,
@@ -841,7 +843,7 @@ describe("getSession", () => {
     expect(fetchMock.mock.calls[0][0]).toBe("/v1/sessions/conv%20with%20space");
   });
 
-  it("getSessionSlim requests the snapshot without items or liveness", async () => {
+  it("getSessionSlim skips items, liveness, and subtree usage", async () => {
     fetchMock.mockResolvedValueOnce(
       mockJsonResponse({
         id: "conv_abc",
@@ -849,20 +851,23 @@ describe("getSession", () => {
         status: "idle",
         created_at: 1704067200,
         items: [],
+        usage_included: false,
+        total_cost_usd: null,
+        usage_by_model: null,
       }),
     );
 
     const session = await getSessionSlim("conv_abc");
 
     expect(fetchMock).toHaveBeenCalledOnce();
-    // The two skipped reads are the most expensive steps of the server's
-    // snapshot build; the chat surface loads items via /items and liveness
-    // via the /health poll, so it opts out of both.
     expect(fetchMock.mock.calls[0][0]).toBe(
-      "/v1/sessions/conv_abc?include_items=false&include_liveness=false",
+      "/v1/sessions/conv_abc?include_items=false&include_liveness=false&include_usage=false",
     );
     expect(session.agentId).toBe("agent_xyz");
     expect(session.items).toEqual([]);
+    expect(session.usageIncluded).toBe(false);
+    expect(session.totalCostUsd).toBeNull();
+    expect(session.usageByModel).toBeNull();
   });
 
   it("getSessionSlim can request a runner-backed state refresh", async () => {
@@ -880,8 +885,25 @@ describe("getSession", () => {
 
     expect(fetchMock).toHaveBeenCalledOnce();
     expect(fetchMock.mock.calls[0][0]).toBe(
-      "/v1/sessions/conv_abc?include_items=false&include_liveness=false&refresh_state=true",
+      "/v1/sessions/conv_abc?include_items=false&include_liveness=false&include_usage=false&refresh_state=true",
     );
+  });
+
+  it("treats an older server's snapshot as already including usage", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv_abc",
+        agent_id: "agent_xyz",
+        status: "idle",
+        created_at: 0,
+        total_cost_usd: 4.5,
+      }),
+    );
+
+    const session = await getSessionSlim("conv_abc");
+
+    expect(session.usageIncluded).toBe(true);
+    expect(session.totalCostUsd).toBe(4.5);
   });
 
   it("maps permission_level from the wire to permissionLevel", async () => {
@@ -995,6 +1017,68 @@ describe("getSession", () => {
     );
     const session = await getSession("conv_top");
     expect(session.parentSessionId).toBeNull();
+  });
+});
+
+describe("getSessionUsage", () => {
+  it("reads subtree cost and per-model usage without fetching the snapshot", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv with space",
+        total_cost_usd: 3.5,
+        usage_by_model: {
+          "model-a": { input_tokens: 10, total_cost_usd: 1 },
+          "model-b": { output_tokens: 20, total_cost_usd: 2.5 },
+        },
+      }),
+    );
+    const controller = new AbortController();
+
+    const usage = await getSessionUsage("conv with space", { signal: controller.signal });
+
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(fetchMock.mock.calls[0][0]).toBe("/v1/sessions/conv%20with%20space/usage");
+    expect(fetchMock.mock.calls[0][1].signal).toBe(controller.signal);
+    expect(usage).toEqual({
+      id: "conv with space",
+      totalCostUsd: 3.5,
+      usageByModel: {
+        "model-a": {
+          inputTokens: 10,
+          outputTokens: null,
+          totalTokens: null,
+          cacheReadInputTokens: null,
+          cacheCreationInputTokens: null,
+          totalCostUsd: 1,
+        },
+        "model-b": {
+          inputTokens: null,
+          outputTokens: 20,
+          totalTokens: null,
+          cacheReadInputTokens: null,
+          cacheCreationInputTokens: null,
+          totalCostUsd: 2.5,
+        },
+      },
+    });
+  });
+
+  it.each([null, 0])("preserves unpriced versus priced-zero usage (%s)", async (cost) => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({ id: "conv_abc", total_cost_usd: cost, usage_by_model: null }),
+    );
+
+    expect(await getSessionUsage("conv_abc")).toEqual({
+      id: "conv_abc",
+      totalCostUsd: cost,
+      usageByModel: null,
+    });
+  });
+
+  it("rejects a failed usage read instead of synthesizing zero spend", async () => {
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({}, { ok: false, status: 503 }));
+
+    await expect(getSessionUsage("conv_abc")).rejects.toMatchObject({ status: 503 });
   });
 });
 

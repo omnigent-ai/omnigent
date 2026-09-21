@@ -66,6 +66,7 @@ import {
   bindOnlyOnlineRunner,
   createSession,
   getSessionSlim,
+  getSessionUsage,
   fetchSessionItemsPage,
   INITIAL_WINDOW_ITEMS,
   interrupt as interruptSession,
@@ -838,16 +839,15 @@ export interface ConversationState {
   tokensUsed: number | null;
   /**
    * Cumulative session spend in USD, server-computed (the same total
-   * the cost-budget policy gates on). Seeded from the session snapshot
-   * and updated by ``session.usage`` SSE events. ``null`` when the
-   * session is **unpriced** — no turn has been priced yet — so the UI
-   * renders "—" rather than a misleading ``$0.00``.
+   * the cost-budget policy gates on). Hydrated independently of the
+   * session metadata and updated by ``session.usage`` SSE events.
+   * ``null`` while unknown or unpriced, never a misleading ``$0.00``.
    */
   sessionCostUsd: number | null;
   /**
    * Per-model usage breakdown over the active session's subtree (itself +
-   * sub-agents), keyed by raw harness model id. Seeded from the session
-   * snapshot on bind and replaced wholesale by ``session.usage`` SSE events
+   * sub-agents), keyed by raw harness model id. Hydrated separately on
+   * bind and replaced wholesale by ``session.usage`` SSE events
    * that carry a per-model change (an event without it leaves the cached
    * map untouched). ``null`` until per-model usage is recorded. The
    * agent-info popover renders this directly; any aggregate view (total
@@ -1234,6 +1234,10 @@ let queryClient: QueryClient | null = null;
 // stale. Heartbeats are filtered before this revision is bumped.
 const streamEventRevisions = new Map<string, number>();
 conversationRegistry.subscribeDisposed((id) => streamEventRevisions.delete(id));
+
+// Reconnects share a binding; only one usage request may hydrate it at a time.
+const sessionUsageHydrations = new WeakSet<AbortController>();
+const sessionUsageRevisions = new WeakMap<ConversationEntry, { cost: number; models: number }>();
 
 // Snapshot reconciliation must teach the already-running stream pump which
 // native preview messages have finalized, including warm session revisits.
@@ -3841,7 +3845,8 @@ async function bindStream(
   if (queryClient === null) {
     throw new Error("chatStore.bindStream: queryClient not initialized");
   }
-  const launchBeforeFetch = mcpStartupBeforeSnapshot(id, get());
+  const stateBeforeFetch = get();
+  const launchBeforeFetch = mcpStartupBeforeSnapshot(id, stateBeforeFetch);
   try {
     // One larger page, so opening a session is a single round trip that then
     // stays still — rather than a small page followed by background growth
@@ -4035,8 +4040,14 @@ async function bindStream(
         // back re-projects (it does not re-bind, so it cannot recompute it).
         sessionReasoningEffort: effectiveEffort,
         tokensUsed: session.lastTotalTokens ?? null,
-        sessionCostUsd: session.totalCostUsd ?? null,
-        sessionUsageByModel: session.usageByModel ?? null,
+        sessionCostUsd:
+          state.sessionCostUsd !== stateBeforeFetch.sessionCostUsd
+            ? state.sessionCostUsd
+            : (session.totalCostUsd ?? state.sessionCostUsd),
+        sessionUsageByModel:
+          state.sessionUsageByModel !== stateBeforeFetch.sessionUsageByModel
+            ? state.sessionUsageByModel
+            : (session.usageByModel ?? state.sessionUsageByModel),
         todos: (session.todos ?? []) as {
           content: string;
           status: "pending" | "in_progress" | "completed";
@@ -4044,6 +4055,7 @@ async function bindStream(
         }[],
       };
     });
+    if (session.usageIncluded === false) void hydrateSessionUsage(id);
     racedNativeModelOptions.delete(id);
   } catch (err) {
     if (isConversationDisposed(id)) return;
@@ -4051,6 +4063,52 @@ async function bindStream(
       loadingConversation: false,
       conversationLoadError: err instanceof Error ? err : new Error(String(err)),
     });
+  }
+}
+
+/** Hydrate display-only subtree totals without delaying bind or reconnect. */
+async function hydrateSessionUsage(id: string): Promise<void> {
+  const entry = conversationRegistry.peek(id);
+  const before = entry?.getState();
+  const controller = before?.abortController;
+  if (
+    entry === undefined ||
+    entry.disposed ||
+    before === undefined ||
+    controller == null ||
+    controller.signal.aborted ||
+    sessionUsageHydrations.has(controller)
+  ) {
+    return;
+  }
+  sessionUsageHydrations.add(controller);
+  const revisionsBeforeFetch = sessionUsageRevisions.get(entry) ?? { cost: 0, models: 0 };
+  try {
+    const usage = await getSessionUsage(id, { signal: controller.signal });
+    if (
+      usage.id !== id ||
+      controller.signal.aborted ||
+      conversationRegistry.peek(id) !== entry ||
+      entry.getState().abortController !== controller
+    ) {
+      return;
+    }
+    const revisions = sessionUsageRevisions.get(entry) ?? { cost: 0, models: 0 };
+    // A live cost/model update during the read wins independently for each field.
+    entrySetter(entry)((state) => ({
+      ...(revisions.cost === revisionsBeforeFetch.cost &&
+      state.sessionCostUsd === before.sessionCostUsd
+        ? { sessionCostUsd: usage.totalCostUsd ?? state.sessionCostUsd }
+        : {}),
+      ...(revisions.models === revisionsBeforeFetch.models &&
+      state.sessionUsageByModel === before.sessionUsageByModel
+        ? { sessionUsageByModel: usage.usageByModel ?? state.sessionUsageByModel }
+        : {}),
+    }));
+  } catch {
+    // Usage is optional display data; retain known totals or leave them unknown.
+  } finally {
+    sessionUsageHydrations.delete(controller);
   }
 }
 
@@ -4604,6 +4662,7 @@ async function reconcileOnReconnect(
     return;
   }
   if (stale()) return;
+  if (session.usageIncluded === false) void hydrateSessionUsage(id);
 
   // Page backwards until the fetched window reaches the pre-gap transcript
   // or the conversation start. A single newest page is not enough: a gap
@@ -6116,6 +6175,20 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       }
       if (event.usageByModel !== undefined) {
         patch.sessionUsageByModel = event.usageByModel;
+      }
+      if (event.totalCostUsd !== undefined || event.usageByModel !== undefined) {
+        const entry =
+          sourceConversationId === null
+            ? undefined
+            : conversationRegistry.peek(sourceConversationId);
+        if (entry !== undefined && !entry.disposed) {
+          // A same-value receipt is still newer than an in-flight usage read.
+          const revisions = sessionUsageRevisions.get(entry);
+          sessionUsageRevisions.set(entry, {
+            cost: (revisions?.cost ?? 0) + (event.totalCostUsd !== undefined ? 1 : 0),
+            models: (revisions?.models ?? 0) + (event.usageByModel !== undefined ? 1 : 0),
+          });
+        }
       }
       if (Object.keys(patch).length > 0) {
         applyToConversation(patch);

@@ -180,6 +180,7 @@ interface SessionResponseWire {
   share_workspace_files?: boolean;
   context_window?: number | null;
   last_total_tokens?: number | null;
+  usage_included?: boolean;
   total_cost_usd?: number | null;
   /**
    * Per-model breakdown of the same subtree usage, keyed by the raw harness
@@ -338,6 +339,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     shareWorkspaceFiles: wire.share_workspace_files ?? false,
     contextWindow: wire.context_window,
     lastTotalTokens: wire.last_total_tokens,
+    usageIncluded: wire.usage_included ?? true,
     totalCostUsd: wire.total_cost_usd,
     usageByModel: usageByModelFromWire(wire.usage_by_model),
     lastTaskError: wire.last_task_error,
@@ -1163,18 +1165,16 @@ export async function getSession(sessionId: string): Promise<Session> {
 }
 
 /**
- * Snapshot a session WITHOUT its committed items or liveness fields.
+ * Snapshot a session without committed items, liveness, or subtree usage.
  *
  * Use this (not `getSession`) when the caller hydrates the transcript
  * via `fetchSessionItemsPage` and reads liveness from the /health poll +
- * WS stream — i.e. the chat surface's snapshot consumers. The skipped
- * reads are the two most expensive steps of the server's snapshot build
- * (the 100-item history read and the runner/host liveness lookup), so
- * this is the fast path for open/switch. The returned `Session` has
- * `items: []`; callers that need the snapshot's own items (or
- * `runner_online`/`host_online` once the wire type carries them) must
- * use `getSession` instead. Older servers ignore the params and return
- * the full snapshot — both shapes parse identically.
+ * WS stream — i.e. the chat surface's snapshot consumers. Subtree usage
+ * is fetched separately with `getSessionUsage`, so a large spawn tree
+ * cannot delay opening the conversation. The returned `Session` has
+ * `items: []` and `usageIncluded: false`; callers needing a full snapshot
+ * use `getSession`. Older servers ignore the params, include usage, and
+ * need no separate usage request.
  *
  * NOTE: keep all consumers of a given react-query key (`["session", id]`)
  * on the SAME variant — mixing full and slim under one key would let a
@@ -1198,6 +1198,7 @@ export async function getSessionSlim(
   const params = new URLSearchParams({
     include_items: "false",
     include_liveness: "false",
+    include_usage: "false",
   });
   if (options.refreshState === true) params.set("refresh_state", "true");
   const res = await authenticatedFetch(
@@ -1205,6 +1206,31 @@ export async function getSessionSlim(
     { signal: options.signal },
   );
   return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
+}
+
+export interface SessionUsageSnapshot {
+  id: string;
+  totalCostUsd: number | null;
+  usageByModel: Record<string, ModelUsage> | null;
+}
+
+/** Read authoritative subtree usage independently of session metadata. */
+export async function getSessionUsage(
+  sessionId: string,
+  options: { signal?: AbortSignal } = {},
+): Promise<SessionUsageSnapshot> {
+  const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}/usage`, {
+    signal: options.signal,
+  });
+  const wire =
+    await readJsonOrThrow<Pick<SessionResponseWire, "id" | "total_cost_usd" | "usage_by_model">>(
+      res,
+    );
+  return {
+    id: wire.id,
+    totalCostUsd: wire.total_cost_usd ?? null,
+    usageByModel: usageByModelFromWire(wire.usage_by_model),
+  };
 }
 
 /** One page of a session's committed items, in chronological order. */

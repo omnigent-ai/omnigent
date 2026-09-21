@@ -1949,10 +1949,11 @@ async def test_concurrent_resource_reads_share_one_session_snapshot(
         """
         nonlocal snapshot_count
         if request.method == "GET" and request.url.path == f"/v1/sessions/{conv}":
-            # The runner's own session lookup reads stored-row fields only, so
-            # it must not download the transcript page or the liveness lookup.
-            assert request.url.params.get("include_items") == "false"
-            assert request.url.params.get("include_liveness") == "false"
+            assert dict(request.url.params) == {
+                "include_items": "false",
+                "include_liveness": "false",
+                "include_usage": "false",
+            }
             snapshot_count += 1
             snapshot_started.set()
             await release.wait()
