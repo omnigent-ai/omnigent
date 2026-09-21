@@ -200,6 +200,77 @@ async def test_reuse_then_patch_forbidden(auth_client: httpx.AsyncClient) -> Non
     assert put.status_code == 403, put.text
 
 
+async def test_legacy_null_owner_reuse_forbidden(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A legacy (NULL created_by) agent can't be seized by a reuser.
+
+    Simulates a pre-migration agent by clearing created_by, then verifies the
+    oldest-referencing-root fallback keeps ownership with ALICE: BOB, who reuses
+    the agent in his own newer session, is refused, while ALICE still succeeds.
+    ``now_epoch`` is stepped so ALICE's original session is unambiguously older
+    than BOB's reuse session (created_at is epoch seconds and would otherwise
+    tie within one test tick).
+    """
+    import itertools
+
+    import sqlalchemy as sa
+
+    import omnigent.stores.conversation_store.sqlalchemy_store as cs
+    from omnigent.db.utils import get_or_create_engine
+
+    monkeypatch.setattr(cs, "now_epoch", lambda c=itertools.count(1_700_000_000): next(c))
+
+    agent = await create_test_agent(auth_client, name="legacy-agent", user=ALICE)
+    alice_session = agent["_session_id"]
+
+    # Make it a legacy row: no recorded owner, so the owner check must fall
+    # back to the owning session resolved by oldest-referencing root.
+    engine = get_or_create_engine(db_uri)
+    with engine.begin() as conn:
+        conn.execute(
+            sa.text("UPDATE agents SET created_by = NULL WHERE id = :id"),
+            {"id": bytes.fromhex(agent["id"])},
+        )
+
+    await _share_editor(auth_client, alice_session, ALICE, BOB)
+    reuse = await auth_client.post(
+        "/v1/sessions", json={"agent_id": agent["id"]}, headers={"X-Forwarded-Email": BOB}
+    )
+    assert reuse.status_code == 201, reuse.text
+    bob_session = reuse.json()["id"]
+
+    # BOB (reuser) is refused — owner resolves to ALICE's original session.
+    bob_put = await auth_client.put(
+        f"/v1/sessions/{bob_session}/agent",
+        files={
+            "bundle": (
+                "agent.tar.gz",
+                build_agent_bundle(name="legacy-agent", description="pwn"),
+                "application/gzip",
+            )
+        },
+        headers={"X-Forwarded-Email": BOB},
+    )
+    assert bob_put.status_code == 403, bob_put.text
+
+    # ALICE (real owner) still succeeds.
+    alice_put = await auth_client.put(
+        f"/v1/sessions/{alice_session}/agent",
+        files={
+            "bundle": (
+                "agent.tar.gz",
+                build_agent_bundle(name="legacy-agent", description="v2"),
+                "application/gzip",
+            )
+        },
+        headers={"X-Forwarded-Email": ALICE},
+    )
+    assert alice_put.status_code == 200, alice_put.text
+
+
 async def test_admin_can_update_any_agent(auth_client: httpx.AsyncClient, db_uri: str) -> None:
     """A workspace admin may replace an agent they did not create."""
     agent = await create_test_agent(auth_client, name="admin-agent", user=ALICE)

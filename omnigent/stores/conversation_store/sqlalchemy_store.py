@@ -4803,7 +4803,6 @@ class SqlAlchemyConversationStore(ConversationStore):
         carry_history_into_native: bool,
         presentation_labels: dict[str, str],
         previous_builtin_id: str | None,
-        created_by: str | None = None,
     ) -> Conversation:
         """
         Rebind a session in place to a different (cloned) agent.
@@ -4825,9 +4824,6 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param presentation_labels: Target-harness ui/wrapper labels.
         :param previous_builtin_id: Built-in switched away from, or
             ``None``.
-        :param created_by: Identity of the switching user, recorded on the
-            new session-scoped agent row so its code can only be mutated by
-            the owner. ``None`` in single-user mode.
         :returns: The updated :class:`Conversation`.
         :raises LookupError: If *conversation_id* does not exist.
         """
@@ -4905,6 +4901,11 @@ class SqlAlchemyConversationStore(ConversationStore):
                     session.flush()
 
             session.add(
+                # created_by is left unset: a switch replaces the agent of an
+                # existing session in place and does not change who owns that
+                # session. Ownership of the replacement resolves through the
+                # owning session (oldest-referencing root), so an editor who
+                # switches the agent does not become its owner.
                 SqlAgent(
                     id=new_agent_id,
                     created_at=now,
@@ -4913,7 +4914,6 @@ class SqlAlchemyConversationStore(ConversationStore):
                     version=1,
                     kind=encoded_agent_kind,
                     description=new_agent_description,
-                    created_by=created_by,
                 )
             )
 

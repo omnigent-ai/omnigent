@@ -92,7 +92,6 @@ class _ConversationStore:
         carry_history_into_native: bool,
         presentation_labels: dict[str, str],
         previous_builtin_id: str | None,
-        created_by: str | None = None,
     ) -> Conversation:
         """Record the call and return the updated conversation.
 

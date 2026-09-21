@@ -3525,7 +3525,6 @@ def register_core_routes(
                 carry_history_into_native=carry_history_into_native,
                 presentation_labels=presentation_labels,
                 previous_builtin_id=previous_builtin_id,
-                created_by=user_id,
             )
         except LookupError as exc:
             raise OmnigentError(

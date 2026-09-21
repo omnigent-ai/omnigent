@@ -1814,7 +1814,6 @@ class ConversationStore(ABC):
         carry_history_into_native: bool,
         presentation_labels: dict[str, str],
         previous_builtin_id: str | None,
-        created_by: str | None = None,
     ) -> Conversation:
         """
         Rebind a session in place to a different (cloned) agent.
@@ -1861,9 +1860,6 @@ class ConversationStore(ABC):
             switching away from, stamped as
             :data:`SWITCH_PREVIOUS_BUILTIN_LABEL_KEY` for a one-click
             "Switch back". ``None`` leaves it unset.
-        :param created_by: Identity of the switching user, recorded on the
-            new session-scoped agent so its code can only be mutated by the
-            owner. ``None`` in single-user mode.
         :returns: The updated :class:`Conversation`.
         :raises LookupError: If no conversation with *conversation_id*
             exists.
