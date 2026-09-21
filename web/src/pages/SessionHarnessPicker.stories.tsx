@@ -99,6 +99,7 @@ export const UnknownCurrentModel: Story = {
 };
 
 export const SmartRoutingSelected: Story = {
+  args: { costRoutingEligible: true },
   decorators: [
     (Story) => (
       <ChatStoreSeed

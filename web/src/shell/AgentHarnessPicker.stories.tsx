@@ -1,5 +1,5 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { userEvent, within } from "storybook/test";
+import { expect, userEvent, within } from "storybook/test";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import type { Host } from "@/hooks/useHosts";
 import type { AgentBundleInput } from "@/lib/agentBundle";
@@ -175,6 +175,13 @@ export const ReadOnlyPermissionSummary: Story = {
       { label: "Model", value: "Opus 4.6" },
       { label: "Permission mode", value: "Plan" },
     ],
+  },
+  play: async ({ canvasElement }) => {
+    const page = within(canvasElement.ownerDocument.body);
+    within(canvasElement).getByTestId("new-chat-landing-agent-select").focus();
+    await expect(await page.findByTestId("new-chat-landing-agent-tooltip")).toHaveTextContent(
+      "Permission mode: Plan",
+    );
   },
 };
 
