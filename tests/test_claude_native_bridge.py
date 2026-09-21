@@ -9250,6 +9250,49 @@ def test_hook_record_stop_counts_only_running_background_tasks() -> None:
     assert record.background_task_count == 3
 
 
+def test_hook_record_stop_excludes_backgrounded_subagents() -> None:
+    """Claude ``local_agent`` tasks belong to the sub-agent tally, not shell tally.
+
+    The SDK task lifecycle uses ``local_bash`` and ``local_agent`` task types,
+    including when Ctrl+B moves a foreground sub-agent into the background.
+    Counting both here would show that child in ``BackgroundTaskIndicator`` and
+    ``SubagentTaskIndicator`` at the same time.
+    """
+    record = _hook_record_from_jsonl_record(
+        _make_jsonl_record(
+            {
+                "hook_event_name": "Stop",
+                "background_tasks": [
+                    {
+                        "id": "bash-task",
+                        "type": "local_bash",
+                        "status": "running",
+                        "description": "Watch tests",
+                        "command": "pytest -f",
+                    },
+                    {
+                        "id": "agent-task",
+                        "type": "local_agent",
+                        "status": "running",
+                        "description": "Review the change",
+                    },
+                ],
+            }
+        )
+    )
+
+    assert record.background_task_count == 1
+    assert record.background_tasks == [
+        {
+            "id": "bash-task",
+            "type": "local_bash",
+            "status": "running",
+            "description": "Watch tests",
+            "command": "pytest -f",
+        }
+    ]
+
+
 def test_hook_record_stop_all_background_tasks_terminal_counts_zero() -> None:
     """Every shell finished → count is 0, dropping the indicator."""
     record = _hook_record_from_jsonl_record(

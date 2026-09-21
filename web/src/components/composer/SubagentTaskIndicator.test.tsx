@@ -62,22 +62,28 @@ describe("SubagentTaskIndicator", () => {
     expect(container).toBeEmptyDOMElement();
   });
 
-  it("counts active, parked, and errored sub-agents while excluding settled rows", () => {
+  it("counts direct children needing attention while excluding settled rows", () => {
     setChildren([
       child({ id: "working", busy: true }),
       child({ id: "parked", busy: true, pending_elicitations_count: 1 }),
+      child({
+        id: "disconnected",
+        current_task_status: "failed",
+        last_task_error: { code: "runner_disconnected", message: "Runner tunnel dropped" },
+      }),
       child({ id: "failed", current_task_status: "failed" }),
       child({ id: "done", current_task_status: "completed" }),
     ]);
     renderIndicator();
 
     const pill = screen.getByTestId("subagent-task-pill");
-    expect(pill).toHaveTextContent("3");
+    expect(pill).toHaveTextContent("4");
     expect(pill).toHaveClass("px-1", "md:px-2", "text-destructive");
     expect(pill).toHaveAttribute("data-state", "error");
     expect(pill).toHaveAccessibleName(
-      "3 sub-agents: 1 active, 1 awaiting input, 1 needs attention",
+      "4 sub-agents: 1 active, 1 awaiting input, 1 disconnected, 1 needs attention",
     );
+    expect(useChildSessionsMock).toHaveBeenCalledWith("conv-1");
   });
 
   it("shows state labels and honest navigation targets in the popover", () => {

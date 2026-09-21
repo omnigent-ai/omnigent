@@ -3468,6 +3468,14 @@ _TERMINAL_BACKGROUND_TASK_STATUSES: frozenset[str] = frozenset(
 _BACKGROUND_TASK_FORWARD_LIMIT = 100
 _BACKGROUND_TASK_FIELD_MAX_CHARS = 512
 _BACKGROUND_TASK_FIELDS: tuple[str, ...] = ("id", "type", "status", "description", "command")
+_BACKGROUND_AGENT_TASK_TYPES: frozenset[str] = frozenset({"agent", "local_agent", "subagent"})
+
+
+def _is_background_shell(raw: object) -> bool:
+    """Return whether a Claude background-task entry belongs in the shell tally."""
+    if not isinstance(raw, dict):
+        return True
+    return raw.get("type") not in _BACKGROUND_AGENT_TASK_TYPES
 
 
 def _normalize_background_task(raw: object) -> _JsonObject | None:
@@ -3580,7 +3588,8 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
             running = [
                 task
                 for task in raw_bg
-                if not (
+                if _is_background_shell(task)
+                and not (
                     isinstance(task, dict)
                     and task.get("status") in _TERMINAL_BACKGROUND_TASK_STATUSES
                 )

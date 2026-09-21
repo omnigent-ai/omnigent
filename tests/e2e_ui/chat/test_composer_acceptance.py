@@ -160,16 +160,18 @@ def test_pr_context_and_background_tasks_share_workspace_bar(
         applied_family = context.evaluate("el => getComputedStyle(el).fontFamily")
         assert applied_family.split(",")[0].strip("\"' ") == font_family
     expect(bar.get_by_test_id("background-task-pill")).to_have_text("1")
-    expect(bar.get_by_test_id("subagent-task-pill")).to_have_text("1")
+    subagent = bar.get_by_test_id("subagent-task-pill")
+    expect(subagent).to_have_text("1")
+    expect(subagent).to_have_accessible_name("1 sub-agent: 1 active")
     expect(bar).to_contain_text("live-branch")
     expect(bar).not_to_contain_text("pr-head-not-checkout")
     bounds = bar.bounding_box()
     assert bounds is not None
     status_ids = (
         "composer-pr-link",
-        "composer-context-ring",
         "background-task-pill",
         "subagent-task-pill",
+        "composer-context-ring",
     )
     control_bounds = {}
     icon_bounds = {}
@@ -198,6 +200,11 @@ def test_pr_context_and_background_tasks_share_workspace_bar(
     trailing = control_bounds[status_ids[-1]]
     assert trailing["x"] + trailing["width"] == pytest.approx(
         bounds["x"] + bounds["width"] - 9, abs=0.5
+    )
+    indicator_ids = ("background-task-pill", "subagent-task-pill", "composer-context-ring")
+    assert all(
+        control_bounds[left]["x"] + control_bounds[left]["width"] < control_bounds[right]["x"]
+        for left, right in pairwise(indicator_ids)
     )
     # A label that would have to truncate collapses the whole bar to icons
     # instead — the full value stays in the title — and a bar with room shows
@@ -250,9 +257,9 @@ def test_pr_context_and_background_tasks_share_workspace_bar(
             "composer-pr-link",
             "composer-workspace-dir",
             "composer-git-branch",
-            "composer-context-ring",
             "background-task-pill",
             "subagent-task-pill",
+            "composer-context-ring",
         )
         for icon in icon_bounds[test_id]
     ]
