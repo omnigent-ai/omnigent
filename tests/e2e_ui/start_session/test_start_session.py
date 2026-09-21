@@ -560,7 +560,7 @@ async def _open_entry_config(page, agent_id: str) -> None:
         .get_by_text("Edit", exact=True)
         .click()
     )
-    await page.get_by_test_id("new-chat-landing-config-gear").click()
+    await expect(page.get_by_test_id("new-chat-landing-config-harness")).to_be_visible()
 
 
 async def _save_config(page) -> None:
@@ -2409,10 +2409,20 @@ async def _drive_select_harness(base_url: str, session_id: str) -> None:
             community_harness = page.get_by_test_id("new-chat-landing-harness-community-brain")
             await expect(community_harness).to_be_visible()
             await expect(community_harness).to_contain_text("Community Brain")
-            # Picking a harness updates the select; Save commits the override
-            # (the agent chip keeps the bare agent label "Polly").
+            # Picking a harness commits immediately in the integrated config
+            # page (the agent chip keeps the bare agent label "Polly").
             await community_harness.click()
-            await _save_config(page)
+            await expect(page.get_by_test_id("new-chat-landing-config-harness")).to_contain_text(
+                "Community Brain"
+            )
+            await page.keyboard.press("Escape")
+            if (
+                await page.get_by_test_id("new-chat-landing-agent-select").get_attribute(
+                    "aria-expanded"
+                )
+                == "true"
+            ):
+                await page.keyboard.press("Escape")
 
             await page.get_by_test_id("new-chat-landing-input").fill("debate the design")
             await page.get_by_test_id("new-chat-landing-submit").click()
@@ -3309,6 +3319,7 @@ async def _drive_add_worktree(base_url: str, session_id: str) -> None:
                                 "branch": "main",
                                 "is_main": True,
                                 "detached": False,
+                                "remote_provider": "github",
                             }
                         ]
                     }
@@ -3391,12 +3402,14 @@ async def _drive_select_existing_worktree(base_url: str, session_id: str) -> Non
                                     "branch": "main",
                                     "is_main": True,
                                     "detached": False,
+                                    "remote_provider": "github",
                                 },
                                 {
                                     "path": "/work/repo-worktrees/feature-x",
                                     "branch": "feature/x",
                                     "is_main": False,
                                     "detached": False,
+                                    "remote_provider": "github",
                                 },
                             ],
                         }
@@ -3425,8 +3438,9 @@ async def _drive_select_existing_worktree(base_url: str, session_id: str) -> Non
             await page.get_by_test_id("new-chat-landing-branch-input").focus()
             option = page.get_by_test_id("new-chat-landing-worktree-option")
             await expect(option).to_have_count(1)
-            await expect(option).to_contain_text("feature/x")
+            await expect(option).to_contain_text("feature-x")
             await option.click()
+            await expect(option.get_by_role("radio")).to_be_checked()
 
             # The warning confirms the session will start in the existing
             # worktree (rather than creating a new one).

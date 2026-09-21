@@ -41,11 +41,28 @@ def test_composer_details_wrap_without_clipping(
 
     page.route(re.compile(rf"/v1/sessions/{session_id}(?:\?.*)?$"), session_details)
     page.route(
+        f"**/v1/sessions/{session_id}/resources/github",
+        lambda route: route.fulfill(
+            json={
+                "object": "session.github.info",
+                "available": has_binding,
+                "repo": {"name_with_owner": "example/repo"} if has_binding else None,
+                "prs": [],
+            }
+        ),
+    )
+    page.route(
         "**/v1/hosts/composer-workspace-host/worktrees?*",
         lambda route: route.fulfill(
             json={
                 "data": [
-                    {"path": _WORKSPACE, "branch": _BRANCH, "is_main": True, "detached": False}
+                    {
+                        "path": _WORKSPACE,
+                        "branch": _BRANCH,
+                        "is_main": True,
+                        "detached": False,
+                        "remote_provider": "github",
+                    }
                 ]
             }
         ),
@@ -55,57 +72,17 @@ def test_composer_details_wrap_without_clipping(
     page.goto(f"{base_url}/c/{session_id}")
     controls = page.get_by_test_id("composer-workspace-controls")
     expect(controls).to_be_visible(timeout=30_000)
-    for popover in ("workspace", "worktree"):
-        controls.get_by_role("button").nth(0 if popover == "workspace" else 1).click()
-
-        menu = page.get_by_role("menu")
-        expect(
-            menu.get_by_text("Workspace" if popover == "workspace" else "Git branch", exact=True)
-        ).to_be_visible()
-        if popover == "workspace":
-            detail = _WORKSPACE if has_binding else "This session has no workspace binding."
-            explanation = "The working directory the session runs in."
-        else:
-            detail = _BRANCH if has_binding else "The workspace branch could not be determined."
-            explanation = None
-        expect(menu.locator("p")).to_have_text([detail, explanation] if explanation else [detail])
-        menu.screenshot(path=tmp_path / f"{popover}-{viewport_width}.png", animations="disabled")
-
-        dimensions = menu.evaluate(
-            """menu => {
-              const bounds = menu.getBoundingClientRect();
-              return {
-                left: bounds.left,
-                right: bounds.right,
-                top: bounds.top,
-                bottom: bounds.bottom,
-                viewport: window.innerWidth,
-                lines: [...menu.querySelectorAll('p')].flatMap(paragraph => {
-                  const range = document.createRange();
-                  range.selectNodeContents(paragraph);
-                  return [...range.getClientRects()].map(line => ({
-                    left: line.left, right: line.right, top: line.top, bottom: line.bottom,
-                  }));
-                }),
-              };
-            }"""
-        )
-        assert dimensions["left"] >= 0
-        assert dimensions["right"] <= dimensions["viewport"]
-        assert (
-            dimensions["right"] - dimensions["left"] <= min(dimensions["viewport"] * 0.9, 448) + 1
-        )
-        if has_binding and viewport_width == 1440:
-            assert dimensions["right"] - dimensions["left"] == pytest.approx(448, abs=1)
-        assert dimensions["lines"]
-        for line in dimensions["lines"]:
-            assert line["left"] >= dimensions["left"] - 1
-            assert line["right"] <= dimensions["right"] + 1
-            assert line["top"] >= dimensions["top"] - 1
-            assert line["bottom"] <= dimensions["bottom"] + 1
-
-        page.keyboard.press("Escape")
-        expect(menu).to_have_count(0)
+    expect(controls.get_by_role("button")).to_have_count(0)
+    workspace = controls.get_by_test_id("composer-workspace-dir")
+    expect(workspace).to_have_attribute(
+        "title", _WORKSPACE if has_binding else "No workspace bound"
+    )
+    if has_binding:
+        worktree = controls.get_by_test_id("composer-git-branch")
+        expect(worktree).to_have_attribute("title", _BRANCH)
+    else:
+        expect(controls.get_by_test_id("composer-git-branch")).to_have_count(0)
+    controls.screenshot(path=tmp_path / f"details-{viewport_width}.png", animations="disabled")
 
 
 @pytest.mark.parametrize(
@@ -138,6 +115,17 @@ def test_composer_workspace_labels_use_available_width(
 
     page.route(re.compile(rf"/v1/sessions/{session_id}(?:\?.*)?$"), session_details)
     page.route(
+        f"**/v1/sessions/{session_id}/resources/github",
+        lambda route: route.fulfill(
+            json={
+                "object": "session.github.info",
+                "available": True,
+                "repo": {"name_with_owner": "example/repo"},
+                "prs": [],
+            }
+        ),
+    )
+    page.route(
         "**/v1/hosts/composer-workspace-host/worktrees?*",
         lambda route: route.fulfill(
             json={
@@ -147,6 +135,7 @@ def test_composer_workspace_labels_use_available_width(
                         "branch": name,
                         "is_main": True,
                         "detached": False,
+                        "remote_provider": "github",
                     }
                 ]
             }
@@ -157,7 +146,7 @@ def test_composer_workspace_labels_use_available_width(
     page.goto(f"{base_url}/c/{session_id}")
     controls = page.get_by_test_id("composer-workspace-controls")
     expect(controls).to_be_visible(timeout=30_000)
-    expect(controls.get_by_role("button")).to_have_count(2)
+    expect(controls.get_by_role("button")).to_have_count(0)
     controls.screenshot(path=tmp_path / f"labels-{viewport_width}-{font_size}.png")
 
     # The bar shows the full names while they fit; once a name would have to
@@ -180,17 +169,17 @@ def test_composer_workspace_labels_use_available_width(
             right: bounds.right,
             bottom: bounds.bottom,
             viewport: window.innerWidth,
-            buttons: [...bar.querySelectorAll('button')].map(button => {
-              const buttonBounds = button.getBoundingClientRect();
-              const label = button.querySelector('span.truncate');
+            items: [...bar.querySelectorAll('[data-testid="composer-workspace-dir"], [data-testid="composer-git-branch"]')].map(item => {
+              const itemBounds = item.getBoundingClientRect();
+              const label = item.querySelector('span.truncate');
               return {
-                left: buttonBounds.left,
-                right: buttonBounds.right,
-                top: buttonBounds.top,
-                bottom: buttonBounds.bottom,
+                left: itemBounds.left,
+                right: itemBounds.right,
+                top: itemBounds.top,
+                bottom: itemBounds.bottom,
                 labelWidth: label.clientWidth,
                 textWidth: label.scrollWidth,
-                icons: [...button.querySelectorAll('svg')].map(icon => {
+                icons: [...item.querySelectorAll('svg')].map(icon => {
                   const iconBounds = icon.getBoundingClientRect();
                   return { left: iconBounds.left, right: iconBounds.right };
                 }),
@@ -201,20 +190,20 @@ def test_composer_workspace_labels_use_available_width(
     )
     assert dimensions["left"] >= 0
     assert dimensions["right"] <= dimensions["viewport"]
-    workspace, worktree = dimensions["buttons"]
+    workspace, worktree = dimensions["items"]
     assert workspace["right"] < worktree["left"]
     assert workspace["top"] == pytest.approx(worktree["top"], abs=1)
-    for button in dimensions["buttons"]:
-        assert button["left"] >= dimensions["left"]
-        assert button["right"] <= dimensions["right"]
-        assert button["bottom"] <= dimensions["bottom"]
+    for item in dimensions["items"]:
+        assert item["left"] >= dimensions["left"]
+        assert item["right"] <= dimensions["right"]
+        assert item["bottom"] <= dimensions["bottom"]
         if collapsed:
             # Collapsed: the label is hidden, so only the icon remains.
-            assert button["labelWidth"] == 0
+            assert item["labelWidth"] == 0
         else:
-            assert button["labelWidth"] > 0
-            assert button["textWidth"] <= button["labelWidth"] + 1
-        for icon in button["icons"]:
+            assert item["labelWidth"] > 0
+            assert item["textWidth"] <= item["labelWidth"] + 1
+        for icon in item["icons"]:
             assert icon["right"] - icon["left"] >= 12
-            assert icon["left"] >= button["left"]
-            assert icon["right"] <= button["right"]
+            assert icon["left"] >= item["left"]
+            assert icon["right"] <= item["right"]
