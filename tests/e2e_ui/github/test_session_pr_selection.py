@@ -7,9 +7,43 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
-from playwright.sync_api import Page, Route, expect
+from playwright.sync_api import Locator, Page, Route, expect
 
 from tests.e2e_ui.github.test_github_tab import _INFO
+
+
+def _expect_pr_tooltip(page: Page, label: str, trigger: Locator) -> Locator:
+    expect(trigger).to_have_attribute("aria-describedby", re.compile(r"\S+"))
+    tooltip_id = trigger.get_attribute("aria-describedby")
+    assert tooltip_id
+    content = page.locator(f'[role="tooltip"][id="{tooltip_id}"]:not([data-state="closed"])')
+    expect(content).to_be_visible()
+    expect(content).to_have_accessible_name(label)
+    expect(content).to_have_attribute("data-slot", "tooltip-content")
+    expect(content).to_have_class(re.compile(r"\bbg-neutral-900\b"))
+    expect(content).to_have_class(re.compile(r"\btext-white\b"))
+    expect(content).to_have_css("color", "rgb(255, 255, 255)")
+    background = content.evaluate("""element => {
+        const canvas = document.createElement("canvas");
+        canvas.width = canvas.height = 1;
+        const context = canvas.getContext("2d");
+        context.fillStyle = getComputedStyle(element).backgroundColor;
+        context.fillRect(0, 0, 1, 1);
+        return [...context.getImageData(0, 0, 1, 1).data];
+    }""")
+    assert max(background[:3]) < 64 and background[3] == 255
+    box, anchor, viewport = content.bounding_box(), trigger.bounding_box(), page.viewport_size
+    assert box and anchor and viewport
+    assert box["x"] >= -1 and box["x"] + box["width"] <= viewport["width"] + 1
+    assert box["y"] >= -1 and box["y"] + box["height"] <= viewport["height"] + 1
+    horizontal_gap = max(
+        box["x"] - anchor["x"] - anchor["width"], anchor["x"] - box["x"] - box["width"], 0
+    )
+    vertical_gap = max(
+        box["y"] - anchor["y"] - anchor["height"], anchor["y"] - box["y"] - box["height"], 0
+    )
+    assert max(horizontal_gap, vertical_gap) <= 24
+    return content
 
 
 def test_session_pr_selection_and_unlink(
@@ -112,7 +146,7 @@ def test_session_pr_selection_and_unlink(
     expect(rail.get_by_role("tab", name="GitHub")).to_have_attribute("aria-selected", "true")
     picker = rail.get_by_role("combobox", name="Session pull request")
     expect(picker).to_have_text(one_label)
-    expect(picker).to_have_attribute("title", one_label)
+    expect(picker).not_to_have_attribute("title", re.compile(r".*"))
     original_picker = picker.element_handle()
     assert original_picker
     link_action = rail.get_by_role("button", name="Link a PR", exact=True)
@@ -132,7 +166,7 @@ def test_session_pr_selection_and_unlink(
     rail.get_by_role("textbox", name="Pull request URL").press("Escape")
     expect(rail.get_by_role("textbox", name="Pull request URL")).to_have_count(0)
     picker.hover()
-    expect(page.get_by_role("tooltip")).to_have_count(0)
+    _expect_pr_tooltip(page, one_label, picker)
     unlink_action.hover()
     expect(page.get_by_role("tooltip", name="Unlink PR", exact=True)).to_be_visible()
     page.keyboard.press("Escape")
@@ -151,12 +185,22 @@ def test_session_pr_selection_and_unlink(
     picker.press("ArrowDown")
     expect(page.get_by_role("listbox")).to_be_visible()
     expect(page.get_by_role("option", name=one_label, exact=True)).to_be_focused()
+    page.keyboard.press("ArrowDown")
+    expect(page.get_by_role("option", name=two_label, exact=True)).to_be_focused()
+    _expect_pr_tooltip(page, two_label, page.get_by_role("option", name=two_label, exact=True))
+    page.keyboard.press("Escape")
+    expect(page.get_by_role("listbox")).to_have_count(0)
+    expect(picker).to_be_focused()
+    picker.hover()
+    _expect_pr_tooltip(page, one_label, picker)
+    picker.click()
+    expect(page.get_by_role("option", name=one_label, exact=True)).to_be_focused()
     page.keyboard.press("End")
     expect(page.get_by_role("option", name=two_label, exact=True)).to_be_focused()
     page.keyboard.press("Enter")
     expect(page.get_by_role("listbox")).to_have_count(0)
     expect(picker).to_have_text(two_label)
-    expect(picker).to_have_attribute("title", two_label)
+    expect(picker).not_to_have_attribute("title", re.compile(r".*"))
     expect(rail.get_by_text("Loading GitHub…", exact=True)).to_be_visible()
     expect(rail.get_by_text("First repository", exact=True)).to_have_count(0)
     assert original_picker.evaluate("element => element.isConnected")
@@ -174,6 +218,26 @@ def test_session_pr_selection_and_unlink(
     expect(rail.get_by_text("Second repository", exact=True)).to_be_visible()
     expect(picker).to_have_text(two_label)
 
+    picker.hover()
+    _expect_pr_tooltip(page, two_label, picker)
+    picker.click()
+    selected_option = page.get_by_role("option", name=two_label, exact=True)
+    selected_option.hover()
+    _expect_pr_tooltip(page, two_label, selected_option)
+    first_option = page.get_by_role("option", name=one_label, exact=True)
+    first_option.hover()
+    _expect_pr_tooltip(page, one_label, first_option)
+    first_option.click()
+    expect(picker).to_have_text(one_label)
+    expect(rail.get_by_text("First repository", exact=True)).to_be_visible()
+    picker.click()
+    second_option = page.get_by_role("option", name=two_label, exact=True)
+    second_option.hover()
+    _expect_pr_tooltip(page, two_label, second_option)
+    second_option.click()
+    expect(picker).to_have_text(two_label)
+    expect(rail.get_by_text("Second repository", exact=True)).to_be_visible()
+
     rail.get_by_role("tablist", name="Pull request").get_by_role(
         "tab", name="Changes", exact=True
     ).click()
@@ -182,7 +246,7 @@ def test_session_pr_selection_and_unlink(
     assert ("diff", two) in requested
     unlink_action.click()
     expect(picker).to_have_text(one_label)
-    expect(picker).to_have_attribute("title", one_label)
+    expect(picker).not_to_have_attribute("title", re.compile(r".*"))
     expect(indicator).to_have_accessible_name("#42")
     unlink_action.click()
     expect(picker).to_have_count(0)
@@ -209,7 +273,7 @@ def test_session_pr_selection_and_unlink(
     expect(rail.get_by_role("textbox", name="Pull request URL")).to_have_value(two)
     rail.get_by_role("button", name="Link", exact=True).click()
     expect(picker).to_have_text(two_label)
-    expect(picker).to_have_attribute("title", two_label)
+    expect(picker).not_to_have_attribute("title", re.compile(r".*"))
     expect(indicator).to_have_accessible_name("#42")
     expect(rail.get_by_text("Second repository", exact=True)).to_be_visible()
 
@@ -260,7 +324,7 @@ def test_session_pr_picker_long_title(
     )
     picker = panel.get_by_role("combobox", name="Session pull request")
     expect(picker).to_have_text(label)
-    expect(picker).to_have_attribute("title", label)
+    expect(picker).not_to_have_attribute("title", re.compile(r".*"))
     selected_text = picker.get_by_text(label, exact=True)
     expect(selected_text).to_have_css("white-space", "nowrap")
     expect(selected_text).to_have_css("text-overflow", "ellipsis")
@@ -269,6 +333,11 @@ def test_session_pr_picker_long_title(
     expect(panel.get_by_role("button", name="Link a PR", exact=True)).to_be_in_viewport()
     expect(panel.get_by_role("button", name="Unlink PR", exact=True)).to_be_in_viewport()
     picker_box = picker.bounding_box()
+    if viewport_width >= 768:
+        picker.hover()
+        tooltip = _expect_pr_tooltip(page, label, picker)
+        assert tooltip.evaluate("element => element.scrollWidth <= element.clientWidth")
+        page.screenshot(path=tmp_path / "session-pr-selected-tooltip.png", animations="disabled")
 
     picker.click()
     titled_option = page.get_by_role("option", name=label, exact=True)
@@ -280,7 +349,7 @@ def test_session_pr_picker_long_title(
     assert titled_box and untitled_box
     assert titled_box["height"] == pytest.approx(untitled_box["height"], abs=0.5)
     for option, option_label in ((titled_option, label), (untitled_option, "example/one #43")):
-        expect(option).to_have_attribute("title", option_label)
+        expect(option).not_to_have_attribute("title", re.compile(r".*"))
         option_text = option.get_by_text(option_label, exact=True)
         expect(option_text).to_have_css("white-space", "nowrap")
         expect(option_text).to_have_css("text-overflow", "ellipsis")
@@ -291,6 +360,11 @@ def test_session_pr_picker_long_title(
     )
     for box in (picker_box, page.get_by_role("listbox").bounding_box()):
         assert box and box["x"] >= 0 and box["x"] + box["width"] <= viewport_width
+    if viewport_width >= 768:
+        titled_option.hover()
+        tooltip = _expect_pr_tooltip(page, label, titled_option)
+        assert tooltip.evaluate("element => element.scrollWidth <= element.clientWidth")
+        page.screenshot(path=tmp_path / "session-pr-option-tooltip.png", animations="disabled")
 
 
 def test_session_pr_account_fallback(
