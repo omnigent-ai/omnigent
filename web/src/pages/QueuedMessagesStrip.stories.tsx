@@ -49,12 +49,31 @@ export const ReorderableWithSteer: Story = {
 
 export const LongBacklog: Story = {
   args: {
-    messages: Array.from({ length: 7 }, (_, index) =>
+    messages: Array.from({ length: 12 }, (_, index) =>
       message(
         `queue-${index + 1}`,
         `Queued follow-up ${index + 1}: verify this intentionally long message remains truncated inside the composer tray.`,
       ),
     ),
     onSteer: () => undefined,
+    onReorder: () => undefined,
   },
+};
+
+export const Mobile: Story = {
+  args: {
+    messages: [
+      message("queue-1", "Make the queued controls comfortable to tap on a narrow screen."),
+      message("queue-2", "Keep the message preview readable beside the actions."),
+    ],
+    onSteer: () => undefined,
+    onReorder: () => undefined,
+  },
+  decorators: [
+    (Story) => (
+      <div className="flex min-h-64 w-[390px] items-end rounded-2xl bg-muted/30 px-2 pb-8">
+        <Story />
+      </div>
+    ),
+  ],
 };

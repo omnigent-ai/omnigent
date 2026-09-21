@@ -35,6 +35,17 @@ describe("QueuedMessagesStrip", () => {
     );
     expect(screen.getByText("first")).toBeInTheDocument();
     expect(screen.getByText("second")).toBeInTheDocument();
+    expect(screen.getByRole("list", { name: "Queued messages" })).toBeInTheDocument();
+    expect(screen.getAllByRole("listitem")).toHaveLength(2);
+  });
+
+  it("keeps the full message available when the visible preview truncates", () => {
+    const text = "A long queued message that cannot fit on one line";
+    render(
+      <QueuedMessagesStrip messages={[msg("q_1", text)]} onDelete={vi.fn()} onEdit={vi.fn()} />,
+    );
+    expect(screen.getByText(text)).toHaveAttribute("title", text);
+    expect(screen.getByText(text)).toHaveClass("truncate");
   });
 
   it.each([
@@ -265,6 +276,24 @@ describe("QueuedMessagesStrip", () => {
         onReorder={vi.fn()}
       />,
     );
-    expect(screen.getAllByRole("button", { name: "Reorder queued message" })).toHaveLength(2);
+    const handles = screen.getAllByRole("button", { name: "Reorder queued message" });
+    expect(handles).toHaveLength(2);
+    expect(handles[0]).toHaveAttribute("tabindex", "0");
+    expect(handles[0]).toHaveAttribute("aria-describedby");
+  });
+
+  it("caps and scrolls a long backlog instead of growing the composer stack", () => {
+    render(
+      <QueuedMessagesStrip
+        messages={Array.from({ length: 12 }, (_, index) => msg(`q_${index}`, `queued ${index}`))}
+        onDelete={vi.fn()}
+        onEdit={vi.fn()}
+      />,
+    );
+    expect(screen.getByRole("list", { name: "Queued messages" })).toHaveClass(
+      "max-h-32",
+      "overflow-y-auto",
+      "overscroll-contain",
+    );
   });
 });
