@@ -1669,7 +1669,8 @@ def ensure_claude_workspace_trusted(workspace: Path) -> None:
     :raises json.JSONDecodeError: If an existing ``~/.claude.json`` is
         not valid JSON, for the same reason.
     """
-    config_path = Path.home() / ".claude.json"
+    config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+    config_path = (Path(config_dir).expanduser() if config_dir else Path.home()) / ".claude.json"
     if config_path.exists():
         data = json.loads(config_path.read_text(encoding="utf-8"))
         if not isinstance(data, dict):
@@ -1701,6 +1702,7 @@ def ensure_claude_workspace_trusted(workspace: Path) -> None:
 
     if not changed:
         return
+    config_path.parent.mkdir(parents=True, exist_ok=True)
     _atomic_write_user_json(config_path, data)
 
 
