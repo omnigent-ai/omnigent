@@ -47,10 +47,10 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from omnigent._platform import normalize_interactive_shells
 from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
 from omnigent.debug_logging import (
-    current_session_id_scope,
     debug_event,
     phase_scope,
     runner_primary_session_id,
+    set_current_session_id,
 )
 from omnigent.entities.session_resources import (
     DEFAULT_ENVIRONMENT_ID,
@@ -3916,38 +3916,24 @@ def create_runner_app(
         )
 
     async def _initialize_session(body: _JsonObject) -> JSONResponse:
-        raw_id = body.get("session_id")
-        session_id = raw_id if isinstance(raw_id, str) else None
-        with current_session_id_scope(session_id):
-            _logger.info(
-                "Runner session initialization started",
-                extra=debug_event("runner_session_init_started", stage="session_init"),
-            )
-            try:
-                response = await _initialize_session_impl(body)
-            except Exception:
-                _logger.exception(
-                    "Runner session initialization failed",
-                    extra=debug_event("runner_session_init_failed", stage="session_init"),
-                )
-                raise
-            failed = response.status_code >= 400
-            log = _logger.error if failed else _logger.info
-            log(
-                "Runner session initialization finished",
-                extra=debug_event(
-                    "runner_session_init_failed" if failed else "runner_session_initialized",
-                    stage="session_init",
-                    status_code=response.status_code,
-                    harness=_session_harness_name(session_id) if session_id else None,
-                ),
-            )
-            return response
-
-    async def _initialize_session_impl(body: _JsonObject) -> JSONResponse:
         from omnigent.runner.session_init_protocol import RunnerInferenceConfigMismatch
 
+        raw_id = body.get("session_id")
+        set_current_session_id(raw_id if isinstance(raw_id, str) else None)
+        _logger.info(
+            "Runner session initialization started",
+            extra=debug_event("runner_session_init_started", stage="session_init"),
+        )
         if process_manager is None:
+            _logger.error(
+                "Runner session initialization failed",
+                extra=debug_event(
+                    "runner_session_init_failed",
+                    stage="session_init",
+                    status_code=501,
+                    error_code="not_implemented",
+                ),
+            )
             return JSONResponse(
                 status_code=501,
                 content={
@@ -3958,6 +3944,15 @@ def create_runner_app(
         session_id = body.get("session_id")
         agent_id = body.get("agent_id")
         if not session_id or not agent_id:
+            _logger.error(
+                "Runner session initialization failed",
+                extra=debug_event(
+                    "runner_session_init_failed",
+                    stage="session_init",
+                    status_code=400,
+                    error_code="invalid_request",
+                ),
+            )
             return JSONResponse(
                 status_code=400,
                 content={
@@ -3997,6 +3992,15 @@ def create_runner_app(
                 },
             )
         except ValueError:
+            _logger.error(
+                "Runner session initialization failed",
+                extra=debug_event(
+                    "runner_session_init_failed",
+                    stage="session_init",
+                    status_code=400,
+                    error_code="invalid_request",
+                ),
+            )
             return JSONResponse(
                 status_code=400,
                 content={
@@ -4023,6 +4027,15 @@ def create_runner_app(
             try:
                 spec_entry = await spec_resolver(agent_id, session_id)
             except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+                _logger.error(
+                    "Runner session initialization failed",
+                    extra=debug_event(
+                        "runner_session_init_failed",
+                        stage="session_init",
+                        status_code=503,
+                        error_code="spec_resolver_failed",
+                    ),
+                )
                 return JSONResponse(
                     status_code=503,
                     content={
@@ -4061,6 +4074,15 @@ def create_runner_app(
             _start_verdict = await _evaluate_agent_start_gate(spec, harness_name)
             if _start_verdict is not None:
                 if _start_verdict.action in ("deny", "ask"):
+                    _logger.error(
+                        "Runner session initialization failed",
+                        extra=debug_event(
+                            "runner_session_init_failed",
+                            stage="session_init",
+                            status_code=403,
+                            error_code="agent_start_denied",
+                        ),
+                    )
                     return JSONResponse(
                         status_code=403,
                         content={
@@ -4115,6 +4137,15 @@ def create_runner_app(
                 # agent_id. Return a clear 400 rather than silently proceeding
                 # with the test-only harness and leaving the session in a
                 # broken/unrunnable state.
+                _logger.error(
+                    "Runner session initialization failed",
+                    extra=debug_event(
+                        "runner_session_init_failed",
+                        stage="session_init",
+                        status_code=400,
+                        error_code="no_agent_spec",
+                    ),
+                )
                 return JSONResponse(
                     status_code=400,
                     content={
@@ -4135,6 +4166,15 @@ def create_runner_app(
                 env=spawn_env,
             )
         except RuntimeError as exc:
+            _logger.error(
+                "Runner session initialization failed",
+                extra=debug_event(
+                    "runner_session_init_failed",
+                    stage="session_init",
+                    status_code=503,
+                    error_code="harness_spawn_failed",
+                ),
+            )
             return JSONResponse(
                 status_code=503,
                 content={
@@ -4607,7 +4647,17 @@ def create_runner_app(
                 recovery_task.add_done_callback(_background_tasks.discard)
                 _background_tasks.add(recovery_task)
             _recovery_turn_ids.setdefault(session_id, set()).add(recovery_id)
+
         status = "running" if session_id in _active_turns else "idle"
+        _logger.info(
+            "Runner session initialization finished",
+            extra=debug_event(
+                "runner_session_initialized",
+                stage="session_init",
+                status_code=201,
+                harness=harness_name,
+            ),
+        )
         return JSONResponse(
             status_code=201,
             content={

@@ -12,8 +12,10 @@ from tests.runner.helpers import NullServerClient
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("agent_id", ["agent", None])
 async def test_runner_request_overrides_primary_and_logs_failed_init(
     monkeypatch: pytest.MonkeyPatch,
+    agent_id: str | None,
 ) -> None:
     monkeypatch.setenv(dl.PRIMARY_SESSION_ID_ENV_VAR, "parent")
     monkeypatch.setenv(dl.RUNNER_ID_ENV_VAR, "runner_parent")
@@ -29,7 +31,7 @@ async def test_runner_request_overrides_primary_and_logs_failed_init(
             transport=httpx.ASGITransport(app=app), base_url="http://runner"
         ) as client:
             response = await client.post(
-                "/v1/sessions", json={"session_id": "child", "agent_id": "agent"}
+                "/v1/sessions", json={"session_id": "child", "agent_id": agent_id}
             )
             assert response.status_code == 501
             probe_response = await client.get("/v1/sessions/child/logging-probe")
@@ -39,6 +41,7 @@ async def test_runner_request_overrides_primary_and_logs_failed_init(
     assert failure["session_id"] == "child"
     assert failure["attributes"]["runner_id"] == "runner_parent"
     assert failure["attributes"]["status_code"] == "501"
+    assert failure["attributes"]["error_code"] == "not_implemented"
     assert next(row for row in rows if row["message"] == "child probe")["session_id"] == "child"
     assert next(row for row in rows if row["message"] == "process probe")["session_id"] == "parent"
     assert not any(row["event_name"] == "runner_session_initialized" for row in rows)

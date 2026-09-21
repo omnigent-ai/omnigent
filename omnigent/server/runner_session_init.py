@@ -135,7 +135,6 @@ class RunnerSessionInitializer:
                 self._tasks.pop(key, None)
                 self._recovery_ids.pop(key, None)
 
-
     async def _post_initialize(
         self,
         runner_client: httpx.AsyncClient,

@@ -3553,6 +3553,11 @@ def create_app(
                 if cached_sandbox is not None and cached_sandbox.stage == "failed":
                     _publish_sandbox_status(conv.id, "ready")
 
+    def _mint_managed_runner_token(runner_id: str, ttl_seconds: int) -> str | None:
+        assert runner_account_store is not None and auth_provider is not None
+        return runner_account_store.with_runner_authority(
+            runner_id, lambda owner: auth_provider.mint_runner_token(owner, ttl_seconds)
+        )
 
     def _resolve_managed_runner_owner(runner_id: str) -> str | None:
         """Owner for a delegated runner, by its bound session.

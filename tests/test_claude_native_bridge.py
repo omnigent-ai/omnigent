@@ -10493,14 +10493,19 @@ def test_claude_pane_ready_is_true_only_at_an_idle_input_box(
 
     assert claude_native_bridge.claude_pane_ready(bridge_dir) is True
 
+    assert claude_native_bridge.claude_pane_text_ready(frames["pane"]) is True
+
     frames["pane"] = _MODEL_PICKER_PANE
     assert claude_native_bridge.claude_pane_ready(bridge_dir) is False
+    assert claude_native_bridge.claude_pane_text_ready(frames["pane"]) is False
 
     frames["pane"] = "  Switch model?\n"
     assert claude_native_bridge.claude_pane_ready(bridge_dir) is False
+    assert claude_native_bridge.claude_pane_text_ready(frames["pane"]) is False
 
     frames["pane"] = _EFFORT_DIALOG_PANE
     assert claude_native_bridge.claude_pane_ready(bridge_dir) is False
+    assert claude_native_bridge.claude_pane_text_ready(frames["pane"]) is False
 
 
 def test_claude_pane_ready_is_false_without_an_advertised_pane(tmp_path: Path) -> None:
