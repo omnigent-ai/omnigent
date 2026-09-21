@@ -3461,9 +3461,9 @@ export function NewChatLandingScreen() {
             sandboxSelected,
             model: pickedModel,
             models: {
-              claude: availableClaudeModels ?? [],
-              codex: availableCodexModels ?? [],
-              pi: availablePiModels ?? [],
+              claude: availableClaudeModels,
+              codex: availableCodexModels,
+              pi: availablePiModels,
             },
           }
         : null,

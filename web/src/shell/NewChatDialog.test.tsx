@@ -1987,6 +1987,49 @@ describe("NewChatLandingScreen cached picker preview", () => {
     },
   );
 
+  describe.each(["absent", "empty"])("restoring an %s catalog", (catalogState) => {
+    it.each(["claude-native", "codex-native", "pi-native"])(
+      "preserves %s's model summary through a reload",
+      (harness) => {
+        mockAgents([{ ...DEFAULT_LANDING_AGENTS[0], name: harness, harness }]);
+        localStorage.setItem(
+          HARNESS_OPTIONS_KEY,
+          JSON.stringify({ [harness]: { model: "saved-model" } }),
+        );
+        mockHosts([
+          {
+            ...host("online"),
+            configured_harnesses: { [harness]: catalogState === "empty" },
+          },
+        ]);
+        mockModelQueries(() => ({ ...SUCCESS_QUERY_STATE, data: [] }));
+        const first = renderLanding();
+        const expectedSummary = catalogState === "absent" ? "saved-model" : "Default";
+        fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+        expect(screen.getByTestId("new-chat-landing-agent-summary-a1")).toHaveTextContent(
+          expectedSummary,
+        );
+        expect(readNewChatPickerOptionsCache(getNewChatPickerCacheKey(""))).not.toBeNull();
+        first.unmount();
+        resetLandingDraft();
+
+        mockHosts([{ ...host("online"), configured_harnesses: { [harness]: false } }]);
+        useHostModelOptionsMock.mockClear();
+        renderLanding();
+        expect(useHostModelOptionsMock.mock.calls.filter(([, h]) => h === harness).at(-1)).toEqual([
+          "host_1",
+          harness,
+          false,
+          { poll: true },
+        ]);
+        fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+        expect(screen.getByTestId("new-chat-landing-agent-summary-a1")).toHaveTextContent(
+          expectedSummary,
+        );
+      },
+    );
+  });
+
   it("preserves the advertised display name verbatim in the live picker and refresh cache", () => {
     mockClaudeModels([
       { id: "sonnet", model: "provider/model-id", displayName: "provider/model-id" },
@@ -2759,7 +2802,7 @@ describe("Run on this machine (desktop host enrollment)", () => {
     await openHostMenu();
 
     const item = await screen.findByTestId("new-chat-landing-run-on-this-machine");
-    expect(item).toHaveTextContent("This machine");
+    expect(item).toHaveTextContent("offline");
     expect(item).toHaveTextContent("jackson-laptop");
     expect(screen.getByTestId("new-chat-landing-use-this-machine")).toHaveTextContent(
       "Use this machine",
