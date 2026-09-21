@@ -67,7 +67,7 @@ import {
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import { useResizableColumn } from "@/hooks/useResizableColumn";
 import { RunnerOfflineError } from "@/hooks/useWorkspaceChangedFiles";
-import { readFileViewPreferences, writeFileViewPreferences } from "@/lib/fileViewPreferences";
+import { useFileViewPreferences } from "./FileViewPreferencesContext";
 import { absoluteTime, relativeTime } from "@/lib/relativeTime";
 import {
   fetchGithubFileContents,
@@ -964,18 +964,10 @@ function GithubPanelDetails({
   const [activeTab, setActiveTab] = useState<"summary" | "changes">("summary");
 
   const themeType = useResolvedThemeMode();
-  // Diff layout is the app-global FileViewer preference (unified/split); seed
-  // from the persisted value and write toggles back so the choice carries over.
-  const [diffStyle, setDiffStyle] = useState<"unified" | "split">(() =>
-    readFileViewPreferences().diffLayout === "split" ? "split" : "unified",
-  );
+  const { diffLayout: diffStyle, setDiffLayout } = useFileViewPreferences();
   const toggleDiffStyle = useCallback(() => {
-    setDiffStyle((prev) => {
-      const next = prev === "split" ? "unified" : "split";
-      writeFileViewPreferences({ ...readFileViewPreferences(), diffLayout: next });
-      return next;
-    });
-  }, []);
+    setDiffLayout((prev) => (prev === "split" ? "unified" : "split"));
+  }, [setDiffLayout]);
 
   const files = useMemo<GithubChangedFile[]>(() => changes.data?.data ?? [], [changes.data]);
   // The sidebar groups the flat file list into a compacted folder tree (the

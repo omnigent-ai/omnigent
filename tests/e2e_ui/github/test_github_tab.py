@@ -199,6 +199,80 @@ def test_github_tab_shows_summary_checks_and_file_tree(
     expect(rail.get_by_role("button", name=re.compile(r"main\.py")).first).to_be_visible()
 
 
+def test_github_diff_layout_carries_over_to_file_viewer(
+    page: Page, seeded_session: tuple[str, str]
+) -> None:
+    """Switching panels and toggling another preference must preserve the layout."""
+    base_url, session_id = seeded_session
+    path = "notes.md"
+    before, after = "# Notes\nBefore\n", "# Notes\nAfter\n"
+    _stub_github(page)
+    environment_url = f"{base_url}/v1/sessions/{session_id}/resources/environments/default"
+    page.route(
+        f"{environment_url}/changes",
+        lambda route: route.fulfill(
+            json={
+                "object": "list",
+                "has_more": False,
+                "data": [{"path": path, "name": path, "status": "modified", "bytes": len(after)}],
+            }
+        ),
+    )
+    page.route(
+        f"{environment_url}/filesystem/{path}",
+        lambda route: route.fulfill(
+            json={
+                "path": path,
+                "content": after,
+                "encoding": "utf-8",
+                "content_type": "text/markdown",
+            }
+        ),
+    )
+    page.route(
+        f"{environment_url}/diff/{path}",
+        lambda route: route.fulfill(json={"path": path, "before": before, "after": after}),
+    )
+    page.set_viewport_size({"width": 2400, "height": 1000})
+    page.add_init_script("""
+        localStorage.setItem('omnigent:file-view-preferences',
+            JSON.stringify({diffLayout: 'unified', diffActive: false}));
+    """)
+    page.goto(f"{base_url}/c/{session_id}?file={path}")
+    viewer = page.locator('[data-testid="file-viewer"]:visible')
+    expect(viewer.get_by_role("button", name="Show diff", exact=True)).to_be_visible()
+    rail = page.get_by_role("complementary", name="Workspace")
+    separator = rail.get_by_role("separator", name="Resize panel", exact=True)
+    box = separator.bounding_box()
+    assert box is not None
+    page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+    page.mouse.down()
+    page.mouse.move(1200, box["y"] + box["height"] / 2)
+    page.mouse.up()
+    rail.get_by_role("tab", name="GitHub").click()
+    rail.get_by_role("tablist", name="Pull request").get_by_role("tab", name="Changes").click()
+    rail.get_by_role("button", name="Switch to split view", exact=True).click()
+
+    rail.get_by_role("tab", name="Files", exact=True).click()
+    rail.locator(f'[role="button"][title="{path}"]').click()
+    viewer.get_by_role("button", name="Show diff", exact=True).click()
+    expect(viewer.get_by_role("button", name="Unified view", exact=True)).to_be_visible()
+    expect(viewer.locator(".monaco-diff-editor")).to_have_class(
+        re.compile(r"\bside-by-side\b"), timeout=30_000
+    )
+    viewer.get_by_role("button", name="View settings", exact=True).click()
+    page.get_by_role("menuitem", name="Wrap lines", exact=True).click()
+    page.keyboard.press("Escape")
+    saved = page.evaluate("JSON.parse(localStorage.getItem('omnigent:file-view-preferences'))")
+    assert saved["diffLayout"] == "split"
+    assert saved["wrapLines"] is True
+
+    viewer.get_by_role("button", name="Unified view", exact=True).click()
+    rail.get_by_role("tab", name="GitHub").click()
+    rail.get_by_role("tablist", name="Pull request").get_by_role("tab", name="Changes").click()
+    expect(rail.get_by_role("button", name="Switch to split view", exact=True)).to_be_visible()
+
+
 @pytest.mark.parametrize(
     "viewport_width",
     [1280, pytest.param(390, marks=pytest.mark.browser_context_args(has_touch=True))],
