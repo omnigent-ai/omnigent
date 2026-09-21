@@ -2602,7 +2602,6 @@ function ComposerImpl(
     (message) => message.conversationId === conversationId,
   );
   const hasQueuedComposerMessages = composerQueuedMessages.length > 0;
-  const hasDockedComposerTray = hasQueuedComposerMessages || Boolean(subAgentLabel);
   const composerContextWindow = useChatStore((s) => s.contextWindow);
   const composerTokensUsed = useChatStore((s) => s.tokensUsed);
   const openComposerGithubTab = useOpenGithubTab();
@@ -3668,7 +3667,7 @@ function ComposerImpl(
         <ComposerWorkspaceBar
           data-testid="composer-workspace-controls"
           className={cn(
-            hasDockedComposerTray && "rounded-t-none",
+            hasQueuedComposerMessages && "rounded-t-none",
             hasQueuedComposerMessages && "pl-2.5",
           )}
         >

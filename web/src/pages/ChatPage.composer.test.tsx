@@ -3772,6 +3772,7 @@ describe("Composer sub-agent tray", () => {
     // that some tray exists.
     expect(screen.getByText("check-account-eligibility")).toBeTruthy();
     expect(screen.getByText(/Chatting with sub-agent/)).toBeTruthy();
+    expect(screen.getByTestId("composer-workspace-controls")).not.toHaveClass("rounded-t-none");
   });
 
   // The sub-agent tray sits directly above the workspace bar, sharing its
