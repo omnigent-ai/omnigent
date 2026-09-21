@@ -772,7 +772,7 @@ function pullRequestLabel(pr: GithubPrAssociation): string {
   const inferred = pr.relationship === "inferred" ? " (from branch)" : "";
   const identity = `${host}${pr.repository} #${pr.number}${inferred}`;
   const title = pr.title?.trim();
-  return title ? `${title} — ${identity}` : identity;
+  return title ? `${identity} — ${title}` : identity;
 }
 
 export function GithubPanel({ conversationId }: { conversationId: string }) {
@@ -895,7 +895,12 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
                   className="w-(--radix-select-trigger-width)"
                 >
                   {prs.map((pr) => (
-                    <SelectItem key={pr.url} value={pr.url} className="wrap-anywhere">
+                    <SelectItem
+                      key={pr.url}
+                      value={pr.url}
+                      title={pullRequestLabel(pr)}
+                      className="*:[span]:last:block *:[span]:last:min-w-0 *:[span]:last:truncate"
+                    >
                       {pullRequestLabel(pr)}
                     </SelectItem>
                   ))}

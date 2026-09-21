@@ -595,28 +595,31 @@ describe("session PR selection", () => {
     };
     const { rerender } = renderPanel();
     const picker = screen.getByRole("combobox", { name: "Session pull request" });
-    expect(picker).toHaveTextContent("First repository — example/one #42");
-    expect(picker).toHaveAttribute("title", "First repository — example/one #42");
+    expect(picker).toHaveTextContent("example/one #42 — First repository");
+    expect(picker).toHaveAttribute("title", "example/one #42 — First repository");
     expect(screen.queryByRole("listbox")).not.toBeInTheDocument();
     fireEvent.click(picker);
     await waitFor(() =>
       expect(
-        screen.getByRole("option", { name: "First repository — example/one #42" }),
+        screen.getByRole("option", { name: "example/one #42 — First repository" }),
       ).toHaveAttribute("aria-selected", "true"),
     );
     expect(
-      screen.getByRole("option", { name: "Second repository — example/two #42" }),
+      screen.getByRole("option", { name: "example/two #42 — Second repository" }),
     ).toBeVisible();
-    fireEvent.click(screen.getByRole("option", { name: "Second repository — example/two #42" }));
-    expect(picker).toHaveTextContent("Second repository — example/two #42");
-    expect(picker).toHaveAttribute("title", "Second repository — example/two #42");
+    expect(
+      screen.getByRole("option", { name: "example/two #42 — Second repository" }),
+    ).toHaveAttribute("title", "example/two #42 — Second repository");
+    fireEvent.click(screen.getByRole("option", { name: "example/two #42 — Second repository" }));
+    expect(picker).toHaveTextContent("example/two #42 — Second repository");
+    expect(picker).toHaveAttribute("title", "example/two #42 — Second repository");
     expect(screen.queryByRole("listbox")).not.toBeInTheDocument();
     expect(useGithubInfo).toHaveBeenLastCalledWith("conv_1", { poll: true, prUrl: two });
 
     state.info = { isLoading: true, error: null, isFetching: true };
     rerender(<GithubPanel conversationId="conv_1" />);
     expect(screen.getByRole("combobox", { name: "Session pull request" })).toBe(picker);
-    expect(picker).toHaveTextContent("Second repository — example/two #42");
+    expect(picker).toHaveTextContent("example/two #42 — Second repository");
     expect(screen.getByText("Loading GitHub…")).toBeInTheDocument();
     expect(screen.queryByText("First repository")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Link a PR" })).toBeEnabled();
@@ -626,13 +629,13 @@ describe("session PR selection", () => {
     state.info = { isLoading: false, error: new Error("Metadata unavailable"), isFetching: false };
     rerender(<GithubPanel conversationId="conv_1" />);
     expect(screen.getByRole("combobox", { name: "Session pull request" })).toBe(picker);
-    expect(picker).toHaveTextContent("Second repository — example/two #42");
+    expect(picker).toHaveTextContent("example/two #42 — Second repository");
     const errorMessage = screen.getByText(/Metadata unavailable/);
     const fallback = screen.getByRole("link", { name: "Open the PR on GitHub" });
     expect(errorMessage.parentElement).toContainElement(fallback);
     expect(fallback).toHaveAttribute("href", two);
     fireEvent.click(picker);
-    fireEvent.click(screen.getByRole("option", { name: "First repository — example/one #42" }));
+    fireEvent.click(screen.getByRole("option", { name: "example/one #42 — First repository" }));
     expect(useGithubInfo).toHaveBeenLastCalledWith("conv_1", { poll: true, prUrl: one });
 
     state.info = { isLoading: true, error: null, isFetching: true };
@@ -685,7 +688,7 @@ describe("session PR selection", () => {
     });
     renderPanel();
     const picker = screen.getByRole("combobox", { name: "Session pull request" });
-    const label = "Fix session selection — github.example.com/example/one #42 (from branch)";
+    const label = "github.example.com/example/one #42 (from branch) — Fix session selection";
     expect(picker).toHaveTextContent(label);
     expect(picker).toHaveAttribute("title", label);
     fireEvent.click(picker);

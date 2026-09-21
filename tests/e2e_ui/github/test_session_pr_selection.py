@@ -18,8 +18,8 @@ def test_session_pr_selection_and_unlink(
     base_url, session_id = seeded_session
     one = "https://github.com/example/one/pull/42"
     two = "https://github.com/example/two/pull/42"
-    one_label = "First repository — example/one #42"
-    two_label = "Second repository — example/two #42"
+    one_label = "example/one #42 — First repository"
+    two_label = "example/two #42 — Second repository"
     urls = [one, two]
     requested: list[tuple[str, str]] = []
     pending_info: list[Route] = []
@@ -224,7 +224,7 @@ def test_session_pr_picker_long_title(
         "Keep pull requests recognizable across multiple repositories while preserving "
         "the full descriptive title for reviewers using narrow workspace panels"
     )
-    label = f"{title} — example/one #42"
+    label = f"example/one #42 — {title}"
     info = {
         **_INFO,
         "tracking_available": True,
@@ -261,9 +261,11 @@ def test_session_pr_picker_long_title(
     picker = panel.get_by_role("combobox", name="Session pull request")
     expect(picker).to_have_text(label)
     expect(picker).to_have_attribute("title", label)
-    selected_text = picker.locator('[data-slot="select-value"]')
+    selected_text = picker.get_by_text(label, exact=True)
+    expect(selected_text).to_have_css("white-space", "nowrap")
     expect(selected_text).to_have_css("text-overflow", "ellipsis")
     assert selected_text.evaluate("element => element.scrollWidth > element.clientWidth")
+    assert selected_text.evaluate("element => element.scrollHeight <= element.clientHeight")
     expect(panel.get_by_role("button", name="Link a PR", exact=True)).to_be_in_viewport()
     expect(panel.get_by_role("button", name="Unlink PR", exact=True)).to_be_in_viewport()
     picker_box = picker.bounding_box()
@@ -276,8 +278,17 @@ def test_session_pr_picker_long_title(
     page.screenshot(path=tmp_path / "session-pr-long-title.png", animations="disabled")
     titled_box, untitled_box = titled_option.bounding_box(), untitled_option.bounding_box()
     assert titled_box and untitled_box
-    assert titled_box["height"] > untitled_box["height"]
-    assert titled_option.evaluate("element => element.scrollWidth <= element.clientWidth")
+    assert titled_box["height"] == pytest.approx(untitled_box["height"], abs=0.5)
+    for option, option_label in ((titled_option, label), (untitled_option, "example/one #43")):
+        expect(option).to_have_attribute("title", option_label)
+        option_text = option.get_by_text(option_label, exact=True)
+        expect(option_text).to_have_css("white-space", "nowrap")
+        expect(option_text).to_have_css("text-overflow", "ellipsis")
+        assert option_text.evaluate("element => element.scrollHeight <= element.clientHeight")
+        assert option.evaluate("element => element.scrollWidth <= element.clientWidth")
+    assert titled_option.get_by_text(label, exact=True).evaluate(
+        "element => element.scrollWidth > element.clientWidth"
+    )
     for box in (picker_box, page.get_by_role("listbox").bounding_box()):
         assert box and box["x"] >= 0 and box["x"] + box["width"] <= viewport_width
 
