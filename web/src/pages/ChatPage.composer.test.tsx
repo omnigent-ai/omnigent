@@ -2208,7 +2208,7 @@ describe("Composer shared visible controls", () => {
 
     fireEvent.click(subagent);
     expect(
-      screen.getByRole("link", { name: "Open Verify queue behavior sub-agent" }),
+      screen.getByRole("link", { name: /Verify queue behavior.*Working.*developer/ }),
     ).toHaveAttribute("href", "/c/conv_child?debug=1");
   });
 
