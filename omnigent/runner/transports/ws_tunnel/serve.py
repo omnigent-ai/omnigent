@@ -395,7 +395,7 @@ async def serve_tunnel(
             _logger.exception(
                 "on_reconnect callback failed",
                 extra=debug_event(
-                    "runner_connected",
+                    "runner_reconnect_callback_failed",
                     session_id=runner_primary_session_id(),
                     runner_id=runner_id,
                     stage="runner_connect",
@@ -841,7 +841,12 @@ async def _serve_tunnel_once(
             "runner %s connected to %s",
             runner_id,
             tunnel_url,
-            extra={"session_id": runner_primary_session_id()},
+            extra=debug_event(
+                "runner_connected",
+                session_id=runner_primary_session_id(),
+                runner_id=runner_id,
+                stage="runner_connect",
+            ),
         )
 
         def _on_resume_from_suspend(gap_s: float) -> None:

@@ -39,6 +39,7 @@ server and runner by session and runner IDs, never by request ID alone.
 | `runner_launch_failed` | Server or host | Host refusal, spawn error, or launch acknowledgement failure. Recovery can still succeed. |
 | `runner_died` | Host | Unexpected process exit, including before tunnel connection. |
 | `runner_connected` | Server or runner | Runner tunnel connection observed. Also emitted on reconnect. |
+| `runner_reconnect_callback_failed` | Runner | The reconnect callback failed; not a successful connection milestone. |
 | `runner_connect_failed` | Server | Managed runner connection deadline expired. |
 | `runner_session_init_started` / `runner_session_initialized` / `runner_session_init_failed` | Server or runner | Initialization request, successful response, or exception/non-success response. Cached server initialization does not emit another outcome. |
 | `runner_stream_ready` | Server | The relay received its first heartbeat. Includes both session and runner IDs. |
@@ -102,3 +103,13 @@ Try a host with an unconfigured harness: the refusal must include the same
 session and runner IDs as its binding. Resume an existing session: there must
 be no new creation-start event. Check a child session's logs carry its own
 session ID while sharing the parent's runner ID.
+
+## Migration from message-based dashboards
+
+The host spawn log is now emitted by `_handle_launch_impl`. Before rolling out,
+update legacy launch queries to accept `event_name = 'runner_spawned'` as well
+as the old `_handle_launch` message predicate. Prefer `attributes['runner_id']`
+for the join, with message extraction only for older rows. This preserves the
+old spawn-based series during the transition; it does not change its denominator
+into server-received creates. Start the new creation series at the deployment
+cutover after readiness and delivery coverage have been verified.
