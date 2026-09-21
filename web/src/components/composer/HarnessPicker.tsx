@@ -1,6 +1,7 @@
 import {
   type ComponentProps,
   type KeyboardEvent,
+  type ReactElement,
   type ReactNode,
   type SyntheticEvent,
   createContext,
@@ -299,6 +300,8 @@ export function HarnessPickerEntry({
   editable = true,
   isMobile = false,
   disabled,
+  tooltip,
+  tooltipTestId,
   testId,
   configTestId,
   editTestId,
@@ -313,6 +316,8 @@ export function HarnessPickerEntry({
   editable?: boolean;
   isMobile?: boolean;
   disabled?: boolean;
+  tooltip?: ReactNode;
+  tooltipTestId?: string;
   testId?: string;
   configTestId?: string;
   editTestId?: string;
@@ -356,7 +361,7 @@ export function HarnessPickerEntry({
           aria-hidden="true"
           className={cn(
             "composer-agent-edit flex h-8 shrink-0 cursor-pointer items-center text-xs text-muted-foreground underline-offset-2 hover:text-foreground hover:underline",
-            showDetails || isMobile
+            row.active || showDetails || isMobile
               ? "opacity-100"
               : cn(
                   "opacity-0",
@@ -371,6 +376,22 @@ export function HarnessPickerEntry({
       )}
     </>
   );
+  const withTooltip = (trigger: ReactElement) =>
+    disabled && tooltip != null ? (
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <span className="flex min-w-0 flex-1">{trigger}</span>
+        </TooltipTrigger>
+        <TooltipContent
+          className="w-64 max-w-[calc(100vw-2rem)] flex-col items-stretch rounded-lg bg-popover p-2.5 text-popover-foreground whitespace-normal shadow-menu ring-1 ring-foreground/10"
+          data-testid={tooltipTestId}
+        >
+          <span className="text-xs leading-5 text-popover-foreground">{tooltip}</span>
+        </TooltipContent>
+      </Tooltip>
+    ) : (
+      trigger
+    );
   return (
     <div
       className={HARNESS_MENU_ROW_CLASS_NAME}
@@ -387,39 +408,41 @@ export function HarnessPickerEntry({
             allowConfigOpen.current = false;
           }}
         >
-          <DropdownMenuSubTrigger
-            {...rowProps}
-            onPointerMove={() => {
-              allowConfigOpen.current = false;
-            }}
-            onClick={(event) => {
-              if (disabled) {
-                event.preventDefault();
-              } else if (isEditTarget(event.target)) {
-                if (open) {
+          {withTooltip(
+            <DropdownMenuSubTrigger
+              {...rowProps}
+              onPointerMove={() => {
+                allowConfigOpen.current = false;
+              }}
+              onClick={(event) => {
+                if (disabled) {
                   event.preventDefault();
-                  onOpenChange(false);
+                } else if (isEditTarget(event.target)) {
+                  if (open) {
+                    event.preventDefault();
+                    onOpenChange(false);
+                  } else {
+                    allowConfigOpen.current = true;
+                  }
                 } else {
-                  allowConfigOpen.current = true;
+                  event.preventDefault();
+                  selectAndClose();
                 }
-              } else {
-                event.preventDefault();
-                selectAndClose();
-              }
-            }}
-            onKeyDown={(event) => {
-              if (event.target !== event.currentTarget) return;
-              if (disabled) event.preventDefault();
-              else if (event.key === "Enter" || event.key === " ") {
-                event.preventDefault();
-                selectAndClose();
-              } else if (event.key === "ArrowRight") {
-                allowConfigOpen.current = !open;
-              }
-            }}
-          >
-            {content}
-          </DropdownMenuSubTrigger>
+              }}
+              onKeyDown={(event) => {
+                if (event.target !== event.currentTarget) return;
+                if (disabled) event.preventDefault();
+                else if (event.key === "Enter" || event.key === " ") {
+                  event.preventDefault();
+                  selectAndClose();
+                } else if (event.key === "ArrowRight") {
+                  allowConfigOpen.current = !open;
+                }
+              }}
+            >
+              {content}
+            </DropdownMenuSubTrigger>,
+          )}
           <HarnessPickerSubContent
             focusSelected={focusConfig}
             onSelectedFocus={onConfigFocused}
@@ -435,34 +458,36 @@ export function HarnessPickerEntry({
           </HarnessPickerSubContent>
         </DropdownMenuSub>
       ) : (
-        <DropdownMenuItem
-          {...rowProps}
-          onSelect={(event) => {
-            if (disabled) event.preventDefault();
-            else onSelect?.();
-          }}
-          onClick={(event) => {
-            if (disabled) {
-              event.preventDefault();
-            } else if (editable && isEditTarget(event.target)) {
-              event.preventDefault();
-              onOpenChange(true);
-            }
-          }}
-          onKeyDown={(event) => {
-            if (
-              editable &&
-              !disabled &&
-              event.target === event.currentTarget &&
-              event.key === "ArrowRight"
-            ) {
-              event.preventDefault();
-              onOpenChange(true);
-            }
-          }}
-        >
-          {content}
-        </DropdownMenuItem>
+        withTooltip(
+          <DropdownMenuItem
+            {...rowProps}
+            onSelect={(event) => {
+              if (disabled) event.preventDefault();
+              else onSelect?.();
+            }}
+            onClick={(event) => {
+              if (disabled) {
+                event.preventDefault();
+              } else if (editable && isEditTarget(event.target)) {
+                event.preventDefault();
+                onOpenChange(true);
+              }
+            }}
+            onKeyDown={(event) => {
+              if (
+                editable &&
+                !disabled &&
+                event.target === event.currentTarget &&
+                event.key === "ArrowRight"
+              ) {
+                event.preventDefault();
+                onOpenChange(true);
+              }
+            }}
+          >
+            {content}
+          </DropdownMenuItem>,
+        )
       )}
     </div>
   );

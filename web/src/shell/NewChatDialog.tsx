@@ -1669,25 +1669,19 @@ export function AgentHarnessPicker({
         editable={editable && !unavailable}
         isMobile={isMobile}
         disabled={unavailable}
+        tooltip={unavailable ? warningMessage : undefined}
+        tooltipTestId={unavailable ? `new-chat-landing-agent-tooltip-${agent.id}` : undefined}
         summaryTestId={`new-chat-landing-agent-summary-${agent.id}`}
         editTestId={`new-chat-landing-agent-config-${agent.id}`}
         warning={
           unavailable && (
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <span
-                  aria-label={warning}
-                  data-testid={`new-chat-landing-agent-warning-${agent.id}`}
-                  tabIndex={0}
-                  className="flex size-4 shrink-0 items-center justify-center text-amber-700 dark:text-amber-300"
-                >
-                  <TriangleAlertIcon className="size-3.5" aria-hidden="true" />
-                </span>
-              </TooltipTrigger>
-              <TooltipContent className="w-64 max-w-[calc(100vw-2rem)] flex-col items-stretch rounded-lg bg-popover p-2.5 text-popover-foreground whitespace-normal shadow-menu ring-1 ring-foreground/10">
-                <span className="text-xs leading-5 text-popover-foreground">{warningMessage}</span>
-              </TooltipContent>
-            </Tooltip>
+            <span
+              aria-label={warning}
+              data-testid={`new-chat-landing-agent-warning-${agent.id}`}
+              className="flex size-4 shrink-0 items-center justify-center text-amber-700 dark:text-amber-300"
+            >
+              <TriangleAlertIcon className="size-3.5" aria-hidden="true" />
+            </span>
           )
         }
       />

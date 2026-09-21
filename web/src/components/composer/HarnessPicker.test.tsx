@@ -191,6 +191,7 @@ describe("HarnessPicker", () => {
     expect(screen.getByTestId("entry")).toHaveAttribute("data-active", "true");
     expect(screen.getByTestId("model")).toHaveClass("text-right");
     expect(screen.getByTestId("edit")).toHaveTextContent("Edit");
+    expect(screen.getByTestId("edit")).toHaveClass("opacity-100");
     expect(screen.getByTestId("edit")).toHaveClass("hover:underline");
     expect(screen.queryByTestId("tooltip")).not.toBeInTheDocument();
     fireEvent.click(screen.getByTestId("edit"));

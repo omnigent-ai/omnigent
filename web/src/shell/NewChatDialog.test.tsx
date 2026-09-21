@@ -3809,7 +3809,8 @@ describe("NewChatLandingScreen", () => {
     expect(screen.getByTestId("new-chat-landing-agent-a1")).toHaveAccessibleDescription(
       "Enter to select; Right Arrow to edit configuration.",
     );
-    expect(editConfig).toHaveClass("composer-agent-edit");
+    expect(editConfig).toHaveClass("composer-agent-edit", "opacity-100");
+    expect(editConfig).toHaveClass("hover:underline");
     expect(screen.getByTestId("new-chat-landing-agent-summary-a1")).toHaveClass("text-right");
     expect(screen.getByTestId("new-chat-landing-agent-a1")).toContainElement(editConfig);
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-config-a1"));
@@ -4061,24 +4062,26 @@ describe("NewChatLandingScreen", () => {
   );
 
   it.each([
-    ["claude-native", "needs-auth"],
-    ["codex-native", "binary-missing"],
-    ["pi-native", "version-too-low"],
-    ["devin-native", false],
-  ])("skips unavailable %s and loads it when the host reports readiness", (harness, readiness) => {
-    mockAgents(catalogAgents);
-    mockHosts([
-      {
-        ...host("online"),
-        configured_harnesses: { ...readyCatalogs, [harness as string]: readiness },
-      },
-    ]);
-    renderLanding();
-    const agent = catalogAgents.find((candidate) => candidate.harness === harness)!;
-    selectUnconfiguredAgent(agent.id);
-    const calls = () => useHostModelOptionsMock.mock.calls.filter(([, h]) => h === harness);
-    expect(calls().every(([, , enabled]) => !enabled)).toBe(true);
-    expect(screen.queryByTestId("new-chat-landing-picker-loading")).toBeNull();
+    ["claude-native", "needs-auth", true],
+    ["codex-native", "binary-missing", false],
+    ["pi-native", "version-too-low", false],
+    ["devin-native", false, false],
+  ])(
+    "skips unavailable %s and loads it when the host reports readiness",
+    (harness, readiness, poll) => {
+      mockAgents(catalogAgents);
+      mockHosts([
+        {
+          ...host("online"),
+          configured_harnesses: { ...readyCatalogs, [harness as string]: readiness },
+        },
+      ]);
+      renderLanding();
+      const agent = catalogAgents.find((candidate) => candidate.harness === harness)!;
+      selectUnconfiguredAgent(agent.id);
+      const calls = () => useHostModelOptionsMock.mock.calls.filter(([, h]) => h === harness);
+      expect(calls().every(([, , enabled]) => !enabled)).toBe(true);
+      expect(screen.queryByTestId("new-chat-landing-picker-loading")).toBeNull();
 
       mockHosts([{ ...host("online"), configured_harnesses: readyCatalogs }]);
       fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
@@ -5845,15 +5848,37 @@ describe("NewChatLandingScreen", () => {
     const selectedHarnessName = screen
       .getByTestId("new-chat-landing-agent-select")
       .getAttribute("aria-label");
+    await userEvent.hover(within(row).getByText("Codex"));
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(
+      "Codex isn't configured on machine-1 — run omni setup on that machine.",
+    );
     fireEvent.click(row);
+    fireEvent.keyDown(row, { key: "Enter" });
+    fireEvent.keyDown(row, { key: " " });
     expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(
       selectedHarnessName ?? "",
     );
-    fireEvent.focus(screen.getByTestId("new-chat-landing-agent-warning-a2"));
-    const tooltip = await screen.findByRole("tooltip");
-    expect(tooltip).toHaveTextContent(
+    await userEvent.unhover(row);
+    const healthyRow = screen.getByTestId("new-chat-landing-agent-a1");
+    healthyRow.focus();
+    expect(healthyRow).toHaveFocus();
+    await waitFor(() => expect(screen.queryByRole("tooltip")).toBeNull());
+    fireEvent.focus(row);
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(
       "Codex isn't configured on machine-1 — run omni setup on that machine.",
     );
+  });
+
+  it("does not add warning tooltips to healthy harness rows", async () => {
+    renderLanding();
+
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    const row = screen.getByTestId("new-chat-landing-agent-a2");
+    await userEvent.hover(within(row).getByText("Codex"));
+    fireEvent.focus(row);
+
+    expect(row).not.toHaveAttribute("aria-disabled");
+    expect(screen.queryByRole("tooltip")).toBeNull();
   });
 
   it("replaces a selected broken harness model label with a warning tooltip", async () => {
