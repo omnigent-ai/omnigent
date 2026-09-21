@@ -3398,6 +3398,12 @@ def resolve_native_claude_config(
     :returns: The launch config, or ``None`` to use Claude's own login.
     """
     from omnigent.host.databricks_credential import api_key_auth_precludes_broker
+    from omnigent.inference_config import (
+        binding_for_harness,
+        load_runtime_inference_config,
+        resolve_bound_model,
+        resolve_bound_provider,
+    )
     from omnigent.onboarding.detected import effective_config_with_detected
     from omnigent.onboarding.provider_config import (
         default_provider_for_harness,
@@ -3406,12 +3412,31 @@ def resolve_native_claude_config(
     from omnigent.runtime.workflow import _load_global_auth, _resolve_provider_for_build
     from omnigent.spec.types import DatabricksAuth
 
+    inference_config = load_runtime_inference_config(load_config())
+    binding = binding_for_harness(inference_config, "claude-native")
+    if binding is not None:
+        bound = resolve_bound_provider(
+            inference_config, "claude-native", spec.executor.auth if spec is not None else None
+        )
+        assert bound is not None
+        resolve_bound_model(
+            inference_config, "claude-native", spec.executor.model if spec is not None else None
+        )
+        resolved = _native_claude_config_from_entry(bound, refresh_models=refresh_models)
+        if resolved is None:
+            raise ValueError(f"Configured provider {bound.name!r} cannot route Claude Code.")
+        if binding.model_allowlist is not None:
+            resolved = replace(resolved, routable_models=binding.model_allowlist)
+        return resolved
+
     # 1. Spec-driven: reuse the harness routing precedence verbatim. A
     #    non-None entry decides the config (including a deliberate None for a
     #    subscription); a None entry means the spec routed to databricks /
     #    global auth → fall back to the spec's own ucode profile.
     if spec is not None:
-        entry = _resolve_provider_for_build(spec, harness_type="claude-sdk")
+        entry = _resolve_provider_for_build(
+            spec, harness_type="claude-sdk", actual_harness="claude-native"
+        )
         if entry is not None:
             return _native_claude_config_from_entry(entry, refresh_models=refresh_models)
         ucode_config = _ucode_config_for_profile(

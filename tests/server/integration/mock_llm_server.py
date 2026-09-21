@@ -1054,9 +1054,8 @@ async def create_message(
 ) -> StreamingResponse | JSONResponse:
     """Anthropic Messages API endpoint for claude-sdk harness.
 
-    Same keyed-queue routing as ``/v1/responses`` but returns
-    Anthropic SSE format (``message_start``, ``content_block_*``,
-    ``message_delta``, ``message_stop``).
+    Uses the same keyed queues as ``/v1/responses`` and honors ``stream``.
+    Native Claude's model validation requests a nonstream JSON message.
     """
     body = await request.body()
     try:
@@ -1090,6 +1089,47 @@ async def create_message(
 
     req_model = parsed.get("model") if isinstance(parsed, dict) else None
     echo_model = req_model if isinstance(req_model, str) and req_model else "mock-model"
+    if isinstance(parsed, dict) and not parsed.get("stream", False):
+        content: list[dict] = []
+        stop_reason = "end_turn"
+        extra: dict = {}
+        output_tokens = max(5, len(qr.text.split()) + len((qr.thinking or "").split()))
+        if qr.refusal_category is not None:
+            content.append({"type": "text", "text": "I can't help with that."})
+            stop_reason = "refusal"
+            extra["stop_details"] = {"type": "refusal", "category": qr.refusal_category}
+            output_tokens = 5
+        elif qr.tool_calls:
+            content.extend(
+                {
+                    "type": "tool_use",
+                    "id": call.get("call_id", f"toolu_{_uuid_mod.uuid4().hex[:12]}"),
+                    "name": call["name"],
+                    "input": json.loads(call.get("arguments", "{}")),
+                }
+                for call in qr.tool_calls
+            )
+            stop_reason = "tool_use"
+            output_tokens = 5
+        else:
+            if qr.thinking:
+                content.append(
+                    {"type": "thinking", "thinking": qr.thinking, "signature": "mock-signature"}
+                )
+            content.append({"type": "text", "text": qr.text})
+        return JSONResponse(
+            {
+                "id": f"msg_{_uuid_mod.uuid4().hex[:12]}",
+                "type": "message",
+                "role": "assistant",
+                "content": content,
+                "model": echo_model,
+                "stop_reason": stop_reason,
+                "stop_sequence": None,
+                "usage": {"input_tokens": 10, **(qr.usage or {}), "output_tokens": output_tokens},
+                **extra,
+            }
+        )
     if qr.refusal_category is not None:
         sse_body = anthropic_sse_refusal_response(model=echo_model, category=qr.refusal_category)
     elif qr.tool_calls:

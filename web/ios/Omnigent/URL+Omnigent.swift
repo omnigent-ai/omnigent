@@ -25,11 +25,11 @@ enum ServerAuthentication: Equatable {
     }
   }
 
-  /// Platform SSO runs inline so its cookies land in WebKit's cookie store.
+  /// Databricks Apps retain inline SSO; workspace login is handled natively.
   var usesInWebViewAuth: Bool {
     switch self {
-    case .databricksWorkspace, .databricksApp: true
-    case .oidc: false
+    case .databricksApp: true
+    case .databricksWorkspace, .oidc: false
     }
   }
 

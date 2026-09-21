@@ -537,6 +537,8 @@ export interface QueuedMessage {
    * compatibility with serialized queue state that predates this field.
    */
   stableId?: string;
+  /** A failed send stays queued until the user explicitly retries or edits it. */
+  requiresRetry?: boolean;
 }
 
 /**
@@ -1056,6 +1058,13 @@ export interface ChatActions {
    * optimistic bubble promotes on POST. No-op if the id isn't queued.
    */
   steerMessage: (queueId: string) => void;
+  /**
+   * Steer EVERY queued message of a conversation, in queue (FIFO) order, so the
+   * whole backlog reaches the running turn now instead of draining one per
+   * idle. Sends chain per conversation, so order is preserved. No-op when the
+   * conversation has nothing queued or no agent to send to.
+   */
+  steerAllQueuedMessages: (conversationId: string) => void;
   /**
    * Drop all queued messages for a conversation. Called when a conversation is
    * deleted so its queue can't linger in memory (it would never flush — you
@@ -1799,7 +1808,23 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     if (target === undefined || agentId === null) return;
     // Remove BEFORE the POST so a concurrent flush can't also send it.
     setActive({ queuedMessages: s.queuedMessages.filter((m) => m.queueId !== queueId) });
-    void s.send(target.text, agentId, target.files, { replyDraft: target.replyDraft });
+    void s.send(target.text, agentId, target.files, queuedSendOptions(target));
+  },
+
+  steerAllQueuedMessages: (conversationId) => {
+    const s = get();
+    const own = s.queuedMessages.filter((m) => m.conversationId === conversationId);
+    if (own.length === 0 || own.some((m) => (m.agentId ?? s.boundAgentId) === null)) return;
+    const batchOrder = new Map(own.map((m, index) => [m.queueId, index]));
+    // Remove BEFORE the POSTs so a concurrent flush can't also send one.
+    setActive({
+      queuedMessages: s.queuedMessages.filter((m) => m.conversationId !== conversationId),
+    });
+    for (const m of own) {
+      const agentId = m.agentId ?? s.boundAgentId;
+      if (agentId === null) continue;
+      void s.send(m.text, agentId, m.files, queuedSendOptions(m, batchOrder));
+    }
   },
 
   clearQueuedMessages: (conversationId) => {
@@ -1843,12 +1868,10 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // so an undrained message from another conversation can sit at index 0; a
     // head-only guard would let it block this conversation's messages forever.
     const head = s.queuedMessages.find((m) => m.conversationId === s.conversationId);
-    if (head === undefined) return;
+    if (head === undefined || head.requiresRetry) return;
     // Remove it BEFORE the POST so a re-entrant flush can't double-send.
     setActive({ queuedMessages: s.queuedMessages.filter((m) => m.queueId !== head.queueId) });
-    void s.send(head.text, head.agentId ?? s.boundAgentId, head.files, {
-      replyDraft: head.replyDraft,
-    });
+    void s.send(head.text, head.agentId ?? s.boundAgentId, head.files, queuedSendOptions(head));
   },
 
   flushBackgroundQueues: () => {
@@ -1892,7 +1915,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       const cooldownUntil = backgroundFlushCooldownUntil.get(conversationId);
       if (cooldownUntil !== undefined && cooldownUntil > now) continue;
       const head = get().queuedMessages.find((m) => m.conversationId === conversationId);
-      if (head === undefined) continue;
+      if (head === undefined || head.requiresRetry) continue;
 
       // Remove BEFORE the work starts so a re-entrant trigger can't double-send.
       backgroundFlushInFlight.add(conversationId);
@@ -2983,6 +3006,41 @@ function setActive(partial: Partial<ChatState> | ((state: ChatState) => Partial<
 }
 
 // ── Internal helpers ─────────────────────────────────────
+
+function queuedSendOptions(
+  message: QueuedMessage,
+  batchOrder?: ReadonlyMap<string, number>,
+): SendOptions {
+  const stableId = message.stableId ?? randomUUID().replace(/-/g, "");
+  return {
+    replyDraft: message.replyDraft,
+    stableId,
+    pinnedConversationId: message.conversationId,
+    onError: (error) => {
+      setActive((s) => {
+        if (s.queuedMessages.some((m) => m.queueId === message.queueId)) return {};
+        // Keep failed sends in batch order, ahead of newly queued messages.
+        const index = s.queuedMessages.findIndex(
+          (m) =>
+            m.conversationId === message.conversationId &&
+            (!m.requiresRetry ||
+              (batchOrder?.get(m.queueId) ?? -1) > (batchOrder?.get(message.queueId) ?? -1)),
+        );
+        const at = index === -1 ? s.queuedMessages.length : index;
+        return {
+          queuedMessages: [
+            ...s.queuedMessages.slice(0, at),
+            { ...message, stableId, requiresRetry: true },
+            ...s.queuedMessages.slice(at),
+          ],
+        };
+      });
+      setterFor(message.conversationId)((s) => ({
+        blocks: [...s.blocks, makeClientErrorBlock(error, "")],
+      }));
+    },
+  };
+}
 
 type Setter = (partial: Partial<ChatState> | ((state: ChatState) => Partial<ChatState>)) => void;
 type Getter = () => ChatState;

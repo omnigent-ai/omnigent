@@ -222,7 +222,8 @@ def test_new_session_menu_uses_the_selected_agents_effective_catalog(
 
     def session_agents(route: Route) -> None:
         # Session-scoped agents must not replace the fixture's selected agent.
-        if parse_qs(urlparse(route.request.url).query).get("visibility") == ["mine"]:
+        query = parse_qs(urlparse(route.request.url).query)
+        if query.get("visibility") == ["mine"] and "pinned" not in query:
             route.fulfill(json={"data": [], "has_more": False})
         else:
             route.fallback()

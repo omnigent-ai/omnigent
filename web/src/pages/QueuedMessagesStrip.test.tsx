@@ -207,6 +207,24 @@ describe("QueuedMessagesStrip", () => {
     expect(onSteer).toHaveBeenCalledWith("q_2");
   });
 
+  it("marks failed messages and offers an explicit retry", () => {
+    const onSteer = vi.fn();
+    render(
+      <TooltipProvider>
+        <QueuedMessagesStrip
+          messages={[{ ...msg("q_failed", "Keep this message"), requiresRetry: true }]}
+          onDelete={vi.fn()}
+          onEdit={vi.fn()}
+          onSteer={onSteer}
+        />
+      </TooltipProvider>,
+    );
+    expect(screen.getByText("Send failed")).toBeInTheDocument();
+    expect(screen.getByText("Keep this message")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Retry queued message" }));
+    expect(onSteer).toHaveBeenCalledWith("q_failed");
+  });
+
   it("gives every row action a 44px mobile tap target with a composer-sized icon", () => {
     render(
       <TooltipProvider>

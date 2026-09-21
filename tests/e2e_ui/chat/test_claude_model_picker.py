@@ -815,7 +815,7 @@ def test_claude_model_label_never_claims_a_version_the_catalog_didnt_give(
     # The catalog lands: its display name supersedes the fallback.
     catalog_state["ready"] = True
     _announce_catalog(page, session_id)
-    expect(label).to_contain_text("Sonnet 5 (1M context)", timeout=10_000)
+    expect(label).to_contain_text("Sonnet 5 1M", timeout=10_000)
 
     log = page.evaluate("window.__modelLabelLog")
     labels = [entry["text"] for entry in log if entry["text"]]

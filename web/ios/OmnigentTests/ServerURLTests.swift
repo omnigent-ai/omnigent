@@ -119,8 +119,8 @@ final class ServerAuthenticationTests: XCTestCase {
     }
   }
 
-  func testPlatformAuthenticationRemainsInline() {
-    XCTAssertTrue(ServerAuthentication.databricksWorkspace.usesInWebViewAuth)
+  func testOnlyAppsAuthenticationRemainsInline() {
+    XCTAssertFalse(ServerAuthentication.databricksWorkspace.usesInWebViewAuth)
     XCTAssertTrue(ServerAuthentication.databricksApp.usesInWebViewAuth)
     XCTAssertFalse(ServerAuthentication.oidc.usesInWebViewAuth)
   }

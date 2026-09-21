@@ -779,6 +779,7 @@ def _build_runner_env(
     interactive_shells: list[str] | None = None,
     host_owns_global_cleanup: bool = False,
     harness_tmp_parent: Path | None = None,
+    inference_config: dict[str, object] | None = None,
 ) -> dict[str, str]:
     """
     Build the environment for a spawned runner subprocess.
@@ -826,16 +827,19 @@ def _build_runner_env(
     # OMNIGENT_RUNNER_ENV_PASSTHROUGH — their credential resolves fine in
     # the CLI/daemon but silently drops before reaching the runner subprocess.
     from omnigent.errors import OmnigentError as _OmnigentError
+    from omnigent.onboarding.provider_config import (
+        load_config,
+        provider_credential_env_vars,
+    )
 
     try:
-        from omnigent.onboarding.provider_config import (
-            load_config,
-            provider_credential_env_vars,
-        )
-
         config_env_vars = provider_credential_env_vars(load_config())
     except (OSError, _OmnigentError):
         config_env_vars = frozenset()
+    if inference_config is not None:
+        config_env_vars |= provider_credential_env_vars(
+            inference_config, include_dollar_key_refs=True
+        )
     forwarded = HARNESS_CREDENTIAL_ENV_VARS | extra_names | config_env_vars
     env = {
         key: value
@@ -872,6 +876,30 @@ def _build_runner_env(
     if interactive_shells is not None:
         env[RUNNER_INTERACTIVE_SHELLS_ENV_VAR] = json.dumps(interactive_shells)
     return env
+
+
+def _write_runner_inference_config(session_id: str, inference_config: dict[str, object]) -> Path:
+    """Materialize an immutable inference revision without changing host settings."""
+    import hashlib
+    import tempfile
+
+    from omnigent.process_logging import data_dir
+
+    payload = json.dumps(inference_config, sort_keys=True, separators=(",", ":"))
+    session_key = hashlib.sha256(session_id.encode()).hexdigest()
+    revision = hashlib.sha256(payload.encode()).hexdigest()
+    directory = data_dir() / "session-inference" / session_key
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path = directory / f"{revision}.json"
+    fd, temp_name = tempfile.mkstemp(prefix=".config-", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+        os.replace(temp_name, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temp_name)
+    return path
 
 
 def _paginate_list_dir(
@@ -1673,9 +1701,23 @@ class HostProcess:
         #
         # Off the loop: the check runs ``<cli> --version``, up to 10s on a hung
         # CLI, which inline would stall the keepalive pong and every other frame.
-        if frame.harness is not None and not await asyncio.to_thread(
-            harness_is_configured, frame.harness
-        ):
+        from omnigent.inference_config import binding_for_harness
+
+        has_binding = (
+            frame.harness is not None
+            and frame.inference_config is not None
+            and (binding_for_harness(frame.inference_config, frame.harness) is not None)
+        )
+        if has_binding:
+            from omnigent.onboarding.harness_install import missing_harness_cli
+
+            assert frame.harness is not None
+            harness_ready = (await asyncio.to_thread(missing_harness_cli, frame.harness)) is None
+        else:
+            harness_ready = frame.harness is None or await asyncio.to_thread(
+                harness_is_configured, frame.harness
+            )
+        if not harness_ready:
             return self._launch_failed(
                 frame,
                 (
@@ -1711,7 +1753,20 @@ class HostProcess:
             interactive_shells=self._interactive_shells,
             host_owns_global_cleanup=self._maintenance_janitor is not None,
             harness_tmp_parent=self._harness_tmp_parent,
+            inference_config=frame.inference_config,
         )
+        if frame.inference_config is not None:
+            try:
+                inference_path = await asyncio.to_thread(
+                    _write_runner_inference_config,
+                    frame.session_id or runner_id,
+                    frame.inference_config,
+                )
+            except OSError as exc:
+                return self._launch_failed(
+                    frame, f"Cannot install session inference config: {exc}"
+                )
+            env["OMNIGENT_INFERENCE_CONFIG"] = str(inference_path)
         # The runner serves one primary session (plus any co-located subagents);
         # pass it so runner-level log records can be attributed to that session.
         if frame.session_id:
@@ -3362,7 +3417,8 @@ class HostProcess:
         loop keeps servicing pings.
 
         :param frame: The list-worktrees request frame.
-        :returns: Result frame with the worktrees on success, or
+        :returns: Result frame with worktrees and their coarse remote provider
+            on success, or
             ``status: "failed"`` with an error message.
         """
         try:
@@ -3388,6 +3444,8 @@ class HostProcess:
                     "branch": wt.branch,
                     "is_main": wt.is_main,
                     "detached": wt.detached,
+                    "remote_provider": wt.remote_provider,
+                    "updated_at": wt.updated_at,
                 }
                 for wt in worktrees
             ],
@@ -3780,6 +3838,9 @@ class HostProcess:
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await self._capability_init_task
                 self._capability_init_task = None
+            from omnigent.models.model_catalog_store import shutdown_catalog_probes
+
+            await shutdown_catalog_probes()
             if self._zygote_prestart_task is not None:
                 self._zygote_prestart_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -4437,7 +4498,9 @@ def _generate_ucode_configs() -> None:
         HOST_DATABRICKS_PROFILE,
         broker_token_command,
     )
+    from omnigent.inference_config import binding_for_harness
     from omnigent.inner.databricks_executor import _read_databrickscfg_host
+    from omnigent.onboarding.provider_config import load_config
     from omnigent.onboarding.ucode_setup import configure_ucode_for_sandbox
 
     workspace = _read_databrickscfg_host(HOST_DATABRICKS_PROFILE)
@@ -4446,12 +4509,38 @@ def _generate_ucode_configs() -> None:
     bearer_command = broker_token_command(workspace)
     if not bearer_command:
         return  # no broker sidecar → not a managed connect host
+    config = load_config()
+    providers = config.get("providers")
+    identities = {
+        "claude": ("claude-native", "claude-sdk"),
+        "codex": ("codex-native", "codex"),
+        "pi": ("pi-native", "pi"),
+        "opencode": ("opencode-native",),
+    }
+    agents: list[str] = []
+    for agent, harnesses in identities.items():
+        for harness in harnesses:
+            binding = binding_for_harness(config, harness)
+            provider = (
+                providers.get(binding.provider)
+                if binding and isinstance(providers, dict)
+                else None
+            )
+            if binding is None or (
+                isinstance(provider, dict)
+                and provider.get("kind") == "databricks"
+                and provider.get("connection") == "databricks"
+            ):
+                agents.append(agent)
+                break
+    if not agents:
+        return
     # opencode is included here (unlike lakebox's claude/codex/pi ``--use-pat``
     # wrappers) so its config is ready at first launch instead of forcing a
     # synchronous on-demand ``ucode configure`` on the runner.
     configure_ucode_for_sandbox(
         HOST_DATABRICKS_PROFILE,
-        agents=("claude", "codex", "pi", "opencode"),
+        agents=tuple(agents),
         extra_env={
             "DATABRICKS_BEARER_COMMAND": bearer_command,
             "DATABRICKS_CONFIG_PROFILE": HOST_DATABRICKS_PROFILE,

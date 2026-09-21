@@ -174,14 +174,21 @@ def create_connection_router(
         state's ``return_to`` with a ``?<provider>=connected|error`` marker.
         """
         user_id = _current_user(request)
+        # Failure fallbacks have no valid state carrying the client's return_to,
+        # so they use the local default; keep it under a subpath mount (the
+        # client-set return_to already carries the prefix).
+        base_path = getattr(request.app.state, "base_path", "")
+        default_return_to = f"{base_path}{_DEFAULT_RETURN_TO}"
         if not code or not state:
-            return redirect_with_status(provider, _DEFAULT_RETURN_TO, "error")
+            return redirect_with_status(provider, default_return_to, "error")
         try:
             claims = _verify_state(state)
         except jwt.PyJWTError:
             _logger.warning("%s callback with invalid state", provider)
-            return redirect_with_status(provider, _DEFAULT_RETURN_TO, "error")
+            return redirect_with_status(provider, default_return_to, "error")
         return_to = sanitize_return_to(claims.get("return_to"))
+        if return_to == _DEFAULT_RETURN_TO:
+            return_to = default_return_to
         if claims.get("sub") != user_id or claims.get("account_generation") != account_generation(
             user_id
         ):

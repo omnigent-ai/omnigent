@@ -35,6 +35,11 @@ def test_non_git_workspace_clears_worktree_request(
     subprocess.run(
         ["git", "init", "--initial-branch=main", str(repo)], check=True, capture_output=True
     )
+    subprocess.run(
+        ["git", "-C", str(repo), "remote", "add", "origin", "https://github.com/acme/repo.git"],
+        check=True,
+        capture_output=True,
+    )
     plain = tmp_path / "plain-folder"
     plain.mkdir()
     _run_in_fresh_loop(_drive_workspace_switch(*seeded_session, repo, plain, project_defaults))
@@ -104,8 +109,7 @@ async def _drive_workspace_switch(
             await workspace_chip.click()
             await page.get_by_role("button", name=str(plain), exact=True).click()
             await expect(workspace_chip).to_contain_text("plain-folder")
-            await expect(branch_chip).to_be_disabled()
-            await expect(branch_chip).to_have_text("Worktree")
+            await expect(branch_chip).to_have_count(0)
             await expect(branch_input).to_be_hidden()
 
             await page.get_by_test_id("new-chat-landing-input").fill("Work in the plain folder")

@@ -22,6 +22,13 @@ browser and the resulting session is copied into the isolated WKWebView cookie
 store, so providers such as Google that reject embedded user agents work. It
 does not implement APNs, background polling, or localhost proxy/CORS behavior.
 
+## Databricks OAuth
+
+Workspace connections use native OAuth, isolated persistent WebKit stores, bounded
+session recovery, and local sign-out. Build-configurable client ID and HTTPS callback
+setup are documented in [Databricks OAuth](docs/databricks-oauth.md). Databricks Apps
+retain inline platform sign-in; generic OIDC is unchanged.
+
 ## Managed app configuration
 
 An administrator can preset the server URLs the app offers via a managed app

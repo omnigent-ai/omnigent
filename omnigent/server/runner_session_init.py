@@ -15,6 +15,19 @@ if TYPE_CHECKING:
     from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
 
 
+def runner_inference_verified(conversation: Conversation, response: httpx.Response) -> bool:
+    """Configured sessions require a runner that accepted their saved routing."""
+    if conversation.inference_snapshot is None:
+        return True
+    if response.status_code >= 400:
+        return False
+    try:
+        payload = response.json()
+    except ValueError:
+        return False
+    return isinstance(payload, dict) and payload.get("inference_config_verified") is True
+
+
 class RunnerSessionInitializer:
     """Share initialization readiness within one runner tunnel generation."""
 
@@ -98,6 +111,12 @@ class RunnerSessionInitializer:
             if self._tasks.get(key) is task:
                 self._tasks.pop(key, None)
             raise
+        if not runner_inference_verified(conversation, response):
+            response = httpx.Response(
+                409,
+                json={"error": "The runner did not accept this session's inference configuration"},
+                request=httpx.Request("POST", "/v1/sessions"),
+            )
         if response.status_code >= 400 and self._tasks.get(key) is task:
             self._tasks.pop(key, None)
         return response
