@@ -820,6 +820,8 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
     }
 
     case "error": {
+      const agentName =
+        !event.responseId || event.responseId === state.responseId ? state.agent : null;
       // Pass `code` through too — renderers need it as a fallback
       // label when `message` is empty (otherwise the error panel
       // shows just `[llm]` with no hint as to what went wrong).
@@ -830,7 +832,7 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
         source: event.source,
         code: event.error.code,
         ...(event.error.level ? { level: event.error.level } : {}),
-        ...structuredErrorFields(event.error),
+        ...structuredErrorFields({ ...event.error, source: event.source }, agentName),
       } satisfies ErrorBlock;
       return;
     }
@@ -857,13 +859,20 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
       // Without this, a policy DENY that fires before any text
       // delta leaves the user staring at an empty bubble.
       if (event.type === "response_failed" && event.response.error) {
+        const agentName =
+          event.response.model.trim() ||
+          (event.response.id === state.responseId ? state.agent : null);
+        const code = event.response.error.code ?? "response_failed";
         yield {
           type: "error",
           ctx: ctx(state),
           message: event.response.error.message ?? "",
-          source: "",
-          code: event.response.error.code ?? "response_failed",
-          ...structuredErrorFields(event.response.error),
+          source: event.source ?? "",
+          code,
+          ...structuredErrorFields(
+            { ...event.response.error, code, source: event.source },
+            agentName,
+          ),
         } satisfies ErrorBlock;
       }
       yield {

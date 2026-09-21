@@ -4378,8 +4378,9 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
         displayName: "Claude Code",
       },
       { agentName: "codex-native-ui", code: "codex_turn_error", displayName: "Codex" },
+      { agentName: "polly (fork ag_copy)", code: "executor_error", displayName: "Polly" },
     ])(
-      "surfaces one named terminal error per $displayName response",
+      "surfaces one named turn error per $displayName response",
       ({ agentName, code, displayName }) => {
         useChatStore.setState({ blocks: [], boundAgentName: agentName });
         const error = {

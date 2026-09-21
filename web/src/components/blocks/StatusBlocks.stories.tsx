@@ -87,6 +87,24 @@ export const NativeAgentTurnError: Story = {
   },
 };
 
+export const NonNativeAgentTurnError: Story = {
+  render: () => (
+    <ErrorBanner
+      message="The turn exceeded the harness watchdog timeout."
+      source="execution"
+      code="RuntimeError"
+      {...structuredErrorFields({ code: "RuntimeError", source: "execution" }, "polly")}
+    />
+  ),
+  play: async ({ canvasElement }) => {
+    await userEvent.click(
+      within(canvasElement).getByRole("button", {
+        name: "Polly ran into an error during this turn.",
+      }),
+    );
+  },
+};
+
 export const TerminalErrorExpanded: Story = {
   render: () => (
     <ErrorBanner message={terminalError} source="execution" code="required_terminal_exited" />
