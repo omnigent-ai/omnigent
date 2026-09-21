@@ -1214,14 +1214,21 @@ export interface SessionUsageSnapshot {
   usageByModel: Record<string, ModelUsage> | null;
 }
 
-/** Read authoritative subtree usage independently of session metadata. */
+/** Read usage outside the shared metadata query; ignore unrelated snapshot fields. */
 export async function getSessionUsage(
   sessionId: string,
   options: { signal?: AbortSignal } = {},
 ): Promise<SessionUsageSnapshot> {
-  const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}/usage`, {
-    signal: options.signal,
+  const params = new URLSearchParams({
+    include_usage: "true",
+    include_items: "false",
+    include_liveness: "false",
+    refresh_state: "false",
   });
+  const res = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(sessionId)}?${params.toString()}`,
+    { signal: options.signal },
+  );
   const wire =
     await readJsonOrThrow<Pick<SessionResponseWire, "id" | "total_cost_usd" | "usage_by_model">>(
       res,

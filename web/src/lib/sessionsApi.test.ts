@@ -30,6 +30,7 @@ import {
   updateSession,
 } from "./sessionsApi";
 import { BACKGROUND_SESSION_TITLES_STORAGE_KEY } from "./backgroundSessionTitlesPreferences";
+import { getSessionHost, setSessionHost } from "./sessionHost";
 
 function mockJsonResponse(
   body: unknown,
@@ -1021,7 +1022,7 @@ describe("getSession", () => {
 });
 
 describe("getSessionUsage", () => {
-  it("reads subtree cost and per-model usage without fetching the snapshot", async () => {
+  it("requests usage without items, liveness, or runner-backed state refresh", async () => {
     fetchMock.mockResolvedValueOnce(
       mockJsonResponse({
         id: "conv with space",
@@ -1037,7 +1038,9 @@ describe("getSessionUsage", () => {
     const usage = await getSessionUsage("conv with space", { signal: controller.signal });
 
     expect(fetchMock).toHaveBeenCalledOnce();
-    expect(fetchMock.mock.calls[0][0]).toBe("/v1/sessions/conv%20with%20space/usage");
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "/v1/sessions/conv%20with%20space?include_usage=true&include_items=false&include_liveness=false&refresh_state=false",
+    );
     expect(fetchMock.mock.calls[0][1].signal).toBe(controller.signal);
     expect(usage).toEqual({
       id: "conv with space",
@@ -1061,6 +1064,33 @@ describe("getSessionUsage", () => {
         },
       },
     });
+  });
+
+  it("ignores other snapshot fields without replacing host routing metadata", async () => {
+    setSessionHost("conv_usage_projection", "host_current");
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv_usage_projection",
+        agent_id: "agent_old",
+        host_id: "host_old",
+        status: "failed",
+        created_at: 0,
+        items: [],
+        total_cost_usd: 3.5,
+        usage_by_model: null,
+      }),
+    );
+
+    try {
+      expect(await getSessionUsage("conv_usage_projection")).toEqual({
+        id: "conv_usage_projection",
+        totalCostUsd: 3.5,
+        usageByModel: null,
+      });
+      expect(getSessionHost("conv_usage_projection")).toBe("host_current");
+    } finally {
+      setSessionHost("conv_usage_projection", null);
+    }
   });
 
   it.each([null, 0])("preserves unpriced versus priced-zero usage (%s)", async (cost) => {

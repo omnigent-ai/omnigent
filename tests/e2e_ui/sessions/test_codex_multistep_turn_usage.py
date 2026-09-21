@@ -41,6 +41,7 @@ import pytest
 import yaml
 from playwright.sync_api import Page, Response, Route, expect
 
+from tests.e2e_ui.chat.test_session_usage_loading import _session_read_matcher
 from tests.e2e_ui.conftest import _ensure_runner_online, _server_state, configure_mock_llm
 
 # The e2e-ui CI job installs the codex CLI; without it the SDK harness cannot
@@ -109,9 +110,10 @@ def _create_codex_session(base_url: str, runner_id: str, model: str) -> str:
     """
     name = f"codex-usage-{uuid.uuid4().hex[:8]}"
     bundle = _build_codex_bundle(name, model)
+    # Background title inference must not consume the turn's scripted responses.
     create_resp = httpx.post(
         f"{base_url}/v1/sessions",
-        data={"metadata": json.dumps({})},
+        data={"metadata": json.dumps({"title": "Codex cumulative usage"})},
         files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
         timeout=30.0,
     )
@@ -229,42 +231,45 @@ def test_codex_multistep_turn_reports_cumulative_usage(
                 f"expected the turn to make exactly 2 model requests, saw "
                 f"{len(requests)} - the codex/mock wiring broke, not the bug"
             )
+            assert {request.get("model") for request in requests} == {model}, (
+                "background inference consumed the turn's scripted responses"
+            )
 
             _assert_cumulative_usage(page, model)
 
             session_url = f"{live_server}/v1/sessions/{session_id}"
+            metadata_read = _session_read_matcher(session_url, include_usage=False)
+            usage_read = _session_read_matcher(session_url, include_usage=True)
             usage_responses: list[Response] = []
 
             def record_usage(response: Response) -> None:
-                if response.url == f"{session_url}/usage":
+                if usage_read(response):
                     usage_responses.append(response)
 
             page.on("response", record_usage)
             # Pause SSE replay so persisted HTTP usage must hydrate the fresh page.
             pending_streams: list[Route] = []
             page.route(f"{session_url}/stream*", lambda route: pending_streams.append(route))
-            with page.expect_response(
-                lambda response: (
-                    response.url.split("?", 1)[0] == session_url
-                    and response.request.method == "GET"
-                )
-            ) as snapshot_response:
+            with page.expect_response(metadata_read) as snapshot_response:
                 page.reload(wait_until="domcontentloaded")
             # Reload can enable the composer after its mount-time focus attempt.
             expect(page.get_by_placeholder(_COMPOSER)).to_be_editable()
             _assert_cumulative_usage(page, model)
             expect(page.locator(_ASSISTANT).filter(has_text=_FINAL_TEXT).first).to_be_visible()
 
-            # Old servers still hydrate from the full snapshot, without /usage.
+            # Old servers hydrate from the initial snapshot without another read.
             if snapshot_response.value.json().get("usage_included") is False:
                 assert usage_responses, "reload never fetched the omitted usage"
                 assert usage_responses[-1].ok
                 usage = usage_responses[-1].json()
                 assert usage["id"] == session_id
+                assert usage["usage_included"] is True
                 model_usage = usage["usage_by_model"][model]
                 assert model_usage["input_tokens"] == _EXPECTED_INPUT
                 assert model_usage["output_tokens"] == _EXPECTED_OUTPUT
                 assert model_usage["total_tokens"] == _EXPECTED_TOTAL
+            else:
+                assert not usage_responses, "the initial snapshot already included usage"
         finally:
             httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
     finally:

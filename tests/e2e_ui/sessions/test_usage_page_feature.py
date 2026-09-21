@@ -11,6 +11,7 @@ import pytest
 from playwright.sync_api import Page, Route, expect
 
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+from tests.e2e_ui.chat.test_session_usage_loading import _session_read_matcher
 from tests.e2e_ui.conftest import _server_state
 
 
@@ -161,7 +162,8 @@ def test_usage_report_link_and_chat_reload_keep_complete_subtree_usage(
     )
     _stub_server_info(page, usage_page=True)
     session_url = f"{base_url}/v1/sessions/{session_id}"
-    usage_url = f"{session_url}/usage"
+    metadata_read = _session_read_matcher(session_url, include_usage=False)
+    usage_read = _session_read_matcher(session_url, include_usage=True)
     try:
         # Seeded storage has no usage SSE events: chat must hydrate over HTTP.
         with page.expect_response(f"{base_url}/v1/usage") as report_response:
@@ -186,13 +188,8 @@ def test_usage_report_link_and_chat_reload_keep_complete_subtree_usage(
                     },
                 )
             with (
-                page.expect_response(
-                    lambda response: (
-                        response.url.split("?", 1)[0] == session_url
-                        and response.request.method == "GET"
-                    )
-                ) as snapshot_response,
-                page.expect_response(usage_url) as usage_response,
+                page.expect_response(metadata_read) as snapshot_response,
+                page.expect_response(usage_read) as usage_response,
             ):
                 if reloading:
                     page.reload(wait_until="domcontentloaded")
@@ -206,6 +203,7 @@ def test_usage_report_link_and_chat_reload_keep_complete_subtree_usage(
             assert usage_response.value.ok
             usage = usage_response.value.json()
             assert usage["id"] == session_id
+            assert usage["usage_included"] is True
             assert usage["total_cost_usd"] == 1.0 + child_cost
             assert usage["usage_by_model"]["parent-model"]["total_cost_usd"] == 1.0
             assert usage["usage_by_model"]["child-model"]["total_cost_usd"] == child_cost

@@ -43,6 +43,7 @@ import yaml
 from playwright.sync_api import Locator, Page, Response, Route, expect
 
 from omnigent.inner.kimi_executor import _resolve_kimi_binary
+from tests.e2e_ui.chat.test_session_usage_loading import _session_read_matcher
 from tests.e2e_ui.conftest import _ensure_runner_online, _server_state, configure_mock_llm
 
 # Binary-presence gate, mirroring tests/e2e/test_kimi_executor_e2e.py and the
@@ -286,22 +287,19 @@ def test_kimi_session_reports_token_usage_in_agent_info(
             live_breakdown = model_groups.all_inner_texts()
 
             session_url = f"{live_server}/v1/sessions/{session_id}"
+            metadata_read = _session_read_matcher(session_url, include_usage=False)
+            usage_read = _session_read_matcher(session_url, include_usage=True)
             usage_responses: list[Response] = []
 
             def record_usage(response: Response) -> None:
-                if response.url == f"{session_url}/usage":
+                if usage_read(response):
                     usage_responses.append(response)
 
             page.on("response", record_usage)
             # Pause SSE replay so a reload cannot pass using the old live event.
             pending_streams: list[Route] = []
             page.route(f"{session_url}/stream*", lambda route: pending_streams.append(route))
-            with page.expect_response(
-                lambda response: (
-                    response.url.split("?", 1)[0] == session_url
-                    and response.request.method == "GET"
-                )
-            ) as snapshot_response:
+            with page.expect_response(metadata_read) as snapshot_response:
                 page.reload(wait_until="domcontentloaded")
             # Reload can enable the composer after its mount-time focus attempt.
             expect(page.get_by_placeholder(_COMPOSER)).to_be_editable()
@@ -311,15 +309,18 @@ def test_kimi_session_reports_token_usage_in_agent_info(
             expect(hydrated_groups).to_have_text(live_breakdown, use_inner_text=True)
             expect(page.locator(_ASSISTANT).first).to_be_visible()
 
-            # Old servers still hydrate from the full snapshot, without /usage.
+            # Old servers hydrate from the initial snapshot without another read.
             if snapshot_response.value.json().get("usage_included") is False:
                 assert usage_responses, "reload never fetched the omitted usage"
                 assert usage_responses[-1].ok
                 usage = usage_responses[-1].json()
                 assert usage["id"] == session_id
+                assert usage["usage_included"] is True
                 assert (
                     sum(model["output_tokens"] for model in usage["usage_by_model"].values()) > 0
                 )
+            else:
+                assert not usage_responses, "the initial snapshot already included usage"
         finally:
             httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
     finally:

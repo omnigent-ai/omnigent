@@ -32,7 +32,7 @@ import type {
 import type { ConversationItem } from "@/lib/conversationItems";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
 import { buildBubbles } from "@/lib/renderItems";
-import { INITIAL_WINDOW_ITEMS, SESSION_HISTORY_PAGE_SIZE } from "@/lib/sessionsApi";
+import { getSessionSlim, INITIAL_WINDOW_ITEMS, SESSION_HISTORY_PAGE_SIZE } from "@/lib/sessionsApi";
 import { SSE_STALL_TIMEOUT_MS } from "@/lib/sse";
 import { serializeReplyDraft, type StoredReplyDraft } from "@/lib/replyDraft";
 import { getCurrentAuthorId } from "@/lib/identity";
@@ -646,9 +646,11 @@ describe("chatStore — lazy subtree usage", () => {
     metadata: Response | Promise<Response> = snapshot(id),
   ): void {
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
-      const url = String(input);
-      if (url === `/v1/sessions/${id}/usage`) return readUsage();
-      if (url.startsWith(`/v1/sessions/${id}?`)) return metadata;
+      const url = new URL(String(input), "http://test.local");
+      if (url.pathname === `/v1/sessions/${encodeURIComponent(id)}`) {
+        if (url.searchParams.get("include_usage") === "true") return readUsage();
+        if (url.searchParams.get("include_usage") === "false") return metadata;
+      }
       return defaultFetchHandler(input, init);
     });
   }
@@ -691,6 +693,50 @@ describe("chatStore — lazy subtree usage", () => {
         totalCostUsd: 3.5,
       },
     });
+  });
+
+  it("keeps the metadata query independent of a held usage snapshot", async () => {
+    let finishUsage!: (response: Response) => void;
+    const pending = new Promise<Response>((resolve) => {
+      finishUsage = resolve;
+    });
+    const readUsage = vi.fn(() => pending);
+    routeUsage("conv_usage", readUsage, snapshot("conv_usage", { status: "running" }));
+
+    await useChatStore.getState().switchTo("conv_usage");
+    await tick();
+
+    expect(readUsage).toHaveBeenCalledOnce();
+    expect(client.getQueryState(["session", "conv_usage"])?.fetchStatus).toBe("idle");
+    const readMetadata = vi.fn(() => getSessionSlim("conv_usage"));
+    const metadata = await client.fetchQuery({
+      queryKey: ["session", "conv_usage"],
+      queryFn: readMetadata,
+      staleTime: 0,
+      retry: false,
+    });
+    expect(readMetadata).toHaveBeenCalledOnce();
+    expect(metadata.status).toBe("running");
+    const cachedMetadata = client.getQueryData(["session", "conv_usage"]);
+    expect(cachedMetadata).toEqual(metadata);
+    expect(useChatStore.getState().loadingConversation).toBe(false);
+    expect(useChatStore.getState().sessionCostUsd).toBeNull();
+
+    finishUsage(
+      snapshot("conv_usage", {
+        agent_id: "agent_old",
+        status: "failed",
+        usage_included: true,
+        total_cost_usd: 3.5,
+      }),
+    );
+    await tick();
+
+    expect(client.getQueryData(["session", "conv_usage"])).toBe(cachedMetadata);
+    expect(useChatStore.getState().sessionStatus).toBe("running");
+    expect(useChatStore.getState().boundAgentId).toBe("agent_xyz");
+    expect(useChatStore.getState().sessionCostUsd).toBe(3.5);
+    expect(readUsage).toHaveBeenCalledOnce();
   });
 
   it("keeps a usage failure non-blocking and unknown without retries", async () => {
@@ -887,10 +933,14 @@ describe("chatStore — lazy subtree usage", () => {
       return fetchMock.mock.calls.filter(([input]) => String(input).endsWith("/stream")).length;
     }
 
-    function usageSnapshotCount(): number {
-      return fetchMock.mock.calls.filter(([input]) =>
-        String(input).startsWith("/v1/sessions/conv_usage?"),
-      ).length;
+    function metadataSnapshotCount(): number {
+      return fetchMock.mock.calls.filter(([input]) => {
+        const url = new URL(String(input), "http://test.local");
+        return (
+          url.pathname === "/v1/sessions/conv_usage" &&
+          url.searchParams.get("include_usage") === "false"
+        );
+      }).length;
     }
 
     it("recovers missed usage while the stream stays heartbeat-alive", async () => {
@@ -926,7 +976,7 @@ describe("chatStore — lazy subtree usage", () => {
       routeUsage("conv_usage", readUsage);
       await useChatStore.getState().switchTo("conv_usage");
       await drainAsync();
-      const initialSnapshots = usageSnapshotCount();
+      const initialSnapshots = metadataSnapshotCount();
 
       await advanceReconcileInterval();
       expect(readUsage).toHaveBeenCalledTimes(2);
@@ -940,7 +990,7 @@ describe("chatStore — lazy subtree usage", () => {
       await advanceReconcileInterval();
 
       expect(streamOpenCount()).toBe(1);
-      expect(usageSnapshotCount()).toBe(initialSnapshots + 2);
+      expect(metadataSnapshotCount()).toBe(initialSnapshots + 2);
       expect(readUsage).toHaveBeenCalledTimes(2);
       expect(useChatStore.getState().sessionStatus).toBe("idle");
       expect(useChatStore.getState().loadingConversation).toBe(false);
@@ -991,13 +1041,13 @@ describe("chatStore — lazy subtree usage", () => {
       await useChatStore.getState().switchTo("conv_usage");
       await useChatStore.getState().switchTo("conv_other");
       await drainAsync();
-      const initialSnapshots = usageSnapshotCount();
+      const initialSnapshots = metadataSnapshotCount();
 
       await advanceReconcileInterval();
 
       expect(streamOpenCount()).toBe(2);
       expect(readUsage).toHaveBeenCalledOnce();
-      expect(usageSnapshotCount()).toBe(initialSnapshots);
+      expect(metadataSnapshotCount()).toBe(initialSnapshots);
       expect(useChatStore.getState().sessionCostUsd).toBeNull();
       expect(conversationRegistry.peek("conv_usage")?.getState().sessionCostUsd).toBe(3.5);
     });

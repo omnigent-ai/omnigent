@@ -7046,7 +7046,7 @@
           },
           "usage_included": {
             "default": true,
-            "description": "`False` when the caller skipped usage aggregation with `include_usage=false`. Both usage fields are then unknown, not zero or this session's own-only spend. Display clients can load them separately through `GET /v1/sessions/{id}/usage`.",
+            "description": "`False` when the caller skipped usage aggregation with `include_usage=false`. Both usage fields are then unknown, not zero or this session's own-only spend. Display clients can load them with a separate `GET /v1/sessions/{id}` using `include_usage=true`, `include_items=false`, `include_liveness=false`, and `refresh_state=false`.",
             "title": "Usage Included",
             "type": "boolean"
           },
@@ -7677,46 +7677,6 @@
           "conversation_id"
         ],
         "title": "SessionUsageEvent",
-        "type": "object"
-      },
-      "SessionUsageResponse": {
-        "description": "Display usage for a session and all its sub-agent descendants.\n\nReturned by `GET /v1/sessions/{id}/usage` independently of the session\nsnapshot. An unpriced total or unrecorded model breakdown stays `None`.",
-        "properties": {
-          "id": {
-            "title": "Id",
-            "type": "string"
-          },
-          "total_cost_usd": {
-            "anyOf": [
-              {
-                "format": "double",
-                "type": "number"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Total Cost Usd"
-          },
-          "usage_by_model": {
-            "anyOf": [
-              {
-                "additionalProperties": {
-                  "$ref": "#/components/schemas/ModelUsage"
-                },
-                "type": "object"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Usage By Model"
-          }
-        },
-        "required": [
-          "id"
-        ],
-        "title": "SessionUsageResponse",
         "type": "object"
       },
       "SetCodexGoalRequest": {
@@ -11341,7 +11301,7 @@
             }
           },
           {
-            "description": "When `False`, skip the subtree usage read and return null usage fields with `usage_included=False`. Display clients can fetch `GET /sessions/{id}/usage` independently.",
+            "description": "When `False`, skip the subtree usage read and return null usage fields with `usage_included=False`. Display clients can independently request this route with `include_usage=true`, `include_items=false`, `include_liveness=false`, and `refresh_state=false`.",
             "in": "query",
             "name": "include_usage",
             "required": false,
@@ -15129,49 +15089,6 @@
           }
         },
         "summary": "Switch Session Agent",
-        "tags": [
-          "sessions"
-        ]
-      }
-    },
-    "/v1/sessions/{session_id}/usage": {
-      "get": {
-        "description": "Read subtree display usage without holding up the session snapshot.\n\nThis request owns the authorization and lifetime of the tree read;\nthe snapshot never starts a detached usage worker.",
-        "operationId": "get_session_usage_v1_sessions__session_id__usage_get",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "session_id",
-            "required": true,
-            "schema": {
-              "title": "Session Id",
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/SessionUsageResponse"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Get Session Usage",
         "tags": [
           "sessions"
         ]

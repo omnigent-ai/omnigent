@@ -134,9 +134,25 @@ def _assert_session_usage_responses(
         assert full.json()["total_cost_usd"] == cost
         assert full.json()["usage_by_model"] == by_model
 
-    usage = client.get(f"{path}/usage", headers=headers)
+    usage = client.get(
+        path,
+        params={
+            "include_items": "false",
+            "include_liveness": "false",
+            "include_usage": "true",
+            "refresh_state": "false",
+        },
+        headers=headers,
+    )
     assert usage.status_code == 200, usage.text
-    assert usage.json() == {"id": session_id, "total_cost_usd": cost, "usage_by_model": by_model}
+    usage_body = usage.json()
+    assert usage_body["id"] == session_id
+    assert usage_body["usage_included"] is True
+    assert usage_body["total_cost_usd"] == cost
+    assert usage_body["usage_by_model"] == by_model
+    assert usage_body["items"] == []
+    assert usage_body["runner_online"] is None
+    assert usage_body["host_online"] is None
     assert usage.headers["Cache-Control"] == "no-store"
 
 

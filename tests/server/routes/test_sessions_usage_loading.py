@@ -19,13 +19,19 @@ from omnigent.errors import OmnigentError
 from omnigent.runner.native.orchestration import _codex_native_launch_config
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, UnifiedAuthProvider
 from omnigent.server.routes._sessions import orchestration
-from omnigent.server.routes.sessions import create_sessions_router, routes_core
+from omnigent.server.routes.sessions import create_sessions_router
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 
 _OWNER = "owner@example.com"
 _READER = "reader@example.com"
+_USAGE_SNAPSHOT_PARAMS = {
+    "include_usage": "true",
+    "include_items": "false",
+    "include_liveness": "false",
+    "refresh_state": "false",
+}
 
 
 @dataclass
@@ -141,7 +147,7 @@ async def test_snapshot_can_skip_usage_without_exposing_parent_only_cost(
         method,
         f"/v1/sessions/{usage_app.parent_id}",
         params={"include_items": "false", "include_liveness": "false", "include_usage": "false"},
-        **({"json": {"external_session_id": "thread-resumed"}} if method == "PATCH" else {}),
+        json={"external_session_id": "thread-resumed"} if method == "PATCH" else None,
     )
     assert response.status_code == 200, response.text
     body = response.json()
@@ -190,7 +196,7 @@ async def test_default_snapshot_still_includes_complete_usage(
         method,
         f"/v1/sessions/{usage_app.parent_id}",
         params=params,
-        **({"json": {"title": "Updated title"}} if method == "PATCH" else {}),
+        json={"title": "Updated title"} if method == "PATCH" else None,
     )
     assert response.status_code == 200, response.text
     body = response.json()
@@ -201,7 +207,7 @@ async def test_default_snapshot_still_includes_complete_usage(
 
 
 @pytest.mark.parametrize("node, expected_cost", [("parent_id", 7.75), ("child_id", 2.75)])
-async def test_usage_endpoint_sums_only_authorized_session_subtree(
+async def test_usage_snapshot_sums_only_authorized_session_subtree(
     usage_app: _UsageApp,
     usage_client: httpx.AsyncClient,
     node: str,
@@ -209,10 +215,12 @@ async def test_usage_endpoint_sums_only_authorized_session_subtree(
 ) -> None:
     """A child includes archived descendants, but not its parent or siblings."""
     session_id = getattr(usage_app, node)
-    response = await usage_client.get(f"/v1/sessions/{session_id}/usage")
+    response = await usage_client.get(f"/v1/sessions/{session_id}", params=_USAGE_SNAPSHOT_PARAMS)
     assert response.status_code == 200, response.text
     body = response.json()
     assert body["id"] == session_id
+    assert body["usage_included"] is True
+    assert body["items"] == []
     assert body["total_cost_usd"] == expected_cost
     assert (
         sum(model["total_cost_usd"] for model in body["usage_by_model"].values()) == expected_cost
@@ -221,46 +229,54 @@ async def test_usage_endpoint_sums_only_authorized_session_subtree(
 
 
 @pytest.mark.parametrize("cost", [None, 0.0])
-async def test_usage_endpoint_distinguishes_unpriced_from_zero(
+async def test_usage_snapshot_distinguishes_unpriced_from_zero(
     usage_app: _UsageApp,
     usage_client: httpx.AsyncClient,
     cost: float | None,
 ) -> None:
-    solo = usage_app.conversations.create_conversation()
+    parent = usage_app.conversations.get_conversation(usage_app.parent_id)
+    assert parent is not None
+    solo = usage_app.conversations.create_conversation(agent_id=parent.agent_id)
     usage_app.permissions.grant(_OWNER, solo.id, LEVEL_OWNER)
     usage_app.conversations.set_session_usage(
         solo.id, {} if cost is None else {"total_cost_usd": cost}
     )
-    response = await usage_client.get(f"/v1/sessions/{solo.id}/usage")
+    response = await usage_client.get(f"/v1/sessions/{solo.id}", params=_USAGE_SNAPSHOT_PARAMS)
     assert response.status_code == 200, response.text
-    assert response.json() == {"id": solo.id, "total_cost_usd": cost, "usage_by_model": None}
+    body = response.json()
+    assert body["id"] == solo.id
+    assert body["usage_included"] is True
+    assert body["total_cost_usd"] == cost
+    assert body["usage_by_model"] is None
 
 
-@pytest.mark.parametrize("suffix", ["?include_usage=false", "/usage"])
+@pytest.mark.parametrize("include_usage", ["false", "true"])
 async def test_usage_reads_require_session_access(
     usage_app: _UsageApp,
     usage_client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
-    suffix: str,
+    include_usage: str,
 ) -> None:
     load_usage = Mock(side_effect=AssertionError("must authorize before loading usage"))
-    monkeypatch.setattr(routes_core, "load_session_usage", load_usage)
     monkeypatch.setattr(orchestration, "load_session_usage", load_usage)
     response = await usage_client.get(
-        f"/v1/sessions/{usage_app.parent_id}{suffix}",
+        f"/v1/sessions/{usage_app.parent_id}",
+        params={**_USAGE_SNAPSHOT_PARAMS, "include_usage": include_usage},
         headers={"X-Forwarded-Email": _READER},
     )
     assert response.status_code == 404, response.text
     load_usage.assert_not_called()
 
 
-async def test_usage_endpoint_accepts_read_only_collaborator(
+async def test_usage_snapshot_accepts_read_only_collaborator(
     usage_app: _UsageApp, usage_client: httpx.AsyncClient
 ) -> None:
     usage_app.permissions.ensure_user(_READER)
     usage_app.permissions.grant(_READER, usage_app.parent_id, LEVEL_READ)
     response = await usage_client.get(
-        f"/v1/sessions/{usage_app.parent_id}/usage", headers={"X-Forwarded-Email": _READER}
+        f"/v1/sessions/{usage_app.parent_id}",
+        params=_USAGE_SNAPSHOT_PARAMS,
+        headers={"X-Forwarded-Email": _READER},
     )
     assert response.status_code == 200, response.text
     assert response.json()["total_cost_usd"] == 7.75
@@ -288,7 +304,7 @@ async def test_usage_opt_out_does_not_authorize_read_only_metadata_writes(
 
 
 @pytest.mark.parametrize("mode", ["admin", "single-user"])
-async def test_usage_endpoint_reads_row_when_authorization_does_not(
+async def test_usage_snapshot_reads_row_when_authorization_does_not(
     usage_app: _UsageApp,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
@@ -305,43 +321,52 @@ async def test_usage_endpoint_reads_row_when_authorization_does_not(
         base_url="http://test",
         headers={"X-Forwarded-Email": _OWNER},
     ) as client:
-        response = await client.get(f"/v1/sessions/{usage_app.parent_id}/usage")
+        response = await client.get(
+            f"/v1/sessions/{usage_app.parent_id}", params=_USAGE_SNAPSHOT_PARAMS
+        )
         assert response.status_code == 200, response.text
         assert response.json()["total_cost_usd"] == 7.75
 
         load_usage = Mock(side_effect=AssertionError("missing sessions must not load usage"))
-        monkeypatch.setattr(routes_core, "load_session_usage", load_usage)
-        missing = await client.get("/v1/sessions/00000000000000000000000000000000/usage")
+        monkeypatch.setattr(orchestration, "load_session_usage", load_usage)
+        missing = await client.get(
+            "/v1/sessions/00000000000000000000000000000000", params=_USAGE_SNAPSHOT_PARAMS
+        )
         assert missing.status_code == 404, missing.text
         load_usage.assert_not_called()
 
 
-async def test_usage_endpoint_requires_authentication(
+async def test_usage_snapshot_requires_authentication(
     usage_app: _UsageApp,
     usage_client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     load_usage = Mock(side_effect=AssertionError("must authenticate before loading usage"))
-    monkeypatch.setattr(routes_core, "load_session_usage", load_usage)
+    monkeypatch.setattr(orchestration, "load_session_usage", load_usage)
     response = await usage_client.get(
-        f"/v1/sessions/{usage_app.parent_id}/usage", headers={"X-Forwarded-Email": ""}
+        f"/v1/sessions/{usage_app.parent_id}",
+        params=_USAGE_SNAPSHOT_PARAMS,
+        headers={"X-Forwarded-Email": ""},
     )
     assert response.status_code == 401, response.text
     load_usage.assert_not_called()
 
 
-async def test_usage_endpoint_preserves_failures_instead_of_fabricating_zero(
+async def test_usage_snapshot_preserves_failures_instead_of_fabricating_zero(
     usage_app: _UsageApp,
     usage_client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        routes_core, "load_session_usage", Mock(side_effect=RuntimeError("tree unavailable"))
+        orchestration, "load_session_usage", Mock(side_effect=RuntimeError("tree unavailable"))
     )
-    failed = await usage_client.get(f"/v1/sessions/{usage_app.parent_id}/usage")
+    failed = await usage_client.get(
+        f"/v1/sessions/{usage_app.parent_id}", params=_USAGE_SNAPSHOT_PARAMS
+    )
     assert failed.status_code == 500
     snapshot = await usage_client.get(
-        f"/v1/sessions/{usage_app.parent_id}", params={"include_usage": "false"}
+        f"/v1/sessions/{usage_app.parent_id}",
+        params={**_USAGE_SNAPSHOT_PARAMS, "include_usage": "false"},
     )
     assert snapshot.status_code == 200, snapshot.text
     assert snapshot.json()["total_cost_usd"] is None
@@ -357,20 +382,23 @@ async def test_slow_usage_request_does_not_hold_session_metadata(
     usage_started = asyncio.Event()
     release_usage = threading.Event()
     loop = asyncio.get_running_loop()
-    original_loader = routes_core.load_session_usage
+    original_loader = orchestration.load_session_usage
 
     def delayed_usage(*args: Any, **kwargs: Any) -> dict[str, Any]:
         loop.call_soon_threadsafe(usage_started.set)
         assert release_usage.wait(timeout=10), "test did not release the usage read"
         return original_loader(*args, **kwargs)
 
-    monkeypatch.setattr(routes_core, "load_session_usage", delayed_usage)
-    usage_task = asyncio.create_task(usage_client.get(f"/v1/sessions/{usage_app.parent_id}/usage"))
+    monkeypatch.setattr(orchestration, "load_session_usage", delayed_usage)
+    usage_task = asyncio.create_task(
+        usage_client.get(f"/v1/sessions/{usage_app.parent_id}", params=_USAGE_SNAPSHOT_PARAMS)
+    )
     try:
         await asyncio.wait_for(usage_started.wait(), timeout=3)
         snapshot = await asyncio.wait_for(
             usage_client.get(
-                f"/v1/sessions/{usage_app.parent_id}", params={"include_usage": "false"}
+                f"/v1/sessions/{usage_app.parent_id}",
+                params={**_USAGE_SNAPSHOT_PARAMS, "include_usage": "false"},
             ),
             timeout=3,
         )

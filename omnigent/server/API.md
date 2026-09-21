@@ -739,24 +739,31 @@ When runner liveness is wired (and not skipped via
     session-scoped (authorized by access to the session), and matches
     `GET /health?session_id=...` for the same id.
 
-### Get Session Usage
+#### Load Display Usage Separately
 
 ```
-GET /v1/sessions/{session_id}/usage
+GET /v1/sessions/{session_id}?include_usage=true&include_items=false&include_liveness=false&refresh_state=false
 
-200 OK — {"id": "conv_abc123", "total_cost_usd": 3.5, "usage_by_model": {...}}
+200 OK — body matches `SessionResponse`, with `usage_included=true`.
 404 Not Found — no session with that id is visible to the caller
 ```
 
-Returns the session's complete subtree cost and per-model usage, including
-archived sub-agents. Both fields use the snapshot's existing usage format;
-unpriced cost and unrecorded model usage remain `null`. The response is
-`Cache-Control: no-store`. Read failures return an error, never a zero total.
+After opting out of usage on the initial snapshot, display clients can make a
+second GET on the same endpoint with the flags above. It returns the session's
+complete subtree cost and per-model usage, including archived sub-agents,
+without reloading transcript items or liveness. It still builds normal session
+metadata: `refresh_state=false` avoids forced cache invalidation, but cache
+misses can still require runner/model work. Unpriced cost and unrecorded model
+usage remain `null`. The response is `Cache-Control: no-store`; read failures
+return an error, never a zero total.
 
-Display clients fetch this independently of snapshot and transcript loading,
-keep usage unknown until it arrives, and must not overwrite newer streamed
-usage with an older in-flight response. This is a separate authorized request,
-not a detached worker using the snapshot request's authorization context.
+This request runs independently of initial snapshot and transcript loading.
+Display clients consume only `total_cost_usd` and `usage_by_model` from its
+response, keep usage unknown until it arrives, and must not overwrite newer
+streamed usage with an older in-flight response. Keep this fetch outside the
+shared session-metadata query/cache so it cannot delay metadata reads or
+replace newer metadata. The request performs its own authorization; the initial
+snapshot does not start a detached usage worker.
 Older servers omit `usage_included` and ignore `include_usage`; their snapshot
 already includes usage, so clients should not issue the separate request.
 

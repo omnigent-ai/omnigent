@@ -1891,18 +1891,6 @@ class ModelUsage(BaseModel):
     total_cost_usd: float | None = None
 
 
-class SessionUsageResponse(BaseModel):
-    """Display usage for a session and all its sub-agent descendants.
-
-    Returned by ``GET /v1/sessions/{id}/usage`` independently of the session
-    snapshot. An unpriced total or unrecorded model breakdown stays ``None``.
-    """
-
-    id: str
-    total_cost_usd: float | None = None
-    usage_by_model: dict[str, ModelUsage] | None = None
-
-
 class BackgroundTaskInfo(BaseModel):
     """
     One still-running background shell from the claude-native ``Stop`` hook.
@@ -2088,7 +2076,9 @@ class SessionResponse(BaseModel):
     :param usage_included: ``False`` when the caller skipped usage aggregation
         with ``include_usage=false``. Both usage fields are then unknown,
         not zero or this session's own-only spend. Display clients can load
-        them separately through ``GET /v1/sessions/{id}/usage``.
+        them with a separate ``GET /v1/sessions/{id}`` using
+        ``include_usage=true``, ``include_items=false``,
+        ``include_liveness=false``, and ``refresh_state=false``.
     :param last_task_error: Error details from the most recently
         failed task. Only present when ``status == "failed"`` and
         the task stored an error. Lets clients display the failure

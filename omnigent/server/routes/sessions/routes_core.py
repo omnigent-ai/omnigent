@@ -52,7 +52,6 @@ from omnigent.runtime import (
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
-from omnigent.runtime.policies.builder import load_session_usage
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
     _harness_elicitation_registry,
@@ -136,7 +135,6 @@ from omnigent.server.routes._sessions.helpers import (
     _permission_level_from_grants,
     _pin_claude_permission_launch_args,
     _presentation_labels_for_agent,
-    _priced_cost_for_display,
     _prune_session_read_state,
     _publish_codex_approval_mode,
     _publish_collaboration_mode,
@@ -156,7 +154,6 @@ from omnigent.server.routes._sessions.helpers import (
     _set_read_state,
     _surface_model_change_forward_failure,
     _title_content_from_item,
-    _usage_by_model_for_display,
     _validate_terminal_launch_args,
     _validated_cost_control_mode_override,
     _validated_subagent_routing_override,
@@ -197,7 +194,6 @@ from omnigent.server.schemas import (
     SessionResponse,
     SessionSwitchAgentRequest,
     SessionTodosEvent,
-    SessionUsageResponse,
     UpdateSessionRequest,
 )
 from omnigent.stores import AgentStore, ConversationStore
@@ -1069,7 +1065,9 @@ def register_core_routes(
             stream, not the snapshot.
         :param include_usage: When ``False``, skip the subtree usage read and
             return null usage fields with ``usage_included=False``. Display
-            clients can fetch ``GET /sessions/{id}/usage`` independently.
+            clients can independently request this route with
+            ``include_usage=true``, ``include_items=false``,
+            ``include_liveness=false``, and ``refresh_state=false``.
         :param refresh_state: When ``True``, refresh runner-derived
             snapshot overlays from the live session instead of serving
             stale AP-process caches. Browser reload/bind requests use
@@ -1104,42 +1102,6 @@ def register_core_routes(
             sandbox_config=getattr(request.app.state, "sandbox_config", None),
             viewer_id=user_id,
             request=request,
-        )
-
-    @router.get(
-        "/sessions/{session_id}/usage",
-        response_model=SessionUsageResponse,
-    )
-    async def get_session_usage(
-        request: Request,
-        response: Response,
-        session_id: str,
-    ) -> SessionUsageResponse:
-        """Read subtree display usage without holding up the session snapshot.
-
-        This request owns the authorization and lifetime of the tree read;
-        the snapshot never starts a detached usage worker.
-        """
-        response.headers["Cache-Control"] = "no-store"
-        user_id = _get_user_id(request, auth_provider)
-        access = await _require_access_and_level(
-            user_id, session_id, LEVEL_READ, permission_store, conversation_store
-        )
-        conv = access.conversation
-        if conv is None:
-            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-        if conv is None:
-            raise _session_not_found()
-        usage = await asyncio.to_thread(
-            load_session_usage,
-            session_id,
-            conversation_store,
-            root_conversation_id=conv.root_conversation_id,
-        )
-        return SessionUsageResponse(
-            id=session_id,
-            total_cost_usd=_priced_cost_for_display(usage),
-            usage_by_model=_usage_by_model_for_display(usage),
         )
 
     @router.get(
