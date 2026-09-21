@@ -90,8 +90,8 @@ uncertainty, relevant environment, and preconditions; omit internal terminology
 unless needed to identify the product/action. Never turn predictions into
 observations, reject a real bug for poor writing, or ask its author to rewrite it.
 
-Restate at most six author-provided steps, preserving their order, commands,
-inputs, timing, environment, and expected/actual results. Each needs its own
+Restate all necessary author-provided steps concisely, preserving their order,
+commands, inputs, timing, environment, and expected/actual results. Each needs its own
 supporting source_quote: copy it before rewriting the step. Split steps that
 need distant excerpts into separately quoted steps. Never invent actions or treat investigation
 suggestions as reproduction steps. Return [] if no usable steps were supplied

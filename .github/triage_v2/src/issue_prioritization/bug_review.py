@@ -43,8 +43,8 @@ class BugReview:
             if actionability != BugActionability.ACTIONABLE or not isinstance(raw, Mapping):
                 raise ValueError("only an actionable bug can have a clarification object")
             steps = raw.get("reproduction_steps", [])
-            if not isinstance(steps, (list, tuple)) or len(steps) > 6:
-                raise ValueError("reproduction_steps must contain at most six steps")
+            if not isinstance(steps, (list, tuple)):
+                raise ValueError("reproduction_steps must be an array")
             parsed_steps = []
             for step in steps:
                 if not isinstance(step, Mapping):
