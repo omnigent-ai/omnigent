@@ -33,8 +33,8 @@ _EPSILON = 0.5
 _MSG1 = "sentinel-tap-msg1 holds the turn open"
 _MSG2 = "sentinel-tap-msg2 queued follow-up row"
 
-# Accessible names of the queued row's interactive controls, left to right:
-# drag handle, then the right-side steer / edit / delete cluster.
+# Accessible names of the queued row's interactive controls: drag handle,
+# then the right-side send / edit / remove cluster.
 _ACTION_LABELS = (
     "Reorder queued message",
     "Send queued message now",
@@ -130,7 +130,7 @@ def test_queued_row_controls_meet_mobile_tap_target(
         for left, right in itertools.pairwise(cluster):
             left_cx = left["x"] + left["width"] / 2
             right_cx = right["x"] + right["width"] / 2
-            spacing = right_cx - left_cx
+            spacing = abs(right_cx - left_cx)
             assert spacing >= _MIN_TAP_PX - _EPSILON, (
                 "adjacent queued-row actions are packed too closely for "
                 f"touch: centers only {spacing:.1f}px apart"
