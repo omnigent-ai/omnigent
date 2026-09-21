@@ -12,12 +12,16 @@ these fields for subsequent attempts.
 ## Opt-in stderr capture
 
 Process and reader status are always included. Stderr text is disabled by
-default. Set `OMNIGENT_CODEX_STARTUP_STDERR_ENABLED=1` in the environment that
+default. Set `OMNIGENT_STARTUP_STDERR_ENABLED=1` in the environment that
 launches the host or runner to include its completed stderr buffer in failure
 logs. `true`, `yes`, and `on` also enable capture; unset, `0`, or other values
 disable it. The host forwards this setting to its runners. Existing hosts and
 runners retain their launch environment, so restart them for a setting change
 to take effect.
+
+The flag is shared across harnesses; native Codex is currently the first
+consumer. Other harnesses can use the shared setting when they add startup
+stderr diagnostics.
 
 Enabled capture retains diagnostic text, including tracebacks and request or
 response context. It applies the same known credential-pattern redaction as

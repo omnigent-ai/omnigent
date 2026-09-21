@@ -3260,7 +3260,7 @@ def test_build_runner_env_passthrough_survives_remote_daemon_hop(
 
 @pytest.mark.parametrize("server_url", [None, "https://example.databricksapps.com"])
 @pytest.mark.parametrize("setting", [None, "1", "0"])
-async def test_codex_startup_stderr_opt_in_survives_daemon_and_runner_hops(
+async def test_startup_stderr_opt_in_survives_daemon_and_runner_hops(
     monkeypatch: pytest.MonkeyPatch,
     server_url: str | None,
     setting: str | None,
@@ -3268,8 +3268,8 @@ async def test_codex_startup_stderr_opt_in_survives_daemon_and_runner_hops(
     """Forward an explicit capture setting without enabling capture by default."""
     from omnigent.cli import _build_host_daemon_env
 
-    flag_name = "OMNIGENT_CODEX_STARTUP_STDERR_ENABLED"
-    sibling_name = "OMNIGENT_CODEX_STARTUP_STDERR_UNRELATED"
+    flag_name = "OMNIGENT_STARTUP_STDERR_ENABLED"
+    sibling_name = "OMNIGENT_STARTUP_STDERR_UNRELATED"
     monkeypatch.delenv(flag_name, raising=False)
     monkeypatch.delenv("OMNIGENT_RUNNER_ENV_PASSTHROUGH", raising=False)
     monkeypatch.setenv(sibling_name, "must-not-forward")

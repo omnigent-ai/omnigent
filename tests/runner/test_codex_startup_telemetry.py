@@ -23,7 +23,7 @@ from omnigent.harnesses.codex_native.bridge import (
 from omnigent.process_logging import RedactingLogFormatter
 from omnigent.runner.native import orchestration
 
-_STDERR_ENV = "OMNIGENT_CODEX_STARTUP_STDERR_ENABLED"
+_STDERR_ENV = "OMNIGENT_STARTUP_STDERR_ENABLED"
 
 
 @dataclass

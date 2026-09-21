@@ -23,6 +23,7 @@ LOG_TO_STDERR_ENV_VAR = "OMNIGENT_LOG_TO_STDERR"
 LOG_FORCE_COLOR_ENV_VAR = "OMNIGENT_LOG_FORCE_COLOR"
 PROCESS_LOG_FILE_ENV_VAR = "OMNIGENT_PROCESS_LOG_FILE"
 LOG_TTY_FD_ENV_VAR = "OMNIGENT_LOG_TTY_FD"
+STARTUP_STDERR_ENABLED_ENV_VAR = "OMNIGENT_STARTUP_STDERR_ENABLED"
 
 
 class ChildLoggingPopenKwargs(TypedDict, total=False):
@@ -350,6 +351,16 @@ def effective_log_level(default: str = "INFO") -> int:
 def should_log_to_stderr() -> bool:
     """Return whether process logs should also mirror to an interactive stderr."""
     return env_truthy(os.environ.get(LOG_TO_STDERR_ENV_VAR))
+
+
+def startup_stderr_capture_enabled() -> bool:
+    """Return whether harness startup failures may include captured stderr text."""
+    return os.environ.get(STARTUP_STDERR_ENABLED_ENV_VAR, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 def _process_log_file_from_env() -> Path | None:

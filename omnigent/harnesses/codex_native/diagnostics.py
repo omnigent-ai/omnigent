@@ -2,17 +2,15 @@
 
 from __future__ import annotations
 
-import os
 import re
 import unicodedata
 from typing import TYPE_CHECKING
 
-from omnigent.process_logging import redact_log_text
+from omnigent.process_logging import redact_log_text, startup_stderr_capture_enabled
 
 if TYPE_CHECKING:
     from omnigent.harnesses.codex_native.app_server import CodexNativeAppServer
 
-STDERR_CAPTURE_ENV_VAR = "OMNIGENT_CODEX_STARTUP_STDERR_ENABLED"
 _STDERR_TAIL_BYTES = 64 * 1024
 _TERMINAL_ESCAPE = re.compile(
     r"(?:\x1b\]|\x9d).*?(?:\x07|\x1b\\|\x9c|$)"
@@ -66,12 +64,7 @@ def collect_codex_startup_diagnostics(
     Text capture requires explicit opt-in. Known credential patterns are
     redacted before a 64 KiB limit, retaining complete entries where possible.
     """
-    capture_enabled = os.environ.get(STDERR_CAPTURE_ENV_VAR, "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
+    capture_enabled = startup_stderr_capture_enabled()
     snapshot: dict[str, object] = {
         "app_server_state": "unavailable" if app_server is None else "not_started",
         "stderr_reader_state": "unavailable" if app_server is None else "not_started",
