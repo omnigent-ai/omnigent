@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, cast
 import pytest
 
 from omnigent.harnesses.codex_native.diagnostics import collect_codex_startup_diagnostics
-from omnigent.process_logging import STARTUP_STDERR_ENABLED_ENV_VAR
+from omnigent.process_logging import HARNESS_STDERR_ENABLED_ENV_VAR
 
 if TYPE_CHECKING:
     from omnigent.harnesses.codex_native.app_server import CodexNativeAppServer
@@ -20,12 +20,12 @@ _RECORD = "2026-09-21T12:00:00.000Z ERROR "
 
 @pytest.fixture(autouse=True)
 def clear_capture_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv(STARTUP_STDERR_ENABLED_ENV_VAR, raising=False)
+    monkeypatch.delenv(HARNESS_STDERR_ENABLED_ENV_VAR, raising=False)
 
 
 @pytest.fixture
 def capture_stderr(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv(STARTUP_STDERR_ENABLED_ENV_VAR, "1")
+    monkeypatch.setenv(HARNESS_STDERR_ENABLED_ENV_VAR, "1")
 
 
 def _server(
@@ -134,7 +134,7 @@ def test_disabled_capture_does_not_read_stderr(
     monkeypatch: pytest.MonkeyPatch, value: str | None
 ) -> None:
     if value is not None:
-        monkeypatch.setenv(STARTUP_STDERR_ENABLED_ENV_VAR, value)
+        monkeypatch.setenv(HARNESS_STDERR_ENABLED_ENV_VAR, value)
 
     class ServerWithoutReadableStderr:
         proc = SimpleNamespace(pid=4242, returncode=None)
@@ -160,7 +160,7 @@ def test_disabled_capture_does_not_read_stderr(
 def test_capture_requires_explicit_truthy_value(
     monkeypatch: pytest.MonkeyPatch, value: str
 ) -> None:
-    monkeypatch.setenv(STARTUP_STDERR_ENABLED_ENV_VAR, value)
+    monkeypatch.setenv(HARNESS_STDERR_ENABLED_ENV_VAR, value)
     snapshot = collect_codex_startup_diagnostics(_server(["startup detail"]))
     assert snapshot["stderr_capture_enabled"] is True
     assert snapshot["stderr_tail"] == "startup detail"

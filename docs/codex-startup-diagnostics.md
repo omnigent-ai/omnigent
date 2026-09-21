@@ -12,16 +12,17 @@ these fields for subsequent attempts.
 ## Opt-in stderr capture
 
 Process and reader status are always included. Stderr text is disabled by
-default. Set `OMNIGENT_STARTUP_STDERR_ENABLED=1` in the environment that
+default. Set `OMNIGENT_HARNESS_STDERR_ENABLED=1` in the environment that
 launches the host or runner to include its completed stderr buffer in failure
 logs. `true`, `yes`, and `on` also enable capture; unset, `0`, or other values
 disable it. The host forwards this setting to its runners. Existing hosts and
 runners retain their launch environment, so restart them for a setting change
 to take effect.
 
-The flag is shared across harnesses; native Codex is currently the first
-consumer. Other harnesses can use the shared setting when they add startup
-stderr diagnostics.
+The flag is shared across harnesses and lifecycle phases. The current
+implementation only includes stderr when native Codex fails during thread
+discovery at startup. It does not add continuous forwarding or runtime-failure
+capture. Those paths can use the same setting when implemented.
 
 Enabled capture retains diagnostic text, including tracebacks and request or
 response context. It applies the same known credential-pattern redaction as
@@ -77,7 +78,7 @@ Successful discovery and cancellation do not emit this failure event.
 ## Verification
 
 ```sh
-uv run --no-sync pytest -q tests/test_codex_native_diagnostics.py tests/runner/test_codex_startup_telemetry.py tests/host/test_connect.py -k 'codex or startup_stderr'
+uv run --no-sync pytest -q tests/test_codex_native_diagnostics.py tests/runner/test_codex_startup_telemetry.py tests/host/test_connect.py -k 'codex or harness_stderr'
 ```
 
 These tests inject a startup timeout and an ended event stream, inspect the

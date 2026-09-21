@@ -6,7 +6,7 @@ import re
 import unicodedata
 from typing import TYPE_CHECKING
 
-from omnigent.process_logging import redact_log_text, startup_stderr_capture_enabled
+from omnigent.process_logging import harness_stderr_capture_enabled, redact_log_text
 
 if TYPE_CHECKING:
     from omnigent.harnesses.codex_native.app_server import CodexNativeAppServer
@@ -64,7 +64,7 @@ def collect_codex_startup_diagnostics(
     Text capture requires explicit opt-in. Known credential patterns are
     redacted before a 64 KiB limit, retaining complete entries where possible.
     """
-    capture_enabled = startup_stderr_capture_enabled()
+    capture_enabled = harness_stderr_capture_enabled()
     snapshot: dict[str, object] = {
         "app_server_state": "unavailable" if app_server is None else "not_started",
         "stderr_reader_state": "unavailable" if app_server is None else "not_started",

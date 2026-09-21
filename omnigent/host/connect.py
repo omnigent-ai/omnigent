@@ -635,8 +635,8 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # telemetry is opt-in. Not a secret (a boolean). The OMNIGENT_OTEL_*
         # knobs (capture-content, FastAPI toggle) ride the prefix allowlist below.
         "OMNIGENT_TELEMETRY_ENABLED",
-        # Preserve the harness startup stderr opt-in through daemon and runner hops.
-        "OMNIGENT_STARTUP_STDERR_ENABLED",
+        # Preserve the harness stderr opt-in through daemon and runner hops.
+        "OMNIGENT_HARNESS_STDERR_ENABLED",
         # Opaque request-routing headers (dev/test): a JSON header map folded by
         # cli_auth.databricks_request_headers into every client→server connection
         # so a request pins to a specific server instance/replica. Must reach the

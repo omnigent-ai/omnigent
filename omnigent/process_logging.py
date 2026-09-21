@@ -23,7 +23,7 @@ LOG_TO_STDERR_ENV_VAR = "OMNIGENT_LOG_TO_STDERR"
 LOG_FORCE_COLOR_ENV_VAR = "OMNIGENT_LOG_FORCE_COLOR"
 PROCESS_LOG_FILE_ENV_VAR = "OMNIGENT_PROCESS_LOG_FILE"
 LOG_TTY_FD_ENV_VAR = "OMNIGENT_LOG_TTY_FD"
-STARTUP_STDERR_ENABLED_ENV_VAR = "OMNIGENT_STARTUP_STDERR_ENABLED"
+HARNESS_STDERR_ENABLED_ENV_VAR = "OMNIGENT_HARNESS_STDERR_ENABLED"
 
 
 class ChildLoggingPopenKwargs(TypedDict, total=False):
@@ -353,9 +353,9 @@ def should_log_to_stderr() -> bool:
     return env_truthy(os.environ.get(LOG_TO_STDERR_ENV_VAR))
 
 
-def startup_stderr_capture_enabled() -> bool:
-    """Return whether harness startup failures may include captured stderr text."""
-    return os.environ.get(STARTUP_STDERR_ENABLED_ENV_VAR, "").strip().lower() in {
+def harness_stderr_capture_enabled() -> bool:
+    """Return whether harness diagnostics may include captured stderr text."""
+    return os.environ.get(HARNESS_STDERR_ENABLED_ENV_VAR, "").strip().lower() in {
         "1",
         "true",
         "yes",
