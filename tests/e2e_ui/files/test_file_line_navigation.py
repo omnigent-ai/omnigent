@@ -463,6 +463,73 @@ def test_citation_preserves_offline_markdown_draft_with_diff_preference(
     assert not writes, "Navigation must not save an offline draft"
 
 
+@pytest.mark.parametrize(
+    "start_mobile", [False, True], ids=["desktop-to-mobile", "mobile-to-desktop"]
+)
+def test_shared_view_change_preserves_hidden_offline_draft(
+    page: Page, seeded_session: tuple[str, str], start_mobile: bool
+) -> None:
+    """Switching modes after a resize must confirm the other viewer's draft."""
+    base_url, session_id = seeded_session
+    path = "src/draft.md"
+    writes = _mock_markdown_files(page, seeded_session, {path: "Original paragraph."})
+    page.route(
+        f"{base_url}/v1/sessions/{session_id}/resources/environments/default/changes",
+        lambda route: route.fulfill(json={"object": "list", "has_more": False, "data": []}),
+    )
+    liveness = {"runner_online": True, "host_online": True}
+    page.route(
+        f"{base_url}/health?session_ids=*",
+        lambda route: route.fulfill(json={"sessions": {session_id: liveness}}),
+    )
+    page.clock.install()
+    viewer = _open_viewer(
+        page, seeded_session, path, {"diffActive": False, "previewableViewMode": "editor"}
+    )
+    original_width = 700 if start_mobile else 1600
+    other_width = 1600 if start_mobile else 700
+    page.set_viewport_size({"width": original_width, "height": 1000})
+    editor = viewer.locator('[contenteditable="true"]')
+    expect(editor).to_be_visible(timeout=30_000)
+    liveness.update(runner_online=False, host_online=False)
+    page.clock.fast_forward(10_000)
+    expect(
+        viewer.get_by_role(
+            "button", name="Runner offline — your changes will save when it reconnects", exact=True
+        )
+    ).to_be_visible(timeout=30_000)
+    editor.fill("Unsaved draft across a resize")
+    editor.evaluate("el => { window.__draftEditor = el; }")
+    page.set_viewport_size({"width": other_width, "height": 1000})
+    expect(editor).to_be_visible()
+    expect(editor).to_have_text("Original paragraph.")
+
+    def choose_source() -> None:
+        trigger = viewer.get_by_role("button", name=re.compile(r"^View mode|^More actions$"))
+        expect(trigger).to_be_visible()
+        collapsed = trigger.get_attribute("aria-label") == "More actions"
+        trigger.click()
+        if collapsed:
+            page.get_by_role("menuitem", name="View mode", exact=True).click()
+        page.get_by_role("menuitem", name="Source", exact=True).click()
+
+    choose_source()
+    dialog = page.get_by_role("dialog", name="Unsaved changes")
+    expect(dialog).to_be_visible()
+    dialog.get_by_role("button", name="Keep editing", exact=True).click()
+    page.set_viewport_size({"width": original_width, "height": 1000})
+    expect(editor).to_have_text("Unsaved draft across a resize")
+    assert editor.evaluate("el => el === window.__draftEditor"), "Cancel must preserve the editor"
+    page.set_viewport_size({"width": other_width, "height": 1000})
+    choose_source()
+    expect(dialog).to_be_visible()
+    dialog.get_by_role("button", name="Discard changes", exact=True).click()
+    expect(dialog).not_to_be_visible()
+    expect(page.locator('[data-testid="file-viewer"] [contenteditable="true"]')).to_have_count(0)
+    expect(viewer.locator('[data-line="1"]')).to_have_text("Original paragraph.")
+    assert not writes, "An offline draft must not be saved by a mode change"
+
+
 def test_plain_markdown_open_restores_scroll_after_citing_another_file(
     page: Page, seeded_session: tuple[str, str]
 ) -> None:

@@ -67,7 +67,7 @@ import {
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import { useResizableColumn } from "@/hooks/useResizableColumn";
 import { RunnerOfflineError } from "@/hooks/useWorkspaceChangedFiles";
-import { useFileViewPreferences } from "./FileViewPreferencesContext";
+import { FileViewPreferencesProvider, useFileViewPreferences } from "./FileViewPreferencesContext";
 import { absoluteTime, relativeTime } from "@/lib/relativeTime";
 import {
   fetchGithubFileContents,
@@ -767,6 +767,14 @@ function SidebarNode({
 }
 
 export function GithubPanel({ conversationId }: { conversationId: string }) {
+  return (
+    <FileViewPreferencesProvider>
+      <GithubPanelBody conversationId={conversationId} />
+    </FileViewPreferencesProvider>
+  );
+}
+
+function GithubPanelBody({ conversationId }: { conversationId: string }) {
   const [selection, setSelection] = useState<{ sessionId: string; url?: string }>();
   const [linking, setLinking] = useState(false);
   const [url, setUrl] = useState("");

@@ -102,9 +102,7 @@ function renderPanel() {
   return render(<GithubPanel conversationId="conv_1" />, {
     wrapper: ({ children }) => (
       <QueryClientProvider client={client}>
-        <MemoryRouter>
-          <FileViewPreferencesProvider>{children}</FileViewPreferencesProvider>
-        </MemoryRouter>
+        <MemoryRouter>{children}</MemoryRouter>
       </QueryClientProvider>
     ),
   });
@@ -313,7 +311,7 @@ describe("GithubPanel", () => {
     expect(screen.getAllByRole("button", { name: /hello\.py/ })).toHaveLength(2);
   });
 
-  it("toggles the diff layout between unified and split", async () => {
+  it("toggles the diff layout when mounted without a shared preferences provider", async () => {
     renderChanges();
     await screen.findAllByTestId("diff");
     // Defaults to unified, so the toggle offers split; clicking flips its label.

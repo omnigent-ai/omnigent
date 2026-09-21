@@ -701,7 +701,17 @@ function FileViewerBody({
     setWrapLines,
     previewableViewMode,
     setPreviewableViewMode,
+    registerDraftGuard,
+    guardViewChange,
+    viewChangePending,
   } = useFileViewPreferences();
+  useLayoutEffect(
+    () =>
+      registerDraftGuard({
+        isDirty: () => isEditorDirtyRef.current,
+      }),
+    [registerDraftGuard],
+  );
   // A ?comment= deep link to a markdown file must open on the rich-text editor
   // so the comment's anchor highlight is visible in context — the whole point
   // of following the link. The editor is forced regardless of the user's sticky
@@ -723,12 +733,13 @@ function FileViewerBody({
 
   // Switch a markdown file to the rich-text editor — the surface where text-
   // selection commenting works. Used by the preview's "switch to edit mode"
-  // hint. Coming from preview/source there are no edits to guard, so it applies
-  // directly (mirrors the toolbar's switchTo for the non-editor case).
+  // hint. Another responsive viewer may still hold a draft.
   const handleRequestEditMode = useCallback(() => {
-    setDeepLinkBiasPath(null);
-    setPreviewableViewMode("editor");
-  }, [setPreviewableViewMode]);
+    guardViewChange(() => {
+      setDeepLinkBiasPath(null);
+      setPreviewableViewMode("editor");
+    });
+  }, [guardViewChange, setPreviewableViewMode]);
 
   // Markdown supports all three previewable modes (preview / editor / source).
   // HTML and notebooks have no rich-text editor, so their "editor" preference
@@ -916,7 +927,7 @@ function FileViewerBody({
   // that AppShell writes (React Router v7 BrowserRouter defers via startTransition,
   // so stale searchParams seen here could emit a navigate("?") that strips it).
   useEffect(() => {
-    if (!open || !ownsUrl) return;
+    if (!open || !ownsUrl || viewChangePending) return;
     const wantDiff = diffActive && isDiffAvailable;
     const hasDiff = searchParams.has("diff");
     if (wantDiff === hasDiff) return; // already in sync — no navigate needed
@@ -932,7 +943,15 @@ function FileViewerBody({
       },
       { replace: true },
     );
-  }, [diffActive, isDiffAvailable, open, ownsUrl, searchParams, setSearchParams]);
+  }, [
+    diffActive,
+    isDiffAvailable,
+    open,
+    ownsUrl,
+    viewChangePending,
+    searchParams,
+    setSearchParams,
+  ]);
 
   // Toolbar actions, declared once and rendered two ways: inline icon buttons
   // when there's room, or rows in an overflow ("⋯") menu when there isn't.
@@ -981,9 +1000,8 @@ function FileViewerBody({
   const toolbarActions: ToolbarAction[] = [];
   if (lang === "markdown" && viewMode !== "diff") {
     // Markdown is a segmented control over three reachable modes: the rich-text
-    // Editor (default), the rendered Preview, and raw Source. Switching away
-    // from the editor must guard unsaved edits; the read-only preview/source
-    // surfaces carry no edits, so they switch freely.
+    // Editor (default), the rendered Preview, and raw Source. Shared mode
+    // changes must protect drafts in every mounted viewer.
     const switchTo = (mode: "preview" | "editor" | "source") => {
       // No-op when already on this surface — re-selecting the active tab must
       // not run the dirty guard (which would pop a discard dialog for nothing).
@@ -997,11 +1015,7 @@ function FileViewerBody({
         setDismissedPosition(position);
         setPreviewableViewMode(mode);
       };
-      if (viewMode === "editor") {
-        guardDirty(apply);
-      } else {
-        apply();
-      }
+      guardViewChange(apply);
     };
     // One toolbar slot: a "view mode" picker rather than three side-by-side
     // buttons (the toolbar is tight once nav/diff/comment actions are present).
@@ -1055,11 +1069,12 @@ function FileViewerBody({
       // file) resolves to "preview" for HTML, so a functional updater keyed on
       // "editor" would no-op the first click. Keying on viewMode makes one click
       // always reach the other surface.
-      onSelect: () => {
-        dismissFilePosition(position);
-        setDismissedPosition(position);
-        setPreviewableViewMode(viewMode === "preview" ? "source" : "preview");
-      },
+      onSelect: () =>
+        guardViewChange(() => {
+          dismissFilePosition(position);
+          setDismissedPosition(position);
+          setPreviewableViewMode(viewMode === "preview" ? "source" : "preview");
+        }),
     });
   }
   // HTML artifacts can be popped out into their own browser tab for full-window
@@ -1101,7 +1116,7 @@ function FileViewerBody({
       icon: <FileDiffIcon className="size-4" />,
       active: viewMode === "diff",
       onSelect: () =>
-        guardDirty(() => {
+        guardViewChange(() => {
           dismissFilePosition(position);
           setDismissedPosition(position);
           setDiffActive(viewMode !== "diff");
