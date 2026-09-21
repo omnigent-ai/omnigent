@@ -30,7 +30,7 @@ const meta = {
     onClose: () => undefined,
   },
   decorators: [
-    (Story) => (
+    (Story, context) => (
       <StoryQueryRouter
         seed={(queryClient) => {
           seedFilesystem(queryClient, workspaceStoryProjects, projectEntries);
@@ -40,39 +40,45 @@ const meta = {
           ]);
           queryClient.setQueryData(
             ["host-worktrees", workspaceStoryHost, workspaceStoryProjects],
-            [
-              {
-                path: workspaceStoryProjects,
-                branch: "main",
-                is_main: true,
-                detached: false,
-              },
-              {
-                path: `${workspaceStoryHome}/worktrees/agentic-layouts`,
-                branch: "agentic/layouts",
-                is_main: false,
-                detached: false,
-                updated_at: 1_700_000_000,
-              },
-              {
-                path: `${workspaceStoryHome}/worktrees/command-palette`,
-                branch: "feature/command-palette",
-                is_main: false,
-                detached: false,
-                updated_at: 1_699_992_800,
-              },
-              {
-                path: `${workspaceStoryHome}/worktrees/streaming-status`,
-                branch: "feature/streaming-status",
-                is_main: false,
-                detached: false,
-                updated_at: 1_699_913_600,
-              },
-            ],
+            context.name === "Full Single Pane"
+              ? []
+              : [
+                  {
+                    path: workspaceStoryProjects,
+                    branch: "main",
+                    is_main: true,
+                    detached: false,
+                  },
+                  ...(context.name === "Main Checkout Only"
+                    ? []
+                    : [
+                        {
+                          path: `${workspaceStoryHome}/worktrees/agentic-layouts`,
+                          branch: "agentic/layouts",
+                          is_main: false,
+                          detached: false,
+                          updated_at: 1_700_000_000,
+                        },
+                        {
+                          path: `${workspaceStoryHome}/worktrees/command-palette`,
+                          branch: "feature/command-palette",
+                          is_main: false,
+                          detached: false,
+                          updated_at: 1_699_992_800,
+                        },
+                        {
+                          path: `${workspaceStoryHome}/worktrees/streaming-status`,
+                          branch: "feature/streaming-status",
+                          is_main: false,
+                          detached: false,
+                          updated_at: 1_699_913_600,
+                        },
+                      ]),
+                ],
           );
         }}
       >
-        <div className="flex h-[min(29rem,calc(100dvh-2rem))] w-[min(45rem,calc(100vw-2rem))] justify-center">
+        <div className="flex h-[min(520px,calc(100dvh-2rem))] w-[min(800px,calc(100vw-2rem))] justify-center">
           <Story />
         </div>
       </StoryQueryRouter>
@@ -92,6 +98,10 @@ export const PopulatedWithConflict: Story = {
 };
 
 export const FullTwoPane: Story = {};
+
+export const FullSinglePane: Story = {};
+
+export const MainCheckoutOnly: Story = {};
 
 export const LinkedWorktreeSelected: Story = {
   play: async ({ canvasElement }) => {

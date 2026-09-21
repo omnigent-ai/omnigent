@@ -701,18 +701,17 @@ export function WorkspacePicker({
       className={cn(
         "flex min-h-0 flex-col overflow-hidden border border-border bg-background",
         hasCommitActions
-          ? "h-[min(35rem,calc(100dvh-6rem))] max-h-full rounded-2xl shadow-xl"
+          ? "h-[min(520px,calc(100dvh-4rem))] w-[min(800px,calc(100vw-2rem))] max-h-full justify-self-center rounded-3xl shadow-xl"
           : "max-h-80 rounded-md",
-        showGitDialog &&
-          "h-[min(29rem,calc(100dvh-4rem))] w-[min(45rem,calc(100vw-2rem))] justify-self-center rounded-3xl",
       )}
       data-testid="workspace-picker"
     >
       <div
         className={cn(
           "flex min-h-14 shrink-0 items-center gap-1 border-b px-4 py-2",
-          showGitDialog && "min-h-11 px-4 py-1",
+          hasCommitActions && "min-h-12 px-4 py-1",
         )}
+        data-testid="workspace-picker-header"
       >
         <PickerIconButton
           label="Up one level"
@@ -840,9 +839,9 @@ export function WorkspacePicker({
       <div
         className={cn(
           showWorktreePanel
-            ? "grid min-h-0 flex-1 grid-cols-1 lg:grid-cols-[minmax(0,1.05fr)_minmax(16rem,0.95fr)]"
+            ? "grid min-h-0 flex-1 grid-cols-1 md:grid-cols-[minmax(0,1.05fr)_minmax(16rem,0.95fr)]"
             : "flex min-h-0 flex-1 flex-col",
-          showGitDialog && "lg:grid-cols-[minmax(0,1.2fr)_minmax(18rem,0.8fr)]",
+          showGitDialog && "md:grid-cols-[minmax(0,1.2fr)_minmax(18rem,0.8fr)]",
         )}
         data-testid="workspace-picker-body"
       >
@@ -1046,7 +1045,7 @@ export function WorkspacePicker({
         {showWorktreePanel && (
           <aside
             className={cn(
-              "flex min-h-0 min-w-0 flex-col border-t bg-muted/10 lg:border-t-0 lg:border-l",
+              "flex min-h-0 min-w-0 flex-col border-t bg-muted/10 md:border-t-0 md:border-l",
               showGitDialog && "bg-muted/[0.07]",
             )}
             aria-label="Worktrees"
@@ -1130,8 +1129,9 @@ export function WorkspacePicker({
         <div
           className={cn(
             "flex min-h-16 shrink-0 items-center justify-end gap-2 border-t px-5 py-3",
-            showGitDialog && "min-h-14 px-5 py-2",
+            hasCommitActions && "min-h-16 px-5 py-2",
           )}
+          data-testid="workspace-picker-footer"
         >
           {onClose && (
             <Button
