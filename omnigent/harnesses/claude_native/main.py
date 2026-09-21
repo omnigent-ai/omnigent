@@ -6294,7 +6294,8 @@ async def _launch_claude_terminal(
     except (Exception, asyncio.CancelledError):
         from omnigent.harnesses.claude_native.diagnostics import ClaudeDebugLogFollower
 
-        ClaudeDebugLogFollower(bridge_dir).close(session_id)
+        with contextlib.suppress(Exception):
+            await asyncio.to_thread(ClaudeDebugLogFollower(bridge_dir).close, session_id)
         raise
 
 

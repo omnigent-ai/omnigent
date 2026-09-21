@@ -268,6 +268,7 @@ def test_rotation_drains_old_inode_before_new_file(
         "old partial completed",
         "replacement file with a larger size than the old cursor",
     ]
+    assert sum(event["bytes_omitted"] for event in _events(caplog)) == 0
 
 
 def test_truncation_discards_incomplete_old_record(
@@ -337,6 +338,56 @@ def test_close_bounds_final_drain_and_reports_unread_bytes(
     assert events[-1]["offset"] == diagnostics._READ_BYTES * diagnostics._CLOSE_READS
     assert events[-1]["text"] == ""
     assert events[-1]["bytes_omitted"] > 0
+    assert follower._fd is None
+
+
+@pytest.mark.parametrize("polls_before_close", [0, 3])
+@pytest.mark.parametrize("current_records", [1, 8])
+def test_cold_follower_accounts_predecessor_without_reading_it(
+    capture_file: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    polls_before_close: int,
+    current_records: int,
+) -> None:
+    monkeypatch.setattr(diagnostics, "_READ_BYTES", 16)
+    record = b"latest failure!\n"
+    assert len(record) == diagnostics._READ_BYTES
+    capture_file.write_bytes(record * current_records)
+    predecessor = capture_file.with_name(capture_file.name + ".1")
+    with predecessor.open("wb") as handle:
+        handle.truncate(10 * 1024 * 1024 + 73)
+    predecessor_size = predecessor.stat().st_size
+    current_inode = capture_file.stat().st_ino
+    marker_inode = (capture_file.parent / diagnostics.CLAUDE_DEBUG_LOG_MARKER).stat().st_ino
+    original_read = diagnostics.os.read
+    reads: list[tuple[int, int]] = []
+
+    def tracked_read(fd: int, size: int) -> bytes:
+        inode = os.fstat(fd).st_ino
+        if inode != marker_inode:
+            reads.append((inode, size))
+        return original_read(fd, size)
+
+    monkeypatch.setattr(diagnostics.os, "read", tracked_read)
+    follower = diagnostics.ClaudeDebugLogFollower(capture_file.parent)
+    for _ in range(polls_before_close):
+        follower.poll("conv_test")
+    follower.close("conv_test")
+    follower.close("conv_test")
+    follower.poll("conv_test")
+
+    read_budget = polls_before_close + diagnostics._CLOSE_READS
+    events = _events(caplog)
+    assert len(reads) == read_budget
+    assert all(read == (current_inode, diagnostics._READ_BYTES) for read in reads)
+    assert [event["text"] for event in events if event["text"]] == [
+        record.decode().rstrip("\n")
+    ] * min(current_records, read_budget)
+    assert sum(event["bytes_omitted"] for event in events) == predecessor_size + max(
+        0, current_records - read_budget
+    ) * len(record)
+    assert all(event["truncated"] for event in events if event["bytes_omitted"])
     assert follower._fd is None
 
 
@@ -421,6 +472,49 @@ def test_non_regular_or_aliased_log_is_never_read(
     follower.poll("conv_test")
     follower.close("conv_test")
     assert not _events(caplog)
+
+
+@pytest.mark.parametrize("kind", ["symlink", "fifo", "directory", "hardlink", "foreign_owner"])
+def test_unsafe_predecessor_is_ignored_without_losing_current_evidence(
+    capture_file: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+) -> None:
+    capture_file.write_text("final failure\n")
+    unrelated = capture_file.parent / "unrelated.log"
+    unrelated.write_text("unrelated private contents\n")
+    predecessor = capture_file.with_name(capture_file.name + ".1")
+    if kind == "symlink":
+        predecessor.symlink_to(unrelated)
+    elif kind == "fifo":
+        os.mkfifo(predecessor)
+    elif kind == "hardlink":
+        os.link(unrelated, predecessor)
+    elif kind == "directory":
+        predecessor.mkdir()
+    else:
+        predecessor.write_text("other owner's contents\n")
+        predecessor_inode = predecessor.stat().st_ino
+        original_fstat = diagnostics.os.fstat
+
+        def foreign_owner_fstat(fd: int) -> os.stat_result:
+            info = original_fstat(fd)
+            if info.st_ino == predecessor_inode:
+                values = list(info)
+                values[4] = info.st_uid + 1
+                return os.stat_result(values)
+            return info
+
+        monkeypatch.setattr(diagnostics.os, "fstat", foreign_owner_fstat)
+
+    follower = diagnostics.ClaudeDebugLogFollower(capture_file.parent)
+    follower.poll("conv_test")
+    follower.close("conv_test")
+
+    events = _events(caplog)
+    assert [event["text"] for event in events] == ["final failure"]
+    assert sum(event["bytes_omitted"] for event in events) == 0
 
 
 @pytest.mark.parametrize("kind", ["symlink", "traversal", "oversized", "malformed"])

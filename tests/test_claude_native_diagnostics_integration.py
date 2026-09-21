@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
+import threading
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -123,6 +125,7 @@ async def test_diagnostics_continue_before_transcript_discovery_and_follow_sessi
     rotated_poll = asyncio.Event()
     active = SimpleNamespace(session_id="original-session")
     observed_sessions: list[str] = []
+    loop = asyncio.get_running_loop()
 
     async def wait_for_hook_state(*_args: object, **_kwargs: object) -> None:
         hook_wait_started.set()
@@ -131,9 +134,9 @@ async def test_diagnostics_continue_before_transcript_discovery_and_follow_sessi
     def poll(session_id: str) -> None:
         observed_sessions.append(session_id)
         if session_id == "original-session":
-            first_poll.set()
+            loop.call_soon_threadsafe(first_poll.set)
         if session_id == "cleared-session":
-            rotated_poll.set()
+            loop.call_soon_threadsafe(rotated_poll.set)
 
     follower = SimpleNamespace(poll=Mock(side_effect=poll), close=Mock())
     make_follower = Mock(return_value=follower)
@@ -286,3 +289,64 @@ async def test_diagnostic_failures_preserve_the_original_forwarder_error(
     assert raised.value is original_error
     follower.poll.assert_called_once_with("original-session")
     follower.close.assert_called_once_with("original-session")
+
+
+@pytest.mark.parametrize("cancel_again", [False, True])
+async def test_blocked_diagnostic_io_leaves_loop_responsive_and_drains_after_poll(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, cancel_again: bool
+) -> None:
+    monkeypatch.setenv(HARNESS_STDERR_ENABLED_ENV_VAR, "1")
+    loop = asyncio.get_running_loop()
+    loop_thread = threading.get_ident()
+    polling = asyncio.Event()
+    closed = asyncio.Event()
+    release = threading.Event()
+    order: list[str] = []
+    worker_threads: list[int] = []
+
+    def poll(_session_id: str) -> None:
+        worker_threads.append(threading.get_ident())
+        loop.call_soon_threadsafe(polling.set)
+        if not release.wait(timeout=3):
+            raise TimeoutError("test did not release diagnostic I/O")
+        order.append("poll")
+
+    def close(_session_id: str) -> None:
+        worker_threads.append(threading.get_ident())
+        order.append("close")
+        loop.call_soon_threadsafe(closed.set)
+
+    follower = SimpleNamespace(poll=Mock(side_effect=poll), close=Mock(side_effect=close))
+    monkeypatch.setattr(forwarder, "ClaudeDebugLogFollower", lambda _path: follower)
+    monkeypatch.setattr(forwarder, "read_active_session_id", lambda _path: "active-session")
+
+    async def forward() -> None:
+        async with forwarder._forward_claude_diagnostics(tmp_path, "original-session", 60):
+            await asyncio.Event().wait()
+
+    task = asyncio.create_task(forward())
+    try:
+        await asyncio.wait_for(polling.wait(), timeout=1)
+        assert not release.is_set()
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        follower.close.assert_not_called()
+        if cancel_again:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            follower.close.assert_not_called()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await asyncio.wait_for(closed.wait(), timeout=1)
+    finally:
+        release.set()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    assert order == ["poll", "close"]
+    assert all(thread != loop_thread for thread in worker_threads)
+    follower.close.assert_called_once_with("active-session")

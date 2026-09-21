@@ -1052,22 +1052,27 @@ async def _forward_claude_diagnostics(
         except Exception:  # noqa: BLE001 — invalid bridge metadata must not stop diagnostics
             return session_id
 
+    stop = asyncio.Event()
+
     async def poll() -> None:
-        while True:
-            follower.poll(active_session_id())
-            await asyncio.sleep(poll_interval_s)
+        try:
+            while not stop.is_set():
+                await asyncio.to_thread(lambda: follower.poll(active_session_id()))
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(stop.wait(), timeout=poll_interval_s)
+        finally:
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(lambda: follower.close(active_session_id()))
 
     task = asyncio.create_task(poll(), name=f"claude-diagnostics-{session_id}")
     try:
         yield
     finally:
-        task.cancel()
-        try:
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await task
-        finally:
-            with contextlib.suppress(Exception):
-                follower.close(active_session_id())
+        stop.set()
+        # Let an in-flight thread finish before closing its descriptor. A second
+        # caller cancellation may return early, but the shielded task still drains.
+        with contextlib.suppress(Exception):
+            await asyncio.shield(task)
 
 
 async def forward_claude_transcript_to_session(

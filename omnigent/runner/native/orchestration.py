@@ -8146,7 +8146,8 @@ async def _auto_create_claude_terminal(
     except (Exception, asyncio.CancelledError) as launch_error:
         from omnigent.harnesses.claude_native.diagnostics import ClaudeDebugLogFollower
 
-        ClaudeDebugLogFollower(bridge_dir).close(session_id)
+        with contextlib.suppress(Exception):
+            await asyncio.to_thread(ClaudeDebugLogFollower(bridge_dir).close, session_id)
         if not isinstance(launch_error, asyncio.CancelledError):
             _logger.exception(
                 "Claude terminal tmux launch failed: session=%s elapsed_ms=%.0f",

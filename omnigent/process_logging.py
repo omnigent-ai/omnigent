@@ -117,9 +117,11 @@ _NAMED_SECRET_PATTERN = re.compile(
     rf"\b[\"']?\s*[:=]\s*)({_AUTHORIZATION_VALUE})"
 )
 _WHITESPACE_SECRET_PATTERN = re.compile(
-    # Require credential-specific labels; bare token/secret/credential often introduce prose.
-    r"(?i)((?<![\w.-])(?:--)?(?:password|passwd|api(?:[_-]|[ \t]+)?key"
+    # Scan prefixes only from each key's start, as for assignment keys above.
+    # Generic token/secret/credential labels require a prefix to distinguish them from prose.
+    r"(?i)((?<![\w.-])(?:[\w.-]*(?:password|passwd|api(?:[_-]|[ \t]+)?key"
     r"|(?:access|refresh|auth)(?:[_-]|[ \t]+)token|client(?:[_-]|[ \t]+)secret)"
+    r"|[\w.-]+(?:token|secret|credential))"
     r"\b[\"']?[ \t]+)"
     # Preserve clear diagnostic phrases, but still redact quoted or ambiguous single values.
     r"(?!(?:(?:is|was)[ \t]+(?:missing|invalid|required|expired|not[ \t]+(?:set|found|configured))"

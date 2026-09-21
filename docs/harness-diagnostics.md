@@ -88,7 +88,9 @@ owner-only file inside the session bridge directory. An explicit user-supplied
 collector creates no file and does not read diagnostics or marker metadata.
 
 A separate task follows the owned file even while transcript discovery or HTTP
-forwarding is stalled. Completed records emit INFO events with
+forwarding is stalled. File reads, redaction, and final draining run in worker
+threads so diagnostic work does not block the forwarding event loop. Completed
+records emit INFO events with
 `event_name=harness_diagnostic_output`, `harness=claude-native`, and
 `source_kind=claude_debug_log`. Each event uses the current active session ID,
 including after a session switch. The diagnostic text can include prompt-hook
@@ -109,9 +111,12 @@ records over 1 MiB are omitted with counts, then collection resumes at the next
 newline. Known credential redaction runs on assembled records before export
 clipping. Rotation drains the old inode before following the replacement;
 truncation resets the read offset. Reattaching a forwarder starts reading the
-owned file from the beginning and can repeat earlier diagnostics.
+owned file from the beginning and can repeat earlier diagnostics. If a rotated
+predecessor already exists on attachment, its size is reported as omitted bytes
+without replaying it. Counts cannot reconstruct files already removed by Claude.
 
 Shutdown, cancellation, and terminal-launch failure drain at most 256 KiB.
+Shutdown lets an in-flight poll finish before closing and draining the file.
 Shutdown prioritizes an already-rotated replacement and reports skipped backlog.
 A final partial record is exported only at the observed end of the file;
 remaining unread bytes are counted as omitted. File or logger failures do not

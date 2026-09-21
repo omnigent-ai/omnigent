@@ -225,13 +225,38 @@ def test_uses_shared_credential_redaction_without_dropping_diagnostics(
             "synthetic client value",
             "ERROR authentication failed: client secret '[REDACTED]' status=401",
         ),
+        (
+            "ERROR failed: DATABASE_PASSWORD synthetic-value status=401",
+            "synthetic-value",
+            "ERROR failed: DATABASE_PASSWORD [REDACTED] status=401",
+        ),
+        (
+            "ERROR failed: provider.api_key synthetic-value status=401",
+            "synthetic-value",
+            "ERROR failed: provider.api_key [REDACTED] status=401",
+        ),
+        (
+            "ERROR failed: service.client-secret 'synthetic client value' status=401",
+            "synthetic client value",
+            "ERROR failed: service.client-secret '[REDACTED]' status=401",
+        ),
+        (
+            "ERROR failed: SESSION_TOKEN Bearer synthetic-value status=401",
+            "synthetic-value",
+            "ERROR failed: SESSION_TOKEN [REDACTED] status=401",
+        ),
+        (
+            "ERROR failed: db-credential synthetic-value status=401",
+            "synthetic-value",
+            "ERROR failed: db-credential [REDACTED] status=401",
+        ),
     ],
 )
 def test_whitespace_credentials_are_redacted_in_text_and_serialized_rows(
     capture_stderr: None, diagnostic: str, secret: str, expected: str
 ) -> None:
     """Snapshots and both log sinks share redaction without changing diagnostic context."""
-    context = "ERROR token refresh failed; api key is missing"
+    context = "ERROR token refresh failed; api key is missing; DATABASE_PASSWORD is missing"
     entries = [diagnostic, context]
     snapshot = collect_codex_startup_diagnostics(_server(entries))
     expected_tail = f"{expected}\n{context}"

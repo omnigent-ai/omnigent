@@ -147,23 +147,33 @@ class ClaudeDebugLogFollower:
         self._pending.clear()
         self._dropping = False
 
-    def _read(self) -> tuple[bytes, list[str]]:
+    def _read(self) -> tuple[bytes, list[str], int]:
         """Read one chunk, draining a renamed inode before switching to its replacement."""
         directory_fd = _open_directory(self._bridge_dir)
         candidate: int | None = None
+        omitted_bytes = 0
         try:
             capture = _read_capture(directory_fd)
             if capture != self._capture:
                 self._reset_file()
                 self._capture = capture
+                # Count the known predecessor only on attachment to this launch;
+                # later rotations are handled through the already-open inode.
+                if capture is not None:
+                    with contextlib.suppress(OSError):
+                        predecessor = _open_file(directory_fd, capture.filename + ".1")
+                        try:
+                            omitted_bytes = os.fstat(predecessor).st_size
+                        finally:
+                            os.close(predecessor)
             if capture is None:
-                return b"", []
+                return b"", [], omitted_bytes
             with contextlib.suppress(FileNotFoundError):
                 candidate = _open_file(directory_fd, capture.filename)
             if self._fd is None:
                 self._fd, candidate = candidate, None
             if self._fd is None:
-                return b"", []
+                return b"", [], omitted_bytes
             info = os.fstat(self._fd)
             if info.st_size < self._offset:
                 os.lseek(self._fd, 0, os.SEEK_SET)
@@ -181,7 +191,7 @@ class ClaudeDebugLogFollower:
                     self._fd, candidate = candidate, None
                     raw = os.read(self._fd, _READ_BYTES)
                     self._offset = len(raw)
-            return raw, records
+            return raw, records, omitted_bytes
         finally:
             if candidate is not None:
                 os.close(candidate)
@@ -289,9 +299,11 @@ class ClaudeDebugLogFollower:
         if self._closed or not harness_stderr_capture_enabled():
             return
         try:
-            raw, previous = self._read()
+            raw, previous, predecessor_bytes = self._read()
             records, omitted_lines, omitted_bytes = self._feed(raw)
-            self._emit(session_id, [*previous, *records], omitted_lines, omitted_bytes)
+            self._emit(
+                session_id, [*previous, *records], omitted_lines, omitted_bytes + predecessor_bytes
+            )
         except Exception:  # noqa: BLE001 — diagnostics cannot stop transcript forwarding
             pass
 

@@ -202,6 +202,47 @@ def test_redact_log_text_handles_whitespace_credentials(text: str, expected: str
 
 
 @pytest.mark.parametrize(
+    "label",
+    [
+        "DATABASE_PASSWORD",
+        "databasepassword",
+        "_password",
+        ".password",
+        "db.password",
+        "db-password",
+        "--db-password",
+        "db.PASSWD",
+        "PROVIDER_API_KEY",
+        "provider.api key",
+        "service.client secret",
+        "SESSION_TOKEN",
+        "db.secret",
+        "db-credential",
+        "token.secret",
+        ".token",
+        "_token",
+        "--credential",
+    ],
+)
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("synthetic-value", "[REDACTED]"),
+        ("'synthetic value'", "'[REDACTED]'"),
+        ("Bearer synthetic-value", "[REDACTED]"),
+    ],
+)
+def test_redact_log_text_handles_prefixed_whitespace_credentials(
+    label: str, value: str, expected: str
+) -> None:
+    """Environment, config, and CLI credential keys retain their complete prefix."""
+    text = f"ERROR failed: {label} {value} status=401"
+    redacted = redact_log_text(text)
+    assert redacted == f"ERROR failed: {label} {expected} status=401"
+    assert redact_log_text(redacted) == redacted
+
+
+@pytest.mark.parametrize(
     "text",
     [
         "ERROR password authentication failed for user example",
@@ -213,7 +254,15 @@ def test_redact_log_text_handles_whitespace_credentials(text: str, expected: str
         "WARN token budget exceeded; token count 8192",
         "ERROR credential resolution failed",
         "ERROR secret provider unavailable",
+        "WARN TOKEN usage 8192; SECRET provider failed; CREDENTIAL resolution failed",
+        "ERROR DATABASE_PASSWORD is missing",
+        "ERROR PROVIDER_API_KEY was not configured",
+        "ERROR app.auth-token has expired",
+        "ERROR db.password authentication failed for user example",
+        "ERROR service.credential validation failed",
         "WARN password_file unavailable; api_key_path not found",
+        "WARN database_password_file unavailable; provider.api_key_path not found",
+        "WARN prefix_token_count 8192",
         "ERROR password\nconnection refused",
         "ERROR api\nkey unavailable",
     ],
@@ -267,13 +316,34 @@ def test_redact_log_text_handles_large_bearer_token_in_linear_time() -> None:
     assert elapsed < 0.5
 
 
-@pytest.mark.parametrize("label", ["password", "api key", "access token"])
+@pytest.mark.parametrize(
+    "label", ["password", "api key", "access token", "DATABASE_PASSWORD", "provider.token"]
+)
 @pytest.mark.parametrize("value", ["synthetic-token-marker", "synthetic.token.marker"])
 def test_redact_log_text_handles_large_whitespace_credentials_in_linear_time(
     label: str, value: str
 ) -> None:
     """Maximum-size credential values retain bounded redaction cost on repeated passes."""
     text = f"ERROR failed: {label} " + (value * 4_000)[:65_000] + " status=401"
+
+    started = time.perf_counter()
+    output = redact_log_text(text)
+    repeated = redact_log_text(output)
+    elapsed = time.perf_counter() - started
+
+    assert output == f"ERROR failed: {label} [REDACTED] status=401"
+    assert repeated == output
+    assert elapsed < 0.5
+
+
+@pytest.mark.parametrize("prefix", ["a_", "a.", "a-"])
+@pytest.mark.parametrize("suffix", ["PASSWORD", "TOKEN"])
+def test_redact_log_text_handles_large_prefixed_keys_in_linear_time(
+    prefix: str, suffix: str
+) -> None:
+    """Key prefixes are scanned only from their start, including on repeated redaction."""
+    label = prefix * 32_000 + suffix
+    text = f"ERROR failed: {label} synthetic-value status=401"
 
     started = time.perf_counter()
     output = redact_log_text(text)
