@@ -1,3 +1,20 @@
+import type * as SandboxModelOptionsModule from "@/hooks/useSandboxModelOptions";
+
+vi.mock("@/hooks/useSandboxModelOptions", async (importOriginal) => ({
+  ...(await importOriginal<typeof SandboxModelOptionsModule>()),
+  useSandboxModelOptions: vi.fn(() => ({
+    data: {
+      configured: false,
+      status: "unconfigured",
+      models: [],
+      configuration_revision: null,
+      provider_label: null,
+      default_model: null,
+    },
+    isLoading: false,
+    error: null,
+  })),
+}));
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   useConversations as useTestConversations,
@@ -11,6 +28,7 @@ vi.mock("@/hooks/useSkills", () => ({
   useSkills: () => ({ skills: [], skillsStatus: "ready", refetch: vi.fn() }),
 }));
 import type * as UseConversationsModule from "@/hooks/useConversations";
+import type * as HostWorktreesModule from "@/hooks/useHostWorktrees";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -71,8 +89,13 @@ vi.mock("@/hooks/useHostFilesystem", () => ({
   useHostFilesystem: () => ({ data: undefined }),
   useCreateHostDirectory: () => ({ mutateAsync: vi.fn(), isPending: false }),
 }));
-vi.mock("@/hooks/useHostWorktrees", () => ({
+vi.mock("@/hooks/useHostWorktrees", async (importOriginal) => ({
+  ...(await importOriginal<typeof HostWorktreesModule>()),
   useHostWorktrees: vi.fn(),
+  hostWorktreesQueryOptions: (hostId: string, repoPath: string) => ({
+    queryKey: ["host-worktrees", hostId, repoPath],
+    queryFn: async () => [],
+  }),
 }));
 vi.mock("@/hooks/useDirectorySessions", () => ({
   useDirectorySessions: () => ({ data: [] }),
@@ -140,7 +163,15 @@ function setRepoIsGit(): void {
     const known = hostId === "host_1" && path === REPO;
     return {
       data: known
-        ? ([{ path: REPO, branch: "main", is_main: true, detached: false }] as HostWorktree[])
+        ? ([
+            {
+              path: REPO,
+              branch: "main",
+              is_main: true,
+              detached: false,
+              remote_provider: "github",
+            },
+          ] as HostWorktree[])
         : ([] as HostWorktree[]),
       isError: false,
     } as ReturnType<typeof useHostWorktrees>;
@@ -497,7 +528,9 @@ describe("NewChatLandingScreen project prefill", () => {
       "title",
       RECENT_WORKSPACE,
     );
-    expect(worktree).toBeDisabled();
+    await waitFor(() =>
+      expect(screen.queryByTestId("new-chat-landing-branch-chip")).not.toBeInTheDocument(),
+    );
 
     const body = await submitAndReadBody();
     expect(body.project_id).toBe("proj_alpha");
@@ -658,8 +691,20 @@ describe("NewChatLandingScreen project prefill", () => {
   const MAIN_REPO = "/Users/corey/projects/gamma";
   const LINKED_WORKTREE = "/Users/corey/projects/gamma-worktrees/feature-x";
   const WORKTREE_LIST: HostWorktree[] = [
-    { path: MAIN_REPO, branch: "main", is_main: true, detached: false },
-    { path: LINKED_WORKTREE, branch: "feature/x", is_main: false, detached: false },
+    {
+      path: MAIN_REPO,
+      branch: "main",
+      is_main: true,
+      detached: false,
+      remote_provider: "github",
+    },
+    {
+      path: LINKED_WORKTREE,
+      branch: "feature/x",
+      is_main: false,
+      detached: false,
+      remote_provider: "github",
+    },
   ];
 
   function setWorktreeRepo(): void {

@@ -1035,6 +1035,7 @@ def _resolve_provider_for_build(
     *,
     harness_type: AgentHarnessType,
     for_launch: bool = False,
+    actual_harness: str | None = None,
 ) -> ProviderEntry | None:
     """Resolve the provider that should route *harness_type*, if any.
 
@@ -1069,11 +1070,19 @@ def _resolve_provider_for_build(
         legacy Databricks credentials into the provider path and fall back to
         the first available credential). ``False`` (readout / cost / native)
         keeps strict, config-only resolution with no synthesis or fallback.
+    :param actual_harness: Preserve a native harness identity when its transport
+        reuses an SDK provider adapter.
     :returns: The :class:`ProviderEntry` to route through, or ``None``.
     :raises OmnigentError: If a named :class:`ProviderAuth` references a
         provider absent from the ``providers:`` block.
     """
-    explicit_config = load_config()
+    from omnigent.inference_config import load_runtime_inference_config, resolve_bound_provider
+
+    explicit_config = load_runtime_inference_config(load_config())
+    identity = actual_harness or str(spec.executor.config.get("harness") or harness_type)
+    bound = resolve_bound_provider(explicit_config, identity, spec.executor.auth)
+    if bound is not None:
+        return bound
     harness = _provider_harness_name(harness_type)
     auth = spec.executor.auth
     if isinstance(auth, ProviderAuth):
@@ -1157,6 +1166,16 @@ def _resolve_spec_model(spec: AgentSpec) -> str | None:
     return spec.executor.model
 
 
+def _resolve_bound_launch_model(spec: AgentSpec, harness: str) -> str | None:
+    """Validate the selected model against this session's inference binding."""
+    from omnigent.inference_config import load_runtime_inference_config, resolve_bound_model
+
+    identity = str(spec.executor.config.get("harness") or harness)
+    return resolve_bound_model(
+        load_runtime_inference_config(load_config()), identity, _resolve_spec_model(spec)
+    )
+
+
 def _add_claude_sdk_skills_env(
     env: dict[str, str],
     spec: AgentSpec,
@@ -1215,12 +1234,18 @@ def _build_claude_sdk_spawn_env(
         :meth:`HarnessProcessManager.get_client(env=...)`.
     """
     env: dict[str, str] = {}
-    model = _resolve_spec_model(spec)
+    model = _resolve_bound_launch_model(spec, "claude-sdk")
     if model is not None:
+        from omnigent.inference_config import binding_for_harness, load_runtime_inference_config
+
         # Specs may pin the provider-routed spelling ("anthropic/<name>") so
         # generic clients route correctly, but the claude CLI rejects
-        # vendor-prefixed model ids — hand it the bare name.
-        env["HARNESS_CLAUDE_SDK_MODEL"] = model.removeprefix("anthropic/")
+        # vendor prefixes. A bound gateway owns its literal model namespace.
+        env["HARNESS_CLAUDE_SDK_MODEL"] = (
+            model
+            if binding_for_harness(load_runtime_inference_config(), "claude-sdk") is not None
+            else model.removeprefix("anthropic/")
+        )
     # Session workspace (the selected working folder), not the bundle workdir.
     # Without this the SDK subprocess inherits the runner's launch cwd — see
     # ``HARNESS_CLAUDE_SDK_CWD`` in ``omnigent/inner/claude_sdk_harness.py``.
@@ -1365,7 +1390,7 @@ def _build_codex_spawn_env(
         :meth:`HarnessProcessManager.get_client(env=...)`.
     """
     env: dict[str, str] = {}
-    model = _resolve_spec_model(spec)
+    model = _resolve_bound_launch_model(spec, "codex")
     if model is not None:
         env["HARNESS_CODEX_MODEL"] = model
 
@@ -1437,7 +1462,11 @@ def _build_pi_spawn_env(
         :meth:`HarnessProcessManager.get_client(env=...)`.
     """
     env: dict[str, str] = {}
-    model = _resolve_spec_model(spec)
+    model = _resolve_bound_launch_model(spec, "pi")
+    from omnigent.inference_config import binding_for_harness, load_runtime_inference_config
+
+    if binding_for_harness(load_runtime_inference_config(), "pi") is not None:
+        env["HARNESS_PI_PRESERVE_MODEL_IDS"] = "true"
     if model is not None:
         env["HARNESS_PI_MODEL"] = model
 
@@ -1449,6 +1478,8 @@ def _build_pi_spawn_env(
     provider = _resolve_provider_for_build(spec, harness_type="pi", for_launch=True)
     if provider is not None:
         configure_agent_harness_with_provider(env, provider, harness_type="pi")
+        if "HARNESS_PI_PRESERVE_MODEL_IDS" in env and provider.family(OPENAI_FAMILY) is not None:
+            env.setdefault("HARNESS_PI_GATEWAY_OPENAI_WIRE_API", RESPONSES_WIRE_API)
     # Skills bridge — same shape as the claude-sdk + codex variants.
     # Always set so the harness wrap doesn't fall back to ``"all"``
     # and override an explicit ``skills: none`` from the spec.
@@ -1489,7 +1520,7 @@ def _build_qwen_spawn_env(
         :meth:`HarnessProcessManager.get_client(env=...)`.
     """
     env: dict[str, str] = {}
-    model = _resolve_spec_model(spec)
+    model = _resolve_bound_launch_model(spec, "qwen")
     if model is not None:
         env["HARNESS_QWEN_MODEL"] = model
     # Session workspace (selected working folder). ``None`` lets the qwen
@@ -1503,6 +1534,15 @@ def _build_qwen_spawn_env(
     # OpenAI-compatible providers.
     provider = _resolve_provider_for_build(spec, harness_type="qwen", for_launch=True)
     if provider is not None:
+        from omnigent.inference_config import binding_for_harness, load_runtime_inference_config
+
+        family = provider.family(OPENAI_FAMILY)
+        if (
+            binding_for_harness(load_runtime_inference_config(), "qwen") is not None
+            and family is not None
+            and family.wire_api == RESPONSES_WIRE_API
+        ):
+            raise ValueError("Qwen's configured gateway must support the chat wire API.")
         configure_agent_harness_with_provider(env, provider, harness_type="qwen")
     # NB: no skills bridge for qwen yet. Unlike the claude-sdk / codex
     # variants, the qwen wrap (omnigent/inner/qwen_harness.py) and
@@ -1622,13 +1662,54 @@ def _build_acp_cli_spawn_env(
     # an explicit key is never silently rerouted through the owner's gateway.
     if harness == "jcode":
         from omnigent.host.databricks_credential import api_key_auth_precludes_broker
-        from omnigent.host.jcode_databricks import connect_jcode_gateway_env
-
-        gateway_env = (
-            None
-            if api_key_auth_precludes_broker(spec)
-            else connect_jcode_gateway_env(session_id=session_id)
+        from omnigent.host.jcode_databricks import (
+            configured_jcode_gateway_env,
+            connect_jcode_gateway_env,
         )
+        from omnigent.inference_config import (
+            binding_for_harness,
+            load_runtime_inference_config,
+            resolve_bound_model,
+            resolve_bound_provider,
+        )
+
+        config = load_runtime_inference_config(load_config())
+        bound = resolve_bound_provider(config, harness, spec.executor.auth)
+        if bound is not None:
+            from omnigent.models.model_catalog import ResolvedModelProvider, _resolve_bearer_token
+
+            family = bound.family(OPENAI_FAMILY)
+            model = resolve_bound_model(config, harness, _resolve_spec_model(spec))
+            binding = binding_for_harness(config, harness)
+            if family is None or not model:
+                raise ValueError("Jcode requires an OpenAI-compatible provider and default model.")
+            if family.wire_api == RESPONSES_WIRE_API:
+                raise ValueError("Jcode's configured gateway must support the chat wire API.")
+            token = _resolve_bearer_token(
+                ResolvedModelProvider(
+                    kind=bound.kind,
+                    api_key=family.api_key,
+                    auth_command=family.auth_command,
+                )
+            )
+            models = binding.model_allowlist if binding is not None else None
+            gateway_env = configured_jcode_gateway_env(
+                base_url=family.base_url,
+                api_key=token,
+                model=model,
+                models=models or (),
+                session_id=session_id,
+            )
+            env["HARNESS_ACP_MODEL"] = model
+            env["HARNESS_ACP_SEND_MODEL"] = "1"
+            if models is not None:
+                env["HARNESS_ACP_MODEL_LIST"] = ",".join(models)
+        else:
+            gateway_env = (
+                None
+                if api_key_auth_precludes_broker(spec)
+                else connect_jcode_gateway_env(session_id=session_id)
+            )
         if gateway_env is not None:
             env.update(gateway_env)
             # The ACP wrap forwards only passthrough-named vars to the jcode subprocess,
@@ -1893,7 +1974,7 @@ def _build_openai_agents_sdk_spawn_env(spec: AgentSpec) -> dict[str, str]:
         ``use_responses=True`` default.
     """
     env: dict[str, str] = {}
-    model = _resolve_spec_model(spec)
+    model = _resolve_bound_launch_model(spec, "openai-agents-sdk")
     if model is not None:
         env["HARNESS_OPENAI_AGENTS_MODEL"] = model
     _set_openai_agents_reasoning_item_id_policy_env(

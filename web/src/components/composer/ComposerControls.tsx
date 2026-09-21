@@ -39,8 +39,12 @@ export function ComposerWorkspaceBar({ className, ...props }: ComponentPropsWith
 
 export const ComposerWorkspaceTrigger = forwardRef<
   HTMLButtonElement,
-  ComponentPropsWithoutRef<"button"> & { kind: "directory" | "worktree"; label: string }
->(function ComposerWorkspaceTrigger({ kind, label, className, ...props }, ref) {
+  ComponentPropsWithoutRef<"button"> & {
+    kind: "directory" | "worktree";
+    label: string;
+    icon?: ReactNode;
+  }
+>(function ComposerWorkspaceTrigger({ kind, label, icon, className, ...props }, ref) {
   const Icon = kind === "directory" ? FolderIcon : GitForkIcon;
   return (
     <button
@@ -54,7 +58,7 @@ export const ComposerWorkspaceTrigger = forwardRef<
       )}
       {...props}
     >
-      <Icon className="size-3.5 shrink-0" />
+      {icon ?? <Icon className="size-3.5 shrink-0" />}
       <span
         data-workspace-collapse-label=""
         className={cn("min-w-0 truncate text-left", COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS)}

@@ -153,6 +153,9 @@ function QueuedRow({
           </Badge>
         )}
       </div>
+      {message.requiresRetry && (
+        <span className="shrink-0 text-xs text-destructive">Send failed</span>
+      )}
       {/* Always visible (not hover-gated) so the actions are discoverable;
           they brighten on hover/focus. */}
       {onSteer ? (
@@ -160,14 +163,16 @@ function QueuedRow({
           <TooltipTrigger asChild>
             <button
               type="button"
-              aria-label="Send queued message now"
+              aria-label={
+                message.requiresRetry ? "Retry queued message" : "Send queued message now"
+              }
               className={ACTION_BUTTON_CLASS}
               onClick={() => onSteer(message.queueId)}
             >
               <ArrowUpIcon className={ACTION_ICON_CLASS} aria-hidden="true" />
             </button>
           </TooltipTrigger>
-          <TooltipContent side="top">Send now</TooltipContent>
+          <TooltipContent side="top">{message.requiresRetry ? "Retry" : "Send now"}</TooltipContent>
         </Tooltip>
       ) : null}
       <button

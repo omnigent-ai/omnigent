@@ -201,6 +201,9 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _recent_mirrored_tool_calls,
     _RelayHandle,
     _runner_relay_tasks,
+    _runner_status_probe_backoff,
+    _runner_status_probe_inflight,
+    _RunnerStatusProbeBackoff,
     _session_active_response_cache,
     _session_background_task_count_cache,
     _session_background_tasks_cache,
@@ -3168,7 +3171,17 @@ async def _run_managed_launch(
         built-in gate into the runner Pod's ``omnigent.ai/agent``
         classifier, or ``None`` to leave it unstamped.
     """
-    from omnigent.server.managed_hosts import resolve_managed_agent_label
+    from omnigent.server.managed_hosts import (
+        deployment_with_inference_snapshot,
+        resolve_managed_agent_label,
+    )
+
+    saved_conversation = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+    if saved_conversation is not None:
+        sandbox_config = deployment_with_inference_snapshot(
+            sandbox_config,
+            saved_conversation.inference_snapshot,
+        )
 
     agent_name: str | None = None
     if agent_store is not None and agent_id is not None:
@@ -4011,11 +4024,13 @@ async def _run_managed_wake(
     """
     from omnigent.onboarding.sandboxes.base import SandboxGoneError
     from omnigent.server.managed_hosts import (
+        deployment_with_inference_snapshot,
         resolve_managed_agent_label,
         resume_managed_host,
     )
     from omnigent.server.routes import sessions as _facade
 
+    sandbox_config = deployment_with_inference_snapshot(sandbox_config, conv.inference_snapshot)
     host_id = conv.host_id
     if host_id is None:
         reason = "managed session has no host binding"
@@ -4263,6 +4278,13 @@ async def _ensure_runner_session_initialized(
                 ),
                 timeout=_RUNNER_SESSION_INIT_TIMEOUT_S,
             )
+        from omnigent.server.runner_session_init import runner_inference_verified
+
+        if not runner_inference_verified(conv, resp):
+            raise OmnigentError(
+                "The runner did not accept this session's saved inference configuration",
+                code=ErrorCode.RUNNER_UNAVAILABLE,
+            )
         # httpx only raises on transport errors; a 4xx/5xx means create_session
         # likely didn't run (terminal + forwarder not set up), so surface it
         # via the same warning path rather than silently forwarding into a
@@ -4276,7 +4298,7 @@ async def _ensure_runner_session_initialized(
             exc_info=True,
             extra={"session_id": session_id},
         )
-        if require_success:
+        if require_success or conv.inference_snapshot is not None:
             raise OmnigentError(
                 "The recovered runner did not finish session initialization.",
                 code=ErrorCode.RUNNER_UNAVAILABLE,
@@ -9091,6 +9113,7 @@ async def _create_session_from_existing_agent(
             _validated_harness_override, body.harness_override, agent
         )
 
+    inference_snapshot = None
     if agent_cache is not None:
         from omnigent.harness_aliases import canonicalize_harness
         from omnigent.models.model_catalog import (
@@ -9109,8 +9132,16 @@ async def _create_session_from_existing_agent(
                 )
             ).spec
         except (KeyError, AttributeError, ValueError, ImportError, OSError):
-            if model_override is not None:
-                raise
+            from omnigent.server.routes.sandbox_inference import managed_inference_configured
+
+            if model_override is not None or (
+                body.host_type == "managed"
+                and managed_inference_configured(request, body.sandbox_provider)
+            ):
+                raise OmnigentError(
+                    "Cannot load the agent to validate its configured inference provider",
+                    code=ErrorCode.INVALID_INPUT,
+                ) from None
             # Without a selection, retain creation when the harness is unknown.
             _logger.debug(
                 "create-time model policy: agent %r failed to load", agent.name, exc_info=True
@@ -9118,8 +9149,32 @@ async def _create_session_from_existing_agent(
             selection_spec = None
         if selection_spec is not None and body.sub_agent_name:
             selection_spec = _find_spec_by_name(selection_spec, body.sub_agent_name)
+        from omnigent.server.routes.sandbox_inference import (
+            configured_snapshot,
+            prepare_create_inference,
+        )
+
+        if selection_spec is None and body.host_type == "managed":
+            from omnigent.server.routes.sandbox_inference import managed_inference_configured
+
+            if managed_inference_configured(request, body.sandbox_provider):
+                raise OmnigentError(
+                    "Cannot determine the harness for the configured inference provider",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+        if selection_spec is not None:
+            inference_snapshot, model_override = await prepare_create_inference(
+                request,
+                body,
+                selection_spec,
+                user_id,
+                conversation_store,
+                harness_override=harness_override,
+                model_override=model_override,
+            )
         if (
             selection_spec is not None
+            and not configured_snapshot(inference_snapshot)
             and canonicalize_harness(harness_override or _spec_harness(selection_spec)) == "acp"
         ):
             default_model = await asyncio.to_thread(_acp_launch_model, selection_spec)
@@ -9291,6 +9346,9 @@ async def _create_session_from_existing_agent(
                 reasoning_effort=spec_effort,
             )
 
+    snapshot_kwargs: dict[str, Any] = (
+        {"inference_snapshot": inference_snapshot} if inference_snapshot is not None else {}
+    )
     try:
         conv = conversation_store.create_conversation(
             agent_id=agent.id,
@@ -9304,6 +9362,7 @@ async def _create_session_from_existing_agent(
             git_branch=git_branch,
             terminal_launch_args=validated_launch_args,
             project_id=project_resolution.project_id,
+            **snapshot_kwargs,
         )
     except NameAlreadyExistsError as exc:
         if (
@@ -9617,6 +9676,7 @@ async def _create_session_from_existing_agent(
         agent_store=agent_store,
         agent_cache=agent_cache,
         liveness_lookup=liveness_lookup,
+        request=request,
     )
 
 
@@ -9627,6 +9687,8 @@ def _create_session_from_bundle(
     bundle_bytes: bytes,
     runner_id: str | None = None,
     spec: AgentSpec | None = None,
+    inference_snapshot: dict[str, Any] | None = None,
+    inference_model: str | None = None,
 ) -> CreatedSessionResponse:
     """
     Validate, store, and persist a bundled session request.
@@ -9675,7 +9737,9 @@ def _create_session_from_bundle(
         )
     assert spec.name is not None
 
-    if _spec_harness(spec) == "acp":
+    from omnigent.server.routes.sandbox_inference import configured_snapshot
+
+    if _spec_harness(spec) == "acp" and not configured_snapshot(inference_snapshot):
         from omnigent.models.model_catalog import _acp_launch_model, validate_acp_model
 
         validate_acp_model(spec, _acp_launch_model(spec))
@@ -9731,6 +9795,8 @@ def _create_session_from_bundle(
         agent_bundle_location=agent_bundle_location,
         agent_description=spec.description,
         runner_id=runner_id,
+        inference_snapshot=inference_snapshot,
+        inference_model=inference_model,
     )
 
 
@@ -10489,6 +10555,137 @@ async def _load_acp_model_options(
     return options
 
 
+# The tunnel transport does not enforce httpx timeouts, so the runner status
+# probe below is bounded here. Healthy runners answer from memory (99.85% of
+# production probes finish inside 5 s), and the runner's own launch-config
+# read of this snapshot has a 10 s budget the bound must leave room for.
+_RUNNER_STATUS_PROBE_TIMEOUT_S: float = 5.0
+# A non-200 that arrives within this is a prompt answer from a responsive
+# runner (a freshly bound one answers 404 until session init lands) and is
+# asked again next snapshot; a slower one counts as a slow probe.
+_RUNNER_STATUS_PROBE_SLOW_S: float = 1.0
+# After a slow probe the session's probe is skipped for a window that doubles
+# per consecutive slow probe up to the cap, so a runner stalled for hours
+# costs a probe every few minutes instead of every window. A prompt answer
+# resets the streak.
+_RUNNER_STATUS_PROBE_BACKOFF_S: float = 30.0
+_RUNNER_STATUS_PROBE_BACKOFF_CAP_S: float = 300.0
+
+
+def _runner_status_probe_window_s(failures: int) -> float:
+    """
+    Return the skip window after *failures* consecutive slow probes.
+
+    :param failures: Consecutive slow probes so far, e.g. ``1`` after the first.
+    :returns: Seconds to skip the probe, e.g. ``30.0`` then ``60.0``, capped.
+    """
+    return min(
+        _RUNNER_STATUS_PROBE_BACKOFF_S * (2 ** (failures - 1)),
+        _RUNNER_STATUS_PROBE_BACKOFF_CAP_S,
+    )
+
+
+async def _probe_runner_live_status(
+    runner_client: httpx.AsyncClient, session_id: str, runner_id: str | None = None
+) -> str | None:
+    """
+    Ask a session's bound runner for its live status, bounded, shared, and backed off.
+
+    Concurrent snapshots of one session await the same in-flight probe. A 200
+    records the status in ``_session_status_cache``; a probe that timed out,
+    failed in transport, or answered slowly without a status puts the session
+    in a skip window that doubles per consecutive slow probe.
+
+    :param runner_client: HTTP client pointed at the session's runner.
+    :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+    :param runner_id: The session's bound runner, e.g.
+        ``"runner_0123456789abcdef"``. A skip window recorded against a
+        different runner is discarded so a rebound session is probed at once.
+    :returns: The runner's raw status, e.g. ``"running"``, or ``None`` when the
+        probe is in backoff, timed out, failed, or returned a non-200.
+    """
+    probe = _runner_status_probe_inflight.get(session_id)
+    if probe is None:
+        backoff = _runner_status_probe_backoff.get(session_id)
+        if backoff is not None and backoff.runner_id != runner_id:
+            _runner_status_probe_backoff.pop(session_id, None)
+        elif backoff is not None and time.monotonic() < backoff.skip_until:
+            return None
+        probe = asyncio.create_task(_run_runner_status_probe(runner_client, session_id, runner_id))
+        _runner_status_probe_inflight[session_id] = probe
+    # Shielded so one cancelled snapshot request does not abort the probe the
+    # other waiters share.
+    return await asyncio.shield(probe)
+
+
+async def _run_runner_status_probe(
+    runner_client: httpx.AsyncClient, session_id: str, runner_id: str | None
+) -> str | None:
+    """
+    Run one bounded runner status probe and record its outcome.
+
+    :param runner_client: HTTP client pointed at the session's runner.
+    :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+    :param runner_id: The session's bound runner, recorded with any skip window.
+    :returns: The runner's raw status on a 200, else ``None``.
+    """
+    started = time.monotonic()
+    try:
+        try:
+            resp = await asyncio.wait_for(
+                runner_client.get(
+                    f"/v1/sessions/{session_id}", timeout=_RUNNER_STATUS_PROBE_TIMEOUT_S
+                ),
+                timeout=_RUNNER_STATUS_PROBE_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError:
+            failure = f"no answer within {_RUNNER_STATUS_PROBE_TIMEOUT_S:g}s"
+        except (httpx.HTTPError, ConnectionError) as exc:
+            failure = f"{type(exc).__name__}: {exc}"
+        else:
+            elapsed = time.monotonic() - started
+            if resp.status_code == 200:
+                try:
+                    payload = resp.json()
+                except ValueError:
+                    payload = None
+                if isinstance(payload, dict):
+                    raw = str(payload.get("status", "idle"))
+                    _session_status_cache[session_id] = raw
+                    if raw in ("idle", "running", "waiting", "failed"):
+                        session_live_state.persist_live_status(session_id, raw)
+                    _runner_status_probe_backoff.pop(session_id, None)
+                    return raw
+                failure = "HTTP 200 with a malformed body"
+            elif elapsed < _RUNNER_STATUS_PROBE_SLOW_S:
+                _runner_status_probe_backoff.pop(session_id, None)
+                _logger.debug(
+                    "Runner status probe for session=%s answered HTTP %s",
+                    session_id,
+                    resp.status_code,
+                    extra={"session_id": session_id},
+                )
+                return None
+            else:
+                failure = f"HTTP {resp.status_code} after {elapsed:.1f}s"
+        previous = _runner_status_probe_backoff.get(session_id)
+        failures = (previous.failures if previous is not None else 0) + 1
+        window = _runner_status_probe_window_s(failures)
+        _runner_status_probe_backoff[session_id] = _RunnerStatusProbeBackoff(
+            skip_until=time.monotonic() + window, failures=failures, runner_id=runner_id
+        )
+        _logger.warning(
+            "Runner status probe for session=%s failed (%s); skipping it for %.0fs",
+            session_id,
+            failure,
+            window,
+            extra={"session_id": session_id},
+        )
+        return None
+    finally:
+        _runner_status_probe_inflight.pop(session_id, None)
+
+
 async def _get_session_snapshot(
     conv_store: ConversationStore,
     session_id: str,
@@ -10503,6 +10700,7 @@ async def _get_session_snapshot(
     host_store: HostStore | None = None,
     sandbox_config: ManagedSandboxDeployment | None = None,
     viewer_id: str | None = None,
+    request: Request | None = None,
 ) -> SessionResponse:
     """
     Read a full session snapshot from the store.
@@ -10616,23 +10814,11 @@ async def _get_session_snapshot(
         # relay values (``"waiting"`` → ``"running"``), so the raw cache value
         # is only needed here when it is actually missing (None).
         if _session_status_cache.get(session_id) is None and runner_client is not None:
-            try:
-                resp = await runner_client.get(
-                    f"/v1/sessions/{session_id}",
-                    timeout=5.0,
-                )
-                if resp.status_code == 200:
-                    raw = resp.json().get("status", "idle")
-                    _session_status_cache[session_id] = raw
-                    if raw in ("idle", "running", "waiting", "failed"):
-                        session_live_state.persist_live_status(session_id, raw)
-                    status = _session_status_from_cache(session_id)
-            except (httpx.HTTPError, ConnectionError):
-                _logger.debug(
-                    "Runner status query failed for %s",
-                    session_id,
-                    extra={"session_id": session_id},
-                )
+            if (
+                await _probe_runner_live_status(runner_client, session_id, conv.runner_id)
+                is not None
+            ):
+                status = _session_status_from_cache(session_id)
     # last_total_tokens and last_task_error come from the context-tokens
     # label written by the forwarder (tasks table has been removed).
     last_total_tokens: int | None = None
@@ -10718,7 +10904,22 @@ async def _get_session_snapshot(
     # session's live Codex app-server ``model/list`` response. Best-effort
     # and cache-backed so a snapshot poll cannot wedge the
     # runner while a turn is active.
-    model_options = await _fetch_model_options(runner_client, session_id, conv, agent_store)
+    from omnigent.server.routes.sandbox_inference import configured_snapshot, inference_service
+
+    inference_configured = configured_snapshot(conv.inference_snapshot)
+    inference_error = None
+    if inference_configured and conv.inference_snapshot is not None:
+        catalog = (
+            await inference_service(request).catalog(conv.inference_snapshot)
+            if request is not None
+            else conv.inference_snapshot["catalog"]
+        )
+        model_options = catalog["models"]
+        inference_error = catalog.get("error")
+        if not conv.reported_model:
+            llm_model = conv.model_override or catalog.get("default_model")
+    else:
+        model_options = await _fetch_model_options(runner_client, session_id, conv, agent_store)
     # Dynamic override from the forwarder (real Claude Code window).
     # Only present after the first statusLine tick; before that the
     # spec default applies.
@@ -10763,7 +10964,7 @@ async def _get_session_snapshot(
         host_for_resume = await asyncio.to_thread(host_store.get_host, conv.host_id)
         if host_for_resume is not None:
             host_resumable = host_resume_supported(host_for_resume, sandbox_config)
-    return _build_session_response(
+    response = _build_session_response(
         conv,
         items,
         status,
@@ -10790,6 +10991,9 @@ async def _get_session_snapshot(
         agent_store=agent_store,
         agent_cache=agent_cache,
     )
+    response.inference_configured = inference_configured
+    response.inference_error = inference_error
+    return response
 
 
 __all__ = [

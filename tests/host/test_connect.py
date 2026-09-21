@@ -2187,6 +2187,54 @@ async def test_run_cancels_inflight_capability_discovery_on_shutdown(
     assert host._capability_init_task is None
 
 
+async def test_run_drains_shielded_model_catalog_probe_on_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A shared probe must finish async cleanup before the host's loop closes."""
+    from omnigent.models import model_catalog_store as store
+
+    host = _make_host_process()
+    probe_started = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    cleanup_finished = asyncio.Event()
+
+    async def _probe() -> None:
+        probe_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cleanup_started.set()
+            await release_cleanup.wait()
+            cleanup_finished.set()
+
+    async def _connect_and_serve() -> None:
+        await store.ensure_catalog("claude-native", "shutdown", _probe)
+
+    monkeypatch.setattr(store, "_inflight", {})
+    monkeypatch.setattr(host, "_start_capability_discovery", lambda: None)
+    monkeypatch.setattr(host, "_connect_and_serve", _connect_and_serve)
+    monkeypatch.setattr(host, "_reap_orphans_once", lambda _child_pids=None: 0)
+    run_task = asyncio.create_task(host.run())
+    try:
+        await asyncio.wait_for(probe_started.wait(), timeout=1.0)
+        run_task.cancel()
+        await asyncio.wait_for(cleanup_started.wait(), timeout=1.0)
+        assert not run_task.done(), "host shutdown must await probe cleanup"
+        release_cleanup.set()
+        await asyncio.wait_for(run_task, timeout=1.0)
+
+        assert cleanup_finished.is_set()
+        assert not store._inflight
+    finally:
+        release_cleanup.set()
+        await _cancel(run_task)
+        probes = list(store._inflight.values())
+        for task in probes:
+            task.cancel()
+        await asyncio.gather(*probes, return_exceptions=True)
+
+
 async def test_capability_probe_failure_does_not_block_registration(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],

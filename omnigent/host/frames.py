@@ -23,6 +23,7 @@ import json
 from dataclasses import dataclass, field
 from enum import Enum
 from os import PathLike
+from typing import Any
 
 from omnigent.harness_availability import HarnessAvailability, is_harness_availability
 from omnigent.util.json_types import JsonObject as _JsonObject
@@ -248,6 +249,7 @@ class HostLaunchRunnerFrame:
     workspace: str
     session_id: str | None = None
     harness: str | None = None
+    inference_config: dict[str, Any] | None = None
 
 
 @dataclass
@@ -642,7 +644,9 @@ class HostListWorktreesResultFrame:
     :param status: ``"ok"`` or ``"failed"``.
     :param worktrees: One dict per worktree with keys ``path`` (str),
         ``branch`` (str | None), ``is_main`` (bool), ``detached``
-        (bool), main first. ``None`` on failure.
+        (bool), and optional ``remote_provider`` (``"github"``, ``"other"``,
+        or null) and ``updated_at`` (Unix epoch seconds or null), main first.
+        Older hosts omit the optional metadata. ``None`` on failure.
     :param error: Error message when ``status`` is ``"failed"``, e.g.
         ``"not a git repository"``. ``None`` on success.
     """
@@ -1208,6 +1212,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "workspace": frame.workspace,
                 "session_id": frame.session_id,
                 "harness": frame.harness,
+                "inference_config": frame.inference_config,
             }
         )
     if isinstance(frame, HostLaunchRunnerResultFrame):
@@ -1784,12 +1789,16 @@ def _decode_launch_runner(msg: _JsonObject) -> HostLaunchRunnerFrame:
     :param msg: Decoded frame object.
     :returns: Typed launch-runner frame.
     """
+    inference_config = msg.get("inference_config")
+    if inference_config is not None and not isinstance(inference_config, dict):
+        raise ValueError("inference_config must be an object or null")
     return HostLaunchRunnerFrame(
         request_id=_required_str(msg, "request_id"),
         binding_token=_required_str(msg, "binding_token"),
         workspace=_required_str(msg, "workspace"),
         session_id=_optional_nullable_str(msg, "session_id"),
         harness=_optional_nullable_str(msg, "harness"),
+        inference_config=inference_config,
     )
 
 

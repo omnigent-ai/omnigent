@@ -77,6 +77,23 @@ describe("openTerminalLink", () => {
     expect(pushSpy).not.toHaveBeenCalled();
   });
 
+  it("rebases session links under the configured base path", () => {
+    window.__OMNIGENT_BASE_PATH__ = "/proxy/6767";
+    window.history.replaceState(null, "", "/proxy/6767/");
+    try {
+      const pushSpy = vi.spyOn(window.history, "pushState");
+      const event = new MouseEvent("click");
+      // Unprefixed terminal link is rebased under the basename.
+      openTerminalLink(event, `${window.location.origin}/c/conv_x`);
+      expect(pushSpy).toHaveBeenCalledWith(null, "", "/proxy/6767/c/conv_x");
+      // Already-prefixed link is pushed unchanged (idempotent, no doubling).
+      openTerminalLink(event, `${window.location.origin}/proxy/6767/c/conv_y`);
+      expect(pushSpy).toHaveBeenCalledWith(null, "", "/proxy/6767/c/conv_y");
+    } finally {
+      delete window.__OMNIGENT_BASE_PATH__;
+    }
+  });
+
   it("prevents the addon's default in-place navigation", () => {
     vi.spyOn(window, "open").mockReturnValue(null);
     const event = new MouseEvent("click");

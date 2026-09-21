@@ -71,7 +71,7 @@ def test_host_browser_preference(
         assert opened == ([f"http://127.0.0.1:{port}"] if expect_open else [])
 
         child.sendcontrol("c")
-        child.expect(_PROMPT_MARKER, timeout=_PROMPT_TIMEOUT)
+        child.expect_exact(_PROMPT_MARKER, timeout=_PROMPT_TIMEOUT)
         child.send("y\r")
         child.expect(pexpect.EOF, timeout=_EXIT_TIMEOUT)
         child.close()

@@ -134,7 +134,8 @@ async def _drive(
             await expect(label).not_to_contain_text(selected)
             await expect(label).to_contain_text("High")
             snapshot_ready.set()
-            await expect(label).to_contain_text(selected_label)
+            compact_selected_label = selected_label.replace(" (1M context)", " 1M")
+            await expect(label).to_contain_text(compact_selected_label)
             await expect(loading).to_have_count(0)
             await page.locator("[data-composer-card]").screenshot(
                 path=output / "bound-model.png", animations="disabled"
@@ -148,7 +149,7 @@ async def _drive(
                 for sample in samples
             ), samples
             assert all(
-                sample["loading"] or selected_label in sample["text"] for sample in samples
+                sample["loading"] or compact_selected_label in sample["text"] for sample in samples
             ), samples
         finally:
             release.set()

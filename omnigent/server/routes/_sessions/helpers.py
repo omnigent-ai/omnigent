@@ -2289,6 +2289,25 @@ async def _persist_external_model_change(
             code=ErrorCode.INVALID_INPUT,
         )
     model = concrete_reported_model(raw_model)
+    if model is not None and conv.inference_snapshot is not None:
+        from omnigent.inference_config import binding_for_harness
+
+        snapshot = conv.inference_snapshot
+        binding = binding_for_harness(snapshot["runtime_config"], snapshot["harness"])
+        allowed = binding.model_allowlist if binding is not None else None
+        if allowed is not None and model not in allowed:
+            prefixes = {
+                "opencode-native": ("omnigent/",),
+                "pi-native": ("omnigent/", "omnigent-openai/", "omnigent-completions/"),
+            }.get(snapshot["harness"], ())
+            model = next(
+                (
+                    model.removeprefix(p)
+                    for p in prefixes
+                    if model.startswith(p) and model.removeprefix(p) in allowed
+                ),
+                model,
+            )
     if model is None or conv.reported_model == model:
         return
     await asyncio.to_thread(
@@ -5702,6 +5721,9 @@ async def _launch_runner_on_host_locked(
             # same configuration check it does at create-time launch. None
             # (agent not resolvable) skips the host-side check — fail open.
             harness=_resolve_harness(conv),
+            inference_config=(
+                conv.inference_snapshot["runtime_config"] if conv.inference_snapshot else None
+            ),
         )
     )
     try:
@@ -6363,7 +6385,7 @@ def _surface_model_change_forward_failure(
     session_id: str,
     model: str | None,
     runner_result: _RunnerForwardResult | None,
-) -> None:
+) -> bool:
     """
     Publish a visible notice when a native pane never took a model change.
 
@@ -6371,7 +6393,7 @@ def _surface_model_change_forward_failure(
     runner, which types ``/model`` into the terminal. On a native terminal that
     injection is the ONLY thing that moves the model, so a dropped forward left
     the row (and the picker) claiming a model the pane was never on, silently.
-    This does not roll the row back — it makes the divergence visible.
+    The return value lets the caller roll back bound model selections.
 
     Call only for native terminal sessions: every other harness re-reads the
     persisted value at its next turn boundary, so a dropped forward there is
@@ -6386,7 +6408,8 @@ def _surface_model_change_forward_failure(
     :param model: The model that was persisted, or ``None`` when cleared.
     :param runner_result: HTTP result from the forward, or ``None`` when no
         runner was reachable.
-    :returns: None.
+    :returns: ``True`` when the runner rejected the change; ``False`` when it
+        accepted the change or no runner answered.
     """
     if runner_result is None:
         _logger.info(
@@ -6396,9 +6419,9 @@ def _surface_model_change_forward_failure(
             model,
             extra={"session_id": session_id},
         )
-        return
+        return False
     if 200 <= runner_result.status_code < 300:
-        return
+        return False
     reason = f"the runner returned status {runner_result.status_code}"
     # The runner's own detail names the concrete cause (e.g. "a dialog may
     # be open in the pane"); carry it into the visible notice when present.
@@ -6427,6 +6450,7 @@ def _surface_model_change_forward_failure(
             ),
         ),
     )
+    return True
 
 
 async def _persist_native_policy_notice(
@@ -9752,6 +9776,8 @@ def _persist_stored_session_bundle(
     agent_bundle_location: str,
     agent_description: str | None,
     runner_id: str | None = None,
+    inference_snapshot: dict[str, Any] | None = None,
+    inference_model: str | None = None,
 ) -> CreatedSessionResponse:
     """
     Persist database rows for a bundle already written to artifacts.
@@ -9774,6 +9800,11 @@ def _persist_stored_session_bundle(
     :raises SQLAlchemyError: If the database transaction fails for
         any non-integrity reason.
     """
+    inference_kwargs: dict[str, Any] = {}
+    if inference_snapshot is not None:
+        inference_kwargs["inference_snapshot"] = inference_snapshot
+    if inference_model is not None:
+        inference_kwargs["model_override"] = inference_model
     try:
         created = conversation_store.create_session_with_agent(
             agent_id=agent_id,
@@ -9789,6 +9820,7 @@ def _persist_stored_session_bundle(
             runner_id=runner_id,
             project_id=metadata.project_id,
             host_id=metadata.host_id,
+            **inference_kwargs,
         )
     except ConversationNotFoundError as exc:
         # Parent was authorized by the caller but vanished (deleted)

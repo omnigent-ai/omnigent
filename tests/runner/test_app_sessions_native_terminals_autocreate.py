@@ -4263,7 +4263,7 @@ def test_routed_spawn_launch_args_need_a_router() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("endpoint", ["subscription", "gateway"])
+@pytest.mark.parametrize("endpoint", ["subscription", "gateway", "bound"])
 async def test_auto_create_claude_terminal_launch_gate_folds_a_canonical_override(
     endpoint: str,
     tmp_path: Path,
@@ -4279,6 +4279,7 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_canonical_overrid
     spellings, launches on its own default instead and resets the pick to Default.
     """
     from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig
+    from omnigent.inference_config import inference_config_scope
 
     monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
@@ -4337,11 +4338,12 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_canonical_overrid
             )
 
     patches: list[dict[str, Any]] = []
+    selected_model = "private/model-b[large]" if endpoint == "bound" else "claude-opus-4-8"
 
     def _handle_request(request: httpx.Request) -> httpx.Response:
         if request.method == "PATCH":
             patches.append(json.loads(request.content))
-        return httpx.Response(200, json={"model_override": "claude-opus-4-8", "labels": {}})
+        return httpx.Response(200, json={"model_override": selected_model, "labels": {}})
 
     fake_client = httpx.AsyncClient(
         base_url="http://test-server",
@@ -4361,17 +4363,34 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_canonical_overrid
         return config
 
     session_id = "0f2d3d5c9a6b4e1f8c7d6e5f4a3b2c1d"
-    await _auto_create_claude_terminal(
-        session_id,
-        _FakeResourceRegistry(),
-        lambda _sid, _evt: None,
-        server_client=fake_client,
-        resolve_launch_config=_resolve,
+    inference = (
+        {
+            "providers": {"gateway": {"kind": "gateway"}},
+            "inference": {
+                "harnesses": {
+                    "claude-native": {
+                        "provider": "gateway",
+                        "default_model": "private/model-a",
+                        "model_allowlist": ["private/model-a", selected_model],
+                    }
+                }
+            },
+        }
+        if endpoint == "bound"
+        else {}
     )
+    with inference_config_scope(inference):
+        await _auto_create_claude_terminal(
+            session_id,
+            _FakeResourceRegistry(),
+            lambda _sid, _evt: None,
+            server_client=fake_client,
+            resolve_launch_config=_resolve,
+        )
     args = captured["spec"].args
     pick_resets = [body for body in patches if "model_override" in body]
-    if endpoint == "subscription":
-        assert args[args.index("--model") + 1] == "claude-opus-4-8"
+    if endpoint in ("subscription", "bound"):
+        assert args[args.index("--model") + 1] == selected_model
         assert pick_resets == []
     else:
         assert args[args.index("--model") + 1] == "system.ai.claude-opus-5"
