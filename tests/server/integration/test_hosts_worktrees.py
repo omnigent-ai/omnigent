@@ -194,6 +194,7 @@ async def test_list_worktrees_returns_data(
                 "is_main": True,
                 "detached": False,
                 "remote_provider": "github",
+                "updated_at": 1_700_000_000,
             },
             {
                 "path": "/Users/corey/repo-worktrees/feature-x",
@@ -201,6 +202,7 @@ async def test_list_worktrees_returns_data(
                 "is_main": False,
                 "detached": False,
                 "remote_provider": "github",
+                "updated_at": 1_700_000_100,
             },
         ],
     }
@@ -216,6 +218,10 @@ async def test_list_worktrees_returns_data(
     assert branches == ["main", "feature/x"]
     assert payload["data"][1]["is_main"] is False
     assert {worktree["remote_provider"] for worktree in payload["data"]} == {"github"}
+    assert [worktree["updated_at"] for worktree in payload["data"]] == [
+        1_700_000_000,
+        1_700_000_100,
+    ]
 
 
 async def test_list_worktrees_passes_through_legacy_entries_without_provider(

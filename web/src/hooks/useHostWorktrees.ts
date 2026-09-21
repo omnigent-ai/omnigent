@@ -1,4 +1,5 @@
 import { queryOptions, useQuery } from "@tanstack/react-query";
+import { useRef } from "react";
 
 import { authenticatedFetch } from "@/lib/identity";
 
@@ -31,6 +32,60 @@ export interface HostWorktree {
    * older hosts; ``null`` means no provider could be safely identified.
    */
   remote_provider?: "github" | "other" | null;
+  /** Unix epoch seconds of the worktree HEAD commit. Missing on older hosts. */
+  updated_at?: number | null;
+}
+
+interface VerifiedGithubWorktreeCache {
+  hostId: string;
+  roots: string[];
+  worktrees: HostWorktree[];
+}
+
+function normalizedHostPath(path: string): string {
+  const normalized = path.replace(/\\/g, "/").replace(/\/+$/, "");
+  return /^[A-Za-z]:\//.test(normalized) ? normalized.toLowerCase() : normalized;
+}
+
+export function pathIsWithinWorktree(path: string, root: string): boolean {
+  const candidate = normalizedHostPath(path);
+  const boundary = normalizedHostPath(root);
+  return candidate === boundary || candidate.startsWith(`${boundary}/`);
+}
+
+/**
+ * Keep a verified GitHub repository visible while a nested path is loading.
+ * Explicit non-GitHub results still hide it immediately (fail closed).
+ */
+export function useVerifiedGithubWorktrees({
+  hostId,
+  requestedPath,
+  worktrees,
+  resolved,
+}: {
+  hostId: string | null;
+  requestedPath: string | null;
+  worktrees: HostWorktree[] | undefined;
+  resolved: boolean;
+}): HostWorktree[] {
+  const cacheRef = useRef<VerifiedGithubWorktreeCache | null>(null);
+  const directlyVerified =
+    resolved && worktrees?.some((worktree) => worktree.remote_provider === "github") === true;
+  if (resolved) {
+    cacheRef.current =
+      directlyVerified && hostId !== null && worktrees !== undefined
+        ? { hostId, roots: worktrees.map((worktree) => worktree.path), worktrees }
+        : null;
+  }
+  const cache = cacheRef.current;
+  const cachedMatch =
+    cache !== null &&
+    cache.hostId === hostId &&
+    requestedPath !== null &&
+    cache.roots.some((root) => pathIsWithinWorktree(requestedPath, root));
+
+  if (resolved) return directlyVerified ? (worktrees ?? []) : [];
+  return cachedMatch ? (cache?.worktrees ?? []) : [];
 }
 
 interface HostWorktreesResponse {

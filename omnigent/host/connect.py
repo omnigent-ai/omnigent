@@ -3445,6 +3445,7 @@ class HostProcess:
                     "is_main": wt.is_main,
                     "detached": wt.detached,
                     "remote_provider": wt.remote_provider,
+                    "updated_at": wt.updated_at,
                 }
                 for wt in worktrees
             ],

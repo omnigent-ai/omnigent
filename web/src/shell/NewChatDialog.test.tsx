@@ -72,6 +72,7 @@ import {
 import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useHostFilesystem, type HostFilesystemEntry } from "@/hooks/useHostFilesystem";
 import { useHostWorktrees } from "@/hooks/useHostWorktrees";
+import type * as HostWorktreesModule from "@/hooks/useHostWorktrees";
 import { useDirectorySessions } from "@/hooks/useDirectorySessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
 import type { Conversation } from "@/hooks/useConversations";
@@ -214,7 +215,8 @@ vi.mock("@/hooks/useHostFilesystem", () => ({
 }));
 // Mocked so it doesn't hit authenticatedFetch (which would pollute the
 // call list the create-flow assertions index into positionally).
-vi.mock("@/hooks/useHostWorktrees", () => ({
+vi.mock("@/hooks/useHostWorktrees", async (importOriginal) => ({
+  ...(await importOriginal<typeof HostWorktreesModule>()),
   useHostWorktrees: vi.fn(),
   hostWorktreesQueryOptions: (hostId: string, repoPath: string) => ({
     queryKey: ["host-worktrees", hostId, repoPath],
@@ -3236,7 +3238,24 @@ describe("NewChatLandingScreen", () => {
 
     const header = screen.getByTestId("new-chat-landing-workspace-controls");
     expect(header).toContainElement(screen.getByTestId("new-chat-landing-workspace-chip"));
+    expect(screen.getByTestId("new-chat-landing-workspace-icon-folder")).toBeInTheDocument();
     expect(screen.queryByTestId("new-chat-landing-branch-chip")).toBeNull();
+  });
+
+  it("uses the scoped light tooltip treatment for submit errors", async () => {
+    renderLanding();
+
+    const submit = screen.getByTestId("new-chat-landing-submit");
+    fireEvent.pointerMove(submit.parentElement!, { pointerType: "mouse" });
+    const tooltip = await screen.findByTestId("new-chat-landing-submit-error-tooltip");
+    expect(tooltip).toHaveClass("bg-popover", "text-popover-foreground", "shadow-menu", "ring-1");
+  });
+
+  it("uses the GitHub folder icon for a verified repository", () => {
+    renderLanding();
+
+    expect(screen.getByTestId("new-chat-landing-workspace-icon-github")).toBeInTheDocument();
+    expect(screen.queryByTestId("new-chat-landing-workspace-icon-folder")).toBeNull();
   });
 
   it.each([undefined, null, "other"] as const)(
@@ -3257,9 +3276,42 @@ describe("NewChatLandingScreen", () => {
       renderLanding();
 
       expect(screen.getByTestId("new-chat-landing-workspace-chip")).toBeVisible();
+      expect(screen.getByTestId("new-chat-landing-workspace-icon-folder")).toBeInTheDocument();
       expect(screen.queryByTestId("new-chat-landing-branch-chip")).toBeNull();
     },
   );
+
+  it("keeps the verified worktree control visible while a nested repo path loads", async () => {
+    const repo = "/Users/corey/repo";
+    const nested = `${repo}/src/components`;
+    localStorage.setItem(RECENT_KEY, JSON.stringify({ host_1: [repo, nested] }));
+    useHostWorktreesMock.mockImplementation(
+      (_host, path) =>
+        (path === nested
+          ? { ...PENDING_QUERY_STATE, data: undefined, isPlaceholderData: true }
+          : {
+              ...SUCCESS_QUERY_STATE,
+              data: [
+                {
+                  path: repo,
+                  branch: "main",
+                  is_main: true,
+                  detached: false,
+                  remote_provider: "github",
+                },
+              ],
+              isPlaceholderData: false,
+            }) as ReturnType<typeof useHostWorktrees>,
+    );
+    renderLanding();
+
+    await waitFor(() => expect(screen.getByTestId("new-chat-landing-branch-chip")).toBeVisible());
+    fireEvent.click(screen.getByTestId("new-chat-landing-workspace-chip"));
+    fireEvent.click(screen.getByRole("button", { name: nested }));
+
+    expect(screen.getByTestId("new-chat-landing-branch-chip")).toBeVisible();
+    expect(screen.getByTestId("new-chat-landing-workspace-icon-github")).toBeInTheDocument();
+  });
 
   describe("worktree choices after workspace changes", () => {
     const gitWorkspace = "/Users/corey/repo";
@@ -3316,24 +3368,19 @@ describe("NewChatLandingScreen", () => {
     it.each([false, true])(
       "clears a named worktree when the new workspace is confirmed non-git (auto-seeded: %s)",
       async (autoSeeded) => {
-        const worktree = await selectNewWorktree(autoSeeded);
+        await selectNewWorktree(autoSeeded);
         selectWorkspace(nextWorkspace);
 
-        expect(worktree).toBeDisabled();
-        expect(worktree).toHaveTextContent(/^Worktree$/);
-        expect(worktree).toHaveAttribute(
-          "title",
-          "Choose a Git working directory to use worktrees",
-        );
-        fireEvent.click(worktree);
+        expect(screen.queryByTestId("new-chat-landing-branch-chip")).toBeNull();
         expect(screen.queryByTestId("new-chat-landing-branch-input")).toBeNull();
 
         selectWorkspace(gitWorkspace);
-        expect(worktree).toBeEnabled();
+        const restoredWorktree = screen.getByTestId("new-chat-landing-branch-chip");
+        expect(restoredWorktree).toBeEnabled();
         if (autoSeeded) {
-          await waitFor(() => expect(worktree).toHaveTextContent(/^worktree-[0-9a-f]{8}$/));
+          await waitFor(() => expect(restoredWorktree).toHaveTextContent(/^worktree-[0-9a-f]{8}$/));
         }
-        fireEvent.click(worktree);
+        fireEvent.click(restoredWorktree);
         if (!autoSeeded) {
           expect(screen.getByTestId("new-chat-landing-branch-input")).toHaveValue("");
           fireEvent.change(screen.getByTestId("new-chat-landing-branch-input"), {
@@ -3358,17 +3405,14 @@ describe("NewChatLandingScreen", () => {
       );
       const worktree = await selectNewWorktree();
       selectWorkspace(nextWorkspace);
-      expect(worktree).toBeEnabled();
-      expect(worktree).toHaveTextContent(branchName);
-      fireEvent.click(worktree);
-      expect(screen.getByTestId("new-chat-landing-branch-input")).toHaveValue(branchName);
+      expect(worktree).not.toBeInTheDocument();
+      expect(screen.queryByTestId("new-chat-landing-branch-chip")).toBeNull();
 
       probeResolved = true;
       fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
         target: { value: "Use the resolved working directory" },
       });
-      expect(worktree).toBeDisabled();
-      expect(worktree).toHaveTextContent(/^Worktree$/);
+      expect(screen.queryByTestId("new-chat-landing-branch-chip")).toBeNull();
       expect(screen.queryByTestId("new-chat-landing-branch-input")).toBeNull();
       expect(screen.queryByTestId("new-chat-landing-base-branch-input")).toBeNull();
       fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
@@ -3427,9 +3471,13 @@ describe("NewChatLandingScreen", () => {
                   isPlaceholderData: false,
                 }) as ReturnType<typeof useHostWorktrees>,
         );
-        const worktree = await selectNewWorktree();
+        await selectNewWorktree();
         selectWorkspace(nextWorkspace);
-        expect(worktree).toHaveTextContent(branchName);
+        if (state === "ready") {
+          expect(screen.getByTestId("new-chat-landing-branch-chip")).toHaveTextContent(branchName);
+        } else {
+          expect(screen.queryByTestId("new-chat-landing-branch-chip")).toBeNull();
+        }
 
         nextResult = {
           ...SUCCESS_QUERY_STATE,
@@ -3439,8 +3487,9 @@ describe("NewChatLandingScreen", () => {
         fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
           target: { value: "Keep my worktree in the next repository" },
         });
-        expect(worktree).toBeEnabled();
-        fireEvent.click(worktree);
+        const restoredWorktree = screen.getByTestId("new-chat-landing-branch-chip");
+        expect(restoredWorktree).toBeEnabled();
+        fireEvent.click(restoredWorktree);
         expect(screen.getByTestId("new-chat-landing-branch-input")).toHaveValue(branchName);
         expect(screen.getByTestId("new-chat-landing-base-branch-input")).toHaveValue("release");
         fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
@@ -5584,16 +5633,13 @@ describe("NewChatLandingScreen", () => {
     expect(worktreeList.closest('[data-slot="popover-content"]')).toHaveClass("overflow-y-auto");
     const options = screen.getAllByTestId("new-chat-landing-worktree-option");
     expect(options).toHaveLength(1); // main tree excluded
-    expect(options[0].textContent).toContain("feature/x");
-    // onMouseDown (fires before the input's blur) drives selection.
-    fireEvent.mouseDown(options[0]);
+    expect(options[0].textContent).toContain("feature-x");
+    const worktreeRadio = within(options[0]).getByRole("radio");
+    fireEvent.click(worktreeRadio);
 
-    // Selecting a worktree auto-closes the popover.
-    await waitFor(() => expect(screen.queryByTestId("new-chat-landing-branch-input")).toBeNull());
-
-    // Reopen the chip: the warning shows and the branch field is prefilled with
-    // the selected worktree's branch.
-    fireEvent.click(screen.getByTestId("new-chat-landing-branch-chip"));
+    // Selection stays in the worktree picker; it does not browse or close the
+    // project-folder surface.
+    expect(worktreeRadio).toBeChecked();
     await screen.findByTestId("new-chat-landing-existing-worktree-warning");
     expect((screen.getByTestId("new-chat-landing-branch-input") as HTMLInputElement).value).toBe(
       "feature/x",
@@ -5643,10 +5689,9 @@ describe("NewChatLandingScreen", () => {
 
     fireEvent.click(screen.getByTestId("new-chat-landing-branch-chip"));
     fireEvent.focus(screen.getByTestId("new-chat-landing-branch-input"));
-    fireEvent.mouseDown(screen.getByTestId("new-chat-landing-worktree-option"));
-    // Selection auto-closes the popover — reopen to edit the prefilled branch.
-    await waitFor(() => expect(screen.queryByTestId("new-chat-landing-branch-input")).toBeNull());
-    fireEvent.click(screen.getByTestId("new-chat-landing-branch-chip"));
+    fireEvent.click(
+      within(screen.getByTestId("new-chat-landing-worktree-option")).getByRole("radio"),
+    );
     await screen.findByTestId("new-chat-landing-existing-worktree-warning");
 
     // Edit the branch away from the prefill: now it's a NEW worktree request.
@@ -5730,7 +5775,7 @@ describe("NewChatLandingScreen", () => {
     expect(body.git?.existing_worktree).toBeUndefined();
   });
 
-  it("filters the worktree dropdown as you type in the branch combobox", async () => {
+  it("keeps existing worktree radios separate while a new branch is drafted", async () => {
     useHostWorktreesMock.mockReturnValue({
       data: [
         {
@@ -5754,26 +5799,19 @@ describe("NewChatLandingScreen", () => {
     );
 
     fireEvent.click(screen.getByTestId("new-chat-landing-branch-chip"));
-    // Radix autofocuses the branch combobox on open, so the dropdown of both
-    // worktrees shows immediately (a focus event keeps it open in jsdom too).
-    fireEvent.focus(screen.getByTestId("new-chat-landing-branch-input"));
     expect(screen.getAllByTestId("new-chat-landing-worktree-option")).toHaveLength(2);
 
-    // Typing in the branch field narrows to matching branch/path substrings.
+    // Drafting a new branch does not repurpose or hide the existing-worktree
+    // radio choices.
     fireEvent.change(screen.getByTestId("new-chat-landing-branch-input"), {
       target: { value: "bugfix" },
     });
-    const options = screen.getAllByTestId("new-chat-landing-worktree-option");
-    expect(options).toHaveLength(1);
-    expect(options[0].textContent).toContain("bugfix/login");
-
-    // A name matching nothing hides the dropdown entirely — that name becomes
-    // a NEW worktree on submit rather than selecting an existing one.
+    expect(screen.getAllByTestId("new-chat-landing-worktree-option")).toHaveLength(2);
     fireEvent.change(screen.getByTestId("new-chat-landing-branch-input"), {
       target: { value: "brand-new-branch" },
     });
-    expect(screen.queryByTestId("new-chat-landing-worktree-dropdown")).toBeNull();
-    expect(screen.queryByTestId("new-chat-landing-worktree-option")).toBeNull();
+    expect(screen.getByTestId("new-chat-landing-worktree-dropdown")).toBeVisible();
+    expect(screen.getAllByTestId("new-chat-landing-worktree-option")).toHaveLength(2);
   });
 
   it("generates a unique worktree branch name and sends it on create", async () => {

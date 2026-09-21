@@ -4,7 +4,7 @@ import { act, renderHook, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { authenticatedFetch } from "@/lib/identity";
-import { useHostWorktrees } from "./useHostWorktrees";
+import { useHostWorktrees, useVerifiedGithubWorktrees } from "./useHostWorktrees";
 
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
 
@@ -86,5 +86,67 @@ describe("useHostWorktrees", () => {
       );
     });
     await waitFor(() => expect(result.current.data?.[0].remote_provider).toBe("other"));
+  });
+});
+
+describe("useVerifiedGithubWorktrees", () => {
+  const githubWorktrees = [
+    {
+      path: "/repo",
+      branch: "main",
+      is_main: true,
+      detached: false,
+      remote_provider: "github" as const,
+    },
+    {
+      path: "/repo-worktrees/feature-x",
+      branch: "feature/x",
+      is_main: false,
+      detached: false,
+      remote_provider: "github" as const,
+    },
+  ];
+
+  it("keeps verified GitHub worktrees visible while a nested path resolves", () => {
+    const { result, rerender } = renderHook(
+      ({ path, worktrees, resolved }) =>
+        useVerifiedGithubWorktrees({
+          hostId: "host_1",
+          requestedPath: path,
+          worktrees,
+          resolved,
+        }),
+      {
+        initialProps: { path: "/repo", worktrees: githubWorktrees, resolved: true },
+      },
+    );
+
+    expect(result.current).toEqual(githubWorktrees);
+    rerender({ path: "/repo/src/components", worktrees: undefined, resolved: false });
+    expect(result.current).toEqual(githubWorktrees);
+  });
+
+  it("hides cached worktrees outside the verified roots and on explicit non-GitHub results", () => {
+    const { result, rerender } = renderHook(
+      ({ path, worktrees, resolved }) =>
+        useVerifiedGithubWorktrees({
+          hostId: "host_1",
+          requestedPath: path,
+          worktrees,
+          resolved,
+        }),
+      {
+        initialProps: { path: "/repo", worktrees: githubWorktrees, resolved: true },
+      },
+    );
+
+    rerender({ path: "/ordinary", worktrees: undefined, resolved: false });
+    expect(result.current).toEqual([]);
+    rerender({
+      path: "/repo/src",
+      worktrees: [{ ...githubWorktrees[0], remote_provider: "other" as const }],
+      resolved: true,
+    });
+    expect(result.current).toEqual([]);
   });
 });

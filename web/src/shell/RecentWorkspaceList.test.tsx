@@ -83,8 +83,22 @@ describe("RecentWorkspaceList", () => {
       .mockResolvedValueOnce(response("other"));
     renderList();
 
-    expect(await screen.findByTestId("recent-workspace-icon-0-github")).toBeInTheDocument();
-    expect(await screen.findByTestId("recent-workspace-icon-1-folder")).toBeInTheDocument();
+    expect(await screen.findByTestId("recent-workspace-icon-0-github")).toHaveClass(
+      "lucide-folder-git-2",
+    );
+    expect(await screen.findByTestId("recent-workspace-icon-1-folder")).toHaveClass(
+      "lucide-folder",
+    );
+  });
+
+  it("marks the selected project folder without changing the separate browse action", () => {
+    renderList({ selectedPath: "/one" });
+
+    expect(screen.getByTestId("recent-workspace-row-0")).toHaveClass("bg-muted");
+    expect(screen.getByTestId("recent-workspace-row-1")).not.toHaveClass("bg-muted");
+    expect(screen.getByTestId("recent-workspace-browse-0").querySelector("svg")).toHaveClass(
+      "lucide-folder-open",
+    );
   });
 
   it("falls back to folder icons for legacy, offline, and unavailable metadata", async () => {

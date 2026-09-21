@@ -379,6 +379,7 @@ def test_list_worktrees_returns_main_first(git_repo: Path) -> None:
     assert main.is_main is True
     assert main.detached is False
     assert main.remote_provider is None
+    assert isinstance(main.updated_at, int)
 
 
 @pytest.mark.parametrize(
@@ -462,6 +463,7 @@ def test_list_worktrees_includes_linked(git_repo: Path) -> None:
     assert linked.path == created.worktree_path
     assert linked.branch == "feature/login"
     assert linked.detached is False
+    assert isinstance(linked.updated_at, int)
 
 
 def test_list_worktrees_from_linked_resolves_same_list(git_repo: Path) -> None:

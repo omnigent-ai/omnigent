@@ -212,6 +212,8 @@ class WorktreeInfo:
     :param remote_provider: ``"github"`` only for a remote whose hostname is
         verified as GitHub, ``"other"`` for a recognized non-GitHub or local
         remote, and ``None`` when no usable remote or provider proof exists.
+    :param updated_at: Unix epoch seconds of the checked-out HEAD commit, or
+        ``None`` when the commit timestamp cannot be resolved.
     """
 
     path: str
@@ -219,6 +221,7 @@ class WorktreeInfo:
     is_main: bool
     detached: bool
     remote_provider: str | None = None
+    updated_at: int | None = None
 
 
 def _remote_hostname(remote_url: str) -> str | None:
@@ -284,6 +287,19 @@ def _remote_provider(repo_root: str) -> str | None:
     return "other" if saw_other else None
 
 
+def _commit_updated_at(repo_root: str, head: str | None) -> int | None:
+    """Return the checked-out commit timestamp for one worktree record."""
+    if head is None:
+        return None
+    result = _run_git(["show", "-s", "--format=%ct", head], cwd=repo_root)
+    if result.returncode != 0:
+        return None
+    try:
+        return int(result.stdout.strip())
+    except ValueError:
+        return None
+
+
 def list_worktrees(*, repo_path: str) -> list[WorktreeInfo]:
     """List the git worktrees of the repository containing ``repo_path``.
 
@@ -310,12 +326,16 @@ def list_worktrees(*, repo_path: str) -> list[WorktreeInfo]:
     worktrees: list[WorktreeInfo] = []
     path: str | None = None
     branch: str | None = None
+    head: str | None = None
     detached = False
     for line in result.stdout.splitlines():
         if line.startswith("worktree "):
             path = line[len("worktree ") :].strip()
             branch = None
+            head = None
             detached = False
+        elif line.startswith("HEAD "):
+            head = line[len("HEAD ") :].strip()
         elif line.startswith("branch "):
             ref = line[len("branch ") :].strip()
             branch = ref[len("refs/heads/") :] if ref.startswith("refs/heads/") else ref
@@ -330,6 +350,7 @@ def list_worktrees(*, repo_path: str) -> list[WorktreeInfo]:
                     is_main=not worktrees,
                     detached=detached,
                     remote_provider=remote_provider,
+                    updated_at=_commit_updated_at(repo_root, head),
                 )
             )
             path = None
@@ -342,6 +363,7 @@ def list_worktrees(*, repo_path: str) -> list[WorktreeInfo]:
                 is_main=not worktrees,
                 detached=detached,
                 remote_provider=remote_provider,
+                updated_at=_commit_updated_at(repo_root, head),
             )
         )
     return worktrees

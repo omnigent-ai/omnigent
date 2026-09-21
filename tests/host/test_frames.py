@@ -1368,6 +1368,7 @@ def test_list_worktrees_result_frame_round_trip() -> None:
                 "is_main": True,
                 "detached": False,
                 "remote_provider": "github",
+                "updated_at": 1_700_000_000,
             },
             {
                 "path": "/Users/alice/myrepo-worktrees/feature-login",

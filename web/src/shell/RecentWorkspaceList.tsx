@@ -1,12 +1,12 @@
-import GithubMono from "@lobehub/icons/es/Github/components/Mono";
 import { useQueries } from "@tanstack/react-query";
-import { ChevronRightIcon, FolderIcon } from "lucide-react";
+import { FolderGit2Icon, FolderIcon, FolderOpenIcon } from "lucide-react";
 
 import { hostWorktreesQueryOptions } from "@/hooks/useHostWorktrees";
 
 export interface RecentWorkspaceListProps {
   hostId: string | null;
   paths: string[];
+  selectedPath?: string;
   onSelect: (path: string) => void;
   onBrowse: (path: string) => void;
 }
@@ -18,6 +18,7 @@ export interface RecentWorkspaceListProps {
 export function RecentWorkspaceList({
   hostId,
   paths,
+  selectedPath,
   onSelect,
   onBrowse,
 }: RecentWorkspaceListProps) {
@@ -35,7 +36,9 @@ export function RecentWorkspaceList({
         return (
           <div
             key={path}
-            className="group/recent flex min-w-0 items-center rounded-md hover:bg-muted focus-within:bg-muted"
+            className={`group/recent flex min-w-0 items-center rounded-md hover:bg-muted focus-within:bg-muted ${
+              path === selectedPath ? "bg-muted" : ""
+            }`}
             data-testid={`recent-workspace-row-${index}`}
           >
             <button
@@ -45,9 +48,8 @@ export function RecentWorkspaceList({
               data-testid={`recent-workspace-select-${index}`}
             >
               {isGithub ? (
-                <GithubMono
-                  size={16}
-                  className="shrink-0 text-muted-foreground"
+                <FolderGit2Icon
+                  className="size-4 shrink-0 text-muted-foreground"
                   aria-hidden
                   data-testid={`recent-workspace-icon-${index}-github`}
                 />
@@ -68,7 +70,7 @@ export function RecentWorkspaceList({
               onClick={() => onBrowse(path)}
               data-testid={`recent-workspace-browse-${index}`}
             >
-              <ChevronRightIcon className="size-4" aria-hidden />
+              <FolderOpenIcon className="size-4" aria-hidden />
             </button>
           </div>
         );

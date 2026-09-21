@@ -11,7 +11,6 @@ import {
   XIcon,
   AlertTriangleIcon,
   SearchIcon,
-  GitBranchIcon,
 } from "lucide-react";
 import { type ReactNode, useEffect, useRef, useState } from "react";
 
@@ -19,7 +18,8 @@ import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { useCreateHostDirectory, useHostFilesystem } from "@/hooks/useHostFilesystem";
-import { useHostWorktrees } from "@/hooks/useHostWorktrees";
+import { useHostWorktrees, useVerifiedGithubWorktrees } from "@/hooks/useHostWorktrees";
+import { WorktreeRadioRow } from "./WorktreeRadioRow";
 
 /** True for Windows drive-letter paths such as `C:/Users/me` or `C:\\Users\\me`. */
 export function isWindowsDrivePath(path: string): boolean {
@@ -446,6 +446,7 @@ export function WorkspacePicker({
   // (e.g. "directory already exists") so it shows inline by the input.
   const [newFolderName, setNewFolderName] = useState<string | null>(null);
   const [createError, setCreateError] = useState<string | null>(null);
+  const [selectedWorktreePath, setSelectedWorktreePath] = useState<string | null>(null);
   const createDir = useCreateHostDirectory();
   const hasCommitActions = onSelect !== undefined || onClose !== undefined;
 
@@ -520,9 +521,23 @@ export function WorkspacePicker({
     error: worktreesError,
   } = useHostWorktrees(hostId, worktreeRepoPath);
   const worktreesPending = Boolean(worktreesFetching || worktreesPlaceholder);
-  const linkedWorktrees = worktreesPending
-    ? []
-    : (hostWorktrees ?? []).filter((worktree) => !worktree.is_main);
+  const verifiedGithubWorktrees = useVerifiedGithubWorktrees({
+    hostId,
+    requestedPath: worktreeRepoPath,
+    worktrees: hostWorktrees,
+    resolved: !worktreesPlaceholder && hostWorktrees !== undefined,
+  });
+  const linkedWorktrees = verifiedGithubWorktrees.filter((worktree) => !worktree.is_main);
+  const showWorktreePanel = verifiedGithubWorktrees.length > 0;
+
+  useEffect(() => {
+    if (
+      selectedWorktreePath !== null &&
+      !linkedWorktrees.some((worktree) => worktree.path === selectedWorktreePath)
+    ) {
+      setSelectedWorktreePath(null);
+    }
+  }, [linkedWorktrees, selectedWorktreePath]);
 
   // Other live agents working in the directory currently shown. Only a
   // resolved absolute path can match a stored workspace; the home view ("")
@@ -633,7 +648,7 @@ export function WorkspacePicker({
     if (currentAbsolute === "" || currentAbsolute === null || navigationPending || error) {
       return;
     }
-    onSelect?.(currentAbsolute);
+    onSelect?.(selectedWorktreePath ?? currentAbsolute);
   }
 
   // Directory the "New folder" action creates in. A resolved absolute
@@ -794,8 +809,8 @@ export function WorkspacePicker({
       </div>
       <div
         className={
-          hasCommitActions
-            ? "grid min-h-0 flex-1 grid-cols-[minmax(0,1.05fr)_minmax(16rem,0.95fr)]"
+          showWorktreePanel
+            ? "grid min-h-0 flex-1 grid-cols-1 lg:grid-cols-[minmax(0,1.05fr)_minmax(16rem,0.95fr)]"
             : "flex min-h-0 flex-1 flex-col"
         }
       >
@@ -980,54 +995,60 @@ export function WorkspacePicker({
             )}
           </div>
         </div>
-        {hasCommitActions && (
+        {showWorktreePanel && (
           <aside
-            className="flex min-h-0 min-w-0 flex-col border-l bg-muted/10"
+            className="flex min-h-0 min-w-0 flex-col border-t bg-muted/10 lg:border-t-0 lg:border-l"
             aria-label="Worktrees"
             data-testid="workspace-picker-worktrees"
           >
             <div className="flex min-h-12 shrink-0 items-center border-b px-4 text-base font-medium">
               Worktrees
             </div>
-            <div
-              className="min-h-0 flex-1 space-y-2 overflow-y-auto p-3"
-              aria-busy={worktreesPending || undefined}
-            >
-              {worktreesPending && (
-                <div className="flex items-center gap-2 px-1 py-2 text-sm text-muted-foreground">
-                  <Spinner className="size-4" />
-                  Loading worktrees…
-                </div>
-              )}
-              {!worktreesPending && worktreesError && (
-                <div className="px-1 py-2 text-sm text-muted-foreground">
-                  Worktrees are unavailable for this folder.
-                </div>
-              )}
-              {!worktreesPending && !worktreesError && linkedWorktrees.length === 0 && (
-                <div className="px-1 py-2 text-sm text-muted-foreground">
-                  No linked worktrees for this repository.
-                </div>
-              )}
-              {linkedWorktrees.map((worktree) => (
-                <button
-                  key={worktree.path}
-                  type="button"
-                  onClick={() => navigateTo(worktree.path)}
-                  className="w-full rounded-xl border border-border bg-background px-4 py-3 text-left shadow-xs transition-colors hover:bg-muted/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                  data-testid={`workspace-picker-worktree-${worktree.path}`}
-                >
-                  <div className="flex min-w-0 items-center gap-2 text-base font-medium text-foreground">
-                    <GitBranchIcon className="size-4 shrink-0 text-muted-foreground" />
-                    <span className="truncate">{worktree.branch ?? "Detached HEAD"}</span>
+            <TooltipProvider>
+              <div
+                className="min-h-0 flex-1 space-y-1 overflow-y-auto p-3"
+                role="radiogroup"
+                aria-label="Choose a worktree"
+                aria-busy={worktreesPending || undefined}
+              >
+                <label className="flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-sm hover:bg-muted focus-within:bg-muted">
+                  <input
+                    type="radio"
+                    name="workspace-picker-worktree"
+                    checked={selectedWorktreePath === null}
+                    onChange={() => setSelectedWorktreePath(null)}
+                    className="size-4 shrink-0 accent-primary"
+                  />
+                  <span className="font-medium text-foreground">Current folder</span>
+                </label>
+                {worktreesPending && linkedWorktrees.length === 0 && (
+                  <div className="flex items-center gap-2 px-2 py-2 text-sm text-muted-foreground">
+                    <Spinner className="size-4" />
+                    Loading worktrees…
                   </div>
-                  <div className="mt-2 flex min-w-0 items-center gap-2 text-sm text-muted-foreground">
-                    <FolderIcon className="size-4 shrink-0" />
-                    <span className="truncate">{worktree.path}</span>
+                )}
+                {!worktreesPending && worktreesError && linkedWorktrees.length === 0 && (
+                  <div className="px-2 py-2 text-sm text-muted-foreground">
+                    Worktrees are unavailable for this folder.
                   </div>
-                </button>
-              ))}
-            </div>
+                )}
+                {!worktreesPending && !worktreesError && linkedWorktrees.length === 0 && (
+                  <div className="px-2 py-2 text-sm text-muted-foreground">
+                    No linked worktrees for this repository.
+                  </div>
+                )}
+                {linkedWorktrees.map((worktree) => (
+                  <WorktreeRadioRow
+                    key={worktree.path}
+                    worktree={worktree}
+                    checked={selectedWorktreePath === worktree.path}
+                    name="workspace-picker-worktree"
+                    onSelect={() => setSelectedWorktreePath(worktree.path)}
+                    testId={`workspace-picker-worktree-${worktree.path}`}
+                  />
+                ))}
+              </div>
+            </TooltipProvider>
           </aside>
         )}
       </div>
@@ -1055,11 +1076,11 @@ export function WorkspacePicker({
                 Boolean(error)
               }
               onClick={handleSelect}
-              title={`Use this folder: ${basename(currentAbsolute)}`}
+              title={`Confirm working directory: ${basename(selectedWorktreePath ?? currentAbsolute)}`}
               className="shrink-0 px-4"
               data-testid="workspace-picker-select"
             >
-              Use this folder
+              Confirm
             </Button>
           )}
         </div>
