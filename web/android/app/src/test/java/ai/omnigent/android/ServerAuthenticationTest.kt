@@ -57,8 +57,8 @@ class ServerAuthenticationTest {
     }
 
     @Test
-    fun `classification preserves current inline authentication behavior`() {
-        assertTrue(ServerAuthentication.DATABRICKS_WORKSPACE.usesInWebViewAuth)
+    fun `only Databricks Apps retain inline authentication`() {
+        assertFalse(ServerAuthentication.DATABRICKS_WORKSPACE.usesInWebViewAuth)
         assertTrue(ServerAuthentication.DATABRICKS_APP.usesInWebViewAuth)
         assertFalse(ServerAuthentication.OIDC.usesInWebViewAuth)
     }
