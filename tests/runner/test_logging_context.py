@@ -32,12 +32,13 @@ async def test_runner_request_overrides_primary_and_logs_failed_init(
                 "/v1/sessions", json={"session_id": "child", "agent_id": "agent"}
             )
             assert response.status_code == 501
-            assert (await client.get("/v1/sessions/child/logging-probe")).status_code == 200
+            probe_response = await client.get("/v1/sessions/child/logging-probe")
+            assert probe_response.status_code == 200
         logging.getLogger("omnigent.runner.test").info("process probe")
     failure = next(row for row in rows if row["event_name"] == "runner_session_init_failed")
     assert failure["session_id"] == "child"
     assert failure["attributes"]["runner_id"] == "runner_parent"
-    assert failure["attributes"]["error_code"] == "not_implemented"
+    assert failure["attributes"]["status_code"] == "501"
     assert next(row for row in rows if row["message"] == "child probe")["session_id"] == "child"
     assert next(row for row in rows if row["message"] == "process probe")["session_id"] == "parent"
     assert not any(row["event_name"] == "runner_session_initialized" for row in rows)

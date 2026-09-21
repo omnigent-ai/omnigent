@@ -12,6 +12,7 @@ See ``designs/SESSION_RESOURCES_API_DESIGN.md`` §Runner internal model.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import re
@@ -1285,21 +1286,23 @@ class SessionResourceRegistry:
             if status_poller is not None:
                 status_poller.tick()
             if resource_role == CLAUDE_NATIVE_TERMINAL_ROLE and not native_input_ready:
-                from omnigent.harnesses.claude_native.bridge import claude_pane_text_ready
+                # Readiness logging must not stop the lifecycle watcher on failure.
+                with contextlib.suppress(Exception):
+                    from omnigent.harnesses.claude_native.bridge import claude_pane_text_ready
 
-                # The watcher already captured this live pane; no extra tmux query.
-                if claude_pane_text_ready(instance.last_pane_text() or ""):
-                    native_input_ready = True
-                    _logger.info(
-                        "Claude native input ready",
-                        extra=debug_event(
-                            "native_input_ready",
-                            session_id=session_id,
-                            harness="claude-native",
-                            terminal_instance_id=instance.diagnostic_id,
-                            stage="native_input",
-                        ),
-                    )
+                    # The watcher already captured this live pane; no extra tmux query.
+                    if claude_pane_text_ready(instance.last_pane_text() or ""):
+                        native_input_ready = True
+                        _logger.info(
+                            "Claude native input ready",
+                            extra=debug_event(
+                                "native_input_ready",
+                                session_id=session_id,
+                                harness="claude-native",
+                                terminal_instance_id=instance.diagnostic_id,
+                                stage="native_input",
+                            ),
+                        )
 
         def _on_activity() -> None:
             # Runs on the watcher daemon thread; hop to the loop so the

@@ -721,9 +721,11 @@ async def test_handle_launch_spawns_subprocess(
     _cleanup_host(host)
 
 
+@pytest.mark.parametrize("binding_token", ["token_xyz", "", "   "])
 async def test_handle_launch_fails_for_bad_workspace(
     caplog: pytest.LogCaptureFixture,
     capsys: pytest.CaptureFixture[str],
+    binding_token: str,
 ) -> None:
     """
     Verify that _handle_launch returns status='failed' when the
@@ -735,7 +737,7 @@ async def test_handle_launch_fails_for_bad_workspace(
     host = _make_host_process()
     frame = HostLaunchRunnerFrame(
         request_id="req_002",
-        binding_token="token_xyz",
+        binding_token=binding_token,
         workspace="/nonexistent/path/that/does/not/exist",
         session_id="session_missing_workspace",
     )
@@ -756,7 +758,9 @@ async def test_handle_launch_fails_for_bad_workspace(
         if getattr(record, "event_name", None) == "runner_launch_failed"
     )
     assert failure.session_id == frame.session_id
-    assert failure.attributes["runner_id"] == token_bound_runner_id(frame.binding_token)
+    assert failure.attributes["runner_id"] == (
+        token_bound_runner_id(binding_token) if binding_token.strip() else None
+    )
     assert failure.attributes["host_request_id"] == frame.request_id
     assert failure.attributes["error_code"] == WORKSPACE_MISSING_ERROR_CODE
     assert "session_missing_workspace" in caplog.text
@@ -767,9 +771,11 @@ async def test_handle_launch_fails_for_bad_workspace(
     assert "/nonexistent/path/that/does/not/exist" in output
 
 
+@pytest.mark.parametrize("binding_token", ["token_abc", "", "   "])
 async def test_handle_launch_refuses_unconfigured_harness(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    binding_token: str,
 ) -> None:
     """
     Verify _handle_launch refuses to spawn when the frame's harness is
@@ -793,7 +799,7 @@ async def test_handle_launch_refuses_unconfigured_harness(
 
     frame = HostLaunchRunnerFrame(
         request_id="req_unconfigured",
-        binding_token="token_abc",
+        binding_token=binding_token,
         workspace=str(workspace),
         harness="codex",
     )

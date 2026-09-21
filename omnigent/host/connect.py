@@ -1606,7 +1606,11 @@ class HostProcess:
             extra=debug_event(
                 "runner_launch_failed",
                 session_id=frame.session_id,
-                runner_id=token_bound_runner_id(frame.binding_token),
+                runner_id=(
+                    token_bound_runner_id(frame.binding_token)
+                    if frame.binding_token.strip()
+                    else None
+                ),
                 host_request_id=frame.request_id,
                 stage="runner_launch",
                 error_code=error_code or "runner_spawn_failed",
@@ -1688,7 +1692,11 @@ class HostProcess:
         )
 
     async def _handle_launch(self, frame: HostLaunchRunnerFrame) -> HostLaunchRunnerResultFrame:
-        with runner_log_scope(frame.session_id, token_bound_runner_id(frame.binding_token)):
+        # Attribution must not move token validation ahead of the launch preflight.
+        log_runner_id = (
+            token_bound_runner_id(frame.binding_token) if frame.binding_token.strip() else None
+        )
+        with runner_log_scope(frame.session_id, log_runner_id):
             _logger.info(
                 "Runner launch requested",
                 extra=debug_event(

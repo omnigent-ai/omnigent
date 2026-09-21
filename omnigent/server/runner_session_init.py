@@ -163,16 +163,6 @@ class RunnerSessionInitializer:
                 )
                 raise
             failed = not 200 <= response.status_code < 300
-            error_code: str | None = None
-            if failed:
-                try:
-                    error_payload = response.json()
-                    if isinstance(error_payload, dict) and isinstance(
-                        error_payload.get("error"), str
-                    ):
-                        error_code = error_payload["error"]
-                except ValueError:
-                    pass
             log = _logger.error if failed else _logger.info
             log(
                 "Runner session initialization finished",
@@ -180,7 +170,6 @@ class RunnerSessionInitializer:
                     "runner_session_init_failed" if failed else "runner_session_initialized",
                     stage="session_init",
                     status_code=response.status_code,
-                    error_code=error_code,
                 ),
             )
             return response

@@ -3931,7 +3931,6 @@ def create_runner_app(
                     extra=debug_event("runner_session_init_failed", stage="session_init"),
                 )
                 raise
-            payload = json.loads(bytes(response.body))
             failed = response.status_code >= 400
             log = _logger.error if failed else _logger.info
             log(
@@ -3940,7 +3939,6 @@ def create_runner_app(
                     "runner_session_init_failed" if failed else "runner_session_initialized",
                     stage="session_init",
                     status_code=response.status_code,
-                    error_code=payload.get("error") if failed else None,
                     harness=_session_harness_name(session_id) if session_id else None,
                 ),
             )
