@@ -469,15 +469,16 @@ reproduction test is your objective instrument.
    otherwise ask the author to split or remove them. Do not guess when changes
    are entangled. Carry only in-scope work into any fork takeover.
 
-   Require the independent, structured scope assessment in Step 4.3 before
-   approving or handing off this existing PR. While iterating on its CI or review
-   findings, keep your own edits within the same scope. Unresolved unrelated or
-   uncertain changes block approval; record them in the review and `fix_summary`.
+   Address Polly's scope findings through the ordinary review process in Step
+   4.3 before approving this existing PR. Keep your own edits within the same
+   scope. Request clarification when its relationship to the reported bug is
+   uncertain; do not approve until clarified. Record unresolved scope concerns
+   in the review and `fix_summary`.
 5. **Report on the existing PR.** Post your fail→pass (or fail→still-fails) result
    and any diff concerns now as a `gh pr comment` / `gh pr review --comment`, and
    record its `pr_url` in your output. The `outcome` reflects what you found
    (`fixed` when the PR resolves every live facet, the diff is sound, and the
-   scope assessment passes;
+   changes stay within the reported problem;
    `partially_fixed` / `not_fixed` otherwise, with specifics). **Default to
    commenting, not competing** — if the PR is close and its approach is sound,
    review it and let the author iterate; don't open a rival PR over fixable nits.
@@ -492,8 +493,8 @@ reproduction test is your objective instrument.
    *indicator* for that maintainer. Choose:
    - **`fixed` and you never pushed to or authored this code** (pure reviewer: the
      repro test passes against the PR as-is, CI green, Polly clean, **the branch is
-     mergeable** — not `CONFLICTING`/`DIRTY` — the scope assessment passes for the
-     current PR, and no fix from you was needed) →
+     mergeable** — not `CONFLICTING`/`DIRTY` — the current diff stays within the
+     reported problem, and no fix from you was needed) →
      submit an **approving** review: `gh pr review <pr> --approve
      --body '…'`. A genuine independent verification — the "someone checked it, take
      your pass" signal a maintainer wants. Note in the body that it's an automated
@@ -1125,16 +1126,12 @@ PR whose automatic run skipped:
 gh workflow run polly-review.yml -R omnigent-ai/omnigent -f pr=<pr>
 ```
 
-Every Polly review assesses the full diff against the original problem, with
-a scope statement and classifications for each changed file. Manual dispatches
-request a fresh assessment even when the head is unchanged. Polly reports
-clearly evidenced unrelated changes under **Blocking issues** and scope
-uncertainty under **Non-blocking notes** as clarification questions. A missing
-linked issue alone is not a scope finding. Neither category fails the review
-workflow. Resolve still requires certainty before approving an existing fix PR
-and must run the read-only check in Step 4.5 on the existing-PR review path:
-missing, malformed, stale, unrelated, or uncertain assessments block approval
-or handoff. A green workflow is not a passing scope assessment.
+Polly reviews scope as part of its ordinary prose findings. Clearly unrelated
+changes belong under **Blocking issues**; uncertain scope belongs under
+**Non-blocking notes** as clarification questions. A missing issue link alone
+is not a finding. On the existing-PR review path, resolve those questions
+against the reported bug before approving. Review findings do not fail the
+Polly workflow, so a green check alone does not mean the review is clean.
 
 Your App token carries `actions: write`, so this dispatch is expected to succeed;
 a `403` means the App lost that permission — record `polly_review` as "could not
@@ -1240,21 +1237,6 @@ what you post. Keep the `validation_prompt` handoff field as the bare prompt tex
 lives in the PR body and the maintainer comment.
 
 ### 4.5 — Submit the final review verdict, then tag the maintainer
-
-On the existing-PR review path, recheck the scope assessment from the successful
-Polly run before approving or handing off. Save that run's review
-comment to `.omnigent/resolve-scope-review.txt` and run:
-
-```bash
-python3 dev/resolve-agent/scope_review.py check --repo <owner/repo> --pr <pr> \
-  --review .omnigent/resolve-scope-review.txt
-```
-
-This read-only check must exit zero against the current head and issue context.
-If stale, dispatch a fresh Polly review. If unrelated or uncertain
-changes remain, report `partially_fixed` / `not_fixed` with the scope findings
-and request changes instead of marking the PR ready. Do not rewrite Polly's
-assessment to make this check pass.
 
 When the branch is **mergeable** (4.2 — re-check `mergeable` now; `main` may have
 moved again since your last push), CI is green (4.2), **and** the automated review

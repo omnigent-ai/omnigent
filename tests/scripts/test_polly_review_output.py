@@ -177,13 +177,22 @@ def test_failure_diagnostics_preserves_logs_without_gateway_secrets(
 
 
 @pytest.mark.parametrize("failure_step", ["secret-scan", "posting", None])
-def test_review_diagnostics_retain_raw_stdout(tmp_path: Path, failure_step: str | None) -> None:
+@pytest.mark.parametrize(
+    "scope_suffix",
+    [
+        "",
+        "<!-- POLLY_SCOPE_START -->\n{malformed\n<!-- POLLY_SCOPE_END -->\n",
+        "<!-- POLLY_SCOPE_START -->\n{}\n<!-- POLLY_SCOPE_END --> (see above)\n" * 2,
+    ],
+    ids=["plain-prose", "malformed-legacy-scope", "duplicate-legacy-scope"],
+)
+def test_review_diagnostics_retain_raw_stdout(
+    tmp_path: Path, failure_step: str | None, scope_suffix: str
+) -> None:
     workflow = yaml.safe_load(_WORKFLOW.read_text())
     steps = {step["name"]: step for step in workflow["jobs"]["review"]["steps"]}
     review = (
-        _REVIEW
-        + '<!-- POLLY_SCOPE_START -->\n{"version": 1}\n<!-- POLLY_SCOPE_END -->\n'
-        + ("test-api-secret\n" if failure_step == "secret-scan" else "")
+        _REVIEW + scope_suffix + ("test-api-secret\n" if failure_step == "secret-scan" else "")
     )
     raw = f"Starting review: test-api-secret at https://gateway.test\n{_MARKER}\n{review}"
     (tmp_path / "stdout.txt").write_text(raw)
@@ -213,10 +222,6 @@ def test_review_diagnostics_retain_raw_stdout(tmp_path: Path, failure_step: str 
 
     def run_step(name: str) -> subprocess.CompletedProcess[str]:
         script = steps[name]["run"].replace("/tmp/", str(tmp_path) + "/")
-        script = script.replace(
-            "dev/resolve-agent/scope_review.py",
-            str(_WORKFLOW.parents[2] / "dev/resolve-agent/scope_review.py"),
-        )
         script = script.replace(
             "pathlib.Path.home() / '.omnigent' / 'logs'",
             f"pathlib.Path({str(tmp_path / 'logs')!r})",
@@ -248,8 +253,7 @@ def test_review_diagnostics_retain_raw_stdout(tmp_path: Path, failure_step: str 
         assert result.returncode == (42 if failure_step else 0)
         if failure_step:
             assert "Forced posting failure" in result.stderr
-        assert _REVIEW in (tmp_path / "comment.md").read_text()
-        assert "<summary>Scope assessment data</summary>" in (tmp_path / "comment.md").read_text()
+        assert review in (tmp_path / "comment.md").read_text()
         assert "Starting review" not in (tmp_path / "comment.md").read_text()
     result = run_step("Prepare Polly diagnostics")
     assert result.returncode == 0, result.stdout + result.stderr
