@@ -108,6 +108,7 @@ from omnigent.runner.native import (
     _COST_POPUP_REPOP_TASKS,
     _REPL_TERMINAL_NAME,
     _REPL_TERMINAL_SESSION_KEY,
+    _SESSION_METADATA_PARAMS,
     NativeLaunchContext,
     PreLaunchResult,
     ResolvedSpec,
@@ -3547,7 +3548,9 @@ def create_runner_app(
             parent_session_id: str | None = None
             agent_name: str | None = None
             try:
-                resp = await server_client.get(f"/v1/sessions/{session_id}")
+                resp = await server_client.get(
+                    f"/v1/sessions/{session_id}", params=_SESSION_METADATA_PARAMS
+                )
                 status_code = resp.status_code
                 if resp.status_code == 200:
                     body = resp.json()
@@ -3607,7 +3610,9 @@ def create_runner_app(
         re-reads it fresh.
         """
         try:
-            resp = await server_client.get(f"/v1/sessions/{session_id}")
+            resp = await server_client.get(
+                f"/v1/sessions/{session_id}", params=_SESSION_METADATA_PARAMS
+            )
             if resp.status_code == 200:
                 raw = resp.json().get("model_override")
                 if isinstance(raw, str) and raw:
