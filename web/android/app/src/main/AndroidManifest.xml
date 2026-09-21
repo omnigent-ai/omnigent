@@ -42,6 +42,29 @@
             </intent-filter>
         </activity>
 
+        <!-- Compatibility receiver for browsers that fall back from Auth Tab to Custom Tabs. -->
+        <activity
+            android:name=".OAuthCallbackActivity"
+            android:exported="true">
+            <intent-filter android:autoVerify="true">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data
+                    android:scheme="${databricksOAuthRedirectScheme}"
+                    android:host="${databricksOAuthRedirectHost}"
+                    android:path="${databricksOAuthRedirectPath}" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data
+                    android:scheme="ai.omnigent.android"
+                    android:host="mobile-redirect" />
+            </intent-filter>
+        </activity>
+
         <activity
             android:name=".ConnectActivity"
             android:exported="false"

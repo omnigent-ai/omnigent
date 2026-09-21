@@ -73,6 +73,25 @@ class DatabricksOAuthAttemptTest {
     }
 
     @Test
+    fun `private callback keeps opaque base64 state and ignores unrelated fields`() {
+        val opaqueState = "eyJub25jZSI6ImFiYyIsInJldHVybl90byI6Ii9vbW5pZ2VudCJ9"
+        val privateAttempt = attempt.copy(state = opaqueState)
+        val response =
+            privateAttempt.authorizationResponse(
+                URI(
+                    "ai.omnigent.android://mobile-redirect" +
+                        "?state=$opaqueState&code=private-code&tracking=ignored",
+                ),
+            )
+
+        assertEquals("private-code", response.code)
+        assertEquals(
+            URI("https://dbc-123.cloud.databricks.com/oidc"),
+            response.issuer.uri,
+        )
+    }
+
+    @Test
     fun `callback retains a supported account issuer`() {
         val issuer = "https%3A%2F%2Faccounts.cloud.databricks.com%2Foidc%2Faccounts%2Facct_1"
         val response =

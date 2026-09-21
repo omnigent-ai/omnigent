@@ -71,10 +71,18 @@ internal class UrlConnectionOAuthTransport : OAuthTransport {
     }
 }
 
+internal fun interface DatabricksTokenRefreshing {
+    fun refresh(
+        refreshToken: String,
+        scope: DatabricksCredentialScope,
+        issuer: DatabricksOAuthIssuer?,
+    ): DatabricksOAuthTokens
+}
+
 class DatabricksOAuthClient internal constructor(
     private val transport: OAuthTransport = UrlConnectionOAuthTransport(),
     private val now: () -> Long = System::currentTimeMillis,
-) {
+) : DatabricksTokenRefreshing {
     fun exchange(
         code: String,
         attempt: DatabricksOAuthAttempt,
@@ -106,7 +114,7 @@ class DatabricksOAuthClient internal constructor(
         )
     }
 
-    fun refresh(
+    override fun refresh(
         refreshToken: String,
         scope: DatabricksCredentialScope,
         issuer: DatabricksOAuthIssuer?,
