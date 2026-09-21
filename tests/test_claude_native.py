@@ -5886,7 +5886,7 @@ async def test_prepare_claude_terminal_cold_resume_injects_external_session_id(
     monkeypatch.setattr(
         claude_native,
         "prepare_bridge_dir",
-        lambda session_id, *, bridge_id=None, workspace, launch_model=None, launch_env=None: (
+        lambda session_id, *, bridge_id=None, workspace, **_vocabulary: (
             tmp_path / (bridge_id or session_id)
         ),
     )
@@ -6002,7 +6002,7 @@ async def test_prepare_claude_terminal_fresh_session_is_not_cold_resumed(
     monkeypatch.setattr(
         claude_native,
         "prepare_bridge_dir",
-        lambda session_id, *, bridge_id=None, workspace, launch_model=None, launch_env=None: (
+        lambda session_id, *, bridge_id=None, workspace, **_vocabulary: (
             tmp_path / (bridge_id or session_id)
         ),
     )
@@ -10161,32 +10161,6 @@ def _gateway_probe_config(**env_extra: str) -> Any:
     )
 
 
-def test_parse_claude_model_aliases_reads_the_usage_line() -> None:
-    """The harness's printed alias enumeration parses verbatim.
-
-    Only the trailing prose fragment is dropped — no alias names are known
-    to the parser, so a new alias in a future Claude release flows through.
-    """
-    stdout = (
-        "Current model: Opus 4.8 (1M context) (effort: high)\n"
-        "Usage: /model <name>. Available: sonnet, opus, haiku, fable, best, "
-        "sonnet[1m], opus[1m], fable[1m], opusplan, default, or a full model ID.\n"
-    )
-    assert claude_native._parse_claude_model_aliases(stdout) == [
-        "sonnet",
-        "opus",
-        "haiku",
-        "fable",
-        "best",
-        "sonnet[1m]",
-        "opus[1m]",
-        "fable[1m]",
-        "opusplan",
-        "default",
-    ]
-    assert claude_native._parse_claude_model_aliases("no usage line here") == []
-
-
 @pytest.mark.parametrize(
     ("stdout", "expected"),
     [
@@ -10295,23 +10269,30 @@ def test_claude_alias_row_marks_1m_context_consistently(
     assert row == {"id": alias, "model": model, "displayName": expected}
 
 
+def _picker_response(*aliases: str) -> bytes:
+    return json.dumps(
+        {
+            "type": "control_response",
+            "response": {
+                "subtype": "success",
+                "request_id": "model-catalog",
+                "response": {"models": [{"value": alias} for alias in aliases]},
+            },
+        }
+    ).encode()
+
+
 async def test_probe_claude_model_options_runs_bare(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A bare subscription launch (no config) asks the harness itself.
-
-    No ``--settings`` rides along without an apiKeyHelper to deliver, and
-    the plain-text usage line still parses when the harness answers
-    without stream-json events (failed per-alias resolutions leave the
-    bare alias rows).
-    """
+    """An unconfigured launch reads the CLI picker without injecting settings."""
 
     class _FakeProcess:
         returncode = 0
 
-        async def communicate(self) -> tuple[bytes, bytes]:
+        async def communicate(self, input: bytes | None = None) -> tuple[bytes, bytes]:
             return (
-                b"Usage: /model <name>. Available: sonnet, opus, or a full model ID.\n",
+                _picker_response("sonnet", "opus"),
                 b"",
             )
 
@@ -10361,14 +10342,24 @@ async def test_probe_claude_model_options_resolves_each_alias_via_the_harness(
             self.returncode = returncode
             self._stdout = stdout
 
-        async def communicate(self) -> tuple[bytes, bytes]:
+        async def communicate(self, input: bytes | None = None) -> tuple[bytes, bytes]:
             return self._stdout, b""
 
     async def _fake_exec(command: str, *args: str, **kwargs: Any) -> _Run:
         if "--model" not in args:
             return _Run(
-                b"Usage: /model <name>. Available: sonnet, opus, haiku, fable, best, "
-                b"sonnet[1m], opus[1m], fable[1m], opusplan, default, or a full model ID.\n"
+                _picker_response(
+                    "sonnet",
+                    "opus",
+                    "haiku",
+                    "fable",
+                    "best",
+                    "sonnet[1m]",
+                    "opus[1m]",
+                    "fable[1m]",
+                    "opusplan",
+                    "default",
+                )
             )
         assert "--output-format" in args and "stream-json" in args and "--verbose" in args
         alias = args[args.index("--model") + 1]
@@ -10419,10 +10410,9 @@ async def test_probe_claude_model_options_runs_the_harness_under_the_launch_env(
     class _FakeProcess:
         returncode = 0
 
-        async def communicate(self) -> tuple[bytes, bytes]:
+        async def communicate(self, input: bytes | None = None) -> tuple[bytes, bytes]:
             return (
-                b"Current model: Opus\n"
-                b"Usage: /model <name>. Available: opus, or a full model ID.\n",
+                _picker_response("opus"),
                 b"",
             )
 
@@ -10442,7 +10432,7 @@ async def test_probe_claude_model_options_runs_the_harness_under_the_launch_env(
     assert probe is not None
     assert probe.alias_rows == [{"id": "opus", "model": "opus", "displayName": "opus"}]
     args = captured["args"]
-    assert args[:2] == ["-p", "/model"]
+    assert args[:3] == ["-p", "--input-format", "stream-json"]
     assert "--strict-mcp-config" in args and "--no-session-persistence" in args
     settings_payload = json.loads(args[args.index("--settings") + 1])
     assert settings_payload == {"apiKeyHelper": "printf token"}
@@ -10476,54 +10466,6 @@ async def test_claude_model_catalog_marks_the_enumerated_default(
     assert [row["id"] for row in rows] == ["sonnet", "opus"]
     assert "isDefault" not in rows[0]
     assert rows[1]["isDefault"] is True
-
-
-async def test_claude_model_catalog_honors_managed_replacement_picker(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Managed replacement rows override Claude's headless alias output."""
-
-    async def _fake_probe(config: object) -> claude_native.ClaudeModelProbe:
-        del config
-        return claude_native.ClaudeModelProbe(
-            alias_rows=[{"id": "fable", "model": "fable", "displayName": "fable"}],
-            default_model="gateway-opus",
-            default_label="Opus",
-        )
-
-    monkeypatch.setattr(claude_native, "probe_claude_model_options", _fake_probe)
-    monkeypatch.setattr(
-        "omnigent.onboarding.ambient.claude_managed_model_picker",
-        lambda: (("gateway-opus", "Opus"), ("gateway-sonnet", "Sonnet")),
-    )
-
-    assert await claude_native.claude_model_catalog(None) == [
-        {
-            "id": "gateway-opus",
-            "model": "gateway-opus",
-            "displayName": "Opus",
-            "isDefault": True,
-        },
-        {"id": "gateway-sonnet", "model": "gateway-sonnet", "displayName": "Sonnet"},
-    ]
-
-
-async def test_claude_model_catalog_keeps_managed_picker_when_probe_fails(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    async def _failed_probe(config: object) -> None:
-        del config
-        return
-
-    monkeypatch.setattr(claude_native, "probe_claude_model_options", _failed_probe)
-    monkeypatch.setattr(
-        "omnigent.onboarding.ambient.claude_managed_model_picker",
-        lambda: (("gateway-opus", "Opus"),),
-    )
-
-    assert await claude_native.claude_model_catalog(None) == [
-        {"id": "gateway-opus", "model": "gateway-opus", "displayName": "Opus"}
-    ]
 
 
 async def test_claude_model_catalog_appends_an_off_list_default(
@@ -10663,7 +10605,7 @@ async def test_probe_claude_model_options_returns_none_on_probe_failure(
     class _FailedProcess:
         returncode = 1
 
-        async def communicate(self) -> tuple[bytes, bytes]:
+        async def communicate(self, input: bytes | None = None) -> tuple[bytes, bytes]:
             return b"", b"boom"
 
     async def _fake_exec(command: str, *args: str, **kwargs: Any) -> _FailedProcess:
@@ -11370,7 +11312,7 @@ def test_configured_provider_wins_over_connect_broker_spec_branch(
     sentinel = claude_native.ClaudeNativeUcodeConfig(env={"MARK": "spec-provider"})
     monkeypatch.setattr(
         "omnigent.runtime.workflow._resolve_provider_for_build",
-        lambda spec, harness_type: object(),  # spec resolves to a provider entry
+        lambda spec, harness_type, actual_harness: object(),  # spec resolves to a provider entry
     )
     monkeypatch.setattr(
         claude_native,
@@ -11445,7 +11387,8 @@ def test_resolve_native_claude_config_spec_path_reaches_connect_broker(
 
     # Spec routes to no provider and carries no ucode profile.
     monkeypatch.setattr(
-        "omnigent.runtime.workflow._resolve_provider_for_build", lambda spec, harness_type: None
+        "omnigent.runtime.workflow._resolve_provider_for_build",
+        lambda spec, harness_type, actual_harness: None,
     )
     monkeypatch.setattr(
         claude_native, "_ucode_config_for_profile", lambda profile, *, refresh_models: None
@@ -11483,7 +11426,8 @@ def test_resolve_native_claude_config_spec_api_key_auth_skips_connect_broker(
     # The shared resolver returns None for an explicit ApiKeyAuth (it leaves bare
     # keys to Claude's own login), which previously fell through to the broker.
     monkeypatch.setattr(
-        "omnigent.runtime.workflow._resolve_provider_for_build", lambda spec, harness_type: None
+        "omnigent.runtime.workflow._resolve_provider_for_build",
+        lambda spec, harness_type, actual_harness: None,
     )
     monkeypatch.setattr(
         claude_native, "_ucode_config_for_profile", lambda profile, *, refresh_models: None

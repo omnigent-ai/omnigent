@@ -253,6 +253,12 @@ Prerequisites:
 1. Install the agent-sandbox controller and its CRDs in the cluster.
 2. The `sandboxes` RBAC rule in `role.yaml` (already applied by this overlay).
 
+To prepare spare Pods before sessions arrive, enable
+[native warm pools](warm-pool/README.md). Warm mode keeps the same credential
+broker and durable Sandbox lifecycle, and adds claim allocation plus an
+explicit `pods/exec` grant for post-allocation activation. The linked guide
+includes template generation, capacity planning, and opt-in deployment validation.
+
 ### Suspend and resume
 
 `shutdownPolicy` is `Retain`, so a lapsed deadline **suspends** the sandbox: the
@@ -341,17 +347,19 @@ caches all survive a suspend. Requirements and caveats:
   pre-created, deployment-global, shared, and rejected at/over `$HOME`. Use
   `pvc_mounts` for shared datasets and caches, this for per-session work.
 
-### Warm pools are not usable yet
+### Native warm pools
 
-The extension CRDs (`SandboxWarmPool` / `SandboxClaim`) look like the answer to
-slow image pulls, but they cannot help Omnigent as the API stands: a
-`SandboxClaim` that sets either `env` or `volumeClaimTemplates` is documented
-(and tested upstream) to force a **cold start**, and Omnigent needs both, a
-per-session host identity in `env` and a per-session workspace claim. A warm
-pod's pre-created volumes are also pool-owned and recycled across claims, which
-is not acceptable for sandbox isolation. Pre-pulling the host image onto nodes
-is the workaround until upstream can inject per-claim identity without
-discarding the warm pod.
+Opt in with `sandbox.agent_sandbox.warm_pool`; see the
+[warm-pool guide](warm-pool/README.md). Session identity arrives after allocation,
+and each Sandbox gets its own template-created HOME PVC when durable HOME is
+enabled. Claims need no environment or volume overrides, and allocated
+workspaces are never returned to the spare pool.
+
+An allocated warm Sandbox keeps its original image, mounts, resources, and agent
+classifier. Changing that profile can block wake while preserving the Sandbox
+and PVC. Versioned pools select profiles for new allocations; existing
+allocations are not migrated. Use direct provisioning for new sessions that
+need profile changes across suspension.
 
 ## Persistent storage mounts (`pvc_mounts`)
 

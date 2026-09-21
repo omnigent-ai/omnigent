@@ -60,17 +60,24 @@ function ConfigChoices({ choices }: { choices: readonly ComposerConfigChoice[] }
  * separate page-local copies. Pass a section as undefined to omit it.
  */
 export function ComposerConfigSections({
+  sdk,
   models,
   efforts,
   extra,
 }: {
+  sdk?: ComposerConfigSection;
   models?: ComposerConfigSection;
   efforts?: ComposerConfigSection;
   // Additional sections rendered after Models/Effort — e.g. Devin Fusion's
   // Lead / Effort / Sidekick selectors. Each gets its own separator + header.
   extra?: readonly ComposerConfigSection[];
 }) {
-  const sections = [...(models ? [models] : []), ...(efforts ? [efforts] : []), ...(extra ?? [])];
+  const sections = [
+    ...(sdk ? [sdk] : []),
+    ...(models ? [models] : []),
+    ...(efforts ? [efforts] : []),
+    ...(extra ?? []),
+  ];
   return (
     <>
       {sections.map((section, index) => (

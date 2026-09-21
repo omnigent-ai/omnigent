@@ -186,6 +186,7 @@ class _ConversationStore:
         up_to_response_id: str | None = None,
         project_id: str | None = None,
         file_id_map: dict[str, str] | None = None,
+        created_by: str | None = None,
     ) -> Conversation:
         """
         Record the fork call and return a fixed new conversation.

@@ -882,7 +882,7 @@ def _capturing_sse_logger() -> Iterator[list[logging.LogRecord]]:
 
 
 def test_log_sse_event_logs_kept_and_skips_noise(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(session_stream, "debug_sink_enabled", lambda: True)
+    monkeypatch.setattr(session_stream, "sse_logging_enabled", lambda: True)
     with _capturing_sse_logger() as records:
         session_stream._log_sse_event(
             "conv_1", {"type": "response.completed", "response": {"id": "resp_1"}, "delta": "text"}
@@ -906,7 +906,7 @@ def test_log_sse_event_logs_kept_and_skips_noise(monkeypatch: pytest.MonkeyPatch
 
 
 def test_log_sse_event_noop_when_sink_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(session_stream, "debug_sink_enabled", lambda: False)
+    monkeypatch.setattr(session_stream, "sse_logging_enabled", lambda: False)
     with _capturing_sse_logger() as records:
         session_stream._log_sse_event("conv_1", {"type": "response.completed"})
     assert records == []
@@ -935,6 +935,7 @@ def _capturing_audit_logger() -> Iterator[list[logging.LogRecord]]:
 def test_log_sse_event_emits_turn_finished_on_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
     # A terminal SSE event emits one first-class turn_finished audit row carrying
     # the outcome + safe ids; a non-terminal event emits none.
+    monkeypatch.setattr(session_stream, "sse_logging_enabled", lambda: True)
     monkeypatch.setattr(session_stream, "debug_sink_enabled", lambda: True)
     with _capturing_audit_logger() as records:
         session_stream._log_sse_event(
@@ -991,6 +992,7 @@ def test_failed_event_logs_nested_error_code_without_content(
             "message": "private legacy detail",
         }
     expected_code = "legacy_error" if legacy_error else "runner_error"
+    monkeypatch.setattr(session_stream, "sse_logging_enabled", lambda: True)
     monkeypatch.setattr(session_stream, "debug_sink_enabled", lambda: True)
     with _capturing_sse_logger() as sse_records, _capturing_audit_logger() as audit_records:
         session_stream._log_sse_event("conv_failed", event)
@@ -1020,6 +1022,7 @@ def test_failed_event_logs_omit_unrecognized_sources(
     monkeypatch: pytest.MonkeyPatch, source: object
 ) -> None:
     """Unvalidated source data must not enter diagnostics or suppress the failure log."""
+    monkeypatch.setattr(session_stream, "sse_logging_enabled", lambda: True)
     monkeypatch.setattr(session_stream, "debug_sink_enabled", lambda: True)
     with _capturing_sse_logger() as sse_records, _capturing_audit_logger() as audit_records:
         session_stream._log_sse_event(

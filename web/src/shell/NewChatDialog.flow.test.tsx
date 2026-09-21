@@ -1,3 +1,20 @@
+import type * as SandboxModelOptionsModule from "@/hooks/useSandboxModelOptions";
+
+vi.mock("@/hooks/useSandboxModelOptions", async (importOriginal) => ({
+  ...(await importOriginal<typeof SandboxModelOptionsModule>()),
+  useSandboxModelOptions: vi.fn(() => ({
+    data: {
+      configured: false,
+      status: "unconfigured",
+      models: [],
+      configuration_revision: null,
+      provider_label: null,
+      default_model: null,
+    },
+    isLoading: false,
+    error: null,
+  })),
+}));
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useConversations as useTestConversations } from "@/hooks/useConversations";
 
@@ -13,6 +30,7 @@ vi.mock("@/hooks/useSkills", () => ({
   }),
 }));
 import type * as UseConversationsModule from "@/hooks/useConversations";
+import type * as HostWorktreesModule from "@/hooks/useHostWorktrees";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 import type { SessionListWireItem } from "@/lib/sessionListCache";
 
@@ -124,8 +142,40 @@ vi.mock("@/hooks/useHostFilesystem", () => ({
   // an idle mutation keeps it inert for these tests.
   useCreateHostDirectory: () => ({ mutateAsync: vi.fn(), isPending: false }),
 }));
-vi.mock("@/hooks/useHostWorktrees", () => ({
-  useHostWorktrees: () => ({ data: undefined }),
+vi.mock("@/hooks/useHostWorktrees", async (importOriginal) => ({
+  ...(await importOriginal<typeof HostWorktreesModule>()),
+  useHostWorktrees: (_hostId: string | null, path: string | null) => ({
+    data:
+      path === "/Users/corey/universe/src/foo"
+        ? [
+            {
+              path,
+              branch: "main",
+              is_main: true,
+              detached: false,
+              remote_provider: "github",
+            },
+          ]
+        : path === null
+          ? undefined
+          : [],
+    isPlaceholderData: false,
+  }),
+  hostWorktreesQueryOptions: (hostId: string, repoPath: string) => ({
+    queryKey: ["host-worktrees", hostId, repoPath],
+    queryFn: async () =>
+      repoPath === "/Users/corey/universe/src/foo"
+        ? [
+            {
+              path: repoPath,
+              branch: "main",
+              is_main: true,
+              detached: false,
+              remote_provider: "github" as const,
+            },
+          ]
+        : [],
+  }),
 }));
 // No other sessions in scope — keep the conflict hooks inert so they don't
 // issue their own /health fetch or surface a warning. The warning is covered
@@ -302,7 +352,6 @@ function openAgentModels(agentId: string): void {
 /** Open a configurable agent's advanced brain-harness settings. */
 function openAgentConfig(agentId: string): void {
   openAgentModels(agentId);
-  fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
 }
 
 function pickPermissionOption(value: string): void {
@@ -322,9 +371,9 @@ function pickSelectOption(triggerTestId: string, label: string): void {
   fireEvent.click(screen.getByText(label));
 }
 
-/** Close the config modal by clicking Save (commits the draft). */
-function saveConfig(): void {
-  fireEvent.click(screen.getByTestId("new-chat-landing-config-save"));
+/** Close the inline config after its selection applies immediately. */
+function closeAgentConfig(): void {
+  fireEvent.keyDown(document, { key: "Escape" });
 }
 
 beforeEach(() => {
@@ -1697,6 +1746,48 @@ describe("NewChatLandingScreen create flow", () => {
     expect(body.reasoning_effort).toBe("high");
   });
 
+  it("clears remembered model + effort when both create-composer picks return to Default", async () => {
+    localStorage.setItem(
+      "omnigent:last-mode-by-harness",
+      JSON.stringify({ "claude-native": { model: "opus", effort: "high" } }),
+    );
+    setAgents([agent({ id: "ag_native", name: "claude-native-ui", display_name: "Claude Code" })]);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_native" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    openAgentModels("ag_native");
+    expect(screen.getByTestId("new-chat-landing-agent-model-opus")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    expect(screen.getByTestId("new-chat-landing-agent-effort-high")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-model-default"));
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-effort-default"));
+    const stored = JSON.parse(localStorage.getItem("omnigent:last-mode-by-harness") ?? "{}")[
+      "claude-native"
+    ];
+    expect(stored?.model).toBe("");
+    expect(stored?.effort).toBe("");
+
+    fireEvent.keyDown(screen.getByTestId("new-chat-landing-agent-models"), { key: "Escape" });
+    typeMessage("go");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string);
+    expect(body.model_override).toBeUndefined();
+    expect(body.reasoning_effort).toBeUndefined();
+  });
+
   it("persists a picked model for claude-native, preserving the stored effort", async () => {
     // Effort is already on record. Picking only the model must merge — not
     // clobber — so the next session seeds BOTH from storage.
@@ -1838,10 +1929,10 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    // Open Polly's config modal and pick the Pi harness, then Save.
+    // Open Polly's inline config and pick the Pi harness.
     openAgentConfig("ag_polly");
     pickSelectOption("new-chat-landing-config-harness", "Pi");
-    saveConfig();
+    closeAgentConfig();
     expect(screen.getByTestId("new-chat-landing-agent-select").textContent).not.toContain("(");
     typeMessage("go");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
@@ -1866,12 +1957,9 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    // With no explicit pick the pill shows just the agent name — the spec
-    // default is not suffixed (it lives in the Advanced menu's radios).
+    // With no explicit pick the pill shows the agent and its declared SDK.
     expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain("Polly");
-    expect(screen.getByTestId("new-chat-landing-agent-select").textContent).not.toContain(
-      "Claude SDK",
-    );
+    expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain("Claude SDK");
     typeMessage("go");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
 
@@ -1894,14 +1982,13 @@ describe("NewChatLandingScreen create flow", () => {
 
     renderLanding();
     await waitForWorkspaceSeed();
-    // Pick Pi, Save, then change mind back to the spec default (Claude SDK)
-    // and Save again.
+    // Pick Pi, then change mind back to the spec default (Claude SDK).
     openAgentConfig("ag_polly");
     pickSelectOption("new-chat-landing-config-harness", "Pi");
-    saveConfig();
+    closeAgentConfig();
     openAgentConfig("ag_polly");
     pickSelectOption("new-chat-landing-config-harness", "Claude SDK");
-    saveConfig();
+    closeAgentConfig();
     typeMessage("go");
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
 
@@ -1921,9 +2008,7 @@ describe("NewChatLandingScreen create flow", () => {
     expect(screen.queryByTestId("cost-toggle-trigger")).toBeNull();
   });
 
-  it("renders the config modal footer without its own background or top border", async () => {
-    // The Cancel/Save footer should blend into the modal body — no gray tray
-    // band and no divider line above the buttons.
+  it("renders the inline config surface without a gray tray or top border", async () => {
     setAgents([
       agent({ id: "ag_polly", name: "polly", display_name: "Polly", harness: "claude-sdk" }),
     ]);
@@ -1931,12 +2016,10 @@ describe("NewChatLandingScreen create flow", () => {
     await waitForWorkspaceSeed();
     openAgentConfig("ag_polly");
 
-    const footer = screen
-      .getByTestId("new-chat-landing-config-save")
-      .closest("[data-slot=dialog-footer]");
-    expect(footer).not.toBeNull();
-    expect(footer).toHaveClass("bg-transparent", "border-t-0");
-    expect(footer?.className).not.toMatch(/bg-muted/);
+    const configMenu = screen.getAllByRole("menu").at(-1);
+    expect(configMenu).toHaveClass("composer-agent-config-menu");
+    expect(configMenu?.className).not.toMatch(/bg-muted|border-t/);
+    expect(screen.queryByTestId("new-chat-landing-config-save")).toBeNull();
   });
 
   it("omits cost_control_mode_override when Smart Routing is left unpicked", async () => {

@@ -1602,6 +1602,169 @@ async def test_slow_capability_discovery_blocks_registration_and_frame_dispatch(
     assert hello.gateway_inference == {"claude-native": True}
 
 
+async def test_connection_auth_overlaps_capability_discovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Blocking credential discovery does not starve startup capability work."""
+    host = _make_host_process()
+    capability_started = threading.Event()
+    capability_release = asyncio.Event()
+
+    async def _discover() -> None:
+        capability_started.set()
+        await capability_release.wait()
+
+    def _headers() -> dict[str, str]:
+        if not capability_started.wait(timeout=1.0):
+            raise AssertionError("capability discovery did not overlap authentication")
+        assert host._owned_subprocess_ops == 1
+        return {}
+
+    class _RejectedConnection:
+        async def __aenter__(self) -> None:
+            raise ConnectionError("stop after authentication")
+
+    monkeypatch.setattr(host, "_initialize_capabilities", _discover)
+    monkeypatch.setattr(host, "_build_connect_headers", _headers)
+    monkeypatch.setattr(
+        "omnigent.host.connect.websockets.asyncio.client.connect",
+        lambda *args, **kwargs: _RejectedConnection(),
+    )
+    host._start_capability_discovery()
+
+    try:
+        with pytest.raises(ConnectionError, match="stop after authentication"):
+            await host._connect_and_serve()
+    finally:
+        capability_release.set()
+        if host._capability_init_task is not None:
+            await host._capability_init_task
+
+    assert host._owned_subprocess_ops == 0
+
+
+async def test_cancelled_readiness_probe_keeps_orphan_reaper_paused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancellation cannot release subprocess ownership before its worker exits."""
+    host = _make_host_process()
+    probe_started = threading.Event()
+    probe_release = threading.Event()
+
+    def _configured() -> dict[str, bool]:
+        probe_started.set()
+        if not probe_release.wait(timeout=1.0):
+            raise AssertionError("test did not release readiness probe")
+        return {"claude-native": True}
+
+    monkeypatch.setattr("omnigent.host.connect.configured_harness_map", _configured)
+    probe_task = asyncio.create_task(host._probe_configured_harnesses(startup=True))
+    assert await asyncio.to_thread(probe_started.wait, 1.0)
+    assert host._owned_subprocess_ops == 1
+
+    probe_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await probe_task
+    assert host._owned_subprocess_ops == 1
+    assert len(host._host_subprocess_tasks) == 1
+
+    probe_release.set()
+    for _ in range(100):
+        if host._owned_subprocess_ops == 0:
+            break
+        await asyncio.sleep(0.01)
+    assert host._owned_subprocess_ops == 0
+    assert host._host_subprocess_tasks == set()
+
+
+async def test_owner_lookup_overlaps_capability_discovery_after_websocket_upgrade(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Owner attribution adds no serial wait before host registration."""
+    host = _make_host_process()
+    capability_started = asyncio.Event()
+    capability_release = asyncio.Event()
+    owner_started = asyncio.Event()
+    owner_release = asyncio.Event()
+    tunnel = _BlockingTunnel()
+
+    async def _discover() -> None:
+        capability_started.set()
+        await capability_release.wait()
+        host._capabilities_initialized = True
+
+    async def _owner(*, headers: dict[str, str] | None = None) -> None:
+        assert headers == {"Authorization": "Bearer test"}
+        assert websocket_accepted.is_set()
+        owner_started.set()
+        await owner_release.wait()
+
+    websocket_accepted = asyncio.Event()
+
+    class _Connect:
+        async def __aenter__(self) -> _BlockingTunnel:
+            await asyncio.wait_for(capability_started.wait(), timeout=1.0)
+            assert not owner_started.is_set()
+            websocket_accepted.set()
+            return tunnel
+
+        async def __aexit__(self, *exc_info: object) -> bool:
+            return False
+
+    monkeypatch.setattr(host, "_initialize_capabilities", _discover)
+    monkeypatch.setattr(host, "_build_connect_headers", lambda: {"Authorization": "Bearer test"})
+    monkeypatch.setattr(host, "_ensure_owner_user_id", _owner)
+    monkeypatch.setattr(
+        "omnigent.host.connect.websockets.asyncio.client.connect",
+        lambda *args, **kwargs: _Connect(),
+    )
+    host._start_capability_discovery()
+    connect_task = asyncio.create_task(host._connect_and_serve())
+
+    try:
+        await asyncio.wait_for(websocket_accepted.wait(), timeout=1.0)
+        await asyncio.wait_for(owner_started.wait(), timeout=1.0)
+        await asyncio.wait_for(capability_started.wait(), timeout=1.0)
+        assert tunnel.sent == []
+
+        owner_release.set()
+        await asyncio.sleep(0)
+        assert tunnel.sent == []
+
+        capability_release.set()
+        await asyncio.wait_for(tunnel.first_send.wait(), timeout=1.0)
+        assert isinstance(decode_host_frame(tunnel.sent[0]), HostHelloFrame)
+    finally:
+        await _cancel(connect_task)
+        if host._capability_init_task is not None:
+            await _cancel(host._capability_init_task)
+
+
+async def test_rejected_websocket_upgrade_skips_owner_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rejected tunnel does not start attribution work that cannot be canceled."""
+    host = _make_host_process()
+
+    async def _owner(*, headers: dict[str, str] | None = None) -> None:
+        del headers
+        raise AssertionError("owner lookup must start only after an accepted upgrade")
+
+    class _RejectedConnection:
+        async def __aenter__(self) -> None:
+            raise ConnectionError("test rejection")
+
+    monkeypatch.setattr(host, "_ensure_owner_user_id", _owner)
+    monkeypatch.setattr(host, "_build_connect_headers", dict)
+    monkeypatch.setattr(
+        "omnigent.host.connect.websockets.asyncio.client.connect",
+        lambda *args, **kwargs: _RejectedConnection(),
+    )
+
+    with pytest.raises(ConnectionError, match="test rejection"):
+        await host._connect_and_serve()
+
+
 @pytest.mark.parametrize(
     ("configured", "gateway"),
     [
@@ -1978,7 +2141,7 @@ async def test_run_prewarms_zygote_during_capability_discovery(
     monkeypatch.setattr(
         host, "_ensure_zygote_started", lambda: loop.call_soon_threadsafe(prewarm_started.set)
     )
-    monkeypatch.setattr(host, "_reap_orphans_once", lambda: 0)
+    monkeypatch.setattr(host, "_reap_orphans_once", lambda _child_pids=None: 0)
     run_task = asyncio.create_task(host.run())
     try:
         await asyncio.wait_for(
@@ -2022,6 +2185,54 @@ async def test_run_cancels_inflight_capability_discovery_on_shutdown(
 
     assert discovery_cancelled.is_set()
     assert host._capability_init_task is None
+
+
+async def test_run_drains_shielded_model_catalog_probe_on_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A shared probe must finish async cleanup before the host's loop closes."""
+    from omnigent.models import model_catalog_store as store
+
+    host = _make_host_process()
+    probe_started = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    cleanup_finished = asyncio.Event()
+
+    async def _probe() -> None:
+        probe_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cleanup_started.set()
+            await release_cleanup.wait()
+            cleanup_finished.set()
+
+    async def _connect_and_serve() -> None:
+        await store.ensure_catalog("claude-native", "shutdown", _probe)
+
+    monkeypatch.setattr(store, "_inflight", {})
+    monkeypatch.setattr(host, "_start_capability_discovery", lambda: None)
+    monkeypatch.setattr(host, "_connect_and_serve", _connect_and_serve)
+    monkeypatch.setattr(host, "_reap_orphans_once", lambda _child_pids=None: 0)
+    run_task = asyncio.create_task(host.run())
+    try:
+        await asyncio.wait_for(probe_started.wait(), timeout=1.0)
+        run_task.cancel()
+        await asyncio.wait_for(cleanup_started.wait(), timeout=1.0)
+        assert not run_task.done(), "host shutdown must await probe cleanup"
+        release_cleanup.set()
+        await asyncio.wait_for(run_task, timeout=1.0)
+
+        assert cleanup_finished.is_set()
+        assert not store._inflight
+    finally:
+        release_cleanup.set()
+        await _cancel(run_task)
+        probes = list(store._inflight.values())
+        for task in probes:
+            task.cancel()
+        await asyncio.gather(*probes, return_exceptions=True)
 
 
 async def test_capability_probe_failure_does_not_block_registration(
@@ -2339,14 +2550,7 @@ def test_reap_orphans_reaps_orphaned_children(tmp_path: Path) -> None:
 
 
 def test_reap_orphans_never_steals_tracked_runner_exit_code(tmp_path: Path) -> None:
-    """The reaper must not consume a tracked runner's exit status (#1782).
-
-    A naive ``waitpid(-1)`` reaper would reap a just-exited tracked runner
-    behind ``Popen``'s back, making ``_watch_runner``'s ``poll()`` report a
-    bogus exit 0 for a crash. ``_reap_orphans_once`` peeks with ``WNOWAIT``
-    and skips tracked pids, so the runner's real exit code survives for the
-    ``host.runner_exited`` report.
-    """
+    """The reaper collects tracked exits through Popen, preserving crash codes."""
     host = _make_host_process()
 
     # A tracked runner that exits non-zero (a "crash").
@@ -2354,10 +2558,9 @@ def test_reap_orphans_never_steals_tracked_runner_exit_code(tmp_path: Path) -> N
     host._runners["runner_crash"] = _RunnerHandle(
         proc=runner, log_path=tmp_path / "runner-crash.log"
     )
-    # Wait until the OS reports it as exited (zombie), WITHOUT Popen.wait().
+    # Exercise cleanup while the runner is exiting.
     deadline = time.monotonic() + 5.0
     while time.monotonic() < deadline and runner.poll() is None:
-        # poll() would itself reap; instead peek via the reaper repeatedly.
         host._reap_orphans_once()
         time.sleep(0.05)
 
@@ -5724,7 +5927,7 @@ async def test_run_prestarts_zygote_before_first_launch(
 
     monkeypatch.setattr(HostProcess, "_connect_and_serve", _fake_connect)
     # Keep run()'s shutdown sweep from reaping unrelated pytest children.
-    monkeypatch.setattr(HostProcess, "_reap_orphans_once", lambda self_: 0)
+    monkeypatch.setattr(HostProcess, "_reap_orphans_once", lambda self_, _child_pids=None: 0)
 
     await host.run()
 

@@ -174,9 +174,10 @@ import secrets
 import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from dataclasses import field as dataclass_field
-from typing import TYPE_CHECKING, cast
+from functools import partial
+from typing import TYPE_CHECKING, Any, cast
 
 import click
 from fastapi import HTTPException
@@ -615,7 +616,10 @@ class ManagedSandboxConfig:
         :func:`omnigent.onboarding.sandboxes.base.render_host_config_write_command`.
         Non-secret by design: credentials stay behind
         ``api_key_ref: env:VAR`` indirection, resolved inside the
-        sandbox against its own environment.
+        sandbox against its own environment. Saved session inference settings
+        replace the current template's providers and bindings on restore.
+    :param model_discovery: Server-only catalog endpoints and credential references,
+        keyed by inference provider name. Never installed in the sandbox.
     """
 
     server_url: str
@@ -624,6 +628,7 @@ class ManagedSandboxConfig:
     managed_launch_supported: bool = True
     provider: str | None = None
     host_config: dict[str, object] | None = None
+    model_discovery: dict[str, object] = dataclass_field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -785,14 +790,17 @@ class ManagedSandboxDeployment:
         ponytail: builds launchers on each call; memoize on the deployment only
         if /v1/info shows up hot (provider count is tiny, __init__ does no I/O).
 
-        :returns: ``{provider: {"multi_repo": bool}}`` for each launchable
-            provider, in configured order.
+        :returns: Capability flags for each launchable provider, in configured order.
         """
         caps: dict[str, dict[str, bool]] = {}
         for config in self.configs:
             if config.managed_launch_supported and config.provider is not None:
                 launcher = config.launcher_factory()
                 caps[config.provider] = {"multi_repo": launcher.capabilities.multi_repo}
+                from omnigent.inference_config import parse_inference_config
+
+                if parse_inference_config(config.host_config or {}):
+                    caps[config.provider]["inference_models"] = True
         return caps
 
 
@@ -1163,6 +1171,26 @@ def _apply_keep_warm(
     return merged
 
 
+def deployment_with_inference_snapshot(
+    deployment: ManagedSandboxDeployment, snapshot: dict[str, Any] | None
+) -> ManagedSandboxDeployment:
+    """Restore saved inference settings while retaining current sandbox lifecycle settings."""
+    from omnigent.inference_config import snapshot_runtime_config
+
+    runtime = snapshot_runtime_config(snapshot)
+    if runtime is None:
+        if not any((entry.host_config or {}).get("inference") for entry in deployment.configs):
+            return deployment
+        runtime = {"inference": {}}
+    return replace(
+        deployment,
+        configs=tuple(
+            replace(entry, host_config={**(entry.host_config or {}), **(runtime or {})})
+            for entry in deployment.configs
+        ),
+    )
+
+
 def _parse_host_config(raw: dict[str, object]) -> dict[str, object] | None:
     """
     Extract and validate the top-level ``sandbox.host_config`` block.
@@ -1197,6 +1225,10 @@ def _parse_host_config(raw: dict[str, object]) -> dict[str, object] | None:
     # validation here yet still ride to the sandbox, where the merge writes
     # `providers: null` over any existing block — the silent degradation this
     # parse exists to prevent.
+    from omnigent.inference_config import parse_inference_config, validate_inference_credentials
+
+    if parse_inference_config(host_config):
+        validate_inference_credentials(host_config)
     if "providers" in host_config:
         providers = host_config["providers"]
         # load_providers silently ignores a non-mapping providers value, so
@@ -1408,6 +1440,7 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
         raise ValueError(
             f"server config 'sandbox.provider' must be one of: {supported} (got {provider!r})"
         )
+    warm_pool = _parse_agent_sandbox_warm_pool(raw)
     server_url = raw.get("server_url")
     if not isinstance(server_url, str) or not server_url.strip():
         raise ValueError(
@@ -1417,6 +1450,24 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
     # Validated regardless of provider (like server_url): a malformed
     # host_config should stop startup even for staged/unsupported providers.
     host_config = _parse_host_config(raw)
+    model_discovery = raw.get("model_discovery", {})
+    if not isinstance(model_discovery, dict):
+        raise ValueError("sandbox.model_discovery must be a mapping")
+    for name, discovery in model_discovery.items():
+        if not isinstance(discovery, dict) or set(discovery) - {
+            "base_url",
+            "api_key_ref",
+            "auth_command",
+            "family",
+        }:
+            raise ValueError(f"Invalid sandbox.model_discovery entry {name!r}")
+        if not isinstance(discovery.get("base_url"), str):
+            raise ValueError(f"sandbox.model_discovery.{name} requires base_url")
+        if not (discovery.get("api_key_ref") or discovery.get("auth_command")):
+            raise ValueError(f"sandbox.model_discovery.{name} requires a credential reference")
+    from omnigent.inference_config import validate_inference_credentials
+
+    validate_inference_credentials({}, model_discovery)
     if provider == "agent_sandbox":
         host_config = _apply_keep_warm(host_config, _parse_keep_warm_s(raw))
     if provider == "modal":
@@ -1572,6 +1623,7 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
         _reject_overlapping_kubernetes_mounts(pvc_mounts, secret_mounts)
         launcher_factory = _kubernetes_launcher_factory(
             agent_sandbox=provider == "agent_sandbox",
+            warm_pool=warm_pool,
             image=_parse_provider_image(raw, "kubernetes"),
             env=_parse_provider_env(raw, "kubernetes"),
             namespace=_parse_provider_string(raw, "kubernetes", "namespace"),
@@ -1639,6 +1691,7 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
         ),
         provider=provider,
         host_config=host_config,
+        model_discovery=model_discovery,
     )
 
 
@@ -2738,13 +2791,15 @@ def _validate_dns1123_label(value: str | None, field: str) -> None:
         )
 
 
-def _validate_dns1123_subdomain(value: str | None, field: str) -> None:
-    """Reject a ``sandbox.kubernetes.<field>`` that is not a DNS-1123 subdomain."""
+def _validate_dns1123_subdomain(
+    value: str | None, field: str, *, provider: str = "kubernetes"
+) -> None:
+    """Reject a provider resource name that is not a DNS-1123 subdomain."""
     if value is None:
         return
     if len(value) > 253 or not _DNS1123_SUBDOMAIN_RE.fullmatch(value):
         raise ValueError(
-            f"server config 'sandbox.kubernetes.{field}' is not a valid "
+            f"server config 'sandbox.{provider}.{field}' is not a valid "
             f"Kubernetes name (RFC 1123 DNS subdomain): {value!r}"
         )
 
@@ -3228,9 +3283,23 @@ def _reject_overlapping_kubernetes_mounts(
                 )
 
 
+def _parse_agent_sandbox_warm_pool(raw: dict[str, object]) -> str | None:
+    """Validate the optional native warm-pool selection for agent-sandbox."""
+    if "agent_sandbox" in raw and raw.get("provider") != "agent_sandbox":
+        raise ValueError("server config 'sandbox.agent_sandbox' requires provider: agent_sandbox")
+    section = _parse_provider_section(raw, "agent_sandbox")
+    if section is None:
+        return None
+    _reject_unknown_keys(section, {"warm_pool"}, "sandbox.agent_sandbox")
+    name = _parse_provider_string(raw, "agent_sandbox", "warm_pool")
+    _validate_dns1123_subdomain(name, "warm_pool", provider="agent_sandbox")
+    return name
+
+
 def _kubernetes_launcher_factory(
     *,
     agent_sandbox: bool = False,
+    warm_pool: str | None = None,
     image: str | None,
     env: list[str] | None,
     namespace: str | None,
@@ -3253,6 +3322,8 @@ def _kubernetes_launcher_factory(
     :param agent_sandbox: Launch each Pod inside an agent-sandbox ``Sandbox``
         custom resource (``provider: agent_sandbox``) rather than a ``Job``,
         which makes the sandbox reclaim itself once no runner keeps it alive.
+    :param warm_pool: Operator-owned ``SandboxWarmPool`` name for new
+        agent-sandbox allocations, or ``None`` for direct Sandbox creation.
     :param image: Registry image with omnigent pre-installed, or ``None`` for
         the official prebaked host image (env-overridable).
     :param env: Names of server-process environment variables injected into
@@ -3296,11 +3367,13 @@ def _kubernetes_launcher_factory(
         """Construct the Kubernetes launcher (lazy SDK import inside)."""
         from omnigent.onboarding.sandboxes.kubernetes import KubernetesSandboxLauncher
 
-        launcher_cls: type[KubernetesSandboxLauncher] = KubernetesSandboxLauncher
+        launcher_cls: Callable[..., SandboxHostLauncher] = KubernetesSandboxLauncher
         if agent_sandbox:
-            from omnigent.onboarding.sandboxes.agent_sandbox import AgentSandboxLauncher
+            from omnigent.onboarding.sandboxes.agent_sandbox_warm_pool import (
+                AgentSandboxWarmPoolLauncher,
+            )
 
-            launcher_cls = AgentSandboxLauncher
+            launcher_cls = partial(AgentSandboxWarmPoolLauncher, warm_pool=warm_pool)
         return launcher_cls(
             image=image,
             env=env,
@@ -3412,6 +3485,7 @@ async def launch_managed_host(
     # across a user's managed sandboxes.
     host_name = f"managed-{host_id[:8]}"
     try:
+        await asyncio.to_thread(launcher.prepare_for_launch, agent_name=agent_name)
         await asyncio.to_thread(launcher.prepare)
         sandbox_id = await asyncio.to_thread(launcher.provision, host_name)
     except click.ClickException as exc:
@@ -3502,6 +3576,7 @@ async def relaunch_managed_host(
             provider=host.sandbox_provider,
         )
     try:
+        await asyncio.to_thread(launcher.prepare_for_launch, agent_name=agent_name)
         await asyncio.to_thread(launcher.prepare)
         sandbox_id = await asyncio.to_thread(launcher.provision, host.name)
     except click.ClickException as exc:
@@ -3666,36 +3741,31 @@ async def _register_and_start_host(
         registration fails.
     """
     token = secrets.token_urlsafe(32)
-    if keep_host_on_failure:
-        record = await asyncio.to_thread(
-            host_store.replace_managed_host_sandbox,
-            host_id=host_id,
-            user_id=owner,
-            token=token,
-            provider=launcher.provider,
-            sandbox_id=sandbox_id,
-            token_expires_at=now_epoch() + config.token_ttl_s,
-        )
-        if record is None:
-            await _terminate_sandbox_best_effort(
-                launcher,
-                sandbox_id,
-                host_id=host_id,
-                provider=launcher.provider,
-            )
-            raise ValueError(f"managed host {host_id!r} no longer exists")
-    else:
-        record = await asyncio.to_thread(
-            host_store.register_managed_host,
-            host_id=host_id,
-            name=host_name,
-            user_id=owner,
-            token=token,
-            provider=launcher.provider,
-            sandbox_id=sandbox_id,
-            token_expires_at=now_epoch() + config.token_ttl_s,
-        )
+    record = None
     try:
+        if keep_host_on_failure:
+            record = await asyncio.to_thread(
+                host_store.replace_managed_host_sandbox,
+                host_id=host_id,
+                user_id=owner,
+                token=token,
+                provider=launcher.provider,
+                sandbox_id=sandbox_id,
+                token_expires_at=now_epoch() + config.token_ttl_s,
+            )
+            if record is None:
+                raise ValueError(f"managed host {host_id!r} no longer exists")
+        else:
+            record = await asyncio.to_thread(
+                host_store.register_managed_host,
+                host_id=host_id,
+                name=host_name,
+                user_id=owner,
+                token=token,
+                provider=launcher.provider,
+                sandbox_id=sandbox_id,
+                token_expires_at=now_epoch() + config.token_ttl_s,
+            )
         # Uniform across providers: provision() fixed the sandbox id and the
         # token was armed against it above, so start_host starts the host with
         # a token that already resolves. The exec-model default execs in; the
@@ -3714,14 +3784,30 @@ async def _register_and_start_host(
         )
         await _wait_for_host_online(host_store, host_id)
     except Exception as exc:
-        # Broad on purpose: any post-provision failure — launcher CLI
-        # errors, provider SDK exceptions (e.g. Modal's
-        # SandboxTerminated), raw network errors from the in-sandbox
-        # exec — must tear down the sandbox and revoke the armed token,
-        # or the sandbox leaks running until the provider's lifetime
-        # cap. Cleanup-then-reraise at a system boundary, not a
-        # swallow: every path below re-raises as an HTTPException.
-        if keep_host_on_failure:
+        # The provider allocated the sandbox before registration or startup
+        # could fail, so both failures must attempt cleanup.
+        if record is None:
+            current = None
+            try:
+                current = await asyncio.to_thread(host_store.get_host, host_id)
+            except Exception:
+                _logger.exception("Could not inspect failed host registration")
+            # A provider can reuse an ID already retained for active work or cleanup.
+            if (
+                current is None
+                or current.sandbox_provider != launcher.provider
+                or sandbox_id
+                not in (
+                    current.sandbox_id,
+                    current.terminating_sandbox_id,
+                )
+            ):
+                await _terminate_sandbox_best_effort(
+                    launcher, sandbox_id, host_id=host_id, provider=launcher.provider
+                )
+            if isinstance(exc, ValueError):
+                raise
+        elif keep_host_on_failure:
             await _terminate_sandbox_best_effort(
                 launcher,
                 sandbox_id,
@@ -3950,6 +4036,7 @@ async def resume_managed_host(
             launcher.provider,
         )
         try:
+            await asyncio.to_thread(launcher.prepare_for_launch, agent_name=agent_name)
             await asyncio.to_thread(launcher.resume, sandbox_id)
             token = secrets.token_urlsafe(32)
             armed = await asyncio.to_thread(

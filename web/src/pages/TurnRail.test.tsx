@@ -122,6 +122,75 @@ afterEach(() => {
 });
 
 describe("TurnRail", () => {
+  it("does not fetch history while automatically aligning the active tick", () => {
+    const loadOlder = vi.spyOn(useChatStore.getState(), "loadMoreHistory").mockResolvedValue();
+    const { container } = render(
+      <TurnRail
+        turns={makeTurns(60)}
+        hasMoreHistory
+        loadingMoreHistory={false}
+        activeTurnId="turn_59"
+      />,
+    );
+    const rail = container.querySelector<HTMLElement>(".turn-rail-fade")!;
+    rail.scrollBy = vi.fn(() => {
+      // A smooth alignment passes through the near-top zone before reaching its
+      // target, then an upward re-alignment crosses back through it.
+      rail.scrollTop = 20;
+      fireEvent.scroll(rail);
+      rail.scrollTop = 120;
+      fireEvent.scroll(rail);
+      rail.scrollTop = 20;
+      fireEvent.scroll(rail);
+    });
+    emitIntersection(observers[0]!, screen.getByLabelText("Jump to: prompt number 59"), {
+      rootTop: 0,
+      rootBottom: 288,
+      targetTop: 590,
+      targetBottom: 600,
+    });
+    expect(rail.scrollBy).toHaveBeenCalled();
+    expect(loadOlder).not.toHaveBeenCalled();
+  });
+
+  it.each(["pointer", "keyboard", "none"] as const)(
+    "fetches on upward rail movement only with reader interaction: %s",
+    (interaction) => {
+      const loadOlder = vi.spyOn(useChatStore.getState(), "loadMoreHistory").mockResolvedValue();
+      const { container } = render(
+        <TurnRail turns={makeTurns(60)} hasMoreHistory loadingMoreHistory={false} />,
+      );
+      const rail = container.querySelector<HTMLElement>(".turn-rail-fade")!;
+      rail.scrollTop = 120;
+      fireEvent.scroll(rail);
+      if (interaction === "pointer") fireEvent.mouseEnter(rail);
+      if (interaction === "keyboard") act(() => screen.getAllByRole("button")[0]!.focus());
+
+      rail.scrollTop = 20;
+      fireEvent.scroll(rail);
+      expect(loadOlder).toHaveBeenCalledTimes(interaction === "none" ? 0 : 1);
+
+      loadOlder.mockClear();
+      rail.scrollTop = 30;
+      fireEvent.scroll(rail);
+      expect(loadOlder).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    { hasMoreHistory: true, loadingMoreHistory: false, expected: 1 },
+    { hasMoreHistory: false, loadingMoreHistory: false, expected: 0 },
+    { hasMoreHistory: true, loadingMoreHistory: true, expected: 0 },
+  ])("handles upward wheels without scroll range: %o", ({ expected, ...props }) => {
+    const loadOlder = vi.spyOn(useChatStore.getState(), "loadMoreHistory").mockResolvedValue();
+    const { container } = render(<TurnRail turns={makeTurns(3)} {...props} />);
+    const rail = container.querySelector<HTMLElement>(".turn-rail-fade")!;
+    fireEvent.wheel(rail, { deltaY: 120 });
+    expect(loadOlder).not.toHaveBeenCalled();
+    fireEvent.wheel(rail, { deltaY: -120 });
+    expect(loadOlder).toHaveBeenCalledTimes(expected);
+  });
+
   it("renders nothing for a single-turn (or empty) conversation", () => {
     const { container } = renderRail(makeTurns(1));
     expect(container).toBeEmptyDOMElement();

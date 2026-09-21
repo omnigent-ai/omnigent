@@ -156,6 +156,29 @@ final class DeepLinkTests: XCTestCase {
     XCTAssertNotNil(DeepLink.parse(URL(string: "omnigent://localhost:8000/c/conv_\(hex)")!))
   }
 
+  @MainActor
+  func testConversationURLPreservesWorkspaceQueryAndFragment() {
+    for (base, expected) in [
+      (
+        "https://workspace.databricks.com/omnigent?o=123",
+        "https://workspace.databricks.com/omnigent/c/abc?o=123"
+      ),
+      (
+        "https://workspace.databricks.com/omnigent/?o=123#view",
+        "https://workspace.databricks.com/omnigent/c/abc?o=123#view"
+      ),
+      ("http://localhost:8000/", "http://localhost:8000/c/abc"),
+      (
+        "https://example.com/custom%20mount?view=chat",
+        "https://example.com/custom%20mount/c/abc?view=chat"
+      ),
+    ] {
+      XCTAssertEqual(
+        AppRootView.conversationURL(for: URL(string: base)!, path: "/c/abc").absoluteString,
+        expected)
+    }
+  }
+
   func testThemeSourceMapsToUserInterfaceStyle() {
     XCTAssertEqual(ThemeSource.system.userInterfaceStyle, .unspecified)
     XCTAssertEqual(ThemeSource.light.userInterfaceStyle, .light)

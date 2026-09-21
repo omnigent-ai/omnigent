@@ -15,6 +15,7 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 from sqlalchemy.sql.dml import Insert
 
+from omnigent.db.account_authority import require_active_account
 from omnigent.db.compression import decode
 from omnigent.db.db_models import SqlProject, SqlUser, current_workspace_id
 from omnigent.db.utils import (
@@ -206,6 +207,7 @@ class SqlAlchemyProjectStore(ProjectStore):
         encoded_config = _encode_config(config)
 
         def write(session: Session) -> Project:
+            require_active_account(session, user_id)
             if self._name_taken(session, user_id=user_id, name=name, exclude_id=None):
                 raise OmnigentError(
                     f"A project named {name!r} already exists",
@@ -267,6 +269,7 @@ class SqlAlchemyProjectStore(ProjectStore):
         updated_at = now_epoch()
 
         def write(session: Session) -> Project | None:
+            require_active_account(session, user_id)
             row = session.get(SqlProject, (current_workspace_id(), project_id))
             if row is None or row.user_id != user_id:
                 return None
@@ -327,6 +330,7 @@ class SqlAlchemyProjectStore(ProjectStore):
         preference_user_id = RESERVED_USER_LOCAL if user_id is None else user_id
 
         def write(session: Session) -> ProjectOrderPreference:
+            require_active_account(session, user_id)
             workspace_id = current_workspace_id()
             if ids is None:
                 raw = session.scalar(

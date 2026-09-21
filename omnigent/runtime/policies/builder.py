@@ -228,10 +228,10 @@ def any_policies_apply(
     tool_name: str | None = None,
     conversation: Conversation | None = None,
 ) -> bool:
-    """Return ``True`` when at least one policy would run for this evaluation.
+    """Return ``True`` when this evaluation may need to run policies.
 
-    Cheaper than building a full :class:`PolicyEngine`: only checks whether
-    the combined policy list is non-empty. Used as a fast-path guard in
+    Cheaper than building a full :class:`PolicyEngine`: checks whether
+    policies may apply. Used as a fast-path guard in
     ``POST /policies/evaluate`` to skip the engine build (and the associated
     conversation-store reads for labels/state/usage) when nothing would fire.
 
@@ -249,7 +249,8 @@ def any_policies_apply(
         sub-agent conversations this lets the check see the CHILD spec's own
         guardrails (which :func:`build_policy_engine` enforces), so a bundle
         whose only policies live on a sub-agent is not fast-path skipped.
-        ``None`` checks the passed *spec* alone.
+        Children with a policy store must build the engine to resolve
+        inherited session policies against their verified root.
     :returns: ``False`` when the engine would have an empty policy list and
         ``evaluate()`` would unconditionally return ALLOW/UNSPECIFIED.
     """
@@ -270,6 +271,14 @@ def any_policies_apply(
     # Session policies are LRU-cached per (workspace_id, conversation_id) —
     # this is a cache hit on any call after the first for this session.
     if _load_session_policy_specs(conversation_id, policy_store):
+        return True
+    # The engine verifies ancestry before inheriting root session policies.
+    # A child's local policy list cannot rule out an inherited policy.
+    if (
+        policy_store is not None
+        and conversation is not None
+        and conversation.parent_conversation_id is not None
+    ):
         return True
     return False
 

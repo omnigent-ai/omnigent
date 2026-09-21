@@ -38,7 +38,7 @@ const meta = {
               conversationId: null,
               sessionHarness: "claude-native",
               llmModel: "system.ai.claude-opus-4-6",
-              selectedEffort: "high",
+              sessionReasoningEffort: "high",
               costControlModeOverride: null,
               pendingModelChange: null,
               nativeVendorOwnsModel: false,

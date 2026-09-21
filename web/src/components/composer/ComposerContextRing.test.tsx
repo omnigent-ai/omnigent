@@ -1,8 +1,8 @@
 import { cleanup, render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS } from "./ChatComposer";
 import { ComposerContextRing } from "./ComposerContextRing";
 
 function renderRing(contextWindow: number | null, tokensUsed: number | null) {
@@ -25,13 +25,20 @@ describe("ComposerContextRing", () => {
     expect(renderRing(1000, null).container).toBeEmptyDOMElement();
   });
 
-  it("shows the used percentage, rounded", () => {
+  it("keeps usage text out of the bar while preserving an accessible percentage", () => {
     renderRing(1000, 123);
-    expect(screen.getByTestId("composer-context-ring")).toHaveTextContent("12%");
-    expect(screen.getByTestId("composer-context-ring")).toHaveClass("gap-1", "shrink-0");
+    expect(screen.getByTestId("composer-context-ring")).not.toHaveTextContent("12%");
+    expect(screen.getByTestId("composer-context-ring")).toHaveClass("shrink-0");
+    expect(screen.getByTestId("composer-context-ring")).not.toHaveClass("gap-1");
     expect(screen.getByLabelText("12% of context used")).toBeInTheDocument();
-    // Short and informative: it stays visible when the workspace bar collapses.
-    expect(screen.getByText("12%")).not.toHaveClass(COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS);
+  });
+
+  it("shows the actual context usage in the tooltip", async () => {
+    const user = userEvent.setup();
+    renderRing(1000, 123);
+    await user.tab();
+    expect(screen.getByTestId("composer-context-ring")).toHaveFocus();
+    expect(await screen.findByText("123 / 1,000 tokens (12% used)")).toBeInTheDocument();
   });
 
   it("fits the SVG to the painted ring so its padding does not widen the label gap", () => {
@@ -44,7 +51,8 @@ describe("ComposerContextRing", () => {
 
   it("clamps over-full usage to 100%", () => {
     renderRing(1000, 4000);
-    expect(screen.getByTestId("composer-context-ring")).toHaveTextContent("100%");
+    expect(screen.getByLabelText("100% of context used")).toBeInTheDocument();
+    expect(screen.getByTestId("composer-context-ring")).not.toHaveTextContent("100%");
   });
 
   it("stays grayscale — never warning/destructive — even at high usage", () => {

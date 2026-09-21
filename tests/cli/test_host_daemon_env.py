@@ -31,6 +31,32 @@ _PROXY_ENV: Final = {
 
 
 @pytest.mark.parametrize("server_url", [None, _REMOTE_SERVER_URL])
+def test_pi_env_denylist_reaches_runner_through_host_daemon(
+    monkeypatch: pytest.MonkeyPatch,
+    server_url: str | None,
+) -> None:
+    """Pi's denylist crosses both hops without forwarding the named secrets."""
+    denylist = "ANTHROPIC_AUTH_TOKEN, UNRELATED_SECRET"
+    monkeypatch.setenv("OMNIGENT_PI_ENV_UNSET", denylist)
+    monkeypatch.setenv("UNRELATED_SECRET", "synthetic-unrelated-secret")
+    monkeypatch.setattr("omnigent.onboarding.provider_config.load_config", dict)
+
+    daemon_env = _build_host_daemon_env(server_url=server_url)
+    runner_env = _build_runner_env(
+        daemon_env,
+        server_url=server_url or "http://localhost:6767",
+        runner_id="runner_pi_env",
+        binding_token="binding-pi-env",
+        workspace="/tmp/workspace",
+        parent_pid=12345,
+    )
+
+    for env in (daemon_env, runner_env):
+        assert env["OMNIGENT_PI_ENV_UNSET"] == denylist
+        assert "UNRELATED_SECRET" not in env
+
+
+@pytest.mark.parametrize("server_url", [None, _REMOTE_SERVER_URL])
 def test_runner_can_read_keyring_from_cli_desktop_session(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

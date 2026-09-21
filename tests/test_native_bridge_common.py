@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import subprocess
 import sys
@@ -236,3 +237,59 @@ def test_reap_isolates_a_module_that_raises_on_import(
     # The broken module's import RuntimeError is swallowed; claude still runs.
     assert native_bridge_common.reap_orphaned_native_bridge_dirs() == 3
     assert called == ["claude"]
+
+
+def test_reap_logs_an_unavailable_harness_below_error(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A harness whose bridge cannot import is unavailable, not a session error.
+
+    Several bridges import ``sqlite3`` at module scope, so an interpreter built
+    without ``_sqlite3`` cannot import them at all. Skipping them is the sweep's
+    documented behaviour, and reporting a documented skip at ERROR made
+    maintenance housekeeping read as a mid-session failure.
+    """
+    agents = (SimpleNamespace(key="unavailable"), SimpleNamespace(key="claude"))
+    monkeypatch.setattr("omnigent.harness_plugins.native_agents", lambda: agents)
+
+    real_import = native_bridge_common.importlib.import_module
+
+    def _fake_import(name: str, *args: object, **kwargs: object):
+        if name == "omnigent.harnesses.unavailable_native.bridge":
+            raise ModuleNotFoundError("No module named '_sqlite3'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(native_bridge_common.importlib, "import_module", _fake_import)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge.prune_orphaned_bridge_dirs", lambda: 3
+    )
+
+    with caplog.at_level(logging.DEBUG, logger=native_bridge_common.__name__):
+        assert native_bridge_common.reap_orphaned_native_bridge_dirs() == 3
+
+    records = [r for r in caplog.records if "unavailable_native" in r.getMessage()]
+    assert records, "the skipped harness must still be reported"
+    assert [r.levelno for r in records] == [logging.WARNING]
+
+
+def test_reap_still_errors_on_a_module_that_raises_on_import(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A bridge that imports and then raises is a defect, and keeps its ERROR."""
+    agents = (SimpleNamespace(key="broken"),)
+    monkeypatch.setattr("omnigent.harness_plugins.native_agents", lambda: agents)
+
+    real_import = native_bridge_common.importlib.import_module
+
+    def _fake_import(name: str, *args: object, **kwargs: object):
+        if name == "omnigent.harnesses.broken_native.bridge":
+            raise RuntimeError("boom at import time")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(native_bridge_common.importlib, "import_module", _fake_import)
+
+    with caplog.at_level(logging.DEBUG, logger=native_bridge_common.__name__):
+        assert native_bridge_common.reap_orphaned_native_bridge_dirs() == 0
+
+    records = [r for r in caplog.records if "broken_native" in r.getMessage()]
+    assert [r.levelno for r in records] == [logging.ERROR]

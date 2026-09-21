@@ -111,7 +111,12 @@ def _subagent_id_from_meta_path(meta_path: Path) -> str:
 
 
 _DEFAULT_POLL_INTERVAL_S = 0.25
+# An observer hook can legitimately report late — Claude Code's own startup and
+# first tool call sit in front of it — so a slow start is not a failure. Notice
+# it early at WARNING and only call it broken once the hook has stayed silent
+# well past any plausible startup.
 _TRANSCRIPT_DISCOVERY_WARNING_S = 30.0
+_TRANSCRIPT_DISCOVERY_ERROR_S = 180.0
 _OBSERVER_HOOK_STDERR_READ_BYTES = 64 * 1024
 # Minimum spacing between pane reads. One ``tmux capture-pane`` subprocess per
 # window feeds every footer-derived signal (permission mode + /btw overlay), so
@@ -194,6 +199,7 @@ class _TranscriptDiscoveryDiagnostics:
 
     started_at: float
     warning_logged: bool = False
+    error_logged: bool = False
     discovery_logged: bool = False
 
 
@@ -223,7 +229,7 @@ def _observe_transcript_discovery(
     diagnostics: _TranscriptDiscoveryDiagnostics,
     now: float | None = None,
 ) -> None:
-    """Log transcript discovery, or one actionable error when it never occurs."""
+    """Log transcript discovery, warning once it is slow and erroring once it is stuck."""
     elapsed_s = (time.monotonic() if now is None else now) - diagnostics.started_at
     if transcript_path is not None:
         if not diagnostics.discovery_logged:
@@ -235,22 +241,40 @@ def _observe_transcript_discovery(
             )
             diagnostics.discovery_logged = True
         return
-    if diagnostics.warning_logged or elapsed_s < _TRANSCRIPT_DISCOVERY_WARNING_S:
+    escalate = elapsed_s >= _TRANSCRIPT_DISCOVERY_ERROR_S
+    if escalate:
+        if diagnostics.error_logged:
+            return
+    elif diagnostics.warning_logged or elapsed_s < _TRANSCRIPT_DISCOVERY_WARNING_S:
         return
 
     hooks_size = _diagnostic_file_size(bridge_dir / _HOOKS_FILE)
     stderr_size = _diagnostic_file_size(bridge_dir / OBSERVER_HOOK_STDERR_FILE)
     settings_present = (bridge_dir / _INVOCATION_SETTINGS_FILE).is_file()
-    _logger.error(
-        "Claude transcript forwarding has not started: no observer hook reported a "
-        "transcript path after %.0fs; session=%s last_hook=%s hooks_bytes=%s "
-        "observer_stderr_bytes=%s hook_settings=%s",
+    args = (
         max(0.0, elapsed_s),
         session_id,
         _last_observer_hook_name(bridge_dir) or "none",
         hooks_size if hooks_size is not None else "missing",
         stderr_size if stderr_size is not None else "missing",
         "present" if settings_present else "missing",
+    )
+    detail = (
+        "transcript path after %.0fs; session=%s last_hook=%s hooks_bytes=%s "
+        "observer_stderr_bytes=%s hook_settings=%s"
+    )
+    if escalate:
+        _logger.error(
+            "Claude transcript forwarding has not started: no observer hook reported a " + detail,
+            *args,
+            extra={"session_id": session_id},
+        )
+        diagnostics.error_logged = True
+        diagnostics.warning_logged = True
+        return
+    _logger.warning(
+        "Claude transcript forwarding is still waiting: no observer hook has reported a " + detail,
+        *args,
         extra={"session_id": session_id},
     )
     diagnostics.warning_logged = True
@@ -347,13 +371,14 @@ def _note_forward_success() -> None:
     _forward_health.degraded_logged = False
 
 
-def _note_forward_failure(retry_key: str, exc: httpx.HTTPError) -> None:
+def _note_forward_failure(retry_key: str, exc: httpx.HTTPError, *, session_id: str) -> None:
     """
     Record a forward post failure; escalate once when sync degrades.
 
     :param retry_key: Stable retry key of the failed post, e.g.
         ``"item:source-1"``.
     :param exc: The latest failed post's HTTP exception.
+    :param session_id: Session targeted by the failed post.
     :returns: None.
     """
     _forward_health.consecutive_failures += 1
@@ -368,6 +393,7 @@ def _note_forward_failure(retry_key: str, exc: httpx.HTTPError) -> None:
             _forward_health.consecutive_failures,
             retry_key,
             extra={
+                "session_id": session_id,
                 "event_name": "claude_forward_sync_degraded",
                 "attributes": {
                     "exception_type": type(exc).__name__,
@@ -930,17 +956,20 @@ class _PostRetryTracker:
         # delivered); reset process-level forward-sync health (#1120).
         _note_forward_success()
 
-    def record_failure(self, key: str, exc: httpx.HTTPError) -> _PostRetryDecision:
+    def record_failure(
+        self, key: str, exc: httpx.HTTPError, *, session_id: str
+    ) -> _PostRetryDecision:
         """
         Record one failed post and compute the next retry action.
 
         :param key: Stable retry key, e.g. ``"item:source-1"``.
         :param exc: HTTP exception raised while posting the event.
+        :param session_id: Session targeted by the failed post.
         :returns: Retry decision for this failure.
         """
         # Count every failed post (transient or permanent) so a sustained
         # outage escalates once to a degraded-sync signal (#1120).
-        _note_forward_failure(key, exc)
+        _note_forward_failure(key, exc, session_id=session_id)
         entry = self._entries.get(key)
         if entry is None:
             entry = _PostRetryEntry()
@@ -1974,7 +2003,18 @@ async def _forward_one_subagent(
                 "child=%s source_id=%s",
                 entry.child_conversation_id,
                 item.source_id,
-                extra={"session_id": parent_session_id},
+                extra={
+                    "session_id": entry.child_conversation_id,
+                    "event_name": "claude_subagent_transcript_dropped",
+                    "attributes": {
+                        "parent_session_id": parent_session_id,
+                        "drop_reason": "oversized_item",
+                        "item_count": 1,
+                        "http_status": 413,
+                        "attempts": 0,
+                        "response_id": item.response_id,
+                    },
+                },
             )
             append_dead_letter(
                 bridge_dir,
@@ -2006,7 +2046,9 @@ async def _forward_one_subagent(
                     batch_capability=batch_capability,
                 )
             except httpx.HTTPError as exc:
-                decision = item_retry_tracker.record_failure(retry_key, exc)
+                decision = item_retry_tracker.record_failure(
+                    retry_key, exc, session_id=entry.child_conversation_id
+                )
                 if not decision.exhausted:
                     _logger.warning(
                         "Failed to forward claude-native sub-agent item batch; "
@@ -2022,7 +2064,11 @@ async def _forward_one_subagent(
                         extra={"session_id": parent_session_id},
                     )
                     break
-                if not decision.permanent and not _is_subagent_delivery_not_confirmed(exc):
+                if (
+                    not decision.permanent
+                    and not _is_subagent_delivery_not_confirmed(exc)
+                    and not _batch_response_never_received(exc)
+                ):
                     _logger.error(
                         "Dropping claude-native sub-agent transcript batch after "
                         "transient delivery retries were exhausted; child=%s items=%s "
@@ -2031,7 +2077,18 @@ async def _forward_one_subagent(
                         len(batch),
                         decision.attempts,
                         _http_status_for_log(exc),
-                        extra={"session_id": parent_session_id},
+                        extra={
+                            "session_id": entry.child_conversation_id,
+                            "event_name": "claude_subagent_transcript_dropped",
+                            "attributes": {
+                                "parent_session_id": parent_session_id,
+                                "drop_reason": "transient_retries_exhausted",
+                                "item_count": len(batch),
+                                "http_status": _http_status_for_log(exc),
+                                "attempts": decision.attempts,
+                                "exception_type": type(exc).__name__,
+                            },
+                        },
                     )
                     for pending_item in batch:
                         item = pending_item.item
@@ -2080,7 +2137,9 @@ async def _forward_one_subagent(
                         item=item,
                     )
                 except httpx.HTTPError as item_exc:
-                    item_decision = item_retry_tracker.record_failure(item_retry_key, item_exc)
+                    item_decision = item_retry_tracker.record_failure(
+                        item_retry_key, item_exc, session_id=entry.child_conversation_id
+                    )
                     if not item_decision.exhausted:
                         stop_after_batch = True
                         _logger.warning(
@@ -2096,20 +2155,35 @@ async def _forward_one_subagent(
                             extra={"session_id": parent_session_id},
                         )
                         break
+                    if _is_permanent_http_error(item_exc):
+                        dead_letter_reason = "permanent HTTP failure after retries"
+                        drop_category = "permanent_http_failure"
+                    elif _is_subagent_delivery_not_confirmed(item_exc):
+                        dead_letter_reason = "delivery not confirmed after retries"
+                        drop_category = "delivery_not_confirmed"
+                    else:
+                        dead_letter_reason = "transient HTTP failure after retries"
+                        drop_category = "transient_retries_exhausted"
                     _logger.error(
                         "Dropping claude-native sub-agent transcript item after "
                         "individual delivery retries; child=%s source_id=%s http_status=%s",
                         entry.child_conversation_id,
                         item.source_id,
                         _http_status_for_log(item_exc),
-                        extra={"session_id": parent_session_id},
+                        extra={
+                            "session_id": entry.child_conversation_id,
+                            "event_name": "claude_subagent_transcript_dropped",
+                            "attributes": {
+                                "parent_session_id": parent_session_id,
+                                "drop_reason": drop_category,
+                                "item_count": 1,
+                                "http_status": _http_status_for_log(item_exc),
+                                "attempts": item_decision.attempts,
+                                "exception_type": type(item_exc).__name__,
+                                "response_id": item.response_id,
+                            },
+                        },
                     )
-                    if _is_permanent_http_error(item_exc):
-                        dead_letter_reason = "permanent HTTP failure after retries"
-                    elif _is_subagent_delivery_not_confirmed(item_exc):
-                        dead_letter_reason = "delivery not confirmed after retries"
-                    else:
-                        dead_letter_reason = "transient HTTP failure after retries"
                     append_dead_letter(
                         bridge_dir,
                         session_id=entry.child_conversation_id,
@@ -2179,7 +2253,9 @@ async def _forward_one_subagent(
             output=new_entry.delivery_error if desired_status == "failed" else None,
         )
     except httpx.HTTPError as exc:
-        decision = status_retry_tracker.record_failure(retry_key, exc)
+        decision = status_retry_tracker.record_failure(
+            retry_key, exc, session_id=entry.child_conversation_id
+        )
         _logger.warning(
             "Failed to forward claude-native sub-agent status; child=%s status=%s "
             "attempt=%s next_retry_s=%.3f http_status=%s",
@@ -2428,7 +2504,9 @@ async def _forward_available_subagents(
                     tool_use_id=meta["toolUseId"],
                 )
             except httpx.HTTPError as exc:
-                decision = start_retry_tracker.record_failure(retry_key, exc)
+                decision = start_retry_tracker.record_failure(
+                    retry_key, exc, session_id=immediate_parent_session_id
+                )
                 if decision.exhausted:
                     _logger.error(
                         "Dropping claude-native sub-agent after permanent HTTP failures; "
@@ -3697,7 +3775,9 @@ async def _forward_available_status_events(
                                 retry_tracker.clear(retry_key)
                                 await _mark_compaction_persisted(bridge_dir, seq)
                             else:
-                                decision = retry_tracker.record_failure(retry_key, exc)
+                                decision = retry_tracker.record_failure(
+                                    retry_key, exc, session_id=session_id
+                                )
                                 if decision.exhausted:
                                     _logger.error(
                                         "Dropping compaction boundary (hook path) after "
@@ -3829,7 +3909,7 @@ async def _forward_available_status_events(
                 background_tasks=(None if status == "failed" else record.background_tasks),
             )
         except httpx.HTTPError as exc:
-            decision = retry_tracker.record_failure(retry_key, exc)
+            decision = retry_tracker.record_failure(retry_key, exc, session_id=session_id)
             if decision.exhausted:
                 _logger.error(
                     "Dropping Claude hook status after permanent HTTP failures; "
@@ -3927,6 +4007,25 @@ async def _ensure_state_for_transcript(
         if validated != disk_state:
             await _write_forward_state_async(bridge_dir, validated)
         return validated
+    # Claude moves the transcript on EnterWorktree/ExitWorktree (into the new
+    # cwd's project dir). The bytes before the cursor are unchanged, so keep
+    # tailing from the same offset instead of re-seeding at byte 0 or EOF.
+    for cursor in (state, disk_state):
+        if cursor is None or cursor.byte_offset is None or cursor.cursor_fingerprint is None:
+            continue
+        if cursor.transcript_path.name != transcript_path.name:
+            continue
+        try:
+            fingerprint = _jsonl_cursor_fingerprint(
+                transcript_path, cursor.byte_offset, missing_ok=False
+            )
+        except FileNotFoundError:
+            # Keep the relocation proof while the advertised path is unavailable.
+            return cursor
+        if fingerprint == cursor.cursor_fingerprint:
+            moved = replace(cursor, transcript_path=transcript_path)
+            await _write_forward_state_async(bridge_dir, moved)
+            return moved
     byte_offset = 0
     if start_at_offset is not None:
         # Cold resume: the caller wrote the prefix and measured it before
@@ -3972,7 +4071,11 @@ async def _cancel_subagent_forward_task(
 
 
 def _promote_pending_settle(
-    dedupe: _ForwardDedupeState, items: list[ClaudeTranscriptItem]
+    dedupe: _ForwardDedupeState,
+    items: list[ClaudeTranscriptItem],
+    *,
+    transcript_path: Path,
+    byte_offset: int,
 ) -> bool:
     """
     Activate a pending turn settle once the transcript is quiescent.
@@ -3981,16 +4084,24 @@ def _promote_pending_settle(
     and a late tool result can appear in the same tail. Promote only when a
     batch carries no item at all for the pending turn: any activity
     means its tail may still be in flight, and promoting then would
-    mis-mark the tail as a scheduled wake.
+    mis-mark the tail as a scheduled wake. A missing transcript or an
+    unfinished trailing record is not evidence of quiescence.
 
     :param dedupe: Mutable per-session dedupe/latch state.
     :param items: Transcript items read this poll (may be empty).
+    :param transcript_path: Transcript file that supplied the batch.
+    :param byte_offset: Offset after the last complete record read.
     :returns: ``True`` when the pending settle was activated.
     """
     pending = dedupe.pending_settled_response_id
     if pending is None:
         return False
     if any(item.response_id == pending for item in items):
+        return False
+    try:
+        if transcript_path.stat().st_size != byte_offset:
+            return False
+    except FileNotFoundError:
         return False
     dedupe.settled_response_id = pending
     dedupe.pending_settled_response_id = None
@@ -4137,7 +4248,7 @@ async def _handle_compact_summary_item(
             retry_tracker.clear(retry_key)
             await _mark_compaction_persisted(bridge_dir, seq, expect_completion_ack=True)
             return True
-        decision = retry_tracker.record_failure(retry_key, exc)
+        decision = retry_tracker.record_failure(retry_key, exc, session_id=session_id)
         _logger.warning(
             "Failed to persist compaction boundary (transcript path); "
             "session=%s seq=%s attempt=%s permanent=%s next_retry_s=%.3f http_status=%s",
@@ -4213,9 +4324,14 @@ async def _forward_available_items(
         if result.line_cursor == state.line_cursor and result.byte_offset == (
             state.byte_offset or 0
         ):
-            # Quiet poll — the transcript is fully consumed, so a pending
-            # turn settle is safe to activate (and persist) here.
-            promoted = _promote_pending_settle(dedupe, items)
+            # A quiet poll can activate a pending settle once the file is
+            # present and its last complete record reaches EOF.
+            promoted = _promote_pending_settle(
+                dedupe,
+                items,
+                transcript_path=state.transcript_path,
+                byte_offset=result.byte_offset,
+            )
             if promoted or dedupe.pending_settled_response_id != state.pending_settled_response_id:
                 state = _with_settle_latch(state, dedupe)
                 await _write_forward_state_async(bridge_dir, state)
@@ -4308,7 +4424,7 @@ async def _forward_available_items(
                 item=item,
             )
         except httpx.HTTPError as exc:
-            decision = retry_tracker.record_failure(retry_key, exc)
+            decision = retry_tracker.record_failure(retry_key, exc, session_id=session_id)
             if decision.exhausted:
                 _logger.error(
                     "Dropping Claude transcript item after permanent HTTP failures; "
@@ -4397,14 +4513,32 @@ async def _forward_available_items(
         await _write_forward_state_async(bridge_dir, updated)
     # Fully-consumed batch: a pending settle may activate now, provided
     # this batch carried no assistant output for the settling turn.
-    _promote_pending_settle(dedupe, items)
-    updated = TranscriptForwardState(
+    _promote_pending_settle(
+        dedupe,
+        items,
         transcript_path=state.transcript_path,
-        line_cursor=result.line_cursor,
         byte_offset=result.byte_offset,
+    )
+    fingerprint = _jsonl_cursor_fingerprint(state.transcript_path, result.byte_offset)
+    # A worktree move can race the read or POSTs. Keep the last valid cursor
+    # if the advanced one cannot be fingerprinted; seen IDs deduplicate replay.
+    cursor = (
+        state
+        if fingerprint is None
+        else replace(
+            state,
+            line_cursor=result.line_cursor,
+            byte_offset=result.byte_offset,
+            cursor_fingerprint=fingerprint,
+        )
+    )
+    updated = TranscriptForwardState(
+        transcript_path=cursor.transcript_path,
+        line_cursor=cursor.line_cursor,
+        byte_offset=cursor.byte_offset,
         current_response_id=current_response_id,
         seen_source_ids=_bounded_seen_source_ids(seen_source_ids),
-        cursor_fingerprint=_jsonl_cursor_fingerprint(state.transcript_path, result.byte_offset),
+        cursor_fingerprint=cursor.cursor_fingerprint,
         settled_response_id=dedupe.settled_response_id,
         pending_settled_response_id=dedupe.pending_settled_response_id,
     )
@@ -5809,6 +5943,23 @@ def _http_status_for_log(exc: httpx.HTTPError) -> int | None:
     return None
 
 
+def _batch_response_never_received(exc: httpx.HTTPError) -> bool:
+    """
+    Return whether ``exc`` failed before any response reached the client.
+
+    A transport failure (read/connect/write timeout, read error, protocol
+    error) means the server never rendered a verdict on the batch, so the
+    payload is unproven rather than rejected. Splitting the batch is then
+    strictly better than discarding it: a whole-batch read timeout is usually
+    the batch's own size against the flat post timeout, and single items fit
+    where 100 do not.
+
+    :param exc: HTTP exception raised while posting an Omnigent event.
+    :returns: ``True`` when no HTTP response was received.
+    """
+    return not isinstance(exc, httpx.HTTPStatusError)
+
+
 def _read_hook_state(bridge_dir: Path) -> HookForwardState | None:
     """
     Read the durable hook forwarder cursor from the bridge directory.
@@ -6627,14 +6778,18 @@ def _complete_jsonl_end_offset(path: Path) -> int:
     return 0
 
 
-def _jsonl_cursor_fingerprint(path: Path, byte_offset: int) -> str | None:
+def _jsonl_cursor_fingerprint(
+    path: Path, byte_offset: int, *, missing_ok: bool = True
+) -> str | None:
     """
     Hash bytes immediately before a JSONL cursor for stale-cursor checks.
 
     :param path: JSONL file path.
     :param byte_offset: Cursor byte offset, e.g. ``4096``.
+    :param missing_ok: Whether a missing path returns ``None`` instead of raising.
     :returns: SHA-256 digest for the bytes before the cursor, or
         ``None`` when the file does not exist or the offset is invalid.
+    :raises FileNotFoundError: If the path is missing and ``missing_ok`` is false.
     """
     if byte_offset < 0:
         return None
@@ -6648,6 +6803,8 @@ def _jsonl_cursor_fingerprint(path: Path, byte_offset: int) -> str | None:
             handle.seek(sample_start)
             sample = handle.read(byte_offset - sample_start)
     except FileNotFoundError:
+        if not missing_ok:
+            raise
         return None
     payload = byte_offset.to_bytes(8, "big", signed=False) + sample
     return hashlib.sha256(payload).hexdigest()

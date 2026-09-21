@@ -19,12 +19,13 @@ import re
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Protocol, SupportsIndex, SupportsInt, cast
+from typing import Literal, SupportsIndex, SupportsInt, TypeVar, cast
 
 import httpx
+import psutil
 import websockets.asyncio.client
 from websockets.exceptions import ConnectionClosed, InvalidStatus, InvalidURI
 
@@ -49,6 +50,7 @@ from omnigent.host import HOST_FATAL_EXIT_CODE
 from omnigent.host.daemon_lifecycle import DaemonLifecycleLock
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    HOST_CAPABILITIES,
     WORKSPACE_MISSING_ERROR_CODE,
     HostConnectionErrorFrame,
     HostCreateDirFrame,
@@ -173,10 +175,7 @@ from omnigent.util.tunnel_limits import (
 from omnigent.version import VERSION
 
 _logger = logging.getLogger(__name__)
-
-
-class _WaitidInfo(Protocol):
-    si_pid: int
+_T = TypeVar("_T")
 
 
 def _coerce_int(value: object) -> int:
@@ -259,13 +258,8 @@ _LOG_TAIL_MAX_LINES = 15
 # so a crashed runner is reported within about one client poll.
 _RUNNER_WATCH_INTERVAL_S = 0.5
 
-# Cadence of the orphan-reaper sweep. The host installs itself as a child
-# subreaper (Linux — see :func:`_install_child_subreaper`), so a harness's
-# detached tool subprocess (node/npm/chromium/tmux/python) whose runner
-# parent died reparents to the host. With no reaper such an orphan lingers
-# as a ``<defunct>`` zombie; over an overnight blocked run they reached
-# ~900 zombies and OOM'd the box (#1782). A ``WNOHANG`` sweep is a cheap
-# syscall, so 2s keeps zombie lifetime short at negligible cost.
+# Collect adopted children every two seconds. Process discovery runs off-loop;
+# exit-status collection uses nonblocking waits.
 _ORPHAN_REAP_INTERVAL_S = 2.0
 
 
@@ -659,6 +653,10 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # NAMES, not secrets, so allowlisting it leaks nothing on its own.
         # (Literal, not RUNNER_ENV_PASSTHROUGH_ENV_VAR, which is defined below.)
         "OMNIGENT_RUNNER_ENV_PASSTHROUGH",
+        # Credential-env denylists must survive both daemon and runner hops.
+        # This carries variable names only; their values still follow normal forwarding.
+        "OMNIGENT_PI_ENV_UNSET",
+        "OMNIGENT_ACP_ENV_UNSET",
         # Keep host and spawned-runner routing decisions aligned when the
         # host-slice-key kill switch is explicitly disabled.
         "OMNIGENT_HOST_SLICE_KEY_ENABLED",
@@ -781,6 +779,7 @@ def _build_runner_env(
     interactive_shells: list[str] | None = None,
     host_owns_global_cleanup: bool = False,
     harness_tmp_parent: Path | None = None,
+    inference_config: dict[str, object] | None = None,
 ) -> dict[str, str]:
     """
     Build the environment for a spawned runner subprocess.
@@ -828,16 +827,19 @@ def _build_runner_env(
     # OMNIGENT_RUNNER_ENV_PASSTHROUGH — their credential resolves fine in
     # the CLI/daemon but silently drops before reaching the runner subprocess.
     from omnigent.errors import OmnigentError as _OmnigentError
+    from omnigent.onboarding.provider_config import (
+        load_config,
+        provider_credential_env_vars,
+    )
 
     try:
-        from omnigent.onboarding.provider_config import (
-            load_config,
-            provider_credential_env_vars,
-        )
-
         config_env_vars = provider_credential_env_vars(load_config())
     except (OSError, _OmnigentError):
         config_env_vars = frozenset()
+    if inference_config is not None:
+        config_env_vars |= provider_credential_env_vars(
+            inference_config, include_dollar_key_refs=True
+        )
     forwarded = HARNESS_CREDENTIAL_ENV_VARS | extra_names | config_env_vars
     env = {
         key: value
@@ -874,6 +876,30 @@ def _build_runner_env(
     if interactive_shells is not None:
         env[RUNNER_INTERACTIVE_SHELLS_ENV_VAR] = json.dumps(interactive_shells)
     return env
+
+
+def _write_runner_inference_config(session_id: str, inference_config: dict[str, object]) -> Path:
+    """Materialize an immutable inference revision without changing host settings."""
+    import hashlib
+    import tempfile
+
+    from omnigent.process_logging import data_dir
+
+    payload = json.dumps(inference_config, sort_keys=True, separators=(",", ":"))
+    session_key = hashlib.sha256(session_id.encode()).hexdigest()
+    revision = hashlib.sha256(payload.encode()).hexdigest()
+    directory = data_dir() / "session-inference" / session_key
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path = directory / f"{revision}.json"
+    fd, temp_name = tempfile.mkstemp(prefix=".config-", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+        os.replace(temp_name, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temp_name)
+    return path
 
 
 def _paginate_list_dir(
@@ -1121,9 +1147,12 @@ class HostProcess:
         # The orphan reaper skips its sweep while this is >0 so it never
         # ``wait()``s a child that ``subprocess.run`` is about to reap itself —
         # stealing it would corrupt that command's returncode to 0 (#1782).
-        # Mutated only via :meth:`_host_subprocess_op`; safe as a plain int
-        # because both the mutation and the reaper run on the event loop.
+        # Mutated only on the event loop by the guard helpers below, so a plain
+        # counter is sufficient.
         self._owned_subprocess_ops = 0
+        # Keep cancellation-shielded worker tasks alive until they release the
+        # orphan-reaper guard after their subprocesses have actually finished.
+        self._host_subprocess_tasks: set[asyncio.Task[object]] = set()
         # Copy-on-write runner forkserver, on by default; set
         # OMNIGENT_RUNNER_ZYGOTE=0 (or false/no/off) to opt out onto the direct
         # Popen path. POSIX-only (needs os.fork + AF_UNIX fd-passing); the host
@@ -1174,127 +1203,89 @@ class HostProcess:
         self._lifecycle_lost = asyncio.Event()
 
     def _tracked_runner_pids(self) -> set[int]:
-        """PIDs of runners this host spawned and still tracks directly.
+        """Return child PIDs whose exit status still belongs to a process handle.
 
-        The orphan reaper must NOT ``wait()`` these: their exit status is
-        owned by their :class:`subprocess.Popen` (read via ``poll()`` /
-        ``.returncode`` for the ``host.runner_exited`` report). Reaping one
-        out from under ``Popen`` makes ``poll()`` either spin forever
-        (``while poll() is None`` in ``_watch_runner``) or report a bogus
-        exit 0 for a crash — so the reaper skips these and lets
-        ``_watch_runner`` / ``_handle_stop`` own them.
-
-        The runner zygote is included for the same reason: it is a direct
-        ``Popen`` child of the daemon whose status ``ZygoteManager._proc``
-        owns. Reaping it as an "orphan" on an unexpected crash would consume
-        its status out from under the manager, confusing ``is_running()`` /
-        ``stop()``.
-
-        :returns: Set of live tracked pids (runners + the zygote).
+        Poll direct children through their Popen so their status survives even
+        without a running watcher. Keep the runner records until the watcher
+        handles the exit; removing them here would suppress crash reporting.
         """
-        pids = {h.proc.pid for h in self._runners.values()}
-        zygote_pid = self._zygote.pid if self._zygote is not None else None
+        pids: set[int] = set()
+        for handle in self._runners.values():
+            proc = handle.proc
+            # Forked-runner polling can block on zygote IPC. An unresponsive
+            # owner protects only its own PID, not the rest of the sweep.
+            code = proc.returncode if isinstance(proc, ZygoteRunnerProc) else proc.poll()
+            if code is None:
+                pids.add(proc.pid)
+        zygote_pid = self._zygote.unreaped_pid if self._zygote is not None else None
         if zygote_pid is not None:
             pids.add(zygote_pid)
         return pids
 
+    @staticmethod
+    def _orphan_child_pids() -> list[int]:
+        """Snapshot direct children without consuming any exit status."""
+        try:
+            return [child.pid for child in psutil.Process().children()]
+        except psutil.Error:
+            _logger.debug("Could not enumerate host children", exc_info=True)
+            return []
+
     async def _orphan_reaper_loop(self) -> None:
-        """Reap orphaned descendant processes reparented to this host.
-
-        A harness spawns its tool subprocesses detached
-        (``start_new_session=True`` — ``omnigent.inner._proc.spawn_kwargs``),
-        so when the runner that owns them dies, those grandchildren
-        (``node`` / ``npm`` / ``chromium`` / ``tmux`` / ``python``) are
-        orphaned and reparented to this host (it is PID 1 in a container, or
-        a child subreaper otherwise — see :func:`_install_child_subreaper`).
-        Nothing ``wait()``s them, so each becomes a permanent ``<defunct>``
-        zombie; a blocked overnight run accumulated ~900 and OOM'd the box
-        (#1782).
-
-        This loop periodically reaps any ready-to-reap child that is NOT a
-        Popen-tracked runner (:meth:`_tracked_runner_pids`), draining zombies
-        without disturbing runner exit reporting. Non-Linux (no reparenting)
-        and the "no orphans yet" case both make this a cheap no-op sweep.
-
-        :returns: None. Runs until cancelled on shutdown.
-        """
+        """Collect exited descendants adopted by this host until shutdown."""
         while True:
             try:
                 await asyncio.sleep(_ORPHAN_REAP_INTERVAL_S)
-                self._reap_orphans_once()
+                if self._owned_subprocess_ops or not IS_POSIX:
+                    continue
+                # Process discovery may scan a large process table. Only the
+                # nonblocking, ownership-aware waits run on the event loop.
+                child_pids = await asyncio.to_thread(self._orphan_child_pids)
+                self._reap_orphans_once(child_pids)
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001 — a reaper must never die on a stray error
                 _logger.debug("orphan reaper sweep failed", exc_info=True)
 
-    def _reap_orphans_once(self) -> int:
-        """Reap ready orphaned children without corrupting runner exits.
+    def _reap_orphans_once(self, child_pids: Iterable[int] | None = None) -> int:
+        """Reap each unowned child independently, preserving owned exit status.
 
-        The hazard: the host reads each runner's exit status through its
-        :class:`subprocess.Popen` (``poll()`` / ``.returncode``) for the
-        ``host.runner_exited`` report. A blind ``waitpid(-1)`` reaper that
-        consumes a just-crashed tracked runner makes ``Popen.poll()`` report
-        a bogus exit 0 (verified) — the crash cause is lost. So the reaper
-        must drain orphans while leaving tracked runners' status intact.
+        Targeted waits let a stalled owner coexist with orphan cleanup. A
+        completed process handle no longer reserves its reusable PID, but its
+        runner record remains available to the watcher for crash reporting.
 
-        Two implementations, same guarantee:
-
-        * **Linux/POSIX with** ``os.waitid`` — *peek* at the next reapable
-          child with ``WNOWAIT`` (does not consume). Reap it only if it is
-          not a tracked runner; if it is, stop the sweep and let the runner's
-          own Popen reaper (``_watch_runner``) consume it. Cleanest: a tracked
-          runner's status is never touched.
-        * **Platforms without** ``os.waitid`` **(e.g. macOS)** — ``waitpid``
-          has no peek, so reap with ``WNOHANG`` and, if the reaped pid is a
-          tracked runner, re-inject its exit status onto the ``Popen`` so
-          ``_watch_runner`` still reports the true code. Safe because
-          ``_reap_orphans_once`` runs to completion on the event loop without
-          awaiting, so it cannot interleave with ``_watch_runner`` /
-          ``_handle_stop``.
-
-        This runs only when the host is PID 1 (container) or a child
-        subreaper (:func:`_install_child_subreaper`); otherwise no orphan
-        ever reparents here and every sweep is a no-op.
-
+        :param child_pids: Optional direct-child snapshot collected off-loop.
         :returns: Count of orphan (non-runner) processes reaped this sweep.
         """
         if self._owned_subprocess_ops > 0:
-            # A host-owned subprocess (e.g. a git worktree command) is running
-            # in a worker thread. Its child is a DIRECT child of this process
-            # but NOT a tracked runner, so it is indistinguishable from an
-            # orphan to the reaper — reaping it would steal it from
-            # ``subprocess.run``'s own ``wait()`` and corrupt that command's
-            # returncode to 0 (CPython swallows the ECHILD and reports 0).
-            # Skip this sweep; a later one drains any real orphans once the op
-            # finishes. A worktree op can hold this off for up to
-            # ``_GIT_TIMEOUT_S`` (120s) per git command, so real orphans can
-            # linger that long in the rare case a runner dies mid-worktree-op —
-            # acceptable, since the leak this guards against accrues over hours,
-            # not a two-minute worst case.
+            # An unregistered Popen (spawn or host-owned command) must collect
+            # its own status before orphan cleanup can safely resume.
             return 0
         if not hasattr(os, "WNOHANG"):
-            # Windows: no child reparenting to a subreaper and no ``WNOHANG`` /
-            # ``waitpid(-1, ...)`` — nothing to reap and the calls would raise.
             return 0
-        if hasattr(os, "waitid") and hasattr(os, "P_ALL"):
-            return self._reap_orphans_waitid()
-        return self._reap_orphans_waitpid()
+        if child_pids is None:
+            child_pids = self._orphan_child_pids()
+        tracked = self._tracked_runner_pids()
+        reaped = 0
+        for pid in child_pids:
+            if pid in tracked:
+                continue
+            try:
+                waited_pid, _status = os.waitpid(pid, os.WNOHANG)
+            except OSError:
+                # A watcher may have consumed this exit after the snapshot.
+                continue
+            reaped += waited_pid > 0
+        if reaped:
+            _logger.debug("orphan reaper reaped %d process(es)", reaped)
+        return reaped
 
     @contextlib.contextmanager
     def _host_subprocess_op(self) -> Iterator[None]:
-        """Mark a host-owned ``subprocess`` operation as in flight.
+        """Pause orphan cleanup while an unregistered subprocess has an owner.
 
-        Wrap any host-owned :mod:`subprocess` call (or the ``to_thread`` that
-        runs it) in this so the orphan reaper pauses and cannot ``wait()`` the
-        child out from under ``subprocess``'s own reaping — see
-        :meth:`_reap_orphans_once` for why that would corrupt the command's
-        exit code (#1782).
-
-        Increment/decrement run on the event loop (the reaper does too), so a
-        plain counter needs no lock. Re-entrant and exception-safe: the
-        decrement is in a ``finally``.
-
-        :returns: A context manager; the body runs with the reaper paused.
+        Counter updates and reaping run on the event loop. The guarded work
+        may run in a worker thread, but its entry and exit must not.
         """
         self._owned_subprocess_ops += 1
         try:
@@ -1302,81 +1293,26 @@ class HostProcess:
         finally:
             self._owned_subprocess_ops -= 1
 
-    def _reap_orphans_waitid(self) -> int:
-        """Peek-and-reap using ``os.waitid(WNOWAIT)`` (Linux/POSIX).
+    async def _run_host_subprocess_in_thread(self, operation: Callable[[], _T]) -> _T:
+        """Run a subprocess-owning operation off-loop without losing its exit status.
 
-        :returns: Count of orphan processes reaped.
+        Cancellation stops waiting for the result but cannot stop a worker
+        thread. Keep the orphan reaper paused until the worker itself finishes.
         """
-        reaped = 0
-        tracked = self._tracked_runner_pids()
-        waitid = cast(
-            "Callable[[object, int, int], _WaitidInfo | None]",
-            vars(os)["waitid"],
-        )
-        p_all = vars(os)["P_ALL"]
-        while True:
-            try:
-                info = waitid(p_all, 0, os.WEXITED | os.WNOHANG | os.WNOWAIT)
-            except (ChildProcessError, OSError):
-                break
-            if info is None:
-                break  # children exist but none ready to reap
-            pid = info.si_pid
-            if pid in tracked:
-                # Leave it for _watch_runner's Popen to reap+report. Break, not
-                # continue: WNOWAIT keeps returning the same head pid, so
-                # continuing would spin. The runner is reaped within ~0.5s and
-                # the next sweep proceeds past it.
-                break
-            try:
-                os.waitpid(pid, 0)  # consume the orphan
-                reaped += 1
-            except ChildProcessError:
-                break
-        if reaped:
-            _logger.debug("orphan reaper reaped %d process(es)", reaped)
-        return reaped
+        self._owned_subprocess_ops += 1
+        task = asyncio.create_task(asyncio.to_thread(operation))
+        retained_task = cast("asyncio.Task[object]", task)
+        self._host_subprocess_tasks.add(retained_task)
 
-    def _reap_orphans_waitpid(self) -> int:
-        """Reap with ``waitpid(WNOHANG)``, re-injecting tracked-runner status.
+        def _release(completed: asyncio.Task[_T]) -> None:
+            self._host_subprocess_tasks.discard(cast("asyncio.Task[object]", completed))
+            self._owned_subprocess_ops -= 1
+            if not completed.cancelled():
+                # A canceled caller no longer retrieves a later worker error.
+                completed.exception()
 
-        Fallback for platforms without ``os.waitid`` (no peek). See
-        :meth:`_reap_orphans_once` for why re-injection is race-free.
-
-        :returns: Count of orphan (non-runner) processes reaped.
-        """
-        reaped = 0
-        while True:
-            try:
-                pid, status = os.waitpid(-1, os.WNOHANG)
-            except (ChildProcessError, OSError):
-                break
-            if pid == 0:
-                break  # children exist but none ready
-            handle = self._runner_handle_for_pid(pid)
-            if handle is not None:
-                # A tracked runner — do NOT count it as an orphan. Re-inject
-                # the status so its Popen (and thus _watch_runner) reports the
-                # true exit code instead of ECHILD → bogus 0.
-                if handle.proc.returncode is None:
-                    handle.proc.returncode = os.waitstatus_to_exitcode(status)
-                continue
-            reaped += 1
-        if reaped:
-            _logger.debug("orphan reaper reaped %d process(es)", reaped)
-        return reaped
-
-    def _runner_handle_for_pid(self, pid: int) -> _RunnerHandle | None:
-        """Return the tracked runner handle owning *pid*, or ``None``.
-
-        :param pid: An OS process id observed by the reaper.
-        :returns: The matching :class:`_RunnerHandle`, or ``None`` if *pid*
-            is not a tracked runner (i.e. an orphan to reap).
-        """
-        for handle in self._runners.values():
-            if handle.proc.pid == pid:
-                return handle
-        return None
+        task.add_done_callback(_release)
+        return await asyncio.shield(task)
 
     def _alive_runner_ids(self) -> list[str]:
         """Return IDs of runners that are still alive.
@@ -1765,9 +1701,23 @@ class HostProcess:
         #
         # Off the loop: the check runs ``<cli> --version``, up to 10s on a hung
         # CLI, which inline would stall the keepalive pong and every other frame.
-        if frame.harness is not None and not await asyncio.to_thread(
-            harness_is_configured, frame.harness
-        ):
+        from omnigent.inference_config import binding_for_harness
+
+        has_binding = (
+            frame.harness is not None
+            and frame.inference_config is not None
+            and (binding_for_harness(frame.inference_config, frame.harness) is not None)
+        )
+        if has_binding:
+            from omnigent.onboarding.harness_install import missing_harness_cli
+
+            assert frame.harness is not None
+            harness_ready = (await asyncio.to_thread(missing_harness_cli, frame.harness)) is None
+        else:
+            harness_ready = frame.harness is None or await asyncio.to_thread(
+                harness_is_configured, frame.harness
+            )
+        if not harness_ready:
             return self._launch_failed(
                 frame,
                 (
@@ -1803,7 +1753,20 @@ class HostProcess:
             interactive_shells=self._interactive_shells,
             host_owns_global_cleanup=self._maintenance_janitor is not None,
             harness_tmp_parent=self._harness_tmp_parent,
+            inference_config=frame.inference_config,
         )
+        if frame.inference_config is not None:
+            try:
+                inference_path = await asyncio.to_thread(
+                    _write_runner_inference_config,
+                    frame.session_id or runner_id,
+                    frame.inference_config,
+                )
+            except OSError as exc:
+                return self._launch_failed(
+                    frame, f"Cannot install session inference config: {exc}"
+                )
+            env["OMNIGENT_INFERENCE_CONFIG"] = str(inference_path)
         # The runner serves one primary session (plus any co-located subagents);
         # pass it so runner-level log records can be attributed to that session.
         if frame.session_id:
@@ -1835,24 +1798,25 @@ class HostProcess:
         # abandoned fork would never be watched, stopped, or reaped, and the
         # zygote would retain its exit status forever. On cancellation we let
         # the spawn land and then tear that runner down.
-        spawn = asyncio.ensure_future(
-            asyncio.to_thread(self._spawn_runner_proc, env, _session_slug, workspace)
-        )
-        try:
-            proc, log_path = await asyncio.shield(spawn)
-        except asyncio.CancelledError:
-            task = asyncio.create_task(
-                self._stop_abandoned_spawn(spawn),
-                name="host-stop-abandoned-runner-spawn",
+        with self._host_subprocess_op():
+            spawn = asyncio.ensure_future(
+                asyncio.to_thread(self._spawn_runner_proc, env, _session_slug, workspace)
             )
-            self._runner_stop_tasks.add(task)
-            task.add_done_callback(self._runner_stop_tasks.discard)
-            raise
-        except OSError as exc:
-            return self._launch_failed(
-                frame,
-                f"failed to spawn runner: {exc}",
-            )
+            try:
+                proc, log_path = await asyncio.shield(spawn)
+            except asyncio.CancelledError:
+                task = asyncio.create_task(
+                    self._stop_abandoned_spawn(spawn),
+                    name="host-stop-abandoned-runner-spawn",
+                )
+                self._runner_stop_tasks.add(task)
+                task.add_done_callback(self._runner_stop_tasks.discard)
+                raise
+            except OSError as exc:
+                return self._launch_failed(
+                    frame,
+                    f"failed to spawn runner: {exc}",
+                )
 
         if proc.poll() is not None:
             # The runner died before Popen returned — its actual error
@@ -2250,6 +2214,7 @@ class HostProcess:
             # _handle_stop (or _cleanup_runners) removed it first —
             # an intentional termination, not a crash to report.
             return
+        self._runners.pop(runner_id)
         self._trigger_maintenance("runner_exited")
         if handle.proc.returncode == 0:
             # A clean exit (code 0) is a graceful shutdown, not a crash — the
@@ -3452,7 +3417,8 @@ class HostProcess:
         loop keeps servicing pings.
 
         :param frame: The list-worktrees request frame.
-        :returns: Result frame with the worktrees on success, or
+        :returns: Result frame with worktrees and their coarse remote provider
+            on success, or
             ``status: "failed"`` with an error message.
         """
         try:
@@ -3478,6 +3444,8 @@ class HostProcess:
                     "branch": wt.branch,
                     "is_main": wt.is_main,
                     "detached": wt.detached,
+                    "remote_provider": wt.remote_provider,
+                    "updated_at": wt.updated_at,
                 }
                 for wt in worktrees
             ],
@@ -3490,7 +3458,7 @@ class HostProcess:
     ) -> dict[str, HarnessAvailability] | None:
         """Collect harness readiness without letting a probe break the channel."""
         try:
-            return await asyncio.to_thread(configured_harness_map)
+            return await self._run_host_subprocess_in_thread(configured_harness_map)
         except Exception as exc:
             _logger.exception("Host harness readiness probe failed")
             if startup:
@@ -3870,6 +3838,9 @@ class HostProcess:
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await self._capability_init_task
                 self._capability_init_task = None
+            from omnigent.models.model_catalog_store import shutdown_catalog_probes
+
+            await shutdown_catalog_probes()
             if self._zygote_prestart_task is not None:
                 self._zygote_prestart_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -3960,7 +3931,10 @@ class HostProcess:
         self._conn_upgrade_accepted = False
         self._conn_frame_received = False
         url = self._tunnel_url()
-        headers = self._build_connect_headers()
+        # Credential discovery may invoke the Databricks CLI. Keep it off the
+        # event loop so startup capability discovery can make progress at the
+        # same time instead of starting only after authentication completes.
+        headers = await self._run_host_subprocess_in_thread(self._build_connect_headers)
 
         _logger.info("Connecting to %s", url)
         # Build a verifying SSL context from a real CA bundle for wss:// — a bare
@@ -4010,7 +3984,7 @@ class HostProcess:
         record_websocket_connected("host", reconnect=reconnect)
         disconnect_error: BaseException | None = None
         try:
-            await self._ensure_owner_user_id()
+            await self._ensure_owner_user_id(headers=headers)
             await self._serve_frames(ws)
         except BaseException as exc:
             disconnect_error = exc
@@ -4035,7 +4009,7 @@ class HostProcess:
             # upgrade-time exception can be classified above.
             await ws_cm.__aexit__(*sys.exc_info())
 
-    async def _ensure_owner_user_id(self) -> None:
+    async def _ensure_owner_user_id(self, *, headers: dict[str, str] | None = None) -> None:
         """Resolve this host's owning user once and publish it for attribution.
 
         Best-effort ``GET /v1/me`` (the same call the CLI resume picker uses),
@@ -4044,16 +4018,26 @@ class HostProcess:
         this host spawns) and in ``OMNIGENT_USER_ID`` (so the host's own
         debug-log rows carry it). A single-user server / managed host answers no
         owner, and any failure is swallowed -- attribution must never disrupt the
-        host, and those rows simply ship ``user_id = NULL``.
+        host, and those rows simply ship ``user_id = NULL``. The accepted
+        tunnel's request headers may be supplied so this lookup reuses the
+        same credential resolution rather than probing authentication twice.
+
+        :param headers: Auth and routing headers already built for the tunnel.
         """
         if self._owner_user_id is not None:
             return
         try:
             from omnigent.resume_dispatch import _resolve_current_user_id
 
-            headers = self._build_connect_headers()
+            request_headers = headers
+            if request_headers is None:
+                request_headers = await self._run_host_subprocess_in_thread(
+                    self._build_connect_headers
+                )
             owner = await asyncio.to_thread(
-                _resolve_current_user_id, base_url=self._server_url, headers=headers
+                _resolve_current_user_id,
+                base_url=self._server_url,
+                headers=request_headers,
             )
         except Exception:  # noqa: BLE001 — attribution is best-effort
             return
@@ -4170,6 +4154,7 @@ class HostProcess:
             interactive_shells=self._interactive_shells,
             telemetry_opt_out=_tel_opt_out,
             installation_id=_tel_install_id,
+            capabilities=list(HOST_CAPABILITIES),
         )
         try:
             encoded_hello = encode_host_frame(hello)
@@ -4513,7 +4498,9 @@ def _generate_ucode_configs() -> None:
         HOST_DATABRICKS_PROFILE,
         broker_token_command,
     )
+    from omnigent.inference_config import binding_for_harness
     from omnigent.inner.databricks_executor import _read_databrickscfg_host
+    from omnigent.onboarding.provider_config import load_config
     from omnigent.onboarding.ucode_setup import configure_ucode_for_sandbox
 
     workspace = _read_databrickscfg_host(HOST_DATABRICKS_PROFILE)
@@ -4522,12 +4509,38 @@ def _generate_ucode_configs() -> None:
     bearer_command = broker_token_command(workspace)
     if not bearer_command:
         return  # no broker sidecar → not a managed connect host
+    config = load_config()
+    providers = config.get("providers")
+    identities = {
+        "claude": ("claude-native", "claude-sdk"),
+        "codex": ("codex-native", "codex"),
+        "pi": ("pi-native", "pi"),
+        "opencode": ("opencode-native",),
+    }
+    agents: list[str] = []
+    for agent, harnesses in identities.items():
+        for harness in harnesses:
+            binding = binding_for_harness(config, harness)
+            provider = (
+                providers.get(binding.provider)
+                if binding and isinstance(providers, dict)
+                else None
+            )
+            if binding is None or (
+                isinstance(provider, dict)
+                and provider.get("kind") == "databricks"
+                and provider.get("connection") == "databricks"
+            ):
+                agents.append(agent)
+                break
+    if not agents:
+        return
     # opencode is included here (unlike lakebox's claude/codex/pi ``--use-pat``
     # wrappers) so its config is ready at first launch instead of forcing a
     # synchronous on-demand ``ucode configure`` on the runner.
     configure_ucode_for_sandbox(
         HOST_DATABRICKS_PROFILE,
-        agents=("claude", "codex", "pi", "opencode"),
+        agents=tuple(agents),
         extra_env={
             "DATABRICKS_BEARER_COMMAND": bearer_command,
             "DATABRICKS_CONFIG_PROFILE": HOST_DATABRICKS_PROFILE,

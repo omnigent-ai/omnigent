@@ -177,6 +177,24 @@ describe("createSession", () => {
     });
   });
 
+  it("preserves the saved inference policy on an empty session catalog", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv_policy",
+        agent_id: "agent_xyz",
+        status: "idle",
+        created_at: 1704067200,
+        inference_configured: true,
+        inference_error: "Gateway unavailable",
+        model_options: [],
+      }),
+    );
+    const session = await createSession("agent_xyz");
+    expect(session.inferenceConfigured).toBe(true);
+    expect(session.inferenceError).toBe("Gateway unavailable");
+    expect(session.codexModelOptions).toEqual([]);
+  });
+
   it("forwards initial_items when provided", async () => {
     fetchMock.mockResolvedValueOnce(
       mockJsonResponse({
@@ -768,7 +786,7 @@ describe("runner binding", () => {
     expect(JSON.parse(init.body as string)).toEqual({ subagent_routing_override: null });
   });
 
-  it("forwards silent:true so bind-time auto-apply skips runner forward", async () => {
+  it("forwards silent:true for persistence-only session updates", async () => {
     fetchMock.mockResolvedValueOnce(
       mockJsonResponse({
         id: "conv_abc",
