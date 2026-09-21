@@ -8144,10 +8144,7 @@ async def _auto_create_claude_terminal(
             resource_role=CLAUDE_NATIVE_TERMINAL_ROLE,
         )
     except (Exception, asyncio.CancelledError) as launch_error:
-        from omnigent.harnesses.claude_native.diagnostics import ClaudeDebugLogFollower
-
-        with contextlib.suppress(Exception):
-            await asyncio.to_thread(ClaudeDebugLogFollower(bridge_dir).close, session_id)
+        # Preserve the original failure even if diagnostic cleanup is cancelled.
         if not isinstance(launch_error, asyncio.CancelledError):
             _logger.exception(
                 "Claude terminal tmux launch failed: session=%s elapsed_ms=%.0f",
@@ -8155,6 +8152,10 @@ async def _auto_create_claude_terminal(
                 (time.monotonic() - started_at) * 1000,
                 extra={"session_id": session_id},
             )
+        from omnigent.harnesses.claude_native.diagnostics import ClaudeDebugLogFollower
+
+        with contextlib.suppress(Exception):
+            await asyncio.to_thread(ClaudeDebugLogFollower(bridge_dir).close, session_id)
         raise
     if reset_pick_after_launch:
         await _clear_session_model_override(session_id, server_client)

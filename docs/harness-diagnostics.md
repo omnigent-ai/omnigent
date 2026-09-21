@@ -26,6 +26,11 @@ terminal control codes. It does not filter prompts or payloads by content;
 configure capture only where this text is appropriate for the deployment's log
 storage and readers.
 
+Redaction is pattern-based, not a general detector of secrets in prose. For
+example, `password hunter2` is redacted, but `The password is hunter2` becomes
+`The password [REDACTED] hunter2`: the actual value remains. Treat exported
+diagnostics as potentially sensitive even after redaction.
+
 The captured text appears in the owning process's ordinary local logs, including
 runner logs under `~/.omnigent/logs/runner/`, and in structured event attributes.
 It also reaches any configured debug-log or OpenTelemetry exporter. This flag
@@ -129,6 +134,10 @@ Shutdown prioritizes an already-rotated replacement and reports skipped backlog.
 A final partial record is exported only at the observed end of the file;
 remaining unread bytes are counted as omitted. File or logger failures do not
 replace the original session error.
+
+Terminal launch failures are logged before their final diagnostic drain. If the
+caller cancels during that drain, cancellation still propagates and the worker
+can finish draining, but the original launch failure is already in the logs.
 
 Claude owns disk rotation. In Claude 2.1.277, the custom debug file rotates near
 10 MiB to `<filename>.1`, retaining one predecessor (roughly 20 MiB total, with

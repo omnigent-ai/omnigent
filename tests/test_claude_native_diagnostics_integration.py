@@ -263,6 +263,66 @@ async def test_cli_launch_failure_drains_diagnostics_and_preserves_original_erro
     follower.close.assert_called_once_with("failed-child")
 
 
+async def test_cli_logs_launch_error_before_cancellation_during_diagnostic_drain(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setenv(HARNESS_STDERR_ENABLED_ENV_VAR, "1")
+    monkeypatch.setattr(claude_native, "resolve_claude_launch", lambda cmd, args: (cmd, args))
+    loop = asyncio.get_running_loop()
+    draining = asyncio.Event()
+    drained = asyncio.Event()
+    release = threading.Event()
+
+    def close(_session_id: str) -> None:
+        loop.call_soon_threadsafe(draining.set)
+        if not release.wait(timeout=3):
+            raise TimeoutError("test did not release diagnostic drain")
+        loop.call_soon_threadsafe(drained.set)
+
+    follower = SimpleNamespace(close=Mock(side_effect=close))
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.diagnostics.ClaudeDebugLogFollower",
+        lambda _path: follower,
+    )
+    original_error = httpx.ConnectError("simulated launch transport failure")
+
+    def launch_failure(_request: httpx.Request) -> httpx.Response:
+        raise original_error
+
+    async with httpx.AsyncClient(
+        base_url="http://unused.invalid", transport=httpx.MockTransport(launch_failure)
+    ) as client:
+        task = asyncio.create_task(
+            claude_native._launch_claude_terminal(
+                client, "failed-child", (), command="claude", bridge_dir=tmp_path
+            )
+        )
+        try:
+            await asyncio.wait_for(draining.wait(), timeout=1)
+            records = [
+                record
+                for record in caplog.records
+                if record.getMessage() == "Claude terminal launch failed: session=failed-child"
+            ]
+            assert len(records) == 1
+            assert records[0].exc_info is not None
+            assert records[0].exc_info[1] is original_error
+            assert records[0].session_id == "failed-child"
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        finally:
+            release.set()
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        await asyncio.wait_for(drained.wait(), timeout=1)
+
+    follower.close.assert_called_once_with("failed-child")
+
+
 @pytest.mark.parametrize("failure_point", ["session_metadata", "poll", "close"])
 async def test_diagnostic_failures_preserve_the_original_forwarder_error(
     monkeypatch: pytest.MonkeyPatch,

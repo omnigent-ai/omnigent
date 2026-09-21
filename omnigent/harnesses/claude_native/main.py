@@ -6291,9 +6291,15 @@ async def _launch_claude_terminal(
                 "Claude terminal launch response did not include terminal id."
             )
         return terminal_id
-    except (Exception, asyncio.CancelledError):
+    except (Exception, asyncio.CancelledError) as launch_error:
         from omnigent.harnesses.claude_native.diagnostics import ClaudeDebugLogFollower
 
+        if not isinstance(launch_error, asyncio.CancelledError):
+            _logger.exception(
+                "Claude terminal launch failed: session=%s",
+                session_id,
+                extra={"session_id": session_id},
+            )
         with contextlib.suppress(Exception):
             await asyncio.to_thread(ClaudeDebugLogFollower(bridge_dir).close, session_id)
         raise

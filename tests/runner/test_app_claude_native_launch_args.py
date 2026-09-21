@@ -523,3 +523,100 @@ async def test_legacy_metadata_loader_reads_the_auto_harness_flag(
         metadata = await _load_legacy_claude_launch_metadata(client, "conv_abc")
 
     assert metadata.auto_harness is expected
+
+
+async def test_runner_launch_error_is_logged_before_cancellable_diagnostic_drain(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Cancelling a blocked diagnostic drain must leave the launch error logged."""
+    import asyncio
+    import contextlib
+    import logging
+    import threading
+    from unittest.mock import AsyncMock, Mock
+
+    import httpx
+
+    from omnigent.harnesses.claude_native import diagnostics
+    from omnigent.runner.native import orchestration
+    from omnigent.runner.resource_registry import SessionResourceRegistry
+    from omnigent.runner.session_init_protocol import (
+        SESSION_INIT_PROTOCOL_VERSION,
+        RunnerSessionInitEnvelope,
+        RunnerSessionInitSnapshot,
+    )
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge.ensure_claude_workspace_trusted", lambda _: None
+    )
+    monkeypatch.setattr("omnigent.inference_config.load_runtime_inference_config", dict)
+    monkeypatch.setattr("omnigent.config.load_effective_config", dict)
+    monkeypatch.setattr(orchestration, "resolve_cli_binary", lambda _: None)
+    caplog.set_level(logging.ERROR, logger="omnigent.runner.app")
+    session_id = "conv_launch_cancelled_during_drain"
+    original_error = httpx.ConnectError("original launch transport failure")
+    registry = Mock(spec=SessionResourceRegistry)
+    registry.launch_required_terminal.side_effect = original_error
+    session_init = RunnerSessionInitEnvelope(
+        protocol_version=SESSION_INIT_PROTOCOL_VERSION,
+        server_version="test",
+        session_id=session_id,
+        agent_id="agent",
+        snapshot=RunnerSessionInitSnapshot(created_at=0, updated_at=0, workspace=str(bridge_dir)),
+    )
+    loop = asyncio.get_running_loop()
+    closing = asyncio.Event()
+    closed = asyncio.Event()
+    release_close = threading.Event()
+
+    def blocked_close(_session_id: str) -> None:
+        loop.call_soon_threadsafe(closing.set)
+        try:
+            if not release_close.wait(timeout=3):
+                raise TimeoutError("test did not release diagnostic close")
+        finally:
+            loop.call_soon_threadsafe(closed.set)
+
+    follower = Mock(close=Mock(side_effect=blocked_close))
+    monkeypatch.setattr(diagnostics, "ClaudeDebugLogFollower", lambda _: follower)
+    task = asyncio.create_task(
+        orchestration._auto_create_claude_terminal(
+            session_id,
+            registry,
+            Mock(),
+            server_client=AsyncMock(spec=httpx.AsyncClient),
+            session_init=session_init,
+            auth_token_factory=lambda: None,
+            resolve_launch_config=AsyncMock(return_value=None),
+        )
+    )
+    try:
+        await asyncio.wait_for(closing.wait(), timeout=1)
+        errors_before_cancel = [
+            record
+            for record in caplog.records
+            if record.getMessage().startswith("Claude terminal tmux launch failed:")
+        ]
+        task.cancel("cancelled during diagnostic cleanup")
+        with pytest.raises(asyncio.CancelledError, match="cancelled during diagnostic cleanup"):
+            await asyncio.wait_for(task, timeout=1)
+        assert task.cancelled()
+        assert not release_close.is_set()
+        assert len(errors_before_cancel) == 1
+        record = errors_before_cancel[0]
+        assert record.levelno == logging.ERROR
+        assert record.exc_info is not None
+        assert record.exc_info[1] is original_error
+        assert getattr(record, "session_id", None) == session_id
+        assert f"session={session_id}" in record.getMessage()
+        registry.launch_required_terminal.assert_awaited_once()
+        follower.close.assert_called_once_with(session_id)
+    finally:
+        release_close.set()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        if closing.is_set():
+            await asyncio.wait_for(closed.wait(), timeout=1)
