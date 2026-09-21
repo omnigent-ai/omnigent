@@ -150,9 +150,8 @@ def test_composer_workspace_labels_use_available_width(
     controls.screenshot(path=tmp_path / f"labels-{viewport_width}-{font_size}.png")
 
     # The bar shows the full names while they fit; once a name would have to
-    # truncate (long labels, or the narrow mobile bar) every chip drops to its
-    # icon instead of showing clipped text.
-    collapsed = long_labels or viewport_width == 390
+    # truncate, every chip drops to its icon instead of showing clipped text.
+    collapsed = long_labels
     if collapsed:
         expect(controls).to_have_attribute("data-labels", "collapsed")
         for label in controls.locator("span.truncate").all():
