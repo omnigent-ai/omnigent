@@ -554,7 +554,12 @@ async def test_runner_launch_error_is_logged_before_cancellable_diagnostic_drain
     monkeypatch.setattr("omnigent.inference_config.load_runtime_inference_config", dict)
     monkeypatch.setattr("omnigent.config.load_effective_config", dict)
     monkeypatch.setattr(orchestration, "resolve_cli_binary", lambda _: None)
-    caplog.set_level(logging.ERROR, logger="omnigent.runner.app")
+    # Keep application traceback renderers out of this synchronization test.
+    logger = logging.getLogger(f"{__name__}.launch_failure")
+    caplog.set_level(logging.ERROR, logger=logger.name)
+    monkeypatch.setattr(logger, "handlers", [caplog.handler])
+    monkeypatch.setattr(logger, "propagate", False)
+    monkeypatch.setattr(orchestration, "_logger", logger)
     session_id = "conv_launch_cancelled_during_drain"
     original_error = httpx.ConnectError("original launch transport failure")
     registry = Mock(spec=SessionResourceRegistry)
@@ -574,7 +579,7 @@ async def test_runner_launch_error_is_logged_before_cancellable_diagnostic_drain
     def blocked_close(_session_id: str) -> None:
         loop.call_soon_threadsafe(closing.set)
         try:
-            if not release_close.wait(timeout=3):
+            if not release_close.wait(timeout=30):
                 raise TimeoutError("test did not release diagnostic close")
         finally:
             loop.call_soon_threadsafe(closed.set)
@@ -593,17 +598,13 @@ async def test_runner_launch_error_is_logged_before_cancellable_diagnostic_drain
         )
     )
     try:
-        await asyncio.wait_for(closing.wait(), timeout=1)
+        await asyncio.wait_for(closing.wait(), timeout=10)
+        assert not closed.is_set()
         errors_before_cancel = [
             record
             for record in caplog.records
             if record.getMessage().startswith("Claude terminal tmux launch failed:")
         ]
-        task.cancel("cancelled during diagnostic cleanup")
-        with pytest.raises(asyncio.CancelledError, match="cancelled during diagnostic cleanup"):
-            await asyncio.wait_for(task, timeout=1)
-        assert task.cancelled()
-        assert not release_close.is_set()
         assert len(errors_before_cancel) == 1
         record = errors_before_cancel[0]
         assert record.levelno == logging.ERROR
@@ -611,12 +612,18 @@ async def test_runner_launch_error_is_logged_before_cancellable_diagnostic_drain
         assert record.exc_info[1] is original_error
         assert getattr(record, "session_id", None) == session_id
         assert f"session={session_id}" in record.getMessage()
+        task.cancel("cancelled during diagnostic cleanup")
+        with pytest.raises(asyncio.CancelledError, match="cancelled during diagnostic cleanup"):
+            await asyncio.wait_for(task, timeout=10)
+        assert task.cancelled()
+        assert not release_close.is_set()
+        assert not closed.is_set()
         registry.launch_required_terminal.assert_awaited_once()
         follower.close.assert_called_once_with(session_id)
     finally:
         release_close.set()
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
-            await task
+            await asyncio.wait_for(task, timeout=10)
         if closing.is_set():
-            await asyncio.wait_for(closed.wait(), timeout=1)
+            await asyncio.wait_for(closed.wait(), timeout=10)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import threading
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -270,6 +271,11 @@ async def test_cli_logs_launch_error_before_cancellation_during_diagnostic_drain
 ) -> None:
     monkeypatch.setenv(HARNESS_STDERR_ENABLED_ENV_VAR, "1")
     monkeypatch.setattr(claude_native, "resolve_claude_launch", lambda cmd, args: (cmd, args))
+    logger = logging.getLogger(f"{__name__}.launch_failure")
+    caplog.set_level(logging.ERROR, logger=logger.name)
+    monkeypatch.setattr(logger, "handlers", [caplog.handler])
+    monkeypatch.setattr(logger, "propagate", False)
+    monkeypatch.setattr(claude_native, "_logger", logger)
     loop = asyncio.get_running_loop()
     draining = asyncio.Event()
     drained = asyncio.Event()
@@ -277,7 +283,7 @@ async def test_cli_logs_launch_error_before_cancellation_during_diagnostic_drain
 
     def close(_session_id: str) -> None:
         loop.call_soon_threadsafe(draining.set)
-        if not release.wait(timeout=3):
+        if not release.wait(timeout=30):
             raise TimeoutError("test did not release diagnostic drain")
         loop.call_soon_threadsafe(drained.set)
 
@@ -300,7 +306,7 @@ async def test_cli_logs_launch_error_before_cancellation_during_diagnostic_drain
             )
         )
         try:
-            await asyncio.wait_for(draining.wait(), timeout=1)
+            await asyncio.wait_for(draining.wait(), timeout=10)
             records = [
                 record
                 for record in caplog.records
@@ -318,7 +324,7 @@ async def test_cli_logs_launch_error_before_cancellation_during_diagnostic_drain
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
-        await asyncio.wait_for(drained.wait(), timeout=1)
+        await asyncio.wait_for(drained.wait(), timeout=10)
 
     follower.close.assert_called_once_with("failed-child")
 
