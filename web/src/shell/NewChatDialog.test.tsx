@@ -3392,16 +3392,16 @@ describe("NewChatLandingScreen", () => {
     expect(tooltip).toHaveClass("bg-popover", "text-popover-foreground", "shadow-menu", "ring-1");
   });
 
-  it("uses the GitHub folder icon for a verified repository", () => {
+  it("uses the Git folder icon for a verified repository", () => {
     renderLanding();
 
-    expect(screen.getByTestId("new-chat-landing-workspace-icon-github")).toBeInTheDocument();
+    expect(screen.getByTestId("new-chat-landing-workspace-icon-git")).toBeInTheDocument();
     expect(screen.queryByTestId("new-chat-landing-workspace-icon-folder")).toBeNull();
   });
 
   it.each([undefined, null, "other"] as const)(
-    "hides the worktree selector without verified GitHub metadata (%s)",
-    (remoteProvider) => {
+    "creates a worktree without GitHub metadata (%s)",
+    async (remoteProvider) => {
       useHostWorktreesMock.mockReturnValue({
         ...SUCCESS_QUERY_STATE,
         data: [
@@ -3414,11 +3414,28 @@ describe("NewChatLandingScreen", () => {
           },
         ],
       } as unknown as ReturnType<typeof useHostWorktrees>);
+      authenticatedFetchMock.mockResolvedValue(new Response(JSON.stringify({ id: "conv_new" })));
       renderLanding();
 
       expect(screen.getByTestId("new-chat-landing-workspace-chip")).toBeVisible();
-      expect(screen.getByTestId("new-chat-landing-workspace-icon-folder")).toBeInTheDocument();
-      expect(screen.queryByTestId("new-chat-landing-branch-chip")).toBeNull();
+      expect(screen.getByTestId("new-chat-landing-workspace-icon-git")).toBeInTheDocument();
+      expect(screen.getByTestId("new-chat-landing-branch-chip")).toBeVisible();
+      fireEvent.click(screen.getByTestId("new-chat-landing-branch-chip"));
+      fireEvent.change(screen.getByLabelText("New worktree"), {
+        target: { value: "feature/compatible" },
+      });
+      fireEvent.change(screen.getByTestId("new-chat-landing-base-branch-input"), {
+        target: { value: "main" },
+      });
+      fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+        target: { value: "work in a new worktree" },
+      });
+      fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+
+      await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
+      const [, init] = authenticatedFetchMock.mock.calls[0];
+      const body = JSON.parse((init as RequestInit).body as string);
+      expect(body.git).toEqual({ branch_name: "feature/compatible", base_branch: "main" });
     },
   );
 
@@ -3451,7 +3468,7 @@ describe("NewChatLandingScreen", () => {
     fireEvent.click(screen.getByRole("button", { name: nested }));
 
     expect(screen.getByTestId("new-chat-landing-branch-chip")).toBeVisible();
-    expect(screen.getByTestId("new-chat-landing-workspace-icon-github")).toBeInTheDocument();
+    expect(screen.getByTestId("new-chat-landing-workspace-icon-git")).toBeInTheDocument();
   });
 
   describe("worktree choices after workspace changes", () => {
@@ -5953,77 +5970,80 @@ describe("NewChatLandingScreen", () => {
     expect(screen.queryByTestId("workspace-picker-conflict")).toBeNull();
   });
 
-  it("lists existing worktrees and starts directly in a selected one (git bind mode)", async () => {
-    // The seeded repo has one linked worktree; the main tree is filtered out.
-    useHostWorktreesMock.mockReturnValue({
-      data: [
-        {
-          path: "/Users/corey/repo",
-          branch: "main",
-          is_main: true,
-          detached: false,
-          remote_provider: "github",
-        },
-        {
-          path: "/Users/corey/repo-worktrees/feature-x",
-          branch: "feature/x",
-          is_main: false,
-          detached: false,
-          remote_provider: "github",
-        },
-      ],
-    } as unknown as ReturnType<typeof useHostWorktrees>);
-    authenticatedFetchMock.mockResolvedValue({
-      ok: true,
-      json: async () => ({ id: "conv_new" }),
-    } as unknown as Response);
-    renderLanding();
-    await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
-    );
+  it.each([undefined, null, "other", "github"] as const)(
+    "starts in an existing worktree regardless of provider metadata (%s)",
+    async (remoteProvider) => {
+      // The seeded repo has one linked worktree; the main tree is filtered out.
+      useHostWorktreesMock.mockReturnValue({
+        data: [
+          {
+            path: "/Users/corey/repo",
+            branch: "main",
+            is_main: true,
+            detached: false,
+            ...(remoteProvider === undefined ? {} : { remote_provider: remoteProvider }),
+          },
+          {
+            path: "/Users/corey/repo-worktrees/feature-x",
+            branch: "feature/x",
+            is_main: false,
+            detached: false,
+            ...(remoteProvider === undefined ? {} : { remote_provider: remoteProvider }),
+          },
+        ],
+      } as unknown as ReturnType<typeof useHostWorktrees>);
+      authenticatedFetchMock.mockResolvedValue({
+        ok: true,
+        json: async () => ({ id: "conv_new" }),
+      } as unknown as Response);
+      renderLanding();
+      await waitFor(() =>
+        expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+      );
 
-    // Open the worktree popover, focus the branch combobox to reveal the
-    // existing-worktree dropdown, and select the one linked worktree.
-    fireEvent.click(screen.getByTestId("new-chat-landing-branch-chip"));
-    fireEvent.focus(screen.getByTestId("new-chat-landing-branch-input"));
-    const worktreeList = screen.getByTestId("new-chat-landing-worktree-dropdown");
-    expect(worktreeList).not.toHaveClass("absolute", "top-full");
-    expect(worktreeList).toHaveClass("max-h-40", "overflow-y-auto");
-    expect(worktreeList.closest('[data-slot="popover-content"]')).toHaveClass("overflow-y-auto");
-    const options = screen.getAllByTestId("new-chat-landing-worktree-option");
-    expect(options).toHaveLength(1); // main tree excluded
-    expect(options[0].textContent).toContain("feature-x");
-    const worktreeRadio = within(options[0]).getByRole("radio");
-    fireEvent.click(worktreeRadio);
+      // Open the worktree popover, focus the branch combobox to reveal the
+      // existing-worktree dropdown, and select the one linked worktree.
+      fireEvent.click(screen.getByTestId("new-chat-landing-branch-chip"));
+      fireEvent.focus(screen.getByTestId("new-chat-landing-branch-input"));
+      const worktreeList = screen.getByTestId("new-chat-landing-worktree-dropdown");
+      expect(worktreeList).not.toHaveClass("absolute", "top-full");
+      expect(worktreeList).toHaveClass("max-h-40", "overflow-y-auto");
+      expect(worktreeList.closest('[data-slot="popover-content"]')).toHaveClass("overflow-y-auto");
+      const options = screen.getAllByTestId("new-chat-landing-worktree-option");
+      expect(options).toHaveLength(1); // main tree excluded
+      expect(options[0].textContent).toContain("feature-x");
+      const worktreeRadio = within(options[0]).getByRole("radio");
+      fireEvent.click(worktreeRadio);
 
-    // Selection stays in the worktree picker; it does not browse or close the
-    // project-folder surface.
-    expect(worktreeRadio).toBeChecked();
-    await screen.findByTestId("new-chat-landing-existing-worktree-warning");
-    expect((screen.getByTestId("new-chat-landing-branch-input") as HTMLInputElement).value).toBe(
-      "feature/x",
-    );
+      // Selection stays in the worktree picker; it does not browse or close the
+      // project-folder surface.
+      expect(worktreeRadio).toBeChecked();
+      await screen.findByTestId("new-chat-landing-existing-worktree-warning");
+      expect((screen.getByTestId("new-chat-landing-branch-input") as HTMLInputElement).value).toBe(
+        "feature/x",
+      );
 
-    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
-      target: { value: "work in the worktree" },
-    });
-    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+      fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+        target: { value: "work in the worktree" },
+      });
+      fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
 
-    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
-    const [, init] = authenticatedFetchMock.mock.calls[0];
-    const body = JSON.parse((init as RequestInit).body as string) as {
-      workspace?: string;
-      git?: { branch_name: string; existing_worktree?: boolean; base_branch?: string };
-    };
-    // Workspace is bound straight to the worktree dir. The git block is in
-    // bind mode (`existing_worktree`): no worktree is created, but the
-    // worktree's branch rides along as `branch_name` so the sidebar shows it
-    // and the delete flow can offer to remove it. No base_branch on a bind.
-    expect(body.workspace).toBe("/Users/corey/repo-worktrees/feature-x");
-    expect(body.git?.existing_worktree).toBe(true);
-    expect(body.git?.branch_name).toBe("feature/x");
-    expect(body.git?.base_branch).toBeUndefined();
-  });
+      await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
+      const [, init] = authenticatedFetchMock.mock.calls[0];
+      const body = JSON.parse((init as RequestInit).body as string) as {
+        workspace?: string;
+        git?: { branch_name: string; existing_worktree?: boolean; base_branch?: string };
+      };
+      // Workspace is bound straight to the worktree dir. The git block is in
+      // bind mode (`existing_worktree`): no worktree is created, but the
+      // worktree's branch rides along as `branch_name` so the sidebar shows it
+      // and the delete flow can offer to remove it. No base_branch on a bind.
+      expect(body.workspace).toBe("/Users/corey/repo-worktrees/feature-x");
+      expect(body.git?.existing_worktree).toBe(true);
+      expect(body.git?.branch_name).toBe("feature/x");
+      expect(body.git?.base_branch).toBeUndefined();
+    },
+  );
 
   it("creates a new worktree when the prefilled branch name is edited", async () => {
     useHostWorktreesMock.mockReturnValue({

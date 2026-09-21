@@ -36,7 +36,7 @@ export interface HostWorktree {
   updated_at?: number | null;
 }
 
-interface VerifiedGithubWorktreeCache {
+interface VerifiedGitWorktreeCache {
   hostId: string;
   roots: string[];
   worktrees: HostWorktree[];
@@ -54,10 +54,10 @@ export function pathIsWithinWorktree(path: string, root: string): boolean {
 }
 
 /**
- * Keep a verified GitHub repository visible while a nested path is loading.
- * Explicit non-GitHub results still hide it immediately (fail closed).
+ * Keep a verified Git repository visible while a nested path is loading.
+ * An explicit non-Git result clears the cache.
  */
-export function useVerifiedGithubWorktrees({
+export function useVerifiedGitWorktrees({
   hostId,
   requestedPath,
   worktrees,
@@ -68,9 +68,10 @@ export function useVerifiedGithubWorktrees({
   worktrees: HostWorktree[] | undefined;
   resolved: boolean;
 }): HostWorktree[] {
-  const cacheRef = useRef<VerifiedGithubWorktreeCache | null>(null);
-  const directlyVerified =
-    resolved && worktrees?.some((worktree) => worktree.remote_provider === "github") === true;
+  const cacheRef = useRef<VerifiedGitWorktreeCache | null>(null);
+  // A successful nonempty listing proves Git support, including on older hosts
+  // that omit remote_provider. Worktrees do not depend on a remote provider.
+  const directlyVerified = resolved && worktrees !== undefined && worktrees.length > 0;
   if (resolved) {
     cacheRef.current =
       directlyVerified && hostId !== null && worktrees !== undefined

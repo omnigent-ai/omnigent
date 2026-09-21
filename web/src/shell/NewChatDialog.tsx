@@ -258,7 +258,7 @@ import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
 import { useHostFilesystem, type HostFilesystemEntry } from "@/hooks/useHostFilesystem";
 import {
   useHostWorktrees,
-  useVerifiedGithubWorktrees,
+  useVerifiedGitWorktrees,
   type HostWorktree,
 } from "@/hooks/useHostWorktrees";
 import { useNativeServerSwitcherForMainSurface } from "@/hooks/useNativeServerSwitcher";
@@ -4287,13 +4287,13 @@ export function NewChatLandingScreen() {
     worktreesEnabled ? selectedHostId : null,
     worktreesEnabled ? workspaceTrimmed : null,
   );
-  const verifiedGithubWorktrees = useVerifiedGithubWorktrees({
+  const verifiedGitWorktrees = useVerifiedGitWorktrees({
     hostId: selectedHostId,
     requestedPath: worktreesEnabled ? workspaceTrimmed : null,
     worktrees: hostWorktrees,
     resolved: !hostWorktreesArePlaceholder && hostWorktrees !== undefined,
   });
-  const workspaceHasVerifiedGithubRemote = verifiedGithubWorktrees.length > 0;
+  const workspaceIsGit = verifiedGitWorktrees.length > 0;
   const workspaceIsNonGit =
     worktreesEnabled && !hostWorktreesArePlaceholder && hostWorktrees?.length === 0;
 
@@ -4309,12 +4309,12 @@ export function NewChatLandingScreen() {
   // Linked worktrees (exclude the main work tree — "starting in the main
   // repo" is just picking that directory, not selecting a worktree).
   const linkedWorktrees = useMemo(
-    () => verifiedGithubWorktrees.filter((worktree) => !worktree.is_main),
-    [verifiedGithubWorktrees],
+    () => verifiedGitWorktrees.filter((worktree) => !worktree.is_main),
+    [verifiedGitWorktrees],
   );
   const mainWorktree = useMemo(
-    () => verifiedGithubWorktrees.find((worktree) => worktree.is_main) ?? null,
-    [verifiedGithubWorktrees],
+    () => verifiedGitWorktrees.find((worktree) => worktree.is_main) ?? null,
+    [verifiedGitWorktrees],
   );
   // The worktree the picked directory currently points at, if any. Set when
   // the user navigated the picker straight into a worktree folder, or clicked
@@ -4346,18 +4346,18 @@ export function NewChatLandingScreen() {
   // the workspace is a worktree and the branch field still holds its
   // prefilled branch (the user hasn't edited it to request a new worktree).
   const startInExistingWorktree =
-    workspaceHasVerifiedGithubRemote &&
+    workspaceIsGit &&
     activeWorktree !== null &&
     prefilledBranch !== "" &&
     branchName.trim() === prefilledBranch;
   // A new, isolated worktree is created only when a branch is named and the
   // workspace isn't already sitting on that existing worktree.
   const shouldCreateWorktree =
-    workspaceHasVerifiedGithubRemote && branchName.trim() !== "" && !startInExistingWorktree;
+    workspaceIsGit && branchName.trim() !== "" && !startInExistingWorktree;
   const worktreeVerificationPending =
     worktreesEnabled &&
     !workspaceIsNonGit &&
-    !workspaceHasVerifiedGithubRemote &&
+    !workspaceIsGit &&
     (hostWorktreesArePlaceholder || hostWorktrees === undefined);
   // Auto-fill the base branch when a new-worktree branch is named, but only
   // until the user touches the base field — then their choice (including a
@@ -4459,7 +4459,7 @@ export function NewChatLandingScreen() {
     // Need the git-ness probe for the CURRENT workspace resolved (not the
     // anti-flicker placeholder from a previous path).
     if (hostWorktreesArePlaceholder || hostWorktrees === undefined) return;
-    if (!workspaceHasVerifiedGithubRemote) return;
+    if (!workspaceIsGit) return;
     worktreeSeededForRef.current = workspaceTrimmed;
     if (hostWorktrees.some((w) => w.is_main)) setAutoSeededBranch(generateBranchName());
   }, [
@@ -4473,7 +4473,7 @@ export function NewChatLandingScreen() {
     prefilledBranch,
     hostWorktrees,
     hostWorktreesArePlaceholder,
-    workspaceHasVerifiedGithubRemote,
+    workspaceIsGit,
     generateBranchName,
   ]);
 
@@ -4833,7 +4833,7 @@ export function NewChatLandingScreen() {
         : (selectedHostDisplayName ?? "No host selected");
   const worktreeControlAvailable =
     !sandboxSelected &&
-    workspaceHasVerifiedGithubRemote &&
+    workspaceIsGit &&
     (branchName.trim() !== "" ||
       (worktreesEnabled && (hostWorktrees === undefined || hostWorktrees.length > 0)));
   const showGithubRepoPicker = githubReposEnabled && sandboxRepoPickerConnected;
@@ -5710,10 +5710,10 @@ export function NewChatLandingScreen() {
       kind="directory"
       label={noExecutionTargetSelected ? "No host selected" : visibleWorktreeHeader.repositoryLabel}
       icon={
-        workspaceHasVerifiedGithubRemote ? (
+        workspaceIsGit ? (
           <FolderGit2Icon
             className="size-3.5 shrink-0"
-            data-testid="new-chat-landing-workspace-icon-github"
+            data-testid="new-chat-landing-workspace-icon-git"
           />
         ) : (
           <FolderIcon
@@ -5849,7 +5849,7 @@ export function NewChatLandingScreen() {
               </Popover>
               {/* Worktree selection stays a separate real action from the directory picker. */}
               {(!workspaceLoading || cachedWorkspace !== null) &&
-                (noExecutionTargetSelected || workspaceHasVerifiedGithubRemote) && (
+                (noExecutionTargetSelected || workspaceIsGit) && (
                   <Popover open={worktreePopoverOpen} onOpenChange={setWorktreePopoverOpen}>
                     <PopoverTrigger asChild>
                       <ComposerWorkspaceTrigger

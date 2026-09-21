@@ -18,7 +18,7 @@ import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { useCreateHostDirectory, useHostFilesystem } from "@/hooks/useHostFilesystem";
-import { useHostWorktrees, useVerifiedGithubWorktrees } from "@/hooks/useHostWorktrees";
+import { useHostWorktrees, useVerifiedGitWorktrees } from "@/hooks/useHostWorktrees";
 import { WorktreeRadioRow } from "./WorktreeRadioRow";
 
 /** True for Windows drive-letter paths such as `C:/Users/me` or `C:\\Users\\me`. */
@@ -520,14 +520,14 @@ export function WorkspacePicker({
     error: worktreesError,
   } = useHostWorktrees(hostId, worktreeQueryPath);
   const worktreesPending = Boolean(worktreesFetching || worktreesPlaceholder);
-  const verifiedGithubWorktrees = useVerifiedGithubWorktrees({
+  const verifiedGitWorktrees = useVerifiedGitWorktrees({
     hostId,
     requestedPath: requestedWorktreePath,
     worktrees: hostWorktrees,
     resolved: !worktreesPlaceholder && hostWorktrees !== undefined,
   });
-  const linkedWorktrees = verifiedGithubWorktrees.filter((worktree) => !worktree.is_main);
-  const showWorktreePanel = verifiedGithubWorktrees.length > 0;
+  const linkedWorktrees = verifiedGitWorktrees.filter((worktree) => !worktree.is_main);
+  const showWorktreePanel = verifiedGitWorktrees.length > 0;
 
   useEffect(() => {
     if (

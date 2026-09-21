@@ -32,7 +32,7 @@ export function RecentWorkspaceList({
   return (
     <div className="flex flex-col gap-0" data-testid="recent-workspace-list">
       {paths.map((path, index) => {
-        const isGithub = worktreeQueries[index]?.data?.[0]?.remote_provider === "github";
+        const isGit = (worktreeQueries[index]?.data?.length ?? 0) > 0;
         return (
           <div
             key={path}
@@ -47,11 +47,11 @@ export function RecentWorkspaceList({
               onClick={() => onSelect(path)}
               data-testid={`recent-workspace-select-${index}`}
             >
-              {isGithub ? (
+              {isGit ? (
                 <FolderGit2Icon
                   className="size-4 shrink-0 text-muted-foreground"
                   aria-hidden
-                  data-testid={`recent-workspace-icon-${index}-github`}
+                  data-testid={`recent-workspace-icon-${index}-git`}
                 />
               ) : (
                 <FolderIcon
