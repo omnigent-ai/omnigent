@@ -631,7 +631,9 @@ async def _drive_permission_mode(base_url: str, session_id: str) -> None:
                 "Bypass permissions",
             )
             for label in perm_labels:
-                await expect(page.get_by_role("menuitem", name=label, exact=True)).to_be_visible()
+                await expect(
+                    page.get_by_role("menuitemradio", name=label, exact=True)
+                ).to_be_visible()
             await page.get_by_test_id("new-chat-landing-permission-option-acceptEdits").click()
             await expect(perm).to_contain_text("Accept edits")
 
@@ -2206,14 +2208,16 @@ async def _drive_approval_mode(base_url: str, session_id: str) -> None:
             await expect(approval).to_be_visible()
             await approval.click()
             for label in ("Default", "Full access", "Read only", "Bypass approvals & sandbox"):
-                await expect(page.get_by_role("menuitem", name=label, exact=True)).to_be_visible()
+                await expect(
+                    page.get_by_role("menuitemradio", name=label, exact=True)
+                ).to_be_visible()
             await page.get_by_test_id("new-chat-landing-permission-option-bypass").click()
             await expect(approval).to_contain_text("Bypass approvals & sandbox")
             await expect(
                 page.get_by_test_id("new-chat-landing-permission-menu")
             ).not_to_be_visible()
             await approval.click()
-            await page.get_by_role("menuitem", name="Full access", exact=True).click()
+            await page.get_by_role("menuitemradio", name="Full access", exact=True).click()
             await expect(approval).to_contain_text("Full access")
 
             await page.get_by_test_id("new-chat-landing-input").fill("set up the project")
@@ -3774,7 +3778,9 @@ async def _drive_agy_skip_permissions(base_url: str, session_id: str) -> None:
             # agy has exactly two states: its own prompt, or no prompt at all.
             await skip.click()
             for label in ("Ask every time", "Skip permissions"):
-                await expect(page.get_by_role("menuitem", name=label, exact=True)).to_be_visible()
+                await expect(
+                    page.get_by_role("menuitemradio", name=label, exact=True)
+                ).to_be_visible()
             await page.get_by_test_id("new-chat-landing-permission-option-skip").click()
 
             await expect(skip).to_contain_text("Skip permissions")
