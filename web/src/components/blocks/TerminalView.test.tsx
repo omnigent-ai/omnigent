@@ -62,7 +62,7 @@ const terminalSessionMock = vi.hoisted(() => ({
     container: HTMLDivElement;
     clipboardEnabled: boolean;
     adaptCodexPalette: boolean;
-    onClipboardRequest?: (text: string) => void;
+    onClipboardRequest?: (text: string, copyEvent?: ClipboardEvent) => void;
     onFileLink?: (uri: string) => boolean;
     onState: (state: ConnectionState) => void;
     dispose: ReturnType<typeof vi.fn>;
@@ -90,7 +90,7 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
       _onActivity?: () => void,
       _onInput?: () => void,
       clipboardEnabled = true,
-      onClipboardRequest?: (text: string) => void,
+      onClipboardRequest?: (text: string, copyEvent?: ClipboardEvent) => void,
       _focusOnConnect = true,
       adaptCodexPalette = false,
       onFileLink?: (uri: string) => boolean,
@@ -218,21 +218,33 @@ describe("control-mode terminal", () => {
   });
 });
 
-describe("tmux clipboard", () => {
+describe("terminal clipboard", () => {
   async function renderClipboardView() {
     render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
     await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
     return terminalSessionMock.instances[0];
   }
 
-  async function requestClipboard(text: string, terminalIndex = 0): Promise<void> {
-    act(() => terminalSessionMock.instances[terminalIndex].onClipboardRequest?.(text));
+  async function requestClipboard(
+    text: string,
+    terminalIndex = 0,
+    copyEvent?: ClipboardEvent,
+  ): Promise<void> {
+    act(() => terminalSessionMock.instances[terminalIndex].onClipboardRequest?.(text, copyEvent));
     // Sonner publishes toast updates on the next event-loop turn.
     await act(async () => {
       await new Promise<void>((resolve) => {
         setTimeout(resolve, 0);
       });
     });
+  }
+
+  async function copySelection(text: string, terminalIndex = 0) {
+    const setData = vi.fn();
+    const event = new Event("copy", { bubbles: true, cancelable: true }) as ClipboardEvent;
+    Object.defineProperty(event, "clipboardData", { value: { setData } });
+    await requestClipboard(text, terminalIndex, event);
+    return { event, setData };
   }
 
   function visibleClipboardConsent(): HTMLElement | null {
@@ -268,12 +280,10 @@ describe("tmux clipboard", () => {
 
     expect(clipboardMock.copyText).not.toHaveBeenCalled();
     expect(prompt).not.toBeNull();
-    expect(
-      screen.getAllByText("Allow this terminal to copy to your clipboard?").length,
-    ).toBeGreaterThan(0);
+    expect(screen.getAllByText("Allow copying from terminals?").length).toBeGreaterThan(0);
     expect(prompt).toHaveTextContent("Your selection hasn’t been copied yet.");
     expect(prompt).toHaveTextContent(
-      "Your permission is required because terminal programs can silently replace your clipboard with text or commands you didn’t intend to paste.",
+      "Allowing copying also lets terminal programs silently replace your clipboard with text or commands you didn’t intend to paste.",
     );
     expect(within(prompt).getByRole("checkbox", { name: "Remember my choice" })).toBeChecked();
     expect(prompt).toHaveTextContent("Change this in Settings → General.");
@@ -287,6 +297,146 @@ describe("tmux clipboard", () => {
     await requestClipboardConsent("next text");
     expect(visibleClipboardConsent()).toBeInTheDocument();
     expect(clipboardMock.copyText).toHaveBeenCalledTimes(1);
+  });
+
+  it("asks before copying browser selections and Copy once does not grant future copies", async () => {
+    await renderClipboardView();
+    const first = await copySelection("browser selection");
+
+    expect(first.setData).not.toHaveBeenCalled();
+    expect(clipboardMock.copyText).not.toHaveBeenCalled();
+    expect(visibleClipboardConsent()).toBeInTheDocument();
+    clickConsentButton("Copy once");
+    await waitFor(() => expect(visibleClipboardConsent()).toBeNull());
+    expect(clipboardMock.copyText).toHaveBeenCalledWith("browser selection");
+
+    const next = await copySelection("next browser selection");
+    expect(next.setData).not.toHaveBeenCalled();
+    expect(visibleClipboardConsent()).toBeInTheDocument();
+    expect(readTerminalClipboardPreference()).toBe("ask");
+    expect(clipboardMock.copyText).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses the native copy event for allowed selections without requiring the async clipboard API", async () => {
+    writeTerminalClipboardPreference("allow");
+    await renderClipboardView();
+
+    const copied = await copySelection("selected text");
+
+    expect(copied.setData).toHaveBeenCalledWith("text/plain", "selected text");
+    expect(copied.event.defaultPrevented).toBe(true);
+    expect(clipboardMock.copyText).not.toHaveBeenCalled();
+    expect(visibleClipboardConsent()).toBeNull();
+  });
+
+  it("blocks browser selection copies and explains how to re-enable them", async () => {
+    writeTerminalClipboardPreference("block");
+    await renderClipboardView();
+
+    const copied = await copySelection("blocked text");
+
+    expect(copied.setData).not.toHaveBeenCalled();
+    expect(clipboardMock.copyText).not.toHaveBeenCalled();
+    expect(visibleClipboardConsent()).toBeNull();
+    expect(screen.getByText("Copying from this terminal is blocked.")).toBeInTheDocument();
+    expect(screen.getByText("Change this in Settings → General.")).toBeInTheDocument();
+  });
+
+  it.each(["ask", "block"] as const)(
+    "revokes selection copying in a mounted terminal when Settings changes to %s",
+    async (decision) => {
+      writeTerminalClipboardPreference("allow");
+      await renderClipboardView();
+      const before = await copySelection("allowed text");
+      expect(before.setData).toHaveBeenCalledWith("text/plain", "allowed text");
+
+      act(() => writeTerminalClipboardPreference(decision));
+      const after = await copySelection("after revocation");
+
+      expect(after.setData).not.toHaveBeenCalled();
+      expect(clipboardMock.copyText).not.toHaveBeenCalled();
+      expect(terminalSessionMock.instances).toHaveLength(1);
+      if (decision === "ask") expect(visibleClipboardConsent()).toBeInTheDocument();
+      else expect(visibleClipboardConsent()).toBeNull();
+    },
+  );
+
+  it("keeps an older in-flight program copy from overwriting a newer browser selection", async () => {
+    writeTerminalClipboardPreference("allow");
+    await renderClipboardView();
+    let finishOldCopy: (() => void) | undefined;
+    clipboardMock.copyText.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          finishOldCopy = resolve;
+        }),
+    );
+    await requestClipboard("older program copy");
+    const newer = await copySelection("newer browser selection");
+
+    expect(newer.setData).not.toHaveBeenCalled();
+    expect(clipboardMock.copyText).toHaveBeenCalledTimes(1);
+    await act(async () => finishOldCopy?.());
+    expect(clipboardMock.copyText.mock.calls).toEqual([
+      ["older program copy"],
+      ["newer browser selection"],
+    ]);
+  });
+
+  it("lets a native selection copy satisfy a pending browser retry", async () => {
+    writeTerminalClipboardPreference("allow");
+    await renderClipboardView();
+    clipboardMock.copyText.mockRejectedValueOnce(new Error("browser needs a gesture"));
+    await requestClipboard("program selection");
+    await waitFor(() => expect(visibleClipboardConsent()).toHaveTextContent("Copy needs a click"));
+
+    const copied = await copySelection("explicit browser selection");
+
+    expect(copied.setData).toHaveBeenCalledWith("text/plain", "explicit browser selection");
+    await waitFor(() => expect(visibleClipboardConsent()).toBeNull());
+    expect(clipboardMock.copyText).toHaveBeenCalledTimes(1);
+    expect(readTerminalClipboardPreference()).toBe("allow");
+  });
+
+  it.each(["ask", "allow", "block"] as const)(
+    "honors %s for explicit selections in read-only terminals without allowing program writes",
+    async (decision) => {
+      writeTerminalClipboardPreference(decision);
+      render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" readOnly />);
+      await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+      await requestClipboard("program request from read-only terminal");
+      expect(clipboardMock.copyText).not.toHaveBeenCalled();
+      expect(visibleClipboardConsent()).toBeNull();
+
+      const copied = await copySelection("explicit read-only selection");
+
+      if (decision === "allow") {
+        expect(copied.setData).toHaveBeenCalledWith("text/plain", "explicit read-only selection");
+      } else {
+        expect(copied.setData).not.toHaveBeenCalled();
+      }
+      if (decision === "ask") {
+        expect(visibleClipboardConsent()).toBeInTheDocument();
+        clickConsentButton("Copy once");
+        await waitFor(() => expect(visibleClipboardConsent()).toBeNull());
+        expect(clipboardMock.copyText).toHaveBeenCalledWith("explicit read-only selection");
+      } else {
+        expect(visibleClipboardConsent()).toBeNull();
+        expect(clipboardMock.copyText).not.toHaveBeenCalled();
+      }
+    },
+  );
+
+  it("does not copy selections from an inactive terminal", async () => {
+    writeTerminalClipboardPreference("allow");
+    render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" active={false} />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+
+    const copied = await copySelection("hidden selection");
+
+    expect(copied.setData).not.toHaveBeenCalled();
+    expect(clipboardMock.copyText).not.toHaveBeenCalled();
+    expect(visibleClipboardConsent()).toBeNull();
   });
 
   it("allows automatic copies for the rest of the mounted terminal session", async () => {

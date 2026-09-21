@@ -85,13 +85,13 @@ function TerminalClipboardPromptContent({
   const rememberDescriptionId = useId();
   const title =
     reason === "consent"
-      ? "Allow this terminal to copy to your clipboard?"
+      ? "Allow copying from terminals?"
       : reason === "permission"
         ? "Finish copying your selection"
         : "Copy needs a click";
   const description =
     reason === "consent"
-      ? "Your selection hasn’t been copied yet. Your permission is required because terminal programs can silently replace your clipboard with text or commands you didn’t intend to paste."
+      ? "Your selection hasn’t been copied yet. Allowing copying also lets terminal programs silently replace your clipboard with text or commands you didn’t intend to paste."
       : reason === "permission"
         ? "Clipboard copying is now allowed. Your selection hasn’t been copied yet. Click Copy now to finish."
         : copyFailed
@@ -145,7 +145,7 @@ function TerminalClipboardPromptContent({
                 disabled={!canRemember}
                 aria-describedby={rememberDescriptionId}
                 onChange={(event) => setRemember(event.target.checked)}
-                className="mt-0.5 size-4 shrink-0 accent-primary"
+                className="mt-0.5 size-4 shrink-0 scroll-my-1 accent-primary"
               />
               <span>Remember my choice</span>
             </label>

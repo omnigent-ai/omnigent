@@ -143,6 +143,38 @@ class _ClipboardBrowser:
             _clipboard_frame(text)
         )
 
+    def copy_selection(self, text: str) -> str:
+        """Select real xterm output; simulate clipboard commit without touching the OS."""
+        terminal_id = _terminal_id(self.session_ids[self.active_session])
+        self.sockets[terminal_id].send(b"\x1b[2J\x1b[H" + text.encode() + b"\r\n")
+        self.page.wait_for_timeout(200)  # Let xterm's buffered parser render the line.
+        screen = self.terminal.locator(".xterm-screen")
+        screen.click(trial=True)
+        bounds = screen.bounding_box()
+        assert bounds is not None
+        cols, rows = self.resizes[terminal_id][-1]
+        cell_width = bounds["width"] / cols
+        y = bounds["y"] + bounds["height"] / rows / 2
+        self.page.mouse.move(bounds["x"] + cell_width / 4, y)
+        self.page.mouse.down()
+        self.page.mouse.move(bounds["x"] + (len(text) + 0.25) * cell_width, y, steps=5)
+        self.page.mouse.up()
+        return self.textarea.evaluate(
+            """element => {
+                const data = new DataTransfer();
+                const event = new ClipboardEvent("copy", {
+                    clipboardData: data, bubbles: true, cancelable: true,
+                });
+                element.dispatchEvent(event);
+                const text = data.getData("text/plain");
+                if (data.types.includes("text/plain")) {
+                    window.__terminalClipboard.text = text;
+                    window.__terminalClipboard.writes.push(text);
+                }
+                return text;
+            }"""
+        )
+
     def expect_no_copy(self) -> None:
         # Let the injected WebSocket frame reach the browser before checking.
         self.page.wait_for_timeout(200)
@@ -247,10 +279,10 @@ def test_terminal_clipboard_popup_floats_bottom_right_without_resizing_or_steali
 
     expect(ui.consent).to_be_visible()
     expect(ui.consent).to_have_attribute("role", "region")
-    expect(ui.consent).to_contain_text("Allow this terminal to copy to your clipboard?")
+    expect(ui.consent).to_contain_text("Allow copying from terminals?")
     expect(ui.consent).to_contain_text("Your selection hasn’t been copied yet.")
     expect(ui.consent).to_contain_text(
-        "Your permission is required because terminal programs can silently replace your "
+        "Allowing copying also lets terminal programs silently replace your "
         "clipboard with text or commands you didn’t intend to paste."
     )
     expect(ui.consent.get_by_role("checkbox", name=_REMEMBER_LABEL)).to_be_checked()
@@ -533,12 +565,15 @@ def test_terminal_clipboard_pending_selection_survives_a_cross_tab_grant(
         settings.close()
 
 
+@pytest.mark.parametrize("source", ["program", "selection"])
 def test_terminal_clipboard_settings_revokes_a_mounted_terminals_permission(
     clipboard_browser: _ClipboardBrowser,
+    source: str,
 ) -> None:
     ui = clipboard_browser
     ui.open()
-    ui.request_copy("initial selection")
+    request_copy = ui.request_copy if source == "program" else ui.copy_selection
+    request_copy("initial selection")
     ui.consent.get_by_role("button", name="Allow copying", exact=True).click()
     _expect_clipboard(ui.page, "initial selection")
 
@@ -565,7 +600,7 @@ def test_terminal_clipboard_settings_revokes_a_mounted_terminals_permission(
                 )
 
             ui.page.bring_to_front()
-            ui.request_copy(f"selection with {option}")
+            request_copy(f"selection with {option}")
             if option == "Allow copying":
                 _expect_clipboard(ui.page, f"selection with {option}")
                 expect(ui.consent).to_have_count(0)
@@ -580,6 +615,81 @@ def test_terminal_clipboard_settings_revokes_a_mounted_terminals_permission(
         settings.close()
 
     ui.reload()
-    ui.request_copy("automatic selection after settings change")
+    request_copy("automatic selection after settings change")
     _expect_clipboard(ui.page, "automatic selection after settings change")
+    expect(ui.consent).to_have_count(0)
+
+
+def test_terminal_clipboard_browser_selection_asks_and_copy_once_does_not_remember(
+    clipboard_browser: _ClipboardBrowser,
+) -> None:
+    ui = clipboard_browser
+    ui.open()
+
+    assert ui.copy_selection("first browser selection") == ""
+    expect(ui.consent).to_be_visible()
+    ui.expect_no_copy()
+    ui.consent.get_by_role("button", name="Copy once", exact=True).click()
+    _expect_clipboard(ui.page, "first browser selection")
+    expect(ui.consent).to_have_count(0)
+
+    assert ui.copy_selection("second browser selection") == ""
+    expect(ui.consent).to_be_visible()
+    _expect_clipboard(ui.page, "first browser selection")
+    ui.consent.get_by_role("button", name="Allow copying", exact=True).click()
+    _expect_clipboard(ui.page, "second browser selection")
+
+    ui.reload()
+    assert ui.copy_selection("selection after reload") == "selection after reload"
+    _expect_clipboard(ui.page, "selection after reload")
+    expect(ui.consent).to_have_count(0)
+    ui.open(session=1)
+    assert ui.copy_selection("selection from another session") == "selection from another session"
+    _expect_clipboard(ui.page, "selection from another session")
+    expect(ui.consent).to_have_count(0)
+
+
+@pytest.mark.parametrize("remember", [True, False], ids=["remember", "session-only"])
+def test_terminal_clipboard_settings_blocks_selection_copying_after_returning_to_session(
+    clipboard_browser: _ClipboardBrowser,
+    remember: bool,
+) -> None:
+    ui = clipboard_browser
+    ui.open()
+    assert ui.copy_selection("initial browser selection") == ""
+    ui.consent.get_by_role("checkbox", name=_REMEMBER_LABEL).set_checked(remember)
+    allow = "Allow copying" if remember else "Allow for this session"
+    ui.consent.get_by_role("button", name=allow, exact=True).click()
+    _expect_clipboard(ui.page, "initial browser selection")
+    assert ui.copy_selection("allowed browser selection") == "allowed browser selection"
+    _expect_clipboard(ui.page, "allowed browser selection")
+
+    ui.page.get_by_test_id("settings-button").click()
+    preference = ui.page.get_by_test_id("terminal-clipboard-preference-select")
+    expect(preference).to_contain_text("Allow copying" if remember else "Ask before copying")
+    preference.click()
+    ui.page.get_by_role("option", name="Block copying", exact=True).click()
+    expect(preference).to_contain_text("Block copying")
+    ui.page.get_by_role("link", name="Back", exact=True).click()
+    expect(ui.terminal).to_have_attribute("data-state", "connected", timeout=20_000)
+
+    assert ui.copy_selection("blocked browser selection") == ""
+    expect(ui.page.get_by_text("Copying from this terminal is blocked.")).to_be_visible()
+    _expect_clipboard(ui.page, "allowed browser selection")
+    expect(ui.consent).to_have_count(0)
+    if remember and (screenshot_dir := os.environ.get("E2E_SCREENSHOT_DIR")):
+        directory = Path(screenshot_dir)
+        directory.mkdir(parents=True, exist_ok=True)
+        ui.page.screenshot(path=str(directory / "terminal-clipboard-selection-blocked.png"))
+    ui.request_copy("blocked program selection")
+    ui.page.wait_for_timeout(200)
+    _expect_clipboard(ui.page, "allowed browser selection")
+
+    ui.reload()
+    assert ui.copy_selection("blocked selection after reload") == ""
+    ui.expect_no_copy()
+    expect(ui.consent).to_have_count(0)
+    ui.open(session=1)
+    assert ui.copy_selection("blocked selection from another session") == ""
+    ui.expect_no_copy()
     expect(ui.consent).to_have_count(0)

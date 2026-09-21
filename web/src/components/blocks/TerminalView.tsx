@@ -41,6 +41,7 @@ import {
   type ConnectionState,
   type TerminalActivityListener,
   type TerminalInputListener,
+  applyTerminalCopy,
   isUnexpectedTerminalClose,
   resolveTerminalWorkspaceFileLink,
   TerminalSession,
@@ -82,6 +83,14 @@ export const RECONNECT_BACKOFF_MS = [
  * plain reset-on-connect, a connect→drop hot loop would retry forever.
  */
 export const RECONNECT_STABLE_MS = 30_000;
+
+interface TerminalClipboardRequest {
+  scope: string;
+  epoch: number;
+  generation: number;
+  text: string;
+  source: "terminal" | "selection";
+}
 
 interface TerminalViewProps {
   /** Session/conversation identifier, e.g. ``"conv_abc123"``. */
@@ -167,14 +176,13 @@ export function TerminalView({
   const [resumeError, setResumeError] = useState<string | null>(null);
   const clipboardServerIdentity = getOmnigentServerIdentity();
   const clipboardScope = JSON.stringify([clipboardServerIdentity, sessionId, terminalId, readOnly]);
-  const [clipboardPrompt, setClipboardPrompt] = useState<{
-    scope: string;
-    epoch: number;
-    generation: number;
-    text: string;
-    reason: TerminalClipboardPromptReason;
-    copyFailed?: boolean;
-  } | null>(null);
+  const [clipboardPrompt, setClipboardPrompt] = useState<
+    | (TerminalClipboardRequest & {
+        reason: TerminalClipboardPromptReason;
+        copyFailed?: boolean;
+      })
+    | null
+  >(null);
   const clipboardScopeRef = useRef({ scope: clipboardScope, epoch: 0 });
   // Unremembered choices apply to one mounted terminal; saved choices apply
   // to every terminal on this server in the current browser or app.
@@ -188,14 +196,13 @@ export function TerminalView({
   const clipboardActiveRef = useRef(active);
   const clipboardWorkerEpochRef = useRef(0);
   const clipboardAutoRunningRef = useRef<number | null>(null);
-  const clipboardAutoPendingRef = useRef<{
-    scope: string;
-    epoch: number;
-    workerEpoch: number;
-    generation: number;
-    text: string;
-    kind: "automatic" | "user";
-  } | null>(null);
+  const clipboardAutoPendingRef = useRef<
+    | (TerminalClipboardRequest & {
+        workerEpoch: number;
+        kind: "automatic" | "user";
+      })
+    | null
+  >(null);
   const [clipboardScopeEpoch, setClipboardScopeEpoch] = useState(0);
   useLayoutEffect(() => {
     if (clipboardActiveRef.current !== active) {
@@ -334,13 +341,7 @@ export function TerminalView({
   }, []);
 
   const queueSessionClipboardCopy = useCallback(
-    (request: {
-      scope: string;
-      epoch: number;
-      generation: number;
-      text: string;
-      kind: "automatic" | "user";
-    }) => {
+    (request: TerminalClipboardRequest & { kind: "automatic" | "user" }) => {
       // At most one browser clipboard promise is in flight per live terminal
       // epoch; newer requests replace the single pending text value.
       const workerEpoch = clipboardWorkerEpochRef.current;
@@ -398,11 +399,11 @@ export function TerminalView({
   );
 
   const notifyClipboardRequest = useCallback(
-    (text: string) => {
+    (text: string, copyEvent?: ClipboardEvent) => {
       if (
         !clipboardMountedRef.current ||
         !clipboardActiveRef.current ||
-        readOnly ||
+        (readOnly && !copyEvent) ||
         clipboardScopeRef.current.scope !== clipboardScope ||
         clipboardScopeRef.current.epoch !== clipboardScopeEpoch
       ) {
@@ -415,14 +416,39 @@ export function TerminalView({
           decision: readTerminalClipboardPreference(),
         };
       }
-      if (clipboardConsentRef.current.decision === "block") return;
-      if (clipboardConsentRef.current.decision === "allow" && !clipboardNeedsClickRef.current) {
+      if (clipboardConsentRef.current.decision === "block") {
+        if (copyEvent) {
+          toast.info("Copying from this terminal is blocked.", {
+            id: "terminal-clipboard-blocked",
+            description: "Change this in Settings → General.",
+          });
+        }
+        return;
+      }
+      const source = copyEvent ? "selection" : "terminal";
+      if (
+        clipboardConsentRef.current.decision === "allow" &&
+        copyEvent?.clipboardData &&
+        clipboardAutoRunningRef.current === null
+      ) {
+        // Keep native copy gestures independent of browser async-clipboard permissions.
+        // If a write is in flight, queue below so it cannot overwrite this selection.
+        setClipboardPrompt(null);
+        clipboardNeedsClickRef.current = false;
+        applyTerminalCopy(copyEvent, text);
+        return;
+      }
+      if (
+        clipboardConsentRef.current.decision === "allow" &&
+        (copyEvent || !clipboardNeedsClickRef.current)
+      ) {
         setClipboardPrompt(null);
         queueSessionClipboardCopy({
           scope: clipboardScope,
           epoch: clipboardScopeEpoch,
           generation,
           text,
+          source,
           kind: "automatic",
         });
         return;
@@ -433,6 +459,7 @@ export function TerminalView({
         epoch: clipboardScopeEpoch,
         generation,
         text,
+        source,
         reason: clipboardConsentRef.current.decision === "allow" ? "browser" : "consent",
       });
     },
@@ -444,7 +471,7 @@ export function TerminalView({
       const prompt =
         clipboardMountedRef.current &&
         clipboardActiveRef.current &&
-        !readOnly &&
+        (!readOnly || clipboardPrompt?.source === "selection") &&
         clipboardPrompt?.scope === clipboardScope &&
         clipboardPrompt.epoch === clipboardScopeEpoch &&
         clipboardPrompt.generation === clipboardRequestGenerationRef.current
@@ -477,6 +504,7 @@ export function TerminalView({
           epoch: clipboardScopeEpoch,
           generation,
           text: prompt.text,
+          source: prompt.source,
           kind: "user",
         });
       }
@@ -496,7 +524,7 @@ export function TerminalView({
     clipboardPrompt.epoch === clipboardScopeEpoch &&
     clipboardPrompt.generation === clipboardRequestGenerationRef.current &&
     active &&
-    !readOnly
+    (!readOnly || clipboardPrompt.source === "selection")
       ? clipboardPrompt
       : null;
 

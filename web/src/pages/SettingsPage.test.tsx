@@ -309,14 +309,18 @@ describe("SettingsPage", () => {
     renderPage("/settings/general");
     const select = screen.getByTestId("terminal-clipboard-preference-select");
     expect(select).toHaveValue("ask");
-    expect(screen.getByText("Terminal clipboard")).toBeInTheDocument();
+    expect(screen.getByText("Copying from terminals")).toBeInTheDocument();
+    expect(screen.getByText(/Controls copying text from all sessions/)).toBeInTheDocument();
+    expect(
+      screen.getByText(/Allowing copying also lets terminal programs silently replace/),
+    ).toBeInTheDocument();
     expect(screen.getByText(/all sessions and terminals on this server/)).toBeInTheDocument();
     expect(screen.getByText(/this browser or app/)).toBeInTheDocument();
     expect(within(select).getByRole("option", { name: "Allow copying" })).toBeInTheDocument();
     expect(within(select).getByRole("option", { name: "Block copying" })).toBeInTheDocument();
   });
 
-  it("persists terminal clipboard choices and can revoke automatic copying", () => {
+  it("persists terminal clipboard choices and can revoke copying", () => {
     renderPage("/settings/general");
     const select = screen.getByTestId("terminal-clipboard-preference-select");
     fireEvent.change(select, { target: { value: "allow" } });

@@ -1538,11 +1538,11 @@ function TerminalClipboardControl() {
     <div className="flex flex-wrap items-start justify-between gap-x-6 gap-y-3">
       <div className="flex min-w-0 flex-1 flex-col gap-1">
         <span id={labelId} className="text-ui font-medium">
-          Terminal clipboard
+          Copying from terminals
         </span>
         <span id={descriptionId} className="text-sm text-muted-foreground">
           {canRemember
-            ? "Allow lets terminals replace your clipboard across all sessions and terminals on this server in this browser or app. Choose Ask or Block to revoke automatic copying."
+            ? "Controls copying text from all sessions and terminals on this server in this browser or app. Allowing copying also lets terminal programs silently replace your clipboard with text or commands you didn’t intend to paste."
             : "This connection can’t remember clipboard permissions. You can still allow or block copying for each open terminal."}
         </span>
         {saveFailed && (
