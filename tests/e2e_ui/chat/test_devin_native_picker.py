@@ -177,6 +177,10 @@ async def _drive(base_url: str, session_id: str) -> None:
                 f"""window.localStorage.setItem(
                     "omnigent:recent-workspaces",
                     JSON.stringify({{ {_HOST_ID}: ["/work/repo"] }})
+                );
+                window.localStorage.setItem(
+                    "omnigent:last-mode-by-harness",
+                    JSON.stringify({{ "devin-native": {{ model: "swe-2" }} }})
                 );"""
             )
 
@@ -191,9 +195,17 @@ async def _drive(base_url: str, session_id: str) -> None:
             await page.clock.fast_forward(30_000)
             assert devin_requests == []
 
-            # Open Devin's config submenu (the `agent-config-*` Edit entry only
-            # exists when `selectedAgentHasKnobs` honours `devinMode`).
-            await _open_entry_models(page, _DEVIN_AGENT_ID)
+            await page.get_by_test_id("new-chat-landing-agent-select").click()
+            await page.get_by_test_id("new-chat-landing-harness-more").click()
+            await expect(
+                page.get_by_test_id(f"new-chat-landing-agent-summary-{_DEVIN_AGENT_ID}")
+            ).to_have_text("swe-2")
+            assert devin_requests == []
+            await (
+                page.get_by_test_id(f"new-chat-landing-agent-config-{_DEVIN_AGENT_ID}")
+                .get_by_text("Edit", exact=True)
+                .click()
+            )
 
             # Devin's own families render, from the devin-native catalog probe.
             models = page.get_by_test_id("new-chat-landing-agent-models")
@@ -203,6 +215,9 @@ async def _drive(base_url: str, session_id: str) -> None:
                     page.get_by_test_id(f"new-chat-landing-agent-model-{model['id']}")
                 ).to_be_visible()
             assert devin_requests
+            requests_before = len(devin_requests)
+            await page.clock.fast_forward(30_000)
+            await _wait_until(lambda: len(devin_requests) > requests_before)
 
             # The Effort ladder renders, carrying only the DEFAULT model's rungs.
             # Devin has no --effort flag, so this is the only way to express effort

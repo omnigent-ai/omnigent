@@ -3868,7 +3868,11 @@ export function NewChatLandingScreen() {
                   ? devinModelOptions
                   : [];
       const savedFusion = fusionOption(catalog)?.fusion;
-      const model = catalog.find((option) => option.id === saved.model);
+      const model =
+        catalog.find((option) => option.id === saved.model) ??
+        (native.iconKind === "devin" && catalog.length === 0 && saved.model
+          ? { id: saved.model }
+          : undefined);
       const label = visibleModelLabel(
         savedFusion !== undefined && isFusionModelUid(saved.model)
           ? // A fusion id isn't a catalog row id, so label it from the combo.
