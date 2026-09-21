@@ -115,6 +115,45 @@ describe("LoginPage sanitizeReturnTo open-redirect defense", () => {
   });
 });
 
+describe("LoginPage return_to under a base path", () => {
+  beforeEach(() => {
+    window.__OMNIGENT_BASE_PATH__ = "/proxy/6767";
+  });
+  afterEach(() => {
+    delete window.__OMNIGENT_BASE_PATH__;
+  });
+
+  it("defaults to the base root (not origin root) when no return_to is given", async () => {
+    renderLoginAt("");
+    await waitFor(() => expect(hrefWrites.length).toBeGreaterThan(0));
+    expect(hrefWrites[0]).toBe("/proxy/6767/");
+  });
+
+  it("falls back to the base root for an off-origin return_to", async () => {
+    renderLoginAt("https://evil.com");
+    await waitFor(() => expect(hrefWrites.length).toBeGreaterThan(0));
+    expect(hrefWrites[0]).toBe("/proxy/6767/");
+    expect(hrefWrites[0]).not.toContain("evil.com");
+  });
+
+  it("preserves a legitimate base-prefixed return_to unchanged", async () => {
+    // The captured return_to already carries the base prefix; it must be used
+    // as-is so the post-reload BrowserRouter (basename) matches the route.
+    renderLoginAt("%2Fproxy%2F6767%2Fsessions%2Fabc");
+    await waitFor(() => expect(hrefWrites.length).toBeGreaterThan(0));
+    expect(hrefWrites[0]).toBe("/proxy/6767/sessions/abc");
+  });
+
+  it("prefixes a legitimate same-origin return_to that isn't already base-prefixed", async () => {
+    // A server-issued redirect (e.g. the device-authorization consent bounce)
+    // may not know about the deployment base path — it must still land under
+    // it, not at the bare domain root where the reverse proxy has no route.
+    renderLoginAt("%2Foauth%2Fdevice%3Fuser_code%3DABCD-2345");
+    await waitFor(() => expect(hrefWrites.length).toBeGreaterThan(0));
+    expect(hrefWrites[0]).toBe("/proxy/6767/oauth/device?user_code=ABCD-2345");
+  });
+});
+
 describe("LoginPage v2 (?login-v2=1) flow", () => {
   function renderLoginV2(extra = "") {
     return render(

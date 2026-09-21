@@ -93,7 +93,7 @@ export const Reconnecting: Story = {
     />
   ),
   play: async ({ canvasElement }) => {
-    await userEvent.click(within(canvasElement).getByRole("button", { name: "Retry" }));
+    await userEvent.click(within(canvasElement).getByRole("button", { name: "Resume session" }));
   },
 };
 

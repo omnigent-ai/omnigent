@@ -29,6 +29,7 @@ import os
 import re
 import tempfile
 import uuid
+import weakref
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -48,7 +49,7 @@ if TYPE_CHECKING:
 import httpx
 
 from omnigent.debug_logging import runner_primary_session_id
-from omnigent.harness_aliases import canonicalize_harness
+from omnigent.harness_aliases import canonicalize_harness, is_native_harness
 from omnigent.models.model_override import (
     harness_supports_model_override,
     model_family_mismatch,
@@ -949,6 +950,130 @@ def should_dispatch_locally(tool_name: str) -> bool:
     return tool_name in _ALL_LOCAL_TOOLS
 
 
+# Granted tool names per live AgentSpec + effective harness, keyed by
+# ``id(spec)`` because AgentSpec is an unhashable dataclass. The weakref
+# guards against id reuse after the spec is garbage-collected.
+_granted_tool_names_cache: dict[
+    tuple[int, str | None], tuple[weakref.ref[AgentSpec], frozenset[str]]
+] = {}
+_GRANTED_TOOL_NAMES_CACHE_MAX = 256
+
+
+def _effective_harness_name(agent_spec: AgentSpec, effective_harness: str | None) -> str | None:
+    """Return the canonical harness a session actually runs.
+
+    The session's override outranks the spec: a spec declaring ``claude-sdk``
+    can run ``claude-native`` (and the reverse) when the server pinned a
+    harness at session create or Smart Routing picked one.
+
+    :param agent_spec: The session's resolved agent spec.
+    :param effective_harness: The session's harness override, or ``None`` when
+        the caller doesn't know it and the spec's declaration stands.
+    :returns: Canonical harness id, e.g. ``"claude-native"``, or ``None``.
+    """
+    raw = (
+        effective_harness or agent_spec.executor.config.get("harness") or agent_spec.executor.type
+    )
+    if not isinstance(raw, str) or not raw:
+        return None
+    return canonicalize_harness(raw) or raw
+
+
+def _surface_only_spec(agent_spec: AgentSpec) -> AgentSpec:
+    """Return *agent_spec* with the OS-env options that only cost work stripped.
+
+    Only the *presence* of ``os_env`` decides whether ``sys_os_*`` is
+    registered, but building one honours ``fork`` (mkdtemp + full working-tree
+    copy) and ``start_in_scratch`` (raises without an active sandbox). Neither
+    changes the tool names, so the surface probe drops both.
+    """
+    os_env = agent_spec.os_env
+    if os_env is None or not (os_env.fork or os_env.start_in_scratch):
+        return agent_spec
+    return dataclasses.replace(
+        agent_spec,
+        os_env=dataclasses.replace(os_env, fork=False, start_in_scratch=False),
+    )
+
+
+def _granted_tool_names(agent_spec: AgentSpec, harness: str | None = None) -> frozenset[str]:
+    """Return the non-MCP tool surface advertised for *agent_spec* on *harness*.
+
+    Mirrors advertisement: the names ``ToolManager`` registers, spec-local
+    tools by declared name (no workdir load needed), and ``sys_os_*`` when the
+    session runs a native harness, whose relay advertises them unconditionally
+    (see :func:`build_native_relay_tool_schemas`). MCP tools are runner-owned
+    and resolved by the MCP manager, never by this set.
+
+    :param agent_spec: The session's resolved agent spec.
+    :param harness: Canonical harness the session runs, from
+        :func:`_effective_harness_name`. Only the native/non-native split
+        matters here.
+    :raises Exception: Propagates ``ToolManager`` construction failures so
+        callers can fail closed instead of guessing at the surface.
+    """
+    cache_key = (id(agent_spec), harness)
+    cached = _granted_tool_names_cache.get(cache_key)
+    if cached is not None and cached[0]() is agent_spec:
+        return cached[1]
+    # Shut the probe manager down so a manager-created OS environment doesn't
+    # outlive the check; with fork/scratch stripped above there is nothing
+    # expensive to tear down.
+    manager = ToolManager(_surface_only_spec(agent_spec))
+    try:
+        names = set(manager.get_tool_names())
+    finally:
+        manager.shutdown()
+    names.update(info.name for info in agent_spec.local_tools)
+    if is_native_harness(harness):
+        names.update(_OS_ENV_TOOLS)
+    granted = frozenset(names)
+    if len(_granted_tool_names_cache) >= _GRANTED_TOOL_NAMES_CACHE_MAX:
+        _granted_tool_names_cache.clear()
+    _granted_tool_names_cache[cache_key] = (weakref.ref(agent_spec), granted)
+    return granted
+
+
+def _ungranted_tool_reason(
+    tool_name: str,
+    agent_spec: AgentSpec | None,
+    effective_harness: str | None = None,
+) -> str | None:
+    """Return why *tool_name* is refused for *agent_spec*, or ``None`` if allowed.
+
+    The check is skipped when no granted surface is known: ``agent_spec`` is
+    ``None`` (spec-less dispatch paths) or is not a real :class:`AgentSpec`
+    (partial stand-ins cannot build a ``ToolManager``). Fails closed when the
+    surface exists but cannot be computed.
+
+    :param tool_name: Tool the caller wants to dispatch, e.g. ``"sys_os_shell"``.
+    :param agent_spec: The session's resolved agent spec, or ``None``.
+    :param effective_harness: The session's harness override, so a session
+        running a harness its spec never declared is judged on the surface it
+        was actually advertised. ``None`` falls back to the spec.
+    """
+    from omnigent.spec.types import AgentSpec as _AgentSpec
+
+    if not isinstance(agent_spec, _AgentSpec):
+        return None
+    try:
+        granted = _granted_tool_names(
+            agent_spec, _effective_harness_name(agent_spec, effective_harness)
+        )
+    except Exception as exc:
+        _logger.exception("granted tool surface unavailable for %s", tool_name)
+        return (
+            f"tool {tool_name!r} is not enabled: the agent's granted tool surface "
+            f"could not be resolved ({type(exc).__name__}: {exc})"
+        )
+    if tool_name in granted:
+        return None
+    return (
+        f"tool {tool_name!r} is not enabled for this agent "
+        f"(not in the agent spec's registered tool surface)"
+    )
+
+
 def _is_spec_local_python_tool(tool_name: str, agent_spec: AgentSpec | None) -> bool:
     local_tools = agent_spec.local_tools if agent_spec is not None else []
     return any(
@@ -1715,7 +1840,7 @@ async def _inherited_parent_model(
         parent_model = validate_model_override(raw_model)
     except ValueError:
         return None
-    if child_harness is not None and model_family_mismatch(child_harness, parent_model):
+    if child_harness is not None and _dispatch_model_mismatch(child_harness, parent_model):
         _logger.debug(
             "sys_session_send: not inheriting parent model %r for sub-agent %r "
             "(family mismatch with harness %s); child runs its default",
@@ -2152,6 +2277,25 @@ def _subagent_allowed_harnesses(
     )
 
 
+def _dispatch_model_mismatch(harness: str, model: str) -> str | None:
+    """Treat configured model IDs as opaque; legacy sessions retain family checks."""
+    from omnigent.errors import OmnigentError
+    from omnigent.inference_config import (
+        binding_for_harness,
+        load_runtime_inference_config,
+        resolve_bound_model,
+    )
+
+    config = load_runtime_inference_config()
+    if binding_for_harness(config, harness) is not None:
+        try:
+            resolve_bound_model(config, harness, model)
+        except OmnigentError as exc:
+            return str(exc)
+        return None
+    return model_family_mismatch(harness, model)
+
+
 def _normalize_subagent_model(
     model: str,
     *,
@@ -2177,8 +2321,15 @@ def _normalize_subagent_model(
     :param harness: The child's declared harness, e.g. ``"claude-native"``.
     :returns: The id to persist as ``model_override``.
     """
+    from omnigent.inference_config import binding_for_harness, load_runtime_inference_config
     from omnigent.models.model_catalog import resolve_model_provider
 
+    # ACP commands own their model namespace, even when provider credentials are shared.
+    if canonicalize_harness(harness) == "acp" or (
+        harness is not None
+        and binding_for_harness(load_runtime_inference_config(), harness) is not None
+    ):
+        return model
     sub_spec = _find_subagent_spec(sub_agent_name, agent_spec)
     if sub_spec is None or harness is None:
         return model
@@ -2626,7 +2777,7 @@ async def _execute_subagent_tool(
                     f"{child_harness or 'unknown'!r} has no model-override "
                     "plumbing. Omit 'model' to use the harness default."
                 )
-            mismatch = model_family_mismatch(child_harness, model) if child_harness else None
+            mismatch = _dispatch_model_mismatch(child_harness, model) if child_harness else None
             if mismatch is not None:
                 return (
                     f"Error: sys_session_send 'model' rejected for sub-agent "
@@ -4342,6 +4493,7 @@ _SCHEDULED_TASK_CREATE_FIELDS = (
     "permission_mode",
     "workspace",
     "host_id",
+    "execution_target",
 )
 # Fields the update tool forwards to PATCH /v1/scheduled-tasks/{id}.
 _SCHEDULED_TASK_UPDATE_FIELDS = (
@@ -4356,6 +4508,7 @@ _SCHEDULED_TASK_UPDATE_FIELDS = (
     "max_cost_usd",
     "workspace",
     "host_id",
+    "execution_target",
     "state",
 )
 _SCHEDULED_TASK_ID_RE = re.compile(r"^[0-9a-fA-F]{32}$")
@@ -5632,10 +5785,10 @@ async def _rename_current_session_via_rest(
             {"error": "sys_session_rename could not verify the session is top-level"}
         )
     try:
-        response = await server_client.patch(
-            f"/v1/sessions/{conversation_id}",
+        response = await server_client.post(
+            f"/v1/sessions/{conversation_id}/agent-title",
             json={"title": normalized_title},
-            timeout=30.0,
+            timeout=90.0,
         )
     except Exception as exc:  # noqa: BLE001
         return json.dumps({"error": f"sys_session_rename failed: {exc}"})
@@ -5652,6 +5805,8 @@ async def _rename_current_session_via_rest(
         return json.dumps({"error": f"sys_session_rename returned invalid JSON: {exc}"})
     if not isinstance(payload, dict):
         return json.dumps({"error": "sys_session_rename returned a non-object response"})
+    if payload.get("renamed") is False:
+        return json.dumps(payload)
     updated_title = payload.get("title")
     if not isinstance(updated_title, str):
         return json.dumps({"error": "sys_session_rename response omitted the updated title"})
@@ -6181,6 +6336,7 @@ async def execute_tool(
     harness_client: httpx.AsyncClient | None = None,
     publish_event: Callable[[str, _JsonObject], None] | None = None,
     filesystem_registry: FilesystemRegistry | None = None,
+    effective_harness: str | None = None,
 ) -> str:
     """
     Execute a tool and return the output string.
@@ -6204,6 +6360,10 @@ async def execute_tool(
         so that ``sys_os_write`` and ``sys_os_edit`` calls record changed
         paths for the ``GET …/changes`` endpoint. ``sys_os_shell`` is
         not tracked — shell side-effects cannot be attributed to a session.
+    :param effective_harness: Harness the session actually runs, when the
+        caller knows it (the server's per-session override outranks the
+        spec's declaration). Decides whether the native relay's
+        unconditional ``sys_os_*`` counts toward the granted surface.
     :returns: Tool output string.
     """
     if not arguments.strip():
@@ -6212,6 +6372,12 @@ async def execute_tool(
     if error is not None:
         return json.dumps({"error": error})
     assert args is not None
+    # MCP dispatch resolves the target against the spec inside the MCP
+    # manager; every other branch is gated on the spec's granted surface.
+    if mcp_manager is None:
+        refusal = _ungranted_tool_reason(tool_name, agent_spec, effective_harness)
+        if refusal is not None:
+            return json.dumps({"error": refusal})
     try:
         if mcp_manager is not None:
             # All MCP tool calls are routed through the AP server's
@@ -6280,6 +6446,7 @@ async def execute_tool(
                 local_tool_workdir=local_tool_workdir,
                 mcp_manager=mcp_manager,
                 filesystem_registry=filesystem_registry,
+                effective_harness=effective_harness,
             )
         elif tool_name in _SUBAGENT_TOOLS:
             output = await _execute_subagent_tool(
@@ -6539,8 +6706,9 @@ async def dispatch_tool_locally(
     session_async_tasks: dict[str, tuple[asyncio.Task[str], asyncio.Event]] | None = None,
     publish_event: Callable[[str, _JsonObject], None] | None = None,
     filesystem_registry: FilesystemRegistry | None = None,
+    effective_harness: str | None = None,
 ) -> str:
-    """Execute a tool locally and PATCH the result to the harness.
+    """Execute a tool once and POST its result to the harness.
 
     :param runner_workspace: Optional CLI launch workspace used to
         resolve placeholder cwd values for runner-owned filesystem
@@ -6560,8 +6728,15 @@ async def dispatch_tool_locally(
         for the ``GET …/changes`` endpoint.
     :param resource_registry: Optional session-resource registry used to
         observe tool-launched terminals.
+    :param effective_harness: Harness the session actually runs, forwarded to
+        ``execute_tool`` for the granted-surface check.
     :returns: The tool output string.
     """
+    if not conversation_id:
+        raise ValueError(
+            "dispatch_tool_locally requires conversation_id to POST the "
+            "harness session-keyed URL; got None/empty"
+        )
     output = await execute_tool(
         tool_name=tool_name,
         arguments=arguments,
@@ -6581,6 +6756,7 @@ async def dispatch_tool_locally(
         harness_client=harness_client,
         filesystem_registry=filesystem_registry,
         publish_event=publish_event,
+        effective_harness=effective_harness,
     )
 
     # A file-mutating tool just ran — nudge the web to refetch the
@@ -6592,39 +6768,38 @@ async def dispatch_tool_locally(
             now=asyncio.get_running_loop().time(),
         )
 
-    # POST the result back to the harness as a ``tool_result``
-    # event on the session-keyed events endpoint. ``conversation_id``
-    # is required: the harness validates the URL segment against
-    # its own runner-stamped value and fails 404 on mismatch —
-    # without an id we'd be unable to form a valid URL. Fail loud
-    # per ``designs/DESIGN_PRINCIPLES.md`` rather than substituting
-    # a synthetic default. ``response_id`` is unused at the URL /
-    # body level (the harness has at most one in-flight turn so the
-    # ``call_id`` alone keys the parked Future) — kept on the
-    # function signature for symmetry with callers that track it.
-    del response_id  # see comment above — intentionally unused
-    if not conversation_id:
-        raise ValueError(
-            "dispatch_tool_locally requires conversation_id to POST the "
-            "harness session-keyed URL; got None/empty"
-        )
-    try:
-        resp = await harness_client.post(
-            f"/v1/sessions/{conversation_id}/events",
-            json={"type": "tool_result", "call_id": call_id, "output": output},
-            timeout=30.0,
-        )
-        resp.raise_for_status()
-    except Exception as exc:  # noqa: BLE001
-        _logger.warning(
-            "Runner local dispatch tool_result event failed for %s (call_id=%s): %s",
-            tool_name,
-            call_id,
-            exc,
-            extra={"session_id": conversation_id},
-        )
+    # Retry only delivery: tools can have side effects. The harness ignores
+    # duplicate call_ids, including when the first acknowledgement was lost.
+    for attempt in range(2):
+        try:
+            resp = await harness_client.post(
+                f"/v1/sessions/{conversation_id}/events",
+                json={"type": "tool_result", "call_id": call_id, "output": output},
+                timeout=30.0,
+            )
+            resp.raise_for_status()
+            return output
+        except Exception as exc:
+            retryable = isinstance(exc, httpx.TransportError) or (
+                isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code >= 500
+            )
+            retry = attempt == 0 and retryable
+            _logger.warning(
+                "Runner local dispatch tool_result event failed for %s "
+                "(call_id=%s, response_id=%s, attempt=%s, retry=%s): %s",
+                tool_name,
+                call_id,
+                response_id,
+                attempt + 1,
+                retry,
+                exc,
+                extra={"session_id": conversation_id},
+            )
+            if retry:
+                continue
+            raise
 
-    return output
+    raise AssertionError("tool result delivery attempts exhausted")
 
 
 # ── OS env tools (OSEnvironment-backed) ──────────────────
@@ -7399,6 +7574,7 @@ async def _execute_async_inbox_tool(
     mcp_manager: RunnerMcpManager | None,
     filesystem_registry: FilesystemRegistry | None = None,
     harness_client: httpx.AsyncClient | None = None,
+    effective_harness: str | None = None,
 ) -> str:
     """
     Runner-local dispatch for async inbox tools.
@@ -7418,6 +7594,9 @@ async def _execute_async_inbox_tool(
     :param resource_registry: Optional session-resource registry used by
         async terminal-tool launches.
     :param harness_client: Unused; kept for caller compatibility.
+    :param effective_harness: Harness the session actually runs, forwarded to
+        ``_spawn_async_tool`` so the target is judged against the surface the
+        session was advertised.
     :returns: Tool output string.
     """
     del harness_client
@@ -7445,6 +7624,7 @@ async def _execute_async_inbox_tool(
             local_tool_workdir=local_tool_workdir,
             mcp_manager=mcp_manager,
             filesystem_registry=filesystem_registry,
+            effective_harness=effective_harness,
         )
 
     if tool_name == SysCancelAsyncTool.name():
@@ -7927,6 +8107,7 @@ def _spawn_async_tool(
     mcp_manager: RunnerMcpManager | None,
     filesystem_registry: FilesystemRegistry | None = None,
     local_tool_workdir: Path | None | _UnsetLocalToolWorkdir = _UNSET_LOCAL_TOOL_WORKDIR,
+    effective_harness: str | None = None,
 ) -> str:
     """
     Spawn a tool as a background asyncio.Task.
@@ -7943,6 +8124,8 @@ def _spawn_async_tool(
         ``GET …/changes`` endpoint.
     :param resource_registry: Optional session-resource registry used by
         async terminal-tool launches.
+    :param effective_harness: Harness the session actually runs, used to judge
+        the target against the surface the session was advertised.
     :returns: JSON handle string with canonical ``handle_id``,
         plus compatibility ``task_id`` (identical value; remove in 0.8.0),
         ``tool_name``, ``status``, and ``message``. Prefer
@@ -7959,6 +8142,10 @@ def _spawn_async_tool(
         return "Error: sys_call_async cannot dispatch itself"
     if session_inbox is None or session_async_tasks is None:
         return "Error: async inbox not initialized for this session"
+    if mcp_manager is None:
+        refusal = _ungranted_tool_reason(target_tool, agent_spec, effective_harness)
+        if refusal is not None:
+            return f"Error: sys_call_async refused: {refusal}"
 
     handle_id = f"handle_{uuid.uuid4().hex[:12]}"
     cancel_event = asyncio.Event()
@@ -8015,6 +8202,7 @@ def _spawn_async_tool(
                 mcp_manager=mcp_manager,
                 session_inbox=session_inbox if target_tool in _TERMINAL_TOOLS else None,
                 filesystem_registry=filesystem_registry,
+                effective_harness=effective_harness,
             )
             execution_task = asyncio.create_task(exec_coro)
             cancellation_task = asyncio.create_task(cancel_event.wait())

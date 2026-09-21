@@ -1,3 +1,7 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
+import { SidebarDataProvider } from "@/hooks/useSidebarData";
 // The session-drag preview (dnd-kit DragOverlay) must render in a portal under
 // <body>, never inline inside the sidebar <aside>. The aside always carries a
 // CSS translate (the mobile slide-in), which makes it the containing block for
@@ -8,9 +12,18 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
+
+const orderingState = vi.hoisted(() => ({ available: true }));
+vi.mock("@/hooks/useProjectOrder", () => ({
+  useProjectOrder: () => ({
+    data: orderingState.available
+      ? { sort_mode: "alphabetical", ordered_project_ids: null }
+      : undefined,
+  }),
+  useSaveProjectOrder: () => ({ mutate: vi.fn(), isPending: false }),
+}));
 
 vi.mock("@/hooks/useConversations", () => ({
   useConversations: vi.fn(),
@@ -31,7 +44,7 @@ vi.mock("@/hooks/useConversations", () => ({
   useBulkMoveToProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useBulkStopSessions: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useStopSession: () => ({ mutate: vi.fn() }),
-  useProjects: () => ({ data: [] }),
+  useProjects: vi.fn(() => ({ data: [] })),
   useProjectSessions: () => ({
     data: undefined,
     isLoading: false,
@@ -57,7 +70,7 @@ vi.mock("@/lib/serverOrigin", () => ({
     ["localhost", "127.0.0.1", "0.0.0.0", "::1", "[::1]"].includes(new URL(origin).hostname),
 }));
 
-import { useConversations } from "@/hooks/useConversations";
+import { useConversations, useProjects } from "@/hooks/useConversations";
 import { Sidebar } from "./Sidebar";
 
 const useConvMock = vi.mocked(useConversations);
@@ -105,11 +118,13 @@ function renderSidebar() {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={qc}>
-      <TooltipProvider>
-        <MemoryRouter initialEntries={["/"]}>
-          <Sidebar open onClose={vi.fn()} />
-        </MemoryRouter>
-      </TooltipProvider>
+      <SidebarDataProvider>
+        <TooltipProvider>
+          <MemoryRouter initialEntries={["/"]}>
+            <Sidebar open onClose={vi.fn()} />
+          </MemoryRouter>
+        </TooltipProvider>
+      </SidebarDataProvider>
     </QueryClientProvider>,
   );
 }
@@ -123,6 +138,8 @@ function startRowDrag(row: HTMLElement) {
 }
 
 beforeEach(() => {
+  orderingState.available = true;
+  vi.mocked(useProjects).mockReturnValue({ data: [] } as unknown as ReturnType<typeof useProjects>);
   mockConversations([conv("conv_a")]);
 });
 
@@ -133,6 +150,33 @@ afterEach(() => {
 });
 
 describe("session drag preview portal", () => {
+  it.each([false, true])("enables project dragging only with order data: %s", (available) => {
+    orderingState.available = available;
+    vi.mocked(useProjects).mockReturnValue({
+      data: [{ id: "project-a", name: "Alpha" }],
+    } as unknown as ReturnType<typeof useProjects>);
+    renderSidebar();
+    const header = screen.getByRole("button", { name: "Alpha" });
+    startRowDrag(header);
+    const preview = document.body.querySelector('[class*="max-w-[16rem]"]');
+    if (available) {
+      expect(preview).not.toBeNull();
+    } else {
+      expect(preview).toBeNull();
+      expect(fireEvent.keyDown(header, { key: " ", code: "Space" })).toBe(true);
+      fireEvent.click(header);
+      expect(header).toHaveAttribute("aria-expanded", "true");
+    }
+  });
+
+  it("does not intercept Space on a session action as a keyboard drag", () => {
+    renderSidebar();
+    const button = screen.getByRole("button", { name: "Pin conversation" });
+    button.focus();
+    expect(fireEvent.keyDown(button, { key: " ", code: "Space" })).toBe(true);
+    expect(document.body.querySelector('[class*="max-w-[16rem]"]')).toBeNull();
+  });
+
   it("renders the drag preview under <body>, outside the translated aside", () => {
     const { container } = renderSidebar();
 

@@ -12,6 +12,7 @@ from omnigent.onboarding.provider_config import (
     GEMINI_FAMILY,
     OPENAI_FAMILY,
     PI_SURFACE,
+    FamilyConfig,
     default_provider_for_harness,
     harness_family,
     load_providers,
@@ -1015,3 +1016,38 @@ def test_claude_sdk_resolution_survives_stray_cli_config_claude_entry() -> None:
     }
     entry = default_provider_for_harness(config, "claude-sdk")  # must NOT raise
     assert entry is not None and entry.name == "vendor-anthropic"
+
+
+def test_resolve_model_tier_follows_alias_chain() -> None:
+    """A ``models:`` value that names another tier resolves to its id.
+
+    Deployments alias tier names to ids (``deepseek-pro: deepseek-v4-pro``)
+    and reference the alias from other keys (``default: deepseek-pro``), so
+    both accessors must agree on which string is the concrete id.
+    """
+    family = FamilyConfig(
+        base_url="http://bifrost.example.com/v1",
+        models={
+            "default": "deepseek-pro",
+            "deepseek-pro": "deepseek-v4-pro",
+            "glm": "GLM-5.3",
+        },
+    )
+    # ``default_model`` stays the raw accessor; resolution is explicit.
+    assert family.default_model == "deepseek-pro"
+    assert family.resolve_model_tier(family.default_model or "") == "deepseek-v4-pro"
+    # An entry naming no other tier passes through untouched.
+    assert family.resolve_model_tier("GLM-5.3") == "GLM-5.3"
+
+
+def test_resolve_model_tier_is_bounded_on_cyclic_aliases() -> None:
+    """A cyclic alias map terminates instead of looping."""
+    family = FamilyConfig(base_url="http://bifrost.example.com/v1", models={"a": "b", "b": "a"})
+    assert family.resolve_model_tier("a") == "a"
+    assert family.resolve_model_tier("b") == "b"
+
+
+def test_resolve_model_tier_without_models_map_is_passthrough() -> None:
+    """No ``models:`` map → nothing to resolve."""
+    family = FamilyConfig(base_url="http://bifrost.example.com/v1")
+    assert family.resolve_model_tier("gpt-5") == "gpt-5"

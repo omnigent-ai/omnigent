@@ -74,16 +74,15 @@ export function TurnRail({
   // Vertical center of the hovered tick within the rail's own coordinate
   // space, so the (rail-relative) preview box tracks it as the rail scrolls.
   const [previewTop, setPreviewTop] = useState(0);
+  // Re-arm active-tick correction after pointer interaction suppresses it.
+  const [correctionNonce, setCorrectionNonce] = useState(0);
+  // Prepending history changes tick IDs and re-arms correction;
+  // response-preview churn does not.
+  const turnIdsKey = turns.map((turn) => turn.itemId).join("\u0000");
 
   // Keep the active tick reachable in the rail's own viewport as the transcript
-  // scrolls, so the highlight tracks your position like a scrollbar thumb.
-  // Only scrolls when that tick has drifted out of (or past) the rail
-  // viewport, and only far enough to bring it back to the edge — never
-  // re-centering. This is what lets a tick-click leave the rail alone: after
-  // you scroll the rail to a tick and click it, that tick is already in view,
-  // so there's nothing to correct and the rail stays parked. The fade masks
-  // (32px top/bottom) are treated as the usable edges so a tracked tick never
-  // hides under them.
+  // scrolls. Observer rects arrive post-layout, avoiding forced synchronous
+  // layout reads when a conversation mounts a new set of ticks.
   useEffect(() => {
     const rail = railRef.current;
     if (!rail || !activeId) return;
@@ -93,31 +92,29 @@ export function TurnRail({
     if (interactingRef.current) return;
     const tick = tickRefs.current.get(activeId);
     if (!tick) return;
-    const top = tick.offsetTop;
-    const bottom = tick.offsetTop + tick.offsetHeight;
-    const viewTop = rail.scrollTop + FADE;
-    const viewBottom = rail.scrollTop + rail.clientHeight - FADE;
-    const max = rail.scrollHeight - rail.clientHeight;
-    let next: number;
-    if (top < viewTop) {
-      // Run sits above the usable viewport — bring its top to the top edge.
-      next = top - FADE;
-    } else if (bottom > viewBottom) {
-      // Run sits below — bring its bottom to the bottom edge.
-      next = bottom - rail.clientHeight + FADE;
-    } else {
-      // Already fully in view: leave the rail exactly where it is.
-      return;
-    }
-    const clamped = Math.max(0, Math.min(next, max));
-    if (Math.abs(clamped - rail.scrollTop) < 1) return;
-    rail.scrollTo({ top: clamped, behavior: "smooth" });
-    // Re-run on `turns` too, not just `activeId`: loading older history
-    // prepends ticks without changing which transcript turns are on screen, so
-    // `activeId` stays put. Without this, a fresh load (pinned to the bottom)
-    // leaves the rail stuck at the top with the active tick stranded off-screen
-    // below the fade — the reported "should start at the bottom" bug.
-  }, [activeId, turns]);
+    let cancelled = false;
+    const observer = new IntersectionObserver(
+      ([entry]) => {
+        if (cancelled || !entry?.rootBounds || interactingRef.current) return;
+        observer.disconnect();
+        const usableTop = entry.rootBounds.top + FADE;
+        const usableBottom = entry.rootBounds.bottom - FADE;
+        const delta =
+          entry.boundingClientRect.top < usableTop
+            ? entry.boundingClientRect.top - usableTop
+            : entry.boundingClientRect.bottom > usableBottom
+              ? entry.boundingClientRect.bottom - usableBottom
+              : 0;
+        if (Math.abs(delta) >= 1) rail.scrollBy({ top: delta, behavior: "smooth" });
+      },
+      { root: rail, threshold: 1 },
+    );
+    observer.observe(tick);
+    return () => {
+      cancelled = true;
+      observer.disconnect();
+    };
+  }, [activeId, turnIdsKey, correctionNonce]);
 
   // Page in older history when the rail nears its own top. Two triggers:
   //  - scroll: fires when the ticks overflow the box and the user scrolls up.
@@ -136,10 +133,18 @@ export function TurnRail({
     const onWheel = (e: WheelEvent) => {
       if (e.deltaY < 0) fetchOlder();
     };
-    rail.addEventListener("scroll", fetchOlder, { passive: true });
+    let previousTop = rail.scrollTop;
+    const onScroll = () => {
+      const scrollingUp = rail.scrollTop < previousTop;
+      previousTop = rail.scrollTop;
+      // Active-tick tracking scrolls the rail without a reader gesture.
+      const readerInRail = interactingRef.current || rail.contains(document.activeElement);
+      if (scrollingUp && readerInRail) fetchOlder();
+    };
+    rail.addEventListener("scroll", onScroll, { passive: true });
     rail.addEventListener("wheel", onWheel, { passive: true });
     return () => {
-      rail.removeEventListener("scroll", fetchOlder);
+      rail.removeEventListener("scroll", onScroll);
       rail.removeEventListener("wheel", onWheel);
     };
   }, [hasMoreHistory, loadingMoreHistory]);
@@ -255,6 +260,7 @@ export function TurnRail({
       onMouseLeave={() => {
         interactingRef.current = false;
         setHoveredId(null);
+        setCorrectionNonce((nonce) => nonce + 1);
       }}
     >
       <div

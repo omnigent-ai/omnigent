@@ -1,48 +1,48 @@
-"""Persistence for the ``accounts`` auth provider.
+"""Accounts-mode credentials, durable revocation, and token issuance.
 
-Sibling to :class:`omnigent.stores.permission_store.PermissionStore`
-— same database, separate API surface. Lives here (not under
-``stores/``) because it's a server-only concept: only the accounts
-provider's routes and bootstrap touch it, never the runtime or the
-runner. Internal hosted deploys that run header/OIDC don't
-instantiate this store at all, so the new code path is invisible
-to them.
-
-The split is deliberate. PermissionStore is a stable contract that
-many subsystems depend on (permission checks, session lookups,
-admin-flag gating) and polluting it with accounts-specific methods
-muddles that boundary. Accounts mode owns its own persistence
-surface; PermissionStore stays exactly as it is on ``main``.
-
-Schema:
-
-- Reads / writes three columns on the existing ``users`` table —
-  ``password_hash``, ``created_at``, ``last_login_at`` — added by
-  the ``g1a2b3c4d5e6`` migration. Those columns are nullable, so
-  rows created in header/OIDC mode (where ``PermissionStore.ensure_user``
-  is the writer) leave them unset and accounts-specific reads
-  return ``None``.
-- Owns the ``account_tokens`` table outright — invite + magic-login
-  tokens, atomic single-use via ``UPDATE … WHERE redeemed_at IS NULL``.
+Accounts and permission stores share the users table. Accounts mode owns
+passwords, generation IDs, deletion tombstones, and invite/magic-login tokens.
+Header/OIDC identities leave the accounts-specific columns unset.
 """
 
 from __future__ import annotations
 
 import time
+import uuid
+from collections.abc import Callable
 from typing import cast
 
-from sqlalchemy import and_, delete, exists, select, update
+from sqlalchemy import and_, delete, exists, or_, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from omnigent.db.account_authority import (
+    account_authority_scope,
+    current_account_user,
+    lock_account,
+    require_active_account,
+    session_account_owner_query,
+)
 from omnigent.db.db_models import (
     SqlAccountToken,
+    SqlConnection,
+    SqlConversationMetadata,
+    SqlDeviceGrant,
+    SqlHost,
+    SqlProject,
+    SqlScheduledTask,
     SqlSessionPermission,
     SqlUser,
+    SqlUserDailyCost,
     current_workspace_id,
 )
-from omnigent.db.enum_codecs import decode_account_token_kind, encode_account_token_kind
+from omnigent.db.enum_codecs import (
+    decode_account_token_kind,
+    encode_account_token_kind,
+    encode_device_grant_status,
+    encode_scheduled_task_state,
+)
 from omnigent.db.utils import (
     get_or_create_engine,
     make_named_managed_session_maker,
@@ -67,7 +67,88 @@ def _to_account(row: SqlUser) -> Account:
         created_at=row.created_at,
         last_login_at=row.last_login_at,
         has_password=row.password_hash is not None,
+        account_generation=row.account_generation,
     )
+
+
+def _revoke_durable_authority(session: Session, user_id: str, *, now: int) -> None:
+    """Disable everything *user_id* owns that could act without them present.
+
+    Runs inside the caller's ``delete_user`` transaction. Hosts mirror
+    :meth:`HostStore.delete_host`: bound sessions are detached, launch
+    credentials cleared, and rows with pending sandbox cleanup are kept
+    as tombstones instead of being dropped.
+    """
+    workspace_id = current_workspace_id()
+    session.execute(
+        delete(SqlUserDailyCost).where(
+            SqlUserDailyCost.workspace_id == workspace_id,
+            SqlUserDailyCost.user_id == user_id,
+        )
+    )
+    session.execute(
+        delete(SqlConnection).where(
+            SqlConnection.workspace_id == workspace_id,
+            SqlConnection.user_id == user_id,
+        )
+    )
+    project_ids = select(SqlProject.id).where(
+        SqlProject.workspace_id == workspace_id,
+        SqlProject.user_id == user_id,
+    )
+    session.execute(
+        update(SqlConversationMetadata)
+        .where(
+            SqlConversationMetadata.workspace_id == workspace_id,
+            SqlConversationMetadata.project_id.in_(project_ids),
+        )
+        .values(project_id=None)
+    )
+    session.execute(
+        delete(SqlProject).where(
+            SqlProject.workspace_id == workspace_id,
+            SqlProject.user_id == user_id,
+        )
+    )
+    session.execute(
+        update(SqlScheduledTask)
+        .where(
+            SqlScheduledTask.workspace_id == workspace_id,
+            SqlScheduledTask.user_id == user_id,
+            SqlScheduledTask.state != encode_scheduled_task_state("deleted"),
+        )
+        .values(state=encode_scheduled_task_state("deleted"), updated_at=now)
+    )
+    session.execute(
+        update(SqlDeviceGrant)
+        .where(
+            SqlDeviceGrant.workspace_id == workspace_id,
+            SqlDeviceGrant.user_id == user_id,
+            SqlDeviceGrant.status != encode_device_grant_status("revoked"),
+        )
+        .values(
+            status=encode_device_grant_status("revoked"),
+            refresh_token_hash=None,
+            prev_refresh_token_hash=None,
+        )
+    )
+    from omnigent.stores.host_store import delete_host_in_session
+
+    hosts = (
+        session.execute(
+            select(SqlHost)
+            .where(
+                SqlHost.workspace_id == workspace_id,
+                SqlHost.user_id == user_id,
+            )
+            .order_by(SqlHost.host_id)
+            .with_for_update()
+        )
+        .scalars()
+        .all()
+    )
+    for host in hosts:
+        delete_host_in_session(session, host)
 
 
 def _to_account_token(row: SqlAccountToken) -> AccountToken:
@@ -80,6 +161,7 @@ def _to_account_token(row: SqlAccountToken) -> AccountToken:
         created_at=row.created_at,
         expires_at=row.expires_at,
         invited_is_admin=row.invited_is_admin,
+        account_generation=row.account_generation,
     )
 
 
@@ -130,7 +212,8 @@ class SqlAlchemyAccountStore:
 
         Used by ``/auth/register`` (invite redemption), by the
         first-boot admin bootstrap, and by admin "create user"
-        flows. Raises if the user already exists — registration
+        flows. Re-registration replaces a tombstone with a fresh generation.
+        Raises if an active user already exists — registration
         UX should check uniqueness first to give a clean error.
 
         :param user_id: Chosen username, e.g. ``"alice"``.
@@ -145,15 +228,16 @@ class SqlAlchemyAccountStore:
         now = int(time.time())
 
         def write(session: Session) -> Account:
-            existing = session.get(SqlUser, (current_workspace_id(), user_id))
-            if existing is not None:
+            existing = lock_account(session, user_id)
+            if existing is not None and existing.deleted_at is None:
                 raise ValueError(f"user {user_id!r} already exists")
-            row = SqlUser(
-                id=user_id,
-                is_admin=is_admin,
-                password_hash=password_hash,
-                created_at=now,
-            )
+            row = existing or SqlUser(id=user_id)
+            row.is_admin = is_admin
+            row.password_hash = password_hash
+            row.created_at = now
+            row.last_login_at = None
+            row.deleted_at = None
+            row.account_generation = uuid.uuid4().hex
             session.add(row)
             try:
                 session.flush()
@@ -171,7 +255,66 @@ class SqlAlchemyAccountStore:
         """Look up a user by id. Returns ``None`` if missing."""
         with self._session("select_user_by_id") as session:
             row = session.get(SqlUser, (current_workspace_id(), user_id))
-            return _to_account(row) if row is not None else None
+            return _to_account(row) if row is not None and row.deleted_at is None else None
+
+    def with_runner_authority(
+        self, runner_id: str, issue: Callable[[str], str | None]
+    ) -> str | None:
+        """Mint for the session owner while locking both session and host authority."""
+        query = (
+            session_account_owner_query()
+            .add_columns(
+                SqlHost.host_id,
+                SqlHost.user_id.label("host_owner"),
+                SqlHost.account_generation.label("host_generation"),
+                SqlConversationMetadata.id.label("session_id"),
+            )
+            .join(
+                SqlConversationMetadata,
+                and_(
+                    SqlSessionPermission.workspace_id == SqlConversationMetadata.workspace_id,
+                    SqlSessionPermission.conversation_id == SqlConversationMetadata.id,
+                ),
+            )
+            .join(
+                SqlHost,
+                and_(
+                    SqlConversationMetadata.workspace_id == SqlHost.workspace_id,
+                    SqlConversationMetadata.host_id == SqlHost.host_id,
+                ),
+            )
+            .where(
+                SqlHost.workspace_id == current_workspace_id(),
+                SqlHost.deleted_at.is_(None),
+                SqlConversationMetadata.runner_id == runner_id,
+            )
+            .order_by(None)
+            .order_by(SqlConversationMetadata.id, SqlUser.id)
+            .limit(1)
+        )
+
+        def write(session: Session) -> str | None:
+            snapshot = session.execute(query).one_or_none()
+            if snapshot is None:
+                return None
+            owner, generation = snapshot.session_owner, snapshot.session_generation
+            require_active_account(
+                session,
+                owner,
+                generation=generation,
+                related_accounts={snapshot.host_owner: snapshot.host_generation},
+            )
+            # Re-read the binding after acquiring the account lock. Deletion
+            # can remove ownership while the first snapshot waits for that lock.
+            current = session.execute(
+                query.with_for_update().execution_options(populate_existing=True)
+            ).one_or_none()
+            if current != snapshot:
+                return None
+            with account_authority_scope(owner, generation):
+                return issue(owner)
+
+        return run_write_transaction(self._session_immediate, "authorize_runner", write)
 
     def is_admin(self, user_id: str) -> bool:
         """Whether ``user_id`` has the admin flag set.
@@ -184,7 +327,7 @@ class SqlAlchemyAccountStore:
         """
         with self._session("select_user_admin_status") as session:
             row = session.get(SqlUser, (current_workspace_id(), user_id))
-            return row is not None and row.is_admin
+            return row is not None and row.deleted_at is None and row.is_admin
 
     def set_admin(self, user_id: str, is_admin: bool) -> None:
         """Set the admin flag on an existing user row.
@@ -202,6 +345,7 @@ class SqlAlchemyAccountStore:
         """
 
         def write(session: Session) -> None:
+            require_active_account(session, user_id)
             session.execute(
                 update(SqlUser)
                 .where(
@@ -240,9 +384,13 @@ class SqlAlchemyAccountStore:
                 .scalars()
                 .all()
             )
-            return [_to_account(r) for r in rows if r.id not in _HIDDEN_LIST_USERS]
+            return [
+                _to_account(r)
+                for r in rows
+                if r.id not in _HIDDEN_LIST_USERS and r.deleted_at is None
+            ]
 
-    def _locked_admin_ids(self, session: Session) -> list[str]:
+    def _locked_admin_ids(self, session: Session, *, include: tuple[str, ...] = ()) -> list[str]:
         """Return every admin's user id, locked against concurrent change.
 
         Must be called on a session opened via ``self._session_immediate``
@@ -261,26 +409,44 @@ class SqlAlchemyAccountStore:
         counting it as a real admin would let the actual last admin
         get deleted believing a usable admin remains.
         """
-        query = select(SqlUser.id).where(
-            SqlUser.workspace_id == current_workspace_id(),
-            SqlUser.is_admin.is_(True),
-            SqlUser.id.not_in(_HIDDEN_LIST_USERS),
+        query = (
+            select(SqlUser)
+            .where(
+                SqlUser.workspace_id == current_workspace_id(),
+                or_(SqlUser.is_admin.is_(True), SqlUser.id.in_(include)),
+            )
+            .order_by(SqlUser.id)
         )
         if self._supports_for_update:
             query = query.with_for_update()
-        return list(session.execute(query).scalars().all())
+        rows = session.execute(query.execution_options(populate_existing=True)).scalars().all()
+        return [
+            row.id
+            for row in rows
+            if row.is_admin and row.deleted_at is None and row.id not in _HIDDEN_LIST_USERS
+        ]
 
     def delete_user(self, user_id: str) -> bool | None:
-        """Delete a user row and their permission grants, refusing to
-        remove the last admin.
+        """Tombstone an account and revoke the durable authority it owns,
+        refusing to remove the last admin.
 
-        Explicitly deletes all ``session_permissions`` rows for the user
-        before removing the user row — the DB no longer cascades this.
+        In the same transaction as the tombstone this also removes
+        the user's ``session_permissions`` rows, marks their scheduled
+        tasks ``deleted`` (so the scheduler never fires them again),
+        revokes their device/refresh grants (so no further access tokens
+        can be minted), and deletes or tombstones their hosts (so an
+        unattended run has nowhere to land). Because everything shares
+        one transaction, a partial failure rolls back the whole delete
+        rather than leaving authority behind.
+
         The admin-invariant check and the delete run in the same locked
         transaction (see :meth:`_locked_admin_ids`), so this is atomic
         against a concurrent delete of a different admin — unlike a
         plain read-then-delete, the two can't both observe "an admin
         remains" and both apply.
+
+        JWT authentication checks the stored generation and tombstone on every
+        request, including requests reaching another server replica.
 
         :returns: ``True`` if deleted, ``False`` if refused because
             ``user_id`` is the last remaining admin, ``None`` if no such
@@ -288,11 +454,17 @@ class SqlAlchemyAccountStore:
         """
 
         def write(session: Session) -> bool | None:
-            target = session.get(SqlUser, (current_workspace_id(), user_id))
-            if target is None:
+            # Acquire the complete lock set in username order, including the
+            # actor and target, before checking the last-admin invariant.
+            actor = current_account_user()
+            include = (user_id, actor) if actor is not None else (user_id,)
+            admin_ids = self._locked_admin_ids(session, include=include)
+            require_active_account(session, None)
+            target = lock_account(session, user_id)
+            if target is None or target.deleted_at is not None:
                 return None
             if target.is_admin:
-                other_admins = [uid for uid in self._locked_admin_ids(session) if uid != user_id]
+                other_admins = [uid for uid in admin_ids if uid != user_id]
                 if not other_admins:
                     return False
             session.execute(
@@ -301,10 +473,36 @@ class SqlAlchemyAccountStore:
                     SqlSessionPermission.user_id == user_id,
                 )
             )
-            session.delete(target)
+            _revoke_durable_authority(session, user_id, now=int(time.time()))
+            target.deleted_at = int(time.time())
+            target.password_hash = None
+            target.project_order = None
+            target.is_admin = False
+            session.execute(
+                delete(SqlAccountToken).where(
+                    SqlAccountToken.workspace_id == current_workspace_id(),
+                    or_(SqlAccountToken.user_id == user_id, SqlAccountToken.created_by == user_id),
+                )
+            )
             return True
 
         return run_write_transaction(self._session_immediate, "delete_user", write)
+
+    def login_snapshot(self, user_id: str) -> tuple[str | None, str | None]:
+        """Read the password and generation together before password verification."""
+        with self._session("authenticate_account") as session:
+            row = session.get(SqlUser, (current_workspace_id(), user_id))
+            if row is None or row.deleted_at is not None:
+                return None, None
+            return row.password_hash, row.account_generation
+
+    def accepts_generation(self, user_id: str, generation: str) -> bool:
+        """Read revocation state on every accounts authentication attempt."""
+        with self._session("validate_account_authority") as session:
+            row = session.get(SqlUser, (current_workspace_id(), user_id))
+            return (
+                row is not None and row.deleted_at is None and row.account_generation == generation
+            )
 
     def get_password_hash(self, user_id: str) -> str | None:
         """Fetch a user's password hash for verification.
@@ -316,24 +514,29 @@ class SqlAlchemyAccountStore:
         """
         with self._session("select_password_hash") as session:
             row = session.get(SqlUser, (current_workspace_id(), user_id))
-            return row.password_hash if row is not None else None
+            return row.password_hash if row is not None and row.deleted_at is None else None
 
     def update_password(self, user_id: str, password_hash: str) -> None:
         """Replace a user's stored password hash.
 
         Used by self-serve ``/auth/users/me/password`` and
-        admin-initiated reset. No-op silently if the user does
-        not exist (the route should 404 first).
+        admin-initiated reset. Provision a generation when a passwordless
+        sharing identity first receives credentials. Existing generations stay
+        unchanged. No-op if the user does not exist (the route should 404 first).
         """
 
         def write(session: Session) -> None:
+            generation = require_active_account(session, user_id)
             session.execute(
                 update(SqlUser)
                 .where(
                     SqlUser.workspace_id == current_workspace_id(),
                     SqlUser.id == user_id,
                 )
-                .values(password_hash=password_hash)
+                .values(
+                    password_hash=password_hash,
+                    account_generation=generation or uuid.uuid4().hex,
+                )
             )
 
         run_write_transaction(self._session_immediate, "update_password", write)
@@ -346,6 +549,7 @@ class SqlAlchemyAccountStore:
         """
 
         def write(session: Session) -> None:
+            require_active_account(session, user_id)
             session.execute(
                 update(SqlUser)
                 .where(
@@ -390,7 +594,9 @@ class SqlAlchemyAccountStore:
             raise ValueError(f"unknown token kind {kind!r}")
 
         def write(session: Session) -> AccountToken:
+            generation = require_active_account(session, user_id)
             row = SqlAccountToken(
+                account_generation=generation,
                 id=token_id,
                 kind=encode_account_token_kind(kind),
                 user_id=user_id,

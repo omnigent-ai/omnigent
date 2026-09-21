@@ -26,6 +26,11 @@ from issue_prioritization.pipeline import PipelineRun
 DUPLICATE_COMMENT_MARKER = "<!-- omnigent-duplicate-check -->"
 
 
+class GitHubNotFound(RuntimeError):
+    """A GitHub resource returned 404 — e.g. an issue deleted or transferred out
+    of the repo since the bronze snapshot. Callers may skip it, not fail."""
+
+
 class GitHubLabels(Protocol):
     def sync_missing_labels(self, manifest: LabelManifest) -> None: ...
 
@@ -371,7 +376,10 @@ class GitHubClient:
                 content = response.read()
         except HTTPError as exc:
             detail = exc.read().decode(errors="replace")
-            raise RuntimeError(f"GitHub API {method} {path} failed: {exc.code} {detail}") from exc
+            message = f"GitHub API {method} {path} failed: {exc.code} {detail}"
+            if exc.code == 404:
+                raise GitHubNotFound(message) from exc
+            raise RuntimeError(message) from exc
         return json.loads(content) if content else None
 
 
@@ -411,36 +419,47 @@ class GitHubMutationSink:
         states = self.states.load()
         updated = []
         applied = []
+        skipped: list[int] = []
         try:
             for proposed in run.mutations:
                 issue_number = proposed.target.issue_number
-                current_labels = self.client.issue_labels(issue_number)
-                state = self.planner.resolve_state(
-                    issue_number,
-                    current_labels,
-                    states.get(issue_number),
-                )
-                target = proposed.target
-                if self.target_resolver is not None:
-                    target = self.target_resolver(target, current_labels, state)
-                plan = self.planner.plan_one(target, current_labels, state)
-                if plan.labels_add or plan.labels_remove:
-                    self.client.apply_labels(issue_number, plan.labels_add, plan.labels_remove)
-                applied.append(plan)
-                previous = states.get(issue_number)
-                if plan.next_state != previous and (
-                    previous is not None or plan.next_state.has_ownership
-                ):
-                    updated.append(plan.next_state)
-                states[issue_number] = plan.next_state
-                labels_after = _labels_after(current_labels, plan)
-                if item := ranked.get(issue_number):
-                    self.client.upsert_issue_comment(
+                try:
+                    current_labels = self.client.issue_labels(issue_number)
+                    state = self.planner.resolve_state(
                         issue_number,
-                        build_triage_comment(item, plan, labels_after, run.scored_at),
+                        current_labels,
+                        states.get(issue_number),
                     )
+                    target = proposed.target
+                    if self.target_resolver is not None:
+                        target = self.target_resolver(target, current_labels, state)
+                    plan = self.planner.plan_one(target, current_labels, state)
+                    if plan.labels_add or plan.labels_remove:
+                        self.client.apply_labels(issue_number, plan.labels_add, plan.labels_remove)
+                    applied.append(plan)
+                    previous = states.get(issue_number)
+                    if plan.next_state != previous and (
+                        previous is not None or plan.next_state.has_ownership
+                    ):
+                        updated.append(plan.next_state)
+                    states[issue_number] = plan.next_state
+                    labels_after = _labels_after(current_labels, plan)
+                    if item := ranked.get(issue_number):
+                        self.client.upsert_issue_comment(
+                            issue_number,
+                            build_triage_comment(item, plan, labels_after, run.scored_at),
+                        )
+                except GitHubNotFound:
+                    # The bronze snapshot lags GitHub: an issue deleted or
+                    # transferred since ingestion 404s on this live re-check.
+                    # Skip it rather than abort the whole apply.
+                    skipped.append(issue_number)
         finally:
             self.states.upsert(updated)
+        if skipped:
+            print(
+                f"Skipped {len(skipped)} issue(s) gone from GitHub (deleted/transferred): {skipped}"
+            )
         return tuple(applied)
 
 

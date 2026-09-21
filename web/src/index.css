@@ -386,9 +386,50 @@
   line-height: 20px;
 }
 
-.composer-agent-menu [role="menuitem"].composer-agent-row {
-  gap: 4px;
-  padding: 0 12px 0 0;
+.composer-agent-menu [role^="menuitem"] {
+  background-color: transparent;
+}
+
+.composer-agent-menu [role^="menuitem"]:not([data-disabled]) {
+  cursor: pointer;
+}
+
+/* Show the selection initially; interaction takes over until the menu reopens. */
+.composer-agent-menu[data-initial-selection="true"]
+  :is(
+    .composer-agent-row,
+    [role="menuitem"]:not(.composer-agent-select, .composer-agent-edit)
+  )[data-active="true"],
+.composer-agent-menu[data-input-method="pointer"]:not([data-initial-selection="true"])
+  :is(
+    [role^="menuitem"]:not(.composer-agent-select, .composer-agent-edit),
+    .composer-agent-row
+  ):not([data-disabled]):hover,
+.composer-agent-menu[data-input-method="keyboard"]
+  [role^="menuitem"]:not(.composer-agent-select, .composer-agent-edit):focus,
+.composer-agent-menu[data-input-method="keyboard"] .composer-agent-row:focus-within,
+.composer-agent-menu
+  [role="menuitem"][aria-haspopup="menu"][data-state="open"]:not(
+    .composer-agent-select,
+    .composer-agent-edit
+  ),
+.composer-agent-menu .composer-agent-row:has(> [aria-haspopup="menu"][data-state="open"]) {
+  background-color: var(--muted);
+}
+
+.composer-agent-menu .composer-agent-row > [role="menuitem"] {
+  gap: 0;
+  padding: 0;
+}
+
+.composer-agent-menu .composer-agent-edit {
+  padding: 0 12px 0 4px;
+}
+
+.composer-agent-menu
+  .composer-agent-select:not(:has(> .composer-agent-edit))
+  .composer-agent-choice {
+  padding-right: 12px;
 }
 
 .composer-agent-menu [role="menuitemcheckbox"] {
@@ -413,6 +454,37 @@
   border-width: 0.5px;
   border-color: color(srgb 0.960784 0.960784 0.956863 / 0.04);
   background-color: rgba(255, 255, 255, 0.05);
+}
+
+/* --background is the opaque palette canvas; flatten tints over it to mask the stack. */
+.composer-workspace-surface {
+  background:
+    linear-gradient(
+      color-mix(in oklch, var(--muted) 70%, transparent),
+      color-mix(in oklch, var(--muted) 70%, transparent)
+    ),
+    var(--background);
+}
+
+.composer-subagent-surface {
+  background:
+    linear-gradient(
+      color-mix(in oklch, var(--brand-accent) 10%, transparent),
+      color-mix(in oklch, var(--brand-accent) 10%, transparent)
+    ),
+    var(--background);
+}
+
+/* Soft brand-accent wash behind the whole side-chat pane: a single diffuse
+   glow from the top-right that fades to nothing, matching the design. One
+   gradient (no seam) over the full pane height (no hard edge above the
+   composer), kept very subtle so it reads fine behind message bubbles too. */
+.side-chat-backdrop {
+  background: radial-gradient(
+    150% 110% at 100% 0%,
+    color-mix(in oklch, var(--brand-accent) 8%, transparent),
+    transparent 70%
+  );
 }
 
 /* Fixed default icon geometry: a 14px glyph centered in a 16px SVG box. */
@@ -1098,6 +1170,13 @@ aside[aria-label="Workspace"][data-maximized] {
     --text-ui: var(--mobile-ui-font-size);
   }
 
+  /* Keep draft text and its mirrors above Safari's input-focus zoom threshold.
+   * Native inputs must also preserve larger Appearance sizes. */
+  .composer-input-text,
+  [data-ios-native] textarea.composer-input-text {
+    font-size: max(16px, var(--text-ui));
+  }
+
   /* Keep mobile sidebar glyphs uniform. Desktop icon geometry is unchanged. */
   .conversations-sidebar {
     --sidebar-icon-size-mobile: 16px;
@@ -1139,6 +1218,14 @@ aside[aria-label="Workspace"][data-maximized] {
   display: none;
 }
 
+/* The virtualized transcript holds its own read position across history
+ * prepends and in-flow changes above the list (Transcript.tsx). Its rows are
+ * absolutely positioned, so native anchoring can't see them and would only
+ * double-count the in-flow part. */
+[data-virtualized-transcript] {
+  overflow-anchor: none;
+}
+
 /* Streamdown hard-codes `content-visibility: auto` with a flat 200px intrinsic
  * size on every code block, so offscreen blocks lay out at 200px and snap to
  * their real height (100–1700px) as they scroll in — shifting the transcript
@@ -1161,9 +1248,10 @@ aside[aria-label="Workspace"][data-maximized] {
   font-size: 1em;
 }
 
-/* Keep download aligned with our header overlay; sticky controls otherwise
- * drift into the code body and then underneath the transcript's header fade. */
-.chat-code-block > [data-streamdown="code-block"] > .sticky {
+/* Keep Streamdown's actions aligned with our header overlays; sticky controls
+ * otherwise drift into the block body when the transcript scrolls. */
+.chat-code-block > [data-streamdown="code-block"] > .sticky,
+.chat-mermaid > [data-streamdown="mermaid-block"] > .sticky {
   position: static;
 }
 
@@ -1188,12 +1276,10 @@ aside[aria-label="Workspace"][data-maximized] {
   text-indent: -2.5rem;
 }
 
-/* Our own mermaid fullscreen button (see ChatMermaidBlock in message.tsx)
- * sits in a pill at the block's top-right. Nudge Streamdown's mermaid action
- * bar left by that pill's footprint so the two rows sit side by side rather
- * than overlapping. */
+/* Reserve the 1.5rem fullscreen button plus Streamdown's 0.5rem action gap.
+ * The fullscreen overlay sits outside the Mermaid block's 1px border. */
 .chat-mermaid [data-streamdown="mermaid-block-actions"] {
-  margin-right: 2.75rem;
+  margin-right: calc(2rem - 1px);
 }
 
 /* Streamdown's <button> link-safety-modal variant and wrap-anywhere reset can
@@ -1264,7 +1350,28 @@ aside[aria-label="Workspace"][data-maximized] {
   vertical-align: -0.075em;
 }
 
-/* Flash highlight on nav jump. Duration must match FLASH_DURATION_MS in chatStore.ts. */
+/* Message highlights must match FLASH_DURATION_MS in chatStore.ts. */
+@keyframes message-highlight {
+  0%,
+  40% {
+    background-color: var(--message-highlight);
+  }
+  100% {
+    background-color: transparent;
+  }
+}
+
+.animate-message-highlight {
+  --message-highlight: color-mix(in oklch, var(--warning) 16%, transparent);
+  animation: message-highlight 1500ms ease-out;
+  border-radius: var(--radius-lg);
+}
+
+.dark .animate-message-highlight {
+  --message-highlight: color-mix(in oklch, var(--warning) 24%, transparent);
+}
+
+/* Workspace navigation keeps its compact outline highlight. */
 @keyframes user-msg-flash {
   0% {
     box-shadow: 0 0 0 0 var(--ring);
@@ -1282,8 +1389,13 @@ aside[aria-label="Workspace"][data-maximized] {
   border-radius: var(--radius-2xl);
 }
 
-/* Reduced-motion: static outline still signals the target. */
+/* Reduced-motion: static highlights still signal the target. */
 @media (prefers-reduced-motion: reduce) {
+  .animate-message-highlight {
+    animation: none;
+    background-color: var(--message-highlight);
+  }
+
   .animate-user-msg-flash {
     animation: none;
     box-shadow: 0 0 0 2px var(--ring);
@@ -1796,6 +1908,20 @@ aside[aria-label="Workspace"][data-maximized] {
 .tiptap-md-content .ProseMirror pre code {
   background: none;
   padding: 0;
+}
+/* Code-block node view (TipTapCodeBlockView): the wrapper owns the block
+   spacing; the inner <pre> loses its own margin so the language selector and
+   the mermaid preview sit flush with the source. */
+.tiptap-md-content .ProseMirror .tiptap-code-block {
+  margin: 0.75em 0;
+}
+.tiptap-md-content .ProseMirror .tiptap-code-block pre {
+  margin: 0;
+}
+.tiptap-md-content .ProseMirror .tiptap-mermaid-preview {
+  border-top: 1px solid var(--border);
+  margin-top: 0.5em;
+  padding-top: 0.5em;
 }
 .tiptap-md-content .ProseMirror a {
   color: var(--primary);

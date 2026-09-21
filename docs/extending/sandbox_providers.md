@@ -1,10 +1,17 @@
 # Sandbox providers
 
 Omnigent supports running agent hosts in remote sandboxes. Built-in providers
-(Modal, Daytona, Blaxel, CoreWeave Sandbox, E2B, Islo, OpenShell, Boxlite,
-Kubernetes, microsandbox)
+(Modal, Daytona, Blaxel, CoreWeave Sandbox, E2B, Gensee, Islo, OpenShell,
+Boxlite, Kubernetes, microsandbox)
 ship with the core package. Third-party packages can add new providers through
 the `omnigent.sandbox_providers` entrypoint group.
+
+## Harness providers and model lists
+
+Managed Kubernetes and Agent Sandbox deployments can bind individual harnesses
+to different inference gateways and curate the models shown in both composers.
+See [Model and provider selection](../../designs/MANAGED_SANDBOX_MODEL_SELECTION.md)
+for configuration, credential setup, session lifetime, and verification steps.
 
 ## How it works
 
@@ -13,9 +20,9 @@ Each sandbox provider implements the
 Providers that exec into a running sandbox (Modal, Daytona, …) inherit
 `ExecModelHostLauncher`, which provides a default `start_host` that probes
 `$HOME`, creates a workspace, clones a repo, and backgrounds `omnigent host`.
-Providers whose sandbox boots running the host directly (Kubernetes) inherit
-`SandboxHostLauncher` and override `start_host` to build the infrastructure
-manifest instead.
+Providers whose sandbox boots running the host directly (Kubernetes), or whose
+control plane owns host startup (Gensee), inherit `SandboxHostLauncher` and
+override `start_host` without exposing a general-purpose exec transport.
 
 ## Creating a community sandbox provider
 
@@ -140,6 +147,19 @@ sandbox:
 The server resolves the provider through the registry and calls
 `prepare()` → `provision()` → `start_host()` → wait for online registration.
 Each managed sandbox authenticates back with a server-minted per-launch token.
+
+Sandbox automations use this same launch path and create a fresh sandbox for
+each run. Existing managed sandbox hosts cannot be pinned as automation targets.
+Their lifecycle follows the server's sandbox configuration, just like ordinary
+chats: automations do not override timeouts or terminate a sandbox when a run
+finishes. Server owners must choose provider lifetime, idle, and cleanup settings
+appropriate for their automation frequency and resource budget.
+
+For `agent_sandbox`, `sandbox.keep_warm_s` controls the runner idle timeout;
+the existing keepalive renews the sandbox deadline while the runner is alive.
+Once renewal stops, expiry suspends compute while retaining storage. Other
+providers have different lifetime behavior, so enabling managed sandboxes alone
+does not guarantee a short shutdown time.
 
 `sandbox.reaper` is deployment-wide: configure it next to `provider` or
 `providers`, never inside one provider entry. One configurable loop covers every
