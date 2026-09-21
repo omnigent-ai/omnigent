@@ -3626,6 +3626,36 @@ describe("NewChatLandingScreen", () => {
     expect(body.reasoning_effort).toBeUndefined();
   });
 
+  it("only requests Devin models while Devin is selected on a host", () => {
+    mockAgents([
+      ...DEFAULT_LANDING_AGENTS,
+      {
+        id: "a3",
+        name: "devin-native-ui",
+        display_name: "Devin",
+        description: null,
+        harness: "devin-native",
+        skills: [],
+      },
+    ]);
+    renderLanding();
+
+    expect(useHostModelOptionsMock).toHaveBeenCalledWith("host_1", "devin-native", false);
+    expect(useHostModelOptionsMock).not.toHaveBeenCalledWith("host_1", "devin-native", true);
+
+    useHostModelOptionsMock.mockClear();
+    openAgentModels("a3");
+    expect(useHostModelOptionsMock).toHaveBeenCalledWith("host_1", "devin-native", true);
+    expect(screen.getByTestId("new-chat-landing-agent-models")).toHaveTextContent("SWE-2");
+
+    closeMenu();
+    selectAgent("a1");
+    const devinCalls = useHostModelOptionsMock.mock.calls.filter(
+      ([, harness]) => harness === "devin-native",
+    );
+    expect(devinCalls.at(-1)).toEqual(["host_1", "devin-native", false]);
+  });
+
   it("renders Devin's own model families and only the selected model's effort rungs", () => {
     // Devin declares only `devinMode` (not modelPicker/permissionMode). Both the
     // config-content gate and the models-section gate must honour that flag, or a

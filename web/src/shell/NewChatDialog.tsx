@@ -2479,11 +2479,6 @@ export function NewChatLandingScreen() {
     "pi-native",
     hostSelected,
   );
-  const {
-    data: hostDevinModelOptions,
-    isLoading: hostDevinModelsLoading,
-    error: hostDevinModelsError,
-  } = useHostModelOptions(selectedHostId, "devin-native", !sandboxSelected);
   // Only bridge this host's first fetch. Empty/error responses and host changes
   // must never inherit another catalog or keep retired choices alive.
   const cachedHostModels =
@@ -3145,6 +3140,15 @@ export function NewChatLandingScreen() {
     [agentList, effectiveAgentId, pendingAgent],
   );
   const selectedNativeHarness = nativeCodingAgentForAvailableAgent(selectedAgent)?.harness ?? null;
+  const {
+    data: hostDevinModelOptions,
+    isLoading: hostDevinModelsLoading,
+    error: hostDevinModelsError,
+  } = useHostModelOptions(
+    selectedHostId,
+    "devin-native",
+    hostSelected && selectedNativeHarness === "devin-native",
+  );
   const previewHarness = selectedNativeHarness ?? pickedHarness ?? selectedAgent?.harness ?? null;
   const previewSandboxProvider =
     sandboxProvider ?? (info !== "loading" ? info.sandbox_provider : null);

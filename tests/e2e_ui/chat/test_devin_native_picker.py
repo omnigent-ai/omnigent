@@ -29,6 +29,8 @@ from playwright.async_api import Route, async_playwright, expect
 
 from tests.e2e_ui.start_session.test_start_session import (
     _HOST_ID,
+    _agents_body,
+    _close_entry_models,
     _open_entry_models,
     _register_common_routes,
     _run_in_fresh_loop,
@@ -137,14 +139,19 @@ async def _drive(base_url: str, session_id: str) -> None:
         browser = await pw.chromium.launch()
         page = await browser.new_page()
         try:
+            agents = json.loads(_agents_body())
+            agents["data"].extend(json.loads(_devin_native_agents_body())["data"])
             await _register_common_routes(
                 page,
                 created_session_id=session_id,
                 create_bodies=[],
-                agents_body=_devin_native_agents_body(),
+                agents_body=json.dumps(agents),
             )
 
+            devin_requests: list[str] = []
+
             async def handle_devin_models(route: Route) -> None:
+                devin_requests.append(route.request.url)
                 await route.fulfill(
                     status=200,
                     content_type="application/json",
@@ -152,8 +159,7 @@ async def _drive(base_url: str, session_id: str) -> None:
                 )
 
             async def handle_agent_scan(route: Route) -> None:
-                # Only the stubbed built-in Devin should feed the picker; leftover
-                # sessions on the shared e2e_ui server must not leak in.
+                # Keep sessions from other tests out of the stubbed agent list.
                 await route.fulfill(
                     status=200, content_type="application/json", body=json.dumps({"data": []})
                 )
@@ -166,8 +172,7 @@ async def _drive(base_url: str, session_id: str) -> None:
                 re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
             )
 
-            # A real (non-sandbox) host workspace so the devin-native catalog is
-            # probed (`useHostModelOptions(hostId, "devin-native", !sandbox)`).
+            # A host workspace exercises host model discovery after selection.
             await page.add_init_script(
                 f"""window.localStorage.setItem(
                     "omnigent:recent-workspaces",
@@ -179,6 +184,12 @@ async def _drive(base_url: str, session_id: str) -> None:
             await page.get_by_test_id("new-chat-landing-input").wait_for(
                 state="visible", timeout=30_000
             )
+            await expect(page.get_by_test_id("new-chat-landing-agent-select")).to_have_attribute(
+                "aria-label", re.compile(r"^Claude Code,")
+            )
+            await page.clock.install()
+            await page.clock.fast_forward(30_000)
+            assert devin_requests == []
 
             # Open Devin's config submenu (the `agent-config-*` Edit entry only
             # exists when `selectedAgentHasKnobs` honours `devinMode`).
@@ -191,6 +202,7 @@ async def _drive(base_url: str, session_id: str) -> None:
                 await expect(
                     page.get_by_test_id(f"new-chat-landing-agent-model-{model['id']}")
                 ).to_be_visible()
+            assert devin_requests
 
             # The Effort ladder renders, carrying only the DEFAULT model's rungs.
             # Devin has no --effort flag, so this is the only way to express effort
@@ -222,6 +234,19 @@ async def _drive(base_url: str, session_id: str) -> None:
             await expect(
                 page.get_by_test_id("new-chat-landing-agent-effort-xhigh")
             ).to_have_attribute("data-state", "checked")
+
+            await _close_entry_models(page)
+            await expect(page.get_by_test_id("new-chat-landing-agent-select")).to_have_attribute(
+                "aria-expanded", "false"
+            )
+            await page.get_by_test_id("new-chat-landing-agent-select").press("ArrowDown")
+            await page.get_by_test_id("new-chat-landing-agent-ag_claude_e2e").click()
+            await expect(page.get_by_test_id("new-chat-landing-agent-select")).to_have_attribute(
+                "aria-label", re.compile(r"^Claude Code,")
+            )
+            requests_before = len(devin_requests)
+            await page.clock.fast_forward(30_000)
+            assert len(devin_requests) == requests_before
         finally:
             await browser.close()
 
