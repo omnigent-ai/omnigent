@@ -1,4 +1,10 @@
-import { useMutation, useMutationState, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  useMutation,
+  useMutationState,
+  useQuery,
+  useQueryClient,
+  type QueryClient,
+} from "@tanstack/react-query";
 import { useEffect, useLayoutEffect, useRef } from "react";
 import { authenticatedFetch } from "@/lib/identity";
 import type { NativeModelOption } from "@/lib/types";
@@ -110,6 +116,9 @@ async function fetchHostModelOptions(
   return models;
 }
 
+// A shared request may start from an inactive observer while another needs retries.
+const modelCatalogPollers = new WeakMap<QueryClient, Map<string, number>>();
+
 /** Model choices available before launch, resolved on the selected host. */
 export function useHostModelOptions(
   hostId: string | null,
@@ -117,12 +126,25 @@ export function useHostModelOptions(
   enabled = true,
   { poll = true }: { poll?: boolean } = {},
 ) {
+  const queryClient = useQueryClient();
   const canRefresh = enabled && hostId !== null && poll;
-  // A request's retry callback can outlive the selection that started it.
-  const refreshTarget = useRef({ hostId, harness, canRefresh });
+  const pollerKey = JSON.stringify([hostId, harness]);
+  // Only committed selections participate; suspended renders leave retries alone.
   useLayoutEffect(() => {
-    refreshTarget.current = { hostId, harness, canRefresh };
-  }, [hostId, harness, canRefresh]);
+    if (!canRefresh) return;
+    let pollers = modelCatalogPollers.get(queryClient);
+    if (!pollers) {
+      pollers = new Map();
+      modelCatalogPollers.set(queryClient, pollers);
+    }
+    pollers.set(pollerKey, (pollers.get(pollerKey) ?? 0) + 1);
+    return () => {
+      const remaining = (pollers.get(pollerKey) ?? 1) - 1;
+      if (remaining > 0) pollers.set(pollerKey, remaining);
+      else pollers.delete(pollerKey);
+      if (pollers.size === 0) modelCatalogPollers.delete(queryClient);
+    };
+  }, [queryClient, pollerKey, canRefresh]);
   const query = useQuery({
     queryKey: ["host-model-options", hostId, harness],
     queryFn: () => fetchHostModelOptions(hostId as string, harness),
@@ -132,17 +154,10 @@ export function useHostModelOptions(
     staleTime: 15_000,
     refetchInterval: canRefresh ? 15_000 : false,
     ...(!poll && { refetchOnWindowFocus: false, refetchOnReconnect: false }),
-    // A request racing the host's boot probe gets a structured failure;
-    // the probe itself completes shortly after
-    // (single-flight in the host's catalog store). Retry with backoff so a
-    // picker opened during that warm-up window fills in instead of pinning
-    // the transient error until reopen. A genuinely failing probe still
-    // surfaces its error once the retries exhaust (~22 s).
+    // Retry boot-probe races while any picker uses this catalog. Persistent
+    // failures surface after bounded backoff (~22 s).
     retry: (failureCount) =>
-      refreshTarget.current.canRefresh &&
-      refreshTarget.current.hostId === hostId &&
-      refreshTarget.current.harness === harness &&
-      failureCount < 6,
+      (modelCatalogPollers.get(queryClient)?.get(pollerKey) ?? 0) > 0 && failureCount < 6,
     retryDelay: (attempt) => Math.min(5_000, 1_000 * 2 ** attempt),
   });
   const previouslyRefreshing = useRef(canRefresh);

@@ -506,6 +506,116 @@ describe("useHostModelOptions", () => {
     },
   );
 
+  it.each([false, true])(
+    "retries a shared request while another observer is active (initiator started active: %s)",
+    async (initiallyActive) => {
+      let finishRequest!: (response: Response) => void;
+      fetchMock
+        .mockReturnValueOnce(
+          new Promise<Response>((resolve) => {
+            finishRequest = resolve;
+          }),
+        )
+        .mockResolvedValue(mockResponse({ models: [{ id: "swe-2" }] }));
+      const client = new QueryClient();
+      const sharedWrapper = ({ children }: { children: ReactNode }) => (
+        <QueryClientProvider client={client}>{children}</QueryClientProvider>
+      );
+      const initiator = renderHook(
+        ({ poll }) => useHostModelOptions("host_1", "devin-native", true, { poll }),
+        { wrapper: sharedWrapper, initialProps: { poll: initiallyActive } },
+      );
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+      const active = renderHook(() => useHostModelOptions("host_1", "devin-native"), {
+        wrapper: sharedWrapper,
+      });
+      initiator.rerender({ poll: false });
+      finishRequest(mockResponse({ detail: "catalog warming up" }, 502));
+
+      await waitFor(() => expect(active.result.current.isSuccess).toBe(true), { timeout: 3_000 });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(initiator.result.current.data).toEqual([{ id: "swe-2" }]);
+    },
+  );
+
+  it.each(["host", "harness", "client"])(
+    "does not borrow retries from an active observer of another %s",
+    async (scope) => {
+      let finishRequest!: (response: Response) => void;
+      fetchMock
+        .mockReturnValueOnce(
+          new Promise<Response>((resolve) => {
+            finishRequest = resolve;
+          }),
+        )
+        .mockResolvedValue(mockResponse({ models: [{ id: "other-model" }] }));
+      const client = new QueryClient();
+      const sharedWrapper = ({ children }: { children: ReactNode }) => (
+        <QueryClientProvider client={client}>{children}</QueryClientProvider>
+      );
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      try {
+        const inactive = renderHook(
+          () => useHostModelOptions("host_1", "devin-native", true, { poll: false }),
+          { wrapper: sharedWrapper },
+        );
+        const active = renderHook(
+          () =>
+            useHostModelOptions(
+              scope === "host" ? "host_2" : "host_1",
+              scope === "harness" ? "claude-native" : "devin-native",
+            ),
+          { wrapper: scope === "client" ? wrapper : sharedWrapper },
+        );
+        await waitFor(() => expect(active.result.current.isSuccess).toBe(true));
+        finishRequest(mockResponse({ detail: "CLI unavailable" }, 502));
+        await waitFor(() => expect(inactive.result.current.isError).toBe(true));
+        await vi.advanceTimersByTimeAsync(5_000);
+        expect(fetchMock).toHaveBeenCalledTimes(2);
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it.each(["unmounts", "switches hosts"])(
+    "stops retries when the last active observer %s",
+    async (change) => {
+      let finishRequest!: (response: Response) => void;
+      fetchMock
+        .mockReturnValueOnce(
+          new Promise<Response>((resolve) => {
+            finishRequest = resolve;
+          }),
+        )
+        .mockResolvedValue(mockResponse({ models: [{ id: "other-model" }] }));
+      const client = new QueryClient();
+      const sharedWrapper = ({ children }: { children: ReactNode }) => (
+        <QueryClientProvider client={client}>{children}</QueryClientProvider>
+      );
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      try {
+        const inactive = renderHook(
+          () => useHostModelOptions("host_1", "devin-native", true, { poll: false }),
+          { wrapper: sharedWrapper },
+        );
+        const active = renderHook(({ hostId }) => useHostModelOptions(hostId, "devin-native"), {
+          wrapper: sharedWrapper,
+          initialProps: { hostId: "host_1" },
+        });
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+        if (change === "unmounts") active.unmount();
+        else active.rerender({ hostId: "host_2" });
+        finishRequest(mockResponse({ detail: "CLI unavailable" }, 502));
+        await waitFor(() => expect(inactive.result.current.isError).toBe(true));
+        await vi.advanceTimersByTimeAsync(5_000);
+        expect(fetchMock).toHaveBeenCalledTimes(change === "unmounts" ? 1 : 2);
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
   it("does not restart exhausted retries while the failed harness stays selected", async () => {
     fetchMock.mockResolvedValue(mockResponse({ detail: "catalog unavailable" }, 502));
     vi.useFakeTimers({ shouldAdvanceTime: true });

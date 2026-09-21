@@ -3132,8 +3132,8 @@ export function NewChatLandingScreen() {
     canLoadHostModels("pi-native"),
     { poll: selectedNativeHarness === "pi-native" },
   );
-  // Only bridge this host's first fetch. Empty/error responses and host changes
-  // must never inherit another catalog or keep retired choices alive.
+  // Bridge this host's startup/offline period, but not an empty/error response
+  // or another host's catalog.
   const cachedHostModels =
     cachedPickerOptions &&
     !sandboxSelected &&
@@ -3143,15 +3143,36 @@ export function NewChatLandingScreen() {
         (hostsLoading || hosts?.some((host) => host.host_id === cachedPickerOptions.hostId))))
       ? cachedPickerOptions.models
       : undefined;
-  const availableClaudeModels =
-    hostClaudeModelOptions ??
-    (hostClaudeModelsLoading || selectedHostId === null ? cachedHostModels?.claude : undefined);
-  const availableCodexModels =
-    hostCodexModelOptions ??
-    (hostCodexModelsLoading || selectedHostId === null ? cachedHostModels?.codex : undefined);
-  const availablePiModels =
-    hostPiModelOptions ??
-    (hostPiModelsLoading || selectedHostId === null ? cachedHostModels?.pi : undefined);
+  const hostReadinessPending = hostSelected && (hostsLoading || selectedHost?.status === "offline");
+  const availableHostModels = (
+    harness: string,
+    models: NativeModelOption[] | undefined,
+    loading: boolean,
+    cached?: NativeModelOption[],
+  ) =>
+    // Disabled queries retain data; an explicit setup failure makes it unusable.
+    harnessUnconfiguredOnHost(harness, selectedHost)
+      ? undefined
+      : (models ??
+        (loading || hostReadinessPending || selectedHostId === null ? cached : undefined));
+  const availableClaudeModels = availableHostModels(
+    "claude-native",
+    hostClaudeModelOptions,
+    hostClaudeModelsLoading,
+    cachedHostModels?.claude,
+  );
+  const availableCodexModels = availableHostModels(
+    "codex-native",
+    hostCodexModelOptions,
+    hostCodexModelsLoading,
+    cachedHostModels?.codex,
+  );
+  const availablePiModels = availableHostModels(
+    "pi-native",
+    hostPiModelOptions,
+    hostPiModelsLoading,
+    cachedHostModels?.pi,
+  );
   const {
     data: hostDevinModelOptions,
     isLoading: hostDevinModelsLoading,
@@ -3159,6 +3180,11 @@ export function NewChatLandingScreen() {
   } = useHostModelOptions(selectedHostId, "devin-native", canLoadHostModels("devin-native"), {
     poll: selectedNativeHarness === "devin-native",
   });
+  const availableDevinModels = availableHostModels(
+    "devin-native",
+    hostDevinModelOptions,
+    hostDevinModelsLoading,
+  );
   const previewHarness = selectedNativeHarness ?? pickedHarness ?? selectedAgent?.harness ?? null;
   const previewSandboxProvider =
     sandboxProvider ?? (info !== "loading" ? info.sandbox_provider : null);
@@ -3219,8 +3245,8 @@ export function NewChatLandingScreen() {
   // the id at launch (resolve_devin_launch_model), so the list stays short
   // instead of enumerating every effort variant.
   const devinModelOptions = useMemo(
-    () => (sandboxSelected ? (sandboxCatalog ?? []) : (hostDevinModelOptions ?? [])),
-    [hostDevinModelOptions, sandboxSelected, sandboxCatalog],
+    () => (sandboxSelected ? (sandboxCatalog ?? []) : (availableDevinModels ?? [])),
+    [availableDevinModels, sandboxSelected, sandboxCatalog],
   );
   const piModelOptions = useMemo(
     () =>
@@ -3538,9 +3564,9 @@ export function NewChatLandingScreen() {
             sandboxSelected,
             model: pickedModel,
             models: {
-              claude: hostClaudeModelOptions ?? [],
-              codex: hostCodexModelOptions ?? [],
-              pi: hostPiModelOptions ?? [],
+              claude: availableClaudeModels ?? [],
+              codex: availableCodexModels ?? [],
+              pi: availablePiModels ?? [],
             },
           }
         : null,
@@ -3550,9 +3576,9 @@ export function NewChatLandingScreen() {
       selectedHostId,
       sandboxSelected,
       pickedModel,
-      hostClaudeModelOptions,
-      hostCodexModelOptions,
-      hostPiModelOptions,
+      availableClaudeModels,
+      availableCodexModels,
+      availablePiModels,
     ],
   );
   useEffect(() => {
@@ -3861,22 +3887,24 @@ export function NewChatLandingScreen() {
       }
       const saved = readHarnessOptions(native.harness);
       if (saved.routing === "on") return [agent.id, SMART_ROUTING_LABEL];
-      const catalog =
-        sandboxInferenceConfigured && native.harness !== previewHarness
-          ? []
-          : native.iconKind === "claude"
-            ? claudeModelOptions
-            : native.iconKind === "codex"
-              ? codexModelOptions
-              : native.iconKind === "pi"
-                ? piModelOptions
-                : native.iconKind === "devin"
-                  ? devinModelOptions
-                  : [];
+      const catalogSuppressed = sandboxInferenceConfigured && native.harness !== previewHarness;
+      const catalog = catalogSuppressed
+        ? []
+        : native.iconKind === "claude"
+          ? claudeModelOptions
+          : native.iconKind === "codex"
+            ? codexModelOptions
+            : native.iconKind === "pi"
+              ? piModelOptions
+              : native.iconKind === "devin"
+                ? devinModelOptions
+                : [];
       const savedFusion = fusionOption(catalog)?.fusion;
       const model =
         catalog.find((option) => option.id === saved.model) ??
-        (catalog.length === 0 && saved.model ? { id: saved.model } : undefined);
+        (!catalogSuppressed && catalog.length === 0 && saved.model
+          ? { id: saved.model }
+          : undefined);
       const label = visibleModelLabel(
         savedFusion !== undefined && isFusionModelUid(saved.model)
           ? // A fusion id isn't a catalog row id, so label it from the combo.
