@@ -62,8 +62,8 @@ def _serve(
             try:
                 deadline = time.monotonic() + _IO_TIMEOUT
                 (size,) = struct.unpack("!I", _receive_exact(connection, 4, deadline))
-                if size > MAX_CLIPBOARD_BYTES:
-                    raise ValueError("Clipboard request is too large")
+                if size == 0 or size > MAX_CLIPBOARD_BYTES:
+                    raise ValueError("Clipboard request must contain bounded, non-empty text")
                 payload = _receive_exact(connection, size, deadline)
                 payload.decode("utf-8")
                 if stopped.is_set():
@@ -160,7 +160,7 @@ class TerminalClipboardBridge:
 
 def _copy_to_terminal(socket_path: str, payload: bytes) -> bool:
     """Submit bounded UTF-8 text, never falling back to the host clipboard."""
-    if len(payload) > MAX_CLIPBOARD_BYTES:
+    if not payload or len(payload) > MAX_CLIPBOARD_BYTES:
         return False
     try:
         payload.decode("utf-8")
@@ -190,6 +190,11 @@ def _main() -> int:
         )
         return 2
     payload = sys.stdin.buffer.read(MAX_CLIPBOARD_BYTES + 1)
+    if not payload:
+        print(
+            "Omnigent terminal copying does not support clearing the clipboard.", file=sys.stderr
+        )
+        return 1
     if _copy_to_terminal(sys.argv[1], payload):
         return 0
     print("Could not send text to the terminal clipboard bridge.", file=sys.stderr)

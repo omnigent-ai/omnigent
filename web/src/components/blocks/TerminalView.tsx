@@ -13,7 +13,10 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
-import { copyText } from "@/lib/clipboard";
+import {
+  isTerminalClipboardWritePending,
+  queueTerminalClipboardWrite,
+} from "@/lib/terminalClipboardWriter";
 import { getOmnigentServerIdentity, isDatabricksWorkspace, resolveWebSocketUrl } from "@/lib/host";
 import {
   canRememberTerminalClipboardPreference,
@@ -194,23 +197,12 @@ export function TerminalView({
   const clipboardRequestGenerationRef = useRef(0);
   const clipboardMountedRef = useRef(true);
   const clipboardActiveRef = useRef(active);
-  const clipboardWorkerEpochRef = useRef(0);
-  const clipboardAutoRunningRef = useRef<number | null>(null);
-  const clipboardAutoPendingRef = useRef<
-    | (TerminalClipboardRequest & {
-        workerEpoch: number;
-        kind: "automatic" | "user";
-      })
-    | null
-  >(null);
   const [clipboardScopeEpoch, setClipboardScopeEpoch] = useState(0);
   useLayoutEffect(() => {
     if (clipboardActiveRef.current !== active) {
       clipboardActiveRef.current = active;
       clipboardRequestGenerationRef.current += 1;
-      clipboardWorkerEpochRef.current += 1;
       if (!active) {
-        clipboardAutoPendingRef.current = null;
         setClipboardPrompt(null);
       }
     }
@@ -223,8 +215,6 @@ export function TerminalView({
       };
       clipboardNeedsClickRef.current = false;
       clipboardRequestGenerationRef.current += 1;
-      clipboardWorkerEpochRef.current += 1;
-      clipboardAutoPendingRef.current = null;
       setClipboardPrompt(null);
       setClipboardScopeEpoch(epoch);
     }
@@ -236,8 +226,6 @@ export function TerminalView({
         const previousGeneration = clipboardRequestGenerationRef.current;
         const generation = (clipboardRequestGenerationRef.current += 1);
         clipboardConsentRef.current = { scope, decision };
-        clipboardWorkerEpochRef.current += 1;
-        clipboardAutoPendingRef.current = null;
         clipboardNeedsClickRef.current = false;
         // Shared grants keep waiting text visible; revocations discard it.
         const keepPendingRequest =
@@ -312,8 +300,6 @@ export function TerminalView({
     return () => {
       clipboardMountedRef.current = false;
       clipboardRequestGenerationRef.current += 1;
-      clipboardWorkerEpochRef.current += 1;
-      clipboardAutoPendingRef.current = null;
     };
   }, []);
 
@@ -331,71 +317,33 @@ export function TerminalView({
     onInputRef.current?.();
   }, []);
 
-  const copyTerminalText = useCallback(async (text: string): Promise<boolean> => {
-    try {
-      await copyText(text);
-      return true;
-    } catch {
-      return false;
-    }
-  }, []);
-
   const queueSessionClipboardCopy = useCallback(
     (request: TerminalClipboardRequest & { kind: "automatic" | "user" }) => {
-      // At most one browser clipboard promise is in flight per live terminal
-      // epoch; newer requests replace the single pending text value.
-      const workerEpoch = clipboardWorkerEpochRef.current;
-      clipboardAutoPendingRef.current = { ...request, workerEpoch };
-      if (clipboardAutoRunningRef.current === workerEpoch) return;
-      clipboardAutoRunningRef.current = workerEpoch;
-      void (async () => {
-        try {
-          while (
-            clipboardWorkerEpochRef.current === workerEpoch &&
-            clipboardAutoPendingRef.current?.workerEpoch === workerEpoch
-          ) {
-            const next = clipboardAutoPendingRef.current;
-            clipboardAutoPendingRef.current = null;
-            if (
-              !clipboardMountedRef.current ||
-              !clipboardActiveRef.current ||
-              clipboardScopeRef.current.scope !== next.scope ||
-              clipboardScopeRef.current.epoch !== next.epoch ||
-              (next.kind === "automatic" && clipboardConsentRef.current.decision !== "allow")
-            ) {
-              continue;
-            }
-            // oxlint-disable-next-line no-await-in-loop
-            const copied = await copyTerminalText(next.text);
-            if (
-              !clipboardMountedRef.current ||
-              !clipboardActiveRef.current ||
-              clipboardRequestGenerationRef.current !== next.generation ||
-              clipboardConsentRef.current.scope !== next.scope ||
-              clipboardScopeRef.current.epoch !== next.epoch
-            ) {
-              continue;
-            }
-            if (copied) {
-              clipboardNeedsClickRef.current = false;
-              toast.success("Copied from terminal.", { duration: 1500 });
-            } else {
-              clipboardNeedsClickRef.current = true;
-              setClipboardPrompt({
-                ...next,
-                reason: "browser",
-                copyFailed: next.kind === "user",
-              });
-            }
+      queueTerminalClipboardWrite({
+        text: request.text,
+        isCurrent: () =>
+          clipboardMountedRef.current &&
+          clipboardActiveRef.current &&
+          clipboardRequestGenerationRef.current === request.generation &&
+          clipboardScopeRef.current.scope === request.scope &&
+          clipboardScopeRef.current.epoch === request.epoch &&
+          (request.kind === "user" || clipboardConsentRef.current.decision === "allow"),
+        onResult: (copied) => {
+          if (copied) {
+            clipboardNeedsClickRef.current = false;
+            toast.success("Copied from terminal.", { duration: 1500 });
+          } else {
+            clipboardNeedsClickRef.current = true;
+            setClipboardPrompt({
+              ...request,
+              reason: "browser",
+              copyFailed: request.kind === "user",
+            });
           }
-        } finally {
-          if (clipboardAutoRunningRef.current === workerEpoch) {
-            clipboardAutoRunningRef.current = null;
-          }
-        }
-      })();
+        },
+      });
     },
-    [copyTerminalText],
+    [],
   );
 
   const notifyClipboardRequest = useCallback(
@@ -427,7 +375,7 @@ export function TerminalView({
       if (
         clipboardConsentRef.current.decision === "allow" &&
         copyEvent?.clipboardData &&
-        clipboardAutoRunningRef.current === null
+        !isTerminalClipboardWritePending()
       ) {
         // Keep native copy gestures independent of browser async-clipboard permissions.
         // If a write is in flight, queue below so it cannot overwrite this selection.

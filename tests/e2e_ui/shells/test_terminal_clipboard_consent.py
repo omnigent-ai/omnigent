@@ -32,6 +32,8 @@ window.__terminalClipboard = {
   text: "clipboard before terminal copy",
   writes: [],
   rejectWrites: false,
+  delayNextWrite: false,
+  resolveDelayedWrite: null,
 };
 Object.defineProperty(navigator, "clipboard", {
   configurable: true,
@@ -39,6 +41,12 @@ Object.defineProperty(navigator, "clipboard", {
     writeText: async (text) => {
       if (window.__terminalClipboard.rejectWrites) {
         throw new DOMException("A user gesture is required", "NotAllowedError");
+      }
+      if (window.__terminalClipboard.delayNextWrite) {
+        window.__terminalClipboard.delayNextWrite = false;
+        await new Promise((resolve) => {
+          window.__terminalClipboard.resolveDelayedWrite = resolve;
+        });
       }
       window.__terminalClipboard.text = text;
       window.__terminalClipboard.writes.push(text);
@@ -366,6 +374,42 @@ def test_terminal_clipboard_popup_floats_bottom_right_without_resizing_or_steali
 
     ui.request_copy("next selection")
     _expect_clipboard(ui.page, "next selection")
+    expect(ui.consent).to_have_count(0)
+
+
+@pytest.mark.parametrize("switch", ["visibility", "session"])
+def test_terminal_clipboard_serializes_copies_across_terminal_switches(
+    clipboard_browser: _ClipboardBrowser, switch: str
+) -> None:
+    ui = clipboard_browser
+    ui.open()
+    ui.request_copy("initial grant")
+    ui.consent.get_by_role("button", name="Allow copying", exact=True).click()
+    _expect_clipboard(ui.page, "initial grant")
+    ui.page.evaluate("window.__terminalClipboard.delayNextWrite = true")
+    ui.request_copy("older program text")
+    ui.page.wait_for_function(
+        "typeof window.__terminalClipboard.resolveDelayedWrite === 'function'"
+    )
+
+    if switch == "visibility":
+        ui.page.get_by_role("button", name="Collapse right panel", exact=True).click()
+        ui.page.get_by_role("button", name="Expand right panel", exact=True).click()
+    else:
+        ui.page.locator(f'a[href="/c/{ui.session_ids[1]}"]').click()
+        ui.page.wait_for_url(re.compile(rf"/c/{re.escape(ui.session_ids[1])}"))
+        ui.active_session = 1
+    ui.reveal()
+
+    assert ui.copy_selection("newer selection") == ""
+    assert ui.page.evaluate("window.__terminalClipboard.writes") == ["initial grant"]
+    ui.page.evaluate("window.__terminalClipboard.resolveDelayedWrite()")
+    _expect_clipboard(ui.page, "newer selection")
+    assert ui.page.evaluate("window.__terminalClipboard.writes") == [
+        "initial grant",
+        "older program text",
+        "newer selection",
+    ]
     expect(ui.consent).to_have_count(0)
 
 

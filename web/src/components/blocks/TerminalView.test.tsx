@@ -414,6 +414,64 @@ describe("terminal clipboard", () => {
     expect(readTerminalClipboardPreference()).toBe("allow");
   });
 
+  it.each(["visibility", "preference", "terminal", "remount"] as const)(
+    "serializes a newer selection behind an in-flight write across a %s change",
+    async (transition) => {
+      writeTerminalClipboardPreference("allow");
+      const view = render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
+      await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+      let clipboard = "before copying";
+      let finishOldCopy: (() => void) | undefined;
+      clipboardMock.copyText
+        .mockImplementation(async (text) => {
+          clipboard = text;
+        })
+        .mockImplementationOnce(
+          (text) =>
+            new Promise<void>((resolve) => {
+              finishOldCopy = () => {
+                clipboard = text;
+                resolve();
+              };
+            }),
+        );
+      await requestClipboard("older program text");
+      try {
+        if (transition === "visibility") {
+          view.rerender(
+            <TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" active={false} />,
+          );
+          view.rerender(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />);
+        } else if (transition === "preference") {
+          act(() => writeTerminalClipboardPreference("ask"));
+          act(() => writeTerminalClipboardPreference("allow"));
+        } else if (transition === "terminal") {
+          view.rerender(<TerminalView sessionId="conv_next" terminalId="terminal_bash_s2" />);
+          await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(2));
+        } else {
+          view.unmount();
+          render(<TerminalView sessionId="conv_next" terminalId="terminal_bash_s2" />);
+          await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(2));
+        }
+        const newer = await copySelection(
+          "newer selection",
+          terminalSessionMock.instances.length - 1,
+        );
+        expect(newer.setData).not.toHaveBeenCalled();
+        expect(clipboardMock.copyText).toHaveBeenCalledTimes(1);
+        expect(clipboard).toBe("before copying");
+      } finally {
+        await act(async () => finishOldCopy?.());
+      }
+      expect(clipboardMock.copyText.mock.calls).toEqual([
+        ["older program text"],
+        ["newer selection"],
+      ]);
+      expect(clipboard).toBe("newer selection");
+      expect(visibleClipboardConsent()).toBeNull();
+    },
+  );
+
   it.each(["ask", "allow", "block"] as const)(
     "honors %s for explicit selections in read-only terminals without allowing program writes",
     async (decision) => {

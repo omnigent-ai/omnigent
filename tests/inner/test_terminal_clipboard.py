@@ -94,8 +94,8 @@ def test_helper_fails_closed_without_a_bridge(
 
 @pytest.mark.parametrize(
     "payload",
-    [b"\xff", b"X" * (clipboard.MAX_CLIPBOARD_BYTES + 1)],
-    ids=["invalid-utf8", "oversized"],
+    [b"", b"\xff", b"X" * (clipboard.MAX_CLIPBOARD_BYTES + 1)],
+    ids=["empty", "invalid-utf8", "oversized"],
 )
 def test_client_rejects_non_text_and_oversize_payloads(
     bridge: clipboard.TerminalClipboardBridge, payload: bytes
@@ -103,15 +103,38 @@ def test_client_rejects_non_text_and_oversize_payloads(
     assert not clipboard._copy_to_terminal(str(bridge.socket_path), payload)
 
 
+def test_native_helper_rejects_empty_copies_explicitly(
+    bridge: clipboard.TerminalClipboardBridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run = Mock(return_value=subprocess.CompletedProcess([], 0))
+    monkeypatch.setattr(clipboard.subprocess, "run", run)
+    env = os.environ.copy()
+    bridge.prepare_environment(env)
+    bridge.start()
+    with subprocess.Popen(
+        [str(bridge.bin_dir / "pbcopy")],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+    ) as proc:
+        stdout, stderr = proc.communicate(b"", timeout=5)
+    assert proc.returncode == 1
+    assert stdout == b""
+    assert b"does not support clearing the clipboard" in stderr
+    run.assert_not_called()
+
+
 @pytest.mark.parametrize(
     "wire_request",
     [
+        struct.pack("!I", 0),
         struct.pack("!I", clipboard.MAX_CLIPBOARD_BYTES + 1),
         struct.pack("!I", 1) + b"\xff",
         struct.pack("!I", 5) + b"short"[:2],
         b"\x00\x00",
     ],
-    ids=["oversized", "invalid-utf8", "truncated-body", "truncated-header"],
+    ids=["empty", "oversized", "invalid-utf8", "truncated-body", "truncated-header"],
 )
 def test_listener_rejects_invalid_requests_and_keeps_serving(
     bridge: clipboard.TerminalClipboardBridge,
