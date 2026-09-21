@@ -274,7 +274,7 @@ export function QueuedMessagesStrip({
     <div
       data-testid="composer-queued-strip"
       className={cn(
-        "mx-auto -mb-4 flex w-full flex-col rounded-t-2xl bg-tray/40 px-2 pt-1.5 pb-5.5",
+        "composer-queued-surface mx-auto -mb-4 flex w-full flex-col rounded-t-2xl px-2 pt-1.5 pb-5.5",
         widthClassName,
       )}
     >

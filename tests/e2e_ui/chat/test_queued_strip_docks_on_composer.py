@@ -54,6 +54,7 @@ def test_queued_strip_attaches_to_composer(
     """
     base_url, session_id = seeded_session
     context = browser.new_context(
+        color_scheme="light",
         record_video_dir=os.environ.get("OMNIGENT_E2E_RECORD_DIR"),
     )
     page = context.new_page()
@@ -152,6 +153,22 @@ def test_queued_strip_attaches_to_composer(
                 )
                 assert abs(strip_box["x"] - bar_box["x"]) <= _EPSILON
                 assert abs(strip_box["width"] - bar_box["width"]) <= _EPSILON
+                strip_surface = strip.evaluate(
+                    """element => {
+                        const style = getComputedStyle(element);
+                        return [style.backgroundColor, style.backgroundImage];
+                    }"""
+                )
+                bar_surface = bar.first.evaluate(
+                    """element => {
+                        const style = getComputedStyle(element);
+                        return [style.backgroundColor, style.backgroundImage];
+                    }"""
+                )
+                assert strip_surface == bar_surface, (
+                    "light-theme queued rows and workspace metadata must share "
+                    f"one surface: strip={strip_surface}, bar={bar_surface}"
+                )
                 assert abs(strip_list_box["x"] - (bar_box["x"] + bar_insets["left"])) <= _EPSILON
                 assert (
                     abs(
