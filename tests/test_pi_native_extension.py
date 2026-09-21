@@ -93,16 +93,11 @@ require(extensionPath)(pi);
     ui: { setTitle() {}, setStatus() {}, notify() {} },
   });
   assert.equal(typeof pollInbox, "function");
-  const readyPath = path.join(tmpDir, "input-ready");
-  assert.equal(fs.existsSync(readyPath), false);
 
   for (let attempt = 0; attempt < 5; attempt += 1) {
     pollInbox();
   }
   await new Promise((resolve) => setImmediate(resolve));
-  const readiness = JSON.parse(fs.readFileSync(readyPath, "utf8"));
-  assert.equal(readiness.pid, process.pid);
-  assert.ok(Date.now() - readiness.at < 3000);
 
   assert.deepEqual(
     sendAttempts,

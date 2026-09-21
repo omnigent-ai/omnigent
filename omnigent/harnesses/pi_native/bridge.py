@@ -121,8 +121,6 @@ def clear_inbox(bridge_dir: Path) -> None:
     :param bridge_dir: The session's prepared bridge directory.
     :returns: None.
     """
-    with contextlib.suppress(OSError):
-        (bridge_dir / "input-ready").unlink()
     inbox = bridge_dir / _INBOX_DIR
     if not inbox.is_dir():
         return

@@ -1026,11 +1026,6 @@ class HarnessProcessManager:
         """
         return conversation_id in self._entries
 
-    def session_is_running(self, conversation_id: str) -> bool:
-        """Check the registered harness process without starting or reviving it."""
-        entry = self._entries.get(conversation_id)
-        return entry is not None and entry.process.returncode is None
-
     def has_active_turn(self, conversation_id: str) -> bool:
         """
         Check whether the given conversation has an in-flight

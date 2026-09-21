@@ -1633,3 +1633,31 @@ async def test_cleanup_session_preserves_live_native_bridge_dir(
     assert bridge_dir.exists()
     assert (bridge_dir / "bridge.json").exists()
     assert permission_hook.exists()
+
+
+@pytest.mark.asyncio
+async def test_claude_native_logs_input_ready_once_from_existing_snapshot(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import logging
+
+    monkeypatch.setenv("OMNIGENT_RUNNER_PRIMARY_SESSION_ID", "parent")
+    caplog.set_level(logging.INFO, logger="omnigent.runner.resource_registry")
+    callbacks, _, _, registry = await _observe_native_with_fake_poller(tmp_path, "child")
+    instance = registry.terminal_registry.get("child", "claude", "main")
+    assert instance is not None
+    on_tick = callbacks["on_tick"]
+    assert callable(on_tick)
+    instance._remember_pane_snapshot("Sign in to Claude")
+    on_tick()
+    assert not any(getattr(r, "event_name", None) == "native_input_ready" for r in caplog.records)
+    instance._remember_pane_snapshot("────────────────────\n❯ \n────────────────────")
+    on_tick()
+    on_tick()
+    events = [r for r in caplog.records if getattr(r, "event_name", None) == "native_input_ready"]
+    assert len(events) == 1
+    assert events[0].session_id == "child"
+    assert events[0].attributes["harness"] == "claude-native"
+    assert events[0].attributes["terminal_instance_id"] == instance.diagnostic_id

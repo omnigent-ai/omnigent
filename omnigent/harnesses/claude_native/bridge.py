@@ -4992,7 +4992,11 @@ def claude_pane_ready(bridge_dir: Path) -> bool:
     tmux_target = payload.get("tmux_target")
     if not isinstance(socket_path, str) or not isinstance(tmux_target, str):
         return False
-    pane = _capture_pane(socket_path, tmux_target)
+    return claude_pane_text_ready(_capture_pane(socket_path, tmux_target))
+
+
+def claude_pane_text_ready(pane: str) -> bool:
+    """Recognize usable Claude input in an already captured pane."""
     if _MODEL_PICKER_OPEN_HINT in pane:
         return False
     if any(text in pane for text in _CONFIRM_DIALOG_HINTS):

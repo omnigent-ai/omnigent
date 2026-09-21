@@ -34,6 +34,7 @@ server and runner by session and runner IDs, never by request ID alone.
 | `session_creation_accepted` | Server | The create HTTP request succeeded. This is not runner readiness. |
 | `session_creation_failed` | Server | The create request failed, including 4xx, cancellation, and errors after persistence. |
 | `session_runner_bound` | Server | A runner binding was persisted. `operation` is `create`, `launch`, `replace`, or `bind`; none alone defines a new creation. |
+| `session_runner_unbound` | Server | The runner binding was cleared; ends its SQL correlation interval. |
 | `sandbox_launch_stage` / `sandbox_launch_failed` | Server | Managed provisioning progress; failures preserve the last known stage. Sandbox `ready` only means provisioning/connection finished. |
 | `runner_launch_started` / `runner_spawned` | Host | Launch received / subprocess spawned. Neither proves connectivity. |
 | `runner_launch_failed` | Server or host | Host refusal, spawn error, or launch acknowledgement failure. Recovery can still succeed. |
@@ -44,11 +45,14 @@ server and runner by session and runner IDs, never by request ID alone.
 | `runner_session_init_started` / `runner_session_initialized` / `runner_session_init_failed` | Server or runner | Initialization request, successful response, or exception/non-success response. Cached server initialization does not emit another outcome. |
 | `runner_stream_ready` | Server | The relay received its first heartbeat. Includes both session and runner IDs. |
 | `terminal_started` / `terminal_start_failed` | Runner | Native terminal adapter completed / failed. A started terminal does not prove an interactive input prompt. |
-| `session_runner_ready` | Server | Initialization, current-connection relay readiness, and usable runner input have all been confirmed. |
-| `session_readiness_timeout` | Server | Readiness was not observed within the observer's five-minute budget after initialization; includes the pending stage. The metric still uses the original create-request deadline. |
-| `session_readiness_unavailable` | Server | The runner is older or the native provider has no reliable input probe. This is a measurement gap, not a proven creation failure. |
-| `session_readiness_observation_failed` | Server | The observer itself failed. This is a measurement gap, not a proven creation failure. |
+| `native_input_starting` | Runner | A native terminal adapter is about to run; invalidates earlier input readiness for this session/runner. |
+| `native_input_ready` | Runner | Claude's live pane shows usable chat input, or Codex's app-server thread is available and its bridge state is published. Includes `harness`. |
+| `native_input_stopped` | Runner | Codex's thread forwarder is ending and its app-server is being torn down. |
+| `terminal_exit_observed` / `terminal_close_requested` | Runner | Existing terminal lifecycle boundaries; native terminal exits/closes invalidate input readiness. Ignore superseded terminal exits. |
+| `runner_disconnected` | Server | Current tunnel went away; invalidates initialization and relay evidence for that connection. |
+| `runner_stream_connected` / `runner_stream_closed` | Server | Relay opened / ended; SQL uses these to bound the first-heartbeat readiness interval. |
 
+Runner initialization outcomes also include the resolved `harness`.
 Request completion includes `creation_kind=top_level|child|unknown`, `host_type`,
 and HTTP status. Malformed requests that cannot be classified retain `unknown`.
 Lifecycle failures include `stage` and, when available, `error_code`. Query event
@@ -68,10 +72,13 @@ minutes**, divided by eligible create requests. Use these rules:
    milestones on **both session and runner ID**, within the create's five-minute
    window and the lifetime of that binding. Do not join all logs sharing either
    ID. A runner can host several sessions, and a session can replace its runner.
-4. Require `session_runner_ready` for the same binding. The producer checks
-   initialization and a live relay on the same tunnel generation, plus native
-   input readiness where applicable. Do not require every intermediate log row
-   or substitute `terminal_started`, HTTP 201, or a provisioning `ready` stage.
+4. Require overlapping `runner_connected`, `runner_session_initialized`,
+   `runner_stream_ready`, and `native_input_ready` evidence for the same binding.
+   SQL derives tunnel and native lifecycle intervals from the events. Init and
+   relay evidence must belong to the current connection; native input readiness
+   can survive a reconnect until the terminal restarts or stops. Do not require
+   every intermediate log or substitute `terminal_started`, HTTP 201, or a
+   provisioning `ready` stage.
 5. Reduce to one result per create request. Recovery within the deadline can
    succeed despite earlier diagnostic failures. Reconnects/resumes add no create
    request and cannot inflate the denominator. A new HTTP create request is a
@@ -93,39 +100,74 @@ coverage before interpreting this best-effort debug metric as reliability.
 
 ## Readiness implementation and coverage
 
-With the server debug sink enabled, successful initialization starts a bounded
-background observer. It establishes/reuses the relay, waits for its heartbeat,
-and polls the runner's read-only `/v1/sessions/{id}/readiness` endpoint once per
-second. Creation and user-message handling do not wait for the observer. A
-successful event is emitted once per session/runner/tunnel generation. The
-observer checks the persisted binding again before emitting, and rejects stale
-responses after disconnect, relay replacement, rebind, or deletion. Server
-shutdown cancels outstanding observers. No new attempt ID is propagated.
+There is no readiness endpoint, server observer, extra polling loop, or new
+attempt ID. These are ordinary `logger.info` events delivered through the
+existing optional debug sink. The server does not aggregate a ready event;
+SQL combines the evidence using the existing session and runner IDs.
 
-The runner records successful initialization and checks the harness process is
-still alive. Native providers additionally supply an optional async `input_ready`
-hook over the resolved spawn environment. Probes do not type into terminals or
-accept trust/authentication prompts. Session deletion and agent reset invalidate
-runner readiness; reconnect probes the existing native process again.
+```mermaid
+sequenceDiagram
+    participant User
+    participant Server
+    participant Runner
+    participant Native as Claude / Codex
+    participant Logs as Debug logs + SQL
+    User->>Server: Create session (web or CLI)
+    Server->>Logs: session_creation_started (request_id)
+    Server->>Logs: session_created / session_runner_bound (session_id, runner_id)
+    Runner->>Server: Connect tunnel
+    Server->>Logs: runner_connected
+    Server->>Runner: Existing session initialization
+    Runner->>Native: Start native agent
+    Runner->>Logs: runner_session_initialized
+    Runner->>Server: Existing stream heartbeat
+    Server->>Logs: runner_stream_ready
+    Native-->>Runner: Usable Claude pane / Codex thread started
+    Runner->>Logs: native_input_ready (session_id, runner_id, harness)
+    Note over Logs: SQL finds overlapping evidence within 5 minutes of create
+```
 
-| Provider | Positive evidence |
+Readiness and initialization can arrive in either order. Claude's existing
+terminal watcher checks the pane snapshot it already captured after checking
+pane liveness. It logs once when the existing usable-input detector matches;
+it does not run an extra tmux command, type into the terminal, accept dialogs,
+or wait for a first user message. Ownership transfer installs a watcher for
+the new session. Raw watcher threads pass the session ID explicitly; the sink
+reads the process's runner ID from `OMNIGENT_RUNNER_ID`.
+
+Codex's existing `thread/started` listener logs after publishing the discovered
+thread's bridge state. A known-thread launch logs after successful thread
+preload/resume and terminal registration. A native `/clear` thread switch emits
+readiness with the replacement session ID after transferring its terminal and
+bridge state. There is no extra JSON-RPC probe and
+no wait for the first turn or transcript subscription. Codex can accept turns
+while MCP startup finishes. This means its chat input path is available; it
+does not prove that the terminal/browser has rendered a frame.
+
+| Path | Coverage |
 | --- | --- |
-| Non-native | Successful session initialization and a still-running harness process. |
-| Claude | Live tmux pane with the existing usable-input-box detector. |
-| Codex | Live app-server handshake and a successful read of the current native thread. |
-| OpenCode | Live server response for the current native session. |
-| Pi | Recent heartbeat from the input poller and a live poller process. Relaunch clears the marker. |
-| Qwen | Live pane and the boot event emitted after its input watcher starts. |
-| Cursor, Kimi, Kiro, Devin, Antigravity | Live pane and the provider's existing input/footer detector. |
-| Goose, Hermes | Unsupported: their current settle heuristics do not establish input readiness. |
-| Community native providers | Unsupported unless the provider declares an `input_ready` hook. |
+| Runner-owned Claude native, web and current CLI | Existing live-pane usable-input detector. |
+| Runner-owned Codex native, web and current CLI | Existing native thread discovery or successful resume. |
+| Other native providers and SDK/non-native harnesses | Outside this query's readiness coverage. Successful initialization with another harness is an explicit measurement gap. |
+| Older runners or legacy CLI-owned native processes | No guaranteed readiness event; do not include these deployments in the new series. |
 
-Old runners return no readiness endpoint and produce
-`session_readiness_unavailable`. Roll out both server and runners before metric
-cutover. TUI detectors remain dependent on the underlying CLI's prompt format;
-validate them against deployed CLI versions. Readiness confirms usable input,
-not that a subsequent model request will succeed or that the browser has rendered
-its first frame.
+Unsupported harnesses remain visible as `unmeasurable_creations`; the query
+returns NULL for the headline rate if any unsuccessful request in the cohort
+has that gap. There is still only one creation percentage. Supporting another
+harness later requires defining its positive input-ready signal first.
+
+The query measures **became usable at least once before the deadline**, not
+continued availability after that point. It ignores earlier diagnostic errors
+if startup recovers in time. It retains connection history from `rollout_at`
+because a shared runner may connect before the cohort starts; do not truncate
+that history to the cohort window without carrying forward its state.
+
+This is a best-effort log-derived metric. Lost events, clock skew between server
+and runner, and overlapping lifecycle callbacks can make inferred intervals
+inaccurate. Keep clocks synchronized and validate ingestion before cutover;
+this is not a transactional availability guarantee. Roll out server and runner
+changes together. Claude detection also depends on the deployed CLI's prompt
+format. Neither signal guarantees a later model request will succeed.
 
 ## Verification
 
@@ -135,7 +177,9 @@ Run the focused suites:
 uv run --no-sync pytest -q tests/test_debug_logging.py \
   tests/server/test_creation_logging.py tests/server/test_runner_session_init.py \
   tests/host/test_connect.py tests/runner/test_app_sessions_native_workflow_init.py \
-  tests/server/routes/test_sessions_runner_relay.py
+  tests/server/routes/test_sessions_runner_relay.py \
+  tests/test_session_creation_success_query.py tests/runner/test_resource_registry.py \
+  tests/runner/test_app_sessions_native_terminals_runtime.py
 ```
 
 With the debug sink configured, create a web session and a CLI session. Follow
@@ -147,12 +191,24 @@ session and runner IDs as its binding. Resume an existing session: there must
 be no new creation-start event. Check a child session's logs carry its own
 session ID while sharing the parent's runner ID.
 
-Create a supported native session without sending a message. Verify exactly one
-`session_runner_ready` appears after the terminal becomes interactive, with the
-bound session and runner IDs. Delay or fail native startup and confirm there is
-no premature ready event. Reconnect during startup and verify that the previous
-connection's probe cannot mark the replacement ready. An older runner or a
-Goose/Hermes session must report `session_readiness_unavailable`, not success.
+Create fresh Claude and Codex sessions from both the web and CLI without
+sending a message. Filter the debug table by their `session_id` and
+`attributes['runner_id']`: expect `runner_session_initialized`,
+`runner_stream_ready`, and `native_input_ready` (`harness=claude-native` or
+`codex-native`). A sign-in/trust prompt or failed Codex thread discovery must
+not produce native readiness. Reconnect the tunnel: init and relay should
+refresh without another create request or a required native-ready re-emission.
+Restart the native terminal: expect `native_input_starting` before its next
+`native_input_ready`.
+
+Run `session_creation_success.sql` with a deployment-scoped log table,
+`workspace_id`, `rollout_at`, `cohort_start`, `cohort_end`, and `as_of`. Wait at
+least seven minutes from the create (five-minute deadline plus example ingestion
+grace). Expect one creation per HTTP request; a failed startup without recovery
+by five minutes is unsuccessful. For request-level inspection, replace the final
+SELECT as described in the SQL comments. The production dashboard has not been
+updated by this PR. SQLite fixtures test the actual query joins with dialect
+adaptations; validate the query in Databricks before dashboard cutover.
 
 ## Migration from message-based dashboards
 

@@ -1278,6 +1278,29 @@ class SessionResourceRegistry:
             with self._lock:
                 self._status_pollers[session_id] = status_poller
 
+        native_input_ready = False
+
+        def _on_tick() -> None:
+            nonlocal native_input_ready
+            if status_poller is not None:
+                status_poller.tick()
+            if resource_role == CLAUDE_NATIVE_TERMINAL_ROLE and not native_input_ready:
+                from omnigent.harnesses.claude_native.bridge import claude_pane_text_ready
+
+                # The watcher already captured this live pane; no extra tmux query.
+                if claude_pane_text_ready(instance.last_pane_text() or ""):
+                    native_input_ready = True
+                    _logger.info(
+                        "Claude native input ready",
+                        extra=debug_event(
+                            "native_input_ready",
+                            session_id=session_id,
+                            harness="claude-native",
+                            terminal_instance_id=instance.diagnostic_id,
+                            stage="native_input",
+                        ),
+                    )
+
         def _on_activity() -> None:
             # Runs on the watcher daemon thread; hop to the loop so the
             # loop-only publishers (queue.put_nowait) are touched safely.
@@ -1355,6 +1378,7 @@ class SessionResourceRegistry:
             instance.start_idle_watcher_thread(
                 on_activity=_on_activity if activity_publisher is not None else None,
                 on_exit=_on_exit,
+                on_tick=_on_tick if resource_role == CLAUDE_NATIVE_TERMINAL_ROLE else None,
                 replace=replace,
             )
             return
@@ -1377,19 +1401,11 @@ class SessionResourceRegistry:
             # behind it.
             last_activity_emit["value"] = None
 
-        def _on_tick() -> None:
-            # Drive the status-file poller on the watcher cadence. No-op
-            # once it resolves the file and every read is unchanged, cheap
-            # (one ``stat``) otherwise; retires to the PTY watcher if the
-            # file never appears (old Claude) or later vanishes.
-            if status_poller is not None:
-                status_poller.tick()
-
         instance.start_idle_watcher_thread(
             on_activity=_on_activity,
             on_idle=_on_idle,
             on_exit=_on_exit,
-            on_tick=_on_tick if status_poller is not None else None,
+            on_tick=_on_tick,
             idle_threshold_s=_CLAUDE_NATIVE_STATUS_IDLE_THRESHOLD_SECONDS,
             poll_interval_s=_CLAUDE_NATIVE_STATUS_POLL_INTERVAL_SECONDS,
             replace=replace,
@@ -1572,6 +1588,7 @@ class SessionResourceRegistry:
                         session_id=session_id,
                         terminal_id=terminal_id,
                         terminal_instance_id=entry.instance.diagnostic_id,
+                        terminal_name=entry.terminal_name,
                     ),
                 )
                 closed = await self._terminal_registry.close(

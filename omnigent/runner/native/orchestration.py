@@ -5192,6 +5192,17 @@ async def _auto_create_codex_terminal(
         _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
         raise
 
+    if launch_config.external_session_id is not None:
+        _logger.info(
+            "Codex native input ready",
+            extra=debug_event(
+                "native_input_ready",
+                session_id=session_id,
+                harness="codex-native",
+                stage="native_input",
+            ),
+        )
+
     # Known-thread resumes publish bridge state before the terminal starts;
     # only fresh discovery needs to extend the executor's state wait.
     if launch_config.external_session_id is None and thread_start_timeout_seconds is not None:
@@ -5429,6 +5440,16 @@ async def _codex_discover_thread_and_forward(
             ),
         )
 
+        _logger.info(
+            "Codex native input ready",
+            extra=debug_event(
+                "native_input_ready",
+                session_id=session_id,
+                harness="codex-native",
+                stage="native_input",
+            ),
+        )
+
         server_url = _required_runner_env("RUNNER_SERVER_URL")
         auth_factory = _make_auth_token_factory()
         auth_token = auth_factory() if auth_factory is not None else None
@@ -5494,6 +5515,15 @@ async def _codex_discover_thread_and_forward(
         # in its own ``finally``; ``close()`` is idempotent. The app-server
         # subprocess is ours to stop, else it orphans one process per session.
         # Pop first so the dict never holds a closed reference.
+        _logger.info(
+            "Codex native input stopped",
+            extra=debug_event(
+                "native_input_stopped",
+                session_id=session_id,
+                harness="codex-native",
+                stage="native_input",
+            ),
+        )
         leftover_app_server = _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
         with contextlib.suppress(Exception):
             await event_client.close()
@@ -5557,6 +5587,15 @@ async def _codex_forward_known_thread(
         if client is not None:
             with contextlib.suppress(Exception):
                 await client.close()
+        _logger.info(
+            "Codex native input stopped",
+            extra=debug_event(
+                "native_input_stopped",
+                session_id=session_id,
+                harness="codex-native",
+                stage="native_input",
+            ),
+        )
         leftover_app_server = _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
         if leftover_app_server is not None:
             with contextlib.suppress(Exception):
@@ -8893,6 +8932,15 @@ async def _launch_native_terminal(
                 ctx = await build_context(ctx)
             elif resolve_agent_spec is not None:
                 ctx = dataclasses.replace(ctx, agent_spec=await resolve_agent_spec())
+            _logger.info(
+                "Native input startup",
+                extra=debug_event(
+                    "native_input_starting",
+                    session_id=ctx.session_id,
+                    harness=harness_name,
+                    stage="native_input",
+                ),
+            )
             await adapter(ctx)
             _logger.info(
                 "Native terminal started",
@@ -9031,6 +9079,15 @@ async def _ensure_native_terminal(
         try:
             if build_context is not None:
                 ctx = await build_context(ctx)
+            _logger.info(
+                "Native input startup",
+                extra=debug_event(
+                    "native_input_starting",
+                    session_id=ctx.session_id,
+                    harness=agent.harness,
+                    stage="native_input",
+                ),
+            )
             view = await adapter(ctx)
             _logger.info(
                 "Native terminal started",

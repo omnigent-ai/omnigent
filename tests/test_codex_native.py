@@ -2607,6 +2607,7 @@ def test_forwarder_ignores_thread_started_for_current_codex_thread(tmp_path: Pat
 
 def test_forwarder_rotates_session_on_new_codex_thread_and_posts_to_new_session(
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
     Native Codex thread switches create a replacement Omnigent session.
@@ -2617,6 +2618,7 @@ def test_forwarder_rotates_session_on_new_codex_thread_and_posts_to_new_session(
     thread, and send subsequent status/history events to the new AP
     session.
     """
+    caplog.set_level("INFO", logger="omnigent.harnesses.codex_native.forwarder")
     write_bridge_state(
         tmp_path,
         CodexNativeBridgeState(
@@ -2788,6 +2790,13 @@ def test_forwarder_rotates_session_on_new_codex_thread_and_posts_to_new_session(
         for _, payload in posted_events
         if payload["type"] == "external_conversation_item"
     ] == ["after clear"]
+
+    readiness = [
+        r for r in caplog.records if getattr(r, "event_name", None) == "native_input_ready"
+    ]
+    assert len(readiness) == 1
+    assert readiness[0].session_id == "conv_new"
+    assert readiness[0].attributes["runner_id"] == "runner_123"
 
 
 def test_forwarder_rotation_failure_preserves_old_target(

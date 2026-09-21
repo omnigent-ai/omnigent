@@ -264,25 +264,3 @@ async def test_init_logs_rejection_retry_and_cached_success_once() -> None:
     assert all(row["session_id"] == conversation.id for row in events)
     assert all(row["attributes"]["runner_id"] == conversation.runner_id for row in events)
     assert events[1]["attributes"]["status_code"] == "503"
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("status_code", [201, 503])
-async def test_readiness_only_observes_successful_current_initialization(status_code: int) -> None:
-    from unittest.mock import Mock
-
-    registry = _Registry()
-    client = _Client()
-    client.status_code = status_code
-    observer = Mock()
-    initializer = RunnerSessionInitializer(
-        registry,
-        server_version="test",
-        readiness=observer,  # type: ignore[arg-type]
-    )
-    client.release.set()
-    conversation = _conversation()
-    await initializer.initialize(conversation, client, timeout=10)  # type: ignore[arg-type]
-    assert observer.initialized.call_count == int(status_code == 201)
-    initializer.invalidate_runner("runner_init")
-    observer.invalidate_runner.assert_called_once_with("runner_init")

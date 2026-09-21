@@ -6639,16 +6639,12 @@ async def _relay_runner_stream(
     while True:
         started = loop.time()
         try:
-            try:
-                await _relay_runner_stream_once(
-                    session_id,
-                    runner_client,
-                    conversation_store,
-                    ready,
-                )
-            finally:
-                if ready is not None:
-                    ready.clear()
+            await _relay_runner_stream_once(
+                session_id,
+                runner_client,
+                conversation_store,
+                ready,
+            )
             return
         except _RelayTransportLost as lost:
             now = loop.time()
@@ -7411,7 +7407,7 @@ async def _relay_runner_stream_once(
         _logger.info(
             "Relay: task exiting for session=%s",
             session_id,
-            extra={"session_id": session_id},
+            extra=debug_event("runner_stream_closed", session_id=session_id),
         )
         # Drop any in-flight assistant-text entry so a relay that exits
         # WITHOUT a terminal turn event (runner death / tunnel drop
@@ -7468,15 +7464,9 @@ def _ensure_runner_relay(
             extra={"session_id": session_id},
         )
         return None
-    router = get_server_runner_router()
-    connection = router.runner_connection(runner_id) if router is not None else None
     existing = _runner_relay_tasks.get(session_id)
     if existing is not None:
-        if (
-            existing.runner_id == runner_id
-            and existing.connection is connection
-            and not existing.task.done()
-        ):
+        if existing.runner_id == runner_id and not existing.task.done():
             _logger.info(
                 "Relay: reusing existing for session=%s runner=%s",
                 session_id,
@@ -7514,7 +7504,7 @@ def _ensure_runner_relay(
             ),
             name=f"runner-relay-{session_id}",
         )
-    handle = _RelayHandle(runner_id=runner_id, task=task, ready=ready, connection=connection)
+    handle = _RelayHandle(runner_id=runner_id, task=task, ready=ready)
     _runner_relay_tasks[session_id] = handle
 
     def _on_done(t: asyncio.Task[None]) -> None:

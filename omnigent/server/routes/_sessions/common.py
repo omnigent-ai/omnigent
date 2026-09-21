@@ -790,7 +790,6 @@ class _RelayHandle:
     runner_id: str
     task: asyncio.Task[None]
     ready: asyncio.Event
-    connection: object | None = None
 
 
 _runner_relay_tasks: WorkspaceScopedCache[str, _RelayHandle] = WorkspaceScopedCache()
