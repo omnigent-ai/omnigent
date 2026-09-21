@@ -21,10 +21,10 @@ remain unchanged.
 
 Enabled capture retains diagnostic text, including tracebacks and request or
 response context. It applies known credential-pattern redaction, including
-whitespace-delimited values after explicit credential labels, and removes
-terminal control codes. It does not filter prompts or payloads by content;
-configure capture only where this text is appropriate for the deployment's log
-storage and readers.
+whitespace-delimited values after explicit credential labels, normalizes carriage
+returns to newlines, and removes other terminal control codes. It does not filter
+prompts or payloads by content; configure capture only where this text is
+appropriate for the deployment's log storage and readers.
 
 Redaction is pattern-based, not a general detector of secrets in prose. For
 example, `password hunter2` is redacted, but `The password is hunter2` becomes

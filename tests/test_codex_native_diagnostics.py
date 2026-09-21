@@ -306,6 +306,23 @@ def test_multiline_entry_keeps_traceback_context(capture_stderr: None) -> None:
     assert snapshot["stderr_tail_truncated"] is False
 
 
+@pytest.mark.parametrize("line_ending", ["\r", "\r\n"])
+def test_carriage_returns_become_newlines_in_local_and_structured_logs(
+    capture_stderr: None, line_ending: str
+) -> None:
+    snapshot = collect_codex_startup_diagnostics(_server([f"prefix{line_ending}continuation"]))
+    expected = "prefix\ncontinuation"
+    assert snapshot["stderr_tail"] == expected
+    record = logging.LogRecord(
+        "omnigent.runner", logging.ERROR, __file__, 1, "%s", (snapshot["stderr_tail"],), None
+    )
+    record.attributes = snapshot
+    assert RedactingLogFormatter(fmt="%(message)s", use_colors=False).format(record) == expected
+    row = record_to_row(record, source="runner")
+    assert row["message"] == expected
+    assert row["attributes"]["stderr_tail"] == expected
+
+
 def test_budget_keeps_complete_recent_entries(capture_stderr: None) -> None:
     entries = ["old " + "a" * 30_000, "middle " + "b" * 30_000, "recent " + "c" * 30_000]
     snapshot = collect_codex_startup_diagnostics(_server(entries))

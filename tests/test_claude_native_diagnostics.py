@@ -14,7 +14,7 @@ import pytest
 from omnigent._platform import IS_POSIX
 from omnigent.debug_logging import record_to_row
 from omnigent.harnesses.claude_native import bridge, diagnostics
-from omnigent.process_logging import HARNESS_STDERR_ENABLED_ENV_VAR
+from omnigent.process_logging import HARNESS_STDERR_ENABLED_ENV_VAR, RedactingLogFormatter
 
 pytestmark = pytest.mark.skipif(not IS_POSIX, reason="Native diagnostic files use POSIX bridges")
 
@@ -198,6 +198,26 @@ def test_split_utf8_and_credentials_are_redacted_only_after_complete_record(
         row = record_to_row(record, source="runner")
         assert secret not in json.dumps(row)
         assert row["attributes"]["text"] == f"é🙂 {expected}"
+
+
+@pytest.mark.parametrize("line_ending", [b"\r", b"\r\n"])
+def test_carriage_returns_become_newlines_in_local_and_structured_logs(
+    capture_file: Path, caplog: pytest.LogCaptureFixture, line_ending: bytes
+) -> None:
+    capture_file.write_bytes(b"prefix" + line_ending + b"continuation\n")
+    follower = diagnostics.ClaudeDebugLogFollower(capture_file.parent)
+    follower.poll("conv_test")
+    follower.close("conv_test")
+
+    expected = "prefix\ncontinuation"
+    assert [event["text"] for event in _events(caplog)] == [expected]
+    record = caplog.records[-1]
+    local = RedactingLogFormatter(fmt="%(message)s", use_colors=False).format(record)
+    assert expected in local
+    assert "\r" not in local
+    row = record_to_row(record, source="runner")
+    assert row["attributes"]["text"] == expected
+    assert "\r" not in row["message"]
 
 
 def test_credential_redaction_precedes_export_clipping(

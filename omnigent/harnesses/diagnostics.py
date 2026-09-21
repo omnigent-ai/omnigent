@@ -20,8 +20,9 @@ _TERMINAL_ESCAPE = re.compile(
 def sanitize_diagnostic_text(text: str) -> str:
     """Strip terminal controls and redact known credential patterns."""
     text = _TERMINAL_ESCAPE.sub("", text).translate(str.maketrans("\t\v\f", "   "))
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
     cleaned = "".join(
-        char for char in text if char in "\n\r" or unicodedata.category(char) not in {"Cc", "Cf"}
+        char for char in text if char == "\n" or unicodedata.category(char) not in {"Cc", "Cf"}
     ).rstrip()
     return redact_log_text(cleaned, include_whitespace_credentials=True)
 
