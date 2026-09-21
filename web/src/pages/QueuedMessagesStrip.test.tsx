@@ -2,7 +2,7 @@
 // listing messages queued while the agent is busy. It's a pure prop-driven
 // component (no store access), so we exercise it with plain props.
 
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -248,12 +248,16 @@ describe("QueuedMessagesStrip", () => {
         />
       </TooltipProvider>,
     );
-    for (const name of [
+    const actionNames = [
       "Reorder queued message",
-      "Send queued message now",
       "Edit queued message",
+      "Send queued message now",
       "Remove queued message",
-    ]) {
+    ];
+    expect(
+      screen.getAllByRole("button").map((button) => button.getAttribute("aria-label")),
+    ).toEqual(actionNames);
+    for (const name of actionNames) {
       const button = screen.getByRole("button", { name });
       // Keep the 44px touch target while matching the composer's 16px glyphs.
       expect(button, name).toHaveClass("max-md:size-11");
@@ -280,6 +284,48 @@ describe("QueuedMessagesStrip", () => {
     expect(handles).toHaveLength(2);
     expect(handles[0]).toHaveAttribute("tabindex", "0");
     expect(handles[0]).toHaveAttribute("aria-describedby");
+  });
+
+  it("calls onReorder after moving a queued message with the keyboard", async () => {
+    const onReorder = vi.fn();
+    render(
+      <QueuedMessagesStrip
+        messages={[msg("q_1", "first"), msg("q_2", "second"), msg("q_3", "third")]}
+        onDelete={vi.fn()}
+        onEdit={vi.fn()}
+        onReorder={onReorder}
+      />,
+    );
+
+    const handles = screen.getAllByRole("button", { name: "Reorder queued message" });
+    const rows = screen.getAllByRole("listitem");
+    const rect = (top: number, width: number) =>
+      ({
+        x: 0,
+        y: top,
+        top,
+        right: width,
+        bottom: top + 24,
+        left: 0,
+        width,
+        height: 24,
+        toJSON: () => ({}),
+      }) as DOMRect;
+    rows.forEach((row, index) =>
+      vi.spyOn(row, "getBoundingClientRect").mockReturnValue(rect(index * 32, 300)),
+    );
+    handles.forEach((handle, index) =>
+      vi.spyOn(handle, "getBoundingClientRect").mockReturnValue(rect(index * 32, 24)),
+    );
+
+    const handle = handles[0]!;
+    handle.focus();
+    fireEvent.keyDown(handle, { key: " ", code: "Space" });
+    await waitFor(() => expect(handle).toHaveAttribute("aria-pressed", "true"));
+    fireEvent.keyDown(handle, { key: "ArrowDown", code: "ArrowDown" });
+    fireEvent.keyDown(handle, { key: " ", code: "Space" });
+
+    await waitFor(() => expect(onReorder).toHaveBeenCalledWith("q_1", "q_3"));
   });
 
   it("caps and scrolls a long backlog instead of growing the composer stack", () => {

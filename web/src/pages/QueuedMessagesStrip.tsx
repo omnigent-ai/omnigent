@@ -166,6 +166,16 @@ function QueuedRow({
       {/* Always visible (not hover-gated) so the actions are discoverable;
           they brighten on hover/focus. */}
       <span className="flex shrink-0 items-center gap-0">
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon-xs"
+          aria-label="Edit queued message"
+          className={ACTION_BUTTON_CLASS}
+          onClick={() => onEdit(message.queueId)}
+        >
+          <PencilIcon className={ACTION_ICON_CLASS} aria-hidden="true" />
+        </Button>
         {onSteer ? (
           <Tooltip>
             <TooltipTrigger asChild>
@@ -187,16 +197,6 @@ function QueuedRow({
             </TooltipContent>
           </Tooltip>
         ) : null}
-        <Button
-          type="button"
-          variant="ghost"
-          size="icon-xs"
-          aria-label="Edit queued message"
-          className={ACTION_BUTTON_CLASS}
-          onClick={() => onEdit(message.queueId)}
-        >
-          <PencilIcon className={ACTION_ICON_CLASS} aria-hidden="true" />
-        </Button>
         <Button
           type="button"
           variant="ghost"
