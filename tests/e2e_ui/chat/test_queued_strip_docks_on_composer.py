@@ -175,9 +175,16 @@ def test_queued_strip_attaches_to_composer(
                 bar_top_radii = bar.first.evaluate(
                     """element => {
                         const style = getComputedStyle(element);
+                        const divider = getComputedStyle(element, "::before");
                         return {
                             radii: [style.borderTopLeftRadius, style.borderTopRightRadius],
                             dividerWidth: style.borderTopWidth,
+                            divider: {
+                                left: divider.left,
+                                right: divider.right,
+                                height: divider.height,
+                                backgroundColor: divider.backgroundColor,
+                            },
                         };
                     }"""
                 )
@@ -189,8 +196,19 @@ def test_queued_strip_attaches_to_composer(
                     "the docked queue owns the outer rounded top; the workspace bar "
                     f"must not draw an inner arc: {bar_top_radii}"
                 )
-                assert bar_top_radii["dividerWidth"] != "0px", (
-                    "the docked queue and workspace bar must keep a straight divider"
+                assert bar_top_radii["dividerWidth"] == "0px", (
+                    "the docked workspace bar must not draw a full-width top border"
+                )
+                divider = bar_top_radii["divider"]
+                assert divider["left"] == "16px"
+                assert divider["right"] == "16px"
+                assert divider["height"] == "1px"
+                assert divider["backgroundColor"] not in {
+                    "rgba(0, 0, 0, 0)",
+                    "transparent",
+                }, (
+                    "the queue/workspace divider must be the prototype's faint 16px-inset line: "
+                    f"{divider}"
                 )
                 drag_handle_center = drag_handle_box["x"] + drag_handle_box["width"] / 2
                 workspace_icon_center = workspace_icon_box["x"] + workspace_icon_box["width"] / 2

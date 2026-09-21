@@ -3801,7 +3801,10 @@ describe("Composer sub-agent tray", () => {
     expect(screen.getByTestId("composer-workspace-controls")).toHaveClass(
       "rounded-t-none",
       "pl-2.5",
-      "border",
+      "border-t-0",
+      "border-border/50",
+      "before:inset-x-4",
+      "before:h-px",
     );
   });
 });

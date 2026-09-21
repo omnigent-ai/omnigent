@@ -3667,8 +3667,8 @@ function ComposerImpl(
         <ComposerWorkspaceBar
           data-testid="composer-workspace-controls"
           className={cn(
-            hasQueuedComposerMessages && "rounded-t-none",
-            hasQueuedComposerMessages && "pl-2.5",
+            hasQueuedComposerMessages &&
+              "rounded-t-none border-t-0 border-border/50 pl-2.5 before:pointer-events-none before:absolute before:inset-x-4 before:top-0 before:h-px before:bg-border/50 before:content-['']",
           )}
         >
           <ComposerPrLink
