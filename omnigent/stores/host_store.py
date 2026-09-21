@@ -1151,6 +1151,12 @@ class HostStore:
                 raise OmnigentError(
                     "session is no longer bound to this host", code=ErrorCode.UNAUTHORIZED
                 )
+            if meta.inference_snapshot is not None and host.sandbox_provider is None:
+                raise OmnigentError(
+                    "This session has a saved sandbox inference profile. "
+                    "Choose a managed sandbox host or start a new session to use this host.",
+                    code=ErrorCode.INVALID_INPUT,
+                )
 
         run_write_transaction(self._lifecycle_session, "admit_runner_launch", write)
 

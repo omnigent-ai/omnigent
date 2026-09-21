@@ -35,6 +35,11 @@ const UNCOMPRESSED_IMAGE_LIMIT_MB = 5;
 
 export type AttachmentCategory = keyof typeof ATTACHMENT_SIZE_LIMITS_MB;
 
+/** Keep unnamed clipboard images consistent before and after upload. */
+export function attachmentFilename(file: File): string {
+  return file.name || "image.png";
+}
+
 const attachmentIds = new WeakMap<File, string>();
 let nextAttachmentId = 0;
 

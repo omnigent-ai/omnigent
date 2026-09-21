@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   ATTACHMENT_SIZE_LIMITS_MB,
+  attachmentFilename,
   attachmentKey,
   classifyAttachment,
   validateAttachments,
@@ -11,6 +12,18 @@ function makeFile(name: string, type: string, bytes = 10): File {
 }
 
 const MB = 1024 * 1024;
+
+describe("attachmentFilename", () => {
+  it.each(["screenshot.png", "notes.txt", "report.pdf"])("preserves the name %s", (name) => {
+    expect(attachmentFilename(makeFile(name, ""))).toBe(name);
+  });
+
+  it("uses the upload filename for an unnamed clipboard image without renaming the File", () => {
+    const file = makeFile("", "image/png");
+    expect(attachmentFilename(file)).toBe("image.png");
+    expect(file.name).toBe("");
+  });
+});
 
 describe("attachmentKey", () => {
   it("is stable per File object and distinct for equivalent files", () => {

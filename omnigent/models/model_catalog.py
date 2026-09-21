@@ -632,7 +632,9 @@ def _resolve_model_provider_unsafe(spec: object, harness: str | None) -> Resolve
     entry = (
         _acp_provider_entry(agent_spec)
         if harness_type == "acp"
-        else _resolve_provider_for_build(agent_spec, harness_type=harness_type)
+        else _resolve_provider_for_build(
+            agent_spec, harness_type=harness_type, actual_harness=harness
+        )
     )
     if entry is not None:
         return _provider_from_entry(entry, harness_type)
@@ -839,6 +841,16 @@ def _acp_launch_model(spec: AgentSpec) -> str | None:
         retain the legacy filtering of inherited Databricks spec models.
     """
     model = getattr(spec.executor, "model", None)
+    from omnigent.inference_config import (
+        binding_for_harness,
+        load_runtime_inference_config,
+        resolve_bound_model,
+    )
+
+    config = load_runtime_inference_config()
+    harness = str(spec.executor.config.get("harness") or "acp")
+    if binding_for_harness(config, harness) is not None:
+        return resolve_bound_model(config, harness, model)
     if isinstance(model, str) and model:
         if not model.startswith(("databricks-", "databricks/")) or acp_curated_models(spec):
             return model
@@ -875,8 +887,17 @@ def _acp_provider_entry(spec: AgentSpec) -> ProviderEntry | None:
     :raises OmnigentError: If the explicitly selected provider cannot be resolved.
     """
     from omnigent.errors import ErrorCode, OmnigentError
+    from omnigent.inference_config import load_runtime_inference_config, resolve_bound_provider
     from omnigent.runtime.workflow import _resolve_provider_for_build
     from omnigent.spec.types import ProviderAuth
+
+    bound = resolve_bound_provider(
+        load_runtime_inference_config(),
+        str(spec.executor.config.get("harness") or "acp"),
+        spec.executor.auth,
+    )
+    if bound is not None:
+        return bound
 
     if not isinstance(spec.executor.auth, ProviderAuth):
         return None
@@ -918,7 +939,16 @@ def acp_curated_models(spec: object) -> tuple[str, ...]:
         first; empty for unbound, unconfigured, or default-only providers.
     :raises OmnigentError: If an explicitly selected provider cannot be resolved.
     """
-    entry = _acp_provider_entry(cast("AgentSpec", spec))
+    from omnigent.inference_config import binding_for_harness, load_runtime_inference_config
+
+    agent_spec = cast("AgentSpec", spec)
+    binding = binding_for_harness(
+        load_runtime_inference_config(),
+        str(agent_spec.executor.config.get("harness") or "acp"),
+    )
+    entry = _acp_provider_entry(agent_spec)
+    if binding is not None and binding.model_allowlist is not None:
+        return binding.model_allowlist
     if entry is None:
         return ()
     default = _acp_provider_default(entry)
@@ -941,6 +971,19 @@ def validate_acp_model(spec: object, model: str | None) -> None:
     :raises OmnigentError: If the provider cannot be resolved or excludes the model.
     """
     from omnigent.errors import ErrorCode, OmnigentError
+    from omnigent.inference_config import (
+        binding_for_harness,
+        load_runtime_inference_config,
+        resolve_bound_model,
+    )
+
+    agent_spec = cast("AgentSpec", spec)
+    config = load_runtime_inference_config()
+    harness = str(agent_spec.executor.config.get("harness") or "acp")
+    if binding_for_harness(config, harness) is not None:
+        _acp_provider_entry(agent_spec)
+        resolve_bound_model(config, harness, model)
+        return
 
     curated = acp_curated_models(spec)
     if model is not None and curated and model not in curated:
@@ -1076,6 +1119,17 @@ def list_models_for_worker(
         listing = _listing_for_provider(provider, transport=transport)
     if harness is None:
         return listing
+    from omnigent.inference_config import binding_for_harness, load_runtime_inference_config
+
+    binding = binding_for_harness(load_runtime_inference_config(), harness)
+    if binding is not None:
+        if binding.model_allowlist is None:
+            return listing
+        by_id = {model.id: model for model in listing.models}
+        return replace(
+            listing,
+            models=tuple(by_id[mid] for mid in binding.model_allowlist if mid in by_id),
+        )
     filtered = tuple(m for m in listing.models if model_family_mismatch(harness, m.id) is None)
     return replace(listing, models=filtered)
 

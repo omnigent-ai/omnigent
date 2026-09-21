@@ -481,6 +481,9 @@ export interface Session {
   }[];
   /** Runner-owned model picker rows for the active native session. */
   codexModelOptions?: NativeModelOption[];
+  /** A saved sandbox inference policy owns the model catalog. */
+  inferenceConfigured?: boolean;
+  inferenceError?: string | null;
   /**
    * True while the runner is auto-creating the terminal for a
    * terminal-first session (claude-native / codex-native). Sourced

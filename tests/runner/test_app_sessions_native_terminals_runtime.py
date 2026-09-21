@@ -632,6 +632,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
         *,
         terminal_launch_args: list[str] | None = None,
         retain_client: bool = False,
+        cwd: Path | None = None,
     ) -> Any:
         """
         Record preloading of the known Codex thread.
@@ -645,6 +646,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
             "loaded the resume thread"
         )
         preload_calls.append((transport, loaded_thread_id, terminal_launch_args))
+        assert isinstance(cwd, Path)
         assert retain_client is retain_subscription
         return retained_client if retain_client else None
 
@@ -986,6 +988,7 @@ async def test_auto_create_codex_terminal_fork_clones_rollout_and_resumes(
         *,
         terminal_launch_args: list[str] | None = None,
         retain_client: bool = False,
+        cwd: Path | None = None,
     ) -> None:
         """
         Record preloading of the cloned Codex thread.
@@ -1261,6 +1264,7 @@ async def test_auto_create_codex_terminal_fork_builds_rollout_from_items_and_res
         *,
         terminal_launch_args: list[str] | None = None,
         retain_client: bool = False,
+        cwd: Path | None = None,
     ) -> None:
         """:param transport: App-server URL. :param loaded_thread_id: Resumed thread."""
         assert terminal_launch_args is None
@@ -3766,6 +3770,7 @@ async def test_auto_create_codex_terminal_default_pin_requires_a_fresh_catalog(
         *,
         terminal_launch_args: list[str] | None = None,
         retain_client: bool = False,
+        cwd: Path | None = None,
     ) -> None:
         """
         Accept preloading of the known Codex thread.
@@ -4004,6 +4009,7 @@ async def test_auto_create_codex_terminal_accepts_gateway_spelled_override(
         *,
         terminal_launch_args: list[str] | None = None,
         retain_client: bool = False,
+        cwd: Path | None = None,
     ) -> None:
         """Accept preloading of the known Codex thread."""
         del transport, loaded_thread_id, terminal_launch_args

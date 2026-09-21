@@ -24,7 +24,7 @@ from pathlib import Path
 from types import FrameType
 from typing import Literal
 
-from omnigent.host.identity import (
+from omnigent.host.identity_env import (
     HOST_ID_ENV_VAR,
     HOST_NAME_ENV_VAR,
     HOST_TOKEN_ENV_VAR,

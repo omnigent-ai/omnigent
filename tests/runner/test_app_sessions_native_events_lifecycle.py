@@ -747,6 +747,57 @@ async def test_opencode_native_model_options_uses_cli_catalog(
 
 
 @pytest.mark.asyncio
+async def test_bound_opencode_switch_qualifies_the_literal_gateway_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import Mock
+
+    from omnigent.inference_config import inference_config_scope
+    from omnigent.spec.types import ExecutorSpec
+
+    update = Mock(return_value=True)
+    monkeypatch.setattr("omnigent.harnesses.opencode_native.bridge.update_model_override", update)
+    spec = AgentSpec(
+        spec_version=1,
+        name="bound-opencode",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "opencode-native"}),
+    )
+
+    async def resolve(_agent: str, session_id: str | None = None) -> AgentSpec:
+        return spec
+
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=resolve,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    profile = {
+        "providers": {"gateway": {"kind": "gateway"}},
+        "inference": {
+            "harnesses": {
+                "opencode-native": {
+                    "provider": "gateway",
+                    "default_model": "omnigent/literal",
+                    "model_allowlist": ["omnigent/literal"],
+                }
+            }
+        },
+    }
+    async with _runner_client(app) as client:
+        response = await client.post(
+            "/v1/sessions", json={"session_id": "bound-opencode", "agent_id": "agent-1"}
+        )
+        assert response.status_code == 201, response.text
+        with inference_config_scope(profile):
+            response = await client.post(
+                "/v1/sessions/bound-opencode/events",
+                json={"type": "model_change", "model": "omnigent/literal"},
+            )
+    assert response.status_code == 200, response.text
+    assert update.call_args.args[1] == "omnigent/omnigent/literal"
+
+
+@pytest.mark.asyncio
 async def test_codex_native_model_options_returns_503_until_bridge_state_exists(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

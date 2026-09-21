@@ -28,6 +28,7 @@ from sqlalchemy import (
     true,
 )
 from sqlalchemy.dialects.mysql import BINARY as MySQLBinary
+from sqlalchemy.dialects.mysql import LONGTEXT as MySQLLongText
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from omnigent.db.compression import CompressedLargeText, CompressedText
@@ -703,6 +704,10 @@ class SqlConversationMetadata(OmnigentBase):
     external_session_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     session_state: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
     session_usage: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
+    # JSON-encoded provider binding and model catalog captured at session creation.
+    inference_snapshot: Mapped[str | None] = mapped_column(
+        Text().with_variant(MySQLLongText(), "mysql"), nullable=True
+    )
     # JSON-encoded list of strings. NULL for non-native sessions.
     terminal_launch_args: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
     # Required when host_id is set; enforced by check constraint below.

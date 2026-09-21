@@ -664,18 +664,18 @@ def create_accounts_auth_router(
         """
         token_id = request.query_params.get("t", "").strip()
         if not token_id:
-            return RedirectResponse(url="/login?magic=missing", status_code=302)
+            return RedirectResponse(url=f"{config.base_url}/login?magic=missing", status_code=302)
 
         now = int(time.time())
         token = account_store.redeem_token(token_id, kind="magic", now_epoch_seconds=now)
         if token is None or token.user_id is None:
-            return RedirectResponse(url="/login?magic=expired", status_code=302)
+            return RedirectResponse(url=f"{config.base_url}/login?magic=expired", status_code=302)
 
         # Confirm the underlying user still exists (admin may have
         # deleted them after the token was minted).
         user = account_store.get_user(token.user_id)
         if user is None or user.account_generation != token.account_generation:
-            return RedirectResponse(url="/login?magic=expired", status_code=302)
+            return RedirectResponse(url=f"{config.base_url}/login?magic=expired", status_code=302)
         if token.account_generation is not None:
             bind_account_authority(token.user_id, token.account_generation)
 
@@ -689,7 +689,7 @@ def create_accounts_auth_router(
             provider="accounts",
             account_generation=user.account_generation,
         )
-        resp = RedirectResponse(url="/", status_code=302)
+        resp = RedirectResponse(url=f"{config.base_url}/", status_code=302)
         _set_session_cookie(
             resp,
             session_jwt,

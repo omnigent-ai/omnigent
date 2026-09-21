@@ -551,6 +551,33 @@ _WATCHER_TASKS: set[asyncio.Task[None]] = set()
 _session_status_cache: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
 
 
+@dataclass
+class _RunnerStatusProbeBackoff:
+    """
+    Skip window for a session's runner status probe after slow probes.
+
+    :param skip_until: Monotonic time before which the probe is skipped.
+    :param failures: Consecutive slow or failed probes; sets the next window.
+    :param runner_id: Runner the slow probes were against, e.g.
+        ``"runner_0123456789abcdef"``; a rebind to another runner discards
+        the window.
+    """
+
+    skip_until: float
+    failures: int
+    runner_id: str | None
+
+
+_runner_status_probe_backoff: WorkspaceScopedCache[str, _RunnerStatusProbeBackoff] = (
+    WorkspaceScopedCache()
+)
+
+# The one runner status probe in flight per session; concurrent snapshots await it.
+_runner_status_probe_inflight: WorkspaceScopedCache[str, asyncio.Task[str | None]] = (
+    WorkspaceScopedCache()
+)
+
+
 _session_active_response_cache: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
 
 
@@ -1094,6 +1121,7 @@ __all__ = [
     "_MirroredToolCall",
     "_PendingPolicyAskWrites",
     "_RelayHandle",
+    "_RunnerStatusProbeBackoff",
     "_browser_action_claim_events",
     "_browser_action_claims",
     "_browser_action_owners",
@@ -1116,6 +1144,8 @@ __all__ = [
     "_read_last_seen",
     "_recent_mirrored_tool_calls",
     "_runner_relay_tasks",
+    "_runner_status_probe_backoff",
+    "_runner_status_probe_inflight",
     "_server_host_registry",
     "_server_runner_router",
     "_session_active_response_cache",

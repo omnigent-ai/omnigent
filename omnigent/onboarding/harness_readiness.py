@@ -27,6 +27,7 @@ from __future__ import annotations
 import logging
 import os
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 
 import omnigent.onboarding.gemini_auth as _gemini_auth
 import omnigent.onboarding.kimi_auth as _kimi_auth
@@ -76,6 +77,11 @@ from omnigent.onboarding.provider_config import (
 # runtime), distinct from the CLI-wrapping ``antigravity-native`` (``agy``)
 # harness gated below on its binary plus an API key or OAuth credential.
 _logger = logging.getLogger(__name__)
+
+# Bound startup and periodic readiness work: the slow checks are independent
+# CLI version/auth probes, but an unbounded process burst would be unfriendly on
+# smaller hosts.
+_READINESS_PROBE_MAX_WORKERS = 4
 
 _SDK_HARNESSES: frozenset[str] = frozenset(
     {"claude-sdk", "openai-agents", "openai-agents-sdk", "antigravity"}
@@ -574,12 +580,25 @@ def configured_harness_map() -> dict[str, HarnessAvailability]:
     spellings.add(GOOSE_KEY)  # headless Goose (``goose acp``) gates on the goose binary
     spellings.add(HERMES_KEY)  # Hermes Agent wraps the ``hermes`` CLI
     spellings.add(COPILOT_KEY)
-    availability_cache: dict[tuple[str, ...], HarnessAvailability] = {}
-    result: dict[str, HarnessAvailability] = {}
+    canonical_by_cache_key: dict[tuple[str, ...], str] = {}
+    cache_key_by_spelling: dict[str, tuple[str, ...]] = {}
     for spelling in spellings:
         canonical = _canonical_harness(spelling)
         cache_key = ("codex",) if _is_codex_family_harness(canonical) else ("harness", canonical)
-        if cache_key not in availability_cache:
-            availability_cache[cache_key] = _harness_availability(canonical)
-        result[spelling] = availability_cache[cache_key]
-    return result
+        canonical_by_cache_key.setdefault(cache_key, canonical)
+        cache_key_by_spelling[spelling] = cache_key
+
+    with ThreadPoolExecutor(
+        max_workers=min(_READINESS_PROBE_MAX_WORKERS, len(canonical_by_cache_key)),
+        thread_name_prefix="harness-readiness",
+    ) as executor:
+        futures = {
+            cache_key: executor.submit(_harness_availability, canonical)
+            for cache_key, canonical in canonical_by_cache_key.items()
+        }
+        availability_cache = {cache_key: future.result() for cache_key, future in futures.items()}
+
+    return {
+        spelling: availability_cache[cache_key]
+        for spelling, cache_key in cache_key_by_spelling.items()
+    }

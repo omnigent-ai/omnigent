@@ -3644,8 +3644,11 @@ def create_runner_app(
         session_id: str,
         agent_id: str,
     ) -> _SessionInitContext:
+        from omnigent.runner.session_init_protocol import validate_runner_inference_config
+
         if envelope.session_id != session_id or envelope.agent_id != agent_id:
             raise ValueError("session initialization envelope identity mismatch")
+        validate_runner_inference_config(envelope.snapshot.inference_config)
 
         global _server_version
         _server_version = envelope.server_version
@@ -3686,6 +3689,10 @@ def create_runner_app(
     ) -> _SessionInitContext:
         envelope = parse_runner_session_init_envelope(body)
         if envelope is None:
+            if os.environ.get("OMNIGENT_INFERENCE_CONFIG"):
+                from omnigent.runner.session_init_protocol import validate_runner_inference_config
+
+                validate_runner_inference_config(None)
             return await _load_legacy_session_init_context()
         body_sub_agent = body.get("sub_agent_name")
         if envelope.sub_agent_name != (
@@ -3895,6 +3902,8 @@ def create_runner_app(
         )
 
     async def _initialize_session(body: _JsonObject) -> JSONResponse:
+        from omnigent.runner.session_init_protocol import RunnerInferenceConfigMismatch
+
         if process_manager is None:
             return JSONResponse(
                 status_code=501,
@@ -3932,6 +3941,17 @@ def create_runner_app(
                 body,
                 session_id=session_id,
                 agent_id=agent_id,
+            )
+        except RunnerInferenceConfigMismatch:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": "inference_config_mismatch",
+                    "detail": (
+                        "This runner has a different saved provider configuration; "
+                        "launch a new runner."
+                    ),
+                },
             )
         except ValueError:
             return JSONResponse(
@@ -4565,6 +4585,12 @@ def create_runner_app(
                     else None
                 ),
                 "terminal_ready": terminal_ready,
+                **(
+                    {"inference_config_verified": True}
+                    if init_context.envelope is not None
+                    and init_context.envelope.snapshot.inference_config is not None
+                    else {}
+                ),
             },
         )
 
@@ -6256,6 +6282,11 @@ def create_runner_app(
             stored_claude_catalog_rows,
             stored_claude_picker_values,
         )
+        from omnigent.inference_config import (
+            binding_for_harness,
+            load_runtime_inference_config,
+            resolve_bound_model,
+        )
         from omnigent.models.claude_model_vocabulary import (
             claude_model_command_arg,
             picker_command_values,
@@ -6292,6 +6323,10 @@ def create_runner_app(
                 if not picker_values:
                     picker_values = stored_claude_picker_values(claude_config, stored_rows)
         model_arg = claude_model_command_arg(resolved_model, env, picker_values=picker_values)
+        inference_config = load_runtime_inference_config()
+        if binding_for_harness(inference_config, "claude-native") is not None:
+            resolved_model = resolve_bound_model(inference_config, "claude-native", selected_model)
+            model_arg = resolved_model
         if model_arg is None:
             _logger.warning(
                 "claude-native model change: %r has no spelling session=%s accepts "
@@ -6754,7 +6789,16 @@ def create_runner_app(
             bridge_dir_for_bridge_id,
             update_model_override,
         )
+        from omnigent.inference_config import (
+            binding_for_harness,
+            load_runtime_inference_config,
+            resolve_bound_model,
+        )
 
+        inference_config = load_runtime_inference_config()
+        if binding_for_harness(inference_config, "opencode-native") is not None:
+            selected = resolve_bound_model(inference_config, "opencode-native", model)
+            model = f"omnigent/{selected}" if selected is not None else None
         updated = await asyncio.to_thread(
             update_model_override, bridge_dir_for_bridge_id(conv_id), model
         )
@@ -13086,19 +13130,34 @@ def _build_spawn_env_from_spec(
     # Namespaced generic-ACP ids (``acp:<slug>``) canonicalize to ``acp`` so the
     # dispatch, model-key lookup, and logging below all key off the base harness;
     # the concrete agent's slug is read from the spec by ``_build_acp_spawn_env``.
+    requested_harness = harness
     harness = canonicalize_harness(harness) or harness
-    acp_default_model: str | None = None
-    if harness == "acp":
-        from omnigent.models.model_catalog import _acp_launch_model, validate_acp_model
-
-        acp_default_model = _acp_launch_model(spec)
-        validate_acp_model(spec, acp_default_model)
-        validate_acp_model(spec, model_override)
     effective_spec = spec
+    from omnigent.inference_config import load_runtime_inference_config, parse_inference_config
+
+    has_inference_bindings = bool(parse_inference_config(load_runtime_inference_config()))
+    if has_inference_bindings and dataclasses.is_dataclass(spec):
+        declared_harness = str(spec.executor.config.get("harness") or "")
+        identity = (
+            requested_harness
+            if requested_harness.startswith("acp:")
+            else declared_harness
+            if harness == "acp" and declared_harness.startswith("acp:")
+            else harness
+        )
+        effective_spec = dataclasses.replace(
+            spec,
+            executor=dataclasses.replace(
+                spec.executor,
+                config={**spec.executor.config, "harness": identity},
+                model=model_override if model_override is not None else spec.executor.model,
+            ),
+        )
     if model_override is not None:
         executor = getattr(spec, "executor", None)
         if (
             harness == "acp"
+            and not has_inference_bindings
             and dataclasses.is_dataclass(spec)
             and dataclasses.is_dataclass(executor)
         ):
@@ -13113,6 +13172,14 @@ def _build_spawn_env_from_spec(
                 AgentSpec,
                 cast(_ModelCopyValue, spec).model_copy(update={"executor": copied_executor}),
             )
+    acp_default_model: str | None = None
+    if harness == "acp":
+        from omnigent.models.model_catalog import _acp_launch_model, validate_acp_model
+
+        policy_spec = effective_spec if has_inference_bindings else spec
+        acp_default_model = _acp_launch_model(policy_spec)
+        validate_acp_model(policy_spec, acp_default_model)
+        validate_acp_model(policy_spec, model_override)
     try:
         from omnigent.runtime.workflow import (
             _build_acp_cli_spawn_env,

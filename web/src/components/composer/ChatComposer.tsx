@@ -12,7 +12,7 @@ import { ArrowUpIcon, Loader2Icon, SquareIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
-import { isComposerSendKey } from "@/lib/composerSendShortcutPreferences";
+import { isComposerSendKey, isComposerSteerAllKey } from "@/lib/composerSendShortcutPreferences";
 import { CHAT_COLUMN_WIDTH } from "@/pages/chatLayout";
 
 export const COMPOSER_COLUMN_WIDTH = `w-full ${CHAT_COLUMN_WIDTH}`;
@@ -39,6 +39,7 @@ export const COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS =
 export interface ComposerKeyIntent {
   shouldSubmitFromKeyboard: boolean;
   shouldPreferSendOverCompletion: boolean;
+  shouldSteerAllFromKeyboard: boolean;
 }
 
 interface ChatComposerProps extends Omit<ComponentPropsWithoutRef<"div">, "children"> {
@@ -219,9 +220,15 @@ export function ComposerTextInput({
           keyboard.submitWithModEnter,
           keyboard.preventsKeyboardSubmit,
         );
+        const shouldSteerAllFromKeyboard = isComposerSteerAllKey(
+          { ...event, isComposing: event.nativeEvent.isComposing },
+          keyboard.submitWithModEnter,
+          keyboard.preventsKeyboardSubmit,
+        );
         input.onKeyDown?.(event, {
           shouldSubmitFromKeyboard,
           shouldPreferSendOverCompletion: keyboard.submitWithModEnter && shouldSubmitFromKeyboard,
+          shouldSteerAllFromKeyboard,
         });
       }}
     />
@@ -323,7 +330,7 @@ export const ComposerSendButton = forwardRef<
       className={cn(
         "size-8 shrink-0 rounded-lg transition-opacity md:size-7",
         !interrupt &&
-          "bg-foreground hover:opacity-80 disabled:bg-muted disabled:text-muted-foreground disabled:opacity-100",
+          "hover:opacity-80 disabled:bg-muted disabled:text-muted-foreground disabled:opacity-100",
         className,
       )}
       aria-label={label}

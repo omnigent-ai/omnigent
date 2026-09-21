@@ -170,6 +170,8 @@ interface SessionResponseWire {
   /** Effective brain harness (override-aware), e.g. ``"claude-sdk"``. */
   harness?: string | null;
   model_override?: string | null;
+  inference_configured?: boolean;
+  inference_error?: string | null;
   /** Per-session cost-control switch; `null`/absent = spec default. */
   cost_control_mode_override?: "on" | "off" | null;
   /** Sub-agent routing switch; `null`/absent reads the same as `"off"` (Default). */
@@ -351,6 +353,12 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     kind: wire.kind === "sub_agent" ? "sub_agent" : "default",
     todos: wire.todos ?? [],
     codexModelOptions: wire.model_options ?? [],
+    ...(wire.inference_configured !== undefined
+      ? {
+          inferenceConfigured: wire.inference_configured,
+          inferenceError: wire.inference_error ?? null,
+        }
+      : {}),
     terminalPending: wire.terminal_pending ?? false,
     sandboxStatus: wire.sandbox_status ?? null,
     mcpStartup: wire.mcp_startup ?? null,
