@@ -1,5 +1,6 @@
 import { useQuery, type QueryClient } from "@tanstack/react-query";
 import { authenticatedFetch } from "@/lib/identity";
+import { isTempConvId } from "@/lib/tempConversationId";
 
 /**
  * Maximum depth of sub-agent nesting the Agents rail renders, counted
@@ -215,13 +216,14 @@ export function useChildSessions(
   conversationId: string | null,
   pollMs?: number | null,
 ): UseChildSessionsResult {
+  const sessionId = isTempConvId(conversationId) ? null : conversationId;
   const { data, isLoading, error } = useQuery({
     queryKey:
-      conversationId === null
+      sessionId === null
         ? ["conversation", null, "child_sessions"]
-        : childSessionsQueryKey(conversationId),
-    queryFn: () => fetchChildSessions(conversationId as string),
-    enabled: conversationId !== null,
+        : childSessionsQueryKey(sessionId),
+    queryFn: () => fetchChildSessions(sessionId as string),
+    enabled: sessionId !== null,
     staleTime: 60_000,
     retry: false,
     refetchOnMount: false,
