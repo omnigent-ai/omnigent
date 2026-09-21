@@ -72,13 +72,17 @@ import stat
 import subprocess
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
 import httpx
 import pytest
 
+from omnigent.harnesses.claude_native.bridge import (
+    _claude_prompt_rendered,
+    bridge_dir_for_bridge_id,
+)
 from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
 from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_executable
 from tests.e2e.helpers import POLL_INTERVAL_S
@@ -715,6 +719,237 @@ def test_claude_native_message_not_duplicated_on_cold_start(
                 "two transcript forwarder tasks were created and each independently "
                 "posted the same assistant turn via external_conversation_item."
             )
+        finally:
+            daemon.send_signal(signal.SIGTERM)
+            try:
+                daemon.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                daemon.kill()
+                daemon.wait()
+
+
+def _write_claude_dialog_shim(bin_dir: Path) -> None:
+    """
+    Write a ``claude`` shim that boots slowly and re-arms the MCP approval dialog.
+
+    Reuses the boot-delay wrapper's sleep and input flush so the first inject
+    lands before Claude renders anything, then turns off
+    ``enableAllProjectMcpServers`` in the runner's per-session sidecar,
+    preserving its transcript hooks. This forces the real MCP approval
+    dialog even with pre-approval enabled; it does not simulate managed policies.
+
+    :param bin_dir: Directory prepended to ``PATH``; the shim is written as
+        ``bin_dir/claude``.
+    :returns: None.
+    :raises RuntimeError: If the real ``claude`` binary can't be found.
+    """
+    real_claude = shutil.which("claude")
+    if real_claude is None:
+        raise RuntimeError("real claude binary not found on PATH")
+    shim = bin_dir / "claude"
+    shim.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, sys, termios, time\n"
+        "from pathlib import Path\n"
+        "args = sys.argv[1:]\n"
+        "if '--settings' not in args:\n"
+        f"    os.execv({real_claude!r}, [{real_claude!r}, *args])\n"
+        f"time.sleep({_BOOT_DELAY_S})\n"
+        "termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)\n"
+        "settings_path = Path(args[args.index('--settings') + 1])\n"
+        "settings = json.loads(settings_path.read_text())\n"
+        "settings['enableAllProjectMcpServers'] = False\n"
+        "settings_path.write_text(json.dumps(settings))\n"
+        f"os.execv({real_claude!r}, [{real_claude!r}, *args])\n"
+    )
+    shim.chmod(shim.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+
+
+def _wait_for_failed_turn(
+    client: httpx.Client,
+    *,
+    session_id: str,
+    timeout: float,
+) -> dict[str, object]:
+    """
+    Poll the session until it reports ``failed``; return ``last_task_error``.
+
+    :param client: HTTP client pointed at the test server.
+    :param session_id: Session/conversation id.
+    :param timeout: Max seconds to wait, e.g. ``90.0`` — well under the
+        readiness gate's 180 s slow-boot cap, so a build that only fails by
+        timing out cannot pass this wait.
+    :returns: The session's ``last_task_error`` payload.
+    :raises AssertionError: If the session does not report ``failed`` in time.
+    """
+    deadline = time.monotonic() + timeout
+    status = None
+    while time.monotonic() < deadline:
+        body = client.get(f"/v1/sessions/{session_id}").json()
+        status = body.get("status")
+        if status == "failed":
+            return dict(body.get("last_task_error") or {})
+        time.sleep(POLL_INTERVAL_S)
+    raise AssertionError(
+        f"Session {session_id} did not report a failed turn within {timeout}s "
+        f"(last status={status!r}); the readiness gate is still stalled on the dialog."
+    )
+
+
+def _wait_for_marker_or_failure(
+    client: httpx.Client,
+    *,
+    session_id: str,
+    marker: str,
+    pane_of: Callable[[], str],
+    timeout: float,
+) -> str:
+    """
+    Poll until an assistant message carries *marker*, failing fast on a failed turn.
+
+    :param client: HTTP client pointed at the test server.
+    :param session_id: Session/conversation id.
+    :param marker: The literal string Claude is asked to echo.
+    :param pane_of: Captures the live Claude pane, attached to the report so
+        a stall is diagnosable from the failure alone.
+    :param timeout: Max seconds to wait.
+    :returns: The assistant text containing *marker*.
+    :raises AssertionError: On a failed turn (with ``last_task_error``) or
+        when the marker never arrives (with the session status and the pane).
+    """
+    deadline = time.monotonic() + timeout
+    status = None
+    retry_started = False
+    while time.monotonic() < deadline:
+        items = client.get(
+            f"/v1/sessions/{session_id}/items", params={"limit": 50, "order": "asc"}
+        )
+        if items.status_code == 200:
+            for item in items.json().get("data", []):
+                text = _assistant_text(item)
+                if marker in text:
+                    return text
+        body = client.get(f"/v1/sessions/{session_id}").json()
+        status = body.get("status")
+        retry_started = retry_started or status != "failed"
+        if status == "failed" and retry_started:
+            raise AssertionError(
+                f"The resent turn failed before answering {marker!r}: "
+                f"{body.get('last_task_error')!r}\nPane:\n{pane_of()}"
+            )
+        time.sleep(POLL_INTERVAL_S)
+    raise AssertionError(
+        f"No assistant message containing {marker!r} within {timeout}s "
+        f"(session status={status!r}).\nPane:\n{pane_of()}"
+    )
+
+
+def _send_marker_message(client: httpx.Client, *, session_id: str, marker: str) -> None:
+    """
+    Post the one-word marker prompt as a user message.
+
+    :param client: HTTP client pointed at the test server.
+    :param session_id: Session/conversation id.
+    :param marker: The literal string Claude is asked to echo.
+    :returns: None.
+    """
+    event = client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "message",
+            "data": {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": f"Reply with exactly one word: {marker}"}
+                ],
+            },
+        },
+        timeout=30.0,
+    )
+    event.raise_for_status()
+
+
+def test_claude_native_first_message_reports_a_terminal_dialog_without_reaping(
+    live_server: str,
+    http_client: httpx.Client,
+    tmp_path: Path,
+) -> None:
+    """
+    A dialog holding Claude's terminal fails the turn fast and leaves it answerable.
+
+    The shim brings Claude up on the "New MCP server found in this project"
+    dialog after the first inject has already started waiting. Unfixed, the
+    readiness gate sits on the dialog for its 180 s cap, the executor reaps
+    the pane, and the web gets a generic timeout with nothing left to answer.
+    Fixed, the turn fails within seconds with the dialog named in the error,
+    the pane is still parked on the dialog, and answering it in the terminal
+    then resending delivers the message and gets the marker back.
+    """
+    workspace = tmp_path / "cn_dialog_ws"
+    workspace.mkdir()
+    (workspace / ".mcp.json").write_text(
+        json.dumps({"mcpServers": {"e2e-noop": {"command": "cat"}}})
+    )
+    marker = f"DIALOG_{uuid.uuid4().hex[:6].upper()}"
+    bin_dir = tmp_path / "shim_bin"
+    bin_dir.mkdir()
+    _write_claude_dialog_shim(bin_dir)
+
+    with _workspace_trusted_in_claude_config(workspace):
+        daemon = _spawn_host_daemon(
+            tmp_path=tmp_path, live_server=live_server, extra_path_dir=bin_dir
+        )
+        try:
+            host_id = _online_host_id(http_client, timeout=30.0)
+            agent_id = _claude_native_agent_id(http_client)
+            create = http_client.post(
+                "/v1/sessions",
+                json={"agent_id": agent_id, "host_id": host_id, "workspace": str(workspace)},
+                timeout=60.0,
+            )
+            create.raise_for_status()
+            session_id = create.json()["id"]
+
+            _send_marker_message(http_client, session_id=session_id, marker=marker)
+
+            error = _wait_for_failed_turn(http_client, session_id=session_id, timeout=90.0)
+            report = json.dumps(error)
+            assert "waiting for an answer" in report, report
+            assert "New MCP server found in this project" in report, report
+
+            # The pane survived the failure and is still parked on the dialog.
+            tmux = json.loads((bridge_dir_for_bridge_id(session_id) / "tmux.json").read_text())
+            socket_path, target = tmux["socket_path"], tmux["tmux_target"]
+
+            def capture_pane() -> str:
+                return subprocess.run(
+                    ["tmux", "-S", socket_path, "capture-pane", "-p", "-t", target],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                ).stdout
+
+            pane = capture_pane()
+            assert "New MCP server found in this project" in pane, pane
+
+            # Answer it the way a person would (Esc: continue without the
+            # server) and resend: the same message now lands and is answered.
+            subprocess.run(
+                ["tmux", "-S", socket_path, "send-keys", "-t", target, "Escape"], check=True
+            )
+            deadline = time.monotonic() + 30.0
+            while not _claude_prompt_rendered(pane := capture_pane()):
+                assert time.monotonic() < deadline, f"Claude did not leave the dialog:\n{pane}"
+                time.sleep(POLL_INTERVAL_S)
+            _send_marker_message(http_client, session_id=session_id, marker=marker)
+            text = _wait_for_marker_or_failure(
+                http_client,
+                session_id=session_id,
+                marker=marker,
+                pane_of=capture_pane,
+                timeout=180.0,
+            )
+            assert marker in text, f"marker {marker!r} missing from response: {text!r}"
         finally:
             daemon.send_signal(signal.SIGTERM)
             try:

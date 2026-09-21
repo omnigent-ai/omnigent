@@ -239,6 +239,15 @@ _MIN_TITLED_RULE_WIDTH = 20
 # Footer rows the permission-mode reader falls back to scanning while the
 # input box has not mounted yet and no rule is on screen to anchor on.
 _PROMPT_SCAN_TAIL_LINES = 5
+# Footer under a Claude Code dialog that waits for a keypress: the consent
+# and selection prompts (MCP approval, API-key approval, folder trust, rewind,
+# ``/model``) all end in an "Enter to … · Esc to …" variant.
+_DIALOG_FOOTER_RE = re.compile(
+    r"enter to (confirm|continue)|press enter to continue|esc to (cancel|exit|reject)",
+    re.IGNORECASE,
+)
+# Lines scanned for a dialog when no box rule anchors the region.
+_DIALOG_SCAN_TAIL_LINES = 15
 _CLAUDE_READY_POLL_INTERVAL_S = 0.15
 _CLAUDE_LIVENESS_POLL_INTERVAL_S = 1.0
 _PASTE_SETTLE_S = 0.1  # let the TUI commit a paste before the separate submit Enter
@@ -480,6 +489,16 @@ class ClaudeTerminalExited(ClaudePromptTimeout):
     def __init__(self, message: str, *, exit_status: str | None = None) -> None:
         super().__init__(message)
         self.exit_status = exit_status
+
+
+class ClaudeTerminalDialog(RuntimeError):
+    """
+    Claude Code's terminal is parked on a dialog only a person can answer.
+
+    Deliberately not a :class:`ClaudePromptTimeout`: the pane is healthy and
+    the dialog is answerable from the embedded terminal, so delivery handlers
+    must report it without reaping the pane.
+    """
 
 
 class ClaudeInjectionCancelled(RuntimeError):
@@ -5330,6 +5349,41 @@ def _format_terminal_failure_tail(pane: str) -> str:
     return f" Last terminal output:\n{tail}"
 
 
+def _terminal_dialog_headline(pane: str) -> str | None:
+    """
+    Name the dialog holding Claude Code's terminal, or ``None``.
+
+    A consent or selection dialog (MCP approval, API-key approval, folder
+    trust, rewind, ``/model``) replaces the input box with a headline, an
+    option list marked by the ``❯`` selector, and an "Enter to … · Esc to …"
+    footer. The read is structural: no composer row on screen, and both the
+    selector row and the footer inside the region below the last box rule
+    (the pane tail when no rule is drawn). A pane echoing such text above a
+    live composer never qualifies, because the composer row is found first.
+    Boxed prompts without that footer (tool permission prompts, the effort
+    dialog) are left to their own paths.
+
+    :param pane: Captured pane text from :func:`_capture_pane`.
+    :returns: The dialog's first line, e.g.
+        ``"New MCP server found in this project: srv0"``, or ``None`` when
+        no dialog is holding the terminal.
+    """
+    if not pane.strip() or _composer_row(pane) is not None:
+        return None
+    lines = [line for line in pane.splitlines() if line.strip()]
+    last_rule = max((i for i, line in enumerate(lines) if _is_box_rule(line)), default=None)
+    region = lines[last_rule + 1 :] if last_rule is not None else lines[-_DIALOG_SCAN_TAIL_LINES:]
+    footer = next((line for line in reversed(region) if _DIALOG_FOOTER_RE.search(line)), None)
+    if footer is None:
+        return None
+    has_selector = any(
+        line.strip().lstrip("│ ").startswith(_CLAUDE_PROMPT_GLYPH) for line in region
+    )
+    if not has_selector and "press enter" not in footer.lower():
+        return None
+    return " ".join(region[0].strip().strip("│").split())[:120]
+
+
 def _wait_for_claude_prompt_ready(
     socket_path: str,
     tmux_target: str,
@@ -5363,6 +5417,11 @@ def _wait_for_claude_prompt_ready(
     :raises ClaudeTerminalExited: If tmux affirms the pane's process has
         exited, carrying the pane's wait-status so a clean quit is
         distinguishable from a crash.
+    :raises ClaudeTerminalDialog: If a consent or selection dialog is holding
+        the terminal (see :func:`_terminal_dialog_headline`) on two
+        consecutive polls. Raised within a poll interval instead of waiting
+        out the budget, so the person can answer the dialog in the embedded
+        terminal and resend; the pane is left alive.
     :raises ClaudePromptTimeout: If the prompt never renders in time
         (Claude failed to boot, or a slow boot outlasted even the hard
         cap). The message carries the seconds actually waited, a poll
@@ -5386,6 +5445,7 @@ def _wait_for_claude_prompt_ready(
     last_nonempty = ""
     exited_status: str | None = None
     pane_exited = False
+    dialog_headline: str | None = None
     # Poll at least once even at timeout_s=0: a single readiness check is
     # still meaningful, and it guarantees a capture to attach on failure.
     while True:
@@ -5398,6 +5458,16 @@ def _wait_for_claude_prompt_ready(
             empty_polls += 1
         if _claude_prompt_rendered(pane):
             return
+        # A dialog seen on two consecutive polls is real; one frame can be a
+        # repaint artifact. Fail now rather than stalling to the cap.
+        headline = _terminal_dialog_headline(pane)
+        if headline is not None and headline == dialog_headline:
+            raise ClaudeTerminalDialog(
+                f"Claude Code is waiting for an answer in its terminal ({headline}), "
+                "so the message was not delivered. Open the terminal, answer the "
+                "prompt, then resend your message." + _format_terminal_failure_tail(pane)
+            )
+        dialog_headline = headline
         now = time.monotonic()
         if now >= hard_deadline:
             break
