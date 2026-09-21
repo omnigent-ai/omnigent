@@ -110,11 +110,13 @@ async def _drive_adjacent_selector(base_url: str, session_id: str, width: int, t
             child_box = await child.bounding_box()
             trigger_box = await harness.bounding_box()
             assert parent_box is not None and child_box is not None and trigger_box is not None
-            # Shared submenu spacing can overlap outer padding, but not the row itself.
-            assert (
-                child_box["x"] >= trigger_box["x"] + trigger_box["width"]
-                or child_box["x"] + child_box["width"] <= trigger_box["x"]
-            ), (trigger_box, child_box)
+            # Radix may overlap the row's outer focus padding by at most 4px;
+            # the model menu must not cover readable or clickable row content.
+            overlap = min(
+                trigger_box["x"] + trigger_box["width"],
+                child_box["x"] + child_box["width"],
+            ) - max(trigger_box["x"], child_box["x"])
+            assert overlap <= 4, (trigger_box, child_box)
             await expect(child).to_have_attribute("data-side", "left" if width == 929 else "right")
 
             await edit.hover()

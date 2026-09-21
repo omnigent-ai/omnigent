@@ -154,8 +154,11 @@ export function HarnessPicker({
   trigger,
   tooltip,
   tooltipTestId,
+  tooltipVariant = "default",
   contentClassName,
   contentAlign = "end",
+  contentSide = "top",
+  contentSideOffset,
   testId,
   configOpen = false,
   onInitialSelectionFocus,
@@ -167,8 +170,11 @@ export function HarnessPicker({
   trigger: TriggerProps;
   tooltip?: ReactNode;
   tooltipTestId?: string;
+  tooltipVariant?: "default" | "session-info";
   contentClassName?: string;
   contentAlign?: "start" | "center" | "end";
+  contentSide?: "top" | "bottom";
+  contentSideOffset?: number;
   testId?: string;
   configOpen?: boolean;
   onInitialSelectionFocus?: () => void;
@@ -253,7 +259,11 @@ export function HarnessPicker({
               </TooltipTrigger>
               <TooltipContent
                 side="top"
-                className="max-w-80 flex-col items-start gap-0.5 px-3 py-2"
+                className={cn(
+                  "max-w-80 flex-col items-start gap-0.5 px-3 py-2",
+                  tooltipVariant === "session-info" &&
+                    "w-64 max-w-[calc(100vw-2rem)] items-stretch rounded-lg bg-popover p-2.5 text-popover-foreground whitespace-normal shadow-menu ring-1 ring-foreground/10",
+                )}
                 data-testid={tooltipTestId}
               >
                 {tooltip}
@@ -264,7 +274,8 @@ export function HarnessPicker({
         <HarnessPickerContent
           configOpen={configOpen}
           menuOpen={open}
-          side="top"
+          side={contentSide}
+          sideOffset={contentSideOffset}
           align={contentAlign}
           collisionPadding={12}
           avoidCollisions
@@ -410,6 +421,7 @@ export function HarnessPickerEntry({
             focusSelected={focusConfig}
             onSelectedFocus={onConfigFocused}
             className="composer-agent-menu composer-agent-config-menu max-h-[var(--radix-dropdown-menu-content-available-height)] w-[13.75rem] max-w-[calc(100vw-2rem)] overflow-y-auto p-2"
+            sideOffset={-4}
             data-testid={configTestId}
             onFocusOutside={(event) => {
               if (event.target instanceof Element && event.target.getAttribute("role") === "menu")
@@ -520,6 +532,7 @@ export function HarnessPickerConfigRow({
       </DropdownMenuSubTrigger>
       <HarnessPickerSubContent
         className="composer-agent-menu composer-agent-config-menu max-h-[var(--radix-dropdown-menu-content-available-height)] w-[13.75rem] max-w-[calc(100vw-2rem)] overflow-y-auto p-2"
+        sideOffset={-4}
         data-testid={configTestId}
         onFocusOutside={(event) => {
           if (event.target instanceof Element && event.target.getAttribute("role") === "menu")
