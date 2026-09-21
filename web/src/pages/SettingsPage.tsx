@@ -174,6 +174,7 @@ import {
   type TerminalThemeMode,
 } from "@/lib/terminalThemePreferences";
 import {
+  canRememberTerminalClipboardPreference,
   readTerminalClipboardPreference,
   subscribeTerminalClipboardPreference,
   writeTerminalClipboardPreference,
@@ -1510,6 +1511,7 @@ function BackgroundSessionTitlesControl() {
 function TerminalClipboardControl() {
   const labelId = useId();
   const descriptionId = useId();
+  const canRemember = canRememberTerminalClipboardPreference();
   const [preference, setPreference] = useState<TerminalClipboardPreference>(
     readTerminalClipboardPreference,
   );
@@ -1525,6 +1527,7 @@ function TerminalClipboardControl() {
   );
 
   const update = (value: string) => {
+    if (!canRemember) return;
     if (value !== "ask" && value !== "allow" && value !== "block") return;
     const saved = writeTerminalClipboardPreference(value);
     if (saved) setPreference(value);
@@ -1538,8 +1541,9 @@ function TerminalClipboardControl() {
           Terminal clipboard
         </span>
         <span id={descriptionId} className="text-sm text-muted-foreground">
-          Allow lets terminals replace your clipboard across all sessions and terminals on this
-          server in this browser or app. Choose Ask or Block to revoke automatic copying.
+          {canRemember
+            ? "Allow lets terminals replace your clipboard across all sessions and terminals on this server in this browser or app. Choose Ask or Block to revoke automatic copying."
+            : "This connection can’t remember clipboard permissions. You can still allow or block copying for each open terminal."}
         </span>
         {saveFailed && (
           <span role="alert" className="text-sm text-destructive">
@@ -1550,6 +1554,7 @@ function TerminalClipboardControl() {
       </div>
       <Select
         value={preference}
+        disabled={!canRemember}
         onValueChange={update}
         componentId="settings.general.terminal_clipboard"
         valueHasNoPii

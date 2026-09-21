@@ -10,7 +10,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
 import { BACKGROUND_SESSION_TITLES_STORAGE_KEY } from "@/lib/backgroundSessionTitlesPreferences";
-import { getOmnigentServerIdentity } from "@/lib/host";
+import * as host from "@/lib/host";
 import {
   readTerminalClipboardPreference,
   writeTerminalClipboardPreference,
@@ -135,10 +135,12 @@ vi.mock("@/components/ui/select", async () => {
   const Select = ({
     value,
     onValueChange,
+    disabled,
     children,
   }: {
     value: string;
     onValueChange: (v: string) => void;
+    disabled?: boolean;
     children: ReactNode;
   }) => {
     const kids = Children.toArray(children);
@@ -151,6 +153,7 @@ vi.mock("@/components/ui/select", async () => {
       <select
         data-testid={typeof testId === "string" ? testId : undefined}
         value={value}
+        disabled={disabled}
         onChange={(e) => onValueChange(e.target.value)}
       >
         {kids.filter((c) => !(isValidElement(c) && c.type === SelectTrigger))}
@@ -227,6 +230,7 @@ beforeEach(() => {
 });
 afterEach(() => {
   cleanup();
+  vi.restoreAllMocks();
   // Reset the font-size preference + applied desktop size so the Appearance
   // tests don't leak state into each other.
   localStorage.clear();
@@ -342,10 +346,22 @@ describe("SettingsPage", () => {
 
   it("updates the terminal clipboard control when another tab changes its decision", () => {
     renderPage("/settings/general");
-    const key = `omnigent:terminal-clipboard:v1:${JSON.stringify(getOmnigentServerIdentity())}`;
+    const key = `omnigent:terminal-clipboard:v1:${JSON.stringify(host.getOmnigentServerIdentity())}`;
     localStorage.setItem(key, "block");
     fireEvent(window, new StorageEvent("storage", { key, storageArea: localStorage }));
     expect(screen.getByTestId("terminal-clipboard-preference-select")).toHaveValue("block");
+  });
+
+  it("disables remembered clipboard preferences when the server identity is unavailable", () => {
+    vi.spyOn(host, "getOmnigentServerIdentity").mockReturnValue(null);
+    renderPage("/settings/general");
+
+    expect(screen.getByTestId("terminal-clipboard-preference-select")).toBeDisabled();
+    expect(
+      screen.getByText(
+        "This connection can’t remember clipboard permissions. You can still allow or block copying for each open terminal.",
+      ),
+    ).toBeInTheDocument();
   });
 
   it("does not claim terminal clipboard permission was saved when storage fails", () => {

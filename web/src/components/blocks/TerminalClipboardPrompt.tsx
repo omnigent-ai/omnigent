@@ -4,9 +4,11 @@ import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 
 export type TerminalClipboardDecision = "allow" | "once" | "block";
+export type TerminalClipboardPromptReason = "consent" | "browser" | "permission";
 
 interface TerminalClipboardPromptProps {
-  needsClick: boolean;
+  reason: TerminalClipboardPromptReason;
+  canRemember: boolean;
   copyFailed: boolean;
   onDecision: (decision: TerminalClipboardDecision, remember: boolean) => void;
   onRetry: () => void;
@@ -15,7 +17,7 @@ interface TerminalClipboardPromptProps {
 
 export function TerminalClipboardPrompt(props: TerminalClipboardPromptProps) {
   const toastId = useId();
-  const { needsClick, copyFailed } = props;
+  const { reason, canRemember, copyFailed } = props;
   const latestProps = useRef(props);
   const mounted = useRef(true);
 
@@ -36,7 +38,8 @@ export function TerminalClipboardPrompt(props: TerminalClipboardPromptProps) {
     toast.custom(
       () => (
         <TerminalClipboardPromptContent
-          needsClick={needsClick}
+          reason={reason}
+          canRemember={canRemember}
           copyFailed={copyFailed}
           onDecision={(decision, remember) => {
             if (mounted.current) latestProps.current.onDecision(decision, remember);
@@ -61,21 +64,39 @@ export function TerminalClipboardPrompt(props: TerminalClipboardPromptProps) {
         },
       },
     );
-  }, [toastId, needsClick, copyFailed]);
+  }, [toastId, reason, canRemember, copyFailed]);
 
   return null;
 }
 
 function TerminalClipboardPromptContent({
-  needsClick,
+  reason,
+  canRemember,
   copyFailed,
   onDecision,
   onRetry,
   onDismiss,
 }: TerminalClipboardPromptProps) {
-  const [remember, setRemember] = useState(true);
+  const [remember, setRemember] = useState(canRemember);
+  const rememberChoice = canRemember && remember;
+  const needsClick = reason !== "consent";
   const titleId = useId();
   const descriptionId = useId();
+  const rememberDescriptionId = useId();
+  const title =
+    reason === "consent"
+      ? "Allow this terminal to copy to your clipboard?"
+      : reason === "permission"
+        ? "Finish copying your selection"
+        : "Copy needs a click";
+  const description =
+    reason === "consent"
+      ? "Your selection hasn’t been copied yet. Your permission is required because terminal programs can silently replace your clipboard with text or commands you didn’t intend to paste."
+      : reason === "permission"
+        ? "Clipboard copying is now allowed. Your selection hasn’t been copied yet. Click Copy now to finish."
+        : copyFailed
+          ? "Your selection hasn’t been copied. Check your browser’s clipboard permissions and try again."
+          : "Your browser needs a click to finish copying. Your saved clipboard preference hasn’t changed.";
 
   return (
     <section
@@ -106,32 +127,37 @@ function TerminalClipboardPromptContent({
               <ClipboardCopyIcon className="size-6" />
             </div>
             <h3 id={titleId} className="min-w-0 text-lg leading-snug font-semibold">
-              {needsClick ? "Copy needs a click" : "Allow this terminal to copy to your clipboard?"}
+              {title}
             </h3>
           </div>
           <p id={descriptionId} className="mt-3 text-ui leading-relaxed text-muted-foreground">
-            {needsClick
-              ? copyFailed
-                ? "Your selection hasn’t been copied. Check your browser’s clipboard permissions and try again."
-                : "Your browser needs a click to finish copying. Your saved clipboard preference hasn’t changed."
-              : "Your selection hasn’t been copied yet. Your permission is required because terminal programs can silently replace your clipboard with text or commands you didn’t intend to paste."}
+            {description}
           </p>
         </div>
         {!needsClick && (
           <div className="mt-5">
-            <label className="flex cursor-pointer items-start gap-2">
+            <label
+              className={`flex items-start gap-2 ${canRemember ? "cursor-pointer" : "cursor-default"}`}
+            >
               <input
                 type="checkbox"
-                checked={remember}
+                checked={rememberChoice}
+                disabled={!canRemember}
+                aria-describedby={rememberDescriptionId}
                 onChange={(event) => setRemember(event.target.checked)}
                 className="mt-0.5 size-4 shrink-0 accent-primary"
               />
               <span>Remember my choice</span>
             </label>
-            <p className="mt-2 text-sm leading-relaxed text-muted-foreground">
-              {remember
-                ? "Change this in Settings → General."
-                : "Allow or Block will apply only while this terminal stays open."}
+            <p
+              id={rememberDescriptionId}
+              className="mt-2 text-sm leading-relaxed text-muted-foreground"
+            >
+              {!canRemember
+                ? "This connection can’t remember clipboard permissions. Allow or Block will apply only while this terminal stays open."
+                : rememberChoice
+                  ? "Change this in Settings → General."
+                  : "Allow or Block will apply only while this terminal stays open."}
             </p>
           </div>
         )}
@@ -150,10 +176,10 @@ function TerminalClipboardPromptContent({
           <>
             <Button
               type="button"
-              onClick={() => onDecision("allow", remember)}
+              onClick={() => onDecision("allow", rememberChoice)}
               componentId="diagnostics.terminal.copy"
             >
-              {remember ? "Allow copying" : "Allow for this session"}
+              {rememberChoice ? "Allow copying" : "Allow for this session"}
             </Button>
             <Button
               type="button"
@@ -163,7 +189,11 @@ function TerminalClipboardPromptContent({
             >
               Copy once
             </Button>
-            <Button type="button" variant="ghost" onClick={() => onDecision("block", remember)}>
+            <Button
+              type="button"
+              variant="ghost"
+              onClick={() => onDecision("block", rememberChoice)}
+            >
               Block
             </Button>
           </>

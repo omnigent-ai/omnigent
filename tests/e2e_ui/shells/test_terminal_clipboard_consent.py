@@ -494,6 +494,45 @@ def test_terminal_clipboard_browser_retry_preserves_remembered_permission(
     expect(ui.consent).to_have_count(0)
 
 
+@pytest.mark.parametrize("finish", ["copy-now", "new-selection"])
+def test_terminal_clipboard_pending_selection_survives_a_cross_tab_grant(
+    clipboard_browser: _ClipboardBrowser, finish: str
+) -> None:
+    ui = clipboard_browser
+    ui.open()
+    ui.request_copy("selection waiting for permission")
+    expect(ui.consent).to_be_visible()
+
+    settings = ui.page.context.new_page()
+    try:
+        settings.goto(f"{ui.base_url}/settings/general")
+        preference = settings.get_by_test_id("terminal-clipboard-preference-select")
+        expect(preference).to_contain_text("Ask before copying")
+        preference.click()
+        settings.get_by_role("option", name="Allow copying", exact=True).click()
+        expect(preference).to_contain_text("Allow copying")
+
+        ui.page.bring_to_front()
+        expect(ui.consent).to_contain_text("Finish copying your selection")
+        expect(ui.consent).to_contain_text("Your selection hasn’t been copied yet.")
+        expect(ui.consent.get_by_role("checkbox")).to_have_count(0)
+        ui.expect_no_copy()
+
+        if finish == "copy-now":
+            ui.consent.get_by_role("button", name="Copy now", exact=True).click()
+            _expect_clipboard(ui.page, "selection waiting for permission")
+        else:
+            ui.request_copy("newer selection")
+            _expect_clipboard(ui.page, "newer selection")
+        expect(ui.consent).to_have_count(0)
+
+        ui.request_copy("automatic selection after shared grant")
+        _expect_clipboard(ui.page, "automatic selection after shared grant")
+        expect(ui.consent).to_have_count(0)
+    finally:
+        settings.close()
+
+
 def test_terminal_clipboard_settings_revokes_a_mounted_terminals_permission(
     clipboard_browser: _ClipboardBrowser,
 ) -> None:
@@ -514,6 +553,16 @@ def test_terminal_clipboard_settings_revokes_a_mounted_terminals_permission(
             preference.click()
             settings.get_by_role("option", name=option, exact=True).click()
             expect(preference).to_contain_text(option)
+
+            if option == "Ask before copying" and (
+                screenshot_dir := os.environ.get("E2E_SCREENSHOT_DIR")
+            ):
+                directory = Path(screenshot_dir)
+                directory.mkdir(parents=True, exist_ok=True)
+                settings.screenshot(
+                    path=str(directory / "terminal-clipboard-settings-revoked.png"),
+                    full_page=True,
+                )
 
             ui.page.bring_to_front()
             ui.request_copy(f"selection with {option}")

@@ -15,6 +15,11 @@ function isPreference(value: unknown): value is TerminalClipboardPreference {
   return value === "ask" || value === "allow" || value === "block";
 }
 
+/** A known server is required to scope a remembered decision. */
+export function canRememberTerminalClipboardPreference(): boolean {
+  return storageKey() !== null;
+}
+
 /** Clipboard trust stays local to this browser/app and Omnigent server. */
 export function readTerminalClipboardPreference(): TerminalClipboardPreference {
   const key = storageKey();

@@ -16,6 +16,7 @@ import { toast } from "sonner";
 import { copyText } from "@/lib/clipboard";
 import { getOmnigentServerIdentity, isDatabricksWorkspace, resolveWebSocketUrl } from "@/lib/host";
 import {
+  canRememberTerminalClipboardPreference,
   readTerminalClipboardPreference,
   subscribeTerminalClipboardPreference,
   writeTerminalClipboardPreference,
@@ -31,7 +32,11 @@ import {
   type TerminalThemeMode,
 } from "@/lib/terminalThemePreferences";
 import { getSessionHost, markHostKeyless, isHostKeyless } from "@/lib/sessionHost";
-import { TerminalClipboardPrompt, type TerminalClipboardDecision } from "./TerminalClipboardPrompt";
+import {
+  TerminalClipboardPrompt,
+  type TerminalClipboardDecision,
+  type TerminalClipboardPromptReason,
+} from "./TerminalClipboardPrompt";
 import {
   type ConnectionState,
   type TerminalActivityListener,
@@ -167,7 +172,7 @@ export function TerminalView({
     epoch: number;
     generation: number;
     text: string;
-    reason: "consent" | "browser";
+    reason: TerminalClipboardPromptReason;
     copyFailed?: boolean;
   } | null>(null);
   const clipboardScopeRef = useRef({ scope: clipboardScope, epoch: 0 });
@@ -220,12 +225,28 @@ export function TerminalView({
   useEffect(
     () =>
       subscribeTerminalClipboardPreference((decision) => {
-        clipboardConsentRef.current = { scope: clipboardScopeRef.current.scope, decision };
-        clipboardRequestGenerationRef.current += 1;
+        const { scope, epoch } = clipboardScopeRef.current;
+        const previousGeneration = clipboardRequestGenerationRef.current;
+        const generation = (clipboardRequestGenerationRef.current += 1);
+        clipboardConsentRef.current = { scope, decision };
         clipboardWorkerEpochRef.current += 1;
         clipboardAutoPendingRef.current = null;
         clipboardNeedsClickRef.current = false;
-        setClipboardPrompt(null);
+        // Shared grants keep waiting selections visible; revocations discard them.
+        const keepPendingSelection =
+          decision === "allow" && clipboardMountedRef.current && clipboardActiveRef.current;
+        setClipboardPrompt((current) =>
+          keepPendingSelection &&
+          current?.scope === scope &&
+          current.epoch === epoch &&
+          current.generation === previousGeneration
+            ? {
+                ...current,
+                generation,
+                reason: current.reason === "consent" ? "permission" : current.reason,
+              }
+            : null,
+        );
       }),
     [clipboardServerIdentity],
   );
@@ -396,6 +417,7 @@ export function TerminalView({
       }
       if (clipboardConsentRef.current.decision === "block") return;
       if (clipboardConsentRef.current.decision === "allow" && !clipboardNeedsClickRef.current) {
+        setClipboardPrompt(null);
         queueSessionClipboardCopy({
           scope: clipboardScope,
           epoch: clipboardScopeEpoch,
@@ -742,7 +764,8 @@ export function TerminalView({
     >
       {visibleClipboardPrompt !== null && (
         <TerminalClipboardPrompt
-          needsClick={visibleClipboardPrompt.reason === "browser"}
+          reason={visibleClipboardPrompt.reason}
+          canRemember={canRememberTerminalClipboardPreference()}
           copyFailed={visibleClipboardPrompt.copyFailed === true}
           onDecision={handleClipboardConsent}
           onRetry={() => handleClipboardConsent("retry")}

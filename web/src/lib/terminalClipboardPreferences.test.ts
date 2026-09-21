@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { getOmnigentServerIdentity } from "./host";
 import { applyImportedSettings, collectSettings, readSettingsFile } from "./settingsPortability";
 import {
+  canRememberTerminalClipboardPreference,
   readTerminalClipboardPreference,
   subscribeTerminalClipboardPreference,
   writeTerminalClipboardPreference,
@@ -38,6 +39,7 @@ afterEach(() => {
 
 describe("terminal clipboard preference", () => {
   it("asks by default and persists allow, block, and revocation", () => {
+    expect(canRememberTerminalClipboardPreference()).toBe(true);
     expect(readTerminalClipboardPreference()).toBe("ask");
     expect(writeTerminalClipboardPreference("allow")).toBe(true);
     expect(localStorage.getItem(KEY)).toBe("allow");
@@ -68,6 +70,7 @@ describe("terminal clipboard preference", () => {
 
   it("cannot persist trust without a known server identity", () => {
     vi.mocked(getOmnigentServerIdentity).mockReturnValue(null);
+    expect(canRememberTerminalClipboardPreference()).toBe(false);
     expect(readTerminalClipboardPreference()).toBe("ask");
     expect(writeTerminalClipboardPreference("allow")).toBe(false);
     expect(localStorage.length).toBe(0);
@@ -173,6 +176,7 @@ describe("terminal clipboard preference", () => {
 
   it("does not grant or persist permission without a browser", () => {
     vi.stubGlobal("window", undefined);
+    expect(canRememberTerminalClipboardPreference()).toBe(false);
     expect(readTerminalClipboardPreference()).toBe("ask");
     expect(writeTerminalClipboardPreference("allow")).toBe(false);
     expect(subscribeTerminalClipboardPreference(vi.fn())).toBeTypeOf("function");
