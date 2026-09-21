@@ -507,6 +507,51 @@ describe("terminal clipboard", () => {
     await waitFor(() => expect(visibleClipboardConsent()).toBeNull());
   });
 
+  it.each(["allow", "block"] as const)(
+    "a remembered %s overrides an earlier opposite terminal-only choice",
+    async (decision) => {
+      render(
+        <>
+          <TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" />
+          <TerminalView sessionId="conv_next" terminalId="terminal_bash_s2" />
+        </>,
+      );
+      await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(2));
+      await requestClipboardConsent("terminal-only choice");
+      uncheckRemember();
+      clickConsentButton(decision === "allow" ? "Block" : "Allow for this session");
+      await waitFor(() => expect(visibleClipboardConsent()).toBeNull());
+      expect(readTerminalClipboardPreference()).toBe("ask");
+
+      const before = await copySelection("before the remembered choice");
+      if (decision === "allow") expect(before.setData).not.toHaveBeenCalled();
+      else
+        expect(before.setData).toHaveBeenCalledWith("text/plain", "before the remembered choice");
+
+      await requestClipboardConsent("choice in another terminal", 1);
+      expect(screen.getByRole("checkbox", { name: "Remember my choice" })).toBeChecked();
+      clickConsentButton(decision === "allow" ? "Allow copying" : "Block");
+      await waitFor(() => expect(visibleClipboardConsent()).toBeNull());
+      expect(readTerminalClipboardPreference()).toBe(decision);
+      clipboardMock.copyText.mockClear();
+
+      const after = await copySelection("after the remembered choice");
+      await requestClipboard("program copy after the remembered choice");
+
+      if (decision === "allow") {
+        expect(after.setData).toHaveBeenCalledWith("text/plain", "after the remembered choice");
+        expect(clipboardMock.copyText).toHaveBeenCalledWith(
+          "program copy after the remembered choice",
+        );
+      } else {
+        expect(after.setData).not.toHaveBeenCalled();
+        expect(clipboardMock.copyText).not.toHaveBeenCalled();
+      }
+      expect(visibleClipboardConsent()).toBeNull();
+      expect(terminalSessionMock.instances).toHaveLength(2);
+    },
+  );
+
   it("keeps another terminal's pending selection available after remembered Allow", async () => {
     render(
       <>
