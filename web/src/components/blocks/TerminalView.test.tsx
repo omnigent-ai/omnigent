@@ -993,6 +993,9 @@ describe("terminal clipboard", () => {
     expect(clipboardMock.copyText).not.toHaveBeenCalled();
     expect(readTerminalClipboardPreference()).toBe("ask");
     await waitFor(() => expect(visibleClipboardConsent()).toBeNull());
+    expect(screen.getByText("Copying from this terminal is blocked.")).toBeInTheDocument();
+    await requestClipboard("another blocked native copy");
+    expect(screen.getAllByText("Copying from this terminal is blocked.")).toHaveLength(1);
   });
 
   it("keeps remembered consent when the browser requires a click to copy", async () => {

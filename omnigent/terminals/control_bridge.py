@@ -52,6 +52,7 @@ from typing import Final
 
 from fastapi import WebSocket, WebSocketDisconnect
 
+from omnigent.inner.terminal_clipboard import MAX_CLIPBOARD_BYTES
 from omnigent.terminals.ws_common import (
     WS_CLOSE_INTERNAL_ERROR,
     WS_CLOSE_TERMINAL_DETACHED,
@@ -126,7 +127,7 @@ _CLIPBOARD_BUFFER_CHANGED_PREFIX: Final = b"%paste-buffer-changed "
 _CLIPBOARD_BUFFER_NAME_RE: Final = re.compile(rb"[A-Za-z0-9_.:-]{1,128}\Z")
 # Browser clipboard writes should stay text-sized. Bound the raw buffer before
 # base64/JSON expansion so a huge tmux buffer cannot become a websocket DoS.
-_CLIPBOARD_MAX_BYTES: Final[int] = 1024 * 1024
+_CLIPBOARD_MAX_BYTES: Final[int] = MAX_CLIPBOARD_BYTES
 _CLIPBOARD_READ_TIMEOUT_S: Final[float] = 2.0
 # A copy-mode commit follows the initiating key or mouse release immediately.
 # Correlating the notification with this client's recent input prevents one

@@ -417,12 +417,10 @@ export function TerminalView({
         };
       }
       if (clipboardConsentRef.current.decision === "block") {
-        if (copyEvent) {
-          toast.info("Copying from this terminal is blocked.", {
-            id: "terminal-clipboard-blocked",
-            description: "Change this in Settings → General.",
-          });
-        }
+        toast.info("Copying from this terminal is blocked.", {
+          id: "terminal-clipboard-blocked",
+          description: "Change this in Settings → General.",
+        });
         return;
       }
       const source = copyEvent ? "selection" : "terminal";

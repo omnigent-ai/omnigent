@@ -51,6 +51,7 @@ from .sandbox import (
     with_additional_write_roots,
     with_denied_unix_sockets,
 )
+from .terminal_clipboard import TerminalClipboardBridge
 
 # Heterogeneous JSON-shaped result returned by :meth:`TerminalInstance.send`
 # and :meth:`TerminalInstance.read`. In practice the dicts carry a mix of
@@ -1028,6 +1029,7 @@ class TerminalInstance:
     # Unix socket don't outlive the terminal.
     _egress_handle: EgressProxyHandle | None = field(default=None, repr=False)
     _egress_tmpdir: Path | None = field(default=None, repr=False)
+    _clipboard_bridge: TerminalClipboardBridge | None = field(default=None, init=False, repr=False)
     _idle_task: asyncio.Task[None] | None = field(default=None, repr=False)
     # Threaded idle-watcher state. Mirrors :attr:`_idle_task` but for
     # callers that don't have a long-lived event loop (the Omnigent path:
@@ -1351,6 +1353,8 @@ class TerminalInstance:
         # ASCII/Latin-1 codeset and re-encode their UTF-8 output byte-by-byte,
         # rendering multibyte characters as mojibake in the pane (issue #2427).
         _apply_utf8_locale_default(env)
+        if self._clipboard_bridge is not None:
+            self._clipboard_bridge.prepare_environment(env)
 
         # Build the command to run inside tmux. If a sandbox policy
         # is configured, wrap the command in the sandbox launcher so
@@ -1440,17 +1444,24 @@ class TerminalInstance:
             ),
         ]
 
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
-            env=env,
-        )
-        _, stderr = await proc.communicate()
-        if proc.returncode != 0:
-            raise RuntimeError(
-                f"tmux launch failed (rc={proc.returncode}): {stderr.decode().strip()}"
+        try:
+            if self._clipboard_bridge is not None:
+                self._clipboard_bridge.start()
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
             )
+            _, stderr = await proc.communicate()
+            if proc.returncode != 0:
+                raise RuntimeError(
+                    f"tmux launch failed (rc={proc.returncode}): {stderr.decode().strip()}"
+                )
+        except BaseException:
+            if self._clipboard_bridge is not None:
+                await asyncio.to_thread(self._clipboard_bridge.close)
+            raise
 
         self.running = True
         self.launch_cwd = effective_cwd
@@ -1619,6 +1630,9 @@ class TerminalInstance:
             with contextlib.suppress(RuntimeError):
                 await self._tmux("kill-server")
         self.running = False
+
+        if self._clipboard_bridge is not None:
+            await asyncio.to_thread(self._clipboard_bridge.close)
 
         if self.os_env is not None:
             self.os_env.close()
@@ -2524,5 +2538,6 @@ def create_terminal_instance(
         tmux_start_on_attach=spec.tmux_start_on_attach,
         keep_alive_after_exit=spec.keep_alive_after_exit,
     )
+    instance._clipboard_bridge = TerminalClipboardBridge(private_dir, socket_path)
 
     return TerminalCreateResult(instance=instance, cwd=cwd)

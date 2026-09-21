@@ -15,14 +15,18 @@ import base64
 import contextlib
 import json
 import os
+import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
 import pytest
 from fastapi import WebSocketDisconnect
 
+from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
+from omnigent.inner.terminal import create_terminal_instance
 from omnigent.terminals.control_bridge import (
     _SEND_KEYS_HEX_BYTES_PER_CALL,
     _clipboard_buffer_name,
@@ -901,6 +905,124 @@ async def test_control_bridge_ignores_copy_without_recent_input() -> None:
     assert ws.sent_text == []
 
     await _kill_and_join(sock, task)
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.parametrize(
+    ("read_only", "recent_input", "sandbox"),
+    [
+        (False, True, "none"),
+        (False, False, "none"),
+        (True, True, "none"),
+        pytest.param(
+            False,
+            True,
+            "darwin_seatbelt",
+            marks=pytest.mark.skipif(sys.platform != "darwin", reason="macOS sandbox"),
+        ),
+    ],
+)
+async def test_native_pbcopy_uses_consent_transport_not_host_clipboard(
+    tmp_path: Path, read_only: bool, recent_input: bool, sandbox: str
+) -> None:
+    """A real pane's pbcopy reaches only the eligible browser attachment."""
+    native_bin = tmp_path / "host-bin"
+    native_bin.mkdir()
+    bypass_marker = tmp_path / "host-clipboard-written"
+    native_copy = native_bin / "pbcopy"
+    native_copy.write_text(f"#!/bin/sh\ncat > {shlex.quote(str(bypass_marker))}\n")
+    native_copy.chmod(0o700)
+    read_paths = [str(Path(__file__).resolve().parents[2])]
+    if sandbox != "none":
+        # An isolated worktree may share an editable venv with another checkout.
+        installed_source = subprocess.check_output(
+            [
+                sys.executable,
+                "-I",
+                "-c",
+                "from pathlib import Path; import omnigent; "
+                "print(Path(omnigent.__file__).resolve().parent.parent)",
+            ],
+            text=True,
+            timeout=5,
+        ).strip()
+        read_paths.append(installed_source)
+    created = create_terminal_instance(
+        name="copy-test",
+        session_key="main",
+        spec=TerminalEnvSpec(
+            command="bash",
+            args=["--noprofile", "--norc"],
+            env={"PATH": f"{native_bin}{os.pathsep}{os.environ['PATH']}"},
+            os_env=OSEnvSpec(
+                type="caller_process",
+                cwd=str(tmp_path),
+                sandbox=OSEnvSandboxSpec(type=sandbox, read_paths=read_paths),
+            ),
+        ),
+    )
+    instance = created.instance
+    ws = _FakeWebSocket(
+        inbound=[{"type": "websocket.receive", "bytes": b"\r"}] if recent_input else []
+    )
+    task: asyncio.Task[None] | None = None
+    try:
+        await instance.launch(cwd=created.cwd)
+        task = asyncio.create_task(
+            bridge_tmux_control_to_websocket(
+                ws,
+                socket_path=str(instance.socket_path),
+                tmux_target=instance.tmux_target,
+                read_only=read_only,
+            )
+        )
+        for _ in range(100):
+            if ws.sent:
+                break
+            await asyncio.sleep(0.02)
+        assert ws.sent, "terminal did not attach"
+        await asyncio.sleep(0.1)
+        copied = "native copy λ\nsecond line\n"
+        done = instance.private_dir / "copy-done"
+        await instance.send(
+            text=f"printf %s {shlex.quote(copied)} | pbcopy && touch {shlex.quote(str(done))}"
+        )
+        for _ in range(100):
+            if done.exists():
+                break
+            await asyncio.sleep(0.03)
+        assert done.exists(), b"".join(ws.sent).decode(errors="replace")
+        assert not bypass_marker.exists(), "native pbcopy bypassed browser consent"
+        if recent_input and not read_only:
+            for _ in range(100):
+                if ws.sent_text:
+                    break
+                await asyncio.sleep(0.02)
+            assert ws.sent_text, "native copy never reached the browser consent transport"
+            message = json.loads(ws.sent_text[-1])
+            assert message["type"] == "clipboard-write"
+            assert base64.b64decode(message["data"]).decode() == copied
+        else:
+            await asyncio.sleep(0.2)
+            assert not ws.sent_text
+        if sandbox != "none":
+            probe = instance.private_dir / "control-socket-probe"
+            await instance.send(
+                text=(
+                    f"if tmux -S {shlex.quote(str(instance.socket_path))} show-options -g "
+                    f">/dev/null 2>&1; then printf exposed; else printf denied; fi "
+                    f"> {shlex.quote(str(probe))}"
+                )
+            )
+            for _ in range(100):
+                if probe.exists() and probe.read_text():
+                    break
+                await asyncio.sleep(0.02)
+            assert probe.read_text() == "denied"
+    finally:
+        if task is not None:
+            await _kill_and_join(instance.socket_path, task)
+        await instance.close()
 
 
 @pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
