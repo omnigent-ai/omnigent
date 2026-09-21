@@ -3417,8 +3417,7 @@ class HostProcess:
         loop keeps servicing pings.
 
         :param frame: The list-worktrees request frame.
-        :returns: Result frame with worktrees and their coarse remote provider
-            on success, or
+        :returns: Result frame with worktrees on success, or
             ``status: "failed"`` with an error message.
         """
         try:
@@ -3444,7 +3443,6 @@ class HostProcess:
                     "branch": wt.branch,
                     "is_main": wt.is_main,
                     "detached": wt.detached,
-                    "remote_provider": wt.remote_provider,
                     "updated_at": wt.updated_at,
                 }
                 for wt in worktrees

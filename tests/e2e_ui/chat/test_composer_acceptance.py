@@ -90,7 +90,6 @@ def test_pr_context_and_background_tasks_share_workspace_bar(
                         "branch": "live-branch",
                         "is_main": True,
                         "detached": False,
-                        "remote_provider": "github",
                     }
                 ]
             }

@@ -208,7 +208,6 @@ function setRepoIsGit(): void {
               branch: "main",
               is_main: true,
               detached: false,
-              remote_provider: "github",
             },
           ] as HostWorktree[])
         : ([] as HostWorktree[]),
@@ -460,14 +459,12 @@ describe("NewChatLandingScreen project-aware create (first-class project_id)", (
                     branch: "main",
                     is_main: true,
                     detached: false,
-                    remote_provider: "github",
                   },
                   {
                     path: EXISTING_WORKTREE,
                     branch: "feature/alpha",
                     is_main: false,
                     detached: false,
-                    remote_provider: "github",
                   },
                 ] as HostWorktree[])
               : ([] as HostWorktree[]),

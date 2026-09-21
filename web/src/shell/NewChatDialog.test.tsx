@@ -1243,7 +1243,6 @@ function setupLandingMocks() {
                 branch: "main",
                 is_main: true,
                 detached: false,
-                remote_provider: "github",
               },
             ],
           }) as ReturnType<typeof useHostWorktrees>,
@@ -3173,7 +3172,6 @@ describe("NewChatLandingScreen", () => {
           branch: "main",
           is_main: true,
           detached: false,
-          remote_provider: "github",
         },
       ],
     } as unknown as ReturnType<typeof useHostWorktrees>);
@@ -3455,7 +3453,6 @@ describe("NewChatLandingScreen", () => {
                   branch: "main",
                   is_main: true,
                   detached: false,
-                  remote_provider: "github",
                 },
               ],
               isPlaceholderData: false,
@@ -3480,7 +3477,6 @@ describe("NewChatLandingScreen", () => {
       branch: "main",
       is_main: true,
       detached: false,
-      remote_provider: "github" as const,
     };
 
     beforeEach(() => {
@@ -4542,7 +4538,6 @@ describe("NewChatLandingScreen", () => {
           branch: "main",
           is_main: true,
           detached: false,
-          remote_provider: "github",
         },
       ],
       isPlaceholderData: false,
@@ -6053,7 +6048,6 @@ describe("NewChatLandingScreen", () => {
           branch: "feature/x",
           is_main: false,
           detached: false,
-          remote_provider: "github",
         },
       ],
     } as unknown as ReturnType<typeof useHostWorktrees>);
@@ -6108,14 +6102,12 @@ describe("NewChatLandingScreen", () => {
           branch: "main",
           is_main: true,
           detached: false,
-          remote_provider: "github",
         },
         {
           path: "/Users/corey/repo-worktrees/review",
           branch: null,
           is_main: false,
           detached: true,
-          remote_provider: "github",
         },
       ],
       isPlaceholderData: false,
@@ -6162,7 +6154,6 @@ describe("NewChatLandingScreen", () => {
           branch: "feature/x",
           is_main: false,
           detached: false,
-          remote_provider: "github",
         },
         {
           path: "/Users/corey/repo-worktrees/bugfix-login",

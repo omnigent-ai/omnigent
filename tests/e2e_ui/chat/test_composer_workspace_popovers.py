@@ -61,7 +61,6 @@ def test_composer_details_wrap_without_clipping(
                         "branch": _BRANCH,
                         "is_main": True,
                         "detached": False,
-                        "remote_provider": "github",
                     }
                 ]
             }
@@ -135,7 +134,6 @@ def test_composer_workspace_labels_use_available_width(
                         "branch": name,
                         "is_main": True,
                         "detached": False,
-                        "remote_provider": "github",
                     }
                 ]
             }

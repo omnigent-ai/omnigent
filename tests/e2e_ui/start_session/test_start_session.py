@@ -3319,7 +3319,6 @@ async def _drive_add_worktree(base_url: str, session_id: str) -> None:
                                 "branch": "main",
                                 "is_main": True,
                                 "detached": False,
-                                "remote_provider": "github",
                             }
                         ]
                     }
@@ -3402,14 +3401,12 @@ async def _drive_select_existing_worktree(base_url: str, session_id: str) -> Non
                                     "branch": "main",
                                     "is_main": True,
                                     "detached": False,
-                                    "remote_provider": "github",
                                 },
                                 {
                                     "path": "/work/repo-worktrees/feature-x",
                                     "branch": "feature/x",
                                     "is_main": False,
                                     "detached": False,
-                                    "remote_provider": "github",
                                 },
                             ],
                         }

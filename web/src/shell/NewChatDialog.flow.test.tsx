@@ -153,7 +153,6 @@ vi.mock("@/hooks/useHostWorktrees", async (importOriginal) => ({
               branch: "main",
               is_main: true,
               detached: false,
-              remote_provider: "github",
             },
           ]
         : path === null
@@ -171,7 +170,6 @@ vi.mock("@/hooks/useHostWorktrees", async (importOriginal) => ({
               branch: "main",
               is_main: true,
               detached: false,
-              remote_provider: "github" as const,
             },
           ]
         : [],

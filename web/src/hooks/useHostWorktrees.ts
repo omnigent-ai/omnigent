@@ -27,11 +27,6 @@ export interface HostWorktree {
   is_main: boolean;
   /** ``true`` when the worktree has a detached HEAD (no branch). */
   detached: boolean;
-  /**
-   * Coarse provider proof derived from local git remote metadata. Missing on
-   * older hosts; ``null`` means no provider could be safely identified.
-   */
-  remote_provider?: "github" | "other" | null;
   /** Unix epoch seconds of the worktree HEAD commit. Missing on older hosts. */
   updated_at?: number | null;
 }
@@ -69,8 +64,7 @@ export function useVerifiedGitWorktrees({
   resolved: boolean;
 }): HostWorktree[] {
   const cacheRef = useRef<VerifiedGitWorktreeCache | null>(null);
-  // A successful nonempty listing proves Git support, including on older hosts
-  // that omit remote_provider. Worktrees do not depend on a remote provider.
+  // The listing includes the main checkout even when no linked worktrees exist.
   const directlyVerified = resolved && worktrees !== undefined && worktrees.length > 0;
   if (resolved) {
     cacheRef.current =

@@ -38,10 +38,10 @@ describe("useHostWorktrees", () => {
     });
 
     await waitFor(() => expect(result.current.data).toHaveLength(1));
-    expect(result.current.data?.[0].remote_provider).toBeUndefined();
+    expect(result.current.data?.[0]).not.toHaveProperty("remote_provider");
   });
 
-  it("does not reuse a prior path's GitHub identity while the next path loads", async () => {
+  it("does not reuse a prior path's worktrees while the next path loads", async () => {
     let resolveSecond: ((value: Response) => void) | undefined;
     authenticatedFetchMock
       .mockResolvedValueOnce(
@@ -51,7 +51,6 @@ describe("useHostWorktrees", () => {
             branch: "main",
             is_main: true,
             detached: false,
-            remote_provider: "github",
           },
         ]),
       )
@@ -67,7 +66,7 @@ describe("useHostWorktrees", () => {
       { initialProps: { path: "/github" }, wrapper: wrapper(client) },
     );
 
-    await waitFor(() => expect(result.current.data?.[0].remote_provider).toBe("github"));
+    await waitFor(() => expect(result.current.data?.[0].path).toBe("/github"));
     rerender({ path: "/ordinary" });
     expect(result.current.data).toBeUndefined();
     expect(result.current.isPlaceholderData).toBe(false);
@@ -80,12 +79,11 @@ describe("useHostWorktrees", () => {
             branch: "main",
             is_main: true,
             detached: false,
-            remote_provider: "other",
           },
         ]),
       );
     });
-    await waitFor(() => expect(result.current.data?.[0].remote_provider).toBe("other"));
+    await waitFor(() => expect(result.current.data?.[0].path).toBe("/ordinary"));
   });
 });
 

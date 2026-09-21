@@ -644,8 +644,8 @@ class HostListWorktreesResultFrame:
     :param status: ``"ok"`` or ``"failed"``.
     :param worktrees: One dict per worktree with keys ``path`` (str),
         ``branch`` (str | None), ``is_main`` (bool), ``detached``
-        (bool), and optional ``remote_provider`` (``"github"``, ``"other"``,
-        or null) and ``updated_at`` (Unix epoch seconds or null), main first.
+        (bool), and optional ``updated_at`` (Unix epoch seconds or null),
+        main first.
         Older hosts omit the optional metadata. ``None`` on failure.
     :param error: Error message when ``status`` is ``"failed"``, e.g.
         ``"not a git repository"``. ``None`` on success.

@@ -245,7 +245,6 @@ def test_composer_pr_link_opens_github_tab(
                         "branch": branch,
                         "is_main": True,
                         "detached": False,
-                        "remote_provider": "github",
                     }
                 ]
             }

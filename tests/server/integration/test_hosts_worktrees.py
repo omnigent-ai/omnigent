@@ -181,7 +181,9 @@ async def wt_setup(
             await comm.send_input({"type": "websocket.disconnect", "code": 1000})
 
 
+@pytest.mark.parametrize("legacy_provider", [False, True])
 async def test_list_worktrees_returns_data(
+    legacy_provider: bool,
     wt_setup: tuple[FastAPI, HostRegistry, ApplicationCommunicator, dict[str, dict[str, Any]]],
 ) -> None:
     """The endpoint returns ``{"object": "list", "data": [...]}`` from the host."""
@@ -193,7 +195,7 @@ async def test_list_worktrees_returns_data(
                 "branch": "main",
                 "is_main": True,
                 "detached": False,
-                "remote_provider": "github",
+                **({"remote_provider": "github"} if legacy_provider else {}),
                 "updated_at": 1_700_000_000,
             },
             {
@@ -201,7 +203,7 @@ async def test_list_worktrees_returns_data(
                 "branch": "feature/x",
                 "is_main": False,
                 "detached": False,
-                "remote_provider": "github",
+                **({"remote_provider": "github"} if legacy_provider else {}),
                 "updated_at": 1_700_000_100,
             },
         ],
@@ -217,17 +219,17 @@ async def test_list_worktrees_returns_data(
     branches = [w["branch"] for w in payload["data"]]
     assert branches == ["main", "feature/x"]
     assert payload["data"][1]["is_main"] is False
-    assert {worktree["remote_provider"] for worktree in payload["data"]} == {"github"}
+    assert payload["data"] == replies["/Users/corey/repo"]["worktrees"]
     assert [worktree["updated_at"] for worktree in payload["data"]] == [
         1_700_000_000,
         1_700_000_100,
     ]
 
 
-async def test_list_worktrees_passes_through_legacy_entries_without_provider(
+async def test_list_worktrees_passes_through_legacy_entries_without_metadata(
     wt_setup: tuple[FastAPI, HostRegistry, ApplicationCommunicator, dict[str, dict[str, Any]]],
 ) -> None:
-    """An older host response remains valid and simply lacks provider proof."""
+    """An older host response remains valid without optional metadata."""
     app, _reg, _comm, replies = wt_setup
     replies["/Users/corey/legacy"] = {
         "worktrees": [
@@ -245,7 +247,7 @@ async def test_list_worktrees_passes_through_legacy_entries_without_provider(
             params={"path": "/Users/corey/legacy"},
         )
     assert resp.status_code == 200, resp.text
-    assert "remote_provider" not in resp.json()["data"][0]
+    assert resp.json()["data"] == replies["/Users/corey/legacy"]["worktrees"]
 
 
 async def test_list_worktrees_non_git_path_400(

@@ -15,7 +15,6 @@ describe("WorktreeRadioRow", () => {
             branch: "feature/auth-refresh",
             is_main: false,
             detached: false,
-            remote_provider: "github",
             updated_at: twoHoursAgo,
           }}
           checked={false}
@@ -43,7 +42,6 @@ describe("WorktreeRadioRow", () => {
             branch: "feature/auth-refresh",
             is_main: false,
             detached: false,
-            remote_provider: "github",
             updated_at: Math.floor((Date.now() - 2 * 60 * 60 * 1000) / 1000),
           }}
           checked
