@@ -1,0 +1,244 @@
+name: Open Code Review
+
+on:
+  issue_comment:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: PR number to review.
+        required: true
+        type: string
+      force:
+        description: Review even if this commit already has a completed review.
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  request:
+    name: Validate review request
+    if: >-
+      github.repository == 'omnigent-ai/omnigent' &&
+      (github.event_name != 'issue_comment' ||
+       (github.event.issue.pull_request != null &&
+        contains(github.event.comment.body, '/ocr')))
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    outputs:
+      pr: ${{ steps.request.outputs.pr }}
+      force: ${{ steps.request.outputs.force }}
+    steps:
+      - name: Authorize trigger
+        id: request
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          INPUT_PR: ${{ inputs.pr }}
+          INPUT_FORCE: ${{ inputs.force }}
+          REVIEW_ALLOWLIST: ${{ vars.REVIEW_ALLOWLIST || '[]' }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const allowed = JSON.parse(process.env.REVIEW_ALLOWLIST);
+            if (!Array.isArray(allowed)) throw new Error('REVIEW_ALLOWLIST must be a JSON array');
+            let number;
+            let force = false;
+            if (context.eventName === 'issue_comment') {
+              const comment = context.payload.comment;
+              const commands = [...comment.body.matchAll(/^[ \t]*\/ocr(?:[ \t]+(force))?[ \t]*\r?$/gm)];
+              if (!context.payload.issue.pull_request || comment.user.type === 'Bot' || !commands.length) return;
+              if (!allowed.includes(comment.user.login)) {
+                const { data } = await github.rest.repos.getCollaboratorPermissionLevel({
+                  owner, repo, username: comment.user.login,
+                });
+                if (!['admin', 'maintain', 'write'].includes(data.permission)) {
+                  core.notice('Only write-access users or REVIEW_ALLOWLIST may request OCR.');
+                  return;
+                }
+              }
+              number = context.payload.issue.number;
+              force = commands.some(command => command[1] === 'force');
+            } else if (context.eventName === 'workflow_dispatch') {
+              if (context.ref !== `refs/heads/${context.payload.repository.default_branch}`) {
+                throw new Error('Run OCR from the default branch so only trusted configuration is loaded.');
+              }
+              number = process.env.INPUT_PR;
+              force = process.env.INPUT_FORCE === 'true';
+            } else {
+              return;
+            }
+            if (!/^[1-9][0-9]*$/.test(String(number))) throw new Error('Expected a positive PR number');
+            core.setOutput('pr', String(number));
+            if (force) core.setOutput('force', 'true');
+
+  review:
+    name: Open Code Review
+    needs: request
+    if: needs.request.outputs.pr != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: write
+    concurrency:
+      group: open-code-review-${{ needs.request.outputs.pr }}
+      cancel-in-progress: false
+    env:
+      OCR_NO_UPDATE: '1'
+    steps:
+      - name: Resolve PR and skip reviewed commits
+        id: pr
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          PR_NUMBER: ${{ needs.request.outputs.pr }}
+          FORCE_REVIEW: ${{ needs.request.outputs.force }}
+        with:
+          script: |
+            const { data: pr } = await github.rest.pulls.get({
+              ...context.repo, pull_number: Number(process.env.PR_NUMBER),
+            });
+            if (pr.state !== 'open' || pr.draft) {
+              core.notice('Skipping a closed or draft PR.');
+              return;
+            }
+            if (process.env.FORCE_REVIEW !== 'true') {
+              const comments = await github.paginate(github.rest.issues.listComments, {
+                ...context.repo, issue_number: pr.number, per_page: 100,
+              });
+              const botComments = comments.filter(comment =>
+                comment.user?.type === 'Bot' && comment.user.login === 'github-actions[bot]');
+              const hasMarker = (comment, marker) => (comment.body || '').split('\n').includes(marker);
+              const prior = botComments.find(comment =>
+                hasMarker(comment, `<!-- ocr-reviewed-sha: ${pr.head.sha} -->`));
+              if (prior) {
+                core.notice(`Open Code Review already completed for ${pr.head.sha}; skipping.`);
+                const marker = `<!-- ocr-skipped-sha: ${pr.head.sha} -->`;
+                if (!botComments.some(comment => hasMarker(comment, marker))) {
+                  await github.rest.issues.createComment({
+                    ...context.repo, issue_number: pr.number,
+                    body: `${marker}\nOpen Code Review skipped: \`${pr.head.sha.slice(0, 7)}\` ` +
+                      `already has a [completed review](${prior.html_url}).\n\n` +
+                      'Push a new commit or comment `/ocr force` to review it again.',
+                  });
+                }
+                return;
+              }
+            }
+            core.setOutput('base', pr.base.ref);
+            core.setOutput('head', pr.head.sha);
+
+      - name: Check gateway configuration
+        if: steps.pr.outputs.head != ''
+        id: gateway
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          GATEWAY_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
+          REVIEW_MODEL: ${{ vars.OMNIGENT_CI_REVIEW_ANTHROPIC_MODEL || vars.OMNIGENT_CI_ANTHROPIC_MODEL }}
+        run: |
+          set -euo pipefail
+          : "${LLM_API_KEY:?Set the LLM_API_KEY repository secret}"
+          : "${GATEWAY_BASE_URL:?Set the GATEWAY_BASE_URL repository secret}"
+          : "${REVIEW_MODEL:?Set OMNIGENT_CI_REVIEW_ANTHROPIC_MODEL or OMNIGENT_CI_ANTHROPIC_MODEL}"
+          gateway="${GATEWAY_BASE_URL%/}"
+          case "$gateway" in
+            */anthropic) ;;
+            *) gateway="${gateway}/anthropic" ;;
+          esac
+          echo "url=$gateway" >> "$GITHUB_OUTPUT"
+
+      # The action checks out the trusted base and reads PR blobs through Git.
+      # It never installs dependencies or executes code from the PR head.
+      - name: Review and publish findings
+        if: steps.pr.outputs.head != ''
+        id: ocr
+        uses: alibaba/open-code-review@cf64e7080f600d507888a26785ad6a8b7a13ab6a
+        with:
+          pr_number: ${{ needs.request.outputs.pr }}
+          base_ref: ${{ steps.pr.outputs.base }}
+          head_sha: ${{ steps.pr.outputs.head }}
+          llm_url: ${{ steps.gateway.outputs.url }}
+          llm_auth_token: ${{ secrets.LLM_API_KEY }}
+          llm_auth_header: Authorization
+          llm_use_anthropic: 'true'
+          llm_model: ${{ vars.OMNIGENT_CI_REVIEW_ANTHROPIC_MODEL || vars.OMNIGENT_CI_ANTHROPIC_MODEL }}
+          ocr_version: '1.12.0'
+          rule: .github/open-code-review/rules.json
+          background: >-
+            Review Omnigent changes for correctness, security, broken contracts,
+            race conditions, and failure paths, including the tests. Verify
+            findings against surrounding code. Omit cosmetic feedback.
+          effort: medium
+          review_concurrency: '2'
+          review_task_timeout: '15'
+          max_tokens_budget: '600000'
+          # Preserve each completed run's SHA marker for duplicate detection.
+          sticky_summary: 'false'
+          incremental: 'true'
+          route_severity_below: low
+          upload_artifacts: 'true'
+          stream_progress: 'true'
+
+      - name: Report review completeness
+        id: report
+        if: ${{ !cancelled() && steps.ocr.outcome != '' && steps.ocr.outcome != 'skipped' }}
+        env:
+          REVIEW_HEAD: ${{ steps.pr.outputs.head }}
+        run: |
+          python3 <<'PY'
+          import json, os, pathlib
+
+          result = pathlib.Path('/tmp/ocr-result.json')
+          if not result.is_file():
+              raise SystemExit('OCR did not produce a result; inspect the workflow logs.')
+          data = json.loads(result.read_text())
+          summary = data.get('summary') or {}
+          log = pathlib.Path('/tmp/ocr-stderr.log')
+          log_text = log.read_text() if log.exists() else ''
+          filter_failed = any(message in log_text for message in
+                              ('Review filter: failed', 'Review filter failed'))
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as output:
+              output.write('## Open Code Review\n\n')
+              output.write(f"Status: {data.get('status', 'unknown')}\n\n")
+              output.write(f"Files reviewed: {summary.get('files_reviewed', 0)}; "
+                           f"findings: {summary.get('comments', 0)}; "
+                           f"tokens: {summary.get('total_tokens', 0):,}; "
+                           f"elapsed: {summary.get('elapsed', 'unknown')}.\n\n")
+              if filter_failed:
+                  output.write('**Finding-filter failure:** OCR retained findings without completing '
+                               'its fact-checking pass. Validate them manually.\n')
+          if filter_failed:
+              print('::warning::OCR finding filter failed; reported findings need manual validation.')
+          if data.get('status') not in ('complete', 'skipped'):
+              raise SystemExit('::error::OCR review is incomplete; inspect the coverage in the JSON artifact.')
+          if data.get('status') == 'complete':
+              head = data.get('manifest', {}).get('input', {}).get('resolved_head')
+              if not head or head != os.environ['REVIEW_HEAD']:
+                  raise SystemExit('::error::OCR result does not match the requested commit.')
+              if not filter_failed:
+                  with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+                      output.write(f'head={head}\n')
+          PY
+
+      - name: Mark successfully published review
+        if: >-
+          steps.ocr.outcome == 'success' && steps.report.outputs.head != '' &&
+          steps.ocr.outputs.comments_failed == '0' && steps.ocr.outputs.summary_comment_url != ''
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          REVIEW_HEAD: ${{ steps.report.outputs.head }}
+          SUMMARY_URL: ${{ steps.ocr.outputs.summary_comment_url }}
+        with:
+          script: |
+            const match = new URL(process.env.SUMMARY_URL).hash.match(/^#issuecomment-(\d+)$/);
+            if (!match) throw new Error('OCR did not return a summary comment URL');
+            const args = { ...context.repo, comment_id: Number(match[1]) };
+            const { data: comment } = await github.rest.issues.getComment(args);
+            if (comment.user?.type !== 'Bot' || comment.user.login !== 'github-actions[bot]') {
+              throw new Error('Refusing to mark a summary not posted by github-actions[bot]');
+            }
+            const marker = `<!-- ocr-reviewed-sha: ${process.env.REVIEW_HEAD} -->`;
+            if (!(comment.body || '').split('\n').includes(marker)) {
+              await github.rest.issues.updateComment({ ...args, body: `${comment.body}\n\n${marker}` });
+            }
