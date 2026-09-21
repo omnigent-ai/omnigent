@@ -134,6 +134,33 @@ def test_queued_strip_attaches_to_composer(
         if bar.count() > 0 and bar.first.is_visible():
             bar_box = bar.first.bounding_box()
             if bar_box is not None:
+                strip_list = strip.get_by_role("list", name="Queued messages")
+                strip_list_box = strip_list.bounding_box()
+                assert strip_list_box is not None, "queued message list has no bounding box"
+                bar_insets = bar.first.evaluate(
+                    """element => {
+                        const style = getComputedStyle(element);
+                        return {
+                            left:
+                                parseFloat(style.paddingLeft) +
+                                parseFloat(style.borderLeftWidth),
+                            right:
+                                parseFloat(style.paddingRight) +
+                                parseFloat(style.borderRightWidth),
+                        };
+                    }"""
+                )
+                assert abs(strip_box["x"] - bar_box["x"]) <= _EPSILON
+                assert abs(strip_box["width"] - bar_box["width"]) <= _EPSILON
+                assert abs(strip_list_box["x"] - (bar_box["x"] + bar_insets["left"])) <= _EPSILON
+                assert (
+                    abs(
+                        strip_list_box["x"]
+                        + strip_list_box["width"]
+                        - (bar_box["x"] + bar_box["width"] - bar_insets["right"])
+                    )
+                    <= _EPSILON
+                )
                 bar_bottom = bar_box["y"] + bar_box["height"]
                 covers_left = bar_box["x"] <= strip_box["x"] + _EPSILON
                 covers_right = (
