@@ -99,7 +99,11 @@ async def _drive(
             await _close_entry_models(page)
             await page.evaluate("""() => {
               window.composerSamples = [];
+              window.sawConversationLoading = false;
               const capture = () => {
+                if (document.body.textContent.includes('Loading conversation…')) {
+                  window.sawConversationLoading = true;
+                }
                 const selector = '[data-testid="composer-agent-config-value"]';
                 const label = document.querySelector(selector);
                 if (label) window.composerSamples.push({
@@ -141,6 +145,7 @@ async def _drive(
                 path=output / "bound-model.png", animations="disabled"
             )
             samples = await page.evaluate("window.composerSamples")
+            assert not await page.evaluate("window.sawConversationLoading")
             assert any("/c/temp" in sample["path"] and sample["loading"] for sample in samples), (
                 samples
             )
