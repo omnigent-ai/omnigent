@@ -231,17 +231,18 @@ jobs:
             if (!match) throw new Error('OCR returned an invalid summary comment URL');
             const args = { ...context.repo, comment_id: Number(match[1]) };
             const { data: comment } = await github.rest.issues.getComment(args);
+            const body = (comment.body || '').replace(
+              /^⚠️ GitHub could not post this as an inline comment: Routed to summary \(severity low(?: · category [^)\r\n]+)?\)$/gm,
+              'ℹ️ Shown here because this finding is low severity.',
+            );
+            if (body === (comment.body || '')) return;
             const marker = `<!-- ocr-summary-run:${process.env.REVIEW_RUN} -->`;
             if (comment.user?.login !== 'github-actions[bot]' || comment.user.type !== 'Bot' ||
                 !comment.issue_url.endsWith(`/issues/${process.env.PR_NUMBER}`) ||
                 !(comment.body || '').split('\n').includes(marker)) {
               throw new Error('Refusing to edit a summary not owned by this OCR run');
             }
-            const body = comment.body.replace(
-              /^⚠️ GitHub could not post this as an inline comment: Routed to summary \(severity low(?: · category [^)\r\n]+)?\)$/gm,
-              'ℹ️ Shown here because this finding is low severity.',
-            );
-            if (body !== comment.body) await github.rest.issues.updateComment({ ...args, body });
+            await github.rest.issues.updateComment({ ...args, body });
 
       - name: Redact review diagnostics
         id: diagnostics
