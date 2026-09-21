@@ -8,11 +8,13 @@ import type * as RunnerHealthProviderModule from "@/hooks/RunnerHealthProvider";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 import type * as GoalApiModule from "@/lib/goalApi";
 import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
+import type { ChildSessionInfo } from "@/hooks/useChildSessions";
 import type * as FileViewerContextModule from "@/shell/FileViewerContext";
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { createRef, StrictMode, type ComponentRef, type ReactElement } from "react";
+import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useChatStore, type ChatState, type QueuedMessage } from "@/store/chatStore";
 import {
@@ -103,9 +105,16 @@ function setComposerGitStatus(overrides: Record<string, unknown> = {}) {
 afterEach(() => setComposerGitStatus());
 // SubagentTaskIndicator's child-session query also needs a QueryClient; stub it
 // so the indicator self-hides (no active children) in isolated composer renders.
+const { childSessionsArgsSpy, composerChildSessions } = vi.hoisted(() => ({
+  childSessionsArgsSpy: vi.fn(),
+  composerChildSessions: { children: [] as ChildSessionInfo[] },
+}));
 vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
   ...(await importOriginal<typeof UseChildSessionsModule>()),
-  useChildSessions: () => ({ children: [] }),
+  useChildSessions: (conversationId: string | null) => {
+    childSessionsArgsSpy(conversationId);
+    return { children: composerChildSessions.children, isLoading: false, error: null };
+  },
 }));
 // HostBadge now renders in the composer's status-line tray and reads the
 // session's host binding via TanStack Query. Stub the hooks so it self-hides
@@ -2036,6 +2045,14 @@ describe("Composer shared visible controls", () => {
   afterEach(() => {
     cleanup();
     vi.restoreAllMocks();
+    childSessionsArgsSpy.mockClear();
+    composerChildSessions.children = [];
+    useChatStore.setState({
+      contextWindow: null,
+      tokensUsed: null,
+      backgroundTaskCount: 0,
+      backgroundTasks: [],
+    });
   });
 
   // The workspace/worktree popover markup moved into the shared
@@ -2142,6 +2159,57 @@ describe("Composer shared visible controls", () => {
     const pr = screen.getByTestId("composer-pr-link");
     const worktree = screen.getByTestId("composer-git-branch");
     expect(pr.compareDocumentPosition(worktree) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+  });
+
+  it("mounts sub-agent work after context and background indicators with navigation", () => {
+    useChatStore.setState({
+      conversationId: "conv_parent",
+      contextWindow: 100_000,
+      tokensUsed: 25_000,
+      backgroundTaskCount: 1,
+      backgroundTasks: [],
+    });
+    composerChildSessions.children = [
+      {
+        id: "conv_child",
+        title: "developer:queue-tests",
+        task_summary: "Verify queue behavior",
+        tool: "developer",
+        session_name: "queue-tests",
+        labels: {},
+        current_task_status: "in_progress",
+        last_task_error: null,
+        busy: true,
+        last_message_preview: null,
+        pending_elicitations_count: 0,
+        routed_model: null,
+      },
+    ];
+
+    render(
+      <MemoryRouter initialEntries={["/c/conv_parent?file=README.md&debug=1"]}>
+        <TooltipProvider>
+          <Composer {...composerProps()} />
+        </TooltipProvider>
+      </MemoryRouter>,
+    );
+
+    const workspace = screen.getByTestId("composer-workspace-controls");
+    const context = within(workspace).getByTestId("composer-context-ring");
+    const background = within(workspace).getByTestId("background-task-pill");
+    const subagent = within(workspace).getByTestId("subagent-task-pill");
+    expect(context.compareDocumentPosition(background) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(
+      0,
+    );
+    expect(
+      background.compareDocumentPosition(subagent) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).not.toBe(0);
+    expect(childSessionsArgsSpy).toHaveBeenCalledWith("conv_parent");
+
+    fireEvent.click(subagent);
+    expect(
+      screen.getByRole("link", { name: "Open Verify queue behavior sub-agent" }),
+    ).toHaveAttribute("href", "/c/conv_child?debug=1");
   });
 
   it("passes the real session id/host/workspace/creation-branch to useComposerGitStatus", () => {
