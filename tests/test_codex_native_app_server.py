@@ -1687,7 +1687,8 @@ def test_mark_launch_default_preserves_a_hidden_configured_default() -> None:
 
     Hidden configured models are explicitly supported: crowning a different
     visible model would let a Default launch pin a model the configuration
-    never selected. An unpinned launch still keeps Codex's own first default.
+    never selected. With no Sol row, an unpinned launch falls back to Codex's
+    own first default.
     """
     from omnigent.harnesses.codex_native.app_server import mark_launch_default
 
@@ -1698,6 +1699,25 @@ def test_mark_launch_default_preserves_a_hidden_configured_default() -> None:
     assert [row.get("isDefault") for row in unpinned] == [True, None]
     pinned = mark_launch_default(rows, "gpt-5.4")
     assert [row.get("isDefault") for row in pinned] == [None, True]
+
+
+def test_mark_launch_default_prefers_omnigent_default_over_codex_default() -> None:
+    """An unpinned catalog prefers Sol over Codex's current catalog default."""
+    from omnigent.harnesses.codex_native.app_server import mark_launch_default
+
+    rows = [
+        {"id": "gpt-6-astra", "isDefault": True},
+        {"id": "system.ai.gpt-5-6-sol"},
+    ]
+
+    assert mark_launch_default(rows, None) == [
+        {"id": "gpt-6-astra"},
+        {"id": "system.ai.gpt-5-6-sol", "isDefault": True},
+    ]
+    assert mark_launch_default(rows, "gpt-6-astra") == [
+        {"id": "gpt-6-astra", "isDefault": True},
+        {"id": "system.ai.gpt-5-6-sol"},
+    ]
 
 
 @pytest.mark.parametrize("reprobe", [False, True])
@@ -3973,8 +3993,8 @@ async def test_probe_codex_model_options_probes_every_launch_shape(
 
     The plain Codex-login shape carries no ``DATABRICKS_HOST`` and no
     provider overrides beyond what the launch resolved (here the dismissal
-    pin), and with no launch-pinned model Codex's own default marker
-    stands.
+    pin). With no launch-pinned model, Omnigent's Sol default wins when it is
+    visible; otherwise Codex's own default marker stands.
     """
     from omnigent.harnesses.codex_native import app_server as codex_native_app_server
     from omnigent.models import model_catalog_store

@@ -52,8 +52,8 @@ def static_model_fallback(provider_kind: str, cli: str) -> StaticModelFallback |
 #: form 400s against codex's own backend.
 _CODEX_LAUNCH_DEFAULT = StaticModelFallback(
     model_ids=("gpt-5.6-sol",),
-    owner="Codex native launch (omnigent.inner.codex_executor)",
-    provenance="codex's own catalog slug for the cheapest current arm",
+    owner="Codex native launch",
+    provenance="codex's catalog slug for Omnigent's preferred launch arm",
     discovery_gap=(
         "the launch default is resolved before any app-server probe can "
         "answer, and codex rejects the bundled catalog's newest row (a bare "
