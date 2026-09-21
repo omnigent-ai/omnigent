@@ -160,8 +160,10 @@ is the review gate after the fact.
 8. Emits a single fenced ```json handoff block: `mode`
    (`reviewed_existing_pr` / `authored_fix`), `outcome` (`fixed` /
    `partially_fixed` / `not_fixed` / `nothing_to_fix` / `needs_more_info`), the
-   per-facet fail→pass proof, the PR URL (opened or reviewed, or empty until the
-   workflow-owned publisher opens it), and the publication state (`ci_status`,
-   `polly_review`, `ui_preview`, `validation_prompt`, `maintainer_review`).
+   plain-English `problem_summary` and `solution_summary` used for the Linear
+   update, the per-facet fail→pass proof, the PR URL (opened or reviewed, or empty
+   until the workflow-owned publisher opens it), and the publication state
+   (`ci_status`, `polly_review`, `ui_preview`, `validation_prompt`,
+   `maintainer_review`).
 
 It does **not** merge. See `AGENTS.md` for the full operating procedure.

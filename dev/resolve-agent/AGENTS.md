@@ -1394,6 +1394,8 @@ the message. Same discipline as repro-agent:
   "bug_url": "https://github.com/omnigent-ai/omnigent/issues/1234",
   "mode": "authored_fix",
   "outcome": "fixed",
+  "problem_summary": "People see internal catalog IDs in the model picker instead of readable model names.",
+  "solution_summary": "The model picker now shows a friendly name for every model.",
   "root_cause": "picker rendered raw catalog IDs because format_label() was never called on the option list",
   "fix_summary": "call format_label() when building picker options in web/src/model/picker.tsx",
   "files_changed": ["web/src/model/picker.tsx"],
@@ -1453,9 +1455,19 @@ Field meanings:
   `already_fixed`/`not_reproduced`, or the 2B.1 audit showed `main` has since
   fixed it — name the fixing commit and recommend closing the ticket), or
   `needs_more_info` (couldn't recover the reproduction).
+- `problem_summary` / `solution_summary` — the two user-facing paragraphs shown
+  prominently in the Linear update under **What's the problem?** and **How is it
+  fixed?** Write plain, natural English for someone who uses the product but has
+  not read the code. `problem_summary` describes what the person experiences and
+  why it matters. `solution_summary` describes the corrected behavior and result.
+  Keep implementation symbols, filenames, commit/merge bookkeeping, test lists,
+  and CI details out of both fields; those belong in the technical fields below.
+  Include both fields even for review mode and no-change outcomes.
 - `root_cause` / `fix_summary` / `files_changed` — the cause and the change. In
-  review mode, describe the reviewed PR's approach and leave `files_changed` empty
-  (you changed nothing).
+  These are the technical details shown under **Additional notes** and used by
+  publication/review fallbacks, so concrete symbols and filenames are welcome.
+  In review mode, describe the reviewed PR's approach and leave `files_changed`
+  empty (you changed nothing).
 - `facets` — per-facet, mirroring the recovered breakdown: each with its own
   `outcome` and a `test_transition` (the fail→pass proof, or why it was skipped).
 - `tests` — `e2e` is the (possibly rewritten) repro test path; `added` is the list
