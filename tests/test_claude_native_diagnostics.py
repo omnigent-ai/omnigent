@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 
 from omnigent._platform import IS_POSIX
+from omnigent.debug_logging import record_to_row
 from omnigent.harnesses.claude_native import bridge, diagnostics
 from omnigent.process_logging import HARNESS_STDERR_ENABLED_ENV_VAR
 
@@ -157,12 +158,33 @@ def test_poll_exports_new_records_once_with_session_and_launch_identity(
     assert events[-1]["offset"] == capture_file.stat().st_size
 
 
+@pytest.mark.parametrize(
+    ("diagnostic", "secret", "expected"),
+    [
+        (
+            "failed token=synthetic-secret-value",
+            "synthetic-secret-value",
+            "failed token=[REDACTED]",
+        ),
+        ("ERROR failed: password hunter2", "hunter2", "ERROR failed: password [REDACTED]"),
+        (
+            "ERROR authentication failed: invalid api key a1b2c3d4e5f60718293a4b5c6d7e8f90",
+            "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+            "ERROR authentication failed: invalid api key [REDACTED]",
+        ),
+    ],
+)
 def test_split_utf8_and_credentials_are_redacted_only_after_complete_record(
-    capture_file: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+    capture_file: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    diagnostic: str,
+    secret: str,
+    expected: str,
 ) -> None:
     monkeypatch.setattr(diagnostics, "_READ_BYTES", 9)
     follower = diagnostics.ClaudeDebugLogFollower(capture_file.parent)
-    raw = "é🙂\x1b[31m failed token=synthetic-secret-value\x1b[0m\n".encode()
+    raw = f"é🙂\x1b[31m {diagnostic}\x1b[0m\n".encode()
     capture_file.write_bytes(raw)
     follower.poll("conv_test")
     assert not _events(caplog)
@@ -170,8 +192,12 @@ def test_split_utf8_and_credentials_are_redacted_only_after_complete_record(
         follower.poll("conv_test")
     follower.close("conv_test")
 
-    assert [event["text"] for event in _events(caplog)] == ["é🙂 failed token=[REDACTED]"]
-    assert "synthetic-secret-value" not in caplog.text
+    assert [event["text"] for event in _events(caplog)] == [f"é🙂 {expected}"]
+    assert secret not in caplog.text
+    for record in caplog.records:
+        row = record_to_row(record, source="runner")
+        assert secret not in json.dumps(row)
+        assert row["attributes"]["text"] == f"é🙂 {expected}"
 
 
 def test_credential_redaction_precedes_export_clipping(

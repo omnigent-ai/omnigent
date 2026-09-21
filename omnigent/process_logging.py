@@ -113,8 +113,18 @@ _AUTHORIZATION_PATTERN = re.compile(
 )
 _NAMED_SECRET_PATTERN = re.compile(
     # Start once per possible key, avoiding retries within long dotted/hyphenated values.
-    rf"(?i)((?<![\w.-])[\w.-]*(?:token|api[_-]?key|secret|password|credential)"
-    rf"\b[\"']?\s*[:=]\s*)({_QUOTED_OR_NONSPACE_VALUE})"
+    rf"(?i)((?<![\w.-])[\w.-]*(?:token|api(?:[_-]|[ \t]+)?key|secret|password|credential)"
+    rf"\b[\"']?\s*[:=]\s*)({_AUTHORIZATION_VALUE})"
+)
+_WHITESPACE_SECRET_PATTERN = re.compile(
+    # Require credential-specific labels; bare token/secret/credential often introduce prose.
+    r"(?i)((?<![\w.-])(?:--)?(?:password|passwd|api(?:[_-]|[ \t]+)?key"
+    r"|(?:access|refresh|auth)(?:[_-]|[ \t]+)token|client(?:[_-]|[ \t]+)secret)"
+    r"\b[\"']?[ \t]+)"
+    # Preserve clear diagnostic phrases, but still redact quoted or ambiguous single values.
+    r"(?!(?:(?:is|was)[ \t]+(?:missing|invalid|required|expired|not[ \t]+(?:set|found|configured))"
+    r"|has[ \t]+expired|(?:authentication|validation|refresh)[ \t]+failed)\b)"
+    rf"(?![:=])({_AUTHORIZATION_VALUE})"
 )
 _SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
     # Keep the broad standalone-bearer behavior: short or punctuation-heavy
@@ -155,6 +165,7 @@ def redact_log_text(text: str) -> str:
     """Replace secret- and token-shaped substrings in log text."""
     text = _AUTHORIZATION_PATTERN.sub(_replace_named_secret, text)
     text = _NAMED_SECRET_PATTERN.sub(_replace_named_secret, text)
+    text = _WHITESPACE_SECRET_PATTERN.sub(_replace_named_secret, text)
     for pattern in _SECRET_PATTERNS:
         text = pattern.sub(
             lambda match: match.group(1) + _REDACTED if match.lastindex else _REDACTED,

@@ -151,22 +151,98 @@ def test_redact_log_text_filters_labeled_and_unlabeled_token_shapes() -> None:
         ("(--password = example )", "(--password = [REDACTED] )"),
         ('{"access_token": "some secret"}', '{"access_token": "[REDACTED]"}'),
         ("{'api-key': 'some secret'}", "{'api-key': '[REDACTED]'}"),
+        ("api key: some-secret status=401", "api key: [REDACTED] status=401"),
+        ("api key: Bearer short-value status=401", "api key: [REDACTED] status=401"),
+        ('"api key" = "some secret"', '"api key" = "[REDACTED]"'),
         ('".db-credential"="example"', '".db-credential"="[REDACTED]"'),
     ],
 )
 def test_redact_log_text_preserves_named_secret_keys(text: str, expected: str) -> None:
     """Punctuation, underscores, and quotes around keys survive value redaction."""
-    assert redact_log_text(text) == expected
+    redacted = redact_log_text(text)
+    assert redacted == expected
+    assert redact_log_text(redacted) == redacted
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("ERROR failed: password hunter2", "ERROR failed: password [REDACTED]"),
+        (
+            "ERROR authentication failed: invalid api key a1b2c3d4e5f60718293a4b5c6d7e8f90",
+            "ERROR authentication failed: invalid api key [REDACTED]",
+        ),
+        ("password supersecret status=401", "password [REDACTED] status=401"),
+        ("PASSWORD\thunter2 status=401", "PASSWORD\t[REDACTED] status=401"),
+        ('"password" "hunter2"', '"password" "[REDACTED]"'),
+        ("API\t KEY  hunter2", "API\t KEY  [REDACTED]"),
+        ('password "some secret" rejected', 'password "[REDACTED]" rejected'),
+        ("--api-key 'some secret' rejected", "--api-key '[REDACTED]' rejected"),
+        ("api_key lowercasesecret status=403", "api_key [REDACTED] status=403"),
+        ("access token synthetic-access-value", "access token [REDACTED]"),
+        ("refresh_token synthetic-refresh-value", "refresh_token [REDACTED]"),
+        ("auth-token synthetic-auth-value", "auth-token [REDACTED]"),
+        ("auth token Bearer short-value status=401", "auth token [REDACTED] status=401"),
+        ("client secret synthetic-client-value", "client secret [REDACTED]"),
+        ("passwd p@ss,word rejected", "passwd [REDACTED] rejected"),
+        ("password expired", "password [REDACTED]"),
+        ('password "is missing"', 'password "[REDACTED]"'),
+        ("password=is missing", "password=[REDACTED] missing"),
+        (
+            "password hunter2 api key abcdef012345 status=401",
+            "password [REDACTED] api key [REDACTED] status=401",
+        ),
+    ],
+)
+def test_redact_log_text_handles_whitespace_credentials(text: str, expected: str) -> None:
+    """Explicit credential labels hide even short/plain values without losing context."""
+    redacted = redact_log_text(text)
+    assert redacted == expected
+    assert redact_log_text(redacted) == redacted
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "ERROR password authentication failed for user example",
+        "ERROR api key is missing; configure the provider",
+        "ERROR refresh token has expired; authenticate again",
+        "ERROR client secret was not configured",
+        "ERROR access token validation failed",
+        "ERROR token refresh failed",
+        "WARN token budget exceeded; token count 8192",
+        "ERROR credential resolution failed",
+        "ERROR secret provider unavailable",
+        "WARN password_file unavailable; api_key_path not found",
+        "ERROR password\nconnection refused",
+        "ERROR api\nkey unavailable",
+    ],
+)
+def test_redact_log_text_preserves_credential_diagnostic_prose(text: str) -> None:
+    """Credential diagnostics and token accounting are not whitespace assignments."""
+    assert redact_log_text(text) == text
 
 
 @pytest.mark.parametrize(
     "text",
     [
         "+" * 20_000,
+        "a-" * 8_192,
+        ("ERROR " + "a-" * 9_000)[:16_384],
         ("synthetic-token-marker" * 4_000)[:65_536],
         ("synthetic.token.marker" * 4_000)[:65_536],
+        "api" + " " * 65_000 + "key is missing",
+        "password is missing; api key is missing\n" * 1_600,
     ],
-    ids=["punctuation", "hyphenated", "dotted"],
+    ids=[
+        "punctuation",
+        "short-hyphenated",
+        "error-short-hyphenated",
+        "hyphenated",
+        "dotted",
+        "spaced-label",
+        "diagnostic-prose",
+    ],
 )
 def test_redact_log_text_handles_large_non_token_input_in_linear_time(text: str) -> None:
     """Long possible key names do not trigger quadratic regex backtracking."""
@@ -188,6 +264,24 @@ def test_redact_log_text_handles_large_bearer_token_in_linear_time() -> None:
     elapsed = time.perf_counter() - started
 
     assert output == "Bearer [REDACTED]"
+    assert elapsed < 0.5
+
+
+@pytest.mark.parametrize("label", ["password", "api key", "access token"])
+@pytest.mark.parametrize("value", ["synthetic-token-marker", "synthetic.token.marker"])
+def test_redact_log_text_handles_large_whitespace_credentials_in_linear_time(
+    label: str, value: str
+) -> None:
+    """Maximum-size credential values retain bounded redaction cost on repeated passes."""
+    text = f"ERROR failed: {label} " + (value * 4_000)[:65_000] + " status=401"
+
+    started = time.perf_counter()
+    output = redact_log_text(text)
+    repeated = redact_log_text(output)
+    elapsed = time.perf_counter() - started
+
+    assert output == f"ERROR failed: {label} [REDACTED] status=401"
+    assert repeated == output
     assert elapsed < 0.5
 
 

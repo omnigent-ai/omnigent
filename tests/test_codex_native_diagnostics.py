@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
+import logging
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
 
 import pytest
 
+from omnigent.debug_logging import record_to_row
 from omnigent.harnesses.codex_native.diagnostics import collect_codex_startup_diagnostics
-from omnigent.process_logging import HARNESS_STDERR_ENABLED_ENV_VAR
+from omnigent.process_logging import HARNESS_STDERR_ENABLED_ENV_VAR, RedactingLogFormatter
 
 if TYPE_CHECKING:
     from omnigent.harnesses.codex_native.app_server import CodexNativeAppServer
@@ -202,6 +205,57 @@ def test_uses_shared_credential_redaction_without_dropping_diagnostics(
     assert "synthetic-" not in tail
     assert snapshot["stderr_lines_omitted"] == 0
     assert snapshot["stderr_tail_truncated"] is False
+
+
+@pytest.mark.parametrize(
+    ("diagnostic", "secret", "expected"),
+    [
+        (
+            "ERROR failed: password hunter2",
+            "hunter2",
+            "ERROR failed: password [REDACTED]",
+        ),
+        (
+            "ERROR authentication failed: invalid api key a1b2c3d4e5f60718293a4b5c6d7e8f90",
+            "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+            "ERROR authentication failed: invalid api key [REDACTED]",
+        ),
+        (
+            "ERROR authentication failed: client secret 'synthetic client value' status=401",
+            "synthetic client value",
+            "ERROR authentication failed: client secret '[REDACTED]' status=401",
+        ),
+    ],
+)
+def test_whitespace_credentials_are_redacted_in_text_and_serialized_rows(
+    capture_stderr: None, diagnostic: str, secret: str, expected: str
+) -> None:
+    """Snapshots and both log sinks share redaction without changing diagnostic context."""
+    context = "ERROR token refresh failed; api key is missing"
+    entries = [diagnostic, context]
+    snapshot = collect_codex_startup_diagnostics(_server(entries))
+    expected_tail = f"{expected}\n{context}"
+    assert snapshot["stderr_tail"] == expected_tail
+    assert snapshot["stderr_lines_omitted"] == 0
+    assert snapshot["stderr_bytes_omitted"] == 0
+    assert snapshot["stderr_tail_truncated"] is False
+    assert entries == [diagnostic, context]
+
+    record = logging.LogRecord(
+        "omnigent.runner", logging.ERROR, __file__, 1, "startup failed: %s", (diagnostic,), None
+    )
+    record.exc_text = f"ValueError: {diagnostic}"
+    record.attributes = snapshot
+    text = RedactingLogFormatter(fmt="%(message)s", use_colors=False).format(record)
+    assert text == f"startup failed: {expected}\nValueError: {expected}"
+
+    row = record_to_row(record, source="runner")
+    assert row["message"] == f"startup failed: {expected}"
+    assert row["stack_trace"] == f"ValueError: {expected}"
+    attributes = row["attributes"]
+    assert isinstance(attributes, dict)
+    assert attributes["stderr_tail"] == expected_tail
+    assert secret not in json.dumps(row)
 
 
 def test_terminal_controls_are_removed_before_credential_redaction(capture_stderr: None) -> None:
