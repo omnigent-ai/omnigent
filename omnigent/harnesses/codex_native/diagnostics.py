@@ -2,56 +2,13 @@
 
 from __future__ import annotations
 
-import re
-import unicodedata
 from typing import TYPE_CHECKING
 
-from omnigent.process_logging import harness_stderr_capture_enabled, redact_log_text
+from omnigent.harnesses.diagnostics import bounded_diagnostic_tail
+from omnigent.process_logging import harness_stderr_capture_enabled
 
 if TYPE_CHECKING:
     from omnigent.harnesses.codex_native.app_server import CodexNativeAppServer
-
-_STDERR_TAIL_BYTES = 64 * 1024
-_TERMINAL_ESCAPE = re.compile(
-    r"(?:\x1b\]|\x9d).*?(?:\x07|\x1b\\|\x9c|$)"
-    r"|\x1b[P^_].*?(?:\x1b\\|$)"
-    r"|(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]"
-    r"|\x1b[ -/]*[@-~]",
-    re.DOTALL,
-)
-
-
-def _without_terminal_controls(text: str) -> str:
-    text = _TERMINAL_ESCAPE.sub("", text).translate(str.maketrans("\t\v\f", "   "))
-    return "".join(
-        char for char in text if char in "\n\r" or unicodedata.category(char) not in {"Cc", "Cf"}
-    ).rstrip()
-
-
-def _stderr_snapshot(entries: list[str] | None) -> dict[str, object]:
-    lines = [redact_log_text(_without_terminal_controls(line)) for line in entries or ()]
-    retained: list[str] = []
-    remaining = _STDERR_TAIL_BYTES
-    for line in reversed(lines):
-        encoded = line.encode("utf-8")
-        required = len(encoded) + bool(retained)
-        if required > remaining:
-            # Keep complete entries unless even the newest entry exceeds the budget.
-            if not retained:
-                retained.append(encoded[-remaining:].decode("utf-8", errors="ignore"))
-            break
-        retained.append(line)
-        remaining -= required
-
-    tail = "\n".join(reversed(retained))
-    omitted_bytes = len("\n".join(lines).encode("utf-8")) - len(tail.encode("utf-8"))
-    return {
-        "stderr_tail_available": entries is not None,
-        "stderr_tail": tail,
-        "stderr_tail_truncated": omitted_bytes > 0,
-        "stderr_lines_omitted": len(lines) - len(retained),
-        "stderr_bytes_omitted": omitted_bytes,
-    }
 
 
 def collect_codex_startup_diagnostics(
@@ -71,7 +28,15 @@ def collect_codex_startup_diagnostics(
         "stderr_capture_enabled": capture_enabled,
     }
     if capture_enabled:
-        snapshot.update(_stderr_snapshot(None if app_server is None else app_server.recent_stderr))
+        entries = None if app_server is None else app_server.recent_stderr
+        tail = bounded_diagnostic_tail(entries or [])
+        snapshot.update(
+            stderr_tail_available=entries is not None,
+            stderr_tail=tail["tail"],
+            stderr_tail_truncated=tail["truncated"],
+            stderr_lines_omitted=tail["lines_omitted"],
+            stderr_bytes_omitted=tail["bytes_omitted"],
+        )
     if app_server is None:
         return snapshot
 

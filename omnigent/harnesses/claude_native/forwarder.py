@@ -44,6 +44,7 @@ from omnigent.harnesses.claude_native.bridge import (
     url_component,
     write_active_session_id,
 )
+from omnigent.harnesses.claude_native.diagnostics import ClaudeDebugLogFollower
 from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
 from omnigent.harnesses.claude_native.status import sync_raw_status_context
 from omnigent.inner.hook_scripts.subagent_router import AGENT_TOOL_NAMES
@@ -53,6 +54,7 @@ from omnigent.native._native_post_delivery import (
     post_external_session_status,
     post_may_have_been_delivered,
 )
+from omnigent.process_logging import harness_stderr_capture_enabled
 from omnigent.session_event_batch import (
     MAX_SESSION_EVENT_BATCH_EVENTS,
     encode_session_event_batch,
@@ -1031,6 +1033,43 @@ async def _forward_progress_timeout(
         response_hooks.remove(_response_received)
 
 
+@contextlib.asynccontextmanager
+async def _forward_claude_diagnostics(
+    bridge_dir: Path,
+    session_id: str,
+    poll_interval_s: float,
+) -> AsyncIterator[None]:
+    """Follow diagnostics independently of transcript discovery and HTTP progress."""
+    if not harness_stderr_capture_enabled():
+        yield
+        return
+
+    follower = ClaudeDebugLogFollower(bridge_dir)
+
+    def active_session_id() -> str:
+        try:
+            return read_active_session_id(bridge_dir) or session_id
+        except Exception:  # noqa: BLE001 — invalid bridge metadata must not stop diagnostics
+            return session_id
+
+    async def poll() -> None:
+        while True:
+            follower.poll(active_session_id())
+            await asyncio.sleep(poll_interval_s)
+
+    task = asyncio.create_task(poll(), name=f"claude-diagnostics-{session_id}")
+    try:
+        yield
+    finally:
+        task.cancel()
+        try:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+        finally:
+            with contextlib.suppress(Exception):
+                follower.close(active_session_id())
+
+
 async def forward_claude_transcript_to_session(
     *,
     base_url: str,
@@ -1126,6 +1165,7 @@ async def forward_claude_transcript_to_session(
     from omnigent.cli_auth import open_server_client
 
     async with (
+        _forward_claude_diagnostics(bridge_dir, session_id, poll_interval_s),
         open_server_client(base_url, headers=headers, auth=auth, timeout=timeout) as client,
         open_server_client(
             base_url, headers=headers, auth=auth, timeout=timeout

@@ -2471,7 +2471,9 @@ def augment_claude_args(
             skills_filter=skills_filter,
         )
     )
-    return args
+    from omnigent.harnesses.claude_native.diagnostics import augment_claude_debug_args
+
+    return augment_claude_debug_args(args, bridge_dir)
 
 
 def _arg_value(args: tuple[str, ...], flag: str) -> str | None:

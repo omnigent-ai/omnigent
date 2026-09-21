@@ -6274,20 +6274,28 @@ async def _launch_claude_terminal(
         append_system_prompt=append_system_prompt,
         allowed_tools=allowed_tools,
     )
-    resp = await client.post(
-        f"/v1/sessions/{url_component(session_id)}/resources/terminals",
-        json=body,
-        timeout=30.0,
-    )
-    if resp.status_code >= 400:
-        raise click.ClickException(
-            f"Claude terminal launch failed ({resp.status_code}): {error_text(resp)}"
+    try:
+        resp = await client.post(
+            f"/v1/sessions/{url_component(session_id)}/resources/terminals",
+            json=body,
+            timeout=30.0,
         )
-    payload = resp.json()
-    terminal_id = payload.get("id")
-    if not isinstance(terminal_id, str) or not terminal_id:
-        raise click.ClickException("Claude terminal launch response did not include terminal id.")
-    return terminal_id
+        if resp.status_code >= 400:
+            raise click.ClickException(
+                f"Claude terminal launch failed ({resp.status_code}): {error_text(resp)}"
+            )
+        payload = resp.json()
+        terminal_id = payload.get("id")
+        if not isinstance(terminal_id, str) or not terminal_id:
+            raise click.ClickException(
+                "Claude terminal launch response did not include terminal id."
+            )
+        return terminal_id
+    except (Exception, asyncio.CancelledError):
+        from omnigent.harnesses.claude_native.diagnostics import ClaudeDebugLogFollower
+
+        ClaudeDebugLogFollower(bridge_dir).close(session_id)
+        raise
 
 
 async def _find_running_claude_terminal(
