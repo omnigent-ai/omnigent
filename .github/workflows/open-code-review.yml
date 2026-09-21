@@ -80,6 +80,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
+      actions: read
       contents: read
       pull-requests: write
     concurrency:
@@ -104,18 +105,38 @@ jobs:
               return;
             }
             if (process.env.FORCE_REVIEW !== 'true') {
-              const comments = await github.paginate(github.rest.issues.listComments, {
-                ...context.repo, issue_number: pr.number, per_page: 100,
+              const receipt = `ocr-completed-${pr.number}-${pr.head.sha}`;
+              const artifacts = await github.paginate(github.rest.actions.listArtifacts, {
+                ...context.repo, name: receipt, per_page: 100,
               });
-              const botComments = comments.filter(comment =>
-                comment.user?.type === 'Bot' && comment.user.login === 'github-actions[bot]');
-              const hasMarker = (comment, marker) => (comment.body || '').split('\n').includes(marker);
-              const prior = botComments.find(comment =>
-                hasMarker(comment, `<!-- ocr-reviewed-sha: ${pr.head.sha} -->`));
+              let prior;
+              if (artifacts.length) {
+                const { data: workflow } = await github.rest.actions.getWorkflow({
+                  ...context.repo, workflow_id: 'open-code-review.yml',
+                });
+                for (const artifact of artifacts) {
+                  if (artifact.name !== receipt || artifact.expired || !artifact.workflow_run?.id) continue;
+                  const { data: run } = await github.rest.actions.getWorkflowRun({
+                    ...context.repo, run_id: artifact.workflow_run.id,
+                  });
+                  if (run.workflow_id === workflow.id && run.status === 'completed' &&
+                      run.conclusion === 'success' &&
+                      run.head_branch === context.payload.repository.default_branch &&
+                      ['issue_comment', 'workflow_dispatch'].includes(run.event)) {
+                    prior = run;
+                    break;
+                  }
+                }
+              }
               if (prior) {
                 core.notice(`Open Code Review already completed for ${pr.head.sha}; skipping.`);
+                const comments = await github.paginate(github.rest.issues.listComments, {
+                  ...context.repo, issue_number: pr.number, per_page: 100,
+                });
                 const marker = `<!-- ocr-skipped-sha: ${pr.head.sha} -->`;
-                if (!botComments.some(comment => hasMarker(comment, marker))) {
+                if (!comments.some(comment => comment.user?.type === 'Bot' &&
+                    comment.user.login === 'github-actions[bot]' &&
+                    (comment.body || '').split('\n').includes(marker))) {
                   await github.rest.issues.createComment({
                     ...context.repo, issue_number: pr.number,
                     body: `${marker}\nOpen Code Review skipped: \`${pr.head.sha.slice(0, 7)}\` ` +
@@ -173,12 +194,61 @@ jobs:
           review_concurrency: '2'
           review_task_timeout: '15'
           max_tokens_budget: '600000'
-          # Preserve each completed run's SHA marker for duplicate detection.
           sticky_summary: 'false'
           incremental: 'true'
           route_severity_below: low
-          upload_artifacts: 'true'
+          upload_artifacts: 'false'
           stream_progress: 'true'
+
+      - name: Redact review diagnostics
+        id: diagnostics
+        if: ${{ !cancelled() && steps.ocr.outcome != '' && steps.ocr.outcome != 'skipped' }}
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          GATEWAY_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
+        run: |
+          python3 <<'PY'
+          import json, os, pathlib, tempfile
+          from urllib.parse import urlsplit
+
+          def variants(value):
+              if not value:
+                  return set()
+              forms = {value, json.dumps(value)[1:-1], json.dumps(value, ensure_ascii=False)[1:-1]}
+              return forms | {form.replace('/', r'\/') for form in forms}
+
+          key_variants = variants(os.environ.get('LLM_API_KEY', ''))
+          gateway = os.environ.get('GATEWAY_BASE_URL', '').rstrip('/')
+          url = urlsplit(gateway)
+          redactions = key_variants | variants(gateway) | variants(f'{url.scheme}://{url.netloc}' if url.netloc else '')
+          destination = pathlib.Path(tempfile.mkdtemp(prefix='ocr-diagnostics-', dir=os.environ['RUNNER_TEMP']))
+          copied = False
+          exposed_key = False
+          for name in ('ocr-result.json', 'ocr-stderr.log'):
+              source = pathlib.Path('/tmp') / name
+              if not source.is_file():
+                  continue
+              text = source.read_text(errors='replace')
+              exposed_key |= any(value in text for value in key_variants)
+              for value in sorted(redactions, key=len, reverse=True):
+                  text = text.replace(value, '[REDACTED]')
+              (destination / name).write_text(text)
+              copied = True
+          if copied:
+              with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+                  output.write(f'path={destination}\n')
+          if exposed_key:
+              raise SystemExit('::error::OCR diagnostics contained the gateway key; only redacted copies may be uploaded.')
+          PY
+
+      - name: Upload redacted diagnostics
+        if: ${{ !cancelled() && steps.diagnostics.outputs.path != '' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ocr-review-result-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.diagnostics.outputs.path }}
+          retention-days: 7
+          if-no-files-found: error
 
       - name: Report review completeness
         id: report
@@ -221,24 +291,32 @@ jobs:
                       output.write(f'head={head}\n')
           PY
 
-      - name: Mark successfully published review
+      - name: Record successfully published review
+        id: receipt
         if: >-
           steps.ocr.outcome == 'success' && steps.report.outputs.head != '' &&
           steps.ocr.outputs.comments_failed == '0' && steps.ocr.outputs.summary_comment_url != ''
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
+          PR_NUMBER: ${{ needs.request.outputs.pr }}
           REVIEW_HEAD: ${{ steps.report.outputs.head }}
           SUMMARY_URL: ${{ steps.ocr.outputs.summary_comment_url }}
+        run: |
+          python3 <<'PY'
+          import json, os, pathlib
+
+          receipt = pathlib.Path(os.environ['RUNNER_TEMP']) / 'ocr-completion.json'
+          receipt.write_text(json.dumps({
+              'pr': int(os.environ['PR_NUMBER']),
+              'head': os.environ['REVIEW_HEAD'],
+              'summary_url': os.environ['SUMMARY_URL'],
+          }) + '\n')
+          PY
+
+      - name: Upload completion receipt
+        if: steps.receipt.outcome == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          script: |
-            const match = new URL(process.env.SUMMARY_URL).hash.match(/^#issuecomment-(\d+)$/);
-            if (!match) throw new Error('OCR did not return a summary comment URL');
-            const args = { ...context.repo, comment_id: Number(match[1]) };
-            const { data: comment } = await github.rest.issues.getComment(args);
-            if (comment.user?.type !== 'Bot' || comment.user.login !== 'github-actions[bot]') {
-              throw new Error('Refusing to mark a summary not posted by github-actions[bot]');
-            }
-            const marker = `<!-- ocr-reviewed-sha: ${process.env.REVIEW_HEAD} -->`;
-            if (!(comment.body || '').split('\n').includes(marker)) {
-              await github.rest.issues.updateComment({ ...args, body: `${comment.body}\n\n${marker}` });
-            }
+          name: ocr-completed-${{ needs.request.outputs.pr }}-${{ steps.report.outputs.head }}
+          path: ${{ runner.temp }}/ocr-completion.json
+          retention-days: 90
+          if-no-files-found: error

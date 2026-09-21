@@ -15,7 +15,9 @@ WORKFLOW = yaml.safe_load((ROOT / ".github/workflows/open-code-review.yml").read
 AUTHORIZE = WORKFLOW["jobs"]["request"]["steps"][0]["with"]["script"]
 RESOLVE = WORKFLOW["jobs"]["review"]["steps"][0]["with"]["script"]
 REPORT = next(s for s in WORKFLOW["jobs"]["review"]["steps"] if s.get("id") == "report")["run"]
-MARK = WORKFLOW["jobs"]["review"]["steps"][-1]["with"]["script"]
+STEPS = {step.get("id"): step for step in WORKFLOW["jobs"]["review"]["steps"]}
+DIAGNOSTICS = STEPS["diagnostics"]["run"]
+RECEIPT = STEPS["receipt"]["run"]
 HEAD = "a" * 40
 
 NODE_RUNNER = r"""
@@ -30,14 +32,18 @@ const github = {rest: {
     return {data: {permission: input.permission}};
   }},
   pulls: {get: async () => ({data: input.pr})},
+  actions: {
+    listArtifacts: () => {},
+    getWorkflow: async () => ({data: {id: 42}}),
+    getWorkflowRun: async (args) => ({data: input.runs[args.run_id]}),
+  },
   issues: {
     listComments: () => {},
     createComment: async (args) => { calls.push({create: args}); },
-    getComment: async () => ({data: input.summary_comment}),
-    updateComment: async (args) => { calls.push({update: args}); },
   },
 }};
-github.paginate = async () => input.comments;
+github.paginate = async (method) =>
+  method === github.rest.actions.listArtifacts ? input.artifacts : input.comments;
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
 (async () => {
   let error;
@@ -60,7 +66,8 @@ class OpenCodeReviewWorkflowTest(unittest.TestCase):
         pr=None,
         script=AUTHORIZE,
         comments=None,
-        summary_comment=None,
+        artifacts=None,
+        runs=None,
         extra_env=None,
     ):
         result = subprocess.run(
@@ -72,7 +79,8 @@ class OpenCodeReviewWorkflowTest(unittest.TestCase):
                     "permission": permission,
                     "pr": pr,
                     "comments": comments or [],
-                    "summary_comment": summary_comment,
+                    "artifacts": artifacts or [],
+                    "runs": runs or {},
                 }
             ),
             env={
@@ -98,6 +106,7 @@ class OpenCodeReviewWorkflowTest(unittest.TestCase):
             "repo": {"owner": "omnigent-ai", "repo": "omnigent"},
             "eventName": "issue_comment",
             "payload": {
+                "repository": {"default_branch": "main"},
                 "issue": {"number": 7878, "pull_request": {"url": "pr"} if is_pr else None},
                 "comment": {"body": body, "user": {"login": "reviewer", "type": user_type}},
             },
@@ -190,7 +199,7 @@ class OpenCodeReviewWorkflowTest(unittest.TestCase):
             "html_url": "https://github.com/omnigent-ai/omnigent/pull/7878#issuecomment-123",
         }
 
-    def resolve(self, comments, force=False):
+    def resolve(self, comments=(), force=False, artifacts=(), runs=None):
         pr = {
             "number": 7878,
             "state": "open",
@@ -203,59 +212,201 @@ class OpenCodeReviewWorkflowTest(unittest.TestCase):
             script=RESOLVE,
             pr=pr,
             comments=comments,
+            artifacts=artifacts,
+            runs=runs,
             extra_env={"FORCE_REVIEW": "true" if force else ""},
         )
 
-    def test_completed_commit_skips_before_gateway_and_posts_one_notice(self):
-        completed = self.completed_comment()
-        result = self.resolve([completed])
-        self.assertEqual(result["outputs"], {})
-        self.assertEqual(len(result["calls"]), 1)
-        notice = result["calls"][0]["create"]
-        self.assertIn("/ocr force", notice["body"])
-        self.assertIn(completed["html_url"], notice["body"])
-        self.assertEqual(notice["issue_number"], 7878)
-        result = self.resolve([completed, self.completed_comment(notice["body"])])
-        self.assertEqual(result["outputs"], {})
-        self.assertEqual(result["calls"], [])
+    def completion(self):
+        artifact = {
+            "name": f"ocr-completed-7878-{HEAD}",
+            "expired": False,
+            "workflow_run": {"id": 123},
+        }
+        run = {
+            "workflow_id": 42,
+            "status": "completed",
+            "conclusion": "success",
+            "head_branch": "main",
+            "event": "issue_comment",
+            "html_url": "https://github.com/omnigent-ai/omnigent/actions/runs/123",
+        }
+        return artifact, run
 
-    def test_force_bypasses_completed_commit_marker(self):
-        result = self.resolve([self.completed_comment()], force=True)
+    def test_completed_commit_skips_before_gateway_and_posts_one_notice(self):
+        artifact, run = self.completion()
+        for event in ("issue_comment", "workflow_dispatch"):
+            with self.subTest(event=event):
+                run["event"] = event
+                result = self.resolve(artifacts=[artifact], runs={123: run})
+                self.assertNotIn("error", result)
+                self.assertEqual(result["outputs"], {})
+                self.assertEqual(len(result["calls"]), 1)
+                notice = result["calls"][0]["create"]
+                self.assertIn("/ocr force", notice["body"])
+                self.assertIn(run["html_url"], notice["body"])
+                self.assertEqual(notice["issue_number"], 7878)
+                result = self.resolve(
+                    [self.completed_comment(notice["body"])],
+                    artifacts=[artifact],
+                    runs={123: run},
+                )
+                self.assertEqual(result["outputs"], {})
+                self.assertEqual(result["calls"], [])
+
+    def test_force_bypasses_completion_receipt(self):
+        artifact, _ = self.completion()
+        # No run fixture: looking up its provenance would fail.
+        result = self.resolve(artifacts=[artifact], force=True)
+        self.assertNotIn("error", result)
         self.assertEqual(result["outputs"], {"base": "main", "head": HEAD})
         self.assertEqual(result["calls"], [])
 
-    def test_only_exact_completion_markers_from_our_bot_suppress_review(self):
-        candidates = [
-            [],
-            [self.completed_comment(login="contributor", user_type="User")],
-            [self.completed_comment(login="another-app[bot]")],
-            [self.completed_comment(f"<!-- ocr-reviewed-sha: {'b' * 40} -->")],
-            [self.completed_comment(f"<!-- ocr-skipped-sha: {HEAD} -->")],
-            [self.completed_comment(f"> <!-- ocr-reviewed-sha: {HEAD} -->")],
+    def test_comment_text_cannot_suppress_review_even_from_actions_bot(self):
+        for login, user_type in (
+            ("github-actions[bot]", "Bot"),
+            ("another-app[bot]", "Bot"),
+            ("contributor", "User"),
+        ):
+            result = self.resolve([self.completed_comment(login=login, user_type=user_type)])
+            self.assertNotIn("error", result)
+            self.assertEqual(result["outputs"], {"base": "main", "head": HEAD})
+            self.assertEqual(result["calls"], [])
+
+    def test_only_successful_default_branch_workflow_receipts_suppress_review(self):
+        cases = [
+            ("artifact", {"name": f"ocr-completed-999-{HEAD}"}),
+            ("artifact", {"name": f"ocr-completed-7878-{'b' * 40}"}),
+            ("artifact", {"expired": True}),
+            ("artifact", {"workflow_run": None}),
+            ("run", {"workflow_id": 99}),
+            ("run", {"status": "in_progress"}),
+            ("run", {"conclusion": "failure"}),
+            ("run", {"conclusion": "cancelled"}),
+            ("run", {"head_branch": "untrusted-pr"}),
+            ("run", {"event": "pull_request"}),
         ]
-        for comments in candidates:
-            with self.subTest(comments=comments):
-                result = self.resolve(comments)
+        for target, overrides in cases:
+            with self.subTest(target=target, overrides=overrides):
+                artifact, run = self.completion()
+                (artifact if target == "artifact" else run).update(overrides)
+                result = self.resolve(artifacts=[artifact], runs={123: run})
+                self.assertNotIn("error", result)
                 self.assertEqual(result["outputs"], {"base": "main", "head": HEAD})
                 self.assertEqual(result["calls"], [])
 
-    def test_completion_marker_is_appended_without_replacing_findings(self):
-        summary = self.completed_comment("OCR findings")
-        result = self.run_script(self.comment(), script=MARK, summary_comment=summary)
-        self.assertNotIn("error", result)
-        update = result["calls"][0]["update"]
-        self.assertEqual(update["comment_id"], 123)
-        self.assertEqual(update["body"], f"OCR findings\n\n<!-- ocr-reviewed-sha: {HEAD} -->")
-        result = self.run_script(
-            self.comment(), script=MARK, summary_comment=self.completed_comment()
+    def run_python(self, script, root, extra_env=None):
+        script = script.split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+        script = script.replace("pathlib.Path('/tmp')", f"pathlib.Path({str(root)!r})")
+        return subprocess.run(
+            [sys.executable, "-c", script],
+            env={
+                **os.environ,
+                "RUNNER_TEMP": str(root),
+                "GITHUB_OUTPUT": str(root / "outputs"),
+                **(extra_env or {}),
+            },
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
         )
-        self.assertEqual(result["calls"], [])
 
-    def test_human_summary_cannot_be_marked_complete(self):
-        summary = self.completed_comment("findings", login="human", user_type="User")
-        result = self.run_script(self.comment(), script=MARK, summary_comment=summary)
-        self.assertIn("Refusing to mark", result["error"])
-        self.assertEqual(result["calls"], [])
+    def test_receipt_records_requested_commit_and_published_summary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            summary = "https://github.com/omnigent-ai/omnigent/pull/7878#issuecomment-123"
+            result = self.run_python(
+                RECEIPT,
+                root,
+                {
+                    "PR_NUMBER": "7878",
+                    "REVIEW_HEAD": HEAD,
+                    "SUMMARY_URL": summary,
+                },
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                json.loads((root / "ocr-completion.json").read_text()),
+                {
+                    "pr": 7878,
+                    "head": HEAD,
+                    "summary_url": summary,
+                },
+            )
+
+    def test_diagnostics_redact_raw_and_escaped_credentials_and_fail_on_key(self):
+        key = 'test-key/with"quote\nand-unicode-\u00e9'
+        gateway = "https://private.example/serving"
+        variants = (
+            key,
+            json.dumps(key)[1:-1],
+            json.dumps(key, ensure_ascii=False)[1:-1],
+            key.replace("/", r"\/"),
+            json.dumps(key)[1:-1].replace("/", r"\/"),
+            json.dumps(key, ensure_ascii=False)[1:-1].replace("/", r"\/"),
+        )
+        for value in variants:
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                raw = value + "\n" + gateway + "\nhttps://private.example/anthropic"
+                raw += "\n" + gateway.replace("/", r"\/")
+                for name in ("ocr-result.json", "ocr-stderr.log"):
+                    (root / name).write_text(raw)
+                result = self.run_python(
+                    DIAGNOSTICS,
+                    root,
+                    {
+                        "LLM_API_KEY": key,
+                        "GATEWAY_BASE_URL": gateway,
+                    },
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("only redacted copies", result.stderr)
+                destination = Path((root / "outputs").read_text().strip().removeprefix("path="))
+                for name in ("ocr-result.json", "ocr-stderr.log"):
+                    sanitized = (destination / name).read_text()
+                    self.assertNotIn(value, sanitized)
+                    self.assertNotIn("private.example", sanitized)
+                    self.assertIn("[REDACTED]", sanitized)
+                    self.assertEqual((root / name).read_text(), raw)
+                self.assertNotIn(value, result.stdout + result.stderr)
+
+    def test_clean_or_missing_diagnostics(self):
+        for files in ([], ["ocr-result.json"], ["ocr-result.json", "ocr-stderr.log"]):
+            with self.subTest(files=files), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                for name in files:
+                    (root / name).write_text("safe diagnostic")
+                result = self.run_python(
+                    DIAGNOSTICS,
+                    root,
+                    {
+                        "LLM_API_KEY": "test-secret",
+                        "GATEWAY_BASE_URL": "https://private.example",
+                    },
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                if not files:
+                    self.assertFalse((root / "outputs").exists())
+                    continue
+                destination = Path((root / "outputs").read_text().strip().removeprefix("path="))
+                self.assertEqual(sorted(p.name for p in destination.iterdir()), sorted(files))
+                for name in files:
+                    self.assertEqual((destination / name).read_text(), "safe diagnostic")
+
+    def test_only_sanitized_diagnostics_are_uploaded(self):
+        self.assertEqual(STEPS["ocr"]["with"]["upload_artifacts"], "false")
+        upload = next(
+            s
+            for s in WORKFLOW["jobs"]["review"]["steps"]
+            if s["name"] == "Upload redacted diagnostics"
+        )
+        self.assertEqual(upload["with"]["path"], "${{ steps.diagnostics.outputs.path }}")
+        self.assertIn("!cancelled()", upload["if"])
+        # The receipt has the implicit success() gate, so a redaction failure cannot complete it.
+        self.assertNotIn("always()", STEPS["receipt"]["if"])
+        self.assertNotIn("!cancelled()", STEPS["receipt"]["if"])
 
     def run_report(self, status, log="", resolved_head=HEAD):
         with tempfile.TemporaryDirectory() as directory:
@@ -317,7 +468,7 @@ class OpenCodeReviewWorkflowTest(unittest.TestCase):
                 self.assertIn("Finding-filter failure", summary)
                 self.assertEqual(outputs, "")
 
-    def test_only_complete_matching_result_is_eligible_for_completion_marker(self):
+    def test_only_complete_matching_result_is_eligible_for_completion_receipt(self):
         result, _, outputs = self.run_report("complete")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(outputs, f"head={HEAD}\n")
@@ -331,7 +482,7 @@ class OpenCodeReviewWorkflowTest(unittest.TestCase):
             self.assertEqual(outputs, "")
 
     def test_failed_publication_cannot_record_completion(self):
-        step = WORKFLOW["jobs"]["review"]["steps"][-1]
+        step = STEPS["receipt"]
         for outcome, failed, head, url, eligible in (
             ("success", "0", HEAD, "summary-url", True),
             ("failure", "0", HEAD, "summary-url", False),
@@ -349,10 +500,10 @@ class OpenCodeReviewWorkflowTest(unittest.TestCase):
                     "report": {"outputs": {"head": head}},
                 }
                 script = (
-                    f"const steps = {json.dumps(steps)}; core.setOutput('mark', {step['if']});"
+                    f"const steps = {json.dumps(steps)}; core.setOutput('receipt', {step['if']});"
                 )
                 result = self.run_script(self.comment(), script=script)
-                self.assertEqual(result["outputs"], {"mark": eligible})
+                self.assertEqual(result["outputs"], {"receipt": eligible})
 
 
 if __name__ == "__main__":
