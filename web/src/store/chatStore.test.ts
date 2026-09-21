@@ -1099,6 +1099,40 @@ describe("chatStore — switchTo", () => {
     },
   );
 
+  it.each([
+    ["nessie", "Nessie"],
+    ["Release Reviewer (fork ag_copy)", "Release Reviewer"],
+  ])("names a failed session using its fetched agent_name=%s", async (agentName, displayName) => {
+    seedSession("conv_named_error", []);
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (
+        url.split("?")[0] === "/v1/sessions/conv_named_error" &&
+        (init?.method ?? "GET") === "GET"
+      ) {
+        return mockResponse({
+          id: "conv_named_error",
+          agent_id: "ag_custom",
+          agent_name: agentName,
+          status: "failed",
+          created_at: 0,
+          items: [],
+          last_task_error: { code: "executor_error", message: "The turn failed." },
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    await useChatStore.getState().switchTo("conv_named_error");
+
+    expect(useChatStore.getState().boundAgentName).toBe(agentName);
+    expect(useChatStore.getState().blocks.find((block) => block.type === "error")).toMatchObject({
+      title: `${displayName} ran into an error during this turn.`,
+      code: "executor_error",
+      message: "The turn failed.",
+    });
+  });
+
   it("refetches the session snapshot even when a stale cached session exists", async () => {
     client.setQueryData(["session", "conv_abc"], {
       id: "conv_abc",
