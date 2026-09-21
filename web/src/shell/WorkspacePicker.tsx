@@ -21,7 +21,11 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import { useCreateHostDirectory, useHostFilesystem } from "@/hooks/useHostFilesystem";
 import { useHostWorktrees, useVerifiedGitWorktrees } from "@/hooks/useHostWorktrees";
 import { cn } from "@/lib/utils";
-import { WorktreeRadioRow } from "./WorktreeRadioRow";
+import {
+  WORKTREE_RADIO_SPACIOUS_INPUT_CLASS,
+  WORKTREE_RADIO_SPACIOUS_ROW_CLASS,
+  WorktreeRadioRow,
+} from "./WorktreeRadioRow";
 
 /** True for Windows drive-letter paths such as `C:/Users/me` or `C:\\Users\\me`. */
 export function isWindowsDrivePath(path: string): boolean {
@@ -1091,7 +1095,10 @@ export function WorkspacePicker({
                   className={cn(
                     "flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-sm hover:bg-muted focus-within:bg-muted",
                     showGitDialog &&
-                      "h-[26px] rounded-md px-2 py-0 text-base transition-colors has-[:checked]:bg-muted",
+                      cn(
+                        WORKTREE_RADIO_SPACIOUS_ROW_CLASS,
+                        "transition-colors has-[:checked]:bg-muted",
+                      ),
                   )}
                   data-testid="workspace-picker-current-folder"
                 >
@@ -1102,8 +1109,7 @@ export function WorkspacePicker({
                     onChange={() => setSelectedWorktreePath(null)}
                     className={cn(
                       "size-4 shrink-0 accent-primary",
-                      showGitDialog &&
-                        "appearance-none rounded-full border border-muted-foreground/60 bg-background checked:border-[5px] checked:border-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2",
+                      showGitDialog && WORKTREE_RADIO_SPACIOUS_INPUT_CLASS,
                     )}
                   />
                   <span

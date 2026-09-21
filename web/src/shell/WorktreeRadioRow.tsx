@@ -11,6 +11,12 @@ import {
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { CopyIcon, EllipsisIcon, FolderOpenIcon } from "lucide-react";
 
+export const WORKTREE_RADIO_SPACIOUS_ROW_CLASS =
+  "min-h-9 rounded-lg px-3 py-1 text-base leading-[1.6]";
+
+export const WORKTREE_RADIO_SPACIOUS_INPUT_CLASS =
+  "appearance-none rounded-full border border-muted-foreground/60 bg-background checked:border-[5px] checked:border-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2";
+
 export function worktreeDisplayName(path: string): string {
   return path.split(/[\\/]/).filter(Boolean).at(-1) ?? path;
 }
@@ -49,7 +55,7 @@ export function WorktreeRadioRow({
       className={cn(
         "flex min-w-0 items-center rounded-md text-sm transition-colors hover:bg-muted focus-within:bg-muted",
         checked && "bg-muted",
-        spacious && "min-h-9 rounded-lg px-3 py-1 text-base leading-[1.6]",
+        spacious && WORKTREE_RADIO_SPACIOUS_ROW_CLASS,
         className,
       )}
       data-testid={testId}
@@ -64,8 +70,7 @@ export function WorktreeRadioRow({
               onChange={onSelect}
               className={cn(
                 "size-4 shrink-0 accent-primary",
-                spacious &&
-                  "appearance-none rounded-full border border-muted-foreground/60 bg-background checked:border-[5px] checked:border-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2",
+                spacious && WORKTREE_RADIO_SPACIOUS_INPUT_CLASS,
               )}
               aria-label={`Use worktree ${displayName}`}
             />

@@ -30,6 +30,10 @@ import {
 } from "@/hooks/useHostFilesystem";
 import { useHostWorktrees } from "@/hooks/useHostWorktrees";
 import type * as HostWorktreesModule from "@/hooks/useHostWorktrees";
+import {
+  WORKTREE_RADIO_SPACIOUS_INPUT_CLASS,
+  WORKTREE_RADIO_SPACIOUS_ROW_CLASS,
+} from "./WorktreeRadioRow";
 
 vi.mock("@/hooks/useHostFilesystem", () => ({
   useHostFilesystem: vi.fn(),
@@ -765,14 +769,18 @@ describe("WorkspacePicker modal actions", () => {
       expect(screen.getByTestId("workspace-picker-body")).toHaveClass(
         "md:grid-cols-[minmax(0,1.2fr)_minmax(18rem,0.8fr)]",
       );
-      expect(screen.getByTestId("workspace-picker-current-folder")).toHaveClass(
-        "h-[26px]",
-        "px-2",
-        "text-base",
+      const currentFolderRow = screen.getByTestId("workspace-picker-current-folder");
+      const linkedWorktreeRow = screen.getByTestId(
+        "workspace-picker-worktree-/Users/corey/worktrees/feature-layout",
       );
-      expect(
-        screen.getByTestId("workspace-picker-worktree-/Users/corey/worktrees/feature-layout"),
-      ).toHaveClass("min-h-9", "px-3", "py-1", "text-base");
+      const spaciousRowClasses = WORKTREE_RADIO_SPACIOUS_ROW_CLASS.split(" ");
+      const spaciousInputClasses = WORKTREE_RADIO_SPACIOUS_INPUT_CLASS.split(" ");
+      expect(currentFolderRow).toHaveClass(...spaciousRowClasses);
+      expect(linkedWorktreeRow).toHaveClass(...spaciousRowClasses);
+      expect(screen.getByRole("radio", { name: "Don't use" })).toHaveClass(...spaciousInputClasses);
+      expect(screen.getByRole("radio", { name: "Use worktree feature-layout" })).toHaveClass(
+        ...spaciousInputClasses,
+      );
       expect(screen.getByTestId("workspace-picker-entry-src")).toHaveClass(
         "min-h-[27px]",
         "px-2",
