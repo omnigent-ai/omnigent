@@ -151,18 +151,48 @@ investigation attempt. It means the **report itself** omits product information
 required to define or execute the reproduction—never that your turn, tools,
 credentials, environment, or infrastructure failed.
 
-**The journey is user-observable only — an ordered list of actions a user
-takes.** Write it as concrete numbered steps, each one an action the user
-performs or a state they change (setup/config, launch, UI interaction,
-environment toggles like VPN or network, sending a message), ending in the
-failure they observe. A good report's "Steps to reproduce" is exactly this
-shape — e.g.:
+**Write a manual reproduction recipe a reader can follow without opening the
+test, recording, or earlier messages.** Keep it user-observable and use concrete
+numbered steps, with one action or closely related action group per step:
 
+- Start with the prerequisites: the build/version actually tested, surface,
+  harness, required authentication/configuration, and starting state (for
+  example, a fresh session versus an existing one). Include only relevant
+  details; explicitly mark unknown requirements instead of inventing them.
+- Name the screen, control, agent, or command to use, and provide the exact
+  input/message or a concrete safe example. Explain how to create any required
+  data. Avoid vague instructions such as "use the feature" or "trigger the bug."
+- Spell out order and timing that matter: before sending the first message,
+  wait until the reply finishes, reload, reopen, or switch sessions. Include a
+  duration or observable completion condition for waits.
+- At the step where the symptom appears, say exactly where to look and include
+  **Expected:** and **Observed:** results. Describe the visible value, error, or
+  behavior, not just "it fails."
+- Keep the original failure and any follow-up/regression checks distinct. For
+  multiple symptoms, label each recipe and its result. State what you actually
+  observed on the running build; label steps or outcomes inferred from the
+  report as unverified. If already fixed, distinguish the reported old failure
+  from the passing result you observed. Do not imply you tested an older build.
+
+For example (use the actual tested build and results in your response):
+
+```markdown
+### Steps to reproduce — terminal shows another session's output
+
+Prerequisites: the tested Omnigent build, with an online host and access to the
+session's shell terminal.
+
+1. Create a new session, call it A, and open its shell terminal.
+2. Run `printf 'session-A\n'` and wait for the shell prompt to return.
+3. Create a second session, call it B, open its shell terminal, and run
+   `printf 'session-B\n'`. Wait for the shell prompt to return.
+4. Select session A in the sidebar and open its shell terminal. Read the output.
+   - **Expected:** A's terminal shows `session-A`.
+   - **Observed:** A's terminal instead shows B's `session-B` output.
 ```
-1. create session A and run one command
-2. create session B and run one command in terminal (different than A)
-3. select session A → terminal still displays session B's output
-```
+
+Retain this level of detail in the final response and the `journey` handoff
+field (see Output); an arrow-separated summary alone is insufficient.
 
 Every step is something a user *does* or *toggles*. The journey does **not**
 contain the internal mechanism (which function is called, which state isn't
@@ -466,8 +496,13 @@ choice:
   recording results, atomically rewrite it, and emit that same object in the
   final fence. The checkpoint and final block must not disagree.
 
-- You may write comprehensive prose above the block (a human-readable summary,
-  the journey, the per-facet notes) — that's fine and encouraged. Then, as the
+- Before the test source and JSON block, include a **Steps to reproduce**
+  section using the manual recipe from Step 1: prerequisites, numbered actions,
+  and expected/observed results at the relevant step. This section is required,
+  even when a recording is available. For `needs_more_info` or
+  `needs_manual_review`, include the known steps and clearly identify missing
+  information or unverified steps; do not invent a successful reproduction.
+  You may also include a brief verdict and per-facet notes. Then, as the
   last thing before the JSON block, paste the **complete, verbatim source of the
   e2e test(s) you authored** as a fenced, path-labelled code block — the whole
   file, never truncated or elided with `# ...` placeholders — so the reproduction
@@ -475,9 +510,8 @@ choice:
   **context, not the contract**: everything the parser needs lives *inside* the
   JSON block, and the ```json block is the **last chunk** of the message, with
   nothing after its closing fence.
-- Do **not** split the artifacts across separate sections or headers (no lone
-  "Reproduction Verdict" / "Journey" / "Facets" blocks standing in for the
-  handoff, and no second data block). Whatever you also say in prose, the single
+- The human-readable sections do not replace the handoff, and there must be no
+  second data block. Whatever you also say in prose, the single
   ```json block below carries the complete, self-contained handoff.
 - Emit that block as **JSON**, never YAML. One ` ```json ` fence, one JSON
   object.
@@ -514,7 +548,7 @@ choice:
   "environment_fidelity": "real",
   "missing_information": [],
   "session_id": "dc59e331-...",
-  "journey": "open model picker → select catalog → picker shows raw IDs",
+  "journey": "Prerequisites: running web build, a new session, and an available catalog.\n1. Open the model picker in the session composer.\n2. Select the available catalog.\n3. Read the model names in the picker.\n   Expected: readable model names.\n   Observed: raw model IDs instead of names.",
   "evidence": "snapshot ref / response / log excerpt, plus root-cause leads"
 }
 ```
@@ -560,14 +594,14 @@ Field meanings:
 - `session_id` — **this session** (in the app), from `sys_session_get_info`, so
   the fix step can replay how you reproduced it and you can browse it at
   `<server>/c/<session_id>`.
-- `journey` — the reconstructed **user-observable** journey: the ordered user
-  actions from Step 1, compacted to one line by joining the numbered steps with
-  ` → `, ending in the observed failure, e.g. `create session A + run a command →
-  create session B + run a different command → select session A → terminal still
-  shows B's output`. Each segment is an action the user takes or a state they
-  toggle. Keep the internal mechanism (function calls, uncleared state, leaked
-  subscriptions, timeouts) **out** of this field — that is root cause and goes in
-  `facets`/`evidence`, not here.
+- `journey` — a string containing the same complete manual reproduction recipe
+  as the **Steps to reproduce** section: prerequisites, numbered user actions,
+  exact inputs, relevant timing, and expected/observed results. Preserve line
+  breaks as `\n` escapes in valid JSON; do not compact the steps into an
+  arrow-separated summary or change this field to an array. Include labeled
+  recipes for separate facets and distinguish verified results from reported
+  or unverified outcomes. Keep the internal mechanism (function calls, uncleared
+  state, leaked subscriptions, timeouts) in `facets`/`evidence`.
 - `evidence` — what you observed live (snapshot reference, response, or log
   excerpt), plus any root-cause leads you noticed while reproducing (hypotheses
   only — you do not fix).
@@ -595,8 +629,8 @@ Field meanings:
     Text-only CLI output is not a reason to skip recording.
   - Do not substitute a video of test output or a made-up demonstration.
 
-Keep the prose before the block terse — the one exception is the full test
-source, which you paste in full. You produce the live-confirmed reproduction +
+Keep other prose terse, but include the full manual reproduction recipe and
+the full test source. You produce the live-confirmed reproduction +
 the test; the fix step takes it from here. You take no further
 action — no fix, no merge, no push.
 

@@ -78,11 +78,17 @@ with `git worktree remove <path>` when done.
    `.omnigent/repro-handoff.json` as soon as the verdict is known, updating it
    as test and recording evidence lands so an interrupted final response does
    not lose a completed reproduction.
-6. Emits a single fenced ```json block (the machine-readable handoff) whose
+6. Presents a **Steps to reproduce** section with prerequisites, concrete
+   numbered actions, exact inputs, relevant waits/reloads, and expected versus
+   observed results at the step where each symptom appears. Verified results
+   are distinguished from reported or unverified outcomes so a reader can
+   repeat the steps manually without opening the test or recording.
+7. Emits a single fenced ```json block (the machine-readable handoff) whose
    `verdict` is exactly one of `reproduced` / `not_reproduced` / `already_fixed`
    / `needs_more_info`, alongside the per-facet breakdown (each facet stamped
    with its `surface`), test path, recordings list, session id, journey, and
-   evidence. Parse `verdict` from that block to label the issue.
+   evidence. The `journey` string preserves the full manual recipe with escaped
+   newlines. Parse `verdict` from that block to label the issue.
 
 It does **not** fix the bug, merge, or push — it produces a live-confirmed
 reproduction plus the test and hands off. The authored test lands in your working
