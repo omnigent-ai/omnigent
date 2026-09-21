@@ -7,7 +7,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { QueuedMessage } from "@/store/chatStore";
-import { QueuedMessagesStrip } from "./QueuedMessagesStrip";
+import { QueuedMessagesStrip, queuedMessageCollisionDetection } from "./QueuedMessagesStrip";
 
 const msg = (queueId: string, text: string): QueuedMessage => ({
   queueId,
@@ -284,6 +284,28 @@ describe("QueuedMessagesStrip", () => {
     expect(handles).toHaveLength(2);
     expect(handles[0]).toHaveAttribute("tabindex", "0");
     expect(handles[0]).toHaveAttribute("aria-describedby");
+  });
+
+  it("does not collide pointer drags abandoned outside queued rows", () => {
+    const rowRect = {
+      x: 0,
+      y: 0,
+      top: 0,
+      right: 300,
+      bottom: 24,
+      left: 0,
+      width: 300,
+      height: 24,
+    };
+    const args = {
+      active: { id: "q_1" },
+      collisionRect: rowRect,
+      droppableContainers: [{ id: "q_2" }],
+      droppableRects: new Map([["q_2", rowRect]]),
+      pointerCoordinates: { x: 500, y: 500 },
+    } as unknown as Parameters<typeof queuedMessageCollisionDetection>[0];
+
+    expect(queuedMessageCollisionDetection(args)).toEqual([]);
   });
 
   it("calls onReorder after moving a queued message with the keyboard", async () => {

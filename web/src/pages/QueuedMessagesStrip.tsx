@@ -1,9 +1,11 @@
 import {
   closestCenter,
   DndContext,
+  type CollisionDetection,
   type DragEndEvent,
   KeyboardSensor,
   MouseSensor,
+  pointerWithin,
   TouchSensor,
   useDraggable,
   useDroppable,
@@ -32,6 +34,9 @@ const ACTION_BUTTON_CLASS =
   "shrink-0 text-muted-foreground transition-colors hover:text-foreground focus-visible:text-foreground max-md:size-11";
 
 const ACTION_ICON_CLASS = "size-3.5 max-md:size-4";
+
+export const queuedMessageCollisionDetection: CollisionDetection = (args) =>
+  args.pointerCoordinates ? pointerWithin(args) : closestCenter(args);
 
 interface QueuedMessagesStripProps {
   /** Messages waiting to be flushed, in FIFO order (head first). */
@@ -285,7 +290,7 @@ export function QueuedMessagesStrip({
         ) : (
           <DndContext
             sensors={sensors}
-            collisionDetection={closestCenter}
+            collisionDetection={queuedMessageCollisionDetection}
             onDragEnd={handleDragEnd}
           >
             {rows}

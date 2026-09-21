@@ -91,16 +91,50 @@ describe("SubagentTaskIndicator", () => {
         title: "Review failure",
       }),
     ]);
-    renderIndicator("conv-1", "/c/conv-1?file=README.md&debug=1");
+    renderIndicator(
+      "conv-1",
+      "/c/conv-1?file=README.md&diff=1&comment=c1&view=changed&message=msg-1&debug=1",
+    );
     fireEvent.click(screen.getByTestId("subagent-task-pill"));
 
-    expect(screen.getByRole("status", { name: "Working" })).toBeInTheDocument();
-    expect(screen.getByRole("status", { name: "Needs response" })).toBeInTheDocument();
-    expect(screen.getByRole("status", { name: "Failed" })).toBeInTheDocument();
-    expect(screen.getByRole("link", { name: "Open Investigate auth sub-agent" })).toHaveAttribute(
-      "href",
-      "/c/working?debug=1",
+    const workingStatus = screen
+      .getAllByRole("status")
+      .find((status) => status.textContent === "Working");
+    expect(workingStatus).toBeDefined();
+    expect(workingStatus).toHaveTextContent("Working");
+    expect(workingStatus?.querySelector('[aria-hidden="true"]')).toBeInTheDocument();
+    expect(
+      screen.getAllByRole("status").some((status) => status.textContent === "Needs response"),
+    ).toBe(true);
+    expect(screen.getAllByRole("status").some((status) => status.textContent === "Failed")).toBe(
+      true,
     );
+    expect(
+      screen.getByRole("link", { name: /Investigate auth.*Working.*researcher/ }),
+    ).toHaveAttribute("href", "/c/working?debug=1");
+  });
+
+  it("renders disconnected sub-agents as a quiet non-destructive state", () => {
+    setChildren([
+      child({
+        id: "disconnected",
+        current_task_status: "failed",
+        last_task_error: { code: "runner_disconnected", message: "Runner tunnel dropped" },
+      }),
+    ]);
+    renderIndicator();
+
+    const pill = screen.getByTestId("subagent-task-pill");
+    expect(pill).toHaveAttribute("data-state", "quiet");
+    expect(pill).not.toHaveClass("text-destructive", "text-warning");
+    expect(pill).toHaveAccessibleName("1 sub-agent: 1 disconnected");
+
+    fireEvent.click(pill);
+    const disconnectedStatus = screen
+      .getAllByRole("status")
+      .find((status) => status.textContent === "Disconnected");
+    expect(disconnectedStatus).toHaveClass("text-muted-foreground");
+    expect(screen.getByRole("link", { name: /Sub-agent.*Disconnected/ })).toBeInTheDocument();
   });
 
   it("uses the parked trigger treatment when no child has an error", () => {

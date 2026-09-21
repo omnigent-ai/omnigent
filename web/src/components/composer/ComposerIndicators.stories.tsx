@@ -3,7 +3,6 @@ import { userEvent, within } from "storybook/test";
 
 import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSessions";
 import { StoryQueryRouter } from "@/storybook/StoryProviders";
-import { ComposerContextRing } from "./ComposerContextRing";
 import { SubagentTaskIndicator } from "./SubagentTaskIndicator";
 
 const conversationId = "conversation-story";
@@ -79,23 +78,4 @@ export const SubagentStatesAndNavigation: Story = {
   ],
   render: () => <SubagentTaskIndicator conversationId={conversationId} />,
   play: ({ canvasElement }) => openIndicator(canvasElement, "subagent-task-pill"),
-};
-
-export const ContextRingCompact: Story = {
-  render: () => (
-    <div className="flex items-center rounded-lg border bg-card px-2 py-1.5">
-      <ComposerContextRing contextWindow={200_000} tokensUsed={83_400} />
-    </div>
-  ),
-};
-
-export const ContextRingNarrow: Story = {
-  render: () => (
-    <div
-      data-labels="collapsed"
-      className="group/composer-workspace flex w-20 items-center justify-end overflow-hidden rounded-lg border bg-card px-2 py-1.5"
-    >
-      <ComposerContextRing contextWindow={200_000} tokensUsed={191_000} />
-    </div>
-  ),
 };

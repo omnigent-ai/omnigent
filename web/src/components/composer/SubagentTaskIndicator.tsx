@@ -5,6 +5,7 @@ import { Button } from "@/components/ui/button";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { useChildSessions, type ChildSessionInfo } from "@/hooks/useChildSessions";
 import { Link, useLocation } from "@/lib/routing";
+import { sessionNavigationSearch } from "@/lib/sessionNavigation";
 import { cn } from "@/lib/utils";
 import { childStatus } from "@/shell/subagentStatus";
 
@@ -15,7 +16,7 @@ import { childStatus } from "@/shell/subagentStatus";
  * counts read as one family (background shells + delegated sub-agents).
  */
 
-type IndicatorState = "active" | "parked" | "error";
+type IndicatorState = "active" | "parked" | "quiet" | "error";
 
 interface IndicatorChild {
   child: ChildSessionInfo;
@@ -41,7 +42,10 @@ function indicatorChild(child: ChildSessionInfo): IndicatorChild | null {
   if (status.activity === "awaiting") {
     return { child, state: "parked", statusLabel: status.label };
   }
-  if (status.activity === "failed" || status.activity === "disconnected") {
+  if (status.activity === "disconnected") {
+    return { child, state: "quiet", statusLabel: status.label };
+  }
+  if (status.activity === "failed") {
     return { child, state: "error", statusLabel: status.label };
   }
   return null;
@@ -50,30 +54,27 @@ function indicatorChild(child: ChildSessionInfo): IndicatorChild | null {
 function statusSummary(items: IndicatorChild[]): string {
   const active = items.filter((item) => item.state === "active").length;
   const parked = items.filter((item) => item.state === "parked").length;
+  const quiet = items.filter((item) => item.state === "quiet").length;
   const errors = items.filter((item) => item.state === "error").length;
   const total = items.length;
   const parts = [
     active > 0 ? `${active} active` : null,
     parked > 0 ? `${parked} awaiting input` : null,
+    quiet > 0 ? `${quiet} disconnected` : null,
     errors > 0 ? `${errors} need${errors === 1 ? "s" : ""} attention` : null,
   ].filter(Boolean);
   return `${total} sub-agent${total === 1 ? "" : "s"}: ${parts.join(", ")}`;
 }
 
-function linkSearch(search: string): string {
-  const params = new URLSearchParams(search);
-  for (const key of ["file", "diff", "comment", "view"]) params.delete(key);
-  const next = params.toString();
-  return next ? `?${next}` : "";
-}
-
 function SubagentStateIndicator({ state, label }: { state: IndicatorState; label: string }) {
   if (state === "active") {
     return (
-      <span className="flex shrink-0 items-center gap-1.5 text-xs text-muted-foreground">
+      <span
+        role="status"
+        className="flex shrink-0 items-center gap-1.5 text-xs text-muted-foreground"
+      >
         <span
-          role="status"
-          aria-label={label}
+          aria-hidden="true"
           className="size-3.5 shrink-0 animate-spin rounded-full motion-reduce:animate-none"
           style={{
             animationDuration: "1.6s",
@@ -83,7 +84,7 @@ function SubagentStateIndicator({ state, label }: { state: IndicatorState; label
             mask: "radial-gradient(farthest-side, transparent calc(100% - 2px), #000 calc(100% - 2px))",
           }}
         />
-        <span aria-hidden="true">{label}</span>
+        {label}
       </span>
     );
   }
@@ -91,10 +92,13 @@ function SubagentStateIndicator({ state, label }: { state: IndicatorState; label
   return (
     <span
       role="status"
-      aria-label={label}
       className={cn(
         "flex shrink-0 items-center gap-1.5 text-xs",
-        state === "parked" ? "text-warning" : "text-destructive",
+        state === "parked"
+          ? "text-warning"
+          : state === "error"
+            ? "text-destructive"
+            : "text-muted-foreground",
       )}
     >
       <span className="size-1.5 rounded-full bg-current" aria-hidden="true" />
@@ -110,7 +114,7 @@ function SubagentNavigationRow({
   item: IndicatorChild;
   onNavigate: (event: MouseEvent<HTMLAnchorElement>) => void;
 }) {
-  const search = linkSearch(useLocation().search);
+  const search = sessionNavigationSearch(useLocation().search);
   const label = subagentLabel(child);
   const tool = child.tool?.trim();
   const showTool = !!tool && tool !== label;
@@ -120,7 +124,6 @@ function SubagentNavigationRow({
       <Link
         to={{ pathname: `/c/${child.id}`, search }}
         componentId="composer-subagent-indicator-row"
-        aria-label={`Open ${label} sub-agent`}
         onClick={onNavigate}
         className="flex items-start gap-2 rounded-lg px-1 py-2 hover:bg-accent/60 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
       >
@@ -188,7 +191,9 @@ export function SubagentTaskIndicator({ conversationId }: { conversationId: stri
     ? "error"
     : items.some((item) => item.state === "parked")
       ? "parked"
-      : "active";
+      : items.some((item) => item.state === "active")
+        ? "active"
+        : "quiet";
 
   const handleNavigate = (event: MouseEvent<HTMLAnchorElement>) => {
     if (!event.metaKey && !event.ctrlKey && !event.shiftKey && !event.altKey) setOpen(false);

@@ -59,21 +59,3 @@ export const LongBacklog: Story = {
     onReorder: () => undefined,
   },
 };
-
-export const Mobile: Story = {
-  args: {
-    messages: [
-      message("queue-1", "Make the queued controls comfortable to tap on a narrow screen."),
-      message("queue-2", "Keep the message preview readable beside the actions."),
-    ],
-    onSteer: () => undefined,
-    onReorder: () => undefined,
-  },
-  decorators: [
-    (Story) => (
-      <div className="flex min-h-64 w-[390px] items-end rounded-2xl bg-muted/30 px-2 pb-8">
-        <Story />
-      </div>
-    ),
-  ],
-};
