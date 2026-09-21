@@ -10,7 +10,11 @@ from pathlib import Path
 from issue_prioritization.areas import AreaCatalog
 from issue_prioritization.artifacts import RankedIssue, rank_issues
 from issue_prioritization.bronze import BronzeIssue
-from issue_prioritization.classification import Classification, Classifier
+from issue_prioritization.classification import (
+    MAX_BUG_REVIEW_CHARACTERS,
+    Classification,
+    Classifier,
+)
 from issue_prioritization.comments import build_triage_comment
 from issue_prioritization.config import ScoringConfig
 from issue_prioritization.duplicates import rank_candidates
@@ -309,6 +313,10 @@ def main() -> None:
         _write_skip_artifact(args.output_dir, args.run_id, args.issue_number, "issue_not_open")
         print(f"Skipping #{args.issue_number}: issue is not open")
         return
+    if args.review_bugs and len(issue.title) + len(issue.body) > MAX_BUG_REVIEW_CHARACTERS:
+        _write_skip_artifact(args.output_dir, args.run_id, issue.number, "bug_review_too_large")
+        print(f"Skipping #{issue.number}: report exceeds the review limit; manual review required")
+        return
     config = ScoringConfig.default()
     areas = AreaCatalog.from_json(args.areas)
     manifest = LabelManifest.from_json(args.label_manifest)
@@ -392,6 +400,11 @@ def main() -> None:
             ).apply_with_plans(run)
             if len(applied_plans) != 1:
                 raise RuntimeError("targeted apply must produce exactly one mutation plan")
+            if (
+                applied_plans[0].close_as_non_actionable
+                or "non_actionable_stale_assessment" in applied_plans[0].blocked
+            ):
+                intake_plan = None
             if intake_plan is not None:
                 _apply_intake(client, issue.number, intake_plan)
             labels_after = client.issue_labels(issue.number)

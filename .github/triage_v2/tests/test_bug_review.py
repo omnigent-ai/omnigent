@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import replace
 from datetime import UTC, datetime
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import pytest
 
@@ -23,6 +23,7 @@ from issue_prioritization.comments import (
 from issue_prioritization.config import ScoringConfig
 from issue_prioritization.event import prioritize_issue, write_event_artifacts
 from issue_prioritization.github import GitHubClient, GitHubMutationSink
+from issue_prioritization.intake import IntakePlan
 from issue_prioritization.labels import LabelManifest
 from issue_prioritization.pipeline import PipelineMode
 
@@ -440,11 +441,22 @@ def test_edit_before_closure_skips_the_stale_assessment(when):
         assert not client.events
 
 
-@pytest.mark.parametrize("when", ["before", "after"])
-def test_event_defers_intake_when_closure_assessment_is_stale(monkeypatch, tmp_path, when):
+@pytest.mark.parametrize(
+    "when,exemption",
+    [
+        ("before", None),
+        ("after", None),
+        *[("label_removed", x) for x in ("security", "duplicate", "Pinned")],
+    ],
+)
+def test_event_defers_intake_when_closure_assessment_is_stale(
+    monkeypatch, tmp_path, when, exemption
+):
     class EventClient(Client):
         def __init__(self):
             super().__init__(labels=("Bug", "needs-triage"))
+            if exemption:
+                self.report = replace(self.report, labels=(*self.report.labels, exemption))
             self.reads = 0
 
         def open_issue(self, number):
@@ -455,16 +467,51 @@ def test_event_defers_intake_when_closure_assessment_is_stale(monkeypatch, tmp_p
         def issue_corpus(self):
             return ()
 
+        def issue_data(self, number):
+            return {"state": "open", "labels": [{"name": x} for x in self.report.labels]}
+
+        def assignee_load(self):
+            return {}
+
+        def issue_labels(self, number):
+            self.report = replace(
+                self.report, labels=tuple(x for x in self.report.labels if x != exemption)
+            )
+            return self.report.labels
+
     client = EventClient()
     query = Mock(return_value=json.dumps(response("non_actionable")))
     classifier = PromptClassifier(query, AreaCatalog({}, {}), review_bugs=True)
-    intake = Mock()
+    intake = Mock(
+        return_value=IntakePlan(
+            ("triaged",), ("needs-triage",), "owner", "none", None, (), 0, "", False
+        )
+    )
+    apply_intake = Mock()
+    monkeypatch.setattr(event, "plan_intake", intake)
+    monkeypatch.setattr(event, "_apply_intake", apply_intake)
+    monkeypatch.setattr(event, "read_maintainers", lambda _: ("owner",))
+
+    _run_event(monkeypatch, tmp_path, client, classifier)
+
+    query.assert_called_once()
+    assert intake.call_count == bool(exemption)
+    apply_intake.assert_not_called()
+    assert "close" not in client.events
+    assert "needs-triage" in client.report.labels
+    artifact = json.loads((tmp_path / "event.json").read_text())
+    assert artifact["status"] == "skipped_stale"
+    assert not artifact["mutation"]["close_as_non_actionable"]
+    assert artifact["intake"] is None
+
+
+def _run_event(monkeypatch, tmp_path, client, classifier, *, mode="apply"):
+    factory = Mock(return_value=classifier)
     monkeypatch.setenv("GITHUB_TOKEN", "fake")
     monkeypatch.setattr(event, "GitHubClient", lambda *args: client)
-    monkeypatch.setattr(event, "serving_endpoint_classifier", lambda *args, **kwargs: classifier)
+    monkeypatch.setattr(event, "serving_endpoint_classifier", factory)
     monkeypatch.setattr(event.AreaCatalog, "from_json", lambda _: AreaCatalog({}, {}))
     monkeypatch.setattr(event.LabelManifest, "from_json", lambda _: LabelManifest(()))
-    monkeypatch.setattr(event, "plan_intake", intake)
     monkeypatch.setattr(
         "sys.argv",
         [
@@ -479,20 +526,40 @@ def test_event_defers_intake_when_closure_assessment_is_stale(monkeypatch, tmp_p
             "--run-id=test",
             "--review-bugs",
             "--intake",
-            "--mode=apply",
+            f"--mode={mode}",
         ],
     )
 
     event.main()
+    return factory
 
-    query.assert_called_once()
-    intake.assert_not_called()
-    assert "close" not in client.events
-    assert "needs-triage" in client.report.labels
+
+@pytest.mark.parametrize("mode", ["dry_run", "apply"])
+def test_event_skips_oversized_author_history_without_partial_review(monkeypatch, tmp_path, mode):
+    payload = {
+        "number": 7,
+        "title": "Session failure",
+        "body": "Source detail. " * 3000,
+        "user": {"login": "author"},
+        "state": "open",
+        "created_at": NOW.isoformat(),
+    }
+    comments = [
+        {"user": {"login": "author"}, "body": "More detail. " * 3000},
+        {"user": {"login": "author"}, "body": "Log detail. " * 3000 + BODY},
+    ]
+    transport = Mock(side_effect=[payload, comments])
+    client = GitHubClient("fake", "org/repo", transport)
+    factory = _run_event(monkeypatch, tmp_path, client, Mock(), mode=mode)
+    factory.assert_not_called()
+    assert transport.call_args_list == [
+        call("GET", "/issues/7", None),
+        call("GET", "/issues/7/comments?per_page=100&page=1", None),
+    ]
     artifact = json.loads((tmp_path / "event.json").read_text())
-    assert artifact["status"] == "skipped_stale"
-    assert not artifact["mutation"]["close_as_non_actionable"]
-    assert artifact["intake"] is None
+    assert artifact["status"] == "skipped"
+    assert artifact["reason"] == "bug_review_too_large"
+    assert artifact["issue_number"] == 7
 
 
 def test_stale_issue_does_not_stop_later_issues():

@@ -137,7 +137,9 @@ The managed triage comment is excluded from author evidence, including when the
 triage account is the author; genuine follow-ups still invalidate stale decisions.
 A true, unclear, or missing reproduction assessment prevents immediate closure.
 Security/duplicate/pinned issues remain exempt. Reports over 100,000 characters
-are skipped for manual review.
+(title, body, and all author follow-ups) produce a `skipped` event with reason
+`bug_review_too_large` for manual review, without model calls or issue changes.
+Author evidence is never truncated to fit the review limit.
 If a reproduction quote cannot be verified, omit the rewritten steps and keep
 the valid assessment and summary; closure quotes still require an exact match.
 Responses must contain one complete JSON object, optionally fenced; trailing
@@ -145,6 +147,8 @@ commas are repaired, but surrounding prose or additional objects are rejected.
 If an edit or author reply aborts closure after its comment is posted, the comment
 is replaced with a skipped-closure notice. The event records `skipped_stale` and
 defers intake because assignment and duplicate decisions also need fresh evidence.
+Intake is also suppressed when the applied plan closes the issue or skips a stale
+assessment, even if the initial plan allowed intake before live labels changed.
 Existing `needs-triage` labels remain; include `--intake --maintainers .github/MAINTAINER`
 on a fresh apply run to complete new-issue intake.
 Immediate closures remove `needs-info` and ask reporters to open a new issue if
