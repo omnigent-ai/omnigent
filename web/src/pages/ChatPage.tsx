@@ -2598,6 +2598,10 @@ function ComposerImpl(
     workspace: composerWorkspace ?? null,
     creationBranch: composerSession?.gitBranch ?? composerBranch ?? null,
   });
+  const composerQueuedMessages = queuedMessages.filter(
+    (message) => message.conversationId === conversationId,
+  );
+  const hasDockedComposerTray = composerQueuedMessages.length > 0 || Boolean(subAgentLabel);
   const composerContextWindow = useChatStore((s) => s.contextWindow);
   const composerTokensUsed = useChatStore((s) => s.tokensUsed);
   const openComposerGithubTab = useOpenGithubTab();
@@ -3633,7 +3637,7 @@ function ComposerImpl(
             drains FIFO on idle. Scope to this conversation so a queue held
             elsewhere never leaks in. */}
         <QueuedMessagesStrip
-          messages={queuedMessages.filter((m) => m.conversationId === conversationId)}
+          messages={composerQueuedMessages}
           onDelete={dequeueMessage}
           onEdit={(queueId) => {
             // Pull the queued message back into the composer for editing:
@@ -3660,7 +3664,10 @@ function ComposerImpl(
             SubagentComposerTray). Truthy (not just non-null) so an empty
             label never peeks a nameless tray. */}
         {subAgentLabel ? <SubagentComposerTray label={subAgentLabel} /> : null}
-        <ComposerWorkspaceBar data-testid="composer-workspace-controls">
+        <ComposerWorkspaceBar
+          data-testid="composer-workspace-controls"
+          className={hasDockedComposerTray ? "rounded-t-none" : undefined}
+        >
           <ComposerPrLink
             state={composerGit.githubState}
             prCount={composerGit.prCount}

@@ -165,9 +165,19 @@ def test_queued_strip_attaches_to_composer(
                         return [style.backgroundColor, style.backgroundImage];
                     }"""
                 )
+                bar_top_radii = bar.first.evaluate(
+                    """element => {
+                        const style = getComputedStyle(element);
+                        return [style.borderTopLeftRadius, style.borderTopRightRadius];
+                    }"""
+                )
                 assert strip_surface == bar_surface, (
                     "light-theme queued rows and workspace metadata must share "
                     f"one surface: strip={strip_surface}, bar={bar_surface}"
+                )
+                assert bar_top_radii == ["0px", "0px"], (
+                    "the docked queue owns the outer rounded top; the workspace bar "
+                    f"must not draw an inner arc: {bar_top_radii}"
                 )
                 assert abs(strip_list_box["x"] - (bar_box["x"] + bar_insets["left"])) <= _EPSILON
                 assert (
