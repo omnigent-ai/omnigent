@@ -2,10 +2,6 @@
 // hooks and the heavy MonacoDiffViewer are mocked; IntersectionObserver (absent
 // in jsdom) is stubbed to fire immediately so lazy sections mount.
 
-import { useState } from "react";
-import { MemoryRouter } from "react-router-dom";
-import { FileViewPreferencesProvider, useFileViewPreferences } from "./FileViewPreferencesContext";
-import { readFileViewPreferences } from "@/lib/fileViewPreferences";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -101,9 +97,7 @@ function renderPanel() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(<GithubPanel conversationId="conv_1" />, {
     wrapper: ({ children }) => (
-      <QueryClientProvider client={client}>
-        <MemoryRouter>{children}</MemoryRouter>
-      </QueryClientProvider>
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
     ),
   });
 }
@@ -311,60 +305,12 @@ describe("GithubPanel", () => {
     expect(screen.getAllByRole("button", { name: /hello\.py/ })).toHaveLength(2);
   });
 
-  it("toggles the diff layout when mounted without a shared preferences provider", async () => {
+  it("toggles the diff layout between unified and split", async () => {
     renderChanges();
     await screen.findAllByTestId("diff");
     // Defaults to unified, so the toggle offers split; clicking flips its label.
     fireEvent.click(screen.getByRole("button", { name: "Switch to split view" }));
     expect(screen.getByRole("button", { name: "Switch to unified view" })).toBeInTheDocument();
-  });
-
-  it("shares layout changes across panel switches without overwriting other preferences", () => {
-    function ViewerPreferences() {
-      const { diffLayout, setDiffLayout, wrapLines, setWrapLines } = useFileViewPreferences();
-      return (
-        <>
-          <output data-testid="viewer-layout">{diffLayout}</output>
-          <button type="button" onClick={() => setWrapLines(!wrapLines)}>
-            Toggle wrap
-          </button>
-          <button type="button" onClick={() => setDiffLayout("unified")}>
-            Choose unified
-          </button>
-        </>
-      );
-    }
-    function PanelSwitcher() {
-      const [github, setGithub] = useState(true);
-      return (
-        <>
-          <button type="button" onClick={() => setGithub(!github)}>
-            Switch panel
-          </button>
-          {github ? <GithubPanel conversationId="conv_1" /> : <ViewerPreferences />}
-        </>
-      );
-    }
-    render(
-      <QueryClientProvider client={new QueryClient()}>
-        <MemoryRouter>
-          <FileViewPreferencesProvider>
-            <PanelSwitcher />
-          </FileViewPreferencesProvider>
-        </MemoryRouter>
-      </QueryClientProvider>,
-    );
-    fireEvent.mouseDown(screen.getByRole("tab", { name: "Changes" }));
-    fireEvent.click(screen.getByRole("button", { name: "Switch to split view" }));
-    fireEvent.click(screen.getByRole("button", { name: "Switch panel" }));
-    expect(screen.getByTestId("viewer-layout")).toHaveTextContent("split");
-    fireEvent.click(screen.getByRole("button", { name: "Toggle wrap" }));
-    expect(readFileViewPreferences()).toMatchObject({ diffLayout: "split", wrapLines: true });
-    fireEvent.click(screen.getByRole("button", { name: "Choose unified" }));
-    fireEvent.click(screen.getByRole("button", { name: "Switch panel" }));
-    fireEvent.mouseDown(screen.getByRole("tab", { name: "Changes" }));
-    expect(screen.getByRole("button", { name: "Switch to split view" })).toBeInTheDocument();
-    expect(readFileViewPreferences()).toMatchObject({ diffLayout: "unified", wrapLines: true });
   });
 
   it("groups the sidebar into a folder tree, compacting single-child chains", async () => {

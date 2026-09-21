@@ -7,8 +7,10 @@
 // refresh. They're stored under a single localStorage key with no
 // per-conversation keying, mirroring that global-toggle semantics.
 //
-// FileViewPreferencesProvider shares live React state between responsive
-// viewers; these helpers seed it on mount and snapshot it on change.
+// FileViewer keeps the live React state as the source of truth for the UI;
+// these helpers only seed that state on mount and snapshot it on change, so
+// a refresh (or a brand-new conversation) starts from the user's last
+// choice instead of the hardcoded defaults.
 
 export interface FileViewPreferences {
   /** Whether the diff view is the preferred mode for changed files. */

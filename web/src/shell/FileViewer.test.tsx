@@ -17,7 +17,7 @@
 import { useMemo } from "react";
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { MemoryRouter, useLocation, useNavigate, useSearchParams } from "react-router-dom";
+import { MemoryRouter, useSearchParams } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Comment } from "@/hooks/useComments";
 import { isFilePositionPending } from "./filePositionState";
@@ -180,10 +180,9 @@ vi.mock("@/store/chatStore", () => ({
 // ── Test helpers ──────────────────────────────────────────────────────────────
 
 import { useComments } from "@/hooks/useComments";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useOptionalCommentSender } from "@/hooks/CommentSenderContext";
 import { useFileDiff } from "@/hooks/useFileDiff";
-import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
-import { FileViewPreferencesProvider } from "./FileViewPreferencesContext";
 import { getSeenCommentIds } from "@/hooks/useSeenComments";
 import { useWorkspaceChangedFiles } from "@/hooks/useWorkspaceChangedFiles";
 import { classifyAndRemapComments, FileViewer } from "./FileViewer";
@@ -589,343 +588,69 @@ describe("FileViewer prev/next navigation order", () => {
   });
 });
 
-describe("FileViewer shared draft protection", () => {
-  function DiffNavigation() {
-    const navigate = useNavigate();
-    return (
-      <button type="button" onClick={() => navigate("/?file=notes.md&diff=1")}>
-        Open diff URL
-      </button>
-    );
-  }
-
-  function renderResponsiveViewers() {
-    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
-    writeFileViewPreferences({
-      diffActive: false,
-      diffLayout: "unified",
-      hideWhitespace: false,
-      wrapLines: false,
-      previewableViewMode: "editor",
-    });
-    const queryClient = new QueryClient();
-    function Viewers() {
-      return (
-        <QueryClientProvider client={queryClient}>
-          <MemoryRouter initialEntries={["/?file=notes.md"]}>
-            <LocationDisplay />
-            <DiffNavigation />
-            <FileViewPreferencesProvider>
-              {(["desktop", "mobile"] as const).map((viewport) => (
-                <div key={viewport} data-testid={`${viewport}-viewer`}>
-                  <FileViewer
-                    viewport={viewport}
-                    frameless
-                    open
-                    conversationId="conv_1"
-                    path="notes.md"
-                    onClose={vi.fn()}
-                  />
-                </div>
-              ))}
-            </FileViewPreferencesProvider>
-          </MemoryRouter>
-        </QueryClientProvider>
-      );
-    }
-    const result = render(<Viewers />);
-    return {
-      desktop: within(screen.getByTestId("desktop-viewer")),
-      mobile: within(screen.getByTestId("mobile-viewer")),
-      resize: (mobile: boolean) => {
-        vi.mocked(useIsMobileViewport).mockReturnValue(mobile);
-        result.rerender(<Viewers />);
-      },
-    };
-  }
-
+describe("FileViewer URL sync — diff param", () => {
   it.each(
-    [false, true].flatMap((startMobile) =>
-      ["Source", "Preview", "Diff", "Diff URL"].map((mode) => ({ startMobile, mode })),
+    [false, true].flatMap((isMobile) =>
+      ["file1.py", "notes.md"].map((path) => ({ isMobile, path })),
     ),
   )(
-    "protects the hidden draft when choosing $mode (startMobile=$startMobile)",
-    async ({ startMobile, mode }) => {
+    "only the active viewer writes the $path URL through resizing (mobile=$isMobile)",
+    async ({ isMobile, path }) => {
       await vi.mocked(useWorkspaceChangedFiles).withImplementation(
         () =>
           ({
-            data: {
-              available: true,
-              data: [{ path: "notes.md", name: "notes.md", status: "modified", bytes: 10 }],
-            },
+            data: { available: true, data: [{ path, name: path, status: "modified", bytes: 10 }] },
           }) as ReturnType<typeof useWorkspaceChangedFiles>,
         async () => {
-          vi.mocked(useIsMobileViewport).mockReturnValue(startMobile);
-          const { desktop, mobile, resize } = renderResponsiveViewers();
-          const original = startMobile ? mobile : desktop;
-          const active = startMobile ? desktop : mobile;
-          const draft = original.getByLabelText("Draft text");
-          fireEvent.change(draft, { target: { value: "Unsaved offline draft" } });
-          resize(!startMobile);
-          const requestMode = () => {
-            if (mode === "Diff URL")
-              fireEvent.click(screen.getByRole("button", { name: "Open diff URL" }));
-            else if (mode === "Diff")
-              fireEvent.click(active.getByRole("button", { name: "Show diff" }));
-            else {
-              fireEvent.pointerDown(active.getByRole("button", { name: /^View mode/ }), {
-                button: 0,
-              });
-              fireEvent.click(screen.getByRole("menuitem", { name: mode }));
-            }
-          };
-          requestMode();
-          expect(screen.getAllByRole("dialog", { name: "Unsaved changes" })).toHaveLength(1);
-          expect(original.getByLabelText("Draft text")).toBe(draft);
-          expect(draft).toHaveValue("Unsaved offline draft");
-          if (mode === "Diff URL")
-            expect(screen.getByTestId("url-params")).toHaveTextContent("diff=1");
-          fireEvent.click(screen.getByRole("button", { name: "Keep editing" }));
-          expect(original.getByLabelText("Draft text")).toBe(draft);
-          expect(draft).toHaveValue("Unsaved offline draft");
-          expect(screen.getByTestId("url-params")).not.toHaveTextContent("diff=");
-          requestMode();
-          expect(screen.getByRole("dialog", { name: "Unsaved changes" })).toBeInTheDocument();
-          fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
-          expect(screen.queryByRole("dialog", { name: "Unsaved changes" })).toBeNull();
-          if (mode.startsWith("Diff")) await screen.findAllByTestId("diff-viewer");
-          for (const viewer of [desktop, mobile]) {
-            expect(viewer.queryByRole("textbox", { name: "Draft text" })).toBeNull();
-            if (mode.startsWith("Diff"))
-              expect(viewer.getByTestId("diff-viewer")).toBeInTheDocument();
-            else
-              expect(viewer.getByTestId("code-viewer")).toHaveAttribute(
-                "data-view-mode",
-                mode.toLowerCase(),
-              );
-          }
-        },
-      );
-    },
-  );
-
-  it("keeps guarding a draft when the confirmed preference leaves its editor mounted", () => {
-    // An unchanged file stays in Edit even when the shared Diff preference changes.
-    const { desktop, mobile, resize } = renderResponsiveViewers();
-    const draft = desktop.getByRole("textbox", { name: "Draft text" });
-    fireEvent.change(draft, { target: { value: "Draft in unchanged file" } });
-    resize(true);
-    fireEvent.click(screen.getByRole("button", { name: "Open diff URL" }));
-    fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
-    expect(desktop.getByRole("textbox", { name: "Draft text" })).toBe(draft);
-    expect(draft).toHaveValue("Draft in unchanged file");
-    fireEvent.pointerDown(mobile.getByRole("button", { name: /^View mode/ }), { button: 0 });
-    fireEvent.click(screen.getByRole("menuitem", { name: "Source" }));
-    expect(screen.getByRole("dialog", { name: "Unsaved changes" })).toBeInTheDocument();
-  });
-
-  it("keeps both drafts on cancel and discards both with one confirmation", () => {
-    const { desktop, mobile, resize } = renderResponsiveViewers();
-    const drafts = [desktop, mobile].map((viewer, index) => {
-      const draft = viewer.getByRole("textbox", { name: "Draft text" });
-      fireEvent.change(draft, { target: { value: `Draft ${index}` } });
-      return draft;
-    });
-    resize(true);
-    const chooseSource = () => {
-      fireEvent.pointerDown(mobile.getByRole("button", { name: /^View mode/ }), { button: 0 });
-      fireEvent.click(screen.getByRole("menuitem", { name: "Source" }));
-    };
-    chooseSource();
-    fireEvent.click(screen.getByRole("button", { name: "Keep editing" }));
-    [desktop, mobile].forEach((viewer, index) => {
-      expect(viewer.getByRole("textbox", { name: "Draft text" })).toBe(drafts[index]);
-      expect(drafts[index]).toHaveValue(`Draft ${index}`);
-    });
-    chooseSource();
-    expect(screen.getAllByRole("dialog", { name: "Unsaved changes" })).toHaveLength(1);
-    fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
-    expect(screen.queryByRole("dialog", { name: "Unsaved changes" })).toBeNull();
-    for (const viewer of [desktop, mobile])
-      expect(viewer.getByTestId("code-viewer")).toHaveAttribute("data-view-mode", "source");
-  });
-});
-
-describe("FileViewer URL sync — diff param", () => {
-  it.each(["file1.py", "notes.md"])(
-    "shares %s diff state between responsive viewers through layout changes",
-    async (path) => {
-      await vi.mocked(useWorkspaceChangedFiles).withImplementation(
-        () =>
-          ({
-            data: {
-              available: true,
-              data: [{ path, bytes: 10, modified_at: null, name: path, status: "modified" }],
-            },
-          }) as ReturnType<typeof useWorkspaceChangedFiles>,
-        async () => {
+          vi.mocked(useIsMobileViewport).mockReturnValue(isMobile);
           useCommentsMock.mockReturnValue(makeCommentsQuery([]));
-          const queryClient = new QueryClient();
-          function ResponsiveViewers() {
+          const client = new QueryClient();
+          function Viewers() {
             return (
-              <QueryClientProvider client={queryClient}>
-                <MemoryRouter initialEntries={[`/?file=${path}&tab=files`]}>
+              <QueryClientProvider client={client}>
+                <MemoryRouter initialEntries={[`/?file=${path}`]}>
                   <LocationDisplay />
-                  <FileViewPreferencesProvider>
-                    <div data-testid="desktop-viewer">
+                  {(["desktop", "mobile"] as const).map((viewport) => (
+                    <div key={viewport} data-testid={viewport}>
                       <FileViewer
-                        viewport="desktop"
-                        frameless
+                        viewport={viewport}
                         open
-                        conversationId="conv_1"
                         path={path}
+                        conversationId="conv_1"
                         onClose={vi.fn()}
                       />
                     </div>
-                    <div data-testid="mobile-viewer">
-                      <FileViewer
-                        viewport="mobile"
-                        open
-                        conversationId="conv_1"
-                        path={path}
-                        onClose={vi.fn()}
-                      />
-                    </div>
-                  </FileViewPreferencesProvider>
+                  ))}
                 </MemoryRouter>
               </QueryClientProvider>
             );
           }
-          const { rerender } = render(<ResponsiveViewers />);
-          const desktop = within(screen.getByTestId("desktop-viewer"));
-          const mobile = within(screen.getByTestId("mobile-viewer"));
-
-          fireEvent.click(desktop.getByRole("button", { name: "Show diff" }));
-          expect(await desktop.findByTestId("diff-viewer")).toBeInTheDocument();
-          expect(await mobile.findByTestId("diff-viewer")).toBeInTheDocument();
-          expect(screen.getByTestId("url-params")).toHaveTextContent(
-            `file=${path}&tab=files&diff=1`,
-          );
-
-          vi.mocked(useIsMobileViewport).mockReturnValue(true);
-          rerender(<ResponsiveViewers />);
+          const { rerender } = render(<Viewers />);
+          const first = within(screen.getByTestId(isMobile ? "mobile" : "desktop"));
+          const second = within(screen.getByTestId(isMobile ? "desktop" : "mobile"));
+          fireEvent.click(first.getByRole("button", { name: "Show diff" }));
+          expect(await first.findByTestId("diff-viewer")).toBeInTheDocument();
+          expect(second.queryByTestId("diff-viewer")).toBeNull();
           expect(screen.getByTestId("url-params")).toHaveTextContent("diff=1");
-          fireEvent.click(mobile.getByRole("button", { name: "Exit diff view" }));
-          expect(desktop.queryByTestId("diff-viewer")).toBeNull();
-          expect(mobile.queryByTestId("diff-viewer")).toBeNull();
-          expect(screen.getByTestId("url-params")).toHaveTextContent(`file=${path}&tab=files`);
-          expect(screen.getByTestId("url-params")).not.toHaveTextContent("diff=");
 
-          vi.mocked(useIsMobileViewport).mockReturnValue(false);
-          rerender(<ResponsiveViewers />);
-          expect(desktop.getByRole("button", { name: "Show diff" })).toBeInTheDocument();
+          // Resizing transfers URL ownership without changing either viewer's mode.
+          vi.mocked(useIsMobileViewport).mockReturnValue(!isMobile);
+          rerender(<Viewers />);
+          expect(screen.getByTestId("url-params")).not.toHaveTextContent("diff=");
+          fireEvent.click(second.getByRole("button", { name: "Show diff" }));
+          expect(await second.findByTestId("diff-viewer")).toBeInTheDocument();
+          expect(screen.getByTestId("url-params")).toHaveTextContent("diff=1");
+          fireEvent.click(second.getByRole("button", { name: "Exit diff view" }));
+          expect(screen.getByTestId("url-params")).not.toHaveTextContent("diff=");
+          expect(first.getByTestId("diff-viewer")).toBeInTheDocument();
+
+          vi.mocked(useIsMobileViewport).mockReturnValue(isMobile);
+          rerender(<Viewers />);
+          expect(screen.getByTestId("url-params")).toHaveTextContent("diff=1");
+          fireEvent.click(first.getByRole("button", { name: "Exit diff view" }));
           expect(screen.getByTestId("url-params")).not.toHaveTextContent("diff=");
         },
       );
-    },
-  );
-
-  it.each(["desktop", "mobile"] as const)(
-    "the hidden %s viewer leaves the diff URL untouched",
-    (viewport) => {
-      useCommentsMock.mockReturnValue(makeCommentsQuery([]));
-      vi.mocked(useIsMobileViewport).mockReturnValue(viewport === "desktop");
-      render(
-        <QueryClientProvider client={new QueryClient()}>
-          <MemoryRouter initialEntries={["/?file=unchanged.md&diff=1"]}>
-            <LocationDisplay />
-            <FileViewer
-              viewport={viewport}
-              open
-              conversationId="conv_1"
-              path="unchanged.md"
-              onClose={vi.fn()}
-            />
-          </MemoryRouter>
-        </QueryClientProvider>,
-      );
-      expect(screen.getByTestId("url-params")).toHaveTextContent("file=unchanged.md&diff=1");
-    },
-  );
-
-  it.each([false, true])(
-    "honors diff history after changing the shared preference (remount=%s)",
-    async (closeBeforeBack) => {
-      useCommentsMock.mockReturnValue(makeCommentsQuery([]));
-      function HistoryNavigation() {
-        const navigate = useNavigate();
-        const location = useLocation();
-        const [params, setParams] = useSearchParams();
-        const path = params.get("file");
-        return (
-          <>
-            <button type="button" onClick={() => navigate("/c/conv_2?file=file1.py")}>
-              Next session
-            </button>
-            <button type="button" onClick={() => setParams({}, { replace: true })}>
-              Close viewer
-            </button>
-            <button
-              type="button"
-              onClick={() => setParams({ file: "file1.py" }, { replace: true })}
-            >
-              Open viewer
-            </button>
-            <button type="button" onClick={() => navigate(-1)}>
-              Back
-            </button>
-            <button type="button" onClick={() => navigate(1)}>
-              Forward
-            </button>
-            <output data-testid="location-path">{location.pathname}</output>
-            {path && (
-              <FileViewer
-                open
-                conversationId={location.pathname.split("/").pop()!}
-                path={path}
-                onClose={vi.fn()}
-              />
-            )}
-          </>
-        );
-      }
-      render(
-        <QueryClientProvider client={new QueryClient()}>
-          <MemoryRouter initialEntries={["/c/conv_1?file=file1.py"]}>
-            <LocationDisplay />
-            <FileViewPreferencesProvider>
-              <HistoryNavigation />
-            </FileViewPreferencesProvider>
-          </MemoryRouter>
-        </QueryClientProvider>,
-      );
-      fireEvent.click(screen.getByRole("button", { name: "Show diff" }));
-      expect(await screen.findByTestId("diff-viewer")).toBeInTheDocument();
-      fireEvent.click(screen.getByRole("button", { name: "Next session" }));
-      // A navigation without an explicit override keeps the shared preference.
-      expect(screen.getByTestId("diff-viewer")).toBeInTheDocument();
-      fireEvent.click(screen.getByRole("button", { name: "Exit diff view" }));
-      expect(screen.queryByTestId("diff-viewer")).toBeNull();
-      if (closeBeforeBack) fireEvent.click(screen.getByRole("button", { name: "Close viewer" }));
-      fireEvent.click(screen.getByRole("button", { name: "Back" }));
-      expect(screen.getByTestId("location-path")).toHaveTextContent("/c/conv_1");
-      expect(await screen.findByTestId("diff-viewer")).toBeInTheDocument();
-      expect(screen.getByTestId("url-params")).toHaveTextContent("diff=1");
-
-      // Keep a Diff entry ahead, then turn it off in the current session.
-      fireEvent.click(screen.getByRole("button", { name: "Forward" }));
-      if (closeBeforeBack) fireEvent.click(screen.getByRole("button", { name: "Open viewer" }));
-      expect(screen.getByTestId("url-params")).toHaveTextContent("diff=1");
-      fireEvent.click(screen.getByRole("button", { name: "Back" }));
-      fireEvent.click(screen.getByRole("button", { name: "Exit diff view" }));
-      expect(screen.getByTestId("url-params")).not.toHaveTextContent("diff=");
-      fireEvent.click(screen.getByRole("button", { name: "Forward" }));
-      expect(screen.getByTestId("location-path")).toHaveTextContent("/c/conv_2");
-      expect(await screen.findByTestId("diff-viewer")).toBeInTheDocument();
-      expect(screen.getByTestId("url-params")).toHaveTextContent("diff=1");
-      // A restored URL must still allow the user to turn Diff off normally.
-      fireEvent.click(screen.getByRole("button", { name: "Exit diff view" }));
-      expect(screen.getByTestId("url-params")).not.toHaveTextContent("diff=");
     },
   );
 

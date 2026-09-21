@@ -198,108 +198,6 @@ def _seed_citation_file(
     )
 
 
-def test_markdown_diff_url_stays_stable_across_responsive_layouts(
-    page: Page, seeded_session: tuple[str, str]
-) -> None:
-    """Hidden responsive viewers must not undo the visible viewer's diff choice."""
-    base_url, session_id = seeded_session
-    path = "src/notes.md"
-    before, after = "# Notes\nBefore\n", "# Notes\nAfter\n"
-    _mock_markdown_files(page, seeded_session, {path: after})
-    environment_url = f"{base_url}/v1/sessions/{session_id}/resources/environments/default"
-    page.route(
-        f"{environment_url}/changes",
-        lambda route: route.fulfill(
-            json={
-                "object": "list",
-                "has_more": False,
-                "data": [
-                    {"path": path, "name": "notes.md", "status": "modified", "bytes": len(after)}
-                ],
-            }
-        ),
-    )
-    page.route(
-        f"{environment_url}/diff/{path}",
-        lambda route: route.fulfill(json={"path": path, "before": before, "after": after}),
-    )
-    viewer = _open_viewer(page, seeded_session, path, {"diffActive": False})
-    expect(viewer.get_by_role("button", name="Show diff", exact=True)).to_be_visible()
-    page.evaluate(
-        """() => {
-          window.diffUrlTransitions = [];
-          let previous = new URLSearchParams(location.search).get('diff');
-          const replaceState = history.replaceState;
-          history.replaceState = function(...args) {
-            replaceState.apply(this, args);
-            const current = new URLSearchParams(location.search).get('diff');
-            if (current !== previous) window.diffUrlTransitions.push(current);
-            previous = current;
-          };
-        }"""
-    )
-    transitions: list[str | None] = []
-    for width, enabled in ((1600, True), (600, False), (600, True), (1600, False)):
-        page.set_viewport_size({"width": width, "height": 1000})
-        label = "Show diff" if enabled else "Exit diff view"
-        viewer.get_by_role("button", name=label, exact=True).click()
-        diff_url = re.compile(r"[?&]diff=1(?:&|$)")
-        if enabled:
-            expect(viewer.locator(".monaco-diff-editor")).to_be_visible(timeout=30_000)
-            expect(page).to_have_url(diff_url)
-        else:
-            expect(viewer.locator(".monaco-diff-editor")).to_have_count(0)
-            expect(page).not_to_have_url(diff_url)
-        # Observe subsequent paints to catch repeated URL writes after the click.
-        page.evaluate(
-            """async () => {
-              for (let frame = 0; frame < 12; frame++) {
-                await new Promise(requestAnimationFrame);
-              }
-            }"""
-        )
-        transitions.append("1" if enabled else None)
-        assert page.evaluate("window.diffUrlTransitions") == transitions
-
-
-def test_diff_history_restores_explicit_view_across_sessions(
-    page: Page, seeded_session_pair: tuple[str, str, str]
-) -> None:
-    """Back/Forward honors diff links even after another session changes the preference."""
-    base_url, session_a, session_b = seeded_session_pair
-    for session_id in (session_a, session_b):
-        _seed_citation_file(page, (base_url, session_id))
-    viewer = _open_viewer(page, (base_url, session_a), _FILE_PATH, {"diffActive": False})
-    viewer.get_by_role("button", name="Show diff", exact=True).click()
-    expect(viewer.locator(".monaco-diff-editor")).to_be_visible(timeout=30_000)
-    diff_url = re.compile(r"[?&]diff=1(?:&|$)")
-    expect(page).to_have_url(diff_url)
-
-    page.locator(f'a[href="/c/{session_b}"]').first.click()
-    page.get_by_role("button", name="Plain file", exact=True).click()
-    viewer.get_by_role("button", name="Exit diff view", exact=True).click()
-    page.get_by_role("button", name="Close citation_target.py", exact=True).click()
-    expect(viewer).to_have_count(0)
-    page.go_back()
-    expect(page).to_have_url(re.compile(f"/c/{session_a}\\?"))
-    expect(page).to_have_url(diff_url)
-    expect(viewer.locator(".monaco-diff-editor")).to_be_visible(timeout=30_000)
-
-    # Create a Diff entry ahead, then change the preference in session A.
-    page.go_forward()
-    page.get_by_role("button", name="Plain file", exact=True).click()
-    expect(page).to_have_url(diff_url)
-    page.go_back()
-    viewer.get_by_role("button", name="Exit diff view", exact=True).click()
-    expect(page).not_to_have_url(diff_url)
-    page.go_forward()
-    expect(page).to_have_url(re.compile(f"/c/{session_b}\\?"))
-    expect(page).to_have_url(diff_url)
-    expect(viewer.locator(".monaco-diff-editor")).to_be_visible(timeout=30_000)
-    viewer.get_by_role("button", name="Exit diff view", exact=True).click()
-    expect(page).not_to_have_url(diff_url)
-
-
 @pytest.mark.parametrize("layout", ["split", "unified"])
 def test_chat_line_link_expands_and_centers_diff_context(
     page: Page,
@@ -463,73 +361,6 @@ def test_citation_preserves_offline_markdown_draft_with_diff_preference(
     assert not writes, "Navigation must not save an offline draft"
 
 
-@pytest.mark.parametrize(
-    "start_mobile", [False, True], ids=["desktop-to-mobile", "mobile-to-desktop"]
-)
-def test_shared_view_change_preserves_hidden_offline_draft(
-    page: Page, seeded_session: tuple[str, str], start_mobile: bool
-) -> None:
-    """Switching modes after a resize must confirm the other viewer's draft."""
-    base_url, session_id = seeded_session
-    path = "src/draft.md"
-    writes = _mock_markdown_files(page, seeded_session, {path: "Original paragraph."})
-    page.route(
-        f"{base_url}/v1/sessions/{session_id}/resources/environments/default/changes",
-        lambda route: route.fulfill(json={"object": "list", "has_more": False, "data": []}),
-    )
-    liveness = {"runner_online": True, "host_online": True}
-    page.route(
-        f"{base_url}/health?session_ids=*",
-        lambda route: route.fulfill(json={"sessions": {session_id: liveness}}),
-    )
-    page.clock.install()
-    viewer = _open_viewer(
-        page, seeded_session, path, {"diffActive": False, "previewableViewMode": "editor"}
-    )
-    original_width = 700 if start_mobile else 1600
-    other_width = 1600 if start_mobile else 700
-    page.set_viewport_size({"width": original_width, "height": 1000})
-    editor = viewer.locator('[contenteditable="true"]')
-    expect(editor).to_be_visible(timeout=30_000)
-    liveness.update(runner_online=False, host_online=False)
-    page.clock.fast_forward(10_000)
-    expect(
-        viewer.get_by_role(
-            "button", name="Runner offline — your changes will save when it reconnects", exact=True
-        )
-    ).to_be_visible(timeout=30_000)
-    editor.fill("Unsaved draft across a resize")
-    editor.evaluate("el => { window.__draftEditor = el; }")
-    page.set_viewport_size({"width": other_width, "height": 1000})
-    expect(editor).to_be_visible()
-    expect(editor).to_have_text("Original paragraph.")
-
-    def choose_source() -> None:
-        trigger = viewer.get_by_role("button", name=re.compile(r"^View mode|^More actions$"))
-        expect(trigger).to_be_visible()
-        collapsed = trigger.get_attribute("aria-label") == "More actions"
-        trigger.click()
-        if collapsed:
-            page.get_by_role("menuitem", name="View mode", exact=True).click()
-        page.get_by_role("menuitem", name="Source", exact=True).click()
-
-    choose_source()
-    dialog = page.get_by_role("dialog", name="Unsaved changes")
-    expect(dialog).to_be_visible()
-    dialog.get_by_role("button", name="Keep editing", exact=True).click()
-    page.set_viewport_size({"width": original_width, "height": 1000})
-    expect(editor).to_have_text("Unsaved draft across a resize")
-    assert editor.evaluate("el => el === window.__draftEditor"), "Cancel must preserve the editor"
-    page.set_viewport_size({"width": other_width, "height": 1000})
-    choose_source()
-    expect(dialog).to_be_visible()
-    dialog.get_by_role("button", name="Discard changes", exact=True).click()
-    expect(dialog).not_to_be_visible()
-    expect(page.locator('[data-testid="file-viewer"] [contenteditable="true"]')).to_have_count(0)
-    expect(viewer.locator('[data-line="1"]')).to_have_text("Original paragraph.")
-    assert not writes, "An offline draft must not be saved by a mode change"
-
-
 def test_plain_markdown_open_restores_scroll_after_citing_another_file(
     page: Page, seeded_session: tuple[str, str]
 ) -> None:
@@ -678,3 +509,78 @@ def test_comment_navigation_supersedes_citation(
     # A fresh citation must still supersede the comment navigation.
     page.get_by_role("button", name="Line 100", exact=True).click()
     page.wait_for_function(_CENTERED_LINE, arg={"text": _AFTER_LINES[99]})
+
+
+def test_markdown_diff_url_stays_stable_across_responsive_layouts(
+    page: Page, seeded_session: tuple[str, str]
+) -> None:
+    """Hidden responsive viewers must not undo the visible viewer's diff choice."""
+    base_url, session_id = seeded_session
+    path = "src/notes.md"
+    before, after = "# Notes\nBefore\n", "# Notes\nAfter\n"
+    _mock_markdown_files(page, seeded_session, {path: after})
+    environment_url = f"{base_url}/v1/sessions/{session_id}/resources/environments/default"
+    page.route(
+        f"{environment_url}/changes",
+        lambda route: route.fulfill(
+            json={
+                "object": "list",
+                "has_more": False,
+                "data": [
+                    {"path": path, "name": "notes.md", "status": "modified", "bytes": len(after)}
+                ],
+            }
+        ),
+    )
+    page.route(
+        f"{environment_url}/diff/{path}",
+        lambda route: route.fulfill(json={"path": path, "before": before, "after": after}),
+    )
+    viewer = _open_viewer(page, seeded_session, path, {"diffActive": False})
+    expect(viewer.get_by_role("button", name="Show diff", exact=True)).to_be_visible()
+    page.evaluate(
+        """() => {
+          window.diffUrlTransitions = [];
+          let previous = new URLSearchParams(location.search).get('diff');
+          const replaceState = history.replaceState;
+          history.replaceState = function(...args) {
+            replaceState.apply(this, args);
+            const current = new URLSearchParams(location.search).get('diff');
+            if (current !== previous) window.diffUrlTransitions.push(current);
+            previous = current;
+          };
+        }"""
+    )
+    transitions: list[str | None] = []
+    for width, enabled in ((1600, True), (600, True), (600, False), (1600, False)):
+        page.set_viewport_size({"width": width, "height": 1000})
+        label = "Show diff" if enabled else "Exit diff view"
+        expect(viewer.get_by_role("button", name=label, exact=True)).to_be_visible()
+        diff_url = re.compile(r"[?&]diff=1(?:&|$)")
+        # Each viewer retains its own mode. On resize the URL follows the newly
+        # visible viewer once, then each click makes exactly one transition.
+        before_click = None if enabled else "1"
+        if (transitions[-1] if transitions else None) != before_click:
+            transitions.append(before_click)
+        if enabled:
+            expect(page).not_to_have_url(diff_url)
+        else:
+            expect(page).to_have_url(diff_url)
+        assert page.evaluate("window.diffUrlTransitions") == transitions
+        viewer.get_by_role("button", name=label, exact=True).click()
+        if enabled:
+            expect(viewer.locator(".monaco-diff-editor")).to_be_visible(timeout=30_000)
+            expect(page).to_have_url(diff_url)
+        else:
+            expect(viewer.locator(".monaco-diff-editor")).to_have_count(0)
+            expect(page).not_to_have_url(diff_url)
+        # Observe subsequent paints to catch repeated URL writes after the click.
+        page.evaluate(
+            """async () => {
+              for (let frame = 0; frame < 12; frame++) {
+                await new Promise(requestAnimationFrame);
+              }
+            }"""
+        )
+        transitions.append("1" if enabled else None)
+        assert page.evaluate("window.diffUrlTransitions") == transitions

@@ -67,7 +67,7 @@ import {
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import { useResizableColumn } from "@/hooks/useResizableColumn";
 import { RunnerOfflineError } from "@/hooks/useWorkspaceChangedFiles";
-import { FileViewPreferencesProvider, useFileViewPreferences } from "./FileViewPreferencesContext";
+import { readFileViewPreferences, writeFileViewPreferences } from "@/lib/fileViewPreferences";
 import { absoluteTime, relativeTime } from "@/lib/relativeTime";
 import {
   fetchGithubFileContents,
@@ -767,14 +767,6 @@ function SidebarNode({
 }
 
 export function GithubPanel({ conversationId }: { conversationId: string }) {
-  return (
-    <FileViewPreferencesProvider>
-      <GithubPanelBody conversationId={conversationId} />
-    </FileViewPreferencesProvider>
-  );
-}
-
-function GithubPanelBody({ conversationId }: { conversationId: string }) {
   const [selection, setSelection] = useState<{ sessionId: string; url?: string }>();
   const [linking, setLinking] = useState(false);
   const [url, setUrl] = useState("");
@@ -972,10 +964,18 @@ function GithubPanelDetails({
   const [activeTab, setActiveTab] = useState<"summary" | "changes">("summary");
 
   const themeType = useResolvedThemeMode();
-  const { diffLayout: diffStyle, setDiffLayout } = useFileViewPreferences();
+  // Diff layout is the app-global FileViewer preference (unified/split); seed
+  // from the persisted value and write toggles back so the choice carries over.
+  const [diffStyle, setDiffStyle] = useState<"unified" | "split">(() =>
+    readFileViewPreferences().diffLayout === "split" ? "split" : "unified",
+  );
   const toggleDiffStyle = useCallback(() => {
-    setDiffLayout((prev) => (prev === "split" ? "unified" : "split"));
-  }, [setDiffLayout]);
+    setDiffStyle((prev) => {
+      const next = prev === "split" ? "unified" : "split";
+      writeFileViewPreferences({ ...readFileViewPreferences(), diffLayout: next });
+      return next;
+    });
+  }, []);
 
   const files = useMemo<GithubChangedFile[]>(() => changes.data?.data ?? [], [changes.data]);
   // The sidebar groups the flat file list into a compacted folder tree (the

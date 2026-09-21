@@ -93,7 +93,7 @@ import { useIOSNativeKeyboardInset } from "@/hooks/useIOSNativeKeyboardInset";
 import { useWorkspaceChangedFiles } from "@/hooks/useWorkspaceChangedFiles";
 import { cn } from "@/lib/utils";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
-import { FileViewPreferencesProvider, useFileViewPreferences } from "./FileViewPreferencesContext";
+import { readFileViewPreferences, writeFileViewPreferences } from "@/lib/fileViewPreferences";
 import { type ChangedSort, compareChangedFiles } from "./FlatFileList";
 import { CodeViewer } from "./CodeViewer";
 import {
@@ -309,7 +309,7 @@ interface FileViewerProps {
    * when the viewer is embedded inside the inline right panel.
    */
   frameless?: boolean;
-  /** Only the viewer for this layout synchronizes the shared URL. */
+  /** Only the viewer for the active layout synchronizes the URL. */
   viewport?: "desktop" | "mobile";
   /** Called when the user presses Escape to close the active file tab. */
   onCloseTab?: () => void;
@@ -337,9 +337,7 @@ export function FileViewer(props: FileViewerProps) {
   const agentId = useChatStore((s) => s.boundAgentId);
   return (
     <CommentSenderProvider sessionId={props.conversationId} agentId={agentId}>
-      <FileViewPreferencesProvider>
-        <FileViewerBody {...props} />
-      </FileViewPreferencesProvider>
+      <FileViewerBody {...props} />
     </CommentSenderProvider>
   );
 }
@@ -364,7 +362,9 @@ function FileViewerBody({
   const [searchParams, setSearchParams] = useSearchParams();
   const isMobile = useIsMobileViewport();
   const ownsUrl = viewport === undefined || (viewport === "mobile") === isMobile;
-  // Capture the linked comment once so our URL writes don't reinitialize it.
+  // Capture URL params once on open — we don't want re-renders caused by our own
+  // param writes to re-run the initialization logic.
+  const initialDiffRef = useRef(searchParams.get("diff") === "1");
   const initialCommentIdRef = useRef(searchParams.get("comment"));
   // Seeded from the parent's persisted state on remount (e.g. returning to a
   // tab); defaults closed on a fresh open. The linked-comment / fresh-open
@@ -689,28 +689,30 @@ function FileViewerBody({
   const isDeletedFile =
     changedFiles.data?.data.some((f) => f.path === path && f.status === "deleted") ?? false;
 
-  // Both responsive viewers share preferences, including while one is CSS-hidden.
-  const {
-    diffActive,
-    setDiffActive,
-    diffLayout,
-    setDiffLayout,
-    hideWhitespace,
-    setHideWhitespace,
-    wrapLines,
-    setWrapLines,
-    previewableViewMode,
-    setPreviewableViewMode,
-    registerDraftGuard,
-    guardViewChange,
-    viewChangePending,
-  } = useFileViewPreferences();
-  useLayoutEffect(
-    () =>
-      registerDraftGuard({
-        isDirty: () => isEditorDirtyRef.current,
-      }),
-    [registerDraftGuard],
+  // Diff is a global toggle — turning it on/off on any file carries over as you
+  // navigate to the next file. Source ↔ preview is also shared across previewable
+  // files (markdown/html/notebooks), while non-previewable files always render
+  // as source.
+  // These are app-global *preferences*, persisted to localStorage so they also
+  // survive a page refresh (and seed a brand-new conversation). Seed precedence:
+  //   1. an explicit ?diff=1 link (shareable override, diff only),
+  //   2. the persisted preference,
+  //   3. the hardcoded default.
+  // Read once on mount so our own writes (and within-tab file navigation) don't
+  // re-run the initializers.
+  const persistedPrefsRef = useRef(readFileViewPreferences());
+  const [diffActive, setDiffActive] = useState(
+    () => initialDiffRef.current || persistedPrefsRef.current.diffActive,
+  );
+  const [diffLayout, setDiffLayout] = useState<"unified" | "split">(
+    () => persistedPrefsRef.current.diffLayout,
+  );
+  const [hideWhitespace, setHideWhitespace] = useState(
+    () => persistedPrefsRef.current.hideWhitespace,
+  );
+  const [wrapLines, setWrapLines] = useState(() => persistedPrefsRef.current.wrapLines);
+  const [previewableViewMode, setPreviewableViewMode] = useState<"editor" | "preview" | "source">(
+    () => persistedPrefsRef.current.previewableViewMode,
   );
   // A ?comment= deep link to a markdown file must open on the rich-text editor
   // so the comment's anchor highlight is visible in context — the whole point
@@ -733,14 +735,25 @@ function FileViewerBody({
 
   // Switch a markdown file to the rich-text editor — the surface where text-
   // selection commenting works. Used by the preview's "switch to edit mode"
-  // hint. Another responsive viewer may still hold a draft.
+  // hint. Coming from preview/source there are no edits to guard, so it applies
+  // directly (mirrors the toolbar's switchTo for the non-editor case).
   const handleRequestEditMode = useCallback(() => {
-    guardViewChange(() => {
-      setDeepLinkBiasPath(null);
-      setPreviewableViewMode("editor");
-    });
-  }, [guardViewChange, setPreviewableViewMode]);
+    setDeepLinkBiasPath(null);
+    setPreviewableViewMode("editor");
+  }, []);
 
+  // Persist the global view preferences so they survive a refresh. commentsOpen
+  // is intentionally excluded — it's contextual (per-open), not a sticky
+  // preference. Idempotent on mount (writes back the seeded values).
+  useEffect(() => {
+    writeFileViewPreferences({
+      diffActive,
+      diffLayout,
+      previewableViewMode,
+      hideWhitespace,
+      wrapLines,
+    });
+  }, [diffActive, diffLayout, previewableViewMode, hideWhitespace, wrapLines]);
   // Markdown supports all three previewable modes (preview / editor / source).
   // HTML and notebooks have no rich-text editor, so their "editor" preference
   // falls back to the rendered preview; "preview" / "source" pass through. The shared
@@ -927,7 +940,7 @@ function FileViewerBody({
   // that AppShell writes (React Router v7 BrowserRouter defers via startTransition,
   // so stale searchParams seen here could emit a navigate("?") that strips it).
   useEffect(() => {
-    if (!open || !ownsUrl || viewChangePending) return;
+    if (!open || !ownsUrl) return;
     const wantDiff = diffActive && isDiffAvailable;
     const hasDiff = searchParams.has("diff");
     if (wantDiff === hasDiff) return; // already in sync — no navigate needed
@@ -943,15 +956,7 @@ function FileViewerBody({
       },
       { replace: true },
     );
-  }, [
-    diffActive,
-    isDiffAvailable,
-    open,
-    ownsUrl,
-    viewChangePending,
-    searchParams,
-    setSearchParams,
-  ]);
+  }, [diffActive, isDiffAvailable, open, ownsUrl, searchParams, setSearchParams]);
 
   // Toolbar actions, declared once and rendered two ways: inline icon buttons
   // when there's room, or rows in an overflow ("⋯") menu when there isn't.
@@ -1000,8 +1005,9 @@ function FileViewerBody({
   const toolbarActions: ToolbarAction[] = [];
   if (lang === "markdown" && viewMode !== "diff") {
     // Markdown is a segmented control over three reachable modes: the rich-text
-    // Editor (default), the rendered Preview, and raw Source. Shared mode
-    // changes must protect drafts in every mounted viewer.
+    // Editor (default), the rendered Preview, and raw Source. Switching away
+    // from the editor must guard unsaved edits; the read-only preview/source
+    // surfaces carry no edits, so they switch freely.
     const switchTo = (mode: "preview" | "editor" | "source") => {
       // No-op when already on this surface — re-selecting the active tab must
       // not run the dirty guard (which would pop a discard dialog for nothing).
@@ -1015,7 +1021,11 @@ function FileViewerBody({
         setDismissedPosition(position);
         setPreviewableViewMode(mode);
       };
-      guardViewChange(apply);
+      if (viewMode === "editor") {
+        guardDirty(apply);
+      } else {
+        apply();
+      }
     };
     // One toolbar slot: a "view mode" picker rather than three side-by-side
     // buttons (the toolbar is tight once nav/diff/comment actions are present).
@@ -1069,12 +1079,11 @@ function FileViewerBody({
       // file) resolves to "preview" for HTML, so a functional updater keyed on
       // "editor" would no-op the first click. Keying on viewMode makes one click
       // always reach the other surface.
-      onSelect: () =>
-        guardViewChange(() => {
-          dismissFilePosition(position);
-          setDismissedPosition(position);
-          setPreviewableViewMode(viewMode === "preview" ? "source" : "preview");
-        }),
+      onSelect: () => {
+        dismissFilePosition(position);
+        setDismissedPosition(position);
+        setPreviewableViewMode(viewMode === "preview" ? "source" : "preview");
+      },
     });
   }
   // HTML artifacts can be popped out into their own browser tab for full-window
@@ -1116,7 +1125,7 @@ function FileViewerBody({
       icon: <FileDiffIcon className="size-4" />,
       active: viewMode === "diff",
       onSelect: () =>
-        guardViewChange(() => {
+        guardDirty(() => {
           dismissFilePosition(position);
           setDismissedPosition(position);
           setDiffActive(viewMode !== "diff");
