@@ -5220,6 +5220,7 @@ async def _auto_create_codex_terminal(
                 codex_home=codex_home,
                 workspace=workspace,
                 event_client=event_client,
+                app_server=app_server,
                 routing_summary=_codex_launch.summary,
                 login_required=_codex_launch.login_required,
                 thread_start_timeout_seconds=thread_start_timeout_seconds,
@@ -5281,6 +5282,7 @@ async def _codex_discover_thread_and_forward(
     workspace: str,
     event_client: CodexAppServerClient,
     routing_summary: str,
+    app_server: CodexNativeAppServer | None = None,
     login_required: bool = False,
     thread_start_timeout_seconds: float | None = None,
     subagent_router: SubagentRouter | None = None,
@@ -5312,6 +5314,8 @@ async def _codex_discover_thread_and_forward(
         routing (provider / profile / model, or the login-fallback state),
         threaded into the startup-timeout error so hosted users can diagnose
         without runner-log access (see #2745).
+    :param app_server: This launch's process, retained for failure diagnostics
+        before cleanup. A later launch may replace the session registry entry.
     :param login_required: ``True`` when the resolved launch defers to
         Codex's own login with no usable stored credential — the TUI parks
         on the sign-in screen and cannot start a thread on its own. Chat
@@ -5335,6 +5339,7 @@ async def _codex_discover_thread_and_forward(
         write_bridge_startup_error,
         write_bridge_state,
     )
+    from omnigent.harnesses.codex_native.diagnostics import collect_codex_startup_diagnostics
     from omnigent.harnesses.codex_native.forwarder import (
         supervise_forwarder,
         wait_for_thread_started,
@@ -5368,6 +5373,7 @@ async def _codex_discover_thread_and_forward(
             "(`omnigent setup`), then send the message again.",
         )
 
+    discovery_started_at = time.monotonic()
     try:
         try:
             if login_required:
@@ -5386,9 +5392,33 @@ async def _codex_discover_thread_and_forward(
             # at startup, or the event stream ended before a thread was
             # created. Stop forwarding (cleanup runs in ``finally``); any other
             # error is a bug and propagates.
+            try:
+                diagnostics = collect_codex_startup_diagnostics(app_server)
+            except Exception as diagnostics_error:  # noqa: BLE001
+                # Diagnostics must not replace the startup error or prevent cleanup.
+                diagnostics = {"diagnostics_error_type": type(diagnostics_error).__name__}
+            failure_event = debug_event("codex_thread_start_failed", session_id=session_id)
+            failure_event["attributes"] = {
+                "harness": "codex-native",
+                "phase": "thread_discovery",
+                "reason": "timeout" if isinstance(exc, TimeoutError) else "event_stream_ended",
+                "timeout_s": (
+                    None
+                    if login_required
+                    else (
+                        thread_start_timeout_seconds
+                        if thread_start_timeout_seconds is not None
+                        else CODEX_NATIVE_DIRECT_THREAD_START_TIMEOUT_SECONDS
+                    )
+                ),
+                "elapsed_ms": round((time.monotonic() - discovery_started_at) * 1000),
+                "login_required": login_required,
+                **diagnostics,
+            }
             _logger.exception(
                 "Codex TUI never started a thread for %s; chat will not forward",
                 session_id,
+                extra=failure_event,
             )
             # Bridge state is never written here; leave the real cause for the executor (#59).
             if isinstance(exc, TimeoutError):
