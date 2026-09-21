@@ -302,6 +302,13 @@ class MessageData(BaseModel):
     :param stream_message_id: Native live-preview stream finalized by
         this assistant message. Persisted so reconnect snapshots can
         suppress delayed preview chunks after the authoritative item.
+    :param source_session_id: For a cross-session (peer) message, the id
+        of the session that sent it. ``None`` for ordinary human/agent
+        messages. Metadata only — it is not rendered into the model's
+        input; it marks provenance and makes peer messages identifiable.
+    :param chain_depth: Hop count carried along a peer-message chain, used
+        by the loop guard to detect a runaway A→B→A→… exchange. Incremented
+        each hop; ``None`` outside a peer chain.
     """
 
     role: Literal["user", "assistant"]
@@ -311,6 +318,8 @@ class MessageData(BaseModel):
     is_meta: bool = Field(default=False, exclude_if=lambda value: value is False)
     interrupted: bool = Field(default=False, exclude_if=lambda value: value is False)
     stream_message_id: str | None = None
+    source_session_id: str | None = None
+    chain_depth: int | None = None
 
     @field_validator("content")
     @classmethod

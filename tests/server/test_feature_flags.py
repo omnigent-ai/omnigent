@@ -38,6 +38,15 @@ def test_empty_entries_are_ignored() -> None:
     assert resolve_feature_flags({FEATURES_ENV_VAR: " , , "}) == FeatureFlags()
 
 
+def test_cross_session_messaging_resolves_and_is_frontend_hidden() -> None:
+    flags = resolve_feature_flags({FEATURES_ENV_VAR: "cross_session_messaging"})
+
+    assert flags.enabled(Feature.CROSS_SESSION_MESSAGING)
+    # Backend capability (server gate + runner tool), not a web surface — it
+    # must not leak into the frontend feature payload.
+    assert "cross_session_messaging" not in flags.frontend_dict()
+
+
 def test_removed_harness_install_variable_fails_with_migration_hint() -> None:
     with pytest.raises(ValueError, match="OMNIGENT_FEATURES=harness_install"):
         resolve_feature_flags({"OMNIGENT_HARNESS_INSTALL_ENABLED": "1"})

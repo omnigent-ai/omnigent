@@ -35,6 +35,7 @@ from omnigent.tools.builtins.spawn import (
     SysSessionCloseTool,
     SysSessionGetHistoryTool,
     SysSessionListTool,
+    SysSessionMessageTool,
     SysSessionSendTool,
 )
 from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
@@ -330,6 +331,23 @@ def test_peek_schema_required_fields_and_no_extra_props() -> None:
         "content_max_chars",
         "content_offset_chars",
     }
+
+
+def test_message_schema_required_fields_and_no_extra_props() -> None:
+    """
+    ``sys_session_message`` requires both ``session_id`` and ``message``
+    and rejects unknown properties.
+
+    Unlike ``sys_session_send`` (whose args are a one-of string/object),
+    the peer-message tool has a fixed two-field shape, so the schema pins
+    both as required and forbids extras.
+    """
+    schema = SysSessionMessageTool().get_schema()
+    assert schema["function"]["name"] == "sys_session_message"
+    params = schema["function"]["parameters"]
+    assert params["required"] == ["session_id", "message"]
+    assert params["additionalProperties"] is False
+    assert set(params["properties"].keys()) == {"session_id", "message"}
 
 
 def test_peek_schema_tail_items_bounds() -> None:

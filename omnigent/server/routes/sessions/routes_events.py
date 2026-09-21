@@ -70,6 +70,7 @@ from omnigent.server.background_session_titles import (
     prepare_background_session_title,
     schedule_background_child_task_summary,
 )
+from omnigent.server.feature_flags import Feature, resolve_feature_flags
 from omnigent.server.host_registry import HostRegistry, RunnerExitReports
 from omnigent.server.routes._auth_helpers import (
     attribution_user as _attribution_user,
@@ -654,6 +655,24 @@ def register_events_routes(
                 pass
             else:
                 created_by = body_created_by
+        # Cross-session (peer) messages carry a ``source_session_id`` in the
+        # message payload. Authorization already rode the LEVEL_EDIT check
+        # above (the runner posts as the session owner), so this gate only
+        # governs rollout and provenance: the feature must be enabled, and —
+        # like ``created_by`` — the marker is reserved for runner-originated
+        # events, the runner's peer-send tool being the sole sanctioned emitter.
+        if body.type == "message" and body.data.get("source_session_id") is not None:
+            flags = getattr(request.app.state, "feature_flags", None) or resolve_feature_flags()
+            if not flags.enabled(Feature.CROSS_SESSION_MESSAGING):
+                raise OmnigentError(
+                    "cross-session messaging is not enabled on this deployment",
+                    code=ErrorCode.FORBIDDEN,
+                )
+            if not _has_runner_created_by_authority(request, conv):
+                raise OmnigentError(
+                    "source_session_id is reserved for runner-originated session events",
+                    code=ErrorCode.FORBIDDEN,
+                )
         # Validate event type at the route boundary. Anything not in
         # ``_ALLOWED_EVENT_TYPES`` is a client mistake — failing here
         # is far better than silently persisting an item the agent

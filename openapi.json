@@ -3187,6 +3187,19 @@
       "MessageData": {
         "description": "Data for a message item (user or assistant).\n\n**Parameters**\n\n- `agent` \u2014 Agent name (required for assistant messages, absent for user). Serialized as `\"model\"` in JSON.",
         "properties": {
+          "chain_depth": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Hop count carried along a peer-message chain, used by the loop guard to detect a runaway A\u2192B\u2192A\u2192\u2026 exchange. Incremented each hop; `None` outside a peer chain.",
+            "title": "Chain Depth"
+          },
           "content": {
             "description": "Heterogeneous content blocks, e.g. `[{\"type\": \"input_text\", \"text\": \"Hello\"}]`.",
             "items": {
@@ -3227,6 +3240,18 @@
             ],
             "title": "Role",
             "type": "string"
+          },
+          "source_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "For a cross-session (peer) message, the id of the session that sent it. `None` for ordinary human/agent messages. Metadata only \u2014 it is not rendered into the model's input; it marks provenance and makes peer messages identifiable.",
+            "title": "Source Session Id"
           },
           "stream_message_id": {
             "anyOf": [

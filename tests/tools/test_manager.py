@@ -65,6 +65,11 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         "sys_session_list",
         "sys_session_get_info",
         "sys_session_rename",
+        # Cross-session (peer) messaging is registered for every agent too:
+        # unlike the spawn writes above, it is not spec-gated — it delivers
+        # only to sessions the caller can already access, and rollout is
+        # gated server-side by the ``cross_session_messaging`` deployment flag.
+        "sys_session_message",
         # Read-only agent discovery tools are likewise always available
         # (global, permission-bounded reads of any accessible session's
         # agent / bundle).

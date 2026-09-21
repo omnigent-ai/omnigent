@@ -583,3 +583,140 @@ async def test_external_conversation_item_direct_terminal_attributes_request_act
     # If this is None, _persist_external_conversation_item stopped reading
     # created_by from the request and direct terminal typing has no author label.
     assert persisted.created_by == "alice@example.com"
+
+
+# ── Cross-session (peer) messaging: flag + runner-authority gate ─────────────
+
+
+@pytest.mark.asyncio
+async def test_peer_message_rejected_when_feature_disabled(
+    auth_client: httpx.AsyncClient,
+    auth_app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``source_session_id`` marker is refused when the flag is off.
+
+    The default app enables no release features, so a peer message must
+    be rejected before anything is persisted — this is the server-side
+    rollout gate.
+    """
+    from omnigent.server.routes import sessions as sessions_mod
+    from omnigent.server.routes.sessions import routes_events as events_mod
+
+    async def _stub(*_: Any, **__: Any) -> _CaptureRunnerClient:
+        return _CaptureRunnerClient()
+
+    monkeypatch.setattr(sessions_mod, "_get_runner_client", _stub)
+    monkeypatch.setattr(events_mod, "_ensure_runner_relay_ready", _noop_relay_ready)
+
+    session_id = _seed_shared_session(db_uri, {"alice@example.com": LEVEL_EDIT})
+    runner_headers = _bind_runner(db_uri, session_id)
+
+    resp = await auth_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "message",
+            "data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "peer hi"}],
+                "source_session_id": "conv_src",
+                "chain_depth": 1,
+            },
+        },
+        headers={"X-Forwarded-Email": "alice@example.com", **runner_headers},
+    )
+    assert resp.status_code == 403, resp.text
+
+    items = await asyncio.to_thread(SqlAlchemyConversationStore(db_uri).list_items, session_id)
+    assert items.data == []
+
+
+@pytest.mark.asyncio
+async def test_peer_message_persisted_with_markers_when_enabled(
+    auth_client: httpx.AsyncClient,
+    auth_app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With the flag on and runner authority, the markers persist on the item."""
+    from omnigent.server.feature_flags import Feature, FeatureFlags
+    from omnigent.server.routes import sessions as sessions_mod
+    from omnigent.server.routes.sessions import routes_events as events_mod
+
+    async def _stub(*_: Any, **__: Any) -> _CaptureRunnerClient:
+        return _CaptureRunnerClient()
+
+    monkeypatch.setattr(sessions_mod, "_get_runner_client", _stub)
+    monkeypatch.setattr(events_mod, "_ensure_runner_relay_ready", _noop_relay_ready)
+    monkeypatch.setattr(
+        auth_app.state,
+        "feature_flags",
+        FeatureFlags(frozenset({Feature.CROSS_SESSION_MESSAGING})),
+    )
+
+    session_id = _seed_shared_session(db_uri, {"alice@example.com": LEVEL_EDIT})
+    runner_headers = _bind_runner(db_uri, session_id)
+
+    resp = await auth_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "message",
+            "data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "peer hi"}],
+                "source_session_id": "conv_src",
+                "chain_depth": 2,
+            },
+        },
+        headers={"X-Forwarded-Email": "alice@example.com", **runner_headers},
+    )
+    assert resp.status_code == 202, resp.text
+
+    items = await asyncio.to_thread(SqlAlchemyConversationStore(db_uri).list_items, session_id)
+    [persisted] = items.data
+    assert persisted.data.source_session_id == "conv_src"
+    assert persisted.data.chain_depth == 2
+
+
+@pytest.mark.asyncio
+async def test_peer_message_marker_requires_runner_authority(
+    auth_client: httpx.AsyncClient,
+    auth_app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Even with the flag on, a non-runner client cannot set source_session_id.
+
+    Like ``created_by``, the peer marker is reserved for runner-originated
+    events; a plain authenticated user posting it is refused.
+    """
+    from omnigent.server.feature_flags import Feature, FeatureFlags
+    from omnigent.server.routes import sessions as sessions_mod
+
+    async def _stub(*_: Any, **__: Any) -> _CaptureRunnerClient:
+        return _CaptureRunnerClient()
+
+    monkeypatch.setattr(sessions_mod, "_get_runner_client", _stub)
+    monkeypatch.setattr(
+        auth_app.state,
+        "feature_flags",
+        FeatureFlags(frozenset({Feature.CROSS_SESSION_MESSAGING})),
+    )
+
+    session_id = _seed_shared_session(db_uri, {"alice@example.com": LEVEL_EDIT})
+
+    resp = await auth_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "message",
+            "data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "peer hi"}],
+                "source_session_id": "conv_src",
+                "chain_depth": 1,
+            },
+        },
+        headers={"X-Forwarded-Email": "alice@example.com"},
+    )
+    assert resp.status_code == 403, resp.text

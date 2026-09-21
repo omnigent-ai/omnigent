@@ -39,6 +39,7 @@ from omnigent.tools.builtins import (
     SysSessionGetHistoryTool,
     SysSessionGetInfoTool,
     SysSessionListTool,
+    SysSessionMessageTool,
     SysSessionRenameTool,
     SysSessionSendTool,
     SysSessionShareTool,
@@ -455,6 +456,15 @@ class ToolManager:
         self._tools[SysSessionListTool.name()] = SysSessionListTool()
         self._tools[SysSessionGetHistoryTool.name()] = SysSessionGetHistoryTool()
         self._tools[SysSessionGetInfoTool.name()] = SysSessionGetInfoTool()
+
+        # Cross-session (peer) messaging: always available, mirroring the
+        # read-only reads above. It writes to another session, but only one
+        # the caller can already access — the server enforces the same
+        # per-user permission boundary and the deployment feature flag, so
+        # registration grants no authority the caller lacked. Distinct from
+        # the child-only spawn writes below, which are gated on declared
+        # sub-agents / spawn.
+        self._tools[SysSessionMessageTool.name()] = SysSessionMessageTool()
 
         # Session sharing: opt-in via the dedicated
         # ``agent_session_sharing`` flag, independent of spawn / declared

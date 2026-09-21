@@ -281,6 +281,17 @@ _ASYNC_INBOX_TOOLS = frozenset(
 # continues child sessions. The read-only observability helpers
 # (peek/list/close) dispatch via ``_SESSION_QUERY_TOOLS`` below.
 _SUBAGENT_TOOLS = frozenset({"sys_session_send"})
+# Priority 5f.0: Cross-session (peer) messaging. ``sys_session_message``
+# delivers to any same-owner session the caller can access — a sibling, a
+# peer on another compute, or an unrelated session — NOT a child. It reuses
+# the ordinary message-delivery path (persist-before-forward, idle-wake) and
+# returns a fire-and-forget delivery ack; it does not register a child or
+# fan a completion into the caller's inbox.
+_PEER_MESSAGE_TOOLS = frozenset({"sys_session_message"})
+# Loop guard: pause a runaway peer chain once it reaches this many hops
+# without human input. Chain depth travels in the message; a human turn
+# resets it (its inbound depth is 0). See ``_execute_peer_message_tool``.
+_MAX_PEER_CHAIN_DEPTH = 40
 _TURN_ACTOR_LABEL = "omnigent.turn_actor"
 
 # Priority 5f.0a: Session-create write. ``sys_session_create`` spawns a
@@ -461,6 +472,7 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     | _SESSION_SELF_WRITE_TOOLS
     | _ASYNC_INBOX_TOOLS
     | _SUBAGENT_TOOLS
+    | _PEER_MESSAGE_TOOLS
     | _LIST_MODELS_TOOLS
     | _ADVISE_MODELS_TOOLS
     | _SESSION_CREATE_TOOLS
@@ -887,6 +899,7 @@ _ALL_LOCAL_TOOLS = (
     | _TERMINAL_TOOLS
     | _ASYNC_INBOX_TOOLS
     | _SUBAGENT_TOOLS
+    | _PEER_MESSAGE_TOOLS
     | _LIST_MODELS_TOOLS
     | _ADVISE_MODELS_TOOLS
     | _SESSION_CREATE_TOOLS
@@ -3251,6 +3264,189 @@ async def _send_to_existing_session(
             "title": instance_title,
             "status": "launching",
             "message": _subagent_launching_message(agent_label, instance_title, target_session_id),
+        }
+    )
+
+
+async def _read_inbound_chain_depth(
+    server_client: httpx.AsyncClient,
+    conversation_id: str,
+) -> int:
+    """
+    Return the peer-chain depth this session is currently at.
+
+    Reads the caller's own most recent inbound (``role="user"``) message and
+    returns its ``chain_depth``. A peer message carries a positive depth; a
+    human message carries none, so a human turn naturally resets the chain to
+    0. Persist-before-forward guarantees the message driving the current turn
+    is already stored, so this reflects the turn's trigger.
+
+    Best-effort: any lookup failure returns 0, so a transient hiccup degrades
+    to "start a fresh chain" rather than blocking the send.
+
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :param conversation_id: The caller's own session id.
+    :returns: The inbound chain depth, or 0 when the latest inbound is human
+        / absent / unreadable.
+    """
+    try:
+        resp = await server_client.get(
+            f"/v1/sessions/{conversation_id}/items",
+            params={"limit": 5, "order": "desc"},
+            timeout=10.0,
+        )
+    except (httpx.HTTPError, RuntimeError):
+        return 0
+    if resp.status_code != 200:
+        return 0
+    try:
+        data = resp.json().get("data", [])
+    except ValueError:
+        return 0
+    if not isinstance(data, list):
+        return 0
+    for item in data:  # newest-first
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") != "message" or item.get("role") != "user":
+            continue
+        depth = item.get("chain_depth")
+        return depth if isinstance(depth, int) and depth > 0 else 0
+    return 0
+
+
+async def _execute_peer_message_tool(
+    args: _JsonObject,
+    *,
+    server_client: httpx.AsyncClient | None = None,
+    conversation_id: str | None = None,
+) -> str:
+    """
+    Deliver a message to a same-owner peer session (``sys_session_message``).
+
+    The cross-session write. Unlike ``sys_session_send``'s child-only
+    by-id path, the target may be any session the caller can access — a
+    sibling, a peer on another compute, or an unrelated session — with the
+    same-owner boundary enforced server-side by the ordinary ``LEVEL_EDIT``
+    check (the runner posts as the session owner) and the deployment-wide
+    ``cross_session_messaging`` flag. The delivered message is stamped with a
+    ``source_session_id`` marker (provenance + identifiability) and a
+    ``chain_depth`` (loop control), then rides the normal message path:
+    persist-before-forward, idle-wake, at-least-once delivery. Fire and
+    forget — it returns a delivery acknowledgement, not a task handle, and
+    does not register a child or await a reply.
+
+    Loop guard: the outgoing depth is one past this session's inbound depth;
+    at ``_MAX_PEER_CHAIN_DEPTH`` hops without human input the send is held and
+    the caller is told to check with its human (a human reply resets the
+    chain). This is a soft pause — the tool declines to send rather than
+    killing the session.
+
+    :param args: Parsed tool arguments: ``session_id`` (target) and
+        ``message`` (text).
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :param conversation_id: The caller's own session id — stamped as the
+        delivered message's ``source_session_id``.
+    :returns: JSON delivery acknowledgement, or a JSON error object.
+    """
+    if server_client is None:
+        return "Error: sys_session_message requires server_client"
+    if conversation_id is None:
+        return "Error: sys_session_message requires conversation_id"
+    target_session_id = args.get("session_id")
+    if not isinstance(target_session_id, str) or not target_session_id:
+        return "Error: sys_session_message requires a non-empty 'session_id' string"
+    message = args.get("message")
+    if not isinstance(message, str) or not message.strip():
+        return "Error: sys_session_message requires a non-empty 'message' string"
+    if target_session_id == conversation_id:
+        return json.dumps(
+            {
+                "error": "self_message",
+                "message": "sys_session_message cannot target the calling session.",
+            }
+        )
+
+    inbound_depth = await _read_inbound_chain_depth(server_client, conversation_id)
+    outgoing_depth = inbound_depth + 1
+    if outgoing_depth > _MAX_PEER_CHAIN_DEPTH:
+        return json.dumps(
+            {
+                "error": "chain_depth_exceeded",
+                "chain_depth": outgoing_depth,
+                "max_chain_depth": _MAX_PEER_CHAIN_DEPTH,
+                "message": (
+                    f"This cross-session exchange has reached {outgoing_depth} hops "
+                    f"without human input (limit {_MAX_PEER_CHAIN_DEPTH}). Pausing to "
+                    "avoid a runaway loop: summarize the current state and check with "
+                    "your human before sending more peer messages."
+                ),
+            }
+        )
+
+    actor = await _session_turn_actor(server_client=server_client, conversation_id=conversation_id)
+    payload: _JsonObject = {
+        "type": "message",
+        "data": {
+            "role": "user",
+            "content": [{"type": "input_text", "text": message}],
+            "source_session_id": conversation_id,
+            "chain_depth": outgoing_depth,
+        },
+        **({"created_by": actor} if actor is not None else {}),
+    }
+    try:
+        resp = await server_client.post(
+            f"/v1/sessions/{target_session_id}/events",
+            json=payload,
+            timeout=_ASK_GATE_DELIVERY_TIMEOUT,
+        )
+    except httpx.HTTPError as exc:
+        return json.dumps(
+            {
+                "error": "delivery_failed",
+                "conversation_id": target_session_id,
+                "message": f"{type(exc).__name__}: {exc}",
+            }
+        )
+    if resp.status_code == 404:
+        return json.dumps({"error": "session_not_found", "conversation_id": target_session_id})
+    if resp.status_code in (401, 403):
+        # Server refused: either the deployment has cross-session messaging
+        # disabled, or the caller lacks edit access to the target. The body
+        # carries the specific reason.
+        return json.dumps(
+            {
+                "error": "not_permitted",
+                "conversation_id": target_session_id,
+                "message": resp.text[:200] or "cross-session messaging refused",
+            }
+        )
+    if resp.status_code >= 400:
+        return json.dumps(
+            {
+                "error": "delivery_failed",
+                "conversation_id": target_session_id,
+                "status": resp.status_code,
+                "message": resp.text[:200],
+            }
+        )
+    item_id: object = None
+    try:
+        item_id = resp.json().get("item_id")
+    except ValueError:
+        item_id = None
+    return json.dumps(
+        {
+            "delivered": True,
+            "conversation_id": target_session_id,
+            "chain_depth": outgoing_depth,
+            **({"item_id": item_id} if isinstance(item_id, str) else {}),
+            "message": (
+                f"Message delivered to session {target_session_id}; it wakes and "
+                "processes on its next turn. Fire-and-forget — no reply is awaited; "
+                "use sys_session_get_history to read any response."
+            ),
         }
     )
 
@@ -6458,6 +6654,12 @@ async def execute_tool(
                 agent_spec=agent_spec,
                 publish_event=publish_event,
                 session_inbox=session_inbox,
+            )
+        elif tool_name in _PEER_MESSAGE_TOOLS:
+            output = await _execute_peer_message_tool(
+                args,
+                server_client=server_client,
+                conversation_id=conversation_id,
             )
         elif tool_name in _LIST_MODELS_TOOLS:
             output = await _execute_list_models_tool(agent_spec=agent_spec)
