@@ -1,5 +1,5 @@
 import { useMutation, useMutationState, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useRef } from "react";
+import { useEffect, useLayoutEffect, useRef } from "react";
 import { authenticatedFetch } from "@/lib/identity";
 import type { NativeModelOption } from "@/lib/types";
 
@@ -120,8 +120,10 @@ export function useHostModelOptions(
   const canRefresh = enabled && hostId !== null && poll;
   // A request's retry callback can outlive the selection that started it.
   const refreshTarget = useRef({ hostId, harness, canRefresh });
-  refreshTarget.current = { hostId, harness, canRefresh };
-  return useQuery({
+  useLayoutEffect(() => {
+    refreshTarget.current = { hostId, harness, canRefresh };
+  }, [hostId, harness, canRefresh]);
+  const query = useQuery({
     queryKey: ["host-model-options", hostId, harness],
     queryFn: () => fetchHostModelOptions(hostId as string, harness),
     enabled: enabled && hostId !== null,
@@ -143,6 +145,15 @@ export function useHostModelOptions(
       failureCount < 6,
     retryDelay: (attempt) => Math.min(5_000, 1_000 * 2 ** attempt),
   });
+  const previouslyRefreshing = useRef(canRefresh);
+  const { isError, isFetching, refetch } = query;
+  useEffect(() => {
+    const becameSelected = canRefresh && !previouslyRefreshing.current;
+    previouslyRefreshing.current = canRefresh;
+    // Retry failed prefetches on selection without restarting exhausted retries.
+    if (becameSelected && isError && !isFetching) void refetch();
+  }, [canRefresh, isError, isFetching, refetch]);
+  return query;
 }
 
 interface InstallHarnessResult {

@@ -1,6 +1,6 @@
 import { focusManager, QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, renderHook, waitFor } from "@testing-library/react";
-import { useState, type ReactNode } from "react";
+import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
+import { startTransition, Suspense, useState, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -484,6 +484,93 @@ describe("useHostModelOptions", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it.each([false, true])(
+    "immediately recovers a failed prefetch on selection (StrictMode: %s)",
+    async (reactStrictMode) => {
+      fetchMock
+        .mockResolvedValueOnce(mockResponse({ detail: "catalog warming up" }, 502))
+        .mockResolvedValue(mockResponse({ models: [{ id: "swe-2" }] }));
+      const { result, rerender } = renderHook(
+        ({ poll }) => useHostModelOptions("host_1", "devin-native", true, { poll }),
+        { wrapper, reactStrictMode, initialProps: { poll: false } },
+      );
+      await waitFor(() => expect(result.current.isError).toBe(true));
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+
+      rerender({ poll: true });
+      await waitFor(() => expect(result.current.isSuccess).toBe(true));
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(result.current.data).toEqual([{ id: "swe-2" }]);
+    },
+  );
+
+  it("does not restart exhausted retries while the failed harness stays selected", async () => {
+    fetchMock.mockResolvedValue(mockResponse({ detail: "catalog unavailable" }, 502));
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const { result, rerender } = renderHook(
+        ({ poll }) => useHostModelOptions("host_1", "devin-native", true, { poll }),
+        { wrapper, initialProps: { poll: false } },
+      );
+      await waitFor(() => expect(result.current.isError).toBe(true));
+      rerender({ poll: true });
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+      await vi.advanceTimersByTimeAsync(23_000);
+      expect(result.current.isError).toBe(true);
+      expect(result.current.isFetching).toBe(false);
+      expect(fetchMock).toHaveBeenCalledTimes(8);
+
+      rerender({ poll: true });
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(fetchMock).toHaveBeenCalledTimes(8);
+      rerender({ poll: false });
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(fetchMock).toHaveBeenCalledTimes(8);
+
+      rerender({ poll: true });
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(9));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps the committed retry policy when a deselection render suspends", async () => {
+    let finishRequest!: (response: Response) => void;
+    fetchMock
+      .mockReturnValueOnce(
+        new Promise<Response>((resolve) => {
+          finishRequest = resolve;
+        }),
+      )
+      .mockResolvedValue(mockResponse({ models: [{ id: "swe-2" }] }));
+    const QueryWrapper = wrapper;
+    const suspended = new Promise<never>(() => {});
+    const onRender = vi.fn();
+    const { result, rerender } = renderHook(
+      ({ poll, suspend }) => {
+        const query = useHostModelOptions("host_1", "devin-native", true, { poll });
+        onRender(poll);
+        if (suspend) throw suspended;
+        return query;
+      },
+      {
+        wrapper: ({ children }) => (
+          <QueryWrapper>
+            <Suspense fallback={null}>{children}</Suspense>
+          </QueryWrapper>
+        ),
+        initialProps: { poll: true, suspend: false },
+      },
+    );
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    act(() => startTransition(() => rerender({ poll: false, suspend: true })));
+    expect(onRender).toHaveBeenCalledWith(false);
+
+    finishRequest(mockResponse({ detail: "catalog warming up" }, 502));
+    await waitFor(() => expect(result.current.isSuccess).toBe(true), { timeout: 3_000 });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it.each(["deselected", "unavailable"])(

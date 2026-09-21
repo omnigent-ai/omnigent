@@ -168,6 +168,27 @@ async def _drive(base_url: str, session_id: str, *, initially_ready: bool) -> No
 
             await page.route("**/v1/hosts", handle_hosts)
 
+            async def assert_devin_idle(expected_count: int | None = None) -> None:
+                # Pause ambient polling and drain earlier requests before the baseline.
+                await page.clock.pause_at(await page.evaluate("Date.now() / 1_000 + 1"))
+                try:
+                    await page.wait_for_load_state("networkidle")
+                    requests_before = len(devin_requests)
+                    if expected_count is not None:
+                        assert requests_before == expected_count
+                    # Claude's completed poll proves timer-triggered requests reached the host.
+                    async with page.expect_response(
+                        lambda response: response.url.endswith(
+                            f"/hosts/{_HOST_ID}/harnesses/claude-native/model-options"
+                        )
+                    ) as polled:
+                        await page.clock.fast_forward(30_000)
+                    await (await polled.value).finished()
+                    await page.wait_for_load_state("networkidle")
+                    assert len(devin_requests) == requests_before
+                finally:
+                    await page.clock.resume()
+
             async def handle_devin_models(route: Route) -> None:
                 devin_requests.append(route.request.url)
                 await route.fulfill(
@@ -212,8 +233,7 @@ async def _drive(base_url: str, session_id: str, *, initially_ready: bool) -> No
             )
             if initially_ready:
                 await _wait_until(lambda: len(devin_requests) == 1)
-            await page.clock.fast_forward(30_000)
-            assert len(devin_requests) == int(initially_ready)
+            await assert_devin_idle(int(initially_ready))
 
             await page.get_by_test_id("new-chat-landing-agent-select").click()
             await page.get_by_test_id("new-chat-landing-harness-more").click()
@@ -228,8 +248,7 @@ async def _drive(base_url: str, session_id: str, *, initially_ready: bool) -> No
                 await expect(
                     page.get_by_test_id(f"new-chat-landing-agent-summary-{_DEVIN_AGENT_ID}")
                 ).to_have_text("SWE-2")
-            await page.clock.fast_forward(30_000)
-            assert len(devin_requests) == 1
+            await assert_devin_idle(1)
             await (
                 page.get_by_test_id(f"new-chat-landing-agent-config-{_DEVIN_AGENT_ID}")
                 .get_by_text("Edit", exact=True)
@@ -288,9 +307,7 @@ async def _drive(base_url: str, session_id: str, *, initially_ready: bool) -> No
             await expect(page.get_by_test_id("new-chat-landing-agent-select")).to_have_attribute(
                 "aria-label", re.compile(r"^Claude Code,")
             )
-            requests_before = len(devin_requests)
-            await page.clock.fast_forward(30_000)
-            assert len(devin_requests) == requests_before
+            await assert_devin_idle()
         finally:
             await browser.close()
 
