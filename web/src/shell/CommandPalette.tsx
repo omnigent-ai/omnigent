@@ -189,10 +189,8 @@ export function CommandPalette({
     );
   }, [actions, query, sessionsOnly]);
 
-  // includeArchived=true shares the sidebar's cache key; archived rows are
-  // filtered out below so the palette only lists active sessions.
   const { data, isFetching, isError, refetch, hasNextPage, fetchNextPage, isFetchNextPageError } =
-    useConversations(sessionsOnly ? "" : debouncedQuery, !sessionsOnly, { enabled: open });
+    useConversations(sessionsOnly ? "" : debouncedQuery, false, { enabled: open });
   const loadedPages = data?.pages.length ?? 0;
   useEffect(() => {
     if (

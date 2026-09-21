@@ -1999,7 +1999,8 @@ export async function fetchAllArchivedProjectNames(): Promise<string[]> {
       order: "desc",
       sort_by: "updated_at",
       limit: "100",
-      visibility: "all",
+      visibility: "archived",
+      // Preserve archive inclusion on older servers that ignore visibility.
       include_archived: "true",
     });
     if (after) params.set("after", after);
@@ -2011,8 +2012,7 @@ export async function fetchAllArchivedProjectNames(): Promise<string[]> {
     // eslint-disable-next-line no-await-in-loop
     const page = (await res.json()) as ConversationsPage;
     for (const conv of page.data) {
-      // include_archived returns archived AND active rows; only archived ones
-      // are filterable on this page, so collect labels from those.
+      // Keep active rows out even if a server ignores the visibility filter.
       if (conv.archived !== true) continue;
       const name = conv.labels?.[PROJECT_LABEL_KEY];
       if (name) names.add(name);
@@ -2340,7 +2340,7 @@ export async function fetchProjectSessionIds(project: string, limit = 2): Promis
   return page.data.map((conv) => conv.id);
 }
 
-/** One page of a project's (non-archived) sessions, newest-first. */
+/** One page of the viewer's active sessions in a project, newest-first. */
 async function fetchProjectSessionsPage(
   project: string,
   after?: string,
@@ -2350,7 +2350,7 @@ async function fetchProjectSessionsPage(
     order: "desc",
     sort_by: "updated_at",
     limit: String(limit),
-    visibility: "all",
+    visibility: "mine",
     project,
   });
   if (after) params.set("after", after);

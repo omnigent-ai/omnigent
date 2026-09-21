@@ -403,7 +403,7 @@ describe("fetchAllArchivedProjectNames", () => {
         mockResponse({
           data: [
             { id: "a", archived: true, labels: { omni_project: "Beta" } },
-            // Active row — include_archived returns it, but it's not filterable here.
+            // Defensively ignore active rows if a server ignores the visibility filter.
             { id: "b", archived: false, labels: { omni_project: "Zeta" } },
             // Archived but unfiled — no project label to collect.
             { id: "c", archived: true, labels: {} },
@@ -416,7 +416,7 @@ describe("fetchAllArchivedProjectNames", () => {
       .mockResolvedValueOnce(
         mockResponse({
           data: [
-            { id: "d", archived: true, labels: { omni_project: "Alpha" } },
+            { id: "d", archived: true, owner: "bob", labels: { omni_project: "Alpha" } },
             // Duplicate project across pages collapses to one entry.
             { id: "e", archived: true, labels: { omni_project: "Beta" } },
           ],
@@ -442,7 +442,7 @@ describe("fetchAllArchivedProjectNames", () => {
       fetchMock.mock.calls.map(([url]) =>
         new URL(String(url), "http://localhost").searchParams.get("visibility"),
       ),
-    ).toEqual(["all", "all"]);
+    ).toEqual(["archived", "archived"]);
   });
 
   it("stops after one request when the first page has no more", async () => {
@@ -2169,7 +2169,7 @@ describe("useProjectSessions", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("fetches the project's non-archived sessions, newest-first, when enabled", async () => {
+  it("fetches the viewer's active project sessions, newest-first, when enabled", async () => {
     fetchMock.mockResolvedValueOnce(
       mockResponse({
         data: [{ id: "conv_a", object: "conversation", title: "A", created_at: 0, updated_at: 9 }],
@@ -2190,7 +2190,7 @@ describe("useProjectSessions", () => {
     expect(url).toContain("order=desc");
     expect(url).toContain("sort_by=updated_at");
     expect(url).toContain("limit=20");
-    expect(url).toContain("visibility=all");
+    expect(url).toContain("visibility=mine");
     // Folders show active sessions only — archived ones leave the sidebar.
     expect(url).not.toContain("include_archived");
     expect(result.current.data?.pages[0]?.data[0]?.id).toBe("conv_a");

@@ -2531,8 +2531,16 @@ function ArchivedSection() {
     }
   }, [project, projectNames, namesQuery.isSuccess, namesQuery.isFetching]);
 
-  // The visible list, filtered server-side via ?project= when one is picked.
-  const listQuery = useConversations("", true, undefined, project);
+  // Named projects need the owner-scoped "all" query, including archived rows.
+  // The unfiltered view can request only archives across all accessible sessions.
+  // Keep includeArchived for older servers that ignore visibility.
+  const listQuery = useConversations(
+    "",
+    true,
+    undefined,
+    project,
+    project === undefined ? "archived" : undefined,
+  );
   const archived = useMemo(
     () => (listQuery.data?.pages ?? []).flatMap((p) => p.data).filter((c) => c.archived === true),
     [listQuery.data],

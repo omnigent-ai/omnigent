@@ -30,6 +30,7 @@ const mocks = vi.hoisted(() => ({
   // the id, getCurrentIsAdmin the flag). null → unauthenticated.
   me: { id: "alice", is_admin: false } as { id: string; is_admin: boolean } | null,
   conversations: [] as Conversation[],
+  conversationQuery: vi.fn(),
   // Optional multi-page dataset (array of per-page row arrays) for pagination
   // tests. When unset the mock serves a single page of `conversations`.
   pages: undefined as Conversation[][] | undefined,
@@ -72,10 +73,12 @@ vi.mock("@/hooks/useConversations", async () => {
     // scoping.
     useConversations: (
       _searchQuery?: string,
-      _includeArchived?: boolean,
+      includeArchived?: boolean,
       _options?: unknown,
       project?: string,
+      visibility?: "mine" | "shared" | "archived",
     ) => {
+      mocks.conversationQuery({ includeArchived, project, visibility });
       // `mocks.pages` (array of per-page row arrays) drives multi-page tests;
       // otherwise serve a single page of `mocks.conversations`.
       const source = mocks.pages ?? [mocks.conversations];
@@ -210,6 +213,7 @@ beforeEach(() => {
   mocks.bulkArchiveMutate.mockReset();
   mocks.bulkDeleteMutate.mockReset();
   mocks.fetchNextPage.mockReset();
+  mocks.conversationQuery.mockReset();
   mocks.theme = "system";
   mocks.accountsEnabled = true;
   mocks.loginUrl = "/login";
@@ -991,6 +995,11 @@ describe("SettingsPage", () => {
     ];
     renderPage("/settings/archived");
 
+    expect(mocks.conversationQuery).toHaveBeenLastCalledWith({
+      includeArchived: true,
+      project: undefined,
+      visibility: "archived",
+    });
     const rows = screen.getAllByTestId("archived-row");
     expect(rows).toHaveLength(1);
     expect(within(rows[0]).getByText("Old chat")).toBeInTheDocument();
@@ -1021,13 +1030,23 @@ describe("SettingsPage", () => {
     mocks.projectNames = ["Alpha", "Beta"];
     mocks.conversations = [
       conv("conv_a", { archived: true, title: "Alpha chat", labels: { omni_project: "Alpha" } }),
-      conv("conv_b", { archived: true, title: "Beta chat", labels: { omni_project: "Beta" } }),
+      conv("conv_b", {
+        archived: true,
+        title: "Beta chat",
+        labels: { omni_project: "Beta" },
+        owner: "bob",
+      }),
       conv("conv_active"),
     ];
     renderPage("/settings/archived");
 
-    // "All projects" (default) lists every archived session.
+    // "All projects" includes shared archives as well as owned ones.
     expect(screen.getAllByTestId("archived-row")).toHaveLength(2);
+    expect(mocks.conversationQuery).toHaveBeenLastCalledWith({
+      includeArchived: true,
+      project: undefined,
+      visibility: "archived",
+    });
     const select = screen.getByTestId("archived-project-filter");
     expect(within(select).getByRole("option", { name: "All projects" })).toBeInTheDocument();
     expect(within(select).getByRole("option", { name: "Alpha" })).toBeInTheDocument();
@@ -1039,10 +1058,21 @@ describe("SettingsPage", () => {
     const rows = screen.getAllByTestId("archived-row");
     expect(rows).toHaveLength(1);
     expect(within(rows[0]).getByText("Alpha chat")).toBeInTheDocument();
+    // Default visibility maps to "all", whose named-project filter is owner-scoped.
+    expect(mocks.conversationQuery).toHaveBeenLastCalledWith({
+      includeArchived: true,
+      project: "Alpha",
+      visibility: undefined,
+    });
 
     // Back to "All projects" restores the full list.
     fireEvent.change(select, { target: { value: "all" } });
     expect(screen.getAllByTestId("archived-row")).toHaveLength(2);
+    expect(mocks.conversationQuery).toHaveBeenLastCalledWith({
+      includeArchived: true,
+      project: undefined,
+      visibility: "archived",
+    });
   });
 
   it("hides the project filter when no archived session belongs to a project", () => {
