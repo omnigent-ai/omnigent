@@ -204,6 +204,28 @@ class OmnigentWebViewClientTest {
     }
 
     @Test
+    fun `workspace navigation with an Android-only URI character fails closed without throwing`() {
+        val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
+        var invalid = 0
+        val session = workspaceSession()
+        val client =
+            client(
+                pinnedOrigin = DATABRICKS_ORIGIN,
+                workspaceSession = { session },
+                onWorkspaceSessionInvalid = { invalid++ },
+            )
+
+        val handled =
+            client.shouldOverrideUrlLoading(
+                webView,
+                request("$DATABRICKS_ORIGIN/omnigent?q=a|b&o=42"),
+            )
+
+        assertTrue(handled)
+        assertEquals(1, invalid)
+    }
+
+    @Test
     fun `native workspace session accepts its bootstrapped app origins`() {
         val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
         val session = workspaceSession()
@@ -228,6 +250,30 @@ class OmnigentWebViewClientTest {
         assertEquals(0, invalid)
         assertEquals(0, genericLogins)
         assertEquals(1, navigations)
+    }
+
+    @Test
+    fun `workspace logout navigation becomes native local sign out`() {
+        val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
+        var signOuts = 0
+        var invalid = 0
+        val client =
+            client(
+                pinnedOrigin = DATABRICKS_ORIGIN,
+                workspaceSession = { workspaceSession() },
+                onWorkspaceSessionInvalid = { invalid++ },
+                onWorkspaceSignOut = { signOuts++ },
+            )
+
+        val handled =
+            client.shouldOverrideUrlLoading(
+                webView,
+                request("$DATABRICKS_ORIGIN/auth/logout"),
+            )
+
+        assertTrue(handled)
+        assertEquals(1, signOuts)
+        assertEquals(0, invalid)
     }
 
     @Test
@@ -412,6 +458,7 @@ class OmnigentWebViewClientTest {
         onNavigationStarted: () -> Unit = {},
         workspaceSession: () -> DatabricksWebSession? = { null },
         onWorkspaceSessionInvalid: (Int?) -> Unit = {},
+        onWorkspaceSignOut: () -> Unit = {},
     ) = OmnigentWebViewClient(
         pinnedOrigin = { pinnedOrigin },
         shouldInjectBridgeAtPageReady = { shouldInjectBridgeAtPageReady },
@@ -421,6 +468,7 @@ class OmnigentWebViewClientTest {
         onRendererGone = onRendererGone,
         workspaceSession = workspaceSession,
         onWorkspaceSessionInvalid = onWorkspaceSessionInvalid,
+        onWorkspaceSignOut = onWorkspaceSignOut,
     )
 
     private fun workspaceSession(): DatabricksWebSession {

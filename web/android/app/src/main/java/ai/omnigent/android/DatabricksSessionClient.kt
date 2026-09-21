@@ -18,6 +18,18 @@ internal data class DatabricksWebContext(
             .getOrNull()
             ?.account == scope.account
 
+    fun navigatingTo(uri: URI): DatabricksWebContext {
+        val target = DatabricksCredentialScope.from(uri, configuration)
+        if (
+            scope.workspaceId != null &&
+            target.workspaceId != null &&
+            scope.workspaceId != target.workspaceId
+        ) {
+            throw DatabricksSessionException.WorkspaceChanged()
+        }
+        return copy(pageUri = uri)
+    }
+
     companion object {
         fun resolve(uri: URI): DatabricksWebContext? {
             if (serverAuthentication(originOf(uri.toString())) !=
@@ -44,22 +56,33 @@ internal data class DatabricksWebSession(
     val workspaceId: String?,
 ) {
     fun navigationUri(uri: URI): URI? {
-        val scope =
-            runCatching { DatabricksCredentialScope.from(uri, configuration) }.getOrNull()
-                ?: return null
-        if (scope.workspaceOrigin.toString() !in allowedOrigins) return null
-        if (scope.workspaceId != null && workspaceId != null &&
-            scope.workspaceId != workspaceId
-        ) {
-            return null
-        }
+        if (!isThisWorkspace(uri)) return null
         if (isLoginPath(uri.path)) return null
         return uri
+    }
+
+    /** True when [uri] is on one of this session's origins and doesn't name another workspace. */
+    private fun isThisWorkspace(uri: URI): Boolean {
+        val scope =
+            runCatching { DatabricksCredentialScope.from(uri, configuration) }.getOrNull()
+                ?: return false
+        if (scope.workspaceOrigin.toString() !in allowedOrigins) return false
+        return scope.workspaceId == null || workspaceId == null || scope.workspaceId == workspaceId
     }
 
     fun isAuthenticationUri(uri: URI): Boolean =
         runCatching { DatabricksCredentialScope.from(uri, configuration) }.isSuccess &&
             isLoginPath(uri.path)
+
+    /** A logout of this workspace; another workspace's logout must not sign this one out. */
+    fun isSignOutUri(uri: URI): Boolean {
+        if (!isThisWorkspace(uri)) return false
+        if (uri.path == "/auth/logout" || uri.path == "/logout") return true
+        return uri.path == "/login.html" &&
+            queryItems(uri).any {
+                it.first == "logout" && it.second == "1"
+            }
+    }
 
     companion object {
         fun isLoginPath(path: String): Boolean =

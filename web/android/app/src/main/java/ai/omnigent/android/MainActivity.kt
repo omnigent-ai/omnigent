@@ -69,7 +69,11 @@ class MainActivity : AppCompatActivity() {
     private val databricksAuthLauncher =
         AuthTabIntent.registerActivityResultLauncher(this, ::handleDatabricksAuthResult)
     private var workspaceCoordinator: DatabricksWorkspaceCoordinator? = null
+    private var workspaceSignOuts: DatabricksSignOutManager? = null
     private var workspaceContext: DatabricksWebContext? = null
+    private var pendingRecoveryContext: DatabricksWebContext? = null
+    private var lastWorkspacePageUri: URI? = null
+    private val workspaceRecoveryPolicy = DatabricksRecoveryPolicy()
     private var workspaceProfile: DatabricksWebProfile? = null
     private var workspaceSession: DatabricksWebSession? = null
     private var workspaceFuture: CompletableFuture<DatabricksWebSession>? = null
@@ -166,8 +170,16 @@ class MainActivity : AppCompatActivity() {
                     return
                 }
             }
-        workspaceContext?.let {
-            workspaceCoordinator = DatabricksWorkspaceCoordinator(applicationContext)
+        workspaceContext?.let { context ->
+            val tokens = DatabricksTokenManager.shared(applicationContext)
+            val signOuts = DatabricksSignOutManager(applicationContext, tokens)
+            // Killed mid sign-out, after its cleanup began but before the selection was cleared.
+            if (signOuts.resumeInterrupted(context, workspaceProfile!!)) {
+                returnToSetup(context.pageUri.toString(), null)
+                return
+            }
+            workspaceSignOuts = signOuts
+            workspaceCoordinator = DatabricksWorkspaceCoordinator(applicationContext, tokens)
         }
         pinnedOrigin = originOf(serverUrl)
 
@@ -288,7 +300,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun handleDatabricksAuthResult(result: AuthTabIntent.AuthResult) {
-        val context = workspaceContext ?: return
+        val context = pendingRecoveryContext ?: workspaceContext ?: return
         val profile = workspaceProfile ?: return
         val manager =
             try {
@@ -426,6 +438,8 @@ class MainActivity : AppCompatActivity() {
                 val error = unwrapCompletionError(rawError)
                 if (error == null && session != null) {
                     workspaceSession = session
+                    pendingRecoveryContext = null
+                    lastWorkspacePageUri = session.pageUri
                     pinnedOrigin = originOf(session.pageUri.toString())
                     removeBridge()
                     installBridge()
@@ -456,6 +470,7 @@ class MainActivity : AppCompatActivity() {
         profile: DatabricksWebProfile,
     ) {
         val generation = ++workspaceGeneration
+        pendingRecoveryContext = context
         connectionMessage.text = getString(R.string.oauth_opening_browser)
         connectionAction.visibility = View.GONE
         profile.clear().whenComplete { _, rawError ->
@@ -494,13 +509,62 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun handleWorkspaceSessionInvalid(status: Int?) {
-        val message =
-            if (status == 403) {
-                getString(R.string.oauth_permission_denied)
-            } else {
-                getString(R.string.oauth_session_expired)
+        if (status == 403) {
+            returnToSetup(
+                workspaceContext?.pageUri?.toString(),
+                getString(R.string.oauth_permission_denied),
+            )
+            return
+        }
+        val context = workspaceContext ?: return
+        val profile = workspaceProfile ?: return
+        val session = workspaceSession ?: return
+        val page =
+            runCatching { webView.url?.let(::URI)?.let(session::navigationUri) }.getOrNull()
+                ?: lastWorkspacePageUri
+                ?: session.pageUri
+        if (!workspaceRecoveryPolicy.begin()) {
+            returnToSetup(context.pageUri.toString(), getString(R.string.oauth_recovery_exhausted))
+            return
+        }
+        val recovery =
+            try {
+                context.navigatingTo(page)
+            } catch (error: Throwable) {
+                returnToSetup(context.pageUri.toString(), error.message)
+                return
             }
-        returnToSetup(workspaceContext?.pageUri?.toString(), message)
+        workspaceSession = null
+        webView.stopLoading()
+        removeBridge()
+        beginWorkspaceConnection(recovery, profile, allowInteractive = false)
+    }
+
+    private fun requestWorkspaceSignOut() {
+        val context = workspaceContext ?: return
+        val profile = workspaceProfile ?: return
+        val signOuts = workspaceSignOuts ?: return
+        workspaceGeneration++
+        workspaceFuture?.cancel(true)
+        databricksLoginManager?.cancel()
+        workspaceSession = null
+        webView.stopLoading()
+        removeBridge()
+        connectionOverlay.visibility = View.VISIBLE
+        connectionMessage.text = getString(R.string.oauth_signing_out)
+        connectionAction.visibility = View.GONE
+        connectionCancel.visibility = View.GONE
+        val cleanup = signOuts.begin(context, profile)
+        ServerStore(this).clearCurrent()
+        cleanup.whenComplete { _, rawError ->
+            runOnUiThread {
+                val error = unwrapCompletionError(rawError)
+                returnToSetup(
+                    context.pageUri.toString(),
+                    error?.let { getString(R.string.oauth_sign_out_incomplete) },
+                )
+            }
+        }
     }
 
     private fun returnToSetup(
@@ -552,7 +616,9 @@ class MainActivity : AppCompatActivity() {
      */
     private fun onServerPickerRequested() {
         switchButton.removeCallbacks(revealSwitcherFallback)
-        switchButton.visibility = View.GONE
+        // Workspace recovery and local sign-out stay natively reachable even
+        // when the current SPA also renders its sidebar server picker.
+        switchButton.visibility = if (workspaceSession != null) View.VISIBLE else View.GONE
         emitServerPicker()
     }
 
@@ -635,6 +701,8 @@ class MainActivity : AppCompatActivity() {
                     onRendererGone = ::recoverFromRendererDeath,
                     workspaceSession = { workspaceSession },
                     onWorkspaceSessionInvalid = ::handleWorkspaceSessionInvalid,
+                    onWorkspaceSignOut = ::requestWorkspaceSignOut,
+                    bridgeScript = { NativeBridgeScript.source(workspaceSession != null) },
                 )
             webChromeClient =
                 OmnigentWebChromeClient(
@@ -802,6 +870,19 @@ class MainActivity : AppCompatActivity() {
             """.trimIndent()
     }
 
+    override fun onResume() {
+        super.onResume()
+        val session = workspaceSession ?: return
+        val profile = workspaceProfile ?: return
+        val page = lastWorkspacePageUri ?: session.pageUri
+        profile.hasSessionCookie(page).whenComplete { present, rawError ->
+            runOnUiThread {
+                if (workspaceSession !== session || isFinishing || isDestroyed) return@runOnUiThread
+                if (rawError != null || present != true) handleWorkspaceSessionInvalid(null)
+            }
+        }
+    }
+
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
         applySystemBarContrast(newConfig)
@@ -834,6 +915,7 @@ class MainActivity : AppCompatActivity() {
                     onServerPickerRequested = ::onServerPickerRequested,
                     onSwitchServer = ::onSwitchServerRequested,
                     onOpenServerSetup = ::onOpenServerSetupRequested,
+                    onSignOut = if (workspaceSession != null) ::requestWorkspaceSignOut else null,
                 ),
             )
         } catch (_: IllegalArgumentException) {
@@ -846,7 +928,7 @@ class MainActivity : AppCompatActivity() {
                 bridgeScriptHandler =
                     WebViewCompat.addDocumentStartJavaScript(
                         webView,
-                        NativeBridgeScript.source,
+                        NativeBridgeScript.source(workspaceSession != null),
                         allowedOrigins,
                     )
             } catch (_: IllegalArgumentException) {
@@ -1033,7 +1115,7 @@ class MainActivity : AppCompatActivity() {
                 returnToSetup(workspaceContext?.pageUri?.toString(), error)
                 return
             }
-            val context = workspaceContext
+            val context = pendingRecoveryContext ?: workspaceContext
             val profile = workspaceProfile
             if (context != null && profile != null) {
                 beginWorkspaceConnection(context, profile, allowInteractive = false)
@@ -1138,6 +1220,9 @@ class MainActivity : AppCompatActivity() {
             // Group 2: actions (divider before this group).
             add(2, 3, 0, getString(R.string.menu_reload))
             add(2, 4, 0, getString(R.string.menu_connect_new))
+            if (workspaceSession != null) {
+                add(2, 5, 0, getString(R.string.menu_sign_out_workspace))
+            }
         }
         popup.setOnMenuItemClickListener { item ->
             when (item.itemId) {
@@ -1148,6 +1233,11 @@ class MainActivity : AppCompatActivity() {
 
                 4 -> {
                     startActivity(Intent(this@MainActivity, ConnectActivity::class.java))
+                    true
+                }
+
+                5 -> {
+                    requestWorkspaceSignOut()
                     true
                 }
 
@@ -1192,6 +1282,12 @@ class MainActivity : AppCompatActivity() {
             webView.clearHistory()
         }
         pageLoaded = true
+        workspaceSession?.let { session ->
+            runCatching { url?.let(::URI)?.let(session::navigationUri) }.getOrNull()?.let {
+                lastWorkspacePageUri = it
+                workspaceRecoveryPolicy.markReady()
+            }
+        }
         loginAttempts = 0 // reached a pinned-origin page — we're past the login redirect
         // Does NOT reset the crash budget: a load-then-crash loop fires onPageReady
         // every cycle, so resetting here would defeat withinCrashBudget()'s guard.

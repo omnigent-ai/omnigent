@@ -75,6 +75,22 @@ class DatabricksWebProfileTest {
     }
 
     @Test
+    fun `foreground session check observes the scoped cookie`() {
+        val backend = FakeBackend()
+        val profile = DatabricksWebProfile("profile-check", backend)
+        backend.cookies["DBAUTH"] = "session"
+
+        val present = profile.hasSessionCookie(session().pageUri)
+        shadowOf(Looper.getMainLooper()).idle()
+        assertTrue(present.get(1, TimeUnit.SECONDS))
+
+        backend.cookies.clear()
+        val missing = profile.hasSessionCookie(session().pageUri)
+        shadowOf(Looper.getMainLooper()).idle()
+        assertFalse(missing.get(1, TimeUnit.SECONDS))
+    }
+
+    @Test
     fun `clear removes profile cookies and web storage`() {
         val backend = FakeBackend()
         backend.cookies["DBAUTH"] = "session"

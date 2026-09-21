@@ -82,6 +82,32 @@ class DatabricksSessionClientTest {
     }
 
     @Test
+    fun `only this workspace's logout signs it out`() {
+        val session =
+            DatabricksWebSession(
+                URI("https://dbc-123.cloud.databricks.com/omnigent?o=42"),
+                emptyList(),
+                setOf("https://dbc-123.cloud.databricks.com", "https://alias.cloud.databricks.com"),
+                configuration,
+                "42",
+            )
+
+        assertTrue(
+            session.isSignOutUri(URI("https://dbc-123.cloud.databricks.com/auth/logout?o=42")),
+        )
+        assertTrue(session.isSignOutUri(URI("https://alias.cloud.databricks.com/logout")))
+        assertTrue(
+            session.isSignOutUri(URI("https://dbc-123.cloud.databricks.com/login.html?logout=1")),
+        )
+        // Another workspace on the same host, and a host this session never accepted.
+        assertFalse(
+            session.isSignOutUri(URI("https://dbc-123.cloud.databricks.com/auth/logout?o=43")),
+        )
+        assertFalse(session.isSignOutUri(URI("https://dbc-456.cloud.databricks.com/auth/logout")))
+        assertFalse(session.isSignOutUri(URI("https://dbc-123.cloud.databricks.com/omnigent?o=42")))
+    }
+
+    @Test
     fun `a workspace context recognizes only its own workspace`() {
         assertTrue(context.isSameWorkspace("https://dbc-123.cloud.databricks.com/omnigent?o=42"))
         assertFalse(context.isSameWorkspace("https://dbc-123.cloud.databricks.com/omnigent?o=43"))
