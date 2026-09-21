@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Protocol
 
+from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.models.model_fallbacks import (
     SMART_ROUTING_CLAUDE_LADDER,
     SMART_ROUTING_CURRENT_GENERATION_GPT,
@@ -303,10 +304,14 @@ RUNNER_CATALOG_TTL_S = 300.0
 
 #: session id → (monotonic deadline, catalog). Process-local, like every other
 #: runner-derived overlay cache on the server.
-_runner_catalog_cache: dict[str, tuple[float, dict[str, list[_RunnerModel]]]] = {}
+_runner_catalog_cache: WorkspaceScopedCache[str, tuple[float, dict[str, list[_RunnerModel]]]] = (
+    WorkspaceScopedCache()
+)
 
 #: Single-flight per session, so a burst of turns costs one runner round trip.
-_runner_catalog_inflight: dict[str, asyncio.Task[dict[str, list[_RunnerModel]] | None]] = {}
+_runner_catalog_inflight: WorkspaceScopedCache[
+    str, asyncio.Task[dict[str, list[_RunnerModel]] | None]
+] = WorkspaceScopedCache()
 
 
 def invalidate_runner_catalog(session_id: str | None = None) -> None:

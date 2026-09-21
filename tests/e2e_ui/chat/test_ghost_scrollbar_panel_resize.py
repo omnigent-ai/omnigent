@@ -109,7 +109,7 @@ def _fully_visible(state: dict) -> bool:
         state["firstMsgTop"] is not None
         and state["lastMsgBottom"] is not None
         and state["firstMsgTop"] >= state["viewportTop"]
-        and state["lastMsgBottom"] <= state["viewportBottom"] - 40
+        and state["lastMsgBottom"] <= state["viewportBottom"] - 32
     )
 
 

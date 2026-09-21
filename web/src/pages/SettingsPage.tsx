@@ -11,7 +11,8 @@
  *
  * - **General** — app-wide behavior preferences.
  * - **Appearance** — theme mode (System / Light / Dark), terminal theme,
- *   default transcript view, Workspace panel default, and UI/code font controls.
+ *   default transcript view, Workspace panel and tab defaults, and UI/code font
+ *   controls.
  * - **Git** — Git behavior: the global "always use a random worktree" default
  *   and the default base branch pre-filled when naming a new worktree branch.
  * - **Keyboard shortcuts** — the full shortcuts reference, shown inline.
@@ -41,11 +42,15 @@ import {
   useRef,
   useState,
 } from "react";
+import GithubMono from "@lobehub/icons/es/Github/components/Mono";
 import { useViewerId } from "@/hooks/useViewerId";
 import {
   ArchiveRestoreIcon,
   AlertTriangleIcon,
+  BotIcon,
   DownloadIcon,
+  FileDiffIcon,
+  FilesIcon,
   KeyRoundIcon,
   Loader2Icon,
   LaptopMinimalIcon,
@@ -99,6 +104,7 @@ import {
 import { MOD_KEY } from "@/components/KeyboardShortcut";
 import { KeyboardShortcutsList } from "@/components/KeyboardShortcutsDialog";
 import { changePassword, logout } from "@/lib/accountsApi";
+import { withBasePath } from "@/lib/basePath";
 import {
   beginGithubConnect,
   disconnectGithub,
@@ -179,6 +185,12 @@ import {
   writeTranscriptViewDefault,
   type TranscriptViewDefault,
 } from "@/lib/transcriptViewPreferences";
+import {
+  DEFAULT_WORKSPACE_TAB,
+  readDefaultWorkspaceTab,
+  writeDefaultWorkspaceTab,
+  type DefaultWorkspaceTab,
+} from "@/lib/workspaceTabPreferences";
 import { readDefaultBaseBranch, writeDefaultBaseBranch } from "@/lib/baseBranchPreferences";
 import { readAlwaysSteer, writeAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import {
@@ -360,11 +372,22 @@ const workspacePanelCards: {
   { value: "collapsed", label: "Collapsed", icon: PanelRightCloseIcon },
 ];
 
+const workspaceTabCards: {
+  value: DefaultWorkspaceTab;
+  label: string;
+  icon: ComponentType<{ className?: string }>;
+}[] = [
+  { value: "files", label: "Files", icon: FilesIcon },
+  { value: "changes", label: "Changes", icon: FileDiffIcon },
+  { value: "github", label: "GitHub", icon: GithubMono },
+  { value: "subagents", label: "Agents", icon: BotIcon },
+];
+
 /** Centered icon + label body shared by the Mode and Terminal theme cards. */
-function iconCardBody(Icon: typeof SunIcon, label: string) {
+function iconCardBody(Icon: ComponentType<{ className?: string }>, label: string) {
   return (
     <>
-      <Icon className="size-6 text-muted-foreground" />
+      <Icon aria-hidden="true" className="size-6 text-muted-foreground" />
       <span className="text-ui font-medium">{label}</span>
     </>
   );
@@ -518,6 +541,36 @@ function WorkspacePanelDefaultControl() {
         items={workspacePanelCards.map((card) => ({
           value: card.value,
           testId: `workspace-panel-default-${card.value}`,
+          body: iconCardBody(card.icon, card.label),
+        }))}
+      />
+    </ThemeSubsection>
+  );
+}
+
+/** Fallback tab for sessions without a remembered Workspace tab. */
+function WorkspaceTabDefaultControl() {
+  const [value, setValue] = useState(() => readDefaultWorkspaceTab());
+  const labelId = useId();
+  const choose = useCallback((next: DefaultWorkspaceTab) => {
+    setValue(next);
+    writeDefaultWorkspaceTab(next);
+  }, []);
+  return (
+    <ThemeSubsection
+      labelId={labelId}
+      title="Default Workspace tab"
+      helper="Shown first in Workspace. Changing this also updates existing chats when reopened or refreshed. Later tab choices are remembered. File links still open the linked file."
+    >
+      <CardRadioGroup<DefaultWorkspaceTab>
+        labelledBy={labelId}
+        value={value}
+        onSelect={choose}
+        className="grid grid-cols-2 gap-3 sm:grid-cols-4"
+        cardClassName="items-center gap-2 p-4"
+        items={workspaceTabCards.map((card) => ({
+          value: card.value,
+          testId: `workspace-tab-default-${card.value}`,
           body: iconCardBody(card.icon, card.label),
         }))}
       />
@@ -766,6 +819,8 @@ function AppearanceSection() {
 
     writeWorkspacePanelDefault(WORKSPACE_PANEL_DEFAULT);
 
+    writeDefaultWorkspaceTab(DEFAULT_WORKSPACE_TAB);
+
     writeHideUnconfiguredHarnesses(DEFAULT_HIDE_UNCONFIGURED_HARNESSES);
 
     applyDesktopUiFontSize(UI_FONT_SIZE_DEFAULT);
@@ -792,6 +847,7 @@ function AppearanceSection() {
           "omnigent:custom-theme",
           "omnigent:default-transcript-view",
           "omnigent:default-workspace-panel",
+          "omnigent:default-workspace-tab",
           "omnigent:hide-unconfigured-harnesses",
         ]) {
           window.localStorage.removeItem(key);
@@ -875,6 +931,8 @@ function AppearanceSection() {
         <TranscriptViewDefaultControl />
 
         <WorkspacePanelDefaultControl />
+
+        <WorkspaceTabDefaultControl />
 
         <HideUnconfiguredHarnessesControl />
 
@@ -2199,14 +2257,14 @@ function AccountSection() {
       // the SPA login form.
       await logout();
       // Hard navigation so the chat store / react-query cache reset.
-      window.location.href = "/login";
+      window.location.href = withBasePath("/login");
       return;
     }
     // OIDC: logout is a server-side GET redirect at /auth/logout that clears
     // the session cookie (and honors the IdP end-session endpoint when
     // configured). A hard navigation lets the browser follow it and resets
     // client caches.
-    window.location.href = "/auth/logout";
+    window.location.href = withBasePath("/auth/logout");
   }, [accountsEnabled]);
 
   const resetPwForm = useCallback(() => {

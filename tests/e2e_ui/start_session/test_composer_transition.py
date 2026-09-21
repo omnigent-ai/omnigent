@@ -41,7 +41,7 @@ async def _drive(
                 page, created_session_id=session_id, create_bodies=create_bodies
             )
             await page.route(
-                re.compile(r"/v1/sessions\?.*kind=any"),
+                re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"),
                 lambda route: route.fulfill(json={"data": []}),
             )
             await page.route(
@@ -134,7 +134,8 @@ async def _drive(
             await expect(label).not_to_contain_text(selected)
             await expect(label).to_contain_text("High")
             snapshot_ready.set()
-            await expect(label).to_contain_text(selected_label)
+            compact_selected_label = selected_label.replace(" (1M context)", " 1M")
+            await expect(label).to_contain_text(compact_selected_label)
             await expect(loading).to_have_count(0)
             await page.locator("[data-composer-card]").screenshot(
                 path=output / "bound-model.png", animations="disabled"
@@ -148,10 +149,79 @@ async def _drive(
                 for sample in samples
             ), samples
             assert all(
-                sample["loading"] or selected_label in sample["text"] for sample in samples
+                sample["loading"] or compact_selected_label in sample["text"] for sample in samples
             ), samples
         finally:
             release.set()
             snapshot_ready.set()
+            await page.unroute_all(behavior="wait")
+            await browser.close()
+
+
+@pytest.mark.parametrize("failure_mode", ["response", "network"])
+def test_failed_delayed_create_returns_temporary_draft(
+    seeded_session_pair: tuple[str, str, str], failure_mode: str
+) -> None:
+    _run_in_fresh_loop(_drive_failed_create(*seeded_session_pair, failure_mode))
+
+
+async def _drive_failed_create(
+    base_url: str, session_id: str, previous_id: str, failure_mode: str
+) -> None:
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch()
+        page = await browser.new_page(viewport={"width": 1920, "height": 1000})
+        release = asyncio.Event()
+        create_bodies = []
+        try:
+            await _register_common_routes(
+                page, created_session_id=session_id, create_bodies=create_bodies
+            )
+            await page.route(
+                re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"),
+                lambda route: route.fulfill(json={"data": []}),
+            )
+
+            async def fail_create(route):
+                if route.request.method != "POST":
+                    await route.fallback()
+                    return
+                create_bodies.append(route.request.post_data_json)
+                await release.wait()
+                if failure_mode == "network":
+                    await route.abort("failed")
+                else:
+                    await route.fulfill(status=422, json={"detail": "Create rejected"})
+
+            await page.route(re.compile(r"/v1/sessions(?:\?.*)?$"), fail_create)
+            await page.goto(f"{base_url}/c/{previous_id}")
+            await page.evaluate(
+                "localStorage.setItem('omnigent:recent-workspaces', "
+                f"JSON.stringify({{{_HOST_ID}: ['/work/repo']}}))"
+            )
+            await page.get_by_test_id("new-chat-button").click()
+            await page.get_by_test_id("new-chat-landing-input").fill("Initial request")
+            await page.get_by_test_id("new-chat-landing-submit").click()
+            await page.wait_for_url(re.compile(r"/c/temp"))
+
+            composer = page.get_by_label("Message the agent")
+            await expect(composer).to_be_editable()
+            await composer.fill("Follow-up typed during creation")
+            temporary_path = page.url
+
+            release.set()
+            await page.wait_for_url(base_url + "/")
+            await expect(page.get_by_test_id("new-chat-landing-input")).to_have_value(
+                "Initial request\n\nFollow-up typed during creation"
+            )
+            assert len(create_bodies) == 1, create_bodies
+
+            stored_drafts = await page.evaluate(
+                "JSON.parse(sessionStorage.getItem('omnigent.sessionDrafts') || '{}')"
+            )
+            temporary_id = temporary_path.rsplit("/", 1)[-1]
+            assert temporary_id not in stored_drafts, stored_drafts
+        finally:
+            release.set()
             await page.unroute_all(behavior="wait")
             await browser.close()

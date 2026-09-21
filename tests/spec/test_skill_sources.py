@@ -66,6 +66,9 @@ def _ctx(
         ("antigravity", None),
         ("antigravity-native", "antigravity"),
         ("native-antigravity", "antigravity"),
+        ("devin", "devin"),
+        ("devin-native", "devin"),
+        ("native-devin", "devin"),
         ("qwen", None),
         (None, None),
         ("", None),
@@ -73,6 +76,58 @@ def _ctx(
 )
 def test_harness_family(harness: str | None, expected: str | None) -> None:
     assert _harness_family(harness) == expected
+
+
+def test_devin_provider_lists_the_cli_reported_skills(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Devin reads skills from several of its own dirs plus .claude/skills with
+    # its own precedence, so the menu is sourced from ``devin skills list``
+    # (authoritative) rather than a dir walk that would only approximate it.
+    payload = json.dumps(
+        [
+            {
+                "name": "code-review",
+                "description": "review",
+                "base_dir": "/w/.claude/skills/code-review",
+                "triggers": ["user"],
+            },
+            {"name": "deploy", "description": "ship", "base_dir": "/w/.devin/skills/deploy"},
+        ]
+    )
+
+    class _Result:
+        returncode = 0
+        stdout = payload
+        stderr = ""
+
+    calls: list[dict[str, object]] = []
+
+    def _run(cmd: list[str], **kwargs: object) -> _Result:
+        calls.append({"cmd": cmd, "cwd": kwargs.get("cwd")})
+        return _Result()
+
+    monkeypatch.setattr("omnigent.spec.skill_sources.subprocess.run", _run)
+    out = resolve_harness_skills(_ctx(tmp_path, tmp_path), "devin-native")
+    assert {s.name for s in out} == {"code-review", "deploy"}
+    review = next(s for s in out if s.name == "code-review")
+    assert review.description == "review"
+    assert review.skill_dir == Path("/w/.claude/skills/code-review")
+    # Sourced from the CLI, in the session's workspace.
+    assert calls[0]["cmd"][:3] == ["devin", "skills", "list"]
+    assert calls[0]["cwd"] == str(tmp_path)
+
+
+def test_devin_provider_fails_soft_when_cli_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A missing/broken devin CLI must not break the menu — the bundled skills
+    # (added by the caller) still show; the host list is just empty.
+    def _run(cmd: list[str], **kwargs: object) -> object:
+        raise FileNotFoundError("devin not on PATH")
+
+    monkeypatch.setattr("omnigent.spec.skill_sources.subprocess.run", _run)
+    assert resolve_harness_skills(_ctx(tmp_path, tmp_path), "devin-native") == []
 
 
 def test_unknown_harness_falls_back_to_generic_host_walk(

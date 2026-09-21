@@ -1,4 +1,5 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Bubble } from "@/lib/renderItems";
 import { useChatStore, type ChatState } from "@/store/chatStore";
@@ -53,6 +54,63 @@ afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
   useChatStore.setState(initialStoreState);
+});
+
+describe("UserBubble literal text", () => {
+  it.each([
+    [
+      "unfinished placeholder",
+      "how about to reduce the output you can do like\n• ••\n" +
+        "<exact line(s) that needs to be seen without edit\n" +
+        "so for any matching line in the output which shows it, dont edit it or excerpt it, " +
+        "if any of the line shows important info",
+    ],
+    ["complete placeholder", "Keep <exact lines> visible."],
+    ["HTML example", '<div class="example">Keep this text</div>'],
+    ["HTML comment", "Keep <!-- this comment --> visible."],
+    ["multiline HTML", "<div>\n  first line\n  second line\n</div>"],
+  ])("preserves %s", (_name, text) => {
+    render(
+      <BubbleView
+        bubble={{
+          kind: "user",
+          itemId: "user_literal",
+          content: [{ type: "input_text", text }],
+        }}
+        isLastAssistant={false}
+      />,
+    );
+
+    const bubble = screen.getByTestId("message-bubble");
+    for (const line of text.split("\n")) {
+      expect(bubble).toHaveTextContent(line.trim());
+    }
+  });
+
+  it("keeps Markdown formatting and inline code alongside literal tags", () => {
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <BubbleView
+          bubble={{
+            kind: "user",
+            itemId: "user_markdown",
+            content: [
+              {
+                type: "input_text",
+                text: "**Keep** <exact lines> and `<code>`\n\n- first\n- second",
+              },
+            ],
+          }}
+          isLastAssistant={false}
+        />
+      </QueryClientProvider>,
+    );
+
+    expect(screen.getByText("Keep")).toHaveAttribute("data-streamdown", "strong");
+    expect(screen.getByText("<code>").tagName).toBe("CODE");
+    expect(screen.getAllByRole("listitem")).toHaveLength(2);
+    expect(screen.getByTestId("message-bubble")).toHaveTextContent("<exact lines>");
+  });
 });
 
 describe("AssistantBubble error retry", () => {
@@ -209,7 +267,7 @@ describe("AssistantBubble error retry", () => {
     );
     render(<BubbleView bubble={errorBubble("required_terminal_exited")} />);
 
-    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    fireEvent.click(screen.getByRole("button", { name: "Resume session" }));
 
     await waitFor(() => expect(screen.queryByTestId("error-pill")).toBeNull());
     expect(fetchMock).toHaveBeenCalledOnce();

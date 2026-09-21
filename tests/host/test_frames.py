@@ -42,6 +42,8 @@ from omnigent.host.frames import (
     HostRunnerExitedFrame,
     HostRunnerStatusFrame,
     HostRunnerStatusResultFrame,
+    HostSkillsFrame,
+    HostSkillsResultFrame,
     HostStatFrame,
     HostStatResultFrame,
     HostStopRunnerFrame,
@@ -127,6 +129,57 @@ def test_import_local_frames_round_trip() -> None:
     )
     assert isinstance(done_failed, HostImportLocalDoneFrame)
     assert done_failed.failed == 2
+
+
+@pytest.mark.parametrize(
+    "frame",
+    [
+        HostSkillsFrame(request_id="req_skills", harness="claude-native", path="~/my project"),
+        HostSkillsFrame(
+            request_id="filtered", harness="claude-sdk", path="/repo", skills_filter=["review"]
+        ),
+        HostSkillsFrame(
+            request_id="hermetic", harness="claude-sdk", path="/repo", skills_filter="none"
+        ),
+        HostSkillsResultFrame(
+            request_id="req_skills",
+            status="ok",
+            skills=[{"name": "toolkit:review", "description": "Review changes"}],
+        ),
+        HostSkillsFrame(
+            request_id="session",
+            harness="session",
+            path="/workspace",
+            session_id="conv",
+            agent_id="agent",
+            agent_version="2",
+            sub_agent_name="child",
+        ),
+        HostSkillsResultFrame(request_id="session", status="ok", session_id="conv"),
+        HostSkillsResultFrame(request_id="filtered", status="ok", agent_id="agent"),
+        HostSkillsResultFrame(request_id="req_skills", status="ok"),
+        HostSkillsResultFrame(
+            request_id="req_skills",
+            status="failed",
+            error_code="invalid_path",
+            error="path must be absolute",
+        ),
+    ],
+)
+def test_skills_frames_round_trip(frame: HostSkillsFrame | HostSkillsResultFrame) -> None:
+    assert decode_host_frame(encode_host_frame(frame)) == frame
+
+
+@pytest.mark.parametrize(
+    "skills", [{}, ["review"], [{"name": "review"}], [{"name": 1, "description": "x"}]]
+)
+def test_skills_result_rejects_malformed_catalog(skills: object) -> None:
+    with pytest.raises(ValueError):
+        decode_host_frame(
+            json.dumps(
+                {"kind": "host.skills_result", "request_id": "r", "status": "ok", "skills": skills}
+            )
+        )
 
 
 def test_model_options_frames_round_trip() -> None:
@@ -258,6 +311,24 @@ def test_hello_frame_without_interactive_shells_is_backward_compatible() -> None
     )
     assert isinstance(decoded, HostHelloFrame)
     assert decoded.interactive_shells is None
+    # An older host advertises no capabilities — the server must read this as an
+    # empty set (feature unsupported), not choke on the missing key.
+    assert decoded.capabilities == []
+
+
+def test_hello_frame_capabilities_round_trip() -> None:
+    """Advertised capability tokens survive encode → decode."""
+    from omnigent.host.frames import CAP_CODEX_SIDE_CHAT
+
+    original = HostHelloFrame(
+        version="0.1.0",
+        frame_protocol_version=1,
+        name="new-host",
+        capabilities=[CAP_CODEX_SIDE_CHAT],
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostHelloFrame)
+    assert decoded.capabilities == [CAP_CODEX_SIDE_CHAT]
 
 
 def test_hello_frame_empty_runners() -> None:
@@ -295,6 +366,59 @@ def test_launch_runner_frame_round_trip() -> None:
     assert decoded.binding_token == "secret_token_xyz"
     assert decoded.workspace == "/Users/corey/projects/frontend"
     assert decoded.session_id == "conv_abc123"
+
+
+def test_launch_runner_preserves_the_full_saved_inference_profile() -> None:
+    config = {
+        "providers": {
+            "bifrost": {
+                "kind": "gateway",
+                "openai": {
+                    "base_url": "https://gateway.example/v1",
+                    "api_key_ref": "env:BIFROST_KEY",
+                },
+            },
+            "unity": {"kind": "databricks", "connection": "databricks"},
+        },
+        "inference": {
+            "harnesses": {
+                "codex-native": {
+                    "provider": "bifrost",
+                    "default_model": "private/model[large]",
+                    "model_allowlist": ["private/model[large]"],
+                },
+                "claude-native": {"provider": "unity"},
+            }
+        },
+    }
+    frame = HostLaunchRunnerFrame(
+        request_id="profile-launch",
+        binding_token="runner-binding",
+        workspace="/workspace",
+        session_id="profile-session",
+        harness="codex-native",
+        inference_config=config,
+    )
+    decoded = decode_host_frame(encode_host_frame(frame))
+    assert decoded == frame
+    assert isinstance(decoded, HostLaunchRunnerFrame)
+    assert decoded.inference_config == config
+
+
+@pytest.mark.parametrize("inference_config", [[], "invalid", False, 1])
+def test_launch_runner_rejects_malformed_inference_config(inference_config: object) -> None:
+    with pytest.raises(ValueError, match="inference_config"):
+        decode_host_frame(
+            json.dumps(
+                {
+                    "kind": "host.launch_runner",
+                    "request_id": "bad-profile",
+                    "binding_token": "runner-binding",
+                    "workspace": "/workspace",
+                    "inference_config": inference_config,
+                }
+            )
+        )
 
 
 def test_launch_runner_result_frame_success_round_trip() -> None:
@@ -1238,7 +1362,14 @@ def test_list_worktrees_result_frame_round_trip() -> None:
         request_id="req_wt_ls_1",
         status="ok",
         worktrees=[
-            {"path": "/Users/alice/myrepo", "branch": "main", "is_main": True, "detached": False},
+            {
+                "path": "/Users/alice/myrepo",
+                "branch": "main",
+                "is_main": True,
+                "detached": False,
+                "remote_provider": "github",
+                "updated_at": 1_700_000_000,
+            },
             {
                 "path": "/Users/alice/myrepo-worktrees/feature-login",
                 "branch": "feature/login",
@@ -1250,6 +1381,19 @@ def test_list_worktrees_result_frame_round_trip() -> None:
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostListWorktreesResultFrame)
     assert decoded == original
+
+
+def test_list_worktrees_result_frame_accepts_legacy_entries_without_provider() -> None:
+    """Older hosts may omit remote_provider without breaking decoding."""
+    decoded = decode_host_frame(
+        '{"kind":"host.list_worktrees_result","request_id":"r","status":"ok",'
+        '"worktrees":[{"path":"/repo","branch":"main","is_main":true,'
+        '"detached":false}],"error":null}'
+    )
+    assert isinstance(decoded, HostListWorktreesResultFrame)
+    assert decoded.worktrees == [
+        {"path": "/repo", "branch": "main", "is_main": True, "detached": False}
+    ]
 
 
 def test_list_worktrees_result_frame_failure_round_trip() -> None:

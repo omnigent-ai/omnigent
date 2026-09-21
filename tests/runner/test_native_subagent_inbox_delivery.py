@@ -844,3 +844,223 @@ async def test_routed_child_off_its_native_spec_still_delivers(
     )
     assert items[0]["status"] == "completed"
     assert items[0]["conversation_id"] == CHILD_SESSION_ID
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("harness_name", ["cursor-native", "claude-sdk"])
+@pytest.mark.parametrize("error_code", [None, "runner_disconnected", "runner_failed_to_start"])
+@pytest.mark.parametrize("previous_execution", ["new", "finished", "active", "messaged"])
+async def test_recovered_child_continues_same_dispatch_before_delivering_result(
+    _clean_subagent_registry: None,
+    monkeypatch: pytest.MonkeyPatch,
+    error_code: str | None,
+    previous_execution: str,
+    harness_name: str,
+) -> None:
+    """Parent initialization keeps the child pending; child init resumes its task once."""
+    from unittest.mock import AsyncMock
+
+    from omnigent.entities import Conversation
+    from omnigent.runner.session_init_protocol import build_runner_session_init_payload
+    from tests.runner.conftest import _sse
+
+    monkeypatch.setattr(runner_app, "_launch_native_terminal", AsyncMock(return_value=True))
+    monkeypatch.setattr(runner_app, "_resolve_native_spawn_env", AsyncMock(return_value={}))
+    harness = _ScriptedHarnessClient(
+        [
+            _sse({"type": "response.created", "response": {"id": "resp_recovered"}}),
+            _sse({"type": "response.completed", "response": {"id": "resp_recovered"}}),
+        ]
+    )
+    started, release = asyncio.Event(), asyncio.Event()
+    if previous_execution == "messaged":
+        original = _ScriptedHarnessClient._StreamHandle.aiter_text
+
+        async def gated_stream(handle: Any) -> Any:
+            started.set()
+            await release.wait()
+            async for frame in original(handle):
+                yield frame
+
+        monkeypatch.setattr(_ScriptedHarnessClient._StreamHandle, "aiter_text", gated_stream)
+    pm = _FakeProcessManager(harness)
+    server = _RecoveryServerClient(
+        [
+            _child_summary(
+                current_task_status="failed" if error_code else "in_progress",
+                last_task_error={"code": error_code, "message": "runner lost"},
+            )
+        ]
+    )
+
+    async def resolve(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        if agent_id == "ag_reviewer":
+            return AgentSpec(
+                spec_version=1,
+                name="worker",
+                executor=ExecutorSpec(type="omnigent", config={"harness": harness_name}),
+            )
+        return AgentSpec(spec_version=1, name="orchestrator")
+
+    resources = runner_app.SessionResourceRegistry()
+    app = create_runner_app(
+        resource_registry=resources,
+        process_manager=pm,
+        spec_resolver=resolve,
+        server_client=server,  # type: ignore[arg-type]
+    )
+    async with _runner_client(app) as client:
+        parent = await client.post(
+            "/v1/sessions", json={"session_id": PARENT_SESSION_ID, "agent_id": "ag_orchestrator"}
+        )
+        assert parent.status_code == 201, parent.text
+        inbox = runner_app._session_inboxes_ref[PARENT_SESSION_ID]
+        entry = runner_app.get_subagent_work(CHILD_SESSION_ID)
+        assert entry is not None and entry.work_id == DISPATCH_ID
+        assert entry.status not in {"failed", "completed", "cancelled"}
+        assert inbox.empty(), "runner crash was delivered as a finished child result"
+        child = Conversation(
+            id=CHILD_SESSION_ID,
+            agent_id="ag_reviewer",
+            runner_id="replacement",
+            root_conversation_id=PARENT_SESSION_ID,
+            parent_conversation_id=PARENT_SESSION_ID,
+            created_at=0,
+            updated_at=0,
+        )
+        payload = build_runner_session_init_payload(
+            child,
+            server_version="test",
+            resume_interrupted_turn=True,
+        )
+        if previous_execution in {"finished", "active"}:
+            # Runner A retains its old turn epoch while this child ran on B.
+            app.state.begin_turn_slot(CHILD_SESSION_ID)
+            app.state.active_turns.pop(CHILD_SESSION_ID)
+        if previous_execution == "active":
+            resources.note_external_session_status(CHILD_SESSION_ID, "running")
+        if previous_execution == "messaged":
+            message = await client.post(
+                f"/v1/sessions/{CHILD_SESSION_ID}/events",
+                json={
+                    "type": "message",
+                    "agent_id": "ag_reviewer",
+                    "content": [{"type": "input_text", "text": "new user instruction"}],
+                },
+            )
+            assert message.status_code == 202, message.text
+            await asyncio.wait_for(started.wait(), timeout=5)
+        for _ in range(2):
+            result = await client.post("/v1/sessions", json=payload)
+            assert result.status_code == 201
+        if previous_execution == "active":
+            assert not harness.posted_bodies, "a surviving native turn must not get another prompt"
+        elif previous_execution == "messaged":
+            assert len(harness.posted_bodies) == 1
+            content = str(harness.posted_bodies[0]["content"])
+            assert "new user instruction" in content
+            assert "Continue the existing task" not in content
+            release.set()
+        else:
+            for _ in range(100):
+                if harness.posted_bodies:
+                    break
+                await asyncio.sleep(0.01)
+            assert len(harness.posted_bodies) == 1, (
+                "interrupted child must receive one continuation turn"
+            )
+            assert "Continue the existing task" in str(harness.posted_bodies[0]["content"])
+        if harness_name == "cursor-native" or previous_execution == "active":
+            # A surviving turn completes through its existing status forwarder.
+            await client.post(
+                f"/v1/sessions/{CHILD_SESSION_ID}/events",
+                json={
+                    "type": "external_session_status",
+                    "data": {"status": "idle", "output": "done"},
+                },
+            )
+        else:
+            for _ in range(100):
+                if not inbox.empty():
+                    break
+                await asyncio.sleep(0.01)
+            assert "review complete: LGTM" in str(harness.posted_bodies[0]["content"])
+        result = inbox.get_nowait()
+        assert result["conversation_id"] == CHILD_SESSION_ID
+        assert result["work_id"] == DISPATCH_ID
+        assert result["status"] == "completed"
+        turn = app.state.active_turns.get(CHILD_SESSION_ID)
+        if turn is not None:
+            await turn
+        await client.post("/v1/sessions", json=payload)
+        assert len(harness.posted_bodies) == (0 if previous_execution == "active" else 1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_code", [None, "runner_disconnected", "runner_failed_to_start"])
+async def test_recovered_pending_child_outlives_launch_timeout_and_delivers_original_result(
+    _clean_subagent_registry: None, error_code: str | None
+) -> None:
+    """Recovery must await the original dispatch, including work on another live runner."""
+    from unittest.mock import AsyncMock
+
+    from omnigent.runner.tool_dispatch import _cleanup_drained_subagent_work, _drain_inbox
+
+    child = _child_summary(
+        runner_id="other-live-runner",
+        current_task_status="failed" if error_code else "in_progress",
+        last_task_error={"code": error_code, "message": "runner lost"},
+    )
+    server = _RecoveryServerClient([child])
+    server.patch = AsyncMock(return_value=server._Resp({}))
+    app = create_runner_app(server_client=server)  # type: ignore[arg-type]
+    await app.state.recover_undrained_subagent_results(PARENT_SESSION_ID)
+    entry = runner_app.get_subagent_work(CHILD_SESSION_ID)
+    assert entry is not None and entry.work_id == DISPATCH_ID
+    inbox = runner_app._session_inboxes_ref[PARENT_SESSION_ID]
+
+    assert (
+        runner_app.reap_stalled_subagent_launches(now=entry.created_at + 181, timeout_s=180) == []
+    )
+    assert inbox.empty()
+    await _drain_inbox(inbox, server_client=server, conversation_id=PARENT_SESSION_ID)
+    server.patch.assert_not_awaited()
+
+    # No local child running edge: the server later records completion elsewhere.
+    child.update(current_task_status="completed", last_task_error=None)
+    reconciled = asyncio.Event()
+
+    async def reconcile() -> None:
+        await app.state.reconcile_pending_subagent_results()
+        reconciled.set()
+
+    sweep = asyncio.create_task(
+        runner_app.run_subagent_launch_reaper(interval_s=0.001, reconcile_pending=reconcile)
+    )
+    try:
+        await asyncio.wait_for(reconciled.wait(), timeout=5)
+    finally:
+        sweep.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await sweep
+    assert inbox.qsize() == 1
+    payload = inbox.get_nowait()
+    assert payload["work_id"] == DISPATCH_ID
+    assert payload["conversation_id"] == CHILD_SESSION_ID
+    assert payload["status"] == "completed"
+    assert payload["output"] == "review complete: LGTM"
+    await _cleanup_drained_subagent_work(payload, server_client=server)
+    server.patch.assert_awaited_once_with(
+        f"/v1/sessions/{CHILD_SESSION_ID}",
+        json={"labels": {runner_app.SUBAGENT_DELIVERED_ID_LABEL_KEY: DISPATCH_ID}},
+        timeout=30.0,
+    )
+    await app.state.reconcile_pending_subagent_results()
+    await app.state.recover_undrained_subagent_results(PARENT_SESSION_ID)
+    assert inbox.empty()
+    late = runner_app.mark_subagent_work_terminal(
+        CHILD_SESSION_ID, status="completed", output="review complete: LGTM"
+    )
+    assert late.delivered and not late.delivered_now
+    assert inbox.empty()
+    assert child["runner_id"] == "other-live-runner"

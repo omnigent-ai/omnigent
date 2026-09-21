@@ -541,7 +541,7 @@ def configure_process_logging(
 
     # Mirror the file handler's reach with the optional debug-log upload sink,
     # so it captures the same records this process writes to disk.
-    from omnigent.debug_logging import attach_debug_log_sink
+    from omnigent.debug_logging import attach_debug_log_sink, attach_sse_file_sink
 
     sink_targets = _debug_sink_target_loggers(logger_names, root=root)
     attach_debug_log_sink(
@@ -550,6 +550,9 @@ def configure_process_logging(
         level=resolved_level,
         send=debug_log_send,
     )
+    # Opt-in local SSE-event file sink (OMNIGENT_SSE_LOG_TO_FILE), independent of
+    # the debug-log table above; a no-op when the env var is not truthy.
+    attach_sse_file_sink(source=destination, level=resolved_level)
 
     logging.captureWarnings(True)
     return path

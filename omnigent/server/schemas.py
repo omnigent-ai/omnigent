@@ -30,6 +30,7 @@ from omnigent.entities import (
     USER_SESSION_TITLE_MAX_CHARS,
     ConversationItem,
 )
+from omnigent.inner.native_attachments import reject_authored_framework_notices
 
 # ── Shared ──────────────────────────────────────────────────────
 
@@ -261,10 +262,9 @@ class AgentObject(BaseModel):
     :param skills: Skills bundled in the agent spec
         (``skills/<dir>/SKILL.md``). Lets the Web UI's
         new-session composer offer a slash-command menu before a
-        session (and its runner) exists. Host-discovered skills
-        are runner-owned, so they are NOT listed here — the
-        session snapshot's ``skills`` field carries the merged
-        set once a runner is bound. Empty list when the spec
+        session exists. ``GET /skills`` discovers host skills and,
+        when given ``session_id``, merges the session's bundled skills.
+        Empty list when the spec
         bundles no skills or when the bundle cannot be loaded.
     :param terminals: Terminal names declared in the spec's
         ``terminals:`` block, in declaration order, e.g.
@@ -932,6 +932,20 @@ class ErrorDetail(BaseModel):
     remediation: str | None = None
 
 
+class ErrorResponse(BaseModel):
+    """
+    The body every failed request carries: a single ``error`` object.
+
+    Mirrors what the FastAPI exception handler emits for an
+    :class:`~omnigent.errors.OmnigentError`, so documented error responses
+    and the runtime envelope stay the same shape.
+
+    :param error: Machine-readable detail about the failure.
+    """
+
+    error: ErrorDetail
+
+
 class IncompleteDetails(BaseModel):
     """
     Details explaining why a response is incomplete.
@@ -1278,6 +1292,12 @@ class SessionEventInput(BaseModel):
     tools: list[dict[str, Any]] | None = None
     created_by: str | None = None
 
+    @field_validator("data")
+    @classmethod
+    def reject_framework_blocks(cls, data: dict[str, Any]) -> dict[str, Any]:
+        reject_authored_framework_notices(data)
+        return data
+
 
 class SessionGitOptions(BaseModel):
     """
@@ -1491,6 +1511,8 @@ class _SessionCreateRequestBase(BaseModel):
         message event instead.
     """
 
+    inference_configuration_revision: str | None = None
+
     # Declared here, in the legacy field position, so validation errors keep
     # main's ordering. Concrete public models narrow the wire type below.
     agent_id: Any
@@ -1694,6 +1716,8 @@ class SessionCreateMetadata(BaseModel):
         ``sandbox_providers``); ``None`` takes the server's first. Only
         valid with ``host_type: "managed"``.
     """
+
+    inference_configuration_revision: str | None = None
 
     title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
     project_id: str | None = None
@@ -2100,20 +2124,9 @@ class SessionResponse(BaseModel):
         sessions are hidden from the default sidebar listing and
         surface only behind the "Show archived" toggle. ``False``
         for normal sessions. Toggled via ``PATCH /v1/sessions/{id}``.
-    :param todos: Current Claude Code todo list items for
-        ``omnigent claude`` sessions, as raw dicts from Claude's
-        todo JSON file. Each dict has ``content``, ``status``,
-        and ``activeForm`` keys. Empty list for non-claude-native
-        sessions or when no todos have been reported yet. Sourced
-        from the Omnigent server's in-memory ``_session_todos_cache``.
-    :param skills: Skills the bound agent has access to — the
-        merged result of the agent spec's bundled ``skills``
-        and the host-scope skills discovered along the agent
-        workdir / ``~/.claude/skills/`` (subject to the spec's
-        ``skills_filter``). Mirrors what the TUI passes to the
-        runner at startup. Empty list when the agent spec
-        cannot be loaded, or when bundled + host discovery
-        yields nothing.
+    :param todos: Current native Plan items reported by a harness. Each has
+        ``content``, ``status``, and ``activeForm``. Persisted in conversation
+        metadata; empty before the first report or after an explicit clear.
     :param model_options: Runner-owned model-picker options for native
         sessions. Claude supplies launch-time gateway aliases; Codex includes
         each model's supported reasoning efforts. Empty while unavailable.
@@ -2199,8 +2212,9 @@ class SessionResponse(BaseModel):
     git_branch: str | None = None
     archived: bool = False
     todos: list[dict[str, Any]] = Field(default_factory=list)
-    skills: list[SkillSummary] = Field(default_factory=list)
     model_options: list[NativeModelOption] = Field(default_factory=list)
+    inference_configured: bool = False
+    inference_error: str | None = None
     terminal_pending: bool = False
     sandbox_status: SandboxStatus | None = None
     # Per-MCP-server startup state for native harness sessions
@@ -2573,6 +2587,10 @@ class SessionForkRequest(BaseModel):
     host_type: Literal["external", "managed"] = "external"
     sandbox_provider: str | None = None
     workspace: str | None = None
+    # Marks the fork as a side chat: it is stamped with the side-chat label so
+    # it is hidden from the left sidebar (it surfaces only as a Workspace-rail
+    # side-chat tab). The fork otherwise behaves normally (its own runner).
+    side_chat: bool = False
 
     model_config = ConfigDict(extra="forbid")
 
@@ -3328,27 +3346,26 @@ class SessionAgentChangedEvent(_SSEEventBase):
 
 class SessionTodosEvent(_SSEEventBase):
     """
-    Todo-list update from a Claude Code terminal-backed session.
+    Plan/TODO update from a native terminal-backed session.
 
-    Emitted after an ``external_session_todos`` POST from the
-    ``omnigent claude`` transcript forwarder, which captures todo
-    updates via ``PostToolUse``/``TodoWrite`` hook events from Claude
-    Code and forwards them to the Omnigent server. Lets web render a
-    live todo panel in the right column without polling.
+    Emitted after an ``external_session_todos`` POST from a native
+    harness forwarder, which captures structured Plan updates from
+    Claude or Codex and forwards them to the Omnigent server. Lets web
+    render a live todo panel in the right column without polling.
 
     :param type: Always ``"session.todos"``.
     :param conversation_id: Session identifier,
         e.g. ``"conv_abc123"``.
-    :param todos: Current todo items read from Claude's todo file.
+    :param todos: Current native Plan/TODO items from a harness.
         Each entry is a raw dict with ``content`` (str),
         ``status`` (``"pending"`` | ``"in_progress"`` |
-        ``"completed"``), and ``activeForm`` (str, the gerund form)
+        ``"completed"``), and ``activeForm`` (str, display activity)
         keys, e.g. ``[{"content": "Fix the bug", "status":
         "in_progress", "activeForm": "Fixing the bug"}]``.
 
     Category: **transient** (SSE-only). On reconnect, clients seed
     the panel from the session snapshot's ``todos`` field, which is
-    populated by ``_session_todos_cache`` at snapshot build time.
+    restored from persisted metadata at snapshot build time.
     """
 
     type: Literal["session.todos"]
@@ -3466,38 +3483,6 @@ class SessionMcpStartupEvent(_SSEEventBase):
     type: Literal["session.mcp_startup"]
     conversation_id: str
     servers: dict[str, McpServerStartup]
-
-
-class SessionSkillsEvent(_SSEEventBase):
-    """
-    Signal that a session's runner-owned skills have resolved.
-
-    Skills are discovered against the bound runner's filesystem and
-    fetched off the session-snapshot hot path: the snapshot kicks a
-    single background fetch (``_load_runner_skills`` in
-    ``omnigent/server/routes/sessions.py``) and serves ``[]`` until
-    it lands. This event fires the moment that background fetch
-    populates the per-session skills cache, so a connected web client
-    can re-read the snapshot and fill its slash-command menu instead
-    of waiting for the next bind.
-
-    Carries no payload beyond the conversation id — it is a "skills
-    are ready, re-read the snapshot" nudge, mirroring the
-    invalidate-then-refetch shape used by
-    :class:`SessionChangedFilesInvalidatedEvent`. The snapshot's
-    ``skills`` field (now cache-backed) stays the source of truth.
-
-    :param type: Always ``"session.skills"``.
-    :param conversation_id: Session identifier,
-        e.g. ``"conv_abc123"``.
-
-    Category: **transient** (SSE-only). On reconnect, clients seed
-    the menu from the session snapshot's ``skills`` field, which is
-    populated by the runner-skills cache at snapshot build time.
-    """
-
-    type: Literal["session.skills"]
-    conversation_id: str
 
 
 class SessionModelOptionsEvent(_SSEEventBase):
@@ -4757,7 +4742,6 @@ ServerStreamEvent = Annotated[
     | SessionTerminalPendingEvent
     | SessionSandboxStatusEvent
     | SessionMcpStartupEvent
-    | SessionSkillsEvent
     | SessionModelOptionsEvent
     | SessionInputConsumedEvent
     | SessionInterruptedEvent
@@ -4972,6 +4956,24 @@ HarnessStreamEvent = (
 
 
 # ── Projects ──────────────────────────────────────────────────────
+
+
+class ProjectOrderRequest(BaseModel):
+    """Rank owned project IDs; unranked projects append in discovery order.
+
+    Null selects alphabetical mode without erasing the remembered manual IDs.
+    """
+
+    ordered_project_ids: (
+        list[Annotated[str, Field(min_length=32, max_length=32, pattern="^[0-9a-f]{32}$")]] | None
+    ) = Field(..., max_length=10000)
+
+
+class ProjectOrderResponse(BaseModel):
+    """Current sorting mode and the manual order retained in either mode."""
+
+    sort_mode: Literal["alphabetical", "manual"]
+    ordered_project_ids: list[str] | None
 
 
 class ProjectObject(BaseModel):

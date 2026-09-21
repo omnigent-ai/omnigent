@@ -26,7 +26,6 @@ import type {
   SessionResourceCreatedEvent,
   SessionResourceDeletedEvent,
   SessionSandboxStatusEvent,
-  SessionSkillsEvent,
   SessionStatusEvent,
   SessionTerminalActivityEvent,
   SessionTerminalPendingEvent,
@@ -1711,36 +1710,6 @@ describe("session.terminal.activity (FLAT envelope)", () => {
         session_id: "conv_abc",
       }),
     ).toEqual([]);
-  });
-});
-
-describe("session.skills (FLAT envelope)", () => {
-  it("lifts conversation_id into the bare nudge", () => {
-    const out = parse("session.skills", {
-      type: "session.skills",
-      conversation_id: "conv_abc",
-    });
-    expect(out).toHaveLength(1);
-    const ev = out[0] as SessionSkillsEvent;
-    expect(ev.type).toBe("session_skills");
-    expect(ev.conversationId).toBe("conv_abc");
-  });
-
-  it("rejects missing conversation_id", () => {
-    // Without a conversation id the store handler can't target a
-    // refetch, so the frame must be dropped rather than lifted.
-    const out = parse("session.skills", {
-      type: "session.skills",
-    });
-    expect(out).toEqual([]);
-  });
-
-  it("rejects an empty conversation_id", () => {
-    const out = parse("session.skills", {
-      type: "session.skills",
-      conversation_id: "",
-    });
-    expect(out).toEqual([]);
   });
 });
 

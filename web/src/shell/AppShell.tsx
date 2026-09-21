@@ -1,12 +1,8 @@
+import { useLoadedConversations } from "@/hooks/useSidebarData";
 import { type CSSProperties, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Outlet, useParams, useSearchParams } from "@/lib/routing";
-import {
-  PROJECT_LABEL_KEY,
-  type Conversation,
-  useConversations,
-  useProjects,
-} from "@/hooks/useConversations";
+import { PROJECT_LABEL_KEY, type Conversation, useProjects } from "@/hooks/useConversations";
 import { conversationDisplayLabel, UNTITLED_CONVERSATION_LABEL } from "./sidebarNav";
 import { useSessionAgent } from "@/hooks/useAgents";
 import { useApproveHotkey } from "@/hooks/useApproveHotkey";
@@ -43,6 +39,7 @@ import {
 } from "@/lib/workspacePanelPreferences";
 import { readTranscriptViewDefault } from "@/lib/transcriptViewPreferences";
 import { updateOverlayToastOffset } from "@/lib/updateOverlayInset";
+import { readDefaultWorkspaceTab } from "@/lib/workspaceTabPreferences";
 import {
   Dialog,
   DialogContent,
@@ -77,6 +74,7 @@ import {
 import { cn } from "@/lib/utils";
 import {
   isNativeWrapper as isNativeWrapperLabel,
+  nativeCodingAgentForSubagentWrapper,
   WRAPPER_LABEL_KEY,
 } from "@/lib/nativeCodingAgents";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
@@ -93,7 +91,12 @@ import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { ChatHeader } from "./ChatHeader";
 import { ExecutionLogsPanel } from "./ExecutionLogsPanel";
 import { FileViewer } from "./FileViewer";
-import { FileViewerContext } from "./FileViewerContext";
+import {
+  FileViewerContext,
+  type FilePosition,
+  type OpenFileOptions,
+  type FileNavigationGuard,
+} from "./FileViewerContext";
 import { FilesPanelDrawer } from "./FilesPanelDrawer";
 import type { ChangedSort } from "./FlatFileList";
 import { GithubPanel } from "./GithubPanel";
@@ -231,7 +234,9 @@ export function AppShell() {
   const pendingConversation = conversationId != null && serverConversationId == null;
   const [fileViewerCommentsOpen, setFileViewerCommentsOpen] = useState(false);
   const [rightRailTab, setRightRailTab] = useState<RightRailTab>(() =>
-    conversationId ? (readSessionWorkspaceState(conversationId).rightRailTab ?? "files") : "files",
+    conversationId
+      ? (readSessionWorkspaceState(conversationId).rightRailTab ?? readDefaultWorkspaceTab())
+      : "files",
   );
   // The comments panel only contributes to the min width when the rail is
   // actually showing the file viewer — on any other tab the FileViewer
@@ -326,6 +331,32 @@ export function AppShell() {
   const [selectedFilePath, setSelectedFilePath] = useState<string | null>(() =>
     conversationId ? (readSessionWorkspaceState(conversationId).selectedFilePath ?? null) : null,
   );
+  // Explicit opens override the URL, including opens without a cited position.
+  const [fileNavigation, setFileNavigation] = useState<{
+    conversationId: string | undefined;
+    path: string;
+    position: FilePosition | undefined;
+  }>();
+  const citationPath = searchParams.get("file");
+  const citationLine = searchParams.get("line");
+  const citationColumn = searchParams.get("column");
+  // Keep URL requests stable across viewer remounts, just like citation clicks.
+  const urlNavigation = useMemo(() => {
+    const line = Number(citationLine);
+    const column = Number(citationColumn);
+    if (!citationPath || !Number.isSafeInteger(line) || line < 1) return undefined;
+    return {
+      conversationId,
+      path: citationPath,
+      position: { line, ...(Number.isSafeInteger(column) && column > 0 ? { column } : {}) },
+    };
+  }, [conversationId, citationPath, citationLine, citationColumn]);
+  const filePosition =
+    fileNavigation?.conversationId === conversationId && fileNavigation?.path === selectedFilePath
+      ? fileNavigation.position
+      : urlNavigation?.path === selectedFilePath
+        ? urlNavigation.position
+        : undefined;
   // Ordered list of open file tabs. ``selectedFilePath`` is the active tab
   // (null = a scope view, Changed/All, is active). Tabs persist when the user
   // switches to a scope view or another rail tab; only ``closeFile`` removes
@@ -426,12 +457,8 @@ export function AppShell() {
   const agentTerminal = useMemo(() => findAgentTerminal(terminals), [terminals]);
 
   const debugMode = useDebugMode();
-  // Restrict the observer to the fields AppShell actually reads: the 30s
-  // refetchInterval otherwise re-renders this whole shell on every background
-  // `isFetching`/`dataUpdatedAt` flap even when the list is unchanged.
-  const { data: conversationsData, isLoading: conversationsLoading } = useConversations("", true, {
-    notifyOnChangeProps: ["data", "isLoading"],
-  });
+  // Reuse sidebar rows; the active-session snapshot covers sessions outside its cache.
+  const { data: conversationsData, isLoading: conversationsLoading } = useLoadedConversations();
   const optimisticConversationTitle = useOptimisticTitle(conversationId ?? "");
   // Surface sessions needing attention as OS notifications + a dock badge.
   // Mounted here (inside the Router) so it can navigate on click and knows
@@ -547,7 +574,7 @@ export function AppShell() {
     (isTempConvId(conversationId)
       ? (optimisticConversationTitle ?? UNTITLED_CONVERSATION_LABEL)
       : null) ||
-    (isChildSession ? UNTITLED_CONVERSATION_LABEL : null);
+    (isChildSession || activeSession?.id === conversationId ? UNTITLED_CONVERSATION_LABEL : null);
   const headerProjectSummary =
     breadcrumbConv?.project_id != null
       ? projectSummaries?.find((p) => p.id === breadcrumbConv.project_id)
@@ -711,6 +738,7 @@ export function AppShell() {
   // root's cached tree, we hold that root until the authoritative
   // resolution lands (a no-op transition once it does).
   const stickyRootRef = useRef<string | null>(null);
+  const previousRootSessionIdRef = useRef<string | null>(null);
   const queryClient = useQueryClient();
   // Derive the root from `serverConversationId` (undefined for a temp id) so the
   // fallback below never yields `temp:*` — otherwise `useChildSessions` would
@@ -821,19 +849,6 @@ export function AppShell() {
   // no-filesystem agent with no terminals/sub-agents would otherwise
   // render an empty white card with no way to dismiss it.
   const hasRailContent = Object.values(railTabsAvailable).some(Boolean);
-  // Keep the selected tab valid. When the current tab disappears — e.g. the
-  // files panel turns off — fall back to the first still-visible tab in
-  // display order (Files · Changes · Agents · Browser). Picking
-  // the first available (rather than ping-ponging between two effects) keeps
-  // this convergent even when several tabs vanish at once.
-  useEffect(() => {
-    if (railTabsAvailable[rightRailTab]) return;
-    const next = (["files", "changes", "github", "subagents", "browser"] as const).find(
-      (t) => railTabsAvailable[t],
-    );
-    if (next) setRightRailTab(next);
-  }, [railTabsAvailable, rightRailTab]);
-
   // Mount the relay at the always-present shell level (not BrowserPane, which
   // only mounts while its tab is selected) so it's listening before the first
   // browser_navigate. No-op outside Electron / with no conversation.
@@ -1013,6 +1028,7 @@ export function AppShell() {
     // terminal absent from the new session's list.
     pendingShellCreateRef.current = null;
     setTerminalPendingClose(null);
+    setFileNavigation(undefined);
     if (!conversationId) {
       // No session → no rail; false (not the open default) so rail-gated
       // effects stay quiet on non-session routes.
@@ -1044,11 +1060,16 @@ export function AppShell() {
             : (stored ?? (defaultToTerminal ? terminalKey : null)),
     );
 
-    // Restore the selected rail tab (the Files vs Changes scope is now the tab
-    // itself). ``nextTab`` stays null when there's no persisted tab and no file
-    // to surface, so the tab-fallback effect can still land on the first
-    // *available* tab — forcing "files" here would shadow it.
-    let nextTab: RightRailTab | null = persisted.rightRailTab ?? null;
+    // A remembered per-session tab wins; otherwise use the Appearance default.
+    // Navigating within the visible Agents tree is one continuous rail action,
+    // so keep that tab while moving between its root and descendants.
+    const keepAgentsAcrossTreeNavigation =
+      rightRailTab === "subagents" &&
+      rootSessionId !== null &&
+      previousRootSessionIdRef.current === rootSessionId;
+    let nextTab: RightRailTab =
+      persisted.rightRailTab ??
+      (keepAgentsAcrossTreeNavigation ? "subagents" : readDefaultWorkspaceTab());
 
     // Restore the open file tabs from the per-session store, then merge the
     // URL ?file= param: a deep-link selects (and, if absent, opens) that file
@@ -1081,7 +1102,7 @@ export function AppShell() {
     if (nextSelected && nextTab !== "files" && nextTab !== "changes") {
       nextTab = "files";
     }
-    if (nextTab !== null) setRightRailTab(nextTab);
+    setRightRailTab(nextTab);
 
     // Restore the rail open-state for this session. A deep link / reload that
     // carries a workspace signal — a file to open (?file=) or a comment to
@@ -1096,6 +1117,11 @@ export function AppShell() {
 
     stateConvRef.current = conversationId;
   }, [conversationId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Record the incoming root after restoration compares it with the outgoing tree.
+  useEffect(() => {
+    previousRootSessionIdRef.current = rootSessionId;
+  }, [rootSessionId]);
 
   // Session metadata can arrive after the restore effect above. Once the
   // terminal-first label is known, apply URL state first, then the per-tab
@@ -1118,6 +1144,21 @@ export function AppShell() {
       setPanelInitialKeyState(terminalKey);
     }
   }, [agentTerminal, conversationId, searchParams, terminalFirst]);
+
+  // Validate the latest selection, including a tab queued by session restoration.
+  useEffect(() => {
+    setRightRailTab((tab) => {
+      // "sidechat" is a dynamic mode (a side-chat tab is selected), not a
+      // gated nav tab — always valid, and never a fallback target.
+      if (tab === "sidechat") return tab;
+      if (railTabsAvailable[tab]) return tab;
+      return (
+        (["files", "changes", "github", "subagents", "browser"] as const).find(
+          (candidate) => railTabsAvailable[candidate],
+        ) ?? tab
+      );
+    });
+  }, [railTabsAvailable, rightRailTab]);
 
   // Persist the per-session rail tab + open file tabs whenever they change.
   // Keyed on the state (not conversationId) and targeted at the conversation
@@ -1145,9 +1186,11 @@ export function AppShell() {
     writeFilesPanelPreferences({ ...readFilesPanelPreferences(), sort: s });
   }, []);
 
-  const openFileViewer = useCallback(
-    (path: string) => {
+  const commitFileNavigation = useCallback(
+    (path: string, options?: OpenFileOptions) => {
+      const position = options?.line ? { line: options.line, column: options.column } : undefined;
       setSelectedFilePath(path);
+      setFileNavigation({ conversationId, path, position });
       // A file and a shell tab can't both own the rail's content slot —
       // opening a file deselects any active shell tab (its tab stays in the
       // strip).
@@ -1187,12 +1230,39 @@ export function AppShell() {
           const next = new URLSearchParams(prev);
           next.set("file", path);
           next.delete("comment"); // stale comment belongs to the previous file
+          // A citation's cited line rides along so the viewer can land on it;
+          // a plain open clears any previous citation's line.
+          if (position?.line != null) next.set("line", String(position.line));
+          else next.delete("line");
+          if (position?.column != null) next.set("column", String(position.column));
+          else next.delete("column");
           return next;
         },
         { replace: true },
       );
     },
     [setPanelInitialKey, terminalFirst, setSearchParams, conversationId],
+  );
+
+  // Desktop and mobile viewers can both be mounted; each may own a draft.
+  const fileNavigationGuardsRef = useRef(new Set<FileNavigationGuard>());
+  const registerNavigationGuard = useCallback((guard: FileNavigationGuard) => {
+    fileNavigationGuardsRef.current.add(guard);
+    return () => {
+      fileNavigationGuardsRef.current.delete(guard);
+    };
+  }, []);
+  const openFileViewer = useCallback(
+    (path: string, options?: OpenFileOptions) => {
+      const guards = [...fileNavigationGuardsRef.current];
+      const navigate = (index: number) => {
+        const guard = guards[index];
+        if (guard) guard(path, options, () => navigate(index + 1));
+        else commitFileNavigation(path, options);
+      };
+      navigate(0);
+    },
+    [commitFileNavigation],
   );
 
   // Strip the file-viewer URL params (file/diff/comment). Memoized on
@@ -1206,6 +1276,8 @@ export function AppShell() {
         next.delete("file");
         next.delete("diff");
         next.delete("comment");
+        next.delete("line");
+        next.delete("column");
         return next;
       },
       { replace: true },
@@ -1487,6 +1559,8 @@ export function AppShell() {
               const params = new URLSearchParams(sp);
               params.set("file", neighbor);
               params.delete("comment");
+              params.delete("line"); // stale citation belongs to the closed file
+              params.delete("column");
               return params;
             },
             { replace: true },
@@ -1521,6 +1595,16 @@ export function AppShell() {
     },
     [selectedFilePath, selectedTerminalKey, clearFileViewerUrl],
   );
+
+  // A side chat the user just opened must be visible: reveal the Workspace rail
+  // so its soft tab shows. WorkspacePanel owns opening/selecting the tab and
+  // clearing the one-shot `sideChatToOpen` signal (it holds the side-chat tab
+  // state, like the browser tabs); AppShell only ensures the rail is open.
+  const sideChatToOpen = useChatStore((s) => s.sideChatToOpen);
+  useEffect(() => {
+    if (sideChatToOpen === null) return;
+    setRightPanelOpen(true);
+  }, [sideChatToOpen]);
 
   function openTerminalsPanel(key: string) {
     setSelectedFilePath(null); // close file viewer
@@ -1742,13 +1826,22 @@ export function AppShell() {
   const fileViewerContextValue = useMemo(
     () => ({
       openFile: openFileViewer,
+      registerNavigationGuard,
       openGithubTab,
       isChangedPath,
       conversationId,
       workspaceRoot,
       workspaceHome,
     }),
-    [openFileViewer, openGithubTab, isChangedPath, conversationId, workspaceRoot, workspaceHome],
+    [
+      openFileViewer,
+      registerNavigationGuard,
+      openGithubTab,
+      isChangedPath,
+      conversationId,
+      workspaceRoot,
+      workspaceHome,
+    ],
   );
 
   // Context for descendants — ChatPage's ConnectionIndicator reads
@@ -1818,7 +1911,13 @@ export function AppShell() {
     typeof createdAtS === "number" &&
     createdAtS > 0 &&
     Date.now() / 1000 - createdAtS < STARTING_GRACE_S;
+  // A native sub-agent mirror — a codex `/side` side chat, or a sub-agent codex
+  // spawned — is a thread inside the parent's CLI and never gets a terminal of
+  // its own, so this spinner would spin forever instead of resolving.
+  const isNativeSubagentMirror =
+    nativeCodingAgentForSubagentWrapper(sessionLabels[WRAPPER_LABEL_KEY]) !== undefined;
   const terminalStartingUp =
+    !isNativeSubagentMirror &&
     !terminalsAvailable &&
     (sessionStatus !== "failed" || chatStatus === "streaming" || launchPending) &&
     (livenessRowPending ||
@@ -2153,6 +2252,7 @@ export function AppShell() {
                     agentCount={agentCount}
                     rootSessionId={rootSessionId}
                     selectedFilePath={selectedFilePath}
+                    filePosition={filePosition}
                     openFiles={openFiles}
                     openFileViewer={openFileViewer}
                     onCloseFile={closeFile}
@@ -2262,9 +2362,11 @@ export function AppShell() {
               {serverConversationId && selectedFilePath !== null && (
                 <div className="md:hidden">
                   <FileViewer
+                    viewport="mobile"
                     open
                     conversationId={serverConversationId}
                     path={selectedFilePath}
+                    position={filePosition}
                     onClose={closeFileViewer}
                     onNavigateTo={openFileViewer}
                     permissionLevel={permissionLevel}

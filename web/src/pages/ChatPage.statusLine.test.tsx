@@ -1,3 +1,8 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("@/hooks/useSkills", () => ({
+  useSkills: () => ({ skills: [], skillsStatus: "ready", refetch: vi.fn() }),
+}));
 import type * as UseWorkspaceChangedFilesModule from "@/hooks/useWorkspaceChangedFiles";
 import type * as UseSessionModule from "@/hooks/useSession";
 import type * as UseHostsModule from "@/hooks/useHosts";
@@ -7,7 +12,6 @@ import type * as FileViewerContextModule from "@/shell/FileViewerContext";
 import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useChatStore } from "@/store/chatStore";
 
@@ -43,7 +47,8 @@ vi.mock("@/hooks/useComposerGitStatus", () => ({
     isWorktree: null,
     worktreePath: null,
     creationBranch: null,
-    repoNameWithOwner: null,
+    repoNameWithOwner: "omnigent-ai/omnigent",
+    githubState: "ready",
     prCount: 0,
     prNumber: null,
     refresh: () => {},
@@ -171,14 +176,13 @@ describe("Composer status line (branch + context ring)", () => {
     openGithubTabMock.mockReset();
     useChatStore.setState({
       conversationId: "conv_test",
-      skills: [],
       contextWindow: null,
       tokensUsed: null,
       sessionCostUsd: null,
       gitBranch: null,
       llmModel: null,
-      selectedModel: null,
-      selectedEffort: null,
+      sessionModelOverride: null,
+      sessionReasoningEffort: null,
       codexModelOptions: [],
       codexPlanMode: false,
       nativeVendorOwnsModel: false,
@@ -241,7 +245,7 @@ describe("Composer status line (branch + context ring)", () => {
     // vendor-owned native session where the model used to be (wrongly) shown.
     useChatStore.setState({
       llmModel: "claude-sonnet-4-6",
-      selectedEffort: "medium",
+      sessionReasoningEffort: "medium",
       nativeVendorOwnsModel: true,
       contextWindow: 100_000,
       tokensUsed: 25_000,

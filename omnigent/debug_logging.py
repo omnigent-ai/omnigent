@@ -29,9 +29,12 @@ import time
 import traceback
 import urllib.parse
 import uuid
+from collections import OrderedDict
 from collections.abc import Callable, Iterator
 from contextvars import ContextVar
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 
 import httpx
 
@@ -465,9 +468,15 @@ def _stamp_error_dimensions(attrs: dict[str, str], record: logging.LogRecord) ->
     Any record carrying ``exc_info`` gains ``error_category`` / ``error_impact``
     derived from the exception (see :func:`omnigent.errors.classify_exception`),
     so every ``_logger.exception`` / ``exc_info=…`` site across the codebase is
-    covered without per-site edits. Explicit callsite values always win.
+    covered without per-site edits. Exception and explicit cause types make
+    generic wrapper errors groupable without their messages. Explicit callsite
+    values always win.
     """
     exc = record.exc_info[1] if isinstance(record.exc_info, tuple) else None
+    if isinstance(exc, BaseException):
+        attrs.setdefault("exception_type", type(exc).__name__)
+        if exc.__cause__ is not None:
+            attrs.setdefault("exception_cause_type", type(exc.__cause__).__name__)
     if isinstance(exc, BaseException) and not (
         "error_category" in attrs and "error_impact" in attrs
     ):
@@ -857,15 +866,274 @@ class ZerobusLogHandler(DebugLogHandler):
         _diag("post_dropped", "dropped %d row(s) after 3 failed insert attempts", len(batch))
 
 
+@dataclass(frozen=True, slots=True)
+class _SseFileItem:
+    """One queued SSE row: the safe fields pulled off the record in emit()."""
+
+    session_id: str
+    created: float
+    level: str
+    event: str | None
+    attrs: dict[str, object]
+
+
+class SseFileHandler(logging.Handler):
+    """Append SSE-event records to per-session JSONL files (opt-in; non-blocking).
+
+    :meth:`emit` never touches the filesystem: it pulls the safe fields off the
+    record and enqueues them, and a daemon writer thread batches, groups by
+    session, and appends to ``<log_dir>/<session_id>-sse.jsonl``. A single server
+    fans out hundreds of concurrent sessions and SSE events (text deltas,
+    terminal activity) are very frequent, so a synchronous write per event would
+    block the workflow thread — this keeps all file I/O off the publish path.
+
+    The writer groups a drained batch by session, so each pass issues one
+    ``os.write`` per session touched (``O_APPEND`` keeps whole-line writes atomic
+    even if a file is shared across a forked child). Open descriptors are bounded
+    by an LRU cache so a many-session server never exhausts fds — an evicted
+    session reopens (and keeps appending) on its next event. The queue is bounded
+    and sheds the oldest record under sustained overload, so publish is never
+    backpressured — best-effort debug data. Content is never written: only the
+    event name and whitelisted ids/dimensions, the same safe subset the ZeroBus
+    table gets.
+
+    Retention is the operator's responsibility: files are appended without
+    rotation and old per-session files are never reaped, so ``<log_dir>`` grows
+    without bound until cleaned up externally. This is a debugging aid, not a
+    managed log stream.
+    """
+
+    # Concurrently open per-session fds; the least-recently-used is closed when
+    # exceeded (reopening in O_APPEND resumes the same file).
+    _MAX_OPEN_FILES = 128
+    # Queue bound before shedding the oldest record, records drained per write
+    # pass, and the writer's idle wakeup interval.
+    _QUEUE_MAX_RECORDS = 20_000
+    _BATCH_MAX_RECORDS = 1_000
+    _FLUSH_INTERVAL_S = 1.0
+
+    def __init__(self, log_dir: Path, source: str) -> None:
+        super().__init__()
+        self._log_dir = log_dir
+        self._source = source
+        self._closed = False
+        self._start_worker()
+        atexit.register(self.close)
+
+    def _start_worker(self) -> None:
+        """Create a fresh queue / fd-cache / thread and launch the writer.
+
+        Re-invoked by :meth:`emit` when the thread has stopped — after a
+        ``logging.config.dictConfig()`` (uvicorn) or ``os.fork()`` (the runner
+        ``_zygote``), which leave the handler attached but kill the thread. The
+        fresh fd cache drops any inherited descriptors (whose files belong to the
+        parent) rather than writing to them.
+
+        The queue / fd-cache / stop-event are also passed to the worker as
+        arguments, so it operates solely on the state it was started with: a
+        concurrent revive that reassigns these attributes cannot make a still-
+        running old worker and the new one share one (non-thread-safe) fd cache.
+        """
+        self._queue: queue.Queue[_SseFileItem | threading.Event] = queue.Queue(
+            maxsize=self._QUEUE_MAX_RECORDS
+        )
+        # session_id -> fd, LRU-ordered; owned by the writer thread (also bound
+        # here for introspection/tests).
+        self._fds: OrderedDict[str, int] = OrderedDict()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            args=(self._queue, self._fds, self._stop),
+            name="omnigent-sse-file-log",
+            daemon=True,
+        )
+        self._thread.start()
+
+    @staticmethod
+    def _safe_session_id(session_id: str) -> str:
+        """Sanitize a session id into a filesystem-safe basename."""
+        return "".join(c if c.isalnum() or c in "-_" else "_" for c in session_id) or "unknown"
+
+    def _extract(self, record: logging.LogRecord) -> _SseFileItem | None:
+        """Pull the safe fields off a record on the caller thread (cheap)."""
+        session_id = getattr(record, "session_id", None)
+        if not session_id:
+            return None  # SSE records always carry one; nothing to key a file on.
+        attrs = getattr(record, "attributes", None)
+        return _SseFileItem(
+            session_id=str(session_id),
+            created=record.created,
+            level=record.levelname,
+            event=getattr(record, "event_name", None),
+            attrs=attrs if isinstance(attrs, dict) else {},
+        )
+
+    def emit(self, record: logging.LogRecord) -> None:
+        # Revive a worker stopped by dictConfig()/fork (see _start_worker).
+        if self._closed or not self._thread.is_alive():
+            try:
+                self._closed = False
+                self._start_worker()
+            except Exception:  # noqa: BLE001 — never break logging over the sink
+                return
+        try:
+            item = self._extract(record)
+        except Exception:  # noqa: BLE001 — a logging handler must never raise into the app
+            return
+        if item is None:
+            return
+        try:
+            self._queue.put_nowait(item)
+        except queue.Full:
+            # Shed the oldest to keep the newest; best-effort, never block publish.
+            try:
+                self._queue.get_nowait()
+                self._queue.put_nowait(item)
+            except queue.Empty:
+                # The writer drained the queue between our full put and this get,
+                # so there is room now and this one record is dropped — acceptable
+                # for a best-effort sink shedding under overload.
+                pass
+
+    def _run(
+        self,
+        work: queue.Queue[_SseFileItem | threading.Event],
+        fds: OrderedDict[str, int],
+        stop: threading.Event,
+    ) -> None:
+        # Operate only on the state this worker was started with (see
+        # _start_worker): never read self._queue/_fds/_stop, so a concurrent
+        # revive cannot repoint us at another worker's cache mid-run.
+        try:
+            while not stop.is_set():
+                batch = self._collect_batch(work, self._FLUSH_INTERVAL_S)
+                if batch:
+                    self._write_batch(fds, batch)
+            # Best-effort drain of whatever is left on shutdown.
+            remaining = self._collect_batch(work, 0.0)
+            if remaining:
+                self._write_batch(fds, remaining)
+        finally:
+            for fd in fds.values():
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+            fds.clear()
+
+    def _collect_batch(
+        self, work: queue.Queue[_SseFileItem | threading.Event], wait: float
+    ) -> list[_SseFileItem | threading.Event]:
+        batch: list[_SseFileItem | threading.Event] = []
+        try:
+            batch.append(work.get(timeout=wait) if wait else work.get_nowait())
+        except queue.Empty:
+            return batch
+        while len(batch) < self._BATCH_MAX_RECORDS:
+            try:
+                batch.append(work.get_nowait())
+            except queue.Empty:
+                break
+        return batch
+
+    def _fd_for(self, fds: OrderedDict[str, int], session_id: str) -> int | None:
+        """Return an open append fd for *session_id* (writer thread only).
+
+        Touches the LRU on reuse; on a miss, opens the session's file and evicts
+        the least-recently-used fd when over the cap.
+        """
+        fd = fds.get(session_id)
+        if fd is not None:
+            fds.move_to_end(session_id)
+            return fd
+        path = self._log_dir / f"{self._safe_session_id(session_id)}-sse.jsonl"
+        try:
+            self._log_dir.mkdir(parents=True, exist_ok=True)
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        except OSError as exc:
+            # Throttled: an unwritable log dir fails identically for every session
+            # on every batch, which would otherwise flood the process logs.
+            _diag("sse_file_open", "SSE file sink cannot open %s: %s", path, exc)
+            return None
+        fds[session_id] = fd
+        if len(fds) > self._MAX_OPEN_FILES:
+            _evicted_id, evicted_fd = fds.popitem(last=False)
+            with contextlib.suppress(OSError):
+                os.close(evicted_fd)
+        return fd
+
+    def _write_batch(
+        self, fds: OrderedDict[str, int], batch: list[_SseFileItem | threading.Event]
+    ) -> None:
+        """Group a drained batch by session and issue one write per session.
+
+        A ``threading.Event`` in the batch is a :meth:`flush` barrier: pending
+        buffers are written before it is set, so its waiter is guaranteed the
+        records queued before it are on disk.
+        """
+        buffers: dict[str, bytearray] = {}
+
+        def flush_buffers() -> None:
+            for session_id, buf in buffers.items():
+                fd = self._fd_for(fds, session_id)
+                if fd is None:
+                    continue
+                with contextlib.suppress(OSError):
+                    os.write(fd, bytes(buf))
+            buffers.clear()
+
+        for item in batch:
+            if isinstance(item, threading.Event):
+                flush_buffers()
+                item.set()
+                continue
+            buffers.setdefault(item.session_id, bytearray()).extend(self._format_line(item))
+        flush_buffers()
+
+    def _format_line(self, item: _SseFileItem) -> bytes:
+        row = {
+            "ts": datetime.fromtimestamp(item.created, tz=timezone.utc).isoformat(),
+            "source": self._source,
+            "level": item.level,
+            "conversation_id": item.session_id,
+            "event": item.event,
+            "attrs": item.attrs,
+        }
+        return (json.dumps(row, default=str) + "\n").encode("utf-8")
+
+    def flush(self, timeout: float = 5.0) -> None:
+        """Block until records queued so far are written (for shutdown / tests)."""
+        if self._closed or not self._thread.is_alive():
+            return
+        barrier = threading.Event()
+        try:
+            self._queue.put_nowait(barrier)
+        except queue.Full:
+            return  # best-effort; cannot guarantee a flush under overload
+        barrier.wait(timeout)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        # Capture the worker we are tearing down: a concurrent emit() can revive
+        # the handler during the join below, swapping in a fresh stop/thread. The
+        # captured worker closes its own fds in _run's finally.
+        stop, thread = self._stop, self._thread
+        self._closed = True
+        stop.set()
+        thread.join(timeout=5.0)
+        super().close()
+
+
 # Process-wide sink; recreated only if a prior instance was closed (e.g. a
 # logging reconfigure closed the root handlers out from under us).
 _active_sink: DebugLogHandler | None = None
 _sink_lock = threading.Lock()
 
-# Dedicated logger for the server's outgoing SSE-event stream. It gets the sink
-# as its sole handler with ``propagate=False`` (wired in attach_debug_log_sink),
-# so its high-volume, table-only records — one per emitted event, names + safe
-# ids, never content — never reach the on-disk/stderr logs.
+# Dedicated logger for the server's outgoing SSE-event stream. It carries
+# ``propagate=False`` (wired in attach_debug_log_sink / attach_sse_file_sink) so
+# its high-volume records — one per emitted event, names + safe ids, never
+# content — reach only the opt-in sinks below and never the on-disk/stderr logs.
+# Two independent sinks may attach: the ZeroBus table (attach_debug_log_sink)
+# and a local JSONL file (attach_sse_file_sink); either, both, or neither.
 SSE_LOGGER_NAME = "omnigent.sse_events"
 
 # Dedicated logger for server request audit events (the per-method
@@ -874,6 +1142,17 @@ SSE_LOGGER_NAME = "omnigent.sse_events"
 # audit rows populate the table without flooding the on-disk/stderr logs, and
 # they disappear entirely when the sink is off (no env vars -> no handler).
 AUDIT_LOGGER_NAME = "omnigent.audit_events"
+
+# Opt-in local file sink for the SSE-event stream, independent of the ZeroBus
+# table. Set OMNIGENT_SSE_LOG_TO_FILE truthy (1/true/yes/on) to also append each
+# emitted event (safe subset — the same ids/dimensions the table gets, never
+# content) as JSONL, split per session into
+# ``<data-dir>/logs/<source>/<session_id>-sse.jsonl`` (e.g.
+# ``~/.omnigent/logs/server/<session_id>-sse.jsonl``); useful for offline
+# debugging when the table is unavailable. Files are not rotated or reaped —
+# operators must clean up the directory themselves. See attach_sse_file_sink.
+SSE_LOG_TO_FILE_ENV_VAR = "OMNIGENT_SSE_LOG_TO_FILE"
+_sse_file_handler: SseFileHandler | None = None
 
 
 def debug_sink_enabled() -> bool:
@@ -955,9 +1234,10 @@ def attach_debug_log_sink(
         _active_sink.setLevel(level)
         for target in loggers:
             target.addHandler(_active_sink)
-        # Table-only SSE-event logger: the sink is its sole handler and it does
-        # not propagate to root, so per-token delta events populate the table
-        # without flooding the on-disk/stderr logs.
+        # SSE-event logger: attach the table sink here and keep the logger from
+        # propagating to root, so per-token delta events populate the table
+        # without flooding the on-disk/stderr logs. The file sink (if enabled)
+        # attaches independently in attach_sse_file_sink.
         sse_logger = logging.getLogger(SSE_LOGGER_NAME)
         sse_logger.setLevel(level)
         sse_logger.propagate = False
@@ -969,3 +1249,57 @@ def attach_debug_log_sink(
         audit_logger.setLevel(level)
         audit_logger.propagate = False
         audit_logger.addHandler(_active_sink)
+
+
+def sse_file_sink_enabled() -> bool:
+    """Whether the opt-in SSE-event file sink is active in this process.
+
+    Lock-free by design (a single global-object read is atomic under the GIL);
+    a stale read only mis-times one record around enable, never corrupts state.
+    """
+    return _sse_file_handler is not None
+
+
+def sse_logging_enabled() -> bool:
+    """Whether any SSE-event sink (ZeroBus table or local file) is active.
+
+    The gate for :func:`omnigent.runtime.session_stream._log_sse_event`: it
+    builds a record only when at least one sink will consume it, so the feature
+    stays free for anyone who enabled neither.
+    """
+    return debug_sink_enabled() or sse_file_sink_enabled()
+
+
+def attach_sse_file_sink(*, source: str, level: int) -> None:
+    """Attach the opt-in SSE-event file sink when ``OMNIGENT_SSE_LOG_TO_FILE`` is truthy.
+
+    A no-op unless the boolean env var is set (1/true/yes/on). Writes one JSONL
+    file per session under ``<data-dir>/logs/<source>/`` (e.g.
+    ``~/.omnigent/logs/server/<session_id>-sse.jsonl``). Independent of the
+    ZeroBus table sink: it configures the SSE logger's level and
+    ``propagate=False`` itself, so enabling only the file sink still keeps the
+    high-volume SSE records off the on-disk/stderr process logs. Idempotent per
+    process.
+    """
+    global _sse_file_handler
+    # Local imports to avoid an import cycle: process_logging imports this module.
+    from omnigent.process_logging import env_truthy, process_log_dir
+
+    if not env_truthy(os.environ.get(SSE_LOG_TO_FILE_ENV_VAR)):
+        return
+    with _sink_lock:
+        if _sse_file_handler is not None:
+            return
+        log_dir = process_log_dir(source)
+        try:
+            handler = SseFileHandler(log_dir, source)
+        except Exception:  # noqa: BLE001 — the sink must never break logging setup
+            _logger.warning("SSE file sink disabled: handler init failed", exc_info=True)
+            return
+        handler.setLevel(level)
+        _sse_file_handler = handler
+        sse_logger = logging.getLogger(SSE_LOGGER_NAME)
+        sse_logger.setLevel(level)
+        sse_logger.propagate = False
+        sse_logger.addHandler(handler)
+        _logger.info("SSE file sink enabled: source=%s dir=%s", source, log_dir)

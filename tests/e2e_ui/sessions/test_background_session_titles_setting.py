@@ -18,10 +18,10 @@ def _open_general_settings(page: Page, base_url: str):
 
 def test_background_session_titles_defaults_on_and_persists(
     page: Page,
-    seeded_session: tuple[str, str],
+    live_server: str,
 ) -> None:
     """The preference starts on, survives an opt-out, and can be restored."""
-    base_url, _session_id = seeded_session
+    base_url = live_server
     toggle = _open_general_settings(page, base_url)
     expect(toggle).to_be_visible(timeout=30_000)
     expect(toggle).to_have_attribute("aria-checked", "true")

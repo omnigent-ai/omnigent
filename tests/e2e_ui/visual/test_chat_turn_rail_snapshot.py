@@ -148,6 +148,7 @@ _TURN_TICK = "[data-turn-tick]"
 
 
 @pytest.mark.visual
+@pytest.mark.workspace_panel_product_default
 def test_chat_turn_rail_matches_baseline(
     snapshot_page: Page,
     live_server: str,

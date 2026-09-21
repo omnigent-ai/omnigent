@@ -30,7 +30,7 @@ async def _drive(base_url: str, session_id: str, output: Path) -> None:
                 agents_body=_codex_native_agents_body(),
             )
             await page.route(
-                re.compile(r"/v1/sessions\?.*kind=any"),
+                re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"),
                 lambda route: route.fulfill(json={"data": []}),
             )
             await page.add_init_script(
