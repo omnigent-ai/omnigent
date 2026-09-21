@@ -146,7 +146,8 @@ describe("ComposerRepositorySelector", () => {
     await userEvent.click(
       screen.getByRole("button", { name: "Repositories, 1 repository selected" }),
     );
-    expect(screen.getByText("documentation")).toBeInTheDocument();
-    expect(screen.getByText("Unavailable")).toBeInTheDocument();
+    const dialog = screen.getByRole("dialog");
+    expect(within(dialog).getByText("documentation")).toBeInTheDocument();
+    expect(within(dialog).getByText("Unavailable")).toBeInTheDocument();
   });
 });

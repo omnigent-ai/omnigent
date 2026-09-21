@@ -1734,10 +1734,7 @@ describe("NewChatLandingScreen initial picker loading", () => {
         "Working directory: No host selected",
       );
       expect(screen.getByTestId("new-chat-landing-workspace-chip")).toBeDisabled();
-      expect(screen.getByTestId("new-chat-landing-branch-chip")).toHaveAccessibleName(
-        "No host selected",
-      );
-      expect(screen.getByTestId("new-chat-landing-branch-chip")).toBeDisabled();
+      expect(screen.queryByTestId("new-chat-landing-branch-chip")).toBeNull();
       expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(
         "No host selected",
       );
@@ -9586,9 +9583,12 @@ describe("NewChatLandingScreen bundle-agent Smart Routing", () => {
       // A pinned model would silently disable routing for the whole session.
       expect(body.model_override).toBeUndefined();
       expect(body.reasoning_effort).toBeUndefined();
-      expect(body.labels).toEqual({
-        "omnigent.client_create_token": expect.stringMatching(/^[0-9a-f]{32}$/),
-      });
+      expect(body.labels).toEqual(
+        expect.objectContaining({
+          "omnigent.client_create_token": expect.stringMatching(/^[0-9a-f]{32}$/),
+        }),
+      );
+      expect(body.labels["omnigent.composer_context.v1.0"]).toBeTypeOf("string");
       expect(body.terminal_launch_args).toBeUndefined();
       // A bundle agent arms at create and routes on the first message event —
       // its harness isn't decided yet, so there is nothing to route here.

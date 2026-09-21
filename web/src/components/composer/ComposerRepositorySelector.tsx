@@ -155,6 +155,7 @@ export function ComposerRepositorySelector({
   ariaLabel = "Repositories",
 }: ComposerRepositorySelectorProps) {
   const [open, setOpen] = useState(false);
+
   const selectedIds = new Set(value.map(({ id }) => id));
   const available = repositories.data ?? EMPTY_REPOSITORIES;
   const availableIds = new Set(available.map(({ id }) => id));
@@ -220,8 +221,8 @@ export function ComposerRepositorySelector({
         sideOffset={6}
         className="w-(--radix-popover-trigger-width) min-w-64 max-w-[calc(100vw-2rem)] gap-0 p-0"
       >
-        <Command className="rounded-lg p-1">
-          <CommandInput placeholder="Search repositories…" aria-label="Search repositories" />
+        <Command className="rounded-lg p-1" label="Search repositories">
+          <CommandInput placeholder="Search repositories…" />
           <CommandList aria-label="Available repositories">
             <CommandItem
               value="no repositories intentional none"

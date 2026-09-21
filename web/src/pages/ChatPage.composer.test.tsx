@@ -2089,10 +2089,8 @@ describe("Composer shared visible controls", () => {
     expect(actions.children).toHaveLength(3);
     expect(workspace).toHaveClass("mx-3", "h-[37px]", "rounded-t-2xl");
     expect(textarea().closest("form")).toHaveClass("pb-[max(20px,env(safe-area-inset-bottom))]");
-    // The branch text now flows through the shared ComposerWorkspaceStatus +
-    // useComposerGitStatus (covered by their own tests); here assert the shared
-    // branch control renders in the bar.
-    expect(within(workspace).getByTestId("composer-git-branch")).toBeInTheDocument();
+    // A normal working directory has no empty worktree affordance.
+    expect(within(workspace).queryByTestId("composer-git-branch")).toBeNull();
     expect(screen.getByTestId("composer-host-select")).toHaveClass("w-11", "md:h-7");
     expect(screen.getByTestId("composer-permission-chip")).toHaveTextContent("Ask for approval");
     const trigger = screen.getByTestId("composer-config-gear");
@@ -2118,7 +2116,16 @@ describe("Composer shared visible controls", () => {
     expect(screen.getByTestId("composer-pr-link")).toHaveTextContent("#42");
     expect(screen.getByTestId("composer-git-branch")).toHaveTextContent("feature/shared-composer");
 
-    setComposerGitStatus({ prCount: 0, prNumber: null });
+    setComposerGitStatus({
+      branch: "feature/shared-composer",
+      branchState: "branch",
+      isWorktree: true,
+      worktreePath: "/home/alice/repo-wt/feature",
+      githubState: "ready",
+      repoNameWithOwner: "omnigent-ai/omnigent",
+      prCount: 0,
+      prNumber: null,
+    });
     view.rerender(
       <TooltipProvider>
         <Composer {...composerProps()} />
@@ -2150,6 +2157,8 @@ describe("Composer shared visible controls", () => {
     setComposerGitStatus({
       branch: "feature/shared-composer",
       branchState: "branch",
+      isWorktree: true,
+      worktreePath: "/home/alice/repo-wt/feature",
       githubState: "ready",
       repoNameWithOwner: "omnigent-ai/omnigent",
       prCount: 1,
