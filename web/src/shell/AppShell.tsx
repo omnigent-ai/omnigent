@@ -91,6 +91,7 @@ import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { ChatHeader } from "./ChatHeader";
 import { ExecutionLogsPanel } from "./ExecutionLogsPanel";
 import { FileViewer } from "./FileViewer";
+import { FileViewPreferencesProvider } from "./FileViewPreferencesContext";
 import {
   FileViewerContext,
   type FilePosition,
@@ -185,6 +186,14 @@ function resolveTerminalViewKey(stored: string | null, agentKey: string): string
 }
 
 export function AppShell() {
+  return (
+    <FileViewPreferencesProvider>
+      <AppShellBody />
+    </FileViewPreferencesProvider>
+  );
+}
+
+function AppShellBody() {
   // Cmd/Ctrl+Enter accepts the pending harness approval prompt. Bound once
   // here so it works on every chat route, regardless of where focus sits.
   useApproveHotkey();
@@ -2362,6 +2371,7 @@ export function AppShell() {
               {serverConversationId && selectedFilePath !== null && (
                 <div className="md:hidden">
                   <FileViewer
+                    viewport="mobile"
                     open
                     conversationId={serverConversationId}
                     path={selectedFilePath}

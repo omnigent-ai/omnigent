@@ -198,6 +198,70 @@ def _seed_citation_file(
     )
 
 
+def test_markdown_diff_url_stays_stable_across_responsive_layouts(
+    page: Page, seeded_session: tuple[str, str]
+) -> None:
+    """Hidden responsive viewers must not undo the visible viewer's diff choice."""
+    base_url, session_id = seeded_session
+    path = "src/notes.md"
+    before, after = "# Notes\nBefore\n", "# Notes\nAfter\n"
+    _mock_markdown_files(page, seeded_session, {path: after})
+    environment_url = f"{base_url}/v1/sessions/{session_id}/resources/environments/default"
+    page.route(
+        f"{environment_url}/changes",
+        lambda route: route.fulfill(
+            json={
+                "object": "list",
+                "has_more": False,
+                "data": [
+                    {"path": path, "name": "notes.md", "status": "modified", "bytes": len(after)}
+                ],
+            }
+        ),
+    )
+    page.route(
+        f"{environment_url}/diff/{path}",
+        lambda route: route.fulfill(json={"path": path, "before": before, "after": after}),
+    )
+    viewer = _open_viewer(page, seeded_session, path, {"diffActive": False})
+    expect(viewer.get_by_role("button", name="Show diff", exact=True)).to_be_visible()
+    page.evaluate(
+        """() => {
+          window.diffUrlTransitions = [];
+          let previous = new URLSearchParams(location.search).get('diff');
+          const replaceState = history.replaceState;
+          history.replaceState = function(...args) {
+            replaceState.apply(this, args);
+            const current = new URLSearchParams(location.search).get('diff');
+            if (current !== previous) window.diffUrlTransitions.push(current);
+            previous = current;
+          };
+        }"""
+    )
+    transitions: list[str | None] = []
+    for width, enabled in ((1600, True), (600, False), (600, True), (1600, False)):
+        page.set_viewport_size({"width": width, "height": 1000})
+        label = "Show diff" if enabled else "Exit diff view"
+        viewer.get_by_role("button", name=label, exact=True).click()
+        diff_url = re.compile(r"[?&]diff=1(?:&|$)")
+        if enabled:
+            expect(viewer.locator(".monaco-diff-editor")).to_be_visible(timeout=30_000)
+            expect(page).to_have_url(diff_url)
+        else:
+            expect(viewer.locator(".monaco-diff-editor")).to_have_count(0)
+            expect(page).not_to_have_url(diff_url)
+        # Observe subsequent paints to catch repeated URL writes after the click.
+        page.evaluate(
+            """async () => {
+              for (let frame = 0; frame < 12; frame++) {
+                await new Promise(requestAnimationFrame);
+              }
+            }"""
+        )
+        transitions.append("1" if enabled else None)
+        assert page.evaluate("window.diffUrlTransitions") == transitions
+
+
 @pytest.mark.parametrize("layout", ["split", "unified"])
 def test_chat_line_link_expands_and_centers_diff_context(
     page: Page,

@@ -120,6 +120,10 @@ vi.mock("./MonacoDiffViewer", () => ({
 
 // ── Mock hooks ────────────────────────────────────────────────────────────────
 
+vi.mock("@/hooks/useIsMobileViewport", () => ({
+  useIsMobileViewport: vi.fn(() => false),
+}));
+
 vi.mock("@/hooks/useComments", () => ({
   useComments: vi.fn(),
   useAddComment: vi.fn(() => ({ mutate: vi.fn() })),
@@ -178,6 +182,8 @@ vi.mock("@/store/chatStore", () => ({
 import { useComments } from "@/hooks/useComments";
 import { useOptionalCommentSender } from "@/hooks/CommentSenderContext";
 import { useFileDiff } from "@/hooks/useFileDiff";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { FileViewPreferencesProvider } from "./FileViewPreferencesContext";
 import { getSeenCommentIds } from "@/hooks/useSeenComments";
 import { useWorkspaceChangedFiles } from "@/hooks/useWorkspaceChangedFiles";
 import { classifyAndRemapComments, FileViewer } from "./FileViewer";
@@ -285,6 +291,7 @@ beforeEach(() => {
   // localStorage. Clear it between tests so a preference written by one test
   // can't leak into another that asserts the hardcoded defaults.
   localStorage.clear();
+  vi.mocked(useIsMobileViewport).mockReturnValue(false);
 });
 
 afterEach(() => {
@@ -583,6 +590,102 @@ describe("FileViewer prev/next navigation order", () => {
 });
 
 describe("FileViewer URL sync — diff param", () => {
+  it.each(["file1.py", "notes.md"])(
+    "shares %s diff state between responsive viewers through layout changes",
+    async (path) => {
+      await vi.mocked(useWorkspaceChangedFiles).withImplementation(
+        () =>
+          ({
+            data: {
+              available: true,
+              data: [{ path, bytes: 10, modified_at: null, name: path, status: "modified" }],
+            },
+          }) as ReturnType<typeof useWorkspaceChangedFiles>,
+        async () => {
+          useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+          const queryClient = new QueryClient();
+          function ResponsiveViewers() {
+            return (
+              <QueryClientProvider client={queryClient}>
+                <MemoryRouter initialEntries={[`/?file=${path}&tab=files`]}>
+                  <LocationDisplay />
+                  <FileViewPreferencesProvider>
+                    <div data-testid="desktop-viewer">
+                      <FileViewer
+                        viewport="desktop"
+                        frameless
+                        open
+                        conversationId="conv_1"
+                        path={path}
+                        onClose={vi.fn()}
+                      />
+                    </div>
+                    <div data-testid="mobile-viewer">
+                      <FileViewer
+                        viewport="mobile"
+                        open
+                        conversationId="conv_1"
+                        path={path}
+                        onClose={vi.fn()}
+                      />
+                    </div>
+                  </FileViewPreferencesProvider>
+                </MemoryRouter>
+              </QueryClientProvider>
+            );
+          }
+          const { rerender } = render(<ResponsiveViewers />);
+          const desktop = within(screen.getByTestId("desktop-viewer"));
+          const mobile = within(screen.getByTestId("mobile-viewer"));
+
+          fireEvent.click(desktop.getByRole("button", { name: "Show diff" }));
+          expect(await desktop.findByTestId("diff-viewer")).toBeInTheDocument();
+          expect(await mobile.findByTestId("diff-viewer")).toBeInTheDocument();
+          expect(screen.getByTestId("url-params")).toHaveTextContent(
+            `file=${path}&tab=files&diff=1`,
+          );
+
+          vi.mocked(useIsMobileViewport).mockReturnValue(true);
+          rerender(<ResponsiveViewers />);
+          expect(screen.getByTestId("url-params")).toHaveTextContent("diff=1");
+          fireEvent.click(mobile.getByRole("button", { name: "Exit diff view" }));
+          expect(desktop.queryByTestId("diff-viewer")).toBeNull();
+          expect(mobile.queryByTestId("diff-viewer")).toBeNull();
+          expect(screen.getByTestId("url-params")).toHaveTextContent(`file=${path}&tab=files`);
+          expect(screen.getByTestId("url-params")).not.toHaveTextContent("diff=");
+
+          vi.mocked(useIsMobileViewport).mockReturnValue(false);
+          rerender(<ResponsiveViewers />);
+          expect(desktop.getByRole("button", { name: "Show diff" })).toBeInTheDocument();
+          expect(screen.getByTestId("url-params")).not.toHaveTextContent("diff=");
+        },
+      );
+    },
+  );
+
+  it.each(["desktop", "mobile"] as const)(
+    "the hidden %s viewer leaves the diff URL untouched",
+    (viewport) => {
+      useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+      vi.mocked(useIsMobileViewport).mockReturnValue(viewport === "desktop");
+      render(
+        <QueryClientProvider client={new QueryClient()}>
+          <MemoryRouter initialEntries={["/?file=unchanged.md&diff=1"]}>
+            <LocationDisplay />
+            <FileViewer
+              viewport={viewport}
+              open
+              conversationId="conv_1"
+              path="unchanged.md"
+              onClose={vi.fn()}
+            />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+      expect(screen.getByTestId("url-params")).toHaveTextContent("file=unchanged.md&diff=1");
+    },
+  );
+
   it("restores the active diff param after another navigation replaces the search params", async () => {
     function FileNavigation() {
       const [, setParams] = useSearchParams();

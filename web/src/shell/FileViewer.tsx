@@ -92,7 +92,8 @@ import { useResizablePanel } from "@/hooks/useResizablePanel";
 import { useIOSNativeKeyboardInset } from "@/hooks/useIOSNativeKeyboardInset";
 import { useWorkspaceChangedFiles } from "@/hooks/useWorkspaceChangedFiles";
 import { cn } from "@/lib/utils";
-import { readFileViewPreferences, writeFileViewPreferences } from "@/lib/fileViewPreferences";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { FileViewPreferencesProvider, useFileViewPreferences } from "./FileViewPreferencesContext";
 import { type ChangedSort, compareChangedFiles } from "./FlatFileList";
 import { CodeViewer } from "./CodeViewer";
 import {
@@ -308,6 +309,8 @@ interface FileViewerProps {
    * when the viewer is embedded inside the inline right panel.
    */
   frameless?: boolean;
+  /** Only the viewer for this layout synchronizes the shared URL. */
+  viewport?: "desktop" | "mobile";
   /** Called when the user presses Escape to close the active file tab. */
   onCloseTab?: () => void;
   /** Called when the comments panel opens or closes inside the viewer. */
@@ -334,7 +337,9 @@ export function FileViewer(props: FileViewerProps) {
   const agentId = useChatStore((s) => s.boundAgentId);
   return (
     <CommentSenderProvider sessionId={props.conversationId} agentId={agentId}>
-      <FileViewerBody {...props} />
+      <FileViewPreferencesProvider>
+        <FileViewerBody {...props} />
+      </FileViewPreferencesProvider>
     </CommentSenderProvider>
   );
 }
@@ -349,6 +354,7 @@ function FileViewerBody({
   onNavigateTo,
   permissionLevel,
   frameless,
+  viewport,
   onCommentsOpenChange,
   sort = "recent",
 }: FileViewerProps) {
@@ -356,9 +362,9 @@ function FileViewerBody({
   // LEVEL_EDIT = 2; levels below 2 are read-only.
   const canEdit = permissionLevel == null || permissionLevel >= 2;
   const [searchParams, setSearchParams] = useSearchParams();
-  // Capture URL params once on open — we don't want re-renders caused by our own
-  // param writes to re-run the initialization logic.
-  const initialDiffRef = useRef(searchParams.get("diff") === "1");
+  const isMobile = useIsMobileViewport();
+  const ownsUrl = viewport === undefined || (viewport === "mobile") === isMobile;
+  // Capture the linked comment once so our URL writes don't reinitialize it.
   const initialCommentIdRef = useRef(searchParams.get("comment"));
   // Seeded from the parent's persisted state on remount (e.g. returning to a
   // tab); defaults closed on a fresh open. The linked-comment / fresh-open
@@ -683,31 +689,19 @@ function FileViewerBody({
   const isDeletedFile =
     changedFiles.data?.data.some((f) => f.path === path && f.status === "deleted") ?? false;
 
-  // Diff is a global toggle — turning it on/off on any file carries over as you
-  // navigate to the next file. Source ↔ preview is also shared across previewable
-  // files (markdown/html/notebooks), while non-previewable files always render
-  // as source.
-  // These are app-global *preferences*, persisted to localStorage so they also
-  // survive a page refresh (and seed a brand-new conversation). Seed precedence:
-  //   1. an explicit ?diff=1 link (shareable override, diff only),
-  //   2. the persisted preference,
-  //   3. the hardcoded default.
-  // Read once on mount so our own writes (and within-tab file navigation) don't
-  // re-run the initializers.
-  const persistedPrefsRef = useRef(readFileViewPreferences());
-  const [diffActive, setDiffActive] = useState(
-    () => initialDiffRef.current || persistedPrefsRef.current.diffActive,
-  );
-  const [diffLayout, setDiffLayout] = useState<"unified" | "split">(
-    () => persistedPrefsRef.current.diffLayout,
-  );
-  const [hideWhitespace, setHideWhitespace] = useState(
-    () => persistedPrefsRef.current.hideWhitespace,
-  );
-  const [wrapLines, setWrapLines] = useState(() => persistedPrefsRef.current.wrapLines);
-  const [previewableViewMode, setPreviewableViewMode] = useState<"editor" | "preview" | "source">(
-    () => persistedPrefsRef.current.previewableViewMode,
-  );
+  // Both responsive viewers share preferences, including while one is CSS-hidden.
+  const {
+    diffActive,
+    setDiffActive,
+    diffLayout,
+    setDiffLayout,
+    hideWhitespace,
+    setHideWhitespace,
+    wrapLines,
+    setWrapLines,
+    previewableViewMode,
+    setPreviewableViewMode,
+  } = useFileViewPreferences();
   // A ?comment= deep link to a markdown file must open on the rich-text editor
   // so the comment's anchor highlight is visible in context — the whole point
   // of following the link. The editor is forced regardless of the user's sticky
@@ -734,20 +728,8 @@ function FileViewerBody({
   const handleRequestEditMode = useCallback(() => {
     setDeepLinkBiasPath(null);
     setPreviewableViewMode("editor");
-  }, []);
+  }, [setPreviewableViewMode]);
 
-  // Persist the global view preferences so they survive a refresh. commentsOpen
-  // is intentionally excluded — it's contextual (per-open), not a sticky
-  // preference. Idempotent on mount (writes back the seeded values).
-  useEffect(() => {
-    writeFileViewPreferences({
-      diffActive,
-      diffLayout,
-      previewableViewMode,
-      hideWhitespace,
-      wrapLines,
-    });
-  }, [diffActive, diffLayout, previewableViewMode, hideWhitespace, wrapLines]);
   // Markdown supports all three previewable modes (preview / editor / source).
   // HTML and notebooks have no rich-text editor, so their "editor" preference
   // falls back to the rendered preview; "preview" / "source" pass through. The shared
@@ -934,7 +916,7 @@ function FileViewerBody({
   // that AppShell writes (React Router v7 BrowserRouter defers via startTransition,
   // so stale searchParams seen here could emit a navigate("?") that strips it).
   useEffect(() => {
-    if (!open) return;
+    if (!open || !ownsUrl) return;
     const wantDiff = diffActive && isDiffAvailable;
     const hasDiff = searchParams.has("diff");
     if (wantDiff === hasDiff) return; // already in sync — no navigate needed
@@ -950,7 +932,7 @@ function FileViewerBody({
       },
       { replace: true },
     );
-  }, [diffActive, isDiffAvailable, open, searchParams, setSearchParams]);
+  }, [diffActive, isDiffAvailable, open, ownsUrl, searchParams, setSearchParams]);
 
   // Toolbar actions, declared once and rendered two ways: inline icon buttons
   // when there's room, or rows in an overflow ("⋯") menu when there isn't.
