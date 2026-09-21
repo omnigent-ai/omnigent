@@ -3,13 +3,12 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from importlib.resources import files
 from string import Template
 from typing import Protocol
 
 from issue_prioritization.areas import AreaCatalog
-from issue_prioritization.bug_review import BugActionability, BugReview
 from issue_prioritization.domain import (
     EvidenceKind,
     Impact,
@@ -74,7 +73,7 @@ class Classification:
     similar_issues: tuple[int, ...] = ()
     duplicate_confidence: float = 0.0
     duplicate_reasoning: str = ""
-    bug_review: BugReview | None = None
+    source_only_quote: str | None = None
 
 
 class Classifier(Protocol):
@@ -110,50 +109,26 @@ class PromptClassifier:
         evidence_kind, information_status, missing_information = _information_assessment(
             issue_type, value
         )
-        bug_review = None
-        reasoning = str(value.get("reasoning", ""))
-        if self.review_bugs and issue_type == IssueType.BUG:
-            bug_review = BugReview.from_mapping(value.get("bug_review"))
-            actionable = bug_review.actionability == BugActionability.ACTIONABLE
-            if actionable != (information_status == InformationStatus.SUFFICIENT):
-                raise ValueError("bug actionability disagrees with information status")
-            if actionable and missing_information:
-                raise ValueError("an actionable bug cannot require missing information")
-            non_actionable = bug_review.actionability == BugActionability.NON_ACTIONABLE
-            if evidence_kind == EvidenceKind.CODE_ANALYSIS and actionable:
-                raise ValueError("code-only evidence cannot establish an actionable bug")
-            if non_actionable and evidence_kind not in (
-                EvidenceKind.CODE_ANALYSIS,
-                EvidenceKind.NONE,
-            ):
-                raise ValueError("a non_actionable bug cannot claim observed failure evidence")
-            bug_review = bug_review.validate_source(issue.body)
-            if non_actionable and (
-                bug_review.source_only_quote is None
-                or bug_review.has_user_facing_repro is not False
-            ):
-                bug_review = replace(
-                    bug_review,
-                    actionability=BugActionability.NEEDS_INFO,
-                    reason="Please confirm whether the described failure actually occurred. "
-                    "Try the provided steps and share the result, or describe how a user "
-                    "can encounter the problem.",
-                    source_only_quote=None,
-                )
-                reasoning = (
-                    "The report needs clarification about the observed behavior "
-                    "before its impact can be assessed."
-                )
-                missing_information = tuple(
-                    dict.fromkeys((*missing_information, MissingInformation.OBSERVED_BEHAVIOR))
-                )
+        source_only_quote = None
+        quote = value.get("source_only_quote")
+        if (
+            self.review_bugs
+            and issue_type == IssueType.BUG
+            and evidence_kind == EvidenceKind.CODE_ANALYSIS
+            and information_status == InformationStatus.NEEDS_INFO
+            and value.get("has_user_facing_repro") is False
+            and isinstance(quote, str)
+            and quote.strip()
+            and " ".join(quote.split()) in " ".join(issue.body.split())
+        ):
+            source_only_quote = " ".join(quote.split())
         return Classification(
             issue_number=issue.number,
             issue_type=issue_type,
             impact=Impact.parse(value.get("impact", value.get("severity"))),
             area_keys=area_keys,
             component_labels=component_labels,
-            reasoning=reasoning,
+            reasoning=str(value.get("reasoning", "")),
             content_hash=issue.content_hash,
             reported_type=reported_issue_type(issue.labels),
             evidence_kind=evidence_kind,
@@ -165,7 +140,7 @@ class PromptClassifier:
             similar_issues=tuple(_int_list(value.get("similar_issues"))),
             duplicate_confidence=_confidence(value.get("duplicate_confidence")),
             duplicate_reasoning=str(value.get("duplicate_reasoning") or ""),
-            bug_review=bug_review,
+            source_only_quote=source_only_quote,
         )
 
 
@@ -192,30 +167,70 @@ def build_prompt(
         author=issue.author,
         body=issue.body if review_bugs else issue.body[:12000],
         code_analysis_guidance=(
-            "Code analysis alone is not usable evidence of an observed user-facing failure. "
-            "Apply the bug review below: only close confidently code-path-only concerns "
-            "without an observation or plausible user-facing reproduction steps. "
-            "Unexecuted UI/CLI/API steps require needs_info, not closure. "
-            "When observation or the validity of the steps is unclear, use needs_info."
+            "Apply the event bug policy at the end of this prompt."
             if review_bugs
             else "Code analysis naming a reachable path and its concrete incorrect impact "
             "can also be sufficient. A defensive code-path report can be sufficient when "
             "it explains reachability and impact; never reject it merely because nobody "
             "ran the path end to end."
         ),
+        bug_closure_guidance=(
+            """Bug closure policy overrides the completeness rubric above; applies only to Bugs.
+Read the complete report and author replies. Judge evidence, not writing style.
+You have not inspected the code or executed any tests.
+
+Return reasoning first: explain whether a failure occurred and evaluate the
+supplied reproduction, including its preconditions. Then return these two fields
+and all other classification fields, each only once:
+- has_user_facing_repro=true: a complete, plausible UI/CLI/public API sequence,
+  even if unexecuted or inferred from source. Internal setup requiring mocks,
+  private cache/registry mutations, or resolver barriers is not a user sequence,
+  even when it also includes public actions.
+- has_user_facing_repro=false: affirmative evidence confines the scenario to
+  internal/synthetic manipulation with NO plausible OR uncertain user workflow.
+  Missing observations/steps or a source-only disclaimer cannot establish false.
+  Assess supplied actions; predicted effects on users do not establish a workflow.
+- has_user_facing_repro=null: steps are missing, incomplete, or uncertain,
+  including uncertainty about whether supported user actions permit the scenario.
+  A fully specified internal-only recipe is false, not null merely because unexecuted.
+- source_only_quote: null unless ALL closure conditions below hold; otherwise
+  copy a short continuous prose excerpt establishing the source-only basis.
+  Match punctuation exactly; only whitespace may change. Never paraphrase.
+
+Keep open when a failure was observed: information_status=sufficient when there
+is enough context to investigate. Plain descriptions, intermittent observations,
+diagnostics, and executed tests of user workflows count. Logs and first-person
+wording are not required. Choose the observed evidence_kind, not code_analysis.
+
+Keep open for clarification when observation is unclear, necessary details are
+missing, or public user steps are unexecuted/uncertain: information_status=needs_info,
+source_only_quote=null. Ask the author to clarify the steps or share the result.
+Even an explicit source-only disclaimer cannot override plausible OR uncertain
+user steps. "I don't know which user actions allow this" means null, never false.
+
+Close ONLY when ALL are established: no observed failure, has_user_facing_repro=false,
+and an explicit source-only/unexecuted internal basis supported by source_only_quote.
+Use information_status=needs_info, missing_information=[observed_behavior],
+evidence_kind=code_analysis, impact=low. Otherwise keep open for clarification.
+
+Predicted Expected/Actual sections and proposed tests prove neither observation
+nor source-only origin. Preserve tense: "unit tests can simulate this" and "no
+live runner needs to be removed" describe future validation, not past experience.
+"Export can be empty; a unit test could check it" needs clarification.
+"Source audit only; open a session, run /clear, send a web message" stays open.
+"Source audit only; nobody ran it; mock a subprocess and check a heartbeat" closes.
+Return one complete JSON object without surrounding prose or trailing commas."""
+            if review_bugs
+            else ""
+        ),
         bug_type_guidance=(
             "An alleged failure remains a Bug even when its trigger or impact is speculative "
-            "or unsupported; use the bug review below to assess it. Reclassify as Feature "
+            "or unsupported; assess its evidence using the event policy. Reclassify as Feature "
             "only when the author actually requests a new capability or refactoring, rather "
             "than merely alleging a possible failure. Missing evidence is not a feature request."
             if review_bugs
             else "For example, a code-quality concern that does not claim incorrect behavior "
             "is usually a Feature, not an incomplete Bug."
-        ),
-        bug_review_rubric=(
-            files("issue_prioritization").joinpath("bug_review_prompt.txt").read_text()
-            if review_bugs
-            else ""
         ),
         duplicate_candidates=(
             json.dumps(duplicate_candidates, ensure_ascii=False, indent=2)

@@ -62,7 +62,6 @@ class BronzeIssue:
             evidence_kind=classification.evidence_kind,
             information_status=classification.information_status,
             missing_information=classification.missing_information,
-            bug_review=classification.bug_review,
             duplicate_count=self.duplicate_count,
             upvote_count=self.upvote_count,
             current_priority=_current_priority(self.labels),

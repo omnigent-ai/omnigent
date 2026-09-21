@@ -6,11 +6,10 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 
 from issue_prioritization.artifacts import RankedIssue
-from issue_prioritization.bug_review import BugActionability
+from issue_prioritization.classification import Classification
 from issue_prioritization.domain import (
     EvidenceKind,
     InformationStatus,
-    IssueType,
     MissingInformation,
     Priority,
 )
@@ -39,16 +38,40 @@ _EVIDENCE_TEXT = {
 }
 
 
+def build_code_only_comment(classification: Classification, *, skipped: bool = False) -> str:
+    metadata = {
+        "content_hash": classification.content_hash,
+        "close_reason": None if skipped else "code_only",
+    }
+    marker = f"<!-- {COMMENT_MARKER} {json.dumps(metadata, separators=(',', ':'))} -->"
+    if skipped:
+        return marker + "\nAutomatic closure skipped: the issue changed or closed after review."
+    return "\n\n".join(
+        (
+            marker,
+            "🤖 **Automated triage**",
+            "We recommend closing as **not planned** because this report describes only "
+            "an inferred code-path problem, without an observed failure or plausible "
+            "steps through a user workflow.",
+            _safe_reasoning(classification.reasoning),
+            "If you encounter this problem, please open a new issue with what you did, "
+            "what happened, and relevant logs or session details.",
+        )
+    )
+
+
+def is_triage_comment(body: str) -> bool:
+    return _comment_metadata(body.strip()) is not None
+
+
 def build_triage_comment(
     item: RankedIssue,
     plan: MutationPlan,
     labels_after: tuple[str, ...],
     evaluated_at: datetime | None = None,
 ) -> str:
-    needs_info = (
-        item.issue.information_status == InformationStatus.NEEDS_INFO
-        and not plan.target.close_as_non_actionable
-        and not any(value.startswith("needs_info_") for value in plan.blocked)
+    needs_info = item.issue.information_status == InformationStatus.NEEDS_INFO and not any(
+        value.startswith("needs_info_") for value in plan.blocked
     )
     deadline = (
         evaluated_at + timedelta(days=NEEDS_INFO_DAYS) if needs_info and evaluated_at else None
@@ -59,30 +82,8 @@ def build_triage_comment(
         "content_hash": item.issue.classification_content_hash,
         "information_status": item.issue.information_status.value,
         "needs_info_deadline": deadline.date().isoformat() if deadline else None,
-        "close_reason": "no_observed_user_impact" if plan.close_as_non_actionable else None,
     }
     marker = f"<!-- {COMMENT_MARKER} {json.dumps(metadata, separators=(',', ':'))} -->"
-    if plan.close_as_non_actionable:
-        review = item.issue.bug_review
-        if review is None:
-            raise ValueError("a non-actionable closure requires a bug review")
-        return "\n".join(
-            (
-                marker,
-                "🤖 **Automated triage**",
-                "",
-                "Based on the report reviewed, we recommend closing as **not planned** "
-                "because it describes only an inferred code-path problem, without an "
-                "observed failure or concrete steps through a user workflow.",
-                "",
-                _plain_text(review.reason),
-                "",
-                "We prioritize bugs that affect users; code-path analysis alone is not enough. "
-                "If this issue is closed and you encounter this problem, "
-                "please open a new issue with what you did, "
-                "what happened, and relevant logs or session details.",
-            )
-        )
     priority_lines = _priority_lines(item, plan, labels_after)
     reasoning = _safe_reasoning(item.issue.classification_reasoning)
     information_lines = _information_lines(item, deadline)
@@ -91,7 +92,6 @@ def build_triage_comment(
             marker,
             "🤖 **Automated triage**",
             "",
-            *_bug_review_lines(item, plan),
             f"- **Bot assessment:** {item.issue.impact.label} impact",
             *priority_lines,
             *information_lines,
@@ -103,67 +103,10 @@ def build_triage_comment(
     )
 
 
-def _bug_review_lines(item: RankedIssue, plan: MutationPlan) -> tuple[str, ...]:
-    issue = item.issue
-    review = issue.bug_review
-    if issue.issue_type != IssueType.BUG or review is None:
-        return ()
-    if "non_actionable_stale_assessment" in plan.blocked:
-        return ("**Automatic closure skipped:** The issue changed or closed after review.", "")
-    if review.actionability == BugActionability.NON_ACTIONABLE:
-        exemptions = tuple(
-            label
-            for label in ("security", "duplicate", "pinned")
-            if f"non_actionable_{label}_exempt" in plan.blocked
-        )
-        if not exemptions:
-            return (f"**Bug assessment:** {_plain_text(review.reason)}", "")
-        return (
-            f"**Bug assessment:** {_plain_text(review.reason)}",
-            "",
-            "Automatic closure was skipped because this issue is exempt "
-            f"({', '.join(exemptions)}). No response deadline is set.",
-            "",
-        )
-    if review.actionability != BugActionability.ACTIONABLE:
-        return (f"**More evidence needed:** {_plain_text(review.reason)}", "")
-    clarification = review.clarification
-    if clarification is None or issue.information_status != InformationStatus.SUFFICIENT:
-        return ()
-    lines = ["**Problem in plain English**", "", _plain_text(clarification.summary), ""]
-    if clarification.reproduction_steps:
-        lines.extend(
-            (
-                "**Steps to reproduce (restated from the report)**",
-                "",
-                *(
-                    f"{index}. {_plain_text(step.text)}"
-                    for index, step in enumerate(clarification.reproduction_steps, start=1)
-                ),
-                "",
-                "These steps have not been independently verified.",
-                "",
-            )
-        )
-    else:
-        lines.extend(("No reproduction steps have been inferred from the report.", ""))
-    return tuple(lines)
-
-
-def _plain_text(value: str) -> str:
-    text = _SPACE.sub(" ", value).strip()
-    text = text.replace("@", "@\u200b").replace("<", "&lt;").replace(">", "&gt;")
-    return re.sub(r"([\\`*_{}\[\]()#!|])", r"\\\1", text)
-
-
-def is_triage_comment(body: str) -> bool:
-    return _comment_metadata(body.strip()) is not None
-
-
 def preserve_needs_info_deadline(body: str, existing_body: str) -> str:
     metadata = _comment_metadata(body)
     existing_metadata = _comment_metadata(existing_body)
-    if not metadata or not existing_metadata or metadata.get("close_reason"):
+    if not metadata or not existing_metadata:
         return body
     if (
         metadata.get("information_status") != InformationStatus.NEEDS_INFO

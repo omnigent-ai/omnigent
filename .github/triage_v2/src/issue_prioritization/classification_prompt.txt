@@ -90,4 +90,4 @@ $body
 Candidate duplicates:
 $duplicate_candidates
 
-$bug_review_rubric
+$bug_closure_guidance

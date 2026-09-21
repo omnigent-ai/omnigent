@@ -144,12 +144,6 @@ def test_serving_classifier_uses_online_chat_endpoint(review_bugs) -> None:
             "information_status": "sufficient",
             "missing_information": [],
             "reasoning": "Affects a real workflow.",
-            "bug_review": {
-                "actionability": "actionable",
-                "reason": "An observed workflow failure.",
-                "readability": "clear",
-                "has_user_facing_repro": True,
-            },
         }
     )
     serving = FakeServingEndpoints(
@@ -176,7 +170,7 @@ def test_serving_classifier_uses_online_chat_endpoint(review_bugs) -> None:
     assert "Broken flow" in request["messages"][0].content
 
 
-@pytest.mark.parametrize("payload", ['{"type":"Feature","impact":"low"}', '{"bug_review":'])
+@pytest.mark.parametrize("payload", ['{"type":"Feature","impact":"low"}', '{"type":'])
 def test_serving_classifier_rejects_truncated_responses_before_json_parsing(payload):
     serving = FakeServingEndpoints(
         SimpleNamespace(

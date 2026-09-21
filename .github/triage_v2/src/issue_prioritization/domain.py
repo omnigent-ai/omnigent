@@ -5,8 +5,6 @@ from dataclasses import dataclass
 from decimal import Decimal
 from enum import StrEnum
 
-from issue_prioritization.bug_review import BugReview
-
 
 class IssueType(StrEnum):
     BUG = "bug"
@@ -142,7 +140,6 @@ class Issue:
     evidence_kind: EvidenceKind = EvidenceKind.NONE
     information_status: InformationStatus = InformationStatus.NOT_APPLICABLE
     missing_information: tuple[MissingInformation, ...] = ()
-    bug_review: BugReview | None = None
     duplicate_count: int = 0
     upvote_count: int = 0
     current_priority: Priority | None = None

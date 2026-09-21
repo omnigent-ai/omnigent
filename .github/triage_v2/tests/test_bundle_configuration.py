@@ -79,8 +79,6 @@ def test_v2_owns_intake_when_enabled_and_manual_dispatch_is_dry_by_default() -> 
     assert "post_duplicate_comments: ${{ inputs.post_comment }}" not in prioritize
     assert "--intake --maintainers .github/MAINTAINER" in reusable
     assert "mode=dry_run" in reusable
-    arguments = reusable.split("args=(", 1)[1].split("\n          )", 1)[0]
-    assert "--review-bugs" in arguments
 
 
 def test_needs_info_expiry_is_gated_and_previewable() -> None:

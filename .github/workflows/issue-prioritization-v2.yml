@@ -110,7 +110,6 @@ jobs:
             --run-id "github-${{ github.run_id }}-${{ github.run_attempt }}"
             --source-revision "${{ github.sha }}"
             --mode "$mode"
-            --review-bugs
           )
           if [ "$INTAKE" = "true" ]; then
             args+=(--intake --maintainers .github/MAINTAINER)

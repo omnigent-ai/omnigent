@@ -15,7 +15,7 @@ from issue_prioritization.classification import (
     Classification,
     Classifier,
 )
-from issue_prioritization.comments import build_triage_comment
+from issue_prioritization.comments import build_code_only_comment, build_triage_comment
 from issue_prioritization.config import ScoringConfig
 from issue_prioritization.duplicates import rank_candidates
 from issue_prioritization.github import (
@@ -35,6 +35,33 @@ from issue_prioritization.mutations import (
 )
 from issue_prioritization.pipeline import PipelineMode, PipelineRun
 from issue_prioritization.scoring import ScoreEngine
+
+_CLOSURE_EXEMPT_LABELS = {"security", "duplicate", "pinned"}
+
+
+def apply_code_only_closure(client: GitHubClient, classification: Classification) -> str:
+    if not classification.source_only_quote:
+        raise ValueError("Closure requires a code-only assessment")
+    number = classification.issue_number
+    for comment_posted in (False, True):
+        live = client.open_issue(number, full_author_history=True)
+        if (
+            live is None
+            or live.content().content_hash != classification.content_hash
+            or _CLOSURE_EXEMPT_LABELS.intersection(label.casefold() for label in live.labels)
+        ):
+            if comment_posted:
+                client.upsert_issue_comment(
+                    number, build_code_only_comment(classification, skipped=True)
+                )
+            return "skipped_stale"
+        if not comment_posted:
+            client.upsert_issue_comment(number, build_code_only_comment(classification))
+    client.close_issue(number)
+    # Keep reply-driven triage active until closure succeeds.
+    if "needs-info" in live.labels:
+        client.apply_labels(number, (), ("needs-info",))
+    return "applied"
 
 
 class MemoryBotStateRepository:
@@ -175,9 +202,6 @@ def write_event_status(
             "evidence_kind": classification.evidence_kind.value,
             "information_status": classification.information_status.value,
             "missing_information": [item.value for item in classification.missing_information],
-            "bug_review": classification.bug_review.as_dict()
-            if classification.bug_review
-            else None,
         },
         "score": _score_payload(decision),
         "mutation": _mutation_payload(plan),
@@ -238,9 +262,7 @@ def _mutation_payload(plan: MutationPlan) -> dict[str, object]:
             "components": list(plan.target.components),
             "issue_type": plan.target.issue_type,
             "needs_info": plan.target.needs_info,
-            "close_as_non_actionable": plan.target.close_as_non_actionable,
         },
-        "close_as_non_actionable": plan.close_as_non_actionable,
         "labels_add": list(plan.labels_add),
         "labels_remove": list(plan.labels_remove),
         "blocked": list(plan.blocked),
@@ -297,9 +319,6 @@ def main() -> None:
     parser.add_argument("--maintainers", type=Path)
     parser.add_argument("--close-duplicates", action="store_true")
     parser.add_argument("--post-duplicate-comments", action="store_true")
-    parser.add_argument(
-        "--review-bugs", action="store_true", help="Enable the bug review prototype"
-    )
     args = parser.parse_args()
     if args.issue_number <= 0:
         raise ValueError("issue_number must be positive")
@@ -308,12 +327,12 @@ def main() -> None:
     if not token:
         raise RuntimeError("GITHUB_TOKEN is required")
     client = GitHubClient(token, args.github_repo)
-    issue = client.open_issue(args.issue_number, full_author_history=args.review_bugs)
+    issue = client.open_issue(args.issue_number, full_author_history=True)
     if issue is None:
         _write_skip_artifact(args.output_dir, args.run_id, args.issue_number, "issue_not_open")
         print(f"Skipping #{args.issue_number}: issue is not open")
         return
-    if args.review_bugs and len(issue.title) + len(issue.body) > MAX_BUG_REVIEW_CHARACTERS:
+    if len(issue.title) + len(issue.body) > MAX_BUG_REVIEW_CHARACTERS:
         _write_skip_artifact(args.output_dir, args.run_id, issue.number, "bug_review_too_large")
         print(f"Skipping #{issue.number}: report exceeds the review limit; manual review required")
         return
@@ -338,7 +357,7 @@ def main() -> None:
             args.model_endpoint,
             areas,
             duplicate_candidates=duplicate_candidates,
-            review_bugs=args.review_bugs,
+            review_bugs=True,
         ),
         config,
         areas,
@@ -346,9 +365,43 @@ def main() -> None:
         args.run_id,
         mode,
     )
+    if classification.source_only_quote:
+        status = (
+            "skipped_exempt"
+            if _CLOSURE_EXEMPT_LABELS.intersection(label.casefold() for label in issue.labels)
+            else "planned"
+        )
+        try:
+            if status == "planned" and mode == PipelineMode.APPLY:
+                status = "apply_unknown"
+                status = apply_code_only_closure(client, classification)
+        finally:
+            args.output_dir.mkdir(parents=True, exist_ok=True)
+            (args.output_dir / "event.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "source": "github_actions",
+                        "run_id": args.run_id,
+                        "mode": mode.value,
+                        "status": status,
+                        "issue_number": issue.number,
+                        "model_endpoint": args.model_endpoint,
+                        "source_revision": args.source_revision,
+                        "content_hash": classification.content_hash,
+                        "operation": "close_as_not_planned",
+                        "reasoning": classification.reasoning,
+                        "source_only_quote": classification.source_only_quote,
+                        "proposed_comment": build_code_only_comment(classification),
+                    },
+                    indent=2,
+                )
+                + "\n"
+            )
+        print(f"Issue #{issue.number}: code-only closure {status}, mode={mode.value}")
+        return
     intake_plan = None
-    # A skipped stale closure needs fresh classification before assignment or duplicate intake.
-    if args.intake and not run.mutations[0].close_as_non_actionable:
+    if args.intake:
         live_issue = client.issue_data(issue.number)
         intake_plan = plan_intake(
             issue,
@@ -400,11 +453,6 @@ def main() -> None:
             ).apply_with_plans(run)
             if len(applied_plans) != 1:
                 raise RuntimeError("targeted apply must produce exactly one mutation plan")
-            if (
-                applied_plans[0].close_as_non_actionable
-                or "non_actionable_stale_assessment" in applied_plans[0].blocked
-            ):
-                intake_plan = None
             if intake_plan is not None:
                 _apply_intake(client, issue.number, intake_plan)
             labels_after = client.issue_labels(issue.number)
@@ -436,11 +484,7 @@ def main() -> None:
             args.model_endpoint,
             args.source_revision,
             issue.labels,
-            status=(
-                "skipped_stale"
-                if "non_actionable_stale_assessment" in applied_plans[0].blocked
-                else "applied"
-            ),
+            status="applied",
             labels_after=labels_after,
             plan=applied_plans[0],
             decision=decision,
