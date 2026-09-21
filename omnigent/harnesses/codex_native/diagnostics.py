@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import unicodedata
 from typing import TYPE_CHECKING
@@ -11,10 +12,8 @@ from omnigent.process_logging import redact_log_text
 if TYPE_CHECKING:
     from omnigent.harnesses.codex_native.app_server import CodexNativeAppServer
 
-_STDERR_TAIL_CHARS = 4096
-_STDERR_ENTRIES = 20
-_STDERR_ENTRY_CHARS = 16_384
-_REDACTED = "[REDACTED]"
+STDERR_CAPTURE_ENV_VAR = "OMNIGENT_CODEX_STARTUP_STDERR_ENABLED"
+_STDERR_TAIL_BYTES = 64 * 1024
 _TERMINAL_ESCAPE = re.compile(
     r"(?:\x1b\]|\x9d).*?(?:\x07|\x1b\\|\x9c|$)"
     r"|\x1b[P^_].*?(?:\x1b\\|$)"
@@ -22,26 +21,6 @@ _TERMINAL_ESCAPE = re.compile(
     r"|\x1b[ -/]*[@-~]",
     re.DOTALL,
 )
-_PAYLOAD = re.compile(
-    r"\b(?:prompts?|inputs?|messages?|instructions?|content|body|payload|headers?)\b"
-    r"|\b(?:request|response)[\"']?\s*(?:[:={\[]|dump\b)",
-    re.IGNORECASE,
-)
-_HEADER = re.compile(
-    r"\b(?:authorization|proxy-authorization|cookie|set-cookie|content-type|user-agent|"
-    r"x-[\w-]+|[\w.-]*(?:token|api[_-]?key|password|secret|credential))[\"']?\s*[:=]",
-    re.IGNORECASE,
-)
-_NEW_RECORD = re.compile(
-    r"^\d{4}-\d{2}-\d{2}[T ]\S+\s+(?:TRACE|DEBUG|INFO|WARN|WARNING|ERROR|FATAL)\b"
-)
-_DIAGNOSTIC = re.compile(
-    r"\b(?:error|warn|warning|failed|failure|invalid|denied|timeout|timed out|refused|unavailable|"
-    r"unauthorized|forbidden|panic)\b",
-    re.IGNORECASE,
-)
-_URL = re.compile(r"\b[a-zA-Z][a-zA-Z0-9+.-]*://[^\s<>\"']+")
-_URL_USERINFO = re.compile(r"(?<=://)\S+(?=@)")
 
 
 def _without_terminal_controls(text: str) -> str:
@@ -51,48 +30,29 @@ def _without_terminal_controls(text: str) -> str:
     ).rstrip()
 
 
-def _redact_url(match: re.Match[str]) -> str:
-    url = _URL_USERINFO.sub(_REDACTED, match.group())
-    return re.sub(r"[?#].*", "?" + _REDACTED, url)
-
-
 def _stderr_snapshot(entries: list[str] | None) -> dict[str, object]:
+    lines = [redact_log_text(_without_terminal_controls(line)) for line in entries or ()]
     retained: list[str] = []
-    omitted = max(0, len(entries) - _STDERR_ENTRIES) if entries is not None else 0
-    # A bounded tail may begin in the middle of a dump. Resume only at a new record.
-    in_payload = entries is not None and len(entries) >= _STDERR_ENTRIES
-    for original in entries[-_STDERR_ENTRIES:] if entries is not None else ():
-        if len(original) > _STDERR_ENTRY_CHARS:
-            omitted += 1
-            in_payload = True
-            continue
-        line = _without_terminal_controls(original)
-        if _NEW_RECORD.match(line):
-            in_payload = False
-        if (
-            "\n" in line
-            or "\r" in line
-            or _PAYLOAD.search(line)
-            or _HEADER.search(line)
-            or line.lstrip().startswith(("{", "[", "}", "]", '"', "'"))
-        ):
-            in_payload = True
-        if in_payload or not _DIAGNOSTIC.search(line):
-            omitted += 1
-            continue
-        # Sanitize the complete retained line before clipping any of its characters.
-        safe = redact_log_text(line)
-        safe = _URL.sub(_redact_url, safe)
-        retained.append(safe)
+    remaining = _STDERR_TAIL_BYTES
+    for line in reversed(lines):
+        encoded = line.encode("utf-8")
+        required = len(encoded) + bool(retained)
+        if required > remaining:
+            # Keep complete entries unless even the newest entry exceeds the budget.
+            if not retained:
+                retained.append(encoded[-remaining:].decode("utf-8", errors="ignore"))
+            break
+        retained.append(line)
+        remaining -= required
 
-    tail = "\n".join(retained)
-    clipped = max(0, len(tail) - _STDERR_TAIL_CHARS)
-    omitted += tail[:clipped].count("\n")
+    tail = "\n".join(reversed(retained))
+    omitted_bytes = len("\n".join(lines).encode("utf-8")) - len(tail.encode("utf-8"))
     return {
         "stderr_tail_available": entries is not None,
-        "stderr_tail": tail[clipped:],
-        "stderr_tail_truncated": bool(omitted or clipped),
-        "stderr_lines_omitted": omitted,
+        "stderr_tail": tail,
+        "stderr_tail_truncated": omitted_bytes > 0,
+        "stderr_lines_omitted": len(lines) - len(retained),
+        "stderr_bytes_omitted": omitted_bytes,
     }
 
 
@@ -103,15 +63,22 @@ def collect_codex_startup_diagnostics(
 
     Only completed stderr entries already captured in memory are considered;
     an empty buffer says nothing about pending unterminated stderr bytes.
-    Payloads and their continuations are omitted, and useful diagnostic lines
-    are redacted before a final 4096-character tail limit. Omitted counts refer
-    to captured entries (normally individual lines), including privacy filtering.
+    Text capture requires explicit opt-in. Known credential patterns are
+    redacted before a 64 KiB limit, retaining complete entries where possible.
     """
+    capture_enabled = os.environ.get(STDERR_CAPTURE_ENV_VAR, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
     snapshot: dict[str, object] = {
         "app_server_state": "unavailable" if app_server is None else "not_started",
         "stderr_reader_state": "unavailable" if app_server is None else "not_started",
+        "stderr_capture_enabled": capture_enabled,
     }
-    snapshot.update(_stderr_snapshot(None if app_server is None else app_server.recent_stderr))
+    if capture_enabled:
+        snapshot.update(_stderr_snapshot(None if app_server is None else app_server.recent_stderr))
     if app_server is None:
         return snapshot
 

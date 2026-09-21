@@ -3258,6 +3258,43 @@ def test_build_runner_env_passthrough_survives_remote_daemon_hop(
     assert "DATABRICKS_UNNAMED" not in runner_env
 
 
+@pytest.mark.parametrize("server_url", [None, "https://example.databricksapps.com"])
+@pytest.mark.parametrize("setting", [None, "1", "0"])
+async def test_codex_startup_stderr_opt_in_survives_daemon_and_runner_hops(
+    monkeypatch: pytest.MonkeyPatch,
+    server_url: str | None,
+    setting: str | None,
+) -> None:
+    """Forward an explicit capture setting without enabling capture by default."""
+    from omnigent.cli import _build_host_daemon_env
+
+    flag_name = "OMNIGENT_CODEX_STARTUP_STDERR_ENABLED"
+    sibling_name = "OMNIGENT_CODEX_STARTUP_STDERR_UNRELATED"
+    monkeypatch.delenv(flag_name, raising=False)
+    monkeypatch.delenv("OMNIGENT_RUNNER_ENV_PASSTHROUGH", raising=False)
+    monkeypatch.setenv(sibling_name, "must-not-forward")
+    monkeypatch.setattr("omnigent.onboarding.provider_config.load_config", dict)
+    if setting is not None:
+        monkeypatch.setenv(flag_name, setting)
+
+    daemon_env = _build_host_daemon_env(server_url=server_url)
+    runner_env = _build_runner_env(
+        daemon_env,
+        server_url=server_url or "http://localhost:8000",
+        runner_id="runner_abc",
+        binding_token="tok",
+        workspace="/ws",
+        parent_pid=42,
+    )
+
+    for env in (daemon_env, runner_env):
+        if setting is None:
+            assert flag_name not in env
+        else:
+            assert env[flag_name] == setting
+    assert sibling_name not in runner_env
+
+
 def test_build_runner_env_preserves_ambient_databricks_profile() -> None:
     """
     Ambient Databricks profile/config-file selectors reach host runners.

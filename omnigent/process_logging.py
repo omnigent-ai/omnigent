@@ -111,7 +111,8 @@ _AUTHORIZATION_PATTERN = re.compile(
     rf"(?i)(\bauthorization\b[\"']?\s*[:=]\s*)({_AUTHORIZATION_VALUE})"
 )
 _NAMED_SECRET_PATTERN = re.compile(
-    rf"(?i)(\b[\w.-]*(?:token|api[_-]?key|secret|password|credential)"
+    # Start once per possible key, avoiding retries within long dotted/hyphenated values.
+    rf"(?i)((?<![\w.-])[\w.-]*(?:token|api[_-]?key|secret|password|credential)"
     rf"\b[\"']?\s*[:=]\s*)({_QUOTED_OR_NONSPACE_VALUE})"
 )
 _SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (

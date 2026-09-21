@@ -1,4 +1,4 @@
-"""Privacy and lifecycle coverage for bounded Codex startup snapshots."""
+"""Opt-in stderr and lifecycle coverage for Codex startup snapshots."""
 
 from __future__ import annotations
 
@@ -9,12 +9,25 @@ from typing import TYPE_CHECKING, cast
 
 import pytest
 
-from omnigent.harnesses.codex_native.diagnostics import collect_codex_startup_diagnostics
+from omnigent.harnesses.codex_native.diagnostics import (
+    STDERR_CAPTURE_ENV_VAR,
+    collect_codex_startup_diagnostics,
+)
 
 if TYPE_CHECKING:
     from omnigent.harnesses.codex_native.app_server import CodexNativeAppServer
 
 _RECORD = "2026-09-21T12:00:00.000Z ERROR "
+
+
+@pytest.fixture(autouse=True)
+def clear_capture_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(STDERR_CAPTURE_ENV_VAR, raising=False)
+
+
+@pytest.fixture
+def capture_stderr(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(STDERR_CAPTURE_ENV_VAR, "1")
 
 
 def _server(
@@ -34,7 +47,9 @@ def _server(
     )
 
 
-def test_unavailable_capture_and_empty_completed_line_buffer_are_distinct() -> None:
+def test_unavailable_capture_and_empty_completed_line_buffer_are_distinct(
+    capture_stderr: None,
+) -> None:
     unavailable = collect_codex_startup_diagnostics(None)
     not_started = collect_codex_startup_diagnostics(_server())
     empty = collect_codex_startup_diagnostics(_server([]))
@@ -42,10 +57,12 @@ def test_unavailable_capture_and_empty_completed_line_buffer_are_distinct() -> N
     assert unavailable == {
         "app_server_state": "unavailable",
         "stderr_reader_state": "unavailable",
+        "stderr_capture_enabled": True,
         "stderr_tail_available": False,
         "stderr_tail": "",
         "stderr_tail_truncated": False,
         "stderr_lines_omitted": 0,
+        "stderr_bytes_omitted": 0,
     }
     assert not_started["app_server_state"] == "not_started"
     assert not_started["stderr_reader_state"] == "not_started"
@@ -114,147 +131,145 @@ async def test_stderr_overrun_cause_is_reported_without_its_payload() -> None:
     assert "private diagnostic payload" not in str(snapshot)
 
 
-def test_preserves_simple_provider_authentication_and_mcp_failures() -> None:
+@pytest.mark.parametrize("value", [None, "", "0", "false", "no", "off", "unexpected"])
+def test_disabled_capture_does_not_read_stderr(
+    monkeypatch: pytest.MonkeyPatch, value: str | None
+) -> None:
+    if value is not None:
+        monkeypatch.setenv(STDERR_CAPTURE_ENV_VAR, value)
+
+    class ServerWithoutReadableStderr:
+        proc = SimpleNamespace(pid=4242, returncode=None)
+        stderr_task = None
+        codex_cli_version = (0, 154, 0)
+
+        @property
+        def recent_stderr(self) -> list[str]:
+            raise AssertionError("stderr must not be read without opt-in")
+
+    snapshot = collect_codex_startup_diagnostics(
+        cast("CodexNativeAppServer", ServerWithoutReadableStderr())
+    )
+    assert snapshot["stderr_capture_enabled"] is False
+    assert snapshot["app_server_state"] == "running"
+    assert snapshot["app_server_pid"] == 4242
+    assert snapshot["codex_version"] == "0.154.0"
+    assert snapshot["stderr_reader_state"] == "not_started"
+    assert not any(key.startswith("stderr_tail") or key.endswith("_omitted") for key in snapshot)
+
+
+@pytest.mark.parametrize("value", ["1", "true", "yes", "on", " TRUE "])
+def test_capture_requires_explicit_truthy_value(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv(STDERR_CAPTURE_ENV_VAR, value)
+    snapshot = collect_codex_startup_diagnostics(_server(["startup detail"]))
+    assert snapshot["stderr_capture_enabled"] is True
+    assert snapshot["stderr_tail"] == "startup detail"
+
+
+def test_preserves_diagnostic_context_and_complete_tracebacks(capture_stderr: None) -> None:
     entries = [
-        "ERROR Invalid configuration: unknown model provider local-test",
-        "ERROR authentication failed: HTTP 401 Unauthorized",
-        "ERROR MCP connection failed: connection refused",
+        "INFO startup: waiting for model provider",
+        "ERROR failed to parse response body: unexpected EOF",
+        "WARN request headers invalid: content-type is missing",
+        "Traceback (most recent call last):",
+        '  File "startup.py", line 42, in initialize',
+        "ValueError: invalid input",
+        "additional context without a severity label",
+        '{"error": {"message": "connection refused"}}',
     ]
     original = entries.copy()
     snapshot = collect_codex_startup_diagnostics(_server(entries))
     assert snapshot["stderr_tail"] == "\n".join(entries)
     assert snapshot["stderr_lines_omitted"] == 0
+    assert snapshot["stderr_bytes_omitted"] == 0
     assert snapshot["stderr_tail_truncated"] is False
     assert entries == original
 
 
-def test_preserves_startup_warnings_without_retaining_payloads() -> None:
-    warning = _RECORD.replace("ERROR", "WARN") + "waiting for backfill lease"
-    locked = _RECORD.replace("ERROR", "WARNING") + "database is locked"
-    entries = [warning, "WARN prompt: private prompt marker", "private continuation", locked]
-    snapshot = collect_codex_startup_diagnostics(_server(entries))
-    assert snapshot["stderr_tail"] == warning + "\n" + locked
-    assert snapshot["stderr_lines_omitted"] == 2
-    assert "private" not in str(snapshot)
-
-
-@pytest.mark.parametrize(
-    "header",
-    [
-        "ERROR request dump:",
-        'ERROR response={"status":401}',
-        "ERROR prompt: private prompt marker",
-        "ERROR input: private prompt marker",
-        'ERROR messages=[{"content":"private prompt marker"}]',
-        "ERROR instructions: private prompt marker",
-        "ERROR body: private prompt marker",
-        _RECORD + "Authorization:",
-        _RECORD + "Cookie: session=private-cookie-marker",
-        _RECORD + "Set-Cookie: session=private-cookie-marker",
-        "ERROR token:",
-        "ERROR password:",
-        "ERROR x-private-header:",
-        "ERROR failed\tAuthorization:\tBasic private-credential-marker",
-        "ERROR failed\vAuthorization:",
-        "ERROR failed\fAuthorization:",
-    ],
-)
-def test_payload_and_header_continuations_are_suppressed(header: str) -> None:
+def test_uses_shared_credential_redaction_without_dropping_diagnostics(
+    capture_stderr: None,
+) -> None:
     entries = [
-        header,
-        "invalid-private-credential-marker",
-        "ERROR private prompt continuation marker",
-        _RECORD + "MCP connection failed: connection refused",
+        "ERROR request failed: Authorization: Bearer synthetic-token-marker",
+        "ERROR authentication failed: api_key=synthetic-key-marker status=401",
+        'ERROR provider failed: {"password": "synthetic-password-marker", "status": 403}',
     ]
     snapshot = collect_codex_startup_diagnostics(_server(entries))
-    assert snapshot["stderr_tail"] == entries[-1]
-    assert snapshot["stderr_lines_omitted"] == 3
-    assert snapshot["stderr_tail_truncated"] is True
-    assert "private" not in str(snapshot)
+    tail = str(snapshot["stderr_tail"])
+    assert "Authorization: [REDACTED]" in tail
+    assert "api_key=[REDACTED] status=401" in tail
+    assert '"password": "[REDACTED]", "status": 403' in tail
+    assert "synthetic-" not in tail
+    assert snapshot["stderr_lines_omitted"] == 0
+    assert snapshot["stderr_tail_truncated"] is False
 
 
-def test_multiline_request_dump_is_not_partially_retained() -> None:
-    dump = (
-        "ERROR request failed:\n"
-        "POST https://user:private-password-marker@example.test/?q=private-query-marker\n"
-        "Authorization: Bearer private-token-marker\n"
-        "Cookie: session=private-cookie-marker\n"
-        '{"messages":[{"content":"private prompt marker"}]}'
-    )
-    snapshot = collect_codex_startup_diagnostics(_server([dump]))
-    assert snapshot["stderr_tail"] == ""
-    assert snapshot["stderr_lines_omitted"] == 1
-    assert "private" not in str(snapshot)
-
-
-@pytest.mark.parametrize("count", [20, 25])
-def test_full_ring_may_begin_in_the_middle_of_a_private_dump(count: int) -> None:
-    entries = ["ERROR private acquisition marker"] * (count - 1)
-    entries.append(_RECORD + "MCP connection failed: connection refused")
-    snapshot = collect_codex_startup_diagnostics(_server(entries))
-    assert snapshot["stderr_tail"] == entries[-1]
-    assert snapshot["stderr_lines_omitted"] == count - 1
-    assert "private acquisition" not in str(snapshot)
-
-
-def test_terminal_escapes_are_removed_before_payload_detection_and_redaction() -> None:
+def test_terminal_controls_are_removed_before_credential_redaction(capture_stderr: None) -> None:
     entries = [
-        "ERROR pro\x1b[31mmpt: private prompt marker",
-        _RECORD + "auth failed: Bear\x1b[0mer private-token-marker",
-        _RECORD + "MCP connec\u200dtion failed\x1b]0;private-title-marker\x07: refused\x00",
+        _RECORD + "auth failed: Bear\x1b[0mer synthetic-token-marker",
+        _RECORD + "MCP connec\u200dtion failed\x1b]0;synthetic-title-marker\x07: refused\x00",
     ]
     snapshot = collect_codex_startup_diagnostics(_server(entries))
     tail = str(snapshot["stderr_tail"])
     assert "Bearer [REDACTED]" in tail
     assert "MCP connection failed: refused" in tail
-    assert "private" not in tail
+    assert "synthetic-" not in tail
     assert "\x1b" not in tail
     assert "\x00" not in tail
     assert "\u200d" not in tail
 
 
-def test_url_userinfo_query_and_fragment_are_redacted() -> None:
-    line = (
-        "ERROR MCP connection failed: "
-        "https://private-user:private/password@example.test/rpc"
-        "?q=private-query-marker&session=private-session-marker#private-fragment-marker"
-    )
-    snapshot = collect_codex_startup_diagnostics(_server([line]))
-    assert snapshot["stderr_tail"] == (
-        "ERROR MCP connection failed: https://[REDACTED]@example.test/rpc?[REDACTED]"
-    )
-    assert "private" not in str(snapshot)
+def test_multiline_entry_keeps_traceback_context(capture_stderr: None) -> None:
+    diagnostic = "request failed:\nTraceback:\n  initialize()\nValueError: invalid response body"
+    snapshot = collect_codex_startup_diagnostics(_server([diagnostic]))
+    assert snapshot["stderr_tail"] == diagnostic
+    assert snapshot["stderr_tail_truncated"] is False
 
 
-def test_complete_line_is_redacted_before_final_tail_clipping() -> None:
-    private_value = "private-token-marker" * 250
-    line = "ERROR MCP failed " + "padding " * 650 + " Bearer " + private_value
+def test_budget_keeps_complete_recent_entries(capture_stderr: None) -> None:
+    entries = ["old " + "a" * 30_000, "middle " + "b" * 30_000, "recent " + "c" * 30_000]
+    snapshot = collect_codex_startup_diagnostics(_server(entries))
+    assert snapshot["stderr_tail"] == "\n".join(entries[1:])
+    assert snapshot["stderr_lines_omitted"] == 1
+    assert snapshot["stderr_bytes_omitted"] == len(entries[0]) + 1
+    assert snapshot["stderr_tail_truncated"] is True
+
+
+def test_exact_utf8_budget_includes_separator(capture_stderr: None) -> None:
+    entries = ["a", "é" * 32_767]
+    snapshot = collect_codex_startup_diagnostics(_server(entries))
+    assert snapshot["stderr_tail"] == "\n".join(entries)
+    assert len(str(snapshot["stderr_tail"]).encode("utf-8")) == 65_536
+    assert snapshot["stderr_tail_truncated"] is False
+    snapshot = collect_codex_startup_diagnostics(_server(["aa", entries[1]]))
+    assert snapshot["stderr_tail"] == entries[1]
+    assert snapshot["stderr_lines_omitted"] == 1
+    assert snapshot["stderr_bytes_omitted"] == 3
+
+
+def test_single_oversized_entry_keeps_valid_utf8_tail(capture_stderr: None) -> None:
+    line = "€" * 30_000 + " root cause"
+    snapshot = collect_codex_startup_diagnostics(_server(["earlier line", line]))
+    tail = str(snapshot["stderr_tail"])
+    assert len(tail.encode("utf-8")) <= 65_536
+    assert line.endswith(tail)
+    assert tail.endswith(" root cause")
+    assert "\ufffd" not in tail
+    assert snapshot["stderr_tail_truncated"] is True
+    assert snapshot["stderr_lines_omitted"] == 1
+    assert snapshot["stderr_bytes_omitted"] == len(
+        ("earlier line\n" + line).encode("utf-8")
+    ) - len(tail.encode("utf-8"))
+
+
+def test_redacts_complete_entry_before_clipping(capture_stderr: None) -> None:
+    line = "context " * 10_000 + " Bearer " + "synthetic-token-marker" * 5_000
     snapshot = collect_codex_startup_diagnostics(_server([line]))
     tail = str(snapshot["stderr_tail"])
-    assert len(tail) == 4096
+    assert len(tail.encode("utf-8")) == 65_536
     assert tail.endswith("Bearer [REDACTED]")
-    assert "private-token-marker" not in tail
+    assert "synthetic-token-marker" not in tail
     assert snapshot["stderr_tail_truncated"] is True
-
-
-def test_oversized_entries_are_omitted_whole_without_exposing_a_suffix() -> None:
-    entries = [
-        "ERROR request dump " + "private prompt marker " * 10_000,
-        "invalid-private-credential-marker",
-        _RECORD + "MCP connection failed: refused",
-    ]
-    snapshot = collect_codex_startup_diagnostics(_server(entries))
-    assert snapshot["stderr_tail"] == entries[-1]
-    assert snapshot["stderr_lines_omitted"] == 2
-    assert snapshot["stderr_tail_truncated"] is True
-
-
-def test_large_sanitized_tail_is_bounded_and_counts_fully_omitted_lines() -> None:
-    entries = [_RECORD + "MCP connection failed " + "x" * 1000 for _ in range(150)]
-    snapshot = collect_codex_startup_diagnostics(_server(entries))
-    assert len(str(snapshot["stderr_tail"])) == 4096
-    assert str(snapshot["stderr_tail"]).endswith(entries[-1])
-    omitted = snapshot["stderr_lines_omitted"]
-    assert isinstance(omitted, int)
-    assert omitted > 130
-    assert snapshot["stderr_tail_truncated"] is True
+    assert snapshot["stderr_lines_omitted"] == 0

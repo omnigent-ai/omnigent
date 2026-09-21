@@ -139,15 +139,55 @@ def test_redact_log_text_filters_labeled_and_unlabeled_token_shapes() -> None:
         assert redact_log_text(redacted) == redacted
 
 
-def test_redact_log_text_handles_large_non_token_input_in_linear_time() -> None:
-    """Punctuation-heavy log lines do not trigger quadratic regex backtracking."""
-    text = "+" * 20_000
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("--token=example", "--token=[REDACTED]"),
+        (".token=example", ".token=[REDACTED]"),
+        ("..access-token=example", "..access-token=[REDACTED]"),
+        ("foo.token=example", "foo.token=[REDACTED]"),
+        ("foo-token=example", "foo-token=[REDACTED]"),
+        ("_token=example", "_token=[REDACTED]"),
+        ("(--password = example )", "(--password = [REDACTED] )"),
+        ('{"access_token": "some secret"}', '{"access_token": "[REDACTED]"}'),
+        ("{'api-key': 'some secret'}", "{'api-key': '[REDACTED]'}"),
+        ('".db-credential"="example"', '".db-credential"="[REDACTED]"'),
+    ],
+)
+def test_redact_log_text_preserves_named_secret_keys(text: str, expected: str) -> None:
+    """Punctuation, underscores, and quotes around keys survive value redaction."""
+    assert redact_log_text(text) == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "+" * 20_000,
+        ("synthetic-token-marker" * 4_000)[:65_536],
+        ("synthetic.token.marker" * 4_000)[:65_536],
+    ],
+    ids=["punctuation", "hyphenated", "dotted"],
+)
+def test_redact_log_text_handles_large_non_token_input_in_linear_time(text: str) -> None:
+    """Long possible key names do not trigger quadratic regex backtracking."""
 
     started = time.perf_counter()
     output = redact_log_text(text)
     elapsed = time.perf_counter() - started
 
     assert output == text
+    assert elapsed < 0.5
+
+
+def test_redact_log_text_handles_large_bearer_token_in_linear_time() -> None:
+    """A maximum-size stderr line can be redacted without blocking the runner."""
+    text = "Bearer " + ("synthetic-token-marker" * 4_000)[:65_529]
+
+    started = time.perf_counter()
+    output = redact_log_text(text)
+    elapsed = time.perf_counter() - started
+
+    assert output == "Bearer [REDACTED]"
     assert elapsed < 0.5
 
 

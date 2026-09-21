@@ -20,7 +20,10 @@ from omnigent.harnesses.codex_native.bridge import (
     read_bridge_startup_error,
     read_bridge_state,
 )
+from omnigent.process_logging import RedactingLogFormatter
 from omnigent.runner.native import orchestration
+
+_STDERR_ENV = "OMNIGENT_CODEX_STARTUP_STDERR_ENABLED"
 
 
 @dataclass
@@ -39,6 +42,7 @@ class _Startup:
 @pytest.fixture
 def startup(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> _Startup:
     """Provide an owned launch without starting subprocesses or network clients."""
+    monkeypatch.delenv(_STDERR_ENV, raising=False)
     close_order: list[str] = []
     app_server = CodexNativeAppServer(
         codex_path="/test/codex",
@@ -236,13 +240,16 @@ async def test_failure_emits_bounded_redacted_stderr_at_error_level(
     caplog: pytest.LogCaptureFixture,
     startup: _Startup,
 ) -> None:
+    monkeypatch.setenv(_STDERR_ENV, "1")
     secret = "private-codex-startup-token"
     diagnostic = (
         "2026-09-21T12:00:00.000Z ERROR MCP connection failed: connection refused"
-        + "; retry failed" * 20
+        + "; retry failed 失敗" * 250
     )
+    body_diagnostic = "ERROR request body invalid: model field is missing"
     startup.app_server.recent_stderr = [diagnostic for _ in range(30)] + [
-        f"2026-09-21T12:00:01.000Z ERROR MCP connection failed: Authorization: Bearer {secret}"
+        body_diagnostic,
+        f"2026-09-21T12:00:01.000Z ERROR MCP connection failed: Authorization: Bearer {secret}",
     ]
     monkeypatch.setattr(
         forwarder, "wait_for_thread_started", AsyncMock(side_effect=TimeoutError())
@@ -254,11 +261,59 @@ async def test_failure_emits_bounded_redacted_stderr_at_error_level(
     [record] = _failure_records(caplog)
     tail = record.attributes["stderr_tail"]
     assert "MCP connection failed" in tail
-    assert len(tail) <= 4096
+    assert body_diagnostic in tail
+    assert 4096 < len(tail.encode("utf-8")) <= 64 * 1024
+    assert record.attributes["stderr_capture_enabled"] is True
     assert record.attributes["stderr_tail_available"] is True
     assert record.attributes["stderr_tail_truncated"] is True
+    assert record.attributes["stderr_lines_omitted"] > 0
+    assert record.attributes["stderr_bytes_omitted"] > 0
     assert secret not in str(record.attributes)
     assert secret not in str(record_to_row(record, "runner"))
+    local_line = RedactingLogFormatter(use_colors=False).format(record)
+    assert "Codex startup stderr:" in local_line
+    assert "MCP connection failed" in local_line
+    assert body_diagnostic in local_line
+    assert secret not in local_line
+
+
+@pytest.mark.parametrize("setting", [None, "0", "false"])
+async def test_failure_omits_stderr_without_capture_opt_in(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    startup: _Startup,
+    setting: str | None,
+) -> None:
+    if setting is not None:
+        monkeypatch.setenv(_STDERR_ENV, setting)
+    diagnostic = "ERROR request body invalid: diagnostic disabled for this launch"
+    startup.app_server.recent_stderr = [diagnostic]
+    monkeypatch.setattr(
+        forwarder, "wait_for_thread_started", AsyncMock(side_effect=TimeoutError())
+    )
+
+    with caplog.at_level(logging.ERROR, logger="omnigent.runner.app"):
+        await _discover(startup)
+
+    [record] = _failure_records(caplog)
+    assert record.attributes["stderr_capture_enabled"] is False
+    assert record.attributes["app_server_state"] == "running"
+    assert record.attributes["app_server_pid"] == 4242
+    assert record.attributes["stderr_reader_state"] == "not_started"
+    capture_fields = {
+        "stderr_tail",
+        "stderr_tail_available",
+        "stderr_tail_truncated",
+        "stderr_lines_omitted",
+        "stderr_bytes_omitted",
+    }
+    assert not capture_fields.intersection(record.attributes)
+    row = record_to_row(record, "runner")
+    assert not capture_fields.intersection(row["attributes"])
+    assert diagnostic not in str(row)
+    local_line = RedactingLogFormatter(use_colors=False).format(record)
+    assert diagnostic not in local_line
+    assert "Codex startup stderr:" not in local_line
 
 
 async def test_diagnostics_error_preserves_original_failure_and_cleanup(

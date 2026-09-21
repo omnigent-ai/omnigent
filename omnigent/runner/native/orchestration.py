@@ -5416,8 +5416,13 @@ async def _codex_discover_thread_and_forward(
                 **diagnostics,
             }
             _logger.exception(
-                "Codex TUI never started a thread for %s; chat will not forward",
+                "Codex TUI never started a thread for %s; chat will not forward%s",
                 session_id,
+                (
+                    f"\nCodex startup stderr:\n{diagnostics['stderr_tail']}"
+                    if diagnostics.get("stderr_tail")
+                    else ""
+                ),
                 extra=failure_event,
             )
             # Bridge state is never written here; leave the real cause for the executor (#59).
