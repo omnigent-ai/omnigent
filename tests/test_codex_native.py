@@ -659,7 +659,9 @@ class _FakeCodexAppServerClient:
         error: Exception | None = None,
         events: list[dict[str, Any]] | None = None,
     ) -> None:
-        self.response = response or {"result": {"thread": {"id": "thread_123"}}}
+        self.response = response or {
+            "result": {"thread": {"id": "thread_123"}, "config": {}, "layers": []}
+        }
         self.error = error
         self.events = events or []
         self.connected = False
@@ -793,16 +795,16 @@ def test_preload_codex_thread_for_resume_manages_subscription(
 
     assert fake_client.connected is True
     assert fake_client.requests == [
+        ("config/read", {"includeLayers": True, "cwd": str(Path.cwd())}),
         (
             "thread/resume",
             {
                 "threadId": "019e96aa-0be2-7343-8d3b-6f914d60936b",
                 "excludeTurns": True,
-                "permissions": ":danger-full-access",
-                "approvalPolicy": "never",
-                "approvalsReviewer": "auto_review",
+                "config": {},
+                "cwd": str(Path.cwd()),
             },
-        )
+        ),
     ]
     assert fake_client.closed is not retain_client
     assert retained is (fake_client if retain_client else None)
@@ -894,121 +896,68 @@ def test_is_unreadable_thread_error(exc: BaseException, expected: bool) -> None:
     assert codex_native_app_server.is_unreadable_thread_error(exc) is expected
 
 
-def test_codex_resume_permission_params_parse_legacy_flags() -> None:
-    """Legacy approval and sandbox flags become preload overrides."""
-    assert codex_native_app_server._codex_resume_permission_params(
-        ["-a", "on-failure", "-s=read-only"]
-    ) == {
-        "approvalPolicy": "on-failure",
-        "sandbox": "read-only",
-    }
-
-
-def test_codex_resume_permission_params_repairs_legacy_full_access_profile() -> None:
-    """An incomplete stored Full Access profile resumes as the matching preset."""
-    args = [
-        "-c",
-        'default_permissions=":danger-full-access"',
-        "-c",
-        'approvals_reviewer="user"',
-    ]
-
-    assert codex_native_app_server._codex_resume_permission_params(args) == {
-        "permissions": ":danger-full-access",
-        "approvalPolicy": "never",
-        "approvalsReviewer": "user",
-    }
-    assert codex_native_app_server.build_codex_remote_args(
-        codex_args=tuple(args),
-        thread_id="thread_x",
-        remote_url="ws://127.0.0.1:9876",
-    ) == [
-        "resume",
-        "--remote",
-        "ws://127.0.0.1:9876",
-        "thread_x",
-    ]
-
-
-@pytest.mark.parametrize(
-    ("permission_args", "expected_permissions"),
-    [
-        ((), {"approvalsReviewer": "auto_review"}),
-        (
-            ("-a", "on-failure", "-s=read-only"),
-            {"approvalPolicy": "on-failure", "sandbox": "read-only"},
-        ),
-        (
-            ("--ask-for-approval=on-request", "--sandbox", "workspace-write"),
-            {"approvalPolicy": "on-request", "sandbox": "workspace-write"},
-        ),
-        (
-            (
-                "--config",
-                'sandbox_mode="read-only"',
-                '-c=approval_policy="on-request"',
-                "-c",
-                'approvals_reviewer="auto_review"',
-            ),
-            {
-                "sandbox": "read-only",
-                "approvalPolicy": "on-request",
-                "approvalsReviewer": "auto_review",
-            },
-        ),
-        (
-            (
-                '--config=default_permissions=":danger-full-access"',
-                "-c",
-                'approvals_reviewer="user"',
-            ),
-            {
-                "permissions": ":danger-full-access",
-                "approvalPolicy": "never",
-                "approvalsReviewer": "user",
-            },
-        ),
-        (
-            ("--dangerously-bypass-approvals-and-sandbox",),
-            {"approvalPolicy": "never", "sandbox": "danger-full-access"},
-        ),
-    ],
-)
-def test_remote_resume_applies_permissions_only_on_app_server(
+def test_remote_resume_applies_effective_config_layers_only_on_app_server(
     monkeypatch: pytest.MonkeyPatch,
-    permission_args: tuple[str, ...],
-    expected_permissions: dict[str, str],
 ) -> None:
-    """Remote attachment must not repeat the policy already applied by preload."""
-    fake_client = _FakeCodexAppServerClient()
+    """Preload transfers raw effective layers; remote attachment repeats no config."""
+    fake_client = _FakeCodexAppServerClient(
+        response={
+            "result": {
+                "config": {"sandbox_mode": "read-only"},
+                "layers": [
+                    {
+                        "config": {
+                            "future_permissions": {"network": "session"},
+                            "sandbox_mode": "read-only",
+                        }
+                    },
+                    {
+                        "config": {
+                            "future_permissions": {
+                                "network": "user",
+                                "filesystem": "user",
+                            }
+                        }
+                    },
+                ],
+            }
+        }
+    )
     monkeypatch.setattr(
         codex_native_app_server,
         "client_for_transport",
         lambda *_args, **_kwargs: fake_client,
     )
-    model_args = ("--model", "test-model", "-c", 'model_reasoning_effort="high"')
-    launch_args = (*permission_args, *model_args)
     asyncio.run(
         codex_native_app_server.preload_codex_thread_for_resume(
-            "ws://127.0.0.1:9876", "thread_test", terminal_launch_args=launch_args
+            "ws://127.0.0.1:9876", "thread_test"
         )
     )
     assert fake_client.requests == [
+        ("config/read", {"includeLayers": True, "cwd": str(Path.cwd())}),
         (
             "thread/resume",
-            {"threadId": "thread_test", "excludeTurns": True, **expected_permissions},
-        )
+            {
+                "threadId": "thread_test",
+                "excludeTurns": True,
+                "config": {
+                    "future_permissions": {
+                        "network": "session",
+                        "filesystem": "user",
+                    },
+                    "sandbox_mode": "read-only",
+                },
+                "cwd": str(Path.cwd()),
+            },
+        ),
     ]
     assert fake_client.closed
     assert codex_native_app_server.build_codex_remote_args(
-        codex_args=launch_args,
+        codex_args=("-c", "future_permissions.network=false"),
         thread_id="thread_test",
         remote_url="ws://127.0.0.1:9876",
         config_overrides=('model_provider="test-provider"',),
     ) == [
-        "-c",
-        'model_provider="test-provider"',
-        *model_args,
         "resume",
         "--remote",
         "ws://127.0.0.1:9876",
@@ -1036,8 +985,6 @@ def test_remote_resume_omits_app_server_permission_config(
         bypass_sandbox=True,
         bypass_hook_trust=True,
     ) == [
-        "-c",
-        'model_provider="test-provider"',
         "--dangerously-bypass-hook-trust",
         "resume",
         "--remote",
@@ -1100,7 +1047,14 @@ def test_remote_resume_transfers_permission_config_to_preload(
     assignment: str,
     expected_config: dict[str, object],
 ) -> None:
-    fake_client = _FakeCodexAppServerClient()
+    fake_client = _FakeCodexAppServerClient(
+        response={
+            "result": {
+                "config": {},
+                "layers": [{"config": expected_config}],
+            }
+        }
+    )
     monkeypatch.setattr(
         codex_native_app_server, "client_for_transport", lambda *_args, **_kwargs: fake_client
     )
@@ -1116,16 +1070,16 @@ def test_remote_resume_transfers_permission_config_to_preload(
     )
 
     assert fake_client.requests == [
+        ("config/read", {"includeLayers": True, "cwd": str(Path.cwd())}),
         (
             "thread/resume",
             {
                 "threadId": "thread_test",
                 "excludeTurns": True,
-                "sandbox": "workspace-write",
-                "approvalPolicy": "never",
                 "config": expected_config,
+                "cwd": str(Path.cwd()),
             },
-        )
+        ),
     ]
     assert codex_native_app_server.build_codex_remote_args(
         codex_args=launch_args,
@@ -1162,15 +1116,20 @@ def test_remote_resume_merges_permission_config_without_dropping_profile() -> No
         'model="test-model"',
     )
 
-    assert codex_native_app_server._codex_resume_permission_params(launch_args) == {
-        "permissions": "restricted",
-        "config": {"permissions.restricted.network.enabled": False, "network.enabled": False},
-    }
+    app_server_argv = codex_native_app_server._build_native_codex_app_server_argv(
+        tagged_argv0="codex",
+        listen_url="ws://127.0.0.1:9876",
+        config_overrides=(),
+        terminal_launch_args=launch_args,
+    )
+    assert app_server_argv.count("-c") == 7
+    assert "permissions.restricted.network.enabled=false" in app_server_argv
+    assert "network.enabled=false" in app_server_argv
     assert codex_native_app_server.build_codex_remote_args(
         codex_args=launch_args,
         thread_id="thread_test",
         remote_url="ws://127.0.0.1:9876",
-    ) == ["-c", 'model="test-model"', "resume", "--remote", "ws://127.0.0.1:9876", "thread_test"]
+    ) == ["resume", "--remote", "ws://127.0.0.1:9876", "thread_test"]
 
 
 @pytest.mark.parametrize(
@@ -1213,10 +1172,20 @@ def test_remote_resume_preserves_overlapping_permission_config_order(
         "workspace-write",
         *(f"-c={assignment}" for assignment in assignments),
     )
-    assert codex_native_app_server._codex_resume_permission_params(launch_args) == {
-        "sandbox": "workspace-write",
-        "config": expected_config,
-    }
+    app_server_argv = codex_native_app_server._build_native_codex_app_server_argv(
+        tagged_argv0="codex",
+        listen_url="ws://127.0.0.1:9876",
+        config_overrides=(),
+        terminal_launch_args=launch_args,
+    )
+    assert app_server_argv[4:] == [
+        *(part for assignment in assignments for part in ("-c", assignment)),
+        "-c",
+        'sandbox_mode="workspace-write"',
+        "-c",
+        "features.hooks=true",
+    ]
+    assert expected_config
     assert codex_native_app_server.build_codex_remote_args(
         codex_args=launch_args,
         thread_id="thread_test",
@@ -1264,18 +1233,19 @@ def test_remote_resume_preserves_legacy_bypass_args(
         ("--full-auto",),
         ("-c", "approvals_reviewer=false"),
         ("--config", 'sandbox_mode=""'),
-        ("-c",),
-        ("--config",),
         ("-c", 'developer_instructions="Do not change approval_policy"'),
     ],
 )
-def test_remote_resume_preserves_settings_not_applied_by_preload(args: tuple[str, ...]) -> None:
-    """Do not silently discard unsupported policy settings or unrelated config."""
+def test_remote_resume_preserves_only_settings_not_applied_by_preload(
+    args: tuple[str, ...],
+) -> None:
+    """Raw config is transferred; unknown and malformed flags still reach Codex."""
+    preserved = list(args) if args == ("--full-auto",) else []
     assert codex_native_app_server.build_codex_remote_args(
         codex_args=args,
         thread_id="thread_test",
         remote_url="ws://127.0.0.1:9876",
-    ) == [*args, "resume", "--remote", "ws://127.0.0.1:9876", "thread_test"]
+    ) == [*preserved, "resume", "--remote", "ws://127.0.0.1:9876", "thread_test"]
 
 
 def _started_event(turn_id: str) -> dict[str, Any]:
@@ -1650,10 +1620,6 @@ def test_build_codex_remote_args_passes_transport_verbatim(
         (
             "thread_host",
             [
-                "-c",
-                'model="catalog-databricks-openai-default"',
-                "-c",
-                'model_provider="omnigent_databricks"',
                 "resume",
                 "--remote",
                 "ws://127.0.0.1:9876",
@@ -1668,18 +1634,16 @@ def test_build_codex_remote_args_emits_config_overrides_before_subcommand(
 ) -> None:
     """
     ``build_codex_remote_args`` emits each ``config_overrides`` entry as a
-    ``-c <value>`` global flag ahead of the attach flags.
+    ``-c <value>`` global flag ahead of fresh-thread attach flags.
 
     The ``--remote`` TUI is a separate process that does not inherit the
     app-server's ``-c`` flags; without these the TUI falls back to the
     OpenAI built-in provider (``requires_openai_auth = true``), renders
     the first-run login onboarding screen, and never creates a thread —
     so a host-spawned session hangs in ``running`` with no response.
-    Asserting the exact argv (not just membership) guards two things at
-    once: that the overrides are forwarded at all, and that they land
-    *before* the ``resume`` subcommand — codex treats ``-c`` as a global
-    option and rejects it when placed after a subcommand, which would
-    abort TUI startup and reintroduce the hang.
+    Resumed TUIs omit them because provider selection is materialized in the
+    private config and the app-server's effective layers are transferred by
+    preload; Codex rejects permission-bearing config on remote resume.
     """
     assert (
         codex_native_app_server.build_codex_remote_args(

@@ -40,49 +40,175 @@ def test_codex_paths_expand_windows_home_with_either_separator(
 
 
 @pytest.mark.parametrize(
-    ("args", "expected"),
+    ("args", "expected_app_server_args"),
     [
-        (("--yolo",), {"approvalPolicy": "never", "sandbox": "danger-full-access"}),
+        (
+            ("--yolo",),
+            ['approval_policy="never"', 'sandbox_mode="danger-full-access"'],
+        ),
         (
             ("--approve-for-me",),
-            {
-                "approvalPolicy": "on-request",
-                "sandbox": "workspace-write",
-                "approvalsReviewer": "auto_review",
-            },
+            [
+                'approvals_reviewer="auto_review"',
+                'approval_policy="on-request"',
+                'sandbox_mode="workspace-write"',
+            ],
         ),
         (
             ("--not-so-yolo",),
-            {
-                "approvalPolicy": "on-request",
-                "sandbox": "workspace-write",
-                "approvalsReviewer": "auto_review",
-            },
+            [
+                'approvals_reviewer="auto_review"',
+                'approval_policy="on-request"',
+                'sandbox_mode="workspace-write"',
+            ],
         ),
-        (("-sread-only", "-anever"), {"sandbox": "read-only", "approvalPolicy": "never"}),
-        (("-s=read-only", "-a=never"), {"sandbox": "read-only", "approvalPolicy": "never"}),
+        (
+            ("-sread-only", "-anever"),
+            ['sandbox_mode="read-only"', 'approval_policy="never"'],
+        ),
+        (
+            ("-s=read-only", "-a=never"),
+            ['sandbox_mode="read-only"', 'approval_policy="never"'],
+        ),
         (
             ("-csandbox_workspace_write.network_access=false", "-anever"),
-            {
-                "approvalPolicy": "never",
-                "config": {"sandbox_workspace_write.network_access": False},
-            },
+            ["sandbox_workspace_write.network_access=false", 'approval_policy="never"'],
         ),
-        (("-auntrusted", "-capproval_policy=never"), {"approvalPolicy": "untrusted"}),
+        (
+            ("-auntrusted", "-capproval_policy=never"),
+            ["approval_policy=never", 'approval_policy="untrusted"'],
+        ),
         (
             ("--not-so-yolo", "-capprovals_reviewer=user", "-anever"),
-            {
-                "approvalPolicy": "never",
-                "approvalsReviewer": "auto_review",
-                "sandbox": "workspace-write",
-            },
+            [
+                "approvals_reviewer=user",
+                'approvals_reviewer="auto_review"',
+                'approval_policy="on-request"',
+                'sandbox_mode="workspace-write"',
+                'approval_policy="never"',
+            ],
         ),
     ],
 )
-def test_remote_resume_option_spellings(args: tuple[str, ...], expected: dict) -> None:
-    assert app_server._codex_resume_permission_params(args) == expected
+def test_remote_resume_option_spellings(
+    args: tuple[str, ...], expected_app_server_args: list[str]
+) -> None:
+    assert app_server._build_native_codex_app_server_argv(
+        tagged_argv0="codex",
+        listen_url="ws://127.0.0.1:9876",
+        config_overrides=(),
+        terminal_launch_args=args,
+    ) == [
+        "codex",
+        "app-server",
+        "--listen",
+        "ws://127.0.0.1:9876",
+        *(part for override in expected_app_server_args for part in ("-c", override)),
+        "-c",
+        "features.hooks=true",
+    ]
     assert app_server.build_codex_remote_args(
         codex_args=args, thread_id="thread-test", remote_url="ws://127.0.0.1:9876"
+    ) == ["resume", "--remote", "ws://127.0.0.1:9876", "thread-test"]
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("--approve-for-me", "--sandbox", "danger-full-access"),
+        ("--approve-for-me", "--yolo"),
+    ],
+)
+def test_remote_resume_rejects_conflicting_permission_aliases(args: tuple[str, ...]) -> None:
+    with pytest.raises(ValueError, match="conflicts with sandbox and bypass flags"):
+        app_server._build_native_codex_app_server_argv(
+            tagged_argv0="codex",
+            listen_url="ws://127.0.0.1:9876",
+            config_overrides=(),
+            terminal_launch_args=args,
+        )
+
+
+def test_remote_resume_future_permission_namespace_is_server_owned() -> None:
+    args = (
+        "-c",
+        "future_permissions.network=false",
+    )
+    assert app_server._build_native_codex_app_server_argv(
+        tagged_argv0="codex",
+        listen_url="ws://127.0.0.1:9876",
+        config_overrides=(),
+        terminal_launch_args=args,
+    ) == [
+        "codex",
+        "app-server",
+        "--listen",
+        "ws://127.0.0.1:9876",
+        "-c",
+        "future_permissions.network=false",
+        "-c",
+        'approvals_reviewer="auto_review"',
+        "-c",
+        "features.hooks=true",
+    ]
+    assert app_server.build_codex_remote_args(
+        codex_args=args,
+        thread_id="thread-test",
+        remote_url="ws://127.0.0.1:9876",
+        config_overrides=('future_permissions.fs="restricted"',),
+    ) == ["resume", "--remote", "ws://127.0.0.1:9876", "thread-test"]
+
+
+def test_strict_config_is_applied_to_app_server() -> None:
+    assert app_server._build_native_codex_app_server_argv(
+        tagged_argv0="codex",
+        listen_url="ws://127.0.0.1:9876",
+        config_overrides=(),
+        terminal_launch_args=(
+            "--strict-config",
+            "-c",
+            "future_permissions.network=false",
+        ),
+    ) == [
+        "codex",
+        "app-server",
+        "--listen",
+        "ws://127.0.0.1:9876",
+        "--strict-config",
+        "-c",
+        "future_permissions.network=false",
+        "-c",
+        'approvals_reviewer="auto_review"',
+        "-c",
+        "features.hooks=true",
+    ]
+
+
+def test_app_server_forces_policy_hooks_after_user_config() -> None:
+    args = ("-c", "features.hooks=false")
+
+    enforced = app_server._build_native_codex_app_server_argv(
+        tagged_argv0="codex",
+        listen_url="ws://127.0.0.1:9876",
+        config_overrides=(),
+        terminal_launch_args=args,
+    )
+    assert enforced[-2:] == ["-c", "features.hooks=true"]
+    assert enforced.index("features.hooks=false") < enforced.index("features.hooks=true")
+    unsupported = app_server._build_native_codex_app_server_argv(
+        tagged_argv0="codex",
+        listen_url="ws://127.0.0.1:9876",
+        config_overrides=(),
+        terminal_launch_args=args,
+        enforce_policy_hooks=False,
+    )
+    assert "features.hooks=false" in unsupported
+    assert "features.hooks=true" not in unsupported
+    assert app_server.build_codex_remote_args(
+        codex_args=args,
+        thread_id="thread-test",
+        remote_url="ws://127.0.0.1:9876",
+        codex_cli_version=(0, 155, 0),
     ) == ["resume", "--remote", "ws://127.0.0.1:9876", "thread-test"]
 
 
@@ -98,7 +224,19 @@ def test_remote_resume_option_spellings(args: tuple[str, ...], expected: dict) -
 )
 def test_profile_selector_applied_by_server_not_terminal(args: tuple[str, ...]) -> None:
     assert codex_config_profile(args) == "strict"
-    assert app_server._codex_resume_permission_params(args) == {}
+    assert app_server._build_native_codex_app_server_argv(
+        tagged_argv0="codex",
+        listen_url="ws://127.0.0.1:9876",
+        config_overrides=(),
+        terminal_launch_args=args,
+    ) == [
+        "codex",
+        "app-server",
+        "--listen",
+        "ws://127.0.0.1:9876",
+        "-c",
+        "features.hooks=true",
+    ]
     for thread_id in (None, "thread-test"):
         result = app_server.build_codex_remote_args(
             codex_args=args, thread_id=thread_id, remote_url="ws://127.0.0.1:9876"
@@ -134,7 +272,9 @@ def test_profile_materialization_preserves_layers_and_private_edits(
     (source / "config.toml").write_text(original)
     (private / "config.toml").write_text(original)
     (source / "strict.config.toml").write_text(
-        'sandbox_mode="read-only"\nmodel="profile-model"\n[sandbox_workspace_write]\nwritable_roots=["/profile"]\n'
+        'sandbox_mode="read-only"\nmodel="profile-model"\n'
+        '[future_permissions]\nnetwork="restricted"\n'
+        '[sandbox_workspace_write]\nwritable_roots=["/profile"]\n'
     )
     materialize_codex_config_profile(private, source, "strict", codex_version=version)
     config = tomlkit.parse((private / "config.toml").read_text())
@@ -145,11 +285,13 @@ def test_profile_materialization_preserves_layers_and_private_edits(
         "network_access": False,
         "writable_roots": ["/profile"],
     }
+    assert config["future_permissions"] == {"network": "restricted"}
     config["model"] = "edited-model"
     (private / "config.toml").write_text(tomlkit.dumps(config))
     materialize_codex_config_profile(private, source, None, codex_version=version)
     restored = tomlkit.parse((private / "config.toml").read_text())
     assert "sandbox_mode" not in restored
+    assert "future_permissions" not in restored
     assert restored["model"] == "edited-model"
     assert restored["sandbox_workspace_write"]["writable_roots"] == ["/base"]
     assert (source / "config.toml").read_text() == original
@@ -333,7 +475,12 @@ async def test_remote_resume_add_dir_preserves_configured_roots(
 ) -> None:
     client = AsyncMock()
     client.request.return_value = {
-        "result": {"config": {"sandbox_workspace_write": {"writable_roots": ["/configured"]}}}
+        "result": {
+            "config": {"sandbox_workspace_write": {"writable_roots": ["/configured"]}},
+            "layers": [
+                {"config": {"sandbox_workspace_write": {"writable_roots": ["/configured"]}}}
+            ],
+        }
     }
     monkeypatch.setattr(app_server, "client_for_transport", lambda *args, **kwargs: client)
     args = (
@@ -354,7 +501,7 @@ async def test_remote_resume_add_dir_preserves_configured_roots(
         "/second",
         "/configured",
     ]
-    assert resume["config"]["sandbox_workspace_write.network_access"] is False
+    assert resume["config"] == {"sandbox_workspace_write": {"writable_roots": ["/configured"]}}
     assert app_server.build_codex_remote_args(
         codex_args=args, thread_id="thread-test", remote_url="ws://127.0.0.1:9876"
     ) == ["resume", "--remote", "ws://127.0.0.1:9876", "thread-test"]
@@ -397,7 +544,15 @@ async def test_remote_resume_named_permissions_add_dir(
             "config": {
                 "default_permissions": "restricted",
                 "sandbox_workspace_write": {"writable_roots": ["/inactive-legacy-root"]},
-            }
+            },
+            "layers": [
+                {
+                    "config": {
+                        "default_permissions": "restricted",
+                        "sandbox_workspace_write": {"writable_roots": ["/inactive-legacy-root"]},
+                    }
+                }
+            ],
         }
     }
     monkeypatch.setattr(app_server, "client_for_transport", lambda *args, **kwargs: client)
@@ -408,8 +563,8 @@ async def test_remote_resume_named_permissions_add_dir(
         terminal_launch_args=("--add-dir=extra", "-cdefault_permissions=restricted"),
     )
     params = client.request.call_args_list[-1].args[1]
-    assert params["permissions"] == "restricted"
     assert params["runtimeWorkspaceRoots"] == [str(tmp_path), str(tmp_path / "extra")]
+    assert params["config"]["default_permissions"] == "restricted"
 
 
 async def test_remote_resume_config_read_failure_does_not_discard_add_dir(
@@ -433,7 +588,14 @@ async def test_remote_resume_relative_config_roots_are_absolute(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     client = AsyncMock()
-    client.request.return_value = {"result": {"config": {}}}
+    client.request.return_value = {
+        "result": {
+            "config": {"sandbox_workspace_write": {"writable_roots": ["relative-output"]}},
+            "layers": [
+                {"config": {"sandbox_workspace_write": {"writable_roots": ["relative-output"]}}}
+            ],
+        }
+    }
     monkeypatch.setattr(app_server, "client_for_transport", lambda *args, **kwargs: client)
     await app_server.preload_codex_thread_for_resume(
         "ws://127.0.0.1:9876",
@@ -451,3 +613,88 @@ async def test_remote_resume_relative_config_roots_are_absolute(
         str(tmp_path / "extra"),
         str(tmp_path / "relative-output"),
     ]
+
+
+async def test_remote_resume_transfers_raw_config_layers_by_precedence(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    client = AsyncMock()
+    client.request.return_value = {
+        "result": {
+            "config": {},
+            "layers": [
+                {
+                    "config": {
+                        "future_permissions": {"network": "session"},
+                        "sandbox_workspace_write": {"network_access": False},
+                    }
+                },
+                {
+                    "config": {
+                        "future_permissions": {"filesystem": "project"},
+                        "sandbox_workspace_write": {"writable_roots": ["project-output"]},
+                    },
+                    "disabledReason": "project not trusted",
+                },
+                {
+                    "config": {
+                        "future_permissions": {
+                            "network": "user",
+                            "filesystem": "user",
+                        }
+                    }
+                },
+                {"name": "runtime"},
+                {"name": "system", "config": None},
+            ],
+        }
+    }
+    monkeypatch.setattr(app_server, "client_for_transport", lambda *args, **kwargs: client)
+    await app_server.preload_codex_thread_for_resume(
+        "ws://127.0.0.1:9876", "thread-test", cwd=tmp_path
+    )
+    params = client.request.call_args_list[-1].args[1]
+    assert params["config"] == {
+        "future_permissions": {"network": "session", "filesystem": "user"},
+        "sandbox_workspace_write": {
+            "network_access": False,
+        },
+    }
+
+
+async def test_remote_resume_preserves_cross_key_permission_precedence(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    client = AsyncMock()
+    client.request.return_value = {
+        "result": {
+            "config": {"sandbox_mode": "read-only"},
+            "layers": [
+                {"config": {"sandbox_mode": "read-only"}},
+                {"config": {"default_permissions": ":danger-full-access"}},
+            ],
+        }
+    }
+    monkeypatch.setattr(app_server, "client_for_transport", lambda *args, **kwargs: client)
+
+    await app_server.preload_codex_thread_for_resume(
+        "ws://127.0.0.1:9876", "thread-test", cwd=tmp_path
+    )
+
+    params = client.request.call_args_list[-1].args[1]
+    assert params["config"] == {"sandbox_mode": "read-only"}
+
+
+async def test_legacy_remote_resume_does_not_require_config_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = AsyncMock()
+    monkeypatch.setattr(app_server, "client_for_transport", lambda *args, **kwargs: client)
+
+    await app_server.preload_codex_thread_for_resume(
+        "ws://127.0.0.1:9876", "thread-test", transfer_config=False
+    )
+
+    client.request.assert_awaited_once_with(
+        "thread/resume", {"threadId": "thread-test", "excludeTurns": True}
+    )

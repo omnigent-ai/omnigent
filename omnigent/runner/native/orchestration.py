@@ -4942,6 +4942,9 @@ async def _auto_create_codex_terminal(
                 retain_client=codex_remote_resume_omits_permission_args(
                     app_server.codex_cli_version
                 ),
+                transfer_config=codex_remote_resume_omits_permission_args(
+                    app_server.codex_cli_version
+                ),
             )
             if retained_resume_client is not None:
                 event_client = retained_resume_client

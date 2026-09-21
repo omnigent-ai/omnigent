@@ -3896,6 +3896,99 @@ def test_materialize_codex_provider_config_applies_custom_retry_policy(tmp_path:
     assert provider["stream_idle_timeout_ms"] == 300_000
 
 
+def test_materialize_codex_provider_config_removes_top_level_override_from_argv(
+    tmp_path: Path,
+) -> None:
+    """Inline provider maps are private config, not subprocess arguments."""
+    import tomllib
+
+    from omnigent.inner.codex_executor import materialize_codex_provider_config
+
+    codex_home = tmp_path / "codex-home"
+    remaining = materialize_codex_provider_config(
+        codex_home,
+        [
+            'model_providers={local={name="Local",requires_openai_auth=false}}',
+            'model_provider="local"',
+        ],
+    )
+
+    assert remaining == ['model_provider="local"']
+    config = tomllib.loads((codex_home / "config.toml").read_text())
+    assert config["model_providers"]["local"]["name"] == "Local"
+
+
+def test_materialize_codex_provider_config_merges_partial_provider_override(
+    tmp_path: Path,
+) -> None:
+    import tomllib
+
+    from omnigent.inner.codex_executor import materialize_codex_provider_config
+
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text(
+        '[model_providers.corp]\nname="Corp"\nbase_url="https://corp.invalid/v1"\n'
+        '[model_providers.corp.auth]\ntype="bearer"\nenv_key="CORP_TOKEN"\n'
+    )
+
+    remaining = materialize_codex_provider_config(
+        codex_home,
+        [
+            'model_providers.corp.wire_api="responses"',
+            "model_providers.corp.auth.timeout_ms=3000",
+        ],
+    )
+
+    assert remaining == []
+    provider = tomllib.loads((codex_home / "config.toml").read_text())["model_providers"]["corp"]
+    assert provider["name"] == "Corp"
+    assert provider["base_url"] == "https://corp.invalid/v1"
+    assert provider["wire_api"] == "responses"
+    assert provider["auth"] == {
+        "type": "bearer",
+        "env_key": "CORP_TOKEN",
+        "timeout_ms": 3000,
+    }
+
+
+@pytest.mark.parametrize(
+    "provider_config",
+    [
+        (
+            'model_providers = { local = { name = "Local", '
+            'base_url = "https://local.invalid/v1", wire_api = "responses", '
+            "requires_openai_auth = false } }\n"
+        ),
+        (
+            "[model_providers]\n"
+            'local = { name = "Local", base_url = "https://local.invalid/v1", '
+            'wire_api = "responses", requires_openai_auth = false }\n'
+        ),
+    ],
+)
+def test_materialize_codex_provider_config_merges_nested_override_into_inline_provider(
+    tmp_path: Path,
+    provider_config: str,
+) -> None:
+    import tomllib
+
+    from omnigent.inner.codex_executor import materialize_codex_provider_config
+
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    config_path = codex_home / "config.toml"
+    config_path.write_text(provider_config)
+
+    materialize_codex_provider_config(
+        codex_home,
+        ['model_providers.local.http_headers.X-Test="example"'],
+    )
+
+    provider = tomllib.loads(config_path.read_text())["model_providers"]["local"]
+    assert provider["http_headers"] == {"X-Test": "example"}
+
+
 # ---------------------------------------------------------------------------
 # _clean_codex_env tests
 # ---------------------------------------------------------------------------

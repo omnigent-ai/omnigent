@@ -1099,7 +1099,12 @@ def materialize_codex_provider_config(
     provider_overrides: list[str] = []
     argv_overrides: list[str] = []
     for override in config_overrides:
-        if override.lstrip().startswith(_CODEX_PROVIDER_CONFIG_PREFIX):
+        key, separator, _ = override.partition("=")
+        normalized_key = key.strip()
+        if separator and (
+            normalized_key == "model_providers"
+            or normalized_key.startswith(_CODEX_PROVIDER_CONFIG_PREFIX)
+        ):
             provider_overrides.append(override)
         else:
             argv_overrides.append(override)
@@ -1123,22 +1128,56 @@ def materialize_codex_provider_config(
     if not isinstance(providers, MutableMapping):
         raise ValueError("Codex model_providers config must be a TOML table")
 
+    def inline_value(value: object) -> object:
+        if isinstance(value, MutableMapping):
+            table = tomlkit.inline_table()
+            for key, nested_value in value.items():
+                table[key] = inline_value(nested_value)
+            return table
+        if isinstance(value, list):
+            array = tomlkit.array()
+            for nested_value in value:
+                array.append(inline_value(nested_value))
+            return array
+        return value
+
+    def merge_provider_config(
+        existing_config: MutableMapping[str, object],
+        override_config: MutableMapping[str, object],
+    ) -> None:
+        for key, value in override_config.items():
+            existing_value = existing_config.get(key)
+            if isinstance(existing_value, MutableMapping) and isinstance(value, MutableMapping):
+                merge_provider_config(existing_value, value)
+            else:
+                if isinstance(existing_config, tomlkit.items.InlineTable):
+                    value = inline_value(value)
+                existing_config[key] = value
+
     for override in provider_overrides:
         fragment = tomlkit.parse(override)
         generated = fragment.get("model_providers")
         if not isinstance(generated, MutableMapping) or not generated:
             raise ValueError("Codex provider override must define model_providers")
         for provider_name, provider_config in generated.items():
-            providers[provider_name] = provider_config
+            existing_provider = providers.get(provider_name)
+            if isinstance(existing_provider, MutableMapping) and isinstance(
+                provider_config, MutableMapping
+            ):
+                merge_provider_config(existing_provider, provider_config)
+            else:
+                if isinstance(providers, tomlkit.items.InlineTable):
+                    provider_config = inline_value(provider_config)
+                providers[provider_name] = provider_config
 
     policy = retry_policy if retry_policy is not None else RetryPolicy()
     for provider_name, provider_config in list(providers.items()):
         if not isinstance(provider_config, MutableMapping):
             continue
         if isinstance(provider_config, tomlkit.items.InlineTable):
-            inline_provider = tomlkit.inline_table()
-            for key, value in provider_config.items():
-                inline_provider[key] = value
+            inline_provider = inline_value(provider_config)
+            if not isinstance(inline_provider, tomlkit.items.InlineTable):
+                raise AssertionError("inline provider normalization returned a non-table")
             providers[provider_name] = inline_provider
             provider_config = inline_provider
         provider_config["request_max_retries"] = policy.max_retries
@@ -1146,11 +1185,13 @@ def materialize_codex_provider_config(
         if policy.timeout_per_request_s is not None:
             provider_config["stream_idle_timeout_ms"] = int(policy.timeout_per_request_s * 1000)
 
+    rendered = tomlkit.dumps(document)
+    tomlkit.parse(rendered)
     fd, tmp_name = tempfile.mkstemp(prefix="config.toml.", dir=str(codex_home))
     try:
         os.chmod(tmp_name, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(tomlkit.dumps(document))
+            handle.write(rendered)
         os.replace(tmp_name, config_path)
         os.chmod(config_path, 0o600)
     finally:

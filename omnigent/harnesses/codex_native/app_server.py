@@ -15,7 +15,7 @@ import sys
 import tempfile
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, TypeAlias, cast
 
@@ -353,6 +353,87 @@ def _pin_codex_config_model(codex_home: Path, model: str) -> None:
     if not replaced:
         lines.insert(0, pin_line)
     config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _pin_codex_config_model_provider(codex_home: Path, config_overrides: Sequence[str]) -> None:
+    """Persist a generated provider selection while preserving the user's base."""
+    provider: str | None = None
+    for override in config_overrides:
+        key, separator, raw_value = override.partition("=")
+        if not separator or key.strip() != "model_provider":
+            continue
+        value = _codex_config_string(raw_value)
+        if not value:
+            raise ValueError("Codex model_provider override must be a non-empty string")
+        provider = value
+    state_path = codex_home / ".omnigent-model-provider-state.toml"
+    if provider is None and not state_path.exists():
+        return
+    config_path = codex_home / "config.toml"
+    _materialize_config_symlink(config_path)
+    document = (
+        tomlkit.parse(config_path.read_text(encoding="utf-8"))
+        if config_path.exists()
+        else tomlkit.document()
+    )
+    current_present = "model_provider" in document
+    current_value = document.get("model_provider")
+    if current_present and not isinstance(current_value, str):
+        raise ValueError("Codex model_provider config must be a string")
+    current = (current_present, current_value if isinstance(current_value, str) else "")
+
+    if state_path.exists():
+        try:
+            state = tomlkit.parse(state_path.read_text()).unwrap()
+        except tomlkit.exceptions.TOMLKitError as error:
+            raise ValueError(f"Invalid Codex model-provider state: {state_path}") from error
+
+        def selection(name: str) -> tuple[bool, str]:
+            present = state.get(f"{name}_present")
+            value = state.get(name)
+            if not isinstance(present, bool) or not isinstance(value, str):
+                raise ValueError(f"Invalid Codex model-provider state: {state_path}")
+            return present, value
+
+        base = selection("base")
+        generated = {selection("applied")}
+        if "pending_present" in state or "pending" in state:
+            generated.add(selection("pending"))
+        if current not in generated:
+            base = current
+    else:
+        base = current
+
+    target = (True, provider) if provider is not None else base
+    if target[0]:
+        document["model_provider"] = target[1]
+    elif "model_provider" in document:
+        del document["model_provider"]
+    pending_state = tomlkit.dumps(
+        {
+            "base_present": base[0],
+            "base": base[1],
+            "applied_present": current[0],
+            "applied": current[1],
+            "pending_present": target[0],
+            "pending": target[1],
+        }
+    )
+    final_state = tomlkit.dumps(
+        {
+            "base_present": base[0],
+            "base": base[1],
+            "applied_present": target[0],
+            "applied": target[1],
+        }
+    )
+    _write_private_config(state_path, pending_state)
+    _write_private_config(config_path, tomlkit.dumps(document))
+    if provider is None:
+        state_path.unlink()
+    else:
+        _write_private_config(state_path, final_state)
+    os.chmod(config_path, 0o600)
 
 
 def _pin_codex_config_effort(codex_home: Path, effort: str, model: str | None) -> None:
@@ -1707,11 +1788,25 @@ def _build_native_codex_app_server_argv(
     tagged_argv0: str,
     listen_url: str,
     config_overrides: Sequence[str],
+    terminal_launch_args: Sequence[str] = (),
+    terminal_config_overrides: Sequence[str] | None = None,
+    enforce_policy_hooks: bool = True,
 ) -> list[str]:
-    """Build argv for the native Codex app-server subprocess."""
+    """Build app-server argv with generic CLI config and resolved aliases."""
     argv = [tagged_argv0, "app-server", "--listen", listen_url]
-    for override in config_overrides:
+    if _codex_terminal_has_flag(terminal_launch_args, "--strict-config"):
+        argv.append("--strict-config")
+    for override in (
+        *(
+            _codex_app_server_terminal_config_overrides(terminal_launch_args)
+            if terminal_config_overrides is None
+            else terminal_config_overrides
+        ),
+        *config_overrides,
+    ):
         argv.extend(["-c", override])
+    if enforce_policy_hooks:
+        argv.extend(["-c", "features.hooks=true"])
     return argv
 
 
@@ -1783,6 +1878,8 @@ class CodexNativeAppServer:
         it to the host janitor; standalone callers keep the safe default.
     :param config_profile: Codex user config-file profile materialized into
         the private user layer before app-server and terminal startup.
+    :param terminal_launch_args: User Codex ``-c`` overrides and current
+        permission aliases converted into app-server config overrides.
     """
 
     codex_path: str
@@ -1813,6 +1910,8 @@ class CodexNativeAppServer:
     router_hooks_registered: bool = False
     reconcile_process_registry: bool = True
     config_profile: str | None = None
+    terminal_launch_args: tuple[str, ...] = ()
+    terminal_config_overrides: tuple[str, ...] = field(default=(), init=False)
 
     async def start(self) -> None:
         """
@@ -1885,6 +1984,7 @@ class CodexNativeAppServer:
             extend_model_catalog=codex_extended_catalog_requested(self.env),
             supported_efforts=CODEX_NATIVE_EFFORTS,
         )
+        _pin_codex_config_model_provider(self.codex_home, ())
         compose_profile_instructions = _materialize_codex_profile_for_start(
             self.codex_home,
             config_source,
@@ -1918,9 +2018,22 @@ class CodexNativeAppServer:
             self.developer_instructions,
             use_current_base=compose_profile_instructions,
         )
+        self.terminal_config_overrides = tuple(
+            materialize_codex_provider_config(
+                self.codex_home,
+                _codex_app_server_terminal_config_overrides(self.terminal_launch_args),
+            )
+        )
         self.config_overrides = materialize_codex_provider_config(
             self.codex_home,
             self.config_overrides,
+        )
+        _pin_codex_config_model_provider(
+            self.codex_home,
+            [
+                *self.terminal_config_overrides,
+                *self.config_overrides,
+            ],
         )
         if codex_version is not None and not policy_hooks_supported:
             self._disable_policy_hook(
@@ -1966,6 +2079,9 @@ class CodexNativeAppServer:
             tagged_argv0=tagged_argv0,
             listen_url=resolved_listen,
             config_overrides=self.config_overrides,
+            terminal_launch_args=self.terminal_launch_args,
+            terminal_config_overrides=self.terminal_config_overrides,
+            enforce_policy_hooks=policy_hooks_supported,
         )
         proc_env = {**self.env, "CODEX_HOME": str(self.codex_home)}
         self.process_owner_lock = acquire_codex_native_process_owner_lock()
@@ -3032,8 +3148,8 @@ def build_codex_native_server(
         crash registry sweep. Runner-owned launches disable this because the
         host janitor owns it; standalone callers keep the
         synchronous safety default.
-    :param terminal_launch_args: Original CLI options used to select the Codex
-        config-file profile (distinct from the Databricks routing profile).
+    :param terminal_launch_args: Original CLI options used for the Codex
+        config-file profile, generic config overrides, and permission aliases.
     :returns: Configured app-server process wrapper.
     :raises ImportError: If no Codex CLI is available.
     :raises OSError: If Databricks routing was requested but no
@@ -3091,6 +3207,7 @@ def build_codex_native_server(
         env=env,
         config_overrides=config_overrides,
         config_profile=codex_config_profile(terminal_launch_args),
+        terminal_launch_args=tuple(terminal_launch_args),
         cwd=cwd,
         bridge_dir=bridge_dir,
         developer_instructions=developer_instructions,
@@ -3907,6 +4024,69 @@ def normalize_codex_permission_launch_args(
     return args
 
 
+def _codex_app_server_terminal_config_overrides(
+    terminal_launch_args: Sequence[str] | None,
+) -> list[str]:
+    """Express terminal config and current permission aliases as app-server config."""
+    args = normalize_codex_permission_launch_args(terminal_launch_args)
+    config_overrides: list[str] = []
+    typed_overrides: list[str] = []
+    auto_review = False
+    sandbox_alias = False
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--":
+            break
+        if arg == "--dangerously-bypass-approvals-and-sandbox":
+            sandbox_alias = True
+            typed_overrides = [
+                'approval_policy="never"',
+                'sandbox_mode="danger-full-access"',
+            ]
+        elif arg == "--approve-for-me":
+            auto_review = True
+        elif arg in {"--ask-for-approval", "-a", "--sandbox", "-s"}:
+            if index + 1 < len(args):
+                index += 1
+                key = "approval_policy" if arg in {"--ask-for-approval", "-a"} else "sandbox_mode"
+                sandbox_alias = sandbox_alias or key == "sandbox_mode"
+                typed_overrides.append(f"{key}={json.dumps(args[index])}")
+        elif arg.startswith(("--ask-for-approval=", "-a=")):
+            typed_overrides.append(f"approval_policy={json.dumps(arg.split('=', 1)[1])}")
+        elif arg.startswith(("--sandbox=", "-s=")):
+            sandbox_alias = True
+            typed_overrides.append(f"sandbox_mode={json.dumps(arg.split('=', 1)[1])}")
+        elif arg in {"--config", "-c"} and index + 1 < len(args):
+            index += 1
+            config_overrides.append(args[index])
+        elif arg.startswith(("--config=", "-c=")):
+            config_overrides.append(arg.split("=", 1)[1])
+        index += 1
+    if auto_review:
+        if sandbox_alias:
+            raise ValueError("--approve-for-me conflicts with sandbox and bypass flags")
+        config_overrides.extend(
+            [
+                'approvals_reviewer="auto_review"',
+                'approval_policy="on-request"',
+                'sandbox_mode="workspace-write"',
+            ]
+        )
+    config_overrides.extend(typed_overrides)
+    return config_overrides
+
+
+def _codex_terminal_has_flag(terminal_launch_args: Sequence[str] | None, flag: str) -> bool:
+    """Return whether a valueless global flag occurs before the prompt separator."""
+    for arg in canonical_codex_launch_args(terminal_launch_args or ()):
+        if arg == "--":
+            return False
+        if arg == flag:
+            return True
+    return False
+
+
 def _codex_config_string(raw_value: str) -> str:
     try:
         value = tomlkit.parse(f"value = {raw_value}")["value"]
@@ -3915,100 +4095,20 @@ def _codex_config_string(raw_value: str) -> str:
     return value if isinstance(value, str) else ""
 
 
-def _codex_resume_permission_params(terminal_launch_args: Sequence[str] | None) -> CodexParams:
-    """Convert persisted Codex permission args into thread-resume overrides."""
-    params: CodexParams = {}
-    typed_params: CodexParams = {}
-    args = normalize_codex_permission_launch_args(terminal_launch_args)
-    index = 0
-    while index < len(args):
-        arg = args[index]
-        if arg == "--":
-            break
-        value: str | None = None
-        if arg == "--dangerously-bypass-approvals-and-sandbox":
-            typed_params.update(approvalPolicy="never", sandbox="danger-full-access")
-        elif arg in {"--ask-for-approval", "-a", "--sandbox", "-s"}:
-            if index + 1 < len(args):
-                value = args[index + 1]
-                index += 1
-            if value is not None:
-                field = "approvalPolicy" if arg in {"--ask-for-approval", "-a"} else "sandbox"
-                typed_params[field] = value
-        elif arg.startswith(("--ask-for-approval=", "-a=")):
-            typed_params["approvalPolicy"] = arg.split("=", 1)[1]
-        elif arg.startswith(("--sandbox=", "-s=")):
-            typed_params["sandbox"] = arg.split("=", 1)[1]
-        elif arg in {"--config", "-c"} and index + 1 < len(args):
-            index += 1
-            key, _, value = args[index].partition("=")
-            _set_codex_resume_config_param(params, key, value)
-        elif arg.startswith(("--config=", "-c=")):
-            key, _, value = arg.split("=", 1)[1].partition("=")
-            _set_codex_resume_config_param(params, key, value)
-        index += 1
-    if "--approve-for-me" in args:
-        if "sandbox" in typed_params:
-            raise ValueError("--approve-for-me conflicts with sandbox and bypass flags")
-        params.update(
-            approvalsReviewer="auto_review", approvalPolicy="on-request", sandbox="workspace-write"
-        )
-    params.update(typed_params)
-    if "permissions" in params:
-        params.pop("sandbox", None)
-    return params
+def _merge_codex_resume_table(base: CodexParams, overlay: CodexParams) -> None:
+    for key, value in overlay.items():
+        existing = base.get(key)
+        if isinstance(existing, dict) and isinstance(value, dict):
+            _merge_codex_resume_table(cast(CodexParams, existing), cast(CodexParams, value))
+        else:
+            base[key] = value
 
 
-_CODEX_RESUME_PERMISSION_CONFIG_FIELDS = {
-    "approval_policy": "approvalPolicy",
-    "approvals_reviewer": "approvalsReviewer",
-    "default_permissions": "permissions",
-    "sandbox_mode": "sandbox",
-}
-
-
-def _set_codex_resume_config_param(params: CodexParams, key: str, raw_value: str) -> bool:
-    key = key.strip()
-    field = _CODEX_RESUME_PERMISSION_CONFIG_FIELDS.get(key)
-    if field is not None:
-        value = _codex_config_string(raw_value)
-        if not value:
-            return False
-        params[field] = value
-        return True
-    if key.split(".", 1)[0] not in {"sandbox_workspace_write", "network", "permissions"}:
-        return False
-    try:
-        config_value = tomlkit.parse(f"value = {raw_value}").unwrap()["value"]
-    except tomlkit.exceptions.TOMLKitError:
-        config_value = raw_value.strip().strip("\"'")
-    try:
-        json.dumps(config_value, allow_nan=False)
-    except (TypeError, ValueError):
-        return False
-    config = cast(CodexParams, params.setdefault("config", {}))
-    _set_codex_resume_config_value(config, key, config_value)
-    return True
-
-
-def _set_codex_resume_config_value(config: CodexParams, key: str, value: object) -> None:
-    """Preserve CLI order without overlapping keys in the app-server's unordered config map."""
-    for existing_key in list(config):
-        if existing_key.startswith(f"{key}."):
-            del config[existing_key]
-    segments = key.split(".")
-    for prefix_length in range(1, len(segments)):
-        ancestor = ".".join(segments[:prefix_length])
-        if ancestor not in config:
-            continue
-        target = config
-        for segment in (ancestor, *segments[prefix_length:-1]):
-            if not isinstance(target.get(segment), dict):
-                target[segment] = {}
-            target = cast(CodexParams, target[segment])
-        target[segments[-1]] = value
-        return
-    config[key] = value
+def _merge_codex_resume_config(base: CodexParams, overlay: CodexParams) -> None:
+    """Merge one lower-to-higher precedence raw Codex config layer."""
+    if overlay.get("sandbox_mode") is not None and overlay.get("default_permissions") is None:
+        base.pop("default_permissions", None)
+    _merge_codex_resume_table(base, overlay)
 
 
 async def preload_codex_thread_for_resume(
@@ -4018,6 +4118,7 @@ async def preload_codex_thread_for_resume(
     terminal_launch_args: Sequence[str] | None = None,
     retain_client: bool = False,
     cwd: Path | None = None,
+    transfer_config: bool = True,
 ) -> CodexAppServerClient | None:
     """
     Load an existing Codex thread into a freshly started app-server.
@@ -4032,10 +4133,14 @@ async def preload_codex_thread_for_resume(
         or ``"/tmp/app-server.sock"``.
     :param thread_id: Codex thread id to load, e.g.
         ``"019e96aa-0be2-7343-8d3b-6f914d60936b"``.
-    :param terminal_launch_args: Persisted permission overrides for the resumed thread.
+    :param terminal_launch_args: Persisted launch options used only to derive
+        runtime workspace roots. Codex resolves config and permission options
+        on the app-server process itself.
     :param retain_client: Keep the thread subscribed through terminal attachment.
         The caller must pass the returned client to the forwarder and close it.
     :param cwd: Session working directory for resolving additional writable roots.
+    :param transfer_config: Transfer effective config layers for Codex 0.154+
+        remote resumes. Older clients keep their launch arguments on the TUI.
     :returns: The subscribed client when retained, otherwise None.
     :raises RuntimeError: If the app-server rejects the resume.
     """
@@ -4046,7 +4151,6 @@ async def preload_codex_thread_for_resume(
     retained = False
     try:
         await client.connect()
-        params = _codex_resume_permission_params(terminal_launch_args)
         args = canonical_codex_launch_args(terminal_launch_args or ())
         additional_roots: list[str] = []
         effective_cwd = cwd or Path.cwd()
@@ -4077,28 +4181,60 @@ async def preload_codex_thread_for_resume(
             }:
                 index += 1
             index += 1
-        if additional_roots:
+        params: CodexParams = {}
+        loaded_config: dict[str, object] = {}
+        if transfer_config:
             response = await client.request(
-                "config/read", {"includeLayers": False, "cwd": str(effective_cwd)}
+                "config/read", {"includeLayers": True, "cwd": str(effective_cwd)}
             )
             result = response.get("result")
-            loaded_config = result.get("config") if isinstance(result, dict) else None
-            if not isinstance(loaded_config, dict):
+            if not isinstance(result, dict):
+                raise ValueError("Codex config/read returned an invalid result")
+            loaded_config_value = result.get("config")
+            if not isinstance(loaded_config_value, dict):
                 raise ValueError("Codex config/read returned an invalid config")
+            loaded_config = loaded_config_value
+            layers = result.get("layers")
+            if not isinstance(layers, list):
+                raise ValueError("Codex config/read returned invalid config layers")
+            resume_config: CodexParams = {}
+            for layer in reversed(layers):
+                if not isinstance(layer, dict):
+                    raise ValueError("Codex config/read returned an invalid config layer")
+                if layer.get("disabledReason") is not None:
+                    continue
+                layer_config = layer.get("config")
+                if layer_config is None:
+                    continue
+                if not isinstance(layer_config, dict):
+                    raise ValueError("Codex config/read returned an invalid config layer")
+                _merge_codex_resume_config(resume_config, cast(CodexParams, layer_config))
+            params.update(config=resume_config, cwd=str(effective_cwd))
+        elif additional_roots:
+            try:
+                response = await client.request(
+                    "config/read", {"includeLayers": False, "cwd": str(effective_cwd)}
+                )
+            except CodexAppServerResponseError as exc:
+                if not _codex_rejects_request_field(exc, "includeLayers"):
+                    raise
+                response = await client.request("config/read", {"cwd": str(effective_cwd)})
+            result = response.get("result")
+            loaded_config_value = result.get("config") if isinstance(result, dict) else None
+            if not isinstance(loaded_config_value, dict):
+                raise ValueError("Codex config/read returned an invalid config")
+            loaded_config = loaded_config_value
+            params["cwd"] = str(effective_cwd)
+        if additional_roots:
             sandbox_config = loaded_config.get("sandbox_workspace_write") or {}
+            if not isinstance(sandbox_config, dict):
+                raise ValueError("sandbox_workspace_write must be a table")
             roots = sandbox_config.get("writable_roots") or []
-            config = cast(CodexParams, params.setdefault("config", {}))
-            if "sandbox_workspace_write" in config:
-                configured = config["sandbox_workspace_write"]
-                if not isinstance(configured, dict):
-                    raise ValueError("sandbox_workspace_write must be a table")
-                roots = configured.get("writable_roots", roots)
-            roots = config.get("sandbox_workspace_write.writable_roots", roots)
             if not isinstance(roots, list) or not all(isinstance(root, str) for root in roots):
                 raise ValueError(
                     "sandbox_workspace_write.writable_roots must be an array of paths"
                 )
-            if params.get("permissions") or loaded_config.get("default_permissions"):
+            if loaded_config.get("default_permissions"):
                 roots = []
             params["runtimeWorkspaceRoots"] = list(
                 dict.fromkeys(
@@ -4109,7 +4245,6 @@ async def preload_codex_thread_for_resume(
                     ]
                 )
             )
-            params["cwd"] = str(effective_cwd)
         await client.request(
             "thread/resume",
             {
@@ -4267,9 +4402,9 @@ def _strip_approval_sandbox_flags(codex_args: tuple[str, ...]) -> list[str]:
     return cleaned
 
 
-def _strip_codex_resume_permission_args(codex_args: tuple[str, ...]) -> list[str]:
-    """Omit permissions configured on the app-server at startup or thread/resume."""
-    args = _strip_approval_sandbox_flags(codex_args)
+def _strip_codex_resume_config_args(codex_args: tuple[str, ...]) -> list[str]:
+    """Omit config, profile, and workspace inputs transferred through preload."""
+    args = without_codex_config_profile(_strip_approval_sandbox_flags(codex_args))
     cleaned: list[str] = []
     index = 0
     while index < len(args):
@@ -4277,23 +4412,16 @@ def _strip_codex_resume_permission_args(codex_args: tuple[str, ...]) -> list[str
         if arg == "--":
             cleaned.extend(args[index:])
             break
-        if arg == "--add-dir":
+        if arg in {"-c", "--config", "--add-dir"}:
+            if index + 1 >= len(args):
+                cleaned.append(arg)
+                index += 1
+                continue
             index += 2
             continue
-        assignment: str | None = None
-        width = 1
-        if arg in {"-c", "--config"} and index + 1 < len(args):
-            assignment = args[index + 1]
-            width = 2
-        elif arg.startswith(("-c=", "--config=")):
-            assignment = arg.split("=", 1)[1]
-        if assignment is not None:
-            key, separator, raw_value = assignment.partition("=")
-            # Leave unsupported settings for Codex to validate, rather than
-            # silently dropping a policy that preload does not apply.
-            if separator and _set_codex_resume_config_param({}, key, raw_value):
-                index += width
-                continue
+        if arg.startswith(("-c=", "--config=", "--add-dir=")):
+            index += 1
+            continue
         cleaned.append(arg)
         index += 1
     return cleaned
@@ -4350,8 +4478,9 @@ def build_codex_remote_args(
         settings already cover everything.
     :param thread_id: Codex thread id to resume, e.g. ``"thread_abc123"``.
         ``None`` starts a fresh remote Codex TUI thread instead of
-        resuming an existing one. On Codex 0.154+, omit terminal permission
-        args; app-server startup and preload still configure the thread.
+        resuming an existing one. On Codex 0.154+, omit config/profile inputs
+        and current permission aliases after transferring them through the
+        app-server, while preserving unrelated TUI flags.
     :param remote_url: App-server endpoint the TUI attaches to, e.g.
         ``"unix:///home/user/.omnigent/codex-native/x/app-server.sock"``
         or ``"ws://127.0.0.1:9876"``.
@@ -4361,7 +4490,7 @@ def build_codex_remote_args(
         Each is emitted as a ``-c <value>`` global flag. Empty for a
         plain Codex-login launch that needs no provider routing.
     :param codex_cli_version: Probed app-server CLI version. Before 0.154,
-        preserve permission flags because a remote TUI can reapply its own
+        preserve launch flags because a remote TUI can reapply its own
         defaults on attach. ``None`` uses the 0.154+ compatible arguments.
     :param bypass_sandbox: When ``True`` for a fresh thread or a pre-0.154
         resume, emit a single
@@ -4403,10 +4532,16 @@ def build_codex_remote_args(
         return [*override_args, *passthrough, "--remote", remote_url]
     if not codex_remote_resume_omits_permission_args(codex_cli_version):
         return [*override_args, *passthrough, "resume", "--remote", remote_url, thread_id]
-    # Codex rejects explicit permission overrides on remote resume, even
-    # when they match the app-server policy. config_overrides went to server
-    # startup; codex_args went to preload's thread/resume call.
-    resume_args = _strip_codex_resume_permission_args((*override_args, *passthrough))
+    # Codex rejects permission overrides on remote resume. The app-server
+    # resolves CLI config, current aliases, and materialized profiles; preload
+    # then transfers Codex's raw effective config layers to the thread.
+    # Config/profile values and current permission aliases are already in the
+    # effective config snapshot. Keep unrelated TUI flags such as --model and
+    # --image; silently dropping settings that preload did not apply would be
+    # worse than letting Codex validate a newly introduced flag.
+    resume_args = _strip_codex_resume_config_args(tuple(passthrough))
+    if bypass_hook_trust and _CODEX_BYPASS_HOOK_TRUST_FLAG not in resume_args:
+        resume_args.insert(0, _CODEX_BYPASS_HOOK_TRUST_FLAG)
     return [*resume_args, "resume", "--remote", remote_url, thread_id]
 
 

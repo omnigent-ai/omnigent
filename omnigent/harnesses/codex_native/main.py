@@ -1290,6 +1290,9 @@ async def _prepare_codex_terminal(
                     retain_client=codex_remote_resume_omits_permission_args(
                         app_server.codex_cli_version
                     ),
+                    transfer_config=codex_remote_resume_omits_permission_args(
+                        app_server.codex_cli_version
+                    ),
                 )
                 write_bridge_state(
                     bridge_dir,

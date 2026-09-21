@@ -959,6 +959,7 @@ async def test_auto_create_codex_terminal_recreate_cancels_prior_forwarder(
         terminal_launch_args: list[str] | None = None,
         retain_client: bool = False,
         cwd: Path | None = None,
+        transfer_config: bool = True,
     ) -> None:
         """
         No-op thread preload.
@@ -967,7 +968,7 @@ async def test_auto_create_codex_terminal_recreate_cancels_prior_forwarder(
         :param loaded_thread_id: Thread id passed to ``thread/resume``.
         :returns: None.
         """
-        del transport, loaded_thread_id, terminal_launch_args
+        del transport, loaded_thread_id, terminal_launch_args, transfer_config
 
     runs: list[_ForwarderRun] = []
 
@@ -1243,6 +1244,7 @@ async def test_auto_create_codex_terminal_refused_resume_closes_app_server(
         terminal_launch_args: list[str] | None = None,
         retain_client: bool = False,
         cwd: Path | None = None,
+        transfer_config: bool = True,
     ) -> None:
         """
         Refuse the resume the way a stale writer-lock holder does.
@@ -1251,7 +1253,7 @@ async def test_auto_create_codex_terminal_refused_resume_closes_app_server(
         :param loaded_thread_id: Thread id passed to ``thread/resume``.
         :raises RuntimeError: Always, mirroring the app-server error.
         """
-        del transport, terminal_launch_args
+        del transport, terminal_launch_args, transfer_config
         raise RuntimeError(f"thread {loaded_thread_id} already has an active writer")
 
     class _UnreachableResourceRegistry:
@@ -1427,6 +1429,7 @@ async def test_auto_create_codex_terminal_unreadable_thread_starts_fresh(
         terminal_launch_args: list[str] | None = None,
         retain_client: bool = False,
         cwd: Path | None = None,
+        transfer_config: bool = True,
     ) -> None:
         """
         Refuse the resume the way codex's thread-store does for a bad rollout.
@@ -1435,7 +1438,7 @@ async def test_auto_create_codex_terminal_unreadable_thread_starts_fresh(
         :param loaded_thread_id: Thread id passed to ``thread/resume``.
         :raises CodexAppServerResponseError: Always, mirroring the app-server.
         """
-        del transport, terminal_launch_args
+        del transport, terminal_launch_args, transfer_config
         raise codex_app_mod.CodexAppServerResponseError(
             {
                 "code": -32603,

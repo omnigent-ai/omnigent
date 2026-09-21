@@ -633,6 +633,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
         terminal_launch_args: list[str] | None = None,
         retain_client: bool = False,
         cwd: Path | None = None,
+        transfer_config: bool = True,
     ) -> Any:
         """
         Record preloading of the known Codex thread.
@@ -648,6 +649,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
         preload_calls.append((transport, loaded_thread_id, terminal_launch_args))
         assert isinstance(cwd, Path)
         assert retain_client is retain_subscription
+        assert transfer_config is retain_subscription
         return retained_client if retain_client else None
 
     async def _fake_forward_known_thread(**kwargs: Any) -> None:
@@ -989,6 +991,7 @@ async def test_auto_create_codex_terminal_fork_clones_rollout_and_resumes(
         terminal_launch_args: list[str] | None = None,
         retain_client: bool = False,
         cwd: Path | None = None,
+        transfer_config: bool = True,
     ) -> None:
         """
         Record preloading of the cloned Codex thread.
@@ -1001,6 +1004,7 @@ async def test_auto_create_codex_terminal_fork_clones_rollout_and_resumes(
             "fork-resume must not expose stale bridge state before preload"
         )
         assert terminal_launch_args is None
+        assert transfer_config is True
         preload_calls.append((transport, loaded_thread_id))
 
     async def _fake_forward_known_thread(**kwargs: Any) -> None:
@@ -1265,9 +1269,11 @@ async def test_auto_create_codex_terminal_fork_builds_rollout_from_items_and_res
         terminal_launch_args: list[str] | None = None,
         retain_client: bool = False,
         cwd: Path | None = None,
+        transfer_config: bool = True,
     ) -> None:
         """:param transport: App-server URL. :param loaded_thread_id: Resumed thread."""
         assert terminal_launch_args is None
+        assert transfer_config is True
         preload_calls.append((transport, loaded_thread_id))
 
     async def _fake_forward_known_thread(**kwargs: Any) -> None:
@@ -3771,6 +3777,7 @@ async def test_auto_create_codex_terminal_default_pin_requires_a_fresh_catalog(
         terminal_launch_args: list[str] | None = None,
         retain_client: bool = False,
         cwd: Path | None = None,
+        transfer_config: bool = True,
     ) -> None:
         """
         Accept preloading of the known Codex thread.
@@ -3780,6 +3787,7 @@ async def test_auto_create_codex_terminal_default_pin_requires_a_fresh_catalog(
         :param terminal_launch_args: Pass-through args, unused.
         """
         del transport, loaded_thread_id, terminal_launch_args
+        assert transfer_config is False
 
     async def _fake_forward_known_thread(**kwargs: Any) -> None:
         """
@@ -4010,9 +4018,11 @@ async def test_auto_create_codex_terminal_accepts_gateway_spelled_override(
         terminal_launch_args: list[str] | None = None,
         retain_client: bool = False,
         cwd: Path | None = None,
+        transfer_config: bool = True,
     ) -> None:
         """Accept preloading of the known Codex thread."""
         del transport, loaded_thread_id, terminal_launch_args
+        assert transfer_config is False
 
     async def _fake_forward_known_thread(**kwargs: Any) -> None:
         """Accept the known-thread forwarder invocation."""
