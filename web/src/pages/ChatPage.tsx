@@ -45,6 +45,7 @@ import {
   ComposerSendButton,
 } from "@/components/composer/ChatComposer";
 import { ComposerAddMenu } from "@/components/composer/ComposerAddMenu";
+import { ComposerSettingsButton } from "@/components/composer/ComposerSettingsButton";
 import { BackgroundTaskIndicator } from "@/components/composer/BackgroundTaskIndicator";
 import { SubagentTaskIndicator } from "@/components/composer/SubagentTaskIndicator";
 import { ReplyDraftBlocks } from "@/components/composer/ReplyDraftBlocks";
@@ -3949,7 +3950,6 @@ function ComposerImpl(
                   disabled || isReadOnly || hasPendingElicitation || composerLockedByBtw
                 }
                 onAttach={() => fileInputRef.current?.click()}
-                onAdvancedSettings={() => setPickerOpenNonce((nonce) => nonce + 1)}
                 showGoal={showGoalControl || showClaudeGoalControl || showPollyCodexGoalControl}
                 onGoal={() => setGoalDialogOpen(true)}
                 goalDisabled={!composerSessionId || (!showGoalControl && isReadOnly)}
@@ -4009,6 +4009,11 @@ function ComposerImpl(
           ),
           trailing: (
             <>
+              <ComposerSettingsButton
+                data-testid="composer-settings"
+                disabled={isReadOnly || unreachable}
+                onClick={() => setPickerOpenNonce((nonce) => nonce + 1)}
+              />
               <div className="flex min-w-0 items-center rounded-lg">
                 <SessionHarnessPicker
                   busy={configBusy}

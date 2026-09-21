@@ -16,6 +16,7 @@ import {
   ComposerConfigTooltipRows,
 } from "@/components/composer/ComposerControls";
 import { ComposerAddMenu } from "@/components/composer/ComposerAddMenu";
+import { ComposerSettingsButton } from "@/components/composer/ComposerSettingsButton";
 import { ComposerRepositorySelector } from "@/components/composer/ComposerRepositorySelector";
 import { McpContextSelector } from "@/components/composer/McpContextSelector";
 import { mcpContextOptionsFromServers } from "@/components/composer/mcpContextOptions";
@@ -6447,7 +6448,6 @@ export function NewChatLandingScreen() {
                         testIdPrefix="new-chat-landing"
                         disabled={creating}
                         onAttach={() => fileInputRef.current?.click()}
-                        onAdvancedSettings={() => setContextSettingsOpen(true)}
                         onPlan={
                           directModeOptions.some((mode) => mode.value === "plan")
                             ? () => selectDirectMode("plan")
@@ -6901,6 +6901,11 @@ export function NewChatLandingScreen() {
                 ),
                 trailing: (
                   <>
+                    <ComposerSettingsButton
+                      data-testid="new-chat-landing-settings"
+                      disabled={creating}
+                      onClick={() => setContextSettingsOpen(true)}
+                    />
                     <div className="flex min-w-0 items-center rounded-lg">
                       {/* One trigger combines the harness glyph with model / effort;
                     the selected entry's submenu owns run configuration. */}

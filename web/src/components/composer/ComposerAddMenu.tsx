@@ -5,7 +5,6 @@ import {
   MessagesSquareIcon,
   PaperclipIcon,
   PlusIcon,
-  SettingsIcon,
   TargetIcon,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -34,7 +33,6 @@ export function ComposerAddMenu({
   onPlan,
   planActive,
   onSideChat,
-  onAdvancedSettings,
   projects = EMPTY_PROJECTS,
   onProjectSelect,
 }: {
@@ -55,7 +53,6 @@ export function ComposerAddMenu({
   /** Start a new side chat (a fork of this conversation opened as a rail tab).
    *  Absent when the session can't host one. */
   onSideChat?: () => void;
-  onAdvancedSettings?: () => void;
   projects?: readonly { name: string }[];
   onProjectSelect?: (name: string) => void;
 }) {
@@ -161,7 +158,7 @@ export function ComposerAddMenu({
                 <span>Files and images</span>
               </DropdownMenuItem>
             </div>
-            {(showGoal || showPlan || onProjectSelect || onSideChat || onAdvancedSettings) && (
+            {(showGoal || showPlan || onProjectSelect || onSideChat) && (
               <div className="flex flex-col gap-0.5">
                 <div className="px-2 py-1 text-xs leading-4 text-muted-foreground">Session</div>
                 <div className="flex flex-col gap-px">
@@ -173,20 +170,6 @@ export function ComposerAddMenu({
                       <span className="shrink-0">Start a new side chat</span>
                       <span className="truncate text-xs leading-4 text-muted-foreground">
                         Ask without affecting this conversation
-                      </span>
-                    </DropdownMenuItem>
-                  )}
-                  {onAdvancedSettings && (
-                    <DropdownMenuItem
-                      data-testid={`${testIdPrefix}-advanced-settings-action`}
-                      onSelect={onAdvancedSettings}
-                    >
-                      <span className="flex size-4 shrink-0 items-center justify-center">
-                        <SettingsIcon className="size-3.5" />
-                      </span>
-                      <span className="shrink-0">Advanced settings</span>
-                      <span className="truncate text-xs leading-4 text-muted-foreground">
-                        Model, effort, and session configuration
                       </span>
                     </DropdownMenuItem>
                   )}
