@@ -1822,14 +1822,18 @@ class ConversationStore(ABC):
         conversation row — the transcript, comments, files, host,
         and workspace are untouched; only the agent/harness changes.
         In one transaction it: deletes the session's current
-        session-scoped agent (the unique ``session_id`` index forbids
-        two agents on one session, so the old must go before the new
-        binds), creates a new session-scoped agent from the supplied
-        bundle, points ``agent_id`` at it, applies the model-settings
-        and label deltas below, and clears ``external_session_id``
-        (the old harness's native runtime state). The whole operation
-        is atomic: any failure rolls back and the session stays on its
-        current agent.
+        session-scoped agent (now unreferenced once ``agent_id`` is
+        repointed), creates a new session-scoped agent from the
+        supplied bundle, points ``agent_id`` at it, applies the
+        model-settings and label deltas below, and clears
+        ``external_session_id`` (the old harness's native runtime
+        state). The whole operation is atomic: any failure rolls back
+        and the session stays on its current agent.
+
+        The replacement agent's ``created_by`` is left unset, so it is
+        admin-only to mutate until a full switch implementation assigns
+        the session owner (the delete is also not yet reference-safe for
+        an agent shared via reuse or named sub-agents).
 
         :param conversation_id: Session to switch, e.g.
             ``"conv_abc123"``.

@@ -4901,11 +4901,11 @@ class SqlAlchemyConversationStore(ConversationStore):
                     session.flush()
 
             session.add(
-                # created_by is left unset: a switch replaces the agent of an
-                # existing session in place and does not change who owns that
-                # session. Ownership of the replacement resolves through the
-                # owning session (oldest-referencing root), so an editor who
-                # switches the agent does not become its owner.
+                # created_by is left unset. A switch only binds a vetted
+                # built-in, and an unowned session-scoped agent is admin-only to
+                # mutate (see require_agent_owner), so a shared editor who
+                # switches cannot then edit the replacement. Assigning the
+                # session owner here is left to a full switch implementation.
                 SqlAgent(
                     id=new_agent_id,
                     created_at=now,
