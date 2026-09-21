@@ -8,6 +8,9 @@
 // uses camelCase fields + a `type` discriminator string equal to the
 // Python class name lowercased (e.g. ResponseStartBlock → "response_start").
 
+import { capitalizeAgentName } from "./agentLabels";
+import { agentRootName } from "./forkHarness";
+import { nativeCodingAgentForAgentName } from "./nativeCodingAgents";
 import type { RoutingDecisionExtras } from "./routingDecision";
 import type { CodexPersistMode, RememberScope, Response } from "./types";
 
@@ -446,15 +449,30 @@ export interface ErrorBlock {
 
 /**
  * Extract the optional structured failure fields (`title` / `cause` /
- * `remediation`) from any error-shaped source, dropping absent ones so an
- * `ErrorBlock` stays minimal when the failure wasn't classified. Spread the
- * result into an `ErrorBlock` alongside `message` / `source` / `code`.
+ * `remediation`), naming the agent for otherwise unclassified native turn errors.
+ * Capture the name with the failure so later agent switches cannot relabel it.
  */
 export function structuredErrorFields(
-  src: { title?: string | null; cause?: string | null; remediation?: string | null } | null,
+  src: {
+    code?: string | null;
+    title?: string | null;
+    cause?: string | null;
+    remediation?: string | null;
+  } | null,
+  agentName?: string | null,
 ): Pick<ErrorBlock, "title" | "cause" | "remediation"> {
   const out: Pick<ErrorBlock, "title" | "cause" | "remediation"> = {};
   if (src?.title) out.title = src.title;
+  if (
+    !out.title &&
+    (src?.code === "native_turn_error" || src?.code === "codex_turn_error") &&
+    agentName?.trim()
+  ) {
+    const rootName = agentRootName(agentName.trim());
+    const displayName =
+      nativeCodingAgentForAgentName(rootName)?.displayName ?? capitalizeAgentName(rootName);
+    out.title = `${displayName} ran into an error during this turn.`;
+  }
   if (src?.cause) out.cause = src.cause;
   if (src?.remediation) out.remediation = src.remediation;
   return out;

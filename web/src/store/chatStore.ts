@@ -3992,7 +3992,7 @@ async function bindStream(
               message: session.lastTaskError.message,
               source: "",
               code: session.lastTaskError.code,
-              ...structuredErrorFields(session.lastTaskError),
+              ...structuredErrorFields(session.lastTaskError, session.agentName),
             }
           : null;
       return {
@@ -6432,7 +6432,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
               message: statusError.message,
               source: "",
               code: statusError.code,
-              ...structuredErrorFields(statusError),
+              ...structuredErrorFields(statusError, s.boundAgentName),
             } satisfies ErrorBlock,
           ];
         }
