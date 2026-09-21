@@ -442,3 +442,106 @@ def test_reject_uploaded_callable_tools_recurses_into_sub_agents() -> None:
     root.sub_agents = [sub]
     with pytest.raises(OmnigentError, match=r"may not declare a server-side Python callable tool"):
         _reject_uploaded_callable_tools(root)
+
+
+# ── stdio MCP servers on untrusted uploads ──────────────────
+
+
+def _stdio_mcp_bundle(name: str, command: str) -> bytes:
+    """Bundle declaring one ``transport: stdio`` MCP server spawning *command*."""
+    return _make_bundle_bytes(
+        {
+            "config.yaml": _MIN_CONFIG.format(name=name),
+            "tools/mcp/local.yaml": yaml.dump(
+                {"name": "local", "transport": "stdio", "command": command, "args": ["-c", "id"]}
+            ),
+        }
+    )
+
+
+def test_validate_bundle_rejects_stdio_mcp_server(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An untrusted upload may not declare a stdio MCP server.
+
+    The runner spawns ``command`` unsandboxed on the host, so a session
+    editor naming an arbitrary executable would get command execution.
+    """
+    monkeypatch.delenv("OMNIGENT_SESSION_STDIO_MCP_COMMANDS", raising=False)
+    with pytest.raises(OmnigentError, match=r"stdio MCP servers are not allowed for session"):
+        validate_agent_bundle(_stdio_mcp_bundle("stdio_agent", "/bin/sh"))
+
+
+def test_validate_bundle_allows_stdio_mcp_server_when_not_enforced(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The trusted single-user path keeps operator-authored stdio MCPs working."""
+    monkeypatch.delenv("OMNIGENT_SESSION_STDIO_MCP_COMMANDS", raising=False)
+    spec = validate_agent_bundle(
+        _stdio_mcp_bundle("local_stdio_agent", "/bin/sh"),
+        enforce_handler_allowlist=False,
+    )
+    assert spec.mcp_servers[0].transport == "stdio"
+
+
+def test_validate_bundle_allows_operator_allowlisted_stdio_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``OMNIGENT_SESSION_STDIO_MCP_COMMANDS`` re-enables exactly the listed commands."""
+    monkeypatch.setenv("OMNIGENT_SESSION_STDIO_MCP_COMMANDS", "npx, uvx")
+    spec = validate_agent_bundle(_stdio_mcp_bundle("allowlisted_agent", "npx"))
+    assert spec.mcp_servers[0].command == "npx"
+    with pytest.raises(OmnigentError, match=r"stdio MCP servers are not allowed"):
+        validate_agent_bundle(_stdio_mcp_bundle("blocked_agent", "/bin/sh"))
+
+
+def test_validate_bundle_stdio_wildcard_allowlist(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A ``*`` allowlist restores the permissive behaviour for every command."""
+    monkeypatch.setenv("OMNIGENT_SESSION_STDIO_MCP_COMMANDS", "*")
+    spec = validate_agent_bundle(_stdio_mcp_bundle("wildcard_agent", "/bin/sh"))
+    assert spec.mcp_servers[0].command == "/bin/sh"
+
+
+def test_validate_bundle_http_mcp_server_still_allowed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """HTTP MCP servers are unaffected by the stdio guard."""
+    monkeypatch.delenv("OMNIGENT_SESSION_STDIO_MCP_COMMANDS", raising=False)
+    bundle = _make_bundle_bytes(
+        {
+            "config.yaml": _MIN_CONFIG.format(name="http_agent"),
+            "tools/mcp/remote.yaml": yaml.dump(
+                {"name": "remote", "transport": "http", "url": "https://example.com/mcp"}
+            ),
+        }
+    )
+    spec = validate_agent_bundle(bundle)
+    assert spec.mcp_servers[0].transport == "http"
+
+
+def test_reject_uploaded_stdio_mcp_servers_recurses_into_sub_agents(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stdio MCP hidden in a sub-agent is caught by the same guard."""
+    from omnigent.server.bundles import _reject_uploaded_stdio_mcp_servers
+    from omnigent.spec import AgentSpec
+    from omnigent.spec.types import MCPServerConfig
+
+    monkeypatch.delenv("OMNIGENT_SESSION_STDIO_MCP_COMMANDS", raising=False)
+    sub = AgentSpec(name="evil_sub", spec_version=1)
+    sub.mcp_servers = [MCPServerConfig(name="shell", transport="stdio", command="/bin/sh")]
+    root = AgentSpec(name="root", spec_version=1)
+    root.sub_agents = [sub]
+    with pytest.raises(OmnigentError, match=r"stdio MCP servers are not allowed"):
+        _reject_uploaded_stdio_mcp_servers(root)
+
+
+def test_trusted_spec_load_still_accepts_stdio_mcp_server(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Operator-registered (template/built-in) agents load stdio MCPs unchanged.
+
+    Only the untrusted upload boundary enforces the guard; the trusted
+    :func:`omnigent.spec.load` path used for operator-authored agents does not.
+    """
+    from omnigent.spec import load
+
+    monkeypatch.delenv("OMNIGENT_SESSION_STDIO_MCP_COMMANDS", raising=False)
+    spec = load(_stdio_mcp_bundle("template_agent", "/bin/sh"), dest=tmp_path / "agent")
+    assert spec.mcp_servers[0].transport == "stdio"

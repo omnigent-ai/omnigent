@@ -311,3 +311,180 @@ def _single_yaml_bundle(yaml_text: str) -> bytes:
         info.size = len(data)
         tf.addfile(info, io.BytesIO(data))
     return buf.getvalue()
+
+
+_STRICT_STDIO_BODY = {
+    "name": "shell",
+    "transport": "stdio",
+    "command": "/bin/sh",
+    "args": ["-c", "id"],
+}
+
+
+async def test_create_stdio_mcp_server_rejected_on_multi_user_server(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without the single-user marker a session editor cannot declare a stdio MCP."""
+    session = await create_test_session(client, name="mcp-stdio-strict")
+    session_id = session["id"]
+    monkeypatch.delenv("OMNIGENT_LOCAL_SINGLE_USER", raising=False)
+    monkeypatch.delenv("OMNIGENT_SESSION_STDIO_MCP_COMMANDS", raising=False)
+
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/agent/mcp-servers", json=_STRICT_STDIO_BODY
+    )
+
+    assert resp.status_code == 400, resp.text
+    detail = resp.text
+    assert "stdio MCP servers are not allowed for session agents" in detail
+    assert "HTTP transport" in detail
+    agent_resp = await client.get(f"/v1/sessions/{session_id}/agent")
+    assert agent_resp.json()["mcp_servers"] == []
+
+
+async def test_update_to_stdio_mcp_server_rejected_on_multi_user_server(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PUT cannot flip an existing HTTP declaration to a stdio command either."""
+    session = await create_test_session(client, name="mcp-stdio-strict-update")
+    session_id = session["id"]
+    create = await client.post(
+        f"/v1/sessions/{session_id}/agent/mcp-servers",
+        json={"name": "search", "transport": "http", "url": "https://example.com/sse"},
+    )
+    assert create.status_code == 200, create.text
+    monkeypatch.delenv("OMNIGENT_LOCAL_SINGLE_USER", raising=False)
+    monkeypatch.delenv("OMNIGENT_SESSION_STDIO_MCP_COMMANDS", raising=False)
+
+    update = await client.put(
+        f"/v1/sessions/{session_id}/agent/mcp-servers/search", json=_STRICT_STDIO_BODY
+    )
+
+    assert update.status_code == 400, update.text
+    assert "stdio MCP servers are not allowed for session agents" in update.text
+    agent_resp = await client.get(f"/v1/sessions/{session_id}/agent")
+    assert [s["transport"] for s in agent_resp.json()["mcp_servers"]] == ["http"]
+
+
+async def test_http_mcp_server_still_allowed_on_multi_user_server(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """HTTP transports keep working when stdio is blocked."""
+    session = await create_test_session(client, name="mcp-http-strict")
+    session_id = session["id"]
+    monkeypatch.delenv("OMNIGENT_LOCAL_SINGLE_USER", raising=False)
+
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/agent/mcp-servers",
+        json={"name": "search", "transport": "http", "url": "https://example.com/sse"},
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["transport"] == "http"
+
+
+async def test_allowlisted_stdio_command_accepted_on_multi_user_server(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An operator allowlist re-enables exactly the named commands."""
+    session = await create_test_session(client, name="mcp-stdio-allowlist")
+    session_id = session["id"]
+    monkeypatch.delenv("OMNIGENT_LOCAL_SINGLE_USER", raising=False)
+    monkeypatch.setenv("OMNIGENT_SESSION_STDIO_MCP_COMMANDS", "npx")
+
+    allowed = await client.post(
+        f"/v1/sessions/{session_id}/agent/mcp-servers",
+        json={"name": "search", "transport": "stdio", "command": "npx", "args": ["-y", "srv"]},
+    )
+    assert allowed.status_code == 200, allowed.text
+    assert allowed.json()["command"] == "npx"
+
+    blocked = await client.post(
+        f"/v1/sessions/{session_id}/agent/mcp-servers", json=_STRICT_STDIO_BODY
+    )
+    assert blocked.status_code == 400, blocked.text
+
+
+async def test_stdio_mcp_server_allowed_in_local_single_user_mode(
+    client: httpx.AsyncClient,
+) -> None:
+    """The trusted single-user server (conftest default) keeps stdio working."""
+    session = await create_test_session(client, name="mcp-stdio-local")
+    session_id = session["id"]
+
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/agent/mcp-servers", json=_STRICT_STDIO_BODY
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["transport"] == "stdio"
+
+
+_STDIO_SINGLE_YAML = """\
+name: {name}
+prompt: Say hello.
+executor:
+  model: gpt-4o-mini
+  harness: openai-agents
+tools:
+  shell:
+    type: mcp
+    command: /bin/sh
+    args: ["-c", "id"]
+"""
+
+
+async def test_bundle_upload_with_stdio_mcp_rejected_on_multi_user_server(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``PUT /sessions/{id}/agent`` cannot smuggle a stdio MCP past the route guard."""
+    monkeypatch.delenv("OMNIGENT_LOCAL_SINGLE_USER", raising=False)
+    monkeypatch.delenv("OMNIGENT_SESSION_STDIO_MCP_COMMANDS", raising=False)
+    create_session = await client.post(
+        "/v1/sessions",
+        data={"metadata": "{}"},
+        files={
+            "bundle": (
+                "agent.tar.gz",
+                _single_yaml_bundle(
+                    "name: stdio_upload_agent\nprompt: Say hello.\n"
+                    "executor:\n  model: gpt-4o-mini\n  harness: openai-agents\n"
+                ),
+                "application/gzip",
+            )
+        },
+    )
+    assert create_session.status_code == 201, create_session.text
+    session_id = create_session.json()["session_id"]
+
+    replaced = await client.put(
+        f"/v1/sessions/{session_id}/agent",
+        files={
+            "bundle": (
+                "agent.tar.gz",
+                _single_yaml_bundle(_STDIO_SINGLE_YAML.format(name="stdio_upload_agent")),
+                "application/gzip",
+            )
+        },
+    )
+    assert replaced.status_code == 400, replaced.text
+    assert "stdio MCP servers are not allowed for session agents" in replaced.text
+
+    created = await client.post(
+        "/v1/sessions",
+        data={"metadata": "{}"},
+        files={
+            "bundle": (
+                "agent.tar.gz",
+                _single_yaml_bundle(_STDIO_SINGLE_YAML.format(name="stdio_create_agent")),
+                "application/gzip",
+            )
+        },
+    )
+    assert created.status_code == 400, created.text
+    assert "stdio MCP servers are not allowed for session agents" in created.text
