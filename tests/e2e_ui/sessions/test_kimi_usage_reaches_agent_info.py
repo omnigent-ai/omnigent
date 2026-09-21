@@ -40,7 +40,7 @@ from pathlib import Path
 import httpx
 import pytest
 import yaml
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Locator, Page, Response, Route, expect
 
 from omnigent.inner.kimi_executor import _resolve_kimi_binary
 from tests.e2e_ui.conftest import _ensure_runner_online, _server_state, configure_mock_llm
@@ -202,6 +202,17 @@ def _wire_usage_records() -> list[dict]:
     return records
 
 
+def _open_usage_breakdown(page: Page) -> Locator:
+    """Open the token breakdown without the popover's hover-close timer."""
+    trigger = page.get_by_test_id("agent-info-trigger")
+    trigger.focus()
+    trigger.press("Enter")
+    usage_section = page.get_by_test_id("agent-info-usage-by-model")
+    expect(usage_section).to_be_visible(timeout=30_000)
+    usage_section.locator("summary").press("Enter")
+    return usage_section
+
+
 @pytest.mark.timeout(600)
 def test_kimi_session_reports_token_usage_in_agent_info(
     page: Page,
@@ -269,17 +280,45 @@ def test_kimi_session_reports_token_usage_in_agent_info(
                 f"kimi recorded only zero-output usage; records={records!r}"
             )
 
-            # Open the agent-info popover so the (missing) usage section is on
-            # screen for the recording.
-            page.get_by_test_id("agent-info-trigger").click()
+            usage_section = _open_usage_breakdown(page)
+            model_groups = usage_section.locator('[data-testid^="agent-info-model-"]')
+            expect(model_groups.first).to_be_visible()
+            live_breakdown = model_groups.all_inner_texts()
 
-            # Reproduction assertion (FAILS on the current build, passes
-            # post-fix): the recorded usage must surface as the agent-info
-            # per-model ``Token usage`` breakdown. On the buggy build the
-            # executor emits ``TurnComplete(usage=None)`` so the section never
-            # renders (the whole usage/cost block is gated on non-empty
-            # ``usage_by_model``).
-            expect(page.get_by_test_id("agent-info-usage-by-model")).to_be_visible(timeout=15_000)
+            session_url = f"{live_server}/v1/sessions/{session_id}"
+            usage_responses: list[Response] = []
+
+            def record_usage(response: Response) -> None:
+                if response.url == f"{session_url}/usage":
+                    usage_responses.append(response)
+
+            page.on("response", record_usage)
+            # Pause SSE replay so a reload cannot pass using the old live event.
+            pending_streams: list[Route] = []
+            page.route(f"{session_url}/stream*", lambda route: pending_streams.append(route))
+            with page.expect_response(
+                lambda response: (
+                    response.url.split("?", 1)[0] == session_url
+                    and response.request.method == "GET"
+                )
+            ) as snapshot_response:
+                page.reload(wait_until="domcontentloaded")
+            expect(page.get_by_placeholder("Send a message…")).to_be_focused()
+            hydrated_groups = _open_usage_breakdown(page).locator(
+                '[data-testid^="agent-info-model-"]'
+            )
+            expect(hydrated_groups).to_have_text(live_breakdown, use_inner_text=True)
+            expect(page.locator(_ASSISTANT).first).to_be_visible()
+
+            # Old servers still hydrate from the full snapshot, without /usage.
+            if snapshot_response.value.json().get("usage_included") is False:
+                assert usage_responses, "reload never fetched the omitted usage"
+                assert usage_responses[-1].ok
+                usage = usage_responses[-1].json()
+                assert usage["id"] == session_id
+                assert (
+                    sum(model["output_tokens"] for model in usage["usage_by_model"].values()) > 0
+                )
         finally:
             httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
     finally:

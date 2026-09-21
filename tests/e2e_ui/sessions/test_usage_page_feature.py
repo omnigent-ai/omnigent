@@ -6,7 +6,12 @@ import json
 import time
 from datetime import datetime, timedelta, timezone
 
+import httpx
+import pytest
 from playwright.sync_api import Page, Route, expect
+
+from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+from tests.e2e_ui.conftest import _server_state
 
 
 def _stub_server_info(page: Page, *, usage_page: bool) -> None:
@@ -119,6 +124,111 @@ def test_session_table_shows_other_harnesses_badge(
     badge = row.get_by_text("+2")
     expect(badge).to_be_visible()
     expect(badge).to_have_attribute("title", "antigravity, openai-agents")
+
+
+@pytest.mark.min_server_version("0.15.0")
+def test_usage_report_link_and_chat_reload_keep_complete_subtree_usage(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """Stored parent/archived-child costs reach both real HTTP usage surfaces."""
+    base_url, session_id = seeded_session
+    database_uri = _server_state.get("database_uri")
+    if not database_uri:
+        pytest.skip("usage seeding requires the isolated spawned server")
+    store = SqlAlchemyConversationStore(str(database_uri))
+    parent = store.get_conversation(session_id)
+    assert parent is not None
+    title = f"Persisted subtree usage {session_id}"
+    store.update_conversation(session_id, title=title)
+    child = store.create_conversation(
+        agent_id=parent.agent_id, kind="sub_agent", parent_conversation_id=session_id
+    )
+    store.update_conversation(child.id, archived=True)
+    store.set_session_usage(
+        session_id,
+        {
+            "total_cost_usd": 1.0,
+            "by_model": {"parent-model": {"input_tokens": 100, "total_cost_usd": 1.0}},
+        },
+    )
+    store.set_session_usage(
+        child.id,
+        {
+            "total_cost_usd": 2.5,
+            "by_model": {"child-model": {"input_tokens": 200, "total_cost_usd": 2.5}},
+        },
+    )
+    _stub_server_info(page, usage_page=True)
+    session_url = f"{base_url}/v1/sessions/{session_id}"
+    usage_url = f"{session_url}/usage"
+    try:
+        # Seeded storage has no usage SSE events: chat must hydrate over HTTP.
+        with page.expect_response(f"{base_url}/v1/usage") as report_response:
+            page.goto(f"{base_url}/usage")
+        assert report_response.value.ok
+        report = report_response.value.json()
+        report_session = next(row for row in report["sessions"] if row["id"] == session_id)
+        assert report_session["cost_usd"] == 3.5
+        assert report_session["models"] == {"parent-model": 1.0, "child-model": 2.5}
+        row = page.locator("table tr", has_text=title)
+        expect(row.get_by_text("$3.50", exact=True)).to_be_visible()
+
+        for reloading, child_cost in ((False, 2.5), (True, 4.0)):
+            if reloading:
+                store.set_session_usage(
+                    child.id,
+                    {
+                        "total_cost_usd": child_cost,
+                        "by_model": {
+                            "child-model": {"input_tokens": 300, "total_cost_usd": child_cost}
+                        },
+                    },
+                )
+            with (
+                page.expect_response(
+                    lambda response: (
+                        response.url.split("?", 1)[0] == session_url
+                        and response.request.method == "GET"
+                    )
+                ) as snapshot_response,
+                page.expect_response(usage_url) as usage_response,
+            ):
+                if reloading:
+                    page.reload(wait_until="domcontentloaded")
+                else:
+                    row.get_by_role("link", name=title).click()
+
+            snapshot = snapshot_response.value.json()
+            assert snapshot["usage_included"] is False
+            assert snapshot["total_cost_usd"] is None
+            assert snapshot["usage_by_model"] is None
+            assert usage_response.value.ok
+            usage = usage_response.value.json()
+            assert usage["id"] == session_id
+            assert usage["total_cost_usd"] == 1.0 + child_cost
+            assert usage["usage_by_model"]["parent-model"]["total_cost_usd"] == 1.0
+            assert usage["usage_by_model"]["child-model"]["total_cost_usd"] == child_cost
+
+            expect(page.get_by_placeholder("Send a message…")).to_be_editable()
+            trigger = page.get_by_test_id("agent-info-trigger")
+            trigger.focus()
+            trigger.press("Enter")
+            panel = page.get_by_test_id("agent-info-panel")
+            expect(panel.get_by_test_id("agent-info-session-cost")).to_have_text(
+                f"${1.0 + child_cost:.2f}"
+            )
+            breakdown = panel.get_by_test_id("agent-info-usage-by-model")
+            breakdown.locator("summary").press("Enter")
+            expect(breakdown.get_by_test_id("agent-info-model-parent-model")).to_contain_text(
+                "$1.00"
+            )
+            expect(breakdown.get_by_test_id("agent-info-model-child-model")).to_contain_text(
+                f"${child_cost:.2f}"
+            )
+    finally:
+        deleted = httpx.delete(f"{base_url}/v1/sessions/{child.id}", timeout=10.0)
+        deleted.raise_for_status()
 
 
 def _setup_usage_page(page: Page, live_server: str) -> None:

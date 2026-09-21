@@ -39,7 +39,7 @@ import uuid
 import httpx
 import pytest
 import yaml
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Page, Response, Route, expect
 
 from tests.e2e_ui.conftest import _ensure_runner_online, _server_state, configure_mock_llm
 
@@ -150,6 +150,23 @@ def _model_requests(mock_llm_server_url: str, token: str) -> list[dict]:
     return [r for r in resp.json()["requests"] if token in json.dumps(r)]
 
 
+def _assert_cumulative_usage(page: Page, model: str) -> None:
+    """Open agent info and check the tokens from both model requests."""
+    trigger = page.get_by_test_id("agent-info-trigger")
+    trigger.focus()
+    trigger.press("Enter")
+    usage_section = page.get_by_test_id("agent-info-usage-by-model")
+    expect(usage_section).to_be_visible(timeout=30_000)
+    usage_section.locator("summary").press("Enter")
+    model_group = page.get_by_test_id(f"agent-info-model-{model}")
+    expect(model_group).to_be_visible(timeout=30_000)
+    expect(model_group).to_contain_text(
+        re.compile(rf"Total\s*{_EXPECTED_TOTAL}(?!\d)"), timeout=30_000
+    )
+    expect(model_group).to_contain_text(re.compile(rf"Input\s*{_EXPECTED_INPUT}(?!\d)"))
+    expect(model_group).to_contain_text(re.compile(rf"Output\s*{_EXPECTED_OUTPUT}(?!\d)"))
+
+
 @pytest.mark.timeout(600)
 def test_codex_multistep_turn_reports_cumulative_usage(
     page: Page,
@@ -213,27 +230,40 @@ def test_codex_multistep_turn_reports_cumulative_usage(
                 f"{len(requests)} - the codex/mock wiring broke, not the bug"
             )
 
-            # Keyboard activation keeps this usage check out of the hover-close timer.
-            page.get_by_test_id("agent-info-trigger").press("Enter")
-            usage_section = page.get_by_test_id("agent-info-usage-by-model")
-            expect(usage_section).to_be_visible(timeout=30_000)
-            usage_section.locator("summary").press("Enter")
+            _assert_cumulative_usage(page, model)
 
-            model_group = page.get_by_test_id(f"agent-info-model-{model}")
-            expect(model_group).to_be_visible(timeout=30_000)
+            session_url = f"{live_server}/v1/sessions/{session_id}"
+            usage_responses: list[Response] = []
 
-            # Reproduction assertions (FAIL on the buggy build, pass
-            # post-fix): every bucket must cover BOTH model requests. The
-            # buggy build renders the final request only: Input 10 /
-            # Output 5 / Total 15. The breakdown renders label+value runs
-            # with no separator ("Input20Output10..."), so anchor the value
-            # with a not-another-digit lookahead rather than \b (0|O is not
-            # a word boundary).
-            expect(model_group).to_contain_text(
-                re.compile(rf"Total\s*{_EXPECTED_TOTAL}(?!\d)"), timeout=30_000
-            )
-            expect(model_group).to_contain_text(re.compile(rf"Input\s*{_EXPECTED_INPUT}(?!\d)"))
-            expect(model_group).to_contain_text(re.compile(rf"Output\s*{_EXPECTED_OUTPUT}(?!\d)"))
+            def record_usage(response: Response) -> None:
+                if response.url == f"{session_url}/usage":
+                    usage_responses.append(response)
+
+            page.on("response", record_usage)
+            # Pause SSE replay so persisted HTTP usage must hydrate the fresh page.
+            pending_streams: list[Route] = []
+            page.route(f"{session_url}/stream*", lambda route: pending_streams.append(route))
+            with page.expect_response(
+                lambda response: (
+                    response.url.split("?", 1)[0] == session_url
+                    and response.request.method == "GET"
+                )
+            ) as snapshot_response:
+                page.reload(wait_until="domcontentloaded")
+            expect(page.get_by_placeholder("Send a message…")).to_be_focused()
+            _assert_cumulative_usage(page, model)
+            expect(page.locator(_ASSISTANT).filter(has_text=_FINAL_TEXT).first).to_be_visible()
+
+            # Old servers still hydrate from the full snapshot, without /usage.
+            if snapshot_response.value.json().get("usage_included") is False:
+                assert usage_responses, "reload never fetched the omitted usage"
+                assert usage_responses[-1].ok
+                usage = usage_responses[-1].json()
+                assert usage["id"] == session_id
+                model_usage = usage["usage_by_model"][model]
+                assert model_usage["input_tokens"] == _EXPECTED_INPUT
+                assert model_usage["output_tokens"] == _EXPECTED_OUTPUT
+                assert model_usage["total_tokens"] == _EXPECTED_TOTAL
         finally:
             httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
     finally:
