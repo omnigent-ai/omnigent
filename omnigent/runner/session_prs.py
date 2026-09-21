@@ -8,7 +8,7 @@ import os
 import re
 import tempfile
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
@@ -86,6 +86,7 @@ class SessionPullRequest(PullRequestRef):
     last_seen_at: float
     title: str | None = None
     title_checked_at: float = 0
+    title_lookup_timed_out: bool = False
 
 
 class _Registry(BaseModel):
@@ -162,6 +163,7 @@ class SessionPrRegistry:
                     last_seen_at=max(previous.last_seen_at, now) if previous else now,
                     title=previous.title if previous else None,
                     title_checked_at=previous.title_checked_at if previous else 0,
+                    title_lookup_timed_out=previous.title_lookup_timed_out if previous else False,
                 )
             state.prs = list(entries.values())
             if observation_id:
@@ -169,7 +171,11 @@ class SessionPrRegistry:
             self._write(state)
 
     def update_titles(
-        self, titles: Mapping[str, str | None], *, timestamp: float | None = None
+        self,
+        titles: Mapping[str, str | None],
+        *,
+        timestamp: float | None = None,
+        timed_out_urls: Collection[str] = (),
     ) -> None:
         """Cache title lookups without reordering or recreating removed associations."""
         if not titles:
@@ -186,6 +192,7 @@ class SessionPrRegistry:
                 if title is not None:
                     entry.title = title
                 entry.title_checked_at = now
+                entry.title_lookup_timed_out = title is None and entry.url in timed_out_urls
                 changed = True
             if changed:
                 self._write(state)

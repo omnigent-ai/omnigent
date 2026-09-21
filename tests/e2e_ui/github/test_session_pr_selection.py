@@ -23,6 +23,9 @@ def _expect_pr_tooltip(page: Page, label: str, trigger: Locator) -> Locator:
     expect(content).to_have_class(re.compile(r"\bbg-neutral-900\b"))
     expect(content).to_have_class(re.compile(r"\btext-white\b"))
     expect(content).to_have_css("color", "rgb(255, 255, 255)")
+    content.evaluate("""element => Promise.all(
+        element.getAnimations().map(animation => animation.finished.catch(() => {}))
+    )""")
     background = content.evaluate("""element => {
         const canvas = document.createElement("canvas");
         canvas.width = canvas.height = 1;
@@ -362,9 +365,11 @@ def test_session_pr_picker_long_title(
         assert box and box["x"] >= 0 and box["x"] + box["width"] <= viewport_width
     if viewport_width >= 768:
         titled_option.hover()
-        tooltip = _expect_pr_tooltip(page, label, titled_option)
-        assert tooltip.evaluate("element => element.scrollWidth <= element.clientWidth")
-        page.screenshot(path=tmp_path / "session-pr-option-tooltip.png", animations="disabled")
+    tooltip = _expect_pr_tooltip(page, label, titled_option)
+    assert tooltip.evaluate("element => element.scrollWidth <= element.clientWidth")
+    page.screenshot(path=tmp_path / "session-pr-option-tooltip.png", animations="disabled")
+    untitled_option.click()
+    expect(picker).to_have_text("example/one #43")
 
 
 def test_session_pr_account_fallback(

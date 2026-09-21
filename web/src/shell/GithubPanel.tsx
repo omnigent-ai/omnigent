@@ -65,6 +65,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useResizableColumn } from "@/hooks/useResizableColumn";
 import { RunnerOfflineError } from "@/hooks/useWorkspaceChangedFiles";
 import { readFileViewPreferences, writeFileViewPreferences } from "@/lib/fileViewPreferences";
@@ -776,6 +777,7 @@ function pullRequestLabel(pr: GithubPrAssociation): string {
 }
 
 export function GithubPanel({ conversationId }: { conversationId: string }) {
+  const isMobileViewport = useIsMobileViewport();
   const [selection, setSelection] = useState<{ sessionId: string; url?: string }>();
   const [prPickerOpen, setPrPickerOpen] = useState(false);
   const [prPickerTooltipOpen, setPrPickerTooltipOpen] = useState(false);
@@ -935,7 +937,11 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
                             {pullRequestLabel(pr)}
                           </SelectItem>
                         </TooltipTrigger>
-                        <TooltipContent side="left" className="wrap-anywhere">
+                        <TooltipContent
+                          side={isMobileViewport ? "bottom" : "left"}
+                          className="wrap-anywhere"
+                          style={isMobileViewport ? { pointerEvents: "none" } : undefined}
+                        >
                           {pullRequestLabel(pr)}
                         </TooltipContent>
                       </Tooltip>

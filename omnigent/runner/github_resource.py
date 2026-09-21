@@ -73,10 +73,12 @@ _logger = logging.getLogger(__name__)
 _DEFAULT_GH_TIMEOUT_SECONDS = 15.0
 # Cache failed lookups too so inaccessible PRs do not add work to every poll.
 _PR_TITLE_CACHE_SECONDS = 300.0
+_PR_TITLE_TIMEOUT_RETRY_SECONDS = 15.0
 _PR_TITLE_LOOKUP_SECONDS = 2.0
 # Leave headroom for persistence and the runner proxy's ten-second response limit.
 _PR_TITLE_REQUEST_SECONDS = 8.0
 _pr_title_deadline: ContextVar[float | None] = ContextVar("pr_title_deadline", default=None)
+_pr_title_timed_out: ContextVar[bool] = ContextVar("pr_title_timed_out", default=False)
 
 # Fields requested from ``gh pr view``. Always pass ``--json`` — bare
 # ``gh pr view`` opens an interactive/pager view and misbehaves in a
@@ -159,6 +161,7 @@ def _gh(argv: list[str], *, cwd: str, token: str | None = None) -> tuple[int | N
     if (deadline := _pr_title_deadline.get()) is not None:
         timeout = min(timeout, deadline - time.monotonic())
         if timeout <= 0:
+            _pr_title_timed_out.set(True)
             return None, "", "title lookup deadline exceeded"
     # In a managed sandbox the panel must authenticate as the connected owner via
     # the per-user hosts.yml that configure_host_gh writes — never an ambient
@@ -184,7 +187,15 @@ def _gh(argv: list[str], *, cwd: str, token: str | None = None) -> tuple[int | N
         env["GH_ENTERPRISE_TOKEN"] = token
         env.pop("GITHUB_TOKEN", None)
         env.pop("GITHUB_ENTERPRISE_TOKEN", None)
-    return _run(["gh", *argv], cwd=cwd, timeout=timeout, env=env)
+    result = _run(["gh", *argv], cwd=cwd, timeout=timeout, env=env)
+    if (
+        deadline is not None
+        and result[0] is None
+        and result[2] == "timed out"
+        and time.monotonic() >= deadline
+    ):
+        _pr_title_timed_out.set(True)
+    return result
 
 
 # ── Account selection ────────────────────────────────────────────────────────
@@ -771,9 +782,15 @@ def _session_prs_with_titles(
 
     now = time.time()
     titles: dict[str, str | None] = {}
+    timed_out_urls: set[str] = set()
     pending: list[SessionPullRequest] = []
     for entry in entries:
-        stale = now - entry.title_checked_at >= _PR_TITLE_CACHE_SECONDS
+        cache_seconds = (
+            _PR_TITLE_TIMEOUT_RETRY_SECONDS
+            if entry.title_lookup_timed_out
+            else _PR_TITLE_CACHE_SECONDS
+        )
+        stale = now - entry.title_checked_at >= cache_seconds
         if entry.url == info.get("selected_pr_url"):
             title = _pr_title(info.get("pr"))
             if stale or (title is not None and title != entry.title):
@@ -781,24 +798,34 @@ def _session_prs_with_titles(
         elif stale:
             pending.append(entry)
 
+    # Short-backoff retries must not starve PRs that have waited longer or never ran.
+    pending.sort(key=lambda entry: entry.title_checked_at)
     deadline = min(request_deadline, time.monotonic() + _PR_TITLE_LOOKUP_SECONDS)
 
-    def fetch_title(entry: SessionPullRequest) -> tuple[str, str | None] | None:
+    def fetch_title(entry: SessionPullRequest) -> tuple[str, str | None, bool] | None:
         if time.monotonic() >= deadline:
             return None
         token = _pr_title_deadline.set(deadline)
+        timeout_token = _pr_title_timed_out.set(False)
         try:
-            return entry.url, _pr_title(_pr_json(root, entry, "title"))
+            data = _pr_json(root, entry, "title")
+            return entry.url, _pr_title(data), data is None and _pr_title_timed_out.get()
         finally:
+            _pr_title_timed_out.reset(timeout_token)
             _pr_title_deadline.reset(token)
 
     may_cache = time.monotonic() < request_deadline
     if pending and time.monotonic() < deadline:
         with ThreadPoolExecutor(max_workers=min(4, len(pending))) as executor:
-            titles.update(result for result in executor.map(fetch_title, pending) if result)
+            for result in executor.map(fetch_title, pending):
+                if result is not None:
+                    url, title, timed_out = result
+                    titles[url] = title
+                    if timed_out:
+                        timed_out_urls.add(url)
     if titles and may_cache:
         try:
-            registry.update_titles(titles, timestamp=now)
+            registry.update_titles(titles, timestamp=now, timed_out_urls=timed_out_urls)
         except (OSError, ValueError, FileLockTimeout):
             _logger.debug("Could not cache session PR titles", exc_info=True)
 
