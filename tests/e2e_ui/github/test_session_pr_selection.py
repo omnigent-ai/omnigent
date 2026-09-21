@@ -6,6 +6,7 @@ import re
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
+import pytest
 from playwright.sync_api import Page, Route, expect
 
 from tests.e2e_ui.github.test_github_tab import _INFO
@@ -17,6 +18,8 @@ def test_session_pr_selection_and_unlink(
     base_url, session_id = seeded_session
     one = "https://github.com/example/one/pull/42"
     two = "https://github.com/example/two/pull/42"
+    one_label = "First repository — example/one #42"
+    two_label = "Second repository — example/two #42"
     urls = [one, two]
     requested: list[tuple[str, str]] = []
     pending_info: list[Route] = []
@@ -34,6 +37,7 @@ def test_session_pr_selection_and_unlink(
                     "host": "github.com",
                     "repository": value.split("github.com/")[1].split("/pull/")[0],
                     "number": 42,
+                    "title": "  First repository  " if value == one else "Second repository",
                     "relationship": "created",
                 }
                 for value in urls
@@ -107,7 +111,8 @@ def test_session_pr_selection_and_unlink(
     rail = page.get_by_role("complementary", name="Workspace")
     expect(rail.get_by_role("tab", name="GitHub")).to_have_attribute("aria-selected", "true")
     picker = rail.get_by_role("combobox", name="Session pull request")
-    expect(picker).to_have_text("example/one #42")
+    expect(picker).to_have_text(one_label)
+    expect(picker).to_have_attribute("title", one_label)
     original_picker = picker.element_handle()
     assert original_picker
     link_action = rail.get_by_role("button", name="Link a PR", exact=True)
@@ -122,7 +127,7 @@ def test_session_pr_selection_and_unlink(
     page.screenshot(path=str(tmp_path / "session-pr-link-input.png"), animations="disabled")
     rail.get_by_role("button", name="Cancel", exact=True).click()
     expect(rail.get_by_role("textbox", name="Pull request URL")).to_have_count(0)
-    expect(picker).to_have_text("example/one #42")
+    expect(picker).to_have_text(one_label)
     link_action.click()
     rail.get_by_role("textbox", name="Pull request URL").press("Escape")
     expect(rail.get_by_role("textbox", name="Pull request URL")).to_have_count(0)
@@ -134,30 +139,31 @@ def test_session_pr_selection_and_unlink(
     expect(page.get_by_role("tooltip")).to_have_count(0)
     page.screenshot(path=str(tmp_path / "session-pr-count.png"), animations="disabled")
     picker.click()
-    expect(page.get_by_role("option", name="example/one #42")).to_have_attribute(
+    expect(page.get_by_role("option", name=one_label, exact=True)).to_have_attribute(
         "aria-selected", "true"
     )
-    expect(page.get_by_role("option", name="example/two #42")).to_be_visible()
+    expect(page.get_by_role("option", name=two_label, exact=True)).to_be_visible()
     page.screenshot(path=str(tmp_path / "session-pr-popover.png"), animations="disabled")
     page.keyboard.press("Escape")
     expect(page.get_by_role("listbox")).to_have_count(0)
     expect(picker).to_be_focused()
-    expect(picker).to_have_text("example/one #42")
+    expect(picker).to_have_text(one_label)
     picker.press("ArrowDown")
     expect(page.get_by_role("listbox")).to_be_visible()
-    expect(page.get_by_role("option", name="example/one #42")).to_be_focused()
+    expect(page.get_by_role("option", name=one_label, exact=True)).to_be_focused()
     page.keyboard.press("End")
-    expect(page.get_by_role("option", name="example/two #42")).to_be_focused()
+    expect(page.get_by_role("option", name=two_label, exact=True)).to_be_focused()
     page.keyboard.press("Enter")
     expect(page.get_by_role("listbox")).to_have_count(0)
-    expect(picker).to_have_text("example/two #42")
+    expect(picker).to_have_text(two_label)
+    expect(picker).to_have_attribute("title", two_label)
     expect(rail.get_by_text("Loading GitHub…", exact=True)).to_be_visible()
     expect(rail.get_by_text("First repository", exact=True)).to_have_count(0)
     assert original_picker.evaluate("element => element.isConnected")
     expect(rail.get_by_role("button", name="Link a PR", exact=True)).to_be_enabled()
     expect(unlink_action).to_be_enabled()
     picker.click()
-    expect(page.get_by_role("option", name="example/one #42")).to_be_visible()
+    expect(page.get_by_role("option", name=one_label, exact=True)).to_be_visible()
     page.keyboard.press("Escape")
     expect(picker).to_be_focused()
     page.screenshot(path=str(tmp_path / "session-pr-switch-loading.png"), animations="disabled")
@@ -166,6 +172,7 @@ def test_session_pr_selection_and_unlink(
     for route in pending_info:
         route.fulfill(json=info(two))
     expect(rail.get_by_text("Second repository", exact=True)).to_be_visible()
+    expect(picker).to_have_text(two_label)
 
     rail.get_by_role("tablist", name="Pull request").get_by_role(
         "tab", name="Changes", exact=True
@@ -174,7 +181,8 @@ def test_session_pr_selection_and_unlink(
     assert ("changes", two) in requested
     assert ("diff", two) in requested
     unlink_action.click()
-    expect(picker).to_have_text("example/one #42")
+    expect(picker).to_have_text(one_label)
+    expect(picker).to_have_attribute("title", one_label)
     expect(indicator).to_have_accessible_name("#42")
     unlink_action.click()
     expect(picker).to_have_count(0)
@@ -200,9 +208,78 @@ def test_session_pr_selection_and_unlink(
     link.click()
     expect(rail.get_by_role("textbox", name="Pull request URL")).to_have_value(two)
     rail.get_by_role("button", name="Link", exact=True).click()
-    expect(picker).to_have_text("example/two #42")
+    expect(picker).to_have_text(two_label)
+    expect(picker).to_have_attribute("title", two_label)
     expect(indicator).to_have_accessible_name("#42")
     expect(rail.get_by_text("Second repository", exact=True)).to_be_visible()
+
+
+@pytest.mark.parametrize("viewport_width", [1280, 390], ids=["desktop", "mobile"])
+def test_session_pr_picker_long_title(
+    page: Page, seeded_session: tuple[str, str], tmp_path: Path, viewport_width: int
+) -> None:
+    base_url, session_id = seeded_session
+    url = "https://github.com/example/one/pull/42"
+    title = (
+        "Keep pull requests recognizable across multiple repositories while preserving "
+        "the full descriptive title for reviewers using narrow workspace panels"
+    )
+    label = f"{title} — example/one #42"
+    info = {
+        **_INFO,
+        "tracking_available": True,
+        "selected_pr_url": url,
+        "prs": [
+            {
+                "url": url,
+                "host": "github.com",
+                "repository": "example/one",
+                "number": 42,
+                "title": title,
+                "relationship": "created",
+            },
+            {
+                "url": "https://github.com/example/one/pull/43",
+                "host": "github.com",
+                "repository": "example/one",
+                "number": 43,
+                "title": None,
+                "relationship": "attached",
+            },
+        ],
+        "pr": {**_INFO["pr"], "url": url, "number": 42, "title": title},
+    }
+    page.route(re.compile(r"/resources/github(?:\?|$)"), lambda route: route.fulfill(json=info))
+    page.set_viewport_size({"width": viewport_width, "height": 900})
+    page.goto(f"{base_url}/c/{session_id}")
+    page.get_by_test_id("composer-pr-link").click()
+    panel = (
+        page.get_by_test_id("github-panel-drawer")
+        if viewport_width < 768
+        else page.get_by_role("complementary", name="Workspace")
+    )
+    picker = panel.get_by_role("combobox", name="Session pull request")
+    expect(picker).to_have_text(label)
+    expect(picker).to_have_attribute("title", label)
+    selected_text = picker.locator('[data-slot="select-value"]')
+    expect(selected_text).to_have_css("text-overflow", "ellipsis")
+    assert selected_text.evaluate("element => element.scrollWidth > element.clientWidth")
+    expect(panel.get_by_role("button", name="Link a PR", exact=True)).to_be_in_viewport()
+    expect(panel.get_by_role("button", name="Unlink PR", exact=True)).to_be_in_viewport()
+    picker_box = picker.bounding_box()
+
+    picker.click()
+    titled_option = page.get_by_role("option", name=label, exact=True)
+    untitled_option = page.get_by_role("option", name="example/one #43", exact=True)
+    expect(titled_option).to_be_visible()
+    expect(untitled_option).to_be_visible()
+    page.screenshot(path=tmp_path / "session-pr-long-title.png", animations="disabled")
+    titled_box, untitled_box = titled_option.bounding_box(), untitled_option.bounding_box()
+    assert titled_box and untitled_box
+    assert titled_box["height"] > untitled_box["height"]
+    assert titled_option.evaluate("element => element.scrollWidth <= element.clientWidth")
+    for box in (picker_box, page.get_by_role("listbox").bounding_box()):
+        assert box and box["x"] >= 0 and box["x"] + box["width"] <= viewport_width
 
 
 def test_session_pr_account_fallback(
@@ -240,6 +317,9 @@ def test_session_pr_account_fallback(
     page.goto(f"{base_url}/c/{session_id}")
     page.get_by_test_id("composer-pr-link").click()
     rail = page.get_by_role("complementary", name="Workspace")
+    expect(rail.get_by_role("combobox", name="Session pull request")).to_have_text(
+        "example/one #42"
+    )
     expect(rail.get_by_text("Can’t reach the upstream repo", exact=True)).to_be_visible()
     account = rail.get_by_role("combobox", name="GitHub account")
     alternative = rail.get_by_text("or", exact=True)

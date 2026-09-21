@@ -54,13 +54,15 @@ import re
 import shutil
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import ContextVar
 from typing import Any
 from urllib.parse import quote
 
 from filelock import Timeout as FileLockTimeout
 
 from omnigent import config as _config
-from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry
+from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry, SessionPullRequest
 from omnigent.runtime.filesystem_registry import _git_timeout_seconds
 
 _logger = logging.getLogger(__name__)
@@ -69,6 +71,12 @@ _logger = logging.getLogger(__name__)
 # slightly more generous timeout than the local ``git`` reads. Overridable via
 # ``OMNIGENT_GH_TIMEOUT_SECONDS`` so operators can tune it without a restart.
 _DEFAULT_GH_TIMEOUT_SECONDS = 15.0
+# Cache failed lookups too so inaccessible PRs do not add work to every poll.
+_PR_TITLE_CACHE_SECONDS = 300.0
+_PR_TITLE_LOOKUP_SECONDS = 2.0
+# Leave headroom for persistence and the runner proxy's ten-second response limit.
+_PR_TITLE_REQUEST_SECONDS = 8.0
+_pr_title_deadline: ContextVar[float | None] = ContextVar("pr_title_deadline", default=None)
 
 # Fields requested from ``gh pr view``. Always pass ``--json`` — bare
 # ``gh pr view`` opens an interactive/pager view and misbehaves in a
@@ -147,6 +155,11 @@ def _in_sandbox() -> bool:
 
 
 def _gh(argv: list[str], *, cwd: str, token: str | None = None) -> tuple[int | None, str, str]:
+    timeout = _gh_timeout_seconds()
+    if (deadline := _pr_title_deadline.get()) is not None:
+        timeout = min(timeout, deadline - time.monotonic())
+        if timeout <= 0:
+            return None, "", "title lookup deadline exceeded"
     # In a managed sandbox the panel must authenticate as the connected owner via
     # the per-user hosts.yml that configure_host_gh writes — never an ambient
     # GH_TOKEN/GITHUB_TOKEN, which gh ranks ABOVE hosts.yml. Scrub them so a stray
@@ -171,7 +184,7 @@ def _gh(argv: list[str], *, cwd: str, token: str | None = None) -> tuple[int | N
         env["GH_ENTERPRISE_TOKEN"] = token
         env.pop("GITHUB_TOKEN", None)
         env.pop("GITHUB_ENTERPRISE_TOKEN", None)
-    return _run(["gh", *argv], cwd=cwd, timeout=_gh_timeout_seconds(), env=env)
+    return _run(["gh", *argv], cwd=cwd, timeout=timeout, env=env)
 
 
 # ── Account selection ────────────────────────────────────────────────────────
@@ -739,12 +752,68 @@ def _reference_info(root: str, reference: PullRequestRef) -> dict[str, Any]:
     return info
 
 
+def _pr_title(data: dict[str, Any] | None) -> str | None:
+    title = data.get("title") if data else None
+    if not isinstance(title, str):
+        return None
+    return title.strip() or None
+
+
+def _session_prs_with_titles(
+    root: str,
+    info: dict[str, Any],
+    registry: SessionPrRegistry,
+    entries: list[SessionPullRequest],
+    request_deadline: float,
+) -> list[dict[str, Any]]:
+    if not info.get("gh_available"):
+        return [entry.model_dump() for entry in entries]
+
+    now = time.time()
+    titles: dict[str, str | None] = {}
+    pending: list[SessionPullRequest] = []
+    for entry in entries:
+        stale = now - entry.title_checked_at >= _PR_TITLE_CACHE_SECONDS
+        if entry.url == info.get("selected_pr_url"):
+            title = _pr_title(info.get("pr"))
+            if stale or (title is not None and title != entry.title):
+                titles[entry.url] = title
+        elif stale:
+            pending.append(entry)
+
+    deadline = min(request_deadline, time.monotonic() + _PR_TITLE_LOOKUP_SECONDS)
+
+    def fetch_title(entry: SessionPullRequest) -> tuple[str, str | None] | None:
+        if time.monotonic() >= deadline:
+            return None
+        token = _pr_title_deadline.set(deadline)
+        try:
+            return entry.url, _pr_title(_pr_json(root, entry, "title"))
+        finally:
+            _pr_title_deadline.reset(token)
+
+    may_cache = time.monotonic() < request_deadline
+    if pending and time.monotonic() < deadline:
+        with ThreadPoolExecutor(max_workers=min(4, len(pending))) as executor:
+            titles.update(result for result in executor.map(fetch_title, pending) if result)
+    if titles and may_cache:
+        try:
+            registry.update_titles(titles, timestamp=now)
+        except (OSError, ValueError, FileLockTimeout):
+            _logger.debug("Could not cache session PR titles", exc_info=True)
+
+    return [
+        {**entry.model_dump(), "title": titles.get(entry.url) or entry.title} for entry in entries
+    ]
+
+
 def github_info(
     root: str, *, session_id: str | None = None, pr_url: str | None = None
 ) -> dict[str, Any]:
     """Read the selected session PR, with branch inference for untracked sessions."""
     if session_id is None:
         return _workspace_github_info(root)
+    request_deadline = time.monotonic() + _PR_TITLE_REQUEST_SECONDS
     registry = SessionPrRegistry(session_id)
     entries = registry.list()
     if pr_url:
@@ -766,7 +835,7 @@ def github_info(
                 info["selected_pr_url"] = reference.url
             else:
                 info["pr"] = None
-    info["prs"] = [entry.model_dump() for entry in entries]
+    info["prs"] = _session_prs_with_titles(root, info, registry, entries, request_deadline)
     info["tracking_available"] = True
     return info
 

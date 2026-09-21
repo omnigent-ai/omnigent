@@ -479,6 +479,65 @@ def test_removal_survives_replay_and_inference(tmp_path: Path) -> None:
     assert [entry.url for entry in store.list()] == [A]
 
 
+def test_title_cache_is_backward_compatible(tmp_path: Path) -> None:
+    store = SessionPrRegistry("conv_a", root=tmp_path)
+    store.path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "prs": [
+                    {
+                        **PullRequestRef.from_url(A).model_dump(),
+                        "relationship": "created",
+                        "source": "test",
+                        "first_seen_at": 10,
+                        "last_seen_at": 10,
+                    }
+                ],
+            }
+        )
+    )
+    entry = store.list()[0]
+    assert entry.title is None
+    assert entry.title_checked_at == 0
+
+
+def test_title_cache_preserves_order_and_survives_new_observations(tmp_path: Path) -> None:
+    store = SessionPrRegistry("conv_a", root=tmp_path)
+    store.record([PullRequestRef.from_url(A)], relationship="created", source="test", timestamp=10)
+    store.record([PullRequestRef.from_url(B)], relationship="created", source="test", timestamp=20)
+    store.update_titles({A: "First", B: "Second"}, timestamp=30)
+    assert [entry.url for entry in store.list()] == [B, A]
+    assert [entry.last_seen_at for entry in store.list()] == [20, 10]
+    store.record(
+        [PullRequestRef.from_url(A)], relationship="worked_on", source="test", timestamp=40
+    )
+    entry = store.list()[0]
+    assert entry.url == A
+    assert entry.title == "First"
+    assert entry.title_checked_at == 30
+    assert entry.first_seen_at == 10
+    assert entry.relationship == "created"
+
+
+def test_title_cache_preserves_newer_updates_and_removed_prs(tmp_path: Path) -> None:
+    store = SessionPrRegistry("conv_a", root=tmp_path)
+    store.record(
+        [PullRequestRef.from_url(A), PullRequestRef.from_url(B)],
+        relationship="created",
+        source="test",
+    )
+    store.update_titles({A: "New title", B: "Second"}, timestamp=30)
+    store.remove(B)
+    store.update_titles({A: "Old title", B: "Removed title"}, timestamp=20)
+    assert [(entry.url, entry.title) for entry in store.list()] == [(A, "New title")]
+    store.update_titles({A: None, B: "Removed title"}, timestamp=40)
+    assert [(entry.url, entry.title) for entry in store.list()] == [(A, "New title")]
+    assert store.list()[0].title_checked_at == 40
+    store.record([PullRequestRef.from_url(B)], relationship="inferred", source="branch")
+    assert [entry.url for entry in store.list()] == [A]
+
+
 def test_concurrent_writers_preserve_all_prs(tmp_path: Path) -> None:
     def write(number: int) -> None:
         store = SessionPrRegistry("conv_a", root=tmp_path)

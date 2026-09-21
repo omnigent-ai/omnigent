@@ -81,6 +81,7 @@ import {
   type GithubChecks,
   type GithubComment,
   type GithubInfo,
+  type GithubPrAssociation,
 } from "@/hooks/useGithub";
 
 // Shiki bundled themes matching the app's editor look; the concrete side is
@@ -766,6 +767,14 @@ function SidebarNode({
   );
 }
 
+function pullRequestLabel(pr: GithubPrAssociation): string {
+  const host = pr.host === "github.com" ? "" : `${pr.host}/`;
+  const inferred = pr.relationship === "inferred" ? " (from branch)" : "";
+  const identity = `${host}${pr.repository} #${pr.number}${inferred}`;
+  const title = pr.title?.trim();
+  return title ? `${title} — ${identity}` : identity;
+}
+
 export function GithubPanel({ conversationId }: { conversationId: string }) {
   const [selection, setSelection] = useState<{ sessionId: string; url?: string }>();
   const [linking, setLinking] = useState(false);
@@ -797,6 +806,7 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
   }, [conversationId, selected, info.data?.selected_pr_url]);
   const changeSelection = (next?: string) => setSelection({ sessionId: conversationId, url: next });
   const prs = associations?.prs ?? [];
+  const selectedPr = prs.find((pr) => pr.url === (selected ?? associations?.selected_pr_url));
   const linkInEmptyState = prs.length === 0 && deriveGithubPanelState(info).kind === "no-pr";
   const linkControls = (
     <>
@@ -874,6 +884,7 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
               >
                 <SelectTrigger
                   aria-label="Session pull request"
+                  title={selectedPr && pullRequestLabel(selectedPr)}
                   className="min-w-0 flex-1 *:data-[slot=select-value]:block *:data-[slot=select-value]:truncate"
                 >
                   <SelectValue />
@@ -884,10 +895,8 @@ export function GithubPanel({ conversationId }: { conversationId: string }) {
                   className="w-(--radix-select-trigger-width)"
                 >
                   {prs.map((pr) => (
-                    <SelectItem key={pr.url} value={pr.url} className="break-all">
-                      {pr.host === "github.com" ? "" : `${pr.host}/`}
-                      {pr.repository} #{pr.number}
-                      {pr.relationship === "inferred" ? " (from branch)" : ""}
+                    <SelectItem key={pr.url} value={pr.url} className="wrap-anywhere">
+                      {pullRequestLabel(pr)}
                     </SelectItem>
                   ))}
                 </SelectContent>

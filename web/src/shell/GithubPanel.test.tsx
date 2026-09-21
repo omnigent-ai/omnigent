@@ -579,6 +579,7 @@ describe("session PR selection", () => {
             host: "github.com",
             repository: "example/one",
             number: 42,
+            title: "First repository",
             relationship: "created",
           },
           {
@@ -586,6 +587,7 @@ describe("session PR selection", () => {
             host: "github.com",
             repository: "example/two",
             number: 42,
+            title: "Second repository",
             relationship: "created",
           },
         ],
@@ -593,24 +595,28 @@ describe("session PR selection", () => {
     };
     const { rerender } = renderPanel();
     const picker = screen.getByRole("combobox", { name: "Session pull request" });
-    expect(picker).toHaveTextContent("example/one #42");
+    expect(picker).toHaveTextContent("First repository — example/one #42");
+    expect(picker).toHaveAttribute("title", "First repository — example/one #42");
     expect(screen.queryByRole("listbox")).not.toBeInTheDocument();
     fireEvent.click(picker);
     await waitFor(() =>
-      expect(screen.getByRole("option", { name: "example/one #42" })).toHaveAttribute(
-        "aria-selected",
-        "true",
-      ),
+      expect(
+        screen.getByRole("option", { name: "First repository — example/one #42" }),
+      ).toHaveAttribute("aria-selected", "true"),
     );
-    fireEvent.click(screen.getByRole("option", { name: "example/two #42" }));
-    expect(picker).toHaveTextContent("example/two #42");
+    expect(
+      screen.getByRole("option", { name: "Second repository — example/two #42" }),
+    ).toBeVisible();
+    fireEvent.click(screen.getByRole("option", { name: "Second repository — example/two #42" }));
+    expect(picker).toHaveTextContent("Second repository — example/two #42");
+    expect(picker).toHaveAttribute("title", "Second repository — example/two #42");
     expect(screen.queryByRole("listbox")).not.toBeInTheDocument();
     expect(useGithubInfo).toHaveBeenLastCalledWith("conv_1", { poll: true, prUrl: two });
 
     state.info = { isLoading: true, error: null, isFetching: true };
     rerender(<GithubPanel conversationId="conv_1" />);
     expect(screen.getByRole("combobox", { name: "Session pull request" })).toBe(picker);
-    expect(picker).toHaveTextContent("example/two #42");
+    expect(picker).toHaveTextContent("Second repository — example/two #42");
     expect(screen.getByText("Loading GitHub…")).toBeInTheDocument();
     expect(screen.queryByText("First repository")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Link a PR" })).toBeEnabled();
@@ -620,17 +626,70 @@ describe("session PR selection", () => {
     state.info = { isLoading: false, error: new Error("Metadata unavailable"), isFetching: false };
     rerender(<GithubPanel conversationId="conv_1" />);
     expect(screen.getByRole("combobox", { name: "Session pull request" })).toBe(picker);
+    expect(picker).toHaveTextContent("Second repository — example/two #42");
     const errorMessage = screen.getByText(/Metadata unavailable/);
     const fallback = screen.getByRole("link", { name: "Open the PR on GitHub" });
     expect(errorMessage.parentElement).toContainElement(fallback);
     expect(fallback).toHaveAttribute("href", two);
     fireEvent.click(picker);
-    fireEvent.click(screen.getByRole("option", { name: "example/one #42" }));
+    fireEvent.click(screen.getByRole("option", { name: "First repository — example/one #42" }));
     expect(useGithubInfo).toHaveBeenLastCalledWith("conv_1", { poll: true, prUrl: one });
 
     state.info = { isLoading: true, error: null, isFetching: true };
     rerender(<GithubPanel conversationId="conv_other" />);
     expect(screen.queryByRole("combobox", { name: "Session pull request" })).toBeNull();
+  });
+
+  it.each([undefined, null, "", "   "])(
+    "falls back to the PR identity when its title is %j",
+    (title) => {
+      const url = "https://github.com/example/one/pull/42";
+      Object.assign(state.info!.data!, {
+        tracking_available: true,
+        selected_pr_url: url,
+        prs: [
+          {
+            url,
+            host: "github.com",
+            repository: "example/one",
+            number: 42,
+            title,
+            relationship: "created",
+          },
+        ],
+      });
+      renderPanel();
+      const picker = screen.getByRole("combobox", { name: "Session pull request" });
+      expect(picker).toHaveTextContent(/^example\/one #42$/);
+      expect(picker).toHaveAttribute("title", "example/one #42");
+      fireEvent.click(picker);
+      expect(screen.getByRole("option", { name: "example/one #42" })).toBeVisible();
+    },
+  );
+
+  it("keeps the host and inferred marker alongside a trimmed PR title", () => {
+    const url = "https://github.example.com/example/one/pull/42";
+    Object.assign(state.info!.data!, {
+      tracking_available: true,
+      selected_pr_url: url,
+      prs: [
+        {
+          url,
+          host: "github.example.com",
+          repository: "example/one",
+          number: 42,
+          title: "  Fix session selection  ",
+          relationship: "inferred",
+        },
+      ],
+    });
+    renderPanel();
+    const picker = screen.getByRole("combobox", { name: "Session pull request" });
+    const label = "Fix session selection — github.example.com/example/one #42 (from branch)";
+    expect(picker).toHaveTextContent(label);
+    expect(picker).toHaveAttribute("title", label);
+    fireEvent.click(picker);
+    expect(screen.getByRole("option", { name: label })).toBeVisible();
   });
 
   it("passes the selected PR and revisions into file queries", () => {
