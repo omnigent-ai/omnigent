@@ -74,22 +74,8 @@ describe("SessionImage (standalone, no host fetcher)", () => {
     expect(authenticatedFetch).not.toHaveBeenCalled();
   });
 
-  it("reserves the preview box height before the image loads", () => {
-    // WHY: the chat scroller runs with overflow-anchor:none, so an image that
-    // sized itself only on decode would push the transcript down under the
-    // reader. The enclosing box must carry a fixed height from first paint.
-    render(<SessionImage path="/v1/sessions/a/files/x/content" alt="diagram" />);
-    const box = screen.getByRole("img", { name: "diagram" }).closest("div");
-    expect(box).toHaveClass("h-64");
-  });
-
-  it("keeps the reserved box when the path's bytes fail to arrive", () => {
-    // WHY: a fetched path can fail transiently (blocked network, slow bytes),
-    // and collapsing its reserved box to a chip would shift everything below
-    // it mid-read — the layout guarantee
-    // tests/e2e_ui/chat/test_transcript_image_layout.py pins. Only a corrupt
-    // `data:` URI (whose bytes ARE the source, so the failure is final)
-    // collapses to the chip.
+  it("keeps the image source when the path's bytes fail to arrive", () => {
+    // A fetched path can fail transiently, so keep it available for retry.
     render(<SessionImage path="/v1/sessions/a/files/gone/content" alt="diagram" />);
     const img = screen.getByRole("img", { name: "diagram" });
     fireEvent.error(img);
@@ -98,17 +84,16 @@ describe("SessionImage (standalone, no host fetcher)", () => {
       "src",
       "/v1/sessions/a/files/gone/content",
     );
-    expect(screen.getByRole("img", { name: "diagram" }).closest("div")).toHaveClass("h-64");
   });
 
-  it("keeps the reserved box, not the chip, while the path is unresolved", () => {
+  it("keeps the image while the path is unresolved", () => {
     // WHY: no session loaded yet means nothing has failed — a stray error on
     // the src-less <img> must not latch and strand the slot on a chip.
     render(<SessionImage path={undefined} alt="pending" />);
     const img = screen.getByRole("img", { name: "pending" });
     fireEvent.error(img);
 
-    expect(screen.getByRole("img", { name: "pending" }).closest("div")).toHaveClass("h-64");
+    expect(screen.getByRole("img", { name: "pending" }).tagName).toBe("IMG");
   });
 });
 
@@ -237,20 +222,17 @@ describe("InlineImage (data: URI carried by the transcript)", () => {
     "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
   const BAD_PNG = "data:image/png;base64,garbage";
 
-  it("renders the data URI inside the reserved preview box", () => {
-    // WHY: the bytes are already here, so there is no fetch — but the image
-    // still has to paint into the same fixed-height box the fetched previews
-    // reserve, or a late decode would shove the transcript down.
+  it("renders the data URI as a zoomable image", () => {
     render(<InlineImage src={GOOD_PNG} alt="shot.png" className="c" />);
     const img = screen.getByRole("img", { name: "shot.png" });
     expect(img).toHaveAttribute("src", GOOD_PNG);
     expect(img).toHaveClass("c");
-    expect(img.closest("div")).toHaveClass("h-64");
+    expect(screen.getByRole("button", { name: "Zoom image: shot.png" })).toContainElement(img);
   });
 
   it("swaps a corrupt data URI for the unavailable-image chip", () => {
     // WHY: a truncated/corrupt data URI from an imported transcript used to
-    // leave the browser's broken-image glyph sitting in the 256px box. It must
+    // leave the browser's broken-image glyph in the transcript. It must
     // collapse to the same compact chip the embedded fetch failure shows.
     render(<InlineImage src={BAD_PNG} alt="broken.png" />);
     fireEvent.error(screen.getByRole("img", { name: "broken.png" }));
@@ -258,7 +240,6 @@ describe("InlineImage (data: URI carried by the transcript)", () => {
     const chip = screen.getByRole("img", { name: "broken.png" });
     expect(chip).not.toHaveAttribute("src");
     expect(chip).toHaveTextContent("broken.png");
-    expect(chip).not.toHaveClass("h-64");
   });
 
   it("drops the lightbox affordance once the image has failed", () => {
