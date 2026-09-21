@@ -753,10 +753,27 @@ describe("WorkspacePicker modal actions", () => {
 
       expect(screen.getByTestId("workspace-picker-breadcrumbs").textContent).toContain("repo");
       expect(screen.getByRole("complementary", { name: "Worktrees" })).toBeInTheDocument();
+      expect(screen.getByText("Don't use a linked worktree")).toBeInTheDocument();
       expect(screen.getByText("feature-layout")).toBeInTheDocument();
       expect(screen.queryByText("main")).toBeNull();
 
+      expect(screen.getByTestId("workspace-picker")).toHaveClass(
+        "h-[min(29rem,calc(100dvh-4rem))]",
+        "w-[min(45rem,calc(100vw-2rem))]",
+        "rounded-3xl",
+      );
+      expect(screen.getByTestId("workspace-picker-body")).toHaveClass(
+        "lg:grid-cols-[minmax(0,1.2fr)_minmax(18rem,0.8fr)]",
+      );
+      expect(screen.getByTestId("workspace-picker-current-folder")).toHaveClass("min-h-11", "px-3");
+      expect(
+        screen.getByTestId("workspace-picker-worktree-/Users/corey/worktrees/feature-layout"),
+      ).toHaveClass("min-h-11", "px-3");
+
       fireEvent.click(screen.getByRole("radio", { name: "Use worktree feature-layout" }));
+      expect(
+        screen.getByTestId("workspace-picker-worktree-/Users/corey/worktrees/feature-layout"),
+      ).toHaveClass("bg-muted");
       expect(onNavigate).not.toHaveBeenCalledWith("/Users/corey/worktrees/feature-layout");
       fireEvent.click(screen.getByRole("button", { name: "Confirm" }));
       expect(onNavigate).not.toHaveBeenCalledWith("/Users/corey/worktrees/feature-layout");

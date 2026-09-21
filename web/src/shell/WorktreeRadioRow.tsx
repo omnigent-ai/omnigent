@@ -19,6 +19,7 @@ export function WorktreeRadioRow({
   onSelect,
   testId,
   className,
+  spacious = false,
 }: {
   worktree: HostWorktree;
   checked: boolean;
@@ -26,6 +27,7 @@ export function WorktreeRadioRow({
   onSelect: () => void;
   testId: string;
   className?: string;
+  spacious?: boolean;
 }) {
   const displayName = worktreeDisplayName(worktree.path);
   const updatedLabel = worktreeUpdatedLabel(worktree.updated_at);
@@ -39,6 +41,7 @@ export function WorktreeRadioRow({
           className={cn(
             "flex min-w-0 cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-sm transition-colors hover:bg-muted focus-within:bg-muted",
             checked && "bg-muted",
+            spacious && "min-h-11 rounded-lg px-3 text-base",
             className,
           )}
           data-testid={testId}
@@ -48,7 +51,11 @@ export function WorktreeRadioRow({
             name={name}
             checked={checked}
             onChange={onSelect}
-            className="size-4 shrink-0 accent-primary"
+            className={cn(
+              "size-4 shrink-0 accent-primary",
+              spacious &&
+                "appearance-none rounded-full border border-muted-foreground/60 bg-background checked:border-[5px] checked:border-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2",
+            )}
             aria-label={`Use worktree ${displayName}`}
           />
           <span className="min-w-0 flex-1 truncate font-medium text-foreground">{displayName}</span>

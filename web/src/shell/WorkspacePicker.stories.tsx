@@ -52,12 +52,27 @@ const meta = {
                 branch: "agentic/layouts",
                 is_main: false,
                 detached: false,
+                updated_at: 1_700_000_000,
+              },
+              {
+                path: `${workspaceStoryHome}/worktrees/command-palette`,
+                branch: "feature/command-palette",
+                is_main: false,
+                detached: false,
+                updated_at: 1_699_992_800,
+              },
+              {
+                path: `${workspaceStoryHome}/worktrees/streaming-status`,
+                branch: "feature/streaming-status",
+                is_main: false,
+                detached: false,
+                updated_at: 1_699_913_600,
               },
             ],
           );
         }}
       >
-        <div className="h-[min(35rem,calc(100dvh-2rem))] w-[min(720px,calc(100vw-2rem))]">
+        <div className="flex h-[min(29rem,calc(100dvh-2rem))] w-[min(45rem,calc(100vw-2rem))] justify-center">
           <Story />
         </div>
       </StoryQueryRouter>
@@ -77,6 +92,14 @@ export const PopulatedWithConflict: Story = {
 };
 
 export const FullTwoPane: Story = {};
+
+export const LinkedWorktreeSelected: Story = {
+  play: async ({ canvasElement }) => {
+    await userEvent.click(
+      within(canvasElement).getByRole("radio", { name: "Use worktree command-palette" }),
+    );
+  },
+};
 
 export const CompactEmbedded: Story = {
   args: {
