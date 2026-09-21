@@ -38,6 +38,8 @@ describe("structuredErrorFields", () => {
     "rate_limit_exceeded",
     "codex_thread_reset",
     "internal_error",
+    "native_policy_not_enforced",
+    "model_change_not_applied",
   ])("preserves the specific or infrastructure headline for %s", (code) => {
     expect(structuredErrorFields({ code, source: "execution" }, "polly")).toEqual({});
   });

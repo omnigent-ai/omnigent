@@ -70,12 +70,14 @@ def _expect_named_error(page: Page, display_name: str, message: str) -> None:
     ],
     ids=["claude-code", "codex"],
 )
+@pytest.mark.parametrize("failure_after_switch", [False, True], ids=["failed", "delayed-failure"])
 def test_native_failure_names_the_fetched_agent_live_and_after_reload(
     page: Page,
     live_server: str,
     agent_name: str,
     harness: str,
     display_name: str,
+    failure_after_switch: bool,
 ) -> None:
     """A native status failure uses the API name and survives a fresh page."""
     message = "API Error: 502 The upstream server returned an invalid response."
@@ -98,16 +100,13 @@ def test_native_failure_names_the_fetched_agent_live_and_after_reload(
         page.goto(f"{live_server}/c/{session_id}")
         expect(page.get_by_role("textbox", name="Message the agent")).to_be_visible(timeout=15_000)
         _publish_native_status(live_server, session_id, "running", response_id=response_id)
-        _publish_native_status(live_server, session_id, "failed", response_id=response_id)
-        _expect_named_error(page, display_name, message)
-
-        snapshot = httpx.get(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
-        snapshot.raise_for_status()
-        assert snapshot.json()["agent_name"] == agent_name
-        assert snapshot.json()["last_task_error"]["code"] == "native_turn_error"
-        assert snapshot.json()["last_task_error"]["agent_name"] == agent_name
-        page.reload()
-        _expect_named_error(page, display_name, message)
+        if failure_after_switch:
+            _publish_native_status(live_server, session_id, "idle", response_id=response_id)
+        else:
+            _publish_native_status(live_server, session_id, "failed", response_id=response_id)
+            _expect_named_error(page, display_name, message)
+            page.reload()
+            _expect_named_error(page, display_name, message)
 
         agents = httpx.get(f"{live_server}/v1/agents?limit=100", timeout=10.0)
         agents.raise_for_status()
@@ -123,8 +122,16 @@ def test_native_failure_names_the_fetched_agent_live_and_after_reload(
         )
         switched.raise_for_status()
         assert switched.json()["agent_name"] == target["name"]
+        if failure_after_switch:
+            _publish_native_status(live_server, session_id, "failed", response_id=response_id)
+            _expect_named_error(page, display_name, message)
         page.reload()
         _expect_named_error(page, display_name, message)
+        snapshot = httpx.get(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+        snapshot.raise_for_status()
+        assert snapshot.json()["agent_name"] == target["name"]
+        assert snapshot.json()["last_task_error"]["code"] == "native_turn_error"
+        assert snapshot.json()["last_task_error"]["agent_name"] == agent_name
 
 
 def test_non_native_failure_names_its_response_agent_after_reload(

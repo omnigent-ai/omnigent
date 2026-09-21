@@ -184,6 +184,7 @@ from omnigent.server.routes._sessions.helpers import (
     _publish_status,
     _remove_session_worktree_best_effort,
     _require_external_status_forward,
+    _response_agent_name_from_store,
     _session_status_from_cache,
     _signal_harness_elicitation_resolved_by_id,
     _stop_session_host_runner,
@@ -1482,16 +1483,14 @@ def register_events_routes(
                     message=output.strip(),
                 )
             if status_error is not None:
-                failed_agent = (
-                    await asyncio.to_thread(agent_store.get, conv.agent_id)
-                    if conv.agent_id
-                    else None
+                failed_agent_name = await asyncio.to_thread(
+                    _response_agent_name_from_store, conversation_store, session_id, response_id
                 )
                 await _persist_session_status_error_labels(
                     session_id,
                     status_error,
                     conversation_store,
-                    agent_name=failed_agent.name if failed_agent else None,
+                    agent_name=failed_agent_name,
                 )
             elif status == "running":
                 await _persist_session_status_error_labels(session_id, None, conversation_store)

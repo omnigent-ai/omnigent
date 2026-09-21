@@ -4310,6 +4310,30 @@ def _message_text(content: list[dict[str, Any]]) -> str | None:
     return "\n".join(parts) if found_text else None
 
 
+def _response_agent_name_from_store(
+    conversation_store: ConversationStore,
+    session_id: str,
+    response_id: str | None,
+) -> str | None:
+    """Resolve a native failure's speaker without consulting the current binding."""
+    if not response_id:
+        return None
+    page = conversation_store.list_items(
+        session_id, limit=_EXTERNAL_STATUS_ASSISTANT_SCAN_LIMIT, order="desc", type="message"
+    )
+    names = {
+        item.data.agent.strip()
+        for item in page.data
+        if item.response_id == response_id
+        and isinstance(item.data, MessageData)
+        and item.data.role == "assistant"
+        and not item.data.is_meta
+        and item.data.agent
+        and item.data.agent.strip()
+    }
+    return next(iter(names)) if len(names) == 1 else None
+
+
 def _latest_assistant_text_from_store(
     conversation_store: ConversationStore,
     session_id: str,

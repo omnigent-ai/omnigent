@@ -6418,6 +6418,21 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
               block.message === statusError.message,
           );
         if (event.status === "failed" && statusError != null && !hasMatchingStatusError) {
+          const responseAgents = new Set(
+            s.blocks.flatMap((block) =>
+              event.responseId &&
+              block.ctx.responseId === event.responseId &&
+              (block.type === "response_start" ||
+                block.type === "text_done" ||
+                block.type === "tool_group" ||
+                block.type === "reasoning_block") &&
+              block.ctx.agent?.trim()
+                ? [block.ctx.agent.trim()]
+                : [],
+            ),
+          );
+          const statusAgentName =
+            responseAgents.size === 1 ? responseAgents.values().next().value : undefined;
           patch.blocks = [
             ...s.blocks,
             {
@@ -6433,7 +6448,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
               message: statusError.message,
               source: "",
               code: statusError.code,
-              ...structuredErrorFields(statusError, s.boundAgentName),
+              ...structuredErrorFields(statusError, statusAgentName),
             } satisfies ErrorBlock,
           ];
         }

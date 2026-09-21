@@ -508,6 +508,8 @@ const SPECIFIC_ERROR_CODES = new Set([
   "harness_not_configured",
   "internal_error",
   "wrong_replica",
+  "native_policy_not_enforced",
+  "model_change_not_applied",
 ]);
 
 /** The server is retrying. */
