@@ -54,7 +54,10 @@ export function ComposerWorkspaceStatus({
       <WorkspaceStatusItem
         icon={FolderIcon}
         label={workspacePath ? pathTail(workspacePath) : "No workspace"}
-        title={workspacePath ?? "No workspace bound"}
+        title={workspacePath ? `Working directory: ${workspacePath}` : "No working directory bound"}
+        ariaLabel={
+          workspacePath ? `Working directory: ${workspacePath}` : "Working directory: Not selected"
+        }
         testId="composer-workspace-dir"
       />
       {showWorktree ? (
@@ -62,8 +65,9 @@ export function ComposerWorkspaceStatus({
           icon={GitForkIcon}
           label={branchText}
           title={
-            isWorktree && worktreePath ? `${branchTitle} Worktree: ${worktreePath}` : branchTitle
+            isWorktree && worktreePath ? `Worktree: ${worktreePath}. ${branchTitle}` : branchTitle
           }
+          ariaLabel={`Worktree: ${branchText}`}
           testId="composer-git-branch"
         />
       ) : null}
@@ -75,17 +79,20 @@ function WorkspaceStatusItem({
   icon: Icon,
   label,
   title,
+  ariaLabel,
   testId,
 }: {
   icon: typeof FolderIcon;
   label: string;
   title: string;
+  ariaLabel: string;
   testId: string;
 }) {
   return (
     <span
       className="relative inline-flex h-6 min-w-0 max-w-[calc(50%-0.25rem)] items-center gap-1 px-0.5 text-xs leading-4 font-normal text-muted-foreground md:px-1"
       title={title}
+      aria-label={ariaLabel}
       data-testid={testId}
     >
       <Icon className="size-3.5 shrink-0" aria-hidden />

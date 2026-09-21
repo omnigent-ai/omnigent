@@ -702,8 +702,8 @@ describe("WorkspacePicker modal actions", () => {
     );
 
     expect(screen.getByRole("button", { name: "Cancel" })).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Confirm" })).toBeTruthy();
-    fireEvent.click(screen.getByRole("button", { name: "Confirm" }));
+    expect(screen.getByRole("button", { name: "Use this folder" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Use this folder" }));
     expect(onSelect).toHaveBeenCalledWith("/Users/corey/repo");
 
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));

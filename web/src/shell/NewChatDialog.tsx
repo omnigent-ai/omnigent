@@ -1,4 +1,5 @@
 import { useLoadedConversations } from "@/hooks/useSidebarData";
+import { useComposerContext } from "@/hooks/useComposerContext";
 import {
   HarnessPicker,
   HarnessPickerEntry,
@@ -15,6 +16,9 @@ import {
   ComposerConfigTooltipRows,
 } from "@/components/composer/ComposerControls";
 import { ComposerAddMenu } from "@/components/composer/ComposerAddMenu";
+import { ComposerRepositorySelector } from "@/components/composer/ComposerRepositorySelector";
+import { McpContextSelector } from "@/components/composer/McpContextSelector";
+import { mcpContextOptionsFromServers } from "@/components/composer/mcpContextOptions";
 import {
   COMPOSER_HARNESS_MENU_SIZE,
   PickerSectionHeader,
@@ -90,6 +94,15 @@ import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { authenticatedFetch, getCurrentUserId, resolveIdentity } from "@/lib/identity";
 import { backgroundSessionTitlesRequestHeaders } from "@/lib/backgroundSessionTitlesPreferences";
 import { fetchGithubBranches, fetchGithubRepos, type GithubRepo } from "@/lib/githubIntegration";
+import type {
+  ComposerContextResourceState,
+  ComposerMcpSelection,
+  ComposerRepositorySelection,
+} from "@/lib/composerContext";
+import {
+  composerContextToCreateSession,
+  composerContextToLabels,
+} from "@/lib/composerContextAdapters";
 import { randomUUID } from "@/lib/randomUUID";
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import { validateAttachments } from "@/lib/attachments";
@@ -2466,7 +2479,11 @@ export function NewChatLandingScreen() {
   // reading `connected` off the payload doubles as the connection check.
   const githubReposEnabled =
     info !== "loading" && (info.enabled_connections ?? []).includes("github");
-  const { data: sandboxRepoData, isError: sandboxReposErrored } = useQuery({
+  const {
+    data: sandboxRepoData,
+    isError: sandboxReposErrored,
+    isLoading: sandboxReposLoading,
+  } = useQuery({
     queryKey: ["github-repos"],
     queryFn: fetchGithubRepos,
     enabled: githubReposEnabled,
@@ -2475,7 +2492,33 @@ export function NewChatLandingScreen() {
   const sandboxRepoPickerConnected = sandboxRepoData?.connected ?? false;
   const sandboxRepos = sandboxRepoPickerConnected ? (sandboxRepoData?.repos ?? []) : [];
   const sandboxReposTruncated = sandboxRepoData?.truncated ?? false;
+  const repositoryOptions = useMemo<ComposerRepositorySelection[]>(
+    () =>
+      sandboxRepos.map((repository) => ({
+        id: repository.clone_url ?? repository.full_name,
+        url: repository.clone_url ?? `https://github.com/${repository.full_name}.git`,
+        branch: null,
+      })),
+    [sandboxRepos],
+  );
+  const repositoryResource = useMemo<
+    ComposerContextResourceState<readonly ComposerRepositorySelection[]>
+  >(() => {
+    if (sandboxReposLoading) return { status: "loading", data: null, error: null };
+    if (sandboxReposErrored)
+      return { status: "error", data: repositoryOptions, error: new Error("GitHub unavailable") };
+    if (!githubReposEnabled || !sandboxRepoPickerConnected)
+      return { status: "unavailable", data: null, error: null };
+    return { status: "ready", data: repositoryOptions, error: null };
+  }, [
+    githubReposEnabled,
+    repositoryOptions,
+    sandboxRepoPickerConnected,
+    sandboxReposErrored,
+    sandboxReposLoading,
+  ]);
   const [workspace, setWorkspace] = useState<string>(() => restoredDraft?.workspace ?? "");
+  const [mcpContextSelections, setMcpContextSelections] = useState<ComposerMcpSelection[]>([]);
   // Source tracking for the create's field-omission contract: true while the
   // slot's value is the untouched seed the project-prefill effect wrote from
   // the config. ANY other write — a picker selection, browsing, a host
@@ -2609,7 +2652,20 @@ export function NewChatLandingScreen() {
   // existing-chat model-picker shortcut. The picker owns model selection on the
   // landing, so the hotkey bumps a nonce the picker opens on.
   const [modelPickerOpenNonce, setModelPickerOpenNonce] = useState(0);
+  const [contextSettingsOpen, setContextSettingsOpen] = useState(false);
+  const [mcpSelectorOpen, setMcpSelectorOpen] = useState(false);
   useModelPickerHotkey(() => setModelPickerOpenNonce((n) => n + 1));
+  const mcpOptions = useMemo(
+    () => mcpContextOptionsFromServers(pendingAgent?.mcpServers ?? []),
+    [pendingAgent?.mcpServers],
+  );
+  const mcpResource = useMemo<ComposerContextResourceState<readonly (typeof mcpOptions)[number][]>>(
+    () =>
+      pendingAgent
+        ? { status: "ready", data: mcpOptions, error: null }
+        : { status: "unavailable", data: null, error: null },
+    [mcpOptions, pendingAgent],
+  );
 
   // Mirror the current draft fields into a ref every render so the unmount
   // cleanup below can snapshot the latest values without re-subscribing.
@@ -4422,6 +4478,48 @@ export function NewChatLandingScreen() {
   // workspace isn't already sitting on that existing worktree.
   const shouldCreateWorktree =
     workspaceIsGit && branchName.trim() !== "" && !startInExistingWorktree;
+  const composerContext = useComposerContext({
+    workingDirectoryGitState: workspaceIsNonGit
+      ? "not_git"
+      : workspaceIsGit
+        ? "git"
+        : "unknown",
+  });
+  useEffect(() => {
+    composerContext.setState({
+      workingDirectory:
+        workspaceTrimmed === "" ? { kind: "unset" } : { kind: "selected", path: workspaceTrimmed },
+      worktree: startInExistingWorktree
+        ? {
+            kind: "existing",
+            path: activeWorktree!.path,
+            branch: activeWorktree!.branch!,
+          }
+        : shouldCreateWorktree
+          ? {
+              kind: "new",
+              branchName: branchName.trim(),
+              baseBranch: baseBranch.trim() || null,
+            }
+          : { kind: "none" },
+      repositories: sandboxRepoSelections.map((repository) => ({
+        id: repository.url,
+        url: repository.url,
+        branch: repository.branch.trim() || null,
+      })),
+      mcpContext: mcpContextSelections,
+    });
+  }, [
+    activeWorktree,
+    baseBranch,
+    branchName,
+    composerContext.setState,
+    mcpContextSelections,
+    sandboxRepoSelections,
+    shouldCreateWorktree,
+    startInExistingWorktree,
+    workspaceTrimmed,
+  ]);
   const worktreeVerificationPending =
     worktreesEnabled &&
     !workspaceIsNonGit &&
@@ -5221,6 +5319,11 @@ export function NewChatLandingScreen() {
     submittedRef.current = true;
     try {
       const trimmedBranch = branchName.trim();
+      const contextCreate = composerContextToCreateSession(
+        composerContext.state,
+        sandboxSelected ? "managed" : "external",
+      );
+      const composerContextLabels = composerContextToLabels(composerContext.state);
       // `shouldCreateWorktree` (component scope): true only when a branch is
       // named and the workspace isn't already an existing worktree. Starting
       // in an existing worktree sends no git opts — the workspace is bound
@@ -5358,8 +5461,12 @@ export function NewChatLandingScreen() {
       // first-class membership (and a label would go stale on project rename).
       const createLabels =
         selectedProject && createProjectId === null
-          ? { ...(baseLabels ?? {}), [PROJECT_LABEL_KEY]: selectedProject }
-          : baseLabels;
+          ? {
+              ...(baseLabels ?? {}),
+              [PROJECT_LABEL_KEY]: selectedProject,
+              ...composerContextLabels,
+            }
+          : { ...(baseLabels ?? {}), ...composerContextLabels };
 
       let data: { id: string };
 
@@ -5370,7 +5477,7 @@ export function NewChatLandingScreen() {
         // (POST /v1/hosts/{id}/runners) to bind the session to a runner, the
         // same way the fork-resume path does.
         const bundle = await buildAgentBundle(pendingAgent);
-        const metadata: Record<string, unknown> = {};
+        const metadata: Record<string, unknown> = { labels: createLabels };
         // A config-seeded workspace is omitted on a `project_id` create so the
         // server default-fills it (same field semantics as the JSON path).
         if (workspaceTrimmed && !workspaceFromProjectConfig) metadata.workspace = workspaceTrimmed;
@@ -5381,7 +5488,6 @@ export function NewChatLandingScreen() {
           // Born-filed: stamp the project's `omni_project` label so a bundled
           // session groups under its project from its first sidebar appearance,
           // same as the JSON path (see `createLabels`).
-          metadata.labels = { [PROJECT_LABEL_KEY]: selectedProject };
         }
         const bundled = await createBundledSession(
           bundle,
@@ -5458,7 +5564,10 @@ export function NewChatLandingScreen() {
                   // The repos to clone in parallel; the agent starts in the one
                   // repo, or the parent that holds them all. Empty = empty
                   // sandbox workspace.
-                  workspaces: composeSandboxWorkspaces(sandboxRepoSelections),
+                  workspaces:
+                    contextCreate.hostType === "managed"
+                      ? contextCreate.fields.workspaces
+                      : composeSandboxWorkspaces(sandboxRepoSelections),
                   // On a `project_id` create an ABSENT (path) workspace would be
                   // default-filled with the config's path workspace, which a
                   // managed create rejects — pin an explicit null (explicit
@@ -6335,6 +6444,7 @@ export function NewChatLandingScreen() {
                         testIdPrefix="new-chat-landing"
                         disabled={creating}
                         onAttach={() => fileInputRef.current?.click()}
+                        onAdvancedSettings={() => setContextSettingsOpen(true)}
                         onPlan={
                           directModeOptions.some((mode) => mode.value === "plan")
                             ? () => selectDirectMode("plan")
@@ -6888,6 +6998,57 @@ export function NewChatLandingScreen() {
               }}
             />
           </form>
+          <Dialog open={contextSettingsOpen} onOpenChange={setContextSettingsOpen}>
+            <DialogContent className="max-w-lg" data-testid="new-chat-context-settings">
+              <DialogHeader>
+                <DialogTitle>Advanced settings</DialogTitle>
+                <DialogDescription>
+                  Choose repository and MCP context for this session.
+                </DialogDescription>
+              </DialogHeader>
+              <div className="flex min-w-0 flex-col gap-4">
+                <div className="flex min-w-0 flex-col gap-1.5">
+                  <label className="text-sm font-medium text-foreground">Repositories</label>
+                  <ComposerRepositorySelector
+                    value={composerContext.state.repositories}
+                    repositories={repositoryResource}
+                    onChange={(repositories) =>
+                      setSandboxRepoSelections(
+                        repositories.map((repository) => ({
+                          url: repository.url,
+                          branch: repository.branch ?? "",
+                        })),
+                      )
+                    }
+                    disabled={creating}
+                    ariaLabel="Repository context"
+                  />
+                </div>
+                <div className="flex min-w-0 flex-col gap-1.5">
+                  <label className="text-sm font-medium text-foreground">MCP context</label>
+                  <McpContextSelector
+                    open={mcpSelectorOpen}
+                    onOpenChange={setMcpSelectorOpen}
+                    resource={mcpResource}
+                    value={mcpContextSelections}
+                    onChange={setMcpContextSelections}
+                    disabled={creating}
+                  />
+                </div>
+                <Button
+                  type="button"
+                  variant="outline"
+                  className="justify-start"
+                  onClick={() => {
+                    setContextSettingsOpen(false);
+                    setModelPickerOpenNonce((nonce) => nonce + 1);
+                  }}
+                >
+                  Configure model and effort
+                </Button>
+              </div>
+            </DialogContent>
+          </Dialog>
           <Dialog open={workspacePickerOpen} onOpenChange={setWorkspacePickerOpen}>
             <DialogContent
               showCloseButton={false}

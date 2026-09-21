@@ -1182,11 +1182,11 @@ export function WorkspacePicker({
                 Boolean(error)
               }
               onClick={handleSelect}
-              title={`Confirm working directory: ${basename(selectedWorktreePath ?? currentAbsolute)}`}
+              title={`Use this folder: ${basename(selectedWorktreePath ?? currentAbsolute)}`}
               className="shrink-0 rounded-lg px-3 font-normal"
               data-testid="workspace-picker-select"
             >
-              Confirm
+              Use this folder
             </Button>
           )}
         </div>

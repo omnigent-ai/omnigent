@@ -3,8 +3,11 @@ import { describe, expect, it } from "vitest";
 import { normalizeComposerContextState, type ComposerContextState } from "./composerContext";
 import {
   composerContextFromCreateSession,
+  composerContextFromLabels,
   composerContextFromMetadata,
   composerContextToCreateSession,
+  composerContextToLabel,
+  composerContextToLabels,
   composerContextToMetadata,
 } from "./composerContextAdapters";
 
@@ -47,6 +50,21 @@ describe("composer context", () => {
       mcpContext: [],
     });
     expect(composerContextFromMetadata(composerContextToMetadata(empty))).toEqual(empty);
+  });
+
+  it("round-trips session labels and ignores malformed metadata", () => {
+    expect(
+      composerContextFromLabels({
+        "omnigent.composer_context.v1": composerContextToLabel(state),
+      }),
+    ).toEqual(state);
+    expect(composerContextFromLabels(composerContextToLabels(state))).toEqual(state);
+    expect(composerContextFromLabels({ "omnigent.composer_context.v1": "not-json" })).toEqual({
+      workingDirectory: { kind: "unset" },
+      worktree: { kind: "none" },
+      repositories: [],
+      mcpContext: [],
+    });
   });
 
   it("uses existing external create-session workspace and git shapes", () => {

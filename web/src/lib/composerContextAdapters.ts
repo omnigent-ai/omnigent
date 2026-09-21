@@ -19,6 +19,9 @@ export interface ComposerContextMetadataV1 {
   mcp_context: { id: string; server_name: string }[];
 }
 
+export const COMPOSER_CONTEXT_LABEL_KEY = "omnigent.composer_context.v1";
+const COMPOSER_CONTEXT_LABEL_CHUNK_SIZE = 240;
+
 export interface ExternalComposerContextCreateFields {
   workspace: string | null;
   git:
@@ -98,6 +101,48 @@ export function composerContextFromMetadata(
       serverName: server_name,
     })),
   });
+}
+
+export function composerContextToLabel(state: ComposerContextState): string {
+  return JSON.stringify(composerContextToMetadata(state));
+}
+
+export function composerContextToLabels(state: ComposerContextState): Record<string, string> {
+  const serialized = composerContextToLabel(state);
+  const labels: Record<string, string> = {};
+  for (
+    let offset = 0, index = 0;
+    offset < serialized.length;
+    offset += COMPOSER_CONTEXT_LABEL_CHUNK_SIZE, index += 1
+  ) {
+    labels[`${COMPOSER_CONTEXT_LABEL_KEY}.${index}`] = serialized.slice(
+      offset,
+      offset + COMPOSER_CONTEXT_LABEL_CHUNK_SIZE,
+    );
+  }
+  return labels;
+}
+
+export function composerContextFromLabels(
+  labels: Record<string, string> | null | undefined,
+): ComposerContextState {
+  const raw =
+    labels?.[COMPOSER_CONTEXT_LABEL_KEY] ??
+    Object.entries(labels ?? {})
+      .filter(([key]) => key.startsWith(`${COMPOSER_CONTEXT_LABEL_KEY}.`))
+      .sort(([left], [right]) => {
+        const leftIndex = Number(left.slice(COMPOSER_CONTEXT_LABEL_KEY.length + 1));
+        const rightIndex = Number(right.slice(COMPOSER_CONTEXT_LABEL_KEY.length + 1));
+        return leftIndex - rightIndex;
+      })
+      .map(([, value]) => value)
+      .join("");
+  if (!raw) return EMPTY_COMPOSER_CONTEXT;
+  try {
+    return composerContextFromMetadata(JSON.parse(raw) as ComposerContextMetadataV1);
+  } catch {
+    return EMPTY_COMPOSER_CONTEXT;
+  }
 }
 
 function repositoryWorkspace(repository: ComposerRepositorySelection): string {
