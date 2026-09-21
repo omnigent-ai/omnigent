@@ -436,6 +436,101 @@ describe("useHostModelOptions", () => {
       vi.useRealTimers();
     }
   });
+
+  it("prefetches once, polls when selected, and stops when deselected", async () => {
+    fetchMock.mockResolvedValue(mockResponse({ models: [{ id: "swe-2" }] }));
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const { result, rerender } = renderHook(
+        ({ enabled, poll }) => useHostModelOptions("host_1", "devin-native", enabled, { poll }),
+        { wrapper, initialProps: { enabled: false, poll: false } },
+      );
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(fetchMock).not.toHaveBeenCalled();
+
+      rerender({ enabled: true, poll: false });
+      await waitFor(() => expect(result.current.isSuccess).toBe(true));
+      await vi.advanceTimersByTimeAsync(30_000);
+      focusManager.setFocused(false);
+      focusManager.setFocused(true);
+      await vi.advanceTimersByTimeAsync(100);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+
+      rerender({ enabled: true, poll: true });
+      await vi.advanceTimersByTimeAsync(15_000);
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+
+      rerender({ enabled: true, poll: false });
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(result.current.data).toEqual([{ id: "swe-2" }]);
+    } finally {
+      focusManager.setFocused(undefined);
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not retry a failed inactive prefetch", async () => {
+    fetchMock.mockResolvedValue(mockResponse({ detail: "CLI unavailable" }, 502));
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const { result } = renderHook(
+        () => useHostModelOptions("host_1", "devin-native", true, { poll: false }),
+        { wrapper },
+      );
+      await waitFor(() => expect(result.current.isError).toBe(true));
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each(["deselected", "unavailable"])(
+    "stops retrying when the harness becomes %s during a request",
+    async (state) => {
+      let finishRequest!: (response: Response) => void;
+      fetchMock.mockReturnValue(
+        new Promise<Response>((resolve) => {
+          finishRequest = resolve;
+        }),
+      );
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      try {
+        const { result, rerender } = renderHook(
+          ({ enabled, poll }) => useHostModelOptions("host_1", "devin-native", enabled, { poll }),
+          { wrapper, initialProps: { enabled: true, poll: true } },
+        );
+        await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+        rerender({ enabled: state !== "unavailable", poll: state !== "deselected" });
+        finishRequest(mockResponse({ detail: "CLI unavailable" }, 502));
+        await waitFor(() => expect(result.current.isError).toBe(true));
+        await vi.advanceTimersByTimeAsync(60_000);
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it("ends a retry sequence when deselected during backoff", async () => {
+    fetchMock.mockResolvedValue(mockResponse({ detail: "CLI unavailable" }, 502));
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const { result, rerender } = renderHook(
+        ({ poll }) => useHostModelOptions("host_1", "devin-native", true, { poll }),
+        { wrapper, initialProps: { poll: true } },
+      );
+      await waitFor(() => expect(result.current.failureCount).toBe(1));
+      rerender({ poll: false });
+      await vi.advanceTimersByTimeAsync(60_000);
+      // The already-scheduled retry may finish, but must not schedule more.
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(result.current.isError).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe("useStoreCredential", () => {

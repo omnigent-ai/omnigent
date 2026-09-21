@@ -1556,12 +1556,22 @@ describe("NewChatLandingScreen initial picker loading", () => {
     mockAgents(DEFAULT_LANDING_AGENTS);
     editDraft("Draft typed while hosts load");
     expect(expectLoading()).toBe(loading);
-    expect(useHostModelOptionsMock).toHaveBeenCalledWith(null, "claude-native", false);
+    expect(useHostModelOptionsMock).toHaveBeenCalledWith(
+      null,
+      "claude-native",
+      false,
+      expect.any(Object),
+    );
 
     mockHosts([host("online")]);
     editDraft("Draft typed while models load");
     expect(expectLoading()).toBe(loading);
-    expect(useHostModelOptionsMock).toHaveBeenCalledWith("host_1", "claude-native", true);
+    expect(useHostModelOptionsMock).toHaveBeenCalledWith(
+      "host_1",
+      "claude-native",
+      true,
+      expect.any(Object),
+    );
 
     mockModelQueries((harness) => (harness === "claude-native" ? preferredModels : pendingModels));
     editDraft("Keep this draft when configuration finishes loading");
@@ -1698,7 +1708,12 @@ describe("NewChatLandingScreen initial picker loading", () => {
         "No host selected",
       );
       expect(screen.getByTestId("new-chat-landing-permission-chip")).toBeDisabled();
-      expect(useHostModelOptionsMock).toHaveBeenCalledWith(null, "claude-native", false);
+      expect(useHostModelOptionsMock).toHaveBeenCalledWith(
+        null,
+        "claude-native",
+        false,
+        expect.any(Object),
+      );
     },
   );
 
@@ -1708,7 +1723,12 @@ describe("NewChatLandingScreen initial picker loading", () => {
     renderLanding({ managed_sandboxes_enabled: true });
 
     expect(expectReadyPicker()).toHaveAccessibleName(/Claude Code/);
-    expect(useHostModelOptionsMock).toHaveBeenCalledWith(null, "claude-native", false);
+    expect(useHostModelOptionsMock).toHaveBeenCalledWith(
+      null,
+      "claude-native",
+      false,
+      expect.any(Object),
+    );
   });
 
   it.each([
@@ -1729,7 +1749,12 @@ describe("NewChatLandingScreen initial picker loading", () => {
     renderLanding();
 
     expect(expectReadyPicker()).toHaveAccessibleName(new RegExp(label));
-    expect(useHostModelOptionsMock).toHaveBeenCalledWith("host_1", "claude-native", true);
+    expect(useHostModelOptionsMock).toHaveBeenCalledWith(
+      "host_1",
+      "claude-native",
+      true,
+      expect.any(Object),
+    );
   });
 
   it("waits for project config, pinned agents, and the configured host's model before showing its defaults", () => {
@@ -1775,7 +1800,12 @@ describe("NewChatLandingScreen initial picker loading", () => {
     pinnedAgentsReady = true;
     editDraft("Waiting for the configured host's models");
     expect(expectLoading()).toBe(loading);
-    expect(useHostModelOptionsMock).toHaveBeenCalledWith("host_2", "claude-native", true);
+    expect(useHostModelOptionsMock).toHaveBeenCalledWith(
+      "host_2",
+      "claude-native",
+      true,
+      expect.any(Object),
+    );
 
     mockModelQueries(() => preferredModels);
     editDraft("The project defaults are ready");
@@ -3626,34 +3656,80 @@ describe("NewChatLandingScreen", () => {
     expect(body.reasoning_effort).toBeUndefined();
   });
 
-  it("only requests Devin models while Devin is selected on a host", () => {
-    mockAgents([
-      ...DEFAULT_LANDING_AGENTS,
+  const catalogAgents: AvailableAgent[] = [
+    ...DEFAULT_LANDING_AGENTS,
+    {
+      id: "a3",
+      name: "devin-native-ui",
+      display_name: "Devin",
+      description: null,
+      harness: "devin-native",
+      skills: [],
+    },
+    {
+      id: "a4",
+      name: "pi-native-ui",
+      display_name: "Pi",
+      description: null,
+      harness: "pi-native",
+      skills: [],
+    },
+  ];
+  const catalogHarnesses = ["claude-native", "codex-native", "pi-native", "devin-native"];
+  const readyCatalogs = Object.fromEntries(catalogHarnesses.map((harness) => [harness, true]));
+
+  it.each([undefined, readyCatalogs])(
+    "eagerly loads available catalogs and only polls the selected harness (readiness: %s)",
+    (configured_harnesses) => {
+      mockAgents(catalogAgents);
+      mockHosts([{ ...host("online"), configured_harnesses }]);
+      renderLanding();
+
+      for (const agent of catalogAgents) {
+        selectUnconfiguredAgent(agent.id);
+        for (const harness of catalogHarnesses) {
+          const calls = useHostModelOptionsMock.mock.calls.filter(([, h]) => h === harness);
+          expect(calls.at(-1)).toEqual([
+            "host_1",
+            harness,
+            true,
+            { poll: harness === agent.harness },
+          ]);
+        }
+      }
+    },
+  );
+
+  it.each([
+    ["claude-native", "needs-auth"],
+    ["codex-native", "binary-missing"],
+    ["pi-native", "version-too-low"],
+    ["devin-native", false],
+  ])("skips unavailable %s and loads it when the host reports readiness", (harness, readiness) => {
+    mockAgents(catalogAgents);
+    mockHosts([
       {
-        id: "a3",
-        name: "devin-native-ui",
-        display_name: "Devin",
-        description: null,
-        harness: "devin-native",
-        skills: [],
+        ...host("online"),
+        configured_harnesses: { ...readyCatalogs, [harness as string]: readiness },
       },
     ]);
     renderLanding();
+    const agent = catalogAgents.find((candidate) => candidate.harness === harness)!;
+    selectUnconfiguredAgent(agent.id);
+    const calls = () => useHostModelOptionsMock.mock.calls.filter(([, h]) => h === harness);
+    expect(calls().every(([, , enabled]) => !enabled)).toBe(true);
+    expect(screen.queryByTestId("new-chat-landing-picker-loading")).toBeNull();
 
-    expect(useHostModelOptionsMock).toHaveBeenCalledWith("host_1", "devin-native", false);
-    expect(useHostModelOptionsMock).not.toHaveBeenCalledWith("host_1", "devin-native", true);
+    mockHosts([{ ...host("online"), configured_harnesses: readyCatalogs }]);
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), { target: { value: "Ready" } });
+    expect(calls().at(-1)).toEqual(["host_1", harness, true, { poll: true }]);
+  });
 
-    useHostModelOptionsMock.mockClear();
-    openAgentModels("a3");
-    expect(useHostModelOptionsMock).toHaveBeenCalledWith("host_1", "devin-native", true);
-    expect(screen.getByTestId("new-chat-landing-agent-models")).toHaveTextContent("SWE-2");
-
-    closeMenu();
-    selectAgent("a1");
-    const devinCalls = useHostModelOptionsMock.mock.calls.filter(
-      ([, harness]) => harness === "devin-native",
-    );
-    expect(devinCalls.at(-1)).toEqual(["host_1", "devin-native", false]);
+  it("waits for the restored host's readiness before loading catalogs", () => {
+    localStorage.setItem("omnigent:last-host-choice", "host_1");
+    mockHosts(undefined);
+    renderLanding();
+    expect(useHostModelOptionsMock.mock.calls.every(([, , enabled]) => !enabled)).toBe(true);
   });
 
   it.each(["claude-opus-5", "fusion-fable-medium-swe2high", ""])(
@@ -3670,6 +3746,9 @@ describe("NewChatLandingScreen", () => {
           skills: [],
         },
       ]);
+      mockHosts([
+        { ...host("online"), configured_harnesses: { ...readyCatalogs, "devin-native": false } },
+      ]);
       localStorage.setItem(
         HARNESS_OPTIONS_KEY,
         JSON.stringify({ "devin-native": { model: savedModel } }),
@@ -3682,9 +3761,31 @@ describe("NewChatLandingScreen", () => {
         savedModel || "Default",
       );
       expect(readHarnessOptions("devin-native").model).toBe(savedModel);
-      expect(useHostModelOptionsMock).not.toHaveBeenCalledWith("host_1", "devin-native", true);
+      expect(useHostModelOptionsMock).not.toHaveBeenCalledWith(
+        "host_1",
+        "devin-native",
+        true,
+        expect.any(Object),
+      );
     },
   );
+
+  it.each(catalogAgents)("keeps $display_name's saved model summary without a catalog", (agent) => {
+    mockAgents(catalogAgents);
+    mockModelQueries(() => ({ ...SUCCESS_QUERY_STATE, data: [] }));
+    localStorage.setItem(
+      HARNESS_OPTIONS_KEY,
+      JSON.stringify({ [agent.harness!]: { model: "saved-model" } }),
+    );
+    renderLanding();
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    if (!screen.queryByTestId(`new-chat-landing-agent-summary-${agent.id}`)) {
+      fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
+    }
+    expect(screen.getByTestId(`new-chat-landing-agent-summary-${agent.id}`)).toHaveTextContent(
+      "saved-model",
+    );
+  });
 
   it("renders Devin's own model families and only the selected model's effort rungs", () => {
     // Devin declares only `devinMode` (not modelPicker/permissionMode). Both the
@@ -4954,7 +5055,12 @@ describe("NewChatLandingScreen", () => {
     const body = JSON.parse((init as RequestInit).body as string) as Record<string, unknown>;
     expect(body.model_override).toBe("databricks-gpt-5-6");
     expect(body.reasoning_effort).toBeUndefined();
-    expect(useHostModelOptionsMock).toHaveBeenCalledWith("host_1", "codex-native", true);
+    expect(useHostModelOptionsMock).toHaveBeenCalledWith(
+      "host_1",
+      "codex-native",
+      true,
+      expect.any(Object),
+    );
   });
 
   it("keeps legacy Mod+Enter as a default-mode send alias", async () => {
