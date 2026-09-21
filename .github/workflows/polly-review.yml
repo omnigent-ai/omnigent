@@ -505,7 +505,13 @@ jobs:
           Put clearly unrelated work under **Blocking issues**: cite the stated goal,
           identify the specific change, and explain why it serves an independent
           outcome. When the goal is vague or a connection is plausible but unexplained,
-          ask a specific question under **Non-blocking notes**. Do not invent goals
+          ask a specific question under **Non-blocking notes**. A broad label such
+          as "improve developer scripts" does not by itself establish one shared
+          outcome. If changes appear to serve independent purposes, name those
+          purposes and ask what concrete workflow connects them. Keep this scope
+          question separate from suggestions about alternative implementations;
+          asking whether an existing tool could be extended does not establish
+          why the changes belong together. Do not invent goals
           or exclusions, or describe uncertainty as blocking in the summary. Ask for
           clarification first; suggest splitting only when outcomes are independent.
           Use the ordinary prose review sections; no separate scope report is needed.
