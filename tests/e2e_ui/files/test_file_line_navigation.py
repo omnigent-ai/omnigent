@@ -262,6 +262,44 @@ def test_markdown_diff_url_stays_stable_across_responsive_layouts(
         assert page.evaluate("window.diffUrlTransitions") == transitions
 
 
+def test_diff_history_restores_explicit_view_across_sessions(
+    page: Page, seeded_session_pair: tuple[str, str, str]
+) -> None:
+    """Back/Forward honors diff links even after another session changes the preference."""
+    base_url, session_a, session_b = seeded_session_pair
+    for session_id in (session_a, session_b):
+        _seed_citation_file(page, (base_url, session_id))
+    viewer = _open_viewer(page, (base_url, session_a), _FILE_PATH, {"diffActive": False})
+    viewer.get_by_role("button", name="Show diff", exact=True).click()
+    expect(viewer.locator(".monaco-diff-editor")).to_be_visible(timeout=30_000)
+    diff_url = re.compile(r"[?&]diff=1(?:&|$)")
+    expect(page).to_have_url(diff_url)
+
+    page.locator(f'a[href="/c/{session_b}"]').first.click()
+    page.get_by_role("button", name="Plain file", exact=True).click()
+    viewer.get_by_role("button", name="Exit diff view", exact=True).click()
+    page.get_by_role("button", name="Close citation_target.py", exact=True).click()
+    expect(viewer).to_have_count(0)
+    page.go_back()
+    expect(page).to_have_url(re.compile(f"/c/{session_a}\\?"))
+    expect(page).to_have_url(diff_url)
+    expect(viewer.locator(".monaco-diff-editor")).to_be_visible(timeout=30_000)
+
+    # Create a Diff entry ahead, then change the preference in session A.
+    page.go_forward()
+    page.get_by_role("button", name="Plain file", exact=True).click()
+    expect(page).to_have_url(diff_url)
+    page.go_back()
+    viewer.get_by_role("button", name="Exit diff view", exact=True).click()
+    expect(page).not_to_have_url(diff_url)
+    page.go_forward()
+    expect(page).to_have_url(re.compile(f"/c/{session_b}\\?"))
+    expect(page).to_have_url(diff_url)
+    expect(viewer.locator(".monaco-diff-editor")).to_be_visible(timeout=30_000)
+    viewer.get_by_role("button", name="Exit diff view", exact=True).click()
+    expect(page).not_to_have_url(diff_url)
+
+
 @pytest.mark.parametrize("layout", ["split", "unified"])
 def test_chat_line_link_expands_and_centers_diff_context(
     page: Page,

@@ -17,7 +17,7 @@
 import { useMemo } from "react";
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { MemoryRouter, useSearchParams } from "react-router-dom";
+import { MemoryRouter, useLocation, useNavigate, useSearchParams } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Comment } from "@/hooks/useComments";
 import { isFilePositionPending } from "./filePositionState";
@@ -683,6 +683,87 @@ describe("FileViewer URL sync — diff param", () => {
         </QueryClientProvider>,
       );
       expect(screen.getByTestId("url-params")).toHaveTextContent("file=unchanged.md&diff=1");
+    },
+  );
+
+  it.each([false, true])(
+    "honors diff history after changing the shared preference (remount=%s)",
+    async (closeBeforeBack) => {
+      useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+      function HistoryNavigation() {
+        const navigate = useNavigate();
+        const location = useLocation();
+        const [params, setParams] = useSearchParams();
+        const path = params.get("file");
+        return (
+          <>
+            <button type="button" onClick={() => navigate("/c/conv_2?file=file1.py")}>
+              Next session
+            </button>
+            <button type="button" onClick={() => setParams({}, { replace: true })}>
+              Close viewer
+            </button>
+            <button
+              type="button"
+              onClick={() => setParams({ file: "file1.py" }, { replace: true })}
+            >
+              Open viewer
+            </button>
+            <button type="button" onClick={() => navigate(-1)}>
+              Back
+            </button>
+            <button type="button" onClick={() => navigate(1)}>
+              Forward
+            </button>
+            <output data-testid="location-path">{location.pathname}</output>
+            {path && (
+              <FileViewer
+                open
+                conversationId={location.pathname.split("/").pop()!}
+                path={path}
+                onClose={vi.fn()}
+              />
+            )}
+          </>
+        );
+      }
+      render(
+        <QueryClientProvider client={new QueryClient()}>
+          <MemoryRouter initialEntries={["/c/conv_1?file=file1.py"]}>
+            <LocationDisplay />
+            <FileViewPreferencesProvider>
+              <HistoryNavigation />
+            </FileViewPreferencesProvider>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Show diff" }));
+      expect(await screen.findByTestId("diff-viewer")).toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: "Next session" }));
+      // A navigation without an explicit override keeps the shared preference.
+      expect(screen.getByTestId("diff-viewer")).toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: "Exit diff view" }));
+      expect(screen.queryByTestId("diff-viewer")).toBeNull();
+      if (closeBeforeBack) fireEvent.click(screen.getByRole("button", { name: "Close viewer" }));
+      fireEvent.click(screen.getByRole("button", { name: "Back" }));
+      expect(screen.getByTestId("location-path")).toHaveTextContent("/c/conv_1");
+      expect(await screen.findByTestId("diff-viewer")).toBeInTheDocument();
+      expect(screen.getByTestId("url-params")).toHaveTextContent("diff=1");
+
+      // Keep a Diff entry ahead, then turn it off in the current session.
+      fireEvent.click(screen.getByRole("button", { name: "Forward" }));
+      if (closeBeforeBack) fireEvent.click(screen.getByRole("button", { name: "Open viewer" }));
+      expect(screen.getByTestId("url-params")).toHaveTextContent("diff=1");
+      fireEvent.click(screen.getByRole("button", { name: "Back" }));
+      fireEvent.click(screen.getByRole("button", { name: "Exit diff view" }));
+      expect(screen.getByTestId("url-params")).not.toHaveTextContent("diff=");
+      fireEvent.click(screen.getByRole("button", { name: "Forward" }));
+      expect(screen.getByTestId("location-path")).toHaveTextContent("/c/conv_2");
+      expect(await screen.findByTestId("diff-viewer")).toBeInTheDocument();
+      expect(screen.getByTestId("url-params")).toHaveTextContent("diff=1");
+      // A restored URL must still allow the user to turn Diff off normally.
+      fireEvent.click(screen.getByRole("button", { name: "Exit diff view" }));
+      expect(screen.getByTestId("url-params")).not.toHaveTextContent("diff=");
     },
   );
 

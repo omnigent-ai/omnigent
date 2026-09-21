@@ -1,13 +1,21 @@
 import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
-import { useSearchParams } from "@/lib/routing";
+import { useLocation, useSearchParams } from "@/lib/routing";
 import { readFileViewPreferences, writeFileViewPreferences } from "@/lib/fileViewPreferences";
 
 function usePreferencesState() {
   const [searchParams] = useSearchParams();
+  const location = useLocation();
+  const [previousLocationKey, setPreviousLocationKey] = useState(location.key);
   const [initial] = useState(readFileViewPreferences);
   const [diffActive, setDiffActive] = useState(
     () => searchParams.get("diff") === "1" || initial.diffActive,
   );
+  // Honor explicit navigation (including Back/Forward) before viewers sync the URL.
+  // Local toggles keep the same location until their own URL write completes.
+  if (previousLocationKey !== location.key) {
+    setPreviousLocationKey(location.key);
+    if (searchParams.get("diff") === "1") setDiffActive(true);
+  }
   const [diffLayout, setDiffLayout] = useState(initial.diffLayout);
   const [hideWhitespace, setHideWhitespace] = useState(initial.hideWhitespace);
   const [wrapLines, setWrapLines] = useState(initial.wrapLines);
