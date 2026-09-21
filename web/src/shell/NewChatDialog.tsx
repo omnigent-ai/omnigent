@@ -3132,8 +3132,8 @@ export function NewChatLandingScreen() {
     canLoadHostModels("pi-native"),
     { poll: selectedNativeHarness === "pi-native" },
   );
-  // Bridge this host's startup/offline period, but not an empty/error response
-  // or another host's catalog.
+  // Keep this host's cached choices while requests wait for readiness.
+  // A fetched catalog, including an empty one, takes precedence.
   const cachedHostModels =
     cachedPickerOptions &&
     !sandboxSelected &&
@@ -3150,11 +3150,13 @@ export function NewChatLandingScreen() {
     loading: boolean,
     cached?: NativeModelOption[],
   ) =>
-    // Disabled queries retain data; an explicit setup failure makes it unusable.
-    harnessUnconfiguredOnHost(harness, selectedHost)
-      ? undefined
-      : (models ??
-        (loading || hostReadinessPending || selectedHostId === null ? cached : undefined));
+    models ??
+    (loading ||
+    hostReadinessPending ||
+    harnessUnconfiguredOnHost(harness, selectedHost) ||
+    selectedHostId === null
+      ? cached
+      : undefined);
   const availableClaudeModels = availableHostModels(
     "claude-native",
     hostClaudeModelOptions,
@@ -3180,11 +3182,6 @@ export function NewChatLandingScreen() {
   } = useHostModelOptions(selectedHostId, "devin-native", canLoadHostModels("devin-native"), {
     poll: selectedNativeHarness === "devin-native",
   });
-  const availableDevinModels = availableHostModels(
-    "devin-native",
-    hostDevinModelOptions,
-    hostDevinModelsLoading,
-  );
   const previewHarness = selectedNativeHarness ?? pickedHarness ?? selectedAgent?.harness ?? null;
   const previewSandboxProvider =
     sandboxProvider ?? (info !== "loading" ? info.sandbox_provider : null);
@@ -3245,8 +3242,8 @@ export function NewChatLandingScreen() {
   // the id at launch (resolve_devin_launch_model), so the list stays short
   // instead of enumerating every effort variant.
   const devinModelOptions = useMemo(
-    () => (sandboxSelected ? (sandboxCatalog ?? []) : (availableDevinModels ?? [])),
-    [availableDevinModels, sandboxSelected, sandboxCatalog],
+    () => (sandboxSelected ? (sandboxCatalog ?? []) : (hostDevinModelOptions ?? [])),
+    [hostDevinModelOptions, sandboxSelected, sandboxCatalog],
   );
   const piModelOptions = useMemo(
     () =>
@@ -3878,6 +3875,12 @@ export function NewChatLandingScreen() {
         )}
       </>
     ) : null;
+  const hostModelCatalogs: Record<string, NativeModelOption[] | undefined> = {
+    "claude-native": availableClaudeModels,
+    "codex-native": availableCodexModels,
+    "pi-native": availablePiModels,
+    "devin-native": hostDevinModelOptions,
+  };
   const pickerEntrySummaries = Object.fromEntries(
     [...harnessEntries, ...agentEntries].map((agent) => {
       const native = nativeCodingAgentForAvailableAgent(agent);
@@ -3900,11 +3903,14 @@ export function NewChatLandingScreen() {
                 ? devinModelOptions
                 : [];
       const savedFusion = fusionOption(catalog)?.fusion;
+      // Preserve saved IDs while host data is absent; an empty result is authoritative.
+      const hostCatalogUnavailable =
+        !sandboxSelected &&
+        native.harness in hostModelCatalogs &&
+        hostModelCatalogs[native.harness] === undefined;
       const model =
         catalog.find((option) => option.id === saved.model) ??
-        (!catalogSuppressed && catalog.length === 0 && saved.model
-          ? { id: saved.model }
-          : undefined);
+        (hostCatalogUnavailable && saved.model ? { id: saved.model } : undefined);
       const label = visibleModelLabel(
         savedFusion !== undefined && isFusionModelUid(saved.model)
           ? // A fusion id isn't a catalog row id, so label it from the combo.
