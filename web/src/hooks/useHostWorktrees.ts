@@ -1,4 +1,4 @@
-import { queryOptions, useQuery } from "@tanstack/react-query";
+import { queryOptions, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useRef } from "react";
 
 import { authenticatedFetch } from "@/lib/identity";
@@ -144,5 +144,36 @@ export function useHostWorktrees(hostId: string | null, repoPath: string | null)
   return useQuery({
     ...hostWorktreesQueryOptions(hostId ?? "", repoPath ?? ""),
     enabled,
+  });
+}
+
+export async function removeHostWorktree(
+  hostId: string,
+  worktree: Pick<HostWorktree, "path" | "branch">,
+): Promise<void> {
+  const params = new URLSearchParams({ path: worktree.path });
+  if (worktree.branch !== null) params.set("branch", worktree.branch);
+  const res = await authenticatedFetch(
+    `/v1/hosts/${encodeURIComponent(hostId)}/worktrees?${params.toString()}`,
+    { method: "DELETE" },
+  );
+  if (!res.ok) {
+    const body = await res.json().catch(() => null);
+    const detail = body && typeof body.detail === "string" ? `: ${body.detail}` : "";
+    throw new Error(`worktree removal failed: HTTP ${res.status}${detail}`);
+  }
+}
+
+export function useRemoveHostWorktree(hostId: string | null, repoPath: string | null) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (worktree: Pick<HostWorktree, "path" | "branch">) => {
+      if (hostId === null) throw new Error("host is required to remove a worktree");
+      return removeHostWorktree(hostId, worktree);
+    },
+    onSuccess: async () => {
+      if (hostId === null || repoPath === null) return;
+      await queryClient.invalidateQueries({ queryKey: ["host-worktrees", hostId, repoPath] });
+    },
   });
 }

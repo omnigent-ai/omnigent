@@ -19,7 +19,11 @@ import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { useCreateHostDirectory, useHostFilesystem } from "@/hooks/useHostFilesystem";
-import { useHostWorktrees, useVerifiedGitWorktrees } from "@/hooks/useHostWorktrees";
+import {
+  useHostWorktrees,
+  useRemoveHostWorktree,
+  useVerifiedGitWorktrees,
+} from "@/hooks/useHostWorktrees";
 import { cn } from "@/lib/utils";
 import { WorktreeRadioRow } from "./WorktreeRadioRow";
 
@@ -522,6 +526,7 @@ export function WorkspacePicker({
     error: worktreesError,
   } = useHostWorktrees(hostId, worktreeQueryPath);
   const worktreesPending = Boolean(worktreesFetching || worktreesPlaceholder);
+  const removeWorktree = useRemoveHostWorktree(hostId, worktreeQueryPath);
   const verifiedGitWorktrees = useVerifiedGitWorktrees({
     hostId,
     requestedPath: requestedWorktreePath,
@@ -701,7 +706,7 @@ export function WorkspacePicker({
       className={cn(
         "flex min-h-0 flex-col overflow-hidden border border-border bg-background",
         hasCommitActions
-          ? "h-[min(520px,calc(100dvh-4rem))] w-[min(800px,calc(100vw-2rem))] max-h-full justify-self-center rounded-3xl shadow-xl"
+          ? "h-[min(520px,calc(100dvh-4rem))] w-[min(800px,calc(100vw-2rem))] max-h-full justify-self-center rounded-[20px] shadow-xl"
           : "max-h-80 rounded-md",
       )}
       data-testid="workspace-picker"
@@ -715,7 +720,7 @@ export function WorkspacePicker({
       >
         <PickerIconButton
           label="Up one level"
-          icon={<ArrowLeftIcon className="size-5" />}
+          icon={<ArrowLeftIcon className={showGitDialog ? "size-4" : "size-5"} />}
           onClick={() => parent !== null && navigateTo(parent)}
           disabled={parent === null}
           testId="workspace-picker-up"
@@ -737,7 +742,7 @@ export function WorkspacePicker({
             <div
               className={cn(
                 "flex min-w-0 items-center gap-1 overflow-hidden text-base font-medium",
-                showGitDialog && "gap-1.5 text-[1.05rem] font-semibold",
+                showGitDialog && "font-normal leading-[1.6]",
               )}
             >
               {breadcrumbItems.map((item, index) => {
@@ -755,7 +760,7 @@ export function WorkspacePicker({
                     <button
                       type="button"
                       className={`truncate rounded px-1 py-0.5 text-left outline-none transition-colors hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring ${
-                        isLast ? "text-foreground" : "text-muted-foreground"
+                        isLast ? "font-medium text-foreground" : "text-muted-foreground"
                       }`}
                       onClick={() => {
                         if (isLast) {
@@ -815,7 +820,7 @@ export function WorkspacePicker({
         {showGitDialog && (
           <PickerIconButton
             label="New folder"
-            icon={<FolderPlusIcon className="size-5" />}
+            icon={<FolderPlusIcon className="size-4" />}
             onClick={openNewFolder}
             disabled={!canCreateFolder}
             testId="workspace-picker-new-folder"
@@ -823,14 +828,20 @@ export function WorkspacePicker({
         )}
         <PickerIconButton
           label={showHidden ? "Hide hidden files" : "Show hidden files"}
-          icon={showHidden ? <EyeIcon className="size-5" /> : <EyeOffIcon className="size-5" />}
+          icon={
+            showHidden ? (
+              <EyeIcon className={showGitDialog ? "size-4" : "size-5"} />
+            ) : (
+              <EyeOffIcon className={showGitDialog ? "size-4" : "size-5"} />
+            )
+          }
           onClick={() => setShowHidden((v) => !v)}
           testId="workspace-picker-show-hidden"
         />
         {onClose && (
           <PickerIconButton
             label="Close"
-            icon={<XIcon className="size-5" />}
+            icon={<XIcon className={showGitDialog ? "size-4" : "size-5"} />}
             onClick={onClose}
             testId="workspace-picker-close"
           />
@@ -849,17 +860,20 @@ export function WorkspacePicker({
           <div
             className={cn(
               "flex min-h-12 shrink-0 items-center gap-2 border-b px-4",
-              showGitDialog && "min-h-14 border-b-0 px-3 py-2",
+              showGitDialog && "min-h-10 border-b-0 px-3 py-1",
             )}
           >
             <div
               className={cn(
                 "flex min-w-0 flex-1 items-center gap-2",
                 showGitDialog &&
-                  "h-10 rounded-xl border border-border bg-muted/45 px-3 shadow-sm focus-within:border-ring focus-within:ring-2 focus-within:ring-ring/25",
+                  "h-8 rounded-lg border border-border bg-muted/45 px-2 shadow-sm focus-within:border-ring focus-within:ring-2 focus-within:ring-ring/25",
               )}
             >
-              <SearchIcon className="size-5 shrink-0 text-muted-foreground" aria-hidden />
+              <SearchIcon
+                className={cn("size-5 shrink-0 text-muted-foreground", showGitDialog && "size-4")}
+                aria-hidden
+              />
               <input
                 type="search"
                 value={searchInput}
@@ -874,7 +888,10 @@ export function WorkspacePicker({
                 aria-label="Search folders and files"
                 autoComplete="off"
                 spellCheck={false}
-                className="min-w-0 flex-1 bg-transparent text-base text-foreground outline-none placeholder:text-muted-foreground"
+                className={cn(
+                  "min-w-0 flex-1 bg-transparent text-base text-foreground outline-none placeholder:text-muted-foreground",
+                  showGitDialog && "leading-[1.6]",
+                )}
                 data-testid="workspace-picker-search-input"
               />
             </div>
@@ -1013,7 +1030,7 @@ export function WorkspacePicker({
                     onClick={() => isDir && navigateTo(entry.path)}
                     className={cn(
                       "flex min-h-11 w-full items-center gap-2.5 px-5 py-2 text-left text-base transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
-                      showGitDialog && "rounded-lg px-3",
+                      showGitDialog && "min-h-[27px] gap-2 rounded-md px-2 py-[3px] leading-[1.6]",
                       isDir
                         ? "cursor-pointer text-foreground hover:bg-muted"
                         : "cursor-not-allowed text-muted-foreground opacity-55",
@@ -1021,9 +1038,14 @@ export function WorkspacePicker({
                     data-testid={`workspace-picker-entry-${entry.name}`}
                   >
                     {isDir ? (
-                      <FolderIcon className="size-5 shrink-0 text-muted-foreground" />
+                      <FolderIcon
+                        className={cn(
+                          "size-5 shrink-0 text-muted-foreground",
+                          showGitDialog && "size-4",
+                        )}
+                      />
                     ) : (
-                      <FileIcon className="size-5 shrink-0" />
+                      <FileIcon className={cn("size-5 shrink-0", showGitDialog && "size-4")} />
                     )}
                     <span className="flex-1 truncate">{entry.name}</span>
                     {isDir && (
@@ -1054,17 +1076,17 @@ export function WorkspacePicker({
             <div
               className={cn(
                 "flex min-h-12 shrink-0 items-center border-b px-4 text-base font-medium",
-                showGitDialog && "min-h-14 gap-2 border-b-0 px-4 font-semibold",
+                showGitDialog && "min-h-10 gap-2 border-b-0 px-4 font-normal leading-[1.6]",
               )}
             >
-              {showGitDialog && <GitBranchIcon className="size-4.5 text-muted-foreground" />}
+              {showGitDialog && <GitBranchIcon className="size-4 text-muted-foreground" />}
               Worktrees
             </div>
             <TooltipProvider>
               <div
                 className={cn(
                   "min-h-0 flex-1 space-y-1 overflow-y-auto p-3",
-                  showGitDialog && "px-3 pt-0 pb-3",
+                  showGitDialog && "space-y-0.5 px-3 pt-0 pb-3",
                 )}
                 role="radiogroup"
                 aria-label="Choose a worktree"
@@ -1074,7 +1096,7 @@ export function WorkspacePicker({
                   className={cn(
                     "flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-sm hover:bg-muted focus-within:bg-muted",
                     showGitDialog &&
-                      "min-h-11 rounded-lg px-3 text-base transition-colors has-[:checked]:bg-muted",
+                      "h-[26px] rounded-md px-2 py-0 text-base transition-colors has-[:checked]:bg-muted",
                   )}
                   data-testid="workspace-picker-current-folder"
                 >
@@ -1089,7 +1111,9 @@ export function WorkspacePicker({
                         "appearance-none rounded-full border border-muted-foreground/60 bg-background checked:border-[5px] checked:border-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2",
                     )}
                   />
-                  <span className="font-medium text-foreground">
+                  <span
+                    className={cn("font-medium text-foreground", showGitDialog && "font-normal")}
+                  >
                     {showGitDialog ? "Don't use" : "Current folder"}
                   </span>
                 </label>
@@ -1109,6 +1133,11 @@ export function WorkspacePicker({
                     No linked worktrees for this repository.
                   </div>
                 )}
+                {removeWorktree.error && (
+                  <div className="px-2 py-2 text-sm text-destructive" role="alert">
+                    {removeWorktree.error.message}
+                  </div>
+                )}
                 {linkedWorktrees.map((worktree) => (
                   <WorktreeRadioRow
                     key={worktree.path}
@@ -1118,6 +1147,17 @@ export function WorkspacePicker({
                     onSelect={() => setSelectedWorktreePath(worktree.path)}
                     testId={`workspace-picker-worktree-${worktree.path}`}
                     spacious={showGitDialog}
+                    onOpen={() => navigateTo(worktree.path)}
+                    onDelete={
+                      removeWorktree.isPending
+                        ? undefined
+                        : () => {
+                            if (selectedWorktreePath === worktree.path) {
+                              setSelectedWorktreePath(null);
+                            }
+                            removeWorktree.mutate(worktree);
+                          }
+                    }
                   />
                 ))}
               </div>
@@ -1137,8 +1177,9 @@ export function WorkspacePicker({
             <Button
               type="button"
               variant="outline"
-              size="lg"
+              size="sm"
               onClick={onClose}
+              className="rounded-lg px-3 font-normal"
               data-testid="workspace-picker-cancel"
             >
               Cancel
@@ -1147,7 +1188,7 @@ export function WorkspacePicker({
           {onSelect && (
             <Button
               type="button"
-              size="lg"
+              size="sm"
               disabled={
                 currentAbsolute === "" ||
                 currentAbsolute === null ||
@@ -1156,7 +1197,7 @@ export function WorkspacePicker({
               }
               onClick={handleSelect}
               title={`Confirm working directory: ${basename(selectedWorktreePath ?? currentAbsolute)}`}
-              className="shrink-0 px-4"
+              className="shrink-0 rounded-lg px-3 font-normal"
               data-testid="workspace-picker-select"
             >
               Confirm

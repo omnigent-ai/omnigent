@@ -28,7 +28,7 @@ import {
   useHostFilesystem,
   type HostFilesystemEntry,
 } from "@/hooks/useHostFilesystem";
-import { useHostWorktrees } from "@/hooks/useHostWorktrees";
+import { useHostWorktrees, useRemoveHostWorktree } from "@/hooks/useHostWorktrees";
 import type * as HostWorktreesModule from "@/hooks/useHostWorktrees";
 
 vi.mock("@/hooks/useHostFilesystem", () => ({
@@ -46,11 +46,13 @@ vi.mock("@/hooks/useHostWorktrees", async (importOriginal) => ({
     isPlaceholderData: false,
     error: null,
   })),
+  useRemoveHostWorktree: vi.fn(() => ({ mutate: vi.fn(), isPending: false, error: null })),
 }));
 
 const useHostFilesystemMock = vi.mocked(useHostFilesystem);
 const useCreateHostDirectoryMock = vi.mocked(useCreateHostDirectory);
 const useHostWorktreesMock = vi.mocked(useHostWorktrees);
+const useRemoveHostWorktreeMock = vi.mocked(useRemoveHostWorktree);
 
 function dir(name: string, path: string): HostFilesystemEntry {
   return { name, path, type: "directory", bytes: null, modified_at: 0 };
@@ -80,6 +82,11 @@ beforeEach(() => {
     isPlaceholderData: false,
     error: null,
   } as unknown as ReturnType<typeof useHostWorktrees>);
+  useRemoveHostWorktreeMock.mockReturnValue({
+    mutate: vi.fn(),
+    isPending: false,
+    error: null,
+  } as unknown as ReturnType<typeof useRemoveHostWorktree>);
 });
 
 describe("parentOf", () => {
@@ -760,15 +767,29 @@ describe("WorkspacePicker modal actions", () => {
       expect(screen.getByTestId("workspace-picker")).toHaveClass(
         "h-[min(520px,calc(100dvh-4rem))]",
         "w-[min(800px,calc(100vw-2rem))]",
-        "rounded-3xl",
+        "rounded-[20px]",
       );
       expect(screen.getByTestId("workspace-picker-body")).toHaveClass(
         "md:grid-cols-[minmax(0,1.2fr)_minmax(18rem,0.8fr)]",
       );
-      expect(screen.getByTestId("workspace-picker-current-folder")).toHaveClass("min-h-11", "px-3");
+      expect(screen.getByTestId("workspace-picker-current-folder")).toHaveClass(
+        "h-[26px]",
+        "px-2",
+        "text-base",
+      );
       expect(
         screen.getByTestId("workspace-picker-worktree-/Users/corey/worktrees/feature-layout"),
-      ).toHaveClass("min-h-11", "px-3");
+      ).toHaveClass("min-h-9", "px-3", "py-1", "text-base");
+      expect(screen.getByTestId("workspace-picker-entry-src")).toHaveClass(
+        "min-h-[27px]",
+        "px-2",
+        "py-[3px]",
+      );
+      expect(screen.getByTestId("workspace-picker-select")).toHaveClass(
+        "h-7",
+        "px-3",
+        "font-normal",
+      );
 
       fireEvent.click(screen.getByRole("radio", { name: "Use worktree feature-layout" }));
       expect(
@@ -780,6 +801,49 @@ describe("WorkspacePicker modal actions", () => {
       expect(onSelect).toHaveBeenCalledWith("/Users/corey/worktrees/feature-layout");
     },
   );
+
+  it("removes a linked worktree from its action menu", async () => {
+    const mutate = vi.fn();
+    useRemoveHostWorktreeMock.mockReturnValue({
+      mutate,
+      isPending: false,
+      error: null,
+    } as unknown as ReturnType<typeof useRemoveHostWorktree>);
+    useHostWorktreesMock.mockReturnValue({
+      data: [
+        {
+          path: "/Users/corey/repo",
+          branch: "main",
+          is_main: true,
+          detached: false,
+        },
+        {
+          path: "/Users/corey/worktrees/feature-layout",
+          branch: "feature/layout",
+          is_main: false,
+          detached: false,
+        },
+      ],
+      isFetching: false,
+      isPlaceholderData: false,
+      error: null,
+    } as unknown as ReturnType<typeof useHostWorktrees>);
+
+    render(<WorkspacePicker hostId="host_1" initialPath="/Users/corey/repo" onSelect={vi.fn()} />);
+
+    fireEvent.pointerDown(
+      screen.getByRole("button", { name: "Worktree actions for feature-layout" }),
+      { button: 0 },
+    );
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Delete" }));
+
+    expect(mutate).toHaveBeenCalledWith({
+      path: "/Users/corey/worktrees/feature-layout",
+      branch: "feature/layout",
+      is_main: false,
+      detached: false,
+    });
+  });
 
   it("keeps cached verified worktrees and selection while a nested path query is disabled", () => {
     useHostFilesystemMock.mockImplementation((_host, path) =>

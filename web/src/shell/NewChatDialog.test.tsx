@@ -815,7 +815,7 @@ describe("sandbox repository helpers", () => {
       prefilledBranch: "",
       expected: {
         repositoryLabel: "alpha",
-        branchLabel: "New worktree",
+        branchLabel: "New",
         branchDescription: "Create or select a worktree from main repository branch: main",
       },
     },
@@ -2724,7 +2724,7 @@ describe("NewChatLandingScreen cached picker preview", () => {
     expect(readNewChatWorkspaceCache(key)).toMatchObject({
       workspace: "/work/second",
       repositoryLabel: "second",
-      branchLabel: "New worktree",
+      branchLabel: "New",
     });
   });
 });
@@ -3291,7 +3291,7 @@ describe("NewChatLandingScreen", () => {
       "title",
       "Create or select a worktree from main repository branch: main",
     );
-    expect(worktree).toHaveTextContent("New worktree");
+    expect(worktree).toHaveTextContent("New");
     expect(worktree.querySelectorAll("svg")[0]).toHaveClass("size-3.5");
     expect(worktree.querySelectorAll("svg")[1]).toHaveClass("size-3");
     expect(harness).toHaveClass(
@@ -3419,7 +3419,7 @@ describe("NewChatLandingScreen", () => {
       expect(screen.getByTestId("new-chat-landing-workspace-icon-git")).toBeInTheDocument();
       expect(screen.getByTestId("new-chat-landing-branch-chip")).toBeVisible();
       fireEvent.click(screen.getByTestId("new-chat-landing-branch-chip"));
-      fireEvent.change(screen.getByLabelText("New worktree"), {
+      fireEvent.change(screen.getByLabelText("New"), {
         target: { value: "feature/compatible" },
       });
       fireEvent.change(screen.getByTestId("new-chat-landing-base-branch-input"), {
@@ -3503,9 +3503,7 @@ describe("NewChatLandingScreen", () => {
       renderLanding();
       const worktree = screen.getByTestId("new-chat-landing-branch-chip");
       await waitFor(() =>
-        expect(worktree).toHaveTextContent(
-          autoSeeded ? /^worktree-[0-9a-f]{8}$/ : /^New worktree$/,
-        ),
+        expect(worktree).toHaveTextContent(autoSeeded ? /^worktree-[0-9a-f]{8}$/ : /^New$/),
       );
       fireEvent.click(worktree);
       if (!autoSeeded) {

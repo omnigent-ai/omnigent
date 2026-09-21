@@ -677,7 +677,7 @@ export function composerWorktreeHeaderState({
       : `main repository${selectedWorktree.branch ? ` branch: ${selectedWorktree.branch}` : ""}`;
     return {
       repositoryLabel,
-      branchLabel: "New worktree",
+      branchLabel: "New",
       branchDescription: `Create or select a worktree from ${mainState}`,
     };
   }
@@ -6009,15 +6009,8 @@ export function NewChatLandingScreen() {
                           htmlFor="landing-branch-name"
                           className="px-2 text-xs leading-5 text-muted-foreground"
                         >
-                          New worktree
+                          New
                         </label>
-                        {/* Help text sits above the field. The warning for a picked
-                      existing worktree stays below the input (contextual to the
-                      selection). */}
-                        <p className="text-sm text-muted-foreground">
-                          New branch name, or pick an existing worktree. Leave blank to start
-                          directly in the working directory.
-                        </p>
                         <div className="relative flex flex-col">
                           <input
                             id="landing-branch-name"
