@@ -20,7 +20,7 @@ from playwright.sync_api import Page, expect
 
 from omnigent.entities import ErrorData, MessageData, NewConversationItem
 from tests.e2e_ui.chat.test_failure_error_card import _publish_native_status
-from tests.e2e_ui.conftest import seed_committed_items
+from tests.e2e_ui.conftest import _FILES_PROBE_NO_ENV_AGENT_NAME, seed_committed_items
 
 
 @contextmanager
@@ -105,6 +105,24 @@ def test_native_failure_names_the_fetched_agent_live_and_after_reload(
         snapshot.raise_for_status()
         assert snapshot.json()["agent_name"] == agent_name
         assert snapshot.json()["last_task_error"]["code"] == "native_turn_error"
+        assert snapshot.json()["last_task_error"]["agent_name"] == agent_name
+        page.reload()
+        _expect_named_error(page, display_name, message)
+
+        agents = httpx.get(f"{live_server}/v1/agents?limit=100", timeout=10.0)
+        agents.raise_for_status()
+        target = next(
+            agent
+            for agent in agents.json()["data"]
+            if agent["name"] == _FILES_PROBE_NO_ENV_AGENT_NAME
+        )
+        switched = httpx.post(
+            f"{live_server}/v1/sessions/{session_id}/switch-agent",
+            json={"agent_id": target["id"]},
+            timeout=30.0,
+        )
+        switched.raise_for_status()
+        assert switched.json()["agent_name"] == target["name"]
         page.reload()
         _expect_named_error(page, display_name, message)
 

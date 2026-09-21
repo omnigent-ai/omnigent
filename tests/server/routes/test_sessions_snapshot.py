@@ -2775,12 +2775,13 @@ async def test_persist_and_project_structured_error_round_trip() -> None:
         remediation="Run the host as a non-root user (uid != 0).",
     )
     await _persist_session_status_error_labels(
-        "aa11bb22cc33dd44ee55ff6677889900", error, _MockStore()
+        "aa11bb22cc33dd44ee55ff6677889900", error, _MockStore(), agent_name="claude-native-ui"
     )  # type: ignore[arg-type]
 
     labels = captured["aa11bb22cc33dd44ee55ff6677889900"]
     projected = _last_task_error_from_labels(labels)
     assert projected == {
+        "agent_name": "claude-native-ui",
         "code": "required_terminal_exited",
         "message": "Claude Code can't run as root\n\n...diagnostics...",
         "title": "Claude Code can't run as root",
@@ -2816,6 +2817,7 @@ async def test_persist_error_labels_clears_stale_structured_fields() -> None:
     assert labels["omnigent.last_task_error_title"] == ""
     assert labels["omnigent.last_task_error_cause"] == ""
     assert labels["omnigent.last_task_error_remediation"] == ""
+    assert labels["omnigent.last_task_error_agent_name"] == ""
     assert _last_task_error_from_labels(labels) == {
         "code": "runner_error",
         "message": "turn setup failed",

@@ -290,6 +290,9 @@ _LAST_TASK_ERROR_CODE_LABEL_KEY: str = "omnigent.last_task_error_code"
 _LAST_TASK_ERROR_MESSAGE_LABEL_KEY: str = "omnigent.last_task_error_message"
 
 
+_LAST_TASK_ERROR_AGENT_NAME_LABEL_KEY: str = "omnigent.last_task_error_agent_name"
+
+
 # Optional structured failure fields (present when the runner classified the
 # failure — see ``omnigent.runner.launch_failure``), persisted so a reload
 # renders the same clear failure card instead of only the raw code + message.

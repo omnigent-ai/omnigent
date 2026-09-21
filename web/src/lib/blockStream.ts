@@ -861,7 +861,7 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
       if (event.type === "response_failed" && event.response.error) {
         const agentName =
           event.response.model.trim() ||
-          (event.response.id === state.responseId ? state.agent : null);
+          (!event.response.id || event.response.id === state.responseId ? state.agent : null);
         const code = event.response.error.code ?? "response_failed";
         yield {
           type: "error",

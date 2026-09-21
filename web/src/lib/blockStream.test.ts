@@ -20,6 +20,7 @@ import type {
 } from "./blocks";
 import { BlockStream } from "./blockStream";
 import type { StreamEvent } from "./events";
+import { parseEvent } from "./sse";
 import type { Response } from "./types";
 
 function makeResponse(opts?: {
@@ -1416,6 +1417,26 @@ describe("BlockStream — terminal lifecycles", () => {
       });
     },
   );
+
+  it("names a runner failure without id or model using the active turn", () => {
+    const failure = parseEvent("response.failed", {
+      source: "harness",
+      response: {
+        status: "failed",
+        error: { code: "RuntimeError", message: "Harness stopped." },
+      },
+    });
+    expect(failure).not.toBeNull();
+    const blocks = reduce([
+      { type: "response_in_progress", response: makeResponse({ model: "release-reviewer" }) },
+      failure!,
+    ]);
+    expect(blocks.find((block) => block.type === "error")).toMatchObject({
+      title: "Release-reviewer ran into an error during this turn.",
+      message: "Harness stopped.",
+      ctx: { responseId: "resp_1" },
+    });
+  });
 
   it("failure without error does not emit ErrorBlock", () => {
     const blocks = reduce([

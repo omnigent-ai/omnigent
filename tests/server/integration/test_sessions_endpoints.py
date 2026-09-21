@@ -5275,7 +5275,7 @@ async def test_native_rate_limit_failure_is_classified_live_and_after_reload(
 
     snapshot_resp = await client.get(f"/v1/sessions/{session_id}")
     assert snapshot_resp.status_code == 200, snapshot_resp.text
-    assert snapshot_resp.json()["last_task_error"] == expected
+    assert snapshot_resp.json()["last_task_error"] == {**expected, "agent_name": agent["name"]}
 
 
 async def test_post_external_session_status_propagates_runner_delivery_failure(

@@ -660,6 +660,47 @@ class _RecordingLabelStore:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("new_turn_without_identity", [False, True])
+async def test_relay_captures_failure_agent_without_reusing_prior_turn_identity(
+    new_turn_without_identity: bool,
+) -> None:
+    """A status-only failure retains its own turn's name, never a prior turn's."""
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes import sessions as sessions_module
+
+    session_id = "c08158bd064c4f32b4e435414a936711"
+    events: list[dict[str, Any]] = [
+        {"type": "session.status", "status": "running"},
+        {"type": "response.in_progress", "response": {"id": "resp_one", "model": "nessie"}},
+    ]
+    if new_turn_without_identity:
+        events.append({"type": "session.status", "status": "running"})
+    events.append(
+        {
+            "type": "session.status",
+            "status": "failed",
+            "error": {"code": "executor_error", "message": "Harness stopped."},
+        }
+    )
+    gate = asyncio.Event()
+    gate.set()
+    store = _RecordingLabelStore()
+    try:
+        await sessions_module._relay_runner_stream(
+            session_id,
+            _ScriptedRunnerClient(gate, events),  # type: ignore[arg-type]
+            store,  # type: ignore[arg-type]
+        )
+        error = sessions_module._last_task_error_from_labels(store.labels[session_id])
+        assert error is not None
+        assert error.get("agent_name") == (None if new_turn_without_identity else "nessie")
+        assert error["message"] == "Harness stopped."
+    finally:
+        sessions_module._session_status_cache.pop(session_id, None)
+        session_stream.close(session_id)
+
+
+@pytest.mark.asyncio
 async def test_relay_persists_disconnect_error_labels_on_tunnel_close(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

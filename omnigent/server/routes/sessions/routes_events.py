@@ -1482,8 +1482,16 @@ def register_events_routes(
                     message=output.strip(),
                 )
             if status_error is not None:
+                failed_agent = (
+                    await asyncio.to_thread(agent_store.get, conv.agent_id)
+                    if conv.agent_id
+                    else None
+                )
                 await _persist_session_status_error_labels(
-                    session_id, status_error, conversation_store
+                    session_id,
+                    status_error,
+                    conversation_store,
+                    agent_name=failed_agent.name if failed_agent else None,
                 )
             elif status == "running":
                 await _persist_session_status_error_labels(session_id, None, conversation_store)
