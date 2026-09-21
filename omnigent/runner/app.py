@@ -46,7 +46,12 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from omnigent._platform import normalize_interactive_shells
 from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
-from omnigent.debug_logging import debug_event, phase_scope, runner_primary_session_id
+from omnigent.debug_logging import (
+    current_session_id_scope,
+    debug_event,
+    phase_scope,
+    runner_primary_session_id,
+)
 from omnigent.entities.session_resources import (
     DEFAULT_ENVIRONMENT_ID,
     SessionResourceView,
@@ -2872,6 +2877,10 @@ def create_runner_app(
     import hmac
 
     app = FastAPI(title="omnigent-runner")
+
+    from omnigent.runner.logging_context import RunnerLogContextMiddleware
+
+    app.add_middleware(RunnerLogContextMiddleware)
     mcp_execution_registry = McpExecutionRegistry()
     app.state.mcp_execution_registry = mcp_execution_registry
 
@@ -3907,6 +3916,36 @@ def create_runner_app(
         )
 
     async def _initialize_session(body: _JsonObject) -> JSONResponse:
+        raw_id = body.get("session_id")
+        session_id = raw_id if isinstance(raw_id, str) else None
+        with current_session_id_scope(session_id):
+            _logger.info(
+                "Runner session initialization started",
+                extra=debug_event("runner_session_init_started", stage="session_init"),
+            )
+            try:
+                response = await _initialize_session_impl(body)
+            except Exception:
+                _logger.exception(
+                    "Runner session initialization failed",
+                    extra=debug_event("runner_session_init_failed", stage="session_init"),
+                )
+                raise
+            payload = json.loads(bytes(response.body))
+            failed = response.status_code >= 400
+            log = _logger.error if failed else _logger.info
+            log(
+                "Runner session initialization finished",
+                extra=debug_event(
+                    "runner_session_init_failed" if failed else "runner_session_initialized",
+                    stage="session_init",
+                    status_code=response.status_code,
+                    error_code=payload.get("error") if failed else None,
+                ),
+            )
+            return response
+
+    async def _initialize_session_impl(body: _JsonObject) -> JSONResponse:
         from omnigent.runner.session_init_protocol import RunnerInferenceConfigMismatch
 
         if process_manager is None:

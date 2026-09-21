@@ -14,6 +14,7 @@ import pytest
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
+from tests.debug_log_helpers import capture_debug_rows
 from tests.server.helpers import start_session_stream_collector
 
 # Wall-clock ceiling for awaiting relay tasks / stream events. Generous on
@@ -133,15 +134,19 @@ async def test_runner_relay_ready_waits_for_runner_heartbeat() -> None:
     fake_runner = _HeartbeatRunnerClient(release)
 
     try:
-        handle = await sessions_module._ensure_runner_relay_ready(
-            "a7f039e9f1311474878eb7d4699c1013",
-            "runner_ready",
-            fake_runner,  # type: ignore[arg-type]
-            conversation_store=None,
-        )
+        with capture_debug_rows("server") as rows:
+            handle = await sessions_module._ensure_runner_relay_ready(
+                "a7f039e9f1311474878eb7d4699c1013",
+                "runner_ready",
+                fake_runner,  # type: ignore[arg-type]
+                conversation_store=None,
+            )
 
         assert handle is not None
         assert handle.ready.is_set()
+        ready_row = next(row for row in rows if row["event_name"] == "runner_stream_ready")
+        assert ready_row["session_id"] == "a7f039e9f1311474878eb7d4699c1013"
+        assert ready_row["attributes"]["runner_id"] == "runner_ready"
         assert fake_runner.stream_calls[0][0] == "GET"
         assert (
             fake_runner.stream_calls[0][1]

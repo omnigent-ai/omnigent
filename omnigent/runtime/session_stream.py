@@ -130,6 +130,7 @@ _SSE_SAFE_KEYS = (
     "call_id",
     "message_id",
     "phase",
+    "stage",
     "attempt",
     "max_attempts",
     "sequence_number",

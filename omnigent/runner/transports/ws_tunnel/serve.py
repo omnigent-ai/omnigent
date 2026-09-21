@@ -27,7 +27,7 @@ from starlette.types import ASGIApp, Message, Scope
 from websockets.exceptions import ConnectionClosedOK, InvalidURI, WebSocketException
 
 from omnigent.cli_invocation import cli_invocation
-from omnigent.debug_logging import runner_primary_session_id
+from omnigent.debug_logging import debug_event, runner_primary_session_id
 from omnigent.runner.identity import (
     OMNIGENT_INTERNAL_WS_ORIGIN,
     RUNNER_SLICE_KEY_ENV_VAR,
@@ -394,7 +394,12 @@ async def serve_tunnel(
         except Exception:
             _logger.exception(
                 "on_reconnect callback failed",
-                extra={"session_id": runner_primary_session_id()},
+                extra=debug_event(
+                    "runner_connected",
+                    session_id=runner_primary_session_id(),
+                    runner_id=runner_id,
+                    stage="runner_connect",
+                ),
             )
 
     while True:

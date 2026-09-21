@@ -237,3 +237,30 @@ async def test_recovery_has_own_readiness_and_stable_identity_across_failed_post
     initializer.invalidate_session(conv.id)
     await initializer.initialize(conv, client, timeout=10, resume_interrupted_turn=True)  # type: ignore[arg-type]
     assert client.calls[-1]["session_init"]["recovery_id"] != first_id
+
+
+@pytest.mark.asyncio
+async def test_init_logs_rejection_retry_and_cached_success_once() -> None:
+    from tests.debug_log_helpers import capture_debug_rows
+
+    registry = _Registry()
+    client = _Client()
+    client.release.set()
+    initializer = RunnerSessionInitializer(registry, server_version="test")  # type: ignore[arg-type]
+    conversation = _conversation()
+    with capture_debug_rows("server") as rows:
+        client.status_code = 503
+        await initializer.initialize(conversation, client, timeout=1)  # type: ignore[arg-type]
+        client.status_code = 201
+        await initializer.initialize(conversation, client, timeout=1)  # type: ignore[arg-type]
+        await initializer.initialize(conversation, client, timeout=1)  # type: ignore[arg-type]
+    events = [row for row in rows if row["event_name"]]
+    assert [row["event_name"] for row in events] == [
+        "runner_session_init_started",
+        "runner_session_init_failed",
+        "runner_session_init_started",
+        "runner_session_initialized",
+    ]
+    assert all(row["session_id"] == conversation.id for row in events)
+    assert all(row["attributes"]["runner_id"] == conversation.runner_id for row in events)
+    assert events[1]["attributes"]["status_code"] == "503"

@@ -31,7 +31,7 @@ from omnigent.codex_approval_modes import (
     CODEX_NATIVE_PERMISSION_VALUES,
 )
 from omnigent.db.utils import generate_agent_id, generate_file_id
-from omnigent.debug_logging import add_audit_attrs, debug_event
+from omnigent.debug_logging import add_audit_attrs, debug_event, set_current_runner_id
 from omnigent.entities import (
     CommentsFingerprint,
     Conversation,
@@ -73,6 +73,7 @@ from omnigent.server.background_session_titles import (
     BackgroundTitleRequest,
 )
 from omnigent.server.bundles import validate_agent_bundle
+from omnigent.server.creation_logging import creation_metadata, session_created
 from omnigent.server.host_registry import HostRegistry, RunnerExitReports
 from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import (
@@ -472,6 +473,18 @@ def register_core_routes(
                 f"Session {session_id!r} already has a runner bound",
                 code=ErrorCode.CONFLICT,
             )
+        set_current_runner_id(runner_id)
+        add_audit_attrs(runner_id=runner_id)
+        _logger.info(
+            "Session bound to runner",
+            extra=debug_event(
+                "session_runner_bound",
+                session_id=session_id,
+                runner_id=runner_id,
+                operation="create",
+                stage="runner_launch",
+            ),
+        )
         request_id = secrets.token_hex(8)
         future: asyncio.Future[dict[str, str | None]] = asyncio.get_running_loop().create_future()
         conn.pending_launches[request_id] = future
@@ -523,6 +536,9 @@ def register_core_routes(
                 extra=debug_event(
                     "runner_launch_failed",
                     session_id=session_id,
+                    runner_id=runner_id,
+                    stage="runner_launch",
+                    error_code=launch_result.get("error_code") or "host_launch_failed",
                     error_category=ErrorCategory.RUNNER.value,
                     error_impact=ErrorImpact.BLOCKING.value,
                     error_phase=ErrorPhase.RUNNER_LAUNCH.value,
@@ -609,6 +625,7 @@ def register_core_routes(
             # message survives in each entry's `msg`.
             raise HTTPException(status_code=422, detail=exc.errors(include_context=False)) from exc
 
+        creation_metadata(parent_session_id=body.parent_session_id, host_type=body.host_type)
         resp = await _create_session_from_existing_agent(
             conversation_store,
             agent_store,
@@ -795,6 +812,10 @@ def register_core_routes(
         if not isinstance(bundle, StarletteUploadFile):
             raise HTTPException(status_code=422, detail=[_multipart_missing_detail("bundle")])
         parsed_metadata = _parse_session_create_metadata(metadata)
+        creation_metadata(
+            parent_session_id=parsed_metadata.parent_session_id,
+            host_type=parsed_metadata.host_type,
+        )
         from omnigent.server.routes._session_create_validation import (
             resolve_project_session_create,
         )
@@ -805,6 +826,10 @@ def register_core_routes(
             project_store=project_store,
         )
         parsed_metadata = project_resolution.body
+        creation_metadata(
+            parent_session_id=parsed_metadata.parent_session_id,
+            host_type=parsed_metadata.host_type,
+        )
         _reject_reserved_cost_control_label_seed(parsed_metadata.labels)
         _reject_server_reserved_label_seed(parsed_metadata.labels)
 
@@ -870,6 +895,7 @@ def register_core_routes(
             inference_model,
             created_by=user_id,
         )
+        session_created(result.session_id, inherited_runner_id)
         # Top-level creates (no inherited runner) skip the notify —
         # their runner registers itself later.
         if inherited_runner_id is not None:
@@ -2361,6 +2387,17 @@ def register_core_routes(
                     )
                 except ConversationNotFoundError as exc:
                     raise _session_not_found() from exc
+                set_current_runner_id(runner_id)
+                _logger.info(
+                    "Session bound to runner",
+                    extra=debug_event(
+                        "session_runner_bound",
+                        session_id=session_id,
+                        runner_id=runner_id,
+                        operation="bind",
+                        stage="runner_launch",
+                    ),
+                )
                 _runner_client = await _get_runner_client(
                     session_id,
                     runner_router,
