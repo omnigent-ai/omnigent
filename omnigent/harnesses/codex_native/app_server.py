@@ -2252,18 +2252,37 @@ class CodexNativeAppServer:
         :returns: None.
         """
         assert self.proc is not None and self.proc.stderr is not None
-        while True:
-            line = await self.proc.stderr.readline()
-            if not line:
-                return
-            text = line.decode("utf-8", errors="replace").rstrip()
-            if len(text) >= _STDERR_CHUNK_LIMIT:
-                text = f"{text[:_STDERR_CHUNK_LIMIT]}...[truncated]"
+        pending = bytearray()
+        truncated = False
+
+        def record_line() -> None:
+            text = pending.decode("utf-8", errors="replace").rstrip()
+            if truncated:
+                text = f"{text}...[truncated]"
             if self.recent_stderr is not None:
                 self.recent_stderr.append(text)
                 if len(self.recent_stderr) > 20:
                     self.recent_stderr.pop(0)
             _logger.debug("codex-native app-server stderr: %s", text)
+
+        try:
+            # readline() raises on long diagnostics. Keep draining the pipe even
+            # after truncating a line, or stderr backpressure can stall Codex.
+            while chunk := await self.proc.stderr.read(8 * 1024):
+                parts = chunk.split(b"\n")
+                for index, part in enumerate(parts):
+                    remaining = _STDERR_CHUNK_LIMIT - len(pending)
+                    pending.extend(part[:remaining])
+                    truncated |= len(part) > remaining
+                    if index < len(parts) - 1:
+                        record_line()
+                        pending.clear()
+                        truncated = False
+            if pending or truncated:
+                record_line()
+        except Exception:
+            _logger.exception("Codex app-server stderr drain failed")
+            raise
 
 
 def _codex_policy_hook_command(bridge_dir: Path, python_executable: str | None) -> str:
