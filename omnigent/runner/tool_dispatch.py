@@ -3423,9 +3423,7 @@ async def _execute_peer_message_tool(
             }
         )
 
-    actor = await _session_turn_actor(
-        server_client=server_client, conversation_id=conversation_id
-    )
+    actor = await _session_turn_actor(server_client=server_client, conversation_id=conversation_id)
     payload: _JsonObject = {
         "type": "message",
         "data": {

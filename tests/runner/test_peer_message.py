@@ -169,9 +169,7 @@ async def test_rejects_bad_args(args: dict[str, object]) -> None:
     """Malformed arguments return an Error string, not a delivery."""
     handler = _make_handler(items=[], post_response=httpx.Response(202))
     async with _client(handler) as client:
-        out = await _execute_peer_message_tool(
-            args, server_client=client, conversation_id=_SELF
-        )
+        out = await _execute_peer_message_tool(args, server_client=client, conversation_id=_SELF)
     assert out.startswith("Error: sys_session_message")
 
 
