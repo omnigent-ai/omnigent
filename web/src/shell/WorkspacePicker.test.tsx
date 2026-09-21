@@ -753,7 +753,7 @@ describe("WorkspacePicker modal actions", () => {
 
       expect(screen.getByTestId("workspace-picker-breadcrumbs").textContent).toContain("repo");
       expect(screen.getByRole("complementary", { name: "Worktrees" })).toBeInTheDocument();
-      expect(screen.getByText("Don't use a linked worktree")).toBeInTheDocument();
+      expect(screen.getByText("Don't use")).toBeInTheDocument();
       expect(screen.getByText("feature-layout")).toBeInTheDocument();
       expect(screen.queryByText("main")).toBeNull();
 

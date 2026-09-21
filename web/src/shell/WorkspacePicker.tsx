@@ -1091,7 +1091,7 @@ export function WorkspacePicker({
                     )}
                   />
                   <span className="font-medium text-foreground">
-                    {showGitDialog ? "Don't use a linked worktree" : "Current folder"}
+                    {showGitDialog ? "Don't use" : "Current folder"}
                   </span>
                 </label>
                 {worktreesPending && linkedWorktrees.length === 0 && (
