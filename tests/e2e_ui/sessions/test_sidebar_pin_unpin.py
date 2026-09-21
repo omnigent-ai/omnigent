@@ -177,7 +177,7 @@ def _pinned_session_order(page: Page) -> list[str]:
 
 def _updated_at(base_url: str, session_id: str) -> int:
     """Read a session's server-side ``updated_at`` from ``GET /v1/sessions``."""
-    resp = httpx.get(f"{base_url}/v1/sessions", timeout=10.0)
+    resp = httpx.get(f"{base_url}/v1/sessions", params={"visibility": "all"}, timeout=10.0)
     resp.raise_for_status()
     for item in resp.json()["data"]:
         if item["id"] == session_id:

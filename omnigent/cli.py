@@ -9310,6 +9310,7 @@ def _daemon_session_request_params(
     params: dict[str, str | int] = {
         "limit": 1000,
         "include_archived": "true",
+        "visibility": "all",
     }
     if connected_only:
         params["connected"] = "true"

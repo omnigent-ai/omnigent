@@ -95,6 +95,7 @@ export function sessionListQuery(request: SessionPageRequest): string {
   query.set("sort_by", "updated_at");
   query.set("order", "desc");
   query.set("kind", "default");
+  query.set("visibility", "all");
   query.set("include_archived", "false");
   if (request.after) query.set("after", request.after);
   return query.toString();

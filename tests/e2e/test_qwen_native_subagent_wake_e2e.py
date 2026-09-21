@@ -316,7 +316,8 @@ def _register_parent(base_url: str, mock_llm_server_url: str) -> str:
     if resp.status_code not in (200, 201, 409):
         raise RuntimeError(f"agent register failed: {resp.status_code} {resp.text[:500]}")
     listing = _client.get(
-        f"{base_url}/v1/sessions", params={"agent_name": "qwen-wake-parent", "limit": 1}
+        f"{base_url}/v1/sessions",
+        params={"visibility": "all", "agent_name": "qwen-wake-parent", "limit": 1},
     )
     listing.raise_for_status()
     return str(listing.json()["data"][0]["agent_id"])
