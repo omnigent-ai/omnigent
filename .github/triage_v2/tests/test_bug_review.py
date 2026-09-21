@@ -7,6 +7,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from issue_prioritization import event
 from issue_prioritization.areas import AreaCatalog
 from issue_prioritization.bronze import BronzeIssue
 from issue_prioritization.classification import (
@@ -14,7 +15,11 @@ from issue_prioritization.classification import (
     PromptClassifier,
     _parse_json_object,
 )
-from issue_prioritization.comments import build_triage_comment, preserve_needs_info_deadline
+from issue_prioritization.comments import (
+    COMMENT_MARKER,
+    build_triage_comment,
+    preserve_needs_info_deadline,
+)
 from issue_prioritization.config import ScoringConfig
 from issue_prioritization.event import prioritize_issue, write_event_artifacts
 from issue_prioritization.github import GitHubClient, GitHubMutationSink
@@ -172,6 +177,9 @@ def test_trailing_commas_preserve_the_complete_response_and_quoted_text(wrapper)
         '[{"type":"Bug"}]',
         '{"type":"Bug"} {"type":"Feature"}',
         '```json\n{"type":"Bug"}',
+        '```json\n{"type":"Bug"}\n```\nAdditional explanation.',
+        '{"type":"Bug"}\nAdditional explanation.',
+        '```json\n{"type":"Bug"}\n```\n```json\n{"type":"Feature"}\n```',
     ],
 )
 def test_malformed_response_never_falls_back_to_a_nested_object(raw):
@@ -291,6 +299,15 @@ def test_old_and_long_author_comments_are_preserved():
     assert all(comment["body"] in report.body for comment in comments)
 
 
+def test_marker_reference_in_author_reply_is_not_updated_as_the_triage_comment():
+    reply = f"The comment containing `{COMMENT_MARKER}` missed my reproduction steps."
+    transport = Mock(side_effect=[[{"id": 1, "body": reply}], {"id": 2}])
+    body = f"<!-- {COMMENT_MARKER} {{}} -->\nAssessment."
+    client = GitHubClient("fake", "org/repo", transport)
+    assert client.upsert_issue_comment(7, body) == 2
+    assert transport.call_args.args == ("POST", "/issues/7/comments", {"body": body})
+
+
 class Client:
     def __init__(self, *, stale=False, fail=None, labels=("Bug", "needs-info")):
         self.report = issue(labels=labels)
@@ -341,6 +358,51 @@ def test_apply_explains_before_closing_and_removes_reopen_label():
     assert "needs-info" not in client.report.labels
 
 
+@pytest.mark.parametrize(
+    "user", [{"login": "github-actions[bot]", "type": "Bot"}, {"login": "author", "type": "User"}]
+)
+@pytest.mark.parametrize("author_reply", [False, True])
+def test_triage_as_issue_author_preserves_only_genuine_followups(user, author_reply):
+    client = Client()
+    followup = f"More source analysis; the earlier `{COMMENT_MARKER}` comment missed this."
+    old_comment = f"<!-- {COMMENT_MARKER} {{}} -->\nOld triage assessment."
+
+    def transport(method, path, payload):
+        assert method == "GET"
+        if "/comments" in path:
+            comments = [followup, client.comments[-1] if client.comments else old_comment]
+            if client.comments and author_reply:
+                comments.append(BODY)
+            return [{"user": user, "body": body} for body in comments]
+        return {
+            "number": 7,
+            "title": client.report.title,
+            "body": client.report.body,
+            "user": user,
+            "labels": list(client.report.labels),
+            "state": "open",
+            "created_at": NOW.isoformat(),
+        }
+
+    client.open_issue = GitHubClient("fake", "org/repo", transport).open_issue
+    report = client.open_issue(7)
+    assert followup in report.body and old_comment not in report.body
+    run, _, planner, states = preview(report=report)
+    plan = GitHubMutationSink(client, LabelManifest(()), planner, states).apply_with_plans(
+        replace(run, mode=PipelineMode.APPLY)
+    )[0]
+    assert plan.close_as_non_actionable == (not author_reply)
+    assert ("close" in client.events) == (not author_reply)
+    assert (client.open_issue(7).content().content_hash == report.content().content_hash) == (
+        not author_reply
+    )
+    if author_reply:
+        assert "Automatic closure skipped" in client.comments[-1]
+        assert "recommend closing" not in client.comments[-1]
+    else:
+        assert client.events == ["labels", "comment", "close"]
+
+
 @pytest.mark.parametrize("label", ["security", "duplicate", "Pinned"])
 def test_live_exemptions_block_closure_without_requesting_evidence(label):
     client = Client(labels=("Bug", label))
@@ -370,8 +432,67 @@ def test_edit_before_closure_skips_the_stale_assessment(when):
     assert not plan.close_as_non_actionable
     if when == "after":
         assert "recommend closing" in client.comments[0]
+        assert len(client.comments) == 2
+        assert "Automatic closure skipped" in client.comments[-1]
+        assert "recommend closing" not in client.comments[-1]
+        assert '"close_reason":null' in client.comments[-1]
     else:
         assert not client.events
+
+
+@pytest.mark.parametrize("when", ["before", "after"])
+def test_event_defers_intake_when_closure_assessment_is_stale(monkeypatch, tmp_path, when):
+    class EventClient(Client):
+        def __init__(self):
+            super().__init__(labels=("Bug", "needs-triage"))
+            self.reads = 0
+
+        def open_issue(self, number):
+            self.reads += 1
+            changed = self.reads > 1 and (when == "before" or self.comments)
+            return replace(self.report, body=BODY) if changed else self.report
+
+        def issue_corpus(self):
+            return ()
+
+    client = EventClient()
+    query = Mock(return_value=json.dumps(response("non_actionable")))
+    classifier = PromptClassifier(query, AreaCatalog({}, {}), review_bugs=True)
+    intake = Mock()
+    monkeypatch.setenv("GITHUB_TOKEN", "fake")
+    monkeypatch.setattr(event, "GitHubClient", lambda *args: client)
+    monkeypatch.setattr(event, "serving_endpoint_classifier", lambda *args, **kwargs: classifier)
+    monkeypatch.setattr(event.AreaCatalog, "from_json", lambda _: AreaCatalog({}, {}))
+    monkeypatch.setattr(event.LabelManifest, "from_json", lambda _: LabelManifest(()))
+    monkeypatch.setattr(event, "plan_intake", intake)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "issue-priority-event",
+            "--issue-number=7",
+            "--github-repo=org/repo",
+            "--model-endpoint=test",
+            "--areas=unused",
+            "--label-manifest=unused",
+            "--maintainers=unused",
+            f"--output-dir={tmp_path}",
+            "--run-id=test",
+            "--review-bugs",
+            "--intake",
+            "--mode=apply",
+        ],
+    )
+
+    event.main()
+
+    query.assert_called_once()
+    intake.assert_not_called()
+    assert "close" not in client.events
+    assert "needs-triage" in client.report.labels
+    artifact = json.loads((tmp_path / "event.json").read_text())
+    assert artifact["status"] == "skipped_stale"
+    assert not artifact["mutation"]["close_as_non_actionable"]
+    assert artifact["intake"] is None
 
 
 def test_stale_issue_does_not_stop_later_issues():

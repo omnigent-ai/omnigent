@@ -156,6 +156,10 @@ def _plain_text(value: str) -> str:
     return re.sub(r"([\\`*_{}\[\]()#!|])", r"\\\1", text)
 
 
+def is_triage_comment(body: str) -> bool:
+    return _comment_metadata(body.strip()) is not None
+
+
 def preserve_needs_info_deadline(body: str, existing_body: str) -> str:
     metadata = _comment_metadata(body)
     existing_metadata = _comment_metadata(existing_body)

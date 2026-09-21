@@ -226,6 +226,7 @@ def build_prompt(
 
 
 def _parse_json_object(value: str) -> Mapping[str, object]:
+    # Require the complete response, optionally fenced; prose or extra objects are ambiguous.
     cleaned = value.strip()
     if cleaned.startswith("```"):
         lines = cleaned.splitlines()

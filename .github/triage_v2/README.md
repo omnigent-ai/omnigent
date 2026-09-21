@@ -133,11 +133,20 @@ job keep their existing assessment.
 
 One model call assesses the full report and author follow-ups. Closure requires
 an exact supporting quote, `has_user_facing_repro=false`, and live content checks.
+The managed triage comment is excluded from author evidence, including when the
+triage account is the author; genuine follow-ups still invalidate stale decisions.
 A true, unclear, or missing reproduction assessment prevents immediate closure.
 Security/duplicate/pinned issues remain exempt. Reports over 100,000 characters
 are skipped for manual review.
 If a reproduction quote cannot be verified, omit the rewritten steps and keep
 the valid assessment and summary; closure quotes still require an exact match.
+Responses must contain one complete JSON object, optionally fenced; trailing
+commas are repaired, but surrounding prose or additional objects are rejected.
+If an edit or author reply aborts closure after its comment is posted, the comment
+is replaced with a skipped-closure notice. The event records `skipped_stale` and
+defers intake because assignment and duplicate decisions also need fresh evidence.
+Existing `needs-triage` labels remain; include `--intake --maintainers .github/MAINTAINER`
+on a fresh apply run to complete new-issue intake.
 Immediate closures remove `needs-info` and ask reporters to open a new issue if
 they observe the failure. Model assessment does not reproduce or verify the bug.
 

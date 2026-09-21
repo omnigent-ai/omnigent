@@ -339,6 +339,7 @@ def main() -> None:
         mode,
     )
     intake_plan = None
+    # A skipped stale closure needs fresh classification before assignment or duplicate intake.
     if args.intake and not run.mutations[0].close_as_non_actionable:
         live_issue = client.issue_data(issue.number)
         intake_plan = plan_intake(

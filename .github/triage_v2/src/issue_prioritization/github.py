@@ -11,8 +11,8 @@ from urllib.request import Request, urlopen
 from issue_prioritization.artifacts import RankedIssue
 from issue_prioritization.bronze import BronzeIssue
 from issue_prioritization.comments import (
-    COMMENT_MARKER,
     build_triage_comment,
+    is_triage_comment,
     preserve_needs_info_deadline,
 )
 from issue_prioritization.labels import LabelManifest
@@ -265,7 +265,12 @@ class GitHubClient:
                 user = comment.get("user")
                 login = str(user.get("login", "")) if isinstance(user, dict) else ""
                 body = str(comment.get("body") or "").strip()
-                if login.casefold() == author_login.casefold() and body:
+                # The managed comment is not evidence, even when triage runs as the author.
+                if (
+                    login.casefold() == author_login.casefold()
+                    and body
+                    and not is_triage_comment(body)
+                ):
                     comments.append(body)
             if len(value) < 100:
                 return tuple(comments)
@@ -297,8 +302,8 @@ class GitHubClient:
             if not isinstance(value, list):
                 raise ValueError("GitHub issue comments response must be an array")
             for comment in value:
-                if not isinstance(comment, dict) or COMMENT_MARKER not in str(
-                    comment.get("body", "")
+                if not isinstance(comment, dict) or not is_triage_comment(
+                    str(comment.get("body", ""))
                 ):
                     continue
                 comment_id = int(comment["id"])
@@ -440,6 +445,7 @@ class GitHubMutationSink:
             for proposed in run.mutations:
                 issue_number = proposed.target.issue_number
                 labels_written = False
+                comment_written = False
                 try:
                     current_labels = self.client.issue_labels(issue_number)
                     state = self.planner.resolve_state(
@@ -469,6 +475,7 @@ class GitHubMutationSink:
                             issue_number,
                             build_triage_comment(item, plan, labels_after, run.scored_at),
                         )
+                        comment_written = True
                         if plan.close_as_non_actionable:
                             # Recheck edits and author replies after posting the explanation.
                             self._check_non_actionable_closure(item)
@@ -476,15 +483,22 @@ class GitHubMutationSink:
                     applied.append(plan)
                 except StaleBugAssessment:
                     stale.append(issue_number)
-                    applied.append(
-                        replace(
-                            plan,
-                            labels_add=plan.labels_add if labels_written else (),
-                            labels_remove=plan.labels_remove if labels_written else (),
-                            blocked=(*plan.blocked, "non_actionable_stale_assessment"),
-                            next_state=states.get(issue_number, BotState(issue_number, None, ())),
-                        )
+                    plan = replace(
+                        plan,
+                        labels_add=plan.labels_add if labels_written else (),
+                        labels_remove=plan.labels_remove if labels_written else (),
+                        blocked=(*plan.blocked, "non_actionable_stale_assessment"),
+                        next_state=states.get(issue_number, BotState(issue_number, None, ())),
                     )
+                    applied.append(plan)
+                    if comment_written and item is not None:
+                        try:
+                            self.client.upsert_issue_comment(
+                                issue_number,
+                                build_triage_comment(item, plan, labels_after, run.scored_at),
+                            )
+                        except GitHubNotFound:
+                            skipped.append(issue_number)
                 except GitHubNotFound:
                     # The bronze snapshot lags GitHub: an issue deleted or
                     # transferred since ingestion 404s on this live re-check.
