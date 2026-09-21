@@ -160,12 +160,17 @@ def test_pr_context_and_background_tasks_share_workspace_bar(
         applied_family = context.evaluate("el => getComputedStyle(el).fontFamily")
         assert applied_family.split(",")[0].strip("\"' ") == font_family
     expect(bar.get_by_test_id("background-task-pill")).to_have_text("1")
-    expect(bar.get_by_test_id("subagent-task-pill")).to_have_count(0)
+    expect(bar.get_by_test_id("subagent-task-pill")).to_have_text("1")
     expect(bar).to_contain_text("live-branch")
     expect(bar).not_to_contain_text("pr-head-not-checkout")
     bounds = bar.bounding_box()
     assert bounds is not None
-    status_ids = ("composer-pr-link", "composer-context-ring", "background-task-pill")
+    status_ids = (
+        "composer-pr-link",
+        "composer-context-ring",
+        "background-task-pill",
+        "subagent-task-pill",
+    )
     control_bounds = {}
     icon_bounds = {}
     for test_id in ("composer-workspace-dir", "composer-git-branch", *status_ids):
@@ -247,6 +252,7 @@ def test_pr_context_and_background_tasks_share_workspace_bar(
             "composer-git-branch",
             "composer-context-ring",
             "background-task-pill",
+            "subagent-task-pill",
         )
         for icon in icon_bounds[test_id]
     ]
