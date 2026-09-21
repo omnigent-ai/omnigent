@@ -17,6 +17,11 @@ export const WORKTREE_RADIO_SPACIOUS_ROW_CLASS =
 export const WORKTREE_RADIO_SPACIOUS_INPUT_CLASS =
   "appearance-none rounded-full border border-muted-foreground/60 bg-background checked:border-[5px] checked:border-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2";
 
+export const WORKTREE_RADIO_SELECTOR_ROW_CLASS =
+  "h-7 shrink-0 rounded-md px-2 py-0 text-base leading-5";
+
+export const WORKTREE_RADIO_SELECTOR_INPUT_CLASS = "sr-only";
+
 export function worktreeDisplayName(path: string): string {
   return path.split(/[\\/]/).filter(Boolean).at(-1) ?? path;
 }
@@ -33,7 +38,7 @@ export function WorktreeRadioRow({
   onSelect,
   testId,
   className,
-  spacious = false,
+  variant = "default",
   onOpen,
 }: {
   worktree: HostWorktree;
@@ -42,9 +47,11 @@ export function WorktreeRadioRow({
   onSelect: () => void;
   testId: string;
   className?: string;
-  spacious?: boolean;
+  variant?: "default" | "selector" | "spacious";
   onOpen?: () => void;
 }) {
+  const spacious = variant === "spacious";
+  const selector = variant === "selector";
   const displayName = worktreeDisplayName(worktree.path);
   const updatedLabel = worktreeUpdatedLabel(worktree.updated_at);
   const branchLabel = worktree.branch ?? "Detached HEAD";
@@ -56,6 +63,7 @@ export function WorktreeRadioRow({
         "flex min-w-0 items-center rounded-md text-sm transition-colors hover:bg-muted focus-within:bg-muted",
         checked && "bg-muted",
         spacious && WORKTREE_RADIO_SPACIOUS_ROW_CLASS,
+        selector && WORKTREE_RADIO_SELECTOR_ROW_CLASS,
         className,
       )}
       data-testid={testId}
@@ -71,6 +79,7 @@ export function WorktreeRadioRow({
               className={cn(
                 "size-4 shrink-0 accent-primary",
                 spacious && WORKTREE_RADIO_SPACIOUS_INPUT_CLASS,
+                selector && WORKTREE_RADIO_SELECTOR_INPUT_CLASS,
               )}
               aria-label={`Use worktree ${displayName}`}
             />
@@ -78,6 +87,7 @@ export function WorktreeRadioRow({
               className={cn(
                 "min-w-0 flex-1 truncate font-medium text-foreground",
                 spacious && "leading-4",
+                selector && "leading-5",
               )}
             >
               {displayName}
@@ -86,6 +96,7 @@ export function WorktreeRadioRow({
               className={cn(
                 "shrink-0 text-xs text-muted-foreground",
                 spacious && "text-base leading-[1.6]",
+                selector && "text-base leading-5",
               )}
             >
               {updatedLabel}

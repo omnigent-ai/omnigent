@@ -1142,7 +1142,7 @@ export function WorkspacePicker({
                     name="workspace-picker-worktree"
                     onSelect={() => setSelectedWorktreePath(worktree.path)}
                     testId={`workspace-picker-worktree-${worktree.path}`}
-                    spacious={showGitDialog}
+                    variant={showGitDialog ? "spacious" : "default"}
                     onOpen={() => navigateTo(worktree.path)}
                   />
                 ))}

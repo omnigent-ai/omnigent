@@ -6057,14 +6057,40 @@ describe("NewChatLandingScreen", () => {
       // existing-worktree dropdown, and select the one linked worktree.
       fireEvent.click(screen.getByTestId("new-chat-landing-branch-chip"));
       fireEvent.focus(screen.getByTestId("new-chat-landing-branch-input"));
+      const popover = screen
+        .getByTestId("new-chat-landing-worktree-dropdown")
+        .closest('[data-slot="popover-content"]');
+      expect(popover).toHaveClass("w-[min(20rem,calc(100vw-2rem))]", "overflow-hidden", "p-2");
+      expect(screen.getByTestId("new-chat-landing-no-worktree-option")).toHaveClass(
+        "h-7",
+        "shrink-0",
+        "px-2",
+        "py-0",
+        "text-base",
+        "leading-5",
+      );
+      expect(
+        within(screen.getByTestId("new-chat-landing-no-worktree-option")).getByRole("radio"),
+      ).toHaveClass("sr-only");
+      expect(screen.getByTestId("new-chat-landing-worktree-heading")).toHaveClass(
+        "px-2",
+        "py-1",
+        "text-sm",
+        "leading-5",
+      );
       const worktreeList = screen.getByTestId("new-chat-landing-worktree-dropdown");
       expect(worktreeList).not.toHaveClass("absolute", "top-full");
-      expect(worktreeList).toHaveClass("max-h-40", "overflow-y-auto");
-      expect(worktreeList.closest('[data-slot="popover-content"]')).toHaveClass("overflow-y-auto");
+      expect(worktreeList).toHaveClass(
+        "max-h-[min(320px,calc(var(--radix-popover-content-available-height)-160px))]",
+        "overflow-y-auto",
+        "[scrollbar-width:thin]",
+      );
       const options = screen.getAllByTestId("new-chat-landing-worktree-option");
       expect(options).toHaveLength(1); // main tree excluded
       expect(options[0].textContent).toContain("feature-x");
+      expect(options[0]).toHaveClass("h-7", "shrink-0", "px-2", "py-0", "text-base", "leading-5");
       const worktreeRadio = within(options[0]).getByRole("radio");
+      expect(worktreeRadio).toHaveClass("sr-only");
       fireEvent.click(worktreeRadio);
 
       // Selection stays in the worktree picker; it does not browse or close the

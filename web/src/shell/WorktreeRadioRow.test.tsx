@@ -51,7 +51,7 @@ describe("WorktreeRadioRow", () => {
           name="worktree"
           onSelect={vi.fn()}
           testId="worktree-row"
-          spacious
+          variant="spacious"
         />
       </TooltipProvider>,
     );
@@ -75,7 +75,7 @@ describe("WorktreeRadioRow", () => {
           name="worktree"
           onSelect={vi.fn()}
           testId="worktree-row"
-          spacious
+          variant="spacious"
           onOpen={onOpen}
         />
       </TooltipProvider>,
@@ -99,6 +99,41 @@ describe("WorktreeRadioRow", () => {
     );
     fireEvent.click(await screen.findByRole("menuitem", { name: "Copy path" }));
     expect(copyTextMock).toHaveBeenCalledWith("/Users/corey/repo-worktrees/auth-refresh");
+  });
+
+  it("uses the compact selector contract without a visible radio", () => {
+    render(
+      <TooltipProvider>
+        <WorktreeRadioRow
+          worktree={{
+            path: "/Users/corey/repo-worktrees/auth-refresh",
+            branch: "feature/auth-refresh",
+            is_main: false,
+            detached: false,
+            updated_at: null,
+          }}
+          checked
+          name="worktree"
+          onSelect={vi.fn()}
+          testId="worktree-row"
+          variant="selector"
+        />
+      </TooltipProvider>,
+    );
+
+    expect(screen.getByTestId("worktree-row")).toHaveClass(
+      "h-7",
+      "shrink-0",
+      "rounded-md",
+      "px-2",
+      "py-0",
+      "text-base",
+      "leading-5",
+      "bg-muted",
+    );
+    expect(screen.getByRole("radio")).toHaveClass("sr-only");
+    expect(screen.getByText("auth-refresh")).toHaveClass("font-medium", "leading-5");
+    expect(screen.getByText("Unknown")).toHaveClass("text-base", "leading-5");
   });
 
   it("shows a light tooltip with full path, branch, and status on focus", async () => {

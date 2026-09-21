@@ -138,7 +138,11 @@ import { useModelPickerHotkey } from "@/hooks/useModelPickerHotkey";
 import { CliCommandBlock, renderTextWithInlineCode } from "./CliCommandBlock";
 import { WorkspacePicker, isNavigablePath } from "./WorkspacePicker";
 import { RecentWorkspaceList } from "./RecentWorkspaceList";
-import { WorktreeRadioRow } from "./WorktreeRadioRow";
+import {
+  WORKTREE_RADIO_SELECTOR_INPUT_CLASS,
+  WORKTREE_RADIO_SELECTOR_ROW_CLASS,
+  WorktreeRadioRow,
+} from "./WorktreeRadioRow";
 import {
   initialPrefillState,
   prefillDone,
@@ -5947,18 +5951,20 @@ export function NewChatLandingScreen() {
                     <PopoverContent
                       align="start"
                       collisionPadding={16}
-                      className="max-h-[var(--radix-popover-content-available-height)] w-[min(20rem,calc(100vw-2rem))] overflow-y-auto p-3"
+                      className="max-h-[var(--radix-popover-content-available-height)] w-[min(20rem,calc(100vw-2rem))] gap-0 overflow-hidden rounded-xl p-2"
                     >
-                      <div className="flex flex-col gap-2">
+                      <div className="flex min-h-0 flex-col gap-0">
                         <div
-                          className="flex flex-col gap-0.5"
+                          className="flex shrink-0 flex-col"
                           role="radiogroup"
                           aria-label="Choose a worktree"
                         >
                           <label
-                            className={`flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-sm transition-colors hover:bg-muted focus-within:bg-muted ${
-                              branchName.trim() === "" && activeWorktree === null ? "bg-muted" : ""
-                            }`}
+                            className={cn(
+                              "flex cursor-pointer items-center gap-2 transition-colors hover:bg-muted focus-within:bg-muted",
+                              WORKTREE_RADIO_SELECTOR_ROW_CLASS,
+                              branchName.trim() === "" && activeWorktree === null && "bg-muted",
+                            )}
                             data-testid="new-chat-landing-no-worktree-option"
                           >
                             <input
@@ -5974,44 +5980,59 @@ export function NewChatLandingScreen() {
                                 setPrefilledBranch("");
                                 setAutoSeededBranch("");
                               }}
-                              className="size-4 shrink-0 accent-primary"
+                              className={cn(
+                                "size-4 shrink-0 accent-primary",
+                                WORKTREE_RADIO_SELECTOR_INPUT_CLASS,
+                              )}
                             />
                             <span className="font-medium text-foreground">No worktree</span>
                           </label>
-                          <TooltipProvider>
-                            {linkedWorktrees.length > 0 && (
+                          {linkedWorktrees.length > 0 && (
+                            <>
+                              <div className="my-1 h-px shrink-0 bg-border" />
                               <div
-                                className="mt-1 flex max-h-40 shrink-0 flex-col gap-0.5 overflow-y-auto border-t border-border pt-2"
-                                data-testid="new-chat-landing-worktree-dropdown"
+                                className="flex min-h-0 flex-col"
+                                data-testid="new-chat-landing-worktree-section"
                               >
-                                <span className="px-2 py-1 text-xs leading-5 text-muted-foreground">
+                                <span
+                                  className="shrink-0 px-2 py-1 text-sm leading-5 text-muted-foreground"
+                                  data-testid="new-chat-landing-worktree-heading"
+                                >
                                   Worktrees
                                 </span>
-                                {linkedWorktrees.map((worktree) => (
-                                  <WorktreeRadioRow
-                                    key={worktree.path}
-                                    worktree={worktree}
-                                    checked={activeWorktree?.path === worktree.path}
-                                    name="new-chat-existing-worktree"
-                                    onSelect={() => {
-                                      workspaceFromConfigRef.current = false;
-                                      setWorkspace(worktree.path);
-                                    }}
-                                    testId="new-chat-landing-worktree-option"
-                                  />
-                                ))}
+                                <div
+                                  className="flex max-h-[min(320px,calc(var(--radix-popover-content-available-height)-160px))] min-h-0 flex-col overflow-y-auto [scrollbar-width:thin] [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-border [&::-webkit-scrollbar-track]:bg-transparent"
+                                  data-testid="new-chat-landing-worktree-dropdown"
+                                >
+                                  <TooltipProvider>
+                                    {linkedWorktrees.map((worktree) => (
+                                      <WorktreeRadioRow
+                                        key={worktree.path}
+                                        worktree={worktree}
+                                        checked={activeWorktree?.path === worktree.path}
+                                        name="new-chat-existing-worktree"
+                                        onSelect={() => {
+                                          workspaceFromConfigRef.current = false;
+                                          setWorkspace(worktree.path);
+                                        }}
+                                        testId="new-chat-landing-worktree-option"
+                                        variant="selector"
+                                      />
+                                    ))}
+                                  </TooltipProvider>
+                                </div>
                               </div>
-                            )}
-                          </TooltipProvider>
+                            </>
+                          )}
                         </div>
-                        <div className="my-1 h-px bg-border" />
+                        <div className="my-1 h-px shrink-0 bg-border" />
                         <label
                           htmlFor="landing-branch-name"
-                          className="px-2 text-xs leading-5 text-muted-foreground"
+                          className="shrink-0 px-2 py-1 text-sm leading-5 text-muted-foreground"
                         >
                           New
                         </label>
-                        <div className="relative flex flex-col">
+                        <div className="relative flex shrink-0 flex-col">
                           <input
                             id="landing-branch-name"
                             type="text"
