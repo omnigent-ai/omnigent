@@ -816,6 +816,19 @@ _SUBAGENT_FORWARD_RECONNECT_WAIT_S = 5.0
 _managed_launch_tasks: set[asyncio.Task[None]] = set()
 
 
+# custom-lint: disable-next=workspace-scoped-cache -- set of Task objects
+_fork_tasks: set[asyncio.Task[None]] = set()
+
+
+# Pending/failed fork operations keyed by operation id, so a client that
+# refreshes or reconnects mid-clone re-seeds its "Cloning…" state (and a dead
+# fork still shows its failure reason) from the session-updates stream. A
+# "ready" op evicts — from then on the announced session row carries it. Values
+# are ``{"owner", "source_id", "status", "fork_id", "error"}``. Mirrors the
+# retention of _session_sandbox_status_cache.
+_fork_op_cache: WorkspaceScopedCache[str, dict[str, Any]] = WorkspaceScopedCache()
+
+
 _RUNNER_SESSION_INIT_TIMEOUT_S = 10.0
 
 
@@ -1128,6 +1141,8 @@ __all__ = [
     "_browser_action_registry",
     "_catalog_prefetch_tasks",
     "_deferred_elicitation_clear_tasks",
+    "_fork_op_cache",
+    "_fork_tasks",
     "_intentional_stop_sessions",
     "_interrupt_fenced_sessions",
     "_llm_response_denied_turns",

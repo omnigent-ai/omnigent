@@ -32,6 +32,8 @@ import yaml
 from omnigent.entities import Conversation
 from omnigent.entities.conversation import MessageData, NewConversationItem
 from omnigent.server.routes import sessions as sessions_module
+from omnigent.server.routes._sessions.common import _fork_tasks
+from omnigent.server.routes.sessions import routes_core
 from omnigent.server.routes.sessions import routes_events as routes_events_module
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
@@ -2161,6 +2163,7 @@ async def test_sdk_subagent_heal_skips_session_init(
 async def test_fork_of_child_promotes_it_into_the_sidebar(
     client: httpx.AsyncClient,
     db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Forking a sub-agent yields a session the sidebar lists.
 
@@ -2182,9 +2185,24 @@ async def test_fork_of_child_promotes_it_into_the_sidebar(
         agent_id=parent["agent_id"],
     )
 
+    # Promotion runs the fork's deep-copy in a background task (202 accept);
+    # the promoted session id arrives on the "ready" fork_status event.
+    captured: dict[str, str | None] = {}
+    orig_publish = routes_core._publish_fork_status
+
+    def _spy(user_id, src, op_id, status, *, fork_id=None, error=None):  # type: ignore[no-untyped-def]
+        if status == "ready":
+            captured["fork_id"] = fork_id
+        return orig_publish(user_id, src, op_id, status, fork_id=fork_id, error=error)
+
+    monkeypatch.setattr(routes_core, "_publish_fork_status", _spy)
+    fork_before = set(_fork_tasks)
     resp = await client.post(f"/v1/sessions/{child.id}/fork", json={"title": "Promoted"})
-    assert resp.status_code == 201, f"promoting a sub-agent failed: {resp.text}"
-    promoted = resp.json()
+    assert resp.status_code == 202, f"promoting a sub-agent failed: {resp.text}"
+    await asyncio.gather(*(set(_fork_tasks) - fork_before), return_exceptions=True)
+    snap = await client.get(f"/v1/sessions/{captured['fork_id']}")
+    assert snap.status_code == 200, snap.text
+    promoted = snap.json()
 
     assert promoted["id"] != child.id, "promotion must produce a new session"
     assert promoted["parent_session_id"] is None, (

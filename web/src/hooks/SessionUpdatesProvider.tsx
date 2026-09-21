@@ -41,6 +41,9 @@ import {
 import { isModalHostResolved, resolveModalHost } from "@/lib/sessionHost";
 import { type SessionUpdatesFrame, sessionUpdatesSocket } from "@/lib/sessionUpdatesSocket";
 import { isTempConvId } from "@/lib/tempConversationId";
+import { launchRunner } from "@/lib/sessionsApi";
+import { reopenForkDialogForSource, takePendingForkBind } from "@/lib/forkOperations";
+import { toast } from "sonner";
 
 // Coalesce bursts of structural changes / watch-set recomputes into one
 // action. 250 ms is short enough to feel live, long enough to batch the
@@ -375,6 +378,43 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
           refreshProjects();
           void queryClient.invalidateQueries({ queryKey: ["project-config"] });
           return;
+        case "fork_status": {
+          // Background fork progress. Toasts are keyed by operation_id so the
+          // dialog's optimistic "Cloning…" toast, a reconnect replay of it, and
+          // the terminal success/failure all address the same toast (no dupes,
+          // and a mid-clone refresh re-seeds it).
+          if (frame.status === "ready") {
+            toast.success("Session cloned", { id: frame.operation_id, duration: 4000 });
+            // Coding fork: bind its runner now that the fork id exists. Sandbox
+            // and chat forks have no pending bind (undefined → skipped).
+            const bind = takePendingForkBind(frame.operation_id);
+            if (bind && frame.fork_id) {
+              void launchRunner(bind.hostId, frame.fork_id, bind.workspace, bind.git).catch((e) => {
+                // Recovery is the unbound-fork picker on the session page.
+                console.warn(`Clone ${frame.fork_id}: runner bind failed`, e);
+              });
+            }
+            // The finished session enters the sidebar via the session_added the
+            // server publishes alongside; nudge the list so it converges even
+            // if that changed-frame lost a race with this one.
+            void queryClient.invalidateQueries({ queryKey: ["conversations"] });
+          } else if (frame.status === "failed") {
+            takePendingForkBind(frame.operation_id);
+            toast.error(frame.error ?? "Couldn't clone the session.", {
+              id: frame.operation_id,
+              duration: Infinity,
+              action: {
+                label: "Try again",
+                onClick: () => reopenForkDialogForSource(frame.source_id),
+              },
+            });
+          } else {
+            // "cloning" — an optimistic toast already exists in the originating
+            // tab; this drives it in OTHER tabs and re-seeds it after a refresh.
+            toast.loading("Cloning session…", { id: frame.operation_id, duration: Infinity });
+          }
+          return;
+        }
         case "removed":
           for (const id of frame.ids) commentsFingerprintsRef.current.delete(id);
           queryClient.setQueryData<PinnedConversationsResult>(

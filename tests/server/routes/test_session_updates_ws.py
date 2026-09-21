@@ -550,6 +550,63 @@ def test_session_added_event_pushes_unwatched_session(
         assert items[s2]["title"] == "brand new"
 
 
+def test_fork_status_event_is_passed_through(app: FastAPI, stores, fast_rescan: None) -> None:
+    """A ``fork_status`` discovery event is relayed verbatim to the client.
+
+    Background fork progress rides the same discovery channel as
+    ``session_added``; the client drives its "Cloning…" toast off it. The
+    server passes it through (no watch-set membership needed) so the toast
+    updates live in every open tab.
+    """
+    s1 = _seed_session(stores, owner=ALICE, title="watched")
+    with TestClient(app).websocket_connect(
+        "/v1/sessions/updates", headers={"X-Forwarded-Email": ALICE}
+    ) as ws:
+        ws.send_text(json.dumps({"type": "watch", "session_ids": [s1]}))
+        _recv_until(ws, {"snapshot"})
+        sessions_routes.user_session_stream.publish(
+            ALICE,
+            {
+                "type": "fork_status",
+                "operation_id": "forkop_abc_1234",
+                "source_id": s1,
+                "status": "ready",
+                "fork_id": "conv_newfork",
+                "error": None,
+            },
+        )
+        frame = _recv_until(ws, {"fork_status"})
+        assert frame["operation_id"] == "forkop_abc_1234"
+        assert frame["status"] == "ready"
+        assert frame["fork_id"] == "conv_newfork"
+
+
+def test_pending_fork_op_is_replayed_on_connect(app: FastAPI, stores, fast_rescan: None) -> None:
+    """A fork op still ``cloning`` is re-sent when the client (re)connects.
+
+    The discovery channel is live-only, so a client that refreshes mid-clone
+    would miss the pending state; the server replays the retained op so the
+    "Cloning…" toast comes back after a reload.
+    """
+    s1 = _seed_session(stores, owner=ALICE, title="source")
+    # Seed a pending op for Alice (writes the retained cache the replay reads).
+    sessions_routes._publish_fork_status(ALICE, s1, "forkop_pending_9999", "cloning")
+    try:
+        with TestClient(app).websocket_connect(
+            "/v1/sessions/updates", headers={"X-Forwarded-Email": ALICE}
+        ) as ws:
+            # The replay fires before the first watch; find it among early frames.
+            frame = _recv_until(ws, {"fork_status"})
+            assert frame["operation_id"] == "forkop_pending_9999"
+            assert frame["status"] == "cloning"
+            assert frame["source_id"] == s1
+    finally:
+        # Evict so the shared cache doesn't leak into sibling tests.
+        sessions_routes._publish_fork_status(
+            ALICE, s1, "forkop_pending_9999", "ready", fork_id="conv_x"
+        )
+
+
 def test_session_added_for_inaccessible_session_is_not_pushed(
     app: FastAPI, stores, fast_rescan: None
 ) -> None:

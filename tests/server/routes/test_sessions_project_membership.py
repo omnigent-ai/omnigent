@@ -19,6 +19,10 @@ edit/read access to.
 
 from __future__ import annotations
 
+import asyncio
+
+import httpx
+import pytest
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
@@ -30,8 +34,9 @@ from omnigent.server.auth import (
     LEVEL_OWNER,
     UnifiedAuthProvider,
 )
+from omnigent.server.routes._sessions.common import _fork_tasks
 from omnigent.server.routes.projects import create_projects_router
-from omnigent.server.routes.sessions import create_sessions_router
+from omnigent.server.routes.sessions import create_sessions_router, routes_core
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
@@ -191,33 +196,69 @@ def test_unfile_unknown_session_404(db_uri: str) -> None:
     assert resp.status_code == 404
 
 
-def test_fork_inherits_source_project(db_uri: str) -> None:
+async def _fork_and_resolve(
+    app: FastAPI,
+    source_id: str,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    headers: dict[str, str] | None = None,
+) -> str:
+    """Fork over an in-loop async client, drain the background task, return the id.
+
+    Fork materialization is async (202 accept), so the task runs on the test's
+    own loop only when driven by an in-loop ``httpx.AsyncClient`` — the sync
+    ``TestClient`` uses a separate portal loop we can't await. The fork id
+    arrives on the "ready" fork_status event.
+    """
+    captured: dict[str, str | None] = {}
+    orig = routes_core._publish_fork_status
+
+    def _spy(uid, src, op_id, status, *, fork_id=None, error=None):  # type: ignore[no-untyped-def]
+        if status == "ready":
+            captured["fork_id"] = fork_id
+        return orig(uid, src, op_id, status, fork_id=fork_id, error=error)
+
+    monkeypatch.setattr(routes_core, "_publish_fork_status", _spy)
+    before = set(_fork_tasks)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        resp = await c.post(f"/v1/sessions/{source_id}/fork", json={}, headers=headers or {})
+        assert resp.status_code == 202, f"got {resp.status_code}: {resp.text}"
+        await asyncio.gather(*(set(_fork_tasks) - before), return_exceptions=True)
+    assert captured.get("fork_id"), "fork did not complete"
+    return captured["fork_id"]  # type: ignore[return-value]
+
+
+@pytest.mark.asyncio
+async def test_fork_inherits_source_project(db_uri: str, monkeypatch: pytest.MonkeyPatch) -> None:
     """A fork of a filed session lands in the same project as its source."""
     _ensure_agent(db_uri)
     conv = SqlAlchemyConversationStore(db_uri).create_conversation(title="s", agent_id=AGENT_ID)
-    client = TestClient(_single_user_app(db_uri))
+    app = _single_user_app(db_uri)
+    client = TestClient(app)
     project = client.post("/v1/projects", json={"name": "Work"}).json()
     client.patch(f"/v1/sessions/{conv.id}", json={"project_id": project["id"]})
 
-    resp = client.post(f"/v1/sessions/{conv.id}/fork", json={})
-    assert resp.status_code == 201
-    fork = resp.json()
+    fork_id = await _fork_and_resolve(app, conv.id, monkeypatch)
+    fork = client.get(f"/v1/sessions/{fork_id}").json()
     assert fork["project_id"] == project["id"]
 
     # The project folder lists both the source and the fork.
     listed = client.get("/v1/sessions?project=Work")
-    assert {s["id"] for s in listed.json()["data"]} == {conv.id, fork["id"]}
+    assert {s["id"] for s in listed.json()["data"]} == {conv.id, fork_id}
 
 
-def test_fork_of_unfiled_session_stays_unfiled(db_uri: str) -> None:
+@pytest.mark.asyncio
+async def test_fork_of_unfiled_session_stays_unfiled(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Forking a session outside any project must not invent a filing."""
     _ensure_agent(db_uri)
     conv = SqlAlchemyConversationStore(db_uri).create_conversation(title="s", agent_id=AGENT_ID)
-    client = TestClient(_single_user_app(db_uri))
+    app = _single_user_app(db_uri)
 
-    resp = client.post(f"/v1/sessions/{conv.id}/fork", json={})
-    assert resp.status_code == 201
-    assert resp.json()["project_id"] is None
+    fork_id = await _fork_and_resolve(app, conv.id, monkeypatch)
+    assert TestClient(app).get(f"/v1/sessions/{fork_id}").json()["project_id"] is None
 
 
 def test_project_filter_excludes_other_projects(db_uri: str) -> None:
@@ -336,7 +377,10 @@ def test_cannot_file_into_another_owners_project(db_uri: str) -> None:
     assert snap.json()["project_id"] is None
 
 
-def test_fork_of_shared_session_in_foreign_project_stays_unfiled(db_uri: str) -> None:
+@pytest.mark.asyncio
+async def test_fork_of_shared_session_in_foreign_project_stays_unfiled(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Alice forks Bob's shared session filed in Bob's project. Projects are
     owner-private, so her fork must not carry Bob's project id — a foreign id
     would surface in no folder view of hers."""
@@ -345,7 +389,8 @@ def test_fork_of_shared_session_in_foreign_project_stays_unfiled(db_uri: str) ->
     perms = SqlAlchemyPermissionStore(db_uri)
     perms.ensure_user(ALICE)
     perms.grant(ALICE, conv_id, LEVEL_EDIT)
-    client = TestClient(_multi_user_app(db_uri))
+    app = _multi_user_app(db_uri)
+    client = TestClient(app)
     bob_project = client.post("/v1/projects", json={"name": "Bob"}, headers=_hdr(BOB)).json()
     filed = client.patch(
         f"/v1/sessions/{conv_id}",
@@ -354,17 +399,21 @@ def test_fork_of_shared_session_in_foreign_project_stays_unfiled(db_uri: str) ->
     )
     assert filed.status_code == 200
 
-    resp = client.post(f"/v1/sessions/{conv_id}/fork", json={}, headers=_hdr(ALICE))
-    assert resp.status_code == 201
-    assert resp.json()["project_id"] is None
+    fork_id = await _fork_and_resolve(app, conv_id, monkeypatch, headers=_hdr(ALICE))
+    snap = client.get(f"/v1/sessions/{fork_id}", headers=_hdr(ALICE))
+    assert snap.json()["project_id"] is None
 
 
-def test_fork_keeps_own_project_multi_user(db_uri: str) -> None:
+@pytest.mark.asyncio
+async def test_fork_keeps_own_project_multi_user(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Under header auth, Bob's fork of his own filed session stays in his
     project (the ownership check resolves against the forker's id)."""
     _ensure_agent(db_uri)
     conv_id = _seed_owned_session(db_uri, BOB)
-    client = TestClient(_multi_user_app(db_uri))
+    app = _multi_user_app(db_uri)
+    client = TestClient(app)
     bob_project = client.post("/v1/projects", json={"name": "Bob"}, headers=_hdr(BOB)).json()
     client.patch(
         f"/v1/sessions/{conv_id}",
@@ -372,9 +421,9 @@ def test_fork_keeps_own_project_multi_user(db_uri: str) -> None:
         headers=_hdr(BOB),
     )
 
-    resp = client.post(f"/v1/sessions/{conv_id}/fork", json={}, headers=_hdr(BOB))
-    assert resp.status_code == 201
-    assert resp.json()["project_id"] == bob_project["id"]
+    fork_id = await _fork_and_resolve(app, conv_id, monkeypatch, headers=_hdr(BOB))
+    snap = client.get(f"/v1/sessions/{fork_id}", headers=_hdr(BOB))
+    assert snap.json()["project_id"] == bob_project["id"]
 
 
 def test_editor_cannot_file_shared_session(db_uri: str) -> None:

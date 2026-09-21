@@ -7,11 +7,14 @@ shape using minimal real-type stubs — no MagicMock.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
+import httpx
 import pytest
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from httpx import ASGITransport
 from starlette.testclient import TestClient
 
 from omnigent.db.utils import builtin_agent_id
@@ -589,6 +592,61 @@ def _build_app(
     return app
 
 
+# The stub's fork_conversation always mints this id (see _ConversationStore).
+_FORK_ID = "c538360473d41c84c1eee13918fbeca0"
+
+
+async def _post_fork_and_drain(
+    app: FastAPI, source_id: str, json: dict[str, Any] | None = None
+) -> httpx.Response:
+    """POST the fork endpoint via an in-loop async client and await the
+    background materialization so its effects (fork_calls, files, launches,
+    announcements) are observable when the call returns.
+
+    The fork is async: the POST returns 202 immediately and the heavy work
+    runs in a task tracked in ``_fork_tasks``. Driving the app on the test's
+    own loop (not the sync TestClient's separate loop) lets us await those
+    tasks deterministically.
+    """
+    from omnigent.server.routes._sessions.common import _fork_tasks
+
+    before = set(_fork_tasks)
+    transport = ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(f"/v1/sessions/{source_id}/fork", json=json or {})
+    # Drain only the task(s) THIS POST spawned, so a shared module set doesn't
+    # make one test await another's stragglers.
+    await asyncio.gather(*(set(_fork_tasks) - before), return_exceptions=True)
+    return resp
+
+
+async def _post_fork_and_drain_headers(
+    app: FastAPI, source_id: str, json: dict[str, Any], headers: dict[str, str]
+) -> httpx.Response:
+    """Like :func:`_post_fork_and_drain` but with request headers (auth)."""
+    from omnigent.server.routes._sessions.common import _fork_tasks
+
+    before = set(_fork_tasks)
+    transport = ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(f"/v1/sessions/{source_id}/fork", json=json, headers=headers)
+    await asyncio.gather(*(set(_fork_tasks) - before), return_exceptions=True)
+    return resp
+
+
+def _fork_status_spy(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str | None]]:
+    """Record every (status, error) the fork task's _publish_fork_status emits."""
+    statuses: list[tuple[str, str | None]] = []
+    orig = routes_core._publish_fork_status
+
+    def _spy(user_id, source_id, op_id, status, *, fork_id=None, error=None):  # type: ignore[no-untyped-def]
+        statuses.append((status, error))
+        return orig(user_id, source_id, op_id, status, fork_id=fork_id, error=error)
+
+    monkeypatch.setattr(routes_core, "_publish_fork_status", _spy)
+    return statuses
+
+
 # ── Tests ────────────────────────────────────────────────────────
 
 
@@ -624,7 +682,7 @@ async def test_fork_session_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
             ),
         }
     )
-    client = TestClient(_build_app(conv_store, agent_store=agent_store))
+    app = _build_app(conv_store, agent_store=agent_store)
     original_resolver = create_validation.resolve_project_session_create
     chokepoint_calls = 0
 
@@ -635,34 +693,35 @@ async def test_fork_session_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(create_validation, "resolve_project_session_create", _recording_resolver)
 
-    resp = client.post(
-        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork", json={"title": "My Fork"}
+    resp = await _post_fork_and_drain(
+        app, "e9f8f58523cec9a57d3bdf93be543e8c", {"title": "My Fork"}
     )
 
-    assert resp.status_code == 201, f"Expected 201 Created, got {resp.status_code}: {resp.text}"
-    body = resp.json()
-    assert body["id"] == "c538360473d41c84c1eee13918fbeca0"
+    # The fork is accepted immediately; its materialization ran in the drained
+    # background task, so the fork now exists in the store.
+    assert resp.status_code == 202, f"Expected 202 Accepted, got {resp.status_code}: {resp.text}"
+    accept = resp.json()
+    assert accept["source_id"] == "e9f8f58523cec9a57d3bdf93be543e8c"
+    assert accept["status"] == "cloning"
+    assert accept["operation_id"].startswith("forkop_e9f8f58523cec9a57d3bdf93be543e8c_")
+    fork = conv_store._convs[_FORK_ID]
     # The agent_id should be the cloned agent, NOT the original.
-    assert body["agent_id"] != "087b7cb7ac30abf4debfaa578d052ec6", (
+    assert fork.agent_id != "087b7cb7ac30abf4debfaa578d052ec6", (
         "Fork should be bound to a cloned agent, not the source's agent"
     )
-    assert len(body["agent_id"]) == 32, "Cloned agent ID must use the ag_ prefix"
-    assert body["status"] == "idle", "Freshly forked session should be idle"
-    # 2 items copied from the source — proves the store's items were
-    # included in the response, not an empty list.
-    assert len(body["items"]) == 2, f"Expected 2 items (matching source), got {len(body['items'])}"
-    # Verify item content survived the copy — if the route returns empty
-    # shells the client loses conversation history.
+    assert fork.agent_id is not None and len(fork.agent_id) == 32
+    # 2 items copied from the source — proves the store copied the items.
+    fork_items = conv_store.list_items(_FORK_ID).data
     item_texts = [
         part["text"]
-        for item in body["items"]
-        for part in item.get("data", {}).get("content", [])
-        if part.get("type") == "input_text"
+        for item in fork_items
+        for part in (item.data.content if isinstance(item.data, MessageData) else [])
+        if isinstance(part, dict) and part.get("type") == "input_text"
     ]
     assert item_texts == ["Hello", "World"], (
         f"Copied items should preserve content and order, got {item_texts}"
     )
-    assert body["title"] == "My Fork"
+    assert fork.title == "My Fork"
     assert chokepoint_calls == 1
 
     # The agent clone is created INSIDE fork_conversation (atomically), not
@@ -689,9 +748,42 @@ async def test_fork_session_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
     assert fork_call["cloned_agent_name"] == "test-agent", (
         f"Cloned agent should keep the source's root name, got {fork_call['cloned_agent_name']!r}"
     )
-    assert fork_call["agent_id"] == body["agent_id"], (
+    assert fork_call["agent_id"] == fork.agent_id, (
         "Fork must bind the same cloned agent id it asked the store to create"
     )
+
+
+@pytest.mark.asyncio
+async def test_fork_background_failure_leaves_no_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fork whose materialization raises publishes ``failed`` and no ghost row.
+
+    The 202 is already sent, so the failure surfaces as a durable
+    ``fork_status: failed`` (an actionable toast the client can retry). Because
+    nothing is announced until the copy succeeds, a failed fork leaves no
+    committed session — the "no ghost session" acceptance criterion.
+    """
+    conv = _make_conversation()
+    conv_store = _ConversationStore(conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv})
+
+    def _boom(*_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(conv_store, "fork_conversation", _boom)
+    app = _build_app(conv_store)
+    statuses = _fork_status_spy(monkeypatch)
+
+    resp = await _post_fork_and_drain(app, "e9f8f58523cec9a57d3bdf93be543e8c", {})
+
+    assert resp.status_code == 202, f"got {resp.status_code}: {resp.text}"
+    # cloning was seeded, then the op failed with the raised message.
+    assert ("cloning", None) in statuses
+    failed = [error for status, error in statuses if status == "failed"]
+    assert failed and "disk full" in (failed[0] or ""), statuses
+    # No fork committed and none announced (only the source remains).
+    assert _FORK_ID not in conv_store._convs
+    assert set(conv_store._convs) == {"e9f8f58523cec9a57d3bdf93be543e8c"}
 
 
 @pytest.mark.asyncio
@@ -724,14 +816,12 @@ async def test_fork_session_shares_source_file_blob_without_copying_bytes() -> N
         }
     )
     artifact_store = _ArtifactStore(blobs={src_file_id: b"\x89PNG"})
-    client = TestClient(
-        _build_app(conv_store, file_store=file_store, artifact_store=artifact_store)
-    )
+    app = _build_app(conv_store, file_store=file_store, artifact_store=artifact_store)
 
-    resp = client.post(f"/v1/sessions/{source_id}/fork", json={})
+    resp = await _post_fork_and_drain(app, source_id, {})
 
-    assert resp.status_code == 201, resp.text
-    fork_id = resp.json()["id"]
+    assert resp.status_code == 202, resp.text
+    fork_id = _FORK_ID
 
     # The store fork received the complete old→new mapping.
     file_id_map = conv_store.fork_calls[0]["file_id_map"]
@@ -791,17 +881,15 @@ async def test_fork_copies_all_file_rows_without_probing_blobs() -> None:
     )
     # Only the live file has a blob; the fork must not probe either way.
     artifact_store = _ArtifactStore(blobs={live_file_id: b"\x89PNG"})
-    client = TestClient(
-        _build_app(conv_store, file_store=file_store, artifact_store=artifact_store)
-    )
+    app = _build_app(conv_store, file_store=file_store, artifact_store=artifact_store)
 
-    resp = client.post(f"/v1/sessions/{source_id}/fork", json={})
+    resp = await _post_fork_and_drain(app, source_id, {})
 
-    assert resp.status_code == 201, resp.text
+    assert resp.status_code == 202, resp.text
     # Both source files are mapped and copied — no probe-driven skipping.
     file_id_map = conv_store.fork_calls[0]["file_id_map"]
     assert set(file_id_map) == {live_file_id, gone_file_id}
-    fork_id = resp.json()["id"]
+    fork_id = _FORK_ID
     fork_owned = sorted(f.filename for f in file_store.files.values() if f.session_id == fork_id)
     assert fork_owned == ["kept.png", "lost.png"]
     # The fork touched the artifact store zero times (no bytes moved, no HEADs).
@@ -821,18 +909,19 @@ async def test_fork_session_run_config_overrides_pass_through() -> None:
     """
     conv = _make_conversation()
     conv_store = _ConversationStore(conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv})
-    client = TestClient(_build_app(conv_store))
+    app = _build_app(conv_store)
 
-    resp = client.post(
-        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
-        json={
+    resp = await _post_fork_and_drain(
+        app,
+        "e9f8f58523cec9a57d3bdf93be543e8c",
+        {
             "model_override": "opus",
             "reasoning_effort": "high",
             "terminal_launch_args": ["--permission-mode", "auto"],
         },
     )
 
-    assert resp.status_code == 201, f"got {resp.status_code}: {resp.text}"
+    assert resp.status_code == 202, f"got {resp.status_code}: {resp.text}"
     fork_call = conv_store.fork_calls[0]
     assert fork_call["override_model_override_set"] is True
     assert fork_call["override_model_override"] == "opus"
@@ -851,11 +940,11 @@ async def test_fork_session_run_config_omitted_inherits() -> None:
     store keeps today's inherit behavior (and drops no mode labels)."""
     conv = _make_conversation()
     conv_store = _ConversationStore(conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv})
-    client = TestClient(_build_app(conv_store))
+    app = _build_app(conv_store)
 
-    resp = client.post("/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork", json={})
+    resp = await _post_fork_and_drain(app, "e9f8f58523cec9a57d3bdf93be543e8c", {})
 
-    assert resp.status_code == 201, f"got {resp.status_code}: {resp.text}"
+    assert resp.status_code == 202, f"got {resp.status_code}: {resp.text}"
     fork_call = conv_store.fork_calls[0]
     assert fork_call["override_model_override_set"] is False
     assert fork_call["override_reasoning_effort_set"] is False
@@ -871,14 +960,15 @@ async def test_fork_session_run_config_clear_aliases() -> None:
     bound agent's default rather than inheriting the source's."""
     conv = _make_conversation()
     conv_store = _ConversationStore(conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv})
-    client = TestClient(_build_app(conv_store))
+    app = _build_app(conv_store)
 
-    resp = client.post(
-        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
-        json={"model_override": "default", "reasoning_effort": "default"},
+    resp = await _post_fork_and_drain(
+        app,
+        "e9f8f58523cec9a57d3bdf93be543e8c",
+        {"model_override": "default", "reasoning_effort": "default"},
     )
 
-    assert resp.status_code == 201, f"got {resp.status_code}: {resp.text}"
+    assert resp.status_code == 202, f"got {resp.status_code}: {resp.text}"
     fork_call = conv_store.fork_calls[0]
     assert fork_call["override_model_override_set"] is True
     assert fork_call["override_model_override"] is None
@@ -921,34 +1011,33 @@ async def test_fork_session_up_to_response_id_passes_through_and_truncates() -> 
         conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv},
         items_by_conv={"e9f8f58523cec9a57d3bdf93be543e8c": items},
     )
-    client = TestClient(_build_app(conv_store))
+    app = _build_app(conv_store)
 
-    resp = client.post(
-        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
-        json={"up_to_response_id": "resp_001"},
+    resp = await _post_fork_and_drain(
+        app, "e9f8f58523cec9a57d3bdf93be543e8c", {"up_to_response_id": "resp_001"}
     )
 
-    assert resp.status_code == 201, f"Expected 201 Created, got {resp.status_code}: {resp.text}"
+    assert resp.status_code == 202, f"Expected 202 Accepted, got {resp.status_code}: {resp.text}"
     # The route forwarded the truncation point to the store — None here
     # means the request field was dropped and the fork copied everything.
     assert conv_store.fork_calls[0]["up_to_response_id"] == "resp_001"
-    body = resp.json()
-    # Only resp_001's two items survive the truncation; msg_3 (resp_002)
-    # appearing means the store ignored the cutoff.
-    assert [item["response_id"] for item in body["items"]] == ["resp_001", "resp_001"], (
-        f"Fork should contain only resp_001 items, got {body['items']!r}"
+    # Only resp_001's two items survive the truncation in the materialized fork;
+    # resp_002 appearing means the store ignored the cutoff.
+    fork_items = conv_store.list_items(_FORK_ID).data
+    assert [item.response_id for item in fork_items] == ["resp_001", "resp_001"], (
+        f"Fork should contain only resp_001 items, got {fork_items!r}"
     )
 
 
 @pytest.mark.asyncio
-async def test_fork_response_is_bounded_to_newest_item_page() -> None:
-    """The 201 body must not carry the whole copied transcript.
+async def test_fork_accept_carries_no_transcript() -> None:
+    """The 202 accept body carries only the operation handle, never items.
 
-    The fork dialog blocks on this response and uses only the clone's id,
-    so a body that ships every copied item makes the user's wait scale
-    with history size (tens of MB for a long session). Like the
-    GET-session snapshot, the route returns the newest item page in
-    chronological order.
+    Materialization is a background operation now, so the POST returns before
+    any transcript is copied — the whole point of the async fork. This replaces
+    the old "response bounded to the newest 100-item page" guarantee, which was
+    a property of the synchronous 201 body that no longer exists. The copy
+    itself still happens (verified against the store below).
     """
     conv = _make_conversation()
     items = [
@@ -959,36 +1048,27 @@ async def test_fork_response_is_bounded_to_newest_item_page() -> None:
         conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv},
         items_by_conv={"e9f8f58523cec9a57d3bdf93be543e8c": items},
     )
-    client = TestClient(_build_app(conv_store))
+    app = _build_app(conv_store)
 
-    resp = client.post("/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork", json={})
+    resp = await _post_fork_and_drain(app, "e9f8f58523cec9a57d3bdf93be543e8c", {})
 
-    assert resp.status_code == 201, f"Expected 201 Created, got {resp.status_code}: {resp.text}"
-    body = resp.json()
-    assert len(body["items"]) == 100, (
-        f"fork response must carry at most one item page (100), got "
-        f"{len(body['items'])} of 150 copied items — a full-transcript body "
-        f"makes the user-blocked fork response scale with source size"
-    )
-    texts = [
-        part["text"]
-        for item in body["items"]
-        for part in item.get("data", {}).get("content", [])
-        if part.get("type") == "input_text"
-    ]
-    assert texts[0] == "turn 50" and texts[-1] == "turn 149", (
-        f"fork response should carry the NEWEST page in chronological order, "
-        f"got first={texts[0]!r} last={texts[-1]!r}"
-    )
+    assert resp.status_code == 202, f"Expected 202 Accepted, got {resp.status_code}: {resp.text}"
+    assert "items" not in resp.json(), "the accept handle must not ship the transcript"
+    # The materialized fork copied the full source history (the store, not the
+    # response, now carries it).
+    assert len(conv_store.list_items(_FORK_ID, limit=1000).data) == 150
 
 
 @pytest.mark.asyncio
-async def test_fork_session_400_unknown_up_to_response_id() -> None:
-    """An ``up_to_response_id`` matching no response returns 400.
+async def test_fork_unknown_up_to_response_id_fails_in_background(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An ``up_to_response_id`` matching no response fails the async op.
 
-    The store raises ValueError for an unknown response id (stale
-    client state); the route must surface it as ``invalid_input``
-    rather than a 500 or a silent full-history fork.
+    The store raises ValueError for an unknown response id (stale client
+    state). Since materialization now runs after the 202 accept, the request
+    still succeeds and the failure surfaces as a ``fork_status: failed`` event
+    (an actionable toast the client can retry) rather than a synchronous 4xx.
     """
     conv = _make_conversation()
     conv_store = _ConversationStore(
@@ -999,18 +1079,26 @@ async def test_fork_session_400_unknown_up_to_response_id() -> None:
             ]
         },
     )
-    client = TestClient(_build_app(conv_store))
+    app = _build_app(conv_store)
+    statuses: list[tuple[str, str | None]] = []
+    orig = routes_core._publish_fork_status
 
-    resp = client.post(
-        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
-        json={"up_to_response_id": "resp_nope"},
+    def _spy(user_id, source_id, op_id, status, *, fork_id=None, error=None):  # type: ignore[no-untyped-def]
+        statuses.append((status, error))
+        return orig(user_id, source_id, op_id, status, fork_id=fork_id, error=error)
+
+    monkeypatch.setattr(routes_core, "_publish_fork_status", _spy)
+
+    resp = await _post_fork_and_drain(
+        app, "e9f8f58523cec9a57d3bdf93be543e8c", {"up_to_response_id": "resp_nope"}
     )
 
-    assert resp.status_code == 400, (
-        f"Expected 400 for unknown response id, got {resp.status_code}: {resp.text}"
-    )
-    error = resp.json().get("error", {})
-    assert error.get("code") == "invalid_input", f"Expected 'invalid_input', got {error}"
+    assert resp.status_code == 202, f"got {resp.status_code}: {resp.text}"
+    # The background op reported failure with the store's message; no fork
+    # materialized (the ValueError aborted before the fork conversation exists).
+    assert ("cloning", None) in statuses
+    assert any(status == "failed" for status, _ in statuses), statuses
+    assert _FORK_ID not in conv_store._convs, "a failed fork must leave no committed session"
 
 
 @pytest.mark.asyncio
@@ -1046,12 +1134,12 @@ async def test_fork_session_promotes_sub_agent() -> None:
     """
     conv = _make_conversation(kind="sub_agent")
     store = _ConversationStore(conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv})
-    client = TestClient(_build_app(store))
+    app = _build_app(store)
 
-    resp = client.post("/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork", json={})
+    resp = await _post_fork_and_drain(app, "e9f8f58523cec9a57d3bdf93be543e8c", {})
 
-    assert resp.status_code == 201, (
-        f"Expected 201 promoting a sub-agent, got {resp.status_code}: {resp.text}"
+    assert resp.status_code == 202, (
+        f"Expected 202 promoting a sub-agent, got {resp.status_code}: {resp.text}"
     )
     assert len(store.fork_calls) == 1, f"Expected one fork call, got {store.fork_calls}"
 
@@ -1068,11 +1156,11 @@ async def test_fork_session_sub_agent_replaces_presentation_labels() -> None:
     """
     conv = _make_conversation(kind="sub_agent")
     store = _ConversationStore(conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv})
-    client = TestClient(_build_app(store))
+    app = _build_app(store)
 
-    resp = client.post("/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork", json={})
+    resp = await _post_fork_and_drain(app, "e9f8f58523cec9a57d3bdf93be543e8c", {})
 
-    assert resp.status_code == 201, f"Expected 201, got {resp.status_code}: {resp.text}"
+    assert resp.status_code == 202, f"Expected 202, got {resp.status_code}: {resp.text}"
     # None would mean "keep the source's labels" — the child's wrapper.
     assert store.fork_calls[0]["presentation_labels"] == {}, (
         "Promoting a sub-agent must replace its UI-mode labels, got "
@@ -1237,14 +1325,13 @@ async def test_fork_switch_binds_target_agent_bundle() -> None:
         },
     )
     agent_store = _switch_agent_store()
-    client = TestClient(_build_app(conv_store, agent_store=agent_store))
+    app = _build_app(conv_store, agent_store=agent_store)
 
-    resp = client.post(
-        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
-        json={"agent_id": "44b4151dd6cdfed6ee19430832398e05"},
+    resp = await _post_fork_and_drain(
+        app, "e9f8f58523cec9a57d3bdf93be543e8c", {"agent_id": "44b4151dd6cdfed6ee19430832398e05"}
     )
 
-    assert resp.status_code == 201, f"Expected 201, got {resp.status_code}: {resp.text}"
+    assert resp.status_code == 202, f"Expected 202, got {resp.status_code}: {resp.text}"
     # The clone is minted inside fork_conversation, so the route hands it the
     # TARGET agent's bundle (not ag_test/hash) — not a separate create call.
     assert len(agent_store.create_calls) == 0
@@ -1280,14 +1367,13 @@ async def test_fork_switch_drops_claude_permission_mode_label() -> None:
             ]
         },
     )
-    client = TestClient(_build_app(conv_store, agent_store=_switch_agent_store()))
+    app = _build_app(conv_store, agent_store=_switch_agent_store())
 
-    resp = client.post(
-        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
-        json={"agent_id": "44b4151dd6cdfed6ee19430832398e05"},
+    resp = await _post_fork_and_drain(
+        app, "e9f8f58523cec9a57d3bdf93be543e8c", {"agent_id": "44b4151dd6cdfed6ee19430832398e05"}
     )
 
-    assert resp.status_code == 201, f"got {resp.status_code}: {resp.text}"
+    assert resp.status_code == 202, f"got {resp.status_code}: {resp.text}"
     dropped = conv_store.fork_calls[0]["dropped_label_keys"]
     assert "omnigent.claude_native.permission_mode" in dropped, (
         f"agent switch must drop the claude permission-mode label, got {dropped!r}"
@@ -1304,11 +1390,11 @@ async def test_fork_same_agent_keeps_permission_mode_label() -> None:
     """
     conv = _make_conversation()
     conv_store = _ConversationStore(conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv})
-    client = TestClient(_build_app(conv_store))
+    app = _build_app(conv_store)
 
-    resp = client.post("/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork", json={})
+    resp = await _post_fork_and_drain(app, "e9f8f58523cec9a57d3bdf93be543e8c", {})
 
-    assert resp.status_code == 201, f"got {resp.status_code}: {resp.text}"
+    assert resp.status_code == 202, f"got {resp.status_code}: {resp.text}"
     # Nothing conditional to drop, so the permission-mode label carries over.
     assert conv_store.fork_calls[0]["dropped_label_keys"] == frozenset()
 
@@ -1343,14 +1429,15 @@ async def test_fork_codex_bypass_stamps_label_on_codex_target(
             }
         ),
     )
-    client = TestClient(_build_app(conv_store, agent_store=_switch_agent_store()))
+    app = _build_app(conv_store, agent_store=_switch_agent_store())
 
-    resp = client.post(
-        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
-        json={"agent_id": "44b4151dd6cdfed6ee19430832398e05", "codex_bypass_sandbox": True},
+    resp = await _post_fork_and_drain(
+        app,
+        "e9f8f58523cec9a57d3bdf93be543e8c",
+        {"agent_id": "44b4151dd6cdfed6ee19430832398e05", "codex_bypass_sandbox": True},
     )
 
-    assert resp.status_code == 201, f"got {resp.status_code}: {resp.text}"
+    assert resp.status_code == 202, f"got {resp.status_code}: {resp.text}"
     extra = conv_store.fork_calls[0]["extra_labels"]
     assert extra == {"omnigent.codex_native.bypass_sandbox": "1"}, (
         f"bypass opt-in must stamp the codex bypass label, got {extra!r}"
@@ -1569,14 +1656,13 @@ async def test_fork_switch_model_and_carry_gating(
             }
         ),
     )
-    client = TestClient(_build_app(conv_store, agent_store=agent_store))
+    app = _build_app(conv_store, agent_store=agent_store)
 
-    resp = client.post(
-        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
-        json={"agent_id": "280d725b404d2915f9e9d6cccce91303"},
+    resp = await _post_fork_and_drain(
+        app, "e9f8f58523cec9a57d3bdf93be543e8c", {"agent_id": "280d725b404d2915f9e9d6cccce91303"}
     )
 
-    assert resp.status_code == 201, f"Expected 201, got {resp.status_code}: {resp.text}"
+    assert resp.status_code == 202, f"Expected 202, got {resp.status_code}: {resp.text}"
     fork_call = conv_store.fork_calls[0]
     assert fork_call["copy_model_settings"] is expect_copy_model, (
         f"{source_harness}->{target_harness}: copy_model_settings should be "
@@ -1626,11 +1712,11 @@ async def test_fork_no_switch_native_source_carries_history(
         "omnigent.server.routes.sessions.get_agent_cache",
         lambda: _StubAgentCache({"087b7cb7ac30abf4debfaa578d052ec6": "claude-native"}),
     )
-    client = TestClient(_build_app(conv_store))
+    app = _build_app(conv_store)
 
-    resp = client.post("/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork", json={})
+    resp = await _post_fork_and_drain(app, "e9f8f58523cec9a57d3bdf93be543e8c", {})
 
-    assert resp.status_code == 201, f"Expected 201, got {resp.status_code}: {resp.text}"
+    assert resp.status_code == 202, f"Expected 202, got {resp.status_code}: {resp.text}"
     fork_call = conv_store.fork_calls[0]
     assert fork_call["copy_model_settings"] is True
     assert fork_call["copy_terminal_launch_args"] is True, (
@@ -1686,11 +1772,11 @@ async def test_fork_cursor_pi_native_carry_gating(
         "omnigent.server.routes.sessions.get_agent_cache",
         lambda: _StubAgentCache({"087b7cb7ac30abf4debfaa578d052ec6": harness}),
     )
-    client = TestClient(_build_app(conv_store))
+    app = _build_app(conv_store)
 
-    resp = client.post("/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork", json={})
+    resp = await _post_fork_and_drain(app, "e9f8f58523cec9a57d3bdf93be543e8c", {})
 
-    assert resp.status_code == 201, f"Expected 201, got {resp.status_code}: {resp.text}"
+    assert resp.status_code == 202, f"Expected 202, got {resp.status_code}: {resp.text}"
     fork_call = conv_store.fork_calls[0]
     assert fork_call["carry_history_into_native"] is expect_carry, (
         f"A {harness} fork should set carry_history_into_native={expect_carry}."
@@ -1738,11 +1824,11 @@ async def test_fork_reversed_native_spelling_carry_gating(
         "omnigent.server.routes.sessions.get_agent_cache",
         lambda: _StubAgentCache({"087b7cb7ac30abf4debfaa578d052ec6": harness}),
     )
-    client = TestClient(_build_app(conv_store))
+    app = _build_app(conv_store)
 
-    resp = client.post("/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork", json={})
+    resp = await _post_fork_and_drain(app, "e9f8f58523cec9a57d3bdf93be543e8c", {})
 
-    assert resp.status_code == 201, f"Expected 201, got {resp.status_code}: {resp.text}"
+    assert resp.status_code == 202, f"Expected 202, got {resp.status_code}: {resp.text}"
     fork_call = conv_store.fork_calls[0]
     assert fork_call["carry_history_into_native"] is expect_carry, (
         f"A {harness} fork should set carry_history_into_native={expect_carry}: "
@@ -1800,18 +1886,17 @@ async def test_fork_managed_schedules_sandbox_launch(
     conv_store = _ConversationStore(conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv})
     app = _build_app(conv_store)
     launches = _arm_managed_app(app, monkeypatch)
-    client = TestClient(app)
 
-    resp = client.post(
-        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
-        json={"host_type": "managed", "sandbox_provider": "modal"},
+    resp = await _post_fork_and_drain(
+        app,
+        "e9f8f58523cec9a57d3bdf93be543e8c",
+        {"host_type": "managed", "sandbox_provider": "modal"},
     )
 
-    assert resp.status_code == 201, f"got {resp.status_code}: {resp.text}"
-    body = resp.json()
+    assert resp.status_code == 202, f"got {resp.status_code}: {resp.text}"
     assert len(launches) == 1, "a managed fork must schedule exactly one sandbox launch"
     launch = launches[0]
-    assert launch["session_id"] == body["id"]
+    assert launch["session_id"] == _FORK_ID
     assert launch["provider"] == "modal"
     # No repository on either side, so the clone gets an empty sandbox.
     assert launch["repos"] == []
@@ -1854,15 +1939,15 @@ async def test_fork_managed_launch_uses_session_scoped_clone(
     )
     app = _build_app(conv_store, agent_store=agent_store)
     launches = _arm_managed_app(app, monkeypatch)
-    client = TestClient(app)
 
-    resp = client.post(
-        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
-        json={"host_type": "managed", "agent_id": builtin_agent_id("code-reviewer")},
+    resp = await _post_fork_and_drain(
+        app,
+        "e9f8f58523cec9a57d3bdf93be543e8c",
+        {"host_type": "managed", "agent_id": builtin_agent_id("code-reviewer")},
     )
 
-    assert resp.status_code == 201, f"got {resp.status_code}: {resp.text}"
-    fork_agent_id = resp.json()["agent_id"]
+    assert resp.status_code == 202, f"got {resp.status_code}: {resp.text}"
+    fork_agent_id = conv_store._convs[_FORK_ID].agent_id
     launch_agent_id = launches[0]["agent_id"]
     assert launch_agent_id == fork_agent_id, (
         "the launch must classify on the fork's own bound agent, not the source's"
@@ -1883,12 +1968,12 @@ async def test_fork_managed_launch_uses_session_scoped_clone(
                         name="code-reviewer",
                         bundle_location="builtin/hash",
                         version=1,
-                        session_id=resp.json()["id"],
+                        session_id=_FORK_ID,
                     ),
                 }
             ),  # type: ignore[arg-type]
             fork_agent_id,
-            session_id=resp.json()["id"],
+            session_id=_FORK_ID,
         )
         is None
     ), "a forked session's runner must carry no omnigent.ai/agent classifier"
@@ -1911,15 +1996,15 @@ async def test_fork_managed_registers_sandbox_to_forking_user(
     conv_store = _ConversationStore(conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv})
     app = _build_app(conv_store, auth_provider=UnifiedAuthProvider(source="header"))
     launches = _arm_managed_app(app, monkeypatch)
-    client = TestClient(app)
 
-    resp = client.post(
-        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
-        json={"host_type": "managed"},
-        headers={"X-Forwarded-Email": "forker@example.com"},
+    resp = await _post_fork_and_drain_headers(
+        app,
+        "e9f8f58523cec9a57d3bdf93be543e8c",
+        {"host_type": "managed"},
+        {"X-Forwarded-Email": "forker@example.com"},
     )
 
-    assert resp.status_code == 201, f"got {resp.status_code}: {resp.text}"
+    assert resp.status_code == 202, f"got {resp.status_code}: {resp.text}"
     assert launches[0]["owner"] == "forker@example.com"
 
 
@@ -1939,14 +2024,12 @@ async def test_fork_managed_inherits_source_repository(
     conv_store = _ConversationStore(conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv})
     app = _build_app(conv_store)
     launches = _arm_managed_app(app, monkeypatch)
-    client = TestClient(app)
 
-    resp = client.post(
-        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
-        json={"host_type": "managed"},
+    resp = await _post_fork_and_drain(
+        app, "e9f8f58523cec9a57d3bdf93be543e8c", {"host_type": "managed"}
     )
 
-    assert resp.status_code == 201, f"got {resp.status_code}: {resp.text}"
+    assert resp.status_code == 202, f"got {resp.status_code}: {resp.text}"
     repos = launches[0]["repos"]
     assert len(repos) == 1
     assert repos[0].url == "https://github.com/org/repo"
@@ -1956,7 +2039,7 @@ async def test_fork_managed_inherits_source_repository(
     # single-value label, exercising the read fallback.
     assert conv_store.label_writes == [
         (
-            resp.json()["id"],
+            _FORK_ID,
             {
                 f"{MANAGED_REPO_LABEL_KEY}.0": "https://github.com/org/repo#release-1.2",
                 MANAGED_REPO_LABEL_KEY: "https://github.com/org/repo#release-1.2",
@@ -1986,14 +2069,12 @@ async def test_fork_managed_inherits_all_source_repositories(
     # Multi-repo provider — inheriting several repos is only allowed where the
     # provider supports it (a single-repo provider rejects it; see the guard test).
     launches = _arm_managed_app(app, monkeypatch, provider="kubernetes")
-    client = TestClient(app)
 
-    resp = client.post(
-        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
-        json={"host_type": "managed"},
+    resp = await _post_fork_and_drain(
+        app, "e9f8f58523cec9a57d3bdf93be543e8c", {"host_type": "managed"}
     )
 
-    assert resp.status_code == 201, f"got {resp.status_code}: {resp.text}"
+    assert resp.status_code == 202, f"got {resp.status_code}: {resp.text}"
     repos = launches[0]["repos"]
     assert [(r.url, r.branch) for r in repos] == [
         ("https://github.com/org/api", "main"),
@@ -2003,7 +2084,7 @@ async def test_fork_managed_inherits_all_source_repositories(
     # relaunch.
     assert conv_store.label_writes == [
         (
-            resp.json()["id"],
+            _FORK_ID,
             {
                 f"{MANAGED_REPO_LABEL_KEY}.0": "https://github.com/org/api#main",
                 f"{MANAGED_REPO_LABEL_KEY}.1": "https://github.com/org/web",
@@ -2027,19 +2108,18 @@ async def test_fork_managed_explicit_workspace_overrides_inherited(
     conv_store = _ConversationStore(conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv})
     app = _build_app(conv_store)
     launches = _arm_managed_app(app, monkeypatch)
-    client = TestClient(app)
 
-    chosen = client.post(
-        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
-        json={"host_type": "managed", "workspace": "https://github.com/org/other"},
+    chosen = await _post_fork_and_drain(
+        app,
+        "e9f8f58523cec9a57d3bdf93be543e8c",
+        {"host_type": "managed", "workspace": "https://github.com/org/other"},
     )
-    emptied = client.post(
-        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
-        json={"host_type": "managed", "workspace": None},
+    emptied = await _post_fork_and_drain(
+        app, "e9f8f58523cec9a57d3bdf93be543e8c", {"host_type": "managed", "workspace": None}
     )
 
-    assert chosen.status_code == 201, f"got {chosen.status_code}: {chosen.text}"
-    assert emptied.status_code == 201, f"got {emptied.status_code}: {emptied.text}"
+    assert chosen.status_code == 202, f"got {chosen.status_code}: {chosen.text}"
+    assert emptied.status_code == 202, f"got {emptied.status_code}: {emptied.text}"
     assert [r.url for r in launches[0]["repos"]] == ["https://github.com/org/other"]
     assert launches[1]["repos"] == [], "an explicit null workspace means an empty sandbox"
 
@@ -2065,21 +2145,20 @@ async def test_fork_never_inherits_source_sandbox_repo_label(
     conv_store = _ConversationStore(conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv})
     app = _build_app(conv_store)
     _arm_managed_app(app, monkeypatch)
-    client = TestClient(app)
 
-    emptied = client.post(
-        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
-        json={"host_type": "managed", "workspace": None},
+    emptied = await _post_fork_and_drain(
+        app, "e9f8f58523cec9a57d3bdf93be543e8c", {"host_type": "managed", "workspace": None}
     )
-    external = client.post("/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork", json={})
+    external = await _post_fork_and_drain(app, "e9f8f58523cec9a57d3bdf93be543e8c", {})
 
-    assert emptied.status_code == 201, f"got {emptied.status_code}: {emptied.text}"
-    assert external.status_code == 201, f"got {external.status_code}: {external.text}"
-    # Neither clone ends up carrying one, so no relaunch re-clones.
-    for response in (emptied, external):
-        fork = conv_store.get_conversation(response.json()["id"])
-        assert fork is not None
-        assert MANAGED_REPO_LABEL_KEY not in fork.labels
+    assert emptied.status_code == 202, f"got {emptied.status_code}: {emptied.text}"
+    assert external.status_code == 202, f"got {external.status_code}: {external.text}"
+    # Neither clone ends up carrying one, so no relaunch re-clones. Both POSTs
+    # mint the same stub fork id, so the final materialized row reflects the
+    # last (external) fork; both took the drop path.
+    fork = conv_store.get_conversation(_FORK_ID)
+    assert fork is not None
+    assert MANAGED_REPO_LABEL_KEY not in fork.labels
     assert conv_store.label_writes == [], "no workspace resolved, so nothing to re-stamp"
 
 
@@ -2097,15 +2176,15 @@ async def test_fork_managed_restamps_resolved_repository(
     conv_store = _ConversationStore(conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv})
     app = _build_app(conv_store)
     _arm_managed_app(app, monkeypatch)
-    client = TestClient(app)
 
-    resp = client.post(
-        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
-        json={"host_type": "managed", "workspace": "https://github.com/org/other#dev"},
+    resp = await _post_fork_and_drain(
+        app,
+        "e9f8f58523cec9a57d3bdf93be543e8c",
+        {"host_type": "managed", "workspace": "https://github.com/org/other#dev"},
     )
 
-    assert resp.status_code == 201, f"got {resp.status_code}: {resp.text}"
-    fork = conv_store.get_conversation(resp.json()["id"])
+    assert resp.status_code == 202, f"got {resp.status_code}: {resp.text}"
+    fork = conv_store.get_conversation(_FORK_ID)
     assert fork is not None
     assert fork.labels[f"{MANAGED_REPO_LABEL_KEY}.0"] == "https://github.com/org/other#dev"
 
@@ -2123,39 +2202,39 @@ async def test_fork_external_schedules_no_sandbox_launch(
     conv_store = _ConversationStore(conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv})
     app = _build_app(conv_store)
     launches = _arm_managed_app(app, monkeypatch)
-    client = TestClient(app)
 
-    resp = client.post("/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork", json={})
+    resp = await _post_fork_and_drain(app, "e9f8f58523cec9a57d3bdf93be543e8c", {})
 
-    assert resp.status_code == 201, f"got {resp.status_code}: {resp.text}"
+    assert resp.status_code == 202, f"got {resp.status_code}: {resp.text}"
     assert launches == [], "an external fork must not provision a sandbox"
 
 
+# The managed pre-flight guards (server-not-configured / provider-not-offered /
+# multi-repo-on-single-repo) run synchronously BEFORE the 202 accept, so a
+# misconfigured managed fork fails fast with a 400 (naming the misconfiguration)
+# instead of a clone stuck "provisioning" forever. These use the sync client:
+# validation raises before any background task spawns.
 @pytest.mark.asyncio
 async def test_fork_managed_rejects_unconfigured_server() -> None:
-    """A managed fork on a server with no ``sandbox:`` config fails the POST.
-
-    Failing synchronously names the misconfiguration; deferring it to the
-    background launch would leave a clone stuck at "provisioning" forever.
-    """
+    """A managed fork on a server with no ``sandbox:`` config is a synchronous 400."""
     conv = _make_conversation()
     conv_store = _ConversationStore(conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv})
     client = TestClient(_build_app(conv_store))
 
     resp = client.post(
-        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
-        json={"host_type": "managed"},
+        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork", json={"host_type": "managed"}
     )
 
     assert resp.status_code == 400, f"got {resp.status_code}: {resp.text}"
-    assert "managed hosts are not configured" in resp.json()["error"]["message"]
+    assert "managed hosts are not configured" in resp.text
+    assert conv_store.fork_calls == [], "a rejected managed fork must not fork"
 
 
 @pytest.mark.asyncio
 async def test_fork_managed_rejects_unoffered_provider(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A provider this server doesn't offer fails the POST, naming what it has."""
+    """A provider this server doesn't offer is a synchronous 400 naming what it has."""
     conv = _make_conversation()
     conv_store = _ConversationStore(conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv})
     app = _build_app(conv_store)
@@ -2168,17 +2247,18 @@ async def test_fork_managed_rejects_unoffered_provider(
     )
 
     assert resp.status_code == 400, f"got {resp.status_code}: {resp.text}"
-    assert "is not configured on this server" in resp.json()["error"]["message"]
+    assert "is not configured on this server" in resp.text
     assert launches == []
+    assert conv_store.fork_calls == []
 
 
 @pytest.mark.asyncio
 async def test_fork_managed_rejects_multiple_repos_on_single_repo_provider(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A multi-repo source forked onto a single-repo provider fails the POST with
-    a clear 400 (modal is exec-model → single-repo), rather than a background
-    clone failure. The web picker caps this per provider; this guards the API."""
+    """A multi-repo source forked onto a single-repo provider is a synchronous 400
+    (modal is exec-model → single-repo). The web picker caps this per provider;
+    this guards the API."""
     conv = _make_conversation(
         labels={
             f"{MANAGED_REPO_LABEL_KEY}.0": "https://github.com/org/api#main",
@@ -2191,13 +2271,13 @@ async def test_fork_managed_rejects_multiple_repos_on_single_repo_provider(
     client = TestClient(app)
 
     resp = client.post(
-        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
-        json={"host_type": "managed"},
+        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork", json={"host_type": "managed"}
     )
 
     assert resp.status_code == 400, f"got {resp.status_code}: {resp.text}"
-    assert "clones only one repository" in resp.json()["error"]["message"]
+    assert "clones only one repository" in resp.text
     assert launches == [], "a rejected multi-repo fork must schedule no launch"
+    assert conv_store.fork_calls == []
 
 
 @pytest.mark.asyncio
@@ -2223,11 +2303,11 @@ async def test_fork_clone_reuses_source_agent_name_verbatim() -> None:
             ),
         }
     )
-    client = TestClient(_build_app(conv_store, agent_store=agent_store))
+    app = _build_app(conv_store, agent_store=agent_store)
 
-    resp = client.post("/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork", json={})
+    resp = await _post_fork_and_drain(app, "e9f8f58523cec9a57d3bdf93be543e8c", {})
 
-    assert resp.status_code == 201, f"Expected 201, got {resp.status_code}: {resp.text}"
+    assert resp.status_code == 202, f"Expected 202, got {resp.status_code}: {resp.text}"
     assert conv_store.fork_calls[0]["cloned_agent_name"] == "claude-native-ui", (
         "Fork clone should reuse the source name verbatim, no '(fork …)' suffix"
     )

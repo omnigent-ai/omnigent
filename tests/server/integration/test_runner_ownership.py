@@ -13,6 +13,7 @@ different users.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -25,6 +26,8 @@ from fastapi import FastAPI
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ
+from omnigent.server.routes._sessions.common import _fork_tasks
+from omnigent.server.routes.sessions import routes_core
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
@@ -411,15 +414,30 @@ async def test_fork_is_unbound_and_only_forker_can_bind_runner(
     )
     assert grant.status_code == 200, grant.text
 
-    # Bob (read-only) forks Alice's session.
+    # Bob (read-only) forks Alice's session. Materialization is async: the
+    # POST returns 202, the deep-copy + owner grant run in a background task,
+    # and the fork id arrives on the "ready" fork_status event.
+    captured: dict[str, Any] = {}
+    orig_publish = routes_core._publish_fork_status
+
+    def _spy(user_id, src, op_id, status, *, fork_id=None, error=None):  # type: ignore[no-untyped-def]
+        if status == "ready":
+            captured["fork_id"] = fork_id
+        return orig_publish(user_id, src, op_id, status, fork_id=fork_id, error=error)
+
+    monkeypatch.setattr(routes_core, "_publish_fork_status", _spy)
+    fork_before = set(_fork_tasks)
     fork_resp = await auth_client.post(
         f"/v1/sessions/{alice_session['id']}/fork",
         json={},
         headers={"X-Forwarded-Email": BOB},
     )
-    assert fork_resp.status_code == 201, fork_resp.text
-    fork = fork_resp.json()
-    fork_id = fork["id"]
+    assert fork_resp.status_code == 202, fork_resp.text
+    await asyncio.gather(*(set(_fork_tasks) - fork_before), return_exceptions=True)
+    fork_id = captured["fork_id"]
+    snap = await auth_client.get(f"/v1/sessions/{fork_id}", headers={"X-Forwarded-Email": BOB})
+    assert snap.status_code == 200, snap.text
+    fork = snap.json()
 
     # The fork is a fresh, unbound, idle session owned by Bob.
     assert fork["status"] == "idle"

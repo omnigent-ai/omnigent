@@ -386,19 +386,18 @@ describe("createBundledSession", () => {
 });
 
 describe("forkSession", () => {
-  it("POSTs the fork endpoint with the (url-encoded) source id and parses the fork", async () => {
-    fetchMock.mockResolvedValueOnce(
-      mockJsonResponse({
-        id: "conv_fork",
-        agent_id: "agent_clone",
-        status: "idle",
-        created_at: 1704067200,
-        title: "Fork of My session",
-        items: [],
-      }),
+  // Materialization is async: a normal fork returns 202 with an operation
+  // handle, not the finished session.
+  const forkAccepted = (opId = "forkop_conv_fork_ab12") =>
+    mockJsonResponse(
+      { operation_id: opId, source_id: "conv_src", status: "cloning" },
+      { status: 202 },
     );
 
-    const session = await forkSession("conv abc");
+  it("POSTs the fork endpoint with the (url-encoded) source id and parses the accept", async () => {
+    fetchMock.mockResolvedValueOnce(forkAccepted());
+
+    const result = await forkSession("conv abc");
 
     expect(fetchMock).toHaveBeenCalledOnce();
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
@@ -407,20 +406,39 @@ describe("forkSession", () => {
     expect(new Headers(init.headers).get("Content-Type")).toBe("application/json");
     // No title given → empty body so the server derives "Fork of <title>".
     expect(JSON.parse(init.body as string)).toEqual({});
-    expect(session.id).toBe("conv_fork");
-    expect(session.title).toBe("Fork of My session");
-    expect(session.status).toBe("idle");
+    expect(result).toEqual({
+      accepted: true,
+      operationId: "forkop_conv_fork_ab12",
+      sourceId: "conv_src",
+    });
+  });
+
+  it("returns the session for a synchronous (side-chat) fork (201)", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse(
+        {
+          id: "conv_fork",
+          agent_id: "agent_clone",
+          status: "idle",
+          created_at: 1704067200,
+          title: "Side chat",
+          items: [],
+        },
+        { status: 201 },
+      ),
+    );
+
+    const result = await forkSession("conv_src", { sideChat: true });
+
+    expect(result.accepted).toBe(false);
+    if (!result.accepted) {
+      expect(result.session.id).toBe("conv_fork");
+      expect(result.session.status).toBe("idle");
+    }
   });
 
   it("forwards the title when provided", async () => {
-    fetchMock.mockResolvedValueOnce(
-      mockJsonResponse({
-        id: "conv_fork",
-        agent_id: "agent_clone",
-        status: "idle",
-        created_at: 1704067200,
-      }),
-    );
+    fetchMock.mockResolvedValueOnce(forkAccepted());
 
     await forkSession("conv_src", { title: "My clone" });
 
@@ -429,14 +447,7 @@ describe("forkSession", () => {
   });
 
   it("forwards run-config overrides (model / effort / launch args)", async () => {
-    fetchMock.mockResolvedValueOnce(
-      mockJsonResponse({
-        id: "conv_fork",
-        agent_id: "agent_clone",
-        status: "idle",
-        created_at: 1704067200,
-      }),
-    );
+    fetchMock.mockResolvedValueOnce(forkAccepted());
 
     await forkSession("conv_src", {
       config: {
@@ -455,14 +466,7 @@ describe("forkSession", () => {
   });
 
   it("omits run-config fields left undefined so the fork inherits them", async () => {
-    fetchMock.mockResolvedValueOnce(
-      mockJsonResponse({
-        id: "conv_fork",
-        agent_id: "agent_clone",
-        status: "idle",
-        created_at: 1704067200,
-      }),
-    );
+    fetchMock.mockResolvedValueOnce(forkAccepted());
 
     // An empty config object (non-native target) sends no run overrides.
     await forkSession("conv_src", { config: {} });
@@ -472,14 +476,7 @@ describe("forkSession", () => {
   });
 
   it("asks for a managed sandbox when a sandbox target is given", async () => {
-    fetchMock.mockResolvedValueOnce(
-      mockJsonResponse({
-        id: "conv_fork",
-        agent_id: "agent_clone",
-        status: "idle",
-        created_at: 1704067200,
-      }),
-    );
+    fetchMock.mockResolvedValueOnce(forkAccepted());
 
     await forkSession("conv_src", {
       sandbox: { provider: "modal", workspace: "https://github.com/org/repo#main" },
@@ -494,14 +491,7 @@ describe("forkSession", () => {
   });
 
   it("keeps an explicit null workspace, so a sandbox fork can start empty", async () => {
-    fetchMock.mockResolvedValueOnce(
-      mockJsonResponse({
-        id: "conv_fork",
-        agent_id: "agent_clone",
-        status: "idle",
-        created_at: 1704067200,
-      }),
-    );
+    fetchMock.mockResolvedValueOnce(forkAccepted());
 
     // Null is a real choice (empty sandbox); dropping the key would instead
     // inherit the source's repository server-side. A provider the server
@@ -513,14 +503,7 @@ describe("forkSession", () => {
   });
 
   it("sends no host_type when no sandbox target is given (the fork stays unbound)", async () => {
-    fetchMock.mockResolvedValueOnce(
-      mockJsonResponse({
-        id: "conv_fork",
-        agent_id: "agent_clone",
-        status: "idle",
-        created_at: 1704067200,
-      }),
-    );
+    fetchMock.mockResolvedValueOnce(forkAccepted());
 
     await forkSession("conv_src", { config: {} });
 

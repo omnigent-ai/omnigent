@@ -1,5 +1,4 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { useNavigate } from "@/lib/routing";
 import { useQueryClient } from "@tanstack/react-query";
 import {
   AlertTriangleIcon,
@@ -29,7 +28,9 @@ import {
 } from "@/components/ui/select";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import { forkSession, launchRunner } from "@/lib/sessionsApi";
+import { forkSession } from "@/lib/sessionsApi";
+import { registerPendingForkBind } from "@/lib/forkOperations";
+import { toast } from "sonner";
 import { useAvailableAgents, prefetchAvailableAgentDetails } from "@/hooks/useAvailableAgents";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { partitionAgentsByKind } from "@/lib/agentGrouping";
@@ -632,8 +633,9 @@ function ForkRunConfig({
  * targets:
  *
  *  • A connected **host** — pick a directory and optional git worktree; the
- *    form binds the fork to a runner via ``launchRunner``
- *    (``POST /v1/hosts/{id}/runners``) after the fork call returns.
+ *    fork's runner is bound via ``launchRunner``
+ *    (``POST /v1/hosts/{id}/runners``) once the async materialization reports
+ *    ``ready`` (the bind needs the fork id, which arrives with that event).
  *  • A server-provisioned **sandbox**, offered when ``/v1/info`` reports
  *    ``managed_sandboxes_enabled`` — the fork itself carries
  *    ``host_type: "managed"`` and the server provisions the host in the
@@ -645,19 +647,18 @@ function ForkRunConfig({
  * just name + agent.
  *
  * Before creating anything, a host fork pre-flights the picked directory
- * against the host (it must exist and be listable) — the launch below is
- * detached, so a bad path would otherwise produce a clone that silently
- * never starts. A sandbox fork has nothing to pre-flight; the server
- * creates the workspace. After that, the fork call is the only thing the
- * form awaits: on success it closes and
- * navigates into the clone IMMEDIATELY, and (for a coding source) fires the
- * runner launch in the background. Holding the dialog through the launch
- * blocks for as long as a worktree create takes (up to minutes) and hangs
- * forever on a dropped response, so the launch is detached. If it fails the
- * clone stays unbound and the user retries the bind via the session page's
- * directory picker (ChatPage's existing unbound-fork path). A fork-call
- * failure (nothing created) surfaces inline and the inputs stay editable for
- * a straight resubmit.
+ * against the host (it must exist and be listable) — the deferred bind can't
+ * surface a bad path, so it would otherwise produce a clone that silently
+ * never starts. A sandbox fork has nothing to pre-flight; the server creates
+ * the workspace. Materialization (transcript copy, FTS rebuild) is a
+ * background server operation, so the fork call returns an operation handle
+ * immediately: the form closes and shows a non-modal "Cloning…" toast without
+ * navigating. The finished session enters the sidebar — and the toast flips to
+ * success, firing any deferred coding-fork bind — when SessionUpdatesProvider
+ * receives the ``fork_status`` event. A synchronous fork-call failure
+ * (validation / access — nothing created) surfaces inline and the inputs stay
+ * editable for a straight resubmit; a background materialization failure
+ * surfaces as an actionable toast with "Try again".
  *
  * Host/dir prefill from the *source*: its host is the default (when online)
  * and its workspace the default directory. When the source ran in a
@@ -701,7 +702,6 @@ export function ForkSessionForm({
   upToResponseId?: string | null;
   onClose: () => void;
 }) {
-  const navigate = useNavigate();
   const queryClient = useQueryClient();
   // Name is optional — left blank, the server derives "Fork of <source
   // title>" (shown as the input's placeholder). So the field starts empty.
@@ -1184,7 +1184,7 @@ export function ForkSessionForm({
       // Empty title → omit so the server derives "Fork of <source title>".
       // The run-config section (native targets only) reports its ready-to-send
       // value; an empty object (non-native target) sends no run overrides.
-      const fork = await forkSession(sourceSessionId, {
+      const result = await forkSession(sourceSessionId, {
         title: trimmed === "" ? undefined : trimmed,
         agentId: switching ? agentChoice : undefined,
         upToResponseId: upToResponseId ?? undefined,
@@ -1205,13 +1205,17 @@ export function ForkSessionForm({
             }
           : undefined,
       });
-      // Coding fork: launch the runner in the BACKGROUND, then navigate
-      // into the (already-created, unbound) clone immediately — awaiting the
-      // launch would block the modal for a worktree create (up to minutes)
-      // and hang on a dropped response. If the launch fails the clone stays
-      // unbound; ChatPage's existing unbound-fork path lets the user retry
-      // the bind via the directory picker. (A follow-up will surface the
-      // failure proactively + show "Connecting…" for the whole launch.)
+      // Materialization is async: the server accepted the fork and returns an
+      // operation handle. Close the dialog and show a non-modal "Cloning…"
+      // toast keyed to the operation — the session enters the sidebar (and the
+      // toast flips to success/failure) when SessionUpdatesProvider receives
+      // the fork_status event. We do NOT navigate: the user stays put.
+      if (!result.accepted) {
+        // A synchronous side-chat fork never reaches this dialog.
+        throw new Error("Unexpected synchronous fork response.");
+      }
+      // Coding fork: the runner bind needs the fork id, which only arrives with
+      // the `ready` event — stash the bind so the provider fires it then.
       if (isCodingSource && !sandboxSelected && selectedHostId) {
         const trimmedBranch = branchName.trim();
         addRecent(workspaceTrimmed);
@@ -1224,41 +1228,31 @@ export function ForkSessionForm({
         const baseOnSource =
           onSourceHost &&
           (workspaceTrimmed === sourceRepo || workspaceTrimmed === sourceWorkspaceNorm);
-        void launchRunner(
-          selectedHostId,
-          fork.id,
+        registerPendingForkBind(result.operationId, {
+          hostId: selectedHostId,
           // Recreating a deleted source worktree launches from the REPO
           // path (the server derives the worktree directory from the
           // branch), exactly like the renamed-branch path.
-          recreateSourceWorktree ? workspaceTrimmed : effectiveWorkspace,
-          trimmedBranch !== "" && (!usingSourceWorktree || recreateSourceWorktree)
-            ? recreateSourceWorktree
-              ? // The branch survives its deleted directory — recreate the
-                // worktree by checking the existing branch back out (no base:
-                // nothing new is forked).
-                { branchName: trimmedBranch, existingBranch: true }
-              : {
-                  branchName: trimmedBranch,
-                  baseBranch: baseOnSource && sourceBranch ? sourceBranch : undefined,
-                }
-            : undefined,
-        ).catch((e) => {
-          // Swallow: recovery is the unbound-fork picker on the session
-          // page. Logged so a failed launch isn't entirely silent.
-          console.warn(`Clone ${fork.id}: background runner launch failed`, e);
+          workspace: recreateSourceWorktree ? workspaceTrimmed : effectiveWorkspace,
+          git:
+            trimmedBranch !== "" && (!usingSourceWorktree || recreateSourceWorktree)
+              ? recreateSourceWorktree
+                ? // The branch survives its deleted directory — recreate the
+                  // worktree by checking the existing branch back out (no base:
+                  // nothing new is forked).
+                  { branchName: trimmedBranch, existingBranch: true }
+                : {
+                    branchName: trimmedBranch,
+                    baseBranch: baseOnSource && sourceBranch ? sourceBranch : undefined,
+                  }
+              : undefined,
         });
       }
-      // Fire-and-forget: the sidebar refresh must not gate navigation.
-      void queryClient.invalidateQueries({ queryKey: ["conversations"] });
-      // The fork inherits the source's project, and each folder renders its
-      // own ["project-sessions", <name>] list. The WS fallback can't converge
-      // it either: it skips the active session, and the navigate below makes
-      // the fork active.
-      void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
+      toast.loading("Cloning session…", { id: result.operationId, duration: Infinity });
       onClose();
-      navigate(`/c/${fork.id}`);
     } catch (e) {
-      // forkSession failed — nothing created, so inputs stay editable for a resubmit.
+      // forkSession failed synchronously (validation / access) — nothing was
+      // created, so inputs stay editable for a resubmit.
       setError(e instanceof Error ? e.message : "Couldn't clone the session. Try again.");
     } finally {
       setSubmitting(false);

@@ -27,6 +27,18 @@ export type SessionUpdatesFrame =
   | { type: "removed"; ids: string[] }
   | { type: "hosts_changed" }
   | { type: "projects_changed" }
+  | {
+      // Background fork progress. The destination session enters the sidebar
+      // via a normal "changed" frame (the server announces it on success), so
+      // this frame only drives the caller's "Cloning…" toast and, on success,
+      // hands back the fork id so a coding-fork client can bind its runner.
+      type: "fork_status";
+      operation_id: string;
+      source_id: string;
+      status: "cloning" | "ready" | "failed";
+      fork_id: string | null;
+      error: string | null;
+    }
   | { type: "heartbeat" };
 
 type FrameListener = (frame: SessionUpdatesFrame) => void;

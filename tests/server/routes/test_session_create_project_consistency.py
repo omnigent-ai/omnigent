@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -17,6 +18,8 @@ from omnigent.server.auth import UnifiedAuthProvider
 from omnigent.server.routes._session_create_validation import (
     resolve_project_session_create,
 )
+from omnigent.server.routes._sessions.common import _fork_tasks
+from omnigent.server.routes.sessions import routes_core
 from omnigent.server.schemas import (
     ProjectSessionCreateRequest,
     SessionCreateRequest,
@@ -191,6 +194,7 @@ async def test_explicit_agent_differing_from_pin_is_allowed_silently(
 
 async def test_fork_of_mismatched_session_stays_clean(
     project_create_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Forking a session whose agent differs from its project files into the
     same project and surfaces no warning."""
@@ -206,11 +210,29 @@ async def test_fork_of_mismatched_session_stays_clean(
         headers=_headers(),
     )
     assert moved.status_code == 200, moved.text
+
+    # Fork materializes in a background task; resolve the fork id off the
+    # "ready" event, then read its snapshot.
+    captured: dict[str, str | None] = {}
+    orig = routes_core._publish_fork_status
+
+    def _spy(uid, src, op_id, status, *, fork_id=None, error=None):  # type: ignore[no-untyped-def]
+        if status == "ready":
+            captured["fork_id"] = fork_id
+        return orig(uid, src, op_id, status, fork_id=fork_id, error=error)
+
+    monkeypatch.setattr(routes_core, "_publish_fork_status", _spy)
+    before = set(_fork_tasks)
     fork = await project_create_client.post(
         f"/v1/sessions/{session_id}/fork", json={}, headers=_headers()
     )
-    assert fork.status_code == 201, fork.text
-    body = fork.json()
+    assert fork.status_code == 202, fork.text
+    await asyncio.gather(*(set(_fork_tasks) - before), return_exceptions=True)
+    snap = await project_create_client.get(
+        f"/v1/sessions/{captured['fork_id']}", headers=_headers()
+    )
+    assert snap.status_code == 200, snap.text
+    body = snap.json()
     assert "warnings" not in body
     assert body["project_id"] == project_id
 
