@@ -510,20 +510,19 @@ export function WorkspacePicker({
   // resolved it to, falling back to the raw path until the listing
   // arrives (so the breadcrumb stays put rather than flashing empty).
   const currentAbsolute = isHostAbsolutePath(path) ? path : (listedAbsolute ?? path);
-  const worktreeRepoPath =
-    hasCommitActions && isHostAbsolutePath(currentAbsolute) && !navigationPending
-      ? currentAbsolute
-      : null;
+  const requestedWorktreePath =
+    hasCommitActions && isHostAbsolutePath(currentAbsolute) ? currentAbsolute : null;
+  const worktreeQueryPath = navigationPending ? null : requestedWorktreePath;
   const {
     data: hostWorktrees,
     isFetching: worktreesFetching,
     isPlaceholderData: worktreesPlaceholder,
     error: worktreesError,
-  } = useHostWorktrees(hostId, worktreeRepoPath);
+  } = useHostWorktrees(hostId, worktreeQueryPath);
   const worktreesPending = Boolean(worktreesFetching || worktreesPlaceholder);
   const verifiedGithubWorktrees = useVerifiedGithubWorktrees({
     hostId,
-    requestedPath: worktreeRepoPath,
+    requestedPath: requestedWorktreePath,
     worktrees: hostWorktrees,
     resolved: !worktreesPlaceholder && hostWorktrees !== undefined,
   });

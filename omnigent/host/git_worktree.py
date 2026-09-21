@@ -287,17 +287,24 @@ def _remote_provider(repo_root: str) -> str | None:
     return "other" if saw_other else None
 
 
-def _commit_updated_at(repo_root: str, head: str | None) -> int | None:
-    """Return the checked-out commit timestamp for one worktree record."""
-    if head is None:
-        return None
-    result = _run_git(["show", "-s", "--format=%ct", head], cwd=repo_root)
+def _commit_updated_ats(repo_root: str, heads: list[str | None]) -> dict[str, int]:
+    """Return checked-out commit timestamps with one bounded local git call."""
+    unique_heads = list(dict.fromkeys(head for head in heads if head is not None))
+    if not unique_heads:
+        return {}
+    result = _run_git(["show", "-s", "--format=%H%x00%ct", *unique_heads], cwd=repo_root)
     if result.returncode != 0:
-        return None
-    try:
-        return int(result.stdout.strip())
-    except ValueError:
-        return None
+        return {}
+    timestamps: dict[str, int] = {}
+    for line in result.stdout.splitlines():
+        head, separator, raw_timestamp = line.partition("\0")
+        if separator == "":
+            continue
+        try:
+            timestamps[head] = int(raw_timestamp)
+        except ValueError:
+            continue
+    return timestamps
 
 
 def list_worktrees(*, repo_path: str) -> list[WorktreeInfo]:
@@ -323,7 +330,7 @@ def list_worktrees(*, repo_path: str) -> list[WorktreeInfo]:
     if result.returncode != 0:
         raise _git_error("git worktree list failed", result)
 
-    worktrees: list[WorktreeInfo] = []
+    records: list[tuple[str, str | None, bool, str | None]] = []
     path: str | None = None
     branch: str | None = None
     head: str | None = None
@@ -343,30 +350,25 @@ def list_worktrees(*, repo_path: str) -> list[WorktreeInfo]:
             detached = True
         elif line == "" and path is not None:
             # Blank line terminates a record.
-            worktrees.append(
-                WorktreeInfo(
-                    path=path,
-                    branch=branch,
-                    is_main=not worktrees,
-                    detached=detached,
-                    remote_provider=remote_provider,
-                    updated_at=_commit_updated_at(repo_root, head),
-                )
-            )
+            records.append((path, branch, detached, head))
             path = None
     # The porcelain output may omit a trailing blank line for the last record.
     if path is not None:
-        worktrees.append(
-            WorktreeInfo(
-                path=path,
-                branch=branch,
-                is_main=not worktrees,
-                detached=detached,
-                remote_provider=remote_provider,
-                updated_at=_commit_updated_at(repo_root, head),
-            )
+        records.append((path, branch, detached, head))
+    updated_ats = _commit_updated_ats(repo_root, [record[3] for record in records])
+    return [
+        WorktreeInfo(
+            path=worktree_path,
+            branch=worktree_branch,
+            is_main=index == 0,
+            detached=worktree_detached,
+            remote_provider=remote_provider,
+            updated_at=updated_ats.get(worktree_head) if worktree_head is not None else None,
         )
-    return worktrees
+        for index, (worktree_path, worktree_branch, worktree_detached, worktree_head) in enumerate(
+            records
+        )
+    ]
 
 
 def _local_branch_exists(repo_root: str, branch_name: str) -> bool:

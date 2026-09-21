@@ -5867,29 +5867,31 @@ export function NewChatLandingScreen() {
                             />
                             <span className="font-medium text-foreground">No worktree</span>
                           </label>
-                          {linkedWorktrees.length > 0 && (
-                            <div
-                              className="mt-1 flex max-h-40 shrink-0 flex-col gap-0.5 overflow-y-auto border-t border-border pt-2"
-                              data-testid="new-chat-landing-worktree-dropdown"
-                            >
-                              <span className="px-2 py-1 text-xs leading-5 text-muted-foreground">
-                                Worktrees
-                              </span>
-                              {linkedWorktrees.map((worktree) => (
-                                <WorktreeRadioRow
-                                  key={worktree.path}
-                                  worktree={worktree}
-                                  checked={activeWorktree?.path === worktree.path}
-                                  name="new-chat-existing-worktree"
-                                  onSelect={() => {
-                                    workspaceFromConfigRef.current = false;
-                                    setWorkspace(worktree.path);
-                                  }}
-                                  testId="new-chat-landing-worktree-option"
-                                />
-                              ))}
-                            </div>
-                          )}
+                          <TooltipProvider>
+                            {linkedWorktrees.length > 0 && (
+                              <div
+                                className="mt-1 flex max-h-40 shrink-0 flex-col gap-0.5 overflow-y-auto border-t border-border pt-2"
+                                data-testid="new-chat-landing-worktree-dropdown"
+                              >
+                                <span className="px-2 py-1 text-xs leading-5 text-muted-foreground">
+                                  Worktrees
+                                </span>
+                                {linkedWorktrees.map((worktree) => (
+                                  <WorktreeRadioRow
+                                    key={worktree.path}
+                                    worktree={worktree}
+                                    checked={activeWorktree?.path === worktree.path}
+                                    name="new-chat-existing-worktree"
+                                    onSelect={() => {
+                                      workspaceFromConfigRef.current = false;
+                                      setWorkspace(worktree.path);
+                                    }}
+                                    testId="new-chat-landing-worktree-option"
+                                  />
+                                ))}
+                              </div>
+                            )}
+                          </TooltipProvider>
                         </div>
                         <div className="my-1 h-px bg-border" />
                         <label

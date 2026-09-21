@@ -761,14 +761,36 @@ describe("WorkspacePicker modal actions", () => {
     expect(onSelect).toHaveBeenCalledWith("/Users/corey/worktrees/feature-layout");
   });
 
-  it("keeps the verified GitHub worktree panel visible while a nested path loads", () => {
+  it("keeps cached verified worktrees and selection while a nested path query is disabled", () => {
+    useHostFilesystemMock.mockImplementation((_host, path) =>
+      path === "/Users/corey/repo/src"
+        ? result({
+            data: {
+              entries: [dir("src", "/Users/corey/repo/src")],
+              truncated: false,
+            },
+            isLoading: false,
+            isFetching: true,
+            isPlaceholderData: true,
+            error: null,
+          })
+        : result({
+            data: {
+              entries: [dir("src", "/Users/corey/repo/src")],
+              truncated: false,
+            },
+            isLoading: false,
+            isPlaceholderData: false,
+            error: null,
+          }),
+    );
     useHostWorktreesMock.mockImplementation(
       (_host, path) =>
-        (path === "/Users/corey/repo/src"
+        (path === null
           ? {
               data: undefined,
-              isFetching: true,
-              isPlaceholderData: true,
+              isFetching: false,
+              isPlaceholderData: false,
               error: null,
             }
           : {
@@ -796,9 +818,13 @@ describe("WorkspacePicker modal actions", () => {
     render(<WorkspacePicker hostId="host_1" initialPath="/Users/corey/repo" onSelect={vi.fn()} />);
 
     expect(screen.getByTestId("workspace-picker-worktrees")).toBeVisible();
+    const worktreeRadio = screen.getByRole("radio", { name: "Use worktree feature-layout" });
+    fireEvent.click(worktreeRadio);
+    expect(worktreeRadio).toBeChecked();
     fireEvent.click(screen.getByTestId("workspace-picker-entry-src"));
+    expect(useHostWorktreesMock).toHaveBeenLastCalledWith("host_1", null);
     expect(screen.getByTestId("workspace-picker-worktrees")).toBeVisible();
-    expect(screen.getByRole("radio", { name: "Use worktree feature-layout" })).toBeVisible();
+    expect(screen.getByRole("radio", { name: "Use worktree feature-layout" })).toBeChecked();
   });
 
   it("hides the worktree panel without verified GitHub provider metadata", () => {

@@ -466,6 +466,31 @@ def test_list_worktrees_includes_linked(git_repo: Path) -> None:
     assert isinstance(linked.updated_at, int)
 
 
+def test_list_worktrees_fetches_all_timestamps_with_one_git_command(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Timestamp metadata stays O(1) as the number of worktrees grows."""
+    for index in range(4):
+        create_worktree(repo_path=str(git_repo), branch_name=f"feature/{index}")
+
+    original_run_git = git_worktree_module._run_git
+    show_calls: list[list[str]] = []
+
+    def run_git(args: list[str], *, cwd: str) -> subprocess.CompletedProcess[str]:
+        if args[:3] == ["show", "-s", "--format=%H%x00%ct"]:
+            show_calls.append(args)
+        return original_run_git(args, cwd=cwd)
+
+    monkeypatch.setattr(git_worktree_module, "_run_git", run_git)
+
+    result = list_worktrees(repo_path=str(git_repo))
+
+    assert len(result) == 5
+    assert len(show_calls) == 1
+    assert len(show_calls[0][3:]) == len({_rev_parse(Path(worktree.path)) for worktree in result})
+    assert all(isinstance(worktree.updated_at, int) for worktree in result)
+
+
 def test_list_worktrees_from_linked_resolves_same_list(git_repo: Path) -> None:
     """Listing from inside a linked worktree resolves the main repo's full list."""
     _git(git_repo, "remote", "add", "origin", "git@github.com:acme/repo.git")

@@ -142,6 +142,8 @@ describe("useVerifiedGithubWorktrees", () => {
 
     rerender({ path: "/ordinary", worktrees: undefined, resolved: false });
     expect(result.current).toEqual([]);
+    rerender({ path: "/ordinary", worktrees: [], resolved: true });
+    expect(result.current).toEqual([]);
     rerender({
       path: "/repo/src",
       worktrees: [{ ...githubWorktrees[0], remote_provider: "other" as const }],
