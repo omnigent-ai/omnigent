@@ -40,6 +40,7 @@ def response(decision="actionable"):
             "reason": "Assessment of the reported failure.",
             "readability": "clear" if decision == "actionable" else "not_assessed",
             "source_only_quote": SOURCE_ONLY if decision == "non_actionable" else None,
+            "has_user_facing_repro": decision == "actionable",
         },
     }
 
@@ -81,6 +82,9 @@ def test_three_decisions_and_comment_previews(tmp_path, decision):
     assert plan.close_as_non_actionable == (decision == "non_actionable")
     assert plan.target.needs_info == (decision == "needs_info")
     assert artifact["mutation"]["close_as_non_actionable"] == plan.close_as_non_actionable
+    assert artifact["classification"]["bug_review"]["has_user_facing_repro"] == (
+        decision == "actionable"
+    )
     if decision == "needs_info":
         assert "Please update the issue by" in body
     else:
@@ -192,6 +196,36 @@ def test_missing_closure_quote_requests_clarification():
     assert classification.bug_review.source_only_quote is None
     assert run.mutations[0].target.needs_info
     assert not run.mutations[0].close_as_non_actionable
+
+
+@pytest.mark.parametrize("repro", [True, None, "missing"])
+def test_user_facing_or_uncertain_repro_prevents_closure_even_with_source_only_quote(repro):
+    value = response("non_actionable")
+    if repro == "missing":
+        del value["bug_review"]["has_user_facing_repro"]
+    else:
+        value["bug_review"]["has_user_facing_repro"] = repro
+    report = issue(
+        SOURCE_ONLY + " Start a session, run /clear, then send a web message. "
+        "Predicted result: replies disappear from the web transcript."
+    )
+    run, classification, _, _ = preview(value=value, report=report)
+    assert classification.bug_review.actionability == "needs_info"
+    assert classification.bug_review.source_only_quote is None
+    assert run.mutations[0].target.needs_info
+    assert not run.mutations[0].close_as_non_actionable
+    body = build_triage_comment(run.ranked[0], run.mutations[0], (), NOW)
+    assert "Try the provided steps and share the result" in body
+    assert "Please update the issue by" in body
+    assert "recommend closing" not in body
+
+
+@pytest.mark.parametrize("repro", ["false", 0, 1, [], {}])
+def test_invalid_reproduction_assessment_is_rejected(repro):
+    value = response("non_actionable")
+    value["bug_review"]["has_user_facing_repro"] = repro
+    with pytest.raises(ValueError, match="has_user_facing_repro must be a boolean or null"):
+        preview(value=value)
 
 
 @pytest.mark.parametrize(

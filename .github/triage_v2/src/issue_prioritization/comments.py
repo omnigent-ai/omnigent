@@ -72,7 +72,8 @@ def build_triage_comment(
                 "🤖 **Automated triage**",
                 "",
                 "Based on the report reviewed, we recommend closing as **not planned** "
-                "because it does not describe an observed user-facing failure.",
+                "because it describes only an inferred code-path problem, without an "
+                "observed failure or concrete steps through a user workflow.",
                 "",
                 _plain_text(review.reason),
                 "",

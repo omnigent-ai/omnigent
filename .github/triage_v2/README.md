@@ -121,7 +121,9 @@ trapped behind the classifier switch.
 The issue-event workflow can apply three decisions to Bugs: keep observed failures
 open (adding a concise summary and grounded reproduction steps when hard to read),
 request clarification through the existing `needs-info` process when observation
-is unclear, or explain and close clearly speculative/unexecuted findings.
+is unclear, or explain and close confidently code-path-only findings. Plausible
+UI/CLI/API reproduction steps keep the issue open even when unexecuted: ask for
+the result instead of closing it for being inferred from source.
 
 Enable it locally with `issue-priority-event --review-bugs --mode dry_run` and the
 arguments above. Inspect the decision and proposed comment in `event.json`.
@@ -130,8 +132,10 @@ Automatic event runs use
 job keep their existing assessment.
 
 One model call assesses the full report and author follow-ups. Closure requires
-an exact supporting quote and live content checks. Security/duplicate/pinned issues
-remain exempt. Reports over 100,000 characters are skipped for manual review.
+an exact supporting quote, `has_user_facing_repro=false`, and live content checks.
+A true, unclear, or missing reproduction assessment prevents immediate closure.
+Security/duplicate/pinned issues remain exempt. Reports over 100,000 characters
+are skipped for manual review.
 If a reproduction quote cannot be verified, omit the rewritten steps and keep
 the valid assessment and summary; closure quotes still require an exact match.
 Immediate closures remove `needs-info` and ask reporters to open a new issue if

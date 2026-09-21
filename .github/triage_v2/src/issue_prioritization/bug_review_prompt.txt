@@ -3,17 +3,19 @@ Bug review (enabled for this run; applies only when the classified type is Bug):
 Return bug_review before the other classification fields, with evidence before
 the decision, using this shape:
 {
-  "source_only_quote": null,
   "reason": "One plain-English sentence, at most 500 characters",
+  "has_user_facing_repro": true | false | null,
+  "source_only_quote": null,
   "actionability": "actionable | needs_info | non_actionable",
   "readability": "clear | needs_summary | not_assessed",
   "clarification": null
 }
 For Feature and Docs, return bug_review=null and keep their existing assessment.
 
-This review takes precedence over the general completeness rubric above. We
-prioritize observed user-facing failures, not defects inferred only from reading
-source code. Judge the report's evidence, not whether it sounds AI-generated.
+This review takes precedence over the general completeness rubric above. Close
+only when confident the concern is code-path-only: no observed failure and no
+plausible user-facing reproduction steps. Judge the report's evidence, not whether
+it sounds AI-generated. Uncertainty must keep the issue open for clarification.
 You only have the report: never claim to have inspected the code, run tests, or
 verified the failure yourself.
 
@@ -26,17 +28,46 @@ large affected population. A plain description of experienced behavior counts;
 first-person wording, logs, and the phrase "I reproduced it" are not required.
 Code analysis may explain an observed failure, but cannot replace one.
 
+In reason, consider the proposed user actions and any observation before deciding
+has_user_facing_repro and actionability:
+- true: concrete, plausible steps through ordinary UI, CLI, or public API usage
+  that let a user try the reported failure. These count even when proposed,
+  unexecuted, or inferred from source. Steps need not use a numbered list.
+- false: the report affirmatively confines the scenario to code/internal
+  synthetic manipulation or rules out a user trigger. For example, reproduction
+  requires injecting private cache state rather than using the product.
+  Source-inspection origin or missing usable steps alone never establishes false.
+- null: uncertain whether the steps describe a valid user workflow or contain
+  enough detail to try it. A proposed user action sequence with unclear details
+  or uncertain support belongs here, even if the author calls it source-only.
+  Missing detail does not establish that the sequence is internal-only.
+  Ask for clarification; do not assume false.
+If a report proposes users resetting, editing, starting, or otherwise using the
+product, uncertainty about how to do so is null. "I do not know whether users can
+trigger this" is uncertainty, not evidence excluding a user trigger. Only use
+false when there is an affirmative basis for excluding a user workflow.
+A "Steps to reproduce" heading alone is not sufficient. Unrun mocks, injected
+cache barriers, or direct private-state mutations are internal test sketches.
+An executed controlled test can still establish an observed user-facing failure.
+Missing logs, proof of execution, or certainty that steps will reproduce the bug
+must never turn plausible user-facing steps into false.
+
 Decide from the evidence in this order, using the entire report and author replies:
 1. Look for an experienced incorrect result, including observations alongside a
    source-code investigation. If present, assess whether it supplies enough
    context to investigate (actionable) or needs more details (needs_info).
-2. If no observation is established, look for an explicit statement about how
-   the finding originated: source inspection only, a hypothetical outcome, or a
-   scenario that was not executed, or an explicit admission of no failure to
-   report. Only this establishes non_actionable.
-3. If neither is established, choose needs_info. A concrete "can fail" symptom
-   with a technical explanation may describe either an observation or a prediction.
-   Ask whether the failure actually occurred; do not assume either answer.
+2. If the report proposes user actions but it is unclear whether the sequence
+   is supported or how to perform it, set has_user_facing_repro=null and choose
+   needs_info. Do not interpret this uncertainty as absence of a user workflow.
+   If the steps are plausible but unexecuted, set true and choose needs_info.
+   Ask the author to try them and share what happened, or clarify the uncertain
+   steps. An explicit source-only disclaimer cannot override either case.
+3. Only when has_user_facing_repro is false, look for an explicit statement
+   establishing that the finding is based solely on source inspection or an
+   unexecuted internal scenario. The absence of known steps is not evidence that
+   only an internal scenario is possible. With affirmative evidence, choose non_actionable.
+   Otherwise choose needs_info. A technical explanation alone does not establish
+   how the finding originated; do not infer speculation from missing evidence.
 
 Keep the scope and tense of each statement intact. "No live runner needs to be
 removed" is about the requirements of a proposed future test. It does not say
@@ -61,31 +92,33 @@ observed.
 - actionable: enough evidence of an observed user-facing failure. Set
   information_status=sufficient and missing_information=[].
 - needs_info: a reported failure lacks details needed to investigate, or a
-  concrete symptom is described but it is unclear whether it actually occurred.
+  concrete symptom is described but it is unclear whether it actually occurred,
+  or plausible user-facing reproduction steps have not been tried.
   Set information_status=needs_info and list the missing categories. If observation
   is unclear, include observed_behavior and ask in reason whether the failure was
   encountered and what happened. Use evidence_kind=none, or code_analysis when
   the available supporting evidence is source reasoning. These reports retain
-  the existing seven-day reply window.
-- non_actionable: the report clearly presents a source-only finding, hypothetical
-  execution, or predicted consequence, without an accompanying observation.
-  The report must establish that speculative basis: for example, it attributes
-  the finding to a source audit, explicitly labels an outcome hypothetical, or
-  says nobody executed the scenario or there is no failure to report.
-  Technical root-cause details and suggested
-  future validation alone do not establish a source-only origin. Even a detailed user-visible
-  consequence does not rescue a report whose stated basis is only source analysis.
-  In reason, identify what establishes that speculative basis instead of merely
-  listing missing logs, versions, or proof. Set information_status=needs_info, identify the
-  missing observed_behavior, and set evidence_kind to
+  the existing seven-day reply window. Set readability=not_assessed and
+  clarification=null; put the question in reason, not in a summary or recipe.
+- non_actionable: confidently code-path-only, with no observation AND
+  has_user_facing_repro=false. The report must explicitly establish its source-only
+  basis, such as a source audit or an unexecuted internal test scenario.
+  A predicted consequence alone is not a reproduction workflow, but concrete
+  steps through user actions prevent closure even if the consequence is predicted.
+  Technical root-cause details and suggested future validation alone do not
+  establish a source-only origin. In reason, explain both the code-only basis
+  and why the supplied scenario is not a user workflow. Do not merely list missing
+  logs, versions, or proof. Set information_status=needs_info, identify the missing
+  observed_behavior, and set evidence_kind to
   code_analysis or none. Use low impact because user impact is unconfirmed.
   The automation will post an explanation and close as not planned immediately,
   without a seven-day wait. Explain the missing observation in ordinary language.
 
 For non_actionable, source_only_quote must be an exact, continuous excerpt from
-the report (at most 2000 characters) establishing its source-only or hypothetical
-basis. Copy one short sentence from the report's prose, excluding section headings.
-For example, quote "Nobody executed it." alone, without adding "Reproduction:".
+the report (at most 2000 characters) establishing its code-path-only basis.
+Copy one short sentence from the report's prose, excluding section headings.
+A statement that steps were not executed is insufficient when those steps
+describe a plausible user workflow.
 Preserve every character; never paraphrase, combine excerpts, or insert an ellipsis.
 A quote of technical root-cause details or suggested regression tests is
 not sufficient: those can accompany a real failure. Statements such as "no live
@@ -102,7 +135,8 @@ Examples of the distinction (even when the label says validated:reproduced):
   observation is unclear; the final sentence describes future test requirements.
   Ask whether recreation actually failed. It does not establish non_actionable.
 - The same report plus "I found this only by reading the source; nobody ran the
-  sequence" -> non_actionable, even though a user-visible consequence is named.
+  sequence" -> needs_info: deleting a working directory and recreating its
+  terminal is a plausible user workflow. Ask the author to try it.
 - The same report plus "After removing my worktree, recreation failed with that
   error; restarting the runner restored it" -> actionable when enough context
   is supplied, regardless of whether regression tests are merely proposed.
@@ -111,8 +145,20 @@ Examples of the distinction (even when the label says validated:reproduced):
   simulate a pending snapshot in a unit test." -> needs_info. This describes a
   possible failure and a proposed test, without saying the failure occurred.
   A technical explanation and expected result do not establish an observation.
+- "Start a native session, run /clear in its terminal, then send a web message.
+  Predicted: replies disappear from the web transcript. Found by reading source;
+  not yet witnessed." -> has_user_facing_repro=true, needs_info, keep open.
+  With an experienced missing reply instead, assess as actionable.
+- "Source audit only; nobody ran this. Inject a barrier into the private cache
+  resolver, mutate its cached entry, then release the barrier; a stale value
+  should be returned." -> has_user_facing_repro=false, non_actionable: only an
+  unexecuted internal manipulation is provided, with no user workflow.
+- "Source inspection suggests switching agents while a session starts may
+  leave stale tools, but I am unsure whether the UI permits this sequence."
+  -> has_user_facing_repro=null, needs_info. Clarify the proposed user actions;
+  uncertainty about whether they are supported is not grounds for closure.
 
-Keep hypothetical failure claims classified as Bug so this review can close
+Keep hypothetical failure claims classified as Bug so this review can assess
 them. A genuine request for a new capability or refactoring remains Feature;
 do not turn it into a Bug to apply this review.
 

@@ -128,12 +128,16 @@ class PromptClassifier:
             ):
                 raise ValueError("a non_actionable bug cannot claim observed failure evidence")
             bug_review = bug_review.validate_source(issue.body)
-            if non_actionable and bug_review.source_only_quote is None:
+            if non_actionable and (
+                bug_review.source_only_quote is None
+                or bug_review.has_user_facing_repro is not False
+            ):
                 bug_review = replace(
                     bug_review,
                     actionability=BugActionability.NEEDS_INFO,
-                    reason="Did the described failure actually occur, or was it inferred from "
-                    "source code? Please describe what you did and what happened.",
+                    reason="Please confirm whether the described failure actually occurred. "
+                    "Try the provided steps and share the result, or describe how a user "
+                    "can encounter the problem.",
                     source_only_quote=None,
                 )
                 reasoning = (
@@ -189,10 +193,10 @@ def build_prompt(
         body=issue.body if review_bugs else issue.body[:12000],
         code_analysis_guidance=(
             "Code analysis alone is not usable evidence of an observed user-facing failure. "
-            "Apply the bug review below: close clearly source-only concerns as non_actionable, "
-            "even when they predict a concrete consequence. If a concrete failure report "
-            "leaves it unclear whether the symptom was observed, use needs_info; missing "
-            "logs or a reproduction statement alone do not establish speculation."
+            "Apply the bug review below: only close confidently code-path-only concerns "
+            "without an observation or plausible user-facing reproduction steps. "
+            "Unexecuted UI/CLI/API steps require needs_info, not closure. "
+            "When observation or the validity of the steps is unclear, use needs_info."
             if review_bugs
             else "Code analysis naming a reachable path and its concrete incorrect impact "
             "can also be sufficient. A defensive code-path report can be sufficient when "

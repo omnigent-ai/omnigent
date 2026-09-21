@@ -29,6 +29,7 @@ class BugReview:
     reason: str
     clarification: BugClarification | None = None
     source_only_quote: str | None = None
+    has_user_facing_repro: bool | None = None
 
     @classmethod
     def from_mapping(cls, value: object) -> BugReview:
@@ -58,11 +59,15 @@ class BugReview:
                 _text(raw.get("summary"), "summary", 600), tuple(parsed_steps)
             )
         quote = value.get("source_only_quote")
+        user_repro = value.get("has_user_facing_repro")
+        if user_repro is not None and not isinstance(user_repro, bool):
+            raise ValueError("has_user_facing_repro must be a boolean or null")
         review = cls(
             actionability,
             reason,
             clarification,
             _text(quote, "source_only_quote", 2000) if quote is not None else None,
+            user_repro,
         )
         if review.source_only_quote and actionability != BugActionability.NON_ACTIONABLE:
             raise ValueError("only a non_actionable bug can have a source_only_quote")
