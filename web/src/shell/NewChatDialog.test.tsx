@@ -1494,12 +1494,6 @@ function closePrimaryPicker(): void {
   if (row) fireEvent.keyDown(row, { key: "Escape" });
 }
 
-function expectNoAdvancedSettingsInOpenMenus(): void {
-  for (const menu of screen.getAllByRole("menu")) {
-    expect(within(menu).queryByText("Advanced settings")).toBeNull();
-  }
-}
-
 /** Open a Radix Select trigger (opens on pointerdown in jsdom). */
 function openSelect(testId: string): void {
   if (testId === "new-chat-landing-config-harness") {
@@ -3269,7 +3263,6 @@ describe("NewChatLandingScreen", () => {
     const hostChip = screen.getByTestId("new-chat-landing-host-chip");
     const permission = screen.getByTestId("new-chat-landing-permission-chip");
     const worktree = screen.getByTestId("new-chat-landing-branch-chip");
-    const settings = screen.getByTestId("new-chat-landing-settings");
     const harness = screen.getByTestId("new-chat-landing-agent-select");
     const voice = screen.getByRole("button", { name: "Voice dictation" });
     const submit = screen.getByTestId("new-chat-landing-submit");
@@ -3321,11 +3314,6 @@ describe("NewChatLandingScreen", () => {
     expect(worktree).toHaveTextContent("New");
     expect(worktree.querySelectorAll("svg")[0]).toHaveClass("size-3.5");
     expect(worktree.querySelectorAll("svg")[1]).toHaveClass("size-3");
-    expect(settings).toHaveAccessibleName("Advanced settings");
-    expect(settings).toHaveTextContent("Advanced settings");
-    expect(settings.querySelector("span")).toHaveClass(
-      "group-data-[labels=collapsed]/composer-actions:hidden",
-    );
     expect(harness).toHaveClass(
       "min-h-8",
       "min-w-0",
@@ -3360,7 +3348,7 @@ describe("NewChatLandingScreen", () => {
       expect(leftControls).toContainElement(control);
     }
     expect(workspaceControls).toContainElement(worktree);
-    for (const control of [settings, harness, voice, submit]) {
+    for (const control of [harness, voice, submit]) {
       expect(rightControls).toContainElement(control);
     }
     const orderedControls = [
@@ -3369,7 +3357,6 @@ describe("NewChatLandingScreen", () => {
       attach,
       hostChip,
       permission,
-      settings,
       harness,
       voice,
       submit,
@@ -3840,7 +3827,7 @@ describe("NewChatLandingScreen", () => {
       renderLanding({ smart_routing_enabled: smartRoutingEnabled });
       openAgentModels(agentId);
       expect(screen.queryByTestId("new-chat-landing-config-gear")).toBeNull();
-      expectNoAdvancedSettingsInOpenMenus();
+      expect(screen.queryByText("Advanced settings")).toBeNull();
       const models = screen.getByTestId("new-chat-landing-agent-models");
       const efforts = screen.getByTestId("new-chat-landing-agent-efforts");
       expect(models).toBeVisible();
@@ -3873,7 +3860,7 @@ describe("NewChatLandingScreen", () => {
         fireEvent.click(screen.getByTestId(`new-chat-landing-agent-config-${agentId}`));
         expect(screen.getByTestId("new-chat-landing-agent-models")).toBeVisible();
         expect(screen.getByTestId("new-chat-landing-agent-efforts")).toBeVisible();
-        expectNoAdvancedSettingsInOpenMenus();
+        expect(screen.queryByText("Advanced settings")).toBeNull();
       } else {
         expect(screen.queryByTestId(`new-chat-landing-agent-config-${agentId}`)).toBeNull();
         fireEvent.click(screen.getByTestId(`new-chat-landing-agent-${agentId}`));
@@ -3903,7 +3890,7 @@ describe("NewChatLandingScreen", () => {
       fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
       fireEvent.click(screen.getByTestId("new-chat-landing-agent-config-a_claude"));
       expect(screen.getByTestId("new-chat-landing-agent-models")).toBeVisible();
-      expectNoAdvancedSettingsInOpenMenus();
+      expect(screen.queryByText("Advanced settings")).toBeNull();
     },
   );
 
@@ -5376,7 +5363,7 @@ describe("NewChatLandingScreen", () => {
     expect(screen.getByRole("menuitemcheckbox", { name: "Sonnet 4.6" })).toBeVisible();
     expect(screen.queryByText("Fable")).toBeNull();
     expect(screen.queryByText("Sonnet 5")).toBeNull();
-    expectNoAdvancedSettingsInOpenMenus();
+    expect(screen.queryByText("Advanced settings")).toBeNull();
     closePrimaryPicker();
     expect(screen.queryByTestId("new-chat-landing-config-model")).toBeNull();
     expect(screen.queryByTestId("new-chat-landing-config-effort")).toBeNull();
@@ -8089,7 +8076,7 @@ describe("NewChatLandingScreen agent picker (mobile drill-in)", () => {
     clickAgentConfig("a2");
     expect(screen.getAllByRole("menu")).toEqual([menu]);
     expect(screen.getByRole("menuitemcheckbox", { name: "GPT-5.6" })).toBeVisible();
-    expectNoAdvancedSettingsInOpenMenus();
+    expect(screen.queryByText("Advanced settings")).toBeNull();
     expect(screen.queryByTestId("new-chat-landing-agent-a2")).not.toBeInTheDocument();
     fireEvent.click(screen.getByTestId("new-chat-landing-page-back"));
     expect(screen.getByTestId("new-chat-landing-agent-a2")).toBeVisible();
@@ -8122,7 +8109,7 @@ describe("NewChatLandingScreen agent picker (mobile drill-in)", () => {
       clickAgentConfig("a_claude");
       expect(screen.getAllByRole("menu")).toHaveLength(1);
       expect(screen.getByTestId("new-chat-landing-agent-models")).toBeVisible();
-      expectNoAdvancedSettingsInOpenMenus();
+      expect(screen.queryByText("Advanced settings")).toBeNull();
     },
   );
 
@@ -9604,16 +9591,20 @@ describe("NewChatLandingScreen bundle-agent Smart Routing", () => {
           "omnigent.client_create_token": expect.stringMatching(/^[0-9a-f]{32}$/),
         }),
       );
-      expect(body.labels["omnigent.composer_context.v1.0"]).toBeTypeOf("string");
+      const labels = body.labels as Record<string, string>;
+      expect(labels["omnigent.composer_context.v1.0"]).toBeTypeOf("string");
       const composerContextMetadata = JSON.parse(
-        Object.entries(body.labels)
+        Object.entries(labels)
           .filter(([key]) => key.startsWith("omnigent.composer_context.v1."))
           .sort(([left], [right]) => left.localeCompare(right))
           .map(([, value]) => value)
           .join(""),
       );
-      expect(composerContextMetadata).not.toHaveProperty("mcp_context");
-      expect(composerContextMetadata).toHaveProperty("repositories");
+      expect(composerContextMetadata).toEqual({
+        version: 1,
+        working_directory: { path: "/Users/corey/repo" },
+        worktree: { mode: "none" },
+      });
       expect(body.terminal_launch_args).toBeUndefined();
       // A bundle agent arms at create and routes on the first message event —
       // its harness isn't decided yet, so there is nothing to route here.

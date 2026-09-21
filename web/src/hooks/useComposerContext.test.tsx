@@ -11,15 +11,11 @@ describe("useComposerContext", () => {
     act(() => {
       result.current.setWorkingDirectory({ kind: "selected", path: "/repo" });
       result.current.setWorktree({ kind: "new", branchName: "feature", baseBranch: null });
-      result.current.setRepositories([
-        { id: "repo", url: "git@example.com:repo.git", branch: null },
-      ]);
     });
 
     expect(result.current.state).toEqual({
       workingDirectory: { kind: "selected", path: "/repo" },
       worktree: { kind: "new", branchName: "feature", baseBranch: null },
-      repositories: [{ id: "repo", url: "git@example.com:repo.git", branch: null }],
     });
     expect(onChange).toHaveBeenLastCalledWith(result.current.state);
   });
@@ -31,7 +27,6 @@ describe("useComposerContext", () => {
           initialState: {
             workingDirectory: { kind: "selected", path: "/repo" },
             worktree: { kind: "new", branchName: "feature", baseBranch: null },
-            repositories: [],
           },
           workingDirectoryGitState: gitState,
         }),

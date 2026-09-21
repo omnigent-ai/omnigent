@@ -4,7 +4,6 @@ import {
   EMPTY_COMPOSER_CONTEXT,
   normalizeComposerContextState,
   type ComposerContextState,
-  type ComposerRepositorySelection,
   type WorkingDirectoryGitState,
   type WorkingDirectorySelection,
   type WorktreeSelection,
@@ -52,16 +51,10 @@ export function useComposerContext({
     (worktree: WorktreeSelection) => update((current) => ({ ...current, worktree })),
     [update],
   );
-  const setRepositories = useCallback(
-    (repositories: ComposerRepositorySelection[]) =>
-      update((current) => ({ ...current, repositories })),
-    [update],
-  );
   return {
     state,
     setState: update,
     setWorkingDirectory,
     setWorktree,
-    setRepositories,
   };
 }

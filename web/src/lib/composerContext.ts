@@ -5,29 +5,16 @@ export type WorktreeSelection =
   | { kind: "existing"; path: string; branch: string }
   | { kind: "new"; branchName: string; baseBranch: string | null };
 
-export interface ComposerRepositorySelection {
-  id: string;
-  url: string;
-  branch: string | null;
-}
-
 export interface ComposerContextState {
   workingDirectory: WorkingDirectorySelection;
   worktree: WorktreeSelection;
-  repositories: ComposerRepositorySelection[];
 }
-
-export type ComposerContextResourceState<T> =
-  | { status: "idle" | "loading" | "unavailable"; data: null; error: null }
-  | { status: "ready" | "stale"; data: T; error: null }
-  | { status: "error"; data: T | null; error: Error };
 
 export type WorkingDirectoryGitState = "unknown" | "git" | "not_git";
 
 export const EMPTY_COMPOSER_CONTEXT: ComposerContextState = {
   workingDirectory: { kind: "unset" },
   worktree: { kind: "none" },
-  repositories: [],
 };
 
 export function isAbsoluteComposerPath(path: string): boolean {
@@ -57,18 +44,6 @@ function normalizeWorktree(selection: WorktreeSelection): WorktreeSelection {
   return { kind: "new", branchName, baseBranch: selection.baseBranch?.trim() || null };
 }
 
-function stableUnique<T extends { id: string }>(values: T[]): T[] {
-  const seen = new Set<string>();
-  const result: T[] = [];
-  for (const value of values) {
-    const id = value.id.trim();
-    if (id === "" || seen.has(id)) continue;
-    seen.add(id);
-    result.push({ ...value, id });
-  }
-  return result;
-}
-
 export function normalizeComposerContextState(
   state: ComposerContextState,
   workingDirectoryGitState: WorkingDirectoryGitState = "unknown",
@@ -80,12 +55,5 @@ export function normalizeComposerContextState(
   return {
     workingDirectory,
     worktree,
-    repositories: stableUnique(state.repositories)
-      .map((repository) => ({
-        ...repository,
-        url: repository.url.trim(),
-        branch: repository.branch?.trim() || null,
-      }))
-      .filter((repository) => repository.url !== ""),
   };
 }

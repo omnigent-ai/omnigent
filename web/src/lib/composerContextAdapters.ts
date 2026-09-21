@@ -2,7 +2,6 @@ import {
   EMPTY_COMPOSER_CONTEXT,
   normalizeComposerContextState,
   type ComposerContextState,
-  type ComposerRepositorySelection,
   type WorkingDirectorySelection,
   type WorktreeSelection,
 } from "./composerContext";
@@ -14,35 +13,10 @@ export interface ComposerContextMetadataV1 {
     | { mode: "none" }
     | { mode: "existing"; path: string; branch: string }
     | { mode: "new"; branch_name: string; base_branch: string | null };
-  repositories: { id: string; url: string; branch: string | null }[];
 }
 
 export const COMPOSER_CONTEXT_LABEL_KEY = "omnigent.composer_context.v1";
 const COMPOSER_CONTEXT_LABEL_CHUNK_SIZE = 240;
-
-export interface ExternalComposerContextCreateFields {
-  workspace: string | null;
-  git:
-    | null
-    | { branch_name: string; base_branch?: string }
-    | { branch_name: string; existing_worktree: true };
-}
-
-export interface ManagedComposerContextCreateFields {
-  workspaces: string[];
-}
-
-export type ComposerContextCreateAdapterResult =
-  | {
-      hostType: "external";
-      fields: ExternalComposerContextCreateFields;
-      metadata: ComposerContextMetadataV1;
-    }
-  | {
-      hostType: "managed";
-      fields: ManagedComposerContextCreateFields;
-      metadata: ComposerContextMetadataV1;
-    };
 
 function workingDirectoryToMetadata(
   selection: WorkingDirectorySelection,
@@ -64,7 +38,6 @@ export function composerContextToMetadata(state: ComposerContextState): Composer
     version: 1,
     working_directory: workingDirectoryToMetadata(normalized.workingDirectory),
     worktree: worktreeToMetadata(normalized.worktree),
-    repositories: normalized.repositories.map((repository) => ({ ...repository })),
   };
 }
 
@@ -89,7 +62,6 @@ export function composerContextFromMetadata(
   return normalizeComposerContextState({
     workingDirectory: metadataWorkingDirectory(metadata.working_directory),
     worktree: metadataWorktree(metadata.worktree),
-    repositories: metadata.repositories.map((repository) => ({ ...repository })),
   });
 }
 
@@ -134,52 +106,3 @@ export function composerContextFromLabels(
     return EMPTY_COMPOSER_CONTEXT;
   }
 }
-
-function repositoryWorkspace(repository: ComposerRepositorySelection): string {
-  return repository.branch === null ? repository.url : `${repository.url}#${repository.branch}`;
-}
-
-function externalFields(state: ComposerContextState): ExternalComposerContextCreateFields {
-  const workspace = state.workingDirectory.kind === "selected" ? state.workingDirectory.path : null;
-  if (state.worktree.kind === "none") return { workspace, git: null };
-  if (state.worktree.kind === "existing") {
-    return {
-      workspace: state.worktree.path,
-      git: {
-        branch_name: state.worktree.branch,
-        existing_worktree: true,
-      },
-    };
-  }
-  return {
-    workspace,
-    git: {
-      branch_name: state.worktree.branchName,
-      ...(state.worktree.baseBranch === null ? {} : { base_branch: state.worktree.baseBranch }),
-    },
-  };
-}
-
-export function composerContextToCreateSession(
-  state: ComposerContextState,
-  hostType: "external" | "managed",
-): ComposerContextCreateAdapterResult {
-  const normalized = normalizeComposerContextState(state);
-  const metadata = composerContextToMetadata(normalized);
-  if (hostType === "external") {
-    return { hostType, fields: externalFields(normalized), metadata };
-  }
-  return {
-    hostType,
-    fields: { workspaces: normalized.repositories.map(repositoryWorkspace) },
-    metadata,
-  };
-}
-
-export function composerContextFromCreateSession(
-  value: ComposerContextCreateAdapterResult,
-): ComposerContextState {
-  return composerContextFromMetadata(value.metadata);
-}
-
-export type ComposerContextSelection = ComposerRepositorySelection;

@@ -16,8 +16,6 @@ import {
   ComposerConfigTooltipRows,
 } from "@/components/composer/ComposerControls";
 import { ComposerAddMenu } from "@/components/composer/ComposerAddMenu";
-import { ComposerSettingsButton } from "@/components/composer/ComposerSettingsButton";
-import { ComposerRepositorySelector } from "@/components/composer/ComposerRepositorySelector";
 import {
   COMPOSER_HARNESS_MENU_SIZE,
   PickerSectionHeader,
@@ -93,14 +91,7 @@ import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { authenticatedFetch, getCurrentUserId, resolveIdentity } from "@/lib/identity";
 import { backgroundSessionTitlesRequestHeaders } from "@/lib/backgroundSessionTitlesPreferences";
 import { fetchGithubBranches, fetchGithubRepos, type GithubRepo } from "@/lib/githubIntegration";
-import type {
-  ComposerContextResourceState,
-  ComposerRepositorySelection,
-} from "@/lib/composerContext";
-import {
-  composerContextToCreateSession,
-  composerContextToLabels,
-} from "@/lib/composerContextAdapters";
+import { composerContextToLabels } from "@/lib/composerContextAdapters";
 import { randomUUID } from "@/lib/randomUUID";
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import { validateAttachments } from "@/lib/attachments";
@@ -1027,7 +1018,6 @@ export function composeSandboxWorkspaces(repos: LastSandboxRepo[]): string[] {
 // Max repos a managed sandbox may clone — mirrors the server's
 // `_MAX_MANAGED_WORKSPACES` so the picker stops adding before a create 422s.
 const MAX_SANDBOX_REPOS = 10;
-const EMPTY_GITHUB_REPOS: GithubRepo[] = [];
 
 /**
  * Derive a repository's display name from its URL.
@@ -2478,46 +2468,15 @@ export function NewChatLandingScreen() {
   // reading `connected` off the payload doubles as the connection check.
   const githubReposEnabled =
     info !== "loading" && (info.enabled_connections ?? []).includes("github");
-  const {
-    data: sandboxRepoData,
-    isError: sandboxReposErrored,
-    isLoading: sandboxReposLoading,
-  } = useQuery({
+  const { data: sandboxRepoData, isError: sandboxReposErrored } = useQuery({
     queryKey: ["github-repos"],
     queryFn: fetchGithubRepos,
     enabled: githubReposEnabled,
     staleTime: 5 * 60_000,
   });
   const sandboxRepoPickerConnected = sandboxRepoData?.connected ?? false;
-  const sandboxRepos = sandboxRepoPickerConnected
-    ? (sandboxRepoData?.repos ?? EMPTY_GITHUB_REPOS)
-    : EMPTY_GITHUB_REPOS;
+  const sandboxRepos = sandboxRepoPickerConnected ? (sandboxRepoData?.repos ?? []) : [];
   const sandboxReposTruncated = sandboxRepoData?.truncated ?? false;
-  const repositoryOptions = useMemo<ComposerRepositorySelection[]>(
-    () =>
-      sandboxRepos.map((repository) => ({
-        id: repository.clone_url ?? repository.full_name,
-        url: repository.clone_url ?? `https://github.com/${repository.full_name}.git`,
-        branch: null,
-      })),
-    [sandboxRepos],
-  );
-  const repositoryResource = useMemo<
-    ComposerContextResourceState<readonly ComposerRepositorySelection[]>
-  >(() => {
-    if (sandboxReposLoading) return { status: "loading", data: null, error: null };
-    if (sandboxReposErrored)
-      return { status: "error", data: repositoryOptions, error: new Error("GitHub unavailable") };
-    if (!githubReposEnabled || !sandboxRepoPickerConnected)
-      return { status: "unavailable", data: null, error: null };
-    return { status: "ready", data: repositoryOptions, error: null };
-  }, [
-    githubReposEnabled,
-    repositoryOptions,
-    sandboxRepoPickerConnected,
-    sandboxReposErrored,
-    sandboxReposLoading,
-  ]);
   const [workspace, setWorkspace] = useState<string>(() => restoredDraft?.workspace ?? "");
   // Source tracking for the create's field-omission contract: true while the
   // slot's value is the untouched seed the project-prefill effect wrote from
@@ -2652,7 +2611,6 @@ export function NewChatLandingScreen() {
   // existing-chat model-picker shortcut. The picker owns model selection on the
   // landing, so the hotkey bumps a nonce the picker opens on.
   const [modelPickerOpenNonce, setModelPickerOpenNonce] = useState(0);
-  const [contextSettingsOpen, setContextSettingsOpen] = useState(false);
   useModelPickerHotkey(() => setModelPickerOpenNonce((n) => n + 1));
 
   // Mirror the current draft fields into a ref every render so the unmount
@@ -4486,18 +4444,12 @@ export function NewChatLandingScreen() {
               baseBranch: baseBranch.trim() || null,
             }
           : { kind: "none" },
-      repositories: sandboxRepoSelections.map((repository) => ({
-        id: repository.url,
-        url: repository.url,
-        branch: repository.branch.trim() || null,
-      })),
     });
   }, [
     activeWorktree,
     baseBranch,
     branchName,
     setComposerContextState,
-    sandboxRepoSelections,
     shouldCreateWorktree,
     startInExistingWorktree,
     workspaceTrimmed,
@@ -5301,10 +5253,6 @@ export function NewChatLandingScreen() {
     submittedRef.current = true;
     try {
       const trimmedBranch = branchName.trim();
-      const contextCreate = composerContextToCreateSession(
-        composerContextState,
-        sandboxSelected ? "managed" : "external",
-      );
       const composerContextLabels = composerContextToLabels(composerContextState);
       // `shouldCreateWorktree` (component scope): true only when a branch is
       // named and the workspace isn't already an existing worktree. Starting
@@ -5546,10 +5494,7 @@ export function NewChatLandingScreen() {
                   // The repos to clone in parallel; the agent starts in the one
                   // repo, or the parent that holds them all. Empty = empty
                   // sandbox workspace.
-                  workspaces:
-                    contextCreate.hostType === "managed"
-                      ? contextCreate.fields.workspaces
-                      : composeSandboxWorkspaces(sandboxRepoSelections),
+                  workspaces: composeSandboxWorkspaces(sandboxRepoSelections),
                   // On a `project_id` create an ABSENT (path) workspace would be
                   // default-filled with the config's path workspace, which a
                   // managed create rejects — pin an explicit null (explicit
@@ -6879,11 +6824,6 @@ export function NewChatLandingScreen() {
                 ),
                 trailing: (
                   <>
-                    <ComposerSettingsButton
-                      data-testid="new-chat-landing-settings"
-                      disabled={creating}
-                      onClick={() => setContextSettingsOpen(true)}
-                    />
                     <div className="flex min-w-0 items-center rounded-lg">
                       {/* One trigger combines the harness glyph with model / effort;
                     the selected entry's submenu owns run configuration. */}
@@ -6984,46 +6924,6 @@ export function NewChatLandingScreen() {
               }}
             />
           </form>
-          <Dialog open={contextSettingsOpen} onOpenChange={setContextSettingsOpen}>
-            <DialogContent className="max-w-lg" data-testid="new-chat-context-settings">
-              <DialogHeader>
-                <DialogTitle>Advanced settings</DialogTitle>
-                <DialogDescription>
-                  Choose repository context and configure the model and effort for this session.
-                </DialogDescription>
-              </DialogHeader>
-              <div className="flex min-w-0 flex-col gap-4">
-                <div className="flex min-w-0 flex-col gap-1.5">
-                  <label className="text-sm font-medium text-foreground">Repositories</label>
-                  <ComposerRepositorySelector
-                    value={composerContextState.repositories}
-                    repositories={repositoryResource}
-                    onChange={(repositories) =>
-                      setSandboxRepoSelections(
-                        repositories.map((repository) => ({
-                          url: repository.url,
-                          branch: repository.branch ?? "",
-                        })),
-                      )
-                    }
-                    disabled={creating}
-                    ariaLabel="Repository context"
-                  />
-                </div>
-                <Button
-                  type="button"
-                  variant="outline"
-                  className="justify-start"
-                  onClick={() => {
-                    setContextSettingsOpen(false);
-                    setModelPickerOpenNonce((nonce) => nonce + 1);
-                  }}
-                >
-                  Configure model and effort
-                </Button>
-              </div>
-            </DialogContent>
-          </Dialog>
           <Dialog open={workspacePickerOpen} onOpenChange={setWorkspacePickerOpen}>
             <DialogContent
               showCloseButton={false}
