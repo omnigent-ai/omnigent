@@ -76,33 +76,35 @@ class SqlAlchemyAgentStore(AgentStore):
 
     def _session_id_for_agent(self, agent_id: str) -> str | None:
         """
-        Resolve a session-scoped agent to its owning session (spawn-tree root).
+        Resolve a session-scoped agent to a conversation in its spawn tree.
 
-        The returned id backs owning-session authorization: the caller must have
-        access to the agent's session, so no one can act on another user's
-        private agent by guessing its raw id. Access is resolved at the
-        spawn-tree ROOT — ``check_session_access`` walks
-        ``parent_conversation_id`` up to the root and grants on the root's ACL.
+        The returned id backs the owning-session authorization in
+        ``validate_session_agent``: the caller must have READ on the agent's
+        session, so no one can run another user's private agent by guessing its
+        raw id. Access is resolved at the spawn-tree ROOT —
+        ``check_session_access`` walks ``parent_conversation_id`` up to the root
+        and grants on the root's ACL — so any conversation in the tree
+        authorizes identically.
 
-        Within a single spawn tree several conversation rows share the agent
-        (named ``sys_session_send`` children are minted bound to the same
-        ``agent_id``), but they carry the SAME ``root_conversation_id``, so any
-        one of them resolves identically. Reuse breaks that: binding an existing
-        session-scoped agent into a new top-level session (``POST /v1/sessions``
-        with an ``agent_id``) adds a row under a DIFFERENT root, so the agent can
-        be referenced by several roots at once. Ordering by ``created_at`` and
-        taking the earliest makes the resolution deterministic and returns the
-        ORIGINAL owning session (the agent was written together with its first
-        session; every reuse row is necessarily newer) rather than an arbitrary
-        reuser's session. This is what stops a shared user from reusing a
-        legacy (unowned) agent and having the owner lookup resolve to their own
-        session. Ordering by the oldest row also rides out read-replica lag (the
-        root predates any just-written child). ``conversations`` lives on the AP
-        DB, so this runs on the conversation engine.
+        That is what makes this a single bounded query. Named ``sys_session_send``
+        children are created bound to the *same* ``agent_id`` as their mint, so
+        several conversation rows can share it — but they all carry the SAME
+        ``root_conversation_id`` (children inherit their parent's root, and the
+        mint's own root when it is itself a child). So selecting the root from
+        *any one* of them (an unordered ``LIMIT 1``) is unambiguous and O(1):
+        there is no "wrong row" to return. It also sidesteps read-replica lag —
+        the root is the oldest node in the tree, never a just-written child that
+        a replica has not caught up to. ``conversations`` lives on the AP DB, so
+        this runs on the conversation engine.
+
+        This lookup is NOT used to authorize agent-code mutation: a legacy
+        (``created_by`` NULL) agent may be referenced by several unrelated roots
+        after reuse, so agent mutation gates on ``created_by`` and admin status
+        only (see ``require_agent_owner``), never on this reverse lookup.
 
         :param agent_id: Agent identifier, e.g. ``"ag_abc123"``.
-        :returns: The owning (oldest-referencing) session's root conversation
-            id, or ``None`` when no conversation points at this agent.
+        :returns: The agent's spawn-tree root conversation id, or ``None`` when
+            no conversation points at this agent.
         """
         with self._conv_session("select_session_id_for_agent") as conv_sess:
             return conv_sess.execute(
@@ -111,7 +113,6 @@ class SqlAlchemyAgentStore(AgentStore):
                     SqlConversation.workspace_id == current_workspace_id(),
                     SqlConversation.agent_id == agent_id,
                 )
-                .order_by(SqlConversation.created_at.asc(), SqlConversation.id.asc())
                 .limit(1)
             ).scalar_one_or_none()
 

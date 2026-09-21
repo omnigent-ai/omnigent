@@ -200,34 +200,25 @@ async def test_reuse_then_patch_forbidden(auth_client: httpx.AsyncClient) -> Non
     assert put.status_code == 403, put.text
 
 
-async def test_legacy_null_owner_reuse_forbidden(
+async def test_legacy_null_owner_is_admin_only(
     auth_client: httpx.AsyncClient,
     db_uri: str,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A legacy (NULL created_by) agent can't be seized by a reuser.
+    """A legacy (NULL created_by) agent is admin-only to mutate.
 
-    Simulates a pre-migration agent by clearing created_by, then verifies the
-    oldest-referencing-root fallback keeps ownership with ALICE: BOB, who reuses
-    the agent in his own newer session, is refused, while ALICE still succeeds.
-    ``now_epoch`` is stepped so ALICE's original session is unambiguously older
-    than BOB's reuse session (created_at is epoch seconds and would otherwise
-    tie within one test tick).
+    Simulates a pre-migration agent by clearing created_by. Neither a reuser
+    (BOB) nor even the original session owner (ALICE) may mutate it — only an
+    admin. The original owner regains a mutable agent by re-uploading (which
+    creates a fresh owned row), which the other tests already cover.
     """
-    import itertools
-
     import sqlalchemy as sa
 
-    import omnigent.stores.conversation_store.sqlalchemy_store as cs
     from omnigent.db.utils import get_or_create_engine
-
-    monkeypatch.setattr(cs, "now_epoch", lambda c=itertools.count(1_700_000_000): next(c))
 
     agent = await create_test_agent(auth_client, name="legacy-agent", user=ALICE)
     alice_session = agent["_session_id"]
 
-    # Make it a legacy row: no recorded owner, so the owner check must fall
-    # back to the owning session resolved by oldest-referencing root.
+    # Make it a legacy row: clear the recorded owner.
     engine = get_or_create_engine(db_uri)
     with engine.begin() as conn:
         conn.execute(
@@ -242,33 +233,38 @@ async def test_legacy_null_owner_reuse_forbidden(
     assert reuse.status_code == 201, reuse.text
     bob_session = reuse.json()["id"]
 
-    # BOB (reuser) is refused — owner resolves to ALICE's original session.
+    bundle_files = {
+        "bundle": (
+            "agent.tar.gz",
+            build_agent_bundle(name="legacy-agent", description="v2"),
+            "application/gzip",
+        )
+    }
+
+    # BOB (reuser) is refused.
     bob_put = await auth_client.put(
         f"/v1/sessions/{bob_session}/agent",
-        files={
-            "bundle": (
-                "agent.tar.gz",
-                build_agent_bundle(name="legacy-agent", description="pwn"),
-                "application/gzip",
-            )
-        },
+        files=bundle_files,
         headers={"X-Forwarded-Email": BOB},
     )
     assert bob_put.status_code == 403, bob_put.text
 
-    # ALICE (real owner) still succeeds.
+    # Even ALICE (owning-session owner) is refused: a NULL row is admin-only.
     alice_put = await auth_client.put(
         f"/v1/sessions/{alice_session}/agent",
-        files={
-            "bundle": (
-                "agent.tar.gz",
-                build_agent_bundle(name="legacy-agent", description="v2"),
-                "application/gzip",
-            )
-        },
+        files=bundle_files,
         headers={"X-Forwarded-Email": ALICE},
     )
-    assert alice_put.status_code == 200, alice_put.text
+    assert alice_put.status_code == 403, alice_put.text
+
+    # An admin may update it.
+    SqlAlchemyPermissionStore(db_uri).ensure_user(ADMIN, is_admin=True)
+    admin_put = await auth_client.put(
+        f"/v1/sessions/{alice_session}/agent",
+        files=bundle_files,
+        headers={"X-Forwarded-Email": ADMIN},
+    )
+    assert admin_put.status_code == 200, admin_put.text
 
 
 async def test_admin_can_update_any_agent(auth_client: httpx.AsyncClient, db_uri: str) -> None:

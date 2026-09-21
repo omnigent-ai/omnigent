@@ -13,10 +13,10 @@ routes) can be restricted to the user who created the agent.
   read-only through those routes), for single-user mode (no identity), and
   for rows created before this migration.
 
-Left nullable with no backfill: pre-existing session-scoped rows keep NULL
-and authorize against the owning session's owner at request time, then get
-``created_by`` stamped on the first authorized mutation. Template agents keep
-NULL permanently and never reach the owner check.
+Left nullable with no backfill: pre-existing session-scoped rows keep NULL and
+are admin-only to mutate (the owner regains a mutable agent by re-uploading the
+bundle, which writes a fresh row stamped with their identity). Template agents
+keep NULL permanently and never reach the owner check.
 """
 
 from __future__ import annotations

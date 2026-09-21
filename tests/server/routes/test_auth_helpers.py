@@ -333,22 +333,29 @@ def test_agent_owner_single_user_allows(
     require_agent_owner(None, _session_agent(created_by=None), perm_store)
 
 
-def test_agent_owner_legacy_falls_back_to_session_owner(
+def test_agent_owner_legacy_null_is_admin_only(
     perm_store: SqlAlchemyPermissionStore,
     conv_store: SqlAlchemyConversationStore,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A legacy row (created_by=None) authorizes against the owning session's owner."""
+    """A legacy row (created_by=None) is admin-only — no session-owner fallback.
+
+    The reverse lookup to an owning session is not dependable (reuse and session
+    deletion), so an unowned agent can only be mutated by an admin; the original
+    owner must re-upload to get a properly owned agent.
+    """
     monkeypatch.setattr(_auth_helpers, "local_single_user_enabled", lambda: False)
     conv = conv_store.create_conversation()
     perm_store.ensure_user(ALICE)
-    perm_store.ensure_user(BOB)
     perm_store.grant(ALICE, conv.id, LEVEL_OWNER)
 
     agent = _session_agent(created_by=None, session_id=conv.id)
-    # Session owner passes.
-    require_agent_owner(ALICE, agent, perm_store)
-    # A non-owner (e.g. shared editor) is refused.
+    # Even the owning session's owner is refused for a NULL row.
     with pytest.raises(OmnigentError) as exc:
-        require_agent_owner(BOB, agent, perm_store)
+        require_agent_owner(ALICE, agent, perm_store)
     assert exc.value.code == ErrorCode.FORBIDDEN
+
+    # An admin may mutate it.
+    perm_store.ensure_user(BOB)
+    perm_store.set_admin(BOB, True)
+    require_agent_owner(BOB, agent, perm_store)

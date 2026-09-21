@@ -423,18 +423,22 @@ def require_agent_owner(
     runner's authority, so only the user who created it (or a workspace
     admin) may replace or edit it. A ``LEVEL_EDIT`` grant on the *request's*
     session is deliberately insufficient: session sharing hands out EDIT to
-    collaborators, and agent reuse lets several sessions with different
-    owners reference one agent row, so neither the request's session nor the
-    reverse-looked-up owning session can be trusted for this decision.
+    collaborators, and agent reuse lets several sessions with different owners
+    reference one agent row.
+
+    A legacy row (``created_by`` NULL — created before ownership tracking, or
+    minted by a switch) records no trustworthy owner, and the reverse lookup to
+    an owning session is not dependable (reuse spreads the agent across roots,
+    and sessions can be deleted). Such rows are therefore admin-only: the owner
+    regains a mutable agent by re-uploading the bundle, which creates a fresh
+    row stamped with their identity.
 
     Assumes the caller already rejected template agents (``session_id is
     None``) as read-only, so this only sees session-scoped agents.
 
     :param user_id: The authenticated caller, or ``None`` when auth is off.
     :param agent: The session-scoped agent being mutated. Its ``created_by``
-        is the authoritative owner when set; a ``None`` value (template
-        agents aside, a row created before ``created_by`` existed) falls
-        back to the owning session's owner.
+        is the authoritative owner when set; a ``None`` value is admin-only.
     :param permission_store: Permission store, or ``None`` when auth is off.
     :raises OmnigentError: 403 when the caller is neither the owner nor an
         admin.
@@ -450,19 +454,16 @@ def require_agent_owner(
     # Workspace admins bypass, mirroring check_session_access / resolved_allows.
     if user_id is not None and permission_store.is_admin(user_id):
         return
-    # Explicit owner (rows created after created_by was introduced).
-    if agent.created_by is not None:
-        if user_id is not None and user_id == agent.created_by:
-            return
+    # Legacy / unowned row: admins only (handled above); everyone else denied.
+    if agent.created_by is None:
         raise OmnigentError(
-            f"{user_id!r} is not the owner of agent {agent.id!r}",
+            f"agent {agent.id!r} predates ownership tracking; it can only be "
+            "updated by an admin, or re-uploaded by its owner",
             code=ErrorCode.FORBIDDEN,
         )
-    # Legacy row (created_by is None): fall back to the owning session's owner.
-    if agent.session_id is not None:
-        owner = get_session_owner_id(agent.session_id, permission_store)
-        if owner is not None and user_id == owner:
-            return
+    # Explicit owner.
+    if user_id is not None and user_id == agent.created_by:
+        return
     raise OmnigentError(
         f"{user_id!r} is not the owner of agent {agent.id!r}",
         code=ErrorCode.FORBIDDEN,

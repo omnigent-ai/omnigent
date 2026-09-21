@@ -28,8 +28,8 @@ class Agent:
         ``None`` if the agent has never been updated.
     :param created_by: Identity of the user who created a session-scoped
         agent. Gates agent-code mutation to its owner. ``None`` for template
-        agents, single-user mode, and rows created before this field existed
-        (which fall back to the owning session's owner for authorization).
+        agents, single-user mode, and rows created before this field existed;
+        an unowned session-scoped agent is admin-only to mutate.
     """
 
     id: str
