@@ -308,7 +308,7 @@ def main() -> None:
     if not token:
         raise RuntimeError("GITHUB_TOKEN is required")
     client = GitHubClient(token, args.github_repo)
-    issue = client.open_issue(args.issue_number)
+    issue = client.open_issue(args.issue_number, full_author_history=args.review_bugs)
     if issue is None:
         _write_skip_artifact(args.output_dir, args.run_id, args.issue_number, "issue_not_open")
         print(f"Skipping #{args.issue_number}: issue is not open")

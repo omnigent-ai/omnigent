@@ -295,7 +295,7 @@ def test_old_and_long_author_comments_are_preserved():
         page = int(path.rsplit("=", 1)[1])
         return comments[(page - 1) * 100 : page * 100]
 
-    report = GitHubClient("fake", "org/repo", transport).open_issue(7)
+    report = GitHubClient("fake", "org/repo", transport).open_issue(7, full_author_history=True)
     assert BODY in report.body
     assert all(comment["body"] in report.body for comment in comments)
 
@@ -322,7 +322,7 @@ class Client:
     def issue_labels(self, number):
         return self.report.labels
 
-    def open_issue(self, number):
+    def open_issue(self, number, *, full_author_history=False):
         changed = self.stale == "before" or (self.stale == "after" and self.comments)
         return replace(self.report, body=BODY) if changed else self.report
 
@@ -353,9 +353,14 @@ def apply(client, *, mode=PipelineMode.APPLY):
 
 
 def test_apply_explains_before_closing_and_removes_reopen_label():
-    client = Client()
+    class ClosingClient(Client):
+        def close_issue(self, number):
+            assert "needs-info" in self.report.labels
+            super().close_issue(number)
+
+    client = ClosingClient()
     assert apply(client)[0].close_as_non_actionable
-    assert client.events == ["labels", "comment", "close"]
+    assert client.events == ["labels", "comment", "close", "labels"]
     assert "needs-info" not in client.report.labels
 
 
@@ -373,6 +378,7 @@ def test_triage_as_issue_author_preserves_only_genuine_followups(user, author_re
         if "/comments" in path:
             comments = [followup, client.comments[-1] if client.comments else old_comment]
             if client.comments and author_reply:
+                assert "needs-info" in client.report.labels
                 comments.append(BODY)
             return [{"user": user, "body": body} for body in comments]
         return {
@@ -386,7 +392,7 @@ def test_triage_as_issue_author_preserves_only_genuine_followups(user, author_re
         }
 
     client.open_issue = GitHubClient("fake", "org/repo", transport).open_issue
-    report = client.open_issue(7)
+    report = client.open_issue(7, full_author_history=True)
     assert followup in report.body and old_comment not in report.body
     run, _, planner, states = preview(report=report)
     plan = GitHubMutationSink(client, LabelManifest(()), planner, states).apply_with_plans(
@@ -394,14 +400,15 @@ def test_triage_as_issue_author_preserves_only_genuine_followups(user, author_re
     )[0]
     assert plan.close_as_non_actionable == (not author_reply)
     assert ("close" in client.events) == (not author_reply)
-    assert (client.open_issue(7).content().content_hash == report.content().content_hash) == (
-        not author_reply
-    )
+    assert (
+        client.open_issue(7, full_author_history=True).content().content_hash
+        == report.content().content_hash
+    ) == (not author_reply)
     if author_reply:
         assert "Automatic closure skipped" in client.comments[-1]
         assert "recommend closing" not in client.comments[-1]
     else:
-        assert client.events == ["labels", "comment", "close"]
+        assert client.events == ["labels", "comment", "close", "labels"]
 
 
 @pytest.mark.parametrize("label", ["security", "duplicate", "Pinned"])
@@ -420,6 +427,7 @@ def test_api_failure_does_not_claim_successful_closure(failure):
     with pytest.raises(RuntimeError, match=f"{failure} failed"):
         apply(client)
     assert "close" not in client.events
+    assert "needs-info" in client.report.labels
     if client.comments:
         assert "recommend closing" in client.comments[0]
 
@@ -431,6 +439,8 @@ def test_edit_before_closure_skips_the_stale_assessment(when):
     assert "close" not in client.events
     assert "non_actionable_stale_assessment" in plan.blocked
     assert not plan.close_as_non_actionable
+    assert "needs-info" in client.report.labels
+    assert "needs-info" not in plan.labels_remove
     if when == "after":
         assert "recommend closing" in client.comments[0]
         assert len(client.comments) == 2
@@ -459,7 +469,7 @@ def test_event_defers_intake_when_closure_assessment_is_stale(
                 self.report = replace(self.report, labels=(*self.report.labels, exemption))
             self.reads = 0
 
-        def open_issue(self, number):
+        def open_issue(self, number, *, full_author_history=False):
             self.reads += 1
             changed = self.reads > 1 and (when == "before" or self.comments)
             return replace(self.report, body=BODY) if changed else self.report
@@ -505,7 +515,9 @@ def test_event_defers_intake_when_closure_assessment_is_stale(
     assert artifact["intake"] is None
 
 
-def _run_event(monkeypatch, tmp_path, client, classifier, *, mode="apply"):
+def _run_event(
+    monkeypatch, tmp_path, client, classifier, *, mode="apply", review_bugs=True, intake=True
+):
     factory = Mock(return_value=classifier)
     monkeypatch.setenv("GITHUB_TOKEN", "fake")
     monkeypatch.setattr(event, "GitHubClient", lambda *args: client)
@@ -524,14 +536,47 @@ def _run_event(monkeypatch, tmp_path, client, classifier, *, mode="apply"):
             "--maintainers=unused",
             f"--output-dir={tmp_path}",
             "--run-id=test",
-            "--review-bugs",
-            "--intake",
+            *(["--review-bugs"] if review_bugs else []),
+            *(["--intake"] if intake else []),
             f"--mode={mode}",
         ],
     )
 
     event.main()
     return factory
+
+
+@pytest.mark.parametrize("review_bugs", [False, True])
+def test_event_preserves_legacy_history_limits_when_bug_review_is_disabled(
+    monkeypatch, tmp_path, review_bugs
+):
+    payload = {
+        "number": 7,
+        "title": "Session failure",
+        "body": BODY,
+        "user": {"login": "author"},
+        "state": "open",
+        "created_at": NOW.isoformat(),
+    }
+    comments = [{"user": {"login": "author"}, "body": f"Author update {n}."} for n in range(5)]
+    comments.append({"user": {"login": "author"}, "body": "x" * 13_000 + "Log tail."})
+    transport = Mock(side_effect=[payload, comments])
+    query = Mock(return_value=json.dumps(response()))
+    classifier = PromptClassifier(query, AreaCatalog({}, {}), review_bugs=review_bugs)
+    _run_event(
+        monkeypatch,
+        tmp_path,
+        GitHubClient("fake", "org/repo", transport),
+        classifier,
+        mode="dry_run",
+        review_bugs=review_bugs,
+        intake=False,
+    )
+    query.assert_called_once()
+    prompt = query.call_args.args[0]
+    assert BODY in prompt
+    assert ("Author update 0." in prompt) == review_bugs
+    assert ("Log tail." in prompt) == review_bugs
 
 
 @pytest.mark.parametrize("mode", ["dry_run", "apply"])
@@ -568,7 +613,7 @@ def test_stale_issue_does_not_stop_later_issues():
             self.report = issue()
             return self.report.labels
 
-        def open_issue(self, number):
+        def open_issue(self, number, *, full_author_history=False):
             return replace(self.report, body=BODY) if number == 8 else self.report
 
         def close_issue(self, number):

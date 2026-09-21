@@ -52,7 +52,9 @@ class GitHubLabels(Protocol):
 
     def upsert_issue_comment(self, issue_number: int, body: str) -> int: ...
 
-    def open_issue(self, issue_number: int) -> BronzeIssue | None:
+    def open_issue(
+        self, issue_number: int, *, full_author_history: bool = False
+    ) -> BronzeIssue | None:
         """Return an open issue with its author's follow-ups, or None."""
 
     def close_issue(self, issue_number: int) -> None:
@@ -230,13 +232,17 @@ class GitHubClient:
             page += 1
         return tuple(issues[:limit])
 
-    def open_issue(self, issue_number: int) -> BronzeIssue | None:
+    def open_issue(
+        self, issue_number: int, *, full_author_history: bool = False
+    ) -> BronzeIssue | None:
         value = self.issue_data(issue_number)
         if "pull_request" in value or value.get("state") != "open":
             return None
         author = value.get("user")
         author_login = str(author.get("login", "")) if isinstance(author, dict) else ""
         comments = self._author_comments(issue_number, author_login)
+        if not full_author_history:
+            comments = tuple(comment[:4000] for comment in comments[-5:])
         if comments:
             original_body = str(value.get("body") or "")
             value = {
@@ -460,6 +466,15 @@ class GitHubMutationSink:
                     item = ranked.get(issue_number)
                     if plan.close_as_non_actionable:
                         self._check_non_actionable_closure(item)
+                    defer_needs_info = (
+                        plan.close_as_non_actionable and "needs-info" in plan.labels_remove
+                    )
+                    if defer_needs_info:
+                        # Keep reply-driven triage active through the final content check.
+                        plan = replace(
+                            plan,
+                            labels_remove=tuple(x for x in plan.labels_remove if x != "needs-info"),
+                        )
                     if plan.labels_add or plan.labels_remove:
                         self.client.apply_labels(issue_number, plan.labels_add, plan.labels_remove)
                     labels_written = True
@@ -480,6 +495,14 @@ class GitHubMutationSink:
                             # Recheck edits and author replies after posting the explanation.
                             self._check_non_actionable_closure(item)
                             self.client.close_issue(issue_number)
+                            if defer_needs_info:
+                                self.client.apply_labels(issue_number, (), ("needs-info",))
+                                plan = replace(
+                                    plan,
+                                    labels_remove=tuple(
+                                        sorted((*plan.labels_remove, "needs-info"))
+                                    ),
+                                )
                     applied.append(plan)
                 except StaleBugAssessment:
                     stale.append(issue_number)
@@ -517,7 +540,7 @@ class GitHubMutationSink:
     def _check_non_actionable_closure(self, item: RankedIssue | None) -> None:
         if item is None or not target_from_ranked(item).close_as_non_actionable:
             raise ValueError("closure requires a current non-actionable bug assessment")
-        live = self.client.open_issue(item.issue.number)
+        live = self.client.open_issue(item.issue.number, full_author_history=True)
         if live is None or live.content().content_hash != item.issue.classification_content_hash:
             raise StaleBugAssessment(
                 f"Issue #{item.issue.number} changed or closed since classification; rerun triage"

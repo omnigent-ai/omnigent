@@ -130,6 +130,8 @@ arguments above. Inspect the decision and proposed comment in `event.json`.
 Automatic event runs use
 `ISSUE_TRIAGE_BUG_REVIEW_ENABLED` (default `false`). Feature/Docs and the periodic
 job keep their existing assessment.
+With review disabled, event triage retains the latest five author replies capped
+at 4,000 characters each; complete history is used only for review-enabled runs.
 
 One model call assesses the full report and author follow-ups. Closure requires
 an exact supporting quote, `has_user_facing_repro=false`, and live content checks.
@@ -144,6 +146,8 @@ If a reproduction quote cannot be verified, omit the rewritten steps and keep
 the valid assessment and summary; closure quotes still require an exact match.
 Responses must contain one complete JSON object, optionally fenced; trailing
 commas are repaired, but surrounding prose or additional objects are rejected.
+Review responses allow up to 8,192 tokens. A token-limit finish is rejected with
+an explicit error before parsing or applying the incomplete assessment.
 If an edit or author reply aborts closure after its comment is posted, the comment
 is replaced with a skipped-closure notice. The event records `skipped_stale` and
 defers intake because assignment and duplicate decisions also need fresh evidence.
@@ -151,8 +155,10 @@ Intake is also suppressed when the applied plan closes the issue or skips a stal
 assessment, even if the initial plan allowed intake before live labels changed.
 Existing `needs-triage` labels remain; include `--intake --maintainers .github/MAINTAINER`
 on a fresh apply run to complete new-issue intake.
-Immediate closures remove `needs-info` and ask reporters to open a new issue if
-they observe the failure. Model assessment does not reproduce or verify the bug.
+Immediate closures remove `needs-info` only after closure succeeds, so an aborted
+close preserves reply-driven triage. The comment asks reporters to open a new
+issue if they observe the failure. Model assessment does not reproduce or verify
+the bug.
 
 ## Databricks dry-run
 
