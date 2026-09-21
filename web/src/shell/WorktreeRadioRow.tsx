@@ -9,7 +9,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import { CopyIcon, EllipsisIcon, FolderOpenIcon, Trash2Icon } from "lucide-react";
+import { CopyIcon, EllipsisIcon, FolderOpenIcon } from "lucide-react";
 
 export function worktreeDisplayName(path: string): string {
   return path.split(/[\\/]/).filter(Boolean).at(-1) ?? path;
@@ -29,7 +29,6 @@ export function WorktreeRadioRow({
   className,
   spacious = false,
   onOpen,
-  onDelete,
 }: {
   worktree: HostWorktree;
   checked: boolean;
@@ -39,7 +38,6 @@ export function WorktreeRadioRow({
   className?: string;
   spacious?: boolean;
   onOpen?: () => void;
-  onDelete?: () => void;
 }) {
   const displayName = worktreeDisplayName(worktree.path);
   const updatedLabel = worktreeUpdatedLabel(worktree.updated_at);
@@ -105,7 +103,7 @@ export function WorktreeRadioRow({
           </span>
         </TooltipContent>
       </Tooltip>
-      {spacious && (onOpen || onDelete) && (
+      {spacious && onOpen && (
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
             <button
@@ -125,10 +123,6 @@ export function WorktreeRadioRow({
             <DropdownMenuItem onSelect={() => void copyText(worktree.path)}>
               <CopyIcon />
               Copy path
-            </DropdownMenuItem>
-            <DropdownMenuItem variant="destructive" onSelect={onDelete} disabled={!onDelete}>
-              <Trash2Icon />
-              Delete
             </DropdownMenuItem>
           </DropdownMenuContent>
         </DropdownMenu>

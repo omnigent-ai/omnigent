@@ -59,9 +59,8 @@ describe("WorktreeRadioRow", () => {
     expect(screen.getByText("Unknown")).toHaveClass("text-base");
   });
 
-  it("offers open, copy, and delete actions for spacious rows", async () => {
+  it("offers open and copy actions for spacious rows", async () => {
     const onOpen = vi.fn();
-    const onDelete = vi.fn();
     render(
       <TooltipProvider>
         <WorktreeRadioRow
@@ -78,7 +77,6 @@ describe("WorktreeRadioRow", () => {
           testId="worktree-row"
           spacious
           onOpen={onOpen}
-          onDelete={onDelete}
         />
       </TooltipProvider>,
     );
@@ -89,6 +87,7 @@ describe("WorktreeRadioRow", () => {
         button: 0,
       },
     );
+    expect(screen.queryByRole("menuitem", { name: "Delete" })).not.toBeInTheDocument();
     fireEvent.click(await screen.findByRole("menuitem", { name: "Open folder" }));
     expect(onOpen).toHaveBeenCalledOnce();
 
@@ -100,15 +99,6 @@ describe("WorktreeRadioRow", () => {
     );
     fireEvent.click(await screen.findByRole("menuitem", { name: "Copy path" }));
     expect(copyTextMock).toHaveBeenCalledWith("/Users/corey/repo-worktrees/auth-refresh");
-
-    fireEvent.pointerDown(
-      screen.getByRole("button", { name: "Worktree actions for auth-refresh" }),
-      {
-        button: 0,
-      },
-    );
-    fireEvent.click(await screen.findByRole("menuitem", { name: "Delete" }));
-    expect(onDelete).toHaveBeenCalledOnce();
   });
 
   it("shows a light tooltip with full path, branch, and status on focus", async () => {

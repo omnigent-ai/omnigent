@@ -1628,46 +1628,4 @@ def create_hosts_router(
 
         return {"object": "list", "data": worktrees}
 
-    @router.delete("/hosts/{host_id}/worktrees")
-    async def delete_host_worktree(
-        request: Request,
-        host_id: str,
-        path: str = Query(...),
-        branch: str | None = Query(default=None),
-    ) -> dict[str, Any]:
-        """Remove a linked worktree while preserving its branch."""
-        from omnigent.server.routes._host_worktree import (
-            WorktreeHostUnavailableError,
-            WorktreeProxyError,
-            remove_worktree_on_host,
-        )
-
-        user_id = require_user(request, auth_provider)
-        host = await asyncio.to_thread(host_store.get_host, host_id)
-        if host is None:
-            raise HTTPException(status_code=404, detail="host not found")
-        if user_id is not None and host.user_id != user_id:
-            raise HTTPException(status_code=403, detail="not your host")
-        if not path.strip():
-            raise HTTPException(status_code=400, detail="path must not be empty")
-        if "\x00" in path:
-            raise HTTPException(status_code=400, detail="path must not contain NUL bytes")
-
-        conn = host_registry.get(host.host_id)
-        if conn is None:
-            raise _host_absent_error(host)
-        try:
-            await remove_worktree_on_host(
-                host_registry=host_registry,
-                host_conn=conn,
-                worktree_path=path,
-                branch=branch,
-                delete_branch=False,
-            )
-        except WorktreeHostUnavailableError as exc:
-            raise HTTPException(status_code=409, detail=exc.message) from exc
-        except WorktreeProxyError as exc:
-            raise HTTPException(status_code=400, detail=exc.message) from exc
-        return {"object": "worktree.deleted", "path": path}
-
     return router

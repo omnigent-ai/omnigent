@@ -274,41 +274,6 @@ async def test_list_worktrees_missing_path_param_422(
     assert resp.status_code == 422, resp.text
 
 
-async def test_delete_worktree_preserves_branch(
-    wt_setup: tuple[FastAPI, HostRegistry, ApplicationCommunicator, dict[str, dict[str, Any]]],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The picker removes a linked directory without deleting its branch."""
-    app, _reg, _comm, _replies = wt_setup
-    calls: list[dict[str, object]] = []
-
-    async def _remove(**kwargs: object) -> None:
-        calls.append(kwargs)
-
-    monkeypatch.setattr(
-        "omnigent.server.routes._host_worktree.remove_worktree_on_host",
-        _remove,
-    )
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        resp = await client.delete(
-            f"/v1/hosts/{_HOST_ID}/worktrees",
-            params={
-                "path": "/Users/corey/repo-worktrees/feature-x",
-                "branch": "feature/x",
-            },
-        )
-
-    assert resp.status_code == 200, resp.text
-    assert resp.json() == {
-        "object": "worktree.deleted",
-        "path": "/Users/corey/repo-worktrees/feature-x",
-    }
-    assert len(calls) == 1
-    assert calls[0]["worktree_path"] == "/Users/corey/repo-worktrees/feature-x"
-    assert calls[0]["branch"] == "feature/x"
-    assert calls[0]["delete_branch"] is False
-
-
 async def test_list_worktrees_unknown_host_404(
     wt_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
 ) -> None:

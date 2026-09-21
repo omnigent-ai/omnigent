@@ -3,12 +3,11 @@ import { act, renderHook, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { removeHostWorktree, useHostWorktrees } from "./useHostWorktrees";
+import { useHostWorktrees } from "./useHostWorktrees";
 
 const authenticatedFetchMock = vi.fn();
 vi.mock("@/lib/identity", () => ({
-  authenticatedFetch: (url: string, init?: RequestInit) =>
-    init === undefined ? authenticatedFetchMock(url) : authenticatedFetchMock(url, init),
+  authenticatedFetch: (url: string) => authenticatedFetchMock(url),
 }));
 
 const worktrees = [{ path: "/repo", branch: "main", is_main: true, detached: false }];
@@ -26,20 +25,6 @@ function wrapper() {
 afterEach(() => authenticatedFetchMock.mockReset());
 
 describe("useHostWorktrees", () => {
-  it("removes a linked worktree without deleting its branch", async () => {
-    authenticatedFetchMock.mockResolvedValue(response(200, { object: "worktree.deleted" }));
-
-    await removeHostWorktree("host/one", {
-      path: "/repo-worktrees/feature-x",
-      branch: "feature/x",
-    });
-
-    expect(authenticatedFetchMock).toHaveBeenCalledWith(
-      "/v1/hosts/host%2Fone/worktrees?path=%2Frepo-worktrees%2Ffeature-x&branch=feature%2Fx",
-      { method: "DELETE" },
-    );
-  });
-
   it("returns worktrees from a successful response", async () => {
     authenticatedFetchMock.mockResolvedValue(response(200, { object: "list", data: worktrees }));
     const { result } = renderHook(() => useHostWorktrees("host/one", "/repo"), {

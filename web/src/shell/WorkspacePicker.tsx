@@ -19,11 +19,7 @@ import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { useCreateHostDirectory, useHostFilesystem } from "@/hooks/useHostFilesystem";
-import {
-  useHostWorktrees,
-  useRemoveHostWorktree,
-  useVerifiedGitWorktrees,
-} from "@/hooks/useHostWorktrees";
+import { useHostWorktrees, useVerifiedGitWorktrees } from "@/hooks/useHostWorktrees";
 import { cn } from "@/lib/utils";
 import { WorktreeRadioRow } from "./WorktreeRadioRow";
 
@@ -526,7 +522,6 @@ export function WorkspacePicker({
     error: worktreesError,
   } = useHostWorktrees(hostId, worktreeQueryPath);
   const worktreesPending = Boolean(worktreesFetching || worktreesPlaceholder);
-  const removeWorktree = useRemoveHostWorktree(hostId, worktreeQueryPath);
   const verifiedGitWorktrees = useVerifiedGitWorktrees({
     hostId,
     requestedPath: requestedWorktreePath,
@@ -1133,11 +1128,6 @@ export function WorkspacePicker({
                     No linked worktrees for this repository.
                   </div>
                 )}
-                {removeWorktree.error && (
-                  <div className="px-2 py-2 text-sm text-destructive" role="alert">
-                    {removeWorktree.error.message}
-                  </div>
-                )}
                 {linkedWorktrees.map((worktree) => (
                   <WorktreeRadioRow
                     key={worktree.path}
@@ -1148,16 +1138,6 @@ export function WorkspacePicker({
                     testId={`workspace-picker-worktree-${worktree.path}`}
                     spacious={showGitDialog}
                     onOpen={() => navigateTo(worktree.path)}
-                    onDelete={
-                      removeWorktree.isPending
-                        ? undefined
-                        : () => {
-                            if (selectedWorktreePath === worktree.path) {
-                              setSelectedWorktreePath(null);
-                            }
-                            removeWorktree.mutate(worktree);
-                          }
-                    }
                   />
                 ))}
               </div>
