@@ -1029,6 +1029,7 @@ export function composeSandboxWorkspaces(repos: LastSandboxRepo[]): string[] {
 // Max repos a managed sandbox may clone — mirrors the server's
 // `_MAX_MANAGED_WORKSPACES` so the picker stops adding before a create 422s.
 const MAX_SANDBOX_REPOS = 10;
+const EMPTY_GITHUB_REPOS: GithubRepo[] = [];
 
 /**
  * Derive a repository's display name from its URL.
@@ -2490,7 +2491,9 @@ export function NewChatLandingScreen() {
     staleTime: 5 * 60_000,
   });
   const sandboxRepoPickerConnected = sandboxRepoData?.connected ?? false;
-  const sandboxRepos = sandboxRepoPickerConnected ? (sandboxRepoData?.repos ?? []) : [];
+  const sandboxRepos = sandboxRepoPickerConnected
+    ? (sandboxRepoData?.repos ?? EMPTY_GITHUB_REPOS)
+    : EMPTY_GITHUB_REPOS;
   const sandboxReposTruncated = sandboxRepoData?.truncated ?? false;
   const repositoryOptions = useMemo<ComposerRepositorySelection[]>(
     () =>
@@ -4478,7 +4481,7 @@ export function NewChatLandingScreen() {
   // workspace isn't already sitting on that existing worktree.
   const shouldCreateWorktree =
     workspaceIsGit && branchName.trim() !== "" && !startInExistingWorktree;
-  const composerContext = useComposerContext({
+  const { state: composerContextState, setState: setComposerContextState } = useComposerContext({
     workingDirectoryGitState: workspaceIsNonGit
       ? "not_git"
       : workspaceIsGit
@@ -4486,7 +4489,7 @@ export function NewChatLandingScreen() {
         : "unknown",
   });
   useEffect(() => {
-    composerContext.setState({
+    setComposerContextState({
       workingDirectory:
         workspaceTrimmed === "" ? { kind: "unset" } : { kind: "selected", path: workspaceTrimmed },
       worktree: startInExistingWorktree
@@ -4513,7 +4516,7 @@ export function NewChatLandingScreen() {
     activeWorktree,
     baseBranch,
     branchName,
-    composerContext.setState,
+    setComposerContextState,
     mcpContextSelections,
     sandboxRepoSelections,
     shouldCreateWorktree,
@@ -5320,10 +5323,10 @@ export function NewChatLandingScreen() {
     try {
       const trimmedBranch = branchName.trim();
       const contextCreate = composerContextToCreateSession(
-        composerContext.state,
+        composerContextState,
         sandboxSelected ? "managed" : "external",
       );
-      const composerContextLabels = composerContextToLabels(composerContext.state);
+      const composerContextLabels = composerContextToLabels(composerContextState);
       // `shouldCreateWorktree` (component scope): true only when a branch is
       // named and the workspace isn't already an existing worktree. Starting
       // in an existing worktree sends no git opts — the workspace is bound
@@ -7010,7 +7013,7 @@ export function NewChatLandingScreen() {
                 <div className="flex min-w-0 flex-col gap-1.5">
                   <label className="text-sm font-medium text-foreground">Repositories</label>
                   <ComposerRepositorySelector
-                    value={composerContext.state.repositories}
+                    value={composerContextState.repositories}
                     repositories={repositoryResource}
                     onChange={(repositories) =>
                       setSandboxRepoSelections(
