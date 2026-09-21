@@ -135,6 +135,7 @@ def mock_credentials_env(
     # Strip vars that could interfere with the mock path.
     for stale in (
         "ANTHROPIC_API_KEY",
+        "DATABRICKS_HOST",
         "DATABRICKS_TOKEN",
         "CLAUDE_CODE",
         "CLAUDECODE",

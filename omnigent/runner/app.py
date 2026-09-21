@@ -44,8 +44,9 @@ import httpx
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
+from omnigent._platform import normalize_interactive_shells
 from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
-from omnigent.debug_logging import phase_scope, runner_primary_session_id
+from omnigent.debug_logging import debug_event, phase_scope, runner_primary_session_id
 from omnigent.entities.session_resources import (
     DEFAULT_ENVIRONMENT_ID,
     SessionResourceView,
@@ -67,13 +68,18 @@ from omnigent.harness_plugins import (
     model_env_keys,
     spawn_env_builders,
 )
-from omnigent.inner.native_attachments import has_unresolved_file_id, resolve_file_id_block
+from omnigent.inner.native_attachments import (
+    framework_notice_block,
+    has_unresolved_file_id,
+    resolve_file_id_block,
+)
 from omnigent.llms.summarize import (
     build_summarization_input,
     build_summarization_prompt,
     extract_summary_text,
 )
 from omnigent.native.native_coding_agents import (
+    native_coding_agent_for_agent_name,
     native_coding_agent_for_harness,
     native_coding_agent_for_terminal_name,
 )
@@ -174,7 +180,7 @@ from omnigent.server.schemas import (
     BackgroundSessionTitleRequest,
     BackgroundSessionTitleResponse,
 )
-from omnigent.spec.skill_sources import SkillSourceContext, resolve_harness_skills
+from omnigent.spec.skill_sources import resolve_session_skills
 from omnigent.spec.types import AgentSpec, LocalToolInfo, SkillSpec
 from omnigent.terminals.control_bridge import bridge_tmux_control_to_websocket
 from omnigent.terminals.ws_common import WS_CLOSE_TERMINAL_NOT_FOUND
@@ -185,6 +191,9 @@ from omnigent.tools.builtins.load_skill import (
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger(__name__)
+
+# Allow process termination and forwarder cleanup to finish before DELETE proceeds.
+_SESSION_INIT_CANCEL_TIMEOUT_S = 20.0
 
 # Claude-native session model listing: how long one request waits inline for
 # the probe before answering 503-pending, and how long the probe may stay
@@ -218,11 +227,12 @@ _CLAUDE_MODEL_LATE_DIALOG_POLL_S = 2.0
 _CLAUDE_PANE_READY_TIMEOUT_S = 30.0
 _CLAUDE_PANE_READY_POLL_S = 0.25
 
-# Settle delay between keystrokes when driving Codex's /permissions popup. The
-# slash-command menu, the popup, and the Full Access confirm sub-dialog are each
-# drawn asynchronously; without a pause the next key races ahead (e.g. Enter
-# arrives before the /permissions menu commits, so the command never submits).
-_CODEX_PERMISSION_POPUP_RENDER_S = 0.7
+# Settle delay between keystrokes when driving Codex TUI popups. The
+# slash-command menu, the /permissions popup, and the Full Access confirm
+# sub-dialog are each drawn asynchronously; without a pause the next key races
+# ahead (e.g. Enter arrives before the menu commits, so the command never
+# submits).
+_CODEX_POPUP_RENDER_S = 0.7
 
 # Budget for confirming an approval switch actually landed. Codex echoes
 # "Permissions updated to <label>" once the popup applies; we poll the pane for
@@ -291,6 +301,7 @@ for _builder_name in (
     "_auto_create_claude_terminal",
     "_auto_create_codex_terminal",
     "_auto_create_cursor_terminal",
+    "_auto_create_devin_terminal",
     "_auto_create_goose_terminal",
     "_auto_create_hermes_terminal",
     "_auto_create_kimi_terminal",
@@ -529,6 +540,15 @@ _WAKE_POST_TRANSIENT_4XX = frozenset({408, 409, 425, 429})
 # Matches the AP-side ``_SESSION_STREAM_HEARTBEAT_INTERVAL_S``.
 _SESSION_STREAM_HEARTBEAT_S = 15.0
 
+# How long a required-terminal exit waits for the session's in-flight turn
+# stream to converge before releasing the harness subprocess. The harness
+# usually reports the failure that killed its pane (e.g. a prompt-readiness
+# timeout) on that very stream; releasing at once would close the client the
+# runner is reading and turn the report into a bare transport error. A pane
+# that died on its own leaves the harness parked on a readiness wait, so the
+# wait is bounded and the stream failure is then attributed to the exit.
+_TERMINAL_EXIT_RELEASE_GRACE_S = 2.0
+
 # Lazy singleton LLM client for the runner process. Created on first use so
 # the runner does not import llms at startup (imports are expensive and the
 # /v1/summarize endpoint is optional). The concrete type is imported only
@@ -690,7 +710,10 @@ async def _evaluate_policy_via_omnigent(
         verdict_body["data"] = verdict_data
 
     # Retry once on dead-channel / timeout / non-2xx; any unacknowledged verdict
-    # eventually calls on_delivery_failure to cancel the wedged turn.
+    # eventually calls on_delivery_failure to cancel the wedged turn. Track the
+    # failure mode so the wrap-up log attributes the cause instead of lumping
+    # every mode into one unattributed record.
+    failure_reason = "unexpected"
     for _attempt in range(2):
         try:
             resp = await harness_client.post(
@@ -699,6 +722,7 @@ async def _evaluate_policy_via_omnigent(
                 timeout=30.0,
             )
         except _DEAD_HARNESS_CHANNEL_ERRORS as exc:
+            failure_reason = "dead_channel"
             _logger.warning(
                 "Policy verdict %s delivery hit a dead harness channel (attempt %d/2): %s",
                 evaluation_id,
@@ -708,6 +732,7 @@ async def _evaluate_policy_via_omnigent(
             )
             continue
         except Exception:  # noqa: BLE001 — non-transport: no retry, but still signal
+            failure_reason = "unexpected"
             _logger.warning(
                 "Failed to deliver policy verdict %s to harness (unexpected error)",
                 evaluation_id,
@@ -717,6 +742,7 @@ async def _evaluate_policy_via_omnigent(
             break
         if 200 <= resp.status_code < 300:
             return
+        failure_reason = f"http_{resp.status_code}"
         _logger.warning(
             "Policy verdict %s delivery got HTTP %d — harness did not accept it (attempt %d/2)",
             evaluation_id,
@@ -725,13 +751,34 @@ async def _evaluate_policy_via_omnigent(
             extra={"session_id": conversation_id},
         )
 
-    _logger.error(
-        "Policy verdict %s delivery unacknowledged (dead channel / timeout / "
-        "non-2xx / unexpected) after retry; signaling desync for %s",
-        evaluation_id,
-        conversation_id,
-        extra={"session_id": conversation_id},
-    )
+    if failure_reason == "dead_channel":
+        # The harness channel died before the verdict could land — an upstream
+        # disconnect/teardown consequence whose primary failure (the harness
+        # death) is surfaced by stream teardown, not an Omnigent defect. Log at
+        # WARNING with a structured reason; the desync recovery still runs.
+        _logger.warning(
+            "Policy verdict %s undeliverable after retry: harness channel is dead "
+            "(upstream disconnect/teardown); signaling desync for %s",
+            evaluation_id,
+            conversation_id,
+            extra={
+                "session_id": conversation_id,
+                "delivery_failure_reason": "verdict_delivery_channel_dead",
+            },
+        )
+    else:
+        # A live harness refused the verdict (non-2xx) or delivery failed in an
+        # unforeseen way — potentially a real protocol defect, kept at ERROR.
+        _logger.error(
+            "Policy verdict %s delivery unacknowledged (%s) after retry; signaling desync for %s",
+            evaluation_id,
+            failure_reason,
+            conversation_id,
+            extra={
+                "session_id": conversation_id,
+                "delivery_failure_reason": failure_reason,
+            },
+        )
     if on_delivery_failure is not None:
         await on_delivery_failure(conversation_id)
 
@@ -1329,6 +1376,20 @@ def _is_context_overflow_error(event: _JsonObject) -> tuple[int, int] | None:
     return 128000, 128001
 
 
+def _response_failed_payload(
+    error: Mapping[str, object],
+    source: str = "execution",
+) -> _JsonObject:
+    """Build a failure envelope with required error fields and a legacy mirror."""
+    failure_error = {**_normalize_turn_error(error), **error}
+    return {
+        "type": "response.failed",
+        "source": source,
+        "response": {"status": "failed", "error": failure_error},
+        "error": failure_error,
+    }
+
+
 def _response_failed_event(
     error: Mapping[str, object],
     source: str = "execution",
@@ -1348,10 +1409,7 @@ def _response_failed_event(
         so it can persist the right ``ErrorData.source``.
     :returns: UTF-8 encoded SSE frame bytes.
     """
-    response = {"status": "failed", "error": error}
-    payload = json.dumps(
-        {"type": "response.failed", "source": source, "response": response, "error": error}
-    )
+    payload = json.dumps(_response_failed_payload(error, source=source))
     return f"event: response.failed\ndata: {payload}\n\n".encode()
 
 
@@ -1375,15 +1433,18 @@ async def _resolve_forwarded_message_content(
     resolved: list[_JsonObject] = []
     changed = False
     for block in content:
-        new_block = None
+        result = None
         if isinstance(block, dict) and has_unresolved_file_id(block):
-            new_block = await resolve_file_id_block(
+            result = await resolve_file_id_block(
                 block, session_id=session_id, client=server_client
             )
-        if new_block is None:
+        if result is None:
             resolved.append(block)
         else:
+            new_block, notice = result
             resolved.append(new_block)
+            if notice is not None:
+                resolved.append(framework_notice_block(notice))
             changed = True
 
     return resolved if changed else content
@@ -1730,7 +1791,7 @@ def mark_subagent_work_started(child_session_id: str) -> _SubagentWorkEntry | No
     entry = _subagent_work_by_child.get(child_session_id)
     if entry is None:
         return None
-    if entry.status == "launching":
+    if entry.status in {"launching", "waiting"}:
         entry.status = "running"
     return entry
 
@@ -1812,6 +1873,27 @@ def list_subagent_work(parent_session_id: str) -> list[_SubagentWorkEntry]:
     return sorted(entries, key=lambda entry: entry.created_at)
 
 
+# Harness whose sub-agents live as threads inside the parent's own app-server.
+_CODEX_NATIVE_HARNESS = "codex-native"
+
+
+def is_codex_native_subagent_wrapper(wrapper_label: str | None) -> bool:
+    """
+    Whether a child's wrapper label marks it a codex-native sub-agent.
+
+    Covers both a codex-spawned sub-agent and a ``/side`` side chat: each is a
+    thread inside the parent's own app-server, so codex consumes its result in
+    the thread tree and the parent is never waiting on the Omnigent inbox for it.
+
+    :param wrapper_label: The child's ``omnigent.wrapper`` label, or ``None``.
+    :returns: ``True`` when the child is a codex-native sub-agent.
+    """
+    if wrapper_label is None:
+        return False
+    agent = native_coding_agent_for_harness(_CODEX_NATIVE_HARNESS)
+    return agent is not None and wrapper_label == agent.subagent_wrapper_label
+
+
 def undelivered_subagent_dispatch_id(labels: Mapping[str, object]) -> str | None:
     """
     Return the dispatch id of a child turn whose result the parent never drained.
@@ -1828,6 +1910,25 @@ def undelivered_subagent_dispatch_id(labels: Mapping[str, object]) -> str | None
     if labels.get(SUBAGENT_DELIVERED_ID_LABEL_KEY) == dispatch_id:
         return None
     return dispatch_id
+
+
+def _side_chat_text_from_content(content: object) -> str:
+    """
+    Join user text from message content blocks for a Codex ``/side`` follow-up.
+
+    :param content: A message body's ``content`` list, e.g.
+        ``[{"type": "input_text", "text": "and why?"}]``.
+    :returns: The concatenated text, or ``""`` when there is none.
+    """
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") in {"text", "input_text"}:
+            text = block.get("text")
+            if isinstance(text, str) and text:
+                parts.append(text)
+    return "\n".join(parts).strip()
 
 
 class _SubagentRecoveryReadError(Exception):
@@ -1931,31 +2032,48 @@ async def _recover_subagent_results_from_server(
         status = child.get("current_task_status")
         if not isinstance(child_id, str) or not isinstance(status, str):
             continue
-        if status not in _SUBAGENT_TERMINAL_STATUSES:
+        error = child.get("last_task_error")
+        interrupted = status == "in_progress" or (
+            status == "failed"
+            and isinstance(error, dict)
+            and error.get("code") in {"runner_disconnected", "runner_failed_to_start"}
+        )
+        if status not in _SUBAGENT_TERMINAL_STATUSES and not interrupted:
             continue
-        if (
-            get_subagent_work(child_id) is not None
-            or child_id in _drained_delivered_subagent_children
+        existing = get_subagent_work(child_id)
+        if (existing is not None and existing.status != "waiting") or (
+            child_id in _drained_delivered_subagent_children
         ):
             continue
         labels = child.get("labels")
         dispatch_id = undelivered_subagent_dispatch_id(labels if isinstance(labels, dict) else {})
-        if dispatch_id is None:
+        if dispatch_id is None or (existing is not None and existing.work_id != dispatch_id):
             continue
         output: str | None = None
         if status == "failed":
             error = child.get("last_task_error")
             message = error.get("message") if isinstance(error, dict) else None
             output = message if isinstance(message, str) else None
-        else:
+        elif not interrupted:
             output = await _fetch_latest_assistant_text(server_client, child_id)
-        entry = register_subagent_work(
+        # A forwarded completion or newer dispatch may arrive during the history read.
+        if (
+            get_subagent_work(child_id) is not existing
+            or (existing is not None and existing.status != "waiting")
+            or child_id in _drained_delivered_subagent_children
+        ):
+            continue
+        entry = existing or register_subagent_work(
             parent_session_id=parent_id,
             child_session_id=child_id,
             agent=str(child.get("tool") or child.get("agent_name") or "sub-agent"),
             title=str(child.get("session_name") or ""),
             work_id=dispatch_id,
         )
+        if interrupted:
+            # This dispatch already existed; a local launch timeout cannot judge it.
+            entry.status = "waiting"
+            continue
         ack = mark_subagent_work_terminal(child_id, status=status, output=output)
         if ack.delivered_now:
             schedule_wake(entry)
@@ -2152,6 +2270,7 @@ async def run_subagent_launch_reaper(
     *,
     interval_s: float = SUBAGENT_LAUNCH_REAP_INTERVAL_S,
     mark_terminal: MarkSubagentTerminalAndWake | None = None,
+    reconcile_pending: Callable[[], Awaitable[None]] | None = None,
 ) -> None:
     """
     Periodically sweep for sub-agent dispatches wedged in ``launching``.
@@ -2163,12 +2282,15 @@ async def run_subagent_launch_reaper(
     :param mark_terminal: Terminal-delivery callback forwarded to each sweep;
         the entrypoint passes the app's wake-scheduling seam so a reaped
         failure wakes the parent, not just its inbox.
+    :param reconcile_pending: Refresh recovered work awaiting remote completion.
     :returns: None.
     """
     while True:
         await asyncio.sleep(interval_s)
         try:
             reap_stalled_subagent_launches(mark_terminal=mark_terminal)
+            if reconcile_pending is not None:
+                await reconcile_pending()
         except Exception:  # noqa: BLE001 — the sweep is a backstop; never die.
             _logger.warning("sub-agent launch reaper sweep failed", exc_info=True)
 
@@ -2317,6 +2439,9 @@ def _subagent_delivery_not_confirmed_response(
     an untracked status remains a no-op unless the runner knows this session
     was created as a sub-agent. For known sub-agents, Omnigent must not receive a
     2xx acknowledgement unless the terminal payload is confirmed in the
+    parent's inbox — except a tracked entry whose parent is itself a
+    sub-agent, which ``post_session_events`` acknowledges before calling here;
+    the entry is retained and delivered only if this runner ever creates that
     parent's inbox.
 
     :param ack: Delivery acknowledgement returned by
@@ -2648,11 +2773,8 @@ def get_session_agent_id(session_id: str) -> str | None:
     return _session_agent_ids_ref.get(session_id)
 
 
-# How long a session's discovered skills stay cached before the runner
-# re-walks the filesystem. Short enough that a skill or plugin installed
-# mid-session surfaces in the composer menu without a session restart, long
-# enough to collapse the bursty menu-open + per-invocation resolve calls onto
-# a single walk. Module-level so it can be tuned/patched in one place.
+# Repeated invocations share a filesystem scan; installed skills become
+# resolvable after at most one minute without restarting the runner.
 _SESSION_SKILLS_CACHE_TTL_SECONDS = 60.0
 _SESSION_INIT_ENVELOPE_TTL_SECONDS = 60.0
 
@@ -2670,6 +2792,32 @@ class _BodyRequest:
 
     async def json(self) -> _JsonObject:
         return self._body
+
+
+def _require_full_native_lock_coverage(
+    dispatch: dict[str, dict[str, asyncio.Lock]],
+) -> dict[str, dict[str, asyncio.Lock]]:
+    """Fail fast if the native terminal lock dispatch is missing a harness.
+
+    The launch and ensure paths index this map by ``agent.key``; a native
+    harness absent from it raises ``KeyError`` mid terminal-ensure and surfaces
+    to the user as a "malformed runner response (HTTP 500)". Asserting coverage
+    at app construction catches a newly-added native harness that was not wired
+    here immediately, rather than only when someone starts that harness.
+
+    Scoped to the BUILT-IN native providers, not the merged registry: a
+    community-contributed native harness wires its own launcher and must not be
+    forced into this built-in dispatch (that would turn a localized per-launch
+    failure into the whole runner failing to construct).
+    """
+    from omnigent.harness_plugins import _BUILTIN_NATIVE_PROVIDERS
+
+    missing = {provider.key for provider in _BUILTIN_NATIVE_PROVIDERS} - set(dispatch)
+    if missing:
+        raise RuntimeError(
+            f"native terminal lock dispatch is missing built-in harness(es): {sorted(missing)}"
+        )
+    return dispatch
 
 
 def create_runner_app(
@@ -2776,7 +2924,10 @@ def create_runner_app(
     _session_snapshot_cache: dict[str, _SessionSnapshot] = {}  # session_id → snapshot
     _session_snapshot_locks: dict[str, asyncio.Lock] = {}  # session_id → snapshot fetch lock
     _session_spec_locks: dict[str, asyncio.Lock] = {}  # session_id → spec resolution lock
-    _session_init_tasks: dict[tuple[str, str, str | None], asyncio.Task[JSONResponse]] = {}
+    _session_init_tasks: dict[
+        tuple[str, str, str | None, str | None], asyncio.Task[JSONResponse]
+    ] = {}
+    _recovery_turn_ids: dict[str, set[str]] = {}
     _session_init_envelopes: dict[str, tuple[float, RunnerSessionInitEnvelope]] = {}
     # session_id → canonical reasoning effort, seeded from the session-init
     # snapshot and updated by ``effort_change``. In-process harnesses learn the
@@ -2886,10 +3037,20 @@ def create_runner_app(
     _hermes_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _claude_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _antigravity_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
+    _devin_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     app.state.antigravity_terminal_ensure_locks = _antigravity_terminal_ensure_locks
     _repl_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _active_turns: dict[str, asyncio.Task[None] | None] = {}
     app.state.active_turns = _active_turns
+    # Conversations whose claude-sdk `/compact` published an up-front
+    # `response.compaction.in_progress`. Used to (a) swallow the executor's own
+    # later `in_progress` so the web shows a single spinner, and (b) publish a
+    # `failed` if the turn produced no compaction, so the spinner is never
+    # stranded. Discarded on `response.compaction.completed` (real compaction),
+    # else cleared by `_on_proxy_stream_end` — the single turn-end convergence
+    # point reached on every exit path (clean end, setup error, cancel).
+    _sdk_compact_inprogress: set[str] = set()
+    app.state.sdk_compact_inprogress = _sdk_compact_inprogress
     _native_pane_status: dict[str, str] = {}
     app.state.native_pane_status = _native_pane_status
     # Detached watchers answering a /model confirm dialog that pops after
@@ -2906,6 +3067,11 @@ def create_runner_app(
     # Desynced conversations; cleared when a fresh turn binds.
     _desynced_sessions: set[str] = set()
     app.state.desynced_sessions = _desynced_sessions
+    # Required-terminal exits whose handler released the session's harness
+    # subprocess. The release closes the httpx client an in-flight
+    # ``proxy_stream`` is reading, which surfaces there as a transport error;
+    # the stream's failure handler consumes the record to report the exit.
+    _required_terminal_exit_errors: dict[str, dict[str, str]] = {}
     # Monotonic epoch stamped at each turn bind; lets recovery detect a replacement that ran
     # and finished during a teardown await (slot empty, but epoch advanced).
     _turn_epoch_seq = itertools.count(1)
@@ -2916,6 +3082,7 @@ def create_runner_app(
     _desync_terminalized: dict[str, int] = {}
     app.state.desync_terminalized = _desync_terminalized
     _background_tasks: set[asyncio.Task[Any]] = set()
+    _subagent_recovery_tasks: dict[str, asyncio.Task[None]] = {}
     _subagent_wake_pending: set[str] = set()
     _last_rewake_notice: dict[str, str] = {}
     # Parents whose wake POST exhausted its bounded retries while their inbox
@@ -3246,12 +3413,12 @@ def create_runner_app(
         runner log) and attaches the live pane snapshot as a ``Last captured
         terminal output:`` block, which the web UI renders as diagnostics.
         """
-        cause = str(exc).strip()
-        message = (
-            f"Harness stream connection error: {cause}"
-            if cause
-            else "Harness stream connection error."
-        )
+        # httpx raises several transport errors with no message at all
+        # (``ReadError()``), which left the whole diagnostic as the bare
+        # sentence. Fall back to the exception type so the message always names
+        # which transport failure ended the stream.
+        cause = str(exc).strip() or type(exc).__name__
+        message = f"Harness stream connection error: {cause}"
         pane = _live_terminal_pane_snapshot(conv_id)
         if pane:
             message = f"{message}\n\nLast captured terminal output:\n{pane}"
@@ -3262,6 +3429,12 @@ def create_runner_app(
             return
 
         async def _release() -> None:
+            # Let a live turn stream converge first (bounded): the harness's own
+            # failure event may already be on the wire, and releasing now would
+            # sever the stream carrying it.
+            deadline = time.monotonic() + _TERMINAL_EXIT_RELEASE_GRACE_S
+            while session_id in _live_response_id and time.monotonic() < deadline:
+                await asyncio.sleep(0.05)
             try:
                 await process_manager.release(session_id)
             except Exception:
@@ -3303,6 +3476,12 @@ def create_runner_app(
         _teardown_task.add_done_callback(_background_tasks.discard)
         _background_tasks.add(_teardown_task)
 
+        # Record the exit before releasing the harness: the release severs any
+        # in-flight turn stream, whose failure handler then reports this exit
+        # instead of the transport error the severed socket raises.
+        error = _build_required_terminal_error(event)
+        _required_terminal_exit_errors[event.session_id] = error
+
         if event.terminal_name in ("qwen", "antigravity") and event.session_key == "main":
             _publish_event(event.session_id, {"type": "session.status", "status": "idle"})
             _release_required_terminal_session(event.session_id)
@@ -3312,7 +3491,6 @@ def create_runner_app(
             _release_required_terminal_session(event.session_id)
             return
 
-        error = _build_required_terminal_error(event)
         _logger.error(
             "required terminal %s exited; failing turn for %s: %s",
             event.terminal_name,
@@ -3466,8 +3644,11 @@ def create_runner_app(
         session_id: str,
         agent_id: str,
     ) -> _SessionInitContext:
+        from omnigent.runner.session_init_protocol import validate_runner_inference_config
+
         if envelope.session_id != session_id or envelope.agent_id != agent_id:
             raise ValueError("session initialization envelope identity mismatch")
+        validate_runner_inference_config(envelope.snapshot.inference_config)
 
         global _server_version
         _server_version = envelope.server_version
@@ -3508,6 +3689,10 @@ def create_runner_app(
     ) -> _SessionInitContext:
         envelope = parse_runner_session_init_envelope(body)
         if envelope is None:
+            if os.environ.get("OMNIGENT_INFERENCE_CONFIG"):
+                from omnigent.runner.session_init_protocol import validate_runner_inference_config
+
+                validate_runner_inference_config(None)
             return await _load_legacy_session_init_context()
         body_sub_agent = body.get("sub_agent_name")
         if envelope.sub_agent_name != (
@@ -3717,6 +3902,8 @@ def create_runner_app(
         )
 
     async def _initialize_session(body: _JsonObject) -> JSONResponse:
+        from omnigent.runner.session_init_protocol import RunnerInferenceConfigMismatch
+
         if process_manager is None:
             return JSONResponse(
                 status_code=501,
@@ -3737,12 +3924,34 @@ def create_runner_app(
             )
         session_id = cast(str, session_id)
         agent_id = cast(str, agent_id)
+        initial_turn_epoch = _turn_bind_epoch.get(session_id)
+        initial_native_activity = resource_registry.session_activity_epoch(session_id)
+        initially_active = session_id in _active_turns or resource_registry.session_turn_is_active(
+            session_id
+        )
+
+        # Captured before init's first await: the legacy (no-envelope) context
+        # load below probes the server's version over the network, so a reset
+        # landing anywhere in init — including that probe — must fence the
+        # memoizing writes at the end of init.
+        spec_cache_generation = _session_cache_generation(session_id)
 
         try:
             init_context = await _load_session_init_context(
                 body,
                 session_id=session_id,
                 agent_id=agent_id,
+            )
+        except RunnerInferenceConfigMismatch:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": "inference_config_mismatch",
+                    "detail": (
+                        "This runner has a different saved provider configuration; "
+                        "launch a new runner."
+                    ),
+                },
             )
         except ValueError:
             return JSONResponse(
@@ -3796,7 +4005,14 @@ def create_runner_app(
                     spec_entry = _sub_entry
                     spec = _unwrap_resolved_spec(_sub_entry)
                     _session_sub_agent_resolved[session_id] = True
-            harness_name = spec.executor.config.get("harness") or spec.executor.type
+            # The session's override outranks the spec: resolving from the spec
+            # alone made init spawn a harness the turns never ask for, evicting
+            # the override's live subprocess (entries are keyed by conversation).
+            harness_name = (
+                _session_harness_overrides.get(session_id)
+                or spec.executor.config.get("harness")
+                or spec.executor.type
+            )
             harness_name = canonicalize_harness(harness_name) or harness_name
 
             _start_verdict = await _evaluate_agent_start_gate(spec, harness_name)
@@ -3845,7 +4061,11 @@ def create_runner_app(
                     server_client=server_client,
                     optional_labels=init_context.labels,
                 )
-            _session_spec_cache[session_id] = spec_entry
+            # An agent-cache reset acknowledged while init awaited retired
+            # this entry; skip the memoization so the reset wins. Init still
+            # runs on what it resolved — the next spec read re-resolves.
+            if _session_cache_generation_is_current(session_id, spec_cache_generation):
+                _session_spec_cache[session_id] = spec_entry
         else:
             if spec_resolver is not None:
                 # spec_resolver was configured but returned no spec for this
@@ -3881,14 +4101,42 @@ def create_runner_app(
             )
 
         _session_start_cache.setdefault(session_id, time.time())
-        _session_agent_ids[session_id] = agent_id
+        # The same reset that retires the spec entry also retires this
+        # binding, and later resets read it to decide which agent's shared
+        # ``_spec_cache`` entry to drop; reinstating a superseded binding
+        # would misdirect them at the old agent. Same fence as the spec-cache
+        # write above — a fenced-out reader falls back to the fresh session
+        # snapshot instead.
+        if _session_cache_generation_is_current(session_id, spec_cache_generation):
+            _session_agent_ids[session_id] = agent_id
+        else:
+            # The reset that fenced this binding ran before init registered
+            # the harness, so it could not release the subprocess spawned
+            # above with the superseded spec's environment baked in. With
+            # the binding left absent, the next turn's prior-binding teardown
+            # would skip release too, and a new agent sharing the harness and
+            # model would silently reuse the stale process. Release it now so
+            # the next turn respawns from the freshly resolved spec.
+            _logger.info(
+                "session init raced an agent-cache reset; releasing the "
+                "harness spawned from the superseded spec",
+                extra={"session_id": session_id},
+            )
+            # Conditional on idleness (the reaper's guard): a consumer that
+            # touched or is mid-turn on the shared entry after this cutoff is
+            # never torn down out from under it; the entry init itself just
+            # registered predates the cutoff and is released.
+            await process_manager.release(session_id, only_if_idle_cutoff=time.monotonic())
         if session_id not in _session_event_queues:
             _session_event_queues[session_id] = asyncio.Queue()
         if session_id not in _session_inboxes:
             _session_inboxes[session_id] = asyncio.Queue()
         # A fresh queue can mean a fresh runner process rather than a fresh
-        # session: re-queue results the previous process never drained.
-        await _recover_undrained_subagent_results(session_id)
+        # session: re-queue results the previous process never drained. Start
+        # the durable server scan now, but overlap it with terminal creation;
+        # sys_read_inbox uses the same locked helper if a turn races the scan.
+        _deliver_retained_subagent_results(session_id)
+        _subagent_recovery_task = _start_subagent_recovery(session_id)
         if session_id not in _session_async_tasks:
             _session_async_tasks[session_id] = {}
         raw_sub_agent_name = body.get("sub_agent_name")
@@ -3907,19 +4155,22 @@ def create_runner_app(
             # (claude/codex/antigravity) add a pre_launch check and, for
             # claude/codex, a build_context enrichment. All wire the comment
             # relay (pi/opencode route their policy hook through it).
-            _launch_locks = {
-                "claude": _claude_terminal_ensure_locks,
-                "codex": _codex_terminal_ensure_locks,
-                "pi": _pi_terminal_ensure_locks,
-                "cursor": _cursor_terminal_ensure_locks,
-                "kiro": _kiro_terminal_ensure_locks,
-                "antigravity": _antigravity_terminal_ensure_locks,
-                "opencode": _opencode_terminal_ensure_locks,
-                "goose": _goose_terminal_ensure_locks,
-                "hermes": _hermes_terminal_ensure_locks,
-                "qwen": _qwen_terminal_ensure_locks,
-                "kimi": _kimi_terminal_ensure_locks,
-            }[_native_agent.key]
+            _launch_locks = _require_full_native_lock_coverage(
+                {
+                    "claude": _claude_terminal_ensure_locks,
+                    "codex": _codex_terminal_ensure_locks,
+                    "pi": _pi_terminal_ensure_locks,
+                    "cursor": _cursor_terminal_ensure_locks,
+                    "kiro": _kiro_terminal_ensure_locks,
+                    "antigravity": _antigravity_terminal_ensure_locks,
+                    "opencode": _opencode_terminal_ensure_locks,
+                    "goose": _goose_terminal_ensure_locks,
+                    "hermes": _hermes_terminal_ensure_locks,
+                    "qwen": _qwen_terminal_ensure_locks,
+                    "kimi": _kimi_terminal_ensure_locks,
+                    "devin": _devin_terminal_ensure_locks,
+                }
+            )[_native_agent.key]
             _launch_ctx = NativeLaunchContext(
                 session_id=session_id,
                 resource_registry=resource_registry,
@@ -4026,12 +4277,16 @@ def create_runner_app(
             elif harness_name == "codex-native":
 
                 async def _codex_pre_launch(has_terminal: bool) -> PreLaunchResult:
-                    needs = await _codex_session_needs_runner_terminal(server_client, session_id)
+                    needs = (
+                        init_context.envelope is not None
+                        or await _codex_session_needs_runner_terminal(server_client, session_id)
+                    )
                     if not has_terminal:
                         inbound = await _codex_native_terminal_arrives_via_transfer(
                             server_client=server_client,
                             session_id=session_id,
                             resource_registry=resource_registry,
+                            session_labels=init_context.labels,
                         )
                         _logger.info(
                             "Codex terminal transfer-inbound check: session=%s "
@@ -4110,7 +4365,12 @@ def create_runner_app(
                 # pi resolves its spec unwrapped — a resolution error surfaces as
                 # a terminal-start error (the resolver does not swallow it).
                 _launch_resolve_spec = lambda: _resolve_session_agent_spec(session_id)  # noqa: E731
-            elif harness_name in ("cursor-native", "opencode-native", "kimi-native"):
+            elif harness_name in (
+                "cursor-native",
+                "opencode-native",
+                "kimi-native",
+                "devin-native",
+            ):
                 _launch_resolve_spec = lambda: _resolve_session_agent_spec_or_none(  # noqa: E731
                     session_id
                 )
@@ -4187,6 +4447,11 @@ def create_runner_app(
                     finally:
                         _publish_terminal_pending(_publish_event, session_id, False)
 
+        # Preserve the initialization contract: undrained child results are
+        # recovered before POST /sessions returns. The scan no longer delays
+        # native terminal registration because it ran concurrently above.
+        await asyncio.shield(_subagent_recovery_task)
+
         # Crash recovery (Step 8.5 Scenario A): if the session
         # has existing history, check whether the last item
         # indicates an incomplete turn that needs restarting.
@@ -4207,13 +4472,25 @@ def create_runner_app(
         _suppress_recovery = (
             init_context.envelope is not None and init_context.envelope.suppress_recovery_turn
         )
+        recovery_id = (
+            init_context.envelope.recovery_id
+            if init_context.envelope is not None
+            and init_context.envelope.resume_interrupted_turn
+            and not _suppress_recovery
+            else None
+        )
         history: list[_JsonObject]
         if is_native_harness(harness_name):
             await _seed_last_server_item_id(session_id)
             history = []
         else:
             history = await _load_history_as_input(session_id)
-        if history:
+        execution_seen = (
+            initially_active
+            or _turn_bind_epoch.get(session_id) != initial_turn_epoch
+            or resource_registry.session_activity_epoch(session_id) != initial_native_activity
+        )
+        if history and not execution_seen and session_id not in _active_turns:
             _session_histories[session_id] = history
             last = history[-1]
             last_type = last.get("type")
@@ -4223,7 +4500,12 @@ def create_runner_app(
                 or last_type == "function_call"
                 or last_type == "function_call_output"
             )
-            if needs_turn and not _suppress_recovery and session_id not in _active_turns:
+            if (
+                needs_turn
+                and recovery_id is None
+                and not _suppress_recovery
+                and session_id not in _active_turns
+            ):
                 _begin_turn_slot(session_id)
                 _publish_turn_status(session_id, "running")
                 msg_body = {
@@ -4241,6 +4523,47 @@ def create_runner_app(
                     _background_tasks.discard,
                 )
                 _background_tasks.add(_turn_task)
+
+        if recovery_id is not None and recovery_id not in _recovery_turn_ids.get(
+            session_id, set()
+        ):
+            # Active execution, including a newer message, takes precedence over
+            # automatic continuation. Initialization alone cannot consume it.
+            if (
+                not execution_seen
+                and session_id not in _active_turns
+                and not resource_registry.session_turn_is_active(session_id)
+            ):
+                if is_native_harness(harness_name):
+                    _session_histories[session_id] = []
+                _begin_turn_slot(session_id)
+                _publish_turn_status(session_id, "running")
+                recovery_body: _JsonObject = {
+                    "agent_id": agent_id,
+                    "model": body.get("model", agent_id),
+                    "browser_renderer_available": False,
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": (
+                                "Your runner was interrupted while this task was active. "
+                                "Continue the existing task from its current state. "
+                                "Check any interrupted operation's outcome before repeating it."
+                            ),
+                        }
+                    ],
+                }
+                if not is_native_harness(harness_name):
+                    _session_histories.setdefault(session_id, []).append(
+                        {"type": "message", "role": "user", "content": recovery_body["content"]}
+                    )
+                recovery_task = asyncio.create_task(
+                    _run_turn_bg(recovery_body, session_id), name=f"turn-recover-{session_id}"
+                )
+                _active_turns[session_id] = recovery_task
+                recovery_task.add_done_callback(_background_tasks.discard)
+                _background_tasks.add(recovery_task)
+            _recovery_turn_ids.setdefault(session_id, set()).add(recovery_id)
 
         status = "running" if session_id in _active_turns else "idle"
         return JSONResponse(
@@ -4262,6 +4585,12 @@ def create_runner_app(
                     else None
                 ),
                 "terminal_ready": terminal_ready,
+                **(
+                    {"inference_config_verified": True}
+                    if init_context.envelope is not None
+                    and init_context.envelope.snapshot.inference_config is not None
+                    else {}
+                ),
             },
         )
 
@@ -4281,10 +4610,15 @@ def create_runner_app(
         if not isinstance(session_id, str) or not isinstance(agent_id, str):
             return await _initialize_session(body)
         sub_agent_name = body.get("sub_agent_name")
+        try:
+            envelope = parse_runner_session_init_envelope(body)
+        except ValueError:
+            return await _initialize_session(body)
         key = (
             session_id,
             agent_id,
             sub_agent_name if isinstance(sub_agent_name, str) else None,
+            envelope.recovery_id if envelope is not None else None,
         )
         task = _session_init_tasks.get(key)
         if task is None:
@@ -4351,7 +4685,12 @@ def create_runner_app(
                     "detail": ("Runner GET /v1/sessions/{id} needs a HarnessProcessManager."),
                 },
             )
-        if not process_manager.has_session(session_id):
+        # A live session's subprocess can be legitimately unregistered — a
+        # fence-fired release after init raced a reset, or an agent-switch
+        # teardown awaiting its next-turn respawn — so a missing entry alone
+        # is not "no such session": the start cache tracks every session this
+        # runner initialized until it is deleted.
+        if not process_manager.has_session(session_id) and session_id not in _session_start_cache:
             return JSONResponse(
                 status_code=404,
                 content={
@@ -4362,6 +4701,18 @@ def create_runner_app(
         has_turn = session_id in _active_turns or process_manager.has_active_turn(session_id)
         status = "running" if has_turn else "idle"
         agent_id = _session_agent_ids.get(session_id)
+        if agent_id is None:
+            # An agent-cache reset retires the binding while the session
+            # stays live, so a registered session can transiently lack it.
+            # The server snapshot is the authoritative binding; serve it
+            # rather than failing the read (the next turn re-memoizes).
+            snapshot = await _session_snapshot(session_id)
+            if snapshot.ok and snapshot.agent_id is not None:
+                _logger.info(
+                    "session agent binding absent from cache; serving the server snapshot binding",
+                    extra={"session_id": session_id},
+                )
+                agent_id = snapshot.agent_id
         if agent_id is None:
             return JSONResponse(
                 status_code=500,
@@ -4401,6 +4752,33 @@ def create_runner_app(
 
     @app.delete("/v1/sessions/{session_id}")
     async def delete_session(session_id: str) -> JSONResponse:
+        # Stop initialization before it can recreate resources during teardown.
+        init_tasks = [
+            task
+            for key, task in list(_session_init_tasks.items())
+            if key[0] == session_id and not task.done()
+        ]
+        for init_task in init_tasks:
+            init_task.cancel()
+        if init_tasks:
+            # Bound cleanup time; log init failures so resource teardown still runs.
+            _finished, pending = await asyncio.wait(
+                set(init_tasks), timeout=_SESSION_INIT_CANCEL_TIMEOUT_S
+            )
+            if pending:
+                _logger.warning(
+                    "Cancelled session init for %s did not finish within %.0fs",
+                    session_id,
+                    _SESSION_INIT_CANCEL_TIMEOUT_S,
+                )
+            for done_task in _finished:
+                if not done_task.cancelled() and done_task.exception() is not None:
+                    _logger.warning(
+                        "Session init for %s failed while being cancelled: %r",
+                        session_id,
+                        done_task.exception(),
+                    )
+        await _cancel_subagent_recovery(session_id)
         turn_task = _active_turns.pop(session_id, None)
         if turn_task is not None and isinstance(turn_task, asyncio.Task):
             turn_task.cancel()
@@ -4411,8 +4789,10 @@ def create_runner_app(
         _live_response_id.pop(session_id, None)
         # Clear all desync/turn state so a recreated same-id session starts clean.
         _turn_bind_epoch.pop(session_id, None)
+        _recovery_turn_ids.pop(session_id, None)
         _desync_terminalized.pop(session_id, None)
         _desynced_sessions.discard(session_id)
+        _required_terminal_exit_errors.pop(session_id, None)
         _native_pane_status.pop(session_id, None)
         _ingest_next_seq.pop(session_id, None)
         _ingest_now_serving.pop(session_id, None)
@@ -4430,6 +4810,8 @@ def create_runner_app(
         _repl_terminal_ensure_locks.pop(session_id, None)
         _interrupted_sessions.discard(session_id)
         await _cancel_auto_forwarder_task(session_id)
+        # Close any OpenCode server that no forwarder adopted.
+        await _native_runtime.teardown_opencode_native_server(session_id)
 
         if process_manager is not None:
             await process_manager.forward_cancel(session_id)
@@ -4961,25 +5343,70 @@ def create_runner_app(
             title=snapshot.sub_agent_name or "",
         )
 
-    async def _recover_undrained_subagent_results(parent_id: str) -> None:
+    async def _parent_is_nested_subagent(entry: _SubagentWorkEntry) -> bool:
+        """
+        Return whether an undelivered result's parent is itself a sub-agent.
+
+        A mirrored claude-native sub-agent never runs on this runner, so its
+        inbox never exists here and retrying its children's terminal status
+        every 30 s buys nothing. The inbox record is redundant for that
+        topology: the child's result reaches the parent natively inside the
+        Claude process. The status is acknowledged and the entry kept, so a
+        sub-agent parent that does run here later still receives it when its
+        inbox is created (``_deliver_retained_subagent_results``). An unreadable
+        parent snapshot reads as a top-level parent, so the retry contract still
+        covers a parent that lives elsewhere or is re-initializing after a
+        restart.
+
+        :param entry: Terminal work entry whose parent inbox was missing.
+        :returns: ``True`` when the parent's snapshot names its own parent.
+        """
+        snapshot = await _session_snapshot(entry.parent_session_id)
+        return snapshot.ok and snapshot.parent_session_id is not None
+
+    def _deliver_retained_subagent_results(parent_id: str) -> None:
+        """
+        Hand over results acknowledged while ``parent_id`` had no inbox here.
+
+        A terminal child whose sub-agent parent had no inbox here is
+        acknowledged with its entry kept undelivered. If that parent later
+        runs on this runner, creating its inbox delivers those entries and
+        wakes it, as the forwarder's pending retry used to the moment the inbox
+        appeared. A parent that never runs here keeps the entry undelivered;
+        for a claude-native mirror the result already reached it natively.
+        Idempotent: delivered entries are skipped.
+
+        :param parent_id: Parent whose inbox now exists, e.g. ``"conv_parent123"``.
+        :returns: None.
+        """
+        for entry in list_subagent_work(parent_id):
+            if entry.status not in _SUBAGENT_TERMINAL_STATUSES or entry.delivered:
+                continue
+            if _deliver_subagent_completion(entry).delivered_now:
+                _schedule_subagent_wake(entry)
+
+    async def _run_subagent_recovery(parent_id: str) -> None:
         """
         Re-queue terminal child results lost with a runner process restart.
 
         The parent inbox is a process-local queue, so a result queued before
         a restart but not yet drained would otherwise vanish. Runs once per
-        parent per process; a scan that fails on a server read is retried
-        before the next ``sys_read_inbox`` drain. The inbox is created here
-        when missing: after a reconnect the server can dispatch a pending
-        message before it re-initializes the session, and that turn's drain
-        must still see the recovered results.
+        parent per process; pending recovered work is refreshed by the periodic
+        sweep. A failed server read is retried before the next ``sys_read_inbox``
+        drain. The inbox is created here when missing: after a reconnect the
+        server can dispatch a pending message before it re-initializes the session,
+        and that turn's drain
+        must still see the recovered results. Results acknowledged while this
+        parent had no inbox here are handed over first, on every call.
 
         :param parent_id: Parent session whose inbox was recreated, e.g.
             ``"conv_parent123"``.
         :returns: None.
         """
+        _session_inboxes.setdefault(parent_id, asyncio.Queue())
+        _deliver_retained_subagent_results(parent_id)
         if parent_id in _subagent_recovery_done:
             return
-        _session_inboxes.setdefault(parent_id, asyncio.Queue())
         lock = _subagent_recovery_locks.setdefault(parent_id, asyncio.Lock())
         async with lock:
             if parent_id in _subagent_recovery_done:
@@ -5000,7 +5427,65 @@ def create_runner_app(
                 return
             _subagent_recovery_done.add(parent_id)
 
+    def _start_subagent_recovery(parent_id: str) -> asyncio.Task[None]:
+        """Return the session-owned single-flight restart recovery task."""
+        task = _subagent_recovery_tasks.get(parent_id)
+        if task is not None and not task.done():
+            return task
+        _subagent_recovery_tasks.pop(parent_id, None)
+        task = asyncio.create_task(
+            _run_subagent_recovery(parent_id),
+            name=f"subagent-recovery:{parent_id}",
+        )
+        _subagent_recovery_tasks[parent_id] = task
+        _background_tasks.add(task)
+
+        def _drop_completed_recovery(done: asyncio.Task[None]) -> None:
+            _background_tasks.discard(done)
+            if _subagent_recovery_tasks.get(parent_id) is done:
+                _subagent_recovery_tasks.pop(parent_id, None)
+
+        task.add_done_callback(_drop_completed_recovery)
+        return task
+
+    async def _cancel_subagent_recovery(parent_id: str) -> None:
+        """Stop recovery before deleting its session-local inbox and markers."""
+        task = _subagent_recovery_tasks.pop(parent_id, None)
+        if task is None:
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception:  # noqa: BLE001 - recovery failure must not block session deletion
+            _logger.warning(
+                "Sub-agent recovery failed while deleting session %s",
+                parent_id,
+                exc_info=True,
+                extra={"session_id": parent_id},
+            )
+
+    async def _recover_undrained_subagent_results(parent_id: str) -> None:
+        """Await the session-owned single-flight restart recovery task."""
+        await asyncio.shield(_start_subagent_recovery(parent_id))
+
     app.state.recover_undrained_subagent_results = _recover_undrained_subagent_results
+
+    async def _reconcile_pending_subagent_results() -> None:
+        """Refresh only recovered work with no local execution or completion edge."""
+        parents = {
+            entry.parent_session_id
+            for entry in list(_subagent_work_by_child.values())
+            if entry.status == "waiting"
+        }
+        for parent_id in parents:
+            if not any(entry.status == "waiting" for entry in list_subagent_work(parent_id)):
+                continue
+            _subagent_recovery_done.discard(parent_id)
+            await _recover_undrained_subagent_results(parent_id)
+
+    app.state.reconcile_pending_subagent_results = _reconcile_pending_subagent_results
 
     def _note_session_harness_override(conv_id: str, harness_override: str | None) -> None:
         """Record the harness a session was forwarded, so reads match the run.
@@ -5038,6 +5523,8 @@ def create_runner_app(
         conv_id: str,
         status: str,
         error: Mapping[str, object] | None = None,
+        *,
+        source_error: Mapping[str, object] | None = None,
     ) -> None:
         if status == "waiting" and not (
             _server_version is not None and _version_supports_waiting_status(_server_version)
@@ -5061,6 +5548,14 @@ def create_runner_app(
         if error is not None:
             event["error"] = error
         if status == "failed":
+            source = source_error if source_error is not None else (error or {})
+            dimensions: dict[str, str] = {}
+            for key in ("code", "type", "status"):
+                value = source.get(key)
+                if (isinstance(value, int) and not isinstance(value, bool)) or (
+                    isinstance(value, str) and re.fullmatch(r"[\w.:-]{1,128}", value)
+                ):
+                    dimensions[f"source_{key}"] = str(value)
             # Canonical broken-turn signal: every failed turn shown in the UI
             # funnels through here, so log once at ERROR for the dashboard.
             _logger.error(
@@ -5068,7 +5563,12 @@ def create_runner_app(
                 conv_id,
                 harness,
                 error,
-                extra={"session_id": conv_id},
+                extra=debug_event(
+                    "runner_turn_failed",
+                    session_id=conv_id,
+                    harness=harness,
+                    **dimensions,
+                ),
             )
         _publish_event(conv_id, event)
 
@@ -5110,6 +5610,28 @@ def create_runner_app(
             )
             return None
         return state
+
+    async def _codex_native_bridge_dir_for_session(conv_id: str) -> Path:
+        """
+        Bridge directory for a codex-native session.
+
+        Same resolution as :func:`_codex_native_bridge_state_for_session` — the
+        bridge id label when present, else the conversation id — so a request
+        written here lands in the directory the forwarder polls.
+
+        :param conv_id: Conversation id, e.g. ``"conv_abc123"``.
+        :returns: The session's bridge directory.
+        """
+        from omnigent.harnesses.codex_native.bridge import (
+            CODEX_NATIVE_BRIDGE_ID_LABEL_KEY,
+            bridge_dir_for_bridge_id,
+        )
+
+        labels = await _session_labels_for_runner_spawn(
+            server_client=server_client,
+            session_id=conv_id,
+        )
+        return bridge_dir_for_bridge_id(labels.get(CODEX_NATIVE_BRIDGE_ID_LABEL_KEY) or conv_id)
 
     codex_goal_runner = CodexGoalRunner(
         bridge_state_for_session=_codex_native_bridge_state_for_session,
@@ -5383,11 +5905,11 @@ def create_runner_app(
         # session — keeping the SHAPE's stored default (a session's own pin
         # must not become the host-wide default).
         asyncio.get_running_loop().create_task(
-            _write_back_codex_catalog([dict(row) for row in rows])
+            _write_back_codex_catalog(conv_id, [dict(row) for row in rows])
         )
         return marked
 
-    async def _write_back_codex_catalog(rows: list[_JsonObject]) -> None:
+    async def _write_back_codex_catalog(session_id: str, rows: list[_JsonObject]) -> None:
         try:
             from omnigent.harnesses.codex_native.app_server import (
                 codex_catalog_fingerprint,
@@ -5396,7 +5918,10 @@ def create_runner_app(
             )
             from omnigent.models import model_catalog_store
 
-            launch = await asyncio.to_thread(resolve_native_codex_launch, model=None)
+            spec = await _resolve_session_agent_spec(session_id)
+            if spec is None:
+                return
+            launch = await asyncio.to_thread(resolve_native_codex_launch, model=None, spec=spec)
             fingerprint = codex_catalog_fingerprint(launch)
             stored = model_catalog_store.read_catalog("codex-native", fingerprint)
             stored_default = next(
@@ -5413,7 +5938,7 @@ def create_runner_app(
             _logger.debug(
                 "codex model-catalog write-back skipped",
                 exc_info=True,
-                extra={"session_id": runner_primary_session_id()},
+                extra={"session_id": session_id},
             )
 
     async def _handle_pi_native_effort_change(
@@ -5558,6 +6083,34 @@ def create_runner_app(
                 },
             )
         return JSONResponse(status_code=200, content={"permission_mode": settled})
+
+    async def _handle_claude_native_btw_dismiss(conv_id: str) -> Response:
+        """
+        Close a live claude-native session's ``/btw`` overlay from the web UI.
+
+        The reader dismissed the transient side-chat overlay in the web view;
+        mirror that to the terminal by sending Escape to the pane — but only
+        when the ``/btw`` overlay is actually on screen (the bridge guards on
+        this), because a blind Escape on the bare composer would cancel an
+        in-flight turn. Best-effort: the overlay also auto-dismisses on the
+        next injected message, so a miss is harmless.
+        """
+        from omnigent.harnesses.claude_native.bridge import (
+            bridge_dir_for_bridge_id,
+            dismiss_btw_overlay,
+        )
+
+        bridge_id = await _claude_native_bridge_id_for_session(
+            server_client=server_client,
+            session_id=conv_id,
+        )
+        bridge_dir = bridge_dir_for_bridge_id(bridge_id)
+        try:
+            await asyncio.to_thread(dismiss_btw_overlay, bridge_dir)
+        except (RuntimeError, ValueError):
+            # Nothing to recover: the pane overlay closes on the next inject.
+            return Response(status_code=204)
+        return Response(status_code=200)
 
     async def _prepare_claude_native_pane_for_injection(
         conv_id: str,
@@ -5722,11 +6275,22 @@ def create_runner_app(
             inject_slash_command,
             read_claude_status_model,
             read_model_env,
+            read_model_picker_values,
         )
         from omnigent.harnesses.claude_native.main import (
             resolve_claude_native_model_selection,
+            stored_claude_catalog_rows,
+            stored_claude_picker_values,
         )
-        from omnigent.models.claude_model_vocabulary import claude_model_command_arg
+        from omnigent.inference_config import (
+            binding_for_harness,
+            load_runtime_inference_config,
+            resolve_bound_model,
+        )
+        from omnigent.models.claude_model_vocabulary import (
+            claude_model_command_arg,
+            picker_command_values,
+        )
 
         if model is None or not model.strip():
             return Response(status_code=204)
@@ -5741,19 +6305,36 @@ def create_runner_app(
         resolved_model = (
             resolve_claude_native_model_selection(selected_model, claude_config) or selected_model
         )
-        # ``/model`` takes only this session's own picker vocabulary — its
-        # family aliases and its one custom slot. Typing a bare catalog id
-        # outside it leaves the pane on its old model while this handler
-        # reports success, so fail loud instead. Same translation the routed
-        # turn path and the executor apply.
+        # Translate through the pane's picker values, aliases, and custom slot.
+        # An unknown spelling must fail before any command reaches the terminal.
         env = read_model_env(bridge_dir) or None
-        model_arg = claude_model_command_arg(resolved_model, env)
+        cached_options = _claude_model_options_rows.get(conv_id)
+        if cached_options is not None:
+            picker_values = picker_command_values(cached_options[1])
+        else:
+            stored_rows = stored_claude_catalog_rows(claude_config)
+            if stored_rows is not None and not stored_rows:
+                # Discovery stored an authoritative empty catalog (every
+                # picker entry disabled): launch-recorded bridge values are
+                # stale vocabulary, so nothing is switchable.
+                picker_values: list[str] = []
+            else:
+                picker_values = read_model_picker_values(bridge_dir)
+                if not picker_values:
+                    picker_values = stored_claude_picker_values(claude_config, stored_rows)
+        model_arg = claude_model_command_arg(resolved_model, env, picker_values=picker_values)
+        inference_config = load_runtime_inference_config()
+        if binding_for_harness(inference_config, "claude-native") is not None:
+            resolved_model = resolve_bound_model(inference_config, "claude-native", selected_model)
+            model_arg = resolved_model
         if model_arg is None:
             _logger.warning(
-                "claude-native model change: %r has no spelling session=%s accepts (pins=%s)",
+                "claude-native model change: %r has no spelling session=%s accepts "
+                "(pins=%s, picker=%s)",
                 resolved_model,
                 conv_id,
                 sorted(env or ()),
+                picker_values,
                 extra={"session_id": conv_id},
             )
             return JSONResponse(
@@ -5927,6 +6508,140 @@ def create_runner_app(
             )
         return Response(status_code=204)
 
+    async def _handle_devin_native_model_change(
+        conv_id: str,
+        model: str | None,
+    ) -> Response:
+        from omnigent.harnesses.devin_native.bridge import (
+            bridge_dir_for_session_id,
+            inject_model_command,
+        )
+        from omnigent.harnesses.devin_native.main import resolve_devin_launch_model
+
+        if model is None or not model.strip():
+            return Response(status_code=204)
+        # Devin has no separate effort flag — effort is a suffix on the model id.
+        # Compose the picked family with the session's remembered effort so a
+        # New-Chat (model, effort) pick lands on the same variant the launch path
+        # composes (compose is idempotent for an already-composed id).
+        composed = await asyncio.to_thread(
+            resolve_devin_launch_model,
+            model.strip(),
+            _session_reasoning_effort.get(conv_id),
+        )
+        if not composed:
+            return Response(status_code=204)
+        bridge_dir = bridge_dir_for_session_id(conv_id)
+        try:
+            await asyncio.to_thread(
+                inject_model_command,
+                bridge_dir,
+                model=composed,
+                timeout_s=1.0,
+            )
+        except (RuntimeError, ValueError) as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "devin_native_model_failed",
+                    "detail": _client_safe_error_detail(exc, context="devin-native model change"),
+                },
+            )
+        return Response(status_code=204)
+
+    async def _handle_devin_native_permission_mode_change(
+        conv_id: str,
+        mode: str | None,
+    ) -> Response:
+        from omnigent.harnesses.devin_native.bridge import (
+            bridge_dir_for_session_id,
+            inject_permission_mode,
+        )
+
+        if mode is None or not mode.strip():
+            return Response(status_code=204)
+        bridge_dir = bridge_dir_for_session_id(conv_id)
+        try:
+            settled = await asyncio.to_thread(
+                inject_permission_mode,
+                bridge_dir,
+                mode=mode.strip(),
+                timeout_s=1.0,
+            )
+        except (RuntimeError, ValueError) as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "devin_native_permission_mode_failed",
+                    "detail": _client_safe_error_detail(
+                        exc, context="devin-native permission mode change"
+                    ),
+                },
+            )
+        return JSONResponse(status_code=200, content={"permission_mode": settled})
+
+    async def _handle_devin_native_effort_change(
+        conv_id: str,
+        effort: str | None,
+    ) -> Response:
+        from omnigent.harnesses.devin_native.bridge import (
+            bridge_dir_for_session_id,
+            inject_model_command,
+        )
+        from omnigent.harnesses.devin_native.main import resolve_devin_launch_model
+
+        # Devin has no `/effort`: effort is a suffix on the model id, so an effort
+        # switch is a `/model <family+effort>` re-inject. Re-compose the session's
+        # pinned model with the new effort. With no pinned model there is nothing
+        # to re-inject now — the executor still composes it on the next turn.
+        model = await _fetch_session_model_override(conv_id)
+        if not model or not model.strip():
+            return Response(status_code=204)
+        composed = await asyncio.to_thread(resolve_devin_launch_model, model.strip(), effort)
+        if not composed:
+            return Response(status_code=204)
+        bridge_dir = bridge_dir_for_session_id(conv_id)
+        try:
+            await asyncio.to_thread(
+                inject_model_command,
+                bridge_dir,
+                model=composed,
+                timeout_s=1.0,
+            )
+        except (RuntimeError, ValueError) as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "devin_native_effort_failed",
+                    "detail": _client_safe_error_detail(exc, context="devin-native effort change"),
+                },
+            )
+        return Response(status_code=204)
+
+    async def _handle_devin_native_compact(conv_id: str) -> Response:
+        from omnigent.harnesses.devin_native.bridge import (
+            bridge_dir_for_session_id,
+            inject_slash_command,
+        )
+
+        bridge_dir = bridge_dir_for_session_id(conv_id)
+        try:
+            await asyncio.to_thread(
+                inject_slash_command,
+                bridge_dir,
+                command="/compact",
+                timeout_s=1.0,
+            )
+        except (RuntimeError, ValueError) as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "devin_native_compact_failed",
+                    "detail": _client_safe_error_detail(exc, context="devin-native compact"),
+                },
+            )
+        return Response(status_code=200)
+
     async def _handle_claude_native_compact(conv_id: str) -> Response:
         from omnigent.harnesses.claude_native.bridge import (
             bridge_dir_for_bridge_id,
@@ -6074,7 +6789,16 @@ def create_runner_app(
             bridge_dir_for_bridge_id,
             update_model_override,
         )
+        from omnigent.inference_config import (
+            binding_for_harness,
+            load_runtime_inference_config,
+            resolve_bound_model,
+        )
 
+        inference_config = load_runtime_inference_config()
+        if binding_for_harness(inference_config, "opencode-native") is not None:
+            selected = resolve_bound_model(inference_config, "opencode-native", model)
+            model = f"omnigent/{selected}" if selected is not None else None
         updated = await asyncio.to_thread(
             update_model_override, bridge_dir_for_bridge_id(conv_id), model
         )
@@ -6164,10 +6888,14 @@ def create_runner_app(
         return Response(status_code=200)
 
     def _inject_codex_compact(socket_path: str, target: str) -> None:
+        # Typing "/compact" opens Codex's slash-command popup, which draws
+        # asynchronously: an Enter sent back-to-back is swallowed by the
+        # still-opening popup and the command never submits, so settle first.
         from omnigent.harnesses.claude_native.bridge import _run_tmux
 
         _run_tmux(socket_path, "send-keys", "-t", target, "C-u")
         _run_tmux(socket_path, "send-keys", "-l", "-t", target, "/compact")
+        time.sleep(_CODEX_POPUP_RENDER_S)
         _run_tmux(socket_path, "send-keys", "-t", target, "Enter")
 
     def _inject_codex_permission_mode(
@@ -6191,12 +6919,12 @@ def create_runner_app(
         _run_tmux(socket_path, "send-keys", "-t", target, "Escape")
         _run_tmux(socket_path, "send-keys", "-t", target, "C-u")
         _run_tmux(socket_path, "send-keys", "-l", "-t", target, "/permissions")
-        time.sleep(_CODEX_PERMISSION_POPUP_RENDER_S)
+        time.sleep(_CODEX_POPUP_RENDER_S)
         _run_tmux(socket_path, "send-keys", "-t", target, "Enter")
-        time.sleep(_CODEX_PERMISSION_POPUP_RENDER_S)
+        time.sleep(_CODEX_POPUP_RENDER_S)
         _run_tmux(socket_path, "send-keys", "-l", "-t", target, menu_key)
         if needs_confirm:
-            time.sleep(_CODEX_PERMISSION_POPUP_RENDER_S)
+            time.sleep(_CODEX_POPUP_RENDER_S)
             _run_tmux(socket_path, "send-keys", "-l", "-t", target, "1")
 
     def _codex_permission_mode_confirmed(socket_path: str, target: str, label: str) -> bool:
@@ -6216,7 +6944,7 @@ def create_runner_app(
                 return True
             if time.monotonic() >= deadline:
                 return False
-            time.sleep(_CODEX_PERMISSION_POPUP_RENDER_S)
+            time.sleep(_CODEX_POPUP_RENDER_S)
 
     async def _handle_hermes_native_compact(conv_id: str) -> Response:
         from omnigent.harnesses.hermes_native.bridge import (
@@ -6257,6 +6985,115 @@ def create_runner_app(
                 },
             )
         return Response(status_code=200)
+
+    def _is_sdk_compact_body(body: dict[str, Any]) -> bool:
+        """Return whether a buffered body is the synthesized claude-sdk ``/compact``.
+
+        The compact control is dispatched as a resumed turn whose sole content is
+        the literal ``/compact`` slash command. The continuation drain uses this
+        to dispatch a buffered ``/compact`` as its OWN turn (never coalesced
+        behind a later message), so the SDK still sees it as the turn prompt and
+        runs native compaction.
+        """
+        content = body.get("content")
+        if not isinstance(content, list) or len(content) != 1:
+            return False
+        part = content[0]
+        return (
+            isinstance(part, dict)
+            and part.get("type") == "input_text"
+            and part.get("text") == "/compact"
+        )
+
+    async def _handle_claude_sdk_compact(conv_id: str) -> Response:
+        """Compact a claude-sdk session by sending it the ``/compact`` command.
+
+        The Claude SDK owns its own context window in the harness subprocess,
+        so Omnigent-side transcript compaction is ineffective for it. The
+        effective path is to send the literal ``/compact`` slash command to
+        the live client, which runs native compaction — the same PreCompact
+        path auto-compaction uses, whose ``response.compaction.completed`` the
+        executor already emits. We do that by dispatching a resumed
+        ``/compact`` turn: buffered behind an in-flight turn (the harness has a
+        single client), started immediately otherwise. Returns 200 so the
+        Omnigent server treats the control as handled and skips its own
+        (transcript-only) compaction.
+        """
+        compact_body: _JsonObject = {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "/compact"}],
+            "conversation_id": conv_id,
+        }
+        # Serialize the active-turn check + slot bind through the same ingest
+        # gate the message path uses. Without it, the idle branch's check and
+        # its `_active_turns` bind straddle an `await` (history load), so a
+        # message arriving in that window also sees the session idle and binds
+        # the slot — the two turns then clobber each other's `_active_turns`
+        # entry and race the single live SDK client. Under the gate one reaches
+        # its bind before the other's check, so the loser buffers instead.
+        _seq = _ingest_next_seq.get(conv_id, 0)
+        _ingest_next_seq[conv_id] = _seq + 1
+        _cond = _ingest_cond.get(conv_id)
+        if _cond is None:
+            _cond = asyncio.Condition()
+            _ingest_cond[conv_id] = _cond
+        async with _cond:
+            while _ingest_now_serving.get(conv_id, 0) != _seq:
+                await _cond.wait()
+        try:
+            # A turn is already running: buffer so /compact runs as the next turn
+            # rather than racing the live one; the buffer drains via
+            # _check_and_start_next_turn once the active turn ends. The buffered
+            # compact's own in_progress comes from the executor when it later runs
+            # — publishing an up-front spinner here would show "Compacting…" while
+            # the prior turn is still working, so only the idle path does that.
+            if conv_id in _active_turns:
+                _session_message_buffers.setdefault(conv_id, []).append(compact_body)
+                return Response(status_code=200)
+
+            # Publish the compaction spinner up front so the UI shows "Compacting
+            # conversation…" immediately, like the native handlers — the executor's
+            # own in_progress fires only once the SDK PreCompact hook hits (mid-turn),
+            # by which point the generic running status has shown "Working…". The
+            # relay swallows the executor's later duplicate; `completed` (or the
+            # turn-end `failed` fallback in _on_proxy_stream_end) clears the spinner.
+            _publish_event(
+                conv_id, {"type": "response.compaction.in_progress", "task_id": conv_id}
+            )
+            _sdk_compact_inprogress.add(conv_id)
+            try:
+                new_item: _JsonObject = {
+                    "type": "message",
+                    "role": "user",
+                    "content": compact_body["content"],
+                }
+                if conv_id in _session_histories:
+                    _session_histories[conv_id].append(new_item)
+                else:
+                    loaded = await _load_history_as_input(conv_id)
+                    loaded.append(new_item)
+                    _session_histories[conv_id] = loaded
+
+                _begin_turn_slot(conv_id)
+                _publish_turn_status(conv_id, "running")
+                _turn_task = asyncio.create_task(
+                    _run_turn_bg(compact_body, conv_id),
+                    name=f"compact-{conv_id}",
+                )
+                _active_turns[conv_id] = _turn_task
+                _turn_task.add_done_callback(_background_tasks.discard)
+                _background_tasks.add(_turn_task)
+            except Exception:
+                # Never strand the spinner if the turn fails to start.
+                _sdk_compact_inprogress.discard(conv_id)
+                _publish_event(conv_id, {"type": "response.compaction.failed", "task_id": conv_id})
+                raise
+            return Response(status_code=200)
+        finally:
+            async with _cond:
+                _ingest_now_serving[conv_id] = _seq + 1
+                _cond.notify_all()
 
     async def _handle_claude_native_cost_popup(
         conv_id: str,
@@ -6529,6 +7366,17 @@ def create_runner_app(
 
         _active_turns.pop(conv_id, None)
         _release_live_turn_markers(conv_id)
+        # A claude-sdk `/compact` turn that ended without emitting
+        # `response.compaction.completed` produced no compaction (nothing to
+        # compact, or the turn failed before/without streaming). Clear the
+        # up-front spinner with `failed` here — the single turn-end convergence
+        # point, reached on every exit path (clean end, setup error, cancel) — so
+        # no path strands the spinner or leaks the flag into a later turn's
+        # compaction signalling. A successful compaction already discarded the
+        # flag on `response.compaction.completed`, making this a no-op then.
+        if conv_id in _sdk_compact_inprogress:
+            _sdk_compact_inprogress.discard(conv_id)
+            _publish_event(conv_id, {"type": "response.compaction.failed", "task_id": conv_id})
         # Transport-loss ending desyncs harness from runner; flag for clean rebind.
         if error is not None and error.get("code") == "connection_error":
             _desynced_sessions.add(conv_id)
@@ -6545,7 +7393,9 @@ def create_runner_app(
                 _publish_turn_status(conv_id, "idle")
         elif error is not None:
             if not _suppress_status:
-                _publish_turn_status(conv_id, "failed", error=_normalize_turn_error(error))
+                _publish_turn_status(
+                    conv_id, "failed", error=_normalize_turn_error(error), source_error=error
+                )
         else:
             if not has_buffered and not _suppress_status:
                 children = _subagent_work_by_parent.get(conv_id, set())
@@ -6787,6 +7637,19 @@ def create_runner_app(
                 except RuntimeError:
                     pass
 
+    def _recover_failed_tool_dispatch(
+        dispatch_task: asyncio.Task[object], *, conv_id: str, response_id: str
+    ) -> None:
+        if dispatch_task.cancelled() or dispatch_task.exception() is None:
+            return
+        # Recovery can cancel a turn awaiting this dispatch task. Run it
+        # independently so teardown cannot await or cancel itself.
+        task = asyncio.create_task(
+            _resync_turn_state(conv_id, "tool_dispatch_failed", owner_response_id=response_id)
+        )
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
+
     async def _resync_turn_state_on_delivery_failure(
         conv_id: str, response_id: str | None
     ) -> None:
@@ -6872,7 +7735,14 @@ def create_runner_app(
                 _rewake_parent_if_inbox_stranded(session_id)
                 return
 
-            if _is_native_harness(session_id):
+            # A buffered claude-sdk /compact must dispatch as its OWN turn: the
+            # SDK runs native compaction only when /compact is the turn prompt,
+            # but the default non-native drain coalesces the whole buffer and
+            # dispatches only the last body — burying a /compact behind a later
+            # message and silently no-opping it (the runner already returned 200,
+            # so the server won't fall back). Drain one at a time (like native)
+            # whenever a /compact is buffered, so each lands as its own turn.
+            if _is_native_harness(session_id) or any(_is_sdk_compact_body(b) for b in buf):
                 next_body = buf.pop(0)
                 if not buf:
                     _session_message_buffers.pop(session_id, None)
@@ -6898,6 +7768,20 @@ def create_runner_app(
                     )
                 next_body = all_bodies[-1]
 
+            if _is_sdk_compact_body(next_body):
+                # This buffered /compact now dispatches as its own turn. Mirror the
+                # idle path: publish the spinner up front AND set the flag, so
+                # (a) the relay swallows the executor's own duplicate in_progress
+                # (single spinner), and (b) _on_proxy_stream_end publishes `failed`
+                # if the turn ends without a `response.compaction.completed` (a real
+                # executor path — the compaction-complete event can be None) rather
+                # than stranding the spinner. The prior turn has ended, so showing
+                # "Compacting…" now is accurate.
+                _publish_event(
+                    session_id,
+                    {"type": "response.compaction.in_progress", "task_id": session_id},
+                )
+                _sdk_compact_inprogress.add(session_id)
             _begin_turn_slot(session_id)
             _publish_turn_status(session_id, "running")
             _turn_task = asyncio.create_task(
@@ -6913,6 +7797,8 @@ def create_runner_app(
             async with _cond:
                 _ingest_now_serving[session_id] = _seq + 1
                 _cond.notify_all()
+
+    app.state.check_and_start_next_turn = _check_and_start_next_turn
 
     async def _post_subagent_wake_notice(
         parent_id: str,
@@ -6944,6 +7830,16 @@ def create_runner_app(
 
     def _schedule_subagent_wake(entry: _SubagentWorkEntry, *, is_rewake: bool = False) -> None:
         if entry.parent_session_id == entry.child_session_id:
+            return
+        # A codex-native sub-agent (a /side side chat, or one codex spawned) is a
+        # thread in the parent's own app-server, so its completion is not the
+        # parent's to collect — waking the parent would inject an inbox notice
+        # into a chat the user is reading. The wrapper label is only set by the
+        # spawn-tool path, so a forwarder-registered child is caught by the
+        # parent's harness instead.
+        if is_codex_native_subagent_wrapper(entry.wrapper_label) or (
+            _session_harness_name(entry.parent_session_id) == _CODEX_NATIVE_HARNESS
+        ):
             return
         inbox = _session_inboxes.get(entry.parent_session_id)
         if inbox is None:
@@ -7241,10 +8137,11 @@ def create_runner_app(
             superseded.relay.close()
 
         async def _notify_tools_changed() -> None:
+            from threading import Event
+
+            cancelled = Event()
             try:
-                await asyncio.get_running_loop().run_in_executor(
-                    None, post_tools_changed, bridge_dir
-                )
+                await asyncio.to_thread(post_tools_changed, bridge_dir, cancelled=cancelled)
             except (RuntimeError, OSError):
                 # Fire-and-forget below, so anything escaping here resurfaces as
                 # an unretrieved task exception at ERROR. Re-advertising the tool
@@ -7256,11 +8153,16 @@ def create_runner_app(
                     exc_info=True,
                     extra={"session_id": session_id},
                 )
+            finally:
+                # Cancelling an executor future does not stop its worker thread.
+                cancelled.set()
 
         if await_notify:
             await _notify_tools_changed()
         else:
-            _notify_task = asyncio.create_task(_notify_tools_changed())
+            _notify_task = asyncio.create_task(
+                _notify_tools_changed(), name=f"tools-changed:{session_id}"
+            )
             _background_tasks.add(_notify_task)
             _notify_task.add_done_callback(_background_tasks.discard)
 
@@ -7427,8 +8329,14 @@ def create_runner_app(
         instructions: str | None = None
         _note_session_harness_override(conv, cast(str | None, msg_body.get("harness_override")))
         if cached_spec is not None:
+            # The session's recorded override outranks the spec (mirrors
+            # _initialize_session): the native terminal forward carries no
+            # per-event harness_override, so resolving from the body alone
+            # dropped a later turn back onto the spec's harness and evicted
+            # the override harness mid-session.
             h = (
-                cast(str | None, msg_body.get("harness_override"))
+                _session_harness_overrides.get(conv)
+                or cast(str | None, msg_body.get("harness_override"))
                 or cached_spec.executor.config.get("harness")
                 or cached_spec.executor.type
             )
@@ -7815,7 +8723,13 @@ def create_runner_app(
                     spec_resolver=spec_resolver,
                     session_id=conv_id,
                     model_override=cast(str | None, body.get("model_override")),
-                    harness_override=cast(str | None, body.get("harness_override")),
+                    # Session-recorded override first (the note above already
+                    # folded in any body value): a body without one must not
+                    # drop the turn back onto the spec's harness.
+                    harness_override=(
+                        _session_harness_overrides.get(conv_id)
+                        or cast(str | None, body.get("harness_override"))
+                    ),
                     sub_agent_name=_sub_agent_name,
                     cwd=await _session_runtime_cwd(conv_id),
                 )
@@ -7876,6 +8790,9 @@ def create_runner_app(
                     },
                 )
 
+        # A required-terminal exit recorded before this turn belongs to an
+        # earlier stream; only exits observed from here on can end this one.
+        _required_terminal_exit_errors.pop(conv_id, None)
         try:
             client = await manager.get_client(conv_id, harness_name, env=spawn_env)
         except RuntimeError as exc:
@@ -7912,7 +8829,11 @@ def create_runner_app(
                         conv_id,
                         exc,
                         exc_info=True,
-                        extra={"session_id": conv_id},
+                        extra={
+                            "session_id": conv_id,
+                            "event_name": "runner_turn_spec_resolution_failed",
+                            "attributes": {"phase": "eager", "exception_type": type(exc).__name__},
+                        },
                     )
                     _eager_spec_error = (
                         type(exc).__name__,
@@ -7970,7 +8891,11 @@ def create_runner_app(
                     conv_id,
                     exc,
                     exc_info=True,
-                    extra={"session_id": conv_id},
+                    extra={
+                        "session_id": conv_id,
+                        "event_name": "runner_turn_spec_resolution_failed",
+                        "attributes": {"phase": "lazy", "exception_type": type(exc).__name__},
+                    },
                 )
                 return None, (
                     type(exc).__name__,
@@ -7998,13 +8923,7 @@ def create_runner_app(
 
             if _eager_spec_error is not None:
                 _err_type, _err_msg = _eager_spec_error
-                _fail = {
-                    "type": "response.failed",
-                    "error": {
-                        "message": _err_msg,
-                        "type": _err_type,
-                    },
-                }
+                _fail = _response_failed_payload({"message": _err_msg, "type": _err_type})
                 _publish_event(conv_id, _fail)
                 _on_proxy_stream_end(
                     conv_id,
@@ -8088,15 +9007,18 @@ def create_runner_app(
                             "harness rejected turn delivery for %s with status %d",
                             conv_id,
                             harness_resp.status_code,
-                            extra={"session_id": conv_id},
-                        )
-                        _fail_status = {
-                            "type": "response.failed",
-                            "source": "harness",
-                            "error": {
-                                "status": harness_resp.status_code,
+                            extra={
+                                "session_id": conv_id,
+                                "event_name": "harness_turn_rejected",
+                                "attributes": {
+                                    "harness": harness_name,
+                                    "http_status": harness_resp.status_code,
+                                },
                             },
-                        }
+                        )
+                        _fail_status = _response_failed_payload(
+                            {"status": harness_resp.status_code}, source="harness"
+                        )
                         _publish_event(
                             conv_id,
                             _fail_status,
@@ -8158,6 +9080,14 @@ def create_runner_app(
                                     raise _ContextWindowOverflow(*_overflow)
 
                                 _evt_type = event.get("type")
+                                if (
+                                    _evt_type == "response.compaction.in_progress"
+                                    and conv_id in _sdk_compact_inprogress
+                                ):
+                                    # _handle_claude_sdk_compact already published an
+                                    # up-front spinner; drop the executor's own duplicate
+                                    # so the web renders a single compaction spinner.
+                                    continue
                                 if _evt_type == "injection.consumed":
                                     _inj_id = event.get("injection_id")
                                     _buf = _session_message_buffers.get(conv_id)
@@ -8231,6 +9161,10 @@ def create_runner_app(
                                 elif _evt_type == "response.compaction.completed" and event.get(
                                     "summary"
                                 ):
+                                    # A real compaction landed; the completed event clears
+                                    # the up-front spinner, so drop the pending flag and
+                                    # skip the stream-end `failed` fallback.
+                                    _sdk_compact_inprogress.discard(conv_id)
                                     await _handle_harness_compaction(conv_id, event)
 
                                 if is_action_required(event):
@@ -8275,13 +9209,9 @@ def create_runner_app(
                                         ) = await _resolve_turn_spec_lazy()
                                         if _lazy_err is not None:
                                             _err_type, _err_msg = _lazy_err
-                                            _fail = {
-                                                "type": "response.failed",
-                                                "error": {
-                                                    "message": _err_msg,
-                                                    "type": _err_type,
-                                                },
-                                            }
+                                            _fail = _response_failed_payload(
+                                                {"message": _err_msg, "type": _err_type}
+                                            )
                                             _publish_event(conv_id, _fail)
                                             _on_proxy_stream_end(
                                                 conv_id,
@@ -8341,7 +9271,17 @@ def create_runner_app(
                                                     ),
                                                     publish_event=_publish_event,
                                                     filesystem_registry=filesystem_registry,
+                                                    effective_harness=_session_harness_name(
+                                                        conv_id
+                                                    ),
                                                 )
+                                            )
+                                        )
+                                        _dispatch_tasks[-1].add_done_callback(
+                                            functools.partial(
+                                                _recover_failed_tool_dispatch,
+                                                conv_id=conv_id,
+                                                response_id=_response_id,
                                             )
                                         )
 
@@ -8463,6 +9403,9 @@ def create_runner_app(
                     if _dispatch_tasks:
                         await _asyncio.gather(*_dispatch_tasks, return_exceptions=True)
 
+                    # _on_proxy_stream_end clears any claude-sdk `/compact`
+                    # spinner (publishing `failed` when no compaction landed);
+                    # it is the single convergence point for every turn-end path.
                     _on_proxy_stream_end(
                         conv_id, error=_stream_failed_error, owner_response_id=_response_id
                     )
@@ -8476,34 +9419,60 @@ def create_runner_app(
                     ),
                     "type": "_ContextWindowOverflow",
                 }
-                _overflow_fail = {
-                    "type": "response.failed",
-                    "source": "llm",
-                    "response": {"status": "failed", "error": _error},
-                    "error": _error,
-                }
+                _overflow_fail = _response_failed_payload(_error, source="llm")
                 _publish_event(conv_id, _overflow_fail)
                 _on_proxy_stream_end(conv_id, error=_error, owner_response_id=_response_id)
                 yield _response_failed_event(_error, source="llm")
 
             except (httpx.HTTPError, RuntimeError) as exc:
-                _logger.exception(
-                    "proxy stream connection error for %s: %s",
-                    conv_id,
-                    exc,
-                    extra={"session_id": conv_id},
-                )
-                _error = {
-                    "code": "connection_error",
-                    "message": _harness_stream_failure_message(conv_id, exc),
-                    "type": type(exc).__name__,
-                }
-                _http_fail = {
-                    "type": "response.failed",
-                    "source": "harness",
-                    "response": {"status": "failed", "error": _error},
-                    "error": _error,
-                }
+                _exit_error = _required_terminal_exit_errors.pop(conv_id, None)
+                if _exit_error is not None:
+                    # The runner ended this stream itself: the session's required
+                    # terminal exited and its handler released the harness
+                    # subprocess, closing this client mid-read. Report the exit
+                    # and its pane diagnostics, not the transport symptom.
+                    _logger.warning(
+                        "harness stream for %s ended by required terminal exit: %s: %s",
+                        conv_id,
+                        type(exc).__name__,
+                        exc,
+                        extra={
+                            "session_id": conv_id,
+                            "event_name": "harness_stream_ended_by_terminal_exit",
+                            "attributes": {
+                                "harness": harness_name,
+                                "response_id": _response_id,
+                                "exception_type": type(exc).__name__,
+                            },
+                        },
+                    )
+                    # The status event's code is derived from ``type``.
+                    _error = {**_exit_error, "type": _exit_error["code"]}
+                else:
+                    # Name the type as well as the text: the messageless httpx
+                    # errors otherwise log a trailing colon and nothing, so one
+                    # signature covered every transport cause.
+                    _logger.exception(
+                        "proxy stream connection error for %s: %s: %s",
+                        conv_id,
+                        type(exc).__name__,
+                        exc,
+                        extra={
+                            "session_id": conv_id,
+                            "event_name": "harness_stream_failed",
+                            "attributes": {
+                                "harness": harness_name,
+                                "response_id": _response_id,
+                                "exception_type": type(exc).__name__,
+                            },
+                        },
+                    )
+                    _error = {
+                        "code": "connection_error",
+                        "message": _harness_stream_failure_message(conv_id, exc),
+                        "type": type(exc).__name__,
+                    }
+                _http_fail = _response_failed_payload(_error, source="harness")
                 _publish_event(conv_id, _http_fail)
                 _on_proxy_stream_end(conv_id, error=_error, owner_response_id=_response_id)
                 yield _response_failed_event(_error, source="harness")
@@ -8548,6 +9517,72 @@ def create_runner_app(
             body.get("model_override") if isinstance(body, dict) else None,
             extra={"session_id": conversation_id},
         )
+        _side_thread_id = body.get("codex_side_thread_id") if isinstance(body, dict) else None
+        if _side_thread_id:
+            # Codex /side follow-up: the server redirected a side-chat child's
+            # message here (this endpoint's conversation_id is the PARENT), tagged
+            # with the child Codex thread id. Drive it on that thread via the
+            # parent's bridge, isolated from the parent's turn buffer/active-turn
+            # state on purpose so the main conversation is untouched.
+            from omnigent.harnesses.codex_native import side_chat
+            from omnigent.harnesses.codex_native.app_server import client_for_transport
+
+            _side_text = _side_chat_text_from_content(
+                body.get("content") if isinstance(body, dict) else None
+            )
+            if not _side_text:
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": "invalid_request",
+                        "detail": "side chat message had no text",
+                    },
+                )
+            _side_state = await _codex_native_bridge_state_for_session(
+                conversation_id, action="side chat turn"
+            )
+            if _side_state is None:
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "error": "codex_side_chat_no_bridge",
+                        "detail": "Codex /side follow-up requires a loaded parent Codex bridge.",
+                    },
+                )
+            _side_client = client_for_transport(
+                _side_state.socket_path, client_name="omnigent-codex-native-runner"
+            )
+            try:
+                await _side_client.connect()
+                await side_chat.submit_side_turn(_side_client, str(_side_thread_id), _side_text)
+            finally:
+                await _side_client.close()
+            return Response(status_code=202)
+        if body_type == "message" and isinstance(body, dict):
+            # A codex /side command opens a side chat; it must not run a turn
+            # here. Starting one publishes a "running" edge for this session,
+            # and the fork's settling edges belong to the child — idle is
+            # forwarder-owned for codex-native — so nothing would ever clear it
+            # and the chat would sit on "Working…" for good.
+            from omnigent.harnesses.codex_native import side_chat as _side_chat
+
+            _side_question = _side_chat.side_chat_question_from_text(
+                _side_chat_text_from_content(body.get("content"))
+            )
+            if (
+                _side_question is not None
+                and _session_harness_name(conversation_id) == _CODEX_NATIVE_HARNESS
+            ):
+                _side_chat.request_side_chat(
+                    await _codex_native_bridge_dir_for_session(conversation_id),
+                    _side_question,
+                )
+                _logger.info(
+                    "Codex /side recorded without starting a turn: conv=%s",
+                    conversation_id,
+                    extra={"session_id": conversation_id},
+                )
+                return Response(status_code=202)
         if body_type == "message" or body_type is None:
             if not isinstance(body, dict):
                 return JSONResponse(
@@ -8738,6 +9773,15 @@ def create_runner_app(
                     output=output or "Error: native sub-agent turn failed",
                 )
             if delivery_ack is not None:
+                if (
+                    delivery_ack.entry is not None
+                    and delivery_ack.reason == _SUBAGENT_DELIVERY_MISSING_PARENT_INBOX
+                    and await _parent_is_nested_subagent(delivery_ack.entry)
+                ):
+                    # Acknowledge instead of asking the forwarder to poll. The
+                    # entry stays terminal and undelivered; it is handed over
+                    # only if this runner ever creates the parent's inbox.
+                    return Response(status_code=204)
                 is_known = (
                     conversation_id in _session_sub_agent_names or recovered_entry is not None
                 )
@@ -8774,7 +9818,7 @@ def create_runner_app(
                 _session_reasoning_effort[conversation_id] = effort
             else:
                 _session_reasoning_effort.pop(conversation_id, None)
-            if harness in ("claude-native", "codex-native", "pi-native"):
+            if harness in ("claude-native", "codex-native", "pi-native", "devin-native"):
                 if harness == "codex-native":
                     return await _handle_codex_native_settings_update(
                         conversation_id,
@@ -8782,6 +9826,11 @@ def create_runner_app(
                     )
                 if harness == "pi-native":
                     return await _handle_pi_native_effort_change(
+                        conversation_id,
+                        effort,
+                    )
+                if harness == "devin-native":
+                    return await _handle_devin_native_effort_change(
                         conversation_id,
                         effort,
                     )
@@ -8799,6 +9848,7 @@ def create_runner_app(
                 "cursor-native",
                 "opencode-native",
                 "kiro-native",
+                "devin-native",
                 "pi-native",
             ):
                 model = body.get("model") if isinstance(body, dict) else None
@@ -8829,6 +9879,11 @@ def create_runner_app(
                     )
                 if harness == "kiro-native":
                     return await _handle_kiro_native_model_change(
+                        conversation_id,
+                        model,
+                    )
+                if harness == "devin-native":
+                    return await _handle_devin_native_model_change(
                         conversation_id,
                         model,
                     )
@@ -8863,7 +9918,7 @@ def create_runner_app(
 
         if body_type == "permission_mode_change":
             harness = _session_harness_name(conversation_id)
-            if harness == "claude-native":
+            if harness in ("claude-native", "devin-native"):
                 mode = body.get("permission_mode") if isinstance(body, dict) else None
                 if mode is not None and not isinstance(mode, str):
                     return JSONResponse(
@@ -8873,10 +9928,21 @@ def create_runner_app(
                             "detail": "Body 'permission_mode' must be a string or null",
                         },
                     )
+                if harness == "devin-native":
+                    return await _handle_devin_native_permission_mode_change(
+                        conversation_id,
+                        mode,
+                    )
                 return await _handle_claude_native_permission_mode_change(
                     conversation_id,
                     mode,
                 )
+            return Response(status_code=204)
+
+        if body_type == "btw_dismiss":
+            harness = _session_harness_name(conversation_id)
+            if harness == "claude-native":
+                return await _handle_claude_native_btw_dismiss(conversation_id)
             return Response(status_code=204)
 
         if body_type == "codex_approval_mode_change":
@@ -8921,6 +9987,10 @@ def create_runner_app(
                 return await _handle_hermes_native_compact(conversation_id)
             if _session_harness_name(conversation_id) == "qwen-native":
                 return await _handle_qwen_native_compact(conversation_id)
+            if _session_harness_name(conversation_id) == "devin-native":
+                return await _handle_devin_native_compact(conversation_id)
+            if _session_harness_name(conversation_id) == "claude-sdk":
+                return await _handle_claude_sdk_compact(conversation_id)
             return Response(status_code=204)
 
         if body_type == "clear":
@@ -9248,19 +10318,22 @@ def create_runner_app(
             # base context; pi/opencode/cursor/kimi/claude resolve an agent spec
             # via build_context; codex/antigravity add an ownership check (and
             # codex a one-shot policy-notice response wrap).
-            _ensure_locks = {
-                "claude": _claude_terminal_ensure_locks,
-                "codex": _codex_terminal_ensure_locks,
-                "pi": _pi_terminal_ensure_locks,
-                "cursor": _cursor_terminal_ensure_locks,
-                "kiro": _kiro_terminal_ensure_locks,
-                "antigravity": _antigravity_terminal_ensure_locks,
-                "opencode": _opencode_terminal_ensure_locks,
-                "goose": _goose_terminal_ensure_locks,
-                "hermes": _hermes_terminal_ensure_locks,
-                "qwen": _qwen_terminal_ensure_locks,
-                "kimi": _kimi_terminal_ensure_locks,
-            }[_ensure_agent.key]
+            _ensure_locks = _require_full_native_lock_coverage(
+                {
+                    "claude": _claude_terminal_ensure_locks,
+                    "codex": _codex_terminal_ensure_locks,
+                    "pi": _pi_terminal_ensure_locks,
+                    "cursor": _cursor_terminal_ensure_locks,
+                    "kiro": _kiro_terminal_ensure_locks,
+                    "antigravity": _antigravity_terminal_ensure_locks,
+                    "opencode": _opencode_terminal_ensure_locks,
+                    "goose": _goose_terminal_ensure_locks,
+                    "hermes": _hermes_terminal_ensure_locks,
+                    "qwen": _qwen_terminal_ensure_locks,
+                    "kimi": _kimi_terminal_ensure_locks,
+                    "devin": _devin_terminal_ensure_locks,
+                }
+            )[_ensure_agent.key]
             persist_resource_event = body.get("persist_resource_event") is not False
 
             def _publish_ensure_event(event_session_id: str, event: _JsonObject) -> None:
@@ -9360,7 +10433,7 @@ def create_runner_app(
 
                 _ensure_build = _spec_ensure_build
 
-            elif terminal_name in ("cursor", "kimi"):
+            elif terminal_name in ("cursor", "kimi", "devin"):
 
                 async def _spec_or_none_ensure_build(
                     ctx: NativeLaunchContext,
@@ -9393,9 +10466,28 @@ def create_runner_app(
         agent_os_env = getattr(agent_spec, "os_env", None) if agent_spec is not None else None
 
         declared_terminal = None
+        terminals_map = {}
         if agent_spec is not None:
             terminals_map = getattr(agent_spec, "terminals", None) or {}
             declared_terminal = terminals_map.get(terminal_name)
+
+        if (
+            declared_terminal is None
+            and native_coding_agent_for_agent_name(getattr(agent_spec, "name", None)) is not None
+            and normalize_interactive_shells([terminal_name])
+        ):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "code": ErrorCode.INVALID_INPUT,
+                        "message": (
+                            f"Shell {terminal_name!r} is not available on this host. "
+                            f"Available shells: {list(terminals_map) or 'none'}."
+                        ),
+                    }
+                },
+            )
 
         if declared_terminal is not None:
             from omnigent.tools.builtins.sys_terminal import (
@@ -10361,10 +11453,16 @@ def create_runner_app(
                 )
             spec_entry = await spec_resolver(agent_id, session_id)
             if spec_entry is None:
+                # The session still references agent_id, but its stored bundle
+                # no longer resolves (deleted or rebound out from under the
+                # live session). A session-lifecycle condition, not a generic
+                # NOT_FOUND: the distinct code lets the terminal-ensure and
+                # turn-dispatch paths surface a lifecycle reason instead of a
+                # runner startup fault.
                 raise OmnigentError(
                     f"session spec resolver: agent {agent_id!r} for "
                     f"session {session_id!r} was not found",
-                    code=ErrorCode.NOT_FOUND,
+                    code=ErrorCode.SESSION_AGENT_MISSING,
                 )
             sub_agent_name = snapshot.sub_agent_name
             # Root the child at its own bundle dir. Always wrapped, so an
@@ -10429,58 +11527,14 @@ def create_runner_app(
         if not roots:
             roots.append(Path.cwd())
 
-        def _discover() -> list[SkillSpec]:
-            merged: list[SkillSpec] = [s for s in spec.skills if s.user_invocable]
-            seen = {s.name for s in spec.skills}
-            seen_dirs = {s.skill_dir.resolve() for s in spec.skills if s.skill_dir is not None}
-            harness = canonicalize_harness(spec.executor.harness_kind)
-            # Claude Code resolves its user scope from $CLAUDE_CONFIG_DIR
-            # (default ~/.claude); the terminal inherits this env, so the
-            # menu must read the same tier or the two surfaces diverge.
-            configured_claude_dir = os.environ.get("CLAUDE_CONFIG_DIR")
-            # Native Codex honors $CODEX_HOME for its skills; resolve the same
-            # host home the launch seeds from so the menu matches the terminal
-            # (only the native provider reads it — see codex_host_skills).
-            codex_home: Path | None = None
-            if harness is not None and "codex" in harness:
-                from omnigent.inner.codex_executor import _codex_home_config_source_from_env
-
-                codex_home = _codex_home_config_source_from_env()
-            ctx = SkillSourceContext(
-                roots=tuple(roots),
-                home=Path.home(),
-                skills_filter=spec.skills_filter,
-                bundle_dir=_resolved_spec_workdir(entry),
-                claude_config_dir=(
-                    Path(configured_claude_dir).expanduser() if configured_claude_dir else None
-                ),
-                codex_home=codex_home,
-            )
-            for hs in resolve_harness_skills(ctx, harness):
-                if hs.name in seen:
-                    continue
-                if hs.skill_dir is not None and hs.skill_dir.resolve() in seen_dirs:
-                    continue
-                seen.add(hs.name)
-                if hs.skill_dir is not None:
-                    seen_dirs.add(hs.skill_dir.resolve())
-                merged.append(hs)
-            return merged
-
-        skills = await asyncio.to_thread(_discover)
+        skills = await asyncio.to_thread(
+            resolve_session_skills, spec, tuple(roots), _resolved_spec_workdir(entry)
+        )
         _session_skills_cache[session_id] = (
             time.monotonic() + _SESSION_SKILLS_CACHE_TTL_SECONDS,
             skills,
         )
         return skills
-
-    @app.get("/v1/sessions/{session_id}/skills")
-    async def get_session_skills(session_id: str) -> JSONResponse:
-        skills = await _resolve_session_skills(session_id)
-        return JSONResponse(
-            status_code=200,
-            content={"skills": [{"name": s.name, "description": s.description} for s in skills]},
-        )
 
     @app.get("/v1/sessions/{session_id}/models")
     async def get_session_models(session_id: str) -> JSONResponse:
@@ -10591,6 +11645,30 @@ def create_runner_app(
             status_code=200,
             content={"models": _with_model_configuration_source(session_id, models)},
         )
+
+    @app.get("/v1/sessions/{session_id}/devin-model-options")
+    async def get_session_devin_model_options(session_id: str) -> JSONResponse:
+        if _session_harness_name(session_id) != "devin-native":
+            return JSONResponse(status_code=200, content={"models": []})
+        from omnigent.harnesses.devin_native.main import list_devin_cli_model_options
+
+        try:
+            models = await asyncio.to_thread(list_devin_cli_model_options)
+        except Exception as exc:  # noqa: BLE001 - picker failures are retryable.
+            _logger.warning(
+                "Devin-native model discovery failed for session=%s",
+                session_id,
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "devin_native_model_options_failed",
+                    "detail": _client_safe_error_detail(exc, context="devin-native model options"),
+                },
+            )
+        return JSONResponse(status_code=200, content={"models": models})
 
     @app.get("/v1/sessions/{session_id}/cursor-model-options")
     async def get_session_cursor_model_options(session_id: str) -> JSONResponse:
@@ -10708,7 +11786,7 @@ def create_runner_app(
                     "detail": "the harness model probe is still resolving",
                 },
             )
-        if not rows:
+        if rows is None:
             return JSONResponse(
                 status_code=503,
                 content={
@@ -10721,6 +11799,37 @@ def create_runner_app(
             time.monotonic() + _CLAUDE_MODEL_OPTIONS_CACHE_TTL_S,
             rows,
         )
+        # Executor parity: a cold launch may have recorded no picker
+        # vocabulary (the store had no catalog yet), while routing decisions
+        # accept picks against THIS listing. Refresh the bridge snapshot so
+        # a routed turn's executor translates exactly the vocabulary served
+        # here — including an authoritative empty catalog, which clears
+        # stale launch values. Best-effort: the terminal may not exist yet.
+        try:
+            from omnigent.harnesses.claude_native.bridge import (
+                bridge_dir_for_bridge_id,
+                record_model_vocabulary,
+            )
+            from omnigent.models.claude_model_vocabulary import picker_command_values
+
+            bridge_id = await _claude_native_bridge_id_for_session(
+                server_client=server_client,
+                session_id=session_id,
+            )
+            await asyncio.to_thread(
+                record_model_vocabulary,
+                bridge_dir_for_bridge_id(bridge_id),
+                launch_env=None,
+                launch_model=None,
+                picker_values=picker_command_values(rows),
+            )
+        except Exception:  # noqa: BLE001 — vocabulary refresh is advisory
+            _logger.debug(
+                "claude-native model options: bridge vocabulary refresh skipped for session=%s",
+                session_id,
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
         return JSONResponse(status_code=200, content={"models": rows})
 
     @app.get("/v1/sessions/{session_id}/model-options")
@@ -10740,6 +11849,8 @@ def create_runner_app(
             return await get_session_cursor_model_options(session_id)
         if harness == "kiro-native":
             return await get_session_kiro_model_options(session_id)
+        if harness == "devin-native":
+            return await get_session_devin_model_options(session_id)
         return JSONResponse(status_code=200, content={"models": []})
 
     @app.post("/v1/sessions/{session_id}/skills/resolve")
@@ -11040,6 +12151,7 @@ def create_runner_app(
     async def cleanup_session_resources(
         session_id: str,
     ) -> JSONResponse:
+        _required_terminal_exit_errors.pop(session_id, None)
         _codex_terminal_ensure_locks.pop(session_id, None)
         _claude_terminal_ensure_locks.pop(session_id, None)
         _pi_terminal_ensure_locks.pop(session_id, None)
@@ -11067,6 +12179,7 @@ def create_runner_app(
 
     @app.post("/v1/sessions/{session_id}/reset-state")
     async def reset_session_state(session_id: str) -> JSONResponse:
+        _required_terminal_exit_errors.pop(session_id, None)
         _codex_terminal_ensure_locks.pop(session_id, None)
         _claude_terminal_ensure_locks.pop(session_id, None)
         _pi_terminal_ensure_locks.pop(session_id, None)
@@ -11360,6 +12473,7 @@ def create_runner_app(
                         harness_client=None,
                         publish_event=_publish_event,
                         filesystem_registry=filesystem_registry,
+                        effective_harness=_session_harness_name(session_id),
                     )
                 except Exception as exc:
                     _logger.exception(
@@ -12016,11 +13130,41 @@ def _build_spawn_env_from_spec(
     # Namespaced generic-ACP ids (``acp:<slug>``) canonicalize to ``acp`` so the
     # dispatch, model-key lookup, and logging below all key off the base harness;
     # the concrete agent's slug is read from the spec by ``_build_acp_spawn_env``.
+    requested_harness = harness
     harness = canonicalize_harness(harness) or harness
     effective_spec = spec
+    from omnigent.inference_config import load_runtime_inference_config, parse_inference_config
+
+    has_inference_bindings = bool(parse_inference_config(load_runtime_inference_config()))
+    if has_inference_bindings and dataclasses.is_dataclass(spec):
+        declared_harness = str(spec.executor.config.get("harness") or "")
+        identity = (
+            requested_harness
+            if requested_harness.startswith("acp:")
+            else declared_harness
+            if harness == "acp" and declared_harness.startswith("acp:")
+            else harness
+        )
+        effective_spec = dataclasses.replace(
+            spec,
+            executor=dataclasses.replace(
+                spec.executor,
+                config={**spec.executor.config, "harness": identity},
+                model=model_override if model_override is not None else spec.executor.model,
+            ),
+        )
     if model_override is not None:
         executor = getattr(spec, "executor", None)
-        if hasattr(spec, "model_copy") and hasattr(executor, "model_copy"):
+        if (
+            harness == "acp"
+            and not has_inference_bindings
+            and dataclasses.is_dataclass(spec)
+            and dataclasses.is_dataclass(executor)
+        ):
+            effective_spec = dataclasses.replace(
+                spec, executor=dataclasses.replace(spec.executor, model=model_override)
+            )
+        elif hasattr(spec, "model_copy") and hasattr(executor, "model_copy"):
             copied_executor = cast(_ModelCopyValue, executor).model_copy(
                 update={"model": model_override}
             )
@@ -12028,6 +13172,14 @@ def _build_spawn_env_from_spec(
                 AgentSpec,
                 cast(_ModelCopyValue, spec).model_copy(update={"executor": copied_executor}),
             )
+    acp_default_model: str | None = None
+    if harness == "acp":
+        from omnigent.models.model_catalog import _acp_launch_model, validate_acp_model
+
+        policy_spec = effective_spec if has_inference_bindings else spec
+        acp_default_model = _acp_launch_model(policy_spec)
+        validate_acp_model(policy_spec, acp_default_model)
+        validate_acp_model(policy_spec, model_override)
     try:
         from omnigent.runtime.workflow import (
             _build_acp_cli_spawn_env,
@@ -12067,13 +13219,16 @@ def _build_spawn_env_from_spec(
             env = _build_goose_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
         elif harness == "acp":
             env = _build_acp_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
+            # Reset uses the original default even when the process launched
+            # with a session override. Empty defers to the vendor's first model.
+            env["HARNESS_ACP_DEFAULT_MODEL"] = acp_default_model or ""
         elif harness == "copilot":
             env = _build_copilot_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
         elif harness in ACP_CLI_HARNESSES:
             # Builtin ACP CLI harnesses (one catalog row each) share a single
             # builder; the row supplies the command, label, and install info.
             env = _build_acp_cli_spawn_env(
-                effective_spec, harness=harness, cwd=cwd, workdir=workdir
+                effective_spec, harness=harness, cwd=cwd, workdir=workdir, session_id=session_id
             )
         else:
             builder_path = spawn_env_builders().get(harness)
@@ -12091,6 +13246,12 @@ def _build_spawn_env_from_spec(
                 return None
     except ImportError:
         return None
+
+    if env is not None:
+        from omnigent.inner.agent_env import desktop_session_passthrough, strip_desktop_session_env
+
+        env = strip_desktop_session_env(env)
+        env.update(desktop_session_passthrough(effective_spec.os_env))
 
     # Point the harness process at this session's subagent-routing endpoint
     # when one is running (started at session init). Scoped to *harness* so a

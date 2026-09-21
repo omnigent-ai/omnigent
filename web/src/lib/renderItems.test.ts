@@ -31,6 +31,7 @@ function ctx(opts?: {
   itemId?: string | null;
   responseId?: string;
   agent?: string | null;
+  turn?: number;
   timestamp?: number;
   createdBy?: string;
   createdAtS?: number;
@@ -39,7 +40,7 @@ function ctx(opts?: {
   return {
     agent: opts?.agent ?? "test",
     depth: 0,
-    turn: 0,
+    turn: opts?.turn ?? 0,
     timestamp: opts?.timestamp ?? 0,
     responseId: opts?.responseId ?? "resp_1",
     itemId: opts?.itemId === undefined ? null : opts.itemId,
@@ -534,6 +535,107 @@ describe("buildBubbles — bubble grouping", () => {
     expect(turn.items.map((i) => i.kind)).toEqual(["tool", "elicitation", "text"]);
   });
 
+  it("a Claude background-task wake splits the turn so the finished answer keeps its bubble", () => {
+    // Claude Code resumes on a `<task-notification>` (mirrored as a meta
+    // user item) with no human message in between. Grouping every
+    // assistant item after the real question into one bubble folded the
+    // finished answer behind the follow-up work's "Worked for" row; the
+    // wake must land as a system marker that starts a new bubble.
+    const items: ConversationItem[] = [
+      {
+        id: "u_q",
+        response_id: "resp_q",
+        type: "message",
+        status: "completed",
+        role: "user",
+        content: [{ type: "input_text", text: "what is this latency?" }],
+      },
+      {
+        id: "a_answer",
+        response_id: "resp_answer",
+        type: "message",
+        status: "completed",
+        role: "assistant",
+        model: "claude-native-ui",
+        content: [{ type: "output_text", text: "It is end-to-end launch latency." }],
+      },
+      {
+        id: "u_wake",
+        response_id: "resp_wake",
+        type: "message",
+        status: "completed",
+        role: "user",
+        is_meta: true,
+        content: [
+          {
+            type: "input_text",
+            text: [
+              "<task-notification>",
+              "<task-id>b3f9a2c1d</task-id>",
+              "<status>completed</status>",
+              "<summary>Background command completed (exit code 0)</summary>",
+              "</task-notification>",
+            ].join("\n"),
+          },
+        ],
+      },
+      {
+        id: "a_followup_1",
+        response_id: "resp_followup",
+        type: "message",
+        status: "completed",
+        role: "assistant",
+        model: "claude-native-ui",
+        content: [{ type: "output_text", text: "Both runs finished — checking metrics." }],
+      },
+      {
+        id: "fc_runs",
+        response_id: "resp_followup",
+        type: "function_call",
+        status: "completed",
+        model: "claude-native-ui",
+        name: "shell",
+        arguments: '{"command": "air runs list"}',
+        call_id: "call_runs",
+      },
+      {
+        id: "fo_runs",
+        response_id: "resp_followup",
+        type: "function_call_output",
+        status: "completed",
+        call_id: "call_runs",
+        output: "run 1: 40s\nrun 2: 35s\n",
+      },
+      {
+        id: "a_followup_2",
+        response_id: "resp_followup",
+        type: "message",
+        status: "completed",
+        role: "assistant",
+        model: "claude-native-ui",
+        content: [{ type: "output_text", text: "Both additional runs succeeded." }],
+      },
+    ];
+
+    const bubbles = buildBubbles(itemsToBlocks(items), null);
+
+    expect(bubbles.map((b) => b.kind)).toEqual(["user", "assistant", "user", "assistant"]);
+    const answer = bubbles[1] as Extract<Bubble, { kind: "assistant" }>;
+    // Text only: nothing to fold, so the answer renders in full.
+    expect(answer.items.map((i) => i.kind)).toEqual(["text"]);
+    expect((answer.items[0] as Extract<RenderItem, { kind: "text" }>).text).toBe(
+      "It is end-to-end launch latency.",
+    );
+    const marker = bubbles[2] as Extract<Bubble, { kind: "user" }>;
+    expect(marker.itemId).toBe("u_wake");
+    expect((marker.content[0] as { text: string }).text).toBe(
+      "[System: background task b3f9a2c1d completed]\nBackground command completed (exit code 0)",
+    );
+    const followup = bubbles[3] as Extract<Bubble, { kind: "assistant" }>;
+    expect(followup.responseId).toBe("resp_followup");
+    expect(followup.items.some((i) => i.kind === "tool")).toBe(true);
+  });
+
   it("two response_ids produce two assistant bubbles in order", () => {
     const blocks: AnyBlock[] = [
       {
@@ -615,6 +717,89 @@ describe("buildBubbles — bubble grouping", () => {
     const bubbles = buildBubbles(blocks, null);
     const asst = bubbles[1] as Extract<Bubble, { kind: "assistant" }>;
     expect(asst.items[0]).toMatchObject({ kind: "error", level: "info" });
+  });
+
+  it("groups consecutive errors from the same response, turn, and agent", () => {
+    const blocks: AnyBlock[] = [
+      {
+        type: "user_message",
+        ctx: ctx({ itemId: "u1", responseId: "resp_failed" }),
+        content: [{ type: "input_text", text: "Run it" }],
+      },
+      {
+        type: "error",
+        ctx: ctx({ itemId: "err_1", responseId: "resp_failed" }),
+        source: "execution",
+        code: "required_terminal_exited",
+        message: "Terminal exited.",
+      },
+      {
+        type: "error",
+        ctx: ctx({ itemId: "err_2", responseId: "resp_failed" }),
+        source: "execution",
+        code: "runner_disconnected",
+        message: "Runner disconnected.\n\nTerminal diagnostics:\ntunnel: closed",
+      },
+    ];
+
+    const bubbles = buildBubbles(blocks, null);
+    expect(bubbles.map((bubble) => bubble.kind)).toEqual(["user", "assistant"]);
+    const assistant = bubbles[1] as Extract<Bubble, { kind: "assistant" }>;
+    expect(assistant.items).toEqual([
+      {
+        kind: "error",
+        itemId: "err_1",
+        source: "execution",
+        code: "required_terminal_exited",
+        message: "Terminal exited.",
+        relatedErrors: [
+          {
+            itemId: "err_2",
+            source: "execution",
+            code: "runner_disconnected",
+            message: "Runner disconnected.\n\nTerminal diagnostics:\ntunnel: closed",
+          },
+        ],
+      },
+    ]);
+  });
+
+  it("keeps errors with different causal boundaries in separate bubbles", () => {
+    const blocks: AnyBlock[] = [
+      {
+        type: "error",
+        ctx: ctx({ itemId: "err_1", responseId: "resp_1" }),
+        source: "execution",
+        code: "runner_error",
+        message: "First turn failed.",
+      },
+      {
+        type: "error",
+        ctx: ctx({ itemId: "err_2", responseId: "resp_2", turn: 1 }),
+        source: "execution",
+        code: "runner_error",
+        message: "First turn failed.",
+      },
+    ];
+
+    const bubbles = buildBubbles(blocks, null);
+    expect(bubbles).toHaveLength(2);
+    expect(
+      bubbles.map((bubble) =>
+        bubble.kind === "assistant"
+          ? { responseId: bubble.responseId, items: bubble.items.length }
+          : bubble.kind,
+      ),
+    ).toEqual([
+      { responseId: "resp_1", items: 1 },
+      { responseId: "resp_2", items: 1 },
+    ]);
+    for (const bubble of bubbles) {
+      if (bubble.kind !== "assistant") continue;
+      expect((bubble.items[0] as Extract<RenderItem, { kind: "error" }>).relatedErrors).toBe(
+        undefined,
+      );
+    }
   });
 
   it("compaction block becomes a standalone compaction bubble", () => {

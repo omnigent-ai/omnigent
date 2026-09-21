@@ -208,6 +208,9 @@ async def test_wait_for_user_approval_returns_false_on_timeout() -> None:
     # would show a phantom prompt forever.
     assert len(publishes) == 1
     assert publishes[0][1]["elicitation_id"] == "elicit_timeout"
+    # Nobody answered: the card must read "Prompt expired", not the neutral
+    # "Resolved elsewhere" pill that implies someone did.
+    assert publishes[0][1].get("reason") == "unanswered"
 
 
 @pytest.mark.asyncio
@@ -243,6 +246,8 @@ async def test_wait_for_user_approval_publishes_on_cancellation() -> None:
     # leave permanent stuck badges on their session.
     assert len(publishes) == 1
     assert publishes[0][1]["elicitation_id"] == "elicit_cancel"
+    # A cancelled wait ended without a verdict too.
+    assert publishes[0][1].get("reason") == "unanswered"
 
 
 @pytest.mark.asyncio

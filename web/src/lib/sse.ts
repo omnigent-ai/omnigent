@@ -33,6 +33,7 @@ import type {
   ResponseInProgress,
   ResponseQueued,
   RetryEvent,
+  SessionBtwSidechatEvent,
   SessionChangedFilesInvalidatedEvent,
   SessionChildSessionUpdatedEvent,
   SessionModelOptionsEvent,
@@ -44,7 +45,6 @@ import type {
   SessionResourceCreatedEvent,
   SessionResourceDeletedEvent,
   SessionSupersededEvent,
-  SessionSkillsEvent,
   SessionViewer,
   SessionTerminalActivityEvent,
   SessionStatusEvent,
@@ -874,6 +874,23 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       reason: "clear",
     } satisfies SessionSupersededEvent;
   }
+  if (eventType === "session.btw_sidechat") {
+    const conversationId = data.conversation_id;
+    const question = data.question;
+    const answer = data.answer;
+    const truncated = data.truncated;
+    if (typeof conversationId !== "string" || !conversationId) return null;
+    if (typeof question !== "string") return null;
+    if (typeof answer !== "string") return null;
+    if (typeof truncated !== "boolean") return null;
+    return {
+      type: "session_btw_sidechat",
+      conversationId,
+      question,
+      answer,
+      truncated,
+    } satisfies SessionBtwSidechatEvent;
+  }
   if (eventType === "session.resource.created") {
     const resource = parseSessionResource(data.resource);
     if (resource === null) return null;
@@ -926,16 +943,6 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       sessionId,
       terminalId,
     } satisfies SessionTerminalActivityEvent;
-  }
-  if (eventType === "session.skills") {
-    const conversationId = data.conversation_id;
-    if (typeof conversationId !== "string" || !conversationId) return null;
-    // Bare nudge — the runner's skills resolved. The store handler
-    // refetches the (now-warm) snapshot and applies its `skills`.
-    return {
-      type: "session_skills",
-      conversationId,
-    } satisfies SessionSkillsEvent;
   }
   if (eventType === "session.model_options") {
     const conversationId = data.conversation_id;
@@ -1103,9 +1110,17 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
   if (eventType === "response.elicitation_resolved") {
     const elicitationId = data.elicitation_id;
     if (typeof elicitationId !== "string" || !elicitationId) return null;
+    const action = data.action;
+    const hasVerdict = action === "accept" || action === "decline" || action === "cancel";
     return {
       type: "elicitation_resolved",
       elicitationId,
+      // Keep the verdict when present so the card can show it instead
+      // of the ambiguous "Resolved elsewhere" pill.
+      ...(hasVerdict ? { action } : {}),
+      // Only a verdict-less clear may say why: "unanswered" means the
+      // prompt expired, so the card can tell the user what to do next.
+      ...(!hasVerdict && data.reason === "unanswered" ? { reason: data.reason } : {}),
     } satisfies ElicitationResolved;
   }
 
@@ -1153,6 +1168,7 @@ function parseOutputItem(data: Record<string, unknown>): StreamEvent | null {
   const itemType = String(rec.type ?? "");
   const itemId = String(rec.id ?? "");
   const responseId = String(rec.response_id ?? "");
+  const messageId = typeof data.message_id === "string" ? data.message_id : undefined;
 
   if (itemType === "function_call") {
     const argsStr = String(rec.arguments ?? "{}");
@@ -1192,6 +1208,7 @@ function parseOutputItem(data: Record<string, unknown>): StreamEvent | null {
       content: Array.isArray(content) ? (content as Record<string, unknown>[]) : [],
       itemId,
       responseId,
+      ...(messageId !== undefined ? { messageId } : {}),
     } satisfies MessageDone;
   }
 

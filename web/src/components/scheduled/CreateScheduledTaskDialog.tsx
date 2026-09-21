@@ -28,9 +28,11 @@ import { WorkspacePicker } from "@/shell/WorkspacePicker";
 import { AgentHarnessPicker } from "@/shell/NewChatDialog";
 import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useHosts } from "@/hooks/useHosts";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { sandboxOptionLabel } from "@/lib/capabilities";
 import { useCreateScheduledTask, useUpdateScheduledTask } from "@/hooks/useScheduledTasks";
 import { isNativeCodingAgent, nativeAgentHasCapability } from "@/lib/nativeCodingAgents";
-import { sortAgentsForDisplay } from "@/lib/agentGrouping";
+import { isAcpHarnessAgent, selectableSessionAgents } from "@/lib/agentGrouping";
 import {
   isBackdropOverlay,
   isInsidePopper,
@@ -43,12 +45,12 @@ import {
   validateSchedule,
   type ScheduleModel,
 } from "@/lib/scheduleBuilder";
-import { ScheduledTaskApiError, type ScheduledTask } from "@/lib/scheduledTasksApi";
+import {
+  ScheduledTaskApiError,
+  type ScheduledTask,
+  type ScheduledTaskExecutionTarget,
+} from "@/lib/scheduledTasksApi";
 import { localTimezone } from "@/lib/timezones";
-
-// Agents hidden from the scheduled-task picker (mirrors NewChatDialog's set):
-// superseded / SDK-only harnesses that shouldn't be user-pickable here.
-const HIDDEN_PICKER_AGENTS = new Set(["nessie", "kimi", "kimi-code"]);
 
 export function CreateScheduledTaskDialog({
   open,
@@ -67,6 +69,14 @@ export function CreateScheduledTaskDialog({
 }) {
   const { data: agents } = useAvailableAgents({ enabled: open });
   const { data: hosts } = useHosts({ enabled: open });
+  const info = useServerInfo();
+  // Gates the "new sandbox each run" option: only servers that can actually
+  // serve a managed launch advertise it (same flag New Chat's sandbox option
+  // gates on). "loading" → treat as disabled until /v1/info resolves.
+  const managedSandboxesEnabled = info !== "loading" && info.managed_sandboxes_enabled;
+  // Provider-named label for the sandbox host option (e.g. "Modal Sandbox"),
+  // falling back to the generic "New Sandbox" — same helper the New Chat picker uses.
+  const sandboxLabel = sandboxOptionLabel(info !== "loading" ? info.sandbox_provider : null);
   const createMutation = useCreateScheduledTask();
   const updateMutation = useUpdateScheduledTask();
   const isEdit = editingTask !== null;
@@ -96,15 +106,15 @@ export function CreateScheduledTaskDialog({
   const [pickedEffort, setPickedEffort] = useState<string>("");
   const [pickedPermission, setPickedPermission] = useState<string>("");
 
-  const agentList = useMemo(
-    () => sortAgentsForDisplay((agents ?? []).filter((a) => !HIDDEN_PICKER_AGENTS.has(a.name))),
-    [agents],
-  );
+  const agentList = useMemo(() => selectableSessionAgents(agents ?? []), [agents]);
   const harnessEntries = useMemo(
-    () => agentList.filter((a) => isNativeCodingAgent(a)),
+    () => agentList.filter((a) => isNativeCodingAgent(a) || isAcpHarnessAgent(a)),
     [agentList],
   );
-  const agentEntries = useMemo(() => agentList.filter((a) => !isNativeCodingAgent(a)), [agentList]);
+  const agentEntries = useMemo(
+    () => agentList.filter((a) => !isNativeCodingAgent(a) && !isAcpHarnessAgent(a)),
+    [agentList],
+  );
   // Resolve the effective selection: the explicit pick if it's still in the
   // list, else the edited task's own agent (which may be hidden from the picker
   // — never silently retarget it), else the first agent (so a fresh picker
@@ -192,6 +202,10 @@ export function CreateScheduledTaskDialog({
   // Optional pinned host/workspace. "" = unset (server resolves at fire time).
   const [hostId, setHostId] = useState<string>("");
   const [workspace, setWorkspace] = useState<string>("");
+  // When on, each fire runs in a FRESH managed sandbox (execution_target =
+  // "managed_sandbox") instead of a connected host; hides the host/workspace
+  // pickers. Only offered when the server advertises managed sandboxes.
+  const [sandboxMode, setSandboxMode] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [scheduleUnsupported, setScheduleUnsupported] = useState(false);
 
@@ -217,6 +231,7 @@ export function CreateScheduledTaskDialog({
         setScheduleUnsupported(parsedSchedule === null);
         setHostId(editingTask.hostId ?? "");
         setWorkspace(editingTask.workspace ?? "");
+        setSandboxMode(editingTask.executionTarget === "managed_sandbox");
       } else {
         setName(initialName ?? "");
         setPrompt(initialPrompt ?? "");
@@ -228,6 +243,7 @@ export function CreateScheduledTaskDialog({
         setScheduleUnsupported(false);
         setHostId("");
         setWorkspace("");
+        setSandboxMode(false);
       }
       setError(null);
     }
@@ -250,8 +266,9 @@ export function CreateScheduledTaskDialog({
     selectedHost ?? hostOptions.find((h) => h.status === "online") ?? hostOptions[0];
 
   // A workspace is only valid with a host — mirror the server's pairing rule so
-  // the user gets inline feedback instead of a 400.
-  const workspaceWithoutHost = workspace.trim() !== "" && hostId === "";
+  // the user gets inline feedback instead of a 400. In sandbox mode there is no
+  // host/workspace pairing at all, so the rule doesn't apply.
+  const workspaceWithoutHost = !sandboxMode && workspace.trim() !== "" && hostId === "";
   // Block submit on an invalid schedule (bad interval, empty multi-select) so
   // the form never posts an RRULE the server's validate_rrule would 400.
   const scheduleInvalid = scheduleUnsupported || validateSchedule(schedule) !== null;
@@ -274,6 +291,7 @@ export function CreateScheduledTaskDialog({
     setSchedule(DEFAULT_SCHEDULE_MODEL);
     setHostId("");
     setWorkspace("");
+    setSandboxMode(false);
     setError(null);
     setScheduleUnsupported(false);
   }
@@ -286,13 +304,26 @@ export function CreateScheduledTaskDialog({
   async function handleSubmit() {
     setError(null);
     try {
+      // A sandbox task runs hostless (fresh sandbox per fire), so host/workspace
+      // are omitted. Only send executionTarget when it's meaningful: on create
+      // when sandbox is chosen (connected_host is the server default), and on
+      // edit only when it actually changed — mirroring how agentId is threaded.
+      const executionTarget: ScheduledTaskExecutionTarget = sandboxMode
+        ? "managed_sandbox"
+        : "connected_host";
+      const executionTargetChanged = editingTask
+        ? editingTask.executionTarget !== executionTarget
+        : sandboxMode;
       const input = {
         name: name.trim(),
         prompt: prompt.trim(),
         rrule: buildRRule(schedule),
         timezone: editingTask?.timezone ?? localTimezone(),
-        ...(hostId !== "" ? { hostId } : {}),
-        ...(hostId !== "" && workspace.trim() !== "" ? { workspace: workspace.trim() } : {}),
+        ...(executionTargetChanged ? { executionTarget } : {}),
+        ...(!sandboxMode && hostId !== "" ? { hostId } : {}),
+        ...(!sandboxMode && hostId !== "" && workspace.trim() !== ""
+          ? { workspace: workspace.trim() }
+          : {}),
       };
       if (editingTask) {
         // Thread model/effort ONLY when the agent supports them. Each control's
@@ -362,8 +393,8 @@ export function CreateScheduledTaskDialog({
           <DialogTitle>{isEdit ? "Edit automation" : "New automation"}</DialogTitle>
           <DialogDescription>
             {isEdit
-              ? "Update this recurring agent session. It fires on a connected host."
-              : "Runs an agent session on a recurring schedule. Fires on a connected host."}
+              ? "Update this recurring agent session."
+              : "Runs an agent session on a recurring schedule."}
           </DialogDescription>
         </DialogHeader>
 
@@ -430,13 +461,9 @@ export function CreateScheduledTaskDialog({
                 // default modal mode can turn an inside-dialog click into a
                 // parent Dialog outside interaction while the menu dismisses.
                 dropdownModal={false}
-                // Bound the dropdown height so it scrolls in the modal instead
-                // of running off the bottom of the screen (the trigger sits near
-                // the top of a tall dialog, unlike the composer footer). Width
-                // matches the interactive picker so the "needs setup" pills +
-                // agent descriptions fit without cramping (the shared default is
-                // only min-w-64; pin a comfortable fixed width like interactive).
-                contentClassName="max-h-80 w-80"
+                // The shared menu caps against available viewport height, so
+                // constrained screens scroll without clipping taller screens.
+                contentClassName="w-80"
                 // Full-width trigger → left-align the menu's edge to it.
                 contentAlign="start"
                 // Match the sibling <Select> fields (Frequency / host): full
@@ -499,15 +526,26 @@ export function CreateScheduledTaskDialog({
               intentionally has no visible control. It is still sent in the create
               payload so the schedule evaluates in the user's local zone. */}
 
-          {/* Optional host + workspace pin. Left unset, the server resolves the
-              owner's connected host and its home directory at fire time. */}
+          {/* Host / execution target. When the server offers managed sandboxes,
+              a "New Sandbox" entry sits in the same picker (mirroring the New Chat
+              composer): choosing it provisions a FRESH sandbox per fire
+              (execution_target=managed_sandbox, hostless) instead of a connected
+              host. Otherwise the picker is the optional connected-host pin. */}
           <div className="flex flex-col gap-1.5" data-testid="task-host-field">
             <Label htmlFor="task-host">Host (optional)</Label>
             <Select
-              value={hostId === "" ? UNSET_HOST : hostId}
+              value={sandboxMode ? SANDBOX_HOST : hostId === "" ? UNSET_HOST : hostId}
               componentId="tasks.scheduled.host"
               onValueChange={(v) => {
+                if (v === SANDBOX_HOST) {
+                  // A sandbox run is hostless; drop any pinned host/workspace.
+                  setSandboxMode(true);
+                  setHostId("");
+                  setWorkspace("");
+                  return;
+                }
                 if (preservePinnedHost && v === UNSET_HOST) return;
+                setSandboxMode(false);
                 const next = v === UNSET_HOST ? "" : v;
                 setHostId(next);
                 // Clearing the host invalidates any pinned workspace.
@@ -522,6 +560,11 @@ export function CreateScheduledTaskDialog({
                 <SelectItem value={UNSET_HOST} disabled={preservePinnedHost}>
                   Resolve at fire time
                 </SelectItem>
+                {(managedSandboxesEnabled || sandboxMode) && (
+                  <SelectItem value={SANDBOX_HOST} data-testid="task-host-sandbox-option">
+                    {sandboxLabel}
+                  </SelectItem>
+                )}
                 {hostOptions.map((host) => (
                   <SelectItem key={host.host_id} value={host.host_id}>
                     {host.name} {host.status === "offline" ? "(offline)" : ""}
@@ -530,11 +573,13 @@ export function CreateScheduledTaskDialog({
               </SelectContent>
             </Select>
             <p className="text-sm text-muted-foreground">
-              Leave unset to run on your connected host when the task fires.
+              {sandboxMode
+                ? "Provisions a fresh sandbox for each run. Shutdown follows the server’s sandbox configuration."
+                : "Leave unset to run on your connected host when the task fires."}
             </p>
           </div>
 
-          {hostId !== "" && (
+          {!sandboxMode && hostId !== "" && (
             <div className="flex flex-col gap-1.5">
               <Label>Workspace (optional)</Label>
               <p className="text-sm text-muted-foreground">
@@ -600,6 +645,9 @@ export function CreateScheduledTaskDialog({
 
 /** Sentinel Select value for "no pinned host" — Radix Select disallows "". */
 const UNSET_HOST = "__unset_host__";
+
+/** Sentinel Select value for the "New Sandbox" option (execution_target=managed_sandbox). */
+const SANDBOX_HOST = "__sandbox__";
 
 // The nested-dropdown dismiss guard now lives in a dependency-free module so
 // other dialogs (project settings) can reuse it without pulling this file's

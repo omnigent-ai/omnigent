@@ -24,7 +24,11 @@ from omnigent.runtime import session_stream
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ, AuthProvider, local_single_user_enabled
 from omnigent.server.bundles import bundle_location, validate_agent_bundle
-from omnigent.server.routes._auth_helpers import get_user_id, require_access
+from omnigent.server.routes._auth_helpers import (
+    get_user_id,
+    require_access,
+    require_agent_owner,
+)
 from omnigent.server.routes._errors import session_not_found
 from omnigent.server.schemas import (
     MCPServerSummary,
@@ -115,13 +119,14 @@ def create_session_mcp_servers_router(
         body: UpsertMCPServerRequest,
     ) -> MCPServerSummary:
         """Create one MCP server declaration on a session-scoped agent."""
-        agent = await _editable_agent(request, session_id)
+        agent, user_id = await _editable_agent(request, session_id)
         spec = await asyncio.to_thread(
             _mutate_bundle,
             agent,
             body,
             mode="create",
             target_name=None,
+            created_by=user_id,
         )
         await _reset_runner_session_agent_cache(session_id, agent.id, runner_router)
         _publish_agent_changed(session_id, agent)
@@ -136,13 +141,14 @@ def create_session_mcp_servers_router(
         body: UpsertMCPServerRequest,
     ) -> MCPServerSummary:
         """Replace one MCP server declaration on a session-scoped agent."""
-        agent = await _editable_agent(request, session_id)
+        agent, user_id = await _editable_agent(request, session_id)
         spec = await asyncio.to_thread(
             _mutate_bundle,
             agent,
             body,
             mode="update",
             target_name=server_name,
+            created_by=user_id,
         )
         await _reset_runner_session_agent_cache(session_id, agent.id, runner_router)
         _publish_agent_changed(session_id, agent)
@@ -159,21 +165,27 @@ def create_session_mcp_servers_router(
         server_name: str,
     ) -> Response:
         """Delete one MCP server declaration from a session-scoped agent."""
-        agent = await _editable_agent(request, session_id)
+        agent, user_id = await _editable_agent(request, session_id)
         await asyncio.to_thread(
             _mutate_bundle,
             agent,
             None,
             mode="delete",
             target_name=server_name,
+            created_by=user_id,
         )
         await _reset_runner_session_agent_cache(session_id, agent.id, runner_router)
         _publish_agent_changed(session_id, agent)
         add_audit_attrs(server_name=server_name)
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
-    async def _editable_agent(request: Request, session_id: str) -> Agent:
-        """Return an editable session-scoped agent."""
+    async def _editable_agent(request: Request, session_id: str) -> tuple[Agent, str | None]:
+        """Authorize the owner and return an editable session-scoped agent.
+
+        Returns the agent together with the authenticated caller id, which
+        the mutation persists as the agent's owner (claim-on-write) for
+        legacy rows that predate the ``created_by`` column.
+        """
         agent = await _bound_agent(request, session_id, LEVEL_EDIT)
         if agent.session_id is None:
             raise OmnigentError(
@@ -185,7 +197,13 @@ def create_session_mcp_servers_router(
                 "Agent bundle storage not configured",
                 code=ErrorCode.INTERNAL_ERROR,
             )
-        return agent
+        # Owner-only: an MCP-server edit rewrites the agent bundle (a new
+        # server injects an arbitrary spawn command), so a LEVEL_EDIT grant
+        # on the session is not enough — only the creating user or an admin
+        # may edit it.
+        user_id = get_user_id(request, auth_provider)
+        await asyncio.to_thread(require_agent_owner, user_id, agent, permission_store)
+        return agent, user_id
 
     def _mutate_bundle(
         agent: Agent,
@@ -193,6 +211,7 @@ def create_session_mcp_servers_router(
         *,
         mode: Literal["create", "update", "delete"],
         target_name: str | None,
+        created_by: str | None = None,
     ) -> AgentSpec:
         """Edit the bundle, validate it, store it, and refresh cache."""
         assert artifact_store is not None
@@ -254,7 +273,7 @@ def create_session_mcp_servers_router(
         # segment (physical artifact key); only the sha encodes content.
         if new_location.rsplit("/", 1)[-1] != agent.bundle_location.rsplit("/", 1)[-1]:
             artifact_store.put(new_location, new_bundle)
-            updated = agent_store.update(agent.id, new_location)
+            updated = agent_store.update(agent.id, new_location, created_by)
             if updated is None:
                 raise OmnigentError("Agent not found", code=ErrorCode.NOT_FOUND)
             agent_cache.replace(

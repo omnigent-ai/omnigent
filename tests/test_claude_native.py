@@ -1877,7 +1877,17 @@ async def test_prepare_daemon_terminal_reports_progress_steps(
     :returns: None.
     """
     updates: list[str] = []
+    startup_events: list[tuple[str, str | None]] = []
     progress = RunnerStartupProgress(update=updates.append)
+
+    def capture_startup_event(
+        event: str,
+        *,
+        session_id: str | None = None,
+        exit_code: int | None = None,
+    ) -> None:
+        del exit_code
+        startup_events.append((event, session_id))
 
     async def fake_create_session(
         client: object,
@@ -1996,6 +2006,7 @@ async def test_prepare_daemon_terminal_reports_progress_steps(
         )
 
     monkeypatch.setattr(claude_native, "_create_claude_session", fake_create_session)
+    monkeypatch.setattr(claude_native, "record_startup_event", capture_startup_event)
     monkeypatch.setattr(claude_native, "wait_for_host_online", fake_wait_for_host_online)
     monkeypatch.setattr(
         claude_native,
@@ -2030,6 +2041,12 @@ async def test_prepare_daemon_terminal_reports_progress_steps(
         "Starting runner...",
         "Starting Claude terminal...",
         "Claude terminal ready.",
+    ]
+    assert startup_events == [
+        ("runner_requested", "conv_daemon_progress"),
+        ("session_runner_bound", None),
+        ("runner_connected", None),
+        ("terminal_available", "conv_daemon_progress"),
     ]
 
 
@@ -2416,6 +2433,16 @@ async def test_prepare_reattaches_existing_claude_terminal(
     terminal instead of attaching to the live one.
     """
     calls: list[str] = []
+    startup_events: list[tuple[str, str | None]] = []
+
+    def capture_startup_event(
+        event: str,
+        *,
+        session_id: str | None = None,
+        exit_code: int | None = None,
+    ) -> None:
+        del exit_code
+        startup_events.append((event, session_id))
 
     async def fake_find(client: object, session_id: str) -> str | None:
         """
@@ -2473,6 +2500,7 @@ async def test_prepare_reattaches_existing_claude_terminal(
         return {"omnigent.claude_native.bridge_id": "bridge_abc"}
 
     monkeypatch.setattr(claude_native, "_find_running_claude_terminal", fake_find)
+    monkeypatch.setattr(claude_native, "record_startup_event", capture_startup_event)
     monkeypatch.setattr(claude_native, "_bind_session_runner", fail_bind)
     monkeypatch.setattr(claude_native, "_launch_claude_terminal", fail_launch)
     monkeypatch.setattr(claude_native, "_fetch_claude_session_labels", fake_fetch_labels)
@@ -2494,6 +2522,10 @@ async def test_prepare_reattaches_existing_claude_terminal(
         reattached=True,
     )
     assert calls == ["find:conv_abc"]
+    assert startup_events == [
+        ("session_resolved", "conv_abc"),
+        ("terminal_available", "conv_abc"),
+    ]
 
 
 @pytest.mark.asyncio
@@ -2562,6 +2594,77 @@ async def test_find_running_claude_terminal_miss_statuses_relaunch(
         found = await claude_native._find_running_claude_terminal(client, "conv_abc")
 
     assert found is None
+
+
+@pytest.mark.asyncio
+async def test_terminal_ready_wait_surfaces_recorded_launch_failure() -> None:
+    """
+    A dead launch fails the wait fast with the runner's recorded cause.
+
+    When ``claude`` exits at startup (e.g. it rejects its argv), the
+    terminal never comes up but the runner persists an error item with
+    the captured pane output. The wait must raise that real cause
+    promptly instead of burning the full timeout and reporting only a
+    generic "did not create the Claude terminal" message — the failure
+    mode where the user's TTY hides the actual error in the runner log.
+    """
+    items_calls = 0
+    recorded_cause = (
+        "Claude Code exited during startup.\n\nLast captured terminal output:\n"
+        "Error: Invalid MCP configuration:\nMCP config file not found: /work/hello"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal items_calls
+        if request.url.path.endswith("/items"):
+            items_calls += 1
+            if items_calls == 1:
+                # Baseline read before the launch failure lands.
+                return httpx.Response(200, json={"data": []})
+            return httpx.Response(
+                200,
+                json={"data": [{"id": "item_err_1", "type": "error", "message": recorded_cause}]},
+            )
+        # The terminal resource never appears.
+        return httpx.Response(404, json={"error": {"message": "not found"}})
+
+    transport = httpx.MockTransport(handler)
+    started = asyncio.get_event_loop().time()
+    async with httpx.AsyncClient(transport=transport, base_url="https://example.com") as client:
+        with pytest.raises(click.ClickException) as excinfo:
+            await claude_native._wait_for_claude_terminal_ready(client, "conv_abc", timeout_s=5.0)
+    elapsed = asyncio.get_event_loop().time() - started
+
+    assert "could not start the Claude terminal" in excinfo.value.message
+    assert "MCP config file not found" in excinfo.value.message
+    # Fail-fast, not at the deadline: the cause was visible on the first
+    # polls, so the wait must not sit out the timeout.
+    assert elapsed < 2.0
+
+
+@pytest.mark.asyncio
+async def test_terminal_ready_wait_ignores_stale_error_items() -> None:
+    """
+    An error persisted before the wait began does not abort the launch.
+
+    A resumed session may carry an old failure item; that is not this
+    launch's outcome, so the wait keeps polling and times out with the
+    generic message rather than blaming the stale error.
+    """
+    stale = {"id": "item_err_old", "type": "error", "message": "an earlier failure"}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/items"):
+            return httpx.Response(200, json={"data": [stale]})
+        return httpx.Response(404, json={"error": {"message": "not found"}})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="https://example.com") as client:
+        with pytest.raises(click.ClickException) as excinfo:
+            await claude_native._wait_for_claude_terminal_ready(client, "conv_abc", timeout_s=0.3)
+
+    assert "did not create the Claude terminal" in excinfo.value.message
+    assert "an earlier failure" not in excinfo.value.message
 
 
 # ── same-machine tmux attach (Phase 4) ─────────────────────
@@ -2657,6 +2760,59 @@ async def test_read_claude_terminal_tmux_unavailable(response: httpx.Response) -
 
     assert result.socket is None
     assert result.target is None
+
+
+@pytest.mark.asyncio
+async def test_direct_tmux_attach_records_start_and_exit(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Direct tmux attachment records the foreground handoff lifecycle."""
+    from omnigent.terminals import ws_common
+
+    startup_events: list[tuple[str, int | None]] = []
+
+    class Process:
+        returncode = 0
+
+        async def wait(self) -> int:
+            return self.returncode
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+    async def spawn(*args: object, **kwargs: object) -> Process:
+        del args, kwargs
+        return Process()
+
+    async def pane_dead(socket_path: str, tmux_target: str) -> bool:
+        assert socket_path == str(tmp_path / "tmux.sock")
+        assert tmux_target == "claude:main"
+        return True
+
+    def capture_startup_event(
+        event: str,
+        *,
+        session_id: str | None = None,
+        exit_code: int | None = None,
+    ) -> None:
+        del session_id
+        startup_events.append((event, exit_code))
+
+    monkeypatch.setattr(claude_native.asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr(ws_common, "_check_pane_dead_definitive", pane_dead)
+    monkeypatch.setattr(claude_native, "record_startup_event", capture_startup_event)
+
+    outcome = await claude_native._attach_direct_tmux(
+        tmp_path / "tmux.sock",
+        "claude:main",
+    )
+
+    assert outcome is claude_native._AttachOutcome.EXITED
+    assert startup_events == [
+        ("terminal_attach_started", None),
+        ("terminal_attach_exited", 0),
+    ]
 
 
 def test_can_attach_direct_tmux_true_when_socket_local_and_tmux_present(
@@ -3341,7 +3497,9 @@ async def test_ensure_local_claude_resume_transcript_survives_malformed_file_met
 
 
 @pytest.mark.asyncio
-async def test_create_claude_session_omits_title_for_generic_seed_path() -> None:
+async def test_create_claude_session_omits_title_for_generic_seed_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """
     Session creation must not seed a title in create-time metadata.
 
@@ -3357,7 +3515,17 @@ async def test_create_claude_session_omits_title_for_generic_seed_path() -> None
     sidebar fallback keys off the wrapper label.
     """
     captured_metadata: dict[str, object] = {}
+    startup_events: list[tuple[str, str | None]] = []
     session_id_returned = "conv_0123456789abcdef"
+
+    def capture_startup_event(
+        event: str,
+        *,
+        session_id: str | None = None,
+        exit_code: int | None = None,
+    ) -> None:
+        del exit_code
+        startup_events.append((event, session_id))
 
     def handler(request: httpx.Request) -> httpx.Response:
         """
@@ -3382,6 +3550,7 @@ async def test_create_claude_session_omits_title_for_generic_seed_path() -> None
         )
 
     transport = httpx.MockTransport(handler)
+    monkeypatch.setattr(claude_native, "record_startup_event", capture_startup_event)
     async with httpx.AsyncClient(transport=transport, base_url="https://example.com") as client:
         session_id = await claude_native._create_claude_session(
             client,
@@ -3390,6 +3559,7 @@ async def test_create_claude_session_omits_title_for_generic_seed_path() -> None
         )
 
     assert session_id == session_id_returned
+    assert startup_events == [("session_resolved", session_id_returned)]
     # No title in metadata: any title here would defeat the generic seed
     # path and resurrect the claude-specific carve-out we just removed.
     assert "title" not in captured_metadata, (
@@ -5716,7 +5886,7 @@ async def test_prepare_claude_terminal_cold_resume_injects_external_session_id(
     monkeypatch.setattr(
         claude_native,
         "prepare_bridge_dir",
-        lambda session_id, *, bridge_id=None, workspace, launch_model=None, launch_env=None: (
+        lambda session_id, *, bridge_id=None, workspace, **_vocabulary: (
             tmp_path / (bridge_id or session_id)
         ),
     )
@@ -5832,7 +6002,7 @@ async def test_prepare_claude_terminal_fresh_session_is_not_cold_resumed(
     monkeypatch.setattr(
         claude_native,
         "prepare_bridge_dir",
-        lambda session_id, *, bridge_id=None, workspace, launch_model=None, launch_env=None: (
+        lambda session_id, *, bridge_id=None, workspace, **_vocabulary: (
             tmp_path / (bridge_id or session_id)
         ),
     )
@@ -9991,32 +10161,6 @@ def _gateway_probe_config(**env_extra: str) -> Any:
     )
 
 
-def test_parse_claude_model_aliases_reads_the_usage_line() -> None:
-    """The harness's printed alias enumeration parses verbatim.
-
-    Only the trailing prose fragment is dropped — no alias names are known
-    to the parser, so a new alias in a future Claude release flows through.
-    """
-    stdout = (
-        "Current model: Opus 4.8 (1M context) (effort: high)\n"
-        "Usage: /model <name>. Available: sonnet, opus, haiku, fable, best, "
-        "sonnet[1m], opus[1m], fable[1m], opusplan, default, or a full model ID.\n"
-    )
-    assert claude_native._parse_claude_model_aliases(stdout) == [
-        "sonnet",
-        "opus",
-        "haiku",
-        "fable",
-        "best",
-        "sonnet[1m]",
-        "opus[1m]",
-        "fable[1m]",
-        "opusplan",
-        "default",
-    ]
-    assert claude_native._parse_claude_model_aliases("no usage line here") == []
-
-
 @pytest.mark.parametrize(
     ("stdout", "expected"),
     [
@@ -10125,23 +10269,30 @@ def test_claude_alias_row_marks_1m_context_consistently(
     assert row == {"id": alias, "model": model, "displayName": expected}
 
 
+def _picker_response(*aliases: str) -> bytes:
+    return json.dumps(
+        {
+            "type": "control_response",
+            "response": {
+                "subtype": "success",
+                "request_id": "model-catalog",
+                "response": {"models": [{"value": alias} for alias in aliases]},
+            },
+        }
+    ).encode()
+
+
 async def test_probe_claude_model_options_runs_bare(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A bare subscription launch (no config) asks the harness itself.
-
-    No ``--settings`` rides along without an apiKeyHelper to deliver, and
-    the plain-text usage line still parses when the harness answers
-    without stream-json events (failed per-alias resolutions leave the
-    bare alias rows).
-    """
+    """An unconfigured launch reads the CLI picker without injecting settings."""
 
     class _FakeProcess:
         returncode = 0
 
-        async def communicate(self) -> tuple[bytes, bytes]:
+        async def communicate(self, input: bytes | None = None) -> tuple[bytes, bytes]:
             return (
-                b"Usage: /model <name>. Available: sonnet, opus, or a full model ID.\n",
+                _picker_response("sonnet", "opus"),
                 b"",
             )
 
@@ -10191,14 +10342,24 @@ async def test_probe_claude_model_options_resolves_each_alias_via_the_harness(
             self.returncode = returncode
             self._stdout = stdout
 
-        async def communicate(self) -> tuple[bytes, bytes]:
+        async def communicate(self, input: bytes | None = None) -> tuple[bytes, bytes]:
             return self._stdout, b""
 
     async def _fake_exec(command: str, *args: str, **kwargs: Any) -> _Run:
         if "--model" not in args:
             return _Run(
-                b"Usage: /model <name>. Available: sonnet, opus, haiku, fable, best, "
-                b"sonnet[1m], opus[1m], fable[1m], opusplan, default, or a full model ID.\n"
+                _picker_response(
+                    "sonnet",
+                    "opus",
+                    "haiku",
+                    "fable",
+                    "best",
+                    "sonnet[1m]",
+                    "opus[1m]",
+                    "fable[1m]",
+                    "opusplan",
+                    "default",
+                )
             )
         assert "--output-format" in args and "stream-json" in args and "--verbose" in args
         alias = args[args.index("--model") + 1]
@@ -10249,10 +10410,9 @@ async def test_probe_claude_model_options_runs_the_harness_under_the_launch_env(
     class _FakeProcess:
         returncode = 0
 
-        async def communicate(self) -> tuple[bytes, bytes]:
+        async def communicate(self, input: bytes | None = None) -> tuple[bytes, bytes]:
             return (
-                b"Current model: Opus\n"
-                b"Usage: /model <name>. Available: opus, or a full model ID.\n",
+                _picker_response("opus"),
                 b"",
             )
 
@@ -10272,7 +10432,7 @@ async def test_probe_claude_model_options_runs_the_harness_under_the_launch_env(
     assert probe is not None
     assert probe.alias_rows == [{"id": "opus", "model": "opus", "displayName": "opus"}]
     args = captured["args"]
-    assert args[:2] == ["-p", "/model"]
+    assert args[:3] == ["-p", "--input-format", "stream-json"]
     assert "--strict-mcp-config" in args and "--no-session-persistence" in args
     settings_payload = json.loads(args[args.index("--settings") + 1])
     assert settings_payload == {"apiKeyHelper": "printf token"}
@@ -10306,54 +10466,6 @@ async def test_claude_model_catalog_marks_the_enumerated_default(
     assert [row["id"] for row in rows] == ["sonnet", "opus"]
     assert "isDefault" not in rows[0]
     assert rows[1]["isDefault"] is True
-
-
-async def test_claude_model_catalog_honors_managed_replacement_picker(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Managed replacement rows override Claude's headless alias output."""
-
-    async def _fake_probe(config: object) -> claude_native.ClaudeModelProbe:
-        del config
-        return claude_native.ClaudeModelProbe(
-            alias_rows=[{"id": "fable", "model": "fable", "displayName": "fable"}],
-            default_model="gateway-opus",
-            default_label="Opus",
-        )
-
-    monkeypatch.setattr(claude_native, "probe_claude_model_options", _fake_probe)
-    monkeypatch.setattr(
-        "omnigent.onboarding.ambient.claude_managed_model_picker",
-        lambda: (("gateway-opus", "Opus"), ("gateway-sonnet", "Sonnet")),
-    )
-
-    assert await claude_native.claude_model_catalog(None) == [
-        {
-            "id": "gateway-opus",
-            "model": "gateway-opus",
-            "displayName": "Opus",
-            "isDefault": True,
-        },
-        {"id": "gateway-sonnet", "model": "gateway-sonnet", "displayName": "Sonnet"},
-    ]
-
-
-async def test_claude_model_catalog_keeps_managed_picker_when_probe_fails(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    async def _failed_probe(config: object) -> None:
-        del config
-        return
-
-    monkeypatch.setattr(claude_native, "probe_claude_model_options", _failed_probe)
-    monkeypatch.setattr(
-        "omnigent.onboarding.ambient.claude_managed_model_picker",
-        lambda: (("gateway-opus", "Opus"),),
-    )
-
-    assert await claude_native.claude_model_catalog(None) == [
-        {"id": "gateway-opus", "model": "gateway-opus", "displayName": "Opus"}
-    ]
 
 
 async def test_claude_model_catalog_appends_an_off_list_default(
@@ -10493,7 +10605,7 @@ async def test_probe_claude_model_options_returns_none_on_probe_failure(
     class _FailedProcess:
         returncode = 1
 
-        async def communicate(self) -> tuple[bytes, bytes]:
+        async def communicate(self, input: bytes | None = None) -> tuple[bytes, bytes]:
             return b"", b"boom"
 
     async def _fake_exec(command: str, *args: str, **kwargs: Any) -> _FailedProcess:
@@ -11200,7 +11312,7 @@ def test_configured_provider_wins_over_connect_broker_spec_branch(
     sentinel = claude_native.ClaudeNativeUcodeConfig(env={"MARK": "spec-provider"})
     monkeypatch.setattr(
         "omnigent.runtime.workflow._resolve_provider_for_build",
-        lambda spec, harness_type: object(),  # spec resolves to a provider entry
+        lambda spec, harness_type, actual_harness: object(),  # spec resolves to a provider entry
     )
     monkeypatch.setattr(
         claude_native,
@@ -11275,7 +11387,8 @@ def test_resolve_native_claude_config_spec_path_reaches_connect_broker(
 
     # Spec routes to no provider and carries no ucode profile.
     monkeypatch.setattr(
-        "omnigent.runtime.workflow._resolve_provider_for_build", lambda spec, harness_type: None
+        "omnigent.runtime.workflow._resolve_provider_for_build",
+        lambda spec, harness_type, actual_harness: None,
     )
     monkeypatch.setattr(
         claude_native, "_ucode_config_for_profile", lambda profile, *, refresh_models: None
@@ -11313,7 +11426,8 @@ def test_resolve_native_claude_config_spec_api_key_auth_skips_connect_broker(
     # The shared resolver returns None for an explicit ApiKeyAuth (it leaves bare
     # keys to Claude's own login), which previously fell through to the broker.
     monkeypatch.setattr(
-        "omnigent.runtime.workflow._resolve_provider_for_build", lambda spec, harness_type: None
+        "omnigent.runtime.workflow._resolve_provider_for_build",
+        lambda spec, harness_type, actual_harness: None,
     )
     monkeypatch.setattr(
         claude_native, "_ucode_config_for_profile", lambda profile, *, refresh_models: None

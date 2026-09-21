@@ -5,9 +5,11 @@ from __future__ import annotations
 import json
 import os
 import re
+from collections.abc import Iterator
 from pathlib import Path
 from urllib.parse import urlparse
 
+import pytest
 from playwright.sync_api import Page, Route, expect
 
 from omnigent.harnesses.claude_native.main import (
@@ -21,6 +23,15 @@ _EXPECTED_ROWS = [
     ("sonnet", "Sonnet 5"),
     ("haiku", "Haiku 4.5"),
 ]
+
+
+@pytest.fixture(autouse=True)
+def _finish_snapshot_routes(page: Page) -> Iterator[None]:
+    """Drain snapshot response handlers before Playwright disposes the page."""
+    yield
+    page.unroute_all(behavior="wait")
+
+
 _MODEL_OPTIONS = [
     {
         "id": "opus",
@@ -157,11 +168,11 @@ def test_claude_native_picker_lists_only_live_databricks_models(
     gear = page.get_by_test_id("composer-config-gear")
     expect(gear).to_be_visible(timeout=15_000)
     gear.click()
-    page.get_by_test_id("composer-config-model").click()
+    page.get_by_test_id("composer-agent-edit").click()
 
     # The model options carry the same data-model-id rows as before (plus the
     # "Default" sentinel row the modal always offers).
-    rows = page.locator('[role="option"][data-model-id]')
+    rows = page.locator('[role="menuitemcheckbox"][data-model-id]')
     expect(rows).to_have_count(len(_EXPECTED_ROWS))
     for index, (model_id, label) in enumerate(_EXPECTED_ROWS):
         row = rows.nth(index)
@@ -170,31 +181,15 @@ def test_claude_native_picker_lists_only_live_databricks_models(
 
     # The bound system.ai.claude-sonnet-5 model implicitly selects the "sonnet"
     # (Sonnet 5) row; fable / sonnet_5 aren't in the live catalog at all.
-    sonnet_row = page.locator('[role="option"][data-model-id="sonnet"]')
-    expect(sonnet_row).to_have_attribute("data-active", "true")
-    expect(page.locator('[role="option"][data-model-id="fable"]')).to_have_count(0)
-    expect(page.locator('[role="option"][data-model-id="sonnet_5"]')).to_have_count(0)
+    sonnet_row = page.locator('[role="menuitemcheckbox"][data-model-id="sonnet"]')
+    expect(sonnet_row).to_have_attribute("aria-checked", "true")
+    expect(page.locator('[role="menuitemcheckbox"][data-model-id="fable"]')).to_have_count(0)
+    expect(page.locator('[role="menuitemcheckbox"][data-model-id="sonnet_5"]')).to_have_count(0)
     _screenshot(page, "pinned-catalog-picker")
 
 
-def test_claude_native_picker_updates_after_delayed_catalog(
-    page: Page,
-    seeded_session: tuple[str, str],
-) -> None:
-    """A live catalog event fills the modal; the sticky stays a preference.
-
-    The catalog's arrival populates the picker rows and lets the label
-    resolve the reported model to its display name. The cross-session
-    sticky pick is never silently PATCHed onto the session — a request
-    exists only when the user explicitly picks.
-    """
-    base_url, session_id = seeded_session
-    catalog_state = {"ready": False}
-    patch_bodies = _patch_session_as_claude_native(
-        page,
-        session_id,
-        catalog_state=catalog_state,
-    )
+def _install_catalog_stream(page: Page, session_id: str) -> None:
+    """Keep the stream open so tests can announce catalog readiness explicitly."""
     stream_script = """
         (() => {
           const sessionId = __SESSION_ID__;
@@ -220,15 +215,10 @@ def test_claude_native_picker_updates_after_delayed_catalog(
     page.add_init_script(
         stream_script,
     )
-    page.add_init_script("window.localStorage.setItem('omnigent.picker.model', 'opus')")
 
-    page.goto(f"{base_url}/c/{session_id}")
 
-    label = page.get_by_test_id("composer-model-effort-label")
-    expect(label).to_contain_text("system.ai.claude-sonnet-5", timeout=15_000)
+def _announce_catalog(page: Page, session_id: str) -> None:
     page.wait_for_function("window.__claudeModelStreamController !== undefined")
-
-    catalog_state["ready"] = True
     page.evaluate(
         """
         ({ sessionId }) => {
@@ -241,13 +231,145 @@ def test_claude_native_picker_updates_after_delayed_catalog(
         {"sessionId": session_id},
     )
 
+
+@pytest.mark.parametrize("viewport", [(1600, 900), (390, 844)], ids=["desktop", "mobile"])
+def test_claude_native_picker_updates_after_delayed_catalog(
+    page: Page,
+    seeded_session: tuple[str, str],
+    tmp_path: Path,
+    viewport: tuple[int, int],
+) -> None:
+    """Cold labels spin; refreshes and new tabs reuse the exact session name.
+
+    The cache is display-only, the menu remains usable during loading, and
+    the cross-session sticky selection is never PATCHed onto the session.
+    """
+    base_url, session_id = seeded_session
+    catalog_state = {"ready": False}
+    patch_bodies = _patch_session_as_claude_native(
+        page,
+        session_id,
+        catalog_state=catalog_state,
+    )
+    _install_catalog_stream(page, session_id)
+    page.add_init_script(_LABEL_RECORDER)
+    page.add_init_script("window.localStorage.setItem('omnigent.picker.model', 'opus')")
+    page.set_viewport_size({"width": viewport[0], "height": viewport[1]})
+
+    page.goto(f"{base_url}/c/{session_id}")
+
+    label = page.get_by_test_id("composer-agent-config-value")
+    spinner = page.get_by_test_id("composer-model-loading")
+    expect(spinner).to_be_visible(timeout=15_000)
+    expect(label).not_to_contain_text("system.ai.")
+    page.screenshot(path=str(tmp_path / "session-model-cold-spinner.png"))
+    gear = page.get_by_test_id("composer-config-gear")
+    expect(gear).to_be_enabled()
+    gear.click()
+    page.get_by_test_id("composer-agent-edit").click()
+    expect(page.get_by_test_id("composer-agent-config-menu")).to_be_visible()
+    expect(page.get_by_test_id("composer-agent-config-menu")).not_to_contain_text("system.ai.")
+
+    catalog_state["ready"] = True
+    _announce_catalog(page, session_id)
+
     # The catalog labels the reported model; the sticky ("opus") is never
     # silently written as a request.
     expect(label).to_contain_text("Sonnet 5", timeout=10_000)
+    expect(spinner).to_have_count(0)
     assert not any("model_override" in body for body in patch_bodies)
-    page.get_by_test_id("composer-config-gear").click()
-    page.get_by_test_id("composer-config-model").click()
-    expect(page.locator('[role="option"][data-model-id]')).to_have_count(len(_EXPECTED_ROWS))
+    expect(page.locator('[role="menuitemcheckbox"][data-model-id]')).to_have_count(
+        len(_EXPECTED_ROWS)
+    )
+    log = page.evaluate("window.__modelLabelLog")
+    assert any(entry["loading"] for entry in log), "never recorded the cold loading state"
+    assert not any("system.ai." in entry["text"] for entry in log), log
+    page.wait_for_function(
+        """() => Object.keys(localStorage).some(key =>
+            key.startsWith('omnigent:session-model-label:v1:') &&
+            JSON.parse(localStorage.getItem(key)).displayName === 'Sonnet 5')"""
+    )
+
+    catalog_state["ready"] = False
+    page.reload()
+    expect(label).to_contain_text("Sonnet 5", timeout=15_000)
+    expect(spinner).to_have_count(0)
+    page.screenshot(path=str(tmp_path / "session-model-cached-reload.png"))
+    page.wait_for_function("window.__modelLabelLog.some(entry => entry.text.includes('Sonnet 5'))")
+    log = page.evaluate("window.__modelLabelLog")
+    assert not any(entry["loading"] or "system.ai." in entry["text"] for entry in log), log
+    gear.click()
+    expect(page.get_by_test_id("composer-agent-model-summary")).to_have_text("Sonnet 5")
+    page.screenshot(path=str(tmp_path / "session-model-cached-menu.png"))
+    page.get_by_test_id("composer-agent-edit").click()
+    expect(page.get_by_test_id("composer-agent-config-menu")).to_be_visible()
+
+    new_tab = page.context.new_page()
+    try:
+        _patch_session_as_claude_native(new_tab, session_id, catalog_state=catalog_state)
+        _install_catalog_stream(new_tab, session_id)
+        new_tab.add_init_script(_LABEL_RECORDER)
+        new_tab.set_viewport_size({"width": viewport[0], "height": viewport[1]})
+        new_tab.goto(f"{base_url}/c/{session_id}")
+        expect(new_tab.get_by_test_id("composer-agent-config-value")).to_contain_text(
+            "Sonnet 5", timeout=15_000
+        )
+        expect(new_tab.get_by_test_id("composer-model-loading")).to_have_count(0)
+        new_tab.screenshot(path=str(tmp_path / "session-model-cached-new-tab.png"))
+        new_tab.wait_for_function(
+            "window.__modelLabelLog.some(entry => entry.text.includes('Sonnet 5'))"
+        )
+        log = new_tab.evaluate("window.__modelLabelLog")
+        assert not any(entry["loading"] or "system.ai." in entry["text"] for entry in log), log
+    finally:
+        new_tab.unroute_all(behavior="wait")
+        new_tab.close()
+
+
+def test_cached_session_model_label_recovers_after_delayed_identity(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """A boot identity timeout must not strand a warm cache behind a spinner."""
+    base_url, session_id = seeded_session
+    catalog_state = {"ready": True}
+    _patch_session_as_claude_native(page, session_id, catalog_state=catalog_state)
+    _install_catalog_stream(page, session_id)
+    page.goto(f"{base_url}/c/{session_id}")
+    label = page.get_by_test_id("composer-agent-config-value")
+    expect(label).to_contain_text("Sonnet 5", timeout=15_000)
+    page.wait_for_function(
+        """() => Object.keys(localStorage).some(key =>
+            key.startsWith('omnigent:session-model-label:v1:') &&
+            JSON.parse(localStorage.getItem(key)).displayName === 'Sonnet 5')"""
+    )
+
+    catalog_state["ready"] = False
+    page.add_init_script(
+        """(() => {
+          const originalFetch = window.fetch.bind(window);
+          window.fetch = async (input, init) => {
+            const url = typeof input === 'string' ? input : input.url;
+            const response = await originalFetch(input, init);
+            if (new URL(url, location.origin).pathname === '/v1/me') {
+              await new Promise(resolve => { window.__releaseModelIdentity = resolve; });
+            }
+            return response;
+          };
+        })()"""
+    )
+    page.add_init_script(_LABEL_RECORDER)
+    page.reload()
+    spinner = page.get_by_test_id("composer-model-loading")
+    expect(spinner).to_be_visible(timeout=15_000)
+    expect(label).not_to_contain_text("system.ai.")
+    page.wait_for_function("typeof window.__releaseModelIdentity === 'function'")
+    page.evaluate("window.__releaseModelIdentity()")
+    expect(label).to_contain_text("Sonnet 5", timeout=5_000)
+    expect(spinner).to_have_count(0)
+    assert not catalog_state["ready"], "the label must come from cache, not a live catalog"
+    log = page.evaluate("window.__modelLabelLog")
+    assert not any("system.ai." in entry["text"] for entry in log), log
 
 
 def test_claude_native_alias_selection_persists(
@@ -273,10 +395,9 @@ def test_claude_native_alias_selection_persists(
     gear = page.get_by_test_id("composer-config-gear")
     expect(gear).to_be_visible(timeout=15_000)
     gear.click()
-    page.get_by_test_id("composer-config-model").click()
+    page.get_by_test_id("composer-agent-edit").click()
 
     # Selecting only drafts the pick; the PATCH fires on Save.
-    page.locator('[role="option"][data-model-id="opus"]').click()
     with page.expect_response(
         lambda response: (
             response.request.method == "PATCH"
@@ -284,12 +405,12 @@ def test_claude_native_alias_selection_persists(
             and response.status == 200
         )
     ):
-        page.get_by_test_id("composer-config-save").click()
+        page.locator('[role="menuitemcheckbox"][data-model-id="opus"]').click()
 
     assert patch_bodies[-1] == {"model_override": "opus"}
     # The read-only composer label keeps the reported model — a request is
     # not truth until the harness confirms it.
-    expect(page.get_by_test_id("composer-model-effort-label")).to_contain_text("Sonnet 5")
+    expect(page.get_by_test_id("composer-agent-config-value")).to_contain_text("Sonnet 5")
 
 
 def _force_asleep_liveness(page: Page, session_id: str) -> None:
@@ -381,13 +502,14 @@ def test_claude_native_picker_saves_model_while_host_asleep(
     gear = page.get_by_test_id("composer-config-gear")
     expect(gear).to_have_attribute("aria-disabled", "false")
     gear.click()
-    expect(page.get_by_test_id("composer-config-modal")).to_be_visible()
-    page.get_by_test_id("composer-config-model").click()
+    page.get_by_test_id("composer-agent-edit").click()
+    expect(page.get_by_test_id("composer-agent-config-menu")).to_be_visible()
     # The catalog still populates the dropdown while the session sleeps.
-    expect(page.locator('[role="option"][data-model-id]')).to_have_count(len(_EXPECTED_ROWS))
+    expect(page.locator('[role="menuitemcheckbox"][data-model-id]')).to_have_count(
+        len(_EXPECTED_ROWS)
+    )
     _screenshot(page, "asleep-config-gear")
 
-    page.locator('[role="option"][data-model-id="opus"]').click()
     with page.expect_response(
         lambda response: (
             response.request.method == "PATCH"
@@ -395,7 +517,7 @@ def test_claude_native_picker_saves_model_while_host_asleep(
             and response.status == 200
         )
     ):
-        page.get_by_test_id("composer-config-save").click()
+        page.locator('[role="menuitemcheckbox"][data-model-id="opus"]').click()
 
     assert patch_bodies[-1] == {"model_override": "opus"}
 
@@ -435,23 +557,25 @@ def test_claude_native_unpinned_gateway_catalog_offers_only_the_routable_default
 
     page.goto(f"{base_url}/c/{session_id}")
 
-    # The composer label already shows the concrete routable id.
-    expect(page.get_by_test_id("composer-model-effort-label")).to_contain_text(
-        default_model, timeout=15_000
+    # Visible labels omit the catalog prefix; routing keeps the full model id.
+    expect(page.get_by_test_id("composer-agent-config-value")).to_have_text(
+        "claude-sonnet-4-5", timeout=15_000
     )
     _screenshot(page, "unpinned-gateway-composer")
 
     page.get_by_test_id("composer-config-gear").click()
-    page.get_by_test_id("composer-config-model").click()
+
+    page.get_by_test_id("composer-agent-edit").click()
 
     # Exactly one row — the provider's routable default, pre-selected — so no
     # alias row exists to canonicalize into an id the gateway rejects. Picking
     # it can only ever PATCH the concrete gateway id, which the launch
     # resolver passes through verbatim.
-    rows = page.locator('[role="option"][data-model-id]')
+    rows = page.locator('[role="menuitemcheckbox"][data-model-id]')
     expect(rows).to_have_count(1)
+    expect(rows.first).to_have_text("claude-sonnet-4-5")
     expect(rows.first).to_have_attribute("data-model-id", default_model)
-    expect(rows.first).to_have_attribute("data-active", "true")
+    expect(rows.first).to_have_attribute("aria-checked", "true")
     _screenshot(page, "unpinned-gateway-picker")
 
 
@@ -470,25 +594,27 @@ _CLAUDE_LLM_MODEL = "system.ai.claude-sonnet-5"
 # the test quick. Only the switch back to the Claude session is delayed.
 _SNAPSHOT_DELAY_MS = 2_000
 
-# Records every distinct composer model label the page ever paints, tagged with
-# the session route it was painted under. A transient wrong label is invisible
-# to `expect()` (which retries until it passes), so the assertion runs against
-# this log rather than a point-in-time read.
+# Sample each painted frame against React's committed session, not history:
+# BrowserRouter updates history before committing its concurrent route render.
+# Keep transient labels that retrying expect() assertions would miss.
 _LABEL_RECORDER = """
 (() => {
   window.__modelLabelLog = [];
   const record = () => {
-    const el = document.querySelector('[data-testid="composer-model-effort-label"]');
-    const entry = { path: location.pathname, text: el ? el.textContent.trim() : "" };
+    const el = document.querySelector('[data-testid="composer-agent-config-value"]');
+    const current = document.querySelector('main[data-session-id]');
+    const entry = {
+      path: `/c/${current?.dataset.sessionId}`,
+      text: el ? el.textContent.trim() : "",
+      loading: !!document.querySelector('[data-testid="composer-model-loading"]'),
+    };
     const log = window.__modelLabelLog;
     const last = log[log.length - 1];
-    if (!last || last.path !== entry.path || last.text !== entry.text) log.push(entry);
+    if (!last || last.path !== entry.path || last.text !== entry.text ||
+        last.loading !== entry.loading) log.push(entry);
+    requestAnimationFrame(record);
   };
-  new MutationObserver(record).observe(document, {
-    subtree: true,
-    childList: true,
-    characterData: true,
-  });
+  requestAnimationFrame(record);
 })()
 """
 
@@ -602,12 +728,15 @@ def test_composer_model_label_never_shows_the_previous_sessions_model(
         )
     )
 
-    label = page.get_by_test_id("composer-model-effort-label")
+    label = page.get_by_test_id("composer-agent-config-value")
 
     # Open the Codex session FIRST and only — binding it makes gpt-5.5 the
     # sticky pick, and leaves Claude never-visited so its open is cold.
     page.goto(f"{base_url}/c/{codex_session}")
     expect(label).to_contain_text(_CODEX_MODEL_LABEL, timeout=15_000)
+    expect(page.locator("main[data-session-id]")).to_have_attribute(
+        "data-session-id", codex_session
+    )
 
     # Cold-open Claude with its snapshot held, and watch every label the
     # composer paints under the Claude route.
@@ -617,6 +746,12 @@ def test_composer_model_label_never_shows_the_previous_sessions_model(
     page.wait_for_url(re.compile(rf"/c/{re.escape(claude_session)}"))
     expect(label).to_contain_text("Sonnet 5", timeout=15_000)
 
+    page.wait_for_function(
+        """sessionId => window.__modelLabelLog.some(entry =>
+            entry.path === `/c/${sessionId}` && entry.text.includes("Sonnet 5")
+        )""",
+        arg=claude_session,
+    )
     log = page.evaluate("window.__modelLabelLog")
     claude_labels = [e["text"] for e in log if e["path"] == f"/c/{claude_session}"]
     # Guard against a no-op run: the held snapshot must have produced at least
@@ -639,9 +774,9 @@ def test_claude_model_label_never_claims_a_version_the_catalog_didnt_give(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """The label renders the reported model — raw before the catalog labels it.
+    """The label waits for the catalog instead of flashing an ID or guessed name.
 
-    The chip renders only the harness's reported model: the raw wire id
+    The chip renders only the harness's reported model: a spinner
     until the catalog can name it, the catalog's display name after — and
     at no point a version the catalog didn't give (the old fallback said
     "Sonnet 4.6" while the catalog resolves to Sonnet 5). Every label the
@@ -667,61 +802,29 @@ def test_claude_model_label_never_claims_a_version_the_catalog_didnt_give(
         model_options=one_m_catalog,
         llm_model="system.ai.claude-sonnet-5[1m]",
     )
-    stream_script = """
-        (() => {
-          const sessionId = __SESSION_ID__;
-          const originalFetch = window.fetch.bind(window);
-          window.fetch = (input, init) => {
-            const url = typeof input === "string" ? input : input.url;
-            const streamPath = `/v1/sessions/${sessionId}/stream`;
-            if (new URL(url, window.location.origin).pathname === streamPath) {
-              const body = new ReadableStream({
-                start(controller) {
-                  window.__claudeModelStreamController = controller;
-                },
-              });
-              return Promise.resolve(new Response(body, {
-                status: 200,
-                headers: { "content-type": "text/event-stream" },
-              }));
-            }
-            return originalFetch(input, init);
-          };
-        })()
-        """.replace("__SESSION_ID__", json.dumps(session_id))
-    page.add_init_script(stream_script)
+    _install_catalog_stream(page, session_id)
     page.add_init_script(_LABEL_RECORDER)
 
     page.goto(f"{base_url}/c/{session_id}")
 
-    # Pre-catalog: the reported wire id renders raw — honest over pretty.
-    label = page.get_by_test_id("composer-model-effort-label")
-    expect(label).to_contain_text("system.ai.claude-sonnet-5[1m]", timeout=15_000)
-    page.wait_for_function("window.__claudeModelStreamController !== undefined")
+    # Pre-catalog: loading, without inventing a name from the wire id.
+    label = page.get_by_test_id("composer-agent-config-value")
+    expect(page.get_by_test_id("composer-model-loading")).to_be_visible(timeout=15_000)
+    expect(label).not_to_contain_text("system.ai.")
 
     # The catalog lands: its display name supersedes the fallback.
     catalog_state["ready"] = True
-    page.evaluate(
-        """
-        ({ sessionId }) => {
-          const frame = `event: session.model_options\ndata: ${JSON.stringify({
-            conversation_id: sessionId,
-          })}\n\n`;
-          window.__claudeModelStreamController.enqueue(new TextEncoder().encode(frame));
-        }
-        """,
-        {"sessionId": session_id},
-    )
-    expect(label).to_contain_text("Sonnet 5 (1M context)", timeout=10_000)
+    _announce_catalog(page, session_id)
+    expect(label).to_contain_text("Sonnet 5 1M", timeout=10_000)
 
     log = page.evaluate("window.__modelLabelLog")
     labels = [entry["text"] for entry in log if entry["text"]]
     assert labels, "the recorder never saw a composer label"
-    offending = [text for text in labels if "4.6" in text]
+    offending = [text for text in labels if "4.6" in text or "system.ai." in text]
     assert not offending, (
-        f"the composer painted a version the catalog didn't give: {offending} "
+        f"the composer painted a raw ID or a version the catalog didn't give: {offending} "
         f"(full label sequence: {labels}). Labels render the reported model — "
-        "raw before the catalog names it, the catalog's name after — never an "
+        "a spinner before the catalog names it, the catalog's name after — never an "
         "invented version."
     )
     _screenshot(page, "one-m-label-settled")
@@ -782,10 +885,9 @@ def test_union_catalog_pick_patches_the_row_id_verbatim(
     gear = page.get_by_test_id("composer-config-gear")
     expect(gear).to_be_visible(timeout=15_000)
     gear.click()
-    page.get_by_test_id("composer-config-model").click()
-    bracket_row = page.locator('[role="option"][data-model-id="sonnet[1m]"]')
+    page.get_by_test_id("composer-agent-edit").click()
+    bracket_row = page.locator('[role="menuitemcheckbox"][data-model-id="sonnet[1m]"]')
     expect(bracket_row).to_contain_text("Sonnet 5 (1M context)")
-    bracket_row.click()
     with page.expect_response(
         lambda response: (
             response.request.method == "PATCH"
@@ -793,13 +895,13 @@ def test_union_catalog_pick_patches_the_row_id_verbatim(
             and response.status == 200
         )
     ):
-        page.get_by_test_id("composer-config-save").click()
+        bracket_row.click()
 
     assert patch_bodies[-1] == {"model_override": "sonnet[1m]"}
     # The label keeps the reported model ("Sonnet 5" — the bound
     # databricks-claude-sonnet-5); the request flips nothing until the
     # harness confirms.
-    expect(page.get_by_test_id("composer-model-effort-label")).to_contain_text("Sonnet 5")
+    expect(page.get_by_test_id("composer-agent-config-value")).to_contain_text("Sonnet 5")
 
 
 def test_claude_native_picker_highlights_the_reported_model(
@@ -821,16 +923,16 @@ def test_claude_native_picker_highlights_the_reported_model(
     gear = page.get_by_test_id("composer-config-gear")
     expect(gear).to_be_visible(timeout=15_000)
     gear.click()
-    page.get_by_test_id("composer-config-model").click()
+    page.get_by_test_id("composer-agent-edit").click()
 
-    expect(page.locator('[role="option"][data-model-id="sonnet"]')).to_have_attribute(
-        "data-active", "true"
+    expect(page.locator('[role="menuitemcheckbox"][data-model-id="sonnet"]')).to_have_attribute(
+        "aria-checked", "true"
     )
-    expect(page.locator('[role="option"][data-model-id="opus"]')).not_to_have_attribute(
-        "data-active", "true"
+    expect(page.locator('[role="menuitemcheckbox"][data-model-id="opus"]')).not_to_have_attribute(
+        "aria-checked", "true"
     )
-    expect(page.locator('[role="option"][data-model-id="haiku"]')).not_to_have_attribute(
-        "data-active", "true"
+    expect(page.locator('[role="menuitemcheckbox"][data-model-id="haiku"]')).not_to_have_attribute(
+        "aria-checked", "true"
     )
 
 
@@ -855,21 +957,9 @@ def test_claude_native_permission_mode_switch_persists(
 
     page.goto(f"{base_url}/c/{session_id}")
 
-    gear = page.get_by_test_id("composer-config-gear")
-    expect(gear).to_be_visible(timeout=15_000)
-    gear.click()
-
-    # The permission-mode picker is visible for claude-native sessions whose
-    # current mode is known (non-empty label).
-    perm = page.get_by_test_id("composer-config-permission-mode")
-    expect(perm).to_be_visible()
+    perm = page.get_by_test_id("composer-permission-chip")
+    expect(perm).to_be_visible(timeout=15_000)
     perm.click()
-
-    # Located by data attribute, not accessible name: each option renders its
-    # label and description together, so the name is never the bare label.
-    page.locator('[role="option"][data-permission-mode="auto"]').click()
-
-    # Save commits the draft and fires the PATCH.
     with page.expect_response(
         lambda response: (
             response.request.method == "PATCH"
@@ -877,6 +967,7 @@ def test_claude_native_permission_mode_switch_persists(
             and response.status == 200
         )
     ):
-        page.get_by_test_id("composer-config-save").click()
+        page.get_by_test_id("composer-permission-option-auto").click()
 
     assert patch_bodies[-1] == {"permission_mode": "auto"}
+    expect(perm).to_contain_text("Auto")

@@ -46,9 +46,17 @@ describe("rewriteFileUriLinks", () => {
   });
 
   it.each([
+    ["file:///tmp/ws/report.md#L12", "/tmp/ws/report.md#L12"],
+    ["file:///tmp/ws/report.md#L12-L18", "/tmp/ws/report.md#L12-L18"],
+  ])("preserves a recognized source position in %s", (href, expected) => {
+    expect(rewriteHref(href)).toEqual({ href: expected });
+  });
+
+  it.each([
     ["file://fileserver/share/report.md", "UNC host names another machine"],
     ["file:///tmp/report.md?raw=1", "query is not part of a filename"],
     ["file:///tmp/report.md#section", "fragment is not part of a filename"],
+    ["file:///tmp/report.md#Lx", "malformed line fragment"],
     ["file:////evil.com/x.md", "decoded // path would read as protocol-relative"],
     ["file:///tmp/a%3Fb.md", "decoded ? would split the rewritten href"],
     ["file:///tmp/a%23b.md", "decoded # would split the rewritten href"],

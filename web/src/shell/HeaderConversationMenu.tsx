@@ -8,7 +8,9 @@ import {
 } from "react";
 import {
   ArchiveIcon,
+  ArchiveRestoreIcon,
   ChevronLeftIcon,
+  DownloadIcon,
   EllipsisIcon,
   FolderInputIcon,
   GitBranchIcon,
@@ -21,6 +23,7 @@ import {
   ShareIcon,
   Trash2Icon,
 } from "lucide-react";
+import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -42,6 +45,8 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { useQueryClient } from "@tanstack/react-query";
+import { exportSessionTranscript } from "@/lib/sessionsApi";
+import { triggerBrowserDownload } from "@/hooks/useFileContent";
 import {
   PINNED_LABEL_KEY,
   type Conversation,
@@ -114,6 +119,7 @@ export function HeaderConversationMenu({
   const [deleteBranch, setDeleteBranch] = useState(false);
   const previousConversationId = useRef(conversation.id);
   const isPinned = conversation.labels?.[PINNED_LABEL_KEY] != null;
+  const isArchived = conversation.archived === true;
   const label = conversationDisplayLabel(conversation);
   // Mobile taps need a bigger target than the dense desktop row.
   const itemClass = isMobile ? "gap-2.5 px-2.5 py-2" : undefined;
@@ -170,8 +176,26 @@ export function HeaderConversationMenu({
     });
   };
 
+  const exportConversation = async () => {
+    try {
+      const jsonl = await exportSessionTranscript(conversation.id);
+      triggerBrowserDownload(
+        new Blob([jsonl], { type: "application/jsonl" }),
+        `${conversation.id}.jsonl`,
+      );
+    } catch {
+      toast.error("Export failed");
+    }
+  };
+
   const archiveConversation = () => {
     closeMenu();
+    if (isArchived) {
+      // Unarchiving keeps the user on the session — no redirect home and no
+      // Undo toast (mirrors the sidebar row's Unarchive).
+      archive.mutate({ id: conversation.id, archived: false });
+      return;
+    }
     // The row leaves the sidebar optimistically (useArchiveConversation flips
     // the cached `archived` flag in onMutate), and we're viewing the session
     // being archived, so leave its chat surface now — synchronously, like
@@ -228,6 +252,14 @@ export function HeaderConversationMenu({
           Fork
         </DropdownMenuItem>
       )}
+      <DropdownMenuItem
+        data-testid="header-export-conversation"
+        className={itemClass}
+        onSelect={() => void exportConversation()}
+      >
+        <DownloadIcon className="size-3.5" />
+        Export
+      </DropdownMenuItem>
       {hasAgentInfo && onAgentInfo && (
         <DropdownMenuItem
           data-testid="header-agent-info"
@@ -305,8 +337,12 @@ export function HeaderConversationMenu({
         className={itemClass}
         onSelect={archiveConversation}
       >
-        <ArchiveIcon className="size-3.5" />
-        Archive
+        {isArchived ? (
+          <ArchiveRestoreIcon className="size-3.5" />
+        ) : (
+          <ArchiveIcon className="size-3.5" />
+        )}
+        {isArchived ? "Unarchive" : "Archive"}
       </DropdownMenuItem>
       <DropdownMenuItem
         data-testid="header-delete-conversation"

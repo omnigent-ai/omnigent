@@ -8,10 +8,12 @@ designs/SESSION_GIT_WORKTREE.md.
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit
 
 # fetch/add can be slow on large repos; bound it so git can't hang the
 # host's tunnel loop.
@@ -24,6 +26,22 @@ _MAX_DIR_COLLISION_SUFFIX: int = 50
 # (``..``, leading ``-``/``.``, ``/`` edges, ``.lock``, ``@{`` are
 # checked separately.)
 _INVALID_BRANCH_CHARS = re.compile(r"[\x00-\x20~^:?*\[\\\x7f]")
+
+# Provider classification is intentionally conservative. ``github.com`` is a
+# verified GitHub host; arbitrary enterprise domains and SSH aliases may point
+# anywhere, so they remain unknown rather than being guessed from their name.
+_GITHUB_REMOTE_HOSTS = frozenset({"github.com"})
+_KNOWN_NON_GITHUB_REMOTE_HOSTS = frozenset(
+    {
+        "bitbucket.org",
+        "codeberg.org",
+        "dev.azure.com",
+        "gitlab.com",
+        "ssh.dev.azure.com",
+    }
+)
+_SCP_REMOTE = re.compile(r"^(?:[^/@\s]+@)?(?P<host>[^/:\s]+):.+$")
+_WINDOWS_ABSOLUTE = re.compile(r"^[A-Za-z]:[\\/]")
 
 
 class WorktreeError(Exception):
@@ -111,6 +129,8 @@ def _run_git(
         return subprocess.run(
             ["git", *args],
             cwd=cwd,
+            # Keep failure diagnostics stable for repository classification.
+            env={**os.environ, "LC_ALL": "C"},
             capture_output=True,
             text=True,
             timeout=_GIT_TIMEOUT_S,
@@ -156,13 +176,17 @@ def _main_work_tree(repo_path: str) -> str:
     :returns: Absolute path of the main work tree, e.g.
         ``"/Users/alice/myrepo"``.
     :raises WorktreeError: If ``repo_path`` is not a directory or not
-        inside a git work tree.
+        inside a git work tree, or the git command fails.
     """
     if not Path(repo_path).is_dir():
         raise WorktreeError(f"path is not a directory: {repo_path}")
     result = _run_git(["worktree", "list", "--porcelain"], cwd=repo_path)
     if result.returncode != 0:
-        raise WorktreeError(f"not a git repository: {repo_path}")
+        if any(
+            line.startswith("fatal: not a git repository") for line in result.stderr.splitlines()
+        ):
+            raise WorktreeError(f"not a git repository: {repo_path}")
+        raise _git_error("git worktree list failed", result)
     for line in result.stdout.splitlines():
         # Porcelain format: the first record's ``worktree <path>`` line is
         # the main work tree; linked worktrees follow.
@@ -185,12 +209,102 @@ class WorktreeInfo:
         worktrees.
     :param detached: ``True`` when the worktree has a detached HEAD
         (no branch checked out).
+    :param remote_provider: ``"github"`` only for a remote whose hostname is
+        verified as GitHub, ``"other"`` for a recognized non-GitHub or local
+        remote, and ``None`` when no usable remote or provider proof exists.
+    :param updated_at: Unix epoch seconds of the checked-out HEAD commit, or
+        ``None`` when the commit timestamp cannot be resolved.
     """
 
     path: str
     branch: str | None
     is_main: bool
     detached: bool
+    remote_provider: str | None = None
+    updated_at: int | None = None
+
+
+def _remote_hostname(remote_url: str) -> str | None:
+    """Return a remote URL's normalized hostname, local marker, or ``None``.
+
+    ``""`` represents a local path/file remote, which is definitively not a
+    GitHub-hosted remote. Unknown SSH aliases and unparseable values return
+    ``None`` so callers fail closed.
+
+    :param remote_url: Git remote URL read from local repository config.
+    :returns: Lowercase hostname, ``""`` for a local remote, or ``None``.
+    """
+    candidate = remote_url.strip()
+    if not candidate:
+        return None
+    if candidate.startswith(("/", "./", "../", "~/")) or _WINDOWS_ABSOLUTE.match(candidate):
+        return ""
+
+    if candidate.startswith("file:"):
+        return ""
+
+    if "://" not in candidate:
+        scp = _SCP_REMOTE.match(candidate)
+        if scp:
+            return scp.group("host").lower()
+
+    try:
+        parsed = urlsplit(candidate)
+    except ValueError:
+        return None
+    if parsed.scheme == "file":
+        return ""
+    if parsed.scheme:
+        return parsed.hostname.lower() if parsed.hostname else None
+    return None
+
+
+def _remote_provider(repo_root: str) -> str | None:
+    """Classify configured remotes without network or credential access.
+
+    One bounded, argv-only ``git config`` read collects local remote URLs. The
+    URLs are never returned or logged; only the coarse provider classification
+    leaves the host. GitHub Enterprise domains and SSH aliases intentionally
+    remain unknown because local URL text alone cannot prove their provider.
+
+    :param repo_root: Resolved main work tree path.
+    :returns: ``"github"``, ``"other"``, or ``None``.
+    """
+    result = _run_git(["config", "--get-regexp", r"^remote\..*\.url$"], cwd=repo_root)
+    if result.returncode not in (0, 1):
+        return None
+
+    saw_other = False
+    for line in result.stdout.splitlines():
+        parts = line.split(maxsplit=1)
+        if len(parts) != 2:
+            continue
+        hostname = _remote_hostname(parts[1])
+        if hostname in _GITHUB_REMOTE_HOSTS:
+            return "github"
+        if hostname == "" or hostname in _KNOWN_NON_GITHUB_REMOTE_HOSTS:
+            saw_other = True
+    return "other" if saw_other else None
+
+
+def _commit_updated_ats(repo_root: str, heads: list[str | None]) -> dict[str, int]:
+    """Return checked-out commit timestamps with one bounded local git call."""
+    unique_heads = list(dict.fromkeys(head for head in heads if head is not None))
+    if not unique_heads:
+        return {}
+    result = _run_git(["show", "-s", "--format=%H%x00%ct", *unique_heads], cwd=repo_root)
+    if result.returncode != 0:
+        return {}
+    timestamps: dict[str, int] = {}
+    for line in result.stdout.splitlines():
+        head, separator, raw_timestamp = line.partition("\0")
+        if separator == "":
+            continue
+        try:
+            timestamps[head] = int(raw_timestamp)
+        except ValueError:
+            continue
+    return timestamps
 
 
 def list_worktrees(*, repo_path: str) -> list[WorktreeInfo]:
@@ -208,19 +322,27 @@ def list_worktrees(*, repo_path: str) -> list[WorktreeInfo]:
         inside a git work tree, or if ``git worktree list`` fails.
     """
     repo_root = _main_work_tree(repo_path)
+    try:
+        remote_provider = _remote_provider(repo_root)
+    except WorktreeError:
+        remote_provider = None
     result = _run_git(["worktree", "list", "--porcelain"], cwd=repo_root)
     if result.returncode != 0:
         raise _git_error("git worktree list failed", result)
 
-    worktrees: list[WorktreeInfo] = []
+    records: list[tuple[str, str | None, bool, str | None]] = []
     path: str | None = None
     branch: str | None = None
+    head: str | None = None
     detached = False
     for line in result.stdout.splitlines():
         if line.startswith("worktree "):
             path = line[len("worktree ") :].strip()
             branch = None
+            head = None
             detached = False
+        elif line.startswith("HEAD "):
+            head = line[len("HEAD ") :].strip()
         elif line.startswith("branch "):
             ref = line[len("branch ") :].strip()
             branch = ref[len("refs/heads/") :] if ref.startswith("refs/heads/") else ref
@@ -228,21 +350,25 @@ def list_worktrees(*, repo_path: str) -> list[WorktreeInfo]:
             detached = True
         elif line == "" and path is not None:
             # Blank line terminates a record.
-            worktrees.append(
-                WorktreeInfo(
-                    path=path,
-                    branch=branch,
-                    is_main=not worktrees,
-                    detached=detached,
-                )
-            )
+            records.append((path, branch, detached, head))
             path = None
     # The porcelain output may omit a trailing blank line for the last record.
     if path is not None:
-        worktrees.append(
-            WorktreeInfo(path=path, branch=branch, is_main=not worktrees, detached=detached)
+        records.append((path, branch, detached, head))
+    updated_ats = _commit_updated_ats(repo_root, [record[3] for record in records])
+    return [
+        WorktreeInfo(
+            path=worktree_path,
+            branch=worktree_branch,
+            is_main=index == 0,
+            detached=worktree_detached,
+            remote_provider=remote_provider,
+            updated_at=updated_ats.get(worktree_head) if worktree_head is not None else None,
         )
-    return worktrees
+        for index, (worktree_path, worktree_branch, worktree_detached, worktree_head) in enumerate(
+            records
+        )
+    ]
 
 
 def _local_branch_exists(repo_root: str, branch_name: str) -> bool:

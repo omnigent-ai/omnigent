@@ -90,15 +90,16 @@ async def _register_routes(page, *, configured_harnesses: dict[str, Any]) -> Non
 
     await page.route("**/v1/hosts", handle_hosts)
     await page.route("**/v1/agents", handle_agents)
-    await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+    await page.route(
+        re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
+    )
 
 
 def test_version_too_low_warns_with_outdated_cli_copy(
-    seeded_session: tuple[str, str],
+    live_server: str,
 ) -> None:
     """A version-too-low Codex host renders the outdated CLI warning."""
-    base_url, session_id = seeded_session
-    del session_id
+    base_url = live_server
     _run_in_fresh_loop(_drive_version_too_low(base_url))
 
 

@@ -120,6 +120,7 @@ class AgentStore(ABC):
         self,
         agent_id: str,
         bundle_location: str,
+        created_by: str | None = None,
     ) -> Agent | None:
         """
         Update an agent's bundle location, bump its version, and
@@ -130,6 +131,11 @@ class AgentStore(ABC):
             e.g. ``"agent_abc123"``.
         :param bundle_location: New artifact store key for the
             bundle, e.g. ``"ag_abc123/a1b2c3d4e5f6..."``.
+        :param created_by: When set, stamps the agent's owner only if
+            it is not already recorded (claim-on-write). Used by the
+            session-scoped mutation routes to heal pre-migration rows
+            whose ``created_by`` is ``None``; template-refresh callers
+            leave it ``None`` so template rows stay unowned.
         :returns: The updated :class:`Agent`, or ``None`` if not
             found.
         """

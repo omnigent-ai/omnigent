@@ -30,6 +30,7 @@ import { useHosts } from "@/hooks/useHosts";
 import { useHostFilesystem } from "@/hooks/useHostFilesystem";
 import { useRecentWorkspaces } from "@/hooks/useRecentWorkspaces";
 import { launchRunner, updateSession } from "@/lib/sessionsApi";
+import { terminalsQueryKey, type TerminalInfo } from "@/lib/terminals";
 import { useChatStore } from "@/store/chatStore";
 
 /**
@@ -208,7 +209,16 @@ export function SwitchHostDialog({
       // sitting in "Switching…" long after the move has landed.
       handleOpenChange(false);
       void queryClient.invalidateQueries({ queryKey: ["session", sessionId] });
+      void queryClient.invalidateQueries({ queryKey: ["session-agent", sessionId] });
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
+      // The old host's shells don't follow the session, but the terminals
+      // cache is SSE-primary with union-on-fetch semantics and never goes
+      // stale (staleTime: Infinity in useTerminals) — left alone, the strip
+      // keeps rendering the previous host's terminals. Clear, then refetch
+      // from the new runner; an entry racing the fetch survives via the
+      // queryFn union.
+      queryClient.setQueryData<TerminalInfo[]>(terminalsQueryKey(sessionId), []);
+      void queryClient.invalidateQueries({ queryKey: terminalsQueryKey(sessionId) });
     } catch (e) {
       setError(e instanceof Error ? e.message : "Couldn't switch hosts. Try again.");
     } finally {
