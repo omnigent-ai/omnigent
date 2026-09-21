@@ -116,22 +116,21 @@ later author comment reopens the issue and, while V2 is enabled, runs it again.
 Reopening remains available during a V2 rollback so closed reports are not
 trapped behind the classifier switch.
 
-## Optional bug review
+## Bug review
 
-The issue-event workflow can apply three decisions to Bugs: keep observed failures
+The V2 issue-event workflow applies three decisions to Bugs: keep observed failures
 open (adding a concise summary and grounded reproduction steps when hard to read),
 request clarification through the existing `needs-info` process when observation
 is unclear, or explain and close confidently code-path-only findings. Plausible
 UI/CLI/API reproduction steps keep the issue open even when unexecuted: ask for
 the result instead of closing it for being inferred from source.
 
-Enable it locally with `issue-priority-event --review-bugs --mode dry_run` and the
+Preview it locally with `issue-priority-event --review-bugs --mode dry_run` and the
 arguments above. Inspect the decision and proposed comment in `event.json`.
-Automatic event runs use
-`ISSUE_TRIAGE_BUG_REVIEW_ENABLED` (default `false`). Feature/Docs and the periodic
-job keep their existing assessment.
-With review disabled, event triage retains the latest five author replies capped
-at 4,000 characters each; complete history is used only for review-enabled runs.
+Bug review always runs when `ISSUE_PRIORITIZATION_V2_ENABLED=true`. Feature/Docs
+and the periodic job keep their existing assessment. Local CLI runs without
+`--review-bugs` retain the latest five author replies capped at 4,000 characters
+each; bug review uses complete history.
 
 One model call assesses the full report and author follow-ups. Closure requires
 an exact supporting quote, `has_user_facing_repro=false`, and live content checks.

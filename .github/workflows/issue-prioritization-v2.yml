@@ -90,7 +90,6 @@ jobs:
           POST_DUPLICATE_COMMENTS: ${{ inputs.post_duplicate_comments }}
           REPO_POST_DUPLICATE_COMMENTS: ${{ vars.ISSUE_TRIAGE_POST_DUPLICATE_COMMENTS || 'false' }}
           CLOSE_DUPLICATES: ${{ vars.ISSUE_TRIAGE_CLOSE_DUPLICATES || 'false' }}
-          REVIEW_BUGS: ${{ vars.ISSUE_TRIAGE_BUG_REVIEW_ENABLED || 'false' }}
         run: |
           set -euo pipefail
           : "${DATABRICKS_HOST:?Set the DATABRICKS_HOST repository secret}"
@@ -111,10 +110,8 @@ jobs:
             --run-id "github-${{ github.run_id }}-${{ github.run_attempt }}"
             --source-revision "${{ github.sha }}"
             --mode "$mode"
+            --review-bugs
           )
-          if [ "$REVIEW_BUGS" = "true" ]; then
-            args+=(--review-bugs)
-          fi
           if [ "$INTAKE" = "true" ]; then
             args+=(--intake --maintainers .github/MAINTAINER)
             if [ "$CLOSE_DUPLICATES" = "true" ]; then
