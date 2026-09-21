@@ -329,15 +329,18 @@ export function HarnessPickerEntry({
   const isEditTarget = (target: EventTarget) =>
     target instanceof Element && target.closest("[data-harness-edit]") !== null;
   const rowProps = {
-    className: "composer-agent-select min-w-0 flex-1 [&>svg]:hidden",
+    className: cn(
+      "composer-agent-select min-w-0 flex-1 [&>svg]:hidden",
+      disabled && "cursor-not-allowed opacity-60",
+    ),
     "data-testid": testId,
     "data-active": row.active ? "true" : undefined,
     "aria-label": row.label,
+    "aria-disabled": disabled || undefined,
     "aria-description": editable
       ? "Enter to select; Right Arrow to edit configuration."
       : undefined,
     textValue: row.label,
-    disabled,
   };
   const content = (
     <>
@@ -434,9 +437,14 @@ export function HarnessPickerEntry({
       ) : (
         <DropdownMenuItem
           {...rowProps}
-          onSelect={() => onSelect?.()}
+          onSelect={(event) => {
+            if (disabled) event.preventDefault();
+            else onSelect?.();
+          }}
           onClick={(event) => {
-            if (editable && !disabled && isEditTarget(event.target)) {
+            if (disabled) {
+              event.preventDefault();
+            } else if (editable && isEditTarget(event.target)) {
               event.preventDefault();
               onOpenChange(true);
             }

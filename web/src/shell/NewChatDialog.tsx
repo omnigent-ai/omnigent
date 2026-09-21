@@ -1506,15 +1506,36 @@ export function AgentHarnessPicker({
   const triggerEffort = triggerDetails.find(
     (detail) => detail.label === "Effort" || detail.label === "Thinking level",
   );
+  const selectedEntry = [...harnessEntries, ...agentEntries].find(
+    (agent) => agent.id === effectiveAgentId,
+  );
+  const selectedReadiness = harnessReadinessOnHost(selectedEntry?.harness, host);
+  const selectedUnavailable =
+    selectedEntry != null && !selectedReadiness.selectable && selectedReadiness.fallbackRelevant;
+  const selectedWarningMessage = selectedUnavailable
+    ? harnessWarningMessage(
+        selectedEntry.display_name,
+        host?.name,
+        selectedReadiness.reason,
+        selectedEntry.harness,
+      )
+    : null;
   const triggerModelText = triggerModel ? compactModelTriggerLabel(triggerModel.value) : "";
   const triggerEffortText = triggerEffort ? compactModelTriggerLabel(triggerEffort.value) : "";
-  const visibleModelText = triggerModelText === "Default" ? "Models unavailable" : triggerModelText;
+  const visibleModelText = selectedUnavailable
+    ? ""
+    : triggerModelText === "Default"
+      ? "Models unavailable"
+      : triggerModelText;
   const visibleEffortText =
     triggerEffortText === "Default" || triggerEffortText === "—" ? "" : triggerEffortText;
   const triggerAccessibleDetails = triggerDetails
     .map((detail) => `${detail.label} ${compactModelTriggerLabel(detail.value)}`)
     .join(", ");
-  const triggerAccessibleName = [hasAgents ? agentLabel : "No agents", triggerAccessibleDetails]
+  const triggerAccessibleName = [
+    hasAgents ? agentLabel : "No agents",
+    selectedUnavailable ? "unavailable" : triggerAccessibleDetails,
+  ]
     .filter(Boolean)
     .join(", ");
   const triggerText = triggerSdk
@@ -1524,9 +1545,6 @@ export function AgentHarnessPicker({
   const triggerSecondaryText = triggerSdk
     ? compactModelTriggerLabel(triggerSdk.value)
     : visibleEffortText;
-  const selectedEntry = [...harnessEntries, ...agentEntries].find(
-    (agent) => agent.id === effectiveAgentId,
-  );
   const previewOnly = loading && !interactiveWhileLoading;
   const cachedPreview = previewOnly ? readNewChatPickerCache(cacheKey) : null;
   const resolvedPreview = useMemo<NewChatPickerPreview | null>(
@@ -1616,8 +1634,13 @@ export function AgentHarnessPicker({
     const editable = selectedConfigContent !== undefined && (isEntryConfigurable?.(agent) ?? true);
     const readiness = harnessReadinessOnHost(agent.harness, host);
     const unavailable = !readiness.selectable && readiness.fallbackRelevant;
-    const broken = readiness.state === "broken";
     const warning = harnessWarningBadgeText(readiness.reason, collapsedBadge);
+    const warningMessage = harnessWarningMessage(
+      agent.display_name,
+      host?.name,
+      readiness.reason,
+      agent.harness,
+    );
     return (
       <HarnessPickerEntry
         key={agent.id}
@@ -1643,9 +1666,9 @@ export function AgentHarnessPicker({
         summary={summary}
         description={blurb}
         active={active}
-        editable={editable}
+        editable={editable && !unavailable}
         isMobile={isMobile}
-        disabled={broken}
+        disabled={unavailable}
         summaryTestId={`new-chat-landing-agent-summary-${agent.id}`}
         editTestId={`new-chat-landing-agent-config-${agent.id}`}
         warning={
@@ -1655,31 +1678,14 @@ export function AgentHarnessPicker({
                 <span
                   aria-label={warning}
                   data-testid={`new-chat-landing-agent-warning-${agent.id}`}
+                  tabIndex={0}
                   className="flex size-4 shrink-0 items-center justify-center text-amber-700 dark:text-amber-300"
                 >
                   <TriangleAlertIcon className="size-3.5" aria-hidden="true" />
                 </span>
               </TooltipTrigger>
-              <TooltipContent
-                className={
-                  broken
-                    ? "w-72 max-w-[calc(100vw-2rem)] flex-col items-start gap-1 rounded-lg border border-border bg-popover p-3 text-popover-foreground shadow-menu"
-                    : undefined
-                }
-              >
-                {broken ? (
-                  <>
-                    <strong className="font-medium">
-                      {readiness.explanation?.label ?? "Harness unavailable"}
-                    </strong>
-                    <span className="text-xs leading-5 text-muted-foreground">
-                      {readiness.explanation?.description ??
-                        "Choose another harness or repair this harness before continuing."}
-                    </span>
-                  </>
-                ) : (
-                  warning
-                )}
+              <TooltipContent className="w-64 max-w-[calc(100vw-2rem)] flex-col items-stretch rounded-lg bg-popover p-2.5 text-popover-foreground whitespace-normal shadow-menu ring-1 ring-foreground/10">
+                <span className="text-xs leading-5 text-popover-foreground">{warningMessage}</span>
               </TooltipContent>
             </Tooltip>
           )
@@ -1793,7 +1799,9 @@ export function AgentHarnessPicker({
   // Structured rows (bold keys, like the session composer's pill) win over
   // prose; either renders as a real tooltip surface, never the unstyled
   // native `title` hover.
-  const triggerTooltipContent = triggerTooltipRows?.length ? (
+  const triggerTooltipContent = selectedWarningMessage ? (
+    <span className="text-xs leading-5 text-popover-foreground">{selectedWarningMessage}</span>
+  ) : triggerTooltipRows?.length ? (
     <ComposerConfigTooltipRows rows={triggerTooltipRows} />
   ) : (
     triggerTooltip || null
@@ -1835,7 +1843,14 @@ export function AgentHarnessPicker({
         effort:
           disabledLabel === undefined ? (cachedPreview?.effort ?? triggerSecondaryText) : undefined,
         icon:
-          disabledLabel !== undefined ? undefined : cachedPreview ? (
+          disabledLabel !== undefined ? undefined : selectedUnavailable ? (
+            <span
+              className="flex size-4 shrink-0 items-center justify-center text-amber-700 dark:text-amber-300"
+              data-testid="new-chat-landing-agent-warning"
+            >
+              <TriangleAlertIcon className="size-3.5" aria-hidden="true" />
+            </span>
+          ) : cachedPreview ? (
             <span
               className="flex size-4 shrink-0 items-center justify-center"
               data-testid="new-chat-landing-agent-icon"
