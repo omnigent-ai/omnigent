@@ -107,6 +107,7 @@ class NativeHarnessProvider:
     stop_handler: str | None = None
     materialize_agent_spec: str | None = None  # built-in agent seeding
     bridge_dir: str | None = None  # cost-popup bridge-dir lookup
+    input_ready: str | None = None  # async read-only probe of the resolved spawn env
 
 
 @dataclass(frozen=True)
@@ -296,6 +297,23 @@ def _builtin_native_provider(key: str) -> NativeHarnessProvider:
             f"omnigent.{key}_native.bridge_id" if key in _BRIDGE_ID_LABEL_HARNESSES else None
         ),
         materialize_agent_spec=f"{module}:_materialize_{key}_agent_spec",
+        input_ready=(
+            f"omnigent.runner.native.readiness:{key}"
+            if key
+            in {
+                "claude",
+                "codex",
+                "opencode",
+                "pi",
+                "qwen",
+                "cursor",
+                "kimi",
+                "kiro",
+                "devin",
+                "antigravity",
+            }
+            else None
+        ),
     )
 
 

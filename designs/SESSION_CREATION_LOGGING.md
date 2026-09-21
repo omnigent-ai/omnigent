@@ -44,6 +44,10 @@ server and runner by session and runner IDs, never by request ID alone.
 | `runner_session_init_started` / `runner_session_initialized` / `runner_session_init_failed` | Server or runner | Initialization request, successful response, or exception/non-success response. Cached server initialization does not emit another outcome. |
 | `runner_stream_ready` | Server | The relay received its first heartbeat. Includes both session and runner IDs. |
 | `terminal_started` / `terminal_start_failed` | Runner | Native terminal adapter completed / failed. A started terminal does not prove an interactive input prompt. |
+| `session_runner_ready` | Server | Initialization, current-connection relay readiness, and usable runner input have all been confirmed. |
+| `session_readiness_timeout` | Server | Readiness was not observed within the observer's five-minute budget after initialization; includes the pending stage. The metric still uses the original create-request deadline. |
+| `session_readiness_unavailable` | Server | The runner is older or the native provider has no reliable input probe. This is a measurement gap, not a proven creation failure. |
+| `session_readiness_observation_failed` | Server | The observer itself failed. This is a measurement gap, not a proven creation failure. |
 
 Request completion includes `creation_kind=top_level|child|unknown`, `host_type`,
 and HTTP status. Malformed requests that cannot be classified retain `unknown`.
@@ -64,9 +68,10 @@ minutes**, divided by eligible create requests. Use these rules:
    milestones on **both session and runner ID**, within the create's five-minute
    window and the lifetime of that binding. Do not join all logs sharing either
    ID. A runner can host several sessions, and a session can replace its runner.
-4. Require initialization success and relay readiness for the same binding.
-   Native sessions additionally require a genuine interactive-readiness signal.
-   Do not substitute `terminal_started`, HTTP 201, or a provisioning `ready` stage.
+4. Require `session_runner_ready` for the same binding. The producer checks
+   initialization and a live relay on the same tunnel generation, plus native
+   input readiness where applicable. Do not require every intermediate log row
+   or substitute `terminal_started`, HTTP 201, or a provisioning `ready` stage.
 5. Reduce to one result per create request. Recovery within the deadline can
    succeed despite earlier diagnostic failures. Reconnects/resumes add no create
    request and cannot inflate the denominator. A new HTTP create request is a
@@ -76,13 +81,51 @@ minutes**, divided by eligible create requests. Use these rules:
    failure stage, or `readiness_timeout` when no explicit cause was observed.
    Late readiness does not rewrite the deadline result.
 
-This change supplies the shared correlation and lifecycle milestones. This OSS
-revision does **not** provide a universal `terminal_interactive` event or emit a
-synthetic `session_creation_ready`. Deployments must supply the genuine native
-readiness signal before switching a dashboard to the usable-session metric.
+The portable Databricks query is in `session_creation_success.sql`. It keeps
+requests without a session in the denominator, follows binding lifetimes, and
+suppresses the percentage when an unsuccessful request has an explicit
+measurement gap. It does not silently drop unsupported harnesses or mix the
+old spawn-based denominator into the new series.
+
 Pre-request CLI failures remain outside the server-received denominator.
 Missing logs can resemble startup timeouts; validate delivery and version
 coverage before interpreting this best-effort debug metric as reliability.
+
+## Readiness implementation and coverage
+
+With the server debug sink enabled, successful initialization starts a bounded
+background observer. It establishes/reuses the relay, waits for its heartbeat,
+and polls the runner's read-only `/v1/sessions/{id}/readiness` endpoint once per
+second. Creation and user-message handling do not wait for the observer. A
+successful event is emitted once per session/runner/tunnel generation. The
+observer checks the persisted binding again before emitting, and rejects stale
+responses after disconnect, relay replacement, rebind, or deletion. Server
+shutdown cancels outstanding observers. No new attempt ID is propagated.
+
+The runner records successful initialization and checks the harness process is
+still alive. Native providers additionally supply an optional async `input_ready`
+hook over the resolved spawn environment. Probes do not type into terminals or
+accept trust/authentication prompts. Session deletion and agent reset invalidate
+runner readiness; reconnect probes the existing native process again.
+
+| Provider | Positive evidence |
+| --- | --- |
+| Non-native | Successful session initialization and a still-running harness process. |
+| Claude | Live tmux pane with the existing usable-input-box detector. |
+| Codex | Live app-server handshake and a successful read of the current native thread. |
+| OpenCode | Live server response for the current native session. |
+| Pi | Recent heartbeat from the input poller and a live poller process. Relaunch clears the marker. |
+| Qwen | Live pane and the boot event emitted after its input watcher starts. |
+| Cursor, Kimi, Kiro, Devin, Antigravity | Live pane and the provider's existing input/footer detector. |
+| Goose, Hermes | Unsupported: their current settle heuristics do not establish input readiness. |
+| Community native providers | Unsupported unless the provider declares an `input_ready` hook. |
+
+Old runners return no readiness endpoint and produce
+`session_readiness_unavailable`. Roll out both server and runners before metric
+cutover. TUI detectors remain dependent on the underlying CLI's prompt format;
+validate them against deployed CLI versions. Readiness confirms usable input,
+not that a subsequent model request will succeed or that the browser has rendered
+its first frame.
 
 ## Verification
 
@@ -103,6 +146,13 @@ Try a host with an unconfigured harness: the refusal must include the same
 session and runner IDs as its binding. Resume an existing session: there must
 be no new creation-start event. Check a child session's logs carry its own
 session ID while sharing the parent's runner ID.
+
+Create a supported native session without sending a message. Verify exactly one
+`session_runner_ready` appears after the terminal becomes interactive, with the
+bound session and runner IDs. Delay or fail native startup and confirm there is
+no premature ready event. Reconnect during startup and verify that the previous
+connection's probe cannot mark the replacement ready. An older runner or a
+Goose/Hermes session must report `session_readiness_unavailable`, not success.
 
 ## Migration from message-based dashboards
 

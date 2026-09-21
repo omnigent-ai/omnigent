@@ -1524,9 +1524,28 @@ def create_app(
         host_registry=host_registry,
         host_store=host_store,
     )
+    import httpx
+
+    from omnigent.debug_logging import debug_sink_enabled
+    from omnigent.server.routes._sessions.common import _runner_relay_tasks
+    from omnigent.server.session_readiness import SessionReadinessObserver
+
+    def _start_readiness_relay(session_id: str, runner_id: str, client: httpx.AsyncClient) -> None:
+        from omnigent.server.routes.sessions import _ensure_runner_relay
+
+        _ensure_runner_relay(session_id, runner_id, client, conversation_store)
+
+    session_readiness = SessionReadinessObserver(
+        tunnel_registry,
+        conversation_store,
+        _runner_relay_tasks.get,
+        enabled=debug_sink_enabled,
+        start_relay=_start_readiness_relay,
+    )
     runner_session_initializer = RunnerSessionInitializer(
         tunnel_registry,
         server_version=_server_version(),
+        readiness=session_readiness,
     )
     background_title_coordinator = BackgroundSessionTitleCoordinator(
         conversation_store,
@@ -1781,6 +1800,7 @@ def create_app(
             from omnigent.server.routes.sessions import cancel_managed_launch_tasks
 
             await cancel_managed_launch_tasks()
+            await session_readiness.shutdown()
             await background_title_coordinator.shutdown()
             _uninstall_subagent_block_notifier()
             set_resource_registry(None)
@@ -1815,6 +1835,7 @@ def create_app(
     app.state.tunnel_registry = tunnel_registry
     app.state.runner_router = runner_router
     app.state.runner_session_initializer = runner_session_initializer
+    app.state.session_readiness = session_readiness
     app.state.background_title_coordinator = background_title_coordinator
     app.state.host_registry = host_registry
     app.state.host_store = host_store

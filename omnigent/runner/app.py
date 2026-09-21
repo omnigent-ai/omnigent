@@ -2938,6 +2938,7 @@ def create_runner_app(
         tuple[str, str, str | None, str | None], asyncio.Task[JSONResponse]
     ] = {}
     _recovery_turn_ids: dict[str, set[str]] = {}
+    _session_input_readiness: dict[str, tuple[int, str, dict[str, str]]] = {}
     _session_init_envelopes: dict[str, tuple[float, RunnerSessionInitEnvelope]] = {}
     # session_id → canonical reasoning effort, seeded from the session-init
     # snapshot and updated by ``effort_change``. In-process harnesses learn the
@@ -3919,6 +3920,8 @@ def create_runner_app(
         raw_id = body.get("session_id")
         session_id = raw_id if isinstance(raw_id, str) else None
         with current_session_id_scope(session_id):
+            if session_id is not None:
+                _session_input_readiness.pop(session_id, None)
             _logger.info(
                 "Runner session initialization started",
                 extra=debug_event("runner_session_init_started", stage="session_init"),
@@ -4609,6 +4612,13 @@ def create_runner_app(
                 _background_tasks.add(recovery_task)
             _recovery_turn_ids.setdefault(session_id, set()).add(recovery_id)
 
+
+        if _session_cache_generation_is_current(session_id, spec_cache_generation):
+            _session_input_readiness[session_id] = (
+                spec_cache_generation,
+                harness_name,
+                dict(spawn_env or {}),
+            )
         status = "running" if session_id in _active_turns else "idle"
         return JSONResponse(
             status_code=201,
@@ -4681,6 +4691,50 @@ def create_runner_app(
         return JSONResponse(
             status_code=response.status_code,
             content=json.loads(bytes(response.body)),
+        )
+
+    @app.get("/v1/sessions/{session_id}/readiness")
+    async def session_input_readiness(session_id: str) -> JSONResponse:
+        from omnigent.harness_plugins import native_provider_for_key
+        from omnigent.native.native_dispatch import resolve_hook
+
+        snapshot = _session_input_readiness.get(session_id)
+        if (
+            snapshot is None
+            or process_manager is None
+            or not _session_cache_generation_is_current(session_id, snapshot[0])
+            or not process_manager.session_is_running(session_id)
+        ):
+            return JSONResponse({"initialized": False, "input_ready": False})
+        generation, harness, env = snapshot
+        supported = True
+        input_ready = False
+        native = native_coding_agent_for_harness(harness)
+        if is_native_harness(harness):
+            provider = native_provider_for_key(native.key) if native is not None else None
+            probe = resolve_hook(provider, "input_ready") if provider is not None else None
+            supported = probe is not None
+            if probe is not None:
+                try:
+                    async with asyncio.timeout(4):
+                        input_ready = await probe(env) is True
+                except Exception:  # noqa: BLE001 — optional probes must not affect startup
+                    # A probe is observational; startup and first-message delivery own errors.
+                    input_ready = False
+        else:
+            input_ready = True
+        current = (
+            _session_input_readiness.get(session_id) is snapshot
+            and _session_cache_generation_is_current(session_id, generation)
+            and process_manager.session_is_running(session_id)
+        )
+        return JSONResponse(
+            {
+                "initialized": current,
+                "supported": supported,
+                "input_ready": current and input_ready,
+                "harness": harness,
+            }
         )
 
     @app.get("/v1/sessions/{session_id}/stream")
@@ -4889,6 +4943,7 @@ def create_runner_app(
         # Increment before clearing caches so in-flight fills see a changed
         # generation and discard rather than repopulating entries for a dead
         # (or reborn) session.
+        _session_input_readiness.pop(session_id, None)
         _session_cache_generations[session_id] = _session_cache_generations.get(session_id, 0) + 1
 
         _session_spec_cache.pop(session_id, None)
@@ -12171,6 +12226,7 @@ def create_runner_app(
         _session_agent_ids.pop(session_id, None)
         _session_harness_overrides.pop(session_id, None)
         # Bump so any in-flight fill discards its write rather than reinstating it.
+        _session_input_readiness.pop(session_id, None)
         _session_cache_generations[session_id] = _session_cache_generations.get(session_id, 0) + 1
         _session_snapshot_cache.pop(session_id, None)
         _session_skills_cache.pop(session_id, None)

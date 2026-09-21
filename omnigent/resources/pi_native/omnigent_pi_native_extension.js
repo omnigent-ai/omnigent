@@ -1139,7 +1139,20 @@ function startInboxPoller(
   // re-read+re-throw the same file forever (the turn is already reported done).
   const deliverAttempts = new Map();
   const MAX_DELIVER_ATTEMPTS = 5;
+  let lastReadinessHeartbeat = 0;
   pi.__omnigentInboxPoller = setInterval(() => {
+    const now = Date.now();
+    if (now - lastReadinessHeartbeat >= 1000) {
+      try {
+        fs.writeFileSync(
+          path.join(config.inboxDir, "..", "input-ready"),
+          JSON.stringify({ pid: process.pid, at: now }),
+        );
+        lastReadinessHeartbeat = now;
+      } catch (_err) {
+        // Readiness observation must not interfere with input delivery.
+      }
+    }
     let files = [];
     try {
       files = fs

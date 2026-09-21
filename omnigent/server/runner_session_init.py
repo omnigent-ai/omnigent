@@ -15,6 +15,7 @@ from omnigent.runner.session_init_protocol import build_runner_session_init_payl
 
 if TYPE_CHECKING:
     from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
+    from omnigent.server.session_readiness import SessionReadinessObserver
 
 
 def runner_inference_verified(conversation: Conversation, response: httpx.Response) -> bool:
@@ -36,7 +37,14 @@ _logger = logging.getLogger(__name__)
 class RunnerSessionInitializer:
     """Share initialization readiness within one runner tunnel generation."""
 
-    def __init__(self, registry: TunnelRegistry, *, server_version: str) -> None:
+    def __init__(
+        self,
+        registry: TunnelRegistry,
+        *,
+        server_version: str,
+        readiness: SessionReadinessObserver | None = None,
+    ) -> None:
+        self._readiness = readiness
         self._registry = registry
         self._server_version = server_version
         self._tasks: dict[
@@ -126,6 +134,12 @@ class RunnerSessionInitializer:
             )
         if response.status_code >= 400 and self._tasks.get(key) is task:
             self._tasks.pop(key, None)
+        if (
+            200 <= response.status_code < 300
+            and self._readiness is not None
+            and connection is not None
+        ):
+            self._readiness.initialized(conversation, runner_client, connection)
         return response
 
     def invalidate_session(self, session_id: str) -> None:
@@ -190,6 +204,9 @@ class RunnerSessionInitializer:
         for key in list(self._recovery_ids):
             if key[0] == runner_id:
                 self._recovery_ids.pop(key)
+
+        if self._readiness is not None:
+            self._readiness.invalidate_runner(runner_id)
         stale = [key for key in self._tasks if key[0] == runner_id]
         for key in stale:
             task = self._tasks.pop(key)

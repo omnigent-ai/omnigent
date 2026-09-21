@@ -144,6 +144,9 @@ class FakeProcessManager:
     def has_session(self, conversation_id: str) -> bool:
         return conversation_id in self._clients
 
+    def session_is_running(self, conversation_id: str) -> bool:
+        return conversation_id in self._clients
+
     def has_active_turn(self, conversation_id: str) -> bool:
         return conversation_id in self._in_flight
 
@@ -1981,3 +1984,40 @@ async def test_parent_reconnect_restores_interrupted_child_on_old_runner(
         )
         assert store.get_conversation(child.id).runner_id == _RUNNER_ID
         assert store.get_conversation(finished.id).runner_id == child_runner
+
+
+@pytest.mark.asyncio
+async def test_readiness_without_first_message_crosses_real_tunnel(
+    tunnel_three_layer_stack: _TunnelStack,
+) -> None:
+    from tests.debug_log_helpers import capture_debug_rows
+
+    stack = tunnel_three_layer_stack
+    observer = stack.ap_app.state.session_readiness
+    observer._enabled = lambda: True
+    observer._poll_interval = 0.01
+    try:
+        with capture_debug_rows("server") as rows:
+            created = await stack.ap_client.post(
+                "/v1/sessions",
+                data={"metadata": json.dumps({})},
+                files={
+                    "bundle": ("agent.tar.gz", _build_harness_agent_bundle(), "application/gzip")
+                },
+            )
+            assert created.status_code == 201, created.text
+            session_id = created.json()["session_id"]
+            bound = await stack.ap_client.patch(
+                f"/v1/sessions/{session_id}",
+                json={"runner_id": _RUNNER_ID},
+            )
+            assert bound.status_code == 200, bound.text
+            observation = observer._observations[session_id]
+            await asyncio.wait_for(asyncio.shield(observation.task), budget(5.0))
+        ready = [row for row in rows if row["event_name"] == "session_runner_ready"]
+        assert len(ready) == 1
+        assert ready[0]["session_id"] == session_id
+        assert ready[0]["attributes"]["runner_id"] == _RUNNER_ID
+        assert stack.fake_pm._in_flight == {}
+    finally:
+        await observer.shutdown()

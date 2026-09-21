@@ -702,8 +702,16 @@ def register_core_routes(
                         resp.id,
                         exc_info=True,
                     )
+            observer = getattr(request.app.state, "session_readiness", None)
+            connection = observer.connection_for(conv.runner_id) if observer is not None else None
             try:
-                await _rc.post("/v1/sessions", json=init_body, timeout=10.0)
+                init_response = await _rc.post("/v1/sessions", json=init_body, timeout=10.0)
+                if (
+                    observer is not None
+                    and connection is not None
+                    and 200 <= init_response.status_code < 300
+                ):
+                    observer.initialized(conv, _rc, connection)
             except (httpx.HTTPError, ConnectionError):
                 _logger.warning(
                     "Failed to notify runner about session %s",
@@ -2417,6 +2425,10 @@ def register_core_routes(
                     # from the spec, and the recovery turn that executes seeded
                     # initial_items ran on the spec's harness. Recovery stays
                     # enabled: on rebind it is what runs the pending kickoff.
+                    observer = getattr(request.app.state, "session_readiness", None)
+                    connection = (
+                        observer.connection_for(runner_id) if observer is not None else None
+                    )
                     try:
                         runner_init_resp = await _runner_client.post(
                             "/v1/sessions",
@@ -2426,6 +2438,12 @@ def register_core_routes(
                             ),
                             timeout=10.0,
                         )
+                        if (
+                            observer is not None
+                            and connection is not None
+                            and 200 <= runner_init_resp.status_code < 300
+                        ):
+                            observer.initialized(conv, _runner_client, connection)
                     except (httpx.HTTPError, ConnectionError):
                         # ConnectionError covers a tunnel close mid-POST
                         # (same source as the relay's except clause).

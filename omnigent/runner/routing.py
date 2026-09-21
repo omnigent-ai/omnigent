@@ -236,6 +236,10 @@ class RunnerRouter:
         """
         return await self._registry.wait_for_runner(runner_id, timeout_s=timeout_s) is not None
 
+    def runner_connection(self, runner_id: str) -> RunnerSession | None:
+        """Return the current tunnel generation for lifecycle fencing."""
+        return self._registry.get(runner_id)
+
     def runner_owner(self, runner_id: str) -> str | None:
         """
         Return the authenticated owner of *runner_id*, or ``None``.

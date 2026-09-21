@@ -1527,3 +1527,38 @@ async def test_relay_does_not_fail_turn_during_server_shutdown(
         sessions_module._runner_relay_tasks.clear()
         sessions_module._session_status_cache.pop(session_id, None)
         session_stream.close(session_id)
+
+
+@pytest.mark.asyncio
+async def test_relay_replaced_for_new_connection_of_same_runner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import Mock
+
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import orchestration
+
+    router = Mock()
+    router.runner_connection.return_value = object()
+    monkeypatch.setattr(orchestration, "get_server_runner_router", lambda: router)
+    release = asyncio.Event()
+    runner = _HeartbeatRunnerClient(release)
+    session_id = "connection-generation-test"
+    first = second = None
+    try:
+        first = sessions_module._ensure_runner_relay(session_id, "runner", runner)  # type: ignore[arg-type]
+        assert first is not None
+        await asyncio.wait_for(first.ready.wait(), 1)
+        router.runner_connection.return_value = object()
+        second = sessions_module._ensure_runner_relay(session_id, "runner", runner)  # type: ignore[arg-type]
+        assert second is not None and second is not first
+        assert not second.ready.is_set()
+        await asyncio.wait_for(second.ready.wait(), 1)
+        await asyncio.gather(first.task, return_exceptions=True)
+        assert not first.ready.is_set()
+    finally:
+        for handle in (first, second):
+            if handle is not None:
+                handle.task.cancel()
+                await asyncio.gather(handle.task, return_exceptions=True)
+        sessions_module._runner_relay_tasks.pop(session_id, None)
