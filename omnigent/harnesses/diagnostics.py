@@ -23,7 +23,7 @@ def sanitize_diagnostic_text(text: str) -> str:
     cleaned = "".join(
         char for char in text if char in "\n\r" or unicodedata.category(char) not in {"Cc", "Cf"}
     ).rstrip()
-    return redact_log_text(cleaned)
+    return redact_log_text(cleaned, include_whitespace_credentials=True)
 
 
 def bounded_diagnostic_tail(entries: list[str]) -> dict[str, object]:

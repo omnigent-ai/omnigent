@@ -350,3 +350,48 @@ async def test_blocked_diagnostic_io_leaves_loop_responsive_and_drains_after_pol
     assert order == ["poll", "close"]
     assert all(thread != loop_thread for thread in worker_threads)
     follower.close.assert_called_once_with("active-session")
+
+
+async def test_direct_collector_cancellation_serializes_close_and_preserves_original_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv(HARNESS_STDERR_ENABLED_ENV_VAR, "1")
+    loop = asyncio.get_running_loop()
+    polling = asyncio.Event()
+    release = threading.Event()
+    order: list[str] = []
+
+    def poll(_session_id: str) -> None:
+        loop.call_soon_threadsafe(polling.set)
+        if not release.wait(timeout=3):
+            raise TimeoutError("test did not release diagnostic I/O")
+        order.append("poll")
+
+    follower = SimpleNamespace(
+        poll=Mock(side_effect=poll), close=Mock(side_effect=lambda _session: order.append("close"))
+    )
+    monkeypatch.setattr(forwarder, "ClaudeDebugLogFollower", lambda _path: follower)
+    original_error = RuntimeError("forwarding failed after diagnostic cancellation")
+
+    with pytest.raises(RuntimeError) as raised:
+        async with forwarder._forward_claude_diagnostics(tmp_path, "cancel-inner", 60):
+            try:
+                await asyncio.wait_for(polling.wait(), timeout=1)
+                collector = next(
+                    task
+                    for task in asyncio.all_tasks()
+                    if task.get_name() == "claude-diagnostics-cancel-inner"
+                )
+                collector.cancel()
+                with pytest.raises(TimeoutError):
+                    await asyncio.wait_for(asyncio.shield(collector), timeout=0.05)
+                follower.close.assert_not_called()
+            finally:
+                release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await collector
+            raise original_error
+
+    assert raised.value is original_error
+    assert order == ["poll", "close"]
+    follower.close.assert_called_once_with("cancel-inner")

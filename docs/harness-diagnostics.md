@@ -20,10 +20,11 @@ remain unchanged.
 ## Content and destinations
 
 Enabled capture retains diagnostic text, including tracebacks and request or
-response context. It applies the same known credential-pattern redaction as
-other Omnigent process logs and removes terminal control codes. It does not
-filter prompts or payloads by content; configure capture only where this text
-is appropriate for the deployment's log storage and readers.
+response context. It applies known credential-pattern redaction, including
+whitespace-delimited values after explicit credential labels, and removes
+terminal control codes. It does not filter prompts or payloads by content;
+configure capture only where this text is appropriate for the deployment's log
+storage and readers.
 
 The captured text appears in the owning process's ordinary local logs, including
 runner logs under `~/.omnigent/logs/runner/`, and in structured event attributes.
@@ -110,10 +111,17 @@ Each poll reads at most 64 KiB. Partial records are buffered until a newline;
 records over 1 MiB are omitted with counts, then collection resumes at the next
 newline. Known credential redaction runs on assembled records before export
 clipping. Rotation drains the old inode before following the replacement;
-truncation resets the read offset. Reattaching a forwarder starts reading the
-owned file from the beginning and can repeat earlier diagnostics. If a rotated
-predecessor already exists on attachment, its size is reported as omitted bytes
-without replaying it. Counts cannot reconstruct files already removed by Claude.
+Claude normally rotates by renaming the file. Truncation is detected only when
+the observed file size falls below the read offset, which resets the offset and
+discards any buffered partial record. If the same inode is truncated and regrows
+to the offset or beyond between polls, the truncation is not detected: new bytes
+before the offset can be skipped, and a buffered old partial record can be joined
+with new output.
+
+Reattaching a forwarder starts reading the owned file from the beginning and can
+repeat earlier diagnostics. If a rotated predecessor already exists on
+attachment, its size is reported as omitted bytes without replaying it. Counts
+cannot reconstruct files already removed by Claude.
 
 Shutdown, cancellation, and terminal-launch failure drain at most 256 KiB.
 Shutdown lets an in-flight poll finish before closing and draining the file.

@@ -10,8 +10,9 @@ import json
 import logging
 import os
 import tempfile
+import threading
 import time
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
@@ -1053,16 +1054,22 @@ async def _forward_claude_diagnostics(
             return session_id
 
     stop = asyncio.Event()
+    follower_lock = threading.Lock()
+
+    def run_serialized(operation: Callable[[str], None]) -> None:
+        # Cancelling an await cannot stop its worker thread.
+        with follower_lock:
+            operation(active_session_id())
 
     async def poll() -> None:
         try:
             while not stop.is_set():
-                await asyncio.to_thread(lambda: follower.poll(active_session_id()))
+                await asyncio.to_thread(run_serialized, follower.poll)
                 with contextlib.suppress(TimeoutError):
                     await asyncio.wait_for(stop.wait(), timeout=poll_interval_s)
         finally:
             with contextlib.suppress(Exception):
-                await asyncio.to_thread(lambda: follower.close(active_session_id()))
+                await asyncio.shield(asyncio.to_thread(run_serialized, follower.close))
 
     task = asyncio.create_task(poll(), name=f"claude-diagnostics-{session_id}")
     try:
@@ -1071,8 +1078,13 @@ async def _forward_claude_diagnostics(
         stop.set()
         # Let an in-flight thread finish before closing its descriptor. A second
         # caller cancellation may return early, but the shielded task still drains.
-        with contextlib.suppress(Exception):
-            await asyncio.shield(task)
+        try:
+            with contextlib.suppress(Exception):
+                await asyncio.shield(task)
+        except asyncio.CancelledError:
+            # A separately cancelled collector must not replace the caller's error.
+            if not task.cancelled():
+                raise
 
 
 async def forward_claude_transcript_to_session(

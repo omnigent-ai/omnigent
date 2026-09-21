@@ -255,7 +255,7 @@ def test_uses_shared_credential_redaction_without_dropping_diagnostics(
 def test_whitespace_credentials_are_redacted_in_text_and_serialized_rows(
     capture_stderr: None, diagnostic: str, secret: str, expected: str
 ) -> None:
-    """Snapshots and both log sinks share redaction without changing diagnostic context."""
+    """Diagnostic sanitization removes credentials before snapshots reach either log sink."""
     context = "ERROR token refresh failed; api key is missing; DATABASE_PASSWORD is missing"
     entries = [diagnostic, context]
     snapshot = collect_codex_startup_diagnostics(_server(entries))
@@ -266,17 +266,18 @@ def test_whitespace_credentials_are_redacted_in_text_and_serialized_rows(
     assert snapshot["stderr_tail_truncated"] is False
     assert entries == [diagnostic, context]
 
+    tail = snapshot["stderr_tail"]
     record = logging.LogRecord(
-        "omnigent.runner", logging.ERROR, __file__, 1, "startup failed: %s", (diagnostic,), None
+        "omnigent.runner", logging.ERROR, __file__, 1, "startup failed: %s", (tail,), None
     )
-    record.exc_text = f"ValueError: {diagnostic}"
+    record.exc_text = f"ValueError: {tail}"
     record.attributes = snapshot
     text = RedactingLogFormatter(fmt="%(message)s", use_colors=False).format(record)
-    assert text == f"startup failed: {expected}\nValueError: {expected}"
+    assert text == f"startup failed: {expected_tail}\nValueError: {expected_tail}"
 
     row = record_to_row(record, source="runner")
-    assert row["message"] == f"startup failed: {expected}"
-    assert row["stack_trace"] == f"ValueError: {expected}"
+    assert row["message"] == f"startup failed: {expected_tail}"
+    assert row["stack_trace"] == f"ValueError: {expected_tail}"
     attributes = row["attributes"]
     assert isinstance(attributes, dict)
     assert attributes["stderr_tail"] == expected_tail

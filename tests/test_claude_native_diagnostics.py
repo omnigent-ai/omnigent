@@ -284,6 +284,40 @@ def test_truncation_discards_incomplete_old_record(
     assert [event["text"] for event in _events(caplog)] == ["first", "new"]
 
 
+@pytest.mark.parametrize(
+    ("replacement", "expected"),
+    [
+        pytest.param(b"new-record\n", "old-partial", id="equal-regrowth-skips-new-record"),
+        pytest.param(
+            b"new-record-ABCDEFGHIJ\n",
+            "old-partialABCDEFGHIJ",
+            id="larger-regrowth-joins-old-partial",
+        ),
+    ],
+)
+def test_same_inode_truncate_and_regrow_at_or_past_cursor_is_not_detected(
+    capture_file: Path,
+    caplog: pytest.LogCaptureFixture,
+    replacement: bytes,
+    expected: str,
+) -> None:
+    """Only observed shrink resets the cursor; regrowth can skip or join records."""
+    capture_file.write_bytes(b"old-partial")
+    original = capture_file.stat()
+    follower = diagnostics.ClaudeDebugLogFollower(capture_file.parent)
+    follower.poll("conv_test")
+    assert not _events(caplog)
+
+    capture_file.write_bytes(replacement)
+    regrown = capture_file.stat()
+    assert regrown.st_ino == original.st_ino
+    assert regrown.st_size >= original.st_size
+    follower.poll("conv_test")
+    follower.close("conv_test")
+
+    assert [event["text"] for event in _events(caplog)] == [expected]
+
+
 def test_new_launch_never_combines_or_exports_previous_pending_record(
     capture_file: Path, caplog: pytest.LogCaptureFixture
 ) -> None:

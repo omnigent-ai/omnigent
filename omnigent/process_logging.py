@@ -163,11 +163,12 @@ def _replace_named_secret(match: re.Match[str]) -> str:
     return match.group(1) + replacement
 
 
-def redact_log_text(text: str) -> str:
-    """Replace secret- and token-shaped substrings in log text."""
+def redact_log_text(text: str, *, include_whitespace_credentials: bool = False) -> str:
+    """Redact secrets, optionally including ambiguous whitespace labels in diagnostics."""
     text = _AUTHORIZATION_PATTERN.sub(_replace_named_secret, text)
     text = _NAMED_SECRET_PATTERN.sub(_replace_named_secret, text)
-    text = _WHITESPACE_SECRET_PATTERN.sub(_replace_named_secret, text)
+    if include_whitespace_credentials:
+        text = _WHITESPACE_SECRET_PATTERN.sub(_replace_named_secret, text)
     for pattern in _SECRET_PATTERNS:
         text = pattern.sub(
             lambda match: match.group(1) + _REDACTED if match.lastindex else _REDACTED,
