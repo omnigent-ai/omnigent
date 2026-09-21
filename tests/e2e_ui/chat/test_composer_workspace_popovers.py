@@ -169,7 +169,9 @@ def test_composer_workspace_labels_use_available_width(
             right: bounds.right,
             bottom: bounds.bottom,
             viewport: window.innerWidth,
-            items: [...bar.querySelectorAll('[data-testid="composer-workspace-dir"], [data-testid="composer-git-branch"]')].map(item => {
+            items: [...bar.querySelectorAll(
+              '[data-testid="composer-workspace-dir"], [data-testid="composer-git-branch"]',
+            )].map(item => {
               const itemBounds = item.getBoundingClientRect();
               const label = item.querySelector('span.truncate');
               return {
