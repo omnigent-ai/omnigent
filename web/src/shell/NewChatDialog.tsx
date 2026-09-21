@@ -18,8 +18,6 @@ import {
 import { ComposerAddMenu } from "@/components/composer/ComposerAddMenu";
 import { ComposerSettingsButton } from "@/components/composer/ComposerSettingsButton";
 import { ComposerRepositorySelector } from "@/components/composer/ComposerRepositorySelector";
-import { McpContextSelector } from "@/components/composer/McpContextSelector";
-import { mcpContextOptionsFromServers } from "@/components/composer/mcpContextOptions";
 import {
   COMPOSER_HARNESS_MENU_SIZE,
   PickerSectionHeader,
@@ -97,7 +95,6 @@ import { backgroundSessionTitlesRequestHeaders } from "@/lib/backgroundSessionTi
 import { fetchGithubBranches, fetchGithubRepos, type GithubRepo } from "@/lib/githubIntegration";
 import type {
   ComposerContextResourceState,
-  ComposerMcpSelection,
   ComposerRepositorySelection,
 } from "@/lib/composerContext";
 import {
@@ -2522,7 +2519,6 @@ export function NewChatLandingScreen() {
     sandboxReposLoading,
   ]);
   const [workspace, setWorkspace] = useState<string>(() => restoredDraft?.workspace ?? "");
-  const [mcpContextSelections, setMcpContextSelections] = useState<ComposerMcpSelection[]>([]);
   // Source tracking for the create's field-omission contract: true while the
   // slot's value is the untouched seed the project-prefill effect wrote from
   // the config. ANY other write — a picker selection, browsing, a host
@@ -2657,19 +2653,7 @@ export function NewChatLandingScreen() {
   // landing, so the hotkey bumps a nonce the picker opens on.
   const [modelPickerOpenNonce, setModelPickerOpenNonce] = useState(0);
   const [contextSettingsOpen, setContextSettingsOpen] = useState(false);
-  const [mcpSelectorOpen, setMcpSelectorOpen] = useState(false);
   useModelPickerHotkey(() => setModelPickerOpenNonce((n) => n + 1));
-  const mcpOptions = useMemo(
-    () => mcpContextOptionsFromServers(pendingAgent?.mcpServers ?? []),
-    [pendingAgent?.mcpServers],
-  );
-  const mcpResource = useMemo<ComposerContextResourceState<readonly (typeof mcpOptions)[number][]>>(
-    () =>
-      pendingAgent
-        ? { status: "ready", data: mcpOptions, error: null }
-        : { status: "unavailable", data: null, error: null },
-    [mcpOptions, pendingAgent],
-  );
 
   // Mirror the current draft fields into a ref every render so the unmount
   // cleanup below can snapshot the latest values without re-subscribing.
@@ -4507,14 +4491,12 @@ export function NewChatLandingScreen() {
         url: repository.url,
         branch: repository.branch.trim() || null,
       })),
-      mcpContext: mcpContextSelections,
     });
   }, [
     activeWorktree,
     baseBranch,
     branchName,
     setComposerContextState,
-    mcpContextSelections,
     sandboxRepoSelections,
     shouldCreateWorktree,
     startInExistingWorktree,
@@ -7007,7 +6989,7 @@ export function NewChatLandingScreen() {
               <DialogHeader>
                 <DialogTitle>Advanced settings</DialogTitle>
                 <DialogDescription>
-                  Choose repository and MCP context for this session.
+                  Choose repository context and configure the model and effort for this session.
                 </DialogDescription>
               </DialogHeader>
               <div className="flex min-w-0 flex-col gap-4">
@@ -7026,17 +7008,6 @@ export function NewChatLandingScreen() {
                     }
                     disabled={creating}
                     ariaLabel="Repository context"
-                  />
-                </div>
-                <div className="flex min-w-0 flex-col gap-1.5">
-                  <label className="text-sm font-medium text-foreground">MCP context</label>
-                  <McpContextSelector
-                    open={mcpSelectorOpen}
-                    onOpenChange={setMcpSelectorOpen}
-                    resource={mcpResource}
-                    value={mcpContextSelections}
-                    onChange={setMcpContextSelections}
-                    disabled={creating}
                   />
                 </div>
                 <Button

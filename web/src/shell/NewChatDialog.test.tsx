@@ -9605,6 +9605,15 @@ describe("NewChatLandingScreen bundle-agent Smart Routing", () => {
         }),
       );
       expect(body.labels["omnigent.composer_context.v1.0"]).toBeTypeOf("string");
+      const composerContextMetadata = JSON.parse(
+        Object.entries(body.labels)
+          .filter(([key]) => key.startsWith("omnigent.composer_context.v1."))
+          .sort(([left], [right]) => left.localeCompare(right))
+          .map(([, value]) => value)
+          .join(""),
+      );
+      expect(composerContextMetadata).not.toHaveProperty("mcp_context");
+      expect(composerContextMetadata).toHaveProperty("repositories");
       expect(body.terminal_launch_args).toBeUndefined();
       // A bundle agent arms at create and routes on the first message event —
       // its harness isn't decided yet, so there is nothing to route here.

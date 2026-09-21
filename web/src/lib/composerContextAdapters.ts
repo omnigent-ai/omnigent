@@ -2,7 +2,6 @@ import {
   EMPTY_COMPOSER_CONTEXT,
   normalizeComposerContextState,
   type ComposerContextState,
-  type ComposerMcpSelection,
   type ComposerRepositorySelection,
   type WorkingDirectorySelection,
   type WorktreeSelection,
@@ -16,7 +15,6 @@ export interface ComposerContextMetadataV1 {
     | { mode: "existing"; path: string; branch: string }
     | { mode: "new"; branch_name: string; base_branch: string | null };
   repositories: { id: string; url: string; branch: string | null }[];
-  mcp_context: { id: string; server_name: string }[];
 }
 
 export const COMPOSER_CONTEXT_LABEL_KEY = "omnigent.composer_context.v1";
@@ -67,10 +65,6 @@ export function composerContextToMetadata(state: ComposerContextState): Composer
     working_directory: workingDirectoryToMetadata(normalized.workingDirectory),
     worktree: worktreeToMetadata(normalized.worktree),
     repositories: normalized.repositories.map((repository) => ({ ...repository })),
-    mcp_context: normalized.mcpContext.map(({ id, serverName }) => ({
-      id,
-      server_name: serverName,
-    })),
   };
 }
 
@@ -96,10 +90,6 @@ export function composerContextFromMetadata(
     workingDirectory: metadataWorkingDirectory(metadata.working_directory),
     worktree: metadataWorktree(metadata.worktree),
     repositories: metadata.repositories.map((repository) => ({ ...repository })),
-    mcpContext: metadata.mcp_context.map(({ id, server_name }) => ({
-      id,
-      serverName: server_name,
-    })),
   });
 }
 
@@ -192,4 +182,4 @@ export function composerContextFromCreateSession(
   return composerContextFromMetadata(value.metadata);
 }
 
-export type ComposerContextSelection = ComposerRepositorySelection | ComposerMcpSelection;
+export type ComposerContextSelection = ComposerRepositorySelection;

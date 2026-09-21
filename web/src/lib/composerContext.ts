@@ -11,16 +11,10 @@ export interface ComposerRepositorySelection {
   branch: string | null;
 }
 
-export interface ComposerMcpSelection {
-  id: string;
-  serverName: string;
-}
-
 export interface ComposerContextState {
   workingDirectory: WorkingDirectorySelection;
   worktree: WorktreeSelection;
   repositories: ComposerRepositorySelection[];
-  mcpContext: ComposerMcpSelection[];
 }
 
 export type ComposerContextResourceState<T> =
@@ -34,7 +28,6 @@ export const EMPTY_COMPOSER_CONTEXT: ComposerContextState = {
   workingDirectory: { kind: "unset" },
   worktree: { kind: "none" },
   repositories: [],
-  mcpContext: [],
 };
 
 export function isAbsoluteComposerPath(path: string): boolean {
@@ -94,8 +87,5 @@ export function normalizeComposerContextState(
         branch: repository.branch?.trim() || null,
       }))
       .filter((repository) => repository.url !== ""),
-    mcpContext: stableUnique(state.mcpContext)
-      .map((server) => ({ ...server, serverName: server.serverName.trim() }))
-      .filter((server) => server.serverName !== ""),
   };
 }

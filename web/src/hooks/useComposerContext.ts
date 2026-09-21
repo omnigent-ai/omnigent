@@ -4,7 +4,6 @@ import {
   EMPTY_COMPOSER_CONTEXT,
   normalizeComposerContextState,
   type ComposerContextState,
-  type ComposerMcpSelection,
   type ComposerRepositorySelection,
   type WorkingDirectoryGitState,
   type WorkingDirectorySelection,
@@ -58,17 +57,11 @@ export function useComposerContext({
       update((current) => ({ ...current, repositories })),
     [update],
   );
-  const setMcpContext = useCallback(
-    (mcpContext: ComposerMcpSelection[]) => update((current) => ({ ...current, mcpContext })),
-    [update],
-  );
-
   return {
     state,
     setState: update,
     setWorkingDirectory,
     setWorktree,
     setRepositories,
-    setMcpContext,
   };
 }

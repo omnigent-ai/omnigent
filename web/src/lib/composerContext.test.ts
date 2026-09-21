@@ -18,10 +18,6 @@ const state: ComposerContextState = {
     { id: "primary", url: "https://github.com/acme/app.git", branch: "main" },
     { id: "docs", url: "https://github.com/acme/docs.git", branch: null },
   ],
-  mcpContext: [
-    { id: "github", serverName: "github" },
-    { id: "linear", serverName: "linear" },
-  ],
 };
 
 describe("composer context", () => {
@@ -34,10 +30,8 @@ describe("composer context", () => {
     const normalized = normalizeComposerContextState({
       ...state,
       repositories: [state.repositories[1], state.repositories[0], state.repositories[1]],
-      mcpContext: [state.mcpContext[1], state.mcpContext[0], state.mcpContext[1]],
     });
     expect(normalized.repositories.map(({ id }) => id)).toEqual(["docs", "primary"]);
-    expect(normalized.mcpContext.map(({ id }) => id)).toEqual(["linear", "github"]);
   });
 
   it("round-trips persisted metadata including intentional empty selections", () => {
@@ -47,7 +41,6 @@ describe("composer context", () => {
       workingDirectory: { kind: "unset" },
       worktree: { kind: "none" },
       repositories: [],
-      mcpContext: [],
     });
     expect(composerContextFromMetadata(composerContextToMetadata(empty))).toEqual(empty);
   });
@@ -63,8 +56,18 @@ describe("composer context", () => {
       workingDirectory: { kind: "unset" },
       worktree: { kind: "none" },
       repositories: [],
-      mcpContext: [],
     });
+  });
+
+  it("does not serialize or hydrate legacy MCP context metadata", () => {
+    const metadata = composerContextToMetadata(state);
+    expect(metadata).not.toHaveProperty("mcp_context");
+    expect(
+      composerContextFromMetadata({
+        ...metadata,
+        mcp_context: [{ id: "github", server_name: "github" }],
+      } as typeof metadata),
+    ).toEqual(state);
   });
 
   it("uses existing external create-session workspace and git shapes", () => {

@@ -14,14 +14,12 @@ describe("useComposerContext", () => {
       result.current.setRepositories([
         { id: "repo", url: "git@example.com:repo.git", branch: null },
       ]);
-      result.current.setMcpContext([{ id: "github", serverName: "github" }]);
     });
 
     expect(result.current.state).toEqual({
       workingDirectory: { kind: "selected", path: "/repo" },
       worktree: { kind: "new", branchName: "feature", baseBranch: null },
       repositories: [{ id: "repo", url: "git@example.com:repo.git", branch: null }],
-      mcpContext: [{ id: "github", serverName: "github" }],
     });
     expect(onChange).toHaveBeenLastCalledWith(result.current.state);
   });
@@ -34,7 +32,6 @@ describe("useComposerContext", () => {
             workingDirectory: { kind: "selected", path: "/repo" },
             worktree: { kind: "new", branchName: "feature", baseBranch: null },
             repositories: [],
-            mcpContext: [],
           },
           workingDirectoryGitState: gitState,
         }),
