@@ -313,7 +313,9 @@ def _poll_for_assistant_marker(
     :param timeout: Max seconds to wait for the response.
     :returns: The matching assistant message text.
     :raises AssertionError: If no assistant message contains *marker*
-        within *timeout* (the dropped-first-message regression).
+        within *timeout* (the dropped-first-message regression), or as soon
+        as the session reports the turn ``failed`` — carrying its
+        ``last_task_error`` so the terminal's last output is in the report.
     """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -323,6 +325,12 @@ def _poll_for_assistant_marker(
                 text = _assistant_text(item)
                 if marker in text:
                     return text
+        session = client.get(f"/v1/sessions/{session_id}")
+        if session.status_code == 200 and session.json().get("status") == "failed":
+            raise AssertionError(
+                f"The turn failed before any assistant message contained {marker!r}: "
+                f"{session.json().get('last_task_error')!r}"
+            )
         time.sleep(POLL_INTERVAL_S)
     raise AssertionError(
         f"No assistant message containing {marker!r} within {timeout}s — "
@@ -393,6 +401,86 @@ def test_claude_native_first_message_survives_terminal_boot(
                 marker=marker,
                 # Generous: shim sleep + Claude boot + a real LLM turn.
                 timeout=180.0,
+            )
+            assert marker in text, f"marker {marker!r} missing from response: {text!r}"
+        finally:
+            daemon.send_signal(signal.SIGTERM)
+            try:
+                daemon.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                daemon.kill()
+                daemon.wait()
+
+
+def test_claude_native_first_message_survives_project_mcp_approval_gate(
+    live_server: str,
+    http_client: httpx.Client,
+    tmp_path: Path,
+) -> None:
+    """
+    A workspace with an unapproved ``.mcp.json`` still answers the first message.
+
+    Claude Code shows a blocking "New MCP server found in this project" dialog
+    the first time it runs in a directory whose ``.mcp.json`` it has not
+    approved, and every per-session worktree is such a directory. The dialog
+    fires no hook and replaces the input box, so without the pre-approval in
+    ``build_hook_settings`` the readiness gate waits out its slow-boot cap,
+    the turn fails, and the pane is reaped: the marker never arrives and the
+    session reports ``failed``.
+
+    The boot-delay shim pins that stall. On a warm machine Claude renders the
+    dialog before the runner's first inject arrives, and the composer reclaim
+    then Escapes it: the message lands but the project's servers are silently
+    rejected, which this marker cannot see. With the shim the inject lands
+    during boot, Claude comes up on the dialog afterwards, and the gate has
+    nothing to reclaim — unfixed, the turn fails; fixed, no dialog appears.
+    """
+    workspace = tmp_path / "cn_mcp_ws"
+    workspace.mkdir()
+    (workspace / ".mcp.json").write_text(
+        json.dumps({"mcpServers": {"e2e-noop": {"command": "cat"}}})
+    )
+    marker = f"MCPGATE_{uuid.uuid4().hex[:6].upper()}"
+
+    with _workspace_trusted_in_claude_config(workspace):
+        daemon = _spawn_host_daemon_with_claude_shim(tmp_path=tmp_path, live_server=live_server)
+        try:
+            host_id = _online_host_id(http_client, timeout=30.0)
+            agent_id = _claude_native_agent_id(http_client)
+
+            create = http_client.post(
+                "/v1/sessions",
+                json={"agent_id": agent_id, "host_id": host_id, "workspace": str(workspace)},
+                timeout=60.0,
+            )
+            create.raise_for_status()
+            session_id = create.json()["id"]
+
+            event = http_client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={
+                    "type": "message",
+                    "data": {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": f"Reply with exactly one word: {marker}",
+                            }
+                        ],
+                    },
+                },
+                timeout=30.0,
+            )
+            event.raise_for_status()
+
+            text = _poll_for_assistant_marker(
+                http_client,
+                session_id=session_id,
+                marker=marker,
+                # Past the readiness gate's 180 s slow-boot cap, so an unfixed
+                # build fails on the authentic ``failed`` turn, not on this poll.
+                timeout=240.0,
             )
             assert marker in text, f"marker {marker!r} missing from response: {text!r}"
         finally:
