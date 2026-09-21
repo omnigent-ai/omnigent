@@ -38,6 +38,12 @@ fun buildProperty(key: String): String? =
 
 val appVersionCode = buildProperty("versionCode")?.toIntOrNull() ?: 9
 val appVersionName = buildProperty("versionName") ?: "0.1.3"
+val databricksOAuthClientId = buildProperty("databricksOAuthClientId") ?: ""
+val databricksOAuthRedirectUrl =
+    buildProperty("databricksOAuthRedirectUrl") ?: "https://login.databricks.com/mobile-redirect"
+
+fun quotedBuildConfig(value: String): String =
+    "\"${value.replace("\\", "\\\\").replace("\"", "\\\"")}\""
 
 android {
     namespace = "ai.omnigent.android"
@@ -49,6 +55,16 @@ android {
         targetSdk = 36
         versionCode = appVersionCode
         versionName = appVersionName
+        buildConfigField(
+            "String",
+            "DATABRICKS_OAUTH_CLIENT_ID",
+            quotedBuildConfig(databricksOAuthClientId),
+        )
+        buildConfigField(
+            "String",
+            "DATABRICKS_OAUTH_REDIRECT_URL",
+            quotedBuildConfig(databricksOAuthRedirectUrl),
+        )
 
         // Instrumented (androidTest) runner — required for UI Automator / Espresso
         // screenshot tests. Mirrors the androidx.test stable line pinned below.
