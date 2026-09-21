@@ -158,10 +158,22 @@ numbered steps, with one action or closely related action group per step:
 - Start with the prerequisites: the build/version actually tested, surface,
   harness, required authentication/configuration, and starting state (for
   example, a fresh session versus an existing one). Include only relevant
-  details; explicitly mark unknown requirements instead of inventing them.
+  details in one or two short sentences; explicitly mark unknown requirements
+  instead of inventing them. Put fixture setup and CI configuration in evidence.
 - Name the screen, control, agent, or command to use, and provide the exact
   input/message or a concrete safe example. Explain how to create any required
   data. Avoid vague instructions such as "use the feature" or "trigger the bug."
+- For a UI bug, write the clicks and typing a person performs in the app, using
+  visible control names. For example: "Choose `hello_world`, select Grok Build
+  in the harness picker, and create a new session." Do not substitute a POST
+  request, JSON payload, runner binding, session ID placeholder, or test selector
+  for those actions. Commands belong here only when the user's actual surface
+  is a terminal/CLI or the setup requires the user to run them.
+- Keep each step short and use ordinary language: "read the model label next
+  to the composer settings button," not "wait for data-testid to hydrate from
+  the snapshot." Keep protocol events, internal field names, mock executables,
+  fixture environment variables, and persistence explanations in `evidence`.
+  Retain one plain-language caveat when a stand-in limits the result.
 - Spell out order and timing that matter: before sending the first message,
   wait until the reply finishes, reload, reopen, or switch sessions. Include a
   duration or observable completion condition for waits.
@@ -173,26 +185,32 @@ numbered steps, with one action or closely related action group per step:
   observed on the running build; label steps or outcomes inferred from the
   report as unverified. If already fixed, distinguish the reported old failure
   from the passing result you observed. Do not imply you tested an older build.
+- If automation created state through an API or used a mock, verify the manual
+  UI path before calling that recipe reproduced. Otherwise label it **Manual
+  steps not verified**, describe what was actually exercised in `evidence`,
+  and preserve the applicable verdict/environment-fidelity rules. Do not turn
+  automated setup into claimed clicks or a mock response into a real reply.
 
 For example (use the actual tested build and results in your response):
 
 ```markdown
-### Steps to reproduce — terminal shows another session's output
+### Steps to reproduce — wrong model label in a new session
 
-Prerequisites: the tested Omnigent build, with an online host and access to the
-session's shell terminal.
+Prerequisites: Grok Build is installed and authenticated on your host.
 
-1. Create a new session, call it A, and open its shell terminal.
-2. Run `printf 'session-A\n'` and wait for the shell prompt to return.
-3. Create a second session, call it B, open its shell terminal, and run
-   `printf 'session-B\n'`. Wait for the shell prompt to return.
-4. Select session A in the sidebar and open its shell terminal. Read the output.
-   - **Expected:** A's terminal shows `session-A`.
-   - **Observed:** A's terminal instead shows B's `session-B` output.
+1. Open Omnigent on the tested build (include its version or commit).
+2. Choose an agent whose spec pins a model, such as `hello_world`.
+3. Select **Grok Build** in the harness picker and create a new session.
+4. Open the session **before sending any message**.
+5. Read the model/harness label next to the composer settings button.
+   - **Expected:** the label shows **Grok Build**.
+   - **Observed:** the label shows the agent's pinned model instead.
 ```
 
 Retain this level of detail in the final response and the `journey` handoff
 field (see Output); an arrow-separated summary alone is insufficient.
+Before handing off, read the recipe as a person opening the app: they should
+know what to click, type, and look for without understanding the test harness.
 
 Every step is something a user *does* or *toggles*. The journey does **not**
 contain the internal mechanism (which function is called, which state isn't

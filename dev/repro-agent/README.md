@@ -82,7 +82,10 @@ with `git worktree remove <path>` when done.
    numbered actions, exact inputs, relevant waits/reloads, and expected versus
    observed results at the step where each symptom appears. Verified results
    are distinguished from reported or unverified outcomes so a reader can
-   repeat the steps manually without opening the test or recording.
+   repeat the steps manually without opening the test or recording. UI recipes
+   use visible controls and plain language; API setup, test selectors, and mock
+   details stay in evidence. Manual paths that were not driven are labeled
+   unverified.
 7. Emits a single fenced ```json block (the machine-readable handoff) whose
    `verdict` is exactly one of `reproduced` / `not_reproduced` / `already_fixed`
    / `needs_more_info`, alongside the per-facet breakdown (each facet stamped
