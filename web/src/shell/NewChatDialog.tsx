@@ -4483,11 +4483,7 @@ export function NewChatLandingScreen() {
   const shouldCreateWorktree =
     workspaceIsGit && branchName.trim() !== "" && !startInExistingWorktree;
   const { state: composerContextState, setState: setComposerContextState } = useComposerContext({
-    workingDirectoryGitState: workspaceIsNonGit
-      ? "not_git"
-      : workspaceIsGit
-        ? "git"
-        : "unknown",
+    workingDirectoryGitState: workspaceIsNonGit ? "not_git" : workspaceIsGit ? "git" : "unknown",
   });
   useEffect(() => {
     setComposerContextState({

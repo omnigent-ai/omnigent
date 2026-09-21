@@ -2069,15 +2069,13 @@ describe("Composer shared visible controls", () => {
       sessionReasoningEffort: null,
     });
     renderWithTooltips(
-      <MemoryRouter>
-        <Composer
-          {...composerProps({
-            showCodexApprovalMode: true,
-            modelPickerKind: "codex",
-            showModels: true,
-          })}
-        />
-      </MemoryRouter>,
+      <Composer
+        {...composerProps({
+          showCodexApprovalMode: true,
+          modelPickerKind: "codex",
+          showModels: true,
+        })}
+      />,
     );
     const workspace = screen.getByTestId("composer-workspace-controls");
     const card = textarea().closest("[data-composer-card]");

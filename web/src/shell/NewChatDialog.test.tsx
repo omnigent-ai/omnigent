@@ -1740,7 +1740,10 @@ describe("NewChatLandingScreen initial picker loading", () => {
         "Working directory: No host selected",
       );
       expect(screen.getByTestId("new-chat-landing-workspace-chip")).toBeDisabled();
-      expect(screen.queryByTestId("new-chat-landing-branch-chip")).toBeNull();
+      expect(screen.getByTestId("new-chat-landing-branch-chip")).toHaveAccessibleName(
+        "No host selected",
+      );
+      expect(screen.getByTestId("new-chat-landing-branch-chip")).toBeDisabled();
       expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(
         "No host selected",
       );
