@@ -53,7 +53,8 @@ describe("BackgroundTaskIndicator", () => {
     render(<BackgroundTaskIndicator />);
     expect(badge("1 background task still running")).toHaveTextContent("1");
     expect(badge()).toHaveClass(
-      "px-0",
+      "gap-1",
+      "px-1",
       "md:px-2",
       "font-normal",
       "tabular-nums",
@@ -79,6 +80,7 @@ describe("BackgroundTaskIndicator", () => {
     const items = screen.getAllByRole("listitem");
     expect(items[0]).toHaveTextContent("First task");
     expect(items[1]).toHaveTextContent("Second task");
+    expect(screen.getAllByRole("status", { name: "Running" })).toHaveLength(2);
 
     fireEvent.click(trigger);
     expect(trigger).toHaveAttribute("aria-expanded", "false");
