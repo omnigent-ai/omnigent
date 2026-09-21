@@ -17,15 +17,18 @@ export function useSessionReconnect({
   const [reconnecting, setReconnecting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [canReconnectThisMachine, setCanReconnectThisMachine] = useState(false);
-  const inFlight = useRef(false);
-  const generation = useRef(0);
+  const inFlight = useRef<{ progressToast?: string | number } | null>(null);
 
   useEffect(() => {
     setDialogOpen(false);
     setError(null);
     setCanReconnectThisMachine(false);
+    setReconnecting(false);
     return () => {
-      generation.current += 1;
+      if (inFlight.current?.progressToast !== undefined) {
+        toast.dismiss(inFlight.current.progressToast);
+      }
+      inFlight.current = null;
     };
   }, [sessionId, hostId, isOwner]);
 
@@ -36,40 +39,41 @@ export function useSessionReconnect({
       return;
     }
 
-    inFlight.current = true;
+    const operation: { progressToast?: string | number } = {};
+    inFlight.current = operation;
     setReconnecting(true);
     setError(null);
-    const startedGeneration = generation.current;
-    let progressToast: string | number | undefined;
     try {
       // Recheck identity on each click, including retries after re-enrollment.
       const identity = await getHostIdentity();
-      if (generation.current !== startedGeneration) return;
+      if (inFlight.current !== operation) return;
       if (!identity?.cliInstalled || identity.hostId !== hostId) {
         setCanReconnectThisMachine(false);
         setDialogOpen(true);
         return;
       }
       setCanReconnectThisMachine(true);
-      progressToast = toast.loading("Reconnecting this machine…");
+      operation.progressToast = toast.loading("Reconnecting this machine…");
       const result = await controlHost("start");
-      if (generation.current !== startedGeneration) return;
+      if (inFlight.current !== operation) return;
       if (!result.ok) {
         setError(
           result.error ??
             (result.authError
-              ? "Sign-in didn't complete. A browser should have opened — finish signing in, then try again."
+              ? "Sign-in didn't complete. A browser should have opened. Finish signing in, then try again."
               : "Couldn't reconnect this machine. Try again or run the command below from a terminal."),
         );
         setDialogOpen(true);
         return;
       }
       setDialogOpen(false);
-      toast.success("Host reconnected.");
+      toast.success("Host start requested.");
     } finally {
-      if (progressToast !== undefined) toast.dismiss(progressToast);
-      inFlight.current = false;
-      setReconnecting(false);
+      if (inFlight.current === operation) {
+        if (operation.progressToast !== undefined) toast.dismiss(operation.progressToast);
+        inFlight.current = null;
+        setReconnecting(false);
+      }
     }
   }, [hostId, isOwner]);
 

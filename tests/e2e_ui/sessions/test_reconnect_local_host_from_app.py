@@ -28,6 +28,7 @@ _OLD_CREATED_AT = 1_700_000_000
 # in-app reconnect actually drove the desktop bridge. Runs before any app script.
 _DESKTOP_BRIDGE_INIT_SCRIPT = f"""
 window.__controlHostCalls = [];
+window.__hostStatusListeners = [];
 window.omnigentDesktop = {{
   kind: "electron",
   setBadgeCount: function () {{}},
@@ -39,10 +40,20 @@ window.omnigentDesktop = {{
   getHostIdentity: function () {{
     return Promise.resolve({{ cliInstalled: true, hostId: {_THIS_MACHINE_HOST_ID!r} }});
   }},
-  onHostStatusChanged: function () {{ return function () {{}}; }},
+  onHostStatusChanged: function (callback) {{
+    window.__hostStatusListeners.push(callback);
+    return () => {{
+      window.__hostStatusListeners = window.__hostStatusListeners.filter(cb => cb !== callback);
+    }};
+  }},
   controlHost: function (action) {{
     window.__controlHostCalls.push(action);
-    return new Promise(resolve => {{ window.__finishReconnect = resolve; }});
+    return new Promise(resolve => {{
+      window.__finishReconnect = result => {{
+        resolve(result);
+        window.__hostStatusListeners.forEach(callback => callback());
+      }};
+    }});
   }},
   getDesktopFeatures: function () {{ return Promise.resolve(null); }},
 }};
@@ -63,12 +74,13 @@ def _drop_routes(page: Page) -> Iterator[None]:
     page.unroute_all(behavior="ignoreErrors")
 
 
-def _patch_local_offline_host(page: Page, session_id: str) -> None:
+def _patch_local_offline_host(page: Page, session_id: str) -> dict[str, bool]:
     """Patch the browser view into a ``host_offline`` session bound to this machine.
 
     :param page: Playwright page before navigation.
     :param session_id: Session id to patch.
     """
+    host_state = {"online": False}
     host = {
         "host_id": _THIS_MACHINE_HOST_ID,
         "name": "This Mac",
@@ -101,7 +113,9 @@ def _patch_local_offline_host(page: Page, session_id: str) -> None:
         route.fulfill(
             status=200,
             headers={"content-type": "application/json"},
-            body=json.dumps({"hosts": [host]}),
+            body=json.dumps(
+                {"hosts": [{**host, "status": "online" if host_state["online"] else "offline"}]}
+            ),
         )
 
     def _patch_list(route: Route) -> None:
@@ -129,7 +143,7 @@ def _patch_local_offline_host(page: Page, session_id: str) -> None:
             return
         response = fetch_with_retry(route)
         payload = response.json()
-        live = {"runner_online": False, "host_online": False}
+        live = {"runner_online": False, "host_online": host_state["online"]}
         if isinstance(payload.get("sessions"), dict):
             payload["sessions"][session_id] = live
         if isinstance(payload.get("session"), dict):
@@ -145,13 +159,14 @@ def _patch_local_offline_host(page: Page, session_id: str) -> None:
     page.route(re.compile(r"/health(\?|$)"), _patch_health)
     page.route(re.compile(rf"/v1/sessions/{re.escape(session_id)}(\?|$)"), _patch_snapshot)
     page.route_web_socket(re.compile(r"/v1/sessions/updates"), lambda ws: None)
+    return host_state
 
 
-def _open_offline_session(page: Page, seeded_session: tuple[str, str]) -> None:
+def _open_offline_session(page: Page, seeded_session: tuple[str, str]) -> dict[str, bool]:
     """Open a session whose host is the desktop's offline local machine."""
     base_url, session_id = seeded_session
     page.add_init_script(_DESKTOP_BRIDGE_INIT_SCRIPT)
-    _patch_local_offline_host(page, session_id)
+    host_state = _patch_local_offline_host(page, session_id)
     page.goto(f"{base_url}/c/{session_id}")
     expect(page.get_by_test_id("composer-host-select")).to_be_visible(timeout=15_000)
     page.evaluate(
@@ -166,6 +181,7 @@ def _open_offline_session(page: Page, seeded_session: tuple[str, str]) -> None:
     )
     page.get_by_test_id("composer-host-select").click()
     page.get_by_role("menuitem", name="Reconnect host", exact=True).click()
+    return host_state
 
 
 def test_desktop_reconnect_performs_local_host_reconnect(
@@ -173,15 +189,19 @@ def test_desktop_reconnect_performs_local_host_reconnect(
     seeded_session: tuple[str, str],
 ) -> None:
     """One reconnect action shows progress, calls the bridge, and never opens a dialog."""
-    _open_offline_session(page, seeded_session)
+    host_state = _open_offline_session(page, seeded_session)
     page.wait_for_function("() => window.__controlHostCalls.length === 1")
     assert page.evaluate("window.__controlHostCalls") == ["start"]
     expect(page.get_by_text("Reconnecting this machine…", exact=True)).to_be_visible()
     expect(page.get_by_test_id("reconnect-session-dialog")).not_to_be_visible()
-    expect(page.get_by_text("Host reconnected.", exact=True)).not_to_be_visible()
+    expect(page.get_by_text("Host start requested.", exact=True)).not_to_be_visible()
 
+    host_state["online"] = True
     page.evaluate("window.__finishReconnect({ ok: true })")
-    expect(page.get_by_text("Host reconnected.", exact=True)).to_be_visible()
+    expect(page.get_by_test_id("composer-host-select")).to_have_attribute(
+        "aria-label", re.compile(r", online$"), timeout=3_000
+    )
+    expect(page.get_by_text("Host start requested.", exact=True)).to_be_visible()
     assert page.evaluate("window.__reconnectDialogShown") is False
 
 
@@ -190,18 +210,22 @@ def test_desktop_reconnect_failure_offers_retry(
     seeded_session: tuple[str, str],
 ) -> None:
     """A failed direct reconnect opens recovery, and retry can complete it."""
-    _open_offline_session(page, seeded_session)
+    host_state = _open_offline_session(page, seeded_session)
     page.wait_for_function("() => window.__controlHostCalls.length === 1")
     page.evaluate("window.__finishReconnect({ ok: false, authError: true })")
     dialog = page.get_by_test_id("reconnect-session-dialog")
     expect(dialog).to_be_visible()
-    expect(dialog.get_by_role("alert")).to_contain_text("finish signing in")
-    expect(page.get_by_text("Host reconnected.", exact=True)).not_to_be_visible()
+    expect(dialog.get_by_role("alert")).to_contain_text("Finish signing in")
+    expect(page.get_by_text("Host start requested.", exact=True)).not_to_be_visible()
     expect(dialog.get_by_test_id("reconnect-session-command")).to_contain_text("omnigent host")
 
     dialog.get_by_role("button", name="Retry reconnect", exact=True).click()
     page.wait_for_function("() => window.__controlHostCalls.length === 2")
     expect(dialog.get_by_role("button", name="Reconnecting this machine…")).to_be_disabled()
+    host_state["online"] = True
     page.evaluate("window.__finishReconnect({ ok: true })")
+    expect(page.get_by_test_id("composer-host-select")).to_have_attribute(
+        "aria-label", re.compile(r", online$"), timeout=3_000
+    )
     expect(dialog).not_to_be_visible()
-    expect(page.get_by_text("Host reconnected.", exact=True)).to_be_visible()
+    expect(page.get_by_text("Host start requested.", exact=True)).to_be_visible()

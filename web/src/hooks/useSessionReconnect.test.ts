@@ -55,7 +55,7 @@ describe("useSessionReconnect", () => {
     });
     expect(result.current.dialogOpen).toBe(false);
     expect(result.current.localReconnect?.reconnecting).toBe(false);
-    expect(toast.success).toHaveBeenCalledWith("Host reconnected.");
+    expect(toast.success).toHaveBeenCalledWith("Host start requested.");
     expect(toast.dismiss).toHaveBeenCalledWith("progress");
   });
 
@@ -115,7 +115,7 @@ describe("useSessionReconnect", () => {
   });
 
   it.each([
-    { failure: { ok: false, authError: true }, message: /finish signing in/ },
+    { failure: { ok: false, authError: true }, message: /finish signing in/i },
     { failure: { ok: false }, message: /Try again or run the command/ },
     { failure: { ok: false, error: "Connection timed out" }, message: /Connection timed out/ },
   ])(
@@ -169,5 +169,73 @@ describe("useSessionReconnect", () => {
     });
     expect(controlHost).not.toHaveBeenCalled();
     expect(result.current.dialogOpen).toBe(false);
+  });
+
+  it("opens another host's recovery while the previous session is still reconnecting", async () => {
+    const start = deferred<HostActionResult>();
+    vi.mocked(controlHost).mockReturnValue(start.promise);
+    const { result, rerender } = renderHook(useSessionReconnect, { initialProps: localSession });
+    let first!: Promise<void>;
+    await act(async () => {
+      first = result.current.reconnect();
+    });
+
+    rerender({ ...localSession, sessionId: "other-session", hostId: "other-host" });
+    expect(toast.dismiss).toHaveBeenCalledWith("progress");
+    await act(async () => {
+      await result.current.reconnect();
+    });
+    expect(result.current.dialogOpen).toBe(true);
+    expect(result.current.localReconnect).toBeUndefined();
+    expect(controlHost).toHaveBeenCalledOnce();
+
+    await act(async () => {
+      start.resolve({ ok: true });
+      await first;
+    });
+    expect(result.current.dialogOpen).toBe(true);
+    expect(toast.success).not.toHaveBeenCalled();
+  });
+
+  it("does not let an old reconnect clear a newer session's progress or lock", async () => {
+    const oldStart = deferred<HostActionResult>();
+    const newStart = deferred<HostActionResult>();
+    vi.mocked(controlHost)
+      .mockReturnValueOnce(oldStart.promise)
+      .mockReturnValueOnce(newStart.promise);
+    vi.mocked(toast.loading)
+      .mockReturnValueOnce("old-progress")
+      .mockReturnValueOnce("new-progress");
+    const { result, rerender } = renderHook(useSessionReconnect, { initialProps: localSession });
+    let first!: Promise<void>;
+    let second!: Promise<void>;
+    await act(async () => {
+      first = result.current.reconnect();
+    });
+    rerender({ ...localSession, sessionId: "other-session" });
+    await act(async () => {
+      second = result.current.reconnect();
+    });
+    expect(controlHost).toHaveBeenCalledTimes(2);
+    expect(toast.dismiss).toHaveBeenCalledExactlyOnceWith("old-progress");
+
+    await act(async () => {
+      oldStart.resolve({ ok: false, error: "Old failure" });
+      await first;
+      await result.current.reconnect();
+    });
+    expect(controlHost).toHaveBeenCalledTimes(2);
+    expect(result.current.localReconnect?.reconnecting).toBe(true);
+    expect(result.current.localReconnect?.error).toBeNull();
+    expect(result.current.dialogOpen).toBe(false);
+    expect(toast.dismiss).not.toHaveBeenCalledWith("new-progress");
+
+    await act(async () => {
+      newStart.resolve({ ok: true });
+      await second;
+    });
+    expect(result.current.localReconnect?.reconnecting).toBe(false);
+    expect(toast.dismiss).toHaveBeenCalledWith("new-progress");
+    expect(toast.success).toHaveBeenCalledOnce();
   });
 });
