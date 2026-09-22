@@ -14,6 +14,7 @@ from collections.abc import Callable, Generator, Iterator
 from dataclasses import dataclass, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -7283,7 +7284,7 @@ async def test_concurrent_subagent_502s_recover_without_phantom_completion(
         )
 
     attempts: dict[str, int] = {}
-    statuses: list[tuple[str, str]] = []
+    statuses: list[tuple[str, dict[str, Any]]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content.decode("utf-8"))
@@ -7293,8 +7294,8 @@ async def test_concurrent_subagent_502s_recover_without_phantom_completion(
             if attempts[child_id] == 1:
                 return httpx.Response(502, text="bad gateway")
             return httpx.Response(202, json=[{"item_id": f"item-{child_id}"}])
-        if body.get("type") == "external_session_status":
-            statuses.append((child_id, body["data"]["status"]))
+        if body.get("type") in {"external_session_status", "subagent.status"}:
+            statuses.append((child_id, body))
         return httpx.Response(202, json={})
 
     tracker = forwarder._PostRetryTracker(
@@ -7345,10 +7346,163 @@ async def test_concurrent_subagent_502s_recover_without_phantom_completion(
         )
 
     assert set(attempts.values()) == {2}
-    # The clean quiescence edge posts the badge-only "quiesced", never the
-    # terminal "idle" (which the runner would deliver as a completion).
-    assert sorted(status for _, status in statuses) == ["quiesced"] * 5
+    assert sorted(child_id for child_id, _ in statuses) == [f"conv_recover_{i}" for i in range(5)]
+    assert [body for _, body in statuses] == [
+        {"type": "subagent.status", "data": {"idle": True}}
+    ] * 5
     assert all(entry.delivery_error is None for entry in state.subagents.values())
+
+
+async def test_subagent_idle_observation_preserves_timing_and_deduplication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The same five-second gap emits once, resets on activity, and survives restart."""
+    now = 1000.0
+    monkeypatch.setattr(
+        forwarder, "time", SimpleNamespace(time=lambda: now, monotonic=time.monotonic)
+    )
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.touch()
+    child_path = _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="idle-worker",
+        agent_type="Explore",
+        description="long-running task",
+        tool_use_id="toolu_idle",
+    )
+    state = forwarder.SubagentForwardState(
+        subagents={
+            "idle-worker": forwarder.SubagentEntry(
+                subagent_id="idle-worker", child_conversation_id="conv_child"
+            )
+        }
+    )
+    status_events: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/sessions/conv_child/events"
+        body = json.loads(request.content)
+        if isinstance(body, list):
+            return httpx.Response(202, json=[{"item_id": "item"} for _ in body])
+        status_events.append(body)
+        return httpx.Response(202, json={"queued": False})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ap"
+    ) as client:
+
+        async def tick() -> None:
+            nonlocal state
+            state = await forwarder._forward_available_subagents(
+                client=client,
+                parent_session_id="conv_parent",
+                bridge_dir=bridge_dir,
+                transcript_path=transcript_path,
+                state=state,
+                agent_name="claude-native-ui",
+                start_retry_tracker=forwarder._PostRetryTracker(),
+                item_retry_tracker=forwarder._PostRetryTracker(),
+                status_retry_tracker=forwarder._PostRetryTracker(),
+            )
+
+        await tick()
+        assert status_events == []  # No idle observation before the first activity.
+        for cycle in range(2):
+            with child_path.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(
+                        {
+                            "isSidechain": True,
+                            "type": "assistant",
+                            "uuid": f"message-{cycle}",
+                            "message": {
+                                "role": "assistant",
+                                "content": [{"type": "text", "text": f"working {cycle}"}],
+                            },
+                        }
+                    )
+                    + "\n"
+                )
+            await tick()
+            assert status_events[-1] == {
+                "type": "external_session_status",
+                "data": {"status": "running"},
+            }
+            now += forwarder._SUBAGENT_IDLE_QUIESCENCE_S
+            await tick()
+            assert len(status_events) == cycle * 2 + 1
+            now += 0.001
+            await tick()
+            assert status_events[-1] == {"type": "subagent.status", "data": {"idle": True}}
+            await tick()
+            state = forwarder._read_subagent_forward_state(bridge_dir)
+            await tick()
+            assert len(status_events) == cycle * 2 + 2
+
+
+@pytest.mark.parametrize("previous_status", ["running", "idle", "quiesced"])
+async def test_subagent_idle_observation_retries_and_resumes_legacy_checkpoint(
+    tmp_path: Path, previous_status: str
+) -> None:
+    """Only successful delivery advances dedupe; an older idle checkpoint stays deduped."""
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.touch()
+    _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="idle-worker",
+        agent_type="Explore",
+        description="long-running task",
+        tool_use_id="toolu_idle",
+    )
+    forwarder._write_subagent_forward_state(
+        bridge_dir,
+        forwarder.SubagentForwardState(
+            subagents={
+                "idle-worker": forwarder.SubagentEntry(
+                    subagent_id="idle-worker",
+                    child_conversation_id="conv_child",
+                    last_activity_ts=time.time() - 60,
+                    last_status=previous_status,
+                )
+            }
+        ),
+    )
+    state = forwarder._read_subagent_forward_state(bridge_dir)
+    attempts: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(json.loads(request.content))
+        return httpx.Response(503 if len(attempts) == 1 else 202, json={})
+
+    tracker = forwarder._PostRetryTracker(base_delay_s=0.0)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ap"
+    ) as client:
+        for tick in range(3):
+            state = await forwarder._forward_available_subagents(
+                client=client,
+                parent_session_id="conv_parent",
+                bridge_dir=bridge_dir,
+                transcript_path=transcript_path,
+                state=state,
+                agent_name="claude-native-ui",
+                start_retry_tracker=forwarder._PostRetryTracker(),
+                item_retry_tracker=forwarder._PostRetryTracker(),
+                status_retry_tracker=tracker,
+            )
+            if tick == 0 and previous_status != "quiesced":
+                assert state.subagents["idle-worker"].last_status == previous_status
+                assert forwarder._read_subagent_forward_state(bridge_dir) == state
+
+    assert attempts == (
+        []
+        if previous_status == "quiesced"
+        else [{"type": "subagent.status", "data": {"idle": True}}] * 2
+    )
+    assert state.subagents["idle-worker"].last_status == "quiesced"
 
 
 @pytest.mark.asyncio

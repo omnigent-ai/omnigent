@@ -564,21 +564,19 @@ class SubagentEntry:
         so a failed later item can leave the cursor behind without
         re-posting earlier accepted items on the next poll.
     :param last_activity_ts: Unix timestamp of the most recent item
-        observed in this sub-agent's transcript. Used by the quiescence
+        observed in this sub-agent's transcript. Used by the inactivity
         heuristic — when ``now - last_activity_ts >
         _SUBAGENT_IDLE_QUIESCENCE_S`` we publish an
-        ``external_session_status: quiesced`` event (a badge-only
-        signal; the server never forwards it to the runner as a
-        terminal edge). ``None`` when no items have been seen yet (so
-        the heuristic doesn't fire before there's anything to be
-        quiescent about).
-    :param last_status: Last status string POSTed for this
-        sub-agent — used to dedupe so we don't spam ``running`` or
-        ``quiesced`` events on every tick when nothing changed. ``None``
-        means no status has been posted yet.
+        ``subagent.status`` event with ``idle: true``. The server publishes
+        idle but never forwards this observation as a terminal edge.
+        ``None`` means no items have been seen, so the heuristic cannot fire.
+    :param last_status: Last observation posted for this sub-agent. The
+        legacy ``quiesced`` checkpoint marker now records ``subagent.status``
+        with ``idle: true``; keeping it preserves deduplication across upgrades
+        and rollbacks. Other values are ``running``, ``failed``, or ``None``
+        when nothing has been posted yet.
     :param delivery_error: Durable reason the mirrored transcript is
-        incomplete. Its quiescence edge is ``failed`` instead of
-        ``quiesced``.
+        incomplete. After inactivity it reports ``failed`` instead of idle.
     """
 
     subagent_id: str
@@ -2293,9 +2291,8 @@ async def _forward_one_subagent(
         and new_entry.last_activity_ts is not None
         and now - new_entry.last_activity_ts > _SUBAGENT_IDLE_QUIESCENCE_S
     ):
-        # A bare transcript lull is a badge-only "quiesced", never terminal
-        # "idle": the runner delivers idle/failed as authoritative completions,
-        # and a still-running sub-agent mid tool call must not complete.
+        # A transcript lull is an idle observation, not an authoritative
+        # completion: the child may still be in a long-running tool call.
         desired_status = "failed" if new_entry.delivery_error else "quiesced"
     if desired_status is None or desired_status == new_entry.last_status:
         return
@@ -2303,12 +2300,19 @@ async def _forward_one_subagent(
     if status_retry_tracker.retry_delay_s(retry_key) is not None:
         return
     try:
-        await post_external_session_status(
-            client,
-            session_id=entry.child_conversation_id,
-            status=desired_status,
-            output=new_entry.delivery_error if desired_status == "failed" else None,
-        )
+        if desired_status == "quiesced":
+            resp = await client.post(
+                f"/v1/sessions/{entry.child_conversation_id}/events",
+                json={"type": "subagent.status", "data": {"idle": True}},
+            )
+            resp.raise_for_status()
+        else:
+            await post_external_session_status(
+                client,
+                session_id=entry.child_conversation_id,
+                status=desired_status,
+                output=new_entry.delivery_error if desired_status == "failed" else None,
+            )
     except httpx.HTTPError as exc:
         decision = status_retry_tracker.record_failure(
             retry_key, exc, session_id=entry.child_conversation_id

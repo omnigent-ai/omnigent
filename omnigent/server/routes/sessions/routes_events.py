@@ -128,6 +128,7 @@ from omnigent.server.routes._sessions.common import (
     _SLASH_COMMAND_TYPE,
     _SNAPSHOT_RUNNER_TIMEOUT_S,
     _STOP_SESSION_TYPE,
+    _SUBAGENT_STATUS_TYPE,
     _intentional_stop_sessions,
     _interrupt_fenced_sessions,
     _logger,
@@ -572,6 +573,9 @@ def register_events_routes(
         - ``"external_session_status"`` publishes a terminal-observed
           ``session.status`` edge without persisting an item or
           starting/steering a task.
+        - ``"subagent.status"`` with ``data.idle=true`` publishes idle status
+          for transcript inactivity without forwarding a completion
+          to the runner.
         - ``"external_model_change"`` persists a terminal-observed
           model switch to ``model_override`` and publishes a
           ``session.model`` SSE event so the web picker reflects it.
@@ -697,6 +701,7 @@ def register_events_routes(
             _EXTERNAL_BTW_DISMISS_TYPE,
             _EXTERNAL_ELICITATION_RESOLVED_TYPE,
             _EXTERNAL_SESSION_STATUS_TYPE,
+            _SUBAGENT_STATUS_TYPE,
             _EXTERNAL_SESSION_USAGE_TYPE,
             _EXTERNAL_COMPACTION_STATUS_TYPE,
             _EXTERNAL_MCP_STARTUP_TYPE,
@@ -1391,9 +1396,15 @@ def register_events_routes(
                 )
             _signal_harness_elicitation_resolved_by_id(session_id, elicitation_id)
             return {"queued": False}
-        if body.type == _EXTERNAL_SESSION_STATUS_TYPE:
+        if body.type in (_EXTERNAL_SESSION_STATUS_TYPE, _SUBAGENT_STATUS_TYPE):
             status = body.data.get("status")
-            if not isinstance(status, str) or status not in _EXTERNAL_SESSION_STATUS_VALUES:
+            if body.type == _SUBAGENT_STATUS_TYPE:
+                if body.data.get("idle") is not True:
+                    raise OmnigentError(
+                        "subagent.status requires data.idle to be true",
+                        code=ErrorCode.INVALID_INPUT,
+                    )
+            elif not isinstance(status, str) or status not in _EXTERNAL_SESSION_STATUS_VALUES:
                 raise OmnigentError(
                     f"external_session_status requires data.status in "
                     f"{sorted(_EXTERNAL_SESSION_STATUS_VALUES)}; got {status!r}",
@@ -1402,7 +1413,7 @@ def register_events_routes(
             response_id = body.data.get("response_id")
             if response_id is not None and not isinstance(response_id, str):
                 raise OmnigentError(
-                    "external_session_status data.response_id must be a string",
+                    f"{body.type} data.response_id must be a string",
                     code=ErrorCode.INVALID_INPUT,
                 )
             # ``None`` (field absent) = no information; leave the sticky
@@ -1429,22 +1440,9 @@ def register_events_routes(
             blocked_on = (
                 raw_blocked_on if isinstance(raw_blocked_on, str) and raw_blocked_on else None
             )
-            # A background-task ``waiting`` marks an ended turn, so deliver it
-            # as ``idle``: the session takes a new message now, and for a
-            # sub-agent the terminal-delivery branch below must fire (otherwise
-            # the orchestrator hangs). The tally still drives the indicator.
-            # The claude-native forwarder no longer sends ``waiting`` at all —
-            # this normalizes it for runners that predate that change.
-            effective_status = _background_task_delivery_status(status, bg_count, conv)
-            if effective_status != status:
-                status = effective_status
-                body.data["status"] = status
-            if status == "quiesced":
-                # The claude-native sub-agent transcript-quiescence badge: a
-                # UI signal only. Publish it as an idle badge, but never
-                # forward it to the runner — the runner's terminal-delivery
-                # branch consumes "idle"/"failed" as authoritative
-                # completions, and a >5s transcript gap is not one.
+            if body.type == _SUBAGENT_STATUS_TYPE or status == "quiesced":
+                # A transcript lull publishes idle but is not a runner completion.
+                # Legacy "quiesced" input is deprecated; remove in 0.16.0.
                 _publish_status(
                     session_id,
                     "idle",
@@ -1455,6 +1453,17 @@ def register_events_routes(
                     blocked_on=blocked_on,
                 )
                 return {"queued": False}
+            assert isinstance(status, str)
+            # A background-task ``waiting`` marks an ended turn, so deliver it
+            # as ``idle``: the session takes a new message now, and for a
+            # sub-agent the terminal-delivery branch below must fire (otherwise
+            # the orchestrator hangs). The tally still drives the indicator.
+            # The claude-native forwarder no longer sends ``waiting`` at all —
+            # this normalizes it for runners that predate that change.
+            effective_status = _background_task_delivery_status(status, bg_count, conv)
+            if effective_status != status:
+                status = effective_status
+                body.data["status"] = status
             # Terminal edges carry the harness's own persisted text: the
             # child's result on ``idle``, and on ``failed`` — when the
             # forwarder attached no detail — its error report (claude-native's
