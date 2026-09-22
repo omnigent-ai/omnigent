@@ -230,14 +230,16 @@ sys.stdin.readline()
         proc.stdin.write(b"flood\n")
         await proc.stdin.drain()
         assert await asyncio.wait_for(proc.stdout.readline(), 5) == b"ready after flood\n"
+        proc.stdin.write(b"exit\n")
+        await proc.stdin.drain()
+        await asyncio.wait_for(proc.wait(), 5)
+        # stdout and stderr are independent pipes; wait for the final stderr bytes.
+        await asyncio.wait_for(server.stderr_task, 5)
         assert server.recent_stderr is not None
         assert server.recent_stderr[-1] == "newest diagnostic"
         with diagnostics._lock:
             assert diagnostics._queued_bytes <= stderr_diagnostics._QUEUE_BYTES
             assert len(diagnostics._records) <= stderr_diagnostics._QUEUE_RECORDS
-        proc.stdin.write(b"exit\n")
-        await proc.stdin.drain()
-        await asyncio.wait_for(proc.wait(), 5)
         # Still blocked in a real logging handler; close has a finite join budget.
         await asyncio.wait_for(server.close(), 3)
         assert not output.release.is_set()
