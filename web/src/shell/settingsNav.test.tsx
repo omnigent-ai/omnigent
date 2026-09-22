@@ -395,6 +395,30 @@ describe("useSettingsRoute", () => {
     expect(routeHook("/inbox").inSettings).toBe(false);
   });
 
+  it("parses the customize sub-section and defaults a bare/unknown one to the first", () => {
+    expect(routeHook("/settings/customize/harnesses")).toEqual({
+      inSettings: true,
+      section: "customize",
+      subSection: "harnesses",
+    });
+    expect(routeHook("/settings/customize/skills")).toEqual({
+      inSettings: true,
+      section: "customize",
+      subSection: "skills",
+    });
+    // Bare or unknown sub-section falls back to the first sub-section.
+    expect(routeHook("/settings/customize")).toEqual({
+      inSettings: true,
+      section: "customize",
+      subSection: "harnesses",
+    });
+    expect(routeHook("/settings/customize/nope")).toEqual({
+      inSettings: true,
+      section: "customize",
+      subSection: "harnesses",
+    });
+  });
+
   it("keeps General as the bare settings default when a login session exists", () => {
     mocks.loginUrl = "/login";
     expect(routeHook("/settings")).toEqual({ inSettings: true, section: "general" });

@@ -119,6 +119,7 @@ import {
 } from "@/lib/databricksIntegration";
 import { getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isFeatureEnabled } from "@/lib/capabilities";
 import { useOmnigentAnalytics, useOmnigentPageView } from "@/lib/analytics";
 import {
   type Conversation,
@@ -255,6 +256,7 @@ import {
   readBackgroundSessionTitlesEnabled,
   writeBackgroundSessionTitlesEnabled,
 } from "@/lib/backgroundSessionTitlesPreferences";
+import { SettingsCustomizeSection } from "./settings/SettingsCustomizeSection";
 
 // Admin-only management surfaces, rendered as the Members / Policies settings
 // sub-categories. Visible to admins in all modes (accounts, OIDC, single-user).
@@ -281,7 +283,7 @@ export function SettingsPage() {
   // A login session exists (accounts OR OIDC) when the server advertises a
   // login_url; gates the Account section so SSO users get it too.
   const hasAuthSession = info !== "loading" && info.login_url !== null;
-  const { section } = useSettingsRoute();
+  const { section, subSection } = useSettingsRoute();
   // Per-section page view: `settings.appearance`, `settings.account`, etc. The
   // hook re-keys on pathname, so switching sections re-fires under the new id.
   // `section` is a closed SettingsSectionId union (no PII / unbounded values).
@@ -306,6 +308,15 @@ export function SettingsPage() {
         )}
       </Suspense>
     );
+  }
+
+  // For section with sub-sections, render it directly since the section nav
+  // owns its own layout.
+  if (subSection) {
+    // Customize is WIP behind the `customize` release feature; when it's off, fall through to the default section below.
+    if (section === "customize" && isFeatureEnabled(info, "customize")) {
+      return <SettingsCustomizeSection subSection={subSection} />;
+    }
   }
 
   return (
