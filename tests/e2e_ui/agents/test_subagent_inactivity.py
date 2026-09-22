@@ -1,49 +1,11 @@
-"""False "sub-agent finished (completed)" delivery from a mid-task transcript lull.
+"""A transcript pause must not produce a false sub-agent completion notice.
 
-A claude-native Task-tool sub-agent has no explicit "done" record in its
-transcript, so the forwarder infers status from item flow: any transcript lull
-longer than ``_SUBAGENT_IDLE_QUIESCENCE_S`` (5 s) makes the quiescence branch
-post ``external_session_status: idle`` for the child — even while the
-sub-agent is still mid-task (e.g. inside a long tool call). The server
-enriches that edge with the child's latest persisted assistant text (mid-run:
-its FIRST intermediate message) and relays it to the runner, whose handler
-unconditionally promotes ``idle`` to a terminal ``completed`` inbox delivery.
-The parent is then woken with a false ``[System: sub-agent … finished
-(completed) — N results waiting in inbox…]`` notice, injected as a user-role
-message onto the parent's turn — while the sub-agent is still running.
+Drive the real forwarder/server/runner/UI chain using Claude-shaped transcript
+files. A child with an intermediate message and no completion record stays
+unfinished after the five-second idle observation. The parent must not receive
+a "finished (completed)" inbox notification.
 
-Journey (as a user experiences it — timing compressed from the reported
-1–2.5 min to seconds by using a short lull; the code path is identical):
-
-1. run a claude-native session under Omnigent and send it a task,
-2. the session spawns a background sub-agent via Claude Code's own
-   Agent/Task tool; the sub-agent posts one early progress message and then
-   goes quiet for >5 s inside a long tool call (still running, no done
-   record),
-3. keep the parent session open in the web app and keep it working (the
-   reported orchestrators were actively working when the notice arrived),
-4. observe: on a buggy build the parent's chat receives the false ``[System:
-   sub-agent general-purpose/general-purpose finished (completed) — 1 result
-   waiting in inbox. Call sys_read_inbox to collect.]`` notice while the
-   sub-agent is still mid-task — the promised "result" is the sub-agent's
-   first intermediate message, which is all the child transcript holds.
-
-This test drives the REAL product chain end to end: the real claude-native
-sub-agent forwarder (discovery → ``external_subagent_start`` → item mirroring
-→ quiescence status) posting to a real spawned Omnigent server, which relays
-to the real runner, which delivers to the real parent session rendered in the
-real web UI. Only Claude Code itself is simulated — the test writes the exact
-on-disk transcript/meta files Claude Code produces for a Task spawn (CI has no
-interactive Claude login, so the real binary cannot run here).
-
-On a buggy build this test FAILS at the "no false completion" assertion (the
-reproduction); once the quiescence edge stops being promoted to a terminal
-completion (badge-only status, SubagentStop hook, or delivery suppression for
-Task children) the same journey delivers nothing and the test passes.
-
-Run::
-
-    pytest tests/e2e_ui/agents/test_subagent_quiescence_false_completion.py
+Run: pytest tests/e2e_ui/agents/test_subagent_inactivity.py
 """
 
 from __future__ import annotations
@@ -68,7 +30,7 @@ from tests.e2e_ui.conftest import open_right_rail, set_fallback_mock_llm
 # Claude-side sub-agent identity, shaped like the real meta files
 # (``agent-<hex>.meta.json`` + ``toolu_…`` spawn tool-use id).
 _SUBAGENT_ID = "afe4a11b2c3d4e5f6"
-_TOOL_USE_ID = "toolu_01QuiescenceFalseDone"
+_TOOL_USE_ID = "toolu_01IdleFalseDone"
 _SUBAGENT_TYPE = "general-purpose"
 _SUBAGENT_DESCRIPTION = "long-running background research task"
 
@@ -86,7 +48,7 @@ _INTERMEDIATE_TEXT = (
 _FALSE_NOTICE_MARKER = "finished (completed)"
 _NOTICE_PREFIX = "[System: sub-agent"
 
-# Quiescence threshold in the forwarder is 5 s. Tick well past it, and give
+# Inactivity threshold in the forwarder is 5 s. Tick well past it, and give
 # the idle → runner → parent wake propagation time to land. The wake POST is
 # fire-and-forget and delivery is bound to the parent being processed on the
 # runner, so the parent is nudged during the lull (an actively-working
@@ -181,7 +143,7 @@ def _run_forwarder_tick(
     Exactly the loop body ``forward_claude_transcript_to_session`` runs on the
     host machine in production: discovery of new ``agent-*.meta.json`` files,
     ``external_subagent_start`` registration, transcript item mirroring, and
-    the quiescence-based ``external_session_status`` publication.
+    the ``subagent.status`` idle observation.
 
     :param base_url: Spawned Omnigent server base URL.
     :param parent_session_id: Parent conversation id.
@@ -269,14 +231,14 @@ def test_midtask_lull_must_not_deliver_false_completion(
 ) -> None:
     """A still-running sub-agent's transcript lull must not complete it.
 
-    Drives the real chain — forwarder quiescence tick → server relay →
+    Drives the real chain — forwarder inactivity tick → server relay →
     runner promotion → parent inbox/wake — over a Task sub-agent whose
     transcript has produced one intermediate message and then gone quiet (no
     done record). On a buggy build the lull is promoted to a terminal
     ``completed`` delivery and the false ``[System: sub-agent … finished
     (completed)]`` notice lands in the parent session while the sub-agent is
     still running, so this test FAILS there. Any fix that stops promoting the
-    bare quiescence heuristic to a terminal completion makes it pass.
+    inactivity heuristic to a terminal completion makes it pass.
     """
     base_url, session_id = seeded_session
 
@@ -350,11 +312,8 @@ def test_midtask_lull_must_not_deliver_false_completion(
     # "sub-agent exists and is running" state alongside the chat.
     open_right_rail(page)
 
-    # 5. THE LULL: no new transcript records, no done record — the sub-agent
-    # is still inside its long tool call. Tick the real forwarder past the
-    # 5 s quiescence threshold so it publishes its quiescence edge for the
-    # still-running child (``idle`` on a buggy build; the badge-only
-    # ``quiesced`` once fixed).
+    # 5. No new transcript records or completion record: the child is still
+    # in a long tool call. Tick past five seconds to publish its idle observation.
     for _ in range(_LULL_TICKS):
         state = _run_forwarder_tick(
             base_url=base_url,
@@ -365,13 +324,10 @@ def test_midtask_lull_must_not_deliver_false_completion(
             trackers=trackers,
         )
         time.sleep(_TICK_INTERVAL_S)
-    quiescent_entry = state.subagents.get(_SUBAGENT_ID)
-    assert quiescent_entry is not None and quiescent_entry.last_status in (
-        "idle",
-        "quiesced",
-    ), (
-        "forwarder did not reach its quiescence edge over the lull; "
-        f"last_status={quiescent_entry.last_status if quiescent_entry else None!r}"
+    idle_entry = state.subagents.get(_SUBAGENT_ID)
+    assert idle_entry is not None and idle_entry.last_status == "idle", (
+        "forwarder did not report idle over the lull; "
+        f"last_status={idle_entry.last_status if idle_entry else None!r}"
     )
 
     # 6. Keep the parent working, exactly as the reported orchestrators were:

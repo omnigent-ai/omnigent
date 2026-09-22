@@ -90,13 +90,9 @@ _MAX_PERSISTED_COMPACTION_SEQS = 16
 # prose answer can be hundreds of chunks.
 _MAX_SEEN_DELTA_KEYS = 5000
 
-# Seconds of transcript inactivity after which we publish ``idle`` for
-# a sub-agent. The transcript is the only signal we have for sub-agent
-# completion in Phase A (no SubagentStop hook is subscribed); 5s is the
-# shortest window that comfortably absorbs a stalled tool call without
-# flickering the badge. Phase B will replace this with an authoritative
-# hook signal and drop the heuristic.
-_SUBAGENT_IDLE_QUIESCENCE_S = 5.0
+# Seconds without transcript activity before reporting an idle observation.
+# This heuristic does not establish that the sub-agent has completed.
+_SUBAGENT_IDLE_THRESHOLD_S = 5.0
 
 # Meta-file glob inside ``~/.claude/projects/<encoded>/<session>/subagents/``.
 # One per Claude Task-tool subagent; appears alongside the matching
@@ -566,15 +562,14 @@ class SubagentEntry:
     :param last_activity_ts: Unix timestamp of the most recent item
         observed in this sub-agent's transcript. Used by the inactivity
         heuristic — when ``now - last_activity_ts >
-        _SUBAGENT_IDLE_QUIESCENCE_S`` we publish an
+        _SUBAGENT_IDLE_THRESHOLD_S`` we publish an
         ``subagent.status`` event with ``idle: true``. The server publishes
         idle but never forwards this observation as a terminal edge.
         ``None`` means no items have been seen, so the heuristic cannot fire.
-    :param last_status: Last observation handled for this sub-agent. The
-        existing ``quiesced`` checkpoint marker records an idle observation
-        sent or skipped for an older server. It stays private to the cursor
-        to preserve deduplication across development upgrades and rollbacks.
-        Other values are ``running``, ``failed``, or ``None`` before any observation.
+    :param last_status: Last observation handled for this sub-agent:
+        ``running``, ``idle``, or ``failed``. An ``idle`` observation is sent
+        through ``subagent.status`` or skipped for an older server. ``None``
+        means no observation has been handled yet.
     :param delivery_error: Durable reason the mirrored transcript is
         incomplete. After inactivity it reports ``failed`` instead of idle.
     """
@@ -2333,18 +2328,18 @@ async def _forward_one_subagent(
     elif (
         not delivery_pending
         and new_entry.last_activity_ts is not None
-        and now - new_entry.last_activity_ts > _SUBAGENT_IDLE_QUIESCENCE_S
+        and now - new_entry.last_activity_ts > _SUBAGENT_IDLE_THRESHOLD_S
     ):
         # A transcript lull is an idle observation, not an authoritative
         # completion: the child may still be in a long-running tool call.
-        desired_status = "failed" if new_entry.delivery_error else "quiesced"
+        desired_status = "failed" if new_entry.delivery_error else "idle"
     if desired_status is None or desired_status == new_entry.last_status:
         return
     retry_key = f"subagent_status:{entry.child_conversation_id}"
     if status_retry_tracker.retry_delay_s(retry_key) is not None:
         return
     try:
-        if desired_status == "quiesced":
+        if desired_status == "idle":
             await status_capability.post_idle(client, session_id=entry.child_conversation_id)
         else:
             await post_external_session_status(
@@ -2475,7 +2470,7 @@ async def _forward_available_subagents(
     """
     Discover new Claude Task-tool sub-agents on disk, mint Omnigent child
     conversations for them, tail their transcripts, and publish
-    quiescence-based status.
+    activity observations.
 
     Idempotent across forwarder restarts: ``state`` (persisted to
     ``subagent_forwarder.json``) holds the Omnigent child id and byte

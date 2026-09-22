@@ -7260,7 +7260,7 @@ async def test_concurrent_subagent_502s_recover_without_phantom_completion(
     bridge_dir.mkdir()
     transcript_path = tmp_path / "session.jsonl"
     transcript_path.write_text("", encoding="utf-8")
-    old_activity = time.time() - forwarder._SUBAGENT_IDLE_QUIESCENCE_S - 60
+    old_activity = time.time() - forwarder._SUBAGENT_IDLE_THRESHOLD_S - 60
     entries: dict[str, forwarder.SubagentEntry] = {}
     for index in range(5):
         subagent_id = f"recover-{index}"
@@ -7450,7 +7450,7 @@ async def test_subagent_idle_observation_preserves_timing_and_deduplication(
                 "type": "external_session_status",
                 "data": {"status": "running"},
             }
-            now += forwarder._SUBAGENT_IDLE_QUIESCENCE_S
+            now += forwarder._SUBAGENT_IDLE_THRESHOLD_S
             await tick()
             count = len(status_events)
             assert count == cycle * 2 + 1
@@ -7558,11 +7558,11 @@ async def test_subagent_idle_other_errors_are_not_suppressed(status: int, payloa
     assert events == [{"type": "subagent.status", "data": {"idle": True}}] * 2
 
 
-@pytest.mark.parametrize("previous_status", ["running", "idle", "quiesced"])
+@pytest.mark.parametrize("previous_status", ["running", "idle", "failed"])
 async def test_subagent_idle_observation_retries_and_resumes_existing_checkpoint(
     tmp_path: Path, previous_status: str
 ) -> None:
-    """Only successful delivery advances dedupe; an older idle checkpoint stays deduped."""
+    """Only successful delivery advances dedupe; an idle checkpoint stays deduped."""
     bridge_dir = tmp_path / "bridge"
     transcript_path = tmp_path / "session.jsonl"
     transcript_path.touch()
@@ -7609,16 +7609,16 @@ async def test_subagent_idle_observation_retries_and_resumes_existing_checkpoint
                 item_retry_tracker=forwarder._PostRetryTracker(),
                 status_retry_tracker=tracker,
             )
-            if tick == 0 and previous_status != "quiesced":
+            if tick == 0 and previous_status != "idle":
                 assert state.subagents["idle-worker"].last_status == previous_status
                 assert forwarder._read_subagent_forward_state(bridge_dir) == state
 
     assert attempts == (
         []
-        if previous_status == "quiesced"
+        if previous_status == "idle"
         else [{"type": "subagent.status", "data": {"idle": True}}] * 2
     )
-    assert state.subagents["idle-worker"].last_status == "quiesced"
+    assert state.subagents["idle-worker"].last_status == "idle"
 
 
 @pytest.mark.asyncio
@@ -7689,7 +7689,7 @@ async def test_persistent_subagent_502_ends_as_explicit_failure(
             )
         failed_entry = replace(
             state.subagents[subagent_id],
-            last_activity_ts=time.time() - forwarder._SUBAGENT_IDLE_QUIESCENCE_S - 60,
+            last_activity_ts=time.time() - forwarder._SUBAGENT_IDLE_THRESHOLD_S - 60,
         )
         state = await forwarder._forward_available_subagents(
             client=client,
@@ -10839,7 +10839,7 @@ async def test_post_external_session_status_includes_and_omits_response_id() -> 
 
     The turn-bearing edges (native Claude's turn start/end) carry the response
     id so ap-web can drive the bubble's streaming lifecycle; the bare,
-    turn-agnostic edges (e.g. the sub-agent quiescence badge) must keep posting
+    turn-agnostic edges must keep posting
     a ``data`` object with no ``response_id`` key so nothing spuriously matches.
     """
     bodies: list[dict[str, Any]] = []

@@ -32,8 +32,8 @@ from tests.runner.conftest import (
 )
 from tests.runner.helpers import NullServerClient
 
-PARENT_SESSION_ID = "conv_parent_quiesce"
-CHILD_SESSION_ID = "conv_child_quiesce"
+PARENT_SESSION_ID = "conv_parent_idle"
+CHILD_SESSION_ID = "conv_child_idle"
 SUBAGENT_ID = "afalsecompletelull"
 
 
@@ -111,7 +111,7 @@ class _SnapshotServerClient(NullServerClient):
             return self._ChildResp(
                 {
                     "id": CHILD_SESSION_ID,
-                    "agent_id": "ag_child_quiesce",
+                    "agent_id": "ag_child_idle",
                     "agent_name": "claude-native",
                     "sub_agent_name": "general-purpose",
                     "parent_session_id": PARENT_SESSION_ID,
@@ -124,7 +124,7 @@ class _SnapshotServerClient(NullServerClient):
         return self._Response()
 
 
-async def _run_forwarder_quiescence_tick(tmp_path: Path) -> list[dict[str, Any]]:
+async def _run_forwarder_inactivity_tick(tmp_path: Path) -> list[dict[str, Any]]:
     """Run one real forwarder tick over a still-running sub-agent's lull.
 
     Lays out the on-disk shape Claude Code produces for a Task-tool sub-agent
@@ -161,7 +161,7 @@ async def _run_forwarder_quiescence_tick(tmp_path: Path) -> list[dict[str, Any]]
                 child_conversation_id=CHILD_SESSION_ID,
                 byte_offset=0,
                 seen_source_ids=(),
-                # Last item flowed 60 s ago — beyond the 5 s quiescence
+                # Last item flowed 60 s ago — beyond the 5 s inactivity
                 # window — while the sub-agent is still running.
                 last_activity_ts=time.time() - 60.0,
                 last_status="running",
@@ -240,11 +240,11 @@ async def _post_status_to_runner(
 
 
 @pytest.mark.asyncio
-async def test_quiescence_lull_does_not_deliver_false_completion(
+async def test_inactivity_lull_does_not_deliver_false_completion(
     tmp_path: Path,
 ) -> None:
     """A mid-task lull must emit an observation without a terminal status."""
-    status_posts = await _run_forwarder_quiescence_tick(tmp_path)
+    status_posts = await _run_forwarder_inactivity_tick(tmp_path)
     assert status_posts == [{"type": "subagent.status", "data": {"idle": True}}]
 
 
@@ -254,7 +254,7 @@ async def test_explicit_idle_edge_still_delivers_completion(
 ) -> None:
     """A genuine terminal ``idle`` edge must still wake the parent inbox.
 
-    Guards the legitimate completion contract so the quiescence fix cannot
+    Guards the legitimate completion contract so the inactivity fix cannot
     simply suppress every ``idle`` edge: an authoritative terminal ``idle``
     (with the child's final output attached) must keep delivering a
     ``completed`` item to the parent's inbox.
@@ -267,7 +267,7 @@ async def test_explicit_idle_edge_still_delivers_completion(
     assert http == 204, f"genuine idle edge returned unexpected HTTP {http}"
     assert items, (
         "A genuine terminal idle edge delivered nothing to the parent inbox — "
-        "the quiescence fix must not suppress real completions."
+        "the inactivity fix must not suppress real completions."
     )
     assert items[0]["status"] == "completed"
     assert items[0]["conversation_id"] == CHILD_SESSION_ID

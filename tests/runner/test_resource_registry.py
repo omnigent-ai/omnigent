@@ -743,7 +743,7 @@ async def test_required_terminal_exit_while_idle_is_clean_shutdown(
     )
 
     initial_activity = registry.session_activity_epoch("conv_idle")
-    # The agent worked, then its turn completed (pane quiesced → idle).
+    # The agent worked, then its turn completed (pane became quiet → idle).
     on_activity = callbacks["on_activity"]
     on_idle = callbacks["on_idle"]
     assert callable(on_activity) and callable(on_idle)
