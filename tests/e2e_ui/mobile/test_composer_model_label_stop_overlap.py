@@ -221,16 +221,17 @@ def _intersection(a: FloatRect, b: FloatRect) -> tuple[float, float]:
 
 
 def _assert_same_row(a: FloatRect, b: FloatRect) -> None:
-    """Fail unless two boxes are vertically centred on the same line.
+    """Fail unless two boxes share vertical span (occupy the same flex row).
 
     :param a: First bounding box.
     :param b: Second bounding box.
     :returns: None.
     """
-    centre_a = a["y"] + a["height"] / 2
-    centre_b = b["y"] + b["height"] / 2
-    assert abs(centre_a - centre_b) <= 1.0, (
-        f"controls wrapped onto separate rows: centres at y={centre_a:.0f} and y={centre_b:.0f}"
+    _, y_overlap = _intersection(a, b)
+    assert y_overlap > 0, (
+        f"controls wrapped onto separate rows: "
+        f"a spans y=[{a['y']:.0f}, {a['y'] + a['height']:.0f}], "
+        f"b spans y=[{b['y']:.0f}, {b['y'] + b['height']:.0f}]"
     )
 
 
