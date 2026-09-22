@@ -69,7 +69,7 @@ def _wait_for(check: Callable[[], Any], *, description: str, timeout: float = 12
         if result:
             return result
         time.sleep(0.5)
-    pytest.fail(f"Did not observe {description} within {timeout}s")
+    raise pytest.fail.Exception(f"Did not observe {description} within {timeout}s")
 
 
 def _stop(proc: subprocess.Popen[bytes]) -> None:

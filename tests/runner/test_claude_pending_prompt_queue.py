@@ -103,7 +103,8 @@ async def test_question_buffers_messages_and_resumes_fifo(
         return pending_prompt["pending"]
 
     monkeypatch.setattr(runner_app, "_claude_native_bridge_id_for_session", bridge_id)
-    monkeypatch.setattr(claude_native_bridge, "bridge_dir_for_bridge_id", lambda b: tmp_path / b)
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "claude-native")
     monkeypatch.setattr(claude_native_bridge, "has_pending_user_prompt", inspect)
     async with _runner_client(app) as client:
         created = await client.post(
@@ -132,7 +133,9 @@ async def test_question_buffers_messages_and_resumes_fifo(
         )
 
     assert not app.state.session_message_buffers.get(sid)
-    assert set(inspected_dirs) == {tmp_path / "label-owned-bridge"}
+    assert set(inspected_dirs) == {
+        claude_native_bridge.bridge_dir_for_bridge_id("label-owned-bridge")
+    }
     first_body, second_body = harness.posted_bodies
     assert first_body["content"][-1]["content"][0]["text"] == "first"
     assert second_body["content"][-1]["content"][0]["text"] == "second"
