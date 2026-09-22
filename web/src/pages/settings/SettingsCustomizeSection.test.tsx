@@ -26,9 +26,15 @@ vi.mock("@/shell/NewChatDialog", () => ({
 // rendering its full install/auth flow.
 const setupDialogProps = vi.fn();
 vi.mock("@/shell/HarnessSetupDialog", () => ({
-  HarnessSetupDialog: (props: { open: boolean; harness: string | null }) => {
+  HarnessSetupDialog: (props: { open: boolean; harness: string | null; host: Host | null }) => {
     setupDialogProps(props);
-    return props.open ? <div data-testid="setup-dialog" data-harness={props.harness} /> : null;
+    return props.open ? (
+      <div
+        data-testid="setup-dialog"
+        data-harness={props.harness}
+        data-host={props.host?.host_id ?? ""}
+      />
+    ) : null;
   },
 }));
 
@@ -76,6 +82,21 @@ describe("Harnesses subsection", () => {
 
     const dialog = screen.getByTestId("setup-dialog");
     expect(dialog.getAttribute("data-harness")).toBe("codex-native");
+    // The dialog is bound to the host chosen when setup opened, not the live
+    // selection — a later host switch can't redirect the credential/install.
+    expect(dialog.getAttribute("data-host")).toBe("h1");
+  });
+
+  it("treats unknown readiness (host reports nothing) as neutral, not needs-setup", () => {
+    // Older host: configured_harnesses null → every harness is readiness-unknown.
+    hosts = [{ ...ONLINE, configured_harnesses: null }];
+    renderHarnesses();
+
+    // No false "needs setup": no badge, no Set-up button, no bogus "Installed".
+    expect(screen.queryByTestId("harness-action-codex-native")).toBeNull();
+    expect(screen.queryByTestId("harness-action-claude-native")).toBeNull();
+    expect(screen.queryByText("Installed")).toBeNull();
+    expect(screen.queryByText("needs setup")).toBeNull();
   });
 
   it("shows the no-host notice and no Set-up buttons when no host is online", () => {

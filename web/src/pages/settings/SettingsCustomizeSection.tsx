@@ -141,8 +141,11 @@ const HarnessesSection = () => {
   );
   const host = onlineHosts.find((h) => h.host_id === selectedHostId) ?? onlineHosts[0] ?? null;
 
-  // Setup dialog target: reuses the composer's install + auth flow.
-  const [setupHarness, setSetupHarness] = useState<HarnessEntry | null>(null);
+  // Setup dialog target: reuses the composer's install + auth flow. Captures
+  // BOTH the harness and the host chosen when setup opened, so a later host
+  // switch (selection change or the selected host going offline) can't redirect
+  // an in-progress install / credential write to a different machine.
+  const [setupTarget, setSetupTarget] = useState<{ entry: HarnessEntry; host: Host } | null>(null);
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -191,17 +194,17 @@ const HarnessesSection = () => {
               key={entry.harness}
               entry={entry}
               host={host}
-              onSetup={() => setSetupHarness(entry)}
+              onSetup={() => host && setSetupTarget({ entry, host })}
             />
           ))}
         </div>
       </div>
       <HarnessSetupDialog
-        open={setupHarness !== null}
-        onOpenChange={(open) => !open && setSetupHarness(null)}
-        agentName={setupHarness?.name}
-        harness={setupHarness?.harness ?? null}
-        host={host}
+        open={setupTarget !== null}
+        onOpenChange={(open) => !open && setSetupTarget(null)}
+        agentName={setupTarget?.entry.name}
+        harness={setupTarget?.entry.harness ?? null}
+        host={setupTarget?.host ?? null}
       />
     </div>
   );
@@ -284,7 +287,10 @@ function HarnessCard({
 }) {
   const readiness = harnessReadinessOnHost(entry.harness, host);
   const ready = readiness.state === "available" && readiness.reason === "ready";
-  const needsSetup = host !== null && !ready;
+  // Only "setup-required" / "broken" are actionable. A host that reports no
+  // readiness (older host → `readiness-unknown`) stays neutral: no badge, no
+  // Set-up button, rather than a false "needs setup" on a working harness.
+  const needsSetup = readiness.state === "setup-required" || readiness.state === "broken";
   const reason = harnessUnavailableReasonOnHost(entry.harness, host);
 
   return (
