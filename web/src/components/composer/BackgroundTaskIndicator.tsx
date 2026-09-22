@@ -128,7 +128,7 @@ export function BackgroundTaskIndicator() {
             aria-label={`${countLabel} still running`}
             className="shrink-0 gap-1 px-1 font-normal tabular-nums text-muted-foreground md:px-2"
           >
-            <SquareTerminalIcon className="size-3.5" aria-hidden="true" />
+            <SquareTerminalIcon className="size-3.5" strokeWidth={1.5} aria-hidden="true" />
             {bgCount}
           </Button>
         </PopoverTrigger>

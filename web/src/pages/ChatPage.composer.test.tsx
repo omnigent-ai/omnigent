@@ -2195,6 +2195,7 @@ describe("Composer shared visible controls", () => {
     );
 
     const workspace = screen.getByTestId("composer-workspace-controls");
+    const taskIndicators = within(workspace).getByTestId("composer-task-indicators");
     const context = within(workspace).getByTestId("composer-context-ring");
     const background = within(workspace).getByTestId("background-task-pill");
     const subagent = within(workspace).getByTestId("subagent-task-pill");
@@ -2204,6 +2205,7 @@ describe("Composer shared visible controls", () => {
     expect(subagent.compareDocumentPosition(context) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(
       0,
     );
+    expect(taskIndicators).toHaveClass("gap-0");
     expect(context.parentElement).toHaveClass("gap-1");
     expect(childSessionsArgsSpy).toHaveBeenCalledWith("conv_parent");
 

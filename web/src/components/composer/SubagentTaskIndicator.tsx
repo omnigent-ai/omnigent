@@ -216,12 +216,12 @@ export function SubagentTaskIndicator({ conversationId }: { conversationId: stri
             data-state={triggerState}
             aria-label={countLabel}
             className={cn(
-              "shrink-0 gap-1 px-1 md:px-2",
+              "shrink-0 gap-1 px-1 font-normal tabular-nums md:px-2",
               triggerState === "error" && "text-destructive hover:text-destructive",
               triggerState === "parked" && "text-warning hover:text-warning",
             )}
           >
-            <BotIcon className="size-3.5" aria-hidden="true" />
+            <BotIcon className="size-3.5" strokeWidth={1.5} aria-hidden="true" />
             {count}
           </Button>
         </PopoverTrigger>

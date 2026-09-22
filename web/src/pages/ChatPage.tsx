@@ -3690,8 +3690,13 @@ function ComposerImpl(
             }
           />
           <div className="ml-auto flex min-w-0 shrink-0 items-center gap-1">
-            <BackgroundTaskIndicator />
-            <SubagentTaskIndicator conversationId={conversationId} />
+            <div
+              data-testid="composer-task-indicators"
+              className="flex items-center gap-0 empty:hidden"
+            >
+              <BackgroundTaskIndicator />
+              <SubagentTaskIndicator conversationId={conversationId} />
+            </div>
             <ComposerContextRing
               contextWindow={composerContextWindow}
               tokensUsed={composerTokensUsed}

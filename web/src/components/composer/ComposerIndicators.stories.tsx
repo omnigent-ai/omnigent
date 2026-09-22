@@ -81,8 +81,10 @@ function CompactIndicatorRow({ narrow = false }: { narrow?: boolean }) {
           : "group/composer-workspace flex items-center justify-end gap-1 rounded-lg border bg-card px-2 py-1.5"
       }
     >
-      <BackgroundTaskIndicator />
-      <SubagentTaskIndicator conversationId={conversationId} />
+      <div className="flex items-center gap-0 empty:hidden">
+        <BackgroundTaskIndicator />
+        <SubagentTaskIndicator conversationId={conversationId} />
+      </div>
       <ComposerContextRing contextWindow={200_000} tokensUsed={narrow ? 191_000 : 83_400} />
     </div>
   );

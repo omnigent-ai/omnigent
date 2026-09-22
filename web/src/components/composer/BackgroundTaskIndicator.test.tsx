@@ -60,6 +60,7 @@ describe("BackgroundTaskIndicator", () => {
       "tabular-nums",
       "text-muted-foreground",
     );
+    expect(badge().querySelector("svg")).toHaveAttribute("stroke-width", "1.5");
   });
 
   it("shows the count on the badge with a plural accessible name", () => {
