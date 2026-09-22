@@ -2849,22 +2849,27 @@ function SessionFilterMenu({
     : SIDEBAR_FILTERS.filter((filter) => filter.value !== "shared");
   return (
     <DropdownMenu>
-      <Tooltip>
+      <Tooltip disableHoverableContent>
         <TooltipTrigger asChild>
-          <DropdownMenuTrigger asChild>
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon-xs"
-              aria-label="Filter sessions"
-              data-testid="session-filter"
-              onClick={(event) => event.stopPropagation()}
-            >
-              <ListFilterIcon className="size-3.5" />
-            </Button>
-          </DropdownMenuTrigger>
+          {/* Separate nodes keep the Radix tooltip and menu trigger states independent. */}
+          <span className="inline-flex shrink-0">
+            <DropdownMenuTrigger asChild>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-xs"
+                aria-label="Filter sessions"
+                data-testid="session-filter"
+                onClick={(event) => event.stopPropagation()}
+              >
+                <ListFilterIcon className="size-3.5" />
+              </Button>
+            </DropdownMenuTrigger>
+          </span>
         </TooltipTrigger>
-        <TooltipContent side="bottom">Filter sessions</TooltipContent>
+        <TooltipContent side="bottom" data-noninteractive-tooltip>
+          Filter sessions
+        </TooltipContent>
       </Tooltip>
       <DropdownMenuContent align="end" className="min-w-44 [&_[role=menuitemradio]]:text-ui">
         <DropdownMenuLabel className="text-muted-foreground text-sm">Display</DropdownMenuLabel>
@@ -4345,46 +4350,53 @@ function ConversationRowImpl({
               {/* Archived rows omit the pin entirely: pinning is meaningless there
               (archive outranks pin), so there's no pin action even on hover. */}
               {!isArchived && (
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="icon-xs"
-                  aria-label={isPinned ? "Unpin conversation" : "Pin conversation"}
-                  data-testid="quick-pin-conversation"
-                  aria-disabled={!isPinned && atPinCap}
-                  title={!isPinned && atPinCap ? "Unpin a session first" : undefined}
-                  className={cn(
-                    // Desktop-only quick affordance: hidden on mobile (the kebab's
-                    // Pin item below covers that), hover/focus-revealed from `md`
-                    // up. Pinned rows no longer keep a persistent pin marker, since
-                    // the "Pinned" section header (and pinned-first ordering inside
-                    // a project) already conveys the pinned state. Revealed glyph:
-                    // unpin if pinned, pin otherwise.
-                    //
-                    // `md:inline-flex` (not `md:block`): the Button base is
-                    // `inline-flex` and relies on it for `items-center
-                    // justify-center` to center the icon. `md:block` would override
-                    // that display and collapse the centering, leaving the glyph
-                    // pinned to the top-left of the button — so keep the flex
-                    // display when revealing it.
-                    "text-muted-foreground transition-opacity",
-                    "hidden md:inline-flex",
-                    "md:opacity-0 md:group-hover:opacity-100",
-                    "md:group-has-[:focus-visible]:opacity-100 md:group-has-[[aria-expanded=true]]:opacity-100",
-                  )}
-                  onClick={(e) => {
-                    // Keep the toggle click off the surrounding Link (no navigation).
-                    e.preventDefault();
-                    e.stopPropagation();
-                    onTogglePinned(conversation.id);
-                  }}
-                >
-                  {isPinned ? (
-                    <PinOffIcon className="size-3.5" data-icon-size="14" />
-                  ) : (
-                    <PinIcon className="size-3.5" data-icon-size="14" />
-                  )}
-                </Button>
+                <Tooltip disableHoverableContent>
+                  <TooltipContent>
+                    <TooltipArrow />
+                    {!isPinned && atPinCap ? "Unpin a session first" : isPinned ? "Unpin" : "Pin"}
+                  </TooltipContent>
+                  <TooltipTrigger asChild>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon-xs"
+                      aria-label={isPinned ? "Unpin conversation" : "Pin conversation"}
+                      data-testid="quick-pin-conversation"
+                      aria-disabled={!isPinned && atPinCap}
+                      className={cn(
+                        // Desktop-only quick affordance: hidden on mobile (the kebab's
+                        // Pin item below covers that), hover/focus-revealed from `md`
+                        // up. Pinned rows no longer keep a persistent pin marker, since
+                        // the "Pinned" section header (and pinned-first ordering inside
+                        // a project) already conveys the pinned state. Revealed glyph:
+                        // unpin if pinned, pin otherwise.
+                        //
+                        // `md:inline-flex` (not `md:block`): the Button base is
+                        // `inline-flex` and relies on it for `items-center
+                        // justify-center` to center the icon. `md:block` would override
+                        // that display and collapse the centering, leaving the glyph
+                        // pinned to the top-left of the button — so keep the flex
+                        // display when revealing it.
+                        "text-muted-foreground transition-opacity",
+                        "hidden md:inline-flex",
+                        "md:opacity-0 md:group-hover:opacity-100",
+                        "md:group-has-[:focus-visible]:opacity-100 md:group-has-[[aria-expanded=true]]:opacity-100",
+                      )}
+                      onClick={(e) => {
+                        // Keep the toggle click off the surrounding Link (no navigation).
+                        e.preventDefault();
+                        e.stopPropagation();
+                        onTogglePinned(conversation.id);
+                      }}
+                    >
+                      {isPinned ? (
+                        <PinOffIcon className="size-3.5" data-icon-size="14" />
+                      ) : (
+                        <PinIcon className="size-3.5" data-icon-size="14" />
+                      )}
+                    </Button>
+                  </TooltipTrigger>
+                </Tooltip>
               )}
               {/* Archive is owner-only, same as the kebab's Archive item; non-owners
               don't get the quick affordance and instead see that item disabled
@@ -4393,7 +4405,7 @@ function ConversationRowImpl({
                 <Tooltip disableHoverableContent>
                   <TooltipContent>
                     <TooltipArrow />
-                    {isArchived ? "Unarchive conversation" : "Archive conversation"}
+                    {isArchived ? "Unarchive" : "Archive"}
                   </TooltipContent>
                   <TooltipTrigger asChild>
                     <Button
@@ -5727,27 +5739,31 @@ function BulkActionBar({
                 if (!open) setMoveSearch("");
               }}
             >
-              <Tooltip>
+              <Tooltip disableHoverableContent>
                 <TooltipTrigger asChild>
-                  <DropdownMenuTrigger asChild>
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="icon-xs"
-                      className="shrink-0"
-                      disabled={isBusy || ownedSelected.length === 0}
-                      aria-label="Move to project"
-                      data-testid="bulk-move-to-project"
-                    >
-                      {bulkMove.isPending ? (
-                        <Loader2Icon className="size-3.5 animate-spin" />
-                      ) : (
-                        <FolderInputIcon className="size-3.5" />
-                      )}
-                    </Button>
-                  </DropdownMenuTrigger>
+                  {/* Separate nodes keep the Radix tooltip and menu trigger states independent. */}
+                  <span className="inline-flex shrink-0">
+                    <DropdownMenuTrigger asChild>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon-xs"
+                        disabled={isBusy || ownedSelected.length === 0}
+                        aria-label="Move to project"
+                        data-testid="bulk-move-to-project"
+                      >
+                        {bulkMove.isPending ? (
+                          <Loader2Icon className="size-3.5 animate-spin" />
+                        ) : (
+                          <FolderInputIcon className="size-3.5" />
+                        )}
+                      </Button>
+                    </DropdownMenuTrigger>
+                  </span>
                 </TooltipTrigger>
-                <TooltipContent side="bottom">Move to project</TooltipContent>
+                <TooltipContent side="bottom" data-noninteractive-tooltip>
+                  Move to project
+                </TooltipContent>
               </Tooltip>
               <DropdownMenuContent align="end" className="w-52">
                 <div className="flex items-center gap-2 border-b px-2 py-1.5">

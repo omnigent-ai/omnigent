@@ -103,6 +103,13 @@ def test_pin_moves_session_to_pinned_section(
     row.hover()
     pin_button = row.get_by_test_id("quick-pin-conversation")
     expect(pin_button).to_have_attribute("aria-label", "Pin conversation")
+    pin_button.hover()
+    expect(page.get_by_role("tooltip", name="Pin", exact=True)).to_be_visible()
+
+    archive_button = row.get_by_test_id("quick-archive-conversation")
+    archive_button.hover()
+    expect(page.get_by_role("tooltip", name="Archive", exact=True)).to_be_visible()
+
     pin_button.click()
 
     # The row now lives under "Pinned" and out of "Sessions", and the

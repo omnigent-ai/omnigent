@@ -676,6 +676,11 @@ aside[aria-label="Workspace"][data-maximized] {
   background: var(--card-solid) !important;
 }
 
+/* Label-only tooltips must not block controls beneath their portal wrapper. */
+[data-radix-popper-content-wrapper]:has([data-noninteractive-tooltip]) {
+  pointer-events: none !important;
+}
+
 /* Popovers/menus — same glass treatment */
 .dark [data-slot="popover-content"],
 .dark [data-slot="select-content"],
