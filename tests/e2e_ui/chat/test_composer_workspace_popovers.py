@@ -59,7 +59,7 @@ def test_composer_details_wrap_without_clipping(
                     {
                         "path": _WORKSPACE,
                         "branch": _BRANCH,
-                        "is_main": True,
+                        "is_main": False,
                         "detached": False,
                     }
                 ]
@@ -73,12 +73,13 @@ def test_composer_details_wrap_without_clipping(
     expect(controls).to_be_visible(timeout=30_000)
     expect(controls.get_by_role("button")).to_have_count(0)
     workspace = controls.get_by_test_id("composer-workspace-dir")
-    expect(workspace).to_have_attribute(
-        "title", _WORKSPACE if has_binding else "No workspace bound"
+    workspace_title = (
+        f"Working directory: {_WORKSPACE}" if has_binding else "No working directory bound"
     )
+    expect(workspace).to_have_attribute("title", workspace_title)
     if has_binding:
         worktree = controls.get_by_test_id("composer-git-branch")
-        expect(worktree).to_have_attribute("title", _BRANCH)
+        expect(worktree).to_have_attribute("title", f"Worktree: {_WORKSPACE}. {_BRANCH}")
     else:
         expect(controls.get_by_test_id("composer-git-branch")).to_have_count(0)
     controls.screenshot(path=tmp_path / f"details-{viewport_width}.png", animations="disabled")
@@ -132,7 +133,7 @@ def test_composer_workspace_labels_use_available_width(
                     {
                         "path": f"/workspace/{name}",
                         "branch": name,
-                        "is_main": True,
+                        "is_main": False,
                         "detached": False,
                     }
                 ]

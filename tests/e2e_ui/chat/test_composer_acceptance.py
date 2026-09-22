@@ -88,7 +88,7 @@ def test_pr_context_and_background_tasks_share_workspace_bar(
                     {
                         "path": "/work/repo",
                         "branch": "live-branch",
-                        "is_main": True,
+                        "is_main": False,
                         "detached": False,
                     }
                 ]

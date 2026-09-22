@@ -128,8 +128,8 @@ def _agents_body() -> str:
     ``claude-native-ui`` is the only built-in the picker needs here — its
     name is what gates the permission-mode UI (``isClaudeNativeAgent``) and,
     ranked first by display name, it auto-selects so no explicit pick is
-    required. ``harness: null`` keeps the "needs setup" badge off regardless
-    of the (stubbed) host's readiness map.
+    required. The host fixture explicitly reports the harness ready so the row
+    remains selectable under readiness-aware picker behavior.
     """
     return json.dumps(
         {
@@ -139,7 +139,7 @@ def _agents_body() -> str:
                     "name": "claude-native-ui",
                     "display_name": "Claude Code",
                     "description": "Anthropic's coding agent",
-                    "harness": None,
+                    "harness": "claude-native",
                     "skills": [],
                 }
             ]
@@ -412,6 +412,16 @@ def _hosts_body() -> str:
                     "name": "e2e-host",
                     "owner": "e2e",
                     "status": "online",
+                    "configured_harnesses": {
+                        "antigravity-native": True,
+                        "claude-native": True,
+                        "codex-native": True,
+                        "cursor-native": True,
+                        "devin-native": True,
+                        "kimi-native": True,
+                        "opencode-native": True,
+                        "pi-native": True,
+                    },
                 }
             ]
         }
@@ -2531,6 +2541,10 @@ async def _drive_pi_native_start(base_url: str, session_id: str) -> None:
                 "omnigent.ui": "terminal",
                 "omnigent.wrapper": "pi-native-ui",
                 "omnigent.client_create_token": body["labels"]["omnigent.client_create_token"],
+                "omnigent.composer_context.v1.0": (
+                    '{"version":1,"working_directory":{"path":"/work/repo"},'
+                    '"worktree":{"mode":"none"}}'
+                ),
             }, body
             assert re.fullmatch(r"[0-9a-f]{32}", body["labels"]["omnigent.client_create_token"])
         finally:
@@ -2617,6 +2631,10 @@ async def _drive_antigravity_native_start(base_url: str, session_id: str) -> Non
                 "omnigent.ui": "terminal",
                 "omnigent.wrapper": "antigravity-native-ui",
                 "omnigent.client_create_token": body["labels"]["omnigent.client_create_token"],
+                "omnigent.composer_context.v1.0": (
+                    '{"version":1,"working_directory":{"path":"/work/repo"},'
+                    '"worktree":{"mode":"none"}}'
+                ),
             }, body
             assert re.fullmatch(r"[0-9a-f]{32}", body["labels"]["omnigent.client_create_token"])
         finally:
@@ -2713,6 +2731,10 @@ async def _drive_opencode_native_start(base_url: str, session_id: str) -> None:
                 "omnigent.ui": "terminal",
                 "omnigent.wrapper": "opencode-native-ui",
                 "omnigent.client_create_token": body["labels"]["omnigent.client_create_token"],
+                "omnigent.composer_context.v1.0": (
+                    '{"version":1,"working_directory":{"path":"/work/repo"},'
+                    '"worktree":{"mode":"none"}}'
+                ),
             }, body
             assert re.fullmatch(r"[0-9a-f]{32}", body["labels"]["omnigent.client_create_token"])
         finally:
@@ -2804,6 +2826,10 @@ async def _drive_kimi_native_start(base_url: str, session_id: str) -> None:
                 "omnigent.ui": "terminal",
                 "omnigent.wrapper": "kimi-native-ui",
                 "omnigent.client_create_token": body["labels"]["omnigent.client_create_token"],
+                "omnigent.composer_context.v1.0": (
+                    '{"version":1,"working_directory":{"path":"/work/repo"},'
+                    '"worktree":{"mode":"none"}}'
+                ),
             }, body
             assert re.fullmatch(r"[0-9a-f]{32}", body["labels"]["omnigent.client_create_token"])
         finally:

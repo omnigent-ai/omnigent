@@ -357,16 +357,14 @@ def test_composer_model_label_stays_clear_of_stop_button_on_mobile(
         # control (Add) and the rightmost (Stop) share it.
         _assert_same_row(_box(page.get_by_test_id("composer-attach")), stop_box)
 
-        # Given room again, the text comes back: the collapse is measured
-        # against the row's width, not pinned to a breakpoint.
+        # Widening preserves the model in the accessible trigger even when the
+        # expanded action set still requires icon-only labels.
         page.set_viewport_size(_DESKTOP_VIEWPORT)
-        expect(label).to_be_visible()
         expect(label).to_contain_text(_MODEL_ID)
-        expect(row).not_to_have_attribute("data-labels", "collapsed")
         # Measured against the model trigger, not the Stop button: the gated turn
         # may have finished by now, and the row check doesn't depend on it.
         _assert_same_row(_box(page.get_by_test_id("composer-attach")), _box(trigger))
-        _screenshot(page, "chat-composer-desktop-expanded")
+        _screenshot(page, "chat-composer-desktop")
     finally:
         # Drop the snapshot route before teardown so an in-flight fetch
         # doesn't error against the closing context, then let the gated

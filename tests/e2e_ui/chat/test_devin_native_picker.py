@@ -239,24 +239,22 @@ async def _drive(base_url: str, session_id: str, *, initially_ready: bool) -> No
                 page.get_by_test_id(f"new-chat-landing-agent-summary-{_DEVIN_AGENT_ID}")
             ).to_have_text("swe-2")
             await assert_devin_idle(0)
+            if not initially_ready:
+                row = page.get_by_test_id(f"new-chat-landing-agent-{_DEVIN_AGENT_ID}")
+                await expect(row).to_have_attribute("aria-disabled", "true")
+                await row.locator("span.truncate").first.hover()
+                await expect(
+                    page.get_by_test_id(f"new-chat-landing-agent-tooltip-{_DEVIN_AGENT_ID}")
+                ).to_contain_text(
+                    "Devin isn't configured on e2e-host — run omni setup on that machine."
+                )
+                assert not devin_requests
+                return
             await (
                 page.get_by_test_id(f"new-chat-landing-agent-config-{_DEVIN_AGENT_ID}")
                 .get_by_text("Edit", exact=True)
                 .click()
             )
-
-            if not initially_ready:
-                # Even an explicit selection must wait for setup before probing.
-                await expect(
-                    page.get_by_test_id("new-chat-landing-harness-warning")
-                ).to_be_visible()
-                async with page.expect_response("**/v1/hosts") as refreshed:
-                    await page.clock.fast_forward(60_000)
-                await (await refreshed.value).finished()
-                await page.wait_for_load_state("networkidle")
-                assert not devin_requests
-                readiness["devin-native"] = True
-                await page.clock.fast_forward(60_000)
 
             # Devin's own families render, from the devin-native catalog probe.
             models = page.get_by_test_id("new-chat-landing-agent-models")

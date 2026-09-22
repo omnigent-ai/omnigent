@@ -112,7 +112,12 @@ def test_cursor_missing_cli_shows_install_and_login_guidance(
     badge = page.get_by_test_id(f"new-chat-landing-agent-warning-{_AGENT_ID}")
     expect(badge).to_be_visible()
     expect(badge).to_have_accessible_name("binary missing")
+    expect(page.get_by_test_id(f"new-chat-landing-agent-{_AGENT_ID}")).to_have_attribute(
+        "aria-disabled", "true"
+    )
     badge.hover()
     tooltip = page.get_by_role("tooltip")
     expect(tooltip).to_be_visible()
-    expect(tooltip).to_contain_text("binary missing")
+    expect(tooltip).to_contain_text(
+        f"Cursor isn't configured on {_HOST_NAME} — run omni setup on that machine."
+    )
