@@ -5181,15 +5181,14 @@ def test_tmux_injections_are_serialized_per_bridge(
             self._counter_lock = threading.Lock()
             self._acquire_count = 0
 
-        def __enter__(self) -> ObservedInjectionLock:
+        def acquire(self, *, timeout: float = -1) -> bool:
             with self._counter_lock:
                 self._acquire_count += 1
                 if self._acquire_count == 2:
                     second_lock_acquire_started.set()
-            self._lock.acquire()
-            return self
+            return self._lock.acquire(timeout=timeout)
 
-        def __exit__(self, *_args: object) -> None:
+        def release(self) -> None:
             self._lock.release()
 
     lock_key = os.path.normcase(os.path.abspath(os.fspath(bridge_dir)))

@@ -38,9 +38,11 @@ from tests.server.integration.mock_llm_server import (
     anthropic_sse_tool_call_response,
 )
 
+_CLAUDE_BINARY = os.environ.get("OMNIGENT_E2E_CLAUDE_BILLING_NOTICE_BIN") or shutil.which("claude")
+
 pytestmark = [
     pytest.mark.skipif(
-        shutil.which("claude") is None or shutil.which("tmux") is None,
+        _CLAUDE_BINARY is None or shutil.which("tmux") is None,
         reason="requires Claude Code 2.1.278+ and tmux",
     ),
     pytest.mark.timeout(120),
@@ -162,7 +164,7 @@ async def _wait_for_pane(
         if predicate(screen):
             return screen
         await asyncio.sleep(0.1)
-    pytest.fail(f"Timed out waiting for {description}; actual Claude pane:\n{screen}")
+    raise AssertionError(f"Timed out waiting for {description}; actual Claude pane:\n{screen}")
 
 
 @pytest.mark.parametrize("recovery", ["runner_watcher", "permission_mode"])
@@ -175,15 +177,12 @@ async def test_real_claude_billing_notice_unblocks_pending_tool(
     config_dir.mkdir()
     workspace.mkdir()
     marker = workspace / "billing-notice-sentinel.txt"
-    command = shlex.join(
-        [
-            sys.executable,
-            "-c",
-            "from pathlib import Path; "
-            "Path('billing-notice-sentinel.txt').write_text('confirmed'); "
-            "print('billing-notice-tool-completed')",
-        ]
+    script = (
+        "from pathlib import Path; "
+        "Path('billing-notice-sentinel.txt').write_text('confirmed'); "
+        "print('billing-notice-tool-completed')"
     )
+    command = shlex.join([sys.executable, "-c", script])
     (config_dir / ".claude.json").write_text(
         json.dumps(
             {
@@ -239,7 +238,7 @@ async def test_real_claude_billing_notice_unblocks_pending_tool(
                 "claude",
                 "main",
                 TerminalEnvSpec(
-                    command=shutil.which("claude"),
+                    command=_CLAUDE_BINARY,
                     args=[
                         "--model",
                         _MODEL,

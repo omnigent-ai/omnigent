@@ -90,6 +90,7 @@ _INJECTION_CANCEL_EVENT: ContextVar[threading.Event | None] = ContextVar(
 )
 _INJECTION_LOCKS_GUARD = threading.Lock()
 _INJECTION_LOCKS: dict[str, threading.Lock] = {}
+_INJECTION_LOCK_POLL_INTERVAL_S = 0.1
 _InjectionFunction = TypeVar("_InjectionFunction", bound=Callable[..., Any])
 
 BRIDGE_DIR_ENV_VAR = "HARNESS_CLAUDE_NATIVE_BRIDGE_DIR"
@@ -110,12 +111,32 @@ def _bridge_injection_file_lock(bridge_dir: Path) -> FileLock:
     return FileLock(str(lock_dir / f"{bridge_dir.name}.injection.lock"), mode=0o600)
 
 
+@contextlib.contextmanager
+def _cancellable_injection_lock(lock: threading.Lock | FileLock) -> Iterator[None]:
+    """Let cancelled queued writers exit while the active writer keeps its lock."""
+    while True:
+        _check_injection_cancelled()
+        try:
+            if lock.acquire(timeout=_INJECTION_LOCK_POLL_INTERVAL_S):
+                break
+        except FileLockTimeout:
+            pass
+    try:
+        _check_injection_cancelled()
+        yield
+    finally:
+        lock.release()
+
+
 def _serialize_bridge_injection(function: _InjectionFunction) -> _InjectionFunction:
     """Serialize complete tmux injection operations across threads and processes."""
 
     @functools.wraps(function)
     def wrapped(bridge_dir: Path, *args: Any, **kwargs: Any) -> Any:
-        with _bridge_injection_lock(bridge_dir), _bridge_injection_file_lock(bridge_dir):
+        with (
+            _cancellable_injection_lock(_bridge_injection_lock(bridge_dir)),
+            _cancellable_injection_lock(_bridge_injection_file_lock(bridge_dir)),
+        ):
             return function(bridge_dir, *args, **kwargs)
 
     return cast(_InjectionFunction, wrapped)

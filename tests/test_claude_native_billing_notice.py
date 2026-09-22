@@ -6,6 +6,10 @@ import json
 import subprocess
 import sys
 import textwrap
+import threading
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from itertools import pairwise
 from pathlib import Path
 from unittest.mock import Mock
@@ -223,6 +227,94 @@ deliver(Path(sys.argv[1]))
         finally:
             process.communicate("done\n", timeout=10)
     assert process.returncode == 0
+
+
+@contextmanager
+def _held_injection_lock(bridge_dir: Path, holder: str) -> Iterator[None]:
+    if holder == "thread":
+        with bridge._bridge_injection_lock(bridge_dir):
+            yield
+        return
+    ready = bridge_dir / "writer-ready"
+    script = """\
+import sys
+from pathlib import Path
+from omnigent.harnesses.claude_native.bridge import _bridge_injection_file_lock
+
+with _bridge_injection_file_lock(Path(sys.argv[1])):
+    Path(sys.argv[2]).touch()
+    sys.stdin.readline()
+"""
+    with subprocess.Popen(
+        [sys.executable, "-c", script, str(bridge_dir), str(ready)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    ) as process:
+        try:
+            deadline = time.monotonic() + 5
+            while not ready.exists():
+                assert process.poll() is None, "lock holder exited before acquiring its lock"
+                assert time.monotonic() < deadline, "lock holder did not become ready"
+                time.sleep(0.01)
+            yield
+            assert process.poll() is None, "lock holder exited before the waiter cancelled"
+        finally:
+            try:
+                process.communicate("release\n", timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate(timeout=5)
+                raise
+    assert process.returncode == 0
+
+
+@pytest.mark.parametrize("holder", ["thread", "process"])
+def test_cancelled_writer_exits_before_lock_holder_releases(
+    monkeypatch: pytest.MonkeyPatch, bridge_dir: Path, holder: str
+) -> None:
+    cancelled = threading.Event()
+    started = threading.Event()
+    finished = threading.Event()
+    errors: list[Exception] = []
+    sends = Mock()
+    monkeypatch.setattr(bridge, "_run_tmux", sends)
+
+    def deliver() -> None:
+        with bridge.cancellable_injection(cancelled):
+            started.set()
+            try:
+                bridge.inject_user_message(bridge_dir, content="must not be delivered")
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                finished.set()
+
+    worker = threading.Thread(target=deliver, daemon=True)
+    try:
+        with _held_injection_lock(bridge_dir, holder):
+            worker.start()
+            assert started.wait(2), "queued writer did not start"
+            assert not finished.wait(0.15), "writer bypassed the held lock"
+            cancelled.set()
+            assert finished.wait(2), "cancelled writer still waited for the active writer"
+            assert len(errors) == 1
+            assert isinstance(errors[0], bridge.ClaudeInjectionCancelled)
+            sends.assert_not_called()
+    finally:
+        cancelled.set()
+        if worker.ident is not None:
+            worker.join(timeout=5)
+    assert not worker.is_alive()
+    # Cancellation must release any lock the queued writer acquired first.
+    lock = bridge._bridge_injection_lock(bridge_dir)
+    assert lock.acquire(blocking=False), "cancelled writer leaked its thread lock"
+    try:
+        with bridge._bridge_injection_file_lock(bridge_dir).acquire(timeout=0):
+            pass
+    finally:
+        lock.release()
 
 
 def test_message_reclaim_acknowledges_notice_instead_of_cancelling(
