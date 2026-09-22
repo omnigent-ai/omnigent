@@ -1562,6 +1562,80 @@ def test_start_session_managed_remembers_host_over_sandbox_default(
     _run_in_fresh_loop(_drive_managed_remembers_host(base_url, session_id))
 
 
+@pytest.mark.parametrize("viewport_width", [1440, 390], ids=["desktop", "mobile"])
+def test_start_session_managed_repository_uses_workspace_bar(
+    seeded_session: tuple[str, str],
+    viewport_width: int,
+) -> None:
+    """The managed repository picker lives in the responsive workspace bar."""
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(
+        _drive_managed_repository_workspace_bar(base_url, session_id, viewport_width)
+    )
+
+
+async def _drive_managed_repository_workspace_bar(
+    base_url: str, session_id: str, viewport_width: int
+) -> None:
+    repo_url = "https://github.com/omnigent-ai/a-very-long-sandbox-repository-name.git"
+    repo_name = "a-very-long-sandbox-repository-name"
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page(
+            viewport={"width": viewport_width, "height": 844 if viewport_width == 390 else 900}
+        )
+        try:
+            create_bodies: list[dict[str, Any]] = []
+            await _register_common_routes(
+                page, created_session_id=session_id, create_bodies=create_bodies
+            )
+
+            await page.route(
+                "**/v1/info",
+                lambda route: route.fulfill(
+                    status=200, content_type="application/json", body=_managed_info_body()
+                ),
+            )
+
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+
+            controls = page.get_by_test_id("new-chat-landing-workspace-controls")
+            repository = controls.get_by_test_id("new-chat-landing-repo-chip")
+            await expect(controls).to_be_visible()
+            await expect(repository).to_have_attribute(
+                "aria-label", "Sandbox repositories: None selected"
+            )
+            await expect(page.get_by_test_id("new-chat-landing-workspace-chip")).to_have_count(0)
+            await expect(page.get_by_test_id("new-chat-landing-worktree-chip")).to_have_count(0)
+
+            await repository.click()
+            await page.get_by_test_id("new-chat-landing-repo-input").fill(repo_url)
+            await page.get_by_test_id("new-chat-landing-repo-add").click()
+            await expect(repository).to_have_attribute(
+                "aria-label", f"Sandbox repositories: {repo_name}"
+            )
+            repository_label = repository.locator("[data-workspace-collapse-label]")
+            if viewport_width == 390:
+                await expect(controls).to_have_attribute("data-labels", "collapsed")
+                await expect(repository_label).to_be_hidden()
+            else:
+                await expect(controls).not_to_have_attribute("data-labels", "collapsed")
+                await expect(repository_label).to_be_visible()
+
+            await page.keyboard.press("Escape")
+            await page.get_by_test_id("new-chat-landing-input").fill("audit the repository")
+            await page.get_by_test_id("new-chat-landing-submit").click()
+            await _wait_until(lambda: len(create_bodies) == 1)
+            body = create_bodies[0]
+            assert body["host_type"] == "managed", body
+            assert body["workspaces"] == [repo_url], body
+        finally:
+            await browser.close()
+
+
 async def _drive_managed_remembers_host(base_url: str, session_id: str) -> None:
     host_id, host_name = _HOST_ALPHA
     # The loopback E2E server exposes exactly one online host, so the landing

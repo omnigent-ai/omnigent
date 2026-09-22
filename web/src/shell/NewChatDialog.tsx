@@ -30,6 +30,7 @@ import {
 import {
   ChatComposer,
   COMPOSER_COLUMN_WIDTH,
+  COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS,
   ComposerSendButton,
 } from "@/components/composer/ChatComposer";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
@@ -5924,7 +5925,10 @@ export function NewChatLandingScreen() {
                     <GitBranchIcon className="ui-icon" />
                     <span
                       data-workspace-collapse-label=""
-                      className="min-w-0 truncate text-left group-data-[workspace-labels=collapsed]/composer-workspace:hidden"
+                      className={cn(
+                        "min-w-0 truncate text-left",
+                        COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS,
+                      )}
                     >
                       {sandboxRepoLabel}
                     </span>
