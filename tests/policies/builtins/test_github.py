@@ -523,6 +523,27 @@ def test_shell_interpreter_with_c_string_still_classified() -> None:
     assert policy(_sh('sh -c "ls -la"')) is None
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        r"echo \" ; git push https://github.com/octo/secret main",
+        r'echo "x \" y" ; git push https://github.com/octo/secret main',
+    ],
+)
+def test_shell_escaped_quote_does_not_hide_the_push(command: str) -> None:
+    """A backslash-escaped quote must not swallow a following command separator.
+
+    The segment splitter is quote-aware; if it ignored backslash escapes, an
+    escaped quote (``\\"``) would open a spurious quoted region and hide the
+    ``;`` before a denied push, so the whole line parsed as one ``echo`` segment
+    and abstained → ALLOW. Escapes are honoured (matching the shell) so the push
+    is still split into its own segment and gated.
+    """
+    policy = github_policy(write_repos=[_REPO])
+    result = policy(_sh(command))
+    assert result is not None and result["result"] == "DENY"
+
+
 def test_shell_clone_read_allowed_and_denied() -> None:
     """git clone is a read: allowed for an allowlisted repo, denied otherwise."""
     policy = github_policy(read_all=False, read_repos=[_REPO])

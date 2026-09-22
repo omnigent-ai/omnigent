@@ -187,8 +187,14 @@ def is_shell_interpreter(tokens: list[str]) -> bool:
     policy should surface such an unclassifiable interpreter path for approval
     rather than allow it. Matched on the basename so ``/bin/sh`` counts too.
 
+    This tests the head only, not the arguments, so it also returns ``True`` for
+    an interpreter that *does* carry a ``-c`` string. Call it after
+    :func:`unwrap_shell_command` has already returned ``None`` for the tokens
+    (as the github policy does): a readable ``-c`` form is unwrapped and
+    classified there first, so what reaches this check is the stdin/script form.
+
     :param tokens: The output of :func:`real_invocation_tokens`.
-    :returns: ``True`` when the head is a shell interpreter with no ``-c``.
+    :returns: ``True`` when the head is a shell interpreter.
     """
     return bool(tokens) and tokens[0].rsplit("/", 1)[-1] in SHELL_INTERPRETERS
 
@@ -307,12 +313,17 @@ def _split_unquoted_operators(command: str) -> list[str]:
     """
     Split *command* on shell separators, ignoring separators inside quotes.
 
-    Walks the string tracking single- and double-quote state and cuts on ``&&``,
-    ``||`` and each :data:`_SEGMENT_OPERATOR_CHARS` character encountered outside
-    quotes. Best-effort (it does not model backslash escapes); an unbalanced
-    quote simply means the remainder is treated as quoted, and the downstream
-    ``shlex`` parse still fails such a segment closed via each policy's
-    un-tokenizable fail-safe.
+    Walks the string tracking single-/double-quote state and backslash escapes,
+    and cuts on ``&&``, ``||`` and each :data:`_SEGMENT_OPERATOR_CHARS`
+    character encountered outside quotes. A backslash outside single quotes
+    escapes the next character, so neither the backslash nor that character is
+    treated as a quote toggle or an operator — matching how the shell tokenizes,
+    where ``echo \\" ; git push …`` still runs ``git push`` as its own command
+    (the escaped ``"`` does not open a quoted region, so the ``;`` still splits).
+    Missing this reopened a guardrail bypass. Single quotes take no escapes.
+    An unbalanced quote leaves the remainder quoted; the downstream ``shlex``
+    parse then fails that segment closed via each policy's un-tokenizable
+    fail-safe.
 
     :param command: The command string, substitutions already stripped.
     :returns: The raw (un-trimmed) segments between operators.
@@ -324,14 +335,27 @@ def _split_unquoted_operators(command: str) -> list[str]:
     while i < n:
         ch = command[i]
         if in_single:
+            # Single quotes are literal: no escapes, only ``'`` ends the region.
             if ch == "'":
                 in_single = False
             buf.append(ch)
-        elif in_double:
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < n:
+            # Outside single quotes a backslash escapes the next character; keep
+            # both verbatim so an escaped quote/operator is neither a toggle nor
+            # a split point (also correct inside double quotes, e.g. ``\"``).
+            buf.append(ch)
+            buf.append(command[i + 1])
+            i += 2
+            continue
+        if in_double:
             if ch == '"':
                 in_double = False
             buf.append(ch)
-        elif ch == "'":
+            i += 1
+            continue
+        if ch == "'":
             in_single = True
             buf.append(ch)
         elif ch == '"':
