@@ -1440,9 +1440,8 @@ def register_events_routes(
             blocked_on = (
                 raw_blocked_on if isinstance(raw_blocked_on, str) and raw_blocked_on else None
             )
-            if body.type == _SUBAGENT_STATUS_TYPE or status == "quiesced":
+            if body.type == _SUBAGENT_STATUS_TYPE:
                 # A transcript lull publishes idle but is not a runner completion.
-                # Legacy "quiesced" input is deprecated; remove in 0.16.0.
                 _publish_status(
                     session_id,
                     "idle",

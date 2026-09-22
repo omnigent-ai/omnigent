@@ -570,11 +570,11 @@ class SubagentEntry:
         ``subagent.status`` event with ``idle: true``. The server publishes
         idle but never forwards this observation as a terminal edge.
         ``None`` means no items have been seen, so the heuristic cannot fire.
-    :param last_status: Last observation posted for this sub-agent. The
-        legacy ``quiesced`` checkpoint marker now records ``subagent.status``
-        with ``idle: true``; keeping it preserves deduplication across upgrades
-        and rollbacks. Other values are ``running``, ``failed``, or ``None``
-        when nothing has been posted yet.
+    :param last_status: Last observation handled for this sub-agent. The
+        existing ``quiesced`` checkpoint marker records an idle observation
+        sent or skipped for an older server. It stays private to the cursor
+        to preserve deduplication across development upgrades and rollbacks.
+        Other values are ``running``, ``failed``, or ``None`` before any observation.
     :param delivery_error: Durable reason the mirrored transcript is
         incomplete. After inactivity it reports ``failed`` instead of idle.
     """
@@ -622,6 +622,47 @@ class _SessionEventBatchCapability:
     """Cache whether this server accepts arrays at the session-events route."""
 
     supported: bool | None = None
+
+
+@dataclass
+class _SubagentStatusCapability:
+    """Remember an unsupported idle event for this forwarder's server connection."""
+
+    supported: bool = True
+
+    async def post_idle(self, client: httpx.AsyncClient, *, session_id: str) -> None:
+        """Post an idle observation, or skip it once an old server rejects the type.
+
+        :param client: Omnigent HTTP client.
+        :param session_id: Child session receiving the observation.
+        :raises httpx.HTTPError: For failures other than an unknown event type.
+        """
+        if not self.supported:
+            return
+        resp = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={"type": "subagent.status", "data": {"idle": True}},
+        )
+        if resp.status_code == 400:
+            try:
+                payload = resp.json()
+            except ValueError:
+                payload = None
+            error = payload.get("error") if isinstance(payload, dict) else None
+            if (
+                isinstance(error, dict)
+                and error.get("code") == "invalid_input"
+                and isinstance(error.get("message"), str)
+                and error["message"].startswith("Unknown event type: 'subagent.status'.")
+            ):
+                if self.supported:
+                    _logger.info(
+                        "Omnigent server does not accept subagent.status; "
+                        "skipping idle observations until the forwarder restarts"
+                    )
+                self.supported = False
+                return
+        resp.raise_for_status()
 
 
 class _SubagentStateCheckpoint:
@@ -1151,6 +1192,7 @@ async def forward_claude_transcript_to_session(
     )
     subagent_status_retries = _PostRetryTracker()
     session_event_batch_capability = _SessionEventBatchCapability()
+    subagent_status_capability = _SubagentStatusCapability()
     # Dedupe: Claude rewrites the same usage block every poll until
     # the next assistant entry; only POST on real change. Mutated in
     # place by ``_forward_available_items`` and carried across polls.
@@ -1423,6 +1465,7 @@ async def forward_claude_transcript_to_session(
                                         item_retry_tracker=subagent_item_retries,
                                         status_retry_tracker=subagent_status_retries,
                                         batch_capability=session_event_batch_capability,
+                                        status_capability=subagent_status_capability,
                                     ),
                                     timeout=_FORWARD_LOOP_STALL_DEADLINE_S,
                                 ),
@@ -2009,6 +2052,7 @@ async def _forward_one_subagent(
     item_retry_tracker: _PostRetryTracker,
     status_retry_tracker: _PostRetryTracker,
     batch_capability: _SessionEventBatchCapability,
+    status_capability: _SubagentStatusCapability,
 ) -> None:
     """Drain one child's transcript in ordered, byte-capped batches."""
     jsonl_path = subagents_dir / f"agent-{entry.subagent_id}.jsonl"
@@ -2301,11 +2345,7 @@ async def _forward_one_subagent(
         return
     try:
         if desired_status == "quiesced":
-            resp = await client.post(
-                f"/v1/sessions/{entry.child_conversation_id}/events",
-                json={"type": "subagent.status", "data": {"idle": True}},
-            )
-            resp.raise_for_status()
+            await status_capability.post_idle(client, session_id=entry.child_conversation_id)
         else:
             await post_external_session_status(
                 client,
@@ -2430,6 +2470,7 @@ async def _forward_available_subagents(
     item_retry_tracker: _PostRetryTracker,
     status_retry_tracker: _PostRetryTracker,
     batch_capability: _SessionEventBatchCapability | None = None,
+    status_capability: _SubagentStatusCapability | None = None,
 ) -> SubagentForwardState:
     """
     Discover new Claude Task-tool sub-agents on disk, mint Omnigent child
@@ -2460,6 +2501,8 @@ async def _forward_available_subagents(
         ``status:<child_id>``).
     :param batch_capability: Process-local cache of whether the server accepts
         event arrays. A new cache is created for direct callers that omit it.
+    :param status_capability: Process-local cache of whether the server accepts
+        idle observations. A new cache is created for direct callers that omit it.
     :returns: Updated state with new sub-agents registered and
         existing sub-agents' cursors advanced.
     """
@@ -2468,6 +2511,8 @@ async def _forward_available_subagents(
         return state
     if batch_capability is None:
         batch_capability = _SessionEventBatchCapability()
+    if status_capability is None:
+        status_capability = _SubagentStatusCapability()
 
     # ── Register newly-appeared sub-agents ──────────────
     # ``glob`` is sync; offload to a thread so we don't stat the
@@ -2663,6 +2708,7 @@ async def _forward_available_subagents(
                 item_retry_tracker=item_retry_tracker,
                 status_retry_tracker=status_retry_tracker,
                 batch_capability=batch_capability,
+                status_capability=status_capability,
             )
 
     entries = list(updated.subagents.values())

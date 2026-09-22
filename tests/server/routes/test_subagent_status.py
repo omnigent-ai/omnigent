@@ -1,4 +1,4 @@
-"""Quiescence inputs retain status effects without delivering runner completion."""
+"""Subagent inactivity publishes idle status without delivering runner completion."""
 
 from __future__ import annotations
 
@@ -27,10 +27,6 @@ from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
 
-_QUIESCENCE_INPUTS = [
-    pytest.param("subagent.status", {"idle": True}, id="subagent-status"),
-    pytest.param("external_session_status", {"status": "quiesced"}, id="legacy-quiesced"),
-]
 _BACKGROUND_TASK = BackgroundTaskInfo(status="running", description="Wait for CI")
 
 
@@ -65,7 +61,7 @@ async def status_route(
     task_id = uuid4().hex
     scheduled.create(
         scheduled_task_id=task_id,
-        name="quiescence",
+        name="inactivity",
         prompt="test",
         rrule="FREQ=HOURLY;BYMINUTE=0",
         user_id=None,
@@ -148,7 +144,6 @@ async def status_route(
                     cache.pop(conv.id, None)
 
 
-@pytest.mark.parametrize(("event_type", "data"), _QUIESCENCE_INPUTS)
 @pytest.mark.parametrize("is_child", [True, False], ids=["child", "top-level"])
 @pytest.mark.parametrize(
     ("optional", "wire_fields", "count", "tasks"),
@@ -187,10 +182,8 @@ async def status_route(
         ),
     ],
 )
-async def test_quiescence_inputs_have_identical_status_effects(
+async def test_subagent_idle_publishes_status_without_completion(
     status_route: _StatusRoute,
-    event_type: str,
-    data: dict[str, Any],
     is_child: bool,
     optional: dict[str, Any],
     wire_fields: dict[str, Any],
@@ -200,7 +193,8 @@ async def test_quiescence_inputs_have_identical_status_effects(
     route = status_route
     sid = route.child_id if is_child else route.parent_id
     response = await route.client.post(
-        f"/v1/sessions/{sid}/events", json={"type": event_type, "data": {**data, **optional}}
+        f"/v1/sessions/{sid}/events",
+        json={"type": "subagent.status", "data": {"idle": True, **optional}},
     )
     assert response.status_code == 202, response.text
     assert response.json() == {"queued": False}
@@ -246,16 +240,13 @@ async def test_quiescence_inputs_have_identical_status_effects(
     route.telemetry.assert_not_called()
 
 
-@pytest.mark.parametrize(("event_type", "data"), _QUIESCENCE_INPUTS)
-async def test_quiescence_preserves_failed_status(
-    status_route: _StatusRoute, event_type: str, data: dict[str, Any]
-) -> None:
+async def test_subagent_idle_preserves_failed_status(status_route: _StatusRoute) -> None:
     route = status_route
     sid = route.child_id
     common._session_status_cache[sid] = "failed"
     route.store.set_session_live_status(sid, "failed")
     response = await route.client.post(
-        f"/v1/sessions/{sid}/events", json={"type": event_type, "data": data}
+        f"/v1/sessions/{sid}/events", json={"type": "subagent.status", "data": {"idle": True}}
     )
     assert response.status_code == 202, response.text
     await _flush_live_state()
@@ -300,14 +291,13 @@ async def test_subagent_status_requires_literal_true(
     assert route.forwarded == []
 
 
-@pytest.mark.parametrize(("event_type", "data"), _QUIESCENCE_INPUTS)
-async def test_quiescence_validates_optional_response_id(
-    status_route: _StatusRoute, event_type: str, data: dict[str, Any]
+async def test_subagent_idle_validates_optional_response_id(
+    status_route: _StatusRoute,
 ) -> None:
     route = status_route
     response = await route.client.post(
         f"/v1/sessions/{route.child_id}/events",
-        json={"type": event_type, "data": {**data, "response_id": 123}},
+        json={"type": "subagent.status", "data": {"idle": True, "response_id": 123}},
     )
     assert response.status_code == 400, response.text
     assert "data.response_id" in response.json()["error"]["message"]

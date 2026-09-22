@@ -114,10 +114,8 @@ _EXTERNAL_SESSION_STATUS_TYPE: str = "external_session_status"
 _SUBAGENT_STATUS_TYPE: str = "subagent.status"
 
 
-# "quiesced" is a deprecated badge-only input for older runners; remove in
-# 0.16.0. New runners use subagent.status with data.idle=true.
 _EXTERNAL_SESSION_STATUS_VALUES: frozenset[str] = frozenset(
-    {"idle", "running", "waiting", "failed", "quiesced"}
+    {"idle", "running", "waiting", "failed"}
 )
 
 
