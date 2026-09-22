@@ -10343,6 +10343,8 @@ def test_wait_for_claude_prompt_ready_fails_fast_on_a_terminal_dialog(
     message = str(excinfo.value)
     assert "New MCP server found in this project: e2e-noop" in message
     assert "Open the terminal" in message
+    assert "answer the prompt" in message
+    assert "resend your message" in message
     assert "Esc to cancel" in message
 
 
