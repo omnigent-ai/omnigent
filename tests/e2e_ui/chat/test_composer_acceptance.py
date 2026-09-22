@@ -201,11 +201,11 @@ def test_pr_context_and_background_tasks_share_workspace_bar(
     assert trailing["x"] + trailing["width"] == pytest.approx(
         bounds["x"] + bounds["width"] - 9, abs=0.5
     )
-    indicator_ids = ("background-task-pill", "subagent-task-pill", "composer-context-ring")
-    assert all(
-        control_bounds[left]["x"] + control_bounds[left]["width"] < control_bounds[right]["x"]
-        for left, right in pairwise(indicator_ids)
-    )
+    background = control_bounds["background-task-pill"]
+    subagent = control_bounds["subagent-task-pill"]
+    context_ring = control_bounds["composer-context-ring"]
+    assert background["x"] + background["width"] == pytest.approx(subagent["x"], abs=0.5)
+    assert subagent["x"] + subagent["width"] + 4 == pytest.approx(context_ring["x"], abs=0.5)
     # A label that would have to truncate collapses the whole bar to icons
     # instead — the full value stays in the title — and a bar with room shows
     # every label untruncated. Neither state may show an ellipsis.
