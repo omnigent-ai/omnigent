@@ -410,3 +410,27 @@ async def test_failed_reader_preserves_error_and_allows_exporter_cleanup(
         await server.stderr_task
     await server.close()
     assert not diagnostics._thread.is_alive()
+
+
+async def test_cancelling_close_during_eof_wait_still_cleans_up(
+    server: app_server.CodexNativeAppServer, output: _Output
+) -> None:
+    # The process has exited, but a descendant still owns the stderr pipe.
+    stderr = _reader(server)
+    stderr.feed_data(b"before close\n")
+    await output.next()
+    diagnostics, reader = server._stderr_diagnostics, server.stderr_task
+    assert diagnostics is not None and reader is not None
+    stderr.feed_data(b"pending final fragment")
+    await asyncio.sleep(0)
+    closing = asyncio.create_task(server.close())
+    await asyncio.sleep(0)
+    assert not closing.done()
+    closing.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(closing, 3)
+    assert reader.cancelled()
+    assert not diagnostics._thread.is_alive()
+    assert server.stderr_task is None and server._stderr_diagnostics is None
+    assert server.proc is None
+    assert (await output.next()).getMessage().endswith("pending final fragment")

@@ -2199,22 +2199,27 @@ class CodexNativeAppServer:
             unregister_codex_native_process(self.process_registry_tag)
         if self.process_owner_lock is not None:
             self.process_owner_lock.close()
-        if self.stderr_task is not None:
-            if self._stderr_diagnostics is not None:
+        try:
+            if self.stderr_task is not None and self._stderr_diagnostics is not None:
                 # The process has exited; allow buffered output to reach EOF.
                 # A descendant can still hold the pipe open, so bound the wait.
                 await asyncio.wait({self.stderr_task}, timeout=1.0)
-            self.stderr_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await self.stderr_task
-        if self._stderr_diagnostics is not None:
-            diagnostics, self._stderr_diagnostics = self._stderr_diagnostics, None
-            with contextlib.suppress(Exception):
-                await asyncio.to_thread(diagnostics.close)
-        self.proc = None
-        self.stderr_task = None
-        self.process_registry_tag = None
-        self.process_owner_lock = None
+        finally:
+            try:
+                if self.stderr_task is not None:
+                    self.stderr_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await self.stderr_task
+            finally:
+                diagnostics, self._stderr_diagnostics = self._stderr_diagnostics, None
+                self.proc = None
+                self.stderr_task = None
+                self.process_registry_tag = None
+                self.process_owner_lock = None
+                if diagnostics is not None:
+                    diagnostics.finish()
+                    with contextlib.suppress(Exception):
+                        await asyncio.to_thread(diagnostics.close)
 
     async def _wait_until_ready(self) -> CodexAppServerClient:
         """

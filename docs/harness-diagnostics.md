@@ -59,6 +59,9 @@ Events use `event_name=harness_diagnostic_output`, `harness=codex-native`, and
 Each event uses the current session ID from the bridge state, falling back to
 the owning launch session before bridge state exists. Child startup diagnostics
 therefore retain the child's identity when it shares its parent's runner.
+Identity is resolved when a batch is emitted: output buffered immediately before
+a session switch such as `/clear` can be attributed to the replacement session.
+Use `launch_id`, PID, and byte offset to follow the same process across a switch.
 
 | Attribute | Meaning |
 | --- | --- |
