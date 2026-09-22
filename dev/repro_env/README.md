@@ -18,6 +18,18 @@ tests. Existing fixtures attach to the prepared server and runner, and
 `mock_llm_server_url` addresses its model server. They do not provision another
 runner or decide the model backend from ambient credentials.
 
+Attachment supports HTTP/browser journeys and native session fixtures. Tests
+that directly kill/restart a server or runner or access the fixture database
+require their own environment; run those outside `dev.repro_env exec`. Missing
+process/database state produces an explicit error. The three connection
+variables must be supplied together; use the wrapper rather than setting only
+one of them.
+
+Standalone native mock fixtures save an existing provider config to an
+owner-only `config.yaml.e2e-backup` before replacing it and restore it on exit.
+If the test process is killed, recover that backup before retrying; subsequent
+runs refuse to overwrite it.
+
 Arbitrary Python/Playwright commands also work with the wrapper. They receive
 `OMNIGENT_REPRO_SERVER_URL`, `OMNIGENT_REPRO_MODEL_URL`, and
 `OMNIGENT_REPRO_RUNNER_ID`. These URLs are valid only inside that invocation;
@@ -53,3 +65,8 @@ normalization, then bundles diagnostics even on failure. A six-hour lease bounds
 its lifetime if normal cleanup cannot run. `serve` is a foreground supervisor
 intended for the workflow's persistent sandbox; starting it as a background job
 in an agent shell does not give it that lifetime.
+
+Each `serve` attempt requires a fresh output directory with mode 0700. Preserve
+the previous directory for diagnostics and select another with `--output PATH`
+(before the `serve` subcommand). Startup never clears a stop request: the
+workflow may already have requested cancellation before the supervisor starts.

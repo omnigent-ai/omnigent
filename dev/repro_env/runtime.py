@@ -160,6 +160,7 @@ def supervise(output: Path) -> None:
                 if response.status_code == 200 and predicate(response):
                     return
             except httpx.TransportError:
+                # Startup can refuse connections until the service binds; retry until the deadline.
                 pass
             time.sleep(0.2)
         raise TimeoutError(f"not ready: {url}")
@@ -259,6 +260,8 @@ def supervise(output: Path) -> None:
                 raise RuntimeError("environment process exited; inspect process logs")
             time.sleep(0.2)
         state["status"] = "stopped"
+    except InterruptedError:
+        state["status"] = "stopped"
     except Exception as exc:
         _logger.exception("Reproduction environment failed")
         state.update(status="failed", error=f"{type(exc).__name__}: {exc}")
@@ -300,7 +303,13 @@ def supervise(output: Path) -> None:
 def serve(output: Path, lease_seconds: int) -> int:
     """Run in the workflow's persistent sandbox, in the foreground."""
     root = Path.cwd().resolve()
-    output.mkdir(parents=True, exist_ok=True)
+    output.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if (output / "environment.json").exists():
+        raise ValueError(
+            "Reproduction output already contains an attempt; use a fresh --output directory"
+        )
+    if output.stat().st_mode & 0o077:
+        raise ValueError("Reproduction output must be an owner-only directory (mode 0700)")
     if not (root / "omnigent/server/static/web-ui/index.html").is_file():
         raise RuntimeError("Build the SPA before provisioning the reproduction environment")
     if not 60 <= lease_seconds <= 21600:

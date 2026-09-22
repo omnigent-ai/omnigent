@@ -172,7 +172,38 @@ def switch_markdown_view_mode(page: Page, file_viewer: Locator, mode: str) -> No
 # Populated by ``live_server`` so test-scoped fixtures can access the
 # server PID and runner id without changing ``live_server``'s return
 # type (which other tests depend on).
-_server_state: dict[str, object] = {}
+class _ServerState(dict[str, object]):
+    def __missing__(self, key: str) -> object:
+        if self.get("workflow_owned") and key in {
+            "pid",
+            "runner_pid",
+            "database_uri",
+            "restart_server",
+            "binding_token",
+        }:
+            raise RuntimeError(
+                f"Workflow-owned reproduction does not expose {key!r} to test fixtures. "
+                "Use the product HTTP API, or run this process/database test in a "
+                "separate fixture-owned environment outside dev.repro_env exec."
+            )
+        raise KeyError(key)
+
+
+_server_state: dict[str, object] = _ServerState()
+
+
+def _prepared_repro_environment() -> dict[str, str]:
+    keys = ("OMNIGENT_REPRO_SERVER_URL", "OMNIGENT_REPRO_MODEL_URL", "OMNIGENT_REPRO_RUNNER_ID")
+    values = {key: os.environ.get(key, "") for key in keys}
+    if any(values.values()) and not all(values.values()):
+        missing = ", ".join(key for key, value in values.items() if not value)
+        raise RuntimeError(
+            f"Incomplete prepared reproduction environment: missing {missing}. "
+            "Launch tests via python -m dev.repro_env exec -- ..."
+        )
+    return values
+
+
 _WEB_DIR = _REPO_ROOT / "web"
 _BUILD_OUTPUT = _REPO_ROOT / "omnigent" / "server" / "static" / "web-ui"
 
@@ -567,7 +598,7 @@ def mock_llm_server_url(
     :param tmp_path_factory: Pytest temp path factory for logs.
     :returns: The mock server base URL, e.g. ``"http://127.0.0.1:51235"``.
     """
-    if url := os.environ.get("OMNIGENT_REPRO_MODEL_URL"):
+    if url := _prepared_repro_environment()["OMNIGENT_REPRO_MODEL_URL"]:
         yield url
         return
     mock_port = _find_free_port()
@@ -692,7 +723,7 @@ def seed_committed_items(session_id: str, items: list[Any]) -> None:
     if not database_uri:
         raise RuntimeError(
             "seeding needs the spawned server's database; it is "
-            "unavailable when running against --ui-base-url."
+            "unavailable with --ui-base-url or a workflow-owned reproduction environment."
         )
     SqlAlchemyConversationStore(str(database_uri)).append(session_id, items)
 
@@ -760,7 +791,7 @@ def set_session_task_summary(session_id: str, task_summary: str) -> None:
     if not database_uri:
         raise RuntimeError(
             "set_session_task_summary needs the spawned server's database; it "
-            "is unavailable when running against --ui-base-url."
+            "is unavailable with --ui-base-url or a workflow-owned reproduction environment."
         )
     SqlAlchemyConversationStore(str(database_uri)).set_task_summary(session_id, task_summary)
 
@@ -839,7 +870,9 @@ def built_spa(request: pytest.FixtureRequest) -> None:
         ``--ui-skip-build``.
     :returns: ``None``. Side effect is the populated build dir.
     """
-    if os.environ.get("OMNIGENT_REPRO_SERVER_URL") or request.config.getoption("--ui-base-url"):
+    if _prepared_repro_environment()["OMNIGENT_REPRO_SERVER_URL"] or request.config.getoption(
+        "--ui-base-url"
+    ):
         return
     if request.config.getoption("--ui-skip-build"):
         return
@@ -1008,9 +1041,10 @@ def live_server(
         the expected local runner does not report online within
         :data:`_HEALTH_TIMEOUT_S` seconds.
     """
-    if base_url := os.environ.get("OMNIGENT_REPRO_SERVER_URL"):
+    prepared = _prepared_repro_environment()
+    if base_url := prepared["OMNIGENT_REPRO_SERVER_URL"]:
         _server_state.update(
-            runner_id=os.environ["OMNIGENT_REPRO_RUNNER_ID"],
+            runner_id=prepared["OMNIGENT_REPRO_RUNNER_ID"],
             server_url=base_url,
             mock_llm_url=mock_llm_server_url,
             workflow_owned=True,
@@ -2822,7 +2856,13 @@ def _temp_omnigent_mock_config(
     config_path = global_config_path()
     config_dir = config_path.parent
     config_dir.mkdir(parents=True, exist_ok=True)
-    original = config_path.read_text() if config_path.exists() else None
+    backup = config_path.with_name(config_path.name + ".e2e-backup")
+    if backup.exists():
+        raise RuntimeError(
+            f"Unrestored mock-provider backup at {backup}; "
+            "recover the original config before retrying"
+        )
+    original = config_path.read_bytes() if config_path.exists() else None
 
     if harness == "claude":
         mock_config = textwrap.dedent(f"""\
@@ -2850,12 +2890,18 @@ def _temp_omnigent_mock_config(
                     default: {_CODEX_MOCK_MODEL}
             """)
 
-    config_path.write_text(mock_config)
+    if original is not None:
+        fd = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(original)
+            handle.flush()
+            os.fsync(handle.fileno())
     try:
+        config_path.write_text(mock_config)
         yield
     finally:
         if original is not None:
-            config_path.write_text(original)
+            backup.replace(config_path)
         else:
             config_path.unlink(missing_ok=True)
 
