@@ -296,6 +296,40 @@ function findMenuItem(menu, id) {
   return null;
 }
 
+function findTopLevelMenu(menu, label) {
+  return menu.template.find((item) => item.label === label) ?? null;
+}
+
+describe("macOS Notifications menu", () => {
+  it("is available in packaged builds and exposes mode and sound controls", (t) => {
+    const harness = loadMainHarness({ isPackaged: true, platform: "darwin" });
+    t.after(harness.cleanup);
+
+    harness.api.buildMenu();
+    const menu = harness.calls.setApplicationMenu.at(-1);
+
+    assert.ok(findTopLevelMenu(menu, "Notifications"));
+    assert.ok(findMenuItem(menu, "notification_mode_when_away"));
+    assert.ok(findMenuItem(menu, "notification_mode_always"));
+    assert.ok(findMenuItem(menu, "notification_sound_enabled"));
+    assert.ok(findMenuItem(menu, "notification_sound_Glass"));
+  });
+
+  it("persists Always and broadcasts it to connected windows", (t) => {
+    const harness = loadMainHarness({ platform: "darwin" });
+    t.after(harness.cleanup);
+    harness.api.buildMenu();
+
+    findMenuItem(harness.calls.setApplicationMenu.at(-1), "notification_mode_always").click();
+
+    assert.equal(harness.readSettings().notification_mode, "always");
+    assert.deepEqual(harness.calls.sent.at(-1), {
+      channel: "omnigent:notification-mode-changed",
+      payload: "always",
+    });
+  });
+});
+
 function hasDebugMenu(menu) {
   return menu.template.some((item) => item.label === "Debug");
 }

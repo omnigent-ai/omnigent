@@ -35,7 +35,7 @@ import { useLoadedConversations } from "@/hooks/useSidebarData";
 // re-prompted. Under the Electron desktop shell the OS notification path
 // manages permission, so that gate doesn't apply.
 
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "@/lib/routing";
 import type { Conversation } from "@/hooks/useConversations";
 import {
@@ -45,8 +45,10 @@ import {
 } from "@/lib/browserNotifications";
 import {
   type BadgeActivation,
+  getNativeNotificationMode,
   isNativeShell,
   onNativeNotificationActivated,
+  onNativeNotificationModeChanged,
   onOpenPath,
   setBadgeCount,
 } from "@/lib/nativeBridge";
@@ -173,6 +175,33 @@ export function useIdleNotifications(activeConversationId?: string): void {
   // sound was added). Seeded from `isWindowFocused()`; corrected by the
   // listeners in the effect below.
   const windowFocusedRef = useRef<boolean>(isWindowFocused());
+  const notificationModeRef = useRef<"when-away" | "always">("when-away");
+  const notificationSnapshotsSeeded = useRef(false);
+  // Browsers have no native preference to load. In the desktop shell, hold
+  // transition processing until the persisted mode is known so a focused
+  // completion cannot be consumed under the temporary `when-away` default.
+  const [notificationModeReady, setNotificationModeReady] = useState(() => !isNativeShell());
+
+  useEffect(() => {
+    let mounted = true;
+    let receivedModeChange = false;
+    const unsubscribe = onNativeNotificationModeChanged((mode) => {
+      receivedModeChange = true;
+      notificationModeRef.current = mode;
+      setNotificationModeReady(true);
+    });
+    void getNativeNotificationMode().then((mode) => {
+      // A menu event is newer than the startup read, even if its callback wins
+      // the race by only a few milliseconds.
+      if (!mounted || receivedModeChange) return;
+      notificationModeRef.current = mode;
+      setNotificationModeReady(true);
+    });
+    return () => {
+      mounted = false;
+      unsubscribe();
+    };
+  }, []);
 
   // Desktop shell only: clicking an OS notification can't run the web
   // `onClick` closure (it never crosses the IPC boundary), so the shell sends
@@ -285,6 +314,18 @@ export function useIdleNotifications(activeConversationId?: string): void {
     );
     pushBadge(unread, conversations);
 
+    if (!notificationModeReady) {
+      // Seed exactly once from the first real list, then preserve that baseline
+      // until the native preference resolves. Advancing it on later polls would
+      // permanently lose a completion or elicitation that arrived meanwhile.
+      if (conversations.length > 0 && !notificationSnapshotsSeeded.current) {
+        prevStatus.current = buildStatusMap(conversations);
+        prevElicitations.current = buildElicitationMap(conversations);
+        notificationSnapshotsSeeded.current = true;
+      }
+      return;
+    }
+
     const idle = detectIdleTransitions(prevStatus.current, conversations);
     const newElicitations = detectNewElicitations(prevElicitations.current, conversations);
     prevStatus.current = buildStatusMap(conversations);
@@ -326,7 +367,12 @@ export function useIdleNotifications(activeConversationId?: string): void {
     // window is focused AND it's the open conversation.
     if (grantedOrNative) {
       for (const conversation of idle) {
-        if (windowFocused && conversation.id === activeConversationId) continue;
+        if (
+          notificationModeRef.current !== "always" &&
+          windowFocused &&
+          conversation.id === activeConversationId
+        )
+          continue;
         // Skip sessions whose runner is offline. When nothing is actively
         // running, the only thing that flips a session to a terminal status is
         // the server reconciling a dead-runner session (a stale `running`
@@ -352,7 +398,12 @@ export function useIdleNotifications(activeConversationId?: string): void {
             timers.delete(id);
             // Re-check suppression at fire time — the user may have opened the
             // session (or refocused the window) during the settle window.
-            if (windowFocusedRef.current && id === activeIdRef.current) return;
+            if (
+              notificationModeRef.current !== "always" &&
+              windowFocusedRef.current &&
+              id === activeIdRef.current
+            )
+              return;
             // Mark it beeped so a later finish stays silent until the user has
             // viewed this session.
             notifiedSessions.current.add(id);
@@ -362,7 +413,12 @@ export function useIdleNotifications(activeConversationId?: string): void {
         );
       }
       for (const conversation of newElicitations) {
-        if (windowFocused && conversation.id === activeConversationId) continue;
+        if (
+          notificationModeRef.current !== "always" &&
+          windowFocused &&
+          conversation.id === activeConversationId
+        )
+          continue;
         // Same offline-runner guard: a prompt on a dead-runner session can't be
         // acted on and is almost always stale reconciliation.
         if (conversation.runner_online === false) continue;
@@ -376,7 +432,7 @@ export function useIdleNotifications(activeConversationId?: string): void {
         notify(conversation, ELICITATION_BODY, navigate);
       }
     }
-  }, [data, navigate, activeConversationId]);
+  }, [data, navigate, activeConversationId, notificationModeReady]);
 }
 
 /**

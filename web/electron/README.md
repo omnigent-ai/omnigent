@@ -7,9 +7,10 @@ adds native niceties:
 - **OS-native desktop notifications** (via the main-process `Notification`
   API) when an agent finishes a turn (`running` → `idle`/`failed`), raises a
   new elicitation (asks for input), or a runner disconnects (`online` →
-  `offline`). A notification fires for any such event **except** the one
-  conversation you're actively viewing (window focused _and_ that chat
-  open). Sessions already settled at launch don't fire; only fresh
+  `offline`). By default, a notification fires for any such event **except**
+  the conversation you're actively viewing. On macOS, choose
+  **Notifications → Always (Even When Focused)** to notify for that active
+  conversation too. Sessions already settled at launch don't fire; only fresh
   transitions this client observes do. On a turn-end the notification body
   shows the **first few lines of the agent's final message** when they can be
   fetched (one best-effort `GET /items` call), falling back to a generic
@@ -60,8 +61,9 @@ adds native niceties:
   `Assets.car`/Liquid Glass appearance rather than the development PNG. Our other custom actions
   — **New Window**, **New Window on Different Server…**, and
   **Change Server…** — live in a dedicated **Server** submenu. On macOS a
-  **Notifications** submenu turns the notification sound on/off (**Play
-  Notification Sound**, **off by default** — the user opts in) and picks which
+  **Notifications** submenu selects **When Away from Conversation** (the
+  default) or **Always (Even When Focused)**, turns sound on/off (**Play
+  Notification Sound**, **off by default**), and picks which
   macOS system sound to play (**Sound ▸** — Glass, Ping, Hero, …); choosing one
   previews it, and the choice persists in `settings.json` and applies to the
   next notification.
