@@ -78,6 +78,7 @@ from omnigent.policies.builtins._shell import (
     SHELL_TOOLS,
     is_unresolved_invocation,
     real_invocation_tokens,
+    spawns_gated_command_as_child,
     split_command_segments,
     unwrap_shell_command,
 )
@@ -903,8 +904,11 @@ def _classify_shell_command(command: str, _depth: int = 0) -> list[_ShellOp]:
             tokens = real_invocation_tokens(tokens)
             # A leading option means some wrapper's own flags were not modelled,
             # so the real command was never reached. Same fail-safe as an
-            # un-tokenizable segment rather than a silent abstain.
-            unreadable = is_unresolved_invocation(tokens)
+            # un-tokenizable segment rather than a silent abstain. A
+            # process-spawning utility (find -exec, xargs, perl -e, python -c,
+            # awk, make) likewise runs the gated command as a child whose argv is
+            # not modelled here, so route it through the same fail-safe.
+            unreadable = is_unresolved_invocation(tokens) or spawns_gated_command_as_child(tokens)
         if unreadable:
             if re.search(r"\b(git|gh)\b", segment):
                 ops.append(

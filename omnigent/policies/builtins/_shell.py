@@ -131,6 +131,50 @@ _INTERPRETER_C_FLAG = re.compile(r"-[A-Za-z]*c[A-Za-z]*$")
 MAX_SHELL_NESTING = 4
 
 
+# Utilities that RUN another command as a child process (``find … -exec git
+# push``, ``xargs git push``, ``perl -e 'exec("git",…)'``, ``python3 -c
+# "os.execvp('git',…)"``, ``awk 'system("git push …")'``, ``make``). Their
+# ``argv[0]`` is the utility, not the gated command, and the command they spawn
+# is buried in an ``-exec`` clause / trailing args / a ``-e`` / ``-c`` code
+# string / an ``awk`` program this module does not parse. Left unmodelled, the
+# head is not ``git``/``gh`` so the segment produces no op and the policy
+# abstains → ALLOW — an incomplete-fix bypass of the shell-parser fail-open
+# (CVE-2026-62676). Treating it as an unresolved invocation routes it through
+# each policy's keyword-gated fail-safe (ASK / the configured action) instead of
+# silently allowing it. Matched on the basename so an absolute path counts too.
+PROCESS_SPAWNING_UTILITIES: frozenset[str] = frozenset(
+    {
+        "find",
+        "xargs",
+        "perl",
+        "python",
+        "python2",
+        "python3",
+        "ruby",
+        "awk",
+        "gawk",
+        "mawk",
+        "make",
+    }
+)
+
+
+def spawns_gated_command_as_child(tokens: list[str]) -> bool:
+    """
+    Whether the real command is a process-spawning utility (:data:`PROCESS_SPAWNING_UTILITIES`).
+
+    Such a utility runs another command as a child process whose argv this
+    module does not parse, so its head is never ``git`` / ``gh`` / ``cd`` and a
+    gated child would slip past as "not a gated command". A policy should route
+    a ``True`` here through the same fail-safe it uses for an unresolved
+    invocation (keyword-gated ASK / configured action), not abstain.
+
+    :param tokens: The output of :func:`real_invocation_tokens`.
+    :returns: ``True`` when the head is a process-spawning utility.
+    """
+    return bool(tokens) and tokens[0].rsplit("/", 1)[-1] in PROCESS_SPAWNING_UTILITIES
+
+
 def _extract_command_substitutions(command: str) -> tuple[str, list[str]]:
     """
     Pull ``$(...)`` and backtick command-substitution bodies out of a command.

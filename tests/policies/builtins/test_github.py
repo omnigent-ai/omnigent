@@ -454,6 +454,40 @@ def test_shell_grouping_split_is_quote_aware() -> None:
     assert policy(_sh("echo '{ not a real group }' && printf '(%s)' hi")) is None
 
 
+@pytest.mark.parametrize(
+    "spawned",
+    [
+        "find . -maxdepth 0 -exec git push https://github.com/octo/secret main +",
+        "xargs git push https://github.com/octo/secret main",
+        'perl -e \'exec("git","push","https://github.com/octo/secret","main")\'',
+        "python3 -c \"import os; os.execvp('git',['git','push','https://github.com/octo/secret','main'])\"",
+        "awk 'BEGIN{system(\"git push https://github.com/octo/secret main\")}'",
+    ],
+)
+def test_shell_process_spawning_utility_surfaces_the_push(spawned: str) -> None:
+    """A push spawned as a child of find/xargs/perl/python/awk is surfaced.
+
+    The utility's ``argv[0]`` is not ``git``/``gh`` and the spawned command is
+    buried where the parser does not model it, so the segment produced no op and
+    the policy abstained → ALLOW. It is now treated as an unresolved invocation
+    and, because the segment names a gated keyword, surfaced for approval (ASK)
+    rather than allowed.
+    """
+    policy = github_policy(write_repos=[_REPO])
+    assert _action(policy(_sh(spawned))) == "ASK"
+
+
+@pytest.mark.parametrize("benign", ["find . -name '*.py'", "xargs ls -la", "make build"])
+def test_shell_process_spawning_utility_without_gated_keyword_abstains(benign: str) -> None:
+    """A process-spawning utility that names no gated keyword is not over-blocked.
+
+    The fail-safe is keyword-gated: a bare ``find``/``xargs``/``make`` with no
+    git/gh in the segment still abstains, so benign automation is unaffected.
+    """
+    policy = github_policy(write_repos=[_REPO])
+    assert policy(_sh(benign)) is None
+
+
 def test_shell_clone_read_allowed_and_denied() -> None:
     """git clone is a read: allowed for an allowlisted repo, denied otherwise."""
     policy = github_policy(read_all=False, read_repos=[_REPO])
