@@ -9,7 +9,12 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { type InfiniteData, type QueryClient, useQueryClient } from "@tanstack/react-query";
-import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
+import {
+  CONNECTED_STREAM_REFETCH_INTERVAL_MS,
+  DISCONNECTED_STREAM_REFETCH_INTERVAL_MS,
+  type Conversation,
+  type ConversationsPage,
+} from "@/hooks/useConversations";
 import { getOmnigentServerIdentity } from "@/lib/host";
 import { authenticatedFetch, getCurrentUserId, resolveIdentity } from "@/lib/identity";
 import { sessionUpdatesSocket } from "@/lib/sessionUpdatesSocket";
@@ -458,10 +463,20 @@ export function useCanvasSessions(): CanvasSessions {
     const refreshIfVisible = () => {
       if (!document.hidden) void refresh();
     };
-    // The updates stream mirrors card changes in place (see below), so the
-    // interval poll is only the fallback for when that stream is down.
+    // The updates stream mirrors changes in place for cards it watches (see
+    // below), but its watch set is bounded (sidebar-loaded + active sessions),
+    // so canvas cards on the cold tail still need periodic reconciliation.
+    // Poll at the slower connected cadence while the stream covers the hot set,
+    // and the faster disconnected cadence when it's the only source — matching
+    // the sidebar's CONNECTED/DISCONNECTED reconcile intervals.
+    let lastPoll = Date.now();
     const timer = setInterval(() => {
-      if (!sessionUpdatesSocket.isConnected()) refreshIfVisible();
+      const dueMs = sessionUpdatesSocket.isConnected()
+        ? CONNECTED_STREAM_REFETCH_INTERVAL_MS
+        : DISCONNECTED_STREAM_REFETCH_INTERVAL_MS;
+      if (Date.now() - lastPoll < dueMs) return;
+      lastPoll = Date.now();
+      refreshIfVisible();
     }, SESSION_POLL_INTERVAL_MS);
     window.addEventListener("focus", refreshIfVisible);
     document.addEventListener("visibilitychange", refreshIfVisible);
