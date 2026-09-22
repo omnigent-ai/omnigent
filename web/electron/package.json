@@ -63,6 +63,7 @@
     "files": [
       "src/**/*",
       "about/**/*",
+      "browser-permission/**/*",
       "workspace-picker/**/*",
       "setup/**/*",
       "arca-connect/**/*",
