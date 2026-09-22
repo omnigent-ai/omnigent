@@ -13,7 +13,7 @@ import { SettingsCustomizeSection } from "./SettingsCustomizeSection";
 
 let hosts: Host[] = [];
 vi.mock("@/hooks/useHosts", async (importActual) => ({
-  ...(await importActual<typeof import("@/hooks/useHosts")>()),
+  ...(await importActual()),
   useHosts: () => ({ data: hosts }),
 }));
 
