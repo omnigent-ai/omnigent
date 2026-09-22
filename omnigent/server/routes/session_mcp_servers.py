@@ -5,9 +5,7 @@ from __future__ import annotations
 import asyncio
 import gzip
 import io
-import ipaddress
 import logging
-import socket
 import tarfile
 import tempfile
 from dataclasses import dataclass
@@ -42,6 +40,7 @@ from omnigent.spec.types import MCPServerConfig
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.permission_store import PermissionStore
+from omnigent.util.ssrf import host_is_internal
 
 if TYPE_CHECKING:
     from omnigent.runner.routing import RunnerRouter
@@ -58,77 +57,11 @@ class _McpLocation:
     raw: dict[str, Any]
 
 
-# The session MCP-server management route accepted an http url validated only by
-# a scheme-prefix check, and a stdio command/args spawned unsandboxed. A caller
-# with LEVEL_EDIT could point the url at cloud metadata / internal hosts (SSRF)
-# or register an arbitrary local command (RCE) that runs on shared multi-tenant
-# runner infra with the runner's environment. These guards run server-side,
-# before the declaration is persisted, so the transport layer never sees a
-# blocked target.
-
-
-# IPv6 transition prefixes that embed an IPv4 destination in their low 32 bits.
-_NAT64_PREFIX = ipaddress.ip_network("64:ff9b::/96")
-_V4_COMPAT_PREFIX = ipaddress.ip_network("::/96")
-
-
-def _host_is_internal(host: str) -> bool:
-    """
-    Whether *host* is (or resolves to) a non-public address.
-
-    Blocks loopback, private (RFC1918 / ULA), link-local (incl. the
-    169.254.169.254 cloud-metadata address), reserved, multicast and
-    unspecified targets. An IP literal is judged directly; a hostname is
-    resolved and every returned address is judged, so a name that points at an
-    internal address is blocked too. This is a best-effort SSRF guard: it does
-    not defeat DNS rebinding (the address can change between this check and the
-    transport's own connect), which would need connect-time enforcement.
-
-    :param host: The URL host (hostname or IP literal).
-    :returns: ``True`` when the host is, or resolves to, a non-public address.
-    """
-
-    def _non_public(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
-        return (
-            addr.is_loopback
-            or addr.is_private
-            or addr.is_link_local
-            or addr.is_reserved
-            or addr.is_multicast
-            or addr.is_unspecified
-        )
-
-    def _blocked(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
-        # An IPv6 literal can carry an internal IPv4 destination whose address
-        # the outer IPv6 flags do not reflect (6to4 ``2002:a9fe:a9fe::`` /
-        # NAT64 ``64:ff9b::a9fe:a9fe`` / IPv4-mapped / IPv4-compatible for
-        # 169.254.169.254). Decode any embedded IPv4 and judge it too, so these
-        # transition forms can't smuggle a metadata/internal target past the gate.
-        candidates: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = [addr]
-        if isinstance(addr, ipaddress.IPv6Address):
-            embedded = addr.ipv4_mapped or addr.sixtofour
-            if embedded is not None:
-                candidates.append(embedded)
-            low32 = int(addr) & 0xFFFFFFFF
-            # NAT64 well-known prefix and the deprecated IPv4-compatible ::/96.
-            if addr in _NAT64_PREFIX or (addr in _V4_COMPAT_PREFIX and low32 > 1):
-                candidates.append(ipaddress.IPv4Address(low32))
-        return any(_non_public(candidate) for candidate in candidates)
-
-    try:
-        return _blocked(ipaddress.ip_address(host))
-    except ValueError:
-        pass  # not a literal — resolve the name below
-    try:
-        infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
-    except OSError:
-        # Unresolvable: fail closed — an MCP url that does not resolve here is
-        # not a valid public endpoint to register.
-        return True
-    resolved = {info[4][0] for info in infos}
-    if not resolved:
-        return True
-    return any(_blocked(ipaddress.ip_address(ip)) for ip in resolved)
+# Registration-time SSRF / multi-tenant-RCE guard for MCP-server declarations:
+# reject an http url that targets a non-public host, and stdio transport on a
+# multi-tenant server, before the declaration is persisted. Host classification
+# is shared (omnigent.util.ssrf) with the connect-time redirect guard in
+# omnigent.tools.mcp, so both enforcement points agree on what "internal" means.
 
 
 def assert_mcp_server_request_safe(body: UpsertMCPServerRequest) -> None:
@@ -152,11 +85,21 @@ def assert_mcp_server_request_safe(body: UpsertMCPServerRequest) -> None:
             )
         return
     if body.transport == "http" and body.url:
-        host = urlsplit(body.url).hostname
-        if not host or _host_is_internal(host):
+        # A single-user / local server has no other tenant to protect and is
+        # expected to reach its own loopback services, so it may target internal
+        # endpoints — mirroring the stdio carve-out above.
+        if local_single_user_enabled():
+            return
+        try:
+            host = urlsplit(body.url).hostname
+        except ValueError:
+            # Malformed authority (e.g. an unclosed IPv6 literal `http://[::1`).
+            host = None
+        if not host or host_is_internal(host):
             raise OmnigentError(
                 "MCP server url must be a public http(s) endpoint; loopback, "
-                "private, link-local and cloud-metadata addresses are not allowed.",
+                "private, shared, link-local and cloud-metadata addresses are "
+                "not allowed.",
                 code=ErrorCode.FORBIDDEN,
             )
 
