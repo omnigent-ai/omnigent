@@ -88,6 +88,8 @@ def write_model_config(
 ) -> None:
     config_home.mkdir(parents=True, exist_ok=True)
     config = {
+        # The supervisor's lease owns lifetime, including idle investigation time.
+        "runner": {"idle_timeout_s": 0},
         "providers": {
             "repro-claude": {
                 "kind": "key",
@@ -108,7 +110,7 @@ def write_model_config(
                     "models": {"default": codex_model},
                 },
             },
-        }
+        },
     }
     write_json(config_home / "config.yaml", config)
 
@@ -280,7 +282,11 @@ def supervise(output: Path) -> None:
                     response.raise_for_status()
                     write_json(output / filename, response.json())
         for relay in reversed(relays):
-            relay.__exit__(None, None, None)
+            try:
+                relay.__exit__(None, None, None)
+            except Exception as exc:
+                _logger.exception("Reproduction relay cleanup failed")
+                state.update(status="failed", error=f"Relay cleanup: {type(exc).__name__}: {exc}")
         # Signal groups, including descendants even if their direct parent exited.
         for child in reversed(children):
             with contextlib.suppress(ProcessLookupError):

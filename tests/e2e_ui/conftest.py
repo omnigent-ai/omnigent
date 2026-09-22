@@ -2853,7 +2853,8 @@ def _temp_omnigent_mock_config(
     """
     from omnigent.config import global_config_path
 
-    config_path = global_config_path()
+    # Back up and restore the target without replacing a user's config symlink.
+    config_path = global_config_path().resolve()
     config_dir = config_path.parent
     config_dir.mkdir(parents=True, exist_ok=True)
     backup = config_path.with_name(config_path.name + ".e2e-backup")

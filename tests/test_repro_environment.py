@@ -239,3 +239,150 @@ def test_stop_during_startup_is_successful_cancellation(tmp_path, monkeypatch):
     assert json.loads(state.read_text())["status"] == "stopped"
     assert kill.call_count == 2
     child.wait.assert_called()
+
+
+def test_relay_shutdown_closes_an_open_stream(tmp_path):
+    import time
+
+    with socket.socket() as service:
+        service.bind(("127.0.0.1", 0))
+        service.listen()
+        service.settimeout(15)
+        closed = threading.Event()
+
+        def stream():
+            conn, _ = service.accept()
+            with conn:
+                conn.settimeout(15)
+                conn.sendall(b"ready")
+                if conn.recv(1) == b"":
+                    closed.set()
+
+        thread = threading.Thread(target=stream, daemon=True)
+        thread.start()
+        path = tmp_path / "active.sock"
+        with socket.socket(socket.AF_UNIX) as client:
+            try:
+                client.settimeout(5)
+                with Relay(unix_listener=path, tcp_target=service.getsockname()):
+                    client.connect(str(path))
+                    assert client.recv(5) == b"ready"
+                    started = time.monotonic()
+                    # Keep the client open until the relay has shut down.
+                assert time.monotonic() - started < 5
+                assert client.recv(1) == b""
+                assert closed.wait(5)
+            finally:
+                client.close()
+                thread.join(timeout=5)
+        assert not path.exists()
+
+
+def test_generated_provider_config_disables_runner_idle_shutdown(monkeypatch, tmp_path):
+    from dev.repro_env.runtime import write_model_config
+    from omnigent.runner._entry import _load_runner_idle_timeout_s_from_config
+
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    write_model_config(tmp_path, "http://127.0.0.1:12345", "mock-claude", "mock-codex")
+    assert _load_runner_idle_timeout_s_from_config() == 0
+
+
+@pytest.mark.parametrize("raise_in_test", [False, True])
+def test_mock_config_restores_symlink_target(monkeypatch, tmp_path, raise_in_test):
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    target = tmp_path / "original.yaml"
+    target.write_text("original provider config\n")
+    config = tmp_path / "config.yaml"
+    config.symlink_to(target.name)
+    link_inode = config.lstat().st_ino
+    try:
+        with fixtures._temp_omnigent_mock_config("http://127.0.0.1:12345", "claude"):
+            assert "12345" in target.read_text()
+            if raise_in_test:
+                raise ValueError("test assertion failed")
+    except ValueError:
+        assert raise_in_test
+    assert config.is_symlink()
+    assert config.lstat().st_ino == link_inode
+    assert config.readlink() == Path(target.name)
+    assert target.read_text() == "original provider config\n"
+
+
+def test_supervisor_terminates_children_when_relay_cleanup_fails(tmp_path, monkeypatch):
+    import time
+
+    from dev.repro_env import runtime
+
+    state = tmp_path / "environment.json"
+    state.write_text(
+        json.dumps(
+            {
+                "status": "starting",
+                "workspace": str(tmp_path),
+                "expires_at": time.time() + 60,
+            }
+        )
+    )
+    models = tmp_path / "tests/server/integration/repro_models.json"
+    models.parent.mkdir(parents=True)
+    models.write_text('{"claude-native":"mock-claude","codex-native":"mock-codex"}')
+    children = [Mock(pid=123 + i) for i in range(3)]
+    for child in children:
+        child.poll.return_value = None
+    monkeypatch.setattr(runtime.subprocess, "Popen", Mock(side_effect=children))
+    kill = Mock()
+    monkeypatch.setattr(runtime.os, "killpg", kill)
+    client = Mock()
+    client.__enter__ = Mock(return_value=client)
+    client.__exit__ = Mock(return_value=False)
+    client.get.return_value.status_code = 200
+    client.get.return_value.json.return_value = {"online": True}
+    monkeypatch.setattr(runtime.httpx, "Client", Mock(return_value=client))
+    relays = [Mock(), Mock()]
+    for relay in relays:
+        relay.__enter__ = Mock(side_effect=lambda: (tmp_path / "stop").touch())
+        relay.__exit__ = Mock()
+    relays[-1].__exit__.side_effect = TimeoutError("stuck relay")
+    monkeypatch.setattr(runtime, "Relay", Mock(side_effect=relays))
+    runtime.supervise(tmp_path)
+    final = json.loads(state.read_text())
+    assert final["status"] == "failed"
+    assert "stuck relay" in final["error"]
+    for relay in relays:
+        relay.__exit__.assert_called_once()
+    for child in children:
+        child.wait.assert_called()
+        kill.assert_any_call(child.pid, runtime.signal.SIGTERM)
+        kill.assert_any_call(child.pid, runtime.signal.SIGKILL)
+
+
+def test_generated_config_keeps_idle_runner_alive(monkeypatch, tmp_path):
+    import asyncio
+
+    from dev.repro_env.runtime import write_model_config
+    from omnigent.runner._entry import (
+        _load_runner_idle_timeout_s_from_config,
+        _run_inactivity_monitor,
+    )
+
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    write_model_config(tmp_path, "http://127.0.0.1:12345", "mock-claude", "mock-codex")
+    shutdown = Mock()
+
+    async def check():
+        loop = asyncio.get_running_loop()
+        options = {
+            "get_last_activity": lambda: loop.time() - 7200,
+            "has_active_work": lambda: False,
+            "request_shutdown": shutdown,
+            "poll_interval_s": 0.001,
+        }
+        await _run_inactivity_monitor(idle_timeout_s=0.01, **options)
+        shutdown.assert_called_once()
+        shutdown.reset_mock()
+        await _run_inactivity_monitor(
+            idle_timeout_s=_load_runner_idle_timeout_s_from_config(), **options
+        )
+        shutdown.assert_not_called()
+
+    asyncio.run(check())

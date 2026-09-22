@@ -26,7 +26,8 @@ variables must be supplied together; use the wrapper rather than setting only
 one of them.
 
 Standalone native mock fixtures save an existing provider config to an
-owner-only `config.yaml.e2e-backup` before replacing it and restore it on exit.
+owner-only `.e2e-backup` file next to its resolved target before replacing it
+and restore it on exit. A config symlink remains intact.
 If the test process is killed, recover that backup before retrying; subsequent
 runs refuse to overwrite it.
 
@@ -61,7 +62,8 @@ since the last `reset_mock_llm`; save them before resetting if an earlier
 journey's model traffic is needed as evidence.
 
 The workflow stops the environment after session completion and recording
-normalization, then bundles diagnostics even on failure. A six-hour lease bounds
+normalization, then bundles diagnostics even on failure. Runner idle shutdown
+is disabled; the supervisor owns its lifetime. A six-hour lease bounds
 its lifetime if normal cleanup cannot run. `serve` is a foreground supervisor
 intended for the workflow's persistent sandbox; starting it as a background job
 in an agent shell does not give it that lifetime.

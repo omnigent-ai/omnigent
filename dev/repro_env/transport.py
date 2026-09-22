@@ -97,11 +97,13 @@ class Relay:
     async def _close(self):
         if hasattr(self, "server"):
             self.server.close()
-            await self.server.wait_closed()
+        # Python 3.12 waits for accepted streams too; close their handlers first.
         tasks = asyncio.all_tasks() - {asyncio.current_task()}
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        if hasattr(self, "server"):
+            await self.server.wait_closed()
 
     def __enter__(self):
         self.thread.start()
