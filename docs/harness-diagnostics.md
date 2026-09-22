@@ -86,6 +86,13 @@ through shutdown can lose the final diagnostics. With capture disabled, no
 collector thread or queue is created. The existing in-memory startup snapshot remains available in either
 mode, with its text export controlled by the flag.
 
+If capture initialization fails, the reader keeps draining and retaining its
+startup snapshot without falling back to per-line DEBUG logging. It attempts
+one background `harness_diagnostic_capture_failed` warning containing only the
+exception class, session ID, and PID. If no reporting thread can start, the
+exception class remains available as `stderr_capture_error_type` in the startup
+failure snapshot; warning delivery is best effort.
+
 ## Codex startup failure snapshot
 
 When a fresh native Codex session times out waiting for its first thread, or
@@ -111,6 +118,7 @@ included; with the flag disabled, the event omits stderr text and tail metadata.
 | `stderr_reader_state` | `unavailable`, `not_started`, `running`, `cancelled`, `failed`, or `completed` |
 | `stderr_reader_error_type`, `stderr_reader_cause_type` | Exception and immediate cause/context classes when the reader failed; no exception payload |
 | `stderr_capture_enabled` | Whether stderr text capture was explicitly enabled |
+| `stderr_capture_error_type` | Exception class when continuous capture initialization failed; no exception payload |
 | `stderr_tail_available` | With capture enabled, whether an in-memory stderr buffer exists |
 | `stderr_tail` | With capture enabled, at most 65,536 UTF-8 bytes of recent stderr |
 | `stderr_tail_truncated` | Whether the size limit shortened the captured text |

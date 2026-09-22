@@ -40,6 +40,9 @@ def collect_codex_startup_diagnostics(
     if app_server is None:
         return snapshot
 
+    if error_type := getattr(app_server, "stderr_capture_error_type", None):
+        snapshot["stderr_capture_error_type"] = error_type
+
     process = app_server.proc
     if process is not None:
         snapshot["app_server_state"] = "running" if process.returncode is None else "exited"

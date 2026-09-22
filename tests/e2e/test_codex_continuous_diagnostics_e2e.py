@@ -20,7 +20,7 @@ sys.stderr.write('startup diagnostic\\n')
 sys.stderr.flush()
 print('started', flush=True)
 sys.stdin.readline()
-sys.stderr.write('runtime diagnostic password=synthetic-secret\\n')
+sys.stderr.write('runtime diagnostic password synthetic-secret\\n')
 sys.stderr.flush()
 print('runtime-written', flush=True)
 sys.stdin.readline()
@@ -32,18 +32,33 @@ import asyncio
 import json
 import logging
 import sys
+import threading
 from pathlib import Path
+from types import SimpleNamespace
+from omnigent.harnesses.codex_native import stderr_diagnostics
 from omnigent.harnesses.codex_native.app_server import CodexNativeAppServer
 from omnigent.process_logging import configure_process_logging
 
 root = Path(sys.argv[1])
+fail_worker = sys.argv[2] == '1'
+if fail_worker:
+    class UnavailableThread(threading.Thread):
+        def start(self):
+            if self.name.startswith('codex-stderr-diagnostics'):
+                raise RuntimeError('synthetic-start-secret')
+            super().start()
+    stderr_diagnostics.threading = SimpleNamespace(
+        Thread=UnavailableThread, Lock=threading.Lock, Event=threading.Event,
+    )
+
 def send(batch):
     with (root / 'rows.jsonl').open('a') as stream:
         for row in batch:
             stream.write(json.dumps(row) + '\\n')
 
 configure_process_logging(
-    'runner', log_path=root / 'runner.log', level=logging.INFO,
+    'runner', log_path=root / 'runner.log',
+    level=logging.DEBUG if fail_worker else logging.INFO,
     log_to_stderr=False, debug_log_send=send,
 )
 
@@ -87,9 +102,9 @@ async def _wait_for_text(path: Path, text: str) -> None:
             await asyncio.sleep(0.05)
 
 
-@pytest.mark.parametrize("enabled", [True, False])
+@pytest.mark.parametrize("enabled,fail_worker", [(True, False), (False, False), (True, True)])
 async def test_codex_diagnostics_reach_local_and_structured_logs_during_runtime(
-    tmp_path: Path, enabled: bool
+    tmp_path: Path, enabled: bool, fail_worker: bool
 ) -> None:
     (tmp_path / "child.py").write_text(_CHILD)
     (tmp_path / "runner.py").write_text(_RUNNER)
@@ -97,6 +112,7 @@ async def test_codex_diagnostics_reach_local_and_structured_logs_during_runtime(
         sys.executable,
         str(tmp_path / "runner.py"),
         str(tmp_path),
+        "1" if fail_worker else "0",
         env={
             "PATH": os.defpath,
             "PYTHONPATH": str(Path(__file__).resolve().parents[2]),
@@ -110,12 +126,12 @@ async def test_codex_diagnostics_reach_local_and_structured_logs_during_runtime(
     rows_path = tmp_path / "rows.jsonl"
     try:
         assert await asyncio.wait_for(proc.stdout.readline(), 10) == b"started\n"
-        if enabled:
+        if enabled and not fail_worker:
             await _wait_for_text(rows_path, "startup diagnostic")
         proc.stdin.write(b"runtime\n")
         await proc.stdin.drain()
         assert await asyncio.wait_for(proc.stdout.readline(), 10) == b"runtime-written\n"
-        if enabled:
+        if enabled and not fail_worker:
             await _wait_for_text(rows_path, "runtime diagnostic")
             assert proc.returncode is None, "runtime logs must arrive before process exit"
         proc.stdin.write(b"stop\n")
@@ -130,7 +146,17 @@ async def test_codex_diagnostics_reach_local_and_structured_logs_during_runtime(
     local = (tmp_path / "runner.log").read_text()
     rows = _rows(rows_path)
     assert "synthetic-secret" not in local + json.dumps(rows)
-    if enabled:
+    assert "synthetic-start-secret" not in local + json.dumps(rows)
+    if fail_worker:
+        failures = [
+            row for row in rows if row["event_name"] == "harness_diagnostic_capture_failed"
+        ]
+        assert len(failures) == 1
+        assert failures[0]["attributes"]["error_type"] == "RuntimeError"
+        assert not any(row["event_name"] == "harness_diagnostic_output" for row in rows)
+        for marker in ("startup diagnostic", "runtime diagnostic", "final fragment"):
+            assert marker not in local + json.dumps(rows)
+    elif enabled:
         for marker in ("startup diagnostic", "runtime diagnostic", "final fragment"):
             assert marker in local
             assert any(marker in row["attributes"]["text"] for row in rows)

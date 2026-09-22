@@ -54,6 +54,7 @@ from omnigent.harnesses.codex_native.process_registry import (
 from omnigent.harnesses.codex_native.stderr_diagnostics import (
     MAX_STDERR_RECORD_BYTES,
     CodexStderrDiagnostics,
+    report_capture_start_failure,
 )
 from omnigent.inner import _proc
 from omnigent.inner.codex_executor import (
@@ -1823,6 +1824,7 @@ class CodexNativeAppServer:
     reconcile_process_registry: bool = True
     config_profile: str | None = None
     session_id: str | None = None
+    stderr_capture_error_type: str | None = field(default=None, init=False)
     _stderr_diagnostics: CodexStderrDiagnostics | None = field(default=None, init=False)
 
     async def start(self) -> None:
@@ -2272,10 +2274,19 @@ class CodexNativeAppServer:
         """
         assert self.proc is not None and self.proc.stderr is not None
         diagnostics = None
-        if harness_stderr_capture_enabled():
-            with contextlib.suppress(Exception):
+        capture_enabled = harness_stderr_capture_enabled()
+        self.stderr_capture_error_type = None
+        if capture_enabled:
+            try:
                 diagnostics = CodexStderrDiagnostics(
                     session_id=self.session_id, bridge_dir=self.bridge_dir, pid=self.proc.pid
+                )
+            except Exception as exc:  # noqa: BLE001 - capture must never stop pipe draining
+                self.stderr_capture_error_type = type(exc).__name__[:128]
+                report_capture_start_failure(
+                    session_id=self.session_id,
+                    pid=self.proc.pid,
+                    error_type=self.stderr_capture_error_type,
                 )
         self._stderr_diagnostics = diagnostics
         pending = bytearray()
@@ -2294,7 +2305,7 @@ class CodexNativeAppServer:
                 diagnostics.submit(
                     bytes(pending) + (b"\n" if newline else b""), bytes_omitted=omitted_bytes
                 )
-            else:
+            elif not capture_enabled:
                 _logger.debug("codex-native app-server stderr: %s", text)
 
         try:

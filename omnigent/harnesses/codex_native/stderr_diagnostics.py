@@ -22,6 +22,31 @@ _CLOSE_TIMEOUT_S = 1.0
 _logger = logging.getLogger(__name__)
 
 
+def report_capture_start_failure(*, session_id: str | None, pid: int, error_type: str) -> None:
+    """Best-effort, payload-free warning without logging I/O on the pipe reader."""
+
+    def emit() -> None:
+        with contextlib.suppress(Exception):
+            _logger.warning(
+                "Codex stderr diagnostic capture unavailable; session=%s pid=%d error_type=%s",
+                session_id,
+                pid,
+                error_type,
+                extra=debug_event(
+                    "harness_diagnostic_capture_failed",
+                    session_id=session_id,
+                    harness="codex-native",
+                    source_kind="codex_app_server_stderr",
+                    app_server_pid=pid,
+                    error_type=error_type,
+                ),
+            )
+
+    # If thread resources are exhausted, the startup snapshot retains the error type.
+    with contextlib.suppress(Exception):
+        threading.Thread(target=emit, name="codex-stderr-capture-failure", daemon=True).start()
+
+
 class CodexStderrDiagnostics:
     """Buffer complete records without making the reader wait for logging I/O."""
 

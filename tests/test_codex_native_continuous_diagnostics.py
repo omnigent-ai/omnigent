@@ -21,6 +21,7 @@ from omnigent.harnesses.codex_native.bridge import (
     CodexNativeBridgeState,
     write_bridge_state,
 )
+from omnigent.harnesses.codex_native.diagnostics import collect_codex_startup_diagnostics
 from omnigent.process_logging import HARNESS_STDERR_ENABLED_ENV_VAR, RedactingLogFormatter
 
 
@@ -177,6 +178,64 @@ async def test_redacts_complete_large_record_before_clipping_and_preserves_utf8(
     assert "�" not in text
     assert text.endswith("€")
     assert row["attributes"]["truncated"] == "True"
+
+
+@pytest.mark.parametrize("reporter", ["working", "blocked", "unavailable"])
+async def test_worker_start_failure_keeps_draining_without_debug_fallback(
+    server: app_server.CodexNativeAppServer,
+    output: _Output,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    reporter: str,
+) -> None:
+    class UnavailableThread(threading.Thread):
+        def start(self) -> None:
+            if self.name.startswith("codex-stderr-diagnostics") or reporter == "unavailable":
+                raise RuntimeError("synthetic-start-secret")
+            super().start()
+
+    monkeypatch.setattr(
+        stderr_diagnostics,
+        "threading",
+        SimpleNamespace(Thread=UnavailableThread, Lock=threading.Lock, Event=threading.Event),
+    )
+    if reporter == "blocked":
+        output.release.clear()
+    # A fallback DEBUG write would contend with the blocked warning handler.
+    app_server._logger.addHandler(output)
+    try:
+        with caplog.at_level(logging.DEBUG, logger=app_server._logger.name):
+            stderr = _reader(server)
+            stderr.feed_data(b"password synthetic-secret\nafter failed capture\n")
+            stderr.feed_eof()
+            await asyncio.wait_for(server.stderr_task, 5)
+            assert server.recent_stderr == [
+                "password synthetic-secret",
+                "after failed capture",
+            ]
+            snapshot = collect_codex_startup_diagnostics(server)
+            assert snapshot["stderr_reader_state"] == "completed"
+            assert snapshot["stderr_capture_error_type"] == "RuntimeError"
+            assert "synthetic-secret" not in json.dumps(snapshot)
+            await asyncio.wait_for(server.close(), 2)
+            assert "synthetic-secret" not in caplog.text
+            assert "synthetic-start-secret" not in caplog.text
+        if reporter != "unavailable":
+            assert await asyncio.to_thread(output.entered.wait, 5)
+            if reporter == "blocked":
+                assert output.records.empty()
+            output.release.set()
+            row = record_to_row(await output.next(), "runner")
+            assert row["event_name"] == "harness_diagnostic_capture_failed"
+            assert row["session_id"] == "child-session"
+            assert row["attributes"]["error_type"] == "RuntimeError"
+            assert "synthetic-secret" not in json.dumps(row)
+            assert "synthetic-start-secret" not in json.dumps(row)
+        assert output.records.empty()
+    finally:
+        output.release.set()
+        app_server._logger.removeHandler(output)
+        await server.close()
 
 
 async def test_oversized_record_is_omitted_whole_then_capture_recovers(
