@@ -17,6 +17,13 @@ vi.mock("@/hooks/useHosts", async (importActual) => ({
   useHosts: () => ({ data: hosts }),
 }));
 
+// The "Set up" button is gated on the harness_install feature (like New Chat),
+// so drive that flag through the server-info mock.
+let harnessInstall = true;
+vi.mock("@/lib/CapabilitiesContext", () => ({
+  useServerInfo: () => ({ features: { harness_install: harnessInstall } }),
+}));
+
 // The real ComposerAgentIcon pulls in the whole composer; stub it to a marker.
 vi.mock("@/shell/NewChatDialog", () => ({
   ComposerAgentIcon: () => <span data-testid="agent-icon" />,
@@ -57,6 +64,7 @@ const ONLINE: Host = {
 afterEach(() => {
   cleanup();
   hosts = [];
+  harnessInstall = true;
   setupDialogProps.mockReset();
 });
 
@@ -97,6 +105,17 @@ describe("Harnesses subsection", () => {
     expect(screen.queryByTestId("harness-action-claude-native")).toBeNull();
     expect(screen.queryByText("Installed")).toBeNull();
     expect(screen.queryByText("needs setup")).toBeNull();
+  });
+
+  it("hides Set-up (keeps the badge) when harness_install is disabled", () => {
+    // Flag off + binary-missing: the setup dialog would be a dead end (no
+    // runnable install step), so we show status only — matching New Chat.
+    harnessInstall = false;
+    hosts = [{ ...ONLINE, configured_harnesses: { "codex-native": "binary-missing" } }];
+    renderHarnesses();
+
+    expect(screen.getByText("binary missing")).toBeTruthy();
+    expect(screen.queryByTestId("harness-action-codex-native")).toBeNull();
   });
 
   it("shows the no-host notice and no Set-up buttons when no host is online", () => {

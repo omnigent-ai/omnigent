@@ -16,6 +16,8 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { cn } from "@/lib/utils";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isFeatureEnabled } from "@/lib/capabilities";
 import type { CustomizeSubSectionId } from "@/shell/settingsNav";
 import { SIDEBAR_ROW } from "@/shell/sidebarStyles";
 import { ComposerAgentIcon } from "@/shell/NewChatDialog";
@@ -123,8 +125,14 @@ const HARNESS_ENTRIES: HarnessEntry[] = [...NATIVE_CODING_AGENTS]
 
 const HarnessesSection = () => {
   const [query, setQuery] = useState("");
+  const info = useServerInfo();
   const { data: hosts } = useHosts({ refetchOnFocus: true });
   const [selectedHostId, setSelectedHostId] = useState<string | null>(null);
+
+  // Gate the "Set up" affordance on the install feature, matching New Chat: with
+  // it off the setup dialog has no runnable install step, so we show status
+  // only (no button that opens a dead-end dialog).
+  const canSetup = isFeatureEnabled(info, "harness_install");
 
   // Online hosts first, then offline (disabled in the menu). Default the
   // selection to the first online host; the picker can override.
@@ -194,6 +202,7 @@ const HarnessesSection = () => {
               key={entry.harness}
               entry={entry}
               host={host}
+              canSetup={canSetup}
               onSetup={() => host && setSetupTarget({ entry, host })}
             />
           ))}
@@ -279,10 +288,12 @@ function HostSelect({
 function HarnessCard({
   entry,
   host,
+  canSetup,
   onSetup,
 }: {
   entry: HarnessEntry;
   host: Host | null;
+  canSetup: boolean;
   onSetup: () => void;
 }) {
   const readiness = harnessReadinessOnHost(entry.harness, host);
@@ -311,7 +322,7 @@ function HarnessCard({
             ) : null}
           </div>
         </div>
-        {needsSetup && (
+        {needsSetup && canSetup && (
           <Button
             variant="outline"
             size="sm"
