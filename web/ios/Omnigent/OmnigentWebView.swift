@@ -462,18 +462,26 @@ struct OmnigentWebView: UIViewRepresentable {
       activationObserver = nil
       authenticationTask?.cancel()
       workspaceBootstrap.cancel()
-      (webView as? AccessoryFreeWebView)?.onWindowAvailable = nil
-      webView?.stopLoading()
-      webView?.navigationDelegate = nil
-      webView?.uiDelegate = nil
-      if parent.model.webView === webView {
-        parent.model.cancelServerSwitcherWatchdog()
-        parent.model.cancelAuthentication = nil
-        parent.model.signOut = nil
+      let detachedWebView = webView
+      (detachedWebView as? AccessoryFreeWebView)?.onWindowAvailable = nil
+      detachedWebView?.stopLoading()
+      detachedWebView?.navigationDelegate = nil
+      detachedWebView?.uiDelegate = nil
+      let model = parent.model
+      if model.webView === detachedWebView {
+        model.cancelServerSwitcherWatchdog()
+        model.cancelAuthentication = nil
+        model.signOut = nil
         #if DEBUG
-          parent.model.injectDebugFault = nil
+          model.injectDebugFault = nil
         #endif
-        parent.model.isAuthenticating = false
+        model.webView = nil
+        // SwiftUI dismantles representables while mutating its graph. Publishing here would
+        // re-enter graph invalidation, so wait until teardown completes and skip replacements.
+        DispatchQueue.main.async { [weak model] in
+          guard model?.webView == nil else { return }
+          model?.isAuthenticating = false
+        }
       }
       urlObservation = nil
       oidcLoginManager.cancel()
