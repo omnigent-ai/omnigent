@@ -12,6 +12,7 @@ import { type InfiniteData, type QueryClient, useQueryClient } from "@tanstack/r
 import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
 import { getOmnigentServerIdentity } from "@/lib/host";
 import { authenticatedFetch, getCurrentUserId, resolveIdentity } from "@/lib/identity";
+import { sessionUpdatesSocket } from "@/lib/sessionUpdatesSocket";
 import { dedupeConversationsById } from "@/shell/sidebarNav";
 
 /** First page when nothing is cached: small, so the first paint is quick. */
@@ -457,7 +458,11 @@ export function useCanvasSessions(): CanvasSessions {
     const refreshIfVisible = () => {
       if (!document.hidden) void refresh();
     };
-    const timer = setInterval(refreshIfVisible, SESSION_POLL_INTERVAL_MS);
+    // The updates stream mirrors card changes in place (see below), so the
+    // interval poll is only the fallback for when that stream is down.
+    const timer = setInterval(() => {
+      if (!sessionUpdatesSocket.isConnected()) refreshIfVisible();
+    }, SESSION_POLL_INTERVAL_MS);
     window.addEventListener("focus", refreshIfVisible);
     document.addEventListener("visibilitychange", refreshIfVisible);
     return () => {

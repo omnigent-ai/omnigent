@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
 import * as host from "@/lib/host";
 import * as identity from "@/lib/identity";
+import { sessionUpdatesSocket } from "@/lib/sessionUpdatesSocket";
 import {
   applyLiveRows,
   cachedSessionPreview,
@@ -23,6 +24,10 @@ vi.mock("@/lib/identity", () => ({
 
 vi.mock("@/lib/host", () => ({
   getOmnigentServerIdentity: vi.fn(() => "server-a"),
+}));
+
+vi.mock("@/lib/sessionUpdatesSocket", () => ({
+  sessionUpdatesSocket: { isConnected: vi.fn(() => false) },
 }));
 
 function session(
@@ -71,6 +76,7 @@ beforeEach(() => {
   vi.mocked(identity.authenticatedFetch).mockReset();
   vi.mocked(identity.getCurrentUserId).mockReset().mockReturnValue(null);
   vi.mocked(identity.resolveIdentity).mockReset().mockResolvedValue(null);
+  vi.mocked(sessionUpdatesSocket.isConnected).mockReset().mockReturnValue(false);
   window.sessionStorage.clear();
 });
 
@@ -487,6 +493,25 @@ describe("useCanvasSessions", () => {
       await vi.advanceTimersByTimeAsync(SESSION_POLL_INTERVAL_MS + 50);
     });
     expect(identity.authenticatedFetch).toHaveBeenCalledTimes(3);
+  });
+
+  it("skips the interval poll while the updates stream is connected", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    vi.mocked(sessionUpdatesSocket.isConnected).mockReturnValue(true);
+    vi.mocked(identity.authenticatedFetch).mockImplementation(async () =>
+      jsonResponse(page([], null, false)),
+    );
+    const { result } = renderHook(() => useCanvasSessions(), {
+      wrapper: wrapper(new QueryClient()),
+    });
+    // Initial load still runs; the stream then mirrors changes in place.
+    await waitFor(() => expect(result.current.complete).toBe(true));
+    expect(identity.authenticatedFetch).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(SESSION_POLL_INTERVAL_MS * 3 + 50);
+    });
+    expect(identity.authenticatedFetch).toHaveBeenCalledTimes(1);
   });
 
   it("reports an initial failure and keeps cards through a failed refresh on focus", async () => {

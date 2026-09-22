@@ -115,6 +115,7 @@ import { isSideChatCommand, usesNativeSideChatFork } from "@/lib/sideChat";
 import { isTempConvId, newTempConversation } from "@/lib/tempConversationId";
 import { useTerminalActivityStore } from "./terminalActivity";
 import { terminalInfoFromResource, terminalsQueryKey, type TerminalInfo } from "@/lib/terminals";
+import { sessionUpdatesSocket } from "@/lib/sessionUpdatesSocket";
 import type {
   BackgroundTaskInfo,
   ContentBlock,
@@ -2218,8 +2219,11 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // already carry the server id); see the consumed handler.
       // Refresh the sidebar without waiting for the 4 s `useConversations`
       // poll — picks up server-side title auto-gen and any runner_id /
-      // status transitions that happen during the turn.
-      queryClient?.invalidateQueries({ queryKey: ["conversations"] });
+      // status transitions that happen during the turn. When the updates
+      // stream is live it patches those fields in place, so skip the refetch.
+      if (!sessionUpdatesSocket.isConnected()) {
+        queryClient?.invalidateQueries({ queryKey: ["conversations"] });
+      }
     } catch (err) {
       const { message, code } = describeSendFailure(err);
       // A codex `/side` that armed the side-chat latch (line ~2103) but then
@@ -2406,7 +2410,11 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           ),
         }));
       }
-      queryClient?.invalidateQueries({ queryKey: ["conversations"] });
+      // The updates stream patches title/status/runner in place when live;
+      // only fall back to an HTTP refresh when it's down.
+      if (!sessionUpdatesSocket.isConnected()) {
+        queryClient?.invalidateQueries({ queryKey: ["conversations"] });
+      }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       // Settle the conversation this command targeted, wherever the user is
