@@ -544,6 +544,46 @@ def test_shell_escaped_quote_does_not_hide_the_push(command: str) -> None:
     assert result is not None and result["result"] == "DENY"
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "true # it's fine\ng''it push https://github.com/octo/secret main",
+        "echo ok # don't\ngit push https://github.com/octo/secret main",
+    ],
+)
+def test_shell_comment_does_not_hide_a_later_command(command: str) -> None:
+    """A ``#`` comment must not swallow the newline and hide a following push.
+
+    A stray apostrophe in the comment would open a spurious quoted region under
+    naive quote tracking, merging the next line into one un-tokenizable segment
+    that abstains → ALLOW. The unbalanced-quote fallback over-splits instead, so
+    the denied push is isolated and gated.
+    """
+    policy = github_policy(write_repos=[_REPO])
+    result = policy(_sh(command))
+    assert result is not None and result["result"] == "DENY"
+
+
+def test_shell_brace_expansion_does_not_drop_a_branch() -> None:
+    """Brace *expansion* in a push refspec must not fragment the branch list.
+
+    ``git push …/hello main{,} feature`` expands to a push of ``main`` and
+    ``feature``; splitting on the expansion braces would classify only
+    ``git push …/hello main`` (allowed) and drop the disallowed ``feature``
+    branch → ALLOW. Braces split only as a group, so the command stays whole and
+    the disallowed branch is denied.
+    """
+    policy = github_policy(write_repos=[_REPO], write_branches=["main"])
+    result = policy(_sh("git push https://github.com/octo/hello main{,} feature"))
+    assert result is not None and result["result"] == "DENY"
+
+
+def test_shell_brace_expansion_benign_not_over_blocked() -> None:
+    """A benign brace expansion with no gated command still abstains (no false ASK)."""
+    policy = github_policy(write_repos=[_REPO])
+    assert policy(_sh("mkdir -p build/{debug,release}")) is None
+
+
 def test_shell_clone_read_allowed_and_denied() -> None:
     """git clone is a read: allowed for an allowlisted repo, denied otherwise."""
     policy = github_policy(read_all=False, read_repos=[_REPO])
