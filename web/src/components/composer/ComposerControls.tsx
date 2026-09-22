@@ -12,10 +12,12 @@ import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
   DropdownMenuContent,
-  DropdownMenuItem,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { cn } from "@/lib/utils";
+import { permissionModeConcept } from "@/lib/nativeHarnessModes";
 import {
   COMPOSER_COLLAPSED_LABEL_CLASS,
   COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS,
@@ -115,6 +117,8 @@ export const ComposerHostTrigger = forwardRef<
 export function ComposerPermissionPicker({
   label,
   value,
+  harness,
+  selectedValue,
   options,
   disabled = false,
   loading = false,
@@ -124,6 +128,8 @@ export function ComposerPermissionPicker({
 }: {
   label: string;
   value: string;
+  harness?: string | null;
+  selectedValue?: string | null;
   options: readonly { value: string; label: string }[];
   disabled?: boolean;
   loading?: boolean;
@@ -145,6 +151,7 @@ export function ComposerPermissionPicker({
           aria-label={`${label}: ${value}`}
           title={`${label}: ${value}`}
           data-testid={`${testIdPrefix}-permission-chip`}
+          data-permission-concept={permissionModeConcept(harness, selectedValue)}
         >
           <HandIcon className="size-3 shrink-0" />
           <span
@@ -167,16 +174,19 @@ export function ComposerPermissionPicker({
         }}
       >
         <div className="px-2 py-1 text-xs text-muted-foreground">{label}</div>
-        {options.map((option) => (
-          <DropdownMenuItem
-            key={option.value}
-            onSelect={() => onSelect(option.value)}
-            data-testid={`${testIdPrefix}-permission-option-${option.value}`}
-            className="whitespace-normal break-words"
-          >
-            {option.label}
-          </DropdownMenuItem>
-        ))}
+        <DropdownMenuRadioGroup value={selectedValue ?? undefined} onValueChange={onSelect}>
+          {options.map((option) => (
+            <DropdownMenuRadioItem
+              key={option.value}
+              value={option.value}
+              data-testid={`${testIdPrefix}-permission-option-${option.value}`}
+              data-permission-concept={permissionModeConcept(harness, option.value)}
+              className="whitespace-normal break-words"
+            >
+              {option.label}
+            </DropdownMenuRadioItem>
+          ))}
+        </DropdownMenuRadioGroup>
       </DropdownMenuContent>
     </DropdownMenu>
   );

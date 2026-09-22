@@ -27,16 +27,11 @@ export interface HostWorktree {
   is_main: boolean;
   /** ``true`` when the worktree has a detached HEAD (no branch). */
   detached: boolean;
-  /**
-   * Coarse provider proof derived from local git remote metadata. Missing on
-   * older hosts; ``null`` means no provider could be safely identified.
-   */
-  remote_provider?: "github" | "other" | null;
   /** Unix epoch seconds of the worktree HEAD commit. Missing on older hosts. */
   updated_at?: number | null;
 }
 
-interface VerifiedGithubWorktreeCache {
+interface VerifiedGitWorktreeCache {
   hostId: string;
   roots: string[];
   worktrees: HostWorktree[];
@@ -54,10 +49,10 @@ export function pathIsWithinWorktree(path: string, root: string): boolean {
 }
 
 /**
- * Keep a verified GitHub repository visible while a nested path is loading.
- * Explicit non-GitHub results still hide it immediately (fail closed).
+ * Keep a verified Git repository visible while a nested path is loading.
+ * An explicit non-Git result clears the cache.
  */
-export function useVerifiedGithubWorktrees({
+export function useVerifiedGitWorktrees({
   hostId,
   requestedPath,
   worktrees,
@@ -68,9 +63,9 @@ export function useVerifiedGithubWorktrees({
   worktrees: HostWorktree[] | undefined;
   resolved: boolean;
 }): HostWorktree[] {
-  const cacheRef = useRef<VerifiedGithubWorktreeCache | null>(null);
-  const directlyVerified =
-    resolved && worktrees?.some((worktree) => worktree.remote_provider === "github") === true;
+  const cacheRef = useRef<VerifiedGitWorktreeCache | null>(null);
+  // The listing includes the main checkout even when no linked worktrees exist.
+  const directlyVerified = resolved && worktrees !== undefined && worktrees.length > 0;
   if (resolved) {
     cacheRef.current =
       directlyVerified && hostId !== null && worktrees !== undefined

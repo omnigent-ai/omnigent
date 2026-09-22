@@ -11,6 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from omnigent.inner.native_attachments import attachment_cache_dir, materialize_attachment
 from omnigent.native import native_bridge_common
 
 
@@ -49,12 +50,23 @@ def test_prune_removes_dead_keeps_live_and_unmarked(tmp_path: Path) -> None:
     unmarked_dir = root / "unmarked"
     unmarked_dir.mkdir()
 
+    attachment = {
+        "type": "input_file",
+        "filename": "bundle.zip",
+        "file_data": "data:application/zip;base64,UEsDBA==",
+    }
+    for bridge_dir in (dead_dir, live_dir, unmarked_dir):
+        assert materialize_attachment(attachment, bridge_dir) is not None
+
     pruned = native_bridge_common.prune_orphaned_dirs(root)
 
     assert pruned == 1
     assert not dead_dir.exists()
     assert live_dir.exists()
     assert unmarked_dir.exists()
+    assert not attachment_cache_dir(dead_dir).exists()
+    assert attachment_cache_dir(live_dir).exists()
+    assert attachment_cache_dir(unmarked_dir).exists()
 
 
 def test_prune_ignores_non_dir_entries_and_bad_markers(tmp_path: Path) -> None:

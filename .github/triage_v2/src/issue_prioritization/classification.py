@@ -19,6 +19,7 @@ from issue_prioritization.domain import (
 )
 
 _PRIORITY_LABELS = {priority.value for priority in Priority}
+MAX_BUG_REVIEW_CHARACTERS = 100_000
 _TYPE_LABELS = {
     "bug": IssueType.BUG,
     "feature": IssueType.ENHANCEMENT,
@@ -72,6 +73,7 @@ class Classification:
     similar_issues: tuple[int, ...] = ()
     duplicate_confidence: float = 0.0
     duplicate_reasoning: str = ""
+    source_only_quote: str | None = None
 
 
 class Classifier(Protocol):
@@ -84,13 +86,18 @@ class PromptClassifier:
         query: Callable[[str], str],
         areas: AreaCatalog,
         duplicate_candidates: tuple[dict[str, object], ...] = (),
+        *,
+        review_bugs: bool = False,
     ) -> None:
         self.query = query
         self.areas = areas
         self.duplicate_candidates = duplicate_candidates
+        self.review_bugs = review_bugs
 
     def classify(self, issue: IssueContent) -> Classification:
-        response = self.query(build_prompt(issue, self.areas, self.duplicate_candidates))
+        response = self.query(
+            build_prompt(issue, self.areas, self.duplicate_candidates, review_bugs=self.review_bugs)
+        )
         value = _parse_json_object(response)
         area_keys = tuple(
             key for key in _string_list(value.get("area_keys")) if key in self.areas.by_key
@@ -102,6 +109,19 @@ class PromptClassifier:
         evidence_kind, information_status, missing_information = _information_assessment(
             issue_type, value
         )
+        source_only_quote = None
+        quote = value.get("source_only_quote")
+        if (
+            self.review_bugs
+            and issue_type == IssueType.BUG
+            and evidence_kind == EvidenceKind.CODE_ANALYSIS
+            and information_status == InformationStatus.NEEDS_INFO
+            and value.get("has_user_facing_repro") is False
+            and isinstance(quote, str)
+            and quote.strip()
+            and " ".join(quote.split()) in " ".join(issue.body.split())
+        ):
+            source_only_quote = " ".join(quote.split())
         return Classification(
             issue_number=issue.number,
             issue_type=issue_type,
@@ -120,6 +140,7 @@ class PromptClassifier:
             similar_issues=tuple(_int_list(value.get("similar_issues"))),
             duplicate_confidence=_confidence(value.get("duplicate_confidence")),
             duplicate_reasoning=str(value.get("duplicate_reasoning") or ""),
+            source_only_quote=source_only_quote,
         )
 
 
@@ -127,7 +148,13 @@ def build_prompt(
     issue: IssueContent,
     areas: AreaCatalog,
     duplicate_candidates: tuple[dict[str, object], ...] = (),
+    *,
+    review_bugs: bool = False,
 ) -> str:
+    if review_bugs and len(issue.title) + len(issue.body) > MAX_BUG_REVIEW_CHARACTERS:
+        raise ValueError(
+            "Report exceeds the complete-evidence review limit; manual review required"
+        )
     area_lines = [
         f"- {area.key}: label={area.issue_label}. {area.definition}"
         for area in sorted(areas.by_key.values(), key=lambda item: item.key)
@@ -138,7 +165,73 @@ def build_prompt(
         title=issue.title,
         labels=", ".join(issue.labels) if issue.labels else "none",
         author=issue.author,
-        body=issue.body[:12000],
+        body=issue.body if review_bugs else issue.body[:12000],
+        code_analysis_guidance=(
+            "Apply the event bug policy at the end of this prompt."
+            if review_bugs
+            else "Code analysis naming a reachable path and its concrete incorrect impact "
+            "can also be sufficient. A defensive code-path report can be sufficient when "
+            "it explains reachability and impact; never reject it merely because nobody "
+            "ran the path end to end."
+        ),
+        bug_closure_guidance=(
+            """Bug closure policy overrides the completeness rubric above; applies only to Bugs.
+Read the complete report and author replies. Judge evidence, not writing style.
+You have not inspected the code or executed any tests.
+
+Return reasoning first: explain whether a failure occurred and evaluate the
+supplied reproduction, including its preconditions. Then return these two fields
+and all other classification fields, each only once:
+- has_user_facing_repro=true: a complete, plausible UI/CLI/public API sequence,
+  even if unexecuted or inferred from source. Internal setup requiring mocks,
+  private cache/registry mutations, or resolver barriers is not a user sequence,
+  even when it also includes public actions.
+- has_user_facing_repro=false: affirmative evidence confines the scenario to
+  internal/synthetic manipulation with NO plausible OR uncertain user workflow.
+  Missing observations/steps or a source-only disclaimer cannot establish false.
+  Assess supplied actions; predicted effects on users do not establish a workflow.
+- has_user_facing_repro=null: steps are missing, incomplete, or uncertain,
+  including uncertainty about whether supported user actions permit the scenario.
+  A fully specified internal-only recipe is false, not null merely because unexecuted.
+- source_only_quote: null unless ALL closure conditions below hold; otherwise
+  copy a short continuous prose excerpt establishing the source-only basis.
+  Match punctuation exactly; only whitespace may change. Never paraphrase.
+
+Keep open when a failure was observed: information_status=sufficient when there
+is enough context to investigate. Plain descriptions, intermittent observations,
+diagnostics, and executed tests of user workflows count. Logs and first-person
+wording are not required. Choose the observed evidence_kind, not code_analysis.
+
+Keep open for clarification when observation is unclear, necessary details are
+missing, or public user steps are unexecuted/uncertain: information_status=needs_info,
+source_only_quote=null. Ask the author to clarify the steps or share the result.
+Even an explicit source-only disclaimer cannot override plausible OR uncertain
+user steps. "I don't know which user actions allow this" means null, never false.
+
+Close ONLY when ALL are established: no observed failure, has_user_facing_repro=false,
+and an explicit source-only/unexecuted internal basis supported by source_only_quote.
+Use information_status=needs_info, missing_information=[observed_behavior],
+evidence_kind=code_analysis, impact=low. Otherwise keep open for clarification.
+
+Predicted Expected/Actual sections and proposed tests prove neither observation
+nor source-only origin. Preserve tense: "unit tests can simulate this" and "no
+live runner needs to be removed" describe future validation, not past experience.
+"Export can be empty; a unit test could check it" needs clarification.
+"Source audit only; open a session, run /clear, send a web message" stays open.
+"Source audit only; nobody ran it; mock a subprocess and check a heartbeat" closes.
+Return one complete JSON object without surrounding prose or trailing commas."""
+            if review_bugs
+            else ""
+        ),
+        bug_type_guidance=(
+            "An alleged failure remains a Bug even when its trigger or impact is speculative "
+            "or unsupported; assess its evidence using the event policy. Reclassify as Feature "
+            "only when the author actually requests a new capability or refactoring, rather "
+            "than merely alleging a possible failure. Missing evidence is not a feature request."
+            if review_bugs
+            else "For example, a code-quality concern that does not claim incorrect behavior "
+            "is usually a Feature, not an incomplete Bug."
+        ),
         duplicate_candidates=(
             json.dumps(duplicate_candidates, ensure_ascii=False, indent=2)
             if duplicate_candidates
@@ -148,18 +241,26 @@ def build_prompt(
 
 
 def _parse_json_object(value: str) -> Mapping[str, object]:
-    cleaned = value.replace("```json", "").replace("```", "").strip()
-    decoder = json.JSONDecoder()
-    for index, character in enumerate(cleaned):
-        if character != "{":
-            continue
+    # Require the complete response, optionally fenced; prose or extra objects are ambiguous.
+    cleaned = value.strip()
+    if cleaned.startswith("```"):
+        lines = cleaned.splitlines()
+        if lines[0].strip() not in ("```", "```json") or lines[-1].strip() != "```":
+            raise ValueError("classifier returned an invalid JSON code fence")
+        cleaned = "\n".join(lines[1:-1])
+    while True:
         try:
-            parsed, _ = decoder.raw_decode(cleaned, index)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(parsed, Mapping):
-            return parsed
-    raise ValueError("classifier did not return a JSON object")
+            parsed = json.loads(cleaned)
+            break
+        except json.JSONDecodeError as error:
+            prefix = cleaned[: error.pos].rstrip()
+            if cleaned[error.pos : error.pos + 1] not in ("}", "]") or not prefix.endswith(","):
+                raise ValueError("classifier returned invalid JSON") from error
+            # Repair only the trailing comma identified by the decoder, outside strings.
+            cleaned = prefix[:-1] + cleaned[error.pos :]
+    if not isinstance(parsed, Mapping):
+        raise ValueError("classifier did not return a JSON object")
+    return parsed
 
 
 def _issue_type(value: object) -> IssueType:

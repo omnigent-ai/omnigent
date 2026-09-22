@@ -46,6 +46,7 @@ import type { HostWorktree } from "@/hooks/useHostWorktrees";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
 import { NewChatLandingScreen, resetLandingDraft } from "./NewChatDialog";
+import { TooltipProvider } from "@/components/ui/tooltip";
 
 // A `?project=` visit prefills the composer from the project's STORED config
 // (host / working directory / agent / worktree). A field the config leaves
@@ -138,7 +139,7 @@ function agent(overrides: Partial<AvailableAgent> = {}): AvailableAgent {
     name: "hello_world",
     display_name: "Hello World",
     description: null,
-    harness: null,
+    harness: "claude-sdk",
     skills: [],
     ...overrides,
   };
@@ -169,7 +170,6 @@ function setRepoIsGit(): void {
               branch: "main",
               is_main: true,
               detached: false,
-              remote_provider: "github",
             },
           ] as HostWorktree[])
         : ([] as HostWorktree[]),
@@ -202,7 +202,9 @@ function renderLanding(): { rerender: (ui: ReactNode) => void; unmount: () => vo
   function Wrapper({ children }: { children: ReactNode }) {
     return (
       <QueryClientProvider client={client}>
-        <CapabilitiesProvider info={info}>{children}</CapabilitiesProvider>
+        <CapabilitiesProvider info={info}>
+          <TooltipProvider>{children}</TooltipProvider>
+        </CapabilitiesProvider>
       </QueryClientProvider>
     );
   }
@@ -235,7 +237,9 @@ function renderSandboxLanding(): { rerender: (ui: ReactNode) => void } {
   function Wrapper({ children }: { children: ReactNode }) {
     return (
       <QueryClientProvider client={client}>
-        <CapabilitiesProvider info={info}>{children}</CapabilitiesProvider>
+        <CapabilitiesProvider info={info}>
+          <TooltipProvider>{children}</TooltipProvider>
+        </CapabilitiesProvider>
       </QueryClientProvider>
     );
   }
@@ -268,7 +272,9 @@ function renderRoutingLanding(): { rerender: (ui: ReactNode) => void; unmount: (
   function Wrapper({ children }: { children: ReactNode }) {
     return (
       <QueryClientProvider client={client}>
-        <CapabilitiesProvider info={info}>{children}</CapabilitiesProvider>
+        <CapabilitiesProvider info={info}>
+          <TooltipProvider>{children}</TooltipProvider>
+        </CapabilitiesProvider>
       </QueryClientProvider>
     );
   }
@@ -696,14 +702,12 @@ describe("NewChatLandingScreen project prefill", () => {
       branch: "main",
       is_main: true,
       detached: false,
-      remote_provider: "github",
     },
     {
       path: LINKED_WORKTREE,
       branch: "feature/x",
       is_main: false,
       detached: false,
-      remote_provider: "github",
     },
   ];
 
@@ -1117,7 +1121,7 @@ describe("NewChatLandingScreen global always-use-worktree default", () => {
     localStorage.removeItem(ALWAYS_WORKTREE_KEY);
     renderLanding();
 
-    await waitFor(() => expect(branchLabel()).toBe("New worktree"));
+    await waitFor(() => expect(branchLabel()).toBe("New"));
     const body = await submitAndReadBody();
     expect(body.workspace).toBe(REPO);
     expect(body.git).toBeUndefined();

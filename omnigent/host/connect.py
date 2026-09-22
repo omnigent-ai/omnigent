@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, SupportsIndex, SupportsInt, TypeVar, cast
 
+import click
 import httpx
 import psutil
 import websockets.asyncio.client
@@ -41,6 +42,7 @@ from omnigent.debug_logging import (
     PRIMARY_SESSION_ID_ENV_VAR,
     USER_ID_ENV_VAR,
     debug_event,
+    runner_log_scope,
 )
 from omnigent.errors import ErrorCategory, ErrorImpact, ErrorPhase
 from omnigent.gateway_inference import gateway_inference_map
@@ -635,6 +637,8 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # telemetry is opt-in. Not a secret (a boolean). The OMNIGENT_OTEL_*
         # knobs (capture-content, FastAPI toggle) ride the prefix allowlist below.
         "OMNIGENT_TELEMETRY_ENABLED",
+        # Preserve the harness stderr opt-in through daemon and runner hops.
+        "OMNIGENT_HARNESS_STDERR_ENABLED",
         # Opaque request-routing headers (dev/test): a JSON header map folded by
         # cli_auth.databricks_request_headers into every client→server connection
         # so a request pins to a specific server instance/replica. Must reach the
@@ -1601,6 +1605,18 @@ class HostProcess:
             session_id,
             frame.workspace,
             diagnostic,
+            extra=debug_event(
+                "runner_launch_failed",
+                session_id=frame.session_id,
+                runner_id=(
+                    token_bound_runner_id(frame.binding_token)
+                    if frame.binding_token.strip()
+                    else None
+                ),
+                host_request_id=frame.request_id,
+                stage="runner_launch",
+                error_code=error_code or "runner_spawn_failed",
+            ),
         )
         print(
             "  ! Runner launch failed\n"
@@ -1677,7 +1693,24 @@ class HostProcess:
             "URL and that the server is up to date, then retry."
         )
 
-    async def _handle_launch(
+    async def _handle_launch(self, frame: HostLaunchRunnerFrame) -> HostLaunchRunnerResultFrame:
+        # Attribution must not move token validation ahead of the launch preflight.
+        log_runner_id = (
+            token_bound_runner_id(frame.binding_token) if frame.binding_token.strip() else None
+        )
+        with runner_log_scope(frame.session_id, log_runner_id):
+            _logger.info(
+                "Runner launch requested",
+                extra=debug_event(
+                    "runner_launch_started",
+                    stage="runner_launch",
+                    host_request_id=frame.request_id,
+                    harness=frame.harness,
+                ),
+            )
+            return await self._handle_launch_impl(frame)
+
+    async def _handle_launch_impl(
         self,
         frame: HostLaunchRunnerFrame,
     ) -> HostLaunchRunnerResultFrame:
@@ -1859,6 +1892,13 @@ class HostProcess:
             runner_id,
             workspace,
             proc.pid,
+            extra=debug_event(
+                "runner_spawned",
+                session_id=frame.session_id,
+                runner_id=runner_id,
+                stage="runner_launch",
+                host_request_id=frame.request_id,
+            ),
         )
         # Print the exact runner log file (not just the dir): a foreground
         # host's own terminal shows lifecycle lines, but the runner's real
@@ -2235,6 +2275,8 @@ class HostProcess:
             error,
             extra=debug_event(
                 "runner_died",
+                session_id=handle.session_id,
+                stage="runner_process",
                 runner_id=runner_id,
                 error_category=ErrorCategory.RUNNER.value,
                 error_impact=ErrorImpact.BLOCKING.value,
@@ -3104,6 +3146,14 @@ class HostProcess:
                 from omnigent.harnesses.devin_native.main import list_devin_cli_model_options
 
                 devin_models = await asyncio.to_thread(list_devin_cli_model_options)
+            except click.ClickException as exc:
+                # A missing optional CLI is an expected picker result, even when
+                # an older client keeps requesting its catalog.
+                return HostModelOptionsResultFrame(
+                    request_id=frame.request_id,
+                    status="failed",
+                    error=str(exc),
+                )
             except Exception:  # noqa: BLE001 — no catalog, never a crash
                 _logger.warning("Devin model catalog unavailable", exc_info=True)
                 return HostModelOptionsResultFrame(
@@ -3417,8 +3467,7 @@ class HostProcess:
         loop keeps servicing pings.
 
         :param frame: The list-worktrees request frame.
-        :returns: Result frame with worktrees and their coarse remote provider
-            on success, or
+        :returns: Result frame with worktrees on success, or
             ``status: "failed"`` with an error message.
         """
         try:
@@ -3444,7 +3493,6 @@ class HostProcess:
                     "branch": wt.branch,
                     "is_main": wt.is_main,
                     "detached": wt.detached,
-                    "remote_provider": wt.remote_provider,
                     "updated_at": wt.updated_at,
                 }
                 for wt in worktrees

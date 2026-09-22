@@ -39,6 +39,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import type { ReactNode } from "react";
 
 import { authenticatedFetch } from "@/lib/identity";
+import { composerContextToLabels } from "@/lib/composerContextAdapters";
 import { clearOptimisticTitles, getOptimisticTitle } from "@/lib/optimisticTitles";
 import type { Host } from "@/hooks/useHosts";
 import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
@@ -48,6 +49,7 @@ import { NewChatLandingScreen, resetLandingDraft, sanitizeInitialPrompt } from "
 import { writeDefaultBaseBranch } from "@/lib/baseBranchPreferences";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
+import { TooltipProvider } from "@/components/ui/tooltip";
 
 // The landing screen drives the real Web-start flow end to end: the host and
 // first agent auto-select, the working directory seeds from the host's most-
@@ -153,7 +155,6 @@ vi.mock("@/hooks/useHostWorktrees", async (importOriginal) => ({
               branch: "main",
               is_main: true,
               detached: false,
-              remote_provider: "github",
             },
           ]
         : path === null
@@ -171,7 +172,6 @@ vi.mock("@/hooks/useHostWorktrees", async (importOriginal) => ({
               branch: "main",
               is_main: true,
               detached: false,
-              remote_provider: "github" as const,
             },
           ]
         : [],
@@ -222,12 +222,20 @@ function host(overrides: Partial<Host> = {}): Host {
 }
 
 function agent(overrides: Partial<AvailableAgent> = {}): AvailableAgent {
+  const name = overrides.name ?? "hello_world";
+  const harnessByName: Record<string, string> = {
+    "antigravity-native-ui": "antigravity-native",
+    "claude-native-ui": "claude-native",
+    "codex-native-ui": "codex-native",
+    "cursor-native-ui": "cursor-native",
+    "opencode-native-ui": "opencode-native",
+  };
   return {
     id: "ag_hello",
-    name: "hello_world",
+    name,
     display_name: "Hello World",
     description: null,
-    harness: null,
+    harness: harnessByName[name] ?? "claude-sdk",
     skills: [],
     ...overrides,
   };
@@ -289,7 +297,9 @@ function renderLanding(
   function Wrapper({ children }: { children: ReactNode }) {
     return (
       <QueryClientProvider client={client}>
-        <CapabilitiesProvider info={info}>{children}</CapabilitiesProvider>
+        <CapabilitiesProvider info={info}>
+          <TooltipProvider>{children}</TooltipProvider>
+        </CapabilitiesProvider>
       </QueryClientProvider>
     );
   }
@@ -487,6 +497,10 @@ describe("NewChatLandingScreen create flow", () => {
     expect(body.id).toBeUndefined();
     expect(body.labels).toEqual({
       "omnigent.client_create_token": expect.stringMatching(/^[0-9a-f]{32}$/),
+      ...composerContextToLabels({
+        workingDirectory: { kind: "selected", path: SEEDED_WORKSPACE },
+        worktree: { kind: "none" },
+      }),
     });
 
     // On success the screen routes to the freshly created session.
@@ -1208,6 +1222,10 @@ describe("NewChatLandingScreen create flow", () => {
       "omnigent.ui": "terminal",
       "omnigent.wrapper": "claude-code-native-ui",
       "omnigent.client_create_token": expect.stringMatching(/^[0-9a-f]{32}$/),
+      ...composerContextToLabels({
+        workingDirectory: { kind: "selected", path: SEEDED_WORKSPACE },
+        worktree: { kind: "none" },
+      }),
     });
   });
 
@@ -1236,6 +1254,10 @@ describe("NewChatLandingScreen create flow", () => {
       "omnigent.ui": "terminal",
       "omnigent.wrapper": "antigravity-native-ui",
       "omnigent.client_create_token": expect.stringMatching(/^[0-9a-f]{32}$/),
+      ...composerContextToLabels({
+        workingDirectory: { kind: "selected", path: SEEDED_WORKSPACE },
+        worktree: { kind: "none" },
+      }),
     });
   });
 

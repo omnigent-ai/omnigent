@@ -7013,7 +7013,7 @@
                 "type": "null"
               }
             ],
-            "description": "Cumulative LLM spend for this session in USD, e.g. `0.42`. `None` when the session is **unpriced** \u2014 no turn has been priced yet (the model is absent from the pricing catalog, or no usage has been recorded) \u2014 so clients render \"\u2014\" rather than a misleading `$0.00`. Server-computed (cache-aware for relay/codex, exact billing for claude-native), the same total the cost-budget policy gates on. Lets clients seed their cost indicator on resume without waiting for the next `session.usage` SSE event.",
+            "description": "Cumulative LLM spend for this session in USD, e.g. `0.42`. `None` when the session is **unpriced** \u2014 no turn has been priced yet (the model is absent from the pricing catalog, or no usage has been recorded) \u2014 so clients render \"\u2014\" rather than a misleading `$0.00`. Server-computed (cache-aware for relay/codex, exact billing for claude-native), the same total the cost-budget policy gates on. Lets clients seed their cost indicator on resume without waiting for the next `session.usage` SSE event. Also `None` when `usage_included` is `False`.",
             "title": "Total Cost Usd"
           },
           "updated_at": {
@@ -7041,8 +7041,14 @@
                 "type": "null"
               }
             ],
-            "description": "Per-model breakdown of the same subtree usage, keyed by the raw harness model id, e.g. `{\"claude-sonnet-4-6\": ModelUsage(input_tokens=12000, ...)}`. `None` when no per-model usage has been recorded (older sessions recorded before this field existed, or before the first turn). Lets the UI show which models a session spent its tokens / budget on.",
+            "description": "Per-model breakdown of the same subtree usage, keyed by the raw harness model id, e.g. `{\"claude-sonnet-4-6\": ModelUsage(input_tokens=12000, ...)}`. `None` when no per-model usage has been recorded (older sessions recorded before this field existed, or before the first turn). Lets the UI show which models a session spent its tokens / budget on. Also `None` when `usage_included` is `False`.",
             "title": "Usage By Model"
+          },
+          "usage_included": {
+            "default": true,
+            "description": "`False` when the caller skipped usage aggregation with `include_usage=false`. Both usage fields are then unknown, not zero or this session's own-only spend. Display clients can load them with a separate `GET /v1/sessions/{id}` using `include_usage=true`, `include_items=false`, `include_liveness=false`, and `refresh_state=false`.",
+            "title": "Usage Included",
+            "type": "boolean"
           },
           "workspace": {
             "anyOf": [
@@ -9985,7 +9991,7 @@
     },
     "/v1/hosts/{host_id}/worktrees": {
       "get": {
-        "description": "List the git worktrees of a repository on a host.\n\nUsed by the Web UI's new-session worktree picker to show the\nworktrees a session can start in directly. Owner-scoped exactly\nlike the filesystem browse endpoints; NOT scoped to a session.\nA path that is not a git repository is reported as 400 so the\npicker can quietly fall back to \"no worktrees\".\n\n**Returns:** `{\"object\": \"list\", \"data\": [{path, branch, is_main, detached, remote_provider?, updated_at?}, ...]}` (main first).\n\n**Raises**\n\n- `HTTPException` \u2014 404 if host not found, 403 if not owned by caller, 409 if host is offline/unresponsive, 400 on path validation or a non-git path.",
+        "description": "List the git worktrees of a repository on a host.\n\nUsed by the Web UI's new-session worktree picker to show the\nworktrees a session can start in directly. Owner-scoped exactly\nlike the filesystem browse endpoints; NOT scoped to a session.\nA path that is not a git repository is reported as 400 so the\npicker can quietly fall back to \"no worktrees\".\n\n**Returns:** `{\"object\": \"list\", \"data\": [{path, branch, is_main, detached, updated_at?}, ...]}` (main first).\n\n**Raises**\n\n- `HTTPException` \u2014 404 if host not found, 403 if not owned by caller, 409 if host is offline/unresponsive, 400 on path validation or a non-git path.",
         "operationId": "list_host_worktrees_v1_hosts__host_id__worktrees_get",
         "parameters": [
           {
@@ -11293,6 +11299,17 @@
               "title": "Refresh State",
               "type": "boolean"
             }
+          },
+          {
+            "description": "When `False`, skip the subtree usage read and return null usage fields with `usage_included=False`. Display clients can independently request this route with `include_usage=true`, `include_items=false`, `include_liveness=false`, and `refresh_state=false`.",
+            "in": "query",
+            "name": "include_usage",
+            "required": false,
+            "schema": {
+              "default": true,
+              "title": "Include Usage",
+              "type": "boolean"
+            }
           }
         ],
         "responses": {
@@ -11334,6 +11351,17 @@
             "schema": {
               "title": "Session Id",
               "type": "string"
+            }
+          },
+          {
+            "description": "When `False`, skip usage aggregation in the response. Metadata writes during native launch do not need it.",
+            "in": "query",
+            "name": "include_usage",
+            "required": false,
+            "schema": {
+              "default": true,
+              "title": "Include Usage",
+              "type": "boolean"
             }
           }
         ],

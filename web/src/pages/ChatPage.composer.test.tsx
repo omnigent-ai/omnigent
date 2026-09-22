@@ -8,11 +8,13 @@ import type * as RunnerHealthProviderModule from "@/hooks/RunnerHealthProvider";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 import type * as GoalApiModule from "@/lib/goalApi";
 import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
+import type { ChildSessionInfo } from "@/hooks/useChildSessions";
 import type * as FileViewerContextModule from "@/shell/FileViewerContext";
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { createRef, StrictMode, type ComponentRef, type ReactElement } from "react";
+import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useChatStore, type ChatState, type QueuedMessage } from "@/store/chatStore";
 import {
@@ -30,6 +32,7 @@ import {
 } from "@/lib/sessionModelLabelCache";
 import { serializeReplyDraft, type StoredReplyDraft } from "@/lib/replyDraft";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "@/lib/composerSendShortcutPreferences";
+import { composerContextToLabels } from "@/lib/composerContextAdapters";
 import { CHAT_COLUMN_WIDTH } from "./chatLayout";
 
 // Composer reads workspace files via a TanStack query hook (for "@"-file
@@ -103,20 +106,32 @@ function setComposerGitStatus(overrides: Record<string, unknown> = {}) {
 afterEach(() => setComposerGitStatus());
 // SubagentTaskIndicator's child-session query also needs a QueryClient; stub it
 // so the indicator self-hides (no active children) in isolated composer renders.
+const { childSessionsArgsSpy, composerChildSessions } = vi.hoisted(() => ({
+  childSessionsArgsSpy: vi.fn(),
+  composerChildSessions: { children: [] as ChildSessionInfo[] },
+}));
 vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
   ...(await importOriginal<typeof UseChildSessionsModule>()),
-  useChildSessions: () => ({ children: [] }),
+  useChildSessions: (conversationId: string | null) => {
+    childSessionsArgsSpy(conversationId);
+    return { children: composerChildSessions.children, isLoading: false, error: null };
+  },
 }));
 // HostBadge now renders in the composer's status-line tray and reads the
 // session's host binding via TanStack Query. Stub the hooks so it self-hides
 // (no host bound) without needing a QueryClient provider around these renders.
-const { composerSnapshotHost } = vi.hoisted(() => ({
-  composerSnapshotHost: { id: null as string | null },
+const { composerSessionSnapshot } = vi.hoisted(() => ({
+  composerSessionSnapshot: {
+    hostId: null as string | null,
+    workspace: null as string | null,
+    labels: {} as Record<string, string>,
+    gitBranch: null as string | null,
+  },
 }));
 vi.mock("@/hooks/useSession", async (importOriginal) => ({
   ...(await importOriginal<typeof UseSessionModule>()),
   useSession: () => ({
-    session: { hostId: composerSnapshotHost.id },
+    session: composerSessionSnapshot,
     isLoading: false,
     error: null,
   }),
@@ -1442,7 +1457,7 @@ describe("Composer cached model labels", () => {
     });
   beforeEach(() => {
     localStorage.clear();
-    composerSnapshotHost.id = scope.hostId;
+    composerSessionSnapshot.hostId = scope.hostId;
     vi.spyOn(host, "getOmnigentServerIdentity").mockReturnValue("server-a");
     vi.spyOn(identity, "getCurrentUserId").mockReturnValue("user-a");
     setComposerState({
@@ -1461,7 +1476,7 @@ describe("Composer cached model labels", () => {
   });
   afterEach(() => {
     cleanup();
-    composerSnapshotHost.id = null;
+    composerSessionSnapshot.hostId = null;
     vi.restoreAllMocks();
     localStorage.clear();
     useChatStore.setState({ sessionModelSeeded: false, sessionHostId: null, boundAgentId: null });
@@ -1542,7 +1557,7 @@ describe("Composer cached model labels", () => {
 
   it("does not reuse the creation host's cache after the snapshot host changes", () => {
     const first = renderWithTooltips(<Composer {...props()} modelLabelOptions={catalog} />);
-    composerSnapshotHost.id = "new-host";
+    composerSessionSnapshot.hostId = "new-host";
     first.rerender(
       <TooltipProvider>
         <Composer {...props()} codexModelOptions={[]} />
@@ -2036,6 +2051,20 @@ describe("Composer shared visible controls", () => {
   afterEach(() => {
     cleanup();
     vi.restoreAllMocks();
+    childSessionsArgsSpy.mockClear();
+    composerChildSessions.children = [];
+    Object.assign(composerSessionSnapshot, {
+      hostId: null,
+      workspace: null,
+      labels: {},
+      gitBranch: null,
+    });
+    useChatStore.setState({
+      contextWindow: null,
+      tokensUsed: null,
+      backgroundTaskCount: 0,
+      backgroundTasks: [],
+    });
   });
 
   // The workspace/worktree popover markup moved into the shared
@@ -2068,14 +2097,14 @@ describe("Composer shared visible controls", () => {
     const [widthProbe, leading, trailing] = Array.from(actions.children);
     expect(widthProbe).toHaveClass("h-0");
     expect(leading).toContainElement(screen.getByRole("button", { name: "Add" }));
-    expect(trailing).toContainElement(screen.getByTestId("composer-config-gear"));
+    const harnessPicker = screen.getByTestId("composer-config-gear");
+    expect(screen.queryByTestId("composer-settings")).toBeNull();
+    expect(trailing.firstElementChild).toContainElement(harnessPicker);
     expect(actions.children).toHaveLength(3);
     expect(workspace).toHaveClass("mx-3", "h-[37px]", "rounded-t-2xl");
     expect(textarea().closest("form")).toHaveClass("pb-[max(20px,env(safe-area-inset-bottom))]");
-    // The branch text now flows through the shared ComposerWorkspaceStatus +
-    // useComposerGitStatus (covered by their own tests); here assert the shared
-    // branch control renders in the bar.
-    expect(within(workspace).getByTestId("composer-git-branch")).toBeInTheDocument();
+    // A normal working directory has no empty worktree affordance.
+    expect(within(workspace).queryByTestId("composer-git-branch")).toBeNull();
     expect(screen.getByTestId("composer-host-select")).toHaveClass("w-11", "md:h-7");
     expect(screen.getByTestId("composer-permission-chip")).toHaveTextContent("Ask for approval");
     const trigger = screen.getByTestId("composer-config-gear");
@@ -2101,7 +2130,16 @@ describe("Composer shared visible controls", () => {
     expect(screen.getByTestId("composer-pr-link")).toHaveTextContent("#42");
     expect(screen.getByTestId("composer-git-branch")).toHaveTextContent("feature/shared-composer");
 
-    setComposerGitStatus({ prCount: 0, prNumber: null });
+    setComposerGitStatus({
+      branch: "feature/shared-composer",
+      branchState: "branch",
+      isWorktree: true,
+      worktreePath: "/home/alice/repo-wt/feature",
+      githubState: "ready",
+      repoNameWithOwner: "omnigent-ai/omnigent",
+      prCount: 0,
+      prNumber: null,
+    });
     view.rerender(
       <TooltipProvider>
         <Composer {...composerProps()} />
@@ -2133,6 +2171,8 @@ describe("Composer shared visible controls", () => {
     setComposerGitStatus({
       branch: "feature/shared-composer",
       branchState: "branch",
+      isWorktree: true,
+      worktreePath: "/home/alice/repo-wt/feature",
       githubState: "ready",
       repoNameWithOwner: "omnigent-ai/omnigent",
       prCount: 1,
@@ -2142,6 +2182,60 @@ describe("Composer shared visible controls", () => {
     const pr = screen.getByTestId("composer-pr-link");
     const worktree = screen.getByTestId("composer-git-branch");
     expect(pr.compareDocumentPosition(worktree) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+  });
+
+  it("mounts task indicators before the context ring with sub-agent navigation", () => {
+    useChatStore.setState({
+      conversationId: "conv_parent",
+      contextWindow: 100_000,
+      tokensUsed: 25_000,
+      backgroundTaskCount: 1,
+      backgroundTasks: [],
+    });
+    composerChildSessions.children = [
+      {
+        id: "conv_child",
+        title: "developer:queue-tests",
+        task_summary: "Verify queue behavior",
+        tool: "developer",
+        session_name: "queue-tests",
+        labels: {},
+        current_task_status: "in_progress",
+        last_task_error: null,
+        busy: true,
+        last_message_preview: null,
+        pending_elicitations_count: 0,
+        routed_model: null,
+      },
+    ];
+
+    render(
+      <MemoryRouter initialEntries={["/c/conv_parent?file=README.md&debug=1"]}>
+        <TooltipProvider>
+          <Composer {...composerProps()} />
+        </TooltipProvider>
+      </MemoryRouter>,
+    );
+
+    const workspace = screen.getByTestId("composer-workspace-controls");
+    const taskIndicators = within(workspace).getByTestId("composer-task-indicators");
+    const context = within(workspace).getByTestId("composer-context-ring");
+    const background = within(workspace).getByTestId("background-task-pill");
+    const subagent = within(workspace).getByTestId("subagent-task-pill");
+    expect(
+      background.compareDocumentPosition(subagent) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).not.toBe(0);
+    expect(subagent.compareDocumentPosition(context) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(
+      0,
+    );
+    expect(taskIndicators).toHaveClass("gap-0");
+    expect(context.parentElement).toHaveClass("gap-1");
+    expect(childSessionsArgsSpy).toHaveBeenCalledWith("conv_parent");
+
+    fireEvent.click(subagent);
+    expect(
+      screen.getByRole("link", { name: /Verify queue behavior.*Working.*developer/ }),
+    ).toHaveAttribute("href", "/c/conv_child?debug=1");
   });
 
   it("passes the real session id/host/workspace/creation-branch to useComposerGitStatus", () => {
@@ -2157,6 +2251,63 @@ describe("Composer shared visible controls", () => {
         hostId: null,
         workspace: null,
       }),
+    );
+  });
+
+  it("prefers the session worktree over the source workspace stored in composer labels", () => {
+    composerGitStatusArgsSpy.mockClear();
+    Object.assign(composerSessionSnapshot, {
+      hostId: "host-worktree",
+      workspace: "/home/alice/worktrees/feature-x",
+      labels: composerContextToLabels({
+        workingDirectory: { kind: "selected", path: "/home/alice/source-repo" },
+        worktree: { kind: "new", branchName: "feature-x", baseBranch: "main" },
+      }),
+      gitBranch: "feature-x",
+    });
+    setComposerGitStatus({
+      branch: "feature-x",
+      branchState: "branch",
+      isWorktree: true,
+      worktreePath: "/home/alice/worktrees/feature-x",
+      creationBranch: "feature-x",
+    });
+    useChatStore.setState({ conversationId: "conv_worktree", gitBranch: "source-branch" });
+
+    renderWithTooltips(<Composer {...composerProps()} />);
+
+    expect(composerGitStatusArgsSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sessionId: "conv_worktree",
+        hostId: "host-worktree",
+        workspace: "/home/alice/worktrees/feature-x",
+        creationBranch: "feature-x",
+      }),
+    );
+    expect(screen.getByTestId("composer-workspace-dir")).toHaveAccessibleName(
+      "Working directory: /home/alice/worktrees/feature-x",
+    );
+    expect(screen.getByTestId("composer-git-branch")).toHaveTextContent("feature-x");
+  });
+
+  it("falls back to the composer label when the session workspace is absent", () => {
+    composerGitStatusArgsSpy.mockClear();
+    Object.assign(composerSessionSnapshot, {
+      workspace: null,
+      labels: composerContextToLabels({
+        workingDirectory: { kind: "selected", path: "/home/alice/legacy-repo" },
+        worktree: { kind: "none" },
+      }),
+    });
+    useChatStore.setState({ conversationId: "conv_legacy_workspace", gitBranch: null });
+
+    renderWithTooltips(<Composer {...composerProps()} />);
+
+    expect(composerGitStatusArgsSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ workspace: "/home/alice/legacy-repo" }),
+    );
+    expect(screen.getByTestId("composer-workspace-dir")).toHaveAccessibleName(
+      "Working directory: /home/alice/legacy-repo",
     );
   });
 
@@ -3704,6 +3855,7 @@ describe("Composer sub-agent tray", () => {
     // that some tray exists.
     expect(screen.getByText("check-account-eligibility")).toBeTruthy();
     expect(screen.getByText(/Chatting with sub-agent/)).toBeTruthy();
+    expect(screen.getByTestId("composer-workspace-controls")).not.toHaveClass("rounded-t-none");
   });
 
   // The sub-agent tray sits directly above the workspace bar, sharing its
@@ -3720,6 +3872,23 @@ describe("Composer sub-agent tray", () => {
     render(<Composer {...composerProps()} />);
     const bar = document.querySelector('[data-testid="composer-workspace-controls"]');
     expect(bar?.className).not.toContain("rounded-t-none");
+  });
+
+  it("removes the workspace bar's inner arc when the queue tray is docked above it", () => {
+    setComposerState({
+      conversationId: "conv_test",
+      skills: [],
+      queuedMessages: [{ queueId: "q_1", text: "held follow-up", conversationId: "conv_test" }],
+    });
+    renderWithTooltips(<Composer {...composerProps()} />);
+    expect(screen.getByTestId("composer-workspace-controls")).toHaveClass(
+      "rounded-t-none",
+      "pl-2.5",
+      "border-t-0",
+      "border-border/50",
+      "before:inset-x-4",
+      "before:h-px",
+    );
   });
 });
 
@@ -4604,6 +4773,33 @@ describe("Composer config gear", () => {
     expect(calls).toEqual(["model", "effort"]);
   });
 
+  it("shows a titled actionable tooltip when a session config update fails", async () => {
+    const setModel = vi.fn().mockRejectedValue(new Error("Host stopped responding"));
+    const options = [
+      { id: "opus", model: "opus", displayName: "Opus" },
+      { id: "sonnet", model: "sonnet", displayName: "Sonnet" },
+    ] as never;
+    useChatStore.setState({ setModel, codexModelOptions: options });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          showModels: true,
+          modelPickerKind: "claude",
+          codexModelOptions: options,
+        })}
+      />,
+    );
+
+    await openSessionModels();
+    fireEvent.click(screen.getByTestId("composer-agent-model-sonnet"));
+    const error = await screen.findByTestId("composer-config-error");
+    fireEvent.focus(error);
+    const tooltip = await screen.findByTestId("composer-config-error-tooltip");
+    expect(tooltip).toHaveTextContent("Couldn’t update configuration");
+    expect(tooltip).toHaveTextContent("Host stopped responding");
+    expect(tooltip).toHaveTextContent("Try again");
+  });
+
   it("recomputes the Codex effort ladder after a confirmed model change and drops an unsupported level", async () => {
     // Codex advertises a per-model effort ladder. Drafting a lower-ceiling
     // model (Luna, no "ultra") must refresh the dropdown to that model's levels
@@ -4884,6 +5080,21 @@ function setComposerState(
     ...(skillsStatus === undefined ? {} : { skillsStatus }),
   });
 }
+
+describe("Composer attachment picker", () => {
+  afterEach(() => {
+    cleanup();
+  });
+
+  it("accepts the workspace types in the file picker filter", () => {
+    render(<Composer {...composerProps()} />);
+
+    const input = document.querySelector('input[type="file"]') as HTMLInputElement;
+    // Without these the OS picker hides the very files the server now accepts.
+    expect(input.accept).toContain(".zip");
+    expect(input.accept).toContain(".docx");
+  });
+});
 
 describe("saved sandbox inference policy", () => {
   let previous: ChatState;

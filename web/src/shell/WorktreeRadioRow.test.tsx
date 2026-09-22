@@ -4,6 +4,9 @@ import { describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { WorktreeRadioRow } from "./WorktreeRadioRow";
 
+const copyTextMock = vi.fn();
+vi.mock("@/lib/clipboard", () => ({ copyText: (text: string) => copyTextMock(text) }));
+
 describe("WorktreeRadioRow", () => {
   it("shows only the worktree name and updated timestamp in an accessible radio row", () => {
     const twoHoursAgo = Math.floor((Date.now() - 2 * 60 * 60 * 1000) / 1000);
@@ -15,7 +18,6 @@ describe("WorktreeRadioRow", () => {
             branch: "feature/auth-refresh",
             is_main: false,
             detached: false,
-            remote_provider: "github",
             updated_at: twoHoursAgo,
           }}
           checked={false}
@@ -34,6 +36,106 @@ describe("WorktreeRadioRow", () => {
     expect(row).not.toHaveTextContent("/Users/corey");
   });
 
+  it("uses the dialog body type scale for spacious timestamps", () => {
+    render(
+      <TooltipProvider>
+        <WorktreeRadioRow
+          worktree={{
+            path: "/Users/corey/repo-worktrees/auth-refresh",
+            branch: "feature/auth-refresh",
+            is_main: false,
+            detached: false,
+            updated_at: null,
+          }}
+          checked={false}
+          name="worktree"
+          onSelect={vi.fn()}
+          testId="worktree-row"
+          variant="spacious"
+        />
+      </TooltipProvider>,
+    );
+
+    expect(screen.getByText("Unknown")).toHaveClass("text-base");
+  });
+
+  it("offers open and copy actions for spacious rows", async () => {
+    const onOpen = vi.fn();
+    render(
+      <TooltipProvider>
+        <WorktreeRadioRow
+          worktree={{
+            path: "/Users/corey/repo-worktrees/auth-refresh",
+            branch: "feature/auth-refresh",
+            is_main: false,
+            detached: false,
+            updated_at: null,
+          }}
+          checked={false}
+          name="worktree"
+          onSelect={vi.fn()}
+          testId="worktree-row"
+          variant="spacious"
+          onOpen={onOpen}
+        />
+      </TooltipProvider>,
+    );
+
+    fireEvent.pointerDown(
+      screen.getByRole("button", { name: "Worktree actions for auth-refresh" }),
+      {
+        button: 0,
+      },
+    );
+    expect(screen.queryByRole("menuitem", { name: "Delete" })).not.toBeInTheDocument();
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Open folder" }));
+    expect(onOpen).toHaveBeenCalledOnce();
+
+    fireEvent.pointerDown(
+      screen.getByRole("button", { name: "Worktree actions for auth-refresh" }),
+      {
+        button: 0,
+      },
+    );
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Copy path" }));
+    expect(copyTextMock).toHaveBeenCalledWith("/Users/corey/repo-worktrees/auth-refresh");
+  });
+
+  it("uses the compact selector contract without a visible radio", () => {
+    render(
+      <TooltipProvider>
+        <WorktreeRadioRow
+          worktree={{
+            path: "/Users/corey/repo-worktrees/auth-refresh",
+            branch: "feature/auth-refresh",
+            is_main: false,
+            detached: false,
+            updated_at: null,
+          }}
+          checked
+          name="worktree"
+          onSelect={vi.fn()}
+          testId="worktree-row"
+          variant="selector"
+        />
+      </TooltipProvider>,
+    );
+
+    expect(screen.getByTestId("worktree-row")).toHaveClass(
+      "h-7",
+      "shrink-0",
+      "rounded-md",
+      "px-2",
+      "py-0",
+      "text-base",
+      "leading-5",
+      "bg-muted",
+    );
+    expect(screen.getByRole("radio")).toHaveClass("sr-only");
+    expect(screen.getByText("auth-refresh")).toHaveClass("font-medium", "leading-5");
+    expect(screen.getByText("Unknown")).toHaveClass("text-base", "leading-5");
+  });
+
   it("shows a light tooltip with full path, branch, and status on focus", async () => {
     render(
       <TooltipProvider delayDuration={0}>
@@ -43,7 +145,6 @@ describe("WorktreeRadioRow", () => {
             branch: "feature/auth-refresh",
             is_main: false,
             detached: false,
-            remote_provider: "github",
             updated_at: Math.floor((Date.now() - 2 * 60 * 60 * 1000) / 1000),
           }}
           checked

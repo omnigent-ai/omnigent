@@ -1,5 +1,5 @@
 import { appConfig } from "./appConfig";
-import { SidebarDataProvider } from "./hooks/useSidebarData";
+import { IdentityAwareSidebarDataProvider } from "./hooks/useSidebarData";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { StrictMode, useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
@@ -144,7 +144,7 @@ function RootApp({ initialInfo }: { initialInfo: ServerInfo | "loading" }) {
             <TooltipProvider>
               <ImageLightboxProvider>
                 <BrowserRouter basename={getBasePath() || undefined}>
-                  <SidebarDataProvider config={appConfig.sidebar}>
+                  <IdentityAwareSidebarDataProvider config={appConfig.sidebar}>
                     <SessionUpdatesProvider>
                       <RunnerHealthProvider>
                         <QueueFlushProvider>
@@ -152,7 +152,7 @@ function RootApp({ initialInfo }: { initialInfo: ServerInfo | "loading" }) {
                         </QueueFlushProvider>
                       </RunnerHealthProvider>
                     </SessionUpdatesProvider>
-                  </SidebarDataProvider>
+                  </IdentityAwareSidebarDataProvider>
                 </BrowserRouter>
               </ImageLightboxProvider>
             </TooltipProvider>

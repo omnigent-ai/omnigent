@@ -468,12 +468,11 @@ def _latest_user_text(messages: list[Message], bridge_dir: Path) -> str:
     Return the latest user text from executor messages.
 
     Multimodal content blocks (images, files) are materialized to the
-    bridge directory and referenced by path in the returned text so
+    session attachment cache and referenced by path in the returned text so
     Claude Code can read them via its Read tool.
 
     :param messages: Conversation history in executor message shape.
-    :param bridge_dir: Bridge directory path for writing attachment
-        files, e.g. ``Path("/tmp/omnigent/claude-native/<digest>")``.
+    :param bridge_dir: Session bridge path identifying the attachment cache.
     :returns: Concatenated latest user message text, or ``""`` when
         no user text is present.
     """
@@ -489,15 +488,14 @@ def _content_to_text(content: EnqueuedContent, bridge_dir: Path) -> str:
 
     Text blocks are extracted directly. Multimodal blocks
     (``input_image``, ``input_file``) that carry resolved base64 data
-    URIs are decoded to files in the bridge directory and referenced
+    URIs are decoded to files in the session attachment cache and referenced
     by path so Claude Code can view them with its Read tool.
 
     :param content: Message content, e.g. a string or a list of
         ``{"type": "input_text", "text": "..."}`` blocks. May also
         contain ``input_image`` blocks with an ``image_url`` data URI
         or ``input_file`` blocks with a ``file_data`` data URI.
-    :param bridge_dir: Bridge directory path for writing attachment
-        files, e.g. ``Path("/tmp/omnigent/claude-native/<digest>")``.
+    :param bridge_dir: Session bridge path identifying the attachment cache.
     :returns: Plain text content with file-path references prepended
         for any materialized attachments.
     """

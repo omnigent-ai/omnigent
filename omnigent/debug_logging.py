@@ -40,6 +40,7 @@ import httpx
 
 from omnigent.errors import ErrorPhase, OmnigentError, classify_exception
 from omnigent.process_logging import redact_log_text
+from omnigent.runner.identity import RUNNER_ID_ENV_VAR
 from omnigent.version import VERSION
 
 # ── environment contract ────────────────────────────────────────────────────
@@ -63,14 +64,13 @@ PRIMARY_SESSION_ID_ENV_VAR = "OMNIGENT_RUNNER_PRIMARY_SESSION_ID"
 USER_ID_ENV_VAR = "OMNIGENT_USER_ID"
 _user_id_var: ContextVar[str | None] = ContextVar("omnigent_debug_user_id", default=None)
 
-# Request-scoped session attribution on the server. The HTTP middleware binds
-# this for the duration of a request whose matched route carries a
-# ``{session_id}`` path param, so records emitted while handling it inherit the
-# session even when the callsite did not thread it explicitly. Unset on the
-# runner/host (they use the ``OMNIGENT_RUNNER_PRIMARY_SESSION_ID`` env instead),
-# so this never changes runner attribution. An explicit ``extra`` session id
-# always wins over this ambient value.
+# Session attribution for HTTP handlers and scoped lifecycle work on every
+# process. Explicit record fields win; runner environment IDs are fallbacks.
 _session_id_var: ContextVar[str | None] = ContextVar("omnigent_debug_session_id", default=None)
+
+_runner_id_var: ContextVar[str | None] = ContextVar("omnigent_debug_runner_id", default=None)
+_request_id_var: ContextVar[str | None] = ContextVar("omnigent_debug_request_id", default=None)
+
 
 # Ambient lifecycle phase for the code currently executing. Set with
 # ``phase_scope`` around each region (runner launch, harness setup/startup, turn)
@@ -264,8 +264,30 @@ def current_user_id() -> str | None:
     return _user_id_var.get() or os.environ.get(USER_ID_ENV_VAR) or None
 
 
+def set_current_request_id(request_id: str | None) -> None:
+    """Bind the server HTTP request id; host-frame request ids are separate."""
+    _request_id_var.set(request_id or None)
+
+
+def set_current_runner_id(runner_id: str | None) -> None:
+    """Bind a known runner without looking up a session on every log record."""
+    _runner_id_var.set(runner_id or None)
+
+
+@contextlib.contextmanager
+def runner_log_scope(session_id: str | None, runner_id: str | None) -> Iterator[None]:
+    """Attribute a launch, callback, or relay and restore the caller's context."""
+    session_token = _session_id_var.set(session_id or None)
+    runner_token = _runner_id_var.set(runner_id or None)
+    try:
+        yield
+    finally:
+        _runner_id_var.reset(runner_token)
+        _session_id_var.reset(session_token)
+
+
 def set_current_session_id(session_id: str | None) -> None:
-    """Bind the current request's session (server middleware, session-scoped routes only)."""
+    """Bind a known session in the current request or lifecycle task."""
     _session_id_var.set(session_id or None)
 
 
@@ -280,13 +302,7 @@ def current_session_id_scope(session_id: str | None) -> Iterator[None]:
 
 
 def current_session_id() -> str | None:
-    """Best-available request-scoped session attribution (server only).
-
-    Bound by the HTTP middleware only for a request whose matched route carries a
-    ``{session_id}`` path param, so it never mis-attributes a non-session route.
-    Unset on the runner/host. An explicit ``extra`` session id always wins over
-    this (see :func:`record_to_row`).
-    """
+    """Return the session bound to the current request or lifecycle scope."""
     return _session_id_var.get() or None
 
 
@@ -424,15 +440,11 @@ def debug_event(
             "tool_call_dispatched", session_id=session_id,
             tool_call_id=tc.id, model=model))
 
-    ``turn_id`` is populated only from what the callsite passes. ``session_id``
-    is likewise callsite-driven, but the sink additionally falls back to the
-    runner's primary (parent) conversation id when a record carries none (see
-    :func:`record_to_row`); that fallback is runner-only, so on the server an
-    unthreaded ``session_id`` stays null. ``user_id`` has its own ambient
-    fallback (a request-scoped ContextVar on the server, the ``OMNIGENT_USER_ID``
-    env on the runner/host). Freeform ``_logger.debug("…")`` calls need no
-    ``extra``; they ship with null correlation columns and an empty attributes
-    map.
+    Explicit fields win over ambient lifecycle context. The sink enriches
+    ordinary logs too: session/request/runner scopes on the server and host,
+    primary-session and runner environment defaults on runner/harness rows.
+    ``turn_id`` remains callsite-driven. ``user_id`` uses its existing request
+    scope or process-owner environment fallback.
     """
     extra: dict[str, object] = {"event_name": event_name, "attributes": dict(attributes)}
     if session_id is not None:
@@ -450,7 +462,7 @@ def _stack_trace(record: logging.LogRecord) -> str | None:
     return record.exc_text or None
 
 
-def _attributes(record: logging.LogRecord) -> dict[str, str]:
+def _attributes(record: logging.LogRecord, source: str) -> dict[str, str]:
     raw = getattr(record, "attributes", None)
     attrs: dict[str, str] = {}
     if isinstance(raw, dict):
@@ -458,6 +470,17 @@ def _attributes(record: logging.LogRecord) -> dict[str, str]:
         # and drop nulls. Event attributes share the same privacy boundary as
         # messages.
         attrs = {str(k): redact_log_text(str(v)) for k, v in raw.items() if v is not None}
+    for key, value in (
+        ("request_id", getattr(record, "request_id", None) or _request_id_var.get()),
+        (
+            "runner_id",
+            getattr(record, "runner_id", None)
+            or _runner_id_var.get()
+            or (os.environ.get(RUNNER_ID_ENV_VAR) if source in {"runner", "harness"} else None),
+        ),
+    ):
+        if value:
+            attrs.setdefault(key, redact_log_text(str(value)))
     _stamp_error_dimensions(attrs, record)
     return attrs
 
@@ -519,17 +542,12 @@ def record_to_row(record: logging.LogRecord, source: str) -> dict[str, object]:
     the two shapes the ZeroBus JSON path requires for the ``TIMESTAMP`` and
     ``MAP<STRING,STRING>`` columns respectively.
 
-    ``session_id`` is taken from what the callsite threaded via ``extra`` first,
-    then the server's request-scoped :func:`current_session_id` (bound by the
-    HTTP middleware only for a request whose matched route carries a
-    ``{session_id}`` path param -- so it never mis-attributes a non-session
-    route, and an explicit id always wins), and finally the runner's primary
-    (parent) conversation id (:func:`runner_primary_session_id`). The
-    request-scoped var is unset on the runner (which uses the primary-session
-    env), and the primary-session env is absent on the server, so the two
-    fallbacks never collide. A server record on a non-session route stays null.
-    On a runner, a co-located subagent turn whose log is not threaded can be
-    attributed to the parent conversation, an accepted trade-off.
+    Session attribution prefers an explicit record field, then the active
+    request/lifecycle scope, then the primary-session environment on runner
+    and harness rows only. Runner child-session requests bind their own ID;
+    process-wide runner logs can still fall back to the primary session.
+    Request and runner IDs follow the same explicit-before-ambient rule in
+    ``attributes``. Server and host rows never use runner environment defaults.
 
     ``workspace_id``/``app_name`` describe the record's origin deployment: the
     managed service stamps ``record.workspace_id`` per request (so it wins),
@@ -543,7 +561,7 @@ def record_to_row(record: logging.LogRecord, source: str) -> dict[str, object]:
         "session_id": (
             getattr(record, "session_id", None)
             or current_session_id()
-            or runner_primary_session_id()
+            or (runner_primary_session_id() if source in {"runner", "harness"} else None)
         ),
         "turn_id": getattr(record, "turn_id", None),
         "source": source,
@@ -556,7 +574,7 @@ def record_to_row(record: logging.LogRecord, source: str) -> dict[str, object]:
         "func_name": record.funcName,
         "app_version": VERSION,
         "stack_trace": redact_log_text(stack_trace) if stack_trace is not None else None,
-        "attributes": _attributes(record),
+        "attributes": _attributes(record, source),
         "log_id": uuid.uuid4().hex,
         "user_id": getattr(record, "user_id", None) or current_user_id(),
         "workspace_id": _clean(getattr(record, "workspace_id", None)) or workspace_id,

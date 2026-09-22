@@ -243,9 +243,8 @@ def test_composer_pr_link_opens_github_tab(
                     {
                         "path": workspace,
                         "branch": branch,
-                        "is_main": True,
+                        "is_main": False,
                         "detached": False,
-                        "remote_provider": "github",
                     }
                 ]
             }

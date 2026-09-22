@@ -203,8 +203,7 @@ async def post_external_session_status(
         SSE event so ap-web can drive the bubble's streaming lifecycle — that's
         what makes native forwarded tool cards render LIVE (spinner + elapsed
         timer) rather than as static completed cards. ``None`` (the default)
-        preserves the bare, turn-agnostic status edges (e.g. the sub-agent
-        quiescence badge) that don't map to a turn.
+        preserves status edges that don't map to a turn.
     :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
     """
     data: dict[str, object] = {"status": status}

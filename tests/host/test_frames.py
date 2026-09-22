@@ -1352,7 +1352,8 @@ def test_list_worktrees_frame_round_trip() -> None:
     assert decoded == original
 
 
-def test_list_worktrees_result_frame_round_trip() -> None:
+@pytest.mark.parametrize("legacy_provider", [False, True])
+def test_list_worktrees_result_frame_round_trip(legacy_provider: bool) -> None:
     """Verify HostListWorktreesResultFrame survives encode → decode.
 
     The worktree dicts feed the picker; a dropped or reshaped field
@@ -1367,7 +1368,7 @@ def test_list_worktrees_result_frame_round_trip() -> None:
                 "branch": "main",
                 "is_main": True,
                 "detached": False,
-                "remote_provider": "github",
+                **({"remote_provider": "github"} if legacy_provider else {}),
                 "updated_at": 1_700_000_000,
             },
             {
@@ -1383,8 +1384,8 @@ def test_list_worktrees_result_frame_round_trip() -> None:
     assert decoded == original
 
 
-def test_list_worktrees_result_frame_accepts_legacy_entries_without_provider() -> None:
-    """Older hosts may omit remote_provider without breaking decoding."""
+def test_list_worktrees_result_frame_accepts_legacy_entries_without_metadata() -> None:
+    """Older hosts may omit optional metadata without breaking decoding."""
     decoded = decode_host_frame(
         '{"kind":"host.list_worktrees_result","request_id":"r","status":"ok",'
         '"worktrees":[{"path":"/repo","branch":"main","is_main":true,'

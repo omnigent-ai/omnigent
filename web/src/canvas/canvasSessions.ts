@@ -202,6 +202,7 @@ export function sessionListQuery(after: string | null, limit: number): string {
   query.set("sort_by", "updated_at");
   query.set("order", "desc");
   query.set("kind", "default");
+  query.set("visibility", "all");
   query.set("include_archived", "false");
   if (after) query.set("after", after);
   return query.toString();

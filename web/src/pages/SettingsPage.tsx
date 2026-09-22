@@ -174,6 +174,13 @@ import {
   type TerminalThemeMode,
 } from "@/lib/terminalThemePreferences";
 import {
+  canRememberTerminalClipboardPreference,
+  readTerminalClipboardPreference,
+  subscribeTerminalClipboardPreference,
+  writeTerminalClipboardPreference,
+  type TerminalClipboardPreference,
+} from "@/lib/terminalClipboardPreferences";
+import {
   readWorkspacePanelDefault,
   WORKSPACE_PANEL_DEFAULT,
   writeWorkspacePanelDefault,
@@ -1501,6 +1508,75 @@ function BackgroundSessionTitlesControl() {
   );
 }
 
+function TerminalClipboardControl() {
+  const labelId = useId();
+  const descriptionId = useId();
+  const canRemember = canRememberTerminalClipboardPreference();
+  const [preference, setPreference] = useState<TerminalClipboardPreference>(
+    readTerminalClipboardPreference,
+  );
+  const [saveFailed, setSaveFailed] = useState(false);
+
+  useEffect(
+    () =>
+      subscribeTerminalClipboardPreference((value) => {
+        setPreference(value);
+        setSaveFailed(false);
+      }),
+    [],
+  );
+
+  const update = (value: string) => {
+    if (!canRemember) return;
+    if (value !== "ask" && value !== "allow" && value !== "block") return;
+    const saved = writeTerminalClipboardPreference(value);
+    if (saved) setPreference(value);
+    setSaveFailed(!saved);
+  };
+
+  return (
+    <div className="flex flex-wrap items-start justify-between gap-x-6 gap-y-3">
+      <div className="flex min-w-0 flex-1 flex-col gap-1">
+        <span id={labelId} className="text-ui font-medium">
+          Copying from terminals
+        </span>
+        <span id={descriptionId} className="text-sm text-muted-foreground">
+          {canRemember
+            ? "Controls copying text from all sessions and terminals on this server in this browser or app. Allowing copying also lets terminal programs silently replace your clipboard with text or commands you didn’t intend to paste."
+            : "This connection can’t remember clipboard permissions. You can still allow or block copying for each open terminal."}
+        </span>
+        {saveFailed && (
+          <span role="alert" className="text-sm text-destructive">
+            Couldn&apos;t save this preference in this browser or app. Your previous setting is
+            unchanged.
+          </span>
+        )}
+      </div>
+      <Select
+        value={preference}
+        disabled={!canRemember}
+        onValueChange={update}
+        componentId="settings.general.terminal_clipboard"
+        valueHasNoPii
+      >
+        <SelectTrigger
+          aria-labelledby={labelId}
+          aria-describedby={descriptionId}
+          data-testid="terminal-clipboard-preference-select"
+          className="w-48 shrink-0"
+        >
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value="ask">Ask before copying</SelectItem>
+          <SelectItem value="allow">Allow copying</SelectItem>
+          <SelectItem value="block">Block copying</SelectItem>
+        </SelectContent>
+      </Select>
+    </div>
+  );
+}
+
 /** App-wide behavior settings. */
 function GeneralSection() {
   return (
@@ -1516,6 +1592,10 @@ function GeneralSection() {
         <h2 className="mt-3 text-ui font-medium">Sessions</h2>
         <div className="rounded-xl border border-border bg-card p-4">
           <BackgroundSessionTitlesControl />
+        </div>
+        <h2 className="mt-3 text-ui font-medium">Terminal</h2>
+        <div className="rounded-xl border border-border bg-card p-4">
+          <TerminalClipboardControl />
         </div>
       </div>
     </Section>
@@ -2531,8 +2611,16 @@ function ArchivedSection() {
     }
   }, [project, projectNames, namesQuery.isSuccess, namesQuery.isFetching]);
 
-  // The visible list, filtered server-side via ?project= when one is picked.
-  const listQuery = useConversations("", true, undefined, project);
+  // Named projects need the owner-scoped "all" query, including archived rows.
+  // The unfiltered view can request only archives across all accessible sessions.
+  // Keep includeArchived for older servers that ignore visibility.
+  const listQuery = useConversations(
+    "",
+    true,
+    undefined,
+    project,
+    project === undefined ? "archived" : undefined,
+  );
   const archived = useMemo(
     () => (listQuery.data?.pages ?? []).flatMap((p) => p.data).filter((c) => c.archived === true),
     [listQuery.data],

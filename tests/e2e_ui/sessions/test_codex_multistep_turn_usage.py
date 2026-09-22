@@ -39,8 +39,9 @@ import uuid
 import httpx
 import pytest
 import yaml
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Page, Response, Route, expect
 
+from tests.e2e_ui.chat.test_session_usage_loading import _session_read_matcher
 from tests.e2e_ui.conftest import _ensure_runner_online, _server_state, configure_mock_llm
 
 # The e2e-ui CI job installs the codex CLI; without it the SDK harness cannot
@@ -109,9 +110,10 @@ def _create_codex_session(base_url: str, runner_id: str, model: str) -> str:
     """
     name = f"codex-usage-{uuid.uuid4().hex[:8]}"
     bundle = _build_codex_bundle(name, model)
+    # Background title inference must not consume the turn's scripted responses.
     create_resp = httpx.post(
         f"{base_url}/v1/sessions",
-        data={"metadata": json.dumps({})},
+        data={"metadata": json.dumps({"title": "Codex cumulative usage"})},
         files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
         timeout=30.0,
     )
@@ -148,6 +150,23 @@ def _model_requests(mock_llm_server_url: str, token: str) -> list[dict]:
     resp = httpx.get(f"{mock_llm_server_url}/mock/requests", timeout=10.0)
     resp.raise_for_status()
     return [r for r in resp.json()["requests"] if token in json.dumps(r)]
+
+
+def _assert_cumulative_usage(page: Page, model: str) -> None:
+    """Open agent info and check the tokens from both model requests."""
+    trigger = page.get_by_test_id("agent-info-trigger")
+    trigger.focus()
+    trigger.press("Enter")
+    usage_section = page.get_by_test_id("agent-info-usage-by-model")
+    expect(usage_section).to_be_visible(timeout=30_000)
+    usage_section.locator("summary").press("Enter")
+    model_group = page.get_by_test_id(f"agent-info-model-{model}")
+    expect(model_group).to_be_visible(timeout=30_000)
+    expect(model_group).to_contain_text(
+        re.compile(rf"Total\s*{_EXPECTED_TOTAL}(?!\d)"), timeout=30_000
+    )
+    expect(model_group).to_contain_text(re.compile(rf"Input\s*{_EXPECTED_INPUT}(?!\d)"))
+    expect(model_group).to_contain_text(re.compile(rf"Output\s*{_EXPECTED_OUTPUT}(?!\d)"))
 
 
 @pytest.mark.timeout(600)
@@ -212,28 +231,45 @@ def test_codex_multistep_turn_reports_cumulative_usage(
                 f"expected the turn to make exactly 2 model requests, saw "
                 f"{len(requests)} - the codex/mock wiring broke, not the bug"
             )
-
-            # Keyboard activation keeps this usage check out of the hover-close timer.
-            page.get_by_test_id("agent-info-trigger").press("Enter")
-            usage_section = page.get_by_test_id("agent-info-usage-by-model")
-            expect(usage_section).to_be_visible(timeout=30_000)
-            usage_section.locator("summary").press("Enter")
-
-            model_group = page.get_by_test_id(f"agent-info-model-{model}")
-            expect(model_group).to_be_visible(timeout=30_000)
-
-            # Reproduction assertions (FAIL on the buggy build, pass
-            # post-fix): every bucket must cover BOTH model requests. The
-            # buggy build renders the final request only: Input 10 /
-            # Output 5 / Total 15. The breakdown renders label+value runs
-            # with no separator ("Input20Output10..."), so anchor the value
-            # with a not-another-digit lookahead rather than \b (0|O is not
-            # a word boundary).
-            expect(model_group).to_contain_text(
-                re.compile(rf"Total\s*{_EXPECTED_TOTAL}(?!\d)"), timeout=30_000
+            assert {request.get("model") for request in requests} == {model}, (
+                "background inference consumed the turn's scripted responses"
             )
-            expect(model_group).to_contain_text(re.compile(rf"Input\s*{_EXPECTED_INPUT}(?!\d)"))
-            expect(model_group).to_contain_text(re.compile(rf"Output\s*{_EXPECTED_OUTPUT}(?!\d)"))
+
+            _assert_cumulative_usage(page, model)
+
+            session_url = f"{live_server}/v1/sessions/{session_id}"
+            metadata_read = _session_read_matcher(session_url, include_usage=False)
+            usage_read = _session_read_matcher(session_url, include_usage=True)
+            usage_responses: list[Response] = []
+
+            def record_usage(response: Response) -> None:
+                if usage_read(response):
+                    usage_responses.append(response)
+
+            page.on("response", record_usage)
+            # Pause SSE replay so persisted HTTP usage must hydrate the fresh page.
+            pending_streams: list[Route] = []
+            page.route(f"{session_url}/stream*", lambda route: pending_streams.append(route))
+            with page.expect_response(metadata_read) as snapshot_response:
+                page.reload(wait_until="domcontentloaded")
+            # Reload can enable the composer after its mount-time focus attempt.
+            expect(page.get_by_placeholder(_COMPOSER)).to_be_editable()
+            _assert_cumulative_usage(page, model)
+            expect(page.locator(_ASSISTANT).filter(has_text=_FINAL_TEXT).first).to_be_visible()
+
+            # Old servers hydrate from the initial snapshot without another read.
+            if snapshot_response.value.json().get("usage_included") is False:
+                assert usage_responses, "reload never fetched the omitted usage"
+                assert usage_responses[-1].ok
+                usage = usage_responses[-1].json()
+                assert usage["id"] == session_id
+                assert usage["usage_included"] is True
+                model_usage = usage["usage_by_model"][model]
+                assert model_usage["input_tokens"] == _EXPECTED_INPUT
+                assert model_usage["output_tokens"] == _EXPECTED_OUTPUT
+                assert model_usage["total_tokens"] == _EXPECTED_TOTAL
+            else:
+                assert not usage_responses, "the initial snapshot already included usage"
         finally:
             httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
     finally:

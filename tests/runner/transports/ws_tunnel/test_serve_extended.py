@@ -397,8 +397,11 @@ async def test_serve_tunnel_recycle_close_code_resets_backoff(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("callback_fails", [False, True])
 async def test_serve_tunnel_on_reconnect_callback(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    callback_fails: bool,
 ) -> None:
     """on_reconnect runs only after a reconnect reaches the ready state."""
     events: list[str] = []
@@ -423,6 +426,8 @@ async def test_serve_tunnel_on_reconnect_callback(
 
     async def _on_reconnect() -> None:
         events.append("reconnected")
+        if callback_fails:
+            raise RuntimeError("callback failed")
 
     monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
     monkeypatch.setattr(serve_module.asyncio, "sleep", _sleep)
@@ -443,6 +448,14 @@ async def test_serve_tunnel_on_reconnect_callback(
         "ready-3",
         "reconnected",
     ]
+
+    failures = [
+        r
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "runner_reconnect_callback_failed"
+    ]
+    assert len(failures) == int(callback_fails)
+    assert not any(getattr(r, "event_name", None) == "runner_connected" for r in caplog.records)
 
 
 @pytest.mark.asyncio

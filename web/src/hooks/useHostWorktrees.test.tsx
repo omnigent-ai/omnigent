@@ -4,7 +4,7 @@ import { act, renderHook, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { authenticatedFetch } from "@/lib/identity";
-import { useHostWorktrees, useVerifiedGithubWorktrees } from "./useHostWorktrees";
+import { type HostWorktree, useHostWorktrees, useVerifiedGitWorktrees } from "./useHostWorktrees";
 
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
 
@@ -38,10 +38,10 @@ describe("useHostWorktrees", () => {
     });
 
     await waitFor(() => expect(result.current.data).toHaveLength(1));
-    expect(result.current.data?.[0].remote_provider).toBeUndefined();
+    expect(result.current.data?.[0]).not.toHaveProperty("remote_provider");
   });
 
-  it("does not reuse a prior path's GitHub identity while the next path loads", async () => {
+  it("does not reuse a prior path's worktrees while the next path loads", async () => {
     let resolveSecond: ((value: Response) => void) | undefined;
     authenticatedFetchMock
       .mockResolvedValueOnce(
@@ -51,7 +51,6 @@ describe("useHostWorktrees", () => {
             branch: "main",
             is_main: true,
             detached: false,
-            remote_provider: "github",
           },
         ]),
       )
@@ -67,7 +66,7 @@ describe("useHostWorktrees", () => {
       { initialProps: { path: "/github" }, wrapper: wrapper(client) },
     );
 
-    await waitFor(() => expect(result.current.data?.[0].remote_provider).toBe("github"));
+    await waitFor(() => expect(result.current.data?.[0].path).toBe("/github"));
     rerender({ path: "/ordinary" });
     expect(result.current.data).toBeUndefined();
     expect(result.current.isPlaceholderData).toBe(false);
@@ -80,75 +79,51 @@ describe("useHostWorktrees", () => {
             branch: "main",
             is_main: true,
             detached: false,
-            remote_provider: "other",
           },
         ]),
       );
     });
-    await waitFor(() => expect(result.current.data?.[0].remote_provider).toBe("other"));
+    await waitFor(() => expect(result.current.data?.[0].path).toBe("/ordinary"));
   });
 });
 
-describe("useVerifiedGithubWorktrees", () => {
-  const githubWorktrees = [
-    {
-      path: "/repo",
-      branch: "main",
-      is_main: true,
-      detached: false,
-      remote_provider: "github" as const,
+describe("useVerifiedGitWorktrees", () => {
+  it.each([undefined, null, "other", "github"] as const)(
+    "recognizes Git worktrees regardless of provider metadata (%s)",
+    (remoteProvider) => {
+      const worktrees: HostWorktree[] = [
+        { path: "/repo", branch: "main", is_main: true, detached: false },
+        { path: "/repo-worktrees/feature-x", branch: "feature/x", is_main: false, detached: false },
+      ].map((worktree) => ({
+        ...worktree,
+        ...(remoteProvider === undefined ? {} : { remote_provider: remoteProvider }),
+      }));
+      interface Props {
+        hostId: string;
+        requestedPath: string;
+        worktrees: HostWorktree[] | undefined;
+        resolved: boolean;
+      }
+      const { result, rerender } = renderHook((props: Props) => useVerifiedGitWorktrees(props), {
+        initialProps: { hostId: "host_1", requestedPath: "/repo", worktrees, resolved: true },
+      });
+
+      expect(result.current).toEqual(worktrees);
+      const pending = { hostId: "host_1", worktrees: undefined, resolved: false };
+      rerender({ ...pending, requestedPath: "/repo/src/components" });
+      expect(result.current).toEqual(worktrees);
+      rerender({ ...pending, requestedPath: "/repo-worktrees/feature-x/src" });
+      expect(result.current).toEqual(worktrees);
+
+      rerender({ ...pending, requestedPath: "/repo-other" });
+      expect(result.current).toEqual([]);
+      rerender({ ...pending, hostId: "host_2", requestedPath: "/repo" });
+      expect(result.current).toEqual([]);
+
+      rerender({ ...pending, requestedPath: "/repo/src", worktrees: [], resolved: true });
+      expect(result.current).toEqual([]);
+      rerender({ ...pending, requestedPath: "/repo/src" });
+      expect(result.current).toEqual([]);
     },
-    {
-      path: "/repo-worktrees/feature-x",
-      branch: "feature/x",
-      is_main: false,
-      detached: false,
-      remote_provider: "github" as const,
-    },
-  ];
-
-  it("keeps verified GitHub worktrees visible while a nested path resolves", () => {
-    const { result, rerender } = renderHook(
-      ({ path, worktrees, resolved }) =>
-        useVerifiedGithubWorktrees({
-          hostId: "host_1",
-          requestedPath: path,
-          worktrees,
-          resolved,
-        }),
-      {
-        initialProps: { path: "/repo", worktrees: githubWorktrees, resolved: true },
-      },
-    );
-
-    expect(result.current).toEqual(githubWorktrees);
-    rerender({ path: "/repo/src/components", worktrees: undefined, resolved: false });
-    expect(result.current).toEqual(githubWorktrees);
-  });
-
-  it("hides cached worktrees outside the verified roots and on explicit non-GitHub results", () => {
-    const { result, rerender } = renderHook(
-      ({ path, worktrees, resolved }) =>
-        useVerifiedGithubWorktrees({
-          hostId: "host_1",
-          requestedPath: path,
-          worktrees,
-          resolved,
-        }),
-      {
-        initialProps: { path: "/repo", worktrees: githubWorktrees, resolved: true },
-      },
-    );
-
-    rerender({ path: "/ordinary", worktrees: undefined, resolved: false });
-    expect(result.current).toEqual([]);
-    rerender({ path: "/ordinary", worktrees: [], resolved: true });
-    expect(result.current).toEqual([]);
-    rerender({
-      path: "/repo/src",
-      worktrees: [{ ...githubWorktrees[0], remote_provider: "other" as const }],
-      resolved: true,
-    });
-    expect(result.current).toEqual([]);
-  });
+  );
 });

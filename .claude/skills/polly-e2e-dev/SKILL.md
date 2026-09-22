@@ -133,7 +133,7 @@ deploy, which may be stale and reject parts of the bundle.
 Grab the session id, then read the transcript and the side effects:
 
 ```bash
-SID=$(curl -s "$SERVER/v1/sessions?kind=default&order=desc&limit=1" | python -c "import sys,json;print(json.load(sys.stdin)['data'][0]['id'])")
+SID=$(curl -s "$SERVER/v1/sessions?kind=default&order=desc&limit=1&visibility=all" | python -c "import sys,json;print(json.load(sys.stdin)['data'][0]['id'])")
 curl -s "$SERVER/v1/sessions/$SID/items"          | python -m json.tool | tail -60   # brain transcript + tool calls
 curl -s "$SERVER/v1/sessions/$SID/child_sessions" | python -m json.tool             # dispatched sub-agents
 git worktree list                                  # fanout: one per task

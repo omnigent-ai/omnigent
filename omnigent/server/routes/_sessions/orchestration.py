@@ -30,7 +30,7 @@ from pydantic import ValidationError
 from omnigent.cli_invocation import cli_invocation
 from omnigent.db.utils import generate_agent_id, generate_task_id
 from omnigent.db.workspace_cache import WorkspaceScopedCache
-from omnigent.debug_logging import debug_event
+from omnigent.debug_logging import debug_event, runner_log_scope
 from omnigent.entities import (
     Agent,
     CommentsFingerprint,
@@ -129,6 +129,7 @@ from omnigent.server.background_session_titles import (
     prepare_background_session_title,
 )
 from omnigent.server.bundles import bundle_location, validate_agent_bundle
+from omnigent.server.creation_logging import creation_metadata, session_created
 from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
 from omnigent.server.managed_hosts import (
     MANAGED_REPO_LABEL_KEY,
@@ -3191,30 +3192,31 @@ async def _run_managed_launch(
             agent_id,
             session_id=session_id,
         )
-    managed = await _provision_managed_sandbox(
-        session_id=session_id,
-        owner=owner,
-        sandbox_config=sandbox_config,
-        repos=repos,
-        tracker=tracker,
-        host_store=host_store,
-        relaunch_host=relaunch_host,
-        provider=provider,
-        agent_name=agent_name,
-    )
-    if managed is None:
-        return
-    await _bind_and_launch_managed_runner(
-        session_id=session_id,
-        managed=managed,
-        sandbox_config=sandbox_config,
-        tracker=tracker,
-        conversation_store=conversation_store,
-        host_store=host_store,
-        host_registry=host_registry,
-        tunnel_registry=tunnel_registry,
-        relaunch_host=relaunch_host,
-    )
+    with runner_log_scope(session_id, None):
+        managed = await _provision_managed_sandbox(
+            session_id=session_id,
+            owner=owner,
+            sandbox_config=sandbox_config,
+            repos=repos,
+            tracker=tracker,
+            host_store=host_store,
+            relaunch_host=relaunch_host,
+            provider=provider,
+            agent_name=agent_name,
+        )
+        if managed is None:
+            return
+        await _bind_and_launch_managed_runner(
+            session_id=session_id,
+            managed=managed,
+            sandbox_config=sandbox_config,
+            tracker=tracker,
+            conversation_store=conversation_store,
+            host_store=host_store,
+            host_registry=host_registry,
+            tunnel_registry=tunnel_registry,
+            relaunch_host=relaunch_host,
+        )
 
 
 async def _bind_and_launch_managed_runner(
@@ -4829,6 +4831,8 @@ async def _forward_native_terminal_message(
                 file_store,
                 artifact_store,
                 session_id=session_id,
+                # The native runner caches filesystem attachments itself.
+                defer_filesystem_files=True,
             )
         except (ValueError, KeyError):
             _logger.warning(
@@ -6779,6 +6783,7 @@ async def _relay_runner_stream_once(
     # Model/agent label from the turn header, stamped on text segments
     # flushed at tool-call boundaries (the boundary event carries no model).
     current_model: str | None = None
+    failure_agent_name: str | None = None
     # Wall-clock time when the current turn's response.in_progress arrived,
     # used to compute per-turn latency in TurnEndEvent.
     _turn_start_s: float | None = None
@@ -6890,8 +6895,10 @@ async def _relay_runner_stream_once(
                                     session_id,
                                     status_error,
                                     conversation_store,
+                                    agent_name=failure_agent_name,
                                 )
                             elif status == "running":
+                                failure_agent_name = None
                                 await _persist_session_status_error_labels(
                                     session_id,
                                     None,
@@ -6952,6 +6959,7 @@ async def _relay_runner_stream_once(
                         if isinstance(_rid, str) and _rid:
                             current_response_id = _rid
                         _model = resp_obj.get("model")
+                        failure_agent_name = _model if isinstance(_model, str) and _model else None
                         if isinstance(_model, str) and _model:
                             current_model = _model
 
@@ -7401,7 +7409,7 @@ async def _relay_runner_stream_once(
         _logger.info(
             "Relay: task exiting for session=%s",
             session_id,
-            extra={"session_id": session_id},
+            extra=debug_event("runner_stream_closed", session_id=session_id),
         )
         # Drop any in-flight assistant-text entry so a relay that exits
         # WITHOUT a terminal turn event (runner death / tunnel drop
@@ -7488,15 +7496,16 @@ def _ensure_runner_relay(
     # Runtime callers always supply a store. ``None`` is retained for
     # heartbeat-only relay readiness tests that never emit persistable frames.
     relay_store = cast(ConversationStore, conversation_store)
-    task = asyncio.create_task(
-        _relay_runner_stream(
-            session_id,
-            runner_client,
-            relay_store,
-            ready,
-        ),
-        name=f"runner-relay-{session_id}",
-    )
+    with runner_log_scope(session_id, runner_id):
+        task = asyncio.create_task(
+            _relay_runner_stream(
+                session_id,
+                runner_client,
+                relay_store,
+                ready,
+            ),
+            name=f"runner-relay-{session_id}",
+        )
     handle = _RelayHandle(runner_id=runner_id, task=task, ready=ready)
     _runner_relay_tasks[session_id] = handle
 
@@ -8866,6 +8875,7 @@ async def _create_session_from_existing_agent(
         project_store=project_store,
     )
     body = project_resolution.body
+    creation_metadata(parent_session_id=body.parent_session_id, host_type=body.host_type)
     assert body.agent_id is not None
 
     _reject_reserved_cost_control_label_seed(body.labels)
@@ -9412,6 +9422,7 @@ async def _create_session_from_existing_agent(
     # joins the session's session.id group.
     from omnigent.runtime import telemetry
 
+    session_created(conv.id, conv.runner_id)
     telemetry.set_session_id(conv.id)
 
     if (
@@ -10706,6 +10717,7 @@ async def _get_session_snapshot(
     sandbox_config: ManagedSandboxDeployment | None = None,
     viewer_id: str | None = None,
     request: Request | None = None,
+    include_usage: bool = True,
 ) -> SessionResponse:
     """
     Read a full session snapshot from the store.
@@ -10738,8 +10750,10 @@ async def _get_session_snapshot(
     :param include_items: When ``False``, skip the committed-items read
         and return ``items=[]``. Callers that hydrate the transcript
         through ``GET /sessions/{id}/items`` (the web chat surface)
-        pass ``False`` — the items read is the most expensive step of
-        the snapshot build and its result would be discarded.
+        pass ``False`` to avoid a redundant history read and serialization.
+    :param include_usage: When ``False``, skip subtree usage aggregation and
+        return unknown usage with ``usage_included=False``. Launch metadata
+        does not need usage; display clients can fetch it separately.
     :param refresh_state: When ``True``, clear runner-backed snapshot
         overlays for this session before building the response. Browser
         reloads use this so a refresh re-reads current live-session
@@ -10948,18 +10962,17 @@ async def _get_session_snapshot(
         if result is not None:
             runner_online = result.runner_online
             host_online = result.host_online
-    # Subtree usage (this session + its sub-agent descendants) so the
-    # displayed cost includes sub-agents — a codex/claude sub-agent's spend
-    # is persisted on its own child conversation, not the parent's, so the
-    # parent's own session_usage would under-report. Off the event loop
-    # because it pages the conversation tree from the store. The authorized
-    # row's root is passed so the tree root isn't re-derived with a second
-    # point read of the row this handler already holds.
-    subtree_usage = await asyncio.to_thread(
-        load_session_usage,
-        conv.id,
-        conv_store,
-        root_conversation_id=conv.root_conversation_id,
+    # Display costs include descendants. Empty usage marks a skipped aggregate;
+    # None would fall back to the parent's own spend and under-report it.
+    subtree_usage = (
+        await asyncio.to_thread(
+            load_session_usage,
+            conv.id,
+            conv_store,
+            root_conversation_id=conv.root_conversation_id,
+        )
+        if include_usage
+        else {}
     )
     # Static signal telling the open view a host-bound, host-down session is a
     # resumable managed host it can wake by sending a message, vs a terminal
@@ -11001,6 +11014,7 @@ async def _get_session_snapshot(
     )
     response.inference_configured = inference_configured
     response.inference_error = inference_error
+    response.usage_included = include_usage
     return response
 
 
