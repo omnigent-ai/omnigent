@@ -4864,6 +4864,7 @@ async def _auto_create_codex_terminal(
     # Keep it off the runner loop so heartbeats and other sessions can progress.
     app_server = await asyncio.to_thread(
         build_codex_native_server,
+        session_id=session_id,
         socket_path=socket_path,
         codex_home=codex_home,
         cwd=Path(workspace),

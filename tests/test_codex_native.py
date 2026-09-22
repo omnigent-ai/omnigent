@@ -8436,6 +8436,7 @@ async def test_prepare_codex_terminal_fresh_session_passes_developer_instruction
         )
 
     assert captured.get("developer_instructions") == "Be a concise, careful coding assistant."
+    assert captured["session_id"] == "conv_fresh_di"
 
 
 @pytest.mark.asyncio

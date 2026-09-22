@@ -8,11 +8,12 @@ launch environment, so start a fresh host and session after changing it.
 
 | Harness | Diagnostic source | When exported |
 | --- | --- | --- |
-| Codex native | In-memory app-server stderr | First-thread discovery failure, before process cleanup |
+| Codex native | App-server stderr pipe | Continuously throughout the app-server lifetime, plus the existing first-thread discovery failure snapshot |
 | Claude native | An Omnigent-owned Claude `--debug-file` | Continuously while the transcript forwarder runs, plus a bounded final drain on shutdown or launch failure |
 
-The flag is shared across harnesses and lifecycle phases. Codex runtime-failure
-and continuous stderr export are not implemented. Claude's debug channel does
+The flag is shared across harnesses and lifecycle phases. Codex captures the
+app-server's stderr, including startup and runtime diagnostics; it does not read
+the separate TUI's stderr or private log files. Claude's debug channel does
 not capture arbitrary child-process stderr, terminal screen contents, or errors
 that occur before Claude initializes its logger. The terminal's file descriptors
 remain unchanged.
@@ -34,8 +35,10 @@ diagnostics as potentially sensitive even after redaction.
 The captured text appears in the owning process's ordinary local logs, including
 runner logs under `~/.omnigent/logs/runner/`, and in structured event attributes.
 It also reaches any configured debug-log or OpenTelemetry exporter. This flag
-does not enable an exporter or select a destination. It also does not control
-existing DEBUG stderr logging or earlier readiness-error reporting.
+does not enable an exporter or select a destination. When Codex capture is
+enabled, batched INFO diagnostics replace the per-line DEBUG stderr path so
+logging handlers cannot block the pipe reader. With capture disabled, that
+DEBUG path is unchanged. Earlier readiness-error reporting is also unchanged.
 
 Shared credential-pattern improvements also affect ordinary logs with capture
 disabled: assignment labels can contain spaces, and assigned values can include
@@ -43,6 +46,45 @@ a `Bearer` prefix. For example, `api key: is missing` now becomes
 `api key: [REDACTED] missing` because the colon indicates an assignment. Only
 whitespace-delimited label/value matching without `:` or `=` is confined to
 diagnostic sanitization.
+
+## Codex continuous diagnostics
+
+Both CLI and host-managed launches drain app-server stderr for the entire
+process lifetime. With capture enabled, completed records are handed to a
+background thread that sanitizes and emits them at INFO about every 250 ms,
+independently of thread discovery, prompt delivery, or transcript forwarding.
+Events use `event_name=harness_diagnostic_output`, `harness=codex-native`, and
+`source_kind=codex_app_server_stderr`.
+
+Each event uses the current session ID from the bridge state, falling back to
+the owning launch session before bridge state exists. Child startup diagnostics
+therefore retain the child's identity when it shares its parent's runner.
+
+| Attribute | Meaning |
+| --- | --- |
+| `launch_id`, `app_server_pid` | Unique capture identifier and app-server PID |
+| `offset` | Raw stderr bytes consumed through the submitted records, including omitted bytes |
+| `text` | Recent redacted records, at most 65,536 UTF-8 bytes per event |
+| `truncated` | Whether records or bytes were omitted |
+| `lines_omitted`, `bytes_omitted` | Whole source records dropped by input/queue limits, plus omissions from the redacted export buffer |
+| `tail_byte_limit` | Maximum exported text size, 65,536 bytes; metadata and the formatted message add to event size |
+
+The pipe reader performs no export I/O or sanitization. Its handoff queue holds
+at most 1 MiB and 256 complete records, dropping the oldest records under
+pressure. The worker may also hold one batch while delivering it. A source
+record over 1 MiB, including its newline when present, is omitted whole, then
+capture resumes at the next newline. Known credential redaction runs on complete
+assembled records before export clipping. Partial records remain buffered until
+a newline or reader termination; EOF or cancellation submits the final fragment.
+
+Shutdown allows up to one second for buffered pipe output to reach EOF before
+cancelling the reader, then up to one second for the worker's final batch. These
+waits yield the event loop. A blocked handler cannot hold up the subprocess pipe
+or force app-server teardown to wait indefinitely. Capture is best effort:
+logger failures discard the affected batch, and an exporter that remains stuck
+through shutdown can lose the final diagnostics. With capture disabled, no
+collector thread or queue is created. The existing in-memory startup snapshot remains available in either
+mode, with its text export controlled by the flag.
 
 ## Codex startup failure snapshot
 
@@ -157,6 +199,8 @@ or deleted.
 
 ```sh
 uv run --no-sync pytest -q tests/test_codex_native_diagnostics.py tests/runner/test_codex_startup_telemetry.py tests/host/test_connect.py -k 'codex or harness_stderr'
+uv run --no-sync pytest -q tests/test_codex_native_continuous_diagnostics.py tests/test_codex_native_app_server_stderr.py
+uv run --no-sync pytest -q tests/e2e/test_codex_continuous_diagnostics_e2e.py
 uv run --no-sync pytest -q tests/test_claude_native_diagnostics.py tests/test_claude_native_diagnostics_integration.py
 ```
 
@@ -165,6 +209,13 @@ serialized debug-log row, and verify the process snapshot precedes teardown.
 They also check disabled capture, host-to-runner environment forwarding, local
 log output, child attribution, credential redaction, UTF-8 byte limits, and
 unchanged success/cancellation behavior.
+
+Continuous Codex tests check startup and runtime delivery before EOF, session
+switches, final fragments, record and queue bounds, and recovery after logger
+failure. A real subprocess floods stderr while its exporter is blocked to verify
+that pipe draining and shutdown remain responsive.
+The credential-free e2e test uses an isolated runner and synthetic Codex
+subprocess to verify delivery to the real local log and structured-log handler.
 
 Claude tests exercise both launch paths, explicit debug-file preservation,
 opt-out without file access, rotation, partial records, bounded shutdown,
@@ -176,6 +227,12 @@ local logs or the configured debug-log sink by the exact session ID and
 `event_name = 'harness_diagnostic_output'`. Confirm `harness = 'claude-native'`,
 `source_kind = 'claude_debug_log'`, and diagnostic text. A fresh session with the
 flag set to `0` should receive no injected debug-file argument or these events.
+
+For a fresh Codex native session with the flag enabled, use the same event filter
+and confirm `harness = 'codex-native'` and
+`source_kind = 'codex_app_server_stderr'`. Runtime stderr should appear while
+the session remains open, without requiring a startup timeout. A quiet stderr
+pipe produces no events. Setting the flag to `0` disables these INFO events.
 
 After deploying the runner, filter the debug-log table by the incident time
 window, exact session ID, and `event_name = 'codex_thread_start_failed'`.

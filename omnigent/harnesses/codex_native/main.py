@@ -1256,6 +1256,7 @@ async def _prepare_codex_terminal(
             _probe.bind(("127.0.0.1", 0))
             codex_ws_url = f"ws://127.0.0.1:{_probe.getsockname()[1]}"
         app_server = build_codex_native_server(
+            session_id=session_id,
             socket_path=socket_path,
             codex_home=codex_home,
             cwd=Path.cwd(),
