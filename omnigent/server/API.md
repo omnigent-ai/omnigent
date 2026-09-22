@@ -980,6 +980,23 @@ Request body matches `SessionEventInput`:
                                   publishes a `session.status` event with
                                   data `{status: "running" | "waiting" |
                                   "idle" | "failed"}`
+      - "subagent.status"        — internal transcript-inactivity observation.
+                                  Payload: `{idle: true}`; only literal `true`
+                                  is accepted. Uses the existing idle publisher
+                                  (including persistence, response cleanup and
+                                  parent UI updates), then returns without
+                                  forwarding completion to the runner.
+                                  Optional fields: `response_id`,
+                                  `background_task_count`, `background_tasks`,
+                                  `blocked_on`, as for external_session_status.
+                                  Returns `{queued: false}`. Activity resumes
+                                  through external_session_status running.
+                                  On an older server's explicit unknown-event
+                                  rejection (400, `invalid_input`), the native
+                                  forwarder skips subsequent idle observations
+                                  until restart. No fallback status is sent;
+                                  transcript and ordinary status delivery
+                                  continue. Other errors retain normal retries.
       - "external_session_usage"
                                 — internal terminal-observed token-usage
                                   update; persists `context_tokens` /
