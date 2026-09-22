@@ -278,9 +278,16 @@ describe("AssistantBubble error retry", () => {
 });
 
 describe("UserBubble long-prompt collapse", () => {
+  // A unique tail that appears only after the 8 000-code-point boundary.
+  const TAIL = "UNIQUE_TAIL";
+
+  // 8 000 ASCII characters followed by the tail
+  const LONG_TEXT = "a".repeat(8000) + TAIL;
+
+  // An emoji placed at exactly the 8 000th code-point position.
+  const EMOJI_AT_BOUNDARY = "a".repeat(7999) + "🔥" + "b".repeat(100);
+
   const SHORT_TEXT = "Hello, world!";
-  // Generate text just over the 8 000-char threshold.
-  const LONG_TEXT = "a".repeat(8001);
 
   function userBubble(text: string): Extract<Bubble, { kind: "user" }> {
     return {
@@ -298,35 +305,51 @@ describe("UserBubble long-prompt collapse", () => {
     expect(screen.queryByRole("button", { name: /collapse prompt/i })).toBeNull();
   });
 
-  it("collapses a long prompt by default and shows the expand button with char count", () => {
+  it("hides the tail when collapsed, shows it when expanded, hides it again when re-collapsed", () => {
     render(<BubbleView bubble={userBubble(LONG_TEXT)} isLastAssistant={false} />);
 
-    const expandBtn = screen.getByRole("button", { name: /show full prompt/i });
-    expect(expandBtn).toBeInTheDocument();
-    // Button label should include the formatted character count.
-    expect(expandBtn).toHaveTextContent("8,001");
-    // Collapse button must not be visible while collapsed.
-    expect(screen.queryByRole("button", { name: /collapse prompt/i })).toBeNull();
-  });
+    const bubble = screen.getByTestId("message-bubble");
 
-  it("expands the prompt when the expand button is clicked", () => {
-    render(<BubbleView bubble={userBubble(LONG_TEXT)} isLastAssistant={false} />);
+    // Initially collapsed
+    expect(bubble).not.toHaveTextContent(TAIL);
+    expect(screen.getByRole("button", { name: /show full prompt/i })).toBeInTheDocument();
 
+    // After expanding
     fireEvent.click(screen.getByRole("button", { name: /show full prompt/i }));
+    expect(bubble).toHaveTextContent(TAIL);
 
-    // Expand button should be gone; collapse button should appear.
-    expect(screen.queryByRole("button", { name: /show full prompt/i })).toBeNull();
-    expect(screen.getByRole("button", { name: /collapse prompt/i })).toBeInTheDocument();
-  });
-
-  it("collapses the prompt again when the collapse button is clicked", () => {
-    render(<BubbleView bubble={userBubble(LONG_TEXT)} isLastAssistant={false} />);
-
-    // Expand then collapse.
-    fireEvent.click(screen.getByRole("button", { name: /show full prompt/i }));
+    // After collapsing again
     fireEvent.click(screen.getByRole("button", { name: /collapse prompt/i }));
+    expect(bubble).not.toHaveTextContent(TAIL);
+  });
+
+  it("Copy always writes the full text to the clipboard regardless of collapse state", async () => {
+    const writtenTexts: string[] = [];
+    vi.stubGlobal("navigator", {
+      clipboard: {
+        writeText: vi.fn((text: string) => {
+          writtenTexts.push(text);
+          return Promise.resolve();
+        }),
+      },
+    });
+
+    render(<BubbleView bubble={userBubble(LONG_TEXT)} isLastAssistant={false} />);
+
+    const copyButton = screen.getByRole("button", { name: /^copy$/i });
+    fireEvent.click(copyButton);
+
+    await waitFor(() => expect(writtenTexts).toHaveLength(1));
+    expect(writtenTexts[0]).toBe(LONG_TEXT);
+    expect(writtenTexts[0]).toContain(TAIL);
+  });
+
+  it("does not corrupt an emoji at the 8000-code-point slice boundary", () => {
+    render(<BubbleView bubble={userBubble(EMOJI_AT_BOUNDARY)} isLastAssistant={false} />);
+
+    const bubble = screen.getByTestId("message-bubble");
 
     expect(screen.getByRole("button", { name: /show full prompt/i })).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /collapse prompt/i })).toBeNull();
+    expect(bubble).toHaveTextContent("🔥");
   });
 });

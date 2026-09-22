@@ -91,8 +91,12 @@ import {
 // is the path. Global so all markers in a message are found / stripped.
 const ATTACHED_RE = /\[Attached(?: file)?:\s*([^\]]*)\]\s*/g;
 
-// Collapse user prompts longer than this (in chars) by default.
 const COLLAPSE_THRESHOLD = 8000;
+
+// Slice a string by Unicode code points rather than UTF-16 code units.
+function sliceByCodePoint(str: string, limit: number): string {
+  return [...str].slice(0, limit).join("");
+}
 
 // Author labels render only in a shared session; ChatPage provides the
 // value and UserBubble reads it, so the gate lives in one place.
@@ -697,7 +701,9 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   );
   // Collapse long prompts by default to avoid expensive Markdown parsing and
   // a large DOM for text the user hasn't asked to read yet.
-  const isLong = text.length > COLLAPSE_THRESHOLD;
+  // Count code points (not UTF-16 code units) so the threshold is consistent
+  // with what sliceByCodePoint will cut at.
+  const isLong = [...text].length > COLLAPSE_THRESHOLD;
   const [isCollapsed, setIsCollapsed] = useState(isLong);
   // Runtime-injected `[System: ...]` notifications ride in on role=user. When
   // the content is a pure system marker, swap in a muted centered indicator.
@@ -840,7 +846,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
                     mode="static"
                     remarkRehypeOptions={USER_MESSAGE_REMARK_REHYPE_OPTIONS}
                   >
-                    {isCollapsed ? text.slice(0, COLLAPSE_THRESHOLD) : text}
+                    {isCollapsed ? sliceByCodePoint(text, COLLAPSE_THRESHOLD) : text}
                   </FilePathAwareMessageResponse>
                   {/* Gradient fade at the bottom of collapsed prompts to signal
                       there is more content below. */}
