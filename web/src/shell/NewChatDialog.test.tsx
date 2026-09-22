@@ -5886,9 +5886,15 @@ describe("NewChatLandingScreen", () => {
     breakSelectedHarness("a2", "codex-native", false);
 
     const picker = screen.getByTestId("new-chat-landing-agent-select");
+    expect(picker).not.toHaveTextContent("Model unavailable");
     expect(picker).not.toHaveTextContent("Models unavailable");
     expect(screen.getByTestId("new-chat-landing-agent-warning")).toBeVisible();
     await userEvent.hover(picker);
+    expect(await screen.findByTestId("new-chat-landing-agent-tooltip")).toHaveTextContent(
+      "Codex isn't configured on machine-1 — run omni setup on that machine.",
+    );
+    await userEvent.unhover(picker);
+    fireEvent.focus(picker);
     expect(await screen.findByTestId("new-chat-landing-agent-tooltip")).toHaveTextContent(
       "Codex isn't configured on machine-1 — run omni setup on that machine.",
     );

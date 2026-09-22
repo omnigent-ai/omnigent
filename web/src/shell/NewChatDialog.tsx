@@ -1547,6 +1547,7 @@ export function AgentHarnessPicker({
     : visibleEffortText;
   const previewOnly = loading && !interactiveWhileLoading;
   const cachedPreview = previewOnly ? readNewChatPickerCache(cacheKey) : null;
+  const visibleCachedPreview = selectedUnavailable ? null : cachedPreview;
   const resolvedPreview = useMemo<NewChatPickerPreview | null>(
     () =>
       selectedEntry && hasAgents && visibleModelText !== "Models unavailable"
@@ -1832,10 +1833,12 @@ export function AgentHarnessPicker({
       trigger={{
         disabled: disabledLabel !== undefined || previewOnly || !hasAgents,
         "aria-busy": loading || undefined,
-        label: disabledLabel ?? cachedPreview?.label ?? triggerAccessibleName,
-        model: disabledLabel ?? cachedPreview?.model ?? triggerText,
+        label: disabledLabel ?? visibleCachedPreview?.label ?? triggerAccessibleName,
+        model: disabledLabel ?? visibleCachedPreview?.model ?? triggerText,
         effort:
-          disabledLabel === undefined ? (cachedPreview?.effort ?? triggerSecondaryText) : undefined,
+          disabledLabel === undefined
+            ? (visibleCachedPreview?.effort ?? triggerSecondaryText)
+            : undefined,
         icon:
           disabledLabel !== undefined ? undefined : selectedUnavailable ? (
             <span
@@ -1844,15 +1847,15 @@ export function AgentHarnessPicker({
             >
               <TriangleAlertIcon className="size-3.5" aria-hidden="true" />
             </span>
-          ) : cachedPreview ? (
+          ) : visibleCachedPreview ? (
             <span
               className="flex size-4 shrink-0 items-center justify-center"
               data-testid="new-chat-landing-agent-icon"
             >
-              {cachedPreview.smartRouting ? (
+              {visibleCachedPreview.smartRouting ? (
                 <WandSparklesIcon className="size-4" aria-hidden="true" />
               ) : (
-                <ComposerAgentIcon agent={cachedPreview.agent} />
+                <ComposerAgentIcon agent={visibleCachedPreview.agent} />
               )}
             </span>
           ) : (
@@ -1866,7 +1869,7 @@ export function AgentHarnessPicker({
         testIdPrefix: "new-chat-landing",
         "data-testid": "new-chat-landing-agent-select",
       }}
-      tooltip={disabledLabel ?? cachedPreview?.label ?? triggerTooltipContent}
+      tooltip={disabledLabel ?? visibleCachedPreview?.label ?? triggerTooltipContent}
       tooltipTestId="new-chat-landing-agent-tooltip"
       tooltipVariant="session-info"
       contentAlign={contentAlign}
