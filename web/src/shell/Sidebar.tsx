@@ -4184,8 +4184,17 @@ function ConversationRowImpl({
     <li
       ref={setRowRef}
       data-sidebar-session-id={conversation.id}
-      onMouseDown={(event) => dragListeners?.onMouseDown?.(event)}
-      onTouchStart={(event) => dragListeners?.onTouchStart?.(event)}
+      onMouseDown={(event) => {
+        // Portaled dialogs bubble through this row but must not start a drag.
+        if (event.currentTarget.contains(event.target as Node)) {
+          dragListeners?.onMouseDown?.(event);
+        }
+      }}
+      onTouchStart={(event) => {
+        if (event.currentTarget.contains(event.target as Node)) {
+          dragListeners?.onTouchStart?.(event);
+        }
+      }}
       className={cn("group relative", isDragging && "opacity-40")}
     >
       {/* Right-click anywhere on the row opens the same actions as the kebab.

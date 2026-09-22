@@ -1537,7 +1537,7 @@ export function ForkSessionForm({
           <button
             type="button"
             onClick={() => setShowAdvanced((v) => !v)}
-            className="flex cursor-pointer items-center gap-1 self-start text-sm font-medium text-foreground transition hover:text-foreground"
+            className="flex cursor-pointer select-text items-center gap-1 self-start text-sm font-medium text-foreground transition hover:text-foreground"
             data-testid="fork-session-advanced-toggle"
             aria-expanded={showAdvanced}
             aria-controls="fork-session-advanced-content"
