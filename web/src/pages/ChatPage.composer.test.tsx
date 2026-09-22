@@ -2097,11 +2097,9 @@ describe("Composer shared visible controls", () => {
     const [widthProbe, leading, trailing] = Array.from(actions.children);
     expect(widthProbe).toHaveClass("h-0");
     expect(leading).toContainElement(screen.getByRole("button", { name: "Add" }));
-    const settings = screen.getByTestId("composer-settings");
-    expect(settings).toHaveAccessibleName("Advanced settings");
-    expect(settings).toHaveTextContent("Advanced settings");
-    expect(trailing.firstElementChild).toBe(settings);
-    expect(trailing).toContainElement(screen.getByTestId("composer-config-gear"));
+    const harnessPicker = screen.getByTestId("composer-config-gear");
+    expect(screen.queryByTestId("composer-settings")).toBeNull();
+    expect(trailing.firstElementChild).toContainElement(harnessPicker);
     expect(actions.children).toHaveLength(3);
     expect(workspace).toHaveClass("mx-3", "h-[37px]", "rounded-t-2xl");
     expect(textarea().closest("form")).toHaveClass("pb-[max(20px,env(safe-area-inset-bottom))]");
