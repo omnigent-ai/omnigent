@@ -5,13 +5,15 @@ from __future__ import annotations
 import asyncio
 import gzip
 import io
+import ipaddress
 import logging
+import socket
 import tarfile
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import httpx
 import yaml
@@ -54,6 +56,109 @@ class _McpLocation:
     source: Literal["file", "inline"]
     path: Path
     raw: dict[str, Any]
+
+
+# The session MCP-server management route accepted an http url validated only by
+# a scheme-prefix check, and a stdio command/args spawned unsandboxed. A caller
+# with LEVEL_EDIT could point the url at cloud metadata / internal hosts (SSRF)
+# or register an arbitrary local command (RCE) that runs on shared multi-tenant
+# runner infra with the runner's environment. These guards run server-side,
+# before the declaration is persisted, so the transport layer never sees a
+# blocked target.
+
+
+# IPv6 transition prefixes that embed an IPv4 destination in their low 32 bits.
+_NAT64_PREFIX = ipaddress.ip_network("64:ff9b::/96")
+_V4_COMPAT_PREFIX = ipaddress.ip_network("::/96")
+
+
+def _host_is_internal(host: str) -> bool:
+    """
+    Whether *host* is (or resolves to) a non-public address.
+
+    Blocks loopback, private (RFC1918 / ULA), link-local (incl. the
+    169.254.169.254 cloud-metadata address), reserved, multicast and
+    unspecified targets. An IP literal is judged directly; a hostname is
+    resolved and every returned address is judged, so a name that points at an
+    internal address is blocked too. This is a best-effort SSRF guard: it does
+    not defeat DNS rebinding (the address can change between this check and the
+    transport's own connect), which would need connect-time enforcement.
+
+    :param host: The URL host (hostname or IP literal).
+    :returns: ``True`` when the host is, or resolves to, a non-public address.
+    """
+
+    def _non_public(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+        return (
+            addr.is_loopback
+            or addr.is_private
+            or addr.is_link_local
+            or addr.is_reserved
+            or addr.is_multicast
+            or addr.is_unspecified
+        )
+
+    def _blocked(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+        # An IPv6 literal can carry an internal IPv4 destination whose address
+        # the outer IPv6 flags do not reflect (6to4 ``2002:a9fe:a9fe::`` /
+        # NAT64 ``64:ff9b::a9fe:a9fe`` / IPv4-mapped / IPv4-compatible for
+        # 169.254.169.254). Decode any embedded IPv4 and judge it too, so these
+        # transition forms can't smuggle a metadata/internal target past the gate.
+        candidates: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = [addr]
+        if isinstance(addr, ipaddress.IPv6Address):
+            embedded = addr.ipv4_mapped or addr.sixtofour
+            if embedded is not None:
+                candidates.append(embedded)
+            low32 = int(addr) & 0xFFFFFFFF
+            # NAT64 well-known prefix and the deprecated IPv4-compatible ::/96.
+            if addr in _NAT64_PREFIX or (addr in _V4_COMPAT_PREFIX and low32 > 1):
+                candidates.append(ipaddress.IPv4Address(low32))
+        return any(_non_public(candidate) for candidate in candidates)
+
+    try:
+        return _blocked(ipaddress.ip_address(host))
+    except ValueError:
+        pass  # not a literal — resolve the name below
+    try:
+        infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
+    except OSError:
+        # Unresolvable: fail closed — an MCP url that does not resolve here is
+        # not a valid public endpoint to register.
+        return True
+    resolved = {info[4][0] for info in infos}
+    if not resolved:
+        return True
+    return any(_blocked(ipaddress.ip_address(ip)) for ip in resolved)
+
+
+def assert_mcp_server_request_safe(body: UpsertMCPServerRequest) -> None:
+    """
+    Reject an MCP-server declaration that enables SSRF or multi-tenant RCE.
+
+    - ``http``: the url must not target a non-public address (SSRF to cloud
+      metadata / internal services).
+    - ``stdio``: forbidden on a multi-tenant server, where the command would be
+      spawned on shared runner infrastructure with access to other tenants'
+      runner environment (RCE). A single-user/local server still allows it.
+
+    :param body: The create/update request body.
+    :raises OmnigentError: ``FORBIDDEN`` when the declaration is not permitted.
+    """
+    if body.transport == "stdio":
+        if not local_single_user_enabled():
+            raise OmnigentError(
+                "stdio MCP servers are not permitted on this server; use an http transport.",
+                code=ErrorCode.FORBIDDEN,
+            )
+        return
+    if body.transport == "http" and body.url:
+        host = urlsplit(body.url).hostname
+        if not host or _host_is_internal(host):
+            raise OmnigentError(
+                "MCP server url must be a public http(s) endpoint; loopback, "
+                "private, link-local and cloud-metadata addresses are not allowed.",
+                code=ErrorCode.FORBIDDEN,
+            )
 
 
 def create_session_mcp_servers_router(
@@ -120,6 +225,7 @@ def create_session_mcp_servers_router(
     ) -> MCPServerSummary:
         """Create one MCP server declaration on a session-scoped agent."""
         agent, user_id = await _editable_agent(request, session_id)
+        await asyncio.to_thread(assert_mcp_server_request_safe, body)
         spec = await asyncio.to_thread(
             _mutate_bundle,
             agent,
@@ -142,6 +248,7 @@ def create_session_mcp_servers_router(
     ) -> MCPServerSummary:
         """Replace one MCP server declaration on a session-scoped agent."""
         agent, user_id = await _editable_agent(request, session_id)
+        await asyncio.to_thread(assert_mcp_server_request_safe, body)
         spec = await asyncio.to_thread(
             _mutate_bundle,
             agent,
