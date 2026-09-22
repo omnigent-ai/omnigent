@@ -55,18 +55,17 @@ function holdLockIfFree(name: string): Promise<WebLockAttempt> {
     let releaseHeld: () => void = () => {};
     let released = false;
     let settled = false;
-    const controller = new AbortController();
     const timer = setTimeout(() => {
       if (settled) return;
       settled = true;
-      controller.abort();
       settle({ slot: null, usable: false });
     }, WEB_LOCK_ACQUIRE_TIMEOUT_MS);
     // `requestDone` resolves when the callback's returned promise settles —
     // i.e. after `releaseHeld()` runs AND the browser has released the lock.
     // `release` awaits it so the freed slot is observable to the next acquire.
-    const requestDone = navigator.locks
-      .request(name, { ifAvailable: true, signal: controller.signal }, (lock) => {
+    let requestDone: Promise<unknown>;
+    try {
+      requestDone = navigator.locks.request(name, { ifAvailable: true }, (lock) => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
@@ -89,13 +88,19 @@ function holdLockIfFree(name: string): Promise<WebLockAttempt> {
             },
           });
         });
-      })
-      .catch(() => {
-        clearTimeout(timer);
-        if (settled) return;
-        settled = true;
-        settle({ slot: null, usable: false });
       });
+    } catch {
+      clearTimeout(timer);
+      settled = true;
+      settle({ slot: null, usable: false });
+      return;
+    }
+    requestDone.catch(() => {
+      clearTimeout(timer);
+      if (settled) return;
+      settled = true;
+      settle({ slot: null, usable: false });
+    });
   });
 }
 

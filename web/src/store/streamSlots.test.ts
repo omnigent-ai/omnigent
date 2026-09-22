@@ -47,6 +47,19 @@ describe("streamSlots", () => {
     await secondSlot?.release();
   });
 
+  it("falls back when Web Locks rejects synchronously", async () => {
+    const request = vi.fn(() => {
+      throw new DOMException("Unsupported lock options", "NotSupportedError");
+    }) as unknown as LockManager["request"];
+    installLocks(request);
+
+    const slot = await getStreamSlotManager().tryAcquire();
+
+    expect(slot).not.toBeNull();
+    expect(request).toHaveBeenCalledOnce();
+    await slot?.release();
+  });
+
   it("keeps using an available Web Lock and releases it", async () => {
     const request = vi.fn(
       (_name: string, _options: LockOptions, callback: LockGrantedCallback<void>) =>
