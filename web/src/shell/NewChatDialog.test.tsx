@@ -756,9 +756,8 @@ describe("sandbox repository helpers", () => {
         },
       ],
       worktreesResolved: true,
-      branchName: "auth-refresh",
+      branchName: "",
       autoSeededBranch: "",
-      prefilledBranch: "auth-refresh",
       expected: {
         repositoryLabel: "alpha",
         branchLabel: "auth-refresh",
@@ -780,7 +779,6 @@ describe("sandbox repository helpers", () => {
       worktreesResolved: true,
       branchName: "feature/new-ui",
       autoSeededBranch: "",
-      prefilledBranch: "auth-refresh",
       expected: {
         repositoryLabel: "alpha",
         branchLabel: "feature/new-ui",
@@ -796,7 +794,6 @@ describe("sandbox repository helpers", () => {
       worktreesResolved: true,
       branchName: "worktree-1234abcd",
       autoSeededBranch: "worktree-1234abcd",
-      prefilledBranch: "",
       expected: {
         repositoryLabel: "alpha",
         branchLabel: "worktree-1234abcd",
@@ -812,7 +809,6 @@ describe("sandbox repository helpers", () => {
       worktreesResolved: true,
       branchName: "",
       autoSeededBranch: "",
-      prefilledBranch: "",
       expected: {
         repositoryLabel: "alpha",
         branchLabel: "New",
@@ -834,7 +830,6 @@ describe("sandbox repository helpers", () => {
       worktreesResolved: true,
       branchName: "",
       autoSeededBranch: "",
-      prefilledBranch: "",
       expected: {
         repositoryLabel: "alpha",
         branchLabel: "Detached HEAD",
@@ -848,7 +843,6 @@ describe("sandbox repository helpers", () => {
       worktreesResolved: true,
       branchName: "",
       autoSeededBranch: "",
-      prefilledBranch: "",
       expected: {
         repositoryLabel: "Documents",
         branchLabel: "Worktree",
@@ -856,7 +850,7 @@ describe("sandbox repository helpers", () => {
       },
     },
     {
-      name: "resolved data awaiting stale prefill cleanup",
+      name: "explicit branch request from the main repository",
       workspace: "/Users/corey/current-repo",
       worktrees: [
         {
@@ -869,11 +863,10 @@ describe("sandbox repository helpers", () => {
       worktreesResolved: true,
       branchName: "legacy-branch",
       autoSeededBranch: "",
-      prefilledBranch: "legacy-branch",
       expected: {
         repositoryLabel: "current-repo",
-        branchLabel: "Worktree",
-        branchDescription: "Worktree status updating",
+        branchLabel: "legacy-branch",
+        branchDescription: "New worktree branch: legacy-branch",
       },
     },
   ])("describes $name without inventing repository or branch state", (input) => {
@@ -896,11 +889,10 @@ describe("sandbox repository helpers", () => {
       worktreesResolved: false,
       branchName: "old-branch",
       autoSeededBranch: "",
-      prefilledBranch: "old-branch",
       expected: {
         repositoryLabel: "current-repo",
-        branchLabel: "Worktree",
-        branchDescription: "Worktree status loading",
+        branchLabel: "old-branch",
+        branchDescription: "New worktree branch: old-branch",
       },
     },
     {
@@ -910,7 +902,6 @@ describe("sandbox repository helpers", () => {
       worktreesResolved: false,
       branchName: "feature/new-ui",
       autoSeededBranch: "",
-      prefilledBranch: "old-branch",
       expected: {
         repositoryLabel: "current-repo",
         branchLabel: "feature/new-ui",
@@ -924,7 +915,6 @@ describe("sandbox repository helpers", () => {
       worktreesResolved: false,
       branchName: "worktree-1234abcd",
       autoSeededBranch: "worktree-1234abcd",
-      prefilledBranch: "",
       expected: {
         repositoryLabel: "current-repo",
         branchLabel: "worktree-1234abcd",
@@ -6128,10 +6118,8 @@ describe("NewChatLandingScreen", () => {
         expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
       );
 
-      // Open the worktree popover, focus the branch combobox to reveal the
-      // existing-worktree dropdown, and select the one linked worktree.
+      // Open the worktree popover and select the one linked worktree.
       fireEvent.click(screen.getByTestId("new-chat-landing-branch-chip"));
-      fireEvent.focus(screen.getByTestId("new-chat-landing-branch-input"));
       const popover = screen
         .getByTestId("new-chat-landing-worktree-dropdown")
         .closest('[data-slot="popover-content"]');
@@ -6188,13 +6176,32 @@ describe("NewChatLandingScreen", () => {
       expect(worktreeRadio).toHaveClass("sr-only");
       fireEvent.click(worktreeRadio);
 
-      // Selection stays in the worktree picker; it does not browse or close the
-      // project-folder surface.
-      expect(worktreeRadio).toBeChecked();
-      await screen.findByTestId("new-chat-landing-existing-worktree-warning");
-      expect((screen.getByTestId("new-chat-landing-branch-input") as HTMLInputElement).value).toBe(
-        "feature/x",
+      await waitFor(() =>
+        expect(screen.queryByTestId("new-chat-landing-worktree-dropdown")).toBeNull(),
       );
+      expect(screen.getByTestId("new-chat-landing-branch-chip")).toHaveTextContent("feature/x");
+
+      fireEvent.click(screen.getByTestId("new-chat-landing-branch-chip"));
+      expect(screen.getByTestId("new-chat-landing-branch-input")).toHaveValue("");
+      expect(screen.queryByTestId("new-chat-landing-existing-worktree-warning")).toBeNull();
+      expect(
+        within(screen.getByTestId("new-chat-landing-worktree-option")).getByRole("radio"),
+      ).toBeChecked();
+
+      fireEvent.change(screen.getByTestId("new-chat-landing-branch-input"), {
+        target: { value: "feature/new-from-existing" },
+      });
+      const existingWorktreeRadio = within(
+        screen.getByTestId("new-chat-landing-worktree-option"),
+      ).getByRole("radio");
+      expect(existingWorktreeRadio).not.toBeChecked();
+      fireEvent.click(existingWorktreeRadio);
+
+      await waitFor(() =>
+        expect(screen.queryByTestId("new-chat-landing-worktree-dropdown")).toBeNull(),
+      );
+      fireEvent.click(screen.getByTestId("new-chat-landing-branch-chip"));
+      expect(screen.getByTestId("new-chat-landing-branch-input")).toHaveValue("");
 
       fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
         target: { value: "work in the worktree" },
@@ -6261,7 +6268,7 @@ describe("NewChatLandingScreen", () => {
     expect(worktreeList).toHaveClass("min-h-0", "flex-1", "overflow-y-auto");
   });
 
-  it("creates a new worktree when the prefilled branch name is edited", async () => {
+  it("creates a new worktree when New is typed after selecting an existing worktree", async () => {
     useHostWorktreesMock.mockReturnValue({
       data: [
         {
@@ -6282,18 +6289,21 @@ describe("NewChatLandingScreen", () => {
     );
 
     fireEvent.click(screen.getByTestId("new-chat-landing-branch-chip"));
-    fireEvent.focus(screen.getByTestId("new-chat-landing-branch-input"));
     fireEvent.click(
       within(screen.getByTestId("new-chat-landing-worktree-option")).getByRole("radio"),
     );
-    await screen.findByTestId("new-chat-landing-existing-worktree-warning");
+    await waitFor(() =>
+      expect(screen.queryByTestId("new-chat-landing-worktree-dropdown")).toBeNull(),
+    );
 
-    // Edit the branch away from the prefill: now it's a NEW worktree request.
+    fireEvent.click(screen.getByTestId("new-chat-landing-branch-chip"));
+    expect(screen.getByTestId("new-chat-landing-branch-input")).toHaveValue("");
+    expect(screen.queryByTestId("new-chat-landing-existing-worktree-warning")).toBeNull();
+
     fireEvent.change(screen.getByTestId("new-chat-landing-branch-input"), {
       target: { value: "feature/y" },
     });
-    // Warning gone once the name diverges from the existing worktree's branch.
-    expect(screen.queryByTestId("new-chat-landing-existing-worktree-warning")).toBeNull();
+    expect(screen.getByTestId("new-chat-landing-base-branch-input")).toBeInTheDocument();
 
     fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
       target: { value: "branch off" },
