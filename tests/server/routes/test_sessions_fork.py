@@ -1406,13 +1406,7 @@ async def test_fork_codex_bypass_rejected_on_non_codex_target(
 
 @pytest.mark.asyncio
 async def test_fork_switch_binds_session_scoped_target() -> None:
-    """Switching to a session-scoped agent the caller can read succeeds.
-
-    A session-scoped agent (``session_id`` set) is a custom agent bound
-    to one session. ``validate_session_agent`` — the same check
-    ``POST /v1/sessions`` runs — authorizes it via READ access on the
-    owning session, so the fork clones its bundle like any other target.
-    """
+    """Switching to a session-scoped agent clones its bundle into the fork."""
     conv = _make_conversation()
     conv_store = _ConversationStore(
         conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv},

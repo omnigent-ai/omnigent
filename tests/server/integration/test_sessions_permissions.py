@@ -2740,7 +2740,7 @@ async def test_fork_switch_binds_session_scoped_target_with_access(
     fork his own session into a custom agent he also owns.
     """
     agent = await create_test_agent(auth_client, name="corey-custom-agent", user="corey")
-    source = await _create_session_as(auth_client, agent["id"], "corey", title="corey-source")
+    source = await _create_session_as(auth_client, "", "corey", title="corey-source")
 
     resp = await auth_client.post(
         f"/v1/sessions/{source['id']}/fork",
@@ -2772,7 +2772,7 @@ async def test_fork_switch_denies_session_scoped_target_without_access(
     created.
     """
     agent = await create_test_agent(auth_client, name="bryan-custom-agent", user="bryan")
-    source = await _create_session_as(auth_client, agent["id"], "corey", title="corey-source")
+    source = await _create_session_as(auth_client, "", "corey", title="corey-source")
 
     resp = await auth_client.post(
         f"/v1/sessions/{source['id']}/fork",
@@ -2783,6 +2783,9 @@ async def test_fork_switch_denies_session_scoped_target_without_access(
         f"Expected 403/404 for a session-scoped target corey cannot read, "
         f"got {resp.status_code}: {resp.text}"
     )
+
+    corey_sessions = await _list_sessions_as(auth_client, "corey")
+    assert [s["id"] for s in corey_sessions] == [source["id"]]
 
 
 async def test_create_session_rejects_other_users_host(

@@ -2870,7 +2870,7 @@ def register_core_routes(
 
         Deep-copies the source session's conversation items and
         clones the agent into a new session. When ``body.agent_id``
-        is set, the fork binds that built-in agent instead of the
+        is set, the fork binds that agent instead of the
         source's — switching harness (e.g. Claude-SDK → Claude Code,
         or Claude → Codex). The source's model settings carry over
         only within the same provider family; a same-family native
