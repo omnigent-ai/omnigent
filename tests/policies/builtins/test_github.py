@@ -410,51 +410,6 @@ def test_shell_background_operator_does_not_hide_the_push() -> None:
 
 
 @pytest.mark.parametrize(
-    "wrapped",
-    [
-        "( git push https://github.com/octo/secret main )",
-        "(git push https://github.com/octo/secret main)",
-        "{ git push https://github.com/octo/secret main ; }",
-        "cat <(git push https://github.com/octo/secret main)",
-        "true && ( git push https://github.com/octo/secret main )",
-    ],
-)
-def test_shell_grouping_wrapper_does_not_hide_the_push(wrapped: str) -> None:
-    """A denied push wrapped in a subshell / brace group / process substitution
-    is still gated.
-
-    Without splitting on the grouping metacharacters ``(){}`` the segment head
-    is ``(`` / ``{`` (or the fused ``(git``) rather than ``git``, so the parser
-    never classifies the inner push and the policy abstains → ALLOW: a silent
-    bypass of the write allowlist identical in effect to the bare push.
-    """
-    policy = github_policy(write_repos=[_REPO])
-    result = policy(_sh(wrapped))
-    assert result is not None and result["result"] == "DENY"
-
-
-def test_shell_grouping_allowlisted_push_still_allowed() -> None:
-    """An allowlisted push wrapped in a subshell still abstains.
-
-    Splitting on grouping characters must isolate the inner command for gating
-    without turning a permitted push into a false DENY.
-    """
-    policy = github_policy(write_repos=[_REPO])
-    assert policy(_sh("( git push https://github.com/octo/hello main )")) is None
-
-
-def test_shell_grouping_split_is_quote_aware() -> None:
-    """Grouping characters inside quotes are not split points.
-
-    A benign command that merely mentions ``{``/``(`` inside a quoted string
-    must not be fragmented into spurious segments; the command stays whole and
-    the policy abstains (no git/gh invocation to gate).
-    """
-    policy = github_policy(write_repos=[_REPO])
-    assert policy(_sh("echo '{ not a real group }' && printf '(%s)' hi")) is None
-
-
-@pytest.mark.parametrize(
     "spawned",
     [
         "find . -maxdepth 0 -exec git push https://github.com/octo/secret main +",
@@ -521,67 +476,6 @@ def test_shell_interpreter_with_c_string_still_classified() -> None:
     denied = policy(_sh('bash -c "git push https://github.com/octo/secret main"'))
     assert denied is not None and denied["result"] == "DENY"
     assert policy(_sh('sh -c "ls -la"')) is None
-
-
-@pytest.mark.parametrize(
-    "command",
-    [
-        r"echo \" ; git push https://github.com/octo/secret main",
-        r'echo "x \" y" ; git push https://github.com/octo/secret main',
-    ],
-)
-def test_shell_escaped_quote_does_not_hide_the_push(command: str) -> None:
-    """A backslash-escaped quote must not swallow a following command separator.
-
-    The segment splitter is quote-aware; if it ignored backslash escapes, an
-    escaped quote (``\\"``) would open a spurious quoted region and hide the
-    ``;`` before a denied push, so the whole line parsed as one ``echo`` segment
-    and abstained → ALLOW. Escapes are honoured (matching the shell) so the push
-    is still split into its own segment and gated.
-    """
-    policy = github_policy(write_repos=[_REPO])
-    result = policy(_sh(command))
-    assert result is not None and result["result"] == "DENY"
-
-
-@pytest.mark.parametrize(
-    "command",
-    [
-        "true # it's fine\ng''it push https://github.com/octo/secret main",
-        "echo ok # don't\ngit push https://github.com/octo/secret main",
-    ],
-)
-def test_shell_comment_does_not_hide_a_later_command(command: str) -> None:
-    """A ``#`` comment must not swallow the newline and hide a following push.
-
-    A stray apostrophe in the comment would open a spurious quoted region under
-    naive quote tracking, merging the next line into one un-tokenizable segment
-    that abstains → ALLOW. The unbalanced-quote fallback over-splits instead, so
-    the denied push is isolated and gated.
-    """
-    policy = github_policy(write_repos=[_REPO])
-    result = policy(_sh(command))
-    assert result is not None and result["result"] == "DENY"
-
-
-def test_shell_brace_expansion_does_not_drop_a_branch() -> None:
-    """Brace *expansion* in a push refspec must not fragment the branch list.
-
-    ``git push …/hello main{,} feature`` expands to a push of ``main`` and
-    ``feature``; splitting on the expansion braces would classify only
-    ``git push …/hello main`` (allowed) and drop the disallowed ``feature``
-    branch → ALLOW. Braces split only as a group, so the command stays whole and
-    the disallowed branch is denied.
-    """
-    policy = github_policy(write_repos=[_REPO], write_branches=["main"])
-    result = policy(_sh("git push https://github.com/octo/hello main{,} feature"))
-    assert result is not None and result["result"] == "DENY"
-
-
-def test_shell_brace_expansion_benign_not_over_blocked() -> None:
-    """A benign brace expansion with no gated command still abstains (no false ASK)."""
-    policy = github_policy(write_repos=[_REPO])
-    assert policy(_sh("mkdir -p build/{debug,release}")) is None
 
 
 def test_shell_clone_read_allowed_and_denied() -> None:

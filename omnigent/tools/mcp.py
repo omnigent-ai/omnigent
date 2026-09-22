@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, TypeVar
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlparse
 
 import httpx
 from anyio.streams.memory import (
@@ -55,19 +55,8 @@ from mcp.types import Tool as McpToolDef
 
 from omnigent.runner.identity import strip_runner_auth_secrets
 from omnigent.spec.types import MCPServerConfig, RetryPolicy
-from omnigent.util.ssrf import host_is_internal
 
 _T = TypeVar("_T")
-
-
-class _InternalRedirectBlocked(Exception):
-    """Raised when an MCP HTTP transport is redirected to a non-public host.
-
-    Registration-time URL validation only sees the initial url; this closes the
-    connect-time redirect that would otherwise let a public endpoint bounce the
-    transport to an internal / cloud-metadata address (SSRF).
-    """
-
 
 # Type aliases for the (read, write) stream pair returned by MCP
 # transports. Uses anyio's concrete stream types parameterized
@@ -1040,42 +1029,6 @@ class McpServerConnection:
         """
         request.extensions[_CALL_SERIAL_EXTENSION] = self._call_serial
 
-    async def _reject_internal_redirect(self, response: httpx.Response) -> None:
-        """
-        httpx response event hook refusing an external→internal redirect.
-
-        Registration-time validation (``assert_mcp_server_request_safe``) only
-        inspects the initial url; with ``follow_redirects`` enabled a public
-        endpoint could return a ``3xx`` pointing at an internal / cloud-metadata
-        host and the transport would follow it — an SSRF that is far easier than
-        DNS rebinding. This re-validates every redirect hop: if the response's
-        own request host is public but the redirect target is (or resolves to) a
-        non-public address, the hop is refused. A redirect whose origin is
-        already internal (local single-user dev) is left alone, as are
-        same-host / public→public hops, so benign trailing-slash and
-        ``http→https`` redirects keep working. DNS resolution runs off the event
-        loop.
-
-        :param response: The response whose redirect is about to be followed.
-        :raises _InternalRedirectBlocked: when the redirect target is non-public.
-        """
-        if not response.is_redirect:
-            return
-        location = response.headers.get("location")
-        if not location:
-            return
-        origin_host = response.request.url.host
-        target_host = urlparse(urljoin(str(response.request.url), location)).hostname
-        if not target_host:
-            return
-        if origin_host and await asyncio.to_thread(host_is_internal, origin_host):
-            return  # started internal (local dev) — not the SSRF we guard here
-        if await asyncio.to_thread(host_is_internal, target_host):
-            raise _InternalRedirectBlocked(
-                f"MCP server {self.config.name!r} redirected to a non-public "
-                f"address ({target_host!r}); refusing to follow."
-            )
-
     async def _record_response_stream(self, response: httpx.Response) -> None:
         """
         httpx response event hook installing the failure recorder.
@@ -1155,7 +1108,7 @@ class McpServerConnection:
             auth=auth,
             event_hooks={
                 "request": [self._stamp_request_serial],
-                "response": [self._reject_internal_redirect, self._record_response_stream],
+                "response": [self._record_response_stream],
             },
         )
 

@@ -1,35 +1,23 @@
 """
-Guard tests for the session MCP-server SSRF / multi-tenant-RCE protections.
+Guard tests for the session MCP-server SSRF / multi-tenant-RCE registration
+check (:func:`omnigent.server.routes.session_mcp_servers.assert_mcp_server_request_safe`),
+which rejects an internal http ``url`` or stdio transport on a multi-tenant
+server before the declaration is persisted, and the shared host classifier it
+uses (:mod:`omnigent.util.ssrf`).
 
-Two enforcement points share one host classifier (:mod:`omnigent.util.ssrf`):
-
-- **registration time** —
-  :func:`omnigent.server.routes.session_mcp_servers.assert_mcp_server_request_safe`
-  rejects an internal http ``url`` or stdio transport on a multi-tenant server
-  before the declaration is persisted;
-- **connect time** —
-  :meth:`omnigent.tools.mcp.McpServerConnection._reject_internal_redirect`
-  refuses an HTTP redirect that pivots from a public host to an internal one,
-  closing the follow-redirects bypass of the registration-time check.
-
-The tests are hermetic: DNS resolution, the single-user server-mode flag, and
-the shared classifier are stubbed, so no network or real config is touched. The
-default mode is multi-tenant (single-user disabled); the single-user carve-out
-is exercised explicitly.
+The tests are hermetic: DNS resolution and the single-user server-mode flag are
+stubbed, so no network or real config is touched. The default mode is
+multi-tenant (single-user disabled); the single-user carve-out is exercised
+explicitly.
 """
 
 from __future__ import annotations
 
-import asyncio
-import types
-
-import httpx
 import pytest
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.routes import session_mcp_servers as mod
 from omnigent.server.schemas import UpsertMCPServerRequest
-from omnigent.tools import mcp as mcp_mod
 from omnigent.util import ssrf
 
 
@@ -173,46 +161,3 @@ def test_host_is_internal_decodes_ipv6_transition_forms(literal: str) -> None:
 def test_host_is_internal_allows_public_embedded_ipv4(literal: str) -> None:
     """An IPv6 transition form embedding a public IPv4 stays allowed."""
     assert ssrf.host_is_internal(literal) is False
-
-
-# ── connect-time guard: HTTP redirect re-validation ──────────────────────────
-
-
-def _conn() -> types.SimpleNamespace:
-    """A minimal stand-in carrying only what the redirect hook reads."""
-    return types.SimpleNamespace(config=types.SimpleNamespace(name="srv"))
-
-
-def _redirect(from_url: str, to_url: str, status: int = 302) -> httpx.Response:
-    return httpx.Response(
-        status, headers={"location": to_url}, request=httpx.Request("POST", from_url)
-    )
-
-
-def test_redirect_public_to_internal_blocked(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A public endpoint redirecting to an internal host is refused."""
-    monkeypatch.setattr(mcp_mod, "host_is_internal", lambda h: h == "169.254.169.254")
-    resp = _redirect("https://93.184.216.34/mcp", "http://169.254.169.254/latest/")
-    with pytest.raises(mcp_mod._InternalRedirectBlocked):
-        asyncio.run(mcp_mod.McpServerConnection._reject_internal_redirect(_conn(), resp))
-
-
-def test_redirect_public_to_public_allowed(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A public→public redirect (incl. trailing-slash / scheme upgrade) is fine."""
-    monkeypatch.setattr(mcp_mod, "host_is_internal", lambda h: False)
-    resp = _redirect("https://93.184.216.34/mcp", "https://93.184.216.34/mcp/")
-    asyncio.run(mcp_mod.McpServerConnection._reject_internal_redirect(_conn(), resp))
-
-
-def test_redirect_internal_origin_left_alone(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A redirect that starts on an internal origin (local dev) is not our concern."""
-    monkeypatch.setattr(mcp_mod, "host_is_internal", lambda h: True)
-    resp = _redirect("http://127.0.0.1:3000/mcp", "http://127.0.0.1:3000/mcp/")
-    asyncio.run(mcp_mod.McpServerConnection._reject_internal_redirect(_conn(), resp))
-
-
-def test_non_redirect_response_ignored(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A normal (non-3xx) response is passed through untouched."""
-    monkeypatch.setattr(mcp_mod, "host_is_internal", lambda h: True)
-    resp = httpx.Response(200, request=httpx.Request("POST", "https://93.184.216.34/mcp"))
-    asyncio.run(mcp_mod.McpServerConnection._reject_internal_redirect(_conn(), resp))

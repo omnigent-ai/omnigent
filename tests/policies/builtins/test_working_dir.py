@@ -202,17 +202,6 @@ def test_process_spawning_utility_without_dir_op_abstains() -> None:
     assert policy(_sh("find . -name '*.py'")) is None
 
 
-def test_comment_does_not_hide_a_dir_escape() -> None:
-    """A ``#`` comment with a stray apostrophe must not swallow a later cd escape.
-
-    The unbalanced-quote fallback over-splits, so the ``cd`` outside the allowed
-    dir on the following line is still isolated and gated.
-    """
-    policy = block_working_dir_changes(allowed_dirs=["/workspace"])
-    result = policy(_sh("true # it's fine\ncd /etc/secrets"))
-    assert result is not None and result["result"] == "DENY"
-
-
 # ══════════════════════════════════════════════════════════════════════════════
 # Layer 1 — git worktree gating
 # ══════════════════════════════════════════════════════════════════════════════

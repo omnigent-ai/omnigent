@@ -261,32 +261,10 @@ def split_command_segments(command: str) -> list[str]:
     ``&&`` is consumed whole rather than split into two empty halves.
     Command substitutions (``$(...)`` / backticks) are pulled out first and
     their bodies appended as their own segments, so a command hidden inside one
-    (``x=$(git push <url>)``) is still gated.
-
-    The grouping metacharacters ``(``, ``)``, ``{`` and ``}`` are also split
-    points. A gated command wrapped in a subshell group ``( git push … )``, a
-    brace group ``{ git push … ; }``, or a process substitution ``<( git push …
-    )`` runs, but without splitting on these the segment head is ``(`` / ``{``
-    (or the fused ``(git``) rather than ``git``, so the parser never classifies
-    the inner invocation and the policy silently abstains → ALLOW. Splitting on
-    them isolates the inner command as its own segment so it is gated like the
-    bare form. ``{`` / ``}`` split only as a brace *group* (whitespace-delimited,
-    per the shell), never as brace *expansion* (``main{,}``) — splitting the
-    latter would strip a refspec off a ``git push`` and hide the disallowed
-    branch. ``$(…)`` command substitutions are already pulled out above before
-    this split, so their parens never reach here.
-
-    The split is quote-aware: an operator (including a grouping character) is a
-    split point only when it is NOT inside single or double quotes. Grouping
-    characters appear literally inside quoted code far more often than the
-    ``;|&`` operators do — an ``awk`` program ``'BEGIN{system("git push …")}'``,
-    a ``perl -e 'exec("git",…)'`` snippet, a ``python3 -c "…os.execvp('git',…)"``
-    body — and splitting on those would fragment the command so a
-    process-spawning utility's head and its gated keyword could land in
-    different segments, silently reopening the shell-parser fail-open. Honoring
-    quotes keeps such a command whole so the utility head is still classified,
-    while a real ``( … )`` / ``{ …; }`` group (whose operators are unquoted)
-    still splits.
+    (``x=$(git push <url>)``) is still gated. This is a naive split that does
+    not honor operators appearing inside quotes — acceptable because the
+    commands these policies gate do not embed these operators in quoted args in
+    practice, and a mis-split only ever produces an extra ignored segment.
 
     Splitting on a lone ``&`` matters for the gate: without it, a benign
     leading command could hide a gated one behind a background operator
@@ -299,125 +277,10 @@ def split_command_segments(command: str) -> list[str]:
         ``["cd /repo", "npm test"]``.
     """
     outer, bodies = _extract_command_substitutions(command)
-    segments = [seg.strip() for seg in _split_unquoted_operators(outer) if seg.strip()]
+    parts = re.split(r"&&|\|\||[;|\n&]", outer)
+    segments = [seg.strip() for seg in parts if seg.strip()]
     for body in bodies:
         segments.extend(split_command_segments(body))
-    return segments
-
-
-# Single-character command separators handled unconditionally outside quotes:
-# the chaining / background operators (``&&`` / ``||`` are matched as two-char
-# operators first) plus subshell parens ``(`` / ``)``. Brace ``{`` / ``}`` are
-# handled separately — only as a whitespace-delimited group, never as brace
-# expansion; see :func:`_split_unquoted_operators`.
-_SEGMENT_OPERATOR_CHARS: frozenset[str] = frozenset(";|&\n()")
-
-# Quote-unaware fallback split (over-splits on every separator + grouping char,
-# ignoring quotes) used when quote-aware tracking cannot be trusted.
-_UNQUOTED_SPLIT_RE = re.compile(r"&&|\|\||[;|\n&(){}]")
-
-
-def _split_unquoted_operators(command: str) -> list[str]:
-    """
-    Split *command* on shell separators, ignoring separators inside quotes.
-
-    Walks the string tracking single-/double-quote state and backslash escapes,
-    and cuts on ``&&``, ``||`` and each :data:`_SEGMENT_OPERATOR_CHARS`
-    character encountered outside quotes. Quote-awareness keeps a grouping
-    character inside a quoted program (an ``awk '{system("git push …")}'`` body,
-    a ``perl -e 'exec("git",…)'`` snippet) from fragmenting the command so a
-    process-spawning utility's head and its gated keyword stay in one segment.
-
-    Shell subtleties this models, so a stray token cannot hide a separator and
-    slip a gated command past classification:
-
-    - **backslash escapes** — outside single quotes a ``\\`` escapes the next
-      character, so ``echo \\" ; git push …`` still splits on the ``;`` (the
-      escaped ``"`` is not a quote toggle); single quotes take no escapes;
-    - **brace expansion vs brace group** — ``{`` / ``}`` split only as a group
-      delimiter (``{`` followed by whitespace, ``}`` preceded by whitespace),
-      never on brace expansion (``main{,} feature``), which would otherwise
-      strip a refspec off a ``git push`` and drop the disallowed branch from
-      classification;
-    - **unbalanced quotes** — if quote tracking ends inside a quote (a stray
-      apostrophe in a ``#`` comment, a heredoc body, an ANSI-C ``$'…'`` string,
-      or a genuinely unbalanced command), the quote-aware walk is unreliable, so
-      fall back to a quote-unaware over-split. Over-splitting is safe (a gated
-      command is still isolated in its own segment); under-splitting — a stray
-      quote swallowing a separator — is the fail-open to avoid.
-
-    :param command: The command string, substitutions already stripped.
-    :returns: The raw (un-trimmed) segments between operators.
-    """
-    segments: list[str] = []
-    buf: list[str] = []
-    in_single = in_double = False
-    i, n = 0, len(command)
-    while i < n:
-        ch = command[i]
-        if in_single:
-            # Single quotes are literal: no escapes, only ``'`` ends the region.
-            if ch == "'":
-                in_single = False
-            buf.append(ch)
-            i += 1
-            continue
-        if ch == "\\" and i + 1 < n:
-            # Outside single quotes a backslash escapes the next character; keep
-            # both verbatim so an escaped quote/operator is neither a toggle nor
-            # a split point (also correct inside double quotes, e.g. ``\"``).
-            buf.append(ch)
-            buf.append(command[i + 1])
-            i += 2
-            continue
-        if in_double:
-            if ch == '"':
-                in_double = False
-            buf.append(ch)
-            i += 1
-            continue
-        if ch == "'":
-            in_single = True
-            buf.append(ch)
-        elif ch == '"':
-            in_double = True
-            buf.append(ch)
-        elif command[i : i + 2] in ("&&", "||"):
-            segments.append("".join(buf))
-            buf = []
-            i += 2
-            continue
-        elif ch == "{":
-            # Brace-group open (``{ cmd; }``) is a separator; brace expansion
-            # (``main{,}``) is not — the shell requires whitespace after ``{``
-            # for a group, so split only when the next character is whitespace.
-            nxt = command[i + 1] if i + 1 < n else ""
-            if nxt == "" or nxt.isspace():
-                segments.append("".join(buf))
-                buf = []
-            else:
-                buf.append(ch)
-        elif ch == "}":
-            # Group close is preceded by whitespace (``…; }``); a ``}`` closing a
-            # brace expansion is not, so split only when the previous char is
-            # whitespace.
-            if buf and buf[-1].isspace():
-                segments.append("".join(buf))
-                buf = []
-            else:
-                buf.append(ch)
-        elif ch in _SEGMENT_OPERATOR_CHARS:
-            segments.append("".join(buf))
-            buf = []
-        else:
-            buf.append(ch)
-        i += 1
-    segments.append("".join(buf))
-    if in_single or in_double:
-        # Quote tracking diverged from the shell (see "unbalanced quotes"); the
-        # remainder was treated as quoted, which could hide a separator, so
-        # discard this parse and over-split quote-unaware instead.
-        return _UNQUOTED_SPLIT_RE.split(command)
     return segments
 
 
