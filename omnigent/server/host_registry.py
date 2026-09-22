@@ -281,6 +281,15 @@ class HostConnection:
         ``error_code``, and ``error``.
     :param pending_model_options: Per-``request_id`` futures for pre-launch
         model catalogs resolved by the selected host.
+    :param model_options_cache: Per-harness ``(expiry_epoch, result)`` for the
+        most recent successful ``host.model_options`` probe. The composer mounts
+        several observers and polls, so a bare probe would re-query the host on
+        every switch; a short TTL serves repeats without a round-trip. Bound to
+        this connection, so a reconnect (``omni setup`` re-pointing a provider)
+        starts empty and can't serve a stale catalog.
+    :param inflight_model_options: Per-harness in-flight probe tasks, coalescing
+        concurrent requests for one harness onto a single host round-trip (same
+        rationale as ``inflight_installs``).
     :param pending_skills: Per-``request_id`` futures for sessionless skill discovery.
     """
 
@@ -337,6 +346,12 @@ class HostConnection:
         default_factory=dict,
     )
     pending_model_options: dict[str, asyncio.Future[dict[str, Any]]] = field(
+        default_factory=dict,
+    )
+    model_options_cache: dict[str, tuple[float, dict[str, Any]]] = field(
+        default_factory=dict,
+    )
+    inflight_model_options: dict[str, asyncio.Task[dict[str, Any]]] = field(
         default_factory=dict,
     )
     pending_skills: dict[str, asyncio.Future[HostSkillsResultFrame]] = field(

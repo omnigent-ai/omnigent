@@ -8408,10 +8408,10 @@ async def _host_model_options(
     :param harness: Native harness id, e.g. ``"claude-native"``.
     :returns: Model ids the host reported, picker rows first, or an empty list.
     """
-    from omnigent.server.routes._host_model_options import request_host_model_options
+    from omnigent.server.routes._host_model_options import cached_host_model_options
 
     try:
-        result = await request_host_model_options(
+        result = await cached_host_model_options(
             host_registry=host_registry,
             host_conn=host_conn,
             harness=harness,
