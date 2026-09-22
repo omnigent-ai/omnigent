@@ -4488,6 +4488,7 @@ def test_inject_user_message_ignores_prompt_glyph_in_scrollback(
     it, so the gate must NOT treat the pane as ready.
     """
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "time", _VirtualClock())
     bridge_dir = tmp_path / "bridge"
     write_tmux_target(
         bridge_dir,
@@ -5207,7 +5208,7 @@ def test_tmux_injections_are_serialized_per_bridge(
         return {"socket_path": "/tmp/tmux.sock", "tmux_target": "claude:0.0"}
 
     monkeypatch.setattr(claude_native_bridge, "_wait_for_tmux_info", wait_for_tmux_info)
-    monkeypatch.setattr(claude_native_bridge, "_restore_occupied_input", lambda *_args: None)
+    monkeypatch.setattr(claude_native_bridge, "_restore_occupied_input", lambda *_a, **_k: None)
     monkeypatch.setattr(
         claude_native_bridge, "_wait_for_claude_prompt_ready", lambda *_a, **_k: None
     )
@@ -9992,7 +9993,7 @@ def test_a_swallowed_slash_submit_enter_is_retried_while_the_draft_persists(
     bridge_dir = _picker_bridge_dir(tmp_path)
     sends = _fake_tmux(
         monkeypatch,
-        [_IDLE_PANE] + [_composer_pane("/effort high")] * 8 + [_IDLE_PANE],
+        [_IDLE_PANE] + [_composer_pane("/effort high")] * 9 + [_IDLE_PANE],
     )
 
     claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")

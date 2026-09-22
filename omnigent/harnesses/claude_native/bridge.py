@@ -486,6 +486,10 @@ class ClaudeInjectionCancelled(RuntimeError):
     """The caller cancelled delivery before the injection worker finished."""
 
 
+class ClaudeUserPromptPending(RuntimeError):
+    """A native question or permission prompt must be answered before injection."""
+
+
 @contextlib.contextmanager
 def cancellable_injection(cancel_event: threading.Event) -> Iterator[None]:
     """Bind a cancellation flag inherited by this delivery's ``asyncio.to_thread`` worker."""
@@ -1377,7 +1381,7 @@ def clear_approval_wait_marker(marker: Path) -> None:
         marker.unlink(missing_ok=True)
 
 
-def approval_wait_is_fresh(session_id: str) -> bool:
+def approval_wait_is_fresh(session_id: str, *, bridge_dir: Path | None = None) -> bool:
     """
     Whether a permission hook is parked on this session's verdict right now.
 
@@ -1386,12 +1390,14 @@ def approval_wait_is_fresh(session_id: str) -> bool:
 
     :param session_id: Omnigent session id to check, e.g.
         ``"conv_abc123"``.
+    :param bridge_dir: Derive the marker root from this bridge, matching the hook writer.
     :returns: ``True`` when any marker was touched within
         :data:`APPROVAL_WAIT_MARKER_TTL_S`; ``False`` when none exists, all
         are stale, or the root is unreadable.
     """
+    root = bridge_dir.parent / _APPROVAL_WAIT_DIR_NAME if bridge_dir else _APPROVAL_WAIT_ROOT
     try:
-        markers = list(_APPROVAL_WAIT_ROOT.glob(f"{_approval_wait_digest(session_id)}.*.wait"))
+        markers = list(root.glob(f"{_approval_wait_digest(session_id)}.*.wait"))
     except OSError:
         return False
     now = time.time()
@@ -3821,7 +3827,7 @@ def inject_user_message(
     # A surface left occupying the composer swallows everything typed
     # below — and hides the input box, wedging the readiness gate — so
     # reclaim the input box before waiting on it.
-    _restore_occupied_input(info["socket_path"], info["tmux_target"])
+    _restore_occupied_input(info["socket_path"], info["tmux_target"], bridge_dir=bridge_dir)
     # tmux.json only means the tmux session exists; Claude Code's input
     # box mounts a few seconds later. Block until the prompt renders so
     # the first message isn't typed into a still-booting TUI and dropped.
@@ -3829,6 +3835,7 @@ def inject_user_message(
         info["socket_path"],
         info["tmux_target"],
         timeout_s=timeout_s,
+        bridge_dir=bridge_dir,
     )
     # Escape unsupported slash commands (e.g. ``/help``, ``/exit``) so the
     # Claude Code TUI treats them as user text instead of invoking a state
@@ -3909,6 +3916,10 @@ def _paste_and_submit(
     :raises RuntimeError: If a ``tmux`` invocation fails, or if the draft
         never leaves the input box after repeated submit Enters.
     """
+    if has_pending_user_prompt(bridge_dir):
+        raise ClaudeUserPromptPending(
+            "Answer the pending Claude question or permission request before sending a message."
+        )
     # Clear any leftover text in Claude's input field before typing.
     # After Escape-cancel, Claude Code re-populates the prompt area
     # with the previous input for re-editing. Without this clear,
@@ -3963,6 +3974,10 @@ def _paste_and_submit(
             break
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
     time.sleep(_PASTE_SETTLE_S)
+    if has_pending_user_prompt(bridge_dir):
+        raise ClaudeUserPromptPending(
+            "Claude is waiting for an explicit answer; message not sent."
+        )
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
     if not draft_seen:
         # The draft was never observed, so its absence proves nothing —
@@ -4231,7 +4246,11 @@ def inject_slash_command(
     tmux_target = info["tmux_target"]
     # Same reclaim as inject_user_message: a surface left occupying the
     # composer would swallow the C-u and the typed command.
-    _restore_occupied_input(socket_path, tmux_target)
+    _restore_occupied_input(socket_path, tmux_target, bridge_dir=bridge_dir)
+    if has_pending_user_prompt(bridge_dir):
+        raise ClaudeUserPromptPending(
+            "Answer the pending Claude question or permission request before changing settings."
+        )
     # ``C-u`` clears any draft the user is mid-typing; otherwise the
     # paste below concatenates with their text and Enter submits
     # ``<their-draft>/effort high`` as a turn. Unlike Escape it does
@@ -5011,7 +5030,48 @@ def claude_pane_text_ready(pane: str) -> bool:
     return _claude_prompt_rendered(pane)
 
 
-def _restore_occupied_input(socket_path: str, tmux_target: str) -> None:
+def _user_prompt_visible(pane: str) -> bool:
+    """Recognize a native decision dialog, excluding text above a mounted composer."""
+    if not pane.strip() or _composer_row(pane) is not None:
+        return False
+    lines = [line for line in pane.splitlines() if line.strip()]
+    rules = [i for i, line in enumerate(lines) if _is_box_rule(line)]
+    region = "\n".join(lines[rules[-2] + 1 :] if len(rules) >= 2 else lines)
+    return (
+        "Do you want to " in region
+        or "Yes, and don't ask again" in region
+        or (
+            any(hint in region for hint in ("Enter to select", "Enter to submit"))
+            and "Esc to cancel" in region
+        )
+    )
+
+
+def _has_approval_wait(bridge_dir: Path) -> bool:
+    session_id = read_active_session_id(bridge_dir)
+    return session_id is not None and approval_wait_is_fresh(session_id, bridge_dir=bridge_dir)
+
+
+def has_pending_user_prompt(bridge_dir: Path) -> bool:
+    """Check live hook waits and terminal-side fallback prompts without sending input.
+
+    :param bridge_dir: The session's native bridge directory.
+    :returns: Whether a question or permission request needs an explicit answer.
+    """
+    if _has_approval_wait(bridge_dir):
+        return True
+    info = _read_json_file(bridge_dir / _TMUX_FILE)
+    if not isinstance(info, dict):
+        return False
+    socket_path, target = info.get("socket_path"), info.get("tmux_target")
+    if not isinstance(socket_path, str) or not isinstance(target, str):
+        return False
+    return _user_prompt_visible(_capture_pane(socket_path, target))
+
+
+def _restore_occupied_input(
+    socket_path: str, tmux_target: str, *, bridge_dir: Path | None = None
+) -> None:
     """
     Dismiss a terminal-opened surface occupying Claude's input box.
 
@@ -5028,6 +5088,9 @@ def _restore_occupied_input(socket_path: str, tmux_target: str) -> None:
     cancel"), which commits nothing and hands the empty input box back, so
     the web-UI message wins the pane.
 
+    Questions and permission prompts are protected by their hook wait markers
+    and visible decision controls; they require an explicit answer.
+
     Escape is only sent while the surface is verifiably on screen —
     never blind, because on the bare composer Escape interrupts an
     in-flight turn. An empty (torn) capture means "unknown" and gets no
@@ -5042,6 +5105,7 @@ def _restore_occupied_input(socket_path: str, tmux_target: str) -> None:
 
     :param socket_path: Absolute path to the tmux socket.
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :param bridge_dir: Bridge whose live permission hooks protect the native prompt.
     :returns: None.
     """
     deadline = time.monotonic() + _OCCUPIED_INPUT_DISMISS_TIMEOUT_S
@@ -5049,6 +5113,13 @@ def _restore_occupied_input(socket_path: str, tmux_target: str) -> None:
     confirmed = False
     while True:
         pane = _capture_pane(socket_path, tmux_target)
+        if (bridge_dir is not None and _has_approval_wait(bridge_dir)) or _user_prompt_visible(
+            pane
+        ):
+            raise ClaudeUserPromptPending(
+                "Answer the pending Claude question or permission request "
+                "before sending a message."
+            )
         surface = _occupying_surface(pane)
         if surface is None:
             return
@@ -5346,6 +5417,7 @@ def _wait_for_claude_prompt_ready(
     tmux_target: str,
     *,
     timeout_s: float,
+    bridge_dir: Path | None = None,
 ) -> None:
     """
     Block until Claude Code's TUI input box is ready for keystrokes.
@@ -5370,6 +5442,7 @@ def _wait_for_claude_prompt_ready(
         unanswered liveness probe extends the wait to
         :data:`_TMUX_READY_SLOW_BOOT_TIMEOUT_S`; a dead pane or rejected
         query ends the wait at the next liveness check.
+    :param bridge_dir: Protect live permission-hook waits when delivering a message.
     :returns: None.
     :raises ClaudeTerminalExited: If tmux affirms the pane's process has
         exited, carrying the pane's wait-status so a clean quit is
@@ -5402,6 +5475,12 @@ def _wait_for_claude_prompt_ready(
     while True:
         _check_injection_cancelled()
         pane = _capture_pane(socket_path, tmux_target)
+        if (bridge_dir is not None and _has_approval_wait(bridge_dir)) or _user_prompt_visible(
+            pane
+        ):
+            raise ClaudeUserPromptPending(
+                "Claude is waiting for an explicit answer; message not sent."
+            )
         polls += 1
         if pane.strip():
             last_nonempty = pane
