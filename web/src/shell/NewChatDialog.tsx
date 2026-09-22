@@ -6001,11 +6001,11 @@ export function NewChatLandingScreen() {
                     <PopoverContent
                       align="start"
                       collisionPadding={16}
-                      className="max-h-[var(--radix-popover-content-available-height)] w-[min(20rem,calc(100vw-2rem))] gap-0 overflow-hidden rounded-xl p-2"
+                      className="flex max-h-[var(--radix-popover-content-available-height)] w-[min(20rem,calc(100vw-2rem))] flex-col gap-0 overflow-hidden rounded-xl p-2"
                     >
-                      <div className="flex min-h-0 flex-col gap-0">
+                      <div className="flex min-h-0 flex-1 flex-col gap-0">
                         <div
-                          className="flex shrink-0 flex-col"
+                          className="flex min-h-0 flex-1 flex-col"
                           role="radiogroup"
                           aria-label="Choose a worktree"
                         >
@@ -6041,7 +6041,7 @@ export function NewChatLandingScreen() {
                             <>
                               <div className="my-1 h-px shrink-0 bg-border" />
                               <div
-                                className="flex min-h-0 flex-col"
+                                className="flex min-h-0 flex-1 flex-col"
                                 data-testid="new-chat-landing-worktree-section"
                               >
                                 <span
@@ -6051,7 +6051,7 @@ export function NewChatLandingScreen() {
                                   Worktrees
                                 </span>
                                 <div
-                                  className="flex max-h-[min(320px,calc(var(--radix-popover-content-available-height)-160px))] min-h-0 flex-col overflow-y-auto [scrollbar-width:thin] [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-border [&::-webkit-scrollbar-track]:bg-transparent"
+                                  className="flex min-h-0 max-h-80 flex-1 flex-col overflow-y-auto [scrollbar-width:thin] [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-border [&::-webkit-scrollbar-track]:bg-transparent"
                                   data-testid="new-chat-landing-worktree-dropdown"
                                 >
                                   <TooltipProvider>
@@ -6131,13 +6131,13 @@ export function NewChatLandingScreen() {
                             onChange={(e) => setBaseBranch(e.target.value)}
                             placeholder="Base branch (defaults to current)"
                             aria-label="Base branch"
-                            className="rounded-md border border-input bg-background px-3 py-2 text-sm outline-none transition-colors focus-visible:border-ring"
+                            className="shrink-0 rounded-md border border-input bg-background px-3 py-2 text-sm outline-none transition-colors focus-visible:border-ring"
                             data-testid="new-chat-landing-base-branch-input"
                           />
                         )}
                         {startInExistingWorktree && (
                           <p
-                            className="text-xs leading-5 text-muted-foreground"
+                            className="shrink-0 text-xs leading-5 text-muted-foreground"
                             data-testid="new-chat-landing-existing-worktree-warning"
                           >
                             Starts in existing worktree, edit the name to create a new one.

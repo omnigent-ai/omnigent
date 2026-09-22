@@ -6135,7 +6135,18 @@ describe("NewChatLandingScreen", () => {
       const popover = screen
         .getByTestId("new-chat-landing-worktree-dropdown")
         .closest('[data-slot="popover-content"]');
-      expect(popover).toHaveClass("w-[min(20rem,calc(100vw-2rem))]", "overflow-hidden", "p-2");
+      expect(popover).toHaveClass(
+        "flex",
+        "max-h-[var(--radix-popover-content-available-height)]",
+        "w-[min(20rem,calc(100vw-2rem))]",
+        "flex-col",
+        "overflow-hidden",
+        "p-2",
+      );
+      expect(screen.getByRole("radiogroup", { name: "Choose a worktree" })).toHaveClass(
+        "min-h-0",
+        "flex-1",
+      );
       expect(screen.getByTestId("new-chat-landing-no-worktree-option")).toHaveClass(
         "h-7",
         "shrink-0",
@@ -6153,12 +6164,21 @@ describe("NewChatLandingScreen", () => {
         "text-sm",
         "leading-5",
       );
+      expect(screen.getByTestId("new-chat-landing-worktree-section")).toHaveClass(
+        "min-h-0",
+        "flex-1",
+      );
       const worktreeList = screen.getByTestId("new-chat-landing-worktree-dropdown");
       expect(worktreeList).not.toHaveClass("absolute", "top-full");
       expect(worktreeList).toHaveClass(
-        "max-h-[min(320px,calc(var(--radix-popover-content-available-height)-160px))]",
+        "min-h-0",
+        "max-h-80",
+        "flex-1",
         "overflow-y-auto",
         "[scrollbar-width:thin]",
+      );
+      expect(worktreeList).not.toHaveClass(
+        "max-h-[min(320px,calc(var(--radix-popover-content-available-height)-160px))]",
       );
       const options = screen.getAllByTestId("new-chat-landing-worktree-option");
       expect(options).toHaveLength(1); // main tree excluded
@@ -6197,6 +6217,49 @@ describe("NewChatLandingScreen", () => {
       expect(body.git?.base_branch).toBeUndefined();
     },
   );
+
+  it("keeps branch controls visible while the worktree list owns constrained scrolling", async () => {
+    useHostWorktreesMock.mockReturnValue({
+      data: [
+        {
+          path: "/Users/corey/repo",
+          branch: "main",
+          is_main: true,
+          detached: false,
+        },
+        ...Array.from({ length: 12 }, (_, index) => ({
+          path: `/Users/corey/repo-worktrees/feature-${index}`,
+          branch: `feature/${index}`,
+          is_main: false,
+          detached: false,
+        })),
+      ],
+    } as unknown as ReturnType<typeof useHostWorktrees>);
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+
+    fireEvent.click(screen.getByTestId("new-chat-landing-branch-chip"));
+    const popover = screen
+      .getByTestId("new-chat-landing-worktree-dropdown")
+      .closest<HTMLElement>('[data-slot="popover-content"]');
+    expect(popover).not.toBeNull();
+    popover?.style.setProperty("--radix-popover-content-available-height", "240px");
+
+    fireEvent.mouseDown(screen.getByTestId("new-chat-landing-branch-generate"));
+
+    const radioGroup = screen.getByRole("radiogroup", { name: "Choose a worktree" });
+    const worktreeList = screen.getByTestId("new-chat-landing-worktree-dropdown");
+    const branchInput = screen.getByTestId("new-chat-landing-branch-input");
+    const baseBranchInput = await screen.findByTestId("new-chat-landing-base-branch-input");
+    expect(radioGroup).not.toContainElement(branchInput);
+    expect(radioGroup).not.toContainElement(baseBranchInput);
+    expect(branchInput.parentElement).toHaveClass("shrink-0");
+    expect(baseBranchInput).toHaveClass("shrink-0");
+    expect((branchInput as HTMLInputElement).value).toMatch(/^worktree-/);
+    expect(worktreeList).toHaveClass("min-h-0", "flex-1", "overflow-y-auto");
+  });
 
   it("creates a new worktree when the prefilled branch name is edited", async () => {
     useHostWorktreesMock.mockReturnValue({
