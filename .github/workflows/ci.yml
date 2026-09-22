@@ -431,7 +431,11 @@ jobs:
           key: codex-parity-bin-${{ runner.os }}-${{ steps.rustc.outputs.version }}-${{ hashFiles('tests/codex_parity/sidecar/**') }}
 
       - name: Set up pnpm
+        # This job never runs pnpm install, so caching the (empty) pnpm store
+        # makes setup-node's post-step fail on a cache miss.
         uses: ./.github/actions/setup-pnpm
+        with:
+          cache: ""
 
       - name: Install codex CLI
         uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@aa5736c38f5c1258ee29452c6825d75033b952d7
