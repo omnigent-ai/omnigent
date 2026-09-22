@@ -409,6 +409,51 @@ def test_shell_background_operator_does_not_hide_the_push() -> None:
     assert result is not None and result["result"] == "DENY"
 
 
+@pytest.mark.parametrize(
+    "wrapped",
+    [
+        "( git push https://github.com/octo/secret main )",
+        "(git push https://github.com/octo/secret main)",
+        "{ git push https://github.com/octo/secret main ; }",
+        "cat <(git push https://github.com/octo/secret main)",
+        "true && ( git push https://github.com/octo/secret main )",
+    ],
+)
+def test_shell_grouping_wrapper_does_not_hide_the_push(wrapped: str) -> None:
+    """A denied push wrapped in a subshell / brace group / process substitution
+    is still gated.
+
+    Without splitting on the grouping metacharacters ``(){}`` the segment head
+    is ``(`` / ``{`` (or the fused ``(git``) rather than ``git``, so the parser
+    never classifies the inner push and the policy abstains → ALLOW: a silent
+    bypass of the write allowlist identical in effect to the bare push.
+    """
+    policy = github_policy(write_repos=[_REPO])
+    result = policy(_sh(wrapped))
+    assert result is not None and result["result"] == "DENY"
+
+
+def test_shell_grouping_allowlisted_push_still_allowed() -> None:
+    """An allowlisted push wrapped in a subshell still abstains.
+
+    Splitting on grouping characters must isolate the inner command for gating
+    without turning a permitted push into a false DENY.
+    """
+    policy = github_policy(write_repos=[_REPO])
+    assert policy(_sh("( git push https://github.com/octo/hello main )")) is None
+
+
+def test_shell_grouping_split_is_quote_aware() -> None:
+    """Grouping characters inside quotes are not split points.
+
+    A benign command that merely mentions ``{``/``(`` inside a quoted string
+    must not be fragmented into spurious segments; the command stays whole and
+    the policy abstains (no git/gh invocation to gate).
+    """
+    policy = github_policy(write_repos=[_REPO])
+    assert policy(_sh("echo '{ not a real group }' && printf '(%s)' hi")) is None
+
+
 def test_shell_clone_read_allowed_and_denied() -> None:
     """git clone is a read: allowed for an allowlisted repo, denied otherwise."""
     policy = github_policy(read_all=False, read_repos=[_REPO])

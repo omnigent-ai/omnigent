@@ -193,10 +193,29 @@ def split_command_segments(command: str) -> list[str]:
     ``&&`` is consumed whole rather than split into two empty halves.
     Command substitutions (``$(...)`` / backticks) are pulled out first and
     their bodies appended as their own segments, so a command hidden inside one
-    (``x=$(git push <url>)``) is still gated. This is a naive split that does
-    not honor operators appearing inside quotes — acceptable because the
-    commands these policies gate do not embed these operators in quoted args in
-    practice, and a mis-split only ever produces an extra ignored segment.
+    (``x=$(git push <url>)``) is still gated.
+
+    The grouping metacharacters ``(``, ``)``, ``{`` and ``}`` are also split
+    points. A gated command wrapped in a subshell group ``( git push … )``, a
+    brace group ``{ git push … ; }``, or a process substitution ``<( git push …
+    )`` runs, but without splitting on these the segment head is ``(`` / ``{``
+    (or the fused ``(git``) rather than ``git``, so the parser never classifies
+    the inner invocation and the policy silently abstains → ALLOW. Splitting on
+    them isolates the inner command as its own segment so it is gated like the
+    bare form. ``$(…)`` command substitutions are already pulled out above
+    before this split, so their parens never reach here.
+
+    The split is quote-aware: an operator (including a grouping character) is a
+    split point only when it is NOT inside single or double quotes. Grouping
+    characters appear literally inside quoted code far more often than the
+    ``;|&`` operators do — an ``awk`` program ``'BEGIN{system("git push …")}'``,
+    a ``perl -e 'exec("git",…)'`` snippet, a ``python3 -c "…os.execvp('git',…)"``
+    body — and splitting on those would fragment the command so a
+    process-spawning utility's head and its gated keyword could land in
+    different segments, silently reopening the shell-parser fail-open. Honoring
+    quotes keeps such a command whole so the utility head is still classified,
+    while a real ``( … )`` / ``{ …; }`` group (whose operators are unquoted)
+    still splits.
 
     Splitting on a lone ``&`` matters for the gate: without it, a benign
     leading command could hide a gated one behind a background operator
@@ -209,10 +228,65 @@ def split_command_segments(command: str) -> list[str]:
         ``["cd /repo", "npm test"]``.
     """
     outer, bodies = _extract_command_substitutions(command)
-    parts = re.split(r"&&|\|\||[;|\n&]", outer)
-    segments = [seg.strip() for seg in parts if seg.strip()]
+    segments = [seg.strip() for seg in _split_unquoted_operators(outer) if seg.strip()]
     for body in bodies:
         segments.extend(split_command_segments(body))
+    return segments
+
+
+# Single-character command separators / grouping operators (``&&`` and ``||``
+# are handled as two-character operators before these). The grouping characters
+# ``(){}`` isolate a command wrapped in a subshell / brace group / process
+# substitution so it is still classified; see split_command_segments.
+_SEGMENT_OPERATOR_CHARS: frozenset[str] = frozenset(";|&\n(){}")
+
+
+def _split_unquoted_operators(command: str) -> list[str]:
+    """
+    Split *command* on shell separators, ignoring separators inside quotes.
+
+    Walks the string tracking single- and double-quote state and cuts on ``&&``,
+    ``||`` and each :data:`_SEGMENT_OPERATOR_CHARS` character encountered outside
+    quotes. Best-effort (it does not model backslash escapes); an unbalanced
+    quote simply means the remainder is treated as quoted, and the downstream
+    ``shlex`` parse still fails such a segment closed via each policy's
+    un-tokenizable fail-safe.
+
+    :param command: The command string, substitutions already stripped.
+    :returns: The raw (un-trimmed) segments between operators.
+    """
+    segments: list[str] = []
+    buf: list[str] = []
+    in_single = in_double = False
+    i, n = 0, len(command)
+    while i < n:
+        ch = command[i]
+        if in_single:
+            if ch == "'":
+                in_single = False
+            buf.append(ch)
+        elif in_double:
+            if ch == '"':
+                in_double = False
+            buf.append(ch)
+        elif ch == "'":
+            in_single = True
+            buf.append(ch)
+        elif ch == '"':
+            in_double = True
+            buf.append(ch)
+        elif command[i : i + 2] in ("&&", "||"):
+            segments.append("".join(buf))
+            buf = []
+            i += 2
+            continue
+        elif ch in _SEGMENT_OPERATOR_CHARS:
+            segments.append("".join(buf))
+            buf = []
+        else:
+            buf.append(ch)
+        i += 1
+    segments.append("".join(buf))
     return segments
 
 
