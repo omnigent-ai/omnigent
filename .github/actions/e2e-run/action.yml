@@ -98,6 +98,8 @@ runs:
       uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@aa5736c38f5c1258ee29452c6825d75033b952d7
       with:
         harness: claude
+        # Exercise the real classifier-billing notice, absent from the older default pin.
+        version: "2.1.278"
 
     - name: Install Codex CLI
       uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@aa5736c38f5c1258ee29452c6825d75033b952d7

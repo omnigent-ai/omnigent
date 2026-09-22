@@ -1285,6 +1285,31 @@ class SessionResourceRegistry:
             nonlocal native_input_ready
             if status_poller is not None:
                 status_poller.tick()
+            if resource_role == CLAUDE_NATIVE_TERMINAL_ROLE:
+                try:
+                    from omnigent.harnesses.claude_native.bridge import (
+                        acknowledge_auto_mode_billing_notice,
+                        auto_mode_billing_notice_visible,
+                        bridge_dir_for_conversation_id,
+                        bridge_dir_from_launch_args,
+                    )
+
+                    # Recheck a cached match before sending any acknowledgement.
+                    if auto_mode_billing_notice_visible(instance.last_pane_text() or ""):
+                        bridge_dir = bridge_dir_from_launch_args(instance.args)
+                        if bridge_dir is None:
+                            bridge_dir = bridge_dir_for_conversation_id(session_id)
+                        acknowledge_auto_mode_billing_notice(
+                            bridge_dir,
+                            expected_socket_path=str(instance.socket_path),
+                            expected_tmux_target=instance.tmux_target,
+                        )
+                except Exception:  # noqa: BLE001 - keep lifecycle observation running.
+                    _logger.debug(
+                        "Claude auto-mode billing notice acknowledgement failed",
+                        exc_info=True,
+                        extra={"session_id": session_id},
+                    )
             if resource_role == CLAUDE_NATIVE_TERMINAL_ROLE and not native_input_ready:
                 # Readiness logging must not stop the lifecycle watcher on failure.
                 with contextlib.suppress(Exception):

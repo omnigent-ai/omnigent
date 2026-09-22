@@ -57,6 +57,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, cast
 from urllib import request
 
+from filelock import FileLock
+from filelock import Timeout as FileLockTimeout
+
 from omnigent._platform import is_wsl, stable_user_id
 from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
 from omnigent.harnesses.claude_native.status import CONTEXT_RAW_FILE
@@ -94,15 +97,25 @@ REQUEST_SESSION_ID_ENV_VAR = "HARNESS_CLAUDE_NATIVE_REQUEST_SESSION_ID"
 BRIDGE_ID_LABEL_KEY = "omnigent.claude_native.bridge_id"
 
 
+def _bridge_injection_lock(bridge_dir: Path) -> threading.Lock:
+    key = os.path.normcase(os.path.abspath(os.fspath(bridge_dir)))
+    with _INJECTION_LOCKS_GUARD:
+        return _INJECTION_LOCKS.setdefault(key, threading.Lock())
+
+
+def _bridge_injection_file_lock(bridge_dir: Path) -> FileLock:
+    """Coordinate pane writes between the runner and harness processes."""
+    lock_dir = bridge_dir.parent / ".locks"
+    lock_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return FileLock(str(lock_dir / f"{bridge_dir.name}.injection.lock"), mode=0o600)
+
+
 def _serialize_bridge_injection(function: _InjectionFunction) -> _InjectionFunction:
-    """Serialize complete tmux injection operations for each bridge directory."""
+    """Serialize complete tmux injection operations across threads and processes."""
 
     @functools.wraps(function)
     def wrapped(bridge_dir: Path, *args: Any, **kwargs: Any) -> Any:
-        key = os.path.normcase(os.path.abspath(os.fspath(bridge_dir)))
-        with _INJECTION_LOCKS_GUARD:
-            lock = _INJECTION_LOCKS.setdefault(key, threading.Lock())
-        with lock:
+        with _bridge_injection_lock(bridge_dir), _bridge_injection_file_lock(bridge_dir):
             return function(bridge_dir, *args, **kwargs)
 
     return cast(_InjectionFunction, wrapped)
@@ -347,6 +360,28 @@ _OCCUPIED_INPUT_DISMISS_RETRY_INTERVAL_S = 0.75
 SWITCH_MODEL_DIALOG_HINT = "Switch model?"
 EFFORT_DIALOG_HINT = "Change effort level?"
 _CONFIRM_DIALOG_HINTS = (SWITCH_MODEL_DIALOG_HINT, EFFORT_DIALOG_HINT)
+# Only this informational notice is acknowledged automatically. The gateway
+# varies; all decision text and the continuation footer must match exactly.
+_AUTO_MODE_BILLING_NOTICE = re.compile(
+    re.escape(
+        (
+            "We're changing auto mode to no longer charge for classifier requests "
+            "in Claude Code. However, this session isn't eligible because your "
+            "requests go through "
+        ).replace(" ", "")
+    )
+    + r"[A-Za-z0-9._:/-]+"
+    + re.escape(
+        (
+            ", which isn't compatible with this update. "
+            "Nothing breaks: auto mode keeps working, and its classifier requests "
+            "are billed as before. To fix it and access the new version of auto mode, "
+            "ask your gateway to implement: "
+            "https://code.claude.com/docs/en/auto-mode-classifier-billing "
+            "Enter to continue · Esc to cancel"
+        ).replace(" ", "")
+    )
+)
 # Footer rows the ctrl+r prompt-history search renders directly under the
 # input box's closing rule since Claude Code 2.1.212, where the search rides
 # the framed composer as its filter field instead of drawing its own overlay.
@@ -4634,7 +4669,11 @@ def _read_settled_permission_mode(
     """
     deadline = time.monotonic() + _MODE_FOOTER_SETTLE_TIMEOUT_S
     while True:
-        mode = _permission_mode_from_pane(_capture_pane(socket_path, tmux_target))
+        pane = _capture_pane(socket_path, tmux_target)
+        if auto_mode_billing_notice_visible(pane):
+            _acknowledge_auto_mode_billing_notice(socket_path, tmux_target)
+            pane = _capture_pane(socket_path, tmux_target)
+        mode = _permission_mode_from_pane(pane)
         if mode is not None and mode != previous:
             return mode
         if time.monotonic() >= deadline:
@@ -4644,6 +4683,7 @@ def _read_settled_permission_mode(
         time.sleep(_MODE_FOOTER_POLL_INTERVAL_S)
 
 
+@_serialize_bridge_injection
 def set_permission_mode(
     bridge_dir: Path,
     *,
@@ -5138,6 +5178,92 @@ def has_pending_user_prompt(bridge_dir: Path) -> bool:
     return _user_prompt_visible(_capture_pane(socket_path, target))
 
 
+def auto_mode_billing_notice_visible(pane: str) -> bool:
+    """Recognize the exact informational notice below the live pane's last rule."""
+    if _composer_row(pane) is not None:
+        return False
+    lines = pane.splitlines()
+    rules = [index for index, line in enumerate(lines) if _is_box_rule(line)]
+    if not rules:
+        return False
+    # Ignore transcript text above the dialog; tolerate terminal line wrapping,
+    # including wraps within the gateway hostname and documentation URL.
+    body = "".join("".join(lines[rules[-1] + 1 :]).split())
+    return _AUTO_MODE_BILLING_NOTICE.fullmatch(body) is not None
+
+
+def _acknowledge_auto_mode_billing_notice(socket_path: str, tmux_target: str) -> bool:
+    """Confirm the notice on fresh frames before each bounded Enter attempt."""
+    deadline = time.monotonic() + _CONFIRM_DIALOG_ACCEPT_TIMEOUT_S
+    last_enter: float | None = None
+    confirmed = False
+    while time.monotonic() < deadline:
+        pane = _capture_pane(socket_path, tmux_target)
+        if not auto_mode_billing_notice_visible(pane):
+            return last_enter is not None
+        now = time.monotonic()
+        if not confirmed:
+            confirmed = True
+        elif last_enter is None or now - last_enter >= _CONFIRM_DIALOG_RETRY_INTERVAL_S:
+            _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+            _logger.info("claude-native: acknowledged auto-mode classifier-billing notice")
+            last_enter = now
+        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+    return last_enter is not None
+
+
+def bridge_dir_from_launch_args(args: Sequence[str]) -> Path | None:
+    """Read the stable bridge identity from the generated invocation settings path."""
+    found: Path | None = None
+    for index, arg in enumerate(args):
+        if arg == "--settings" and index + 1 < len(args):
+            value = args[index + 1]
+        elif arg.startswith("--settings="):
+            value = arg.partition("=")[2]
+        else:
+            continue
+        path = Path(value)
+        if path.is_absolute() and path.name == _INVOCATION_SETTINGS_FILE:
+            found = path.parent
+    return found
+
+
+def acknowledge_auto_mode_billing_notice(
+    bridge_dir: Path,
+    *,
+    expected_socket_path: str | None = None,
+    expected_tmux_target: str | None = None,
+) -> bool:
+    """Acknowledge a live notice without waiting for another pane writer's lock.
+
+    Called only by the runner's terminal watcher. A cached frame is insufficient:
+    re-read the pane under the same locks used by message and mode injections.
+    """
+    lock = _bridge_injection_lock(bridge_dir)
+    if not lock.acquire(blocking=False):
+        return False
+    try:
+        try:
+            with _bridge_injection_file_lock(bridge_dir).acquire(timeout=0):
+                info = _read_json_file(bridge_dir / _TMUX_FILE)
+                if not isinstance(info, dict):
+                    return False
+                socket_path, target = info.get("socket_path"), info.get("tmux_target")
+                if not isinstance(socket_path, str) or not isinstance(target, str):
+                    return False
+                if expected_socket_path is not None and socket_path != expected_socket_path:
+                    return False
+                if expected_tmux_target is not None and target != expected_tmux_target:
+                    return False
+                if _has_approval_wait(bridge_dir):
+                    return False
+                return _acknowledge_auto_mode_billing_notice(socket_path, target)
+        except FileLockTimeout:
+            return False
+    finally:
+        lock.release()
+
+
 def _restore_occupied_input(
     socket_path: str, tmux_target: str, *, bridge_dir: Path | None = None
 ) -> None:
@@ -5189,6 +5315,9 @@ def _restore_occupied_input(
                 "Answer the pending Claude question or permission request "
                 "before sending a message."
             )
+        if auto_mode_billing_notice_visible(pane):
+            _acknowledge_auto_mode_billing_notice(socket_path, tmux_target)
+            return
         surface = _occupying_surface(pane)
         if surface is None:
             return
@@ -5598,9 +5727,12 @@ def _wait_for_claude_prompt_ready(
             empty_polls += 1
         if _claude_prompt_rendered(pane):
             return
+        billing_notice = auto_mode_billing_notice_visible(pane)
+        if billing_notice:
+            _acknowledge_auto_mode_billing_notice(socket_path, tmux_target)
         # A dialog seen on two consecutive polls is real; one frame can be a
         # repaint artifact. Fail now rather than stalling to the cap.
-        headline = _terminal_dialog_headline(pane)
+        headline = None if billing_notice else _terminal_dialog_headline(pane)
         if headline is not None and headline == dialog_headline:
             raise ClaudeTerminalDialog(
                 f"Claude Code is waiting for an answer in its terminal ({headline}), "
