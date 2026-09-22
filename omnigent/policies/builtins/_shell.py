@@ -175,6 +175,24 @@ def spawns_gated_command_as_child(tokens: list[str]) -> bool:
     return bool(tokens) and tokens[0].rsplit("/", 1)[-1] in PROCESS_SPAWNING_UTILITIES
 
 
+def is_shell_interpreter(tokens: list[str]) -> bool:
+    """
+    Whether the real command is a shell interpreter (:data:`SHELL_INTERPRETERS`).
+
+    A shell interpreter invoked without a ``-c`` command string reads its
+    program from stdin or a script file (``printf '…' | sh``, ``sh script.sh``,
+    a bare ``sh``). That program is opaque to this parser —
+    :func:`unwrap_shell_command` returns ``None`` — so a gated ``git push``
+    hidden in it would produce no op and the policy would abstain → ALLOW. A
+    policy should surface such an unclassifiable interpreter path for approval
+    rather than allow it. Matched on the basename so ``/bin/sh`` counts too.
+
+    :param tokens: The output of :func:`real_invocation_tokens`.
+    :returns: ``True`` when the head is a shell interpreter with no ``-c``.
+    """
+    return bool(tokens) and tokens[0].rsplit("/", 1)[-1] in SHELL_INTERPRETERS
+
+
 def _extract_command_substitutions(command: str) -> tuple[str, list[str]]:
     """
     Pull ``$(...)`` and backtick command-substitution bodies out of a command.

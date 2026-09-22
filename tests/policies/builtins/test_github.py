@@ -488,6 +488,41 @@ def test_shell_process_spawning_utility_without_gated_keyword_abstains(benign: s
     assert policy(_sh(benign)) is None
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "printf %s 'git push https://github.com/octo/secret main' | sh",
+        "echo 'git push https://github.com/octo/secret main' | bash",
+        "sh -s",
+        "sh script.sh",
+        "sh",
+    ],
+)
+def test_shell_stdin_interpreter_is_surfaced(command: str) -> None:
+    """A shell interpreter reading its program from stdin or a script is surfaced.
+
+    Without a ``-c`` string the interpreter's program is opaque to the parser —
+    for ``… | sh`` the gated push even lives in a different segment — so the
+    segment produced no op and the policy abstained → ALLOW. It is now surfaced
+    for approval (ASK) instead of allowed.
+    """
+    policy = github_policy(write_repos=[_REPO])
+    assert _action(policy(_sh(command))) == "ASK"
+
+
+def test_shell_interpreter_with_c_string_still_classified() -> None:
+    """Interpreters with a readable ``-c`` string are unwrapped as before.
+
+    ``sh -c`` / ``bash -lc`` must keep unwrapping to the inner command (so a
+    disallowed push still DENYs and a benign command still abstains) rather than
+    being blanket-surfaced by the new stdin-interpreter path.
+    """
+    policy = github_policy(write_repos=[_REPO])
+    denied = policy(_sh('bash -c "git push https://github.com/octo/secret main"'))
+    assert denied is not None and denied["result"] == "DENY"
+    assert policy(_sh('sh -c "ls -la"')) is None
+
+
 def test_shell_clone_read_allowed_and_denied() -> None:
     """git clone is a read: allowed for an allowlisted repo, denied otherwise."""
     policy = github_policy(read_all=False, read_repos=[_REPO])
