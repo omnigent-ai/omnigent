@@ -4,7 +4,6 @@ import { createElement, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   CONNECTED_STREAM_REFETCH_INTERVAL_MS,
-  DISCONNECTED_STREAM_REFETCH_INTERVAL_MS,
   type Conversation,
   type ConversationsPage,
 } from "@/hooks/useConversations";
@@ -479,7 +478,7 @@ describe("useCanvasSessions", () => {
     expect(identity.authenticatedFetch).toHaveBeenCalledTimes(1);
   });
 
-  it("polls again after each disconnected interval while the page is visible", async () => {
+  it("polls every base interval while disconnected", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     vi.mocked(identity.authenticatedFetch).mockImplementation(async () =>
       jsonResponse(page([], null, false)),
@@ -490,18 +489,13 @@ describe("useCanvasSessions", () => {
     await waitFor(() => expect(result.current.complete).toBe(true));
     expect(identity.authenticatedFetch).toHaveBeenCalledTimes(1);
 
-    // The poll fires on the first base tick at/after the due interval, so give
-    // it the due window plus one tick's slack.
+    // Disconnected: a poll fires on every base tick, unchanged from before.
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(
-        DISCONNECTED_STREAM_REFETCH_INTERVAL_MS + SESSION_POLL_INTERVAL_MS,
-      );
+      await vi.advanceTimersByTimeAsync(SESSION_POLL_INTERVAL_MS + 50);
     });
     expect(identity.authenticatedFetch).toHaveBeenCalledTimes(2);
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(
-        DISCONNECTED_STREAM_REFETCH_INTERVAL_MS + SESSION_POLL_INTERVAL_MS,
-      );
+      await vi.advanceTimersByTimeAsync(SESSION_POLL_INTERVAL_MS + 50);
     });
     expect(identity.authenticatedFetch).toHaveBeenCalledTimes(3);
   });
@@ -518,13 +512,14 @@ describe("useCanvasSessions", () => {
     await waitFor(() => expect(result.current.complete).toBe(true));
     expect(identity.authenticatedFetch).toHaveBeenCalledTimes(1);
 
-    // A disconnected interval elapses but the connected one hasn't: no poll yet.
+    // Connected: the first base tick is skipped, so no poll at 30s.
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(DISCONNECTED_STREAM_REFETCH_INTERVAL_MS + 50);
+      await vi.advanceTimersByTimeAsync(SESSION_POLL_INTERVAL_MS + 50);
     });
     expect(identity.authenticatedFetch).toHaveBeenCalledTimes(1);
 
-    // Past the connected interval: the cold-tail reconciliation poll fires.
+    // The second base tick reaches the connected cadence (60s): the cold-tail
+    // reconciliation poll fires.
     await act(async () => {
       await vi.advanceTimersByTimeAsync(SESSION_POLL_INTERVAL_MS);
     });

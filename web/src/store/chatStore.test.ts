@@ -3376,6 +3376,45 @@ describe("chatStore — sendSlashCommand", () => {
     expect(lastEventBody().data).toEqual({ kind: "skill", name: "deslop", arguments: "" });
   });
 
+  /** Count of `["conversations"]` invalidations recorded by the spy. */
+  function conversationInvalidations(spy: ReturnType<typeof vi.spyOn>): number {
+    return spy.mock.calls.filter(
+      ([arg]: unknown[]) =>
+        typeof arg === "object" &&
+        arg !== null &&
+        "queryKey" in arg &&
+        Array.isArray((arg as { queryKey: unknown[] }).queryKey) &&
+        (arg as { queryKey: unknown[] }).queryKey[0] === "conversations",
+    ).length;
+  }
+
+  it("invalidates conversations after a slash command while the stream is disconnected", async () => {
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+    });
+    vi.spyOn(sessionUpdatesSocket, "isConnected").mockReturnValue(false);
+    const spy = vi.spyOn(client, "invalidateQueries");
+
+    await useChatStore.getState().sendSlashCommand("grill-me", "review", "agent_xyz");
+
+    expect(conversationInvalidations(spy)).toBe(1);
+  });
+
+  it("skips the conversations invalidation after a slash command while connected", async () => {
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+    });
+    const connected = vi.spyOn(sessionUpdatesSocket, "isConnected").mockReturnValue(true);
+    const spy = vi.spyOn(client, "invalidateQueries");
+
+    await useChatStore.getState().sendSlashCommand("grill-me", "review", "agent_xyz");
+
+    expect(conversationInvalidations(spy)).toBe(0);
+    connected.mockRestore();
+  });
+
   it("sets streaming status and pushes an optimistic echo of the typed command", async () => {
     useChatStore.setState({
       conversationId: "conv_existing",
