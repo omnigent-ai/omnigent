@@ -32,6 +32,7 @@ import {
 } from "@/lib/sessionModelLabelCache";
 import { serializeReplyDraft, type StoredReplyDraft } from "@/lib/replyDraft";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "@/lib/composerSendShortcutPreferences";
+import { composerContextToLabels } from "@/lib/composerContextAdapters";
 import { CHAT_COLUMN_WIDTH } from "./chatLayout";
 
 // Composer reads workspace files via a TanStack query hook (for "@"-file
@@ -119,13 +120,18 @@ vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
 // HostBadge now renders in the composer's status-line tray and reads the
 // session's host binding via TanStack Query. Stub the hooks so it self-hides
 // (no host bound) without needing a QueryClient provider around these renders.
-const { composerSnapshotHost } = vi.hoisted(() => ({
-  composerSnapshotHost: { id: null as string | null },
+const { composerSessionSnapshot } = vi.hoisted(() => ({
+  composerSessionSnapshot: {
+    hostId: null as string | null,
+    workspace: null as string | null,
+    labels: {} as Record<string, string>,
+    gitBranch: null as string | null,
+  },
 }));
 vi.mock("@/hooks/useSession", async (importOriginal) => ({
   ...(await importOriginal<typeof UseSessionModule>()),
   useSession: () => ({
-    session: { hostId: composerSnapshotHost.id },
+    session: composerSessionSnapshot,
     isLoading: false,
     error: null,
   }),
@@ -1451,7 +1457,7 @@ describe("Composer cached model labels", () => {
     });
   beforeEach(() => {
     localStorage.clear();
-    composerSnapshotHost.id = scope.hostId;
+    composerSessionSnapshot.hostId = scope.hostId;
     vi.spyOn(host, "getOmnigentServerIdentity").mockReturnValue("server-a");
     vi.spyOn(identity, "getCurrentUserId").mockReturnValue("user-a");
     setComposerState({
@@ -1470,7 +1476,7 @@ describe("Composer cached model labels", () => {
   });
   afterEach(() => {
     cleanup();
-    composerSnapshotHost.id = null;
+    composerSessionSnapshot.hostId = null;
     vi.restoreAllMocks();
     localStorage.clear();
     useChatStore.setState({ sessionModelSeeded: false, sessionHostId: null, boundAgentId: null });
@@ -1551,7 +1557,7 @@ describe("Composer cached model labels", () => {
 
   it("does not reuse the creation host's cache after the snapshot host changes", () => {
     const first = renderWithTooltips(<Composer {...props()} modelLabelOptions={catalog} />);
-    composerSnapshotHost.id = "new-host";
+    composerSessionSnapshot.hostId = "new-host";
     first.rerender(
       <TooltipProvider>
         <Composer {...props()} codexModelOptions={[]} />
@@ -2047,6 +2053,12 @@ describe("Composer shared visible controls", () => {
     vi.restoreAllMocks();
     childSessionsArgsSpy.mockClear();
     composerChildSessions.children = [];
+    Object.assign(composerSessionSnapshot, {
+      hostId: null,
+      workspace: null,
+      labels: {},
+      gitBranch: null,
+    });
     useChatStore.setState({
       contextWindow: null,
       tokensUsed: null,
@@ -2238,6 +2250,63 @@ describe("Composer shared visible controls", () => {
         hostId: null,
         workspace: null,
       }),
+    );
+  });
+
+  it("prefers the session worktree over the source workspace stored in composer labels", () => {
+    composerGitStatusArgsSpy.mockClear();
+    Object.assign(composerSessionSnapshot, {
+      hostId: "host-worktree",
+      workspace: "/home/alice/worktrees/feature-x",
+      labels: composerContextToLabels({
+        workingDirectory: { kind: "selected", path: "/home/alice/source-repo" },
+        worktree: { kind: "new", branchName: "feature-x", baseBranch: "main" },
+      }),
+      gitBranch: "feature-x",
+    });
+    setComposerGitStatus({
+      branch: "feature-x",
+      branchState: "branch",
+      isWorktree: true,
+      worktreePath: "/home/alice/worktrees/feature-x",
+      creationBranch: "feature-x",
+    });
+    useChatStore.setState({ conversationId: "conv_worktree", gitBranch: "source-branch" });
+
+    renderWithTooltips(<Composer {...composerProps()} />);
+
+    expect(composerGitStatusArgsSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sessionId: "conv_worktree",
+        hostId: "host-worktree",
+        workspace: "/home/alice/worktrees/feature-x",
+        creationBranch: "feature-x",
+      }),
+    );
+    expect(screen.getByTestId("composer-workspace-dir")).toHaveAccessibleName(
+      "Working directory: /home/alice/worktrees/feature-x",
+    );
+    expect(screen.getByTestId("composer-git-branch")).toHaveTextContent("feature-x");
+  });
+
+  it("falls back to the composer label when the session workspace is absent", () => {
+    composerGitStatusArgsSpy.mockClear();
+    Object.assign(composerSessionSnapshot, {
+      workspace: null,
+      labels: composerContextToLabels({
+        workingDirectory: { kind: "selected", path: "/home/alice/legacy-repo" },
+        worktree: { kind: "none" },
+      }),
+    });
+    useChatStore.setState({ conversationId: "conv_legacy_workspace", gitBranch: null });
+
+    renderWithTooltips(<Composer {...composerProps()} />);
+
+    expect(composerGitStatusArgsSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ workspace: "/home/alice/legacy-repo" }),
+    );
+    expect(screen.getByTestId("composer-workspace-dir")).toHaveAccessibleName(
+      "Working directory: /home/alice/legacy-repo",
     );
   });
 

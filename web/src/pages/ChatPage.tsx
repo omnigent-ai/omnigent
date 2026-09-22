@@ -2596,10 +2596,12 @@ function ComposerImpl(
     () => composerContextFromLabels(composerSession?.labels),
     [composerSession?.labels],
   );
-  const composerWorkspace =
-    hydratedComposerContext.workingDirectory.kind === "selected"
+  const sessionWorkspace = composerSession?.workspace;
+  const composerWorkspace = sessionWorkspace?.trim()
+    ? sessionWorkspace
+    : hydratedComposerContext.workingDirectory.kind === "selected"
       ? hydratedComposerContext.workingDirectory.path
-      : composerSession?.workspace;
+      : undefined;
   // Live workspace/branch/PR status for the workspace bar (lane-3 shared hook):
   // the branch comes from the host's `git worktree list`, never a PR head.
   const composerGit = useComposerGitStatus({
