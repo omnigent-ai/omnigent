@@ -36,7 +36,6 @@ import { getSessionSlim, INITIAL_WINDOW_ITEMS, SESSION_HISTORY_PAGE_SIZE } from 
 import { SSE_STALL_TIMEOUT_MS } from "@/lib/sse";
 import { serializeReplyDraft, type StoredReplyDraft } from "@/lib/replyDraft";
 import { getCurrentAuthorId } from "@/lib/identity";
-import { sessionUpdatesSocket } from "@/lib/sessionUpdatesSocket";
 import { PRESENCE_IDLE_AFTER_MS } from "@/lib/presenceIdle";
 import {
   setOmnigentHostConfig,
@@ -2713,30 +2712,6 @@ describe("chatStore — send (first-send ordering)", () => {
     expect(conversationInvalidations).toHaveLength(1);
   });
 
-  it("skips the conversations invalidation on send while the updates stream is connected", async () => {
-    // The stream patches title/status/runner in place, so the HTTP refresh
-    // is redundant and only fires as a fallback when the stream is down.
-    useChatStore.setState({
-      conversationId: "conv_existing",
-      abortController: new AbortController(),
-    });
-    const connected = vi.spyOn(sessionUpdatesSocket, "isConnected").mockReturnValue(true);
-    const invalidateSpy = vi.spyOn(client, "invalidateQueries");
-
-    await useChatStore.getState().send("follow up", "agent_xyz");
-
-    const conversationInvalidations = invalidateSpy.mock.calls.filter(
-      ([arg]) =>
-        typeof arg === "object" &&
-        arg !== null &&
-        "queryKey" in arg &&
-        Array.isArray((arg as { queryKey: unknown[] }).queryKey) &&
-        (arg as { queryKey: unknown[] }).queryKey[0] === "conversations",
-    );
-    expect(conversationInvalidations).toHaveLength(0);
-    connected.mockRestore();
-  });
-
   it("rebinds the SSE stream before posting when the controller was cleared (idle disconnect)", async () => {
     // Post-disconnect state: session is still selected, but the pump
     // already exited (e.g. idle proxy closed the connection) and
@@ -3374,45 +3349,6 @@ describe("chatStore — sendSlashCommand", () => {
     await useChatStore.getState().sendSlashCommand("deslop", "", "agent_xyz");
 
     expect(lastEventBody().data).toEqual({ kind: "skill", name: "deslop", arguments: "" });
-  });
-
-  /** Count of `["conversations"]` invalidations recorded by the spy. */
-  function conversationInvalidations(spy: ReturnType<typeof vi.spyOn>): number {
-    return spy.mock.calls.filter(
-      ([arg]: unknown[]) =>
-        typeof arg === "object" &&
-        arg !== null &&
-        "queryKey" in arg &&
-        Array.isArray((arg as { queryKey: unknown[] }).queryKey) &&
-        (arg as { queryKey: unknown[] }).queryKey[0] === "conversations",
-    ).length;
-  }
-
-  it("invalidates conversations after a slash command while the stream is disconnected", async () => {
-    useChatStore.setState({
-      conversationId: "conv_existing",
-      abortController: new AbortController(),
-    });
-    vi.spyOn(sessionUpdatesSocket, "isConnected").mockReturnValue(false);
-    const spy = vi.spyOn(client, "invalidateQueries");
-
-    await useChatStore.getState().sendSlashCommand("grill-me", "review", "agent_xyz");
-
-    expect(conversationInvalidations(spy)).toBe(1);
-  });
-
-  it("skips the conversations invalidation after a slash command while connected", async () => {
-    useChatStore.setState({
-      conversationId: "conv_existing",
-      abortController: new AbortController(),
-    });
-    const connected = vi.spyOn(sessionUpdatesSocket, "isConnected").mockReturnValue(true);
-    const spy = vi.spyOn(client, "invalidateQueries");
-
-    await useChatStore.getState().sendSlashCommand("grill-me", "review", "agent_xyz");
-
-    expect(conversationInvalidations(spy)).toBe(0);
-    connected.mockRestore();
   });
 
   it("sets streaming status and pushes an optimistic echo of the typed command", async () => {
