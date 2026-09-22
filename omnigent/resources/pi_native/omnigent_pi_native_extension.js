@@ -426,6 +426,56 @@ function mcpInputRequired(json) {
 }
 
 /**
+ * Bounded classification for a 2xx ``/mcp`` reply that is not an MCP JSON body.
+ *
+ * ``resp.ok`` is not proof of a JSON answer: an authenticating edge (reverse
+ * proxy, IdP) in front of the server can answer any route with a sign-in
+ * document and status 200. The text names the classification only — never the
+ * body, headers, or URL — because a sign-in document routinely carries tokens
+ * and tenant identifiers.
+ */
+function nonJsonMcpPiResult() {
+  return {
+    content: [
+      {
+        type: "text",
+        text:
+          "Omnigent tool call failed: the server answered 2xx with a non-JSON " +
+          "body, which usually means an authenticating proxy or sign-in page " +
+          "answered instead of Omnigent. Re-authenticate and retry.",
+      },
+    ],
+    isError: true,
+  };
+}
+
+/**
+ * False when ``resp`` declares a content type that is not JSON.
+ *
+ * A declared ``text/html`` (the sign-in case) is rejected. An absent or
+ * unreadable content type is not treated as a signal, so the parse attempt
+ * stays the decider there.
+ */
+function mcpContentTypeIsJson(resp) {
+  let declared = null;
+  try {
+    // Both the property read and the lookup are inside the try: a `headers`
+    // getter can throw just as `get()` can.
+    const headers = resp && resp.headers;
+    if (headers && typeof headers.get === "function") {
+      declared = headers.get("content-type");
+    }
+  } catch (_headerErr) {
+    // An unreadable header is not a signal, so fall through to the parse.
+    // Swallow it here: letting it reach the outer catch would put its message —
+    // which can quote header or body text — into the tool result.
+    return true;
+  }
+  if (typeof declared !== "string" || declared.trim() === "") return true;
+  return /^application\/(?:[\w.+-]+\+)?json\s*(?:;|$)/i.test(declared.trim());
+}
+
+/**
  * POST a single JSON-RPC ``tools/call`` to the server's per-session MCP proxy
  * and return the parsed response (or a fail-closed Pi tool-result on a
  * transport/HTTP error). ``extraParams`` carries the MRTR retry fields
@@ -466,7 +516,16 @@ async function postMcpToolsCall(config, toolName, args, rpcId, extraParams) {
         },
       };
     }
-    return { json: await resp.json() };
+    // Status, content type, and parseability must all agree before this body is
+    // treated as an MCP response. A parse failure is classified here rather
+    // than by the outer catch, whose message would echo the offending body back
+    // through ``err.message``.
+    if (!mcpContentTypeIsJson(resp)) return { piResult: nonJsonMcpPiResult() };
+    try {
+      return { json: await resp.json() };
+    } catch (_parseErr) {
+      return { piResult: nonJsonMcpPiResult() };
+    }
   } catch (err) {
     return {
       piResult: {
@@ -880,6 +939,16 @@ async function triggerCompaction(config, ctx, customInstructions) {
  *   - Applied: return true. The paired ``model_select`` handler mirrors the
  *     resulting model back to Omnigent, so the web pill reflects the switch.
  */
+const inferenceProviderIds = new Set([
+  "omnigent",
+  "omnigent-openai",
+  "omnigent-completions",
+]);
+
+function hasInferenceBinding() {
+  return process.env.OMNIGENT_PI_INFERENCE_BOUND === "1";
+}
+
 async function applyModelChange(pi, config, ctx, modelId) {
   const id = typeof modelId === "string" ? modelId.trim() : "";
   if (!id) return false;
@@ -906,9 +975,24 @@ async function applyModelChange(pi, config, ctx, modelId) {
   }
   let model;
   try {
-    const models = listModels();
+    const models = listModels().filter(
+      (candidate) =>
+        !hasInferenceBinding() ||
+        (candidate && inferenceProviderIds.has(candidate.provider)),
+    );
     const separator = id.indexOf("/");
-    if (separator > 0) {
+    if (hasInferenceBinding()) {
+      // Profile IDs are literal, including slashes that resemble Pi providers.
+      model = models.find((candidate) => candidate && candidate.id === id);
+      if (!model && separator > 0 && inferenceProviderIds.has(id.slice(0, separator))) {
+        model = models.find(
+          (candidate) =>
+            candidate &&
+            candidate.provider === id.slice(0, separator) &&
+            candidate.id === id.slice(separator + 1),
+        );
+      }
+    } else if (separator > 0) {
       const provider = id.slice(0, separator);
       const bareId = id.slice(separator + 1);
       model = models.find(
@@ -976,6 +1060,7 @@ function modelReference(model) {
   const modelId = model && typeof model.id === "string" ? model.id : "";
   if (!modelId) return "";
   const provider = model && typeof model.provider === "string" ? model.provider : "";
+  if (hasInferenceBinding() && inferenceProviderIds.has(provider)) return modelId;
   return provider ? `${provider}/${modelId}` : modelId;
 }
 
@@ -1016,6 +1101,7 @@ async function postModelOptions(config, ctx) {
   const options = [];
   const seen = new Set();
   for (const model of models) {
+    if (hasInferenceBinding() && (!model || !inferenceProviderIds.has(model.provider))) continue;
     const modelId = model && typeof model.id === "string" ? model.id : "";
     const id = modelReference(model);
     if (!id || seen.has(id)) continue;
@@ -1038,6 +1124,7 @@ function startInboxPoller(
   handleCompact,
   handleModelChange,
   handleThinkingLevelChange,
+  isTurnActive,
 ) {
   if (!config || !config.inboxDir || pi.__omnigentInboxPoller) return;
   // Bound the dedup set (FIFO eviction) — delivered files are unlinked, so a
@@ -1083,8 +1170,21 @@ function startInboxPoller(
         payload.type === "user_message" &&
         typeof payload.content === "string"
       ) {
+        // Mid-turn messages must STEER into the active turn: the Pi SDK
+        // holds deliverAs "followUp" until the whole agent loop finishes, so
+        // a web "Send now" delivered as a follow-up stays visibly queued in
+        // the Pi CLI even though the web UI already reported success. When
+        // the agent is idle, keep "followUp" — it starts the next turn
+        // immediately, preserving initiating-message behavior. A turn ending
+        // between this check and the send is benign: the message still
+        // reaches Pi's queue, and a throw leaves the file for the next tick,
+        // which recomputes the mode.
+        const deliverAs =
+          typeof isTurnActive === "function" && isTurnActive()
+            ? "steer"
+            : "followUp";
         try {
-          pi.sendUserMessage(payload.content, { deliverAs: "followUp" });
+          pi.sendUserMessage(payload.content, { deliverAs });
         } catch (_err) {
           // Leave the file to retry next tick, capped by attempt count.
           const key = id ?? fullPath;
@@ -1768,6 +1868,13 @@ module.exports = function (pi) {
         triggerCompaction(config, latestContext, customInstructions),
       (model) => applyModelChange(pi, config, latestContext, model),
       (level) => pi.setThinkingLevel(level),
+      () => {
+        // Prefer the SDK's live idle signal; fall back to the agent loop
+        // state on SDK versions that don't expose isIdle() (same fallback
+        // as requestInterrupt).
+        const idle = safeIsIdle(latestContext);
+        return idle === null ? agentRunning : !idle;
+      },
     );
     const nativeSessionId =
       ctx && ctx.sessionManager && ctx.sessionManager.getSessionId

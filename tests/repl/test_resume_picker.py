@@ -987,12 +987,13 @@ async def test_cross_agent_picker_lists_without_agent_id_filter() -> None:
     result = await pick_conversation_cross_agent_from_sdk(client, out=out, in_=io.StringIO(""))
     assert result is None
     # Verify the picker hit the cross-agent code path on the Sessions API
-    # (server-side ``has_agent_id`` / ``accessible_by`` gates apply).
+    # (server-side ``has_agent_id`` / ownership gates apply).
     assert client.sessions.last_kwargs == {
         "limit": 200,
         "agent_id": None,
         "agent_name": None,
         "order": "desc",
+        "visibility": "mine",
     }
 
 
@@ -1073,6 +1074,7 @@ async def test_wrapper_label_picker_filters_and_lists_without_agent_filter(
         "agent_id": None,
         "agent_name": None,
         "order": "desc",
+        "visibility": "mine",
     }
     rendered = out.getvalue()
     assert "ad9fa6806e0d3c94166f9b4dafcc1069" in rendered
@@ -1117,7 +1119,7 @@ def test_render_workspace_cell_matching_cwd_no_flag(
     *where* the session was started; only the action-required
     hint is suppressed.
     """
-    from omnigent.claude_native_state import write_launch_state
+    from omnigent.harnesses.claude_native.state import write_launch_state
     from omnigent.repl._resume_picker import _render_workspace_cell
 
     monkeypatch.setenv("OMNIGENT_CLAUDE_NATIVE_STATE_DIR", str(tmp_path / "state"))
@@ -1149,7 +1151,7 @@ def test_render_workspace_cell_mismatched_cwd_shows_cd_flag(
     this row is picked — without it the user has no way to
     anticipate the prompt.
     """
-    from omnigent.claude_native_state import write_launch_state
+    from omnigent.harnesses.claude_native.state import write_launch_state
     from omnigent.repl._resume_picker import _render_workspace_cell
 
     monkeypatch.setenv("OMNIGENT_CLAUDE_NATIVE_STATE_DIR", str(tmp_path / "state"))
@@ -1189,7 +1191,7 @@ def test_workspace_metadata_appears_in_wrapper_picker_list(
     ``show_workspace=True`` somewhere between the wrapper picker
     entry point and item rendering is caught.
     """
-    from omnigent.claude_native_state import write_launch_state
+    from omnigent.harnesses.claude_native.state import write_launch_state
     from omnigent.repl._resume_picker import pick_conversation
 
     monkeypatch.setenv("OMNIGENT_CLAUDE_NATIVE_STATE_DIR", str(tmp_path / "state"))
@@ -1237,7 +1239,7 @@ def test_render_workspace_cell_codex_native_uses_codex_state(
     :param tmp_path: Temporary state root and workspace.
     :returns: None.
     """
-    from omnigent.codex_native_state import write_launch_state
+    from omnigent.harnesses.codex_native.state import write_launch_state
     from omnigent.repl._resume_picker import _render_workspace_cell
 
     monkeypatch.setenv("OMNIGENT_CODEX_NATIVE_STATE_DIR", str(tmp_path / "codex-state"))
@@ -1481,6 +1483,7 @@ class _RateLimitedThenOkSessionsNamespace(_FakeSessionsNamespace):
         """Raise ``RateLimitedError`` until the budget is exhausted."""
         from omnigent_client import RateLimitedError
 
+        assert kwargs["visibility"] == "mine"
         self.calls += 1
         if self.remaining_429 > 0:
             self.remaining_429 -= 1

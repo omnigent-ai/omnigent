@@ -182,24 +182,25 @@ jobs:
           BASE_SHA: ${{ steps.state.outputs.base_sha }}
         run: |
           set -euo pipefail
-          # This gate is meta-CI, not CI itself. Every job this Release workflow
-          # spawns (plan, benchmark, cut, bump-main, …) leaves a check-run on
-          # the base commit; a single premature failure on a prior dispatch
-          # would otherwise poison the SHA and block every retry in a
-          # self-sustaining loop. Exclude *all* check-runs that belong to a run
-          # of this workflow, identified by run ID in details_url — not by job
-          # name, so a real nightly `benchmark` regression (different workflow)
-          # is still gated.
-          own_runs="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/release.yml/runs?head_sha=${BASE_SHA}&per_page=100&status=completed" \
-            --jq '.workflow_runs[].id' 2>/dev/null | paste -sd, -)"
+          # Release and PR-management jobs run from main without testing its code.
+          # Exclude their workflow run IDs, preserving real CI with similar job names.
+          # Include this run explicitly in case the API has not indexed it yet.
+          ignored_runs="${GITHUB_RUN_ID}"
+          # workflow_run approval relays also attach checks to main, not the PR head.
+          # Revisit these exclusions if any listed workflow starts validating release code.
+          for workflow in release.yml merge-ready.yml polly-review.yml polly-review-approval-dispatch.yml; do
+            workflow_runs="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${workflow}/runs?head_sha=${BASE_SHA}&per_page=100" \
+              --paginate --jq '.workflow_runs[].id')"
+            ignored_runs="${ignored_runs}"$'\n'"${workflow_runs}"
+          done
+          ignored_runs="$(printf '%s\n' "$ignored_runs" | paste -sd, -)"
           runs="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${BASE_SHA}/check-runs?per_page=100" \
             --paginate --jq '.check_runs[] | [.name, .status, .conclusion // "-", .details_url] | @tsv')"
-          # Drop check-runs whose details_url references one of this
-          # workflow's own runs (e.g. .../actions/runs/<id>/job/<id>).
-          runs="$(printf '%s' "$runs" | awk -F'\t' -v rel="$own_runs" '
-            BEGIN { n=split(rel, a, ","); for (i=1; i<=n; i++) if (a[i]!="") runs[a[i]]=1 }
-            { own=0; for (r in runs) if (index($4, "/runs/" r "/")) { own=1; break }
-              if (!own) print $1 "\t" $2 "\t" $3 }')"
+          # Keep URLs in diagnostics so a blocking check can be inspected directly.
+          runs="$(printf '%s' "$runs" | awk -F'\t' -v ignored="$ignored_runs" '
+            BEGIN { n=split(ignored, a, ","); for (i=1; i<=n; i++) if (a[i]!="") runs[a[i]]=1 }
+            { omit=0; for (r in runs) if (index($4, "/runs/" r "/")) { omit=1; break }
+              if (!omit) print }')"
           total="$(printf '%s' "$runs" | grep -c . || true)"
           pending="$(printf '%s' "$runs" | awk -F'\t' '$2 != "completed"' || true)"
           # Cancelled runs are chronically present on main (superseded
@@ -278,7 +279,7 @@ jobs:
           python-version-file: ".python-version"
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v3
+        uses: omnigent-ai/omnigent/.github/actions/setup-uv@25521b2eb074b11ebe51fe5e3eaeb494e20101eb # self-contained setup
         with:
           enable-cache: true
 
@@ -357,7 +358,8 @@ jobs:
           python-version-file: ".python-version"
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v3
+        # This checkout is the previous release and may not contain the local action.
+        uses: omnigent-ai/omnigent/.github/actions/setup-uv@25521b2eb074b11ebe51fe5e3eaeb494e20101eb # self-contained setup
         with:
           enable-cache: true
 
@@ -408,7 +410,7 @@ jobs:
           python-version-file: ".python-version"
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v3
+        uses: omnigent-ai/omnigent/.github/actions/setup-uv@25521b2eb074b11ebe51fe5e3eaeb494e20101eb # self-contained setup
         with:
           enable-cache: true
 
@@ -468,7 +470,7 @@ jobs:
           python-version-file: ".python-version"
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a # v3
+        uses: omnigent-ai/omnigent/.github/actions/setup-uv@25521b2eb074b11ebe51fe5e3eaeb494e20101eb # self-contained setup
         with:
           enable-cache: true
 
@@ -583,7 +585,7 @@ jobs:
           python-version-file: ".python-version"
 
       - name: Install uv
-        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        uses: omnigent-ai/omnigent/.github/actions/setup-uv@25521b2eb074b11ebe51fe5e3eaeb494e20101eb # self-contained setup
         with:
           enable-cache: false
 

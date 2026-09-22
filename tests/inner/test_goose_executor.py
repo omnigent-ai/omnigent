@@ -945,6 +945,9 @@ async def test_close_terminates_process() -> None:
     mock_proc = MagicMock()
     mock_proc.stdin = MagicMock()
     mock_proc.returncode = None
+    # pid=None routes the tree-aware teardown helpers down their no-pid
+    # branch, which signals this handle directly and makes no OS calls.
+    mock_proc.pid = None
 
     async def fake_wait() -> int:
         return 0
@@ -958,11 +961,19 @@ async def test_close_terminates_process() -> None:
 
 @pytest.mark.asyncio
 async def test_close_kills_when_terminate_raises() -> None:
+    """A graceful teardown that does not complete escalates to a force kill.
+
+    Tree-aware teardown swallows the terminate error itself, so the escalation
+    is driven by the wait that follows never completing.
+    """
     executor = GooseExecutor()
     mock_proc = MagicMock()
     mock_proc.stdin = MagicMock()
     mock_proc.terminate.side_effect = OSError("gone")
     mock_proc.returncode = None
+    # pid=None routes the tree-aware teardown helpers down their no-pid
+    # branch, which signals this handle directly and makes no OS calls.
+    mock_proc.pid = None
     executor._proc = mock_proc
     await executor.close()  # must not propagate
     mock_proc.kill.assert_called_once()
@@ -998,6 +1009,9 @@ def _stdout_proc(*lines: str) -> MagicMock:
     )
     proc = MagicMock()
     proc.stdout = mock_stdout
+    # pid=None routes the tree-aware teardown helpers down their no-pid
+    # branch, which signals this handle directly and makes no OS calls.
+    proc.pid = None
     return proc
 
 

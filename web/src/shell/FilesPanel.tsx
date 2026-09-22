@@ -10,7 +10,7 @@ import {
   SlidersHorizontalIcon,
   XIcon,
 } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useParams } from "@/lib/routing";
 import { useSession } from "@/hooks/useSession";
 import { isOwnerLevel } from "@/lib/permissionsApi";
@@ -309,21 +309,28 @@ export function FilesPanel({
   // workspace they can already read.
   const locationParam = relativizeToWorkspace(browseLocation, workspaceRoot);
 
-  function navigateTo(absolutePath: string) {
-    setBrowseError(null);
-    const next = absolutePath === workspaceRoot ? null : absolutePath;
-    if (conversationId) {
-      if (next === null) browseLocationCache.delete(conversationId);
-      else browseLocationCache.set(conversationId, next);
-    }
-    setBrowseLocation(next);
-  }
+  const navigateTo = useCallback(
+    (absolutePath: string) => {
+      setBrowseError(null);
+      const next = absolutePath === workspaceRoot ? null : absolutePath;
+      if (conversationId) {
+        if (next === null) browseLocationCache.delete(conversationId);
+        else browseLocationCache.set(conversationId, next);
+      }
+      setBrowseLocation(next);
+    },
+    [workspaceRoot, conversationId],
+  );
 
+  // Stable so memo(TreeNodeRow) isn't busted on every FilesPanel re-render.
   /** Re-root onto a directory of the current tree (double-click to open). */
-  function navigateToChild(relativePath: string) {
-    if (!workingDir) return;
-    navigateTo(`${workingDir.replace(/\/$/, "")}/${relativePath}`);
-  }
+  const navigateToChild = useCallback(
+    (relativePath: string) => {
+      if (!workingDir) return;
+      navigateTo(`${workingDir.replace(/\/$/, "")}/${relativePath}`);
+    },
+    [workingDir, navigateTo],
+  );
 
   /**
    * Open a file the TREE named. Tree paths are relative to the browsed
@@ -335,9 +342,12 @@ export function FilesPanel({
    * `/tmp` would be looked up by its bare name under the workspace root and
    * 404.
    */
-  function openTreeFile(path: string) {
-    onFileSelect(joinBrowseLocation(locationParam, path));
-  }
+  const openTreeFile = useCallback(
+    (path: string) => {
+      onFileSelect(joinBrowseLocation(locationParam, path));
+    },
+    [onFileSelect, locationParam],
+  );
 
   const allFilesQuery = useWorkspaceAllFiles(conversationId, { enabled: !flatView }, locationParam);
   // A refused location must say so on the bar. Rendering an empty tree instead
@@ -376,6 +386,17 @@ export function FilesPanel({
     }, 300);
     return () => clearTimeout(timer);
   }, [treeSearch, treeInclude, treeExclude]);
+
+  // Exit search when a folder is revealed from the results. Clears BOTH the raw
+  // and debounced queries: FolderTree renders search mode off the debounced
+  // value, so clearing only `treeSearch` would leave the flat results list up
+  // for the ~300ms debounce window — during which the tree's reveal scroll
+  // fires against rows that aren't mounted yet and never re-fires. Clearing the
+  // debounced value too drops back to the tree synchronously so the scroll lands.
+  const exitTreeSearch = useCallback(() => {
+    setTreeSearch("");
+    setDebouncedTreeSearch("");
+  }, []);
 
   // Only fire search queries on the Explore tab. The include/exclude globs
   // narrow an active text query; globs alone do not search.
@@ -587,12 +608,18 @@ export function FilesPanel({
             sort={changedSort}
             runnerWentOffline={runnerWentOffline}
             searchQuery={debouncedTreeSearch}
-            searchResults={treeSearchQuery.data}
+            // Suppress keep-previous placeholder data: while a new query is in
+            // flight React Query returns the PRIOR term's results (isPlaceholderData),
+            // which would otherwise render as if they matched the new term. Drop
+            // them so the tree shows "Searching…" until the real results land.
+            searchResults={treeSearchQuery.isPlaceholderData ? undefined : treeSearchQuery.data}
             isSearching={treeSearchQuery.isFetching}
             isSearchError={treeSearchQuery.isError}
             searchError={treeSearchQuery.error instanceof Error ? treeSearchQuery.error : null}
             browseLocation={locationParam}
             onNavigateDir={navigateToChild}
+            onExitSearch={exitTreeSearch}
+            scrollParentRef={scrollRef}
           />
         )}
       </section>

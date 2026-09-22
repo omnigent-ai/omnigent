@@ -6,14 +6,13 @@ import asyncio
 import logging
 import re
 import time
-from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 from omnigent.entities.conversation import (
     DEFAULT_GENERATED_TITLE_MAX_CHARS,
     USER_SESSION_TITLE_MAX_CHARS,
-    synthesize_conversation_title,
 )
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.harness_plugins import background_title_generators
@@ -27,6 +26,13 @@ if TYPE_CHECKING:
 
 _logger = logging.getLogger(__name__)
 
+BACKGROUND_SESSION_TITLES_HEADER = "x-omnigent-background-session-titles"
+
+
+def background_session_titles_enabled(headers: Mapping[str, str]) -> bool:
+    """Resolve the browser-local title preference from a request header."""
+    return headers.get(BACKGROUND_SESSION_TITLES_HEADER, "on").lower() != "off"
+
 
 def _background_session_title_harness_supported(harness: str | None) -> bool:
     """Return whether a known session harness may run automatic title inference."""
@@ -38,7 +44,7 @@ def _background_session_title_harness_supported(harness: str | None) -> bool:
 
 @dataclass(frozen=True)
 class BackgroundTitleRequest:
-    """Immutable session inputs captured after the first prompt is forwarded."""
+    """Immutable session inputs for isolated title inference."""
 
     session_id: str
     prompt: str
@@ -116,7 +122,7 @@ class RunnerBackgroundTitleGenerator:
 
 
 class BackgroundSessionTitleCoordinator:
-    """Run one guarded title attempt outside the user turn's critical path."""
+    """Coordinate background titles and policy-aware agent rename requests."""
 
     def __init__(
         self,
@@ -139,6 +145,45 @@ class BackgroundSessionTitleCoordinator:
         self._pending: set[asyncio.Task[None]] = set()
         self._scheduled_session_ids: set[str] = set()
         self._scheduled_task_summary_ids: set[str] = set()
+
+    async def format_agent_title(self, request: BackgroundTitleRequest) -> str | None:
+        """Apply configured title requirements without changing the stored title.
+
+        Without custom requirements, the agent's proposed title is used as-is.
+        Generation failures leave the existing title intact rather than falling
+        back to a proposal that may violate the configured format.
+        """
+        if not self._additional_instructions or not self._additional_instructions.strip():
+            return request.prompt
+        request = replace(request, additional_instructions=self._additional_instructions)
+        try:
+            async with asyncio.timeout(self._timeout_seconds), self._generation_slots:
+                return await self._generate_title(request)
+        except Exception:  # noqa: BLE001
+            _logger.warning(
+                "agent session title generation failed session=%s",
+                request.session_id,
+                exc_info=True,
+            )
+            return None
+
+    async def _generate_title(self, request: BackgroundTitleRequest) -> str | None:
+        generated = await asyncio.wait_for(
+            self._generator(request),
+            timeout=self._timeout_seconds,
+        )
+        has_custom_instructions = bool(
+            request.additional_instructions and request.additional_instructions.strip()
+        )
+        return normalize_background_title(
+            generated,
+            max_chars=(
+                CUSTOM_BACKGROUND_TITLE_MAX_CHARS
+                if has_custom_instructions
+                else BACKGROUND_TITLE_MAX_CHARS
+            ),
+            truncate_overflow=has_custom_instructions,
+        )
 
     def schedule(
         self,
@@ -248,23 +293,7 @@ class BackgroundSessionTitleCoordinator:
                         extra={"session_id": request.session_id},
                     )
                     return
-                generated = await asyncio.wait_for(
-                    self._generator(request),
-                    timeout=self._timeout_seconds,
-                )
-            has_custom_instructions = bool(
-                request.additional_instructions and request.additional_instructions.strip()
-            )
-            max_chars = (
-                CUSTOM_BACKGROUND_TITLE_MAX_CHARS
-                if has_custom_instructions
-                else BACKGROUND_TITLE_MAX_CHARS
-            )
-            title = normalize_background_title(
-                generated,
-                max_chars=max_chars,
-                truncate_overflow=has_custom_instructions,
-            )
+                title = await self._generate_title(request)
             if title is None:
                 _logger.info(
                     "background session title skipped session=%s "
@@ -383,14 +412,15 @@ class PendingBackgroundSessionTitle:
 
     coordinator: BackgroundSessionTitleCoordinator
     request: BackgroundTitleRequest
-    expected_seed_title: str
 
-    def schedule(self) -> None:
-        """Start the prepared title attempt without blocking the caller."""
+    def schedule(self, *, expected_seed_title: str | None) -> None:
+        """Start the attempt using the title persisted by the active store."""
+        if expected_seed_title is None:
+            return
         self.coordinator.schedule(
             session_id=self.request.session_id,
             prompt=self.request.prompt,
-            expected_seed_title=self.expected_seed_title,
+            expected_seed_title=expected_seed_title,
             agent_id=self.request.agent_id,
             harness_override=self.request.harness_override,
             model_override=self.request.model_override,
@@ -403,10 +433,12 @@ def prepare_background_session_title(
     coordinator: BackgroundSessionTitleCoordinator | None,
     conversation: Conversation,
     event: SessionEventInput,
+    enabled: bool = True,
 ) -> PendingBackgroundSessionTitle | None:
     """Prepare a guarded first-turn title attempt for a top-level session."""
     if (
-        coordinator is None
+        not enabled
+        or coordinator is None
         or conversation.title is not None
         or conversation.parent_conversation_id is not None
         or not _background_session_title_harness_supported(conversation.harness_override)
@@ -417,9 +449,6 @@ def prepare_background_session_title(
     if not prompt:
         return None
 
-    expected_seed_title = synthesize_conversation_title([{"type": "input_text", "text": prompt}])
-    if expected_seed_title is None:
-        return None
     return PendingBackgroundSessionTitle(
         coordinator=coordinator,
         request=BackgroundTitleRequest(
@@ -430,7 +459,6 @@ def prepare_background_session_title(
             model_override=conversation.model_override,
             sub_agent_name=conversation.sub_agent_name,
         ),
-        expected_seed_title=expected_seed_title,
     )
 
 

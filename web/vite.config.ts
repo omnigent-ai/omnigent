@@ -5,6 +5,7 @@ import react from "@vitejs/plugin-react";
 import type { Plugin, ProxyOptions } from "vite";
 import { defineConfig } from "vitest/config";
 import { shikiManualChunk } from "./vite.shiki";
+import { streamdownManualChunk } from "./vite.streamdown";
 
 // Databricks workspace-hosted omnigent is mounted behind the api-proxy at this
 // path; a local / self-hosted server mounts at the root. Mirrors the Python
@@ -216,7 +217,16 @@ function safariLookbehindWorkarounds(): Plugin {
   };
 }
 
-export default defineConfig({
+export default defineConfig(({ command }) => ({
+  // Relative asset base for production builds so the SPA can be served under
+  // any path prefix (e.g. code-server's `/proxy/6767/`), decided purely at
+  // server runtime via OMNIGENT_WEB_BASE_PATH — no separate build needed per
+  // deployment. Dynamic code-split chunks and the Monaco worker then resolve
+  // relative to `import.meta.url` instead of a hardcoded `/assets/...`. The
+  // server rewrites the entry/asset refs in `index.html` to absolute
+  // `{base}/assets/...` at serve time (see `_rewrite_web_ui_index` in
+  // omnigent/server/app.py). Dev (`vite serve`) stays at root.
+  base: command === "build" ? "./" : "/",
   plugins: [safariLookbehindWorkarounds(), react(), tailwindcss()],
   resolve: {
     alias: {
@@ -272,8 +282,8 @@ export default defineConfig({
     emptyOutDir: true,
     rollupOptions: {
       output: {
-        manualChunks: shikiManualChunk,
+        manualChunks: (id: string) => streamdownManualChunk(id) ?? shikiManualChunk(id),
       },
     },
   },
-});
+}));

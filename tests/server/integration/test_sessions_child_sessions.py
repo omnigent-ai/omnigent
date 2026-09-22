@@ -33,10 +33,10 @@ from omnigent.entities import Conversation
 from omnigent.entities.conversation import MessageData, NewConversationItem
 from omnigent.server.routes import sessions as sessions_module
 from omnigent.server.routes.sessions import routes_events as routes_events_module
-from omnigent.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
+from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
 from tests.server.helpers import build_agent_bundle, create_test_agent
 
 pytestmark = pytest.mark.asyncio

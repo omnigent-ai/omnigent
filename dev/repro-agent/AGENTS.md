@@ -24,6 +24,22 @@ proving the fix with a before/after test transition — is a separate step; it
 consumes your session (the reconstructed journey, the e2e test, and your notes)
 as its input. You produce a live-confirmed reproduction + the test, and hand off.
 
+## Code comments
+
+Default to no added comments. Add one only to explain a non-obvious constraint
+or reason the code cannot express clearly. Use one short sentence, normally one
+line and at most two. Do not narrate setup, operations, or assertions; repeat
+test names; or duplicate nearby explanations. Keep investigation history in the
+handoff or PR description. Apply the same standard to test docstrings.
+
+Code changes rapidly. Omit comments likely to become misleading as the
+implementation evolves. Keep necessary comments next to the code they describe,
+and update or remove them in the same change whenever that code's behavior or
+assumptions change.
+
+Before handing off or committing, remove redundant or stale comments from the
+deliverable, including tests carried over from repro.
+
 ## Input contract
 
 You are invoked with **just the bug** — reproducing it is your job, so the
@@ -99,10 +115,13 @@ Your first turn is a fixed checklist — do all of it before Step 1:
    note that and carry on — it is not a reproduction failure. When `public` is
    absent or false (the default), skip this — do not call `sys_session_share`.
 2. **Confirm the workspace** (see above) and that you can reach the app and your
-   tooling with one `sys_os_shell` / tool check: the browser tools
-   (`browser_navigate` / `browser_snapshot` / `browser_click` / `browser_type`)
-   for UI journeys, and `sys_session_*` / HTTP for backend journeys. Confirm you
-   can read the report: `gh` is available for a GitHub issue, or a Linear key
+   tooling with one `sys_os_shell` / tool check: Playwright for headless web UI
+   journeys (including CI), and `sys_session_*` / HTTP for backend journeys.
+   The `browser_*` tools control the Omnigent desktop app's embedded browser;
+   their presence in your tool list does not mean a desktop is connected.
+   In headless CI, do not call them, including as a preflight probe. A missing
+   desktop renderer is expected and does not block the Playwright lane.
+   Confirm you can read the report: `gh` is available for a GitHub issue, or a Linear key
    (`LINEAR_API_KEY` or `DATABRICKS_LINEAR_API_KEY`) is set for a Linear ticket
    (if it isn't, stop and report an infrastructure/configuration failure without
    emitting a verdict handoff; the workflow must retry it). Also note — without failing —
@@ -132,18 +151,66 @@ investigation attempt. It means the **report itself** omits product information
 required to define or execute the reproduction—never that your turn, tools,
 credentials, environment, or infrastructure failed.
 
-**The journey is user-observable only — an ordered list of actions a user
-takes.** Write it as concrete numbered steps, each one an action the user
-performs or a state they change (setup/config, launch, UI interaction,
-environment toggles like VPN or network, sending a message), ending in the
-failure they observe. A good report's "Steps to reproduce" is exactly this
-shape — e.g.:
+**Write a manual reproduction recipe a reader can follow without opening the
+test, recording, or earlier messages.** Keep it user-observable and use concrete
+numbered steps, with one action or closely related action group per step:
 
+- Start with the prerequisites: the build/version actually tested, surface,
+  harness, required authentication/configuration, and starting state (for
+  example, a fresh session versus an existing one). Include only relevant
+  details in one or two short sentences; explicitly mark unknown requirements
+  instead of inventing them. Put fixture setup and CI configuration in evidence.
+- Name the screen, control, agent, or command to use, and provide the exact
+  input/message or a concrete safe example. Explain how to create any required
+  data. Avoid vague instructions such as "use the feature" or "trigger the bug."
+- For a UI bug, write the clicks and typing a person performs in the app, using
+  visible control names. For example: "Choose `hello_world`, select Grok Build
+  in the harness picker, and create a new session." Do not substitute a POST
+  request, JSON payload, runner binding, session ID placeholder, or test selector
+  for those actions. Commands belong here only when the user's actual surface
+  is a terminal/CLI or the setup requires the user to run them.
+- Keep each step short and use ordinary language: "read the model label next
+  to the composer settings button," not "wait for data-testid to hydrate from
+  the snapshot." Keep protocol events, internal field names, mock executables,
+  fixture environment variables, and persistence explanations in `evidence`.
+  Retain one plain-language caveat when a stand-in limits the result.
+- Spell out order and timing that matter: before sending the first message,
+  wait until the reply finishes, reload, reopen, or switch sessions. Include a
+  duration or observable completion condition for waits.
+- At the step where the symptom appears, say exactly where to look and include
+  **Expected:** and **Observed:** results. Describe the visible value, error, or
+  behavior, not just "it fails."
+- Keep the original failure and any follow-up/regression checks distinct. For
+  multiple symptoms, label each recipe and its result. State what you actually
+  observed on the running build; label steps or outcomes inferred from the
+  report as unverified. If already fixed, distinguish the reported old failure
+  from the passing result you observed. Do not imply you tested an older build.
+- If automation created state through an API or used a mock, verify the manual
+  UI path before calling that recipe reproduced. Otherwise label it **Manual
+  steps not verified**, describe what was actually exercised in `evidence`,
+  and preserve the applicable verdict/environment-fidelity rules. Do not turn
+  automated setup into claimed clicks or a mock response into a real reply.
+
+For example (use the actual tested build and results in your response):
+
+```markdown
+### Steps to reproduce — wrong model label in a new session
+
+Prerequisites: Grok Build is installed and authenticated on your host.
+
+1. Open Omnigent on the tested build (include its version or commit).
+2. Choose an agent whose spec pins a model, such as `hello_world`.
+3. Select **Grok Build** in the harness picker and create a new session.
+4. Open the session **before sending any message**.
+5. Read the model/harness label next to the composer settings button.
+   - **Expected:** the label shows **Grok Build**.
+   - **Observed:** the label shows the agent's pinned model instead.
 ```
-1. create session A and run one command
-2. create session B and run one command in terminal (different than A)
-3. select session A → terminal still displays session B's output
-```
+
+Retain this level of detail in the final response and the `journey` handoff
+field (see Output); an arrow-separated summary alone is insufficient.
+Before handing off, read the recipe as a person opening the app: they should
+know what to click, type, and look for without understanding the test harness.
 
 Every step is something a user *does* or *toggles*. The journey does **not**
 contain the internal mechanism (which function is called, which state isn't
@@ -214,6 +281,23 @@ system-browser OIDC hop, the native setup screen).
 The surface picks the kind of test you author (Step 3) and the recorder that
 captures it (Step 4).
 
+**When the reported surface is a native one you cannot drive here, defer it —
+never clear it.** This runner drives the web SPA (including at a phone
+viewport), the terminal/CLI, and the Electron desktop shell — it has **no**
+iOS/Android device and no native macOS chrome. So for a native-chrome-only bug
+(safe-area insets, the system-browser OIDC hop, the native setup screen, or any
+native mobile rendering the phone-viewport SPA does not exercise), the most you
+can drive is the web SPA **standing in** for the native app — a substitute that
+can never exhibit the native failure. Do **not** call that `not_reproduced`: a
+stand-in that could not show the bug has not cleared it. The verdict is
+**`needs_manual_review`** (Step 2), which routes the ticket to a human on the
+real device. Name the engine/device profile you actually drove — e.g. "desktop
+Chromium at an iPhone viewport" — in the facet's `evidence`; a `mobile` facet
+you verdict `not_reproduced` or `needs_manual_review` that omits it is rejected.
+This is distinct from a stand-in on which you *did* reproduce the failure
+(that is `likely_repro`, with the stand-in named in `environment_fidelity`).
+Set `environment_fidelity: real` when you drove the surface the ticket reports.
+
 **Prefer a user-facing surface — reserve `api` for the genuinely invisible.**
 If a user encounters the failure on *any* interactive surface — a screen in the
 web SPA, a terminal/TUI pane, or a CLI command that prints the error — that is
@@ -244,17 +328,30 @@ Drive the running app through the journey and **observe the failure yourself**.
 Do this for **each** sub-symptom you enumerated in Step 1 — reproduce them
 independently, because a compound bug can be partly fixed:
 
-- **UI bugs** — use the browser tools to navigate the app, click/type through the
-  reconstructed steps, and `browser_snapshot` the state that shows the failure
-  (e.g. a missing picker, a wrong value, an error toast). The browser tools drive
-  the desktop app's embedded browser, so a UI-journey reproduction expects a
-  desktop / embedded-browser context; if you have no browser pane to drive, say
-  so and fall back to the backend path. If no valid lane is available, report an
-  operational failure without a verdict handoff so the workflow retries; missing
-  browser/tool access is not `needs_more_info`.
+- **UI bugs** — in headless runs, including CI, script and execute the user
+  journey with Playwright using `tests/e2e_ui/` fixtures. Navigate the real SPA,
+  click/type through the reported steps, and capture the visible failure with
+  assertions and screenshots. Follow the environment-fidelity rules above when
+  choosing fixtures; a desktop-only failure is not confirmed by a web stand-in.
+  For a local session with a connected Omnigent desktop browser, you may instead
+  use `browser_navigate`, `browser_snapshot`, `browser_click`, and `browser_type`.
+  If a call reports `no browser renderer is connected`, stop calling that tool
+  family and use Playwright; retrying cannot attach a desktop. Missing desktop
+  access alone is not a reason to replace a UI journey with a backend probe or
+  report an infrastructure failure. If no valid lane can reach the reported
+  surface, name the blocker and follow the verdict and environment-fidelity
+  rules above.
 - **Backend/behavioral bugs** — create a session and drive turns via
   `sys_session_*`, or exercise the server's HTTP API directly, and capture the
   bad response / traceback / exit.
+
+**Inspect screenshots as images.** Do not use `browser_navigate` with a
+`file://` URL to inspect CI artifacts: it targets the desktop browser, not the
+CI filesystem. Use an available image-capable tool to view the saved screenshot.
+If none is available, preserve the image for review, use Playwright DOM/layout
+assertions for what they can establish, and state that visual inspection was
+unavailable. Image dimensions, file metadata, and successful screenshot capture
+alone do not establish that the UI looks correct.
 
 Reach for the real trigger, not the internal function it flows into. If the
 journey depends on a precondition your environment lacks (an online host for a
@@ -293,19 +390,35 @@ unavailable compute/browser/app access, sandbox restrictions, timeout, crash, or
 any other execution problem. Those are workflow failures and must remain
 retryable rather than becoming a product verdict.
 
-- Failure reproduces → **`reproduced`**. Capture the evidence (snapshot, response,
-  log excerpt).
-- Behaves correctly on the running build → that sub-symptom does **not** reproduce
-  here. If the report was against an older version and a later commit clearly
-  fixed it, hunt for the fixing commit (`git log`) and mark it **`already_fixed`**
-  with the commit. Otherwise **`not_reproduced`** and what you'd need to see it
-  (often a `needs_more_info`-style gap).
+- Failure reproduces on the environment the ticket reports → **`reproduced`**.
+  Capture the evidence (snapshot, response, log excerpt).
+- Failure reproduces, but only against a **stand-in** for the reported
+  environment you could not drive (for example the CI egress proxy standing in
+  for a Databricks-network host) → **`likely_repro`**. Name the stand-in in
+  `environment_fidelity` (see below). It still dispatches the fix workflow.
+- The failure depends on **native behaviour this environment cannot exercise**
+  (the iOS soft keyboard, WebKit-only rendering, a native-chrome layout) and the
+  stand-in you can drive — desktop Chromium at a phone viewport — cannot exhibit
+  it either way → **`needs_manual_review`**. This is *not* `not_reproduced`: a
+  substitute that can never show the failure has not cleared it; a human on the
+  real device must decide. Name the engine/device profile you drove in
+  `evidence` (e.g. "desktop Chromium at an iPhone viewport").
+- Behaves correctly on the running build, on an environment that *can* exhibit
+  the reported failure → that sub-symptom does **not** reproduce here. If the
+  report was against an older version and a later commit clearly fixed it, hunt
+  for the fixing commit (`git log`) and mark it **`already_fixed`** with the
+  commit. Otherwise **`not_reproduced`** and what you'd need to see it (often a
+  `needs_more_info`-style gap).
 
 **Roll up to an overall verdict, but never let it hide a live sub-symptom.** If
-*any* sub-symptom still reproduces, the overall verdict is **`reproduced`** — even
+*any* sub-symptom still reproduces, the overall verdict is **`reproduced`** (or
+**`likely_repro`** when every live one was only reproduced on a stand-in) — even
 when other facets are already fixed. Report the per-facet breakdown in the output
-(see below) so a partial fix is visible, not averaged away. Only when *every*
-sub-symptom is fixed is the overall verdict `already_fixed`.
+(see below) so a partial fix is visible, not averaged away. When nothing
+reproduced but a sub-symptom is **`needs_manual_review`** (a native-only failure
+you could not exercise), the overall verdict is `needs_manual_review` — a
+`not_reproduced` you could confirm never outranks a facet you could not. Only
+when *every* sub-symptom is fixed is the overall verdict `already_fixed`.
 
 ## Step 3 — Author the durable e2e test
 
@@ -368,13 +481,26 @@ leaked runner env), and the per-surface mechanics (`web` / `mobile` / `terminal`
 - a **`reproduced`** facet → **before-fix footage** (`kind: "before"`): use the
   authored test to drive and verify the failure, but film only the product surface
   and the user-visible bug (e.g. `recordings/1234/before-picker.webm`). Never film
-  pytest, assertion output, logs, or the test source.
+  pytest, assertion output, or the test source.
 - an **`already_fixed`** facet → **proof-it-works footage** (`kind: "fixed"`): use
   the same test to drive and verify the passing journey, while the video shows only
   the product behaving correctly (e.g. `recordings/1234/fixed-picker.webm`).
 
 `not_reproduced` and `needs_more_info` facets have nothing to film — skip them.
 Name the clip `<before|fixed>-<facet>.<ext>` when you move it to a stable path.
+
+Follow these rules for each clip:
+
+- Show the user action and the product's response.
+- For CLI or terminal output, record the real command and its output, even if
+  only an error message changes. For example, run `omnigent host` with an
+  expired login and capture the error it prints.
+- For internal/API-only results with no visible user interaction, written
+  evidence is enough. Set `recordings: []` and describe the result in `evidence`.
+- If recording is blocked by missing tools or an environment that cannot run
+  the journey, set `recordings: []` and name the specific blocker in
+  `recording_unavailable_reason`. Do not block the verdict because footage is
+  missing or rejected; explain the gap and continue.
 
 ## Output — the reproduction artifacts
 
@@ -388,8 +514,13 @@ choice:
   recording results, atomically rewrite it, and emit that same object in the
   final fence. The checkpoint and final block must not disagree.
 
-- You may write comprehensive prose above the block (a human-readable summary,
-  the journey, the per-facet notes) — that's fine and encouraged. Then, as the
+- Before the test source and JSON block, include a **Steps to reproduce**
+  section using the manual recipe from Step 1: prerequisites, numbered actions,
+  and expected/observed results at the relevant step. This section is required,
+  even when a recording is available. For `needs_more_info` or
+  `needs_manual_review`, include the known steps and clearly identify missing
+  information or unverified steps; do not invent a successful reproduction.
+  You may also include a brief verdict and per-facet notes. Then, as the
   last thing before the JSON block, paste the **complete, verbatim source of the
   e2e test(s) you authored** as a fenced, path-labelled code block — the whole
   file, never truncated or elided with `# ...` placeholders — so the reproduction
@@ -397,18 +528,25 @@ choice:
   **context, not the contract**: everything the parser needs lives *inside* the
   JSON block, and the ```json block is the **last chunk** of the message, with
   nothing after its closing fence.
-- Do **not** split the artifacts across separate sections or headers (no lone
-  "Reproduction Verdict" / "Journey" / "Facets" blocks standing in for the
-  handoff, and no second data block). Whatever you also say in prose, the single
+- The human-readable sections do not replace the handoff, and there must be no
+  second data block. Whatever you also say in prose, the single
   ```json block below carries the complete, self-contained handoff.
 - Emit that block as **JSON**, never YAML. One ` ```json ` fence, one JSON
   object.
 - Include **every** key below, always, even when a value is empty (`""`, `[]`) —
   the parser expects a fixed shape.
-- `verdict` must be **exactly one** of the four string literals
-  `"reproduced"`, `"not_reproduced"`, `"already_fixed"`, `"needs_more_info"` —
-  lowercase, no other wording. This is the field the caller reads to label the
-  issue, so it must match verbatim.
+- `verdict` must be **exactly one** of the six string literals
+  `"reproduced"`, `"likely_repro"`, `"not_reproduced"`, `"already_fixed"`,
+  `"needs_more_info"`, `"needs_manual_review"` — lowercase, no other wording.
+  This is the field the caller reads to label the issue, so it must match
+  verbatim. `reproduced`/`likely_repro`/`not_reproduced`/`already_fixed`/
+  `needs_more_info` are defined in Step 2; `needs_manual_review` is allowed
+  **only** when a facet's failure depends on native behaviour this environment
+  cannot exercise (for example the iOS soft keyboard, or WebKit-only rendering
+  when only desktop Chromium is available) so you can neither confirm nor clear
+  it — state that native dependency in `evidence`. It is not a substitute for
+  finishing the investigation, and never stands in for a workflow failure
+  (those stay retryable, per the `needs_more_info` rule).
 
 ```json
 {
@@ -425,9 +563,10 @@ choice:
      "caption": "open the model picker → select the catalog → picker shows raw IDs instead of names"}
   ],
   "recording_unavailable_reason": "",
+  "environment_fidelity": "real",
   "missing_information": [],
   "session_id": "dc59e331-...",
-  "journey": "open model picker → select catalog → picker shows raw IDs",
+  "journey": "Prerequisites: running web build, a new session, and an available catalog.\n1. Open the model picker in the session composer.\n2. Select the available catalog.\n3. Read the model names in the picker.\n   Expected: readable model names.\n   Observed: raw model IDs instead of names.",
   "evidence": "snapshot ref / response / log excerpt, plus root-cause leads"
 }
 ```
@@ -439,33 +578,48 @@ Field meanings:
   overall `reproduced`; only when *every* sub-symptom is fixed is it
   `already_fixed`).
 - `facets` — an array of the per-sub-symptom breakdown from Steps 1–2, each an
-  object with `symptom`, its own `verdict` (same four literals), its `surface`
+  object with `symptom`, its own `verdict` (same six literals), its `surface`
   (`web` / `terminal` / `cli` / `desktop` / `mobile` / `api`, from Step 1), and one line of
   `evidence`. Always a list, even for a single-symptom bug (then it's one
   element). This is what stops a partially-landed fix from being averaged into a
-  misleading single verdict.
+  misleading single verdict. A `mobile` facet you verdict `not_reproduced` or
+  `needs_manual_review` **must** name the browser engine and device profile you
+  actually drove (e.g. "desktop Chromium at an iPhone viewport") in its
+  `evidence`, so a real negative is distinguishable from a stand-in that could
+  never show the failure; such a facet without it is rejected.
 - `test_path` — the e2e test you authored (the durable regression test), repo-
   relative. When multiple facets still reproduce, cover each live one; if you
   authored more than one file, make this an array of paths. Empty string if you
   authored none (e.g. `needs_more_info`).
-- `missing_information` — `[]` for `reproduced`, `not_reproduced`, and
-  `already_fixed`. For `needs_more_info`, a non-empty list of the concrete
+- `missing_information` — `[]` for every verdict except `needs_more_info`
+  (`reproduced`, `likely_repro`, `not_reproduced`, `already_fixed`, and
+  `needs_manual_review` all take `[]`). For `needs_more_info`, a non-empty list of the concrete
   product details absent from the full ticket and linked reports that prevent a
   reproduction, such as the triggering user action, required input, expected
   behavior, or affected surface. Operational failures, incomplete work, and
   evidence you simply did not attempt to collect are invalid entries and must
   not produce this verdict.
+- `environment_fidelity` — which environment you actually drove. `real` when you
+  drove the surface the ticket reports (or the bug is environment-independent and
+  reproduced here). When you reproduced the failure only against a **stand-in**
+  for the reported environment — the verdict is then `likely_repro` — set
+  `stand-in: <what you drove> — could not drive <the reported surface>`, e.g.
+  `stand-in: CI egress proxy — could not drive the Databricks-network host`, and
+  say the same in `journey` and `evidence`. (When the stand-in *cannot exhibit*
+  the reported failure at all — a native-chrome bug on the web SPA — you do not
+  get a verdict from it: that is `needs_manual_review`, and you name the
+  engine/device profile driven in the facet `evidence` rather than here.)
 - `session_id` — **this session** (in the app), from `sys_session_get_info`, so
   the fix step can replay how you reproduced it and you can browse it at
   `<server>/c/<session_id>`.
-- `journey` — the reconstructed **user-observable** journey: the ordered user
-  actions from Step 1, compacted to one line by joining the numbered steps with
-  ` → `, ending in the observed failure, e.g. `create session A + run a command →
-  create session B + run a different command → select session A → terminal still
-  shows B's output`. Each segment is an action the user takes or a state they
-  toggle. Keep the internal mechanism (function calls, uncleared state, leaked
-  subscriptions, timeouts) **out** of this field — that is root cause and goes in
-  `facets`/`evidence`, not here.
+- `journey` — a string containing the same complete manual reproduction recipe
+  as the **Steps to reproduce** section: prerequisites, numbered user actions,
+  exact inputs, relevant timing, and expected/observed results. Preserve line
+  breaks as `\n` escapes in valid JSON; do not compact the steps into an
+  arrow-separated summary or change this field to an array. Include labeled
+  recipes for separate facets and distinguish verified results from reported
+  or unverified outcomes. Keep the internal mechanism (function calls, uncleared
+  state, leaked subscriptions, timeouts) in `facets`/`evidence`.
 - `evidence` — what you observed live (snapshot reference, response, or log
   excerpt), plus any root-cause leads you noticed while reproducing (hypotheses
   only — you do not fix).
@@ -484,13 +638,17 @@ Field meanings:
   of the surface-appropriate values in `dev/recording-lanes.md`. Keep an
   authored-but-unrendered VHS tape in the artifact, but do not declare it as a
   recording. Empty list when nothing valid was recorded.
-- `recording_unavailable_reason` — empty when every expected clip is present;
-  otherwise the concrete per-surface tooling or reachability blocker. For an
-  API-only bug, say that the evidence is textual. Never substitute a synthetic
-  fallback or test-runner video.
+- `recording_unavailable_reason` — leave empty when every expected clip is
+  present. Otherwise explain each missing clip:
 
-Keep the prose before the block terse — the one exception is the full test
-source, which you paste in full. You produce the live-confirmed reproduction +
+  - For internal/API-only results, say there is no visible user interaction
+    and put the written evidence in `evidence`.
+  - For a recording failure, name the missing tool or the environment problem.
+    Text-only CLI output is not a reason to skip recording.
+  - Do not substitute a video of test output or a made-up demonstration.
+
+Keep other prose terse, but include the full manual reproduction recipe and
+the full test source. You produce the live-confirmed reproduction +
 the test; the fix step takes it from here. You take no further
 action — no fix, no merge, no push.
 

@@ -116,6 +116,21 @@ describe("buildReconnectCommand", () => {
     expect(cmd).toContain("--server 'https://example.com/api?profile=dev&glob=*'");
   });
 
+  it("emits `omnigent devin --resume` for a devin-native local_stranded session", () => {
+    // Every native wrapper resumes through its own verb; `omnigent run` cannot
+    // resume one at all, which is what this used to suggest.
+    const cmd = buildReconnectCommand({
+      conversationId: "conv_devin1",
+      serverUrl: "https://x.databricksapps.com",
+      wrapper: "devin-native-ui",
+      state: "local_stranded",
+    });
+    expect(cmd).toContain("omnigent devin");
+    expect(cmd).toContain("--resume conv_devin1");
+    expect(cmd).not.toContain("omnigent run");
+    expect(cmd).not.toContain("path/to/agent.yaml");
+  });
+
   it("emits `omnigent claude --resume` for a claude-native local_stranded session", () => {
     const cmd = buildReconnectCommand({
       conversationId: "conv_claude1",
@@ -139,6 +154,46 @@ describe("buildReconnectCommand", () => {
     });
     expect(cmd).toContain("omnigent run path/to/agent.yaml");
     expect(cmd).not.toContain("omnigent claude");
+  });
+
+  it("resolves the native verb from the harness when there is no wrapper label", () => {
+    // A pre-native session (e.g. a legacy devin-acp row) carries no wrapper
+    // label. The server canonicalizes its harness to `devin-native`, and that
+    // must still pick the right resume verb instead of the generic run form,
+    // which cannot resume a native session.
+    const cmd = buildReconnectCommand({
+      conversationId: "conv_legacy_devin",
+      serverUrl: "https://x.databricksapps.com",
+      wrapper: null,
+      harness: "devin-native",
+      state: "local_stranded",
+    });
+    expect(cmd).toContain("omnigent devin");
+    expect(cmd).toContain("--resume conv_legacy_devin");
+    expect(cmd).not.toContain("omnigent run");
+  });
+
+  it("prefers the wrapper label over the harness when both are present", () => {
+    const cmd = buildReconnectCommand({
+      conversationId: "conv_both",
+      serverUrl: "https://x.databricksapps.com",
+      wrapper: "claude-code-native-ui",
+      harness: "devin-native",
+      state: "local_stranded",
+    });
+    expect(cmd).toContain("omnigent claude");
+    expect(cmd).not.toContain("omnigent devin");
+  });
+
+  it("falls back to the run form when neither wrapper nor harness is native", () => {
+    const cmd = buildReconnectCommand({
+      conversationId: "conv_generic",
+      serverUrl: "https://x.databricksapps.com",
+      wrapper: null,
+      harness: "openai-agents",
+      state: "local_stranded",
+    });
+    expect(cmd).toContain("omnigent run path/to/agent.yaml");
   });
 });
 
@@ -307,5 +362,29 @@ describe("<ReconnectSessionDialog />", () => {
       />,
     );
     expect(screen.queryByTestId("reconnect-session-dialog")).toBeNull();
+  });
+
+  it("shows the failed local reconnect with an accessible error and retry", () => {
+    const onReconnect = vi.fn();
+    renderDialog({
+      localReconnect: {
+        reconnecting: false,
+        error: "Finish signing in, then try again.",
+        onReconnect,
+      },
+    });
+    expect(screen.getByRole("alert")).toHaveTextContent("Finish signing in");
+    expect(screen.getByTestId("reconnect-session-command")).toHaveTextContent("omnigent host");
+    fireEvent.click(screen.getByRole("button", { name: "Retry reconnect" }));
+    expect(onReconnect).toHaveBeenCalledOnce();
+  });
+
+  it("disables retry while reconnecting", () => {
+    renderDialog({
+      localReconnect: { reconnecting: true, error: null, onReconnect: vi.fn() },
+    });
+    const button = screen.getByRole("button", { name: "Reconnecting this machine…" });
+    expect(button).toBeDisabled();
+    expect(button).toHaveAttribute("aria-busy", "true");
   });
 });

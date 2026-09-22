@@ -33,12 +33,12 @@ _EPSILON = 0.5
 _MSG1 = "sentinel-tap-msg1 holds the turn open"
 _MSG2 = "sentinel-tap-msg2 queued follow-up row"
 
-# Accessible names of the queued row's interactive controls, left to right:
-# drag handle, then the right-side steer / edit / delete cluster.
+# Accessible names of the queued row's interactive controls: drag handle,
+# then the right-side edit / send / remove cluster.
 _ACTION_LABELS = (
     "Reorder queued message",
-    "Send queued message now",
     "Edit queued message",
+    "Send queued message now",
     "Remove queued message",
 )
 
@@ -86,6 +86,13 @@ def test_queued_row_controls_meet_mobile_tap_target(
         composer.fill(_MSG1)
         send.click()
 
+        # Exercise the second send after the background terminal mounts;
+        # its scrollbar must not intercept the composer while hidden.
+        warm_terminal = page.get_by_test_id("main-terminal-view")
+        expect(warm_terminal).to_have_attribute("data-visible", "false", timeout=15_000)
+        expect(warm_terminal.locator(".xterm")).to_be_attached(timeout=15_000)
+        expect(warm_terminal).to_have_attribute("inert", "")
+
         # msg2 -> typed while busy -> held in the client-side queue and shown
         # in the docked strip above the composer.
         composer.fill(_MSG2)
@@ -93,6 +100,7 @@ def test_queued_row_controls_meet_mobile_tap_target(
         strip = page.get_by_test_id("composer-queued-strip")
         expect(strip).to_be_visible(timeout=15_000)
         expect(strip).to_contain_text(_MSG2)
+        assert strip.evaluate("element => getComputedStyle(element).paddingLeft") == "8px"
 
         boxes: dict[str, dict[str, float]] = {}
         for label in _ACTION_LABELS:
@@ -116,7 +124,7 @@ def test_queued_row_controls_meet_mobile_tap_target(
             f"mobile tap target (width, height): {undersized}"
         )
 
-        # Adjacent right-side actions (steer -> edit -> delete) must not be
+        # Adjacent right-side actions (edit -> send -> remove) must not be
         # packed so closely that a finger tap is ambiguous: with >=44px-wide
         # targets that do not overlap, adjacent centers sit >=~44px apart.
         cluster = [boxes[label] for label in _ACTION_LABELS[1:]]

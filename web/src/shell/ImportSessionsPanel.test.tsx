@@ -83,6 +83,7 @@ describe("ImportSessionsPanel", () => {
           { id: "c1", title: "First session" },
           { id: "c2", title: null },
         ],
+        failures: [],
       };
     });
 
@@ -100,5 +101,76 @@ describe("ImportSessionsPanel", () => {
     expect(link1).toHaveAttribute("href", "/c/c1");
     // A null title renders the placeholder rather than crashing.
     expect(screen.getByTestId("import-result-link-c2")).toHaveTextContent("Untitled session");
+  });
+
+  it("shows a reason for each failed session and retries without re-importing successes", async () => {
+    useHostsMock.mockReturnValue({
+      data: [{ host_id: "host_1", name: "mac-laptop", owner: "alice", status: "online" }],
+    } as unknown as ReturnType<typeof useHosts>);
+    importLocalSessionsMock.mockImplementation(async (_host, _source, _limit, onSession) => {
+      onSession?.({ id: "c1", title: "Imported one" });
+      return {
+        imported: 1,
+        alreadyImported: 0,
+        failed: 2,
+        sessions: [{ id: "c1", title: "Imported one" }],
+        failures: [
+          { externalSessionId: "bad-1", source: "codex", reason: "No visible messages to import." },
+          { externalSessionId: null, source: null, reason: "This session could not be read." },
+        ],
+      };
+    });
+
+    renderPanel();
+    fireEvent.click(screen.getByTestId("import-submit"));
+
+    await waitFor(() => expect(screen.getByTestId("import-failures")).toBeInTheDocument());
+    expect(screen.getByTestId("import-result").textContent).toContain("2 failed");
+    const failures = screen.getAllByTestId("import-failure-item");
+    expect(failures).toHaveLength(2);
+    expect(failures[0]).toHaveTextContent("No visible messages to import.");
+    expect(failures[0]).toHaveTextContent("bad-1");
+
+    // Retrying just re-runs the import; server-side dedup skips the successes.
+    importLocalSessionsMock.mockClear();
+    fireEvent.click(screen.getByTestId("import-retry"));
+    await waitFor(() => expect(importLocalSessionsMock).toHaveBeenCalledTimes(1));
+  });
+
+  it("imports one session by harness and ID without listing sessions", async () => {
+    useHostsMock.mockReturnValue({
+      data: [{ host_id: "host_1", name: "mac-laptop", owner: "alice", status: "online" }],
+    } as unknown as ReturnType<typeof useHosts>);
+    importLocalSessionsMock.mockImplementation(async (_host, _source, _limit, onSession) => {
+      onSession?.({ id: "c1", title: "Exact session" });
+      return {
+        imported: 1,
+        alreadyImported: 0,
+        failed: 0,
+        sessions: [{ id: "c1", title: "Exact session" }],
+        failures: [],
+      };
+    });
+
+    renderPanel();
+    fireEvent.change(screen.getAllByRole("combobox")[1], {
+      target: { value: "session" },
+    });
+
+    expect(screen.queryByTestId("import-limit-select")).toBeNull();
+    const idInput = screen.getByTestId("import-session-id");
+    expect(screen.getByTestId("import-submit")).toBeDisabled();
+    fireEvent.change(idInput, { target: { value: "  session-exact  " } });
+    fireEvent.click(screen.getByTestId("import-submit"));
+
+    await waitFor(() =>
+      expect(importLocalSessionsMock).toHaveBeenCalledWith(
+        "host_1",
+        "claude",
+        25,
+        expect.any(Function),
+        "session-exact",
+      ),
+    );
   });
 });

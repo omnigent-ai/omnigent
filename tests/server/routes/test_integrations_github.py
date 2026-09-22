@@ -7,6 +7,7 @@ status → disconnect flow is exercised end-to-end without the network.
 
 from __future__ import annotations
 
+import httpx
 import jwt
 import pytest
 from fastapi import FastAPI, Request
@@ -71,6 +72,25 @@ class _FakeClient:
 
     async def fetch_login(self, access_token: str) -> tuple[str, int]:
         return "octocat", 42
+
+    async def list_repos(self, access_token: str) -> tuple[list[dict[str, object]], bool]:
+        return (
+            [
+                {
+                    "full_name": "caffeinelabs/app",
+                    "clone_url": "https://github.com/caffeinelabs/app.git",
+                    "default_branch": "main",
+                    "private": True,
+                    "pushed_at": "2026-07-28T00:00:00Z",
+                }
+            ],
+            False,
+        )
+
+    async def list_branches(self, access_token: str, full_name: str) -> list[str]:
+        self.branch_calls: list[str] = getattr(self, "branch_calls", [])
+        self.branch_calls.append(full_name)
+        return ["main", "dev"]
 
 
 def _config() -> GitHubAppConfig:
@@ -247,3 +267,82 @@ def test_disconnect(db_uri: str) -> None:
 )
 def test_sanitize_return_to_blocks_off_origin(raw: str | None, expected: str) -> None:
     assert sanitize_return_to(raw) == expected
+
+
+def test_repos_unconnected_returns_false(db_uri: str) -> None:
+    tc, _store, _config, _client = _app(db_uri)
+    resp = tc.get("/v1/connections/github/repos", headers=_USER)
+    assert resp.status_code == 200
+    assert resp.json() == {"connected": False, "repos": [], "truncated": False}
+
+
+def test_repos_lists_when_connected(db_uri: str) -> None:
+    tc, store, _config, _client = _app(db_uri)
+    store.upsert(
+        "alice@example.com",
+        github_login="octocat",
+        github_user_id=42,
+        tokens=GitHubTokenSet("ghu_a", "ghr_a", None, None, "repo"),
+    )
+    resp = tc.get("/v1/connections/github/repos", headers=_USER)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["connected"] is True
+    assert [r["full_name"] for r in body["repos"]] == ["caffeinelabs/app"]
+    assert body["repos"][0]["default_branch"] == "main"
+
+
+def test_repos_returns_502_on_transient_github_error(db_uri: str) -> None:
+    # A transient GitHub fault (httpx error / bad JSON) must surface as the
+    # endpoint's defined 502, not escape as an unhandled 500.
+    tc, store, _config, client = _app(db_uri)
+    store.upsert(
+        "alice@example.com",
+        github_login="octocat",
+        github_user_id=42,
+        tokens=GitHubTokenSet("ghu_a", "ghr_a", None, None, "repo"),
+    )
+
+    async def _boom(_access_token: str) -> tuple[list[dict[str, object]], bool]:
+        raise httpx.ConnectError("boom")
+
+    client.list_repos = _boom  # type: ignore[assignment,method-assign]
+    resp = tc.get("/v1/connections/github/repos", headers=_USER)
+    assert resp.status_code == 502
+
+
+def test_repo_branches_unconnected_returns_false(db_uri: str) -> None:
+    tc, _store, _config, _client = _app(db_uri)
+    resp = tc.get("/v1/connections/github/repos/caffeinelabs/app/branches", headers=_USER)
+    assert resp.status_code == 200
+    assert resp.json() == {"connected": False, "branches": []}
+
+
+def test_repo_branches_lists_when_connected(db_uri: str) -> None:
+    tc, store, _config, client = _app(db_uri)
+    store.upsert(
+        "alice@example.com",
+        github_login="octocat",
+        github_user_id=42,
+        tokens=GitHubTokenSet("ghu_a", "ghr_a", None, None, "repo"),
+    )
+    resp = tc.get("/v1/connections/github/repos/caffeinelabs/app/branches", headers=_USER)
+    assert resp.status_code == 200
+    assert resp.json() == {"connected": True, "branches": ["main", "dev"]}
+    assert client.branch_calls == ["caffeinelabs/app"]
+
+
+def test_repo_branches_rejects_bad_name(db_uri: str) -> None:
+    tc, store, _config, _client = _app(db_uri)
+    store.upsert(
+        "alice@example.com",
+        github_login="octocat",
+        github_user_id=42,
+        tokens=GitHubTokenSet("ghu_a", "ghr_a", None, None, "repo"),
+    )
+    # A path-traversal owner must be rejected before any GitHub call.
+    resp = tc.get("/v1/connections/github/repos/..%2Fx/app/branches", headers=_USER)
+    assert resp.status_code in (400, 404)
+    # A dot-run in a charset-valid segment is also rejected (no traversal).
+    resp = tc.get("/v1/connections/github/repos/o..o/app/branches", headers=_USER)
+    assert resp.status_code == 400

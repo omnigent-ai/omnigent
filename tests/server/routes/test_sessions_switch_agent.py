@@ -17,7 +17,14 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from starlette.testclient import TestClient
 
-from omnigent.entities import Agent, Conversation, ConversationItem, MessageData, PagedList
+from omnigent.entities import (
+    Agent,
+    Conversation,
+    ConversationItem,
+    MessageData,
+    PagedList,
+    StoredFile,
+)
 from omnigent.errors import OmnigentError
 from omnigent.server.routes import sessions as sessions_mod
 from omnigent.server.routes.sessions import create_sessions_router
@@ -70,10 +77,15 @@ class _ConversationStore:
         self._convs = conversations
         self._items = items_by_conv or {}
         self.switch_calls: list[dict[str, Any]] = []
+        self.todo_updates: list[list[dict[str, Any]]] = []
 
     def get_conversation(self, conversation_id: str) -> Conversation | None:
         """:returns: The conversation if present, else None."""
         return self._convs.get(conversation_id)
+
+    def set_session_todos(self, conversation_id: str, todos: list[dict[str, Any]]) -> bool:
+        self.todo_updates.append(todos)
+        return conversation_id in self._convs
 
     def switch_conversation_agent(
         self,
@@ -257,16 +269,34 @@ def _agent(agent_id: str, name: str, bundle: str, session_id: str | None) -> Age
     )
 
 
-def _build_app(conv_store: _ConversationStore, agent_store: _AgentStore) -> FastAPI:
+class _AttachmentFileStore:
+    """File metadata stub for checking retained attachment compatibility."""
+
+    def __init__(self, stored: StoredFile) -> None:
+        self.stored = stored
+
+    def list(self, session_id: str, **kwargs: Any) -> PagedList[StoredFile]:
+        del kwargs
+        files = [self.stored] if self.stored.session_id == session_id else []
+        return PagedList(data=files, first_id=None, last_id=None, has_more=False)
+
+
+def _build_app(
+    conv_store: _ConversationStore,
+    agent_store: _AgentStore,
+    file_store: _AttachmentFileStore | None = None,
+) -> FastAPI:
     """Build a FastAPI app mounting the sessions router + error handler.
 
     :param conv_store: Conversation store stub.
     :param agent_store: Agent store stub.
+    :param file_store: Optional attachment metadata for compatibility checks.
     :returns: A configured FastAPI app.
     """
     router = create_sessions_router(
         conversation_store=conv_store,  # type: ignore[arg-type]
         agent_store=agent_store,  # type: ignore[arg-type]
+        file_store=file_store,  # type: ignore[arg-type]
     )
     app = FastAPI()
 
@@ -647,9 +677,14 @@ async def test_switch_schedules_runner_resource_reset(
     )
     _patch_family_helpers(monkeypatch, same_family=True, native=True, labels={})
     reset_calls: list[str] = []
+    published: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        sessions_mod.session_stream, "publish", lambda _, event: published.append(event)
+    )
 
     async def _record_reset(session_id: str) -> None:
         reset_calls.append(session_id)
+        conv_store.set_session_todos(session_id, [{"content": "stale"}])
 
     monkeypatch.setattr(sessions_mod, "_reset_runner_resources_after_switch", _record_reset)
     client = TestClient(_build_app(conv_store, agent_store))
@@ -666,6 +701,8 @@ async def test_switch_schedules_runner_resource_reset(
     # take effect on the cached primary env and a stale terminal could shadow
     # the rebuild.
     assert reset_calls == ["e9f8f58523cec9a57d3bdf93be543e8c"]
+    assert conv_store.todo_updates == [[{"content": "stale"}], []]
+    assert published[-1]["type"] == "session.todos" and published[-1]["todos"] == []
 
 
 class _RunnerClientStub:
@@ -946,3 +983,78 @@ async def test_switch_400_unloadable_target_bundle(monkeypatch: pytest.MonkeyPat
     assert resp.status_code == 400, resp.text
     # Pre-commit failure → no switch attempted (old agent intact).
     assert conv_store.switch_calls == []
+
+
+@pytest.mark.parametrize(
+    "filename,target_harness,old_runtime,expected_status",
+    [
+        ("sample.zip", "openai-agents", False, 400),
+        ("sample.docx", "claude-sdk", False, 400),
+        ("sample.sqlite", "pi-native", False, 400),
+        ("sample.zip", "cursor-native", False, 400),
+        ("sample.zip", "claude-native", False, 200),
+        ("sample.sqlite", "codex-native", False, 200),
+        ("sample.png", "openai-agents", False, 200),
+        ("sample.txt", "claude-sdk", False, 200),
+        ("sample.zip", "codex-native", True, 409),
+    ],
+)
+def test_switch_checks_attachment_history_before_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+    filename: str,
+    target_harness: str,
+    old_runtime: bool,
+    expected_status: int,
+) -> None:
+    """A rejected harness switch leaves the session binding and history untouched."""
+    source = _conv()
+    file_id = "aa11bb22cc33dd44ee55ff6677889900"
+    item = ConversationItem(
+        id="9980c8a9248139f14f4165e5d53088aa",
+        type="message",
+        status="completed",
+        response_id="resp_attachment",
+        created_at=1,
+        data=MessageData(role="user", content=[{"type": "input_file", "file_id": file_id}]),
+    )
+    conv_store = _ConversationStore({source.id: source}, {source.id: [item]})
+    target = _BUILTIN_CODEX
+    agent_store = _AgentStore({_CURRENT.id: _CURRENT, target.id: target})
+    file_store = _AttachmentFileStore(
+        StoredFile(id=file_id, created_at=1, filename=filename, bytes=4, session_id=source.id)
+    )
+    monkeypatch.setattr(
+        sessions_mod,
+        "get_agent_cache",
+        lambda: _HarnessAgentCacheStub({_CURRENT.id: "claude-native", target.id: target_harness}),
+    )
+    runtime_calls: list[dict[str, Any]] = []
+    if old_runtime:
+        from fastapi import HTTPException
+
+        from omnigent.server.routes._sessions import helpers
+
+        source.host_id, source.runner_id = "host-old", "runner-old"
+
+        def reject_old_runtime(**kwargs: Any) -> None:
+            runtime_calls.append(kwargs)
+            raise HTTPException(status_code=409, detail="Update the host before using these files")
+
+        monkeypatch.setattr(helpers, "require_filesystem_attachment_runtime", reject_old_runtime)
+
+    client = TestClient(_build_app(conv_store, agent_store, file_store))
+    response = client.post(f"/v1/sessions/{source.id}/switch-agent", json={"agent_id": target.id})
+    assert response.status_code == expected_status, response.text
+    if expected_status == 400:
+        assert filename in response.json()["error"]["message"]
+        assert "Claude Code or Codex" in response.json()["error"]["message"]
+    elif old_runtime:
+        assert runtime_calls[0]["host_id"] == "host-old"
+        assert runtime_calls[0]["runner_id"] == "runner-old"
+    if expected_status != 200:
+        assert not conv_store.switch_calls
+        assert not conv_store.todo_updates
+        assert conv_store.get_conversation(source.id) is source
+        assert source.agent_id == _CURRENT.id
+    else:
+        assert len(conv_store.switch_calls) == 1

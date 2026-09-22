@@ -54,6 +54,9 @@ jobs:
           NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
         run: pnpm install --frozen-lockfile --filter web
 
+      - name: Run Electron Design-mode unit regressions
+        run: node --test web/electron/test/designModeScript.test.js
+
       - name: Check formatting
         run: pnpm --filter web run format:check
 

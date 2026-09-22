@@ -1,21 +1,22 @@
 // Per-row state derivation for the sidebar badge.
-// Priority: awaiting > running > no badge.
+// Priority: awaiting > running > error > no badge.
 //
 // Liveness (runner / host reachability) is no longer a sidebar state:
 // it surfaces in the open-session view (see `useSessionLiveness`), so the
 // sidebar no longer renders a "disconnected" badge and `getSessionState`
 // no longer reads runner liveness.
 //
-// "failed" is intentionally not a sidebar state either — the chat surface
-// is the right place to read what failed. Conflating it into the same red
-// badge also led to a stale-cache bug where a prior turn's
-// `_session_status_cache["failed"]` would mask a fresh elicitation.
+// Errors are independent of read state. Native sessions can settle to idle
+// after an error, so callers also inspect the latest conversation message.
 
 import type { Conversation } from "@/hooks/useConversations";
+import type { LatestSessionError } from "@/lib/sessionError";
 
 export type SessionState =
   | { kind: "awaiting"; count: number }
   | { kind: "running" }
+  | { kind: "error" }
+  | { kind: "disconnected" }
   | { kind: "unseen" }
   // The open session's launch/relaunch window — a send in flight or the PTY
   // being created before the server confirms `running`. Not derivable from a
@@ -25,9 +26,13 @@ export type SessionState =
 
 export function getSessionState(
   conversation: Pick<Conversation, "status" | "pending_elicitations_count"> | undefined | null,
+  latestError: LatestSessionError | null = null,
 ): SessionState | null {
   const pending = conversation?.pending_elicitations_count ?? 0;
   if (pending > 0) return { kind: "awaiting", count: pending };
   if (conversation?.status === "running") return { kind: "running" };
+  if (latestError === "disconnected") return { kind: "disconnected" };
+  if (latestError === "recovered_disconnect") return null;
+  if (conversation?.status === "failed" || latestError === "error") return { kind: "error" };
   return null;
 }

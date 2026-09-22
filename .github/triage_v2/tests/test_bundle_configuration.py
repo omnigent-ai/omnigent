@@ -1,5 +1,7 @@
 from pathlib import Path
 
+from issue_prioritization.comments import COMMENT_MARKER
+
 ROOT = Path(__file__).parents[1]
 WORKFLOWS = ROOT.parent / "workflows"
 
@@ -37,6 +39,8 @@ def test_github_events_share_one_v2_workflow() -> None:
     assert "--remove-label needs-info" not in response
     assert "reopen_closed:" in response
     assert "reopen_closed: true" in response
+    response_guard = response.split("    if: >-\n", 1)[1].split("    uses:", 1)[0]
+    assert f"!startsWith(github.event.comment.body, '<!-- {COMMENT_MARKER} ') &&" in response_guard
     assert "group: issue-prioritization-v2-${{ inputs.issue_number }}" in reusable
     assert "  prioritize:\n    if: vars.ISSUE_PRIORITIZATION_V2_ENABLED" not in reusable
     assert reusable.count("if: vars.ISSUE_PRIORITIZATION_V2_ENABLED == 'true'") == 3
@@ -60,10 +64,19 @@ def test_v2_owns_intake_when_enabled_and_manual_dispatch_is_dry_by_default() -> 
     assert "remove in 0.12.0" in legacy
     assert "cancel-in-progress: false" in intake
     assert "github.event.action == 'opened'" in prioritize
+    assert (
+        "issue_number: ${{ fromJSON(format('{0}', "
+        "github.event.issue.number || inputs.issue_number)) }}" in prioritize
+    )
     apply_expression = (
         "apply: ${{ github.event_name != 'workflow_dispatch' || inputs.apply_labels }}"
     )
     assert apply_expression in prioritize
+    assert (
+        "post_duplicate_comments: ${{ github.event_name == 'workflow_dispatch' "
+        "&& inputs.post_comment }}" in prioritize
+    )
+    assert "post_duplicate_comments: ${{ inputs.post_comment }}" not in prioritize
     assert "--intake --maintainers .github/MAINTAINER" in reusable
     assert "mode=dry_run" in reusable
 

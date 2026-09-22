@@ -143,16 +143,9 @@ export function ConnectionIndicator({
 }
 
 /**
- * Main-pane launch indicator — the single in-thread line for every
- * "session is coming up" state. Two launch shapes feed it, in
- * priority order:
- *
- * 1. A managed-sandbox launch (`sandboxStatus` in flight): shows the
- *    current pipeline stage ("Provisioning sandbox…", "Cloning
- *    repository…", …) for ANY session type.
- * 2. A terminal-first runner spin-up (`terminalStartingUp`): shows the
- *    generic "Starting up…" terminal copy. The sandbox stages win
- *    while both are active — they're strictly more specific.
+ * Main-pane managed-sandbox launch indicator. Shows the current pipeline
+ * stage ("Provisioning sandbox…", "Cloning repository…", …) for any session
+ * type. Ordinary terminal startup uses the standard Working indicator.
  *
  * Self-gates to null when neither applies. `hero` is the centered
  * empty-state placeholder (no bubbles yet); `row` is the in-thread
@@ -161,7 +154,6 @@ export function ConnectionIndicator({
  * there).
  */
 export function RunnerStartingIndicator({ variant }: { variant: "hero" | "row" }) {
-  const terminalFirst = useTerminalFirst();
   const sandboxStatus = useChatStore((s) => s.sandboxStatus);
   // `ready` never reaches the store (cleared) and `failed` renders the
   // destructive band in ConnectionIndicator — only in-flight stages
@@ -170,17 +162,8 @@ export function RunnerStartingIndicator({ variant }: { variant: "hero" | "row" }
     sandboxStatus !== null && sandboxStatus.stage !== "failed"
       ? SANDBOX_STAGE_LABELS[sandboxStatus.stage]
       : undefined;
-  // `terminalStartingUp` is computed for ALL sessions in AppShell (it does not
-  // check isTerminalFirst), so gate on isTerminalFirst too: regular agents
-  // (e.g. polly) get the generic ConnectionIndicator "Connecting…" band and
-  // must not also render this.
-  const terminalSpinUp = Boolean(
-    terminalFirst?.isTerminalFirst && terminalFirst.terminalStartingUp,
-  );
-  if (sandboxLabel === undefined && !terminalSpinUp) {
-    return null;
-  }
-  const line = sandboxLabel !== undefined ? `${sandboxLabel}…` : "Starting up…";
+  if (sandboxLabel === undefined) return null;
+  const line = `${sandboxLabel}…`;
   // role=status + aria-live so assistive tech announces the transient wait;
   // the spinner glyph itself is decorative (aria-hidden).
   if (variant === "hero") {
@@ -190,12 +173,8 @@ export function RunnerStartingIndicator({ variant }: { variant: "hero" | "row" }
         role="status"
         aria-live="polite"
         icon={<Loader2Icon className="size-7 animate-spin" aria-hidden />}
-        title={sandboxLabel !== undefined ? `${sandboxLabel}…` : "Starting up…"}
-        description={
-          sandboxLabel !== undefined
-            ? "Setting up your sandbox — this can take a minute."
-            : "This can take a few seconds."
-        }
+        title={line}
+        description="Setting up your sandbox — this can take a minute."
       />
     );
   }

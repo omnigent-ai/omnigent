@@ -21,6 +21,8 @@ from omnigent.runner._entry import (
     _DEFAULT_RUNNER_IDLE_TIMEOUT_S,
     _DEFAULT_RUNNER_THREADPOOL_MAX_WORKERS,
     _agent_cache_dest,
+    _apply_host_interactive_shells,
+    _host_interactive_shells_from_env,
     _InitialAuthTokenFactory,
     _install_crash_logging,
     _install_signal_handlers,
@@ -44,6 +46,7 @@ from omnigent.runner._entry import (
 )
 from omnigent.runner.identity import (
     RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR,
+    RUNNER_INTERACTIVE_SHELLS_ENV_VAR,
     RUNNER_TUNNEL_TOKEN_HEADER,
 )
 from omnigent.runner.transports.ws_tunnel.serve import RUNNER_TUNNEL_REJECTION_PREFIX
@@ -54,6 +57,39 @@ from omnigent.runner.transports.ws_tunnel.serve import RUNNER_TUNNEL_REJECTION_P
 # here (via import_module, so there is no bound-but-unused import) resolves and
 # caches it with the real type.
 importlib.import_module("mcp.client.streamable_http")
+
+
+def test_host_interactive_shells_from_env_normalizes_inventory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Runner wiring accepts only supported, ordered shell basenames."""
+    monkeypatch.setenv(
+        RUNNER_INTERACTIVE_SHELLS_ENV_VAR,
+        '["zsh", "bash", "zsh", "not-a-shell"]',
+    )
+    assert _host_interactive_shells_from_env() == ["zsh", "bash"]
+
+
+def test_apply_host_interactive_shells_only_replaces_native_wrappers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Custom agent terminals remain authored while native fallbacks change."""
+    from types import SimpleNamespace
+
+    from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
+
+    monkeypatch.setenv(RUNNER_INTERACTIVE_SHELLS_ENV_VAR, '["zsh", "bash"]')
+    native = SimpleNamespace(name=CLAUDE_NATIVE_AGENT_NAME, terminals={"bash": object()})
+    custom_terminal = object()
+    custom = SimpleNamespace(name="custom", terminals={"project": custom_terminal})
+
+    _apply_host_interactive_shells(native)
+    _apply_host_interactive_shells(custom)
+
+    assert list(native.terminals) == ["zsh", "bash"]
+    assert native.terminals["zsh"].command is not None
+    assert native.terminals["zsh"].command.endswith("zsh")
+    assert custom.terminals == {"project": custom_terminal}
 
 
 class _TrackingTerminalRegistry:
@@ -2143,9 +2179,15 @@ def test_install_crash_logging_is_idempotent() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("host_owns_global_cleanup", "expected_sweep_orphans"),
+    [(True, False), (False, True)],
+)
 async def test_runner_shutdown_closes_terminal_registry(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    host_owns_global_cleanup: bool,
+    expected_sweep_orphans: bool,
 ) -> None:
     """The --server local runner shuts down terminal-owned resources.
 
@@ -2155,7 +2197,6 @@ async def test_runner_shutdown_closes_terminal_registry(
     startup/shutdown hooks directly and verifies shutdown includes the
     TerminalRegistry, not just harness subprocesses and MCPs.
     """
-    import omnigent.inner.terminal as terminal_mod
     import omnigent.runner._entry as entry_mod
 
     process_managers: list[_FakeProcessManager] = []
@@ -2163,14 +2204,18 @@ async def test_runner_shutdown_closes_terminal_registry(
     mcp_managers: list[_TrackingMcpManager] = []
     async_clients: list[_TrackingAsyncClient] = []
     sync_clients: list[_TrackingSyncClient] = []
+    terminal_sweeps: list[int] = []
+    bridge_sweeps: list[int] = []
 
     class _FakeProcessManager:
         def __init__(self) -> None:
             self.started = False
             self.shutdown_called = False
+            self.instance_dir = Path("/tmp/omnigent-test/ap-test")
             process_managers.append(self)
 
-        async def start(self) -> None:
+        async def start(self, *, sweep_orphans: bool = True) -> None:
+            assert sweep_orphans is expected_sweep_orphans
             self.started = True
 
         async def shutdown(self) -> None:
@@ -2204,10 +2249,18 @@ async def test_runner_shutdown_closes_terminal_registry(
         return client
 
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://runner.test")
-    # create_app() performs its production orphan sweep during construction.
-    # Keep this lifecycle unit test away from terminals owned by other local
-    # runners and test sessions.
-    monkeypatch.setattr(terminal_mod, "_terminals_tmp_root", lambda: tmp_path)
+    if host_owns_global_cleanup:
+        monkeypatch.setenv("OMNIGENT_RUNNER_HOST_OWNS_GLOBAL_CLEANUP", "1")
+    else:
+        monkeypatch.delenv("OMNIGENT_RUNNER_HOST_OWNS_GLOBAL_CLEANUP", raising=False)
+    monkeypatch.setattr(
+        "omnigent.inner.terminal.reap_orphaned_terminals",
+        lambda: terminal_sweeps.append(1) or 0,
+    )
+    monkeypatch.setattr(
+        "omnigent.native.native_bridge_common.reap_orphaned_native_bridge_dirs",
+        lambda: bridge_sweeps.append(1) or 0,
+    )
     monkeypatch.setattr(
         "omnigent.runtime.harnesses.process_manager.HarnessProcessManager",
         _FakeProcessManager,
@@ -2229,7 +2282,10 @@ async def test_runner_shutdown_closes_terminal_registry(
     async with app.router.lifespan_context(app):
         pass
 
-    assert process_managers and process_managers[0].shutdown_called
+    assert process_managers and process_managers[0].started
+    assert process_managers[0].shutdown_called
+    assert terminal_sweeps == ([] if host_owns_global_cleanup else [1])
+    assert bridge_sweeps == ([] if host_owns_global_cleanup else [1])
     assert terminal_registries and terminal_registries[0].shutdown_called
     assert terminal_registries[0].conversation_link_base_url == "http://runner.test"
     # In Omnigent mode (P1) the entry point passes mcp_manager=None; MCP calls are
@@ -2785,24 +2841,22 @@ def test_auth_token_factory_refreshes_expired_oidc_token(
     assert refresh_calls, "the refresh path must have run"
 
 
-def test_create_app_wires_native_bridge_dir_startup_sweep() -> None:
-    """The runner startup path must invoke the native bridge-dir sweep.
+@pytest.mark.parametrize(
+    ("raw_value", "expected"),
+    [(None, False), ("0", False), ("1", True)],
+)
+def test_runner_global_cleanup_ownership_is_explicit(
+    monkeypatch: pytest.MonkeyPatch,
+    raw_value: str | None,
+    expected: bool,
+) -> None:
+    """Only host-launched runners delegate machine-global cleanup."""
+    from omnigent.runner._entry import _runner_host_owns_global_cleanup_from_env
+    from omnigent.runner.identity import RUNNER_HOST_OWNS_GLOBAL_CLEANUP_ENV_VAR
 
-    The prune logic is dead unless ``create_app`` actually calls
-    ``reap_orphaned_native_bridge_dirs`` — the highest-risk path in the
-    bridge-dir-reaping change. A full ``create_app()`` call needs heavy
-    server/token/process-manager scaffolding, so the wiring is guarded by
-    inspecting the factory's source: the sweep must be present and must run
-    after the terminal reap (the placement the design requires).
+    if raw_value is None:
+        monkeypatch.delenv(RUNNER_HOST_OWNS_GLOBAL_CLEANUP_ENV_VAR, raising=False)
+    else:
+        monkeypatch.setenv(RUNNER_HOST_OWNS_GLOBAL_CLEANUP_ENV_VAR, raw_value)
 
-    :returns: None.
-    """
-    import inspect
-
-    from omnigent.runner._entry import create_app
-
-    src = inspect.getsource(create_app)
-
-    assert "reap_orphaned_native_bridge_dirs()" in src
-    # The native bridge-dir sweep runs after the terminal reap.
-    assert src.index("reap_orphaned_terminals()") < src.index("reap_orphaned_native_bridge_dirs()")
+    assert _runner_host_owns_global_cleanup_from_env() is expected

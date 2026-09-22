@@ -18,16 +18,24 @@ import asyncio
 import os
 import shlex
 import sys
+import time
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
+from omnigent.inner import _proc
 from omnigent.inner import acp_executor as acp_executor_module
 from omnigent.inner._acp_omnigent_mcp import OmnigentAcpMcp, _to_acp_mcp_servers
-from omnigent.inner.acp_executor import AcpAgentConfig, AcpExecutor
+from omnigent.inner.acp_executor import (
+    AcpAgentConfig,
+    AcpExecutor,
+    _is_auth_required_error,
+    _unattended_auth_method_id,
+)
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import (
+    ExecutorConfig,
     ExecutorError,
     ReasoningChunk,
     SubAgentCompleted,
@@ -70,6 +78,212 @@ def test_handles_tools_internally_and_streaming() -> None:
 # ---------------------------------------------------------------------------
 # session/new shapes (server- vs client-assigned id, optional model)
 # ---------------------------------------------------------------------------
+
+
+def test_unattended_auth_method_prefers_cached_token() -> None:
+    assert (
+        _unattended_auth_method_id(
+            {
+                "authMethods": [
+                    {"id": "cached_token"},
+                    {"id": "grok.com"},
+                ],
+                "_meta": {"defaultAuthMethodId": "cached_token"},
+            }
+        )
+        == "cached_token"
+    )
+
+
+def test_unattended_auth_method_none_when_only_browser_login() -> None:
+    assert _unattended_auth_method_id({"authMethods": [{"id": "grok.com"}]}) is None
+
+
+def test_unattended_auth_method_none_when_absent() -> None:
+    assert _unattended_auth_method_id({}) is None
+
+
+def test_unattended_auth_method_none_when_ids_malformed() -> None:
+    assert _unattended_auth_method_id({"authMethods": [{"name": "no id"}, "junk", 7]}) is None
+
+
+def test_unattended_auth_method_falls_back_when_default_interactive() -> None:
+    assert (
+        _unattended_auth_method_id(
+            {
+                "authMethods": [{"id": "grok.com"}, {"id": "cached_token"}],
+                "_meta": {"defaultAuthMethodId": "grok.com"},
+            }
+        )
+        == "cached_token"
+    )
+
+
+def test_is_auth_required_error_matches_code_and_message() -> None:
+    assert _is_auth_required_error({"code": -32000, "message": "nope"})
+    assert _is_auth_required_error({"code": -32603, "message": "Authentication required"})
+    assert not _is_auth_required_error({"code": -32603, "message": "boom"})
+    assert not _is_auth_required_error("Authentication required")
+
+
+def _grok_like_initialize_result() -> dict:
+    return {
+        "agentCapabilities": {"promptCapabilities": {"image": False}},
+        "authMethods": [{"id": "grok.com"}, {"id": "cached_token"}],
+        "_meta": {"defaultAuthMethodId": "cached_token"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_session_new_authenticates_after_auth_required_and_retries() -> None:
+    """Auth-required ``session/new`` triggers ``authenticate`` + one retry."""
+    ex = AcpExecutor(AcpAgentConfig(command="x", session_id_mode="server"))
+    calls: list[tuple[str, dict]] = []
+    authenticated = False
+
+    async def fake_rpc(method, params, timeout=30.0):
+        nonlocal authenticated
+        calls.append((method, params))
+        if method == "initialize":
+            return {"result": _grok_like_initialize_result()}
+        if method == "authenticate":
+            authenticated = True
+            return {"result": {}}
+        if method == "session/new":
+            if not authenticated:
+                return {"error": {"code": -32000, "message": "Authentication required"}}
+            return {"result": {"sessionId": "sid-1"}}
+        raise AssertionError(f"unexpected {method}")
+
+    ex._rpc = fake_rpc  # type: ignore[assignment]
+    await ex._ensure_initialized()
+    assert await ex._ensure_session() == "sid-1"
+    assert [c[0] for c in calls] == [
+        "initialize",
+        "session/new",
+        "authenticate",
+        "session/new",
+    ]
+    assert calls[2][1] == {"methodId": "cached_token"}
+
+
+@pytest.mark.asyncio
+async def test_session_new_success_skips_authenticate_despite_auth_methods() -> None:
+    """Advertised methods alone must not trigger an unsolicited authenticate."""
+    ex = AcpExecutor(AcpAgentConfig(command="x", session_id_mode="server"))
+    calls: list[str] = []
+
+    async def fake_rpc(method, params, timeout=30.0):
+        calls.append(method)
+        if method == "initialize":
+            # Gemini-CLI-shaped advertisement: interactive ids the executor's
+            # denylist does not know about.
+            return {
+                "result": {
+                    "agentCapabilities": {"promptCapabilities": {}},
+                    "authMethods": [
+                        {"id": "oauth-personal"},
+                        {"id": "gemini-api-key"},
+                        {"id": "vertex-ai"},
+                    ],
+                }
+            }
+        if method == "session/new":
+            return {"result": {"sessionId": "sid-2"}}
+        raise AssertionError(f"unexpected {method}")
+
+    ex._rpc = fake_rpc  # type: ignore[assignment]
+    await ex._ensure_initialized()
+    assert await ex._ensure_session() == "sid-2"
+    assert calls == ["initialize", "session/new"]
+
+
+@pytest.mark.asyncio
+async def test_initialize_skips_authenticate_without_auth_methods() -> None:
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    calls: list[str] = []
+
+    async def fake_rpc(method, params, timeout=30.0):
+        calls.append(method)
+        return {"result": {"agentCapabilities": {"promptCapabilities": {}}}}
+
+    ex._rpc = fake_rpc  # type: ignore[assignment]
+    await ex._ensure_initialized()
+    assert calls == ["initialize"]
+
+
+@pytest.mark.asyncio
+async def test_session_new_auth_required_browser_only_raises_clear_error() -> None:
+    ex = AcpExecutor(AcpAgentConfig(command="x", session_id_mode="server"))
+
+    async def fake_rpc(method, params, timeout=30.0):
+        if method == "initialize":
+            return {"result": {"authMethods": [{"id": "grok.com"}]}}
+        if method == "session/new":
+            return {"error": {"code": -32000, "message": "Authentication required"}}
+        raise AssertionError(f"unexpected {method}")
+
+    ex._rpc = fake_rpc  # type: ignore[assignment]
+    await ex._ensure_initialized()
+    with pytest.raises(RuntimeError, match="no headless auth method"):
+        await ex._ensure_session()
+
+
+@pytest.mark.asyncio
+async def test_session_new_auth_required_malformed_methods_raises_clear_error() -> None:
+    """Id-less ``authMethods`` entries yield a diagnosis, not a crash."""
+    ex = AcpExecutor(AcpAgentConfig(command="x", session_id_mode="server"))
+
+    async def fake_rpc(method, params, timeout=30.0):
+        if method == "initialize":
+            return {"result": {"authMethods": [{"name": "missing id"}]}}
+        if method == "session/new":
+            return {"error": {"code": -32000, "message": "Authentication required"}}
+        raise AssertionError(f"unexpected {method}")
+
+    ex._rpc = fake_rpc  # type: ignore[assignment]
+    await ex._ensure_initialized()
+    with pytest.raises(RuntimeError, match="no headless auth method"):
+        await ex._ensure_session()
+
+
+@pytest.mark.asyncio
+async def test_session_new_auth_required_without_methods_surfaces_raw_error() -> None:
+    ex = AcpExecutor(AcpAgentConfig(command="x", session_id_mode="server"))
+    calls: list[str] = []
+
+    async def fake_rpc(method, params, timeout=30.0):
+        calls.append(method)
+        if method == "initialize":
+            return {"result": {"agentCapabilities": {"promptCapabilities": {}}}}
+        if method == "session/new":
+            return {"error": {"code": -32000, "message": "Authentication required"}}
+        raise AssertionError(f"unexpected {method}")
+
+    ex._rpc = fake_rpc  # type: ignore[assignment]
+    await ex._ensure_initialized()
+    with pytest.raises(RuntimeError, match="ACP session/new failed: Authentication required"):
+        await ex._ensure_session()
+    assert "authenticate" not in calls
+
+
+@pytest.mark.asyncio
+async def test_authenticate_rpc_error_surfaces() -> None:
+    ex = AcpExecutor(AcpAgentConfig(command="x", session_id_mode="server"))
+
+    async def fake_rpc(method, params, timeout=30.0):
+        if method == "initialize":
+            return {"result": _grok_like_initialize_result()}
+        if method == "session/new":
+            return {"error": {"code": -32000, "message": "Authentication required"}}
+        if method == "authenticate":
+            return {"error": {"code": -32603, "message": "token expired"}}
+        raise AssertionError(f"unexpected {method}")
+
+    ex._rpc = fake_rpc  # type: ignore[assignment]
+    await ex._ensure_initialized()
+    with pytest.raises(RuntimeError, match="ACP authenticate failed: token expired"):
+        await ex._ensure_session()
 
 
 @pytest.mark.asyncio
@@ -344,6 +558,71 @@ def test_usage_omits_absent_and_non_integer_fields() -> None:
     assert AcpExecutor._usage_from_result({"usage": {"inputTokens": True}}) is None
     assert AcpExecutor._usage_from_result({"usage": {"totalTokens": "nope"}}) is None
     assert AcpExecutor._usage_from_result({}) is None
+
+
+def test_usage_maps_cached_writes_to_the_canonical_key() -> None:
+    """``cachedWriteTokens`` surfaces as ``cache_creation_input_tokens``.
+
+    Agents that report cache-creation tokens (e.g. jcode against a Databricks
+    gateway) had them silently dropped before, understating cost — cache writes
+    bill at ~1.25x the input rate.
+    """
+    usage = AcpExecutor._usage_from_result(
+        {
+            "usage": {
+                "inputTokens": 6216,
+                "outputTokens": 5,
+                "totalTokens": 6221,
+                "cachedReadTokens": 0,
+                "cachedWriteTokens": 128,
+            }
+        }
+    )
+    assert usage == {
+        "input_tokens": 6216,
+        "output_tokens": 5,
+        "total_tokens": 6221,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 128,
+    }
+
+
+def test_usage_with_active_model_tags_the_model() -> None:
+    """A turn's usage is stamped with the agent's active model.
+
+    ACP ``result.usage`` carries token counts but no model id, so the server
+    cannot attribute the tokens to a model — leaving its per-model usage view
+    (``usage_by_model``) empty and the UI showing no token counts for the ACP
+    (jcode / Devin / Grok) session. The active model comes from the agent's
+    ``model`` config option, captured at ``session/new``.
+
+    **What breaks if this fails**: token counts never render for any ACP harness.
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._active_model = "system.ai.claude-haiku-4-5"
+    usage = ex._usage_with_active_model(
+        {"usage": {"inputTokens": 10, "outputTokens": 5, "totalTokens": 15}}
+    )
+    assert usage == {
+        "input_tokens": 10,
+        "output_tokens": 5,
+        "total_tokens": 15,
+        "model": "system.ai.claude-haiku-4-5",
+    }
+
+
+def test_usage_with_active_model_skips_stamp_when_model_unknown() -> None:
+    """No active model → no ``model`` key (attribution simply stays absent)."""
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    assert ex._active_model is None
+    assert ex._usage_with_active_model({"usage": {"totalTokens": 15}}) == {"total_tokens": 15}
+
+
+def test_usage_with_active_model_is_none_when_no_usage_reported() -> None:
+    """No usage on the result → ``None`` (never a model-only dict)."""
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._active_model = "system.ai.claude-haiku-4-5"
+    assert ex._usage_with_active_model({}) is None
 
 
 def test_in_progress_tool_update_emits_nothing() -> None:
@@ -1088,6 +1367,38 @@ def test_config_option_update_records_options_and_active_model() -> None:
 
 
 @pytest.mark.asyncio
+async def test_session_new_captures_advertised_model() -> None:
+    """A model advertised in ``session/new``'s config options sets ``_active_model``.
+
+    jcode (and others) report their model in the ``session/new`` result rather than
+    a later ``config_option_update``; capturing it at session creation is what lets
+    a turn's usage name the model, so the server can attribute per-model tokens.
+
+    **What breaks if this fails**: an ACP agent that only advertises its model in
+    ``session/new`` records no model → token counts don't render for the session.
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x", omnigent_mcp=False))
+
+    async def fake_rpc(method: str, params: dict, timeout: float | None = None) -> dict:
+        return {
+            "result": {
+                "sessionId": "s1",
+                "configOptions": [
+                    {
+                        "id": "model",
+                        "currentValue": "system.ai.claude-haiku-4-5",
+                        "options": [{"value": "system.ai.claude-haiku-4-5"}],
+                    }
+                ],
+            }
+        }
+
+    ex._rpc = fake_rpc  # type: ignore[assignment]
+    assert await ex._ensure_session() == "s1"
+    assert ex._active_model == "system.ai.claude-haiku-4-5"
+
+
+@pytest.mark.asyncio
 async def test_model_override_switches_warm_via_set_config_option() -> None:
     """
     A new model is applied with ``session/set_config_option`` using ``configId``.
@@ -1209,6 +1520,151 @@ async def test_model_override_trusts_echoed_value_over_request() -> None:
     ex._rpc = tracking_rpc  # type: ignore[assignment]
     await ex._apply_model_override("s1", "gemini-3-1-pro-low")
     assert calls == ["gemini-3-1-pro-low"]
+
+
+# ---------------------------------------------------------------------------
+# warm model switch (session/set_model) — agents that advertise a catalog
+# ---------------------------------------------------------------------------
+
+
+def _models_result(current: str | None = None, *available: str) -> dict:
+    """A ``session/new`` result carrying a model catalog (Cline's shape)."""
+    models: dict = {"availableModels": [{"modelId": m, "name": m} for m in available]}
+    if current is not None:
+        models["currentModelId"] = current
+    return models
+
+
+def test_session_models_records_catalog_and_current_model() -> None:
+    """
+    A ``models`` object from ``session/new`` is recorded.
+
+    Agents like Cline advertise selectable models here instead of via
+    ``config_option_update``, and report the live one as ``currentModelId``.
+
+    **What breaks if this fails**: the catalog stays empty, so the switch falls
+    through to ``session/set_config_option`` — which these agents don't expose —
+    and the agent silently keeps its own default model.
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._note_session_models(_models_result("a/one", "a/one", "b/two"))
+
+    assert ex._session_model_ids == {"a/one", "b/two"}
+    assert ex._active_model == "a/one"
+
+
+def test_session_models_ignores_non_catalog_payloads() -> None:
+    """A missing or malformed ``models`` value leaves the catalog untouched."""
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._note_session_models(None)
+    ex._note_session_models("nope")
+    ex._note_session_models({"availableModels": ["bare-string", {"noModelId": 1}]})
+
+    assert ex._session_model_ids == set()
+    assert ex._active_model is None
+
+
+@pytest.mark.asyncio
+async def test_model_override_uses_set_model_when_catalog_advertised() -> None:
+    """
+    With a catalog present the switch goes through ``session/set_model``.
+
+    ``session/set_config_option`` must not be attempted: these agents never
+    advertise a ``model`` option, so that path bails out and leaves the agent on
+    its default — which is also what it bills.
+
+    **What breaks if this fails**: a configured or picked model is silently
+    dropped for every catalog-style ACP agent (Cline).
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._note_session_models(_models_result("vendor/default", "vendor/default"))
+    calls: list[tuple[str, dict]] = []
+
+    async def fake_rpc(method, params, timeout=30.0):
+        calls.append((method, params))
+        return {"result": {}}
+
+    ex._rpc = fake_rpc  # type: ignore[assignment]
+    await ex._apply_model_override("s1", "sub/cheap-flash")
+
+    assert calls == [("session/set_model", {"sessionId": "s1", "modelId": "sub/cheap-flash"})]
+    assert ex._active_model == "sub/cheap-flash"
+
+
+@pytest.mark.asyncio
+async def test_set_model_accepts_id_outside_the_advertised_catalog() -> None:
+    """
+    An id the agent did not enumerate is still sent.
+
+    ``availableModels`` is what the agent offers interactively; Cline also accepts
+    subscription-scoped ``cline-pass/*`` ids it never lists. Filtering on the
+    catalog would reject exactly the ids that avoid metered billing.
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._note_session_models(_models_result("anthropic/pricey", "anthropic/pricey"))
+    calls: list[tuple[str, dict]] = []
+
+    async def fake_rpc(method, params, timeout=30.0):
+        calls.append((method, params))
+        return {"result": {}}
+
+    ex._rpc = fake_rpc  # type: ignore[assignment]
+    await ex._apply_model_override("s1", "cline-pass/deepseek-v4.1-flash")
+
+    assert calls[0][1]["modelId"] == "cline-pass/deepseek-v4.1-flash"
+    assert ex._active_model == "cline-pass/deepseek-v4.1-flash"
+
+
+@pytest.mark.asyncio
+async def test_configured_model_applies_when_the_turn_names_none() -> None:
+    """
+    The agent's configured ``model:`` is used when a turn carries no pick.
+
+    A turn only names a model when the user picked one, so without this fallback
+    the ``model:`` in an agent's config entry never reaches the agent at all.
+
+    **What breaks if this fails**: a configured model is inert and the agent runs
+    (and bills) on whatever it defaults to.
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x", model="sub/configured"))
+    ex._note_session_models(_models_result("vendor/default", "vendor/default"))
+    calls: list[tuple[str, dict]] = []
+
+    async def fake_rpc(method, params, timeout=30.0):
+        calls.append((method, params))
+        return {"result": {}}
+
+    ex._rpc = fake_rpc  # type: ignore[assignment]
+    await ex._apply_model_override("s1", None)
+
+    assert calls == [("session/set_model", {"sessionId": "s1", "modelId": "sub/configured"})]
+
+
+@pytest.mark.asyncio
+async def test_set_model_rejection_latches_off_and_does_not_raise() -> None:
+    """
+    A rejected ``session/set_model`` never fails the turn, and is not retried.
+
+    **What breaks if this fails**: an agent that cannot switch models loses the
+    turn entirely instead of answering on the model it already has.
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._note_session_models(_models_result("vendor/default", "vendor/default"))
+    calls: list[str] = []
+
+    async def failing_rpc(method, params, timeout=30.0):
+        calls.append(method)
+        return {"error": {"message": "unknown model"}}
+
+    ex._rpc = failing_rpc  # type: ignore[assignment]
+    await ex._apply_model_override("s1", "bogus/model")
+
+    assert ex._model_switch_supported is False
+    assert ex._active_model == "vendor/default"
+
+    # Latched off: a later turn does not retry.
+    await ex._apply_model_override("s1", "another/model")
+    assert calls == ["session/set_model"]
 
 
 @pytest.mark.asyncio
@@ -1489,7 +1945,7 @@ async def test_mcp_relay_starts_and_builds_serve_mcp_entry() -> None:
         entry = servers[0]
         assert entry["name"] == "omnigent"
         assert "serve-mcp" in entry["args"]
-        assert "omnigent.claude_native_bridge" in entry["args"]
+        assert "omnigent.harnesses.claude_native.bridge" in entry["args"]
         assert all("name" in e and "value" in e for e in entry["env"])
         # Idempotent: a second call returns the cached relay, not a new one.
         assert m.session_new_servers(tools=[], tool_executor=fake_exec, loop=loop) is servers
@@ -1863,3 +2319,300 @@ def test_startup_error_names_the_exception_type_when_str_is_empty() -> None:
     """No stderr and an empty ``str(exc)`` still yields something actionable."""
     ex = AcpExecutor(AcpAgentConfig(command="x", name="A"))
     assert "TimeoutError" in ex._startup_error_message(TimeoutError())
+
+
+# ---------------------------------------------------------------------------
+# Process lifecycle: a torn-down executor must not strand the agent
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+@pytest.mark.asyncio
+async def test_spawned_agent_leads_its_own_process_group(tmp_path: Path) -> None:
+    """The spawned agent is a session/group leader, not in the harness's group.
+
+    Without the boundary ``_proc._killpg`` resolves the target group to the one
+    we share with the harness and daemon, refuses to signal it, and tree-aware
+    teardown silently degrades to a per-descendant walk.
+    """
+    agent_path = tmp_path / "sleepy_agent.py"
+    agent_path.write_text("import time\ntime.sleep(300)\n")
+    ex = AcpExecutor(
+        AcpAgentConfig(command=shlex.join([sys.executable, str(agent_path)]), name="Sleepy")
+    )
+
+    await ex._start_process()
+    try:
+        pid = ex._proc.pid  # type: ignore[union-attr]
+        assert os.getpgid(pid) == pid, "agent must lead its own process group"
+        assert os.getpgid(pid) != os.getpgid(0), "agent must not share our group"
+    finally:
+        await ex.close()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+@pytest.mark.asyncio
+async def test_close_reaps_the_agents_forked_children(tmp_path: Path) -> None:
+    """``close()`` stops the agent's descendants, not just the handle it holds.
+
+    Under a sandbox the handle is the seatbelt ``run_launcher`` wrapper, which
+    forks the real agent; a single-pid ``terminate()`` reached the wrapper and
+    left the agent running for the daemon's whole lifetime.
+    """
+    pid_file = tmp_path / "grandchild.pid"
+    agent_path = tmp_path / "forking_agent.py"
+    agent_path.write_text(
+        "import pathlib, subprocess, sys, time\n"
+        "kid = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(300)'])\n"
+        f"pathlib.Path({str(pid_file)!r}).write_text(str(kid.pid))\n"
+        "time.sleep(300)\n"
+    )
+    ex = AcpExecutor(
+        AcpAgentConfig(command=shlex.join([sys.executable, str(agent_path)]), name="Forking")
+    )
+
+    await ex._start_process()
+    deadline = time.monotonic() + 10.0
+    while not pid_file.exists():
+        assert time.monotonic() < deadline, "the fake agent never forked its child"
+        await asyncio.sleep(0.05)
+    grandchild = int(pid_file.read_text())
+    assert _proc.process_alive(grandchild)
+
+    await ex.close()
+
+    deadline = time.monotonic() + 10.0
+    while _proc.process_alive(grandchild):
+        assert time.monotonic() < deadline, f"agent child {grandchild} survived close()"
+        await asyncio.sleep(0.05)
+
+
+# ── Curated model list gate + spawn-env denylist ────────────────────────────
+
+
+def test_spawn_env_env_unset_strips_declared_names(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``env_unset`` scrubs a name even when it was allowed through.
+
+    Mirrors codex's ``deny_exact`` contract: the denylist applies on top of
+    the passthrough allowlist, so an operator-declared dummy credential is
+    withheld from the vendor CLI (whose built-in providers would activate on
+    its mere presence).
+    """
+    ex = AcpExecutor(
+        AcpAgentConfig(
+            command="agent stdio",
+            name="Grok",
+            env_passthrough=("XAI_API_KEY", "DEEPSEEK_API_KEY"),
+            env_unset=("XAI_API_KEY",),
+        )
+    )
+    monkeypatch.setenv("XAI_API_KEY", "xai-secret")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "ds-secret")
+    env = ex._build_spawn_env()
+    assert env.get("DEEPSEEK_API_KEY") == "ds-secret"
+    assert "XAI_API_KEY" not in env
+
+
+def test_spawn_env_env_unset_empty_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No denylist configured → deny-exact adds no stripping."""
+    ex = AcpExecutor(AcpAgentConfig(command="agent stdio", name="Grok", env_passthrough=("A",)))
+    monkeypatch.setenv("A", "1")
+    env = ex._build_spawn_env()
+    assert env.get("A") == "1"
+
+
+@pytest.mark.asyncio
+async def test_model_override_withheld_outside_curated_list() -> None:
+    """A curated deployment rejects picks outside its verified model set.
+
+    This is the ACP counterpart of pi-native's ``enabledModels`` scoping:
+    the vendor CLI owns its own picker, so the gate sits at the warm-switch
+    boundary instead of a settings file.
+    """
+    ex = AcpExecutor(AcpAgentConfig(command="x", available_models=("model-a", "model-b")))
+    ex._handle_session_update(_model_option("model-a"))
+    ex._rpc = AsyncMock()  # type: ignore[assignment]
+
+    with pytest.raises(RuntimeError, match="configured model list"):
+        await ex._apply_model_override("s1", "model-c")
+    ex._rpc.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_model_override_allowed_within_curated_list() -> None:
+    """A pick inside the curated set still switches warm via set_config_option."""
+    ex = AcpExecutor(AcpAgentConfig(command="x", available_models=("model-a", "model-b")))
+    ex._handle_session_update(_model_option("model-a"))
+    calls: list[tuple[str, dict]] = []
+
+    async def fake_rpc(method, params, timeout=30.0):
+        calls.append((method, params))
+        return {"result": {"configOptions": [{"id": "model", "currentValue": params["value"]}]}}
+
+    ex._rpc = fake_rpc  # type: ignore[assignment]
+    await ex._apply_model_override("s1", "model-b")
+
+    assert calls == [
+        ("session/set_config_option", {"sessionId": "s1", "configId": "model", "value": "model-b"})
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["rpc-error", "no-option", "different-echo", "timeout"])
+async def test_curated_model_failure_stops_before_prompt_and_remains_retryable(
+    failure: str,
+) -> None:
+    """An unsuccessful selection must never send the turn on the previous model."""
+    ex = AcpExecutor(
+        AcpAgentConfig(command="x", available_models=("model-a", "model-b"), omnigent_mcp=False)
+    )
+    ex._proc = type("P", (), {"returncode": None})()  # type: ignore[assignment]
+    ex._reader_task = Mock(spec=asyncio.Task)
+    ex._reader_task.done.return_value = False
+    ex._initialized = True
+    ex._session_id = "s1"
+    ex._handle_session_update(_model_option("model-a"))
+    if failure == "no-option":
+        ex._config_option_ids = {"mode"}
+    ex._send = AsyncMock()  # type: ignore[method-assign]
+    response = (
+        {"result": {"configOptions": [{"id": "model", "currentValue": "model-a"}]}}
+        if failure == "different-echo"
+        else {"error": {"message": "model unavailable"}}
+    )
+    ex._rpc = AsyncMock(  # type: ignore[assignment]
+        return_value=response,
+        side_effect=TimeoutError("switch timed out") if failure == "timeout" else None,
+    )
+
+    async def collect_events():
+        return [
+            event
+            async for event in ex.run_turn(
+                [{"role": "user", "content": "hello"}], [], "", ExecutorConfig(model="model-b")
+            )
+        ]
+
+    events = await asyncio.wait_for(collect_events(), timeout=1.0)
+    assert len(events) == 1
+    error = events[0]
+    assert isinstance(error, ExecutorError)
+    assert "ACP model selection failed" in error.message
+    assert error.retryable and error.preserve_session
+    ex._send.assert_not_awaited()
+    assert ex._session_id == "s1"
+    assert ex._model_switch_supported
+    assert ex._active_model == (None if failure == "timeout" else "model-a")
+
+    ex._config_option_ids = {"model"}
+    ex._rpc = AsyncMock(
+        return_value={
+            "result": {
+                "configOptions": [  # type: ignore[assignment]
+                    {"id": "model", "currentValue": "model-b"},
+                ]
+            }
+        }
+    )
+    await ex._apply_model_override("s1", "model-b")
+    ex._rpc.assert_awaited_once()
+    assert ex._active_model == "model-b"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["process-exit", "reader-stopped", "no-reader", "broken-pipe"])
+async def test_curated_model_failure_does_not_preserve_dead_transport(failure: str) -> None:
+    """A failed transport must be torn down before another turn can create a session."""
+    ex = AcpExecutor(
+        AcpAgentConfig(command="x", available_models=("model-a", "model-b"), omnigent_mcp=False)
+    )
+    ex._proc = Mock(returncode=None)
+    ex._reader_task = Mock(spec=asyncio.Task)
+    ex._reader_task.done.return_value = failure == "reader-stopped"
+    if failure == "no-reader":
+        ex._reader_task = None
+    ex._initialized = True
+    ex._session_id = "s1"
+    ex._handle_session_update(_model_option("model-a"))
+    ex._send = AsyncMock()  # type: ignore[method-assign]
+
+    async def fail_selection(*args, **kwargs):
+        if failure == "process-exit":
+            ex._proc.returncode = 1
+        if failure == "broken-pipe":
+            raise BrokenPipeError("ACP subprocess closed stdin")
+        raise TimeoutError("switch timed out")
+
+    ex._rpc = AsyncMock(side_effect=fail_selection)  # type: ignore[method-assign]
+    events = [
+        event
+        async for event in ex.run_turn(
+            [{"role": "user", "content": "hello"}], [], "", ExecutorConfig(model="model-b")
+        )
+    ]
+    assert len(events) == 1
+    error = events[0]
+    assert isinstance(error, ExecutorError)
+    assert error.retryable
+    assert not error.preserve_session
+    ex._send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_model_override_uncurated_sessions_are_ungated() -> None:
+    """No curated list (the default) keeps the existing any-model behaviour."""
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._handle_session_update(_model_option("model-a"))
+    calls: list[tuple[str, dict]] = []
+
+    async def fake_rpc(method, params, timeout=30.0):
+        calls.append((method, params))
+        return {"result": {"configOptions": [{"id": "model", "currentValue": params["value"]}]}}
+
+    ex._rpc = fake_rpc  # type: ignore[assignment]
+    await ex._apply_model_override("s1", "model-c")
+
+    assert calls == [
+        ("session/set_config_option", {"sessionId": "s1", "configId": "model", "value": "model-c"})
+    ]
+
+
+@pytest.mark.asyncio
+async def test_model_reset_without_configured_default_restores_initial_agent_model() -> None:
+    """A launch override does not become the fallback when the agent owns its default."""
+    ex = AcpExecutor(
+        AcpAgentConfig(command="x", model="model-b", default_model="", omnigent_mcp=False)
+    )
+    calls: list[tuple[str, dict]] = []
+
+    async def fake_rpc(method, params, timeout=30.0):
+        calls.append((method, params))
+        if method == "session/new":
+            return {
+                "result": {
+                    "sessionId": "s1",
+                    "configOptions": [
+                        {"id": "model", "currentValue": "model-a"},
+                    ],
+                }
+            }
+        return {
+            "result": {
+                "configOptions": [
+                    {"id": "model", "currentValue": params["value"]},
+                ]
+            }
+        }
+
+    ex._rpc = fake_rpc  # type: ignore[assignment]
+    session_id = await ex._ensure_session()
+    await ex._apply_model_override(session_id, "model-b")
+    await ex._apply_model_override(session_id, None)
+
+    assert [
+        params["value"] for method, params in calls if method == "session/set_config_option"
+    ] == [
+        "model-b",
+        "model-a",
+    ]
+    assert ex._active_model == "model-a"

@@ -290,22 +290,15 @@ def using_mock_llm(request: pytest.FixtureRequest) -> bool:
     return request.config.getoption("--llm-api-key") is None
 
 
-@pytest.fixture(scope="session")
-def mock_llm_server_url(
-    tmp_path_factory: pytest.TempPathFactory,
-) -> Iterator[str]:
+def _mock_llm_server_process(log_dir: Path) -> Iterator[str]:
     """
-    Start a mock LLM server for the test session.
+    Run a mock gateway with its own response queues and request ledger.
 
-    Always started regardless of ``--llm-api-key`` so mock-only
-    e2e tests run alongside real-LLM tests in the same session.
-    The mock server is a lightweight FastAPI/uvicorn subprocess.
-
-    :param tmp_path_factory: Pytest temp path factory for logs.
+    :param log_dir: Existing directory for the subprocess log.
     :returns: The mock server base URL.
     """
     mock_port = find_free_port()
-    mock_log = tmp_path_factory.mktemp("mock_llm_logs") / "mock_llm.log"
+    mock_log = log_dir / "mock_llm.log"
     log_handle = open(mock_log, "w")  # noqa: SIM115
 
     proc = subprocess.Popen(
@@ -349,6 +342,28 @@ def mock_llm_server_url(
             proc.kill()
             proc.wait(timeout=5)
         log_handle.close()
+
+
+@pytest.fixture(scope="session")
+def mock_llm_server_url(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[str]:
+    """
+    Start a mock LLM server for the test session.
+
+    Always started regardless of ``--llm-api-key`` so mock-only
+    e2e tests run alongside real-LLM tests in the same session.
+
+    :param tmp_path_factory: Pytest temp path factory for logs.
+    :returns: The mock server base URL.
+    """
+    yield from _mock_llm_server_process(tmp_path_factory.mktemp("mock_llm_logs"))
+
+
+@pytest.fixture
+def isolated_mock_llm_server_url(tmp_path: Path) -> Iterator[str]:
+    """Give one test a gateway whose request ledger cannot receive earlier tests' calls."""
+    yield from _mock_llm_server_process(tmp_path)
 
 
 def configure_mock_llm(
@@ -1567,7 +1582,9 @@ def lookup_agent_id(client: httpx.Client, agent_name: str) -> str:
     :returns: The matching ``"ag_..."`` durable id.
     :raises AssertionError: If no session with that agent name exists.
     """
-    resp = client.get("/v1/sessions", params={"agent_name": agent_name, "limit": 1})
+    resp = client.get(
+        "/v1/sessions", params={"visibility": "all", "agent_name": agent_name, "limit": 1}
+    )
     resp.raise_for_status()
     sessions = resp.json()["data"]
     if sessions:
@@ -1700,31 +1717,34 @@ def _flatten_session_item(item: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _output_after_input(items: list[dict[str, Any]], response_id: str) -> list[dict[str, Any]]:
+    """Select output after the requested user input, across harness response ids."""
+    after_input = False
+    output = []
+    for item in items:
+        flattened = _flatten_session_item(item)
+        if flattened.get("type") == "message" and flattened.get("role") == "user":
+            if item.get("response_id") == response_id:
+                after_input = True
+        elif after_input:
+            output.append(flattened)
+    return output
+
+
 def _session_items_for_response(
     client: httpx.Client,
     *,
     session_id: str,
     response_id: str,
 ) -> list[dict[str, Any]]:
-    """Return flat session items for a runner-native turn.
+    """Return output after the requested input's position in the transcript.
 
-    The AP-stamped user input ``response_id`` is only a local grouping id.
-    Runner-native output items use the harness-allocated response id, so
-    do not filter by ``response_id`` here. These E2E helpers create one
-    fresh session per turn; all non-user items in the snapshot belong to
-    the turn under observation.
+    Native output has a harness-allocated response id, so the input's id
+    locates the user message rather than filtering the output ids.
     """
-    del response_id
     resp = client.get(f"/v1/sessions/{session_id}")
     resp.raise_for_status()
-    return [
-        flattened
-        for item in resp.json().get("items", [])
-        if not (
-            (flattened := _flatten_session_item(item)).get("type") == "message"
-            and flattened.get("role") == "user"
-        )
-    ]
+    return _output_after_input(resp.json().get("items", []), response_id)
 
 
 def poll_session_until_terminal(
@@ -1741,7 +1761,8 @@ def poll_session_until_terminal(
     pollable Omnigent ``Task`` for ``GET /v1/responses/{response_id}``. This
     helper returns a Responses-like dict synthesized from the session
     snapshot: terminal status from ``session.status`` and output from
-    non-user ``conversation_items`` sharing the turn ``response_id``.
+    non-user items after the input with the requested ``response_id``. Native
+    harnesses may allocate a different response id for the output.
 
     :param client: HTTP client pointed at the live server.
     :param session_id: Session/conversation id.
@@ -1764,14 +1785,7 @@ def poll_session_until_terminal(
         status = last_body.get("status")
         if status in ("running", "waiting"):
             seen_running = True
-        output = [
-            flattened
-            for item in last_body.get("items", [])
-            if not (
-                (flattened := _flatten_session_item(item)).get("type") == "message"
-                and flattened.get("role") == "user"
-            )
-        ]
+        output = _output_after_input(last_body.get("items", []), response_id)
         has_turn_output = any(item.get("type") != "resource_event" for item in output)
         if status == "failed" or (status == "idle" and (seen_running or has_turn_output)):
             return {
@@ -1811,6 +1825,7 @@ def poll_for_pending_tool_calls(
     :returns: List of action_required function_call items.
     """
     deadline = time.monotonic() + timeout
+    seen_running = False
     while time.monotonic() < deadline:
         if session_id is None:
             resp = client.get(f"/v1/responses/{response_id}")
@@ -1839,7 +1854,10 @@ def poll_for_pending_tool_calls(
                 return pending
             snap = client.get(f"/v1/sessions/{session_id}")
             snap.raise_for_status()
-            if snap.json().get("status") in ("idle", "failed"):
+            status = snap.json().get("status")
+            seen_running = seen_running or status in ("running", "waiting")
+            has_turn_output = any(item.get("type") != "resource_event" for item in items)
+            if status == "failed" or (status == "idle" and (seen_running or has_turn_output)):
                 return []
         time.sleep(POLL_INTERVAL_S)
     return []

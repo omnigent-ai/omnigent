@@ -1,3 +1,8 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
+import { SidebarDataProvider } from "@/hooks/useSidebarData";
+import { sidebarConfig, type SidebarConfig } from "@/lib/sidebarConfig";
 // Integration tests for the Sidebar's session list. The search box no
 // longer carries a filter funnel (agent-type filter + "Show archived"
 // toggle were removed). The sidebar fetches a single session list with
@@ -9,19 +14,27 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { useEffect } from "react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
+import {
+  markConversationSeen,
+  resetReadStateForTests,
+  seedReadState,
+} from "@/hooks/useUnseenConversations";
 import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
 import { clearOptimisticTitles, recordOptimisticTitle } from "@/lib/optimisticTitles";
 import { clearSessionDrafts, setSessionDraft } from "@/lib/sessionDrafts";
+import * as sessionsApi from "@/lib/sessionsApi";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { ExtensionCatalogProvider } from "@/extensions/ExtensionProvider";
+import type { ExtensionCatalogItem } from "@/extensions/types";
 
 // Project mocks are declared via vi.hoisted so they exist before the hoisted
 // vi.mock factory runs. projectsMock is mutated per-test to drive project
 // sections; moveToProjectSpy captures kebab-menu "Change project" calls.
 const {
   projectsMock,
+  projectRowsRef,
   moveToProjectSpy,
   deleteProjectSpy,
   renameProjectSpy,
@@ -33,6 +46,7 @@ const {
   useHostsMock,
 } = vi.hoisted(() => ({
   projectsMock: [] as string[],
+  projectRowsRef: { current: undefined as { id: string; name: string }[] | undefined },
   moveToProjectSpy: vi.fn(),
   deleteProjectSpy: vi.fn(),
   renameProjectSpy: vi.fn(),
@@ -112,7 +126,7 @@ vi.mock("@/hooks/useConversations", () => ({
   // Tests push project NAMES into projectsMock; expose them as first-class
   // {id, name} folders (synthetic id per name) to match useProjects' shape.
   useProjects: () => ({
-    data: projectsMock.map((name: string) => ({ id: `p_${name}`, name })),
+    data: projectRowsRef.current ?? projectsMock.map((name: string) => ({ id: `p_${name}`, name })),
   }),
   // Each project folder fetches its own sessions (server-side ?project=). Derive
   // them from the global-list fixture by label so existing tests keep seeding
@@ -167,6 +181,7 @@ vi.mock("@/lib/serverOrigin", () => ({
 import { useConversations } from "@/hooks/useConversations";
 import { useChatStore } from "@/store/chatStore";
 import { Sidebar } from "./Sidebar";
+import * as identity from "@/lib/identity";
 
 const useConvMock = vi.mocked(useConversations);
 
@@ -224,16 +239,23 @@ function renderSidebar(
   initialEntry = "/",
   onOpenSearch?: () => void,
   info?: ServerInfo,
+  extensions: ExtensionCatalogItem[] = [],
+  onClose = vi.fn(),
+  config: SidebarConfig = sidebarConfig,
 ) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  const sidebar = <Sidebar open={open} onClose={vi.fn()} onOpenSearch={onOpenSearch} />;
+  const sidebar = <Sidebar open={open} onClose={onClose} onOpenSearch={onOpenSearch} />;
   return render(
     <QueryClientProvider client={qc}>
-      <TooltipProvider>
-        <MemoryRouter initialEntries={[initialEntry]}>
-          {info ? <CapabilitiesProvider info={info}>{sidebar}</CapabilitiesProvider> : sidebar}
-        </MemoryRouter>
-      </TooltipProvider>
+      <SidebarDataProvider config={config}>
+        <ExtensionCatalogProvider extensions={extensions}>
+          <TooltipProvider>
+            <MemoryRouter initialEntries={[initialEntry]}>
+              {info ? <CapabilitiesProvider info={info}>{sidebar}</CapabilitiesProvider> : sidebar}
+            </MemoryRouter>
+          </TooltipProvider>
+        </ExtensionCatalogProvider>
+      </SidebarDataProvider>
     </QueryClientProvider>,
   );
 }
@@ -273,9 +295,11 @@ beforeEach(() => {
   useHostsMock.mockReset();
   useHostsMock.mockReturnValue({ data: [] });
   localStorage.clear();
+  resetReadStateForTests();
   clearSessionDrafts();
   clearOptimisticTitles();
   projectsMock.length = 0;
+  projectRowsRef.current = undefined;
   moveToProjectSpy.mockReset();
   deleteProjectSpy.mockReset();
   fetchProjectSessionIdsMock.mockReset();
@@ -295,7 +319,149 @@ function seedPins(ids: string[]) {
 }
 afterEach(cleanup);
 
+const TEST_EXTENSION: ExtensionCatalogItem = {
+  object: "extension",
+  id: "acme.review",
+  display_name: "Review",
+  distribution: "acme-review",
+  version: "1.0.0",
+  extension_api: 1,
+  status: "enabled",
+  permissions: [],
+  pages: [
+    {
+      id: "acme.review.inbox-page",
+      title: "Extension Inbox",
+      route: "inbox",
+      view: "inbox",
+    },
+  ],
+  primary_navigation: [
+    {
+      id: "acme.review.primary-nav",
+      label: "Extension Inbox",
+      page: "acme.review.inbox-page",
+      icon: "puzzle",
+      order: 500,
+      when: null,
+    },
+  ],
+  browser: {
+    declared: true,
+    has_styles: false,
+    digest: "digest",
+    script_url: "/script",
+    style_url: null,
+  },
+};
+
+describe("Sidebar scroll divider", () => {
+  it("separates fixed navigation only while sessions are scrolled", () => {
+    mockConversations([conv("session-1", "A session")]);
+    renderSidebar();
+
+    const divider = screen.getByTestId("sidebar-scroll-divider");
+    const scrollContainer = screen.getByRole("navigation");
+
+    expect(divider).toHaveClass("opacity-0", "absolute", "pointer-events-none");
+    expect(divider).toHaveAttribute("aria-hidden", "true");
+    expect(scrollContainer).not.toContainElement(divider);
+
+    fireEvent.scroll(scrollContainer, { target: { scrollTop: 1 } });
+    expect(divider).toHaveClass("opacity-100");
+
+    fireEvent.scroll(scrollContainer, { target: { scrollTop: 100 } });
+    expect(divider).toHaveClass("opacity-100");
+
+    fireEvent.scroll(scrollContainer, { target: { scrollTop: 0 } });
+    expect(divider).toHaveClass("opacity-0");
+
+    fireEvent.scroll(scrollContainer, { target: { scrollTop: -10 } });
+    expect(divider).toHaveClass("opacity-0");
+  });
+
+  it("resets when returning from settings to a fresh session list", () => {
+    mockConversations([conv("session-1", "A session")]);
+    renderSidebar();
+
+    fireEvent.scroll(screen.getByRole("navigation"), { target: { scrollTop: 100 } });
+    expect(screen.getByTestId("sidebar-scroll-divider")).toHaveClass("opacity-100");
+
+    fireEvent.click(screen.getByTestId("sidebar-settings-float"));
+    expect(screen.queryByTestId("sidebar-scroll-divider")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("link", { name: /back/i }));
+    expect(screen.getByTestId("sidebar-scroll-divider")).toHaveClass("opacity-0");
+  });
+});
+
 describe("Sidebar session list", () => {
+  it.each([null, 1, 2, 3, 4])(
+    "marks shared sessions regardless of permission level %s",
+    (level) => {
+      mockConversations([
+        conv("shared_session", "Claude Code", {
+          owner: "other@example.com",
+          permission_level: level,
+        }),
+        conv("private_session", "Claude Code"),
+      ]);
+      renderSidebar();
+      selectSessionFilter("all");
+
+      const sharedRow = screen.getByText("shared_session").closest("li")!;
+      const indicator = within(sharedRow).getByRole("img", { name: "Shared session" });
+      expect(indicator).toHaveAttribute("title", "Shared with you");
+      expect(indicator).toHaveClass("w-6", "justify-center");
+      expect(indicator).toHaveClass("absolute", "right-1");
+      expect(
+        within(screen.getByText("private_session").closest("li")!).queryByRole("img"),
+      ).toBeNull();
+    },
+  );
+
+  it("keeps the session state rightmost when a shared icon is also present", () => {
+    mockConversations([
+      conv("shared_running", "Claude Code", {
+        owner: "other@example.com",
+        status: "running",
+      }),
+    ]);
+    renderSidebar();
+    selectSessionFilter("all");
+
+    const row = screen.getByText("shared_running").closest("li")!;
+    expect(within(row).getByRole("img", { name: "Shared session" })).toHaveClass("right-8");
+    expect(within(row).getByTestId("session-state-badge").parentElement).toHaveClass("right-1");
+  });
+
+  it("does not mark the viewer's own sessions or sessions without ownership metadata", () => {
+    const viewer = vi.spyOn(identity, "getCurrentUserId").mockReturnValue("viewer@example.com");
+    try {
+      mockConversations([
+        conv("owned_session", "Claude Code", { owner: "viewer@example.com" }),
+        conv("null_owner", "Claude Code", { owner: null }),
+        conv("missing_owner", "Claude Code"),
+      ]);
+      renderSidebar();
+      expect(screen.queryByRole("img", { name: "Shared session" })).toBeNull();
+    } finally {
+      viewer.mockRestore();
+    }
+  });
+
+  it("keeps the shared indicator on pinned sessions across filters", () => {
+    mockConversations([conv("shared_pin", "Claude Code", { owner: "other@example.com" })]);
+    seedPins(["shared_pin"]);
+    renderSidebar();
+
+    for (const filter of ["mine", "shared", "all", "archived"] as const) {
+      selectSessionFilter(filter);
+      const pinned = screen.getByText("Pinned").closest("section")!;
+      expect(within(pinned).getByRole("img", { name: "Shared session" })).toBeInTheDocument();
+    }
+  });
+
   it("uses the interface text token for the empty session-list state", () => {
     mockConversations([]);
     renderSidebar();
@@ -324,6 +490,22 @@ describe("Sidebar session list", () => {
     expect(screen.queryByText("Claude Code")).not.toBeInTheDocument();
   });
 
+  it("renders a provisional (temp:) row as a bare navigable link with no mutating actions", () => {
+    // A client-only temp row has no server session, so its per-row mutations
+    // (kebab: rename/delete/archive/move/share) must be suppressed — invoking
+    // them would POST to /v1/sessions/temp:* (Polly B-3).
+    mockConversations([
+      conv("temp:0a1b2c3d", "Claude Code", { title: "new chat", provisional: true }),
+    ]);
+    renderSidebar();
+
+    // Navigable: the row is still a link into the (soon-to-exist) conversation.
+    const link = screen.getByRole("link", { name: /new chat/ });
+    expect(link).toHaveAttribute("href", expect.stringContaining("/c/temp:0a1b2c3d"));
+    // But no action affordances until it's rekeyed to the real id.
+    expect(screen.queryByRole("button", { name: "Conversation actions" })).not.toBeInTheDocument();
+  });
+
   it("uses the interface text token for session-list errors", () => {
     conversationsRef.current = [];
     useConvMock.mockReturnValue({
@@ -338,14 +520,94 @@ describe("Sidebar session list", () => {
     expect(error).not.toHaveClass("text-sm");
   });
 
-  it("keeps the session list scrollable without visible scrollbar chrome", () => {
-    mockConversations(THREE_TYPE_CONVERSATIONS);
+  it.each([
+    ["shared", "loading"],
+    ["shared", "error"],
+    ["all", "loading"],
+    ["all", "error"],
+    ["archived", "loading"],
+    ["archived", "error"],
+  ] as const)("keeps pins and expanded projects mounted during %s %s", (view, state) => {
+    projectsMock.push("Work");
+    mockConversations([
+      conv("pinned-session", "Claude Code"),
+      conv("filed-session", "Claude Code", { labels: { omni_project: "Work" } }),
+    ]);
+    seedPins(["pinned-session"]);
+    const original = useConvMock.getMockImplementation()!;
+    const retry = vi.fn();
+    const mineRetry = vi.fn();
+    useConvMock.mockImplementation((...args) => {
+      const query = original(...args);
+      if (args[4] !== (view === "archived" ? "archived" : "shared")) {
+        return { ...query, refetch: mineRetry };
+      }
+      return {
+        ...query,
+        data: undefined,
+        isLoading: state === "loading",
+        isError: state === "error",
+        error: state === "error" ? new Error("unavailable") : null,
+        refetch: retry,
+      } as ReturnType<typeof useConversations>;
+    });
     renderSidebar();
+    fireEvent.click(screen.getByRole("button", { name: "Work" }));
+    const pinned = screen.getByText("pinned-session");
+    const filed = screen.getByText("filed-session");
+    const filter = screen.getByTestId("session-filter");
 
-    const scroller = screen.getByLabelText("Conversations").querySelector("nav")!;
-    expect(scroller).toHaveClass("overflow-y-auto", "[scrollbar-width:none]");
-    expect(scroller.className).toContain("[&::-webkit-scrollbar]:hidden");
-    expect(scroller.className).not.toContain("scrollbar-gutter");
+    selectSessionFilter(view);
+
+    expect(screen.getByText("pinned-session")).toBe(pinned);
+    expect(screen.getByText("filed-session")).toBe(filed);
+    expect(screen.getByTestId("session-filter")).toBe(filter);
+    const sessions = screen.getByRole("button", { name: "Sessions" }).closest("section")!;
+    expect(within(sessions).getByRole("status")).toHaveTextContent(
+      state === "loading" ? "Loading…" : /could not be loaded|Failed to load/,
+    );
+    if (state === "error") {
+      fireEvent.click(within(sessions).getByRole("button", { name: "Retry" }));
+      expect(retry).toHaveBeenCalledOnce();
+    }
+    selectSessionFilter("mine");
+    expect(screen.getByText("pinned-session")).toBe(pinned);
+    expect(screen.getByText("filed-session")).toBe(filed);
+  });
+
+  it("reveals a thin, theme-aware scrollbar only while scrolling", () => {
+    vi.useFakeTimers();
+    try {
+      mockConversations(THREE_TYPE_CONVERSATIONS);
+      renderSidebar();
+
+      const scroller = screen.getByLabelText("Conversations").querySelector("nav")!;
+      expect(scroller).toHaveClass("overflow-y-auto", "md:mr-1", "[scrollbar-width:thin]");
+      expect(scroller.className).toContain("[&::-webkit-scrollbar]:w-2");
+      expect(scroller).not.toHaveClass("[scrollbar-width:none]");
+      expect(scroller.className).not.toContain("[&::-webkit-scrollbar]:hidden");
+
+      expect(scroller).toHaveClass("[scrollbar-color:transparent_transparent]");
+      expect(scroller.className).toContain("[&::-webkit-scrollbar-thumb]:bg-transparent");
+      expect(scroller).not.toHaveClass("[scrollbar-color:var(--muted-foreground)_transparent]");
+      expect(scroller.className).not.toContain("[&::-webkit-scrollbar-thumb]:bg-muted-foreground");
+
+      // Scrolling reveals the thumb.
+      act(() => {
+        fireEvent.scroll(scroller, { target: { scrollTop: 40 } });
+      });
+      expect(scroller).toHaveClass("[scrollbar-color:var(--muted-foreground)_transparent]");
+      expect(scroller.className).toContain("[&::-webkit-scrollbar-thumb]:bg-muted-foreground");
+
+      // It hides again once scrolling settles.
+      act(() => {
+        vi.advanceTimersByTime(1000);
+      });
+      expect(scroller).toHaveClass("[scrollbar-color:transparent_transparent]");
+      expect(scroller.className).toContain("[&::-webkit-scrollbar-thumb]:bg-transparent");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("shows a draft icon only beside sessions with unfinished composer content", () => {
@@ -487,6 +749,69 @@ describe("Sidebar session list", () => {
     expect(screen.getByTestId("session-filter-shared")).toHaveAttribute("aria-checked", "true");
   });
 
+  it("withholds the conversation list until identity is ready", () => {
+    mockConversations([conv("conv_mine", "Claude Code")]);
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const tree = (identityReady: boolean) => (
+      <QueryClientProvider client={qc}>
+        <SidebarDataProvider identityReady={identityReady}>
+          <ExtensionCatalogProvider extensions={[]}>
+            <TooltipProvider>
+              <MemoryRouter>
+                <Sidebar open onClose={vi.fn()} />
+              </MemoryRouter>
+            </TooltipProvider>
+          </ExtensionCatalogProvider>
+        </SidebarDataProvider>
+      </QueryClientProvider>
+    );
+    const { rerender } = render(tree(false));
+
+    expect(screen.queryByTestId("sidebar-conversation-list")).toBeNull();
+    expect(screen.getByRole("status")).toHaveTextContent("Loading sessions");
+
+    rerender(tree(true));
+    expect(screen.getByTestId("sidebar-conversation-list")).toBeInTheDocument();
+    expect(screen.getByText("conv_mine")).toBeInTheDocument();
+  });
+
+  it("leaves Shared when runtime policy makes it unavailable", () => {
+    localStorage.setItem("omnigent:session-filter", "shared");
+    mockConversations([
+      conv("conv_mine", "Claude Code"),
+      conv("conv_shared", "Claude Code", { owner: "other@example.com" }),
+    ]);
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const tree = (config: SidebarConfig) => (
+      <QueryClientProvider client={qc}>
+        <SidebarDataProvider config={config}>
+          <ExtensionCatalogProvider extensions={[]}>
+            <TooltipProvider>
+              <MemoryRouter>
+                <Sidebar open onClose={vi.fn()} />
+              </MemoryRouter>
+            </TooltipProvider>
+          </ExtensionCatalogProvider>
+        </SidebarDataProvider>
+      </QueryClientProvider>
+    );
+    const { rerender } = render(tree(sidebarConfig));
+    expect(screen.getByText("conv_shared")).toBeInTheDocument();
+
+    rerender(tree({ ...sidebarConfig, sharedAvailable: false }));
+
+    expect(screen.getByText("conv_mine")).toBeInTheDocument();
+    expect(screen.queryByText("conv_shared")).toBeNull();
+    expect(localStorage.getItem("omnigent:session-filter")).toBe("mine");
+    fireEvent.pointerDown(screen.getByTestId("session-filter"), {
+      button: 0,
+      ctrlKey: false,
+      pointerType: "mouse",
+    });
+    expect(screen.getByTestId("session-filter-mine")).toHaveAttribute("aria-checked", "true");
+    expect(screen.queryByTestId("session-filter-shared")).toBeNull();
+  });
+
   it("drops a persisted Shared filter on a single-user server", () => {
     // "Shared sessions" isn't in the menu on a loopback-only server, so honoring
     // a value stored against a multi-user one would scope the list to a slice
@@ -577,17 +902,17 @@ describe("Sidebar session list", () => {
     expect(screen.getByText("conv_live")).toBeInTheDocument();
   });
 
-  it("requests the list with archived included", () => {
+  it("requests mine and shared scopes without an all-sessions scan", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
     renderSidebar();
-
-    // The sidebar requests the session list with `includeArchived`
-    // hard-wired to true, so the "Archived sessions" filter has something to
-    // show. A regression to false would leave that filter perpetually empty.
-    expect(useConvMock.mock.calls.length).toBeGreaterThanOrEqual(1);
-    for (const call of useConvMock.mock.calls) {
-      expect(call).toEqual(["", true, { reconcileWhileConnected: true }]);
-    }
+    const calls = useConvMock.mock.calls;
+    expect(calls.some((call) => call[1] === true)).toBe(false);
+    expect(calls.find((call) => call[4] === "mine")?.[2]).toMatchObject({
+      refreshIntervalMs: 60_000,
+    });
+    expect(calls.find((call) => call[4] === "shared")?.[2]).toMatchObject({
+      refreshIntervalMs: 180_000,
+    });
   });
 
   it("opens the command palette when the Search button is clicked", () => {
@@ -738,6 +1063,27 @@ describe("Sidebar session list", () => {
     expect(usage).toHaveClass("bg-[var(--sidebar-active)]");
   });
 
+  it("hides Canvas navigation while the release feature is off", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar(true, "/canvas");
+
+    expect(screen.queryByTestId("canvas-nav")).toBeNull();
+  });
+
+  it("renders and highlights the Canvas nav row without lighting New session", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar(true, "/canvas", undefined, {
+      ...FALLBACK_SERVER_INFO,
+      features: { canvas: true },
+    });
+
+    const canvas = screen.getByTestId("canvas-nav");
+    expect(canvas).toHaveAttribute("href", "/canvas");
+    expect(canvas).toHaveAttribute("aria-current", "page");
+    expect(canvas).toHaveClass("bg-[var(--sidebar-active)]");
+    expect(screen.getByTestId("new-chat-button")).not.toHaveClass("bg-[var(--sidebar-active)]");
+  });
+
   it("keeps filtering visible while session selection remains hover-revealed", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
     renderSidebar();
@@ -813,6 +1159,37 @@ describe("Sidebar session list", () => {
     );
   });
 
+  it("renders and activates an extension nav row without activating core rows", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar(true, "/extensions/acme.review/inbox", undefined, undefined, [TEST_EXTENSION]);
+
+    const extension = screen.getByTestId("extension-nav-acme.review.primary-nav");
+    expect(extension).toHaveAttribute("href", "/extensions/acme.review/inbox");
+    expect(extension).toHaveAttribute("aria-current", "page");
+    expect(screen.getByTestId("new-chat-button")).not.toHaveAttribute("aria-current");
+    expect(screen.getByTestId("inbox-button")).not.toHaveAttribute("aria-current");
+  });
+
+  it("closes the mobile sidebar when an extension nav row is selected", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    const onClose = vi.fn();
+    renderSidebar(true, "/", undefined, undefined, [TEST_EXTENSION], onClose);
+
+    fireEvent.click(screen.getByTestId("extension-nav-acme.review.primary-nav"));
+
+    expect(onClose).toHaveBeenCalledOnce();
+  });
+
+  it("leaves the primary nav unchanged for an empty extension catalog", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar();
+
+    expect(screen.queryByTestId(/^extension-nav-/)).toBeNull();
+    expect(screen.getByTestId("new-chat-button")).toBeInTheDocument();
+    expect(screen.getByTestId("scheduled-tasks-nav")).toBeInTheDocument();
+    expect(screen.getByTestId("inbox-button")).toBeInTheDocument();
+  });
+
   it("does NOT close the sidebar when the footer Settings is tapped", () => {
     // No onNavClick on the footer Settings link: on mobile the overlay stays
     // open and swaps to the settings section list rather than collapsing onto
@@ -822,11 +1199,13 @@ describe("Sidebar session list", () => {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     render(
       <QueryClientProvider client={qc}>
-        <TooltipProvider>
-          <MemoryRouter initialEntries={["/"]}>
-            <Sidebar open onClose={onClose} />
-          </MemoryRouter>
-        </TooltipProvider>
+        <SidebarDataProvider>
+          <TooltipProvider>
+            <MemoryRouter initialEntries={["/"]}>
+              <Sidebar open onClose={onClose} />
+            </MemoryRouter>
+          </TooltipProvider>
+        </SidebarDataProvider>
       </QueryClientProvider>,
     );
     fireEvent.click(screen.getByTestId("settings-button"));
@@ -1065,6 +1444,255 @@ describe("Sidebar session list", () => {
     await waitFor(() => {
       expect(screen.getAllByTestId("session-tooltip-location")[0]).toHaveTextContent(expected);
     });
+  });
+});
+
+describe("Sidebar failed session indicator", () => {
+  function renderSessionSidebar(initialEntry = "/") {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const tree = () => {
+      const sidebar = <Sidebar open onClose={vi.fn()} />;
+      return (
+        <QueryClientProvider client={qc}>
+          <SidebarDataProvider>
+            <TooltipProvider>
+              <MemoryRouter initialEntries={[initialEntry]}>
+                <Routes>
+                  <Route path="/c/:conversationId" element={sidebar} />
+                  <Route path="*" element={sidebar} />
+                </Routes>
+              </MemoryRouter>
+            </TooltipProvider>
+          </SidebarDataProvider>
+        </QueryClientProvider>
+      );
+    };
+    const result = render(tree());
+    return { ...result, refresh: () => result.rerender(tree()) };
+  }
+
+  it("replaces an unread dot with the error icon and keeps it after marking read", () => {
+    const session = conv("conv_error", "Codex", {
+      status: "failed",
+      updated_at: 200,
+    });
+    seedReadState([{ id: session.id, viewer_last_seen: 199 }]);
+    mockConversations([session]);
+    renderSidebar();
+
+    const row = screen.getByRole("link", { name: /conv_error/ }).closest("li")!;
+    const badge = within(row).getByRole("img", { name: "Latest message is an error" });
+    expect(badge).toHaveAttribute("data-state", "error");
+    expect(badge.parentElement).toHaveClass("right-1", "w-6", "justify-center");
+    expect(within(row).getByText("(unread)")).toBeInTheDocument();
+    expect(within(row).queryByRole("img", { name: "New messages" })).toBeNull();
+
+    act(() => markConversationSeen(session.id, session.updated_at));
+
+    expect(within(row).queryByText("(unread)")).toBeNull();
+    expect(within(row).getByRole("img", { name: "Latest message is an error" })).toBe(badge);
+  });
+
+  it("keeps the error icon on the active, already-read session", () => {
+    const session = conv("conv_error", "Codex", {
+      status: "failed",
+      updated_at: 200,
+    });
+    seedReadState([{ id: session.id, viewer_last_seen: session.updated_at }]);
+    mockConversations([session]);
+    renderSessionSidebar(`/c/${session.id}`);
+
+    const row = screen.getByRole("link", { name: "conv_error" }).closest("li")!;
+    expect(within(row).queryByText("(unread)")).toBeNull();
+    expect(within(row).getByRole("img", { name: "Latest message is an error" })).toHaveAttribute(
+      "data-state",
+      "error",
+    );
+  });
+
+  it("updates a mounted row when only the session status changes", () => {
+    // Stable project contexts keep unrelated context updates from bypassing
+    // the row's render-field comparator.
+    projectRowsRef.current = [];
+    const session = conv("conv_error", "Codex", {
+      status: "failed",
+      updated_at: 200,
+    });
+    mockConversations([session]);
+    const { refresh } = renderSessionSidebar();
+    const row = screen.getByRole("link", { name: "conv_error" }).closest("li")!;
+    expect(within(row).getByTestId("session-state-badge")).toHaveAttribute("data-state", "error");
+
+    mockConversations([{ ...session, status: "idle" }]);
+    refresh();
+
+    expect(screen.getByRole("link", { name: "conv_error" }).closest("li")).toBe(row);
+    expect(within(row).queryByTestId("session-state-badge")).toBeNull();
+
+    mockConversations([{ ...session, status: "failed" }]);
+    refresh();
+
+    expect(screen.getByRole("link", { name: "conv_error" }).closest("li")).toBe(row);
+    expect(within(row).getByTestId("session-state-badge")).toHaveAttribute("data-state", "error");
+  });
+
+  it.each([
+    { status: "running" as const, pending: 0, expected: "running" },
+    { status: "failed" as const, pending: 2, expected: "awaiting" },
+  ])("lets $expected take precedence over a previous error", ({ status, pending, expected }) => {
+    const session = conv("conv_error", "Codex", { status: "failed" });
+    mockConversations([session]);
+    const { refresh } = renderSessionSidebar();
+    const row = screen.getByRole("link", { name: "conv_error" }).closest("li")!;
+    expect(within(row).getByTestId("session-state-badge")).toHaveAttribute("data-state", "error");
+
+    mockConversations([{ ...session, status, pending_elicitations_count: pending }]);
+    refresh();
+
+    expect(within(row).getByTestId("session-state-badge")).toHaveAttribute("data-state", expected);
+    expect(within(row).queryByRole("img", { name: "Latest message is an error" })).toBeNull();
+  });
+
+  it.each([
+    { status: "streaming" as const, terminalPending: false },
+    { status: "idle" as const, terminalPending: true },
+  ])("shows startup over a previous error for $status/$terminalPending", (startup) => {
+    const wakingId = `conv_error_retry_${startup.status}_${startup.terminalPending}`;
+    mockConversations([
+      conv(wakingId, "Codex", {
+        status: "failed",
+        updated_at: 200,
+      }),
+      conv("conv_other", "Codex", { status: "failed" }),
+    ]);
+    seedReadState([{ id: wakingId, viewer_last_seen: 199 }]);
+    useChatStore.setState({ conversationId: wakingId, ...startup });
+    renderSidebar();
+
+    const wakingRow = screen.getByRole("link", { name: new RegExp(wakingId) }).closest("li")!;
+    expect(within(wakingRow).getByTestId("session-state-badge")).toHaveAttribute(
+      "data-state",
+      "starting",
+    );
+    const otherRow = screen.getByRole("link", { name: "conv_other" }).closest("li")!;
+    expect(within(otherRow).getByTestId("session-state-badge")).toHaveAttribute(
+      "data-state",
+      "error",
+    );
+  });
+
+  it("shows the error icon on a pinned session", () => {
+    seedPins(["conv_error"]);
+    mockConversations([conv("conv_error", "Codex", { status: "failed" })]);
+    renderSidebar();
+
+    const pinnedSection = screen.getByRole("button", { name: /^Pinned/ }).closest("section")!;
+    const row = within(pinnedSection).getByRole("link", { name: "conv_error" }).closest("li")!;
+    expect(within(row).getByRole("img", { name: "Latest message is an error" })).toHaveAttribute(
+      "data-state",
+      "error",
+    );
+  });
+
+  describe.each(["regular", "pinned"] as const)("%s session error explanation", (surface) => {
+    async function openExplanation(state: "error" | "running" | "awaiting" | "starting") {
+      const id = `conv_hint_${surface}_${state}`;
+      const pinned = surface === "pinned";
+      if (pinned) {
+        projectsMock.push("Customer X");
+        seedPins([id]);
+      }
+      mockConversations([
+        conv(id, "Codex", {
+          status: state === "running" ? "running" : "failed",
+          pending_elicitations_count: state === "awaiting" ? 1 : 0,
+          labels: pinned ? { omni_project: "Customer X" } : {},
+        }),
+      ]);
+      if (state === "starting") {
+        useChatStore.setState({ conversationId: id, status: "streaming" });
+      }
+      renderSidebar();
+
+      const row = screen.getByRole("link", { name: id });
+      expect(within(row.closest("li")!).getByTestId("session-state-badge")).toHaveAttribute(
+        "data-state",
+        state,
+      );
+      if (pinned) fireEvent.focus(row);
+      else fireEvent.pointerMove(row, { pointerType: "mouse" });
+      return screen.findByTestId(pinned ? "pinned-project-flyout" : "session-tooltip-content");
+    }
+
+    it("explains the error through the row's existing hover surface", async () => {
+      const content = await openExplanation("error");
+      expect(content).toHaveTextContent("Latest message is an error");
+      const hint = content.querySelector("p.text-destructive");
+      expect(hint).toHaveTextContent("Latest message is an error");
+      expect(hint?.querySelector("svg.lucide-circle-alert")).toHaveAttribute("aria-hidden", "true");
+    });
+
+    it.each(["running", "awaiting", "starting"] as const)(
+      "omits an old error explanation while the session is %s",
+      async (state) => {
+        const content = await openExplanation(state);
+        expect(content).not.toHaveTextContent("Latest message is an error");
+      },
+    );
+  });
+});
+
+describe("Sidebar idle latest-message error", () => {
+  beforeEach(() => {
+    vi.spyOn(sessionsApi, "fetchSessionItemsPage").mockResolvedValue({
+      items: [
+        {
+          id: "native_error",
+          response_id: "response1",
+          type: "message",
+          status: "completed",
+          role: "assistant",
+          content: [{ type: "output_text", text: "API Error: Request rejected (429)" }],
+        },
+      ],
+      hasMore: true,
+    });
+  });
+  afterEach(() => vi.mocked(sessionsApi.fetchSessionItemsPage).mockRestore());
+
+  it("shows the icon for an unopened idle session and keeps it after marking read", async () => {
+    const session = conv("conv_idle_error", "Claude Code", { status: "idle", updated_at: 200 });
+    seedReadState([{ id: session.id, viewer_last_seen: 199 }]);
+    mockConversations([session]);
+    renderSidebar();
+    const row = screen.getByRole("link", { name: /conv_idle_error/ }).closest("li")!;
+    const badge = await within(row).findByRole("img", { name: "Latest message is an error" });
+    expect(badge).toHaveAttribute("data-state", "error");
+    expect(badge.querySelector("svg")).toHaveClass("text-destructive", "size-3.5");
+    expect(within(row).getByText("(unread)")).toBeInTheDocument();
+    act(() => markConversationSeen(session.id, session.updated_at));
+    expect(within(row).queryByText("(unread)")).toBeNull();
+    expect(within(row).getByRole("img", { name: "Latest message is an error" })).toBe(badge);
+    expect(sessionsApi.fetchSessionItemsPage).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows an idle message error on a collapsed project's marker", async () => {
+    projectsMock.push("Customer X");
+    mockConversations([
+      conv("conv_idle_error", "Claude Code", {
+        status: "idle",
+        labels: { omni_project: "Customer X" },
+      }),
+    ]);
+    renderSidebar();
+    const header = screen.getByRole("button", { name: /^Customer X/ });
+    await within(header).findByRole("img", { name: "Latest message is an error" });
+    fireEvent.click(header);
+    const row = screen.getByRole("link", { name: "conv_idle_error" }).closest("li")!;
+    expect(
+      within(row).getByRole("img", { name: "Latest message is an error" }),
+    ).toBeInTheDocument();
+    expect(sessionsApi.fetchSessionItemsPage).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -1360,6 +1988,12 @@ describe("Sidebar load-more vs collapsed Sessions", () => {
   });
 
   it("auto-fetches the next page when the sentinel scrolls into view (infinite scroll)", () => {
+    // Start on the "all" tab so the background all-sessions paginator doesn't
+    // fire on mount (it only runs on "mine"/"shared" tabs). The default tab is
+    // "mine" (DEFAULT_SESSION_FILTER), so force "all" via localStorage before
+    // rendering. This isolates the test to sentinel-triggered pagination only.
+    localStorage.setItem("omnigent:session-filter", "all");
+
     // Capture the IntersectionObserver callback so the test can simulate the
     // sentinel entering the scroll viewport.
     let observerCallback: IntersectionObserverCallback | undefined;
@@ -1406,9 +2040,65 @@ describe("Sidebar load-more vs collapsed Sessions", () => {
     observerCallback!([{ isIntersecting: false } as IntersectionObserverEntry], {} as never);
     expect(fetchNextPage).not.toHaveBeenCalled();
     observerCallback!([{ isIntersecting: true } as IntersectionObserverEntry], {} as never);
-    expect(fetchNextPage).toHaveBeenCalledTimes(1);
+    expect(fetchNextPage).toHaveBeenCalledTimes(2);
 
     vi.unstubAllGlobals();
+  });
+});
+
+// The sidebar uses two queries: an all-sessions query for inbox/WS and a
+// tab-scoped query for display on the "mine" and "shared" tabs. The tab-scoped
+// query passes `visibility` to the server so the server paginates only the
+// relevant sessions (proper fix for OMNI-6002).
+describe("Sidebar visibility filter (server-side mine/shared split)", () => {
+  it('calls useConversations with visibility="mine" when on the mine tab', () => {
+    mockConversations([conv("conv_mine", "Claude Code")]);
+    renderSidebar();
+
+    // Sidebar always renders on the "mine" tab by default. Check that one of the
+    // useConversations calls passes visibility="mine" (the tab-scoped query).
+    const calls = useConvMock.mock.calls;
+    const mineCall = calls.find((args) => args[4] === "mine");
+    expect(mineCall).toBeDefined();
+    // The tab-scoped query uses includeArchived=false and enabled=true.
+    expect(mineCall![1]).toBe(false);
+    expect((mineCall![2] as { enabled?: boolean }).enabled).toBe(true);
+  });
+
+  it('calls useConversations with visibility="shared" when on the shared tab', () => {
+    mockConversations([conv("conv_mine", "Claude Code")]);
+    renderSidebar();
+    selectSessionFilter("shared");
+
+    const calls = useConvMock.mock.calls;
+    const sharedCall = calls.find((args) => args[4] === "shared");
+    expect(sharedCall).toBeDefined();
+    expect(sharedCall![1]).toBe(false);
+    expect((sharedCall![2] as { enabled?: boolean }).enabled).toBe(true);
+  });
+
+  it("disables the tab-scoped query when on the all tab", () => {
+    mockConversations([conv("conv_mine", "Claude Code")]);
+    renderSidebar();
+    selectSessionFilter("all");
+
+    const calls = useConvMock.mock.calls;
+    // No call should pass visibility="mine" or "shared" — the tab-scoped query
+    // is disabled (enabled=false) when the active tab is "all".
+    const disabledTabCalls = calls.filter(
+      (args) => (args[2] as { enabled?: boolean })?.enabled === false,
+    );
+    expect(disabledTabCalls.length).toBeGreaterThan(0);
+  });
+
+  it("renders sessions from the tab-scoped query on the mine tab", () => {
+    // When on the "mine" tab the display query is the filtered one. Both calls
+    // return the same mock data here, so the visible session row reflects the
+    // tab-scoped result.
+    mockConversations([conv("conv_mine", "Claude Code")]);
+    renderSidebar();
+
+    expect(screen.getByText("conv_mine")).toBeInTheDocument();
   });
 });
 
@@ -1509,11 +2199,13 @@ describe("Sidebar project sections", () => {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     render(
       <QueryClientProvider client={qc}>
-        <TooltipProvider>
-          <MemoryRouter initialEntries={["/"]}>
-            <Sidebar open onClose={onClose} />
-          </MemoryRouter>
-        </TooltipProvider>
+        <SidebarDataProvider>
+          <TooltipProvider>
+            <MemoryRouter initialEntries={["/"]}>
+              <Sidebar open onClose={onClose} />
+            </MemoryRouter>
+          </TooltipProvider>
+        </SidebarDataProvider>
       </QueryClientProvider>,
     );
 
@@ -1547,13 +2239,15 @@ describe("Sidebar project sections", () => {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     render(
       <QueryClientProvider client={qc}>
-        <TooltipProvider>
-          <MemoryRouter initialEntries={["/c/conv_filed"]}>
-            <Routes>
-              <Route path="/c/:conversationId" element={<Sidebar open onClose={vi.fn()} />} />
-            </Routes>
-          </MemoryRouter>
-        </TooltipProvider>
+        <SidebarDataProvider>
+          <TooltipProvider>
+            <MemoryRouter initialEntries={["/c/conv_filed"]}>
+              <Routes>
+                <Route path="/c/:conversationId" element={<Sidebar open onClose={vi.fn()} />} />
+              </Routes>
+            </MemoryRouter>
+          </TooltipProvider>
+        </SidebarDataProvider>
       </QueryClientProvider>,
     );
 
@@ -1891,6 +2585,126 @@ describe("Sidebar project sections", () => {
 // A collapsed project bubbles up its hidden rows' marker, using the same
 // SessionStateBadge a row shows. Only while collapsed.
 describe("Sidebar collapsed project marker", () => {
+  it("surfaces an error ahead of unread messages and moves it to the expanded row", () => {
+    projectsMock.push("Customer X");
+    seedReadState([{ id: "conv_unread", viewer_last_seen: 199 }]);
+    mockConversations([
+      conv("conv_error", "Codex", {
+        labels: { omni_project: "Customer X" },
+        status: "failed",
+      }),
+      conv("conv_unread", "Codex", {
+        labels: { omni_project: "Customer X" },
+        status: "idle",
+        updated_at: 200,
+      }),
+    ]);
+    renderSidebar();
+
+    const header = screen.getByRole("button", { name: /^Customer X/ });
+    expect(header).toHaveAttribute("aria-expanded", "false");
+    expect(within(header).getByRole("img", { name: "Latest message is an error" })).toHaveAttribute(
+      "data-state",
+      "error",
+    );
+
+    fireEvent.click(header);
+
+    expect(header).toHaveAttribute("aria-expanded", "true");
+    expect(within(header).queryByTestId("session-state-badge")).toBeNull();
+    const row = screen.getByRole("link", { name: "conv_error" }).closest("li")!;
+    expect(
+      within(row).getByRole("img", { name: "Latest message is an error" }),
+    ).toBeInTheDocument();
+  });
+
+  it.each(["failed", "idle"] as const)(
+    "prioritizes a running session over an unread $0 sibling",
+    (status) => {
+      projectsMock.push("Customer X");
+      seedReadState([
+        { id: "conv_other", viewer_last_seen: 199 },
+        { id: "conv_running", viewer_last_seen: 199 },
+      ]);
+      mockConversations([
+        conv("conv_other", "Codex", {
+          labels: { omni_project: "Customer X" },
+          status,
+          updated_at: 200,
+        }),
+        conv("conv_running", "Codex", {
+          labels: { omni_project: "Customer X" },
+          status: "running",
+          updated_at: 200,
+        }),
+      ]);
+      renderSidebar();
+
+      const header = screen.getByRole("button", { name: /^Customer X/ });
+      expect(within(header).getByTestId("session-state-badge")).toHaveAttribute(
+        "data-state",
+        "running",
+      );
+      expect(within(header).queryByRole("img", { name: "Latest message is an error" })).toBeNull();
+    },
+  );
+
+  it.each([
+    { status: "streaming" as const, terminalPending: false },
+    { status: "idle" as const, terminalPending: true },
+  ])("prioritizes startup over a previous error for $status/$terminalPending", (startup) => {
+    projectsMock.push("Customer X");
+    mockConversations([
+      conv("conv_error", "Codex", {
+        labels: { omni_project: "Customer X" },
+        status: "failed",
+      }),
+    ]);
+    useChatStore.setState({ conversationId: "conv_error", ...startup });
+    renderSidebar();
+
+    const header = screen.getByRole("button", { name: /^Customer X/ });
+    expect(within(header).getByTestId("session-state-badge")).toHaveAttribute(
+      "data-state",
+      "starting",
+    );
+
+    act(() => useChatStore.setState({ status: "idle", terminalPending: false }));
+    expect(within(header).getByTestId("session-state-badge")).toHaveAttribute(
+      "data-state",
+      "error",
+    );
+  });
+
+  it("prioritizes a pending approval over running and errored sessions", () => {
+    projectsMock.push("Customer X");
+    mockConversations([
+      conv("conv_error", "Codex", {
+        labels: { omni_project: "Customer X" },
+        status: "failed",
+      }),
+      conv("conv_awaiting", "Codex", {
+        labels: { omni_project: "Customer X" },
+        pending_elicitations_count: 2,
+      }),
+      conv("conv_running", "Codex", {
+        labels: { omni_project: "Customer X" },
+        status: "running",
+      }),
+    ]);
+    renderSidebar();
+
+    const header = screen.getByRole("button", { name: /^Customer X/ });
+    expect(within(header).getByTestId("session-state-badge")).toHaveAttribute(
+      "data-state",
+      "awaiting",
+    );
+    expect(
+      within(header).getByRole("img", { name: "2 approval prompts waiting" }),
+    ).toBeInTheDocument();
+    expect(within(header).queryByRole("img", { name: "Latest message is an error" })).toBeNull();
+  });
+
   it("shows the row's session-state badge on a collapsed project", () => {
     projectsMock.push("Customer X");
     mockConversations([
@@ -2043,11 +2857,13 @@ describe("Sidebar auto-expand Pinned on pin", () => {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const tree = () => (
       <QueryClientProvider client={qc}>
-        <TooltipProvider>
-          <MemoryRouter initialEntries={["/"]}>
-            <Sidebar open onClose={vi.fn()} />
-          </MemoryRouter>
-        </TooltipProvider>
+        <SidebarDataProvider>
+          <TooltipProvider>
+            <MemoryRouter initialEntries={["/"]}>
+              <Sidebar open onClose={vi.fn()} />
+            </MemoryRouter>
+          </TooltipProvider>
+        </SidebarDataProvider>
       </QueryClientProvider>
     );
     const { rerender } = render(tree());
@@ -2181,14 +2997,16 @@ describe("Sidebar active-row auto-scroll", () => {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     return render(
       <QueryClientProvider client={qc}>
-        <TooltipProvider>
-          <MemoryRouter initialEntries={[initialEntry]}>
-            <Routes>
-              <Route path="/" element={<Sidebar open onClose={vi.fn()} />} />
-              <Route path="/c/:conversationId" element={<Sidebar open onClose={vi.fn()} />} />
-            </Routes>
-          </MemoryRouter>
-        </TooltipProvider>
+        <SidebarDataProvider>
+          <TooltipProvider>
+            <MemoryRouter initialEntries={[initialEntry]}>
+              <Routes>
+                <Route path="/" element={<Sidebar open onClose={vi.fn()} />} />
+                <Route path="/c/:conversationId" element={<Sidebar open onClose={vi.fn()} />} />
+              </Routes>
+            </MemoryRouter>
+          </TooltipProvider>
+        </SidebarDataProvider>
       </QueryClientProvider>,
     );
   }
@@ -2258,4 +3076,33 @@ describe("Sidebar collapsed marker", () => {
     // still match [data-collapsed] and strip the glass border while open.
     expect(openAside).not.toHaveAttribute("data-collapsed");
   });
+});
+
+it("caps Shared display independently of Mine while revealing cached rows", async () => {
+  isServerLocalMock.mockReturnValue(false);
+  const owned = Array.from({ length: 40 }, (_, i) => conv(`owned-${i}`, "agent"));
+  const shared = Array.from({ length: 70 }, (_, i) =>
+    conv(`shared-${i}`, "agent", {
+      owner: "other@example.com",
+      permission_level: 1,
+      updated_at: 100 - i,
+    }),
+  );
+  mockConversations([...owned, ...shared]);
+  renderSidebar(true, "/", undefined, undefined, [], vi.fn(), {
+    ...sidebarConfig,
+    sharedDisplayPageSize: 30,
+  });
+  selectSessionFilter("mine");
+  expect(screen.getByText("owned-39", { exact: true })).toBeInTheDocument();
+  showSharedTab();
+  expect(screen.getByText("shared-29", { exact: true })).toBeInTheDocument();
+  expect(screen.queryByText("shared-30", { exact: true })).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "Load more" }));
+  await waitFor(() => expect(screen.getByText("shared-59", { exact: true })).toBeInTheDocument());
+  expect(screen.queryByText("shared-60", { exact: true })).toBeNull();
+  selectSessionFilter("mine");
+  expect(screen.getByText("owned-39", { exact: true })).toBeInTheDocument();
+  showSharedTab();
+  expect(screen.queryByText("shared-30", { exact: true })).toBeNull();
 });

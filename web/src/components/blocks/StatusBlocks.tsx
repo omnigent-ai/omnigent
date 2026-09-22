@@ -9,12 +9,10 @@
 //   the "Working…" indicator.
 
 import {
-  AlertCircleIcon,
   BrainCircuitIcon,
   CheckIcon,
   ChevronRightIcon,
   CopyIcon,
-  InfoIcon,
   Loader2Icon,
   RotateCcwIcon,
   RotateCwIcon,
@@ -32,6 +30,7 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { shortModelName } from "@/components/CostRoutingControl";
 import { copyText } from "@/lib/clipboard";
+import type { RelatedRenderError, RenderErrorDetails } from "@/lib/renderItems";
 import {
   type RoutingDecisionExtras,
   harnessDisplayLabel,
@@ -41,6 +40,7 @@ import { cn } from "@/lib/utils";
 import { TOOL_SURFACE_WIDTH_CLASS } from "./toolSurface";
 
 interface ErrorBannerProps {
+  itemId?: string | null;
   message: string;
   source: string;
   code: string;
@@ -52,8 +52,10 @@ interface ErrorBannerProps {
   remediation?: string;
   /** `"info"` renders a neutral notice (no failure tone) instead of a destructive error. */
   level?: "error" | "info";
-  /** Reconnect the existing session without replaying or duplicating user input. */
-  onRetry?: () => Promise<void>;
+  /** Recover the existing session or continue after a retryable turn failure. */
+  onRetry?: (error: RelatedRenderError) => Promise<void>;
+  /** Later failures emitted by the same response, turn, and agent. */
+  relatedErrors?: RelatedRenderError[];
 }
 
 /**
@@ -75,6 +77,9 @@ const FAILURE_CODE_DESCRIPTIONS: Record<string, string> = {
   workspace_missing: "The session workspace no longer exists on the host.",
   codex_thread_reset:
     "Codex hit an error reloading the earlier transcript, so it started a fresh thread.",
+  codex_turn_error: "Codex ran into an error during this turn.",
+  native_turn_error: "The agent ran into an error during this turn.",
+  rate_limit_exceeded: "The model's rate limit was reached. You can retry this turn.",
 };
 
 const RETRYABLE_ERROR_CODES = new Set([
@@ -83,6 +88,7 @@ const RETRYABLE_ERROR_CODES = new Set([
   "runner_disconnected",
   "runner_failed_to_start",
   "runner_unavailable",
+  "rate_limit_exceeded",
 ]);
 
 interface ParsedErrorMessage {
@@ -95,6 +101,24 @@ const DIAGNOSTICS_HEADING = /^(?:terminal|lifecycle) diagnostics:\s*$/i;
 const LAST_OUTPUT_HEADING = /^last captured (?:terminal )?output:\s*(.*)$/i;
 const UNAVAILABLE_OUTPUT =
   /^unavailable(?:[.!]|\. The process exited before Omnigent captured a pane snapshot\.)?$/i;
+const EMPTY_RELATED_ERRORS: RelatedRenderError[] = [];
+
+function errorHeadline(error: RenderErrorDetails): string {
+  return (
+    error.title ||
+    FAILURE_CODE_DESCRIPTIONS[error.code] ||
+    (error.level === "info" ? "Notice" : "Something went wrong")
+  );
+}
+
+function relatedErrorText(error: RenderErrorDetails): string {
+  const parts = [
+    error.cause,
+    error.remediation ? `Try this: ${error.remediation}` : undefined,
+    error.message || error.code,
+  ].filter((part): part is string => Boolean(part));
+  return parts.filter((part, index) => parts.indexOf(part) === index).join("\n\n");
+}
 
 function trimBlankBoundaryLines(lines: string[]): string | null {
   let start = 0;
@@ -146,19 +170,29 @@ function parseErrorMessage(rawMessage: string): ParsedErrorMessage {
  * never a blank panel.
  */
 export function ErrorBanner({
+  itemId = null,
   message,
+  source,
   code,
   title,
   cause,
   remediation,
   level,
   onRetry,
+  relatedErrors = EMPTY_RELATED_ERRORS,
 }: ErrorBannerProps) {
-  const notice = level === "info";
+  const notice = level === "info" && relatedErrors.every((error) => error.level === "info");
   const tone = notice ? "var(--muted-foreground)" : "var(--destructive)";
-  const StatusIcon = notice ? InfoIcon : AlertCircleIcon;
-  const headline =
-    title || FAILURE_CODE_DESCRIPTIONS[code] || (notice ? "Notice" : "Something went wrong");
+  const headline = errorHeadline({ message, source: "", code, title, cause, remediation, level });
+  const relatedDetails = useMemo(
+    () =>
+      relatedErrors.map((error) => ({
+        key: error.itemId ?? `${error.code}:${error.source}:${error.message}`,
+        headline: errorHeadline(error),
+        text: relatedErrorText(error),
+      })),
+    [relatedErrors],
+  );
   const parsed = useMemo(() => parseErrorMessage(message), [message]);
   const messageText = useMemo(() => {
     const parts: string[] = [];
@@ -185,16 +219,17 @@ export function ErrorBanner({
   const [retrying, setRetrying] = useState(false);
   const [retryError, setRetryError] = useState<string | null>(null);
   const [dismissed, setDismissed] = useState(false);
-  const [headerHovered, setHeaderHovered] = useState(false);
-  const [headerFocusVisible, setHeaderFocusVisible] = useState(false);
   const copyResetRef = useRef<number>(0);
   const retryInFlightRef = useRef(false);
-  const headerPointerDownRef = useRef(false);
   const dismissButtonRef = useRef<HTMLButtonElement>(null);
   const messageId = useId();
   const diagnosticsId = useId();
-  const retryable = onRetry !== undefined && RETRYABLE_ERROR_CODES.has(code);
-  const showDisclosureIcon = expanded || headerHovered || headerFocusVisible;
+  const actionableError = [
+    { itemId, message, source, code, level, title, cause, remediation },
+    ...relatedErrors,
+  ].find((error) => RETRYABLE_ERROR_CODES.has(error.code));
+  const retryable = onRetry !== undefined && actionableError !== undefined;
+  const retryLabel = actionableError?.code === "rate_limit_exceeded" ? "Retry" : "Resume session";
 
   useEffect(() => () => window.clearTimeout(copyResetRef.current), []);
   useEffect(() => {
@@ -229,7 +264,7 @@ export function ErrorBanner({
           className="relative z-10 h-auto rounded-xl border-border bg-background px-4 py-2 text-sm font-normal text-muted-foreground shadow-xs"
         >
           <Loader2Icon aria-hidden="true" className="animate-spin" />
-          Reconnecting
+          {actionableError?.code === "rate_limit_exceeded" ? "Retrying" : "Reconnecting"}
         </Badge>
       </div>
     );
@@ -243,16 +278,18 @@ export function ErrorBanner({
   };
 
   const retry = async () => {
-    if (!onRetry || retryInFlightRef.current) return;
+    if (!onRetry || !actionableError || retryInFlightRef.current) return;
     retryInFlightRef.current = true;
     setRetrying(true);
     setRetryError(null);
     try {
-      await onRetry();
+      await onRetry(actionableError);
       setDismissed(true);
     } catch (error) {
       retryInFlightRef.current = false;
-      setRetryError(`Retry failed: ${error instanceof Error ? error.message : String(error)}`);
+      setRetryError(
+        `${retryLabel} failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
       setRetrying(false);
     }
   };
@@ -270,18 +307,6 @@ export function ErrorBanner({
         data-testid="error-pill"
         data-level={notice ? "info" : "error"}
         onClick={() => setExpanded((value) => !value)}
-        onMouseEnter={() => setHeaderHovered(true)}
-        onMouseLeave={() => setHeaderHovered(false)}
-        onPointerDown={() => {
-          headerPointerDownRef.current = true;
-          setHeaderFocusVisible(false);
-        }}
-        onPointerUp={() => {
-          headerPointerDownRef.current = false;
-        }}
-        onPointerCancel={() => {
-          headerPointerDownRef.current = false;
-        }}
         className="group/error relative z-10 w-[560px] max-w-full cursor-pointer rounded-[12px] p-[8px] text-foreground"
         style={{
           background: `color-mix(in srgb, ${tone} 4%, var(--app-shell-bg, var(--background)))`,
@@ -297,53 +322,32 @@ export function ErrorBanner({
               event.stopPropagation();
               setExpanded((value) => !value);
             }}
-            onKeyDown={(event) => {
-              setHeaderFocusVisible(event.currentTarget.matches(":focus-visible"));
-            }}
-            onFocus={(event) => {
-              setHeaderFocusVisible(
-                !headerPointerDownRef.current && event.currentTarget.matches(":focus-visible"),
-              );
-            }}
-            onBlur={() => {
-              headerPointerDownRef.current = false;
-              setHeaderFocusVisible(false);
-            }}
             className="flex min-w-0 flex-1 cursor-pointer items-start rounded-lg bg-transparent text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
           >
             <span
               data-testid="error-leading-slot"
               className="mt-[4px] mr-[4px] flex h-[18px] w-[18px] shrink-0 items-center justify-center"
             >
-              {showDisclosureIcon ? (
-                <ChevronRightIcon
-                  data-testid="error-disclosure-icon"
-                  className={cn(
-                    "size-4 text-muted-foreground transition-transform duration-150 animate-in fade-in group-hover/error:text-foreground",
-                    expanded && "rotate-90",
-                  )}
-                  aria-hidden="true"
-                />
-              ) : (
-                <StatusIcon
-                  data-testid="error-status-icon"
-                  className={cn(
-                    "size-[18px] duration-150 animate-in fade-in",
-                    notice ? "text-muted-foreground" : "text-destructive",
-                  )}
-                  aria-hidden="true"
-                />
-              )}
+              <ChevronRightIcon
+                data-testid="error-disclosure-icon"
+                className={cn(
+                  "size-4 text-muted-foreground transition-transform duration-150 group-hover/error:text-foreground",
+                  expanded && "rotate-90",
+                )}
+                aria-hidden="true"
+              />
             </span>
-            <span
-              data-testid="error-headline"
-              title={headline}
-              className={cn(
-                "mr-[4px] min-w-0 flex-1 truncate whitespace-nowrap leading-6",
-                notice ? "text-foreground" : "text-destructive",
-              )}
-            >
-              {headline}
+            <span className="mr-[4px] flex min-w-0 flex-1 flex-col">
+              <span
+                data-testid="error-headline"
+                title={headline}
+                className={cn(
+                  "min-w-0 truncate whitespace-nowrap leading-6",
+                  notice ? "text-foreground" : "text-destructive",
+                )}
+              >
+                {headline}
+              </span>
             </span>
           </button>
           {retryable ? (
@@ -359,7 +363,7 @@ export function ErrorBanner({
               className="h-6 shrink-0 gap-1 rounded-[var(--control-radius,var(--radius-lg))] px-2 leading-5 text-muted-foreground hover:bg-muted hover:text-foreground"
             >
               <RotateCwIcon className="size-3.5" aria-hidden="true" />
-              Retry
+              {retryLabel}
             </Button>
           ) : null}
           <Button
@@ -427,6 +431,34 @@ export function ErrorBanner({
                 {messageText}
               </div>
             </section>
+            {relatedDetails.length > 0 ? (
+              <section
+                aria-labelledby={`${messageId}-related-label`}
+                className="mx-[4px] mt-[16px] min-w-0 border-t border-border pt-[12px]"
+              >
+                <h4
+                  id={`${messageId}-related-label`}
+                  className="text-sm leading-4 font-medium text-muted-foreground"
+                >
+                  Related errors ({relatedDetails.length})
+                </h4>
+                <ol className="mt-[8px] flex min-w-0 list-decimal flex-col gap-[12px] pl-[20px] marker:text-muted-foreground">
+                  {relatedDetails.map((error) => (
+                    <li key={error.key} className="min-w-0 pl-[4px]">
+                      <h5 className="text-sm leading-5 font-medium text-destructive">
+                        {error.headline}
+                      </h5>
+                      <pre
+                        data-testid="related-error-content"
+                        className="mt-[4px] max-w-full min-w-0 whitespace-pre-wrap break-words font-mono text-sm leading-6 text-foreground [overflow-wrap:anywhere]"
+                      >
+                        {error.text}
+                      </pre>
+                    </li>
+                  ))}
+                </ol>
+              </section>
+            ) : null}
             {diagnostics.length > 0 ? (
               <Collapsible
                 open={diagnosticsOpen}
@@ -630,6 +662,7 @@ export function RoutingDecisionCard({
   routing,
 }: RoutingDecisionCardProps) {
   const { harness, scope, decisionId, rawModel, attemptedOverride, routerSource } = routing ?? {};
+  const taskDescription = routing?.taskDescription?.trim();
   const short = shortModelName(model);
   const rawShort = rawPickName(model, rawModel);
   const attemptedShort = attemptedPickName(model, attemptedOverride);
@@ -644,6 +677,7 @@ export function RoutingDecisionCard({
           applied,
           rationale,
           ...(agent ? { agent } : {}),
+          ...(taskDescription ? { task_description: taskDescription } : {}),
           ...(harness ? { harness } : {}),
           ...(scope ? { scope } : {}),
           ...(decisionId ? { decision_id: decisionId } : {}),
@@ -659,6 +693,7 @@ export function RoutingDecisionCard({
       applied,
       rationale,
       agent,
+      taskDescription,
       harness,
       scope,
       decisionId,
@@ -711,7 +746,18 @@ export function RoutingDecisionCard({
         </CollapsibleTrigger>
       </div>
       <div className="flex items-center gap-2 text-sm">
-        <span className="min-w-0 truncate font-mono text-foreground">{rowLabel}</span>
+        {taskDescription ? (
+          // Name the work even when sibling spawns share a type and rationale.
+          <span
+            className="min-w-0 truncate text-foreground"
+            data-testid="routing-decision-task"
+            title={taskDescription}
+          >
+            {taskDescription}
+          </span>
+        ) : (
+          <span className="min-w-0 truncate font-mono text-foreground">{rowLabel}</span>
+        )}
         {attemptedShort ? (
           // The spawn named its own model and the router picked another — the
           // substitution is the whole point of the row, so it shows at a glance.

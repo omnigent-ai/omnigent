@@ -17,28 +17,38 @@ from the DB so a host connected to replica B reads back as
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import secrets
+import weakref
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from omnigent.db.utils import now_epoch
-from omnigent.debug_logging import add_audit_attrs
+from omnigent.debug_logging import (
+    add_audit_attrs,
+    debug_event,
+    set_current_runner_id,
+    set_current_session_id,
+)
 from omnigent.entities import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    WORKSPACE_MISSING_ERROR_CODE,
     HostCreateDirFrame,
     HostDetectCredentialsFrame,
     HostInstallHarnessFrame,
     HostLaunchRunnerFrame,
     HostListDirFrame,
     HostStoreSecretFrame,
+    classify_launch_refusal,
     encode_host_frame,
     optional_str_bool_map,
+    workspace_missing_message,
 )
 from omnigent.onboarding.harness_install import (
     ui_credential_configurable_harnesses,
@@ -51,17 +61,42 @@ from omnigent.server.auth import AuthProvider
 from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.routes._auth_helpers import require_user
-from omnigent.server.routes._host_launch import resolve_host_launch
+from omnigent.server.routes._host_launch import host_absent_error, resolve_host_launch
 from omnigent.server.routes._workspace_validation import (
     _is_windows_absolute_path,
     restore_host_filesystem_url_path,
 )
 from omnigent.server.schemas import SessionGitOptions
 from omnigent.stores import AgentStore, ConversationStore
-from omnigent.stores.host_store import Host, HostStore, host_is_live
+from omnigent.stores.host_store import HostStore, host_is_live
 from omnigent.stores.permission_store import PermissionStore
 
 _logger = logging.getLogger(__name__)
+
+# Managed `/hosts/{host_id}` requests are slice-keyed to the host-owning replica;
+# self-hosted servers are single-replica. The database CAS remains the fallback.
+# custom-lint: disable-next=workspace-scoped-cache -- lock; collision only serializes
+_runner_launch_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+    weakref.WeakValueDictionary()
+)
+# custom-lint: disable-next=workspace-scoped-cache -- set of Task objects
+_runner_launch_cleanup_tasks: set[asyncio.Task[None]] = set()
+
+
+def _track_runner_launch_cleanup(task: asyncio.Task[None]) -> None:
+    """Keep detached launch cleanup alive and report failures."""
+    _runner_launch_cleanup_tasks.add(task)
+
+    def _done(completed: asyncio.Task[None]) -> None:
+        _runner_launch_cleanup_tasks.discard(completed)
+        if not completed.cancelled() and (error := completed.exception()) is not None:
+            _logger.warning(
+                "Detached runner launch cleanup failed",
+                exc_info=(type(error), error, error.__traceback__),
+            )
+
+    task.add_done_callback(_done)
+
 
 _LAUNCH_RESULT_TIMEOUT_S = 30.0
 # Per-call timeout for host.list_dir round-trips. Listing is a single
@@ -86,29 +121,10 @@ _MODEL_OPTIONS_TIMEOUT_S = 15.0
 _INSTALL_HARNESS_TIMEOUT_S = 420.0
 
 
-def _host_absent_error(host: Host) -> OmnigentError:
-    """Classify a "host not on this replica" miss for a host-scoped route.
-
-    Every ``/v1/hosts/{id}/*`` route reaches the host over its live tunnel in
-    the local (this-replica) ``HostRegistry``. When replicas are sharded by
-    host, a request keyed to ``host_id`` can land on a replica that doesn't
-    hold the tunnel — the same wrong-replica case ``RunnerRouter`` handles for
-    runner dispatch (see ``_runner_absent_code``). Tell the two apart using the
-    host record the caller already loaded:
-
-    - still **live** (online + fresh heartbeat) → up on some replica, just not
-      here → :data:`~ErrorCode.WRONG_REPLICA` (400) so the client re-addresses
-      WITHOUT the key.
-    - otherwise → genuinely offline → ``CONFLICT`` (409).
-
-    :param host: The host's persistent record (owner-checked by the caller).
-    :returns: The ``OmnigentError`` to raise; the global handler maps its code
-        to the HTTP status and the ``{"error": {"code": ...}}`` body the
-        client's re-address matches on.
-    """
-    if host_is_live(host):
-        return OmnigentError("host is on another replica", code=ErrorCode.WRONG_REPLICA)
-    return OmnigentError("host is offline", code=ErrorCode.CONFLICT)
+# ``/v1/hosts/{id}/*`` routes share the wrong-replica-vs-offline classification
+# with the runner-launch and import paths; the one implementation lives in
+# ``_host_launch`` so the sites can't drift.
+_host_absent_error = host_absent_error
 
 
 async def _proxy_model_options(
@@ -465,6 +481,20 @@ class StoreHarnessCredentialRequest(BaseModel):
     env_var: str | None = None
 
 
+class HostModelOptionsResponse(BaseModel):
+    """Pre-launch model choices resolved by a host harness.
+
+    ``error`` carries the host's reason for an empty catalog — a probe that
+    failed on the host is not a transport failure, so the request still
+    succeeds and the picker can say WHY it is empty instead of a generic
+    "Models unavailable".
+    """
+
+    models: list[dict[str, Any]]
+    routable_models: list[str]
+    error: str | None = None
+
+
 class LaunchRunnerRequest(BaseModel):
     """Request body for ``POST /v1/hosts/{host_id}/runners``.
 
@@ -636,6 +666,7 @@ def create_hosts_router(
                     # emitted as-is so a client can tell "unknown" from "not
                     # gateway-backed".
                     "gateway_inference": host_registry.gateway_inference(host.host_id),
+                    "interactive_shells": host_registry.interactive_shells(host.host_id),
                 }
             )
         return {"hosts": result}
@@ -678,6 +709,7 @@ def create_hosts_router(
             # Same semantics as list_hosts: reported on connect and held in
             # memory, so ``None`` is "no report on this replica yet".
             "gateway_inference": host_registry.gateway_inference(host.host_id),
+            "interactive_shells": host_registry.interactive_shells(host.host_id),
             "runners": [],
         }
 
@@ -686,7 +718,7 @@ def create_hosts_router(
         request: Request,
         host_id: str,
         harness: str,
-    ) -> dict[str, list[Any]]:
+    ) -> HostModelOptionsResponse:
         """Return pre-launch model choices resolved by the selected host.
 
         A preview of the host's ambient default catalog, not a binding
@@ -715,21 +747,20 @@ def create_hosts_router(
             )
         models = result.get("models")
         routable = result.get("routable_models")
-        payload: dict[str, Any] = {
-            "models": models if isinstance(models, list) else [],
+        error = result.get("error")
+        return HostModelOptionsResponse(
+            models=(
+                [model for model in models if isinstance(model, dict)]
+                if isinstance(models, list)
+                else []
+            ),
             # Every id the harness's endpoint routes: the picker names one
             # row per model, while a launch takes an exact id.
-            "routable_models": (
+            routable_models=(
                 [m for m in routable if isinstance(m, str)] if isinstance(routable, list) else []
             ),
-        }
-        # An honest empty answer carries the reason (e.g. "the codex model
-        # probe failed — see the host log") so the picker can say WHY it is
-        # empty instead of a generic "Models unavailable".
-        error = result.get("error")
-        if isinstance(error, str) and error:
-            payload["error"] = error
-        return payload
+            error=error if isinstance(error, str) and error else None,
+        )
 
     @router.post("/hosts/{host_id}/runners")
     async def launch_runner(
@@ -771,6 +802,8 @@ def create_hosts_router(
             permission_store=permission_store,
         )
         conn = target.conn
+        set_current_session_id(body.session_id)
+        add_audit_attrs(session_id=body.session_id, host_id=host_id)
 
         # W6: validate the requested workspace against the agent's
         # os_env.cwd sandbox boundary BEFORE binding — the same check
@@ -805,76 +838,24 @@ def create_hosts_router(
                 body.session_id,
             )
 
-        # Optional git worktree: when the caller asks to branch, create a
-        # worktree off the validated source repo and bind the runner to
-        # the worktree path instead (the fork-resume path; mirrors
-        # POST /v1/sessions). Created BEFORE the atomic runner bind so a
-        # lost CAS or a failed launch can roll it back, leaving no orphan
-        # worktree on the host.
-        git_branch: str | None = None
-        # CreatedWorktree | None — set ONLY when Omnigent creates a worktree
-        # (create mode). Left None in bind mode so the rollback below never
-        # force-removes the user's pre-existing worktree.
-        worktree = None
         if body.git is not None:
-            from omnigent.host.git_worktree import (
-                WorktreeError,
-                validate_branch_name,
-            )
+            from omnigent.host.git_worktree import WorktreeError, validate_branch_name
 
-            # Shared by both modes — the host never runs git in bind mode, so
-            # the server is the only gate on the name there.
             try:
                 validate_branch_name(body.git.branch_name)
             except WorktreeError as exc:
                 raise HTTPException(status_code=400, detail=exc.message) from exc
 
-            if body.git.existing_worktree:
-                # Binding to a pre-existing worktree: no worktree is created,
-                # but record its branch so the sidebar shows it and the opt-in
-                # delete flow can offer to remove it.
-                git_branch = body.git.branch_name
-            else:
-                from omnigent.server.routes._host_worktree import (
-                    WorktreeHostUnavailableError,
-                    WorktreeProxyError,
-                    create_worktree_on_host,
-                )
+        # Resolve the harness before creating host-side state.
+        harness: str | None = None
+        if agent_store is not None and agent_cache is not None:
+            harness = await _resolve_agent_harness(target.conv, agent_store, agent_cache)
 
-                try:
-                    worktree = await create_worktree_on_host(
-                        host_registry=host_registry,
-                        host_conn=conn,
-                        repo_path=workspace,
-                        branch_name=body.git.branch_name,
-                        base_branch=body.git.base_branch,
-                        existing_branch=body.git.existing_branch,
-                    )
-                except WorktreeHostUnavailableError as exc:
-                    # Host offline / unresponsive — infra, not user input.
-                    raise HTTPException(status_code=409, detail=exc.message) from exc
-                except WorktreeProxyError as exc:
-                    # Host-reported git failure (dup branch, bad base, not a
-                    # repo) — user-correctable input.
-                    raise HTTPException(status_code=400, detail=exc.message) from exc
-                workspace = worktree.worktree_path
-                git_branch = worktree.branch
+        git_branch: str | None = None
+        worktree = None
 
         async def _rollback_worktree() -> None:
-            """
-            Best-effort removal of the worktree created above.
-
-            Called when the runner bind or launch fails after the
-            worktree was created, so a failed request leaves no orphan
-            worktree (and no orphan branch) on the host. Never raises —
-            a cleanup failure is logged and the original error still
-            propagates.
-
-            A recreated worktree (``existing_branch``) checks out a branch
-            that predates this request — the directory is ours to remove,
-            but the branch (and its unpushed commits) is the user's, so it
-            must survive the rollback.
-            """
+            """Remove a worktree created by this request."""
             if worktree is None:
                 return
             from omnigent.server.routes._host_worktree import (
@@ -899,68 +880,127 @@ def create_hosts_router(
                 )
 
         async def _rollback_failed_launch() -> None:
-            """
-            Undo a failed launch *after* the runner was atomically bound.
-
-            Fully unbinds the session — NULLs ``runner_id`` plus the
-            ``host_id`` / ``workspace`` / ``git_branch`` persisted by the
-            ``set_host_id`` call below — and rolls back any worktree
-            created for this launch. Clearing the binding (not just
-            ``runner_id``) keeps the DB consistent with the host's actual
-            state: the worktree is gone, so the row must not keep pointing
-            at it, and a retry that omits a worktree starts from a clean
-            slate rather than inheriting a stale ``git_branch`` (which
-            ``set_host_id`` cannot clear). ``POST /hosts/{id}/runners`` only
-            binds a previously-unbound clone (the fork-resume picker), so a
-            full unbind restores the true pre-call state. Used only on the
-            post-bind failure paths; the lost-CAS path must NOT clear the
-            binding because it belongs to the concurrent winner, not us.
-            """
+            """Clear state created by a failed runner launch."""
+            _logger.error(
+                "Runner launch failed; clearing binding",
+                extra=debug_event(
+                    "runner_launch_failed",
+                    session_id=body.session_id,
+                    runner_id=runner_id,
+                    stage="runner_launch",
+                ),
+            )
             await asyncio.to_thread(conversation_store.clear_host_binding, body.session_id)
             await _rollback_worktree()
 
         binding_token = secrets.token_urlsafe(32)
         runner_id = token_bound_runner_id(binding_token)
 
-        # Atomic bind (UPDATE ... WHERE runner_id IS NULL): only one
-        # concurrent launch can bind an unbound session; a second (or an
-        # already-bound session) gets False. Closes the TOCTOU.
-        bound = await asyncio.to_thread(
-            conversation_store.set_runner_id,
-            body.session_id,
-            runner_id,
-        )
-        if not bound:
-            await _rollback_worktree()
-            raise HTTPException(
-                status_code=400,
-                detail="session already has a runner bound",
-            )
-        # Persist the validated, canonical workspace (the worktree path
-        # when a worktree was created) alongside host_id, plus git_branch
-        # when branching, so the conversation row satisfies
-        # ck_conversations_workspace_required_for_host. ``workspace`` is the
-        # realpath returned by validate_workspace (W6), or body.workspace
-        # verbatim only in non-production wiring without an agent cache.
-        await asyncio.to_thread(
-            conversation_store.set_host_id,
-            body.session_id,
-            host_id,
-            workspace,
-            git_branch,
-        )
+        launch_lock = _runner_launch_locks.setdefault(body.session_id, asyncio.Lock())
+        waited_for_launch = launch_lock.locked()
+        async with launch_lock:
+            if waited_for_launch:
+                current = await asyncio.to_thread(
+                    conversation_store.get_conversation,
+                    body.session_id,
+                )
+                if current is None:
+                    raise HTTPException(status_code=404, detail="session not found")
+                if current.runner_id is not None:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="session already has a runner bound",
+                    )
 
+            if body.git is not None:
+                if body.git.existing_worktree:
+                    git_branch = body.git.branch_name
+                else:
+                    from omnigent.server.routes._host_worktree import (
+                        WorktreeHostUnavailableError,
+                        WorktreeProxyError,
+                        create_worktree_on_host,
+                    )
+
+                    try:
+                        worktree = await create_worktree_on_host(
+                            host_registry=host_registry,
+                            host_conn=conn,
+                            repo_path=workspace,
+                            branch_name=body.git.branch_name,
+                            base_branch=body.git.base_branch,
+                            existing_branch=body.git.existing_branch,
+                        )
+                    except WorktreeHostUnavailableError as exc:
+                        raise HTTPException(status_code=409, detail=exc.message) from exc
+                    except WorktreeProxyError as exc:
+                        raise HTTPException(status_code=400, detail=exc.message) from exc
+                    workspace = worktree.worktree_path
+                    git_branch = worktree.branch
+
+            try:
+                await host_registry.admit_launch(
+                    conn,
+                    body.session_id,
+                    allow_unbound=True,
+                    transfer_from_host_id=target.conv.host_id,
+                )
+            except BaseException:
+                await _rollback_worktree()
+                raise
+
+            bound = await asyncio.to_thread(
+                conversation_store.set_runner_id,
+                body.session_id,
+                runner_id,
+            )
+            if not bound:
+                await _rollback_worktree()
+                raise HTTPException(
+                    status_code=400,
+                    detail="session already has a runner bound",
+                )
+            persist_task = asyncio.create_task(
+                asyncio.to_thread(
+                    conversation_store.set_host_id,
+                    body.session_id,
+                    host_id,
+                    workspace,
+                    git_branch,
+                )
+            )
+            try:
+                await asyncio.shield(persist_task)
+            except BaseException as exc:
+
+                async def _settle_and_rollback() -> None:
+                    with contextlib.suppress(BaseException):
+                        _ = await persist_task
+                    await _rollback_failed_launch()
+
+                if isinstance(exc, asyncio.CancelledError):
+                    cleanup_task = asyncio.create_task(_settle_and_rollback())
+                    _track_runner_launch_cleanup(cleanup_task)
+                else:
+                    await _settle_and_rollback()
+                raise
+
+        set_current_runner_id(runner_id)
+        add_audit_attrs(runner_id=runner_id)
+        _logger.info(
+            "Session bound to runner",
+            extra=debug_event(
+                "session_runner_bound",
+                session_id=body.session_id,
+                runner_id=runner_id,
+                operation="launch",
+                stage="runner_launch",
+            ),
+        )
         request_id = secrets.token_hex(8)
         future: asyncio.Future[dict[str, str | None]] = asyncio.get_running_loop().create_future()
         conn.pending_launches[request_id] = future
 
-        # Resolve the agent's harness so the host can refuse an
-        # unconfigured one before spawning (mirrors POST /v1/sessions).
-        # None — no agent cache wired, or no resolvable agent — skips
-        # the host-side check.
-        harness: str | None = None
-        if agent_store is not None and agent_cache is not None:
-            harness = await _resolve_agent_harness(target.conv, agent_store, agent_cache)
         launch_frame = encode_host_frame(
             HostLaunchRunnerFrame(
                 request_id=request_id,
@@ -968,6 +1008,11 @@ def create_hosts_router(
                 workspace=workspace,
                 session_id=body.session_id,
                 harness=harness,
+                inference_config=(
+                    target.conv.inference_snapshot["runtime_config"]
+                    if target.conv.inference_snapshot
+                    else None
+                ),
             )
         )
         try:
@@ -995,7 +1040,12 @@ def create_hosts_router(
 
         if result.get("status") == "failed":
             await _rollback_failed_launch()
-            if result.get("error_code") == HARNESS_NOT_CONFIGURED_ERROR_CODE:
+            refusal_code = classify_launch_refusal(
+                result.get("error_code"),
+                result.get("error"),
+                workspace,
+            )
+            if refusal_code == HARNESS_NOT_CONFIGURED_ERROR_CODE:
                 # Categorical refusal: the harness isn't configured on
                 # the host, so a retry can't succeed without user action
                 # (`omnigent setup` on the host machine). Surface the
@@ -1003,6 +1053,13 @@ def create_hosts_router(
                 raise OmnigentError(
                     f"host failed to launch runner: {result.get('error')}",
                     code=ErrorCode.HARNESS_NOT_CONFIGURED,
+                )
+            if refusal_code == WORKSPACE_MISSING_ERROR_CODE:
+                # Rebuild the message from the authorized, canonical
+                # workspace rather than reflecting arbitrary host output.
+                raise OmnigentError(
+                    f"host failed to launch runner: {workspace_missing_message(workspace)}",
+                    code=ErrorCode.WORKSPACE_MISSING,
                 )
             raise HTTPException(
                 status_code=502,
@@ -1554,7 +1611,7 @@ def create_hosts_router(
         :param path: Absolute path inside the repo on the host to list
             worktrees for, e.g. ``"/Users/alice/myrepo"``.
         :returns: ``{"object": "list", "data": [{path, branch,
-            is_main, detached}, ...]}`` (main first).
+            is_main, detached, updated_at?}, ...]}`` (main first).
         :raises HTTPException: 404 if host not found, 403 if not owned
             by caller, 409 if host is offline/unresponsive, 400 on path
             validation or a non-git path.

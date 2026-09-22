@@ -103,6 +103,7 @@ def load_agent_def(
         custom handlers — the operator already has code execution, so
         the restriction would add no security there.
     """
+    path: Path | None = None
     if isinstance(path_or_dict, (str, Path)):
         path = Path(path_or_dict)
         with open(path) as f:
@@ -111,28 +112,32 @@ def load_agent_def(
     else:
         data = path_or_dict
         instructions_root = None
+    if not isinstance(data, dict):
+        # An empty or comments-only document loads as None, and a bare scalar or
+        # list loads as that value. Every reader below indexes it as a mapping,
+        # so without this guard the first ``data.get(...)`` raised a bare
+        # AttributeError — which the upload/validate path surfaced as an
+        # internal error instead of naming the malformed spec.
+        found = "an empty document" if data is None else f"a {type(data).__name__}"
+        where = f" in {path}" if path is not None else ""
+        raise ValueError(
+            f"Agent spec must be a YAML mapping of top-level keys; found {found}{where}."
+        )
     if enforce_handler_allowlist:
         _reject_unregistered_policy_handlers(data)
     return _parse_agent_def(data, instructions_root=instructions_root)
 
 
 def _reject_unregistered_policy_handlers(data: YamlData) -> None:
-    """Reject ``type: function`` policies whose handler is not registered.
+    """Reject unregistered handlers before parsing an uploaded policy.
 
-    Scans the raw YAML ``policies:`` mapping for handler dotted paths
-    that are not in the policy registry and raises before any import or
-    factory call. Tool ``callable:`` paths are intentionally *not*
-    scanned — they are a separate surface and are not invoked at parse
-    time. See :func:`load_agent_def` for why this only runs on the
-    untrusted bundle-upload path.
-
-    :param data: The raw agent YAML dict (pre-parse). Non-dict input
-        (malformed YAML) is ignored here and left for the parser to
-        reject.
-    :raises ValueError: If a function policy names an unregistered
-        handler, e.g. ``"subprocess.Popen"``.
+    Check legacy handler/callable fields and native function paths, including
+    wrapped handlers. Tool callable paths are validated separately.
     """
-    from omnigent.policies.registry import is_registered_handler
+    from omnigent.policies.registry import (
+        function_policy_handler_allowed,
+        is_registered_handler,
+    )
 
     if not isinstance(data, dict):
         return
@@ -148,6 +153,23 @@ def _reject_unregistered_policy_handlers(data: YamlData) -> None:
         if isinstance(handler, str) and not is_registered_handler(handler):
             raise ValueError(
                 f"Policy {pname!r}: handler {handler!r} is not a registered policy "
+                f"handler. Uploaded agent bundles may only use handlers from the "
+                f"policy registry; a server admin must add custom handlers via the "
+                f"'policy_modules' config."
+            )
+        # Native function policies may use a string or a path/arguments mapping.
+        func = pdata.get("function")
+        if isinstance(func, str):
+            func_path, func_args = func, None
+        elif isinstance(func, dict):
+            func_path, func_args = func.get("path"), func.get("arguments")
+        else:
+            func_path, func_args = None, None
+        if isinstance(func_path, str) and not function_policy_handler_allowed(
+            func_path, func_args
+        ):
+            raise ValueError(
+                f"Policy {pname!r}: handler {func_path!r} is not a registered policy "
                 f"handler. Uploaded agent bundles may only use handlers from the "
                 f"policy registry; a server admin must add custom handlers via the "
                 f"'policy_modules' config."

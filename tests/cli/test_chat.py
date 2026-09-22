@@ -42,7 +42,7 @@ from omnigent.chat import (
 )
 from omnigent.cli import _build_resume_parts
 from omnigent.inner.databricks_executor import DatabricksCredentials
-from omnigent.model_resolver import ModelResolutionError
+from omnigent.models.model_resolver import ModelResolutionError
 from omnigent.spec import load as load_spec
 from omnigent.spec import validate as validate_spec
 
@@ -86,7 +86,7 @@ def test_redirect_native_resume_routes_kiro_wrapper(monkeypatch: pytest.MonkeyPa
     def _capture(**kwargs: object) -> None:
         captured.update(kwargs)
 
-    monkeypatch.setattr("omnigent.kiro_native.run_kiro_native", _capture)
+    monkeypatch.setattr("omnigent.harnesses.kiro_native.main.run_kiro_native", _capture)
 
     redirected = chat_module._redirect_native_resume_if_needed(
         base_url="https://example.com",
@@ -1224,6 +1224,9 @@ def test_chat_via_daemon_hands_daemon_runner_to_chat_with_server(
     monkeypatch.setattr(chat_module, "_resolve_resume_target", lambda **_k: None)
     monkeypatch.setattr(chat_module, "_prepare_chat_session_via_daemon", _fake_prepare)
     monkeypatch.setattr(chat_module, "_chat_with_server", _fake_chat_with_server)
+    # A one-shot run tears its session down on exit; stub it so this test
+    # asserts the attach inputs without reaching the network.
+    monkeypatch.setattr(chat_module, "_stop_headless_session", lambda **_k: None)
 
     _chat_via_daemon(
         str(agent_yaml),
@@ -1248,6 +1251,121 @@ def test_chat_via_daemon_hands_daemon_runner_to_chat_with_server(
     assert prepare["resume_conversation_id"] is None
     assert prepare["fork_session_id"] is None
     assert prepare["host_id"] == "host_x"
+
+
+def _wire_daemon_chat_stubs(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    session_id: str = "conv_oneshot",
+) -> None:
+    """Stub the daemon chat path down to the session-teardown boundary.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param session_id: Session id the fake prep step returns.
+    """
+
+    async def _fake_prepare(**_kwargs: object) -> _DaemonChatSession:
+        return _DaemonChatSession(session_id=session_id, runner_id="runner_oneshot")
+
+    monkeypatch.setattr(chat_module, "_bundle_agent", lambda _p: b"bundle-bytes")
+    monkeypatch.setattr(
+        "omnigent.host.identity.load_or_create_host_identity",
+        lambda: SimpleNamespace(host_id="host_x", name="x"),
+    )
+    monkeypatch.setattr(chat_module, "_resolve_resume_target", lambda **_k: None)
+    monkeypatch.setattr(chat_module, "_prepare_chat_session_via_daemon", _fake_prepare)
+    monkeypatch.setattr(chat_module, "_chat_with_server", lambda *_a, **_k: None)
+
+
+def test_one_shot_run_stops_its_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``-p`` run stops the session it finished, releasing the runner.
+
+    The daemon tears a runner down only on an explicit stop, so without this
+    a completed one-shot leaves its runner — and that runner's harness
+    subtree — alive until the runner's own idle self-exit.
+    """
+    agent_yaml = tmp_path / "hello.yaml"
+    agent_yaml.write_text(
+        "name: hello\nprompt: Say hi.\nexecutor:\n  model: databricks-gpt-test-model\n"
+    )
+    stopped: list[dict[str, object]] = []
+    _wire_daemon_chat_stubs(monkeypatch)
+    monkeypatch.setattr(
+        "omnigent.cli._stop_session_on_server",
+        lambda **kwargs: stopped.append(kwargs),
+    )
+
+    _chat_via_daemon(
+        str(agent_yaml),
+        "https://example.databricksapps.com",
+        None,
+        overrides=ChatOverrides(),
+        initial_message="say hi",
+    )
+
+    assert stopped == [
+        {
+            "base_url": "https://example.databricksapps.com",
+            "session_id": "conv_oneshot",
+        }
+    ]
+
+
+def test_interactive_run_leaves_its_session_online(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An interactive REPL session is not torn down when the REPL returns.
+
+    Stopping it would kill the runner a user reattaches to with ``--continue``.
+    """
+    agent_yaml = tmp_path / "hello.yaml"
+    agent_yaml.write_text(
+        "name: hello\nprompt: Say hi.\nexecutor:\n  model: databricks-gpt-test-model\n"
+    )
+    stopped: list[dict[str, object]] = []
+    _wire_daemon_chat_stubs(monkeypatch)
+    monkeypatch.setattr(
+        "omnigent.cli._stop_session_on_server",
+        lambda **kwargs: stopped.append(kwargs),
+    )
+
+    _chat_via_daemon(
+        str(agent_yaml),
+        "https://example.databricksapps.com",
+        None,
+        overrides=ChatOverrides(),
+    )
+
+    assert stopped == []
+
+
+def test_one_shot_teardown_failure_does_not_fail_the_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stop that the server rejects must not fail an already-finished run."""
+    agent_yaml = tmp_path / "hello.yaml"
+    agent_yaml.write_text(
+        "name: hello\nprompt: Say hi.\nexecutor:\n  model: databricks-gpt-test-model\n"
+    )
+
+    def _explode(**_kwargs: object) -> None:
+        raise click.ClickException("server said no")
+
+    _wire_daemon_chat_stubs(monkeypatch)
+    monkeypatch.setattr("omnigent.cli._stop_session_on_server", _explode)
+
+    _chat_via_daemon(
+        str(agent_yaml),
+        "https://example.databricksapps.com",
+        None,
+        overrides=ChatOverrides(),
+        initial_message="say hi",
+    )
 
 
 class _FakeSessionsApi:
@@ -1315,7 +1433,7 @@ def _patch_daemon_launch(monkeypatch: pytest.MonkeyPatch, captured: dict[str, ob
     monkeypatch.setattr("omnigent.host.daemon_launch.wait_for_host_online", _no_host_wait)
     monkeypatch.setattr("omnigent.host.daemon_launch.launch_or_reuse_daemon_runner", _fake_launch)
     monkeypatch.setattr("omnigent.host.daemon_launch.wait_for_runner_online", _no_runner_wait)
-    monkeypatch.setattr("omnigent.native_terminal.bind_session_runner", _fake_bind)
+    monkeypatch.setattr("omnigent.native.native_terminal.bind_session_runner", _fake_bind)
 
 
 def test_prepare_chat_session_via_daemon_creates_fresh_and_launches(
@@ -1908,6 +2026,82 @@ def test_apply_overrides_harness_only_clears_pinned_model() -> None:
     assert isinstance(executor, dict)
     assert executor["config"]["harness"] == "pi"
     assert executor.get("model") is None
+
+
+def test_apply_overrides_same_harness_keeps_pinned_model() -> None:
+    """Repeating the spec's harness preserves its pinned model."""
+    raw: dict[str, object] = {
+        "spec_version": 1,
+        "name": "my-agent",
+        "prompt": "repro",
+        "executor": {
+            "type": "omnigent",
+            "model": "my-model-id",
+            "config": {"harness": "pi"},
+        },
+    }
+
+    _apply_overrides_to_raw(raw, ChatOverrides(harness="pi"))
+
+    executor = raw["executor"]
+    assert isinstance(executor, dict)
+    assert executor["config"]["harness"] == "pi"
+    assert executor["model"] == "my-model-id"
+
+
+def test_apply_overrides_flat_same_harness_keeps_pinned_model() -> None:
+    """A canonical harness alias preserves the single-file spec's model."""
+    raw: dict[str, object] = {
+        "name": "single_file",
+        "prompt": "hi",
+        "executor": {"harness": "claude-sdk", "model": "sonnet"},
+    }
+
+    _apply_overrides_to_raw(raw, ChatOverrides(harness="claude"))
+
+    executor = raw["executor"]
+    assert isinstance(executor, dict)
+    assert executor["model"] == "sonnet"
+
+
+@pytest.mark.parametrize("bundled", [False, True], ids=["flat", "bundle"])
+@pytest.mark.parametrize(
+    ("model_location", "cli_model", "expected_model"),
+    [
+        (None, None, "from-env"),
+        ("executor", None, "from-spec"),
+        ("llm", None, "from-spec"),
+        (None, "from-cli", "from-cli"),
+        ("executor", "from-cli", "from-cli"),
+        ("llm", "from-cli", "from-cli"),
+    ],
+)
+def test_apply_overrides_same_harness_model_precedence(
+    monkeypatch: pytest.MonkeyPatch,
+    bundled: bool,
+    model_location: str | None,
+    cli_model: str | None,
+    expected_model: str,
+) -> None:
+    monkeypatch.setenv("OMNIGENT_MODEL", "from-env")
+    executor: dict[str, object] = (
+        {"type": "omnigent", "config": {"harness": "claude-sdk"}}
+        if bundled
+        else {"harness": "claude-sdk"}
+    )
+    raw: dict[str, object] = {"name": "model-precedence", "prompt": "hi", "executor": executor}
+    if bundled:
+        raw["spec_version"] = 1
+    if model_location == "executor":
+        executor["model"] = "from-spec"
+    elif model_location == "llm":
+        raw["llm"] = {"model": "from-spec"}
+
+    _apply_overrides_to_raw(raw, ChatOverrides(harness="claude", model=cli_model))
+
+    llm = raw.get("llm")
+    llm_model = llm.get("model") if isinstance(llm, dict) else None
+    assert (executor.get("model") or llm_model) == expected_model
 
 
 def test_apply_overrides_rejects_harness_for_non_omnigent_executor_type() -> None:
@@ -2988,6 +3182,7 @@ async def test_resolve_latest_conversation_id_async_scopes_by_agent_name() -> No
         "limit": 1,
         "order": "desc",
         "sort_by": "updated_at",
+        "visibility": "mine",
     }
 
 
@@ -3007,6 +3202,7 @@ async def test_resolve_latest_conversation_id_async_returns_none_for_unknown_nam
         "limit": 1,
         "order": "desc",
         "sort_by": "updated_at",
+        "visibility": "mine",
     }
 
 
@@ -4306,7 +4502,9 @@ def test_redirect_native_resume_handles_cursor(monkeypatch: pytest.MonkeyPatch) 
     def _fake_run_cursor_native(**kwargs: object) -> None:
         captured.update(kwargs)
 
-    monkeypatch.setattr("omnigent.cursor_native.run_cursor_native", _fake_run_cursor_native)
+    monkeypatch.setattr(
+        "omnigent.harnesses.cursor_native.main.run_cursor_native", _fake_run_cursor_native
+    )
 
     handled = chat_module._redirect_native_resume_if_needed(
         base_url="https://example.com",
@@ -4342,7 +4540,7 @@ def test_redirect_native_resume_covers_every_native_agent(
     )
     captured: dict[str, object] = {}
     monkeypatch.setattr(
-        "omnigent.goose_native.run_goose_native",
+        "omnigent.harnesses.goose_native.main.run_goose_native",
         lambda **kwargs: captured.update(kwargs),
     )
 
@@ -4402,7 +4600,7 @@ def test_cursor_native_resume_never_drives_an_omnigent_turn(
     )
     redirected: dict[str, object] = {}
     monkeypatch.setattr(
-        "omnigent.cursor_native.run_cursor_native",
+        "omnigent.harnesses.cursor_native.main.run_cursor_native",
         lambda **kwargs: redirected.update(kwargs),
     )
 

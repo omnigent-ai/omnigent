@@ -2,29 +2,35 @@
 
 A shared session's shell runs commands on the runner. When the runner is
 not isolated (``sandbox_active: false``), that shell can read files the
-session owner can reach — so write-capable shell access must be gated the
-same way interactive terminal attach is (see ``test_terminal_attach.py``).
+session owner can reach. A command has no path to inspect, so there is no
+"inside the workspace" form that could be opened to collaborators the way
+the filesystem proxy does — the shell is the owner's machine, full stop.
 
 The shell proxy at
 ``POST /v1/sessions/{id}/resources/environments/{env}/shell`` runs
-``_validate_session(required_level=LEVEL_EDIT)`` *before* proxying. These
+``_validate_session(required_level=LEVEL_OWNER)`` *before* proxying. These
 tests pin that gate end to end at the server boundary:
 
-- a read-only collaborator is rejected with 403 and the request never
-  reaches the runner (decisive: the secret-capable shell is unreachable),
-- an edit collaborator is allowed through and the command is proxied,
+- a read-only or edit collaborator is rejected with 403 and the request
+  never reaches the runner (decisive: the secret-capable shell is
+  unreachable),
+- the owner (and an admin) is allowed through and the command is proxied,
 - an unauthenticated caller is rejected.
 
-The deeper gap — an *edit* collaborator on an unsafe runner reading
-out-of-root/sensitive files via shell — is pinned by
-the strict-xfail matrix in ``test_filesystem_path_isolation_e2e.py``.
+The filesystem proxy carries a second, stricter gate. Mutations under the
+workspace need ``LEVEL_EDIT``; an ABSOLUTE path is the owner's own machine
+and requires ``LEVEL_OWNER`` (matching the host-scoped
+``/v1/hosts/{id}/filesystem`` endpoint behind the workspace picker — without
+it, a shared session would be a weaker route to the very same files).
 
-The filesystem proxy carries a second, stricter gate. A path under the
-workspace is the session's shared context and stays at ``LEVEL_EDIT``; an
-ABSOLUTE path is the owner's own machine and requires ``LEVEL_OWNER``. That
-matches the host-scoped ``/v1/hosts/{id}/filesystem`` endpoint behind the
-workspace picker, which is owner-scoped — without it, a shared session would
-be a weaker route to the very same files.
+Workspace *content reads* (file read/list, changed files, diffs, search, and
+the GitHub diff views) are fail-closed for view-level collaborators: they
+need ``LEVEL_EDIT`` too, UNLESS the session owner opted into sharing files
+(``share_workspace_files`` on the conversation), which lowers the bar to
+``LEVEL_READ``. A plain read grant otherwise shares the conversation, not the
+raw filesystem — which routinely holds secrets (``.env`` / key files). The
+share opt-in never widens absolute-path browsing, which stays owner-only.
+``conv_share`` has sharing off; ``conv_open`` has it on.
 """
 
 from __future__ import annotations
@@ -63,13 +69,14 @@ class _StubConversationStore:
     def get_conversation(self, conversation_id: str) -> Conversation | None:
         return self._conversations.get(conversation_id)
 
-    def add(self, conversation_id: str) -> None:
+    def add(self, conversation_id: str, *, share_workspace_files: bool = False) -> None:
         self._conversations[conversation_id] = Conversation(
             id=conversation_id,
             created_at=0,
             updated_at=0,
             root_conversation_id=conversation_id,
             agent_id="ag_test",
+            share_workspace_files=share_workspace_files,
         )
 
 
@@ -262,10 +269,16 @@ def app(runner_globals_reset: None, runner_client: _RecordingRunnerClient) -> Fa
     del runner_globals_reset
     conv_store = _StubConversationStore()
     conv_store.add("conv_share")
+    # A second session whose owner opted into sharing workspace files with
+    # view-level collaborators — same grant shape, share flag on.
+    conv_store.add("conv_open", share_workspace_files=True)
     perm_store = _StubPermissionStore()
     perm_store.add_grant("owner@example.com", "conv_share", LEVEL_EDIT)
     perm_store.add_grant("viewer@example.com", "conv_share", LEVEL_READ)
     perm_store.add_grant("real-owner@example.com", "conv_share", LEVEL_OWNER)
+    perm_store.add_grant("owner@example.com", "conv_open", LEVEL_EDIT)
+    perm_store.add_grant("viewer@example.com", "conv_open", LEVEL_READ)
+    perm_store.add_grant("real-owner@example.com", "conv_open", LEVEL_OWNER)
     perm_store.add_admin("admin@example.com")
     set_runner_router(_FakeRunnerRouter(runner_client))  # type: ignore[arg-type]
 
@@ -338,19 +351,41 @@ async def test_shell_rejects_unauthenticated_before_runner(
 
 
 @pytest.mark.asyncio
-async def test_shell_allows_edit_collaborator_and_proxies(
+async def test_shell_rejects_edit_collaborator_before_runner(
     client: httpx.AsyncClient,
     runner_client: _RecordingRunnerClient,
 ) -> None:
-    """An edit collaborator is allowed through and the command is proxied."""
+    """Edit is not enough: the shell has no workspace-relative form, so the
+    bar is the same one an absolute filesystem path carries."""
+    resp = await client.post(
+        _SHELL_PATH,
+        json={"command": "cat ~/.ssh/id_rsa"},
+        headers={"X-Forwarded-Email": "owner@example.com"},
+    )
+    assert resp.status_code == 403, resp.text
+    assert runner_client.posts == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "caller",
+    ["real-owner@example.com", "admin@example.com"],
+    ids=["owner", "admin"],
+)
+async def test_shell_allows_owner_and_proxies(
+    client: httpx.AsyncClient,
+    runner_client: _RecordingRunnerClient,
+    caller: str,
+) -> None:
+    """The owner (or an admin) is allowed through and the command is proxied."""
     resp = await client.post(
         _SHELL_PATH,
         json={"command": "echo hi"},
-        headers={"X-Forwarded-Email": "owner@example.com"},
+        headers={"X-Forwarded-Email": caller},
     )
     assert resp.status_code == 200, resp.text
     assert resp.json()["stdout"] == "ok\n"
-    # The edit-level command reached the runner verbatim.
+    # The owner's command reached the runner verbatim.
     assert runner_client.posts == [(_SHELL_PATH, {"command": "echo hi"})]
 
 
@@ -528,19 +563,115 @@ async def test_filesystem_absolute_rejects_unauthenticated_before_runner(
 
 
 @pytest.mark.asyncio
-async def test_filesystem_relative_search_stays_open_to_collaborators(
+async def test_filesystem_relative_search_stays_open_to_edit_collaborators(
     client: httpx.AsyncClient,
     runner_client: _RecordingRunnerClient,
 ) -> None:
     """Control: the owner-only bar applies to absolute paths ONLY. Searching
-    the workspace is still available to a read-only collaborator, so the gate
-    cannot pass by having broken shared sessions."""
+    the workspace is still available to an edit collaborator, so the gate
+    cannot pass by having broken shared sessions. (A view-only viewer is
+    fail-closed here unless the owner shared files — see the matrix below.)"""
     resp = await client.get(
-        _FS_SEARCH_RELATIVE, headers={"X-Forwarded-Email": "viewer@example.com"}
+        _FS_SEARCH_RELATIVE, headers={"X-Forwarded-Email": "owner@example.com"}
     )
 
     assert resp.status_code == 200, resp.text
     assert len(runner_client.gets) == 1
+
+
+# ── Workspace content-read gate: view-level share opt-in ──────────────────────
+# The content-bearing reads a shared viewer could use to see workspace files.
+# ``{cid}`` is filled per session (sharing off vs on).
+_CONTENT_READ_PATHS = (
+    "/v1/sessions/{cid}/resources/environments/default/filesystem/src/app.py",
+    "/v1/sessions/{cid}/resources/environments/default/filesystem",
+    "/v1/sessions/{cid}/resources/environments/default/changes",
+    "/v1/sessions/{cid}/resources/environments/default/diff/src/app.py",
+    "/v1/sessions/{cid}/resources/environments/default/search?q=todo",
+    "/v1/sessions/{cid}/resources/github/changes",
+    "/v1/sessions/{cid}/resources/github/diff",
+    "/v1/sessions/{cid}/resources/github/diff/src/app.py",
+)
+_CONTENT_READ_IDS = (
+    "file-read",
+    "root-list",
+    "changed-files",
+    "file-diff",
+    "search",
+    "github-changes",
+    "github-pr-diff",
+    "github-file-diff",
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("url_tmpl", _CONTENT_READ_PATHS, ids=_CONTENT_READ_IDS)
+async def test_workspace_reads_deny_view_only_when_not_shared(
+    client: httpx.AsyncClient,
+    runner_client: _RecordingRunnerClient,
+    url_tmpl: str,
+) -> None:
+    """With sharing off (the default), a view-only grant cannot read the
+    workspace on ANY content surface, and the request never reaches the
+    runner — so no file bytes or paths can leak."""
+    resp = await client.get(
+        url_tmpl.format(cid="conv_share"), headers={"X-Forwarded-Email": "viewer@example.com"}
+    )
+
+    assert resp.status_code == 403, resp.text
+    assert runner_client.gets == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("url_tmpl", _CONTENT_READ_PATHS, ids=_CONTENT_READ_IDS)
+async def test_workspace_reads_allow_view_only_when_shared(
+    client: httpx.AsyncClient,
+    runner_client: _RecordingRunnerClient,
+    url_tmpl: str,
+) -> None:
+    """Once the owner opts into sharing files (``share_workspace_files``), the
+    same view-only grant reaches every content surface."""
+    resp = await client.get(
+        url_tmpl.format(cid="conv_open"), headers={"X-Forwarded-Email": "viewer@example.com"}
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert len(runner_client.gets) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("url_tmpl", _CONTENT_READ_PATHS, ids=_CONTENT_READ_IDS)
+async def test_workspace_reads_stay_open_to_edit_collaborators(
+    client: httpx.AsyncClient,
+    runner_client: _RecordingRunnerClient,
+    url_tmpl: str,
+) -> None:
+    """Control: an edit collaborator keeps every workspace read surface even
+    when sharing is off — the fix cannot pass by breaking shared browsing
+    outright."""
+    resp = await client.get(
+        url_tmpl.format(cid="conv_share"), headers={"X-Forwarded-Email": "owner@example.com"}
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert len(runner_client.gets) == 1
+
+
+@pytest.mark.asyncio
+async def test_share_opt_in_does_not_widen_absolute_browsing(
+    client: httpx.AsyncClient,
+    runner_client: _RecordingRunnerClient,
+) -> None:
+    """The file-share opt-in governs the workspace only. An absolute path is
+    still the owner's own machine, so a view-only viewer of a shared session
+    is refused it before the runner is reached."""
+    resp = await client.get(
+        "/v1/sessions/conv_open/resources/environments/default/filesystem/%2Fetc%2Fpasswd",
+        headers={"X-Forwarded-Email": "viewer@example.com"},
+    )
+
+    assert resp.status_code == 403, resp.text
+    assert runner_client.gets == []
 
 
 @pytest.mark.asyncio
@@ -570,3 +701,65 @@ async def test_filesystem_windows_absolute_is_owner_gated_too(
 
     assert resp.status_code == 403, resp.text
     assert runner_client.gets == []
+
+
+# ── Elicitation resolve gate ─────────────────────────────────────
+#
+# Elicitations (policy ASK gates, harness permission prompts, questions to
+# the user) are answered by any collaborator who can drive the agent
+# (``LEVEL_EDIT``); a read-only share can neither see nor answer them.
+
+_ELICITATION_PATH = "/v1/sessions/conv_share/elicitations/elicit_0123456789abcdef"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "caller,expected",
+    [
+        ("real-owner@example.com", 202),
+        ("owner@example.com", 202),
+        ("viewer@example.com", 403),
+    ],
+    ids=["owner-allowed", "edit-allowed", "read-denied"],
+)
+async def test_elicitation_resolve_requires_edit(
+    client: httpx.AsyncClient,
+    caller: str,
+    expected: int,
+) -> None:
+    """The verdict endpoint is gated at edit, like the events route that
+    delivers the same verdict in-band."""
+    resp = await client.post(
+        f"{_ELICITATION_PATH}/resolve",
+        json={"action": "accept"},
+        headers={"X-Forwarded-Email": caller},
+    )
+
+    assert resp.status_code == expected, resp.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "caller,expected",
+    [("owner@example.com", 200), ("viewer@example.com", 403)],
+    ids=["edit-allowed", "read-denied"],
+)
+async def test_elicitation_get_requires_edit(
+    client: httpx.AsyncClient,
+    caller: str,
+    expected: int,
+) -> None:
+    """Reading a pending prompt carries the same bar as answering it."""
+    resp = await client.get(_ELICITATION_PATH, headers={"X-Forwarded-Email": caller})
+
+    assert resp.status_code == expected, resp.text
+
+
+@pytest.mark.asyncio
+async def test_elicitation_resolve_rejects_unauthenticated(
+    client: httpx.AsyncClient,
+) -> None:
+    """No identity fails closed at 401 before the permission check."""
+    resp = await client.post(f"{_ELICITATION_PATH}/resolve", json={"action": "accept"})
+
+    assert resp.status_code == 401, resp.text

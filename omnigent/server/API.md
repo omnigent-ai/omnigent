@@ -513,13 +513,12 @@ Fields:
     already carry the message in `items`.
 
   todos (array, default `[]`)
-    Current Claude Code todo list for `omnigent claude` sessions.
+    Current native Plan/TODO list reported by a harness.
     Each item: `{content: string, status: "pending"|"in_progress"|"completed",
     activeForm: string}` where `activeForm` is the gerund form of the
-    current activity (e.g. `"Running tests"`). Sourced from the
-    server's in-memory todo cache (updated by `external_session_todos`
-    events). Empty for non-claude-native sessions or before the first
-    turn creates todos.
+    current activity (e.g. `"Running tests"`). Stored under a reserved
+    key in the existing compressed session-state metadata and updated by
+    `external_session_todos` events. Empty before the first Plan update.
 
   terminal_pending (boolean, default `false`)
     `true` while the runner is auto-creating the terminal for a
@@ -667,6 +666,14 @@ minus `items` and snapshot-only fields.
 Supports cursor pagination and filters such as `search_query` and
 `include_archived`.
 
+Clients should always send `visibility` explicitly: `mine` lists owned
+active sessions, `shared` lists accessible active sessions owned by someone
+else, `archived` lists accessible archived sessions, and `all` lists all
+accessible active sessions. `include_archived=true` also includes archived
+sessions with `visibility=all`; the other modes determine archive filtering
+themselves. The server still defaults to `all` for older clients. Without
+authentication, `mine` and `shared` behave like `all`.
+
 The `kind` filter scopes which conversation kinds are listed:
 `default` (the default) returns only top-level user-initiated
 sessions, `sub_agent` returns only sub-agent child sessions, and
@@ -692,7 +699,7 @@ When liveness is wired, each list item includes two orthogonal signals
 ### Get Session (Snapshot)
 
 ```
-GET /v1/sessions/{session_id}[?include_items=true&include_liveness=true&refresh_state=false]
+GET /v1/sessions/{session_id}[?include_items=true&include_liveness=true&include_usage=true&refresh_state=false]
 
 200 OK — body matches the `SessionResponse` shape above.
 404 Not Found — no session with that id
@@ -717,6 +724,14 @@ Contract" below.
     liveness from the `/health` poll and the live stream (the web
     chat surface), the snapshot's copy is redundant.
 
+  include_usage (query param, boolean, default `true`)
+    When `false`, skip the session/sub-agent usage tree read. The response
+    sets `usage_included=false`, `total_cost_usd=null`, and
+    `usage_by_model=null`: usage is unknown, not zero or the parent's own
+    spend. Runner metadata reads use this option. The web chat also opts
+    out and loads display usage separately, so a slow usage store does not
+    block opening the session. Budget enforcement is unchanged.
+
   refresh_state (query param, boolean, default `false`)
     When `true`, runner-derived snapshot overlays (for example skills
     and Codex-native model options) are refreshed from the bound runner
@@ -731,6 +746,34 @@ When runner liveness is wired (and not skipped via
     Whether the session's bound runner/host is reachable. This is
     session-scoped (authorized by access to the session), and matches
     `GET /health?session_id=...` for the same id.
+
+#### Load Display Usage Separately
+
+```
+GET /v1/sessions/{session_id}?include_usage=true&include_items=false&include_liveness=false&refresh_state=false
+
+200 OK — body matches `SessionResponse`, with `usage_included=true`.
+404 Not Found — no session with that id is visible to the caller
+```
+
+After opting out of usage on the initial snapshot, display clients can make a
+second GET on the same endpoint with the flags above. It returns the session's
+complete subtree cost and per-model usage, including archived sub-agents,
+without reloading transcript items or liveness. It still builds normal session
+metadata: `refresh_state=false` avoids forced cache invalidation, but cache
+misses can still require runner/model work. Unpriced cost and unrecorded model
+usage remain `null`. The response is `Cache-Control: no-store`; read failures
+return an error, never a zero total.
+
+This request runs independently of initial snapshot and transcript loading.
+Display clients consume only `total_cost_usd` and `usage_by_model` from its
+response, keep usage unknown until it arrives, and must not overwrite newer
+streamed usage with an older in-flight response. Keep this fetch outside the
+shared session-metadata query/cache so it cannot delay metadata reads or
+replace newer metadata. The request performs its own authorization; the initial
+snapshot does not start a detached usage worker.
+Older servers omit `usage_included` and ignore `include_usage`; their snapshot
+already includes usage, so clients should not issue the separate request.
 
 ### Delete Session
 
@@ -761,7 +804,7 @@ files, and the conversation row.
 ### Bind Session Runner
 
 ```
-PATCH /v1/sessions/{session_id}
+PATCH /v1/sessions/{session_id}[?include_usage=true]
 Content-Type: application/json
 
 {
@@ -774,6 +817,11 @@ Content-Type: application/json
   "external_session_id": "a1b2c3d4-1234-5678-9abc-def012345678"
 }
 ```
+
+The optional `include_usage=false` query parameter skips usage aggregation in
+the response, with the same unknown-usage contract as GET. It does not change
+the update or its authorization. Native launch metadata writes use it to
+avoid waiting for display costs after persisting a new native thread id.
 
 Request body:
 
@@ -860,6 +908,20 @@ Content-Type: application/json
   }
 }
 
+The encoded request-body limit is 10 MiB. The request may also be a top-level
+JSON array of 1-100 events:
+
+[
+  {"type": "external_conversation_item", "data": {"source_id": "record-1", ...}},
+  {"type": "external_conversation_item", "data": {"source_id": "record-2", ...}}
+]
+
+Batch entries are processed in order and each entry uses the same
+`SessionEventInput` contract described below. A batch response is a JSON array
+of acknowledgements in the corresponding order. Batch processing is not
+atomic: if a later event fails, earlier events may already have completed.
+Retrying source-keyed `external_conversation_item` events is idempotent.
+
 Request body matches `SessionEventInput`:
 
   type (string, required)
@@ -918,6 +980,23 @@ Request body matches `SessionEventInput`:
                                   publishes a `session.status` event with
                                   data `{status: "running" | "waiting" |
                                   "idle" | "failed"}`
+      - "subagent.status"        — internal transcript-inactivity observation.
+                                  Payload: `{idle: true}`; only literal `true`
+                                  is accepted. Uses the existing idle publisher
+                                  (including persistence, response cleanup and
+                                  parent UI updates), then returns without
+                                  forwarding completion to the runner.
+                                  Optional fields: `response_id`,
+                                  `background_task_count`, `background_tasks`,
+                                  `blocked_on`, as for external_session_status.
+                                  Returns `{queued: false}`. Activity resumes
+                                  through external_session_status running.
+                                  On an older server's explicit unknown-event
+                                  rejection (400, `invalid_input`), the native
+                                  forwarder skips subsequent idle observations
+                                  until restart. No fallback status is sent;
+                                  transcript and ordinary status delivery
+                                  continue. Other errors retain normal retries.
       - "external_session_usage"
                                 — internal terminal-observed token-usage
                                   update; persists `context_tokens` /
@@ -959,16 +1038,15 @@ Request body matches `SessionEventInput`:
                                   `{status: "in_progress" | "completed" |
                                   "failed"}`.
       - "external_session_todos"
-                                — internal terminal-observed todo-list
-                                  update from the claude-native forwarder.
-                                  Caches the list in memory (used by the
-                                  snapshot `todos` field) and publishes a
-                                  `session.todos` SSE event. Payload:
+                                — internal native Plan update from a harness.
+                                  Stores the validated snapshot under a reserved
+                                  key in existing compressed `session_state`
+                                  metadata and publishes `session.todos`. Payload:
                                   `{todos: [{content: str, status:
                                   "pending"|"in_progress"|"completed",
                                   activeForm: string}]}`.
-                                  Malformed items are silently dropped
-                                  before caching/broadcasting.
+                                  Malformed items are dropped; item/text/byte
+                                  bounds fail the request with 400.
     The route validates `type` against the conversation entity's item
     discriminator map plus the documented control/internal event types.
     Unknown values fail loud with 400 — they are NOT silently enqueued.
@@ -984,6 +1062,7 @@ Request body matches `SessionEventInput`:
 {"queued": false}                           # "interrupt" and status/control bypasses
 {"queued": false, "item_id": "item_..."}    # "external_conversation_item"
 {"queued": true, "pending_id": "pending_..."} # native-terminal "message" (see below)
+[{"queued": false, "item_id": "item_..."}, ...] # top-level event array
 
 400 Bad Request — unknown `type`, or `data` fails the per-type schema
 404 Not Found — no session with that id
@@ -1089,22 +1168,63 @@ Request body matches `SessionForkRequest`:
     source's full native transcript. When null or omitted, the full
     history is copied.
 
+  host_type (string, "external" | "managed", default "external")
+    How the fork's host is obtained. `"external"` (the default, and
+    the pre-existing behavior): the fork is created unbound and the
+    caller binds compute afterwards. `"managed"`: the SERVER
+    provisions a sandbox host for the fork from its `sandbox:`
+    config, exactly as a `host_type: "managed"` create does — same
+    background launch, same `host_id` / `workspace` null in this
+    response until the sandbox host registers. The sandbox is
+    registered to the FORKING caller, so it resolves that user's
+    credentials, never the source session owner's.
+
+  sandbox_provider (string | null, optional)
+    Which configured sandbox provider to provision (one of the
+    server's `sandbox_providers`); null takes the server's first.
+    Only valid with `host_type: "managed"` (422 otherwise).
+
+  workspace (string | null, optional)
+    Git repository URL, optionally `#<branch>`, cloned into the
+    fork's sandbox as its working directory. Omitting the field
+    inherits the repository the source session recorded, so cloning
+    a sandbox session lands the fork in the same checkout; an
+    explicit null gives the fork an empty sandbox. Only valid with
+    `host_type: "managed"` (422 otherwise) — an external fork's
+    directory is chosen when it binds a host.
+
+    The source's recorded-repository label is never copied onto the
+    fork: the fork records whichever repository it actually resolved
+    (none, for an empty sandbox or an external fork), so a later
+    sandbox relaunch re-clones the fork's own repository rather than
+    the source's.
+
 201 Created — body matches `SessionResponse` (status "idle",
   items are the deep-copied items from the source session).
 
 400 Bad Request — source session is a sub-agent session, has
-  no agent binding, or up_to_response_id names no response in
-  the source session
+  no agent binding, up_to_response_id names no response in
+  the source session, or a managed fork asks for a sandbox this
+  server has not configured
 404 Not Found — no session with that source_id, or the source's
   agent row is missing
+422 Unprocessable Entity — sandbox_provider / workspace without
+  `host_type: "managed"`, or a managed workspace that is not a
+  repository URL
 ```
 
 Creates a new session by deep-copying every item from the source
 session. The server also clones the source's agent (new agent ID,
 same bundle and config) so the fork can be reconfigured independently.
-The forked session is **not** bound to a runner — clients must
-`PATCH /v1/sessions/{id}` with `runner_id` before posting events,
-the same way they bind a runner after resuming an existing session.
+Unless `host_type: "managed"` is requested, the forked session is
+**not** bound to a runner — clients must `PATCH /v1/sessions/{id}`
+with `runner_id` before posting events, the same way they bind a
+runner after resuming an existing session.
+
+The fork's bound agent is always that session-scoped clone, never the
+built-in it derives from. A managed fork's runner therefore carries no
+built-in agent classifier, so an admission policy keyed on one does not
+match it.
 
 The response is a full `SessionResponse` snapshot of the fork — same
 shape as `GET /v1/sessions/{id}` — with status `"idle"` and all
@@ -1214,12 +1334,18 @@ multiplexes them; the per-response stream emits them directly.
 | `response.client_task.cancel` | `ClientTaskCancelEvent` |
 | `response.heartbeat` | `HeartbeatEvent` |
 | `response.elicitation_request` | `ElicitationRequestEvent` |
+| `response.elicitation_resolved` | `ElicitationResolvedEvent` |
 
 See the per-class docstring in `omnigent/server/schemas.py` for
 the canonical wire shape and field types of each `response.*` event.
 When a child/sub-agent elicitation is mirrored into an ancestor stream,
 `response.elicitation_request.params.target_session_id` is the child
 session whose resolve endpoint must receive the verdict.
+`response.elicitation_resolved` carries `action` when a human verdict
+settled the prompt (answered in another tab, the inbox, or the approve
+page) and `reason: "unanswered"` when the hook stopped waiting before
+anyone answered; a clear with neither means the prompt was answered
+in the native terminal, where the verdict is not observable.
 
 ### Reconnect Contract
 

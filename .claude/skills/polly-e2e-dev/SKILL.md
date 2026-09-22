@@ -75,7 +75,7 @@ Read the result with `… | grep '^SUMMARY' | python -m json.tool`. Each run tak
 | `tool_dispatch` | call `sys_os_shell` to write a sentinel | the file appears on disk (bridged `sys_*` dispatch works; `blast_radius` ALLOWs benign shell) |
 | `guardrail_purpose` | `sys_session_send` with **no** `args.purpose` | tool output carries `Denied by policy: … must declare what kind of work it is` (`headless_subagent_purpose_guard`) |
 | `guardrail_blast_radius` | `sys_os_shell("git push --force …")` | tool output carries `Denied by policy: … blast-radius policy` |
-| `fanout_dispatch` | emit 6 `sys_session_send` in one turn | ≥2 sub-agent dispatch handles created (fan-out substrate). **Finding:** reports whether the `spawn_bounds` cap fired (see Known sharp edges) |
+| `fanout_dispatch` | emit 7 `sys_session_send` in one turn | 6 dispatch handles created and the seventh is denied by `spawn_bounds` |
 
 ### The verifiable before→after loop
 
@@ -133,7 +133,7 @@ deploy, which may be stale and reject parts of the bundle.
 Grab the session id, then read the transcript and the side effects:
 
 ```bash
-SID=$(curl -s "$SERVER/v1/sessions?kind=default&order=desc&limit=1" | python -c "import sys,json;print(json.load(sys.stdin)['data'][0]['id'])")
+SID=$(curl -s "$SERVER/v1/sessions?kind=default&order=desc&limit=1&visibility=all" | python -c "import sys,json;print(json.load(sys.stdin)['data'][0]['id'])")
 curl -s "$SERVER/v1/sessions/$SID/items"          | python -m json.tool | tail -60   # brain transcript + tool calls
 curl -s "$SERVER/v1/sessions/$SID/child_sessions" | python -m json.tool             # dispatched sub-agents
 git worktree list                                  # fanout: one per task
@@ -166,21 +166,13 @@ side effects.
 | bridged `sys_*` dispatch | `tool_dispatch` | tool calls in `…/items` |
 | `headless_subagent_purpose_guard` | `guardrail_purpose` ✅ | (deny — prefer mock) |
 | `blast_radius` | `guardrail_blast_radius` ✅ | ASK card on push/merge |
-| `spawn_bounds` | `fanout_dispatch` (finding) ⚠️ | verify cap live |
+| `spawn_bounds` | `fanout_dispatch` ✅ | verify cap live |
 | fanout delegation | `fanout_dispatch` (handles) | `child_sessions` + worktrees + PRs |
 | investigate / cross-review / plan gate / inbox | — (needs judgment) | live playbook above |
 
 ---
 
 ## Known sharp edges (found while building this skill — verify, may change)
-
-- **`spawn_bounds` per-turn cap does not trip in the local server-side path.**
-  The cap is a *stateful* per-turn counter, but the server rebuilds the policy
-  engine per `tools/call` (`_build_policy_engine_from_spec`, `sessions.py`), so
-  the counter resets every call. Stateless policies (`purpose_guard`,
-  `blast_radius`) are unaffected. `fanout_dispatch` reports this as a finding
-  rather than failing. Verify the cap **live**, where a persistent per-turn
-  engine applies.
 - **Two deny formats.** Bridged `sys_*` tools surface a denial as
   `{"error": "Denied by policy: <reason>"}`; SDK function tools use
   `[Denied by policy: <name>] {json}`. Both share the `Denied by policy:`

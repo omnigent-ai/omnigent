@@ -1,5 +1,5 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { userEvent, within } from "storybook/test";
+import { expect, userEvent, within } from "storybook/test";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import type { Host } from "@/hooks/useHosts";
 import type { AgentBundleInput } from "@/lib/agentBundle";
@@ -62,6 +62,10 @@ const readyHost: Host = {
   owner: "developer",
   status: "online",
   configured_harnesses: {
+    // claude-sdk backs the polly/debby/custom (SDK) agents; a host reporting the
+    // native harnesses reports the SDK ones too, so include it or those agents
+    // read as unconfigured.
+    "claude-sdk": true,
     "claude-native": true,
     "codex-native": true,
     "cursor-native": true,
@@ -116,11 +120,22 @@ export const ReadyOnHost: Story = {
   play: async ({ canvasElement }) => openPicker(canvasElement),
 };
 
+export const Configured: Story = {
+  args: {
+    triggerDetails: [{ label: "Model", value: "Opus 4.6" }],
+    selectedConfigContent: <span>Model configuration</span>,
+  },
+  play: async ({ canvasElement }) => openPicker(canvasElement),
+};
+
 export const NeedsSetupBadges: Story = {
   args: {
     host: {
       ...readyHost,
       configured_harnesses: {
+        // SDK agents (polly/debby) stay available; the intended badges here are
+        // the native codex/cursor rows below.
+        "claude-sdk": true,
         "claude-native": true,
         "codex-native": "needs-auth",
         "cursor-native": false,
@@ -135,6 +150,39 @@ export const NeedsSetupBadges: Story = {
     ),
   ],
   play: async ({ canvasElement }) => openPicker(canvasElement),
+};
+
+export const ClaudeSelected: Story = {
+  args: {
+    effectiveAgentId: claude.id,
+    agentLabel: "Claude Code",
+    triggerDetails: [
+      { label: "Model", value: "Opus 4.6" },
+      { label: "Effort", value: "High" },
+    ],
+  },
+  play: async ({ canvasElement }) => openPicker(canvasElement),
+};
+
+export const ReadOnlyPermissionSummary: Story = {
+  args: {
+    triggerDetails: [
+      { label: "Model", value: "Opus 4.6" },
+      { label: "Permission mode", value: "Plan" },
+    ],
+    triggerTooltipRows: [
+      { label: "Harness", value: "Claude Code" },
+      { label: "Model", value: "Opus 4.6" },
+      { label: "Permission mode", value: "Plan" },
+    ],
+  },
+  play: async ({ canvasElement }) => {
+    const page = within(canvasElement.ownerDocument.body);
+    within(canvasElement).getByTestId("new-chat-landing-agent-select").focus();
+    await expect(await page.findByTestId("new-chat-landing-agent-tooltip")).toHaveTextContent(
+      "Permission mode: Plan",
+    );
+  },
 };
 
 export const SmartRoutingWithCustomAgents: Story = {

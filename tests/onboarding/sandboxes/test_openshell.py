@@ -12,7 +12,7 @@ from typing import Any
 import click
 import pytest
 
-from omnigent.onboarding.sandboxes.base import DEFAULT_HOST_IMAGE
+from omnigent.onboarding.sandboxes.base import DEFAULT_HOST_IMAGE, SandboxGoneError
 from omnigent.onboarding.sandboxes.openshell import (
     HOST_IMAGE_ENV_VAR,
     SANDBOX_ENV_PASSTHROUGH_ENV_VAR,
@@ -54,6 +54,7 @@ class _FakeOpenShellAPI:
     create_kwargs: list[dict[str, Any]] = field(default_factory=list)
     exec_calls: list[tuple[str, list[str], bytes | None]] = field(default_factory=list)
     statuses: list[str] = field(default_factory=list)
+    resumed: list[str] = field(default_factory=list)
     deleted: list[str] = field(default_factory=list)
     closed: bool = False
     exec_result: _FakeExecResult = field(default_factory=_FakeExecResult)
@@ -89,6 +90,9 @@ class _FakeOpenShellAPI:
 
     def get_status(self, name: str) -> None:
         self.statuses.append(name)
+
+    def resume_sandbox(self, name: str) -> None:
+        self.resumed.append(name)
 
     def delete_sandbox(self, name: str) -> None:
         self.deleted.append(name)
@@ -268,6 +272,53 @@ def test_put_raises_on_failure(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) 
         launcher.put("sb-1", local_file, "/tmp/wheels.tgz")
 
 
+def test_launcher_capabilities_join_resume_framework(sdk: _SDKState) -> None:
+    """With a resume-capable SDK, the launcher advertises in-place resume.
+
+    This is the gate the server's managed-host wake path
+    (``host_resume_supported`` / ``resume_managed_host``) consults, so a
+    dormant OpenShell host renders as a wakeable \"asleep\" state instead of
+    the terminal ``host_offline`` dead-end. The warm (snapshot) restore stays
+    off until the gateway's snapshot restore is consumable through the SDK.
+    """
+    caps = OpenShellSandboxLauncher().capabilities
+    assert caps.resume_stopped is True
+    assert caps.snapshot_restore is False
+
+
+def test_launcher_capabilities_gate_resume_on_sdk_primitive(
+    sdk: _SDKState, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An SDK predating ``SandboxClient.start`` must not advertise resume.
+
+    Advertised-but-unusable resume would render every dormant host as
+    wakeable while each wake fails; the gate keeps the honest offline state.
+    """
+    monkeypatch.delattr(sys.modules["openshell"].SandboxClient, "start")
+    assert OpenShellSandboxLauncher().capabilities.resume_stopped is False
+
+
+def test_launcher_capabilities_without_sdk_installed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no openshell SDK importable, resume is not advertised."""
+    # An empty stand-in module has no SandboxClient, so the probe's
+    # ``from openshell import SandboxClient`` raises ImportError.
+    monkeypatch.setitem(sys.modules, "openshell", types.ModuleType("openshell"))
+    assert OpenShellSandboxLauncher().capabilities.resume_stopped is False
+
+
+def test_resume_delegates_to_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    """resume wakes the named sandbox through the gateway client."""
+    fake = _FakeOpenShellAPI()
+    launcher = OpenShellSandboxLauncher()
+    monkeypatch.setattr(launcher, "_openshell", lambda: fake)
+
+    launcher.resume("petname-dormant")
+
+    assert fake.resumed == ["petname-dormant"]
+
+
 def test_attach_validates_sandbox(monkeypatch: pytest.MonkeyPatch) -> None:
     """``attach`` checks sandbox status via the API."""
     fake = _FakeOpenShellAPI()
@@ -356,9 +407,13 @@ class _SDKState:
     connect_error: bool = False
     delete_not_found: bool = False
     delete_not_found_via_sandbox_error: bool = False
+    resume_not_found: bool = False
+    resume_sandbox_error: str | None = None
     created_spec: Any = None
     waited: tuple[str, int | None] | None = None
     got: list[str] = field(default_factory=list)
+    resumed: list[tuple[str, str]] = field(default_factory=list)
+    ready_id: str = "id-1"
     execs: list[tuple[str, list[str], bytes | None]] = field(default_factory=list)
     deleted: list[str] = field(default_factory=list)
     closed: bool = False
@@ -415,11 +470,18 @@ def sdk(monkeypatch: pytest.MonkeyPatch) -> _SDKState:
             self, name: str, *, workspace: str, timeout_seconds: int | None = None
         ) -> _SandboxRef:
             state.waited = (name, timeout_seconds)
-            return _SandboxRef(id="id-1", name=name)
+            return _SandboxRef(id=state.ready_id, name=name)
 
         def get(self, name: str, *, workspace: str) -> _SandboxRef:
             state.got.append(name)
             return _SandboxRef(id=f"id-for-{name}", name=name)
+
+        def start(self, name: str, *, workspace: str) -> None:
+            if state.resume_not_found:
+                raise _NotFound(_StatusCode.NOT_FOUND)
+            if state.resume_sandbox_error is not None:
+                raise _SandboxError(state.resume_sandbox_error)
+            state.resumed.append((name, workspace))
 
         def exec(
             self,
@@ -556,6 +618,55 @@ def test_client_execute_pins_sandbox_home(sdk: _SDKState) -> None:
 
     assert sdk.last_workdir == "/sandbox"
     assert sdk.last_env == {"HOME": "/sandbox"}
+
+
+def test_client_resume_waits_ready_and_recaches_id(sdk: _SDKState) -> None:
+    """resume_sandbox drives the SDK start primitive, waits ready, refreshes the id.
+
+    The resumed instance may carry a fresh opaque id, so subsequent execs
+    must use the id reported by the post-resume readiness wait — without an
+    extra ``get()`` round-trip.
+    """
+    client = _OpenShellClient()
+    client.execute("box", ["true"])  # cache the pre-stop id via get()
+    sdk.ready_id = "id-resumed"
+
+    client.resume_sandbox("box")
+
+    assert sdk.resumed == [("box", "default")]
+    assert sdk.waited == ("box", 300)
+    client.execute("box", ["ls"])
+    assert sdk.execs[-1][0] == "id-resumed"
+    assert sdk.got == ["box"]  # no re-get: the resume refreshed the cache
+
+
+def test_client_resume_missing_sandbox_raises_gone(sdk: _SDKState) -> None:
+    """A definitive gateway not-found lets the server recreate the sandbox."""
+    sdk.resume_not_found = True
+
+    with pytest.raises(SandboxGoneError, match="no longer exists"):
+        _OpenShellClient().resume_sandbox("box")
+
+
+def test_client_resume_transient_failure_stays_click_error(sdk: _SDKState) -> None:
+    """A provider outage must not trigger a workspace-destroying recreate."""
+    sdk.resume_sandbox_error = "gateway unavailable"
+
+    with pytest.raises(click.ClickException, match="gateway unavailable") as exc:
+        _OpenShellClient().resume_sandbox("box")
+
+    assert not isinstance(exc.value, SandboxGoneError)
+
+
+def test_client_resume_requires_sdk_support(
+    sdk: _SDKState, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An SDK predating ``SandboxClient.start`` surfaces an actionable upgrade hint."""
+    monkeypatch.delattr(sys.modules["openshell"].SandboxClient, "start")
+    client = _OpenShellClient()
+
+    with pytest.raises(click.ClickException, match="no sandbox resume primitive"):
+        client.resume_sandbox("box")
 
 
 def test_client_delete_ignores_not_found(sdk: _SDKState) -> None:

@@ -1789,6 +1789,30 @@ async def test_turn_catalog_and_verdict_follow_the_panes_vocabulary() -> None:
     )
 
 
+async def test_turn_catalog_spells_managed_models_outside_claude_families() -> None:
+    from omnigent.server.routes._sessions.orchestration import (
+        _model_options_cache,
+        _native_turn_catalog,
+        _routed_turn_model_spelling,
+    )
+
+    session_id = "conv_managed_vocab"
+    conv = _native_conv(session_id)
+    _model_options_cache[session_id] = [
+        {"id": "opus", "model": "system.ai.claude-opus-4-8[1m]"},
+        {"id": "system.ai.glm-5-3", "model": "system.ai.glm-5-3"},
+    ]
+    try:
+        assert "system.ai.glm-5-3" in await _native_turn_catalog(session_id, conv)
+        assert (
+            _routed_turn_model_spelling(session_id, conv, "system.ai.glm-5-3")
+            == "system.ai.glm-5-3"
+        )
+        assert _routed_turn_model_spelling(session_id, conv, "system.ai.kimi-k3") is None
+    finally:
+        _model_options_cache.pop(session_id, None)
+
+
 async def test_turn_catalog_refetches_a_stale_pre_launch_catalog() -> None:
     """A pre-launch host catalog never bounds a turn once a runner is bound."""
     from omnigent.server.routes._sessions.orchestration import (
@@ -2264,3 +2288,50 @@ async def test_a_routing_outage_still_creates_the_fixed_harness_session(
     assert len(decisions) == 1
     assert decisions[0]["applied"] is False
     assert decisions[0]["rationale"]
+
+
+def test_routed_spelling_types_a_managed_picker_row_verbatim() -> None:
+    """A routed model of no Claude family is spelled by the pane's picker row.
+
+    A workspace-managed picker lists every served model by its own id, which
+    ``/model`` takes verbatim. Alias pins spell none of them, so the router's
+    pick was recorded as "not applied" and the pane kept its launch model.
+    """
+    from omnigent.entities import Conversation
+    from omnigent.server.routes._sessions import orchestration as _orchestration
+
+    conv = Conversation(
+        id="conv_managed",
+        created_at=1,
+        updated_at=1,
+        root_conversation_id="conv_managed",
+        agent_id="agent_managed",
+        labels={"omnigent.wrapper": "claude-code-native-ui"},
+    )
+    rows = [
+        {"id": "system.ai.claude-opus-4-8[1m]", "model": "system.ai.claude-opus-4-8[1m]"},
+        {"id": "system.ai.glm-5-3", "model": "system.ai.glm-5-3"},
+    ]
+    _orchestration._model_options_cache["conv_managed"] = rows
+    try:
+        assert (
+            _orchestration._routed_turn_model_spelling("conv_managed", conv, "system.ai.glm-5-3")
+            == "system.ai.glm-5-3"
+        )
+        # The picker's exact row wins over the family alias its pin would
+        # otherwise step onto.
+        assert (
+            _orchestration._routed_turn_model_spelling(
+                "conv_managed", conv, "databricks-claude-opus-4-8"
+            )
+            == "system.ai.claude-opus-4-8[1m]"
+        )
+        # A model no row spells still passes through untranslated: rows that
+        # restate their own id pin nothing, and the pane's launch env stays
+        # the authority on what it can switch to.
+        assert (
+            _orchestration._routed_turn_model_spelling("conv_managed", conv, "system.ai.kimi-k3")
+            == "system.ai.kimi-k3"
+        )
+    finally:
+        _orchestration._model_options_cache.pop("conv_managed", None)

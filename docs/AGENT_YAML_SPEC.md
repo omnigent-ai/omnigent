@@ -55,7 +55,7 @@ of the agent YAML.
 
 ```yaml
 executor:
-  harness: claude-sdk        # claude-sdk, openai-agents, codex, cursor, kiro-native, pi, antigravity, qwen, kimi, copilot, hermes, ...
+  harness: claude-sdk        # claude-sdk, openai-agents, codex, cursor, devin-native, kiro-native, pi, antigravity, qwen, kimi, copilot, hermes, ...
   model: databricks-claude-opus-4-7
   reasoning_effort: high     # optional spec default: low | medium | high | xhigh (harness-dependent)
   auth:
@@ -199,6 +199,41 @@ Then run it with `omni run --harness acp:openclaw` or select `OpenClaw` in the
 app. See the [OpenClaw integration guide](openclaw.md) for registry import,
 Gateway setup, and compatibility details.
 
+To offer a curated model picker for a custom ACP agent, explicitly reference a
+named provider in its agent spec:
+
+```yaml
+executor:
+  harness: acp:helper
+  auth:
+    type: provider
+    name: team-gateway
+```
+
+Configure at least two distinct model IDs in that provider's family `models:`
+map in `config.yaml`, for example `models: {default: model-a, fast: model-b}`.
+Tier aliases resolve to concrete IDs. The provider default leads the picker;
+session selections cannot add models to the configured list. A default-only
+map leaves model switching unrestricted, and an unrelated global default
+provider does not change custom ACP agents. An explicitly selected provider
+must resolve successfully; configuration errors do not remove model restrictions.
+
+With curation enabled, a model pinned in the spec or ACP-agent configuration
+must also appear in the list. An unlisted default prevents launch even when a
+valid override is selected; clearing a selection restores the approved default.
+
+The ACP command still owns its gateway URL and authentication; this provider
+reference supplies model choices, not credentials. Configure matching provider
+definitions on the server and execution host. Select a model from the session
+composer and send a turn to apply it through ACP without losing the live
+session, provided the command supports ACP model switching. If the switch fails,
+the turn reports an error without sending the prompt on the previous model.
+Retrying attempts the switch again in the same session.
+
+Set `OMNIGENT_ACP_ENV_UNSET` on the execution host to a comma-separated list of
+environment variable names to remove from the ACP command's environment. The
+setting propagates through the runner and affects newly spawned commands.
+
 ## Local OS access
 
 Declare `os_env` only for agents that need local file/shell tools.
@@ -280,6 +315,57 @@ os_env:
 Inside the sandbox, `databricks --profile dbc-adb7b1a3-9097 current-user me`
 works; the sandbox holds only `oa_cred_*` placeholders, never a live token.
 
+### Refreshing proxy credentials
+
+File and Unix socket credential sources can opt into renewal with
+`refresh_interval_seconds`. The trusted parent re-reads the source on the first
+request after that interval; sandbox placeholders stay the same. For example,
+a local token broker can mint replacement GitHub App tokens before they expire:
+
+```yaml
+credential_proxy:
+  - type: gh_basic
+    source:
+      unix_socket: /private/broker.sock
+      refresh_interval_seconds: 60
+```
+
+The parent makes an HTTP `GET /token` directly over the Unix socket. The broker
+must return HTTP 200 with a non-empty, single-line token (at most 64 KiB).
+Redirects are not followed, no shell or external executable is involved, and
+one five-second deadline covers connection setup, headers, and the response
+body, including responses that trickle in slowly. Host bindings from one source
+declaration share a cache and one in-flight refresh. Concurrent proxy requests
+await the same result or failure without occupying additional worker threads;
+cancelling one request does not cancel the refresh for other requests.
+
+Keep the broker socket and its private key outside sandbox read/write paths.
+Refresh sources require absolute paths and an active Linux bubblewrap or macOS
+Seatbelt policy. The runtime rejects sources whose paths, symlink targets, or
+parent directories fall inside sandbox read/write grants or the workspace, even
+when the workspace is read-only. Hard-linked files and sockets are rejected.
+Canonical source paths stay protected through launcher serialization: Linux
+rejects mounts that expose them, including implicit toolchain mounts; macOS
+denies file access and Unix-socket connections even under implicit read grants.
+These protections also apply to startup-only Unix socket sources. Existing
+startup-only file, environment, and command sources are unchanged.
+
+Source checks run before startup resolution and every refresh. A symlink source
+must retain its original canonical target for the session; replacing the file
+atomically at the same canonical path remains supported. The trusted broker must keep its own code,
+configuration, and dependencies outside sandbox-writable paths too.
+Choose an interval shorter than the minimum remaining lifetime of tokens
+returned by the source. A failed refresh fails the request; it does not reuse
+an old credential. Proxy requests receive a sanitized HTTP 502 on source failure,
+and a later request retries after the shared attempt finishes. The broker must
+be ready before the helper starts: a source failure during startup prevents
+launch, rather than producing a recoverable request-time 502. Without a refresh
+interval, sources resolve once at startup.
+Environment sources cannot refresh because a running process inherits a fixed
+environment. Shell command sources remain startup-only: a sandbox might otherwise
+replace a script or dependency before the trusted parent executes it again. Use
+a private broker for renewable credentials instead.
+
 ## Tools
 
 Tools are declared under `tools` by name.
@@ -329,6 +415,36 @@ tools:
 ```
 
 For client-provided tools, use `runtime: client` and do not set `callable`.
+
+### Linux desktop keyrings
+
+The host and runner inherit `DBUS_SESSION_BUS_ADDRESS` and `XDG_RUNTIME_DIR`
+to resolve credentials stored by `omnigent setup`. Restart the host from the
+desktop session after changing these values. The keyring must be available
+and unlocked.
+
+Headless harnesses do not inherit these desktop variables by default. For a
+trusted harness that performs its own keyring lookup, such as Goose configured
+with `goose configure`, explicitly opt out of the sandbox and request them:
+
+```yaml
+os_env:
+  type: caller_process
+  sandbox:
+    type: none
+    env_passthrough: [DBUS_SESSION_BUS_ADDRESS, XDG_RUNTIME_DIR]
+```
+
+Unsandboxed terminals retain their declared/inherited desktop environment.
+Active sandboxes remove the host bus address even when it appears in
+`env_passthrough`, and supply a private, writable `XDG_RUNTIME_DIR` instead of
+the desktop directory. Configure authentication separately for sandboxed
+harnesses; the desktop keyring is not an available credential source there.
+
+Environment filtering alone does not isolate the keyring. Desktop addresses
+can be discovered without these variables; socket/filesystem access and process
+isolation must enforce the boundary. Do not grant host desktop runtime paths to
+untrusted sandboxes. `sandbox.type: none` deliberately provides no OS isolation.
 
 ### Tool sandbox containers
 
