@@ -1,5 +1,9 @@
 [build-system]
-requires = ["hatchling>=1.27"]
+# Cap below hatchling 1.32.4, which flipped the default core-metadata-version
+# to 2.5 (2026-09-20) — ahead of what twine and PyPI's Warehouse accept, so
+# `twine`/upload rejects the wheel with "'2.5' is not a valid metadata version".
+# 1.27..<1.32.4 emits Metadata-Version 2.4. Drop the cap once 2.5 is accepted.
+requires = ["hatchling>=1.27,<1.32.4"]
 build-backend = "hatchling.build"
 
 [project]
