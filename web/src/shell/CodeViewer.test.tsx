@@ -6,6 +6,8 @@ import { CodeViewer, type CodeViewerProps } from "./CodeViewer";
 import { ImageLightboxProvider } from "@/components/ImageLightbox";
 import { HTML_PREVIEW_SANDBOX } from "./codeViewerHelpers";
 
+const pdfRendering = vi.hoisted(() => ({ error: null as Error | null }));
+
 // ── Module mocks ──────────────────────────────────────────────────────────────
 
 vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: vi.fn() }));
@@ -26,9 +28,12 @@ vi.mock("./MonacoCodeEditor", () => ({
 // jsdom) never load; its testid presence is the signal that a file was routed
 // to the PDF surface.
 vi.mock("./PdfViewer", () => ({
-  PdfViewer: ({ comments }: { comments: Comment[] }) => (
-    <div data-testid="pdf-viewer-stub" data-comment-ids={comments.map((c) => c.id).join(",")} />
-  ),
+  PdfViewer: ({ comments }: { comments: Comment[] }) => {
+    if (pdfRendering.error) throw pdfRendering.error;
+    return (
+      <div data-testid="pdf-viewer-stub" data-comment-ids={comments.map((c) => c.id).join(",")} />
+    );
+  },
 }));
 // Stub the lazy ModelViewer so the heavy three.js bundle isn't loaded in jsdom
 // (which has no WebGL); its presence in the DOM is the signal that a model file
@@ -667,6 +672,41 @@ describe("CodeViewer image rendering", () => {
 });
 
 describe("CodeViewer PDF routing", () => {
+  it("contains a PDF render failure and allows another file to open", async () => {
+    const error = new Error("PDF renderer failed");
+    pdfRendering.error = error;
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    const suppressExpectedError = (event: ErrorEvent) => {
+      if (event.error === error) event.preventDefault();
+    };
+    window.addEventListener("error", suppressExpectedError);
+    const props: CodeViewerProps = {
+      conversationId: "conv_1",
+      path: "broken.pdf",
+      fileQuery: makePdfQuery(),
+      comments: [],
+      activeSelection: null,
+      onSetActiveSelection: () => {},
+      panelOpen: true,
+      searchOpen: false,
+      setSearchOpen: () => {},
+      searchInputRef: noopRef,
+      viewMode: "source",
+    };
+    try {
+      const { rerender } = render(<CodeViewer {...props} />);
+      expect(await screen.findByRole("alert")).toHaveTextContent("Could not preview this PDF");
+      pdfRendering.error = null;
+      rerender(<CodeViewer {...props} path="healthy.pdf" />);
+      expect(await screen.findByTestId("pdf-viewer-stub")).toBeInTheDocument();
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    } finally {
+      pdfRendering.error = null;
+      window.removeEventListener("error", suppressExpectedError);
+      log.mockRestore();
+    }
+  });
+
   function renderPdf(
     contentType: string | null = "application/pdf",
     path = "report.pdf",
