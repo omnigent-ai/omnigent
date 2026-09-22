@@ -2466,15 +2466,14 @@ function buildMenu() {
     template.push({ label: "Help", submenu: [aboutItem] });
   }
 
-  // Consolidate non-production affordances behind one top-level menu. It is
+  // Consolidate developer affordances behind one top-level menu. It is
   // always present in development and can be explicitly enabled in a packaged
   // macOS app through the DeveloperMode user default. Restart-to-update stays
   // in the production Server menu because it is a normal install path.
   if (developerModeEnabled()) {
     /** @type {Electron.MenuItemConstructorOptions[]} */
-    const debugSubmenu = [];
-    if (!app.isPackaged) {
-      debugSubmenu.push({
+    const debugSubmenu = [
+      {
         id: "debug_authentication",
         label: "Authentication",
         submenu: [
@@ -2494,8 +2493,8 @@ function buildMenu() {
             click: () => void changeCachedOAuthToken("refresh"),
           },
         ],
-      });
-    }
+      },
+    ];
 
     // macOS notification-sound settings: an on/off switch plus a picker of
     // system sounds. Selections persist in settings.json and are read live by

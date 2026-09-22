@@ -245,8 +245,9 @@ Omnigent, set its macOS user default, and reopen it:
 defaults write ai.omnigent.desktop DeveloperMode -bool true
 ```
 
-The **Debug → Developer Tools** menu is then available in the packaged app. To
-turn production debugging off again, quit Omnigent and remove the override:
+The packaged app then exposes **Debug → Authentication** session/token
+simulations and **Debug → Developer Tools**. To turn production debugging off
+again, quit Omnigent and remove the override:
 
 ```bash
 defaults delete ai.omnigent.desktop DeveloperMode
