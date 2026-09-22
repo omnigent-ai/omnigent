@@ -508,7 +508,7 @@ export function removeLocalConversation(tempConvId: string): boolean {
 export interface PendingUserMessage {
   tempId: string;
   content: MessageContentBlock[];
-  /** Unsent first-message draft, including files not uploaded yet. */
+  /** Unsent draft awaiting session/model readiness, including unuploaded files. */
   initialDraft?: { text: string; files: File[] };
   /** Client epoch seconds stamped ONCE at send time — the optimistic
    *  bubble's display timestamp. Stamping here (not at render or
@@ -1302,13 +1302,16 @@ let queueSeq = 0;
 // never reordering a slow one.
 const SEND_CHAIN_MAX_WAIT_MS = 180_000;
 
-function initialNativeModelPending(state: ConversationState): boolean {
+function modelSelectionPending(state: ConversationState): boolean {
   // Claude reports its model before a prompt; other native CLIs may need a turn.
-  return state.sessionModelSeeded && state.sessionHarness === "claude-native";
+  return (
+    state.pendingModelChange !== null ||
+    (state.sessionModelSeeded && state.sessionHarness === "claude-native")
+  );
 }
 
-/** Keep the first draft local while the native model picker is still starting. */
-function waitForInitialModel(conversationId: string, tempId: string): Promise<boolean> {
+/** Keep the draft local while native model startup or a model switch is pending. */
+function waitForModelSelection(conversationId: string, tempId: string): Promise<boolean> {
   return new Promise((resolve, reject) => {
     const finish = (ready: boolean, error?: Error) => {
       clearTimeout(timer);
@@ -1329,10 +1332,9 @@ function waitForInitialModel(conversationId: string, tempId: string): Promise<bo
       } else if (state.conversationLoadError || state.sessionStatus === "failed") {
         finish(
           false,
-          state.conversationLoadError ??
-            new Error("Session failed before the first message was sent."),
+          state.conversationLoadError ?? new Error("Session failed before the message was sent."),
         );
-      } else if (!initialNativeModelPending(state)) {
+      } else if (!modelSelectionPending(state)) {
         finish(true);
       }
     };
@@ -2126,8 +2128,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         ? targetState?.pendingUserMessages.find((p) => p.tempId === opts.reusePendingTempId)
             ?.initialDraft
         : !opensSideChat &&
-            targetState?.sessionModelSeeded &&
-            (targetState.sessionHarness === null || targetState.sessionHarness === "claude-native")
+            targetState &&
+            (modelSelectionPending(targetState) ||
+              (targetState.sessionModelSeeded && targetState.sessionHarness === null))
           ? { text, files: files ?? [] }
           : undefined;
     const alreadyStreaming =
@@ -2232,7 +2235,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // otherwise resolve that id, find an empty chain, and overtake this POST.
       const sessionId = await ensureBoundSession(agentId, get, opts, submitConversationId, rekey);
       postedSessionId = sessionId;
-      if (initialDraft && !(await waitForInitialModel(sessionId, tempId))) return;
+      if (initialDraft && !(await waitForModelSelection(sessionId, tempId))) return;
 
       // Upload any attached files and build the real content blocks with
       // server-assigned file_ids (input_image for images, input_file
@@ -2544,9 +2547,10 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   },
 
   stop: () => {
-    const sessionId = get().conversationId;
+    const state = get();
+    const sessionId = state.conversationId;
     if (!sessionId) return;
-    const initialDraft = get().pendingUserMessages.find((p) => p.initialDraft)?.initialDraft;
+    const initialDraft = state.pendingUserMessages.find((p) => p.initialDraft)?.initialDraft;
     if (initialDraft) {
       const draft = getSessionDraft(sessionId) ?? initialDraft;
       setSessionDraft(sessionId, draft);
@@ -2556,7 +2560,14 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         sendLatchedAt: null,
         failedSendDraft: { ...draft, conversationId: sessionId },
       });
-      return;
+      // A local follow-up must not prevent Interrupt from stopping earlier work.
+      if (
+        state.activeResponse?.state !== "streaming" &&
+        state.sessionStatus !== "running" &&
+        state.sessionStatus !== "waiting" &&
+        state.backgroundTaskCount === 0
+      )
+        return;
     }
     if (isTempConvId(sessionId)) return;
     // Fire-and-forget interrupt; the server emits session.interrupted
@@ -6759,7 +6770,8 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           // steal a real queued message's bubble. Hold the head back for a marker.
           const eventContent = userContentFromEvent(event);
           if (eventContent !== null && isSystemUserContent(eventContent)) return {};
-          if (s.pendingUserMessages.length === 0) return {};
+          if (s.pendingUserMessages.length === 0 || s.pendingUserMessages[0]?.initialDraft)
+            return {};
           return { pendingUserMessages: s.pendingUserMessages.slice(1) };
         }
 
@@ -6793,7 +6805,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         }
 
         // 2. FIFO head fallback (id not adopted yet / cross-client).
-        //    Skipped for a mirrored system marker (the vendor CLI's own
+        //    Skipped for an unsent draft or a mirrored system marker (the vendor CLI's own
         //    interrupt record): it is synthesized by the CLI, never queued
         //    here, so popping the head would hand the queued message's
         //    uploads to the marker and leave the real message empty. A
@@ -6802,7 +6814,8 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         //    branch 1 and never reaches this fallback.
         const eventContent = userContentFromEvent(event);
         const head =
-          eventContent !== null && isSystemUserContent(eventContent)
+          (eventContent !== null && isSystemUserContent(eventContent)) ||
+          s.pendingUserMessages[0]?.initialDraft
             ? undefined
             : s.pendingUserMessages[0];
         if (head) {
@@ -6845,10 +6858,10 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // so the optimistic bubble in `pendingUserMessages` would
       // otherwise linger next to the rendered SlashCommandBlock
       // until refresh. Pop the FIFO head here to ack the local
-      // send; non-empty guard so observing clients (with no pending
-      // bubble) just render the block.
+      // send; observing clients and drafts still held locally cannot
+      // acknowledge a send, so they just render the block.
       applyToConversation((s) => {
-        if (s.pendingUserMessages.length === 0) return {};
+        if (s.pendingUserMessages.length === 0 || s.pendingUserMessages[0]?.initialDraft) return {};
         const [, ...rest] = s.pendingUserMessages;
         return { pendingUserMessages: rest };
       });

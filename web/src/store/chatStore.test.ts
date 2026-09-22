@@ -3735,6 +3735,159 @@ describe("chatStore — first message during native model startup", () => {
   });
 });
 
+describe("chatStore — sending during a model switch", () => {
+  const sessionId = "conv_model_switch_send";
+
+  beforeEach(clearSessionDrafts);
+  afterEach(clearSessionDrafts);
+
+  async function beginModelSwitch(): Promise<() => Promise<void>> {
+    seedSession(sessionId, [
+      userMessage("previous", "hello"),
+      assistantMessage("previous", "hello"),
+    ]);
+    let releasePatch!: (response: Response) => void;
+    fetchMock.mockImplementation((input, init) => {
+      if (String(input).split("?")[0] === `/v1/sessions/${sessionId}`) {
+        if (init?.method === "PATCH") {
+          return new Promise<Response>((resolve) => {
+            releasePatch = resolve;
+          });
+        }
+        return mockResponse({
+          id: sessionId,
+          agent_id: "agent_xyz",
+          status: "idle",
+          created_at: 0,
+          harness: "claude-native",
+          labels: { "omnigent.wrapper": "claude-code-native-ui" },
+          llm_model: "haiku",
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    await useChatStore.getState().switchTo(sessionId);
+    expect(useChatStore.getState()).toMatchObject({
+      status: "idle",
+      sessionModelSeeded: false,
+      llmModel: "haiku",
+    });
+    const changingModel = useChatStore.getState().setModel("sonnet", { expectConfirmation: true });
+    await tick();
+    expect(useChatStore.getState().pendingModelChange).toBe("sonnet");
+    return async () => {
+      handleSessionEvent(
+        { type: "session_model", conversationId: sessionId, model: "sonnet" },
+        sessionId,
+      );
+      releasePatch(mockResponse({ id: sessionId, model_override: "sonnet" }));
+      await changingModel;
+    };
+  }
+
+  function eventBodies(): { type: string; data: Record<string, unknown> }[] {
+    return fetchMock.mock.calls
+      .filter(([url, init]) => String(url).endsWith("/events") && init?.method === "POST")
+      .map(([, init]) => JSON.parse(init.body as string));
+  }
+
+  it("keeps an existing session's message local until the model switch is confirmed", async () => {
+    const confirmModel = await beginModelSwitch();
+    const sending = useChatStore.getState().send("use the new model", "agent_xyz");
+    await tick();
+    expect(eventBodies()).toEqual([]);
+
+    await confirmModel();
+    await sending;
+    expect(eventBodies()).toEqual([
+      {
+        type: "message",
+        data: expect.objectContaining({
+          content: [{ type: "input_text", text: "use the new model" }],
+        }),
+      },
+    ]);
+    expect(useChatStore.getState().pendingUserMessages[0]?.initialDraft).toBeUndefined();
+  });
+
+  it("restores a stopped draft and sends only its correction after the model switch", async () => {
+    const confirmModel = await beginModelSwitch();
+    const sending = useChatStore.getState().send("unfinished instructions", "agent_xyz");
+    await tick();
+    useChatStore.getState().stop();
+    await sending;
+
+    expect(useChatStore.getState()).toMatchObject({
+      status: "idle",
+      pendingUserMessages: [],
+      pendingModelChange: "sonnet",
+      failedSendDraft: { conversationId: sessionId, text: "unfinished instructions", files: [] },
+    });
+    expect(getSessionDraft(sessionId)).toEqual({ text: "unfinished instructions", files: [] });
+    expect(eventBodies()).toEqual([]);
+
+    setSessionDraft(sessionId, { text: "", files: [] });
+    useChatStore.setState({ failedSendDraft: null });
+    const corrected = useChatStore.getState().send("corrected instructions", "agent_xyz");
+    await tick();
+    expect(eventBodies()).toEqual([]);
+    const correctedPending = useChatStore.getState().pendingUserMessages;
+    handleSessionEvent(
+      {
+        type: "slash_command",
+        kind: "command",
+        name: "model",
+        arguments: "sonnet",
+        output: null,
+        agentName: "claude-native-ui",
+        itemId: "item_model_switch",
+        responseId: "response_model_switch",
+      },
+      sessionId,
+    );
+    expect(useChatStore.getState().pendingUserMessages).toEqual(correctedPending);
+    await confirmModel();
+    await corrected;
+
+    expect(eventBodies()).toEqual([
+      {
+        type: "message",
+        data: expect.objectContaining({
+          content: [{ type: "input_text", text: "corrected instructions" }],
+        }),
+      },
+    ]);
+  });
+
+  it("still interrupts an active response while restoring a model-switch draft", async () => {
+    const confirmModel = await beginModelSwitch();
+    useChatStore.setState({
+      status: "streaming",
+      sessionStatus: "running",
+      activeResponse: { responseId: "response_active", state: "streaming", error: null },
+    });
+    const sending = useChatStore.getState().send("unfinished steering instructions", "agent_xyz");
+    await tick();
+    useChatStore.getState().stop();
+    await sending;
+
+    expect(useChatStore.getState()).toMatchObject({
+      status: "idle",
+      sessionStatus: "idle",
+      pendingUserMessages: [],
+      activeResponse: { responseId: "response_active", state: "cancelled" },
+      failedSendDraft: {
+        conversationId: sessionId,
+        text: "unfinished steering instructions",
+        files: [],
+      },
+    });
+    await confirmModel();
+    await tick();
+    expect(eventBodies()).toEqual([expect.objectContaining({ type: "interrupt" })]);
+  });
+});
+
 describe("chatStore — sendSlashCommand", () => {
   /** Parse the JSON body of the single POST /events call. */
   function lastEventBody(): { type: string; data: Record<string, unknown> } {
@@ -6777,6 +6930,33 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
   });
 
   describe("session.input.consumed", () => {
+    it.each([false, true])(
+      "does not consume an unsent model-switch draft (already mirrored=%s)",
+      (alreadyMirrored) => {
+        const event: SessionInputConsumedEvent = {
+          type: "session_input_consumed",
+          itemId: "msg_from_terminal",
+          itemType: "message",
+          data: { role: "user", content: [{ type: "input_text", text: "from the terminal" }] },
+        };
+        useChatStore.setState({ blocks: [], pendingUserMessages: [] });
+        if (alreadyMirrored) handleSessionEvent(event);
+        const pending: PendingUserMessage = {
+          tempId: "pend_unsent",
+          content: [{ type: "input_text", text: "waiting for the model switch" }],
+          initialDraft: { text: "waiting for the model switch", files: [] },
+        };
+        useChatStore.setState({ pendingUserMessages: [pending] });
+
+        handleSessionEvent(event);
+
+        expect(useChatStore.getState().pendingUserMessages).toEqual([pending]);
+        expect(useChatStore.getState().blocks).toMatchObject([
+          { ctx: { itemId: event.itemId }, content: event.data.content },
+        ]);
+      },
+    );
+
     it("promotes the oldest pending user message into blocks (FIFO, plain append)", () => {
       const existingAssistant: AnyBlock = {
         type: "text_done",
