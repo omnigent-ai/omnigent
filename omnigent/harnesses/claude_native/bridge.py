@@ -5157,6 +5157,22 @@ def claude_pane_text_ready(pane: str) -> bool:
     return _claude_prompt_rendered(pane)
 
 
+def rewind_dialog_visible(pane: str) -> bool:
+    """Recognize the idle Rewind menu without matching transcript text."""
+    if _composer_row(pane) is not None:
+        return False
+    lines = pane.splitlines()
+    rules = [index for index, line in enumerate(lines) if _is_box_rule(line.replace("▔", "─"))]
+    if not rules:
+        return False
+    body = " ".join(" ".join(lines[rules[-1] + 1 :]).split())
+    return (
+        body.startswith("Rewind Restore the code and/or conversation to the point before")
+        and "Enter to continue" in body
+        and body.endswith("Esc to cancel")
+    )
+
+
 def _user_prompt_visible(pane: str) -> bool:
     """Recognize a native decision dialog, excluding text above a mounted composer."""
     if not pane.strip() or _composer_row(pane) is not None:

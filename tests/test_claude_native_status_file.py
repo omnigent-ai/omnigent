@@ -12,6 +12,8 @@ import json
 import time
 from pathlib import Path
 
+import pytest
+
 from omnigent.harnesses.claude_native.status_file import (
     IDLE,
     RUNNING,
@@ -404,6 +406,59 @@ def test_waiting_carries_its_reason(tmp_path: Path) -> None:
         sessions, pid=2, session_id="s", status="busy", blocked_on="permission prompt"
     )
     assert read_session_status(busy).blocked_on is None
+
+
+def test_rewind_releases_queue_when_pane_catches_up(tmp_path: Path) -> None:
+    """A late Rewind repaint must release the queue without another file write."""
+    _write_session_file(
+        tmp_path / "sessions", pid=1, session_id="s", status="waiting", blocked_on="dialog open"
+    )
+    visible = False
+    published: list[tuple[str, str | None]] = []
+    poller = SessionStatusPoller(
+        on_status=lambda status, reason: published.append((status, reason)),
+        pane_pid_getter=lambda: 1,
+        session_id_getter=lambda: "s",
+        config_dir=tmp_path,
+        rewind_visible=lambda: visible,
+    )
+    poller.tick()
+    visible = True
+    poller.tick()
+    poller.tick()
+    assert published == [(RUNNING, "dialog open"), (IDLE, None)]
+    visible = False
+    poller.tick()
+    assert published[-1] == (RUNNING, "dialog open")
+
+
+@pytest.mark.parametrize(
+    ("status", "reason"),
+    [
+        ("busy", None),
+        ("waiting", "permission prompt"),
+        ("waiting", "input needed"),
+        ("waiting", "sandbox request"),
+        ("waiting", None),
+    ],
+)
+def test_rewind_frame_cannot_override_active_work_or_questions(
+    tmp_path: Path, status: str, reason: str | None
+) -> None:
+    """A stale pane cannot release a turn parked on an actual decision."""
+    _write_session_file(
+        tmp_path / "sessions", pid=1, session_id="s", status=status, blocked_on=reason
+    )
+    published: list[tuple[str, str | None]] = []
+    poller = SessionStatusPoller(
+        on_status=lambda status, reason: published.append((status, reason)),
+        pane_pid_getter=lambda: 1,
+        session_id_getter=lambda: "s",
+        config_dir=tmp_path,
+        rewind_visible=lambda: True,
+    )
+    poller.tick()
+    assert published == [(RUNNING, reason)]
 
 
 def test_poller_publishes_when_only_the_reason_changes(tmp_path: Path) -> None:

@@ -1468,6 +1468,7 @@ class SessionResourceRegistry:
         from omnigent.harnesses.claude_native.bridge import (
             bridge_dir_for_conversation_id,
             read_claude_session_id,
+            rewind_dialog_visible,
         )
         from omnigent.harnesses.claude_native.status_file import SessionStatusPoller
 
@@ -1488,6 +1489,7 @@ class SessionResourceRegistry:
             pane_pid_getter=instance.pane_pid_sync,
             session_id_getter=_session_id_getter,
             omnigent_session_id=session_id,
+            rewind_visible=lambda: rewind_dialog_visible(instance.last_pane_text() or ""),
         )
 
     async def _handle_terminal_exit(

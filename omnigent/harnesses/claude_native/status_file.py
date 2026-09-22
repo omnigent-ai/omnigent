@@ -297,6 +297,8 @@ class SessionStatusPoller:
         bridge has captured it, or ``None`` before the first hook. Used to
         cross-check the pid file and to scan as a fallback.
     :param config_dir: Explicit Claude config dir override (tests).
+    :param rewind_visible: Whether the terminal currently shows its idle Rewind
+        menu. Other dialogs continue to report running until answered.
     """
 
     def __init__(
@@ -307,6 +309,7 @@ class SessionStatusPoller:
         session_id_getter: Callable[[], str | None],
         config_dir: Path | None = None,
         omnigent_session_id: str | None = None,
+        rewind_visible: Callable[[], bool] | None = None,
     ) -> None:
         self._on_status = on_status
         self._pane_pid_getter = pane_pid_getter
@@ -316,6 +319,7 @@ class SessionStatusPoller:
         # attribution only (distinct from Claude's session uuid above).
         self._omnigent_session_id = omnigent_session_id
         self._config_dir = config_dir
+        self._rewind_visible = rewind_visible
         self._path: Path | None = None
         self._attempts = 0
         self._exhausted = False
@@ -438,10 +442,10 @@ class SessionStatusPoller:
             # detection rides the PTY watcher, so just stop polling.
             self._exhausted = True
             return
-        if self._last_mtime is not None and mtime == self._last_mtime:
-            return
-        self._last_mtime = mtime
-        status = read_session_status(self._path)
+        if self._last_mtime is None or mtime != self._last_mtime:
+            self._last_mtime = mtime
+            self._last_status = read_session_status(self._path)
+        status = self._last_status
         if status is None:
             # An unrecognized literal — the file is an undocumented internal
             # detail whose vocabulary can grow. We are now blind to this
@@ -450,9 +454,17 @@ class SessionStatusPoller:
             self._last_status = None
             self._last_edge = None
             return
-        self._last_status = status
         edge = (status.runner_status, status.blocked_on)
+        # Rewind is idle; running would strand messages before the bridge can
+        # dismiss it. Recheck the pane even without a file write: it may repaint late.
+        if (
+            status.raw_status == "waiting"
+            and status.blocked_on == "dialog open"
+            and self._rewind_visible is not None
+            and self._rewind_visible()
+        ):
+            edge = (IDLE, None)
         if edge == self._last_edge:
             return
         self._last_edge = edge
-        self._on_status(status.runner_status, status.blocked_on)
+        self._on_status(*edge)

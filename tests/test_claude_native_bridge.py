@@ -9596,6 +9596,23 @@ _SHORTCUTS_PANEL_PANE = """\
 """
 
 
+@pytest.mark.parametrize(
+    ("pane", "expected"),
+    [
+        (_REWIND_PANE, True),
+        (_REWIND_PANE.replace("─", "▔"), True),
+        (_REWIND_PANE.replace("point before", "point\n  before"), True),
+        ("", False),
+        (_SETTINGS_PANEL_PANE, False),
+        (_REWIND_PANE + _SHORTCUTS_PANEL_PANE, False),
+        (_REWIND_PANE.replace("Enter to continue", "Enter to select"), False),
+        (_REWIND_PANE.replace("Esc to cancel", ""), False),
+    ],
+)
+def test_rewind_dialog_visible(pane: str, expected: bool) -> None:
+    assert claude_native_bridge.rewind_dialog_visible(pane) is expected
+
+
 def _picker_bridge_dir(tmp_path: Path) -> Path:
     """
     Create a bridge dir advertising a tmux pane.
