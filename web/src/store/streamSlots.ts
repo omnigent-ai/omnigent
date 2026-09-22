@@ -38,53 +38,85 @@ export interface StreamSlotManager {
 }
 
 const SLOT_LOCK_PREFIX = "omnigent:stream-slot:";
+const WEB_LOCK_ACQUIRE_TIMEOUT_MS = 250;
+
+interface WebLockAttempt {
+  slot: StreamSlot | null;
+  usable: boolean;
+}
 
 /**
  * Hold `name` until the returned slot's `release` runs, or resolve `null` when
  * it is already held. `ifAvailable` is what makes this race-free: the callback
  * either gets the lock or gets `null`, atomically.
  */
-function holdLockIfFree(name: string): Promise<StreamSlot | null> {
+function holdLockIfFree(name: string): Promise<WebLockAttempt> {
   return new Promise((settle) => {
     let releaseHeld: () => void = () => {};
     let released = false;
+    let settled = false;
+    const controller = new AbortController();
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      controller.abort();
+      settle({ slot: null, usable: false });
+    }, WEB_LOCK_ACQUIRE_TIMEOUT_MS);
     // `requestDone` resolves when the callback's returned promise settles —
     // i.e. after `releaseHeld()` runs AND the browser has released the lock.
     // `release` awaits it so the freed slot is observable to the next acquire.
     const requestDone = navigator.locks
-      .request(name, { ifAvailable: true }, (lock) => {
+      .request(name, { ifAvailable: true, signal: controller.signal }, (lock) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
         if (lock === null) {
-          settle(null);
+          settle({ slot: null, usable: true });
           return;
         }
         return new Promise<void>((r) => {
           releaseHeld = r;
           settle({
-            release: async () => {
-              if (!released) {
-                released = true;
-                releaseHeld();
-              }
-              await requestDone;
+            usable: true,
+            slot: {
+              release: async () => {
+                if (!released) {
+                  released = true;
+                  releaseHeld();
+                }
+                await requestDone;
+              },
             },
           });
         });
       })
-      .catch(() => settle(null));
+      .catch(() => {
+        clearTimeout(timer);
+        if (settled) return;
+        settled = true;
+        settle({ slot: null, usable: false });
+      });
   });
 }
 
 /** Web Locks manager: coordinated across every same-origin tab. */
 function webLocksSlotManager(count: () => number): StreamSlotManager {
+  const fallback = inMemorySlotManager(count);
+  let webLocksUsable = true;
   return {
     async tryAcquire() {
+      if (!webLocksUsable) return fallback.tryAcquire();
       const n = Math.max(0, count());
       // Sequential, not parallel: `ifAvailable` in parallel could grant two
       // slots to one caller. Take the first free one.
       for (let i = 0; i < n; i += 1) {
         // eslint-disable-next-line no-await-in-loop
-        const slot = await holdLockIfFree(`${SLOT_LOCK_PREFIX}${i}`);
-        if (slot !== null) return slot;
+        const attempt = await holdLockIfFree(`${SLOT_LOCK_PREFIX}${i}`);
+        if (!attempt.usable) {
+          webLocksUsable = false;
+          return fallback.tryAcquire();
+        }
+        if (attempt.slot !== null) return attempt.slot;
       }
       return null;
     },
