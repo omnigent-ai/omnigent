@@ -11,7 +11,8 @@ managed host can never come online.
 
 Runs the real Worker module under Node's web-standard runtime — the same
 ``fetch(request, env)`` entrypoint Cloudflare invokes — in front of a local
-upstream that records the paths it receives.
+upstream that records the paths it receives. Requires Node.js but no external
+services or credentials, so it runs in the default pytest suite.
 """
 
 from __future__ import annotations

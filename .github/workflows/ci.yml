@@ -169,6 +169,12 @@ jobs:
         with:
           enable-cache: true
 
+      - name: Set up Node.js for local relay tests
+        if: matrix.group == 'misc'
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+
       - name: Install test system dependencies
         # ripgrep: the Grep tool prefers it. bubblewrap: the linux_bwrap sandbox
         # needs it. tmux: the integration-mock shard spawns harness terminals.
