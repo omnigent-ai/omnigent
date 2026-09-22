@@ -6247,26 +6247,39 @@ async def _cold_start_agy_conversation(
 
     deadline = time.monotonic() + timeout_s
     port: int | None = None
+    auth_denial_status: int | None = None
     while True:
         # Scope to THIS session's pane agy (avoids binding a foreign agy on a
         # multi-agy host); falls back to the lowest validated candidate when no
         # local pane is reachable or the pane is not resolvable yet.
         port = await asyncio.to_thread(resolve_cold_start_agy_rpc_port, tmux_socket, tmux_target)
         if port is not None:
+            auth_denial_status = None
             try:
                 catalog = await asyncio.to_thread(get_available_models, port)
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code in (401, 403):
+                    auth_denial_status = exc.response.status_code
+                catalog = {}
             except (httpx.HTTPError, ValueError):
                 catalog = {}
             models = catalog.get("models")
             if isinstance(models, dict) and models:
                 break
         if time.monotonic() >= deadline:
+            auth_detail = (
+                f"the model catalog RPC was denied (HTTP {auth_denial_status}); "
+                "check agy authentication or authorization; "
+                if auth_denial_status is not None
+                else ""
+            )
             _logger.warning(
                 "Antigravity cold-start: agy did not expose a ready model catalog within "
-                "%.0fs for session %s; leaving the placeholder conversation id for the "
+                "%.0fs for session %s; %sleaving the placeholder conversation id for the "
                 "reader to bind once a turn creates the conversation.",
                 timeout_s,
                 session_id,
+                auth_detail,
             )
             return None
         await _agy_cold_start_poll_sleep(_AGY_COLD_START_PORT_POLL_INTERVAL_S)
