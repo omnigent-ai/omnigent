@@ -1189,8 +1189,8 @@ def _switch_agent_store() -> _AgentStore:
 
     :returns: A store holding ``087b7cb7…`` (source), ``280d725b…``
         and ``44b4151dd6cdfed6ee19430832398e05`` (bindable built-ins), and
-        ``a98bb825ebd41391c19637c58fe3c0b7`` (a session-scoped agent that must be
-        rejected as a switch target).
+        ``a98bb825ebd41391c19637c58fe3c0b7`` (a session-scoped agent that is
+        bindable once the caller can read the owning session).
     """
     return _AgentStore(
         agents={
@@ -1405,15 +1405,23 @@ async def test_fork_codex_bypass_rejected_on_non_codex_target(
 
 
 @pytest.mark.asyncio
-async def test_fork_switch_404_session_scoped_target() -> None:
-    """Switching to a session-scoped agent is rejected with 404.
+async def test_fork_switch_binds_session_scoped_target() -> None:
+    """Switching to a session-scoped agent the caller can read succeeds.
 
-    A session-scoped agent (``session_id`` set) belongs to one
-    conversation — possibly another user's. Binding it to a fork would
-    leak/alias it across sessions, so only built-in agents are bindable.
+    A session-scoped agent (``session_id`` set) is a custom agent bound
+    to one session. ``validate_session_agent`` — the same check
+    ``POST /v1/sessions`` runs — authorizes it via READ access on the
+    owning session, so the fork clones its bundle like any other target.
     """
     conv = _make_conversation()
-    conv_store = _ConversationStore(conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv})
+    conv_store = _ConversationStore(
+        conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv},
+        items_by_conv={
+            "e9f8f58523cec9a57d3bdf93be543e8c": [
+                _make_item("9980c8a9248139f14f4165e5d53088aa", "Hello")
+            ]
+        },
+    )
     client = TestClient(_build_app(conv_store, agent_store=_switch_agent_store()))
 
     resp = client.post(
@@ -1421,11 +1429,9 @@ async def test_fork_switch_404_session_scoped_target() -> None:
         json={"agent_id": "a98bb825ebd41391c19637c58fe3c0b7"},
     )
 
-    assert resp.status_code == 404, (
-        f"Expected 404 for session-scoped target, got {resp.status_code}: {resp.text}"
-    )
-    # No fork happened — the route rejected before cloning/forking.
-    assert conv_store.fork_calls == []
+    assert resp.status_code == 201, f"Expected 201, got {resp.status_code}: {resp.text}"
+    fork_call = conv_store.fork_calls[0]
+    assert fork_call["cloned_agent_bundle_location"] == "a98bb825ebd41391c19637c58fe3c0b7/hash"
 
 
 @pytest.mark.asyncio
