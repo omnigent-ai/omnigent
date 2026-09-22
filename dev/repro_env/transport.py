@@ -45,8 +45,15 @@ class Relay:
         self.port = 0
         self.loop = asyncio.new_event_loop()
         self.thread = threading.Thread(target=self.loop.run_forever, daemon=True)
+        self._connection_tasks: set[asyncio.Task] = set()
 
     async def _connect(self, reader, writer):
+        # Half-closed transports can lose their event-loop references while
+        # the handler is still waiting for the response in the other direction.
+        task = asyncio.current_task()
+        assert task is not None
+        self._connection_tasks.add(task)
+        task.add_done_callback(self._connection_tasks.discard)
         remote = None
         tasks = []
         try:

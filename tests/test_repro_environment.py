@@ -156,6 +156,58 @@ def test_relay_requires_private_socket_directory(tmp_path):
     assert not path.exists()
 
 
+def test_relay_preserves_half_closed_connection_during_collection():
+    import asyncio
+    import gc
+
+    payload = b"delayed-response" * 20000
+    received = []
+    request_received = threading.Event()
+    respond_now = threading.Event()
+    with socket.socket() as service:
+        service.bind(("127.0.0.1", 0))
+        service.listen()
+        service.settimeout(5)
+
+        def respond():
+            conn, _ = service.accept()
+            with conn:
+                conn.settimeout(5)
+                request = b""
+                while data := conn.recv(65536):
+                    request += data
+                received.append(request)
+                request_received.set()
+                if respond_now.wait(5):
+                    conn.sendall(payload)
+
+        async def collect():
+            # Let the request-side copy and its completion callbacks finish.
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            gc.collect()
+
+        thread = threading.Thread(target=respond, daemon=True)
+        thread.start()
+        try:
+            with Relay(tcp_target=service.getsockname()) as relay:
+                with socket.create_connection(("127.0.0.1", relay.port), timeout=5) as client:
+                    client.sendall(b"request")
+                    client.shutdown(socket.SHUT_WR)
+                    assert request_received.wait(5)
+                    asyncio.run_coroutine_threadsafe(collect(), relay.loop).result(timeout=5)
+                    respond_now.set()
+                    response = b""
+                    while data := client.recv(65536):
+                        response += data
+                    assert response == payload
+        finally:
+            respond_now.set()
+            thread.join(timeout=5)
+        assert not thread.is_alive()
+        assert received == [b"request"]
+
+
 @pytest.mark.parametrize("present", range(1, 7))
 def test_partial_prepared_environment_fails_before_spawning_mock(monkeypatch, present):
     keys = ("OMNIGENT_REPRO_SERVER_URL", "OMNIGENT_REPRO_MODEL_URL", "OMNIGENT_REPRO_RUNNER_ID")
