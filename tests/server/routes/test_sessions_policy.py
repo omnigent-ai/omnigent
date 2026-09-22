@@ -18,7 +18,9 @@ import pytest
 from omnigent.entities import Conversation, ConversationItem
 from omnigent.entities.agent import Agent, LoadedAgent
 from omnigent.entities.conversation import FunctionCallData
+from omnigent.errors import ElicitationDeclinedError
 from omnigent.policies.types import EvaluationContext, PolicyAction, PolicyResult
+from omnigent.server.routes._sessions import orchestration as _orchestration
 from omnigent.server.routes._sessions.orchestration import (
     _evaluate_policy_with_fresh_engine,
 )
@@ -29,7 +31,7 @@ from omnigent.server.routes.sessions import (
     _evaluate_tool_call_policy,
     _persist_policy_deny_sentinel,
 )
-from omnigent.server.schemas import SessionEventInput
+from omnigent.server.schemas import ElicitationResult, SessionEventInput
 from omnigent.spec import AgentSpec
 from omnigent.spec.types import Phase, PolicySpec
 
@@ -861,6 +863,244 @@ async def test_input_ask_declined_denies():
     # through (the dangerous direction).
     assert result["verdict"] == "deny"
     assert result["reason"] == "Deleting files requires approval"
+
+
+# ── Resolver rationale plumbing (#7315) ─────────────────
+
+
+class _StubGateEngine:
+    """Minimal engine for the real ``_hold_native_ask_gate_impl``.
+
+    Only ``spec_for`` / ``ask_timeout`` are touched (via
+    ``resolve_ask_timeout``); the patched
+    ``_publish_and_wait_for_harness_elicitation`` supplies the
+    verdict, so no evaluation happens.
+    """
+
+    ask_timeout = 30
+
+    def spec_for(self, _policy_name: str | None) -> None:
+        """No per-policy override — the spec-level default wins.
+
+        :param _policy_name: Deciding policy name (unused).
+        :returns: Always ``None``.
+        """
+        return None
+
+
+def _patch_gate_verdict(
+    monkeypatch: pytest.MonkeyPatch, verdict: ElicitationResult
+) -> None:
+    """Make the real gate resolve instantly with ``verdict``.
+
+    Patches the two module globals ``_hold_native_ask_gate_impl``
+    calls around the park: the verdict publisher and the
+    fire-and-forget native popup forward.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param verdict: The :class:`ElicitationResult` the human
+        "resolved" with.
+    """
+
+    async def _fake_publish(*_args: Any, **_kwargs: Any) -> ElicitationResult:
+        return verdict
+
+    def _no_popup(*_args: Any, **_kwargs: Any) -> None:
+        """Swallow the native popup forward (no runner under test)."""
+
+    monkeypatch.setattr(
+        _orchestration, "_publish_and_wait_for_harness_elicitation", _fake_publish
+    )
+    monkeypatch.setattr(
+        _orchestration, "_spawn_native_approval_popup_forward", _no_popup
+    )
+
+
+def _ask_result(reason: str = "Deleting files requires approval") -> PolicyResult:
+    """Fabricate a composed ASK result for the gate tests.
+
+    :param reason: The POLICY's reason for asking (the pre-#7315
+        message the harness used to receive on refusal).
+    :returns: An ASK :class:`PolicyResult` decided by ``"gate"``.
+    """
+    return PolicyResult(
+        action=PolicyAction.ASK,
+        reason=reason,
+        deciding_policies=["gate"],
+    )
+
+
+@pytest.mark.asyncio
+async def test_gate_decline_raises_resolver_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The real gate raises with the RESOLVER's rationale, not the
+    policy's reason (#7315).
+
+    Before the fix the decline path raised ``result.reason`` — the
+    question restated as the answer — so a refusal rationale could
+    never reach the harness (``permissionDecisionReason``).
+    """
+    _patch_gate_verdict(
+        monkeypatch,
+        ElicitationResult(action="decline", reason="try read-only mode"),
+    )
+
+    with pytest.raises(ElicitationDeclinedError) as exc_info:
+        await _orchestration._hold_native_ask_gate_impl(
+            _FakeRequest(),
+            session_id="sess_1",
+            phase=Phase.TOOL_CALL,
+            data={"name": "Bash", "arguments": {"command": "rm -rf /"}},
+            engine=_StubGateEngine(),
+            result=_ask_result(),
+            conversation_store=_FakeConversationStore(),
+        )
+
+    assert exc_info.value.args[0] == "try read-only mode"
+    assert exc_info.value.policy_name == "gate"
+
+
+@pytest.mark.asyncio
+async def test_gate_decline_without_reason_falls_back_to_policy_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A decline with no resolver rationale keeps the pre-#7315
+    fallback: the policy's reason rides in the exception."""
+    _patch_gate_verdict(monkeypatch, ElicitationResult(action="decline"))
+
+    with pytest.raises(ElicitationDeclinedError) as exc_info:
+        await _orchestration._hold_native_ask_gate_impl(
+            _FakeRequest(),
+            session_id="sess_1",
+            phase=Phase.TOOL_CALL,
+            data={"name": "Bash", "arguments": {"command": "rm -rf /"}},
+            engine=_StubGateEngine(),
+            result=_ask_result(),
+            conversation_store=_FakeConversationStore(),
+        )
+
+    assert exc_info.value.args[0] == "Deleting files requires approval"
+
+
+@pytest.mark.asyncio
+async def test_gate_cancel_with_reason_publishes_side_channel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cancel carrying a rationale publishes it on the side channel.
+
+    ``cancel`` is how a resolver declines conditionally today
+    ("not like that"), so its rationale must reach the caller the
+    same way a decline's does — without changing the gate's ``bool``
+    contract (#7315).
+    """
+    _patch_gate_verdict(
+        monkeypatch,
+        ElicitationResult(action="cancel", reason="not like that — narrower please"),
+    )
+    # Start from a clean channel so the assertion cannot pass on a
+    # stale value from an earlier test.
+    _orchestration._ask_gate_resolver_reason.set(None)
+
+    approved = await _orchestration._hold_native_ask_gate_impl(
+        _FakeRequest(),
+        session_id="sess_1",
+        phase=Phase.TOOL_CALL,
+        data={"name": "Bash", "arguments": {"command": "rm -rf /"}},
+        engine=_StubGateEngine(),
+        result=_ask_result(),
+        conversation_store=_FakeConversationStore(),
+    )
+
+    assert approved is False
+    assert _orchestration._ask_gate_resolver_reason.get() == (
+        "not like that — narrower please"
+    )
+
+
+@pytest.mark.asyncio
+async def test_gate_accept_clears_side_channel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An accept publishes ``None`` so a later read in the same task
+    can never observe the previous gate call's rationale."""
+    _patch_gate_verdict(monkeypatch, ElicitationResult(action="accept"))
+    _orchestration._ask_gate_resolver_reason.set("stale from an earlier call")
+
+    approved = await _orchestration._hold_native_ask_gate_impl(
+        _FakeRequest(),
+        session_id="sess_1",
+        phase=Phase.TOOL_CALL,
+        data={"name": "Bash", "arguments": {"command": "rm -rf /"}},
+        engine=_StubGateEngine(),
+        result=_ask_result(),
+        conversation_store=_FakeConversationStore(),
+    )
+
+    assert approved is True
+    assert _orchestration._ask_gate_resolver_reason.get() is None
+
+
+@pytest.mark.asyncio
+async def test_input_ask_cancel_with_reason_denies_with_resolver_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end through ``_evaluate_input_policy`` with the REAL
+    gate: a REQUEST-phase ASK the resolver cancels with a rationale
+    denies with the RESOLVER's reason, not the policy's (#7315).
+
+    The fail-closed half of the round-trip keeps the gate's ``bool``
+    contract, so the rationale rides the side channel from the gate
+    into the deny verdict the /events handler acts on.
+    """
+    conv_store = _FakeConversationStore()
+    agent_store = _FakeAgentStore(agent=_make_agent())
+    conv = conv_store.get_conversation("sess_1")
+    body = _make_user_message_body("delete the file /tmp/policy-demo.txt")
+
+    spec = _make_spec_with_guardrails()
+    loaded = LoadedAgent(spec=spec, workdir="/tmp/fake")
+    ask_result = PolicyResult(
+        action=PolicyAction.ASK,
+        reason="Deleting files requires approval",
+        deciding_policies=["llm_prompt_classifier_policy"],
+    )
+
+    async def _eval(_ctx: Any) -> PolicyResult:
+        return ask_result
+
+    _patch_gate_verdict(
+        monkeypatch,
+        ElicitationResult(action="cancel", reason="not like that — try a temp file"),
+    )
+
+    with (
+        patch(_CACHE_PATCH) as mock_cache,
+        patch(_ENGINE_PATCH) as mock_build,
+    ):
+        mock_cache.return_value.load.return_value = loaded
+        mock_engine = mock_build.return_value
+        mock_engine.evaluate = _eval
+        mock_engine.apply_label_writes = lambda x: None
+        # ``resolve_ask_timeout`` reads these off the engine; a bare
+        # MagicMock would raise on ``float()``.
+        mock_engine.spec_for = lambda _name: None
+        mock_engine.ask_timeout = 30
+
+        result = await _evaluate_input_policy(
+            _FakeRequest(),
+            "sess_1",
+            conv,
+            body,
+            conv_store,
+            agent_store,
+            None,
+        )
+
+    assert result == {
+        "verdict": "deny",
+        "reason": "not like that — try a temp file",
+    }
 
 
 @pytest.mark.asyncio

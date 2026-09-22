@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import hashlib
 import json
 import math
@@ -2161,6 +2162,21 @@ def _spawn_native_blocked_notice_forward(
     task.add_done_callback(_native_popup_forward_tasks.discard)
 
 
+# Side channel carrying the resolver's refusal rationale out of
+# ``_hold_native_ask_gate`` on the non-accept (cancel / timeout) path
+# (#7315). The gate keeps its ``bool`` return contract — the facade
+# patch point and the existing test doubles depend on it — so the
+# rationale rides here instead of in the return value. The gate
+# writes the current verdict's reason (``None`` on accept / timeout)
+# immediately before returning and the caller reads it right after
+# the await, so a stale value can never be observed. The decline
+# path does not need this channel: it raises, and the rationale
+# rides in the exception message.
+_ask_gate_resolver_reason: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "omnigent_ask_gate_resolver_reason", default=None
+)
+
+
 async def _hold_native_ask_gate(*args: Any, **kwargs: Any) -> bool:
     """Call-time proxy so a facade patch of this symbol is honored here."""
     from omnigent.server.routes import sessions as _facade
@@ -2187,7 +2203,9 @@ async def _hold_native_ask_gate_impl(
     :func:`_publish_and_wait_for_harness_elicitation`, exactly as the
     ``PermissionRequest`` hook does. The human approves through the
     elicitation's resolve URL; this collapses the verdict to a single
-    boolean the caller maps to ALLOW / DENY.
+    boolean the caller maps to ALLOW / DENY, except that a resolver
+    ``reason`` survives the collapse (raised with the decline, or
+    published via ``_ask_gate_resolver_reason`` on cancel — #7315).
 
     Used for any phase whose ASK must be resolved on the server rather
     than by a runner-side ``wait_for_user_approval`` park:
@@ -2231,7 +2249,9 @@ async def _hold_native_ask_gate_impl(
         timeout / disconnect (fail closed).
     :raises ElicitationDeclinedError: when the human explicitly
         declines (``action == "decline"``). Callers should abort the
-        turn rather than continuing with a DENY.
+        turn rather than continuing with a DENY. The error message
+        carries the resolver's ``reason`` when one was supplied,
+        falling back to the policy's reason.
     """
     tool_name = data.get("name")
     tool_input = data.get("arguments")
@@ -2267,10 +2287,19 @@ async def _hold_native_ask_gate_impl(
     # than feeding a DENY message to the LLM and letting it continue.
     if verdict is not None and verdict.action == "decline":
         raise ElicitationDeclinedError(
-            result.reason or "",
+            # The resolver's rationale wins over the policy's reason:
+            # on a refusal the harness must hear WHY the human said no,
+            # not the question restated as the answer (#7315).
+            verdict.reason or result.reason or "",
             policy_name=result.deciding_policy,
         )
     approved = verdict is not None and verdict.action == "accept"
+    # Publish the resolver's rationale for the non-accept path — a
+    # ``cancel`` carrying "not like that, try X" is how a resolver
+    # declines conditionally today. Always written (``None`` on accept
+    # / timeout) so the caller's read right after this await can never
+    # observe a stale value from an earlier gate call.
+    _ask_gate_resolver_reason.set(verdict.reason if verdict is not None else None)
     if approved:
         # POLICIES.md §7.2: writes accumulated by the ASKing policy
         # land only on approve.
@@ -7917,7 +7946,9 @@ async def _evaluate_input_policy(
         return None
     return {
         "verdict": "deny",
-        "reason": result.reason or "Denied by policy",
+        # Resolver's rationale (a cancel carrying "not like that")
+        # wins over the policy's reason — #7315.
+        "reason": _ask_gate_resolver_reason.get() or result.reason or "Denied by policy",
     }
 
 

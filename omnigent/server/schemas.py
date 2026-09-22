@@ -1220,6 +1220,12 @@ class ElicitationResult(BaseModel):
         binary approve/reject elicitations and for ``decline`` /
         ``cancel`` actions. Values are restricted to JSON scalars
         and string lists per the MCP spec.
+    :param reason: Resolver-supplied rationale for a ``decline`` /
+        ``cancel`` — why the refusal happened and, ideally, what a
+        narrower request would look like. Distinct from ``content``
+        (MCP-mirrored, accept-only): this field exists so a refusal
+        rationale can reach the harness without diverging from the
+        MCP shape. ``None`` when the resolver gave no rationale.
     :param meta: Optional MCP result metadata. Codex uses
         ``_meta.persist`` to distinguish one-time, session-scoped,
         and persistent MCP tool approvals.
@@ -1230,6 +1236,14 @@ class ElicitationResult(BaseModel):
     # ElicitResult.content value type — keep them aligned so an MCP
     # client can bridge to our endpoint without translation.
     content: dict[str, str | int | float | bool | list[str] | None] | None = None
+    # Resolver's refusal rationale. NOT part of the MCP-mirrored
+    # ``content`` (which stays accept-only per the alignment note
+    # above): on a decline the harness is told *not that, but this
+    # would be fine*, so a worker can narrow its request instead of
+    # retrying blind. Additive with a ``None`` default, so existing
+    # clients and both Codex response builders see no wire change —
+    # ``exclude_none`` dumps (the resolve route) drop it when unset.
+    reason: str | None = None
     meta: dict[str, Any] | None = Field(default=None, alias="_meta")
 
     # ``_meta`` must serialize under its alias so the verdict survives the
