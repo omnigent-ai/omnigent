@@ -18,6 +18,12 @@ from pydantic import BaseModel, Field
 
 from omnigent.process_logging import data_dir
 
+# Budget for one read-modify-write of the registry. Short on purpose:
+# both callers treat a timeout as expected (the PR observer is best-effort,
+# the host surfaces "PR tracking is busy"), so a contended file never
+# blocks a tool call. Tests raise it to assert merge behaviour instead.
+_LOCK_TIMEOUT_S = 1
+
 
 def _valid_hostname(host: str) -> bool:
     """Validate bounded ASCII DNS labels without hostname regex backtracking."""
@@ -138,7 +144,7 @@ class SessionPrRegistry:
         if not references:
             return
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        with FileLock(str(self.path) + ".lock", timeout=1):
+        with FileLock(str(self.path) + ".lock", timeout=_LOCK_TIMEOUT_S):
             state = self._read()
             if observation_id and observation_id in state.observations:
                 return
@@ -201,7 +207,7 @@ class SessionPrRegistry:
         """Remember removal so subsequent hook replay cannot attach the PR again."""
         reference = PullRequestRef.from_url(url)
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        with FileLock(str(self.path) + ".lock", timeout=1):
+        with FileLock(str(self.path) + ".lock", timeout=_LOCK_TIMEOUT_S):
             state = self._read()
             state.prs = [pr for pr in state.prs if pr.url != reference.url]
             if reference.url not in state.excluded:

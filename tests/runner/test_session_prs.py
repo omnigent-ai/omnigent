@@ -8,8 +8,10 @@ from pathlib import Path
 
 import pytest
 
+from omnigent.runner import session_prs
 from omnigent.runner.pr_observer import extract_prs, observe_hook
 from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry
+from tests.budgets import budget
 
 A = "https://github.com/example/one/pull/42"
 B = "https://github.com/example/two/pull/42"
@@ -616,7 +618,13 @@ def test_title_cache_preserves_newer_timeout_marker(
     assert store.list() == latest
 
 
-def test_concurrent_writers_preserve_all_prs(tmp_path: Path) -> None:
+def test_concurrent_writers_preserve_all_prs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Sixteen writers serialize through one lock, each holding it across an
+    # fsync; the production 1s budget is a caller guard, not a test bound.
+    monkeypatch.setattr(session_prs, "_LOCK_TIMEOUT_S", budget(5))
+
     def write(number: int) -> None:
         store = SessionPrRegistry("conv_a", root=tmp_path)
         store.record(
