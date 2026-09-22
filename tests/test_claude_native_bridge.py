@@ -4598,6 +4598,110 @@ def test_inject_user_message_resends_enter_when_first_submit_swallowed(
     )
 
 
+@pytest.mark.parametrize("invisible", ["\ufeff", "\u200b"], ids=["bom", "zero-width-space"])
+def test_inject_user_message_confirms_after_claude_removes_invisible_characters(
+    invisible: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Claude's invisible-character review receives its required second Enter."""
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01
+    )
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._SUBMIT_RETRY_INTERVAL_S", 0.02)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_SETTLE_S", 0.0)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_COMMIT_TIMEOUT_S", 0.03)
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+
+    enters: list[list[str]] = []
+    visible_draft = "fix the flaky test"
+    tui = {"pane": _composer_pane(), "reviewed": False}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        del kwargs
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "paste-buffer" in cmd:
+            # Claude renders neither format character even though both remain
+            # in the editor's pasted value.
+            tui["pane"] = _composer_pane(visible_draft)
+        if cmd[-1] == "Enter":
+            enters.append(cmd)
+            if not tui["reviewed"]:
+                # First Enter strips the characters and asks the user to review
+                # the cleaned draft. It therefore stays in the input box.
+                tui["reviewed"] = True
+            else:
+                tui["pane"] = _composer_pane()
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    inject_user_message(bridge_dir, content=invisible * 2 + visible_draft)
+
+    assert len(enters) == 2
+
+
+@pytest.mark.parametrize(
+    "draft",
+    [
+        "❯\n  fix the flaky test",
+        "❯ fix the flaky\n  test",
+    ],
+    ids=["leading-newline", "wrapped-first-line"],
+)
+def test_inject_user_message_verifies_drafts_below_the_prompt_row(
+    draft: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A multiline composer draft stays on the verified submit path."""
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01
+    )
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._SUBMIT_RETRY_INTERVAL_S", 0.02)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_SETTLE_S", 0.0)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_COMMIT_TIMEOUT_S", 0.03)
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+
+    enters: list[list[str]] = []
+    tui = {"pane": _composer_pane(), "swallowed": False}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        del kwargs
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "paste-buffer" in cmd:
+            tui["pane"] = _composer_pane().replace("❯ ", draft, 1)
+        if cmd[-1] == "Enter":
+            enters.append(cmd)
+            if not tui["swallowed"]:
+                tui["swallowed"] = True
+            else:
+                tui["pane"] = _composer_pane()
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    inject_user_message(bridge_dir, content="fix the flaky test")
+
+    assert len(enters) == 2
+
+
+def test_draft_detection_does_not_match_the_composer_prompt_glyph() -> None:
+    """A glyph-only needle does not mistake the empty composer chrome for a draft."""
+    assert not claude_native_bridge._draft_in_input_box(_composer_pane(), "❯")
+    assert claude_native_bridge._draft_in_input_box(_composer_pane("❯"), "❯")
+
+
 def test_inject_user_message_raises_when_draft_never_submits(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

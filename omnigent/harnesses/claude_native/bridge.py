@@ -45,6 +45,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import urllib.parse
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from contextvars import ContextVar
@@ -5584,12 +5585,12 @@ def _draft_in_input_box(pane: str, needle: str) -> bool:
     """
     Return whether the pasted draft is visible in Claude's input box.
 
-    Looks only at the **last** line containing
-    :data:`_CLAUDE_PROMPT_GLYPH` — the live input box always sits at
-    the bottom of the pane, below the transcript, so this never
-    matches the submitted message's transcript echo. The draft counts
-    as visible when the text after the glyph contains *needle* (small
-    pastes render verbatim) or the
+    Looks only inside the live composer's framed region, so it cannot
+    match the submitted message's transcript echo. The whole region matters:
+    a leading newline and terminal wrapping both put some or all of the draft
+    below the row carrying :data:`_CLAUDE_PROMPT_GLYPH`. The draft counts as
+    visible when that region contains *needle* (ignoring display-only line
+    wrapping and non-rendered format characters) or the
     :data:`_PASTED_PLACEHOLDER_PREFIX` placeholder (Claude Code
     collapses large pastes).
 
@@ -5599,13 +5600,56 @@ def _draft_in_input_box(pane: str, needle: str) -> bool:
         only the paste placeholder is then considered.
     :returns: ``True`` when the draft is still sitting in the input box.
     """
-    glyph_lines = [line for line in pane.splitlines() if _CLAUDE_PROMPT_GLYPH in line]
-    if not glyph_lines:
+    region = _composer_region(pane)
+    if region is None:
         return False
-    tail = glyph_lines[-1].rsplit(_CLAUDE_PROMPT_GLYPH, 1)[1]
-    if _PASTED_PLACEHOLDER_PREFIX in tail:
+    if _PASTED_PLACEHOLDER_PREFIX in region:
         return True
-    return bool(needle) and needle in tail
+    # Claude Code omits Unicode format characters from its rendered input
+    # while retaining them in the editor until submit. Compare the same
+    # visible representation on both sides so a pasted U+FEFF/U+200B does not
+    # make the draft unobservable and bypass submit verification. Claude then
+    # removes those characters on the first Enter and asks for confirmation;
+    # the existing verification loop sees the cleaned draft and sends the
+    # required second Enter.
+    visible_needle = _visible_draft_text(needle)
+    visible_region = _visible_draft_text(region)
+    if not visible_needle:
+        return False
+    if visible_needle in visible_region:
+        return True
+    # tmux capture preserves display rows. A long logical line can therefore
+    # split in the middle of the marker, with continuation indentation that
+    # was never part of the input. Whitespace-insensitive comparison rebuilds
+    # that marker while staying scoped to the live composer box.
+    compact_needle = "".join(visible_needle.split())
+    compact_region = "".join(visible_region.split())
+    return bool(compact_needle) and compact_needle in compact_region
+
+
+def _composer_region(pane: str) -> str | None:
+    """Return the live composer's editable text inside its framing rules."""
+    lines = pane.splitlines()
+    rules = [idx for idx, line in enumerate(lines) if _is_box_rule(line)]
+    if not rules:
+        return None
+    # Normally the final two rules frame the composer. In a very short pane the
+    # closing rule is clipped, making the final rule itself the opening frame.
+    for opening in reversed(rules[-2:]):
+        closing = next((idx for idx in rules if idx > opening), len(lines))
+        row = opening + 1
+        while row < closing and not lines[row].strip():
+            row += 1
+        if row < closing and lines[row].strip()[:1] in _COMPOSER_MODE_GLYPHS:
+            first = lines[row]
+            mode = first.find(first.strip()[0])
+            return "\n".join([first[:mode] + first[mode + 1 :], *lines[row + 1 : closing]])
+    return None
+
+
+def _visible_draft_text(text: str) -> str:
+    """Return the characters Claude Code exposes through terminal capture."""
+    return "".join(char for char in text if unicodedata.category(char) not in {"Cc", "Cf"})
 
 
 def _format_terminal_failure_tail(pane: str) -> str:
