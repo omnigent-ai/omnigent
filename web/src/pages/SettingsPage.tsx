@@ -119,7 +119,6 @@ import {
 } from "@/lib/databricksIntegration";
 import { getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { isFeatureEnabled } from "@/lib/capabilities";
 import { useOmnigentAnalytics, useOmnigentPageView } from "@/lib/analytics";
 import {
   type Conversation,
@@ -310,13 +309,11 @@ export function SettingsPage() {
     );
   }
 
-  // For section with sub-sections, render it directly since the section nav
-  // owns its own layout.
-  if (subSection) {
-    // Customize is WIP behind the `customize` release feature; when it's off, fall through to the default section below.
-    if (section === "customize" && isFeatureEnabled(info, "customize")) {
-      return <SettingsCustomizeSection subSection={subSection} />;
-    }
+  // Nested sections own their own layout. useSettingsRoute only sets
+  // subSection for a valid, feature-enabled customize route, so no extra
+  // flag check is needed here.
+  if (section === "customize" && subSection) {
+    return <SettingsCustomizeSection subSection={subSection} />;
   }
 
   return (

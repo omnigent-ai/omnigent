@@ -22,6 +22,7 @@ const mocks = vi.hoisted(() => ({
   // so this is the ONLY signal that hides account/sharing chrome.
   singleUser: false,
   isAdmin: false,
+  customizeEnabled: true,
 }));
 
 vi.mock("@/lib/CapabilitiesContext", () => ({
@@ -29,6 +30,7 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
     accounts_enabled: mocks.accountsEnabled,
     login_url: mocks.loginUrl,
     single_user: mocks.singleUser,
+    features: { customize: mocks.customizeEnabled },
   }),
 }));
 // Admin gating is now mode-agnostic, sourced from `/v1/me` via useIsAdmin
@@ -62,6 +64,7 @@ beforeEach(() => {
   mocks.loginUrl = null;
   mocks.singleUser = false;
   mocks.isAdmin = false;
+  mocks.customizeEnabled = true;
 });
 afterEach(cleanup);
 
@@ -416,6 +419,17 @@ describe("useSettingsRoute", () => {
       inSettings: true,
       section: "customize",
       subSection: "harnesses",
+    });
+  });
+
+  it("falls back to General for a customize deep link when the feature is disabled", () => {
+    mocks.customizeEnabled = false;
+    // Disabled (the default deploy) → the section resolves to General instead
+    // of an empty customize page, and no subSection is set.
+    expect(routeHook("/settings/customize")).toEqual({ inSettings: true, section: "general" });
+    expect(routeHook("/settings/customize/skills")).toEqual({
+      inSettings: true,
+      section: "general",
     });
   });
 

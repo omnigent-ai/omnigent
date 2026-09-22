@@ -199,7 +199,11 @@ export function useSettingsRoute(): {
   const singleUser = isSingleUserMode(info);
   const isValidSection =
     (SECTION_IDS as readonly string[]).includes(next) &&
-    !(singleUser && (next === "members" || next === "sharing"));
+    !(singleUser && (next === "members" || next === "sharing")) &&
+    // Customize is WIP behind the `customize` release feature; a deep link to
+    // it while disabled falls back to the default section rather than an empty
+    // page. Keeps content, nav, and header in agreement on availability.
+    !(next === "customize" && !isFeatureEnabled(info, "customize"));
   const section = isValidSection ? (next as SettingsSectionId) : defaultSection;
   if (section !== "customize") return { inSettings: true, section };
   const sub = segments[idx + 2];

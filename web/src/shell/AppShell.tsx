@@ -270,7 +270,10 @@ export function AppShell() {
   // is no longer the only way out. Mirrors sidebarOpenBeforeMaximizeRef, which
   // stashes and restores the same state around the maximize flow.
   const { inSettings, section } = useSettingsRoute();
-  const hideHeader = inSettings && HEADERLESS_SECTIONS.includes(section);
+  // Only hide the header while the sidebar is open — it carries the
+  // sidebar-reopen control, so hiding it with the sidebar closed strands the
+  // user with no way back. Mirrors extensionOwnsHeader above.
+  const hideHeader = inSettings && HEADERLESS_SECTIONS.includes(section) && sidebarOpen;
   const sidebarOpenBeforeSettingsRef = useRef<boolean | null>(null);
   useEffect(() => {
     if (inSettings) {
