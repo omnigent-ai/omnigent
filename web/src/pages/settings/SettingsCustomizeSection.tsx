@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
 import {
-  BlocksIcon,
+  type BlocksIcon,
   PlusIcon,
   SearchIcon,
   SparkleIcon,
@@ -10,7 +10,7 @@ import {
 import { Link } from "@/lib/routing";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
-import { type CustomizeSubSectionId } from "@/shell/settingsNav";
+import type { CustomizeSubSectionId } from "@/shell/settingsNav";
 import { SIDEBAR_ROW } from "@/shell/sidebarStyles";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { ComposerAgentIcon } from "@/shell/NewChatDialog";
