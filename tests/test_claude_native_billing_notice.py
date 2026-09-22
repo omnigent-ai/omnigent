@@ -75,8 +75,16 @@ def _terminal(monkeypatch: pytest.MonkeyPatch, frames: list[str]) -> Mock:
 
 
 @pytest.mark.parametrize("width", [25, 80, 160])
-def test_notice_matches_wrapped_text_and_gateway(width: int) -> None:
-    body = _BODY.replace("gateway.example.com", "https://other.example.net:8443/api")
+@pytest.mark.parametrize(
+    "gateway",
+    [
+        "https://other.example.net:8443/api",
+        "[::1]:8080",
+        "[2001:db8::1]:8443",
+    ],
+)
+def test_notice_matches_wrapped_text_and_gateway(width: int, gateway: str) -> None:
+    body = _BODY.replace("gateway.example.com", gateway)
     pane = f"{_RULE}\n{textwrap.fill(body, width=width)}\n"
     assert bridge.auto_mode_billing_notice_visible(pane)
 

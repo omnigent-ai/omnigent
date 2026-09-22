@@ -120,7 +120,8 @@ def _cancellable_injection_lock(lock: threading.Lock | FileLock) -> Iterator[Non
             if lock.acquire(timeout=_INJECTION_LOCK_POLL_INTERVAL_S):
                 break
         except FileLockTimeout:
-            pass
+            # Another process still owns the pane; retry after checking cancellation.
+            continue
     try:
         _check_injection_cancelled()
         yield
@@ -391,7 +392,7 @@ _AUTO_MODE_BILLING_NOTICE = re.compile(
             "requests go through "
         ).replace(" ", "")
     )
-    + r"[A-Za-z0-9._:/-]+"
+    + r"[A-Za-z0-9._:/\[\]-]+"
     + re.escape(
         (
             ", which isn't compatible with this update. "
