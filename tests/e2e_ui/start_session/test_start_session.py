@@ -3394,10 +3394,11 @@ async def _drive_add_worktree(base_url: str, session_id: str) -> None:
 def test_start_session_select_existing_worktree(seeded_session: tuple[str, str]) -> None:
     """Picking an existing worktree starts in its directory in git bind mode.
 
-    The branch chip's input doubles as a combobox: focusing it lists the
-    repo's existing worktrees (``GET /v1/hosts/{id}/worktrees``). Selecting
-    one must (a) point the workspace at that worktree's directory and
-    (b) send the ``git`` spec in bind mode on ``POST /v1/sessions`` —
+    The branch chip lists the repo's existing worktrees
+    (``GET /v1/hosts/{id}/worktrees``). Selecting one must (a) point the
+    workspace at that worktree's directory, (b) close the selector without
+    copying the branch into the ``New`` input, and (c) send the ``git`` spec
+    in bind mode on ``POST /v1/sessions`` —
     ``existing_worktree: true`` with the worktree's branch as
     ``branch_name`` — so no worktree is created but the sidebar shows the
     branch and the delete flow can offer to remove it.
@@ -3458,22 +3459,29 @@ async def _drive_select_existing_worktree(base_url: str, session_id: str) -> Non
                 state="visible", timeout=30_000
             )
 
-            # Open the worktree chip; focusing the branch combobox reveals the
-            # repo's existing (linked) worktrees. The main tree is filtered out,
-            # so only the one linked worktree is offered.
+            # Open the worktree chip. The main tree is filtered out, so only
+            # the one linked worktree is offered.
             await page.get_by_test_id("new-chat-landing-branch-chip").click()
-            await page.get_by_test_id("new-chat-landing-branch-input").focus()
             option = page.get_by_test_id("new-chat-landing-worktree-option")
             await expect(option).to_have_count(1)
             await expect(option).to_contain_text("feature-x")
             await option.click()
-            await expect(option.get_by_role("radio")).to_be_checked()
+            await expect(page.get_by_test_id("new-chat-landing-worktree-dropdown")).to_have_count(
+                0
+            )
+            await expect(page.get_by_test_id("new-chat-landing-branch-chip")).to_contain_text(
+                "feature/x"
+            )
 
-            # The warning confirms the session will start in the existing
-            # worktree (rather than creating a new one).
+            # Reopening keeps the existing row selected while reserving New
+            # exclusively for creating a different worktree.
+            await page.get_by_test_id("new-chat-landing-branch-chip").click()
+            await expect(page.get_by_test_id("new-chat-landing-branch-input")).to_have_value("")
+            option = page.get_by_test_id("new-chat-landing-worktree-option")
+            await expect(option.get_by_role("radio")).to_be_checked()
             await expect(
                 page.get_by_test_id("new-chat-landing-existing-worktree-warning")
-            ).to_be_visible()
+            ).to_have_count(0)
 
             await page.get_by_test_id("new-chat-landing-input").fill("work in the worktree")
             await page.get_by_test_id("new-chat-landing-submit").click()
