@@ -274,6 +274,9 @@ for _builder_name in (
 # Servers before 0.3.0 cannot serialize the runner's "waiting" status.
 # Unknown versions also downgrade to "running" so old servers never return 500.
 _WAITING_STATUS_MIN_SERVER_VERSION = "0.3.0"
+# Native pane statuses that mean a terminal turn is still in flight. A
+# ``waiting`` pane may be blocked on user input, so it must stay alive too.
+_NATIVE_PANE_TURN_STATUSES = ("running", "waiting")
 # Cached server version from the /api/version probe; ``None`` until a probe
 # succeeds. A failed probe stays ``None`` and is retried on the next
 # session-create — the GET is cheap and self-heals a transient failure.
@@ -2459,6 +2462,17 @@ def create_runner_app(
     app.state.active_turns = _active_turns
     _native_pane_status: dict[str, str] = {}
     app.state.native_pane_status = _native_pane_status
+    _native_work_status: dict[str, str] = {}
+    app.state.native_work_status = _native_work_status
+    # Native delivery can finish before the terminal turn does. Track which
+    # turn owns each public pane status so stale edges cannot release its pin.
+    _native_pane_status_epoch: dict[str, int] = {}
+    _native_pane_status_response_id: dict[str, str | None] = {}
+    _native_pane_closed_response_ids: dict[str, set[str]] = {}
+    _native_confirmed_epoch: dict[str, int] = {}
+    _native_status_sessions: set[str] = set()
+    # Reject callbacks queued across asynchronous session teardown.
+    _native_session_deleted_generation: dict[str, int] = {}
     # Detached watchers answering a /model confirm dialog that pops after
     # the active turn settles (a mid-turn switch queues in the composer).
     _model_dialog_watchers: set[asyncio.Task[None]] = set()
@@ -2500,6 +2514,101 @@ def create_runner_app(
     _session_inboxes = _session_inboxes_ref
     _session_async_tasks: dict[str, dict[str, tuple[asyncio.Task[str], asyncio.Event]]] = {}
 
+    def _native_status_generation_is_live(
+        session_id: str,
+        generation: int | None = None,
+    ) -> bool:
+        """Return whether a native status may still mutate this session.
+
+        A delete clears the visible session state before it finishes its
+        asynchronous teardown.  Status callbacks queued by the terminal can
+        therefore run after the delete; the cache generation is the stable
+        lifetime marker that lets us reject those callbacks.
+        """
+        current_generation = _session_cache_generations.get(session_id, 0)
+        if generation is not None and generation != current_generation:
+            return False
+        return _native_session_deleted_generation.get(session_id) != current_generation
+
+    def _set_native_pane_status(
+        session_id: str,
+        status: str,
+        *,
+        response_id: str | None = None,
+        turn_epoch: int | None = None,
+        generation: int | None = None,
+    ) -> bool:
+        """Record one native pane status while preserving turn ownership.
+
+        Terminal edges carrying a response id are compare-and-set operations,
+        so an old response cannot clear a newer turn's pin. ``turn_epoch`` and
+        ``generation`` provide the same fence for sources that carry them.
+        """
+        if not _native_status_generation_is_live(session_id, generation):
+            return False
+
+        epoch = turn_epoch if turn_epoch is not None else _turn_bind_epoch.get(session_id, 0)
+        current_epoch = _native_pane_status_epoch.get(session_id)
+        current_response_id = _native_pane_status_response_id.get(session_id)
+        closed_response_ids = _native_pane_closed_response_ids.setdefault(session_id, set())
+
+        if status in _NATIVE_PANE_TURN_STATUSES:
+            if response_id is not None and response_id in closed_response_ids:
+                return False
+            # A new bind starts a new native turn even when the native
+            # forwarder has not attached yet.  Do not let a stale external
+            # running edge move ownership backwards to an older bind epoch.
+            if current_epoch is not None and epoch < current_epoch:
+                return False
+            if current_epoch is not None and current_epoch != epoch and current_response_id:
+                closed_response_ids.add(current_response_id)
+                if len(closed_response_ids) > 32:
+                    closed_response_ids.pop()
+            _native_status_sessions.add(session_id)
+            _native_pane_status[session_id] = status
+            _native_pane_status_epoch[session_id] = epoch
+            if response_id is not None:
+                _native_pane_status_response_id[session_id] = response_id
+            elif current_epoch != epoch:
+                _native_pane_status_response_id[session_id] = None
+            _native_work_status[session_id] = status
+            return True
+
+        if status not in ("idle", "failed"):
+            _native_status_sessions.add(session_id)
+            _native_pane_status[session_id] = status
+            _native_pane_status_epoch[session_id] = epoch
+            _native_work_status[session_id] = status
+            return True
+
+        # A terminal edge for a different response cannot release this pin.
+        if response_id is not None:
+            if response_id in closed_response_ids:
+                return False
+            if current_response_id is not None and response_id != current_response_id:
+                return False
+        if turn_epoch is not None and current_epoch is not None and turn_epoch != current_epoch:
+            return False
+        _native_status_sessions.add(session_id)
+        _native_pane_status[session_id] = status
+        _native_pane_status_epoch[session_id] = epoch
+        _native_work_status[session_id] = status
+        if response_id is not None:
+            closed_response_ids.add(response_id)
+        _native_pane_status_response_id[session_id] = response_id
+        return True
+
+    def _clear_native_pane_status(session_id: str, *, preserve_closed: bool = False) -> None:
+        """Drop all native pin ownership for a deleted or failed session."""
+        _native_pane_status.pop(session_id, None)
+        _native_work_status.pop(session_id, None)
+        _native_pane_status_epoch.pop(session_id, None)
+        _native_pane_status_response_id.pop(session_id, None)
+        _native_confirmed_epoch.pop(session_id, None)
+        if not preserve_closed:
+            _native_pane_closed_response_ids.pop(session_id, None)
+        _native_status_sessions.discard(session_id)
+
     def _has_active_work() -> bool:
         if _active_turns:
             return True
@@ -2515,6 +2624,11 @@ def create_runner_app(
             session_ids = set(_session_start_cache) | set(_session_agent_ids)
             if any(process_manager.has_active_turn(session_id) for session_id in session_ids):
                 return True
+        if any(
+            session_id in _native_status_sessions and status in _NATIVE_PANE_TURN_STATUSES
+            for session_id, status in _native_work_status.items()
+        ):
+            return True
         return False
 
     app.state.has_active_work = _has_active_work
@@ -2694,6 +2808,20 @@ def create_runner_app(
         event: dict[str, object] = {"type": "session.status", "status": status}
         if blocked_on is not None:
             event["blocked_on"] = blocked_on
+        if not _native_status_generation_is_live(session_id):
+            return
+        # Only terminal-backed harnesses need a second lifecycle pin.
+        if is_native_harness(_session_harness_name(session_id)):
+            epoch = _turn_bind_epoch.get(session_id, 0)
+            if status in _NATIVE_PANE_TURN_STATUSES:
+                _native_confirmed_epoch[session_id] = epoch
+            elif (
+                _native_work_status.get(session_id) in _NATIVE_PANE_TURN_STATUSES
+                and _native_confirmed_epoch.get(session_id) != epoch
+            ):
+                return
+            if not _set_native_pane_status(session_id, status):
+                return
         _publish_event(session_id, event)
 
     resource_registry.set_session_status_publisher(_publish_session_status)
@@ -3351,6 +3479,8 @@ def create_runner_app(
                 },
             )
 
+        # Reopen the tombstone only after a reused session id is initialized.
+        _native_session_deleted_generation.pop(session_id, None)
         _session_start_cache.setdefault(session_id, time.time())
         _session_agent_ids[session_id] = agent_id
         if session_id not in _session_event_queues:
@@ -3868,6 +3998,9 @@ def create_runner_app(
 
     @app.delete("/v1/sessions/{session_id}")
     async def delete_session(session_id: str) -> JSONResponse:
+        # Fence queued terminal callbacks before the first teardown await.
+        _session_cache_generations[session_id] = _session_cache_generations.get(session_id, 0) + 1
+        _native_session_deleted_generation[session_id] = _session_cache_generations[session_id]
         turn_task = _active_turns.pop(session_id, None)
         if turn_task is not None and isinstance(turn_task, asyncio.Task):
             turn_task.cancel()
@@ -3879,7 +4012,7 @@ def create_runner_app(
         _turn_bind_epoch.pop(session_id, None)
         _desync_terminalized.pop(session_id, None)
         _desynced_sessions.discard(session_id)
-        _native_pane_status.pop(session_id, None)
+        _clear_native_pane_status(session_id, preserve_closed=True)
         _ingest_next_seq.pop(session_id, None)
         _ingest_now_serving.pop(session_id, None)
         _ingest_cond.pop(session_id, None)
@@ -3925,11 +4058,6 @@ def create_runner_app(
         from omnigent.runner.tool_dispatch import forget_spawn_family
 
         forget_spawn_family(session_id)
-
-        # Increment before clearing caches so in-flight fills see a changed
-        # generation and discard rather than repopulating entries for a dead
-        # (or reborn) session.
-        _session_cache_generations[session_id] = _session_cache_generations.get(session_id, 0) + 1
 
         _session_spec_cache.pop(session_id, None)
         _session_harness_overrides.pop(session_id, None)
@@ -4457,6 +4585,13 @@ def create_runner_app(
         h = spec.executor.config.get("harness") or spec.executor.type
         return canonicalize_harness(h) or h
 
+    def _classify_native_work(conv_id: str, harness: str | None) -> None:
+        """Pin native delivery or clear a pin after switching harnesses."""
+        if is_native_harness(harness):
+            _set_native_pane_status(conv_id, "running")
+        elif harness is not None and conv_id in _native_status_sessions:
+            _clear_native_pane_status(conv_id)
+
     def _publish_turn_status(
         conv_id: str,
         status: str,
@@ -4467,6 +4602,18 @@ def create_runner_app(
         ):
             status = "running"
         harness = _session_harness_name(conv_id)
+        if is_native_harness(harness):
+            # Native injection returns before the terminal finishes. Pin the
+            # runner immediately, without publishing the synthetic edge that
+            # terminal-backed harnesses intentionally suppress below.
+            if status in _NATIVE_PANE_TURN_STATUSES:
+                _set_native_pane_status(conv_id, status)
+            elif status == "failed":
+                # A failed delivery has no native terminal edge to release the
+                # synthetic dispatch pin, so settle it here.
+                _set_native_pane_status(conv_id, status)
+        elif harness is not None and conv_id in _native_status_sessions:
+            _clear_native_pane_status(conv_id)
         if status != "failed" and harness in {
             "claude-native",
             "pi-native",
@@ -5712,6 +5859,18 @@ def create_runner_app(
         """
         _active_turns[conv_id] = None
         _turn_bind_epoch[conv_id] = next(_turn_epoch_seq)
+        harness = _session_harness_name(conv_id)
+        if is_native_harness(harness):
+            # Establish the pin before the harness delivery task is scheduled.
+            # Native delivery may return a successful injection response and
+            # clear ``_active_turns`` while the terminal is still working.
+            _set_native_pane_status(conv_id, "running")
+        elif harness is None and conv_id in _native_status_sessions:
+            # External native sessions may not have a spec cache (for example,
+            # a child status callback arrived before its create handshake).
+            _set_native_pane_status(conv_id, "running")
+        elif harness is not None and conv_id in _native_status_sessions:
+            _clear_native_pane_status(conv_id)
 
     def _release_live_turn_markers(conv_id: str) -> None:
         """Clear ``_live_response_id`` and the process-manager in-flight marker atomically.
@@ -6637,6 +6796,7 @@ def create_runner_app(
         spawn_env: dict[str, str] | None = None
         instructions: str | None = None
         _note_session_harness_override(conv, cast(str | None, msg_body.get("harness_override")))
+        harness_name = _session_harness_name(conv)
         if cached_spec is not None:
             h = (
                 cast(str | None, msg_body.get("harness_override"))
@@ -7035,6 +7195,9 @@ def create_runner_app(
                         "detail": _client_safe_error_detail(exc, context="spec resolve"),
                     },
                 )
+        # This common path covers both background and direct-stream turns,
+        # including the first turn whose harness was resolved lazily above.
+        _classify_native_work(conv_id, harness_name)
         if spawn_env is None:
             spawn_env = await _resolve_native_spawn_env(
                 harness_name,
@@ -7860,6 +8023,12 @@ def create_runner_app(
                     loaded.append(new_item)
                     _session_histories[conversation_id] = loaded
 
+                # Record a routed harness before binding the turn so native
+                # delivery cannot finish before the watchdog pin exists.
+                _note_session_harness_override(
+                    conversation_id,
+                    cast(str | None, message_body.get("harness_override")),
+                )
                 _begin_turn_slot(conversation_id)
                 _logger.info(
                     "post_session_events: starting background turn conv=%s",
@@ -7913,9 +8082,41 @@ def create_runner_app(
             status = data.get("status") if isinstance(data, dict) else None
             forwarded_output = data.get("output") if isinstance(data, dict) else None
             output = forwarded_output if isinstance(forwarded_output, str) else None
+            response_id = data.get("response_id") if isinstance(data, dict) else None
+            response_id = response_id if isinstance(response_id, str) and response_id else None
+            raw_turn_epoch = data.get("turn_epoch") if isinstance(data, dict) else None
+            turn_epoch = (
+                raw_turn_epoch
+                if isinstance(raw_turn_epoch, int) and not isinstance(raw_turn_epoch, bool)
+                else None
+            )
+            raw_generation = data.get("session_generation") if isinstance(data, dict) else None
+            generation = (
+                raw_generation
+                if isinstance(raw_generation, int) and not isinstance(raw_generation, bool)
+                else None
+            )
             delivery_ack: _SubagentDeliveryAck | None = None
             recovered_entry: _SubagentWorkEntry | None = None
             if status in ("running", "waiting", "idle", "failed"):
+                if not _native_status_generation_is_live(conversation_id, generation):
+                    # A terminal can finish its POST after DELETE has already
+                    # cleared the session.  Do not recreate the pin (or wake a
+                    # parent from a dead session) from that late callback.
+                    return Response(status_code=204)
+                status_accepted = _set_native_pane_status(
+                    conversation_id,
+                    status,
+                    response_id=response_id,
+                    turn_epoch=turn_epoch,
+                    generation=generation,
+                )
+                if not status_accepted:
+                    return Response(status_code=204)
+                if status in _NATIVE_PANE_TURN_STATUSES:
+                    _native_confirmed_epoch[conversation_id] = _turn_bind_epoch.get(
+                        conversation_id, 0
+                    )
                 resource_registry.note_external_session_status(conversation_id, status)
                 _fan_out_child_delta_to_parent(
                     conversation_id,

@@ -319,3 +319,276 @@ async def test_drain_session_streams_enqueues_done_sentinel() -> None:
     finally:
         _session_event_queues_ref.pop("conv_drain_a", None)
         _session_event_queues_ref.pop("conv_drain_b", None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["running", "waiting"])
+async def test_native_pane_status_blocks_idle_shutdown_until_idle(status: str) -> None:
+    """A native pane's in-flight status remains active until it settles.
+
+    Native terminal delivery can clear ``active_turns`` before the pane emits
+    its terminal edge. The pane status must keep the idle watchdog blocked in
+    both producing and user-input-waiting states, then release it on ``idle``.
+
+    :param status: In-flight native status to exercise.
+    :returns: None.
+    """
+    from tests.runner.conftest import _FakeProcessManager, _runner_client, _ScriptedHarnessClient
+
+    conv_id = "conv_native"
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_client(app) as client:
+        started = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "external_session_status", "data": {"status": status}},
+        )
+        assert started.status_code == 204, started.text
+        assert app.state.has_active_work() is True, app.state.native_work_status
+
+        async def _release() -> None:
+            settled = await client.post(
+                f"/v1/sessions/{conv_id}/events",
+                json={"type": "external_session_status", "data": {"status": "idle"}},
+            )
+            assert settled.status_code == 204, settled.text
+
+        await _assert_monitor_blocked_then_shuts_down(
+            has_active_work=app.state.has_active_work,
+            release=_release,
+        )
+        assert app.state.has_active_work() is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_uncached_native_dispatch_pins_before_delivery_finishes(
+    stream: bool,
+) -> None:
+    """A first native turn is pinned before its harness delivery can return.
+
+    The first message can arrive before the runner's session-spec cache is
+    warm. The resolved native harness must arm its pin before background or
+    direct-stream delivery clears ``active_turns``.
+    """
+    from omnigent.spec.types import AgentSpec, ExecutorSpec
+    from tests.runner.conftest import (
+        _FakeProcessManager,
+        _runner_client,
+        _ScriptedHarnessClient,
+        _spec_resolver_returning,
+        _sse,
+    )
+
+    conv_id = "conv_uncached_native_pin"
+    harness_client = _ScriptedHarnessClient(
+        [
+            _sse({"type": "response.created", "response": {"id": "resp_uncached"}}),
+            _sse({"type": "response.completed", "response": {"id": "resp_uncached"}}),
+        ]
+    )
+    spec = AgentSpec(
+        spec_version=1,
+        name="native-idle-test",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "goose-native"}),
+    )
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(harness_client),  # type: ignore[arg-type]
+        spec_resolver=await _spec_resolver_returning(spec),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        response = await client.post(
+            f"/v1/sessions/{conv_id}/events?stream={'true' if stream else 'false'}",
+            json={
+                "type": "message",
+                "role": "user",
+                "model": "codex",
+                "agent_id": "agent_native",
+                "content": [{"type": "input_text", "text": "hello"}],
+            },
+        )
+        assert response.status_code == (200 if stream else 202), response.text
+        for _ in range(100):
+            if conv_id not in app.state.active_turns:
+                break
+            await asyncio.sleep(0.01)
+        assert conv_id not in app.state.active_turns
+        assert app.state.has_active_work() is True, app.state.native_work_status
+
+        settled = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={
+                "type": "external_session_status",
+                "data": {"status": "idle"},
+            },
+        )
+        assert settled.status_code == 204, settled.text
+        assert app.state.has_active_work() is False
+
+
+@pytest.mark.asyncio
+async def test_switch_to_non_native_harness_releases_native_pin() -> None:
+    """A native-to-SDK harness switch does not retain native liveness."""
+    from tests.runner.conftest import (
+        _FakeProcessManager,
+        _runner_client,
+        _ScriptedHarnessClient,
+        _sse,
+    )
+
+    conv_id = "conv_native_to_sdk"
+    harness_client = _ScriptedHarnessClient(
+        [
+            _sse({"type": "response.created", "response": {"id": "resp_sdk"}}),
+            _sse({"type": "response.completed", "response": {"id": "resp_sdk"}}),
+        ]
+    )
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(harness_client),  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_client(app) as client:
+        started = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "external_session_status", "data": {"status": "running"}},
+        )
+        assert started.status_code == 204, started.text
+        assert app.state.has_active_work() is True
+
+        response = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "model": "sdk",
+                "content": [{"type": "input_text", "text": "hello"}],
+                "harness_override": "openai-agents",
+            },
+        )
+        assert response.status_code == 202, response.text
+        for _ in range(100):
+            if conv_id not in app.state.active_turns:
+                break
+            await asyncio.sleep(0.01)
+        assert app.state.has_active_work() is False
+
+
+@pytest.mark.asyncio
+async def test_native_failed_external_status_releases_pin() -> None:
+    """A matching native failure settles the watchdog pin."""
+    from tests.runner.conftest import _FakeProcessManager, _runner_client, _ScriptedHarnessClient
+
+    conv_id = "conv_native_failed_pin"
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_client(app) as client:
+        started = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={
+                "type": "external_session_status",
+                "data": {"status": "running", "response_id": "resp_failed"},
+            },
+        )
+        assert started.status_code == 204, started.text
+        assert app.state.has_active_work() is True
+        failed = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={
+                "type": "external_session_status",
+                "data": {"status": "failed", "response_id": "resp_failed"},
+            },
+        )
+        assert failed.status_code == 204, failed.text
+        assert app.state.has_active_work() is False
+
+
+@pytest.mark.asyncio
+async def test_deleted_native_session_ignores_late_status_callback() -> None:
+    """A callback queued across DELETE cannot recreate a native pin."""
+    from tests.runner.conftest import _FakeProcessManager, _runner_client, _ScriptedHarnessClient
+
+    conv_id = "conv_native_deleted_pin"
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_client(app) as client:
+        started = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={
+                "type": "external_session_status",
+                "data": {"status": "running", "response_id": "resp_deleted"},
+            },
+        )
+        assert started.status_code == 204, started.text
+        assert app.state.has_active_work() is True
+        deleted = await client.delete(f"/v1/sessions/{conv_id}")
+        assert deleted.status_code == 200, deleted.text
+        assert app.state.has_active_work() is False
+        late = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={
+                "type": "external_session_status",
+                "data": {"status": "running", "response_id": "resp_deleted"},
+            },
+        )
+        assert late.status_code == 204, late.text
+        assert app.state.has_active_work() is False
+        assert conv_id not in app.state.native_pane_status
+
+
+@pytest.mark.asyncio
+async def test_old_native_terminal_status_does_not_clear_new_turn_pin() -> None:
+    """A delayed old response terminal edge cannot settle a new bind epoch."""
+    from tests.runner.conftest import _FakeProcessManager, _runner_client, _ScriptedHarnessClient
+
+    conv_id = "conv_native_generation_pin"
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_client(app) as client:
+        first = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={
+                "type": "external_session_status",
+                "data": {"status": "running", "response_id": "resp_old"},
+            },
+        )
+        assert first.status_code == 204, first.text
+        app.state.begin_turn_slot(conv_id)
+        app.state.active_turns.pop(conv_id, None)
+
+        stale = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={
+                "type": "external_session_status",
+                "data": {"status": "idle", "response_id": "resp_old"},
+            },
+        )
+        assert stale.status_code == 204, stale.text
+        assert app.state.has_active_work() is True
+
+        current = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={
+                "type": "external_session_status",
+                "data": {"status": "running", "response_id": "resp_new"},
+            },
+        )
+        assert current.status_code == 204, current.text
+        settled = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={
+                "type": "external_session_status",
+                "data": {"status": "idle", "response_id": "resp_new"},
+            },
+        )
+        assert settled.status_code == 204, settled.text
+        assert app.state.has_active_work() is False
