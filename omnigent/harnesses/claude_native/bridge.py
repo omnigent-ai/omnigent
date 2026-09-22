@@ -392,7 +392,7 @@ _AUTO_MODE_BILLING_NOTICE = re.compile(
             "requests go through "
         ).replace(" ", "")
     )
-    + r"[A-Za-z0-9._:/\[\]-]+"
+    + r"[A-Za-z0-9._:/\[\]…-]+"
     + re.escape(
         (
             ", which isn't compatible with this update. "
