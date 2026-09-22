@@ -7843,6 +7843,8 @@ def create_runner_app(
         """Discard waiting input before explicit terminal interruption or teardown."""
         waiter = _claude_prompt_waiters.pop(session_id, None)
         if waiter is not None or _session_harness_name(session_id) == "claude-native":
+            # Cancel queued work even if the terminal control fails; restoring it
+            # could restart work the user explicitly asked to stop.
             _session_message_buffers.pop(session_id, None)
         if waiter is not None:
             waiter.cancel()

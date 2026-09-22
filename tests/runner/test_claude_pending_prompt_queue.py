@@ -214,6 +214,62 @@ async def test_control_cancels_question_waiter_and_queued_input(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("action", "control", "error"),
+    [
+        ("interrupt", "inject_interrupt", "claude_native_interrupt_failed"),
+        ("stop_session", "kill_session", "claude_native_stop_failed"),
+    ],
+)
+@pytest.mark.parametrize("has_active_turn", [False, True])
+async def test_failed_terminal_control_still_cancels_queued_work(
+    action: str,
+    control: str,
+    error: str,
+    has_active_turn: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    pending_prompt: dict[str, bool],
+) -> None:
+    """A failed terminal control must not reauthorize cancelled queued messages."""
+    app, harness = _build_app()
+    sid = uuid.uuid4().hex
+    control_calls: list[tuple[bool, bool]] = []
+
+    def fail_control(*_args: Any, **_kwargs: Any) -> None:
+        control_calls.append(
+            (
+                sid in app.state.session_message_buffers,
+                sid in app.state.claude_prompt_waiters,
+            )
+        )
+        raise RuntimeError("tmux target is unavailable")
+
+    monkeypatch.setattr(claude_native_bridge, control, fail_control)
+    async with _runner_client(app) as client:
+        await client.post("/v1/sessions", json={"session_id": sid, "agent_id": uuid.uuid4().hex})
+        if has_active_turn:
+            app.state.active_turns[sid] = None
+        queued = await client.post(f"/v1/sessions/{sid}/events", json=_message("cancel this"))
+        assert queued.status_code == 202
+        assert queued.json()["status"] == "buffered"
+        waiter = app.state.claude_prompt_waiters.get(sid)
+        response = await client.post(f"/v1/sessions/{sid}/events", json={"type": action})
+        assert response.status_code == 503
+        assert response.json()["error"] == error
+        assert control_calls == [(False, False)]
+        assert (sid in app.state.active_turns) == has_active_turn
+        if waiter is not None:
+            await _until(waiter.done)
+
+        pending_prompt["pending"] = False
+        app.state.active_turns.pop(sid, None)
+        await app.state.check_and_start_next_turn(sid)
+        assert sid not in app.state.claude_prompt_waiters
+        assert sid not in app.state.session_message_buffers
+        assert harness.posted_bodies == []
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("from_waiter", [False, True])
 async def test_stop_during_drain_probe_does_not_restart_session(
     from_waiter: bool, monkeypatch: pytest.MonkeyPatch, pending_prompt: dict[str, bool]

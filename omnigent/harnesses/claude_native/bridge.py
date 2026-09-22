@@ -3989,7 +3989,13 @@ def _paste_and_submit(
     # after the burst, so it submits). Each Enter only fires while the
     # draft is verifiably still present, so a retry can never hit an
     # empty prompt or a permission dialog of the started turn.
-    if _verify_submit_accepted(socket_path, tmux_target, needle=needle, what="submitted message"):
+    if _verify_submit_accepted(
+        socket_path,
+        tmux_target,
+        needle=needle,
+        what="submitted message",
+        bridge_dir=bridge_dir,
+    ):
         return
     raise RuntimeError(
         f"Claude Code did not accept the submitted message within {_SUBMIT_VERIFY_TIMEOUT_S}s "
@@ -4003,6 +4009,7 @@ def _verify_submit_accepted(
     *,
     needle: str,
     what: str,
+    bridge_dir: Path | None = None,
 ) -> bool:
     """
     Wait for a submitted draft to leave the input box, re-sending Enter.
@@ -4021,6 +4028,7 @@ def _verify_submit_accepted(
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
     :param needle: Draft marker from :func:`_submit_needle`.
     :param what: Label for log lines, e.g. ``"submitted message"``.
+    :param bridge_dir: Bridge whose pending questions protect submit retries.
     :returns: ``True`` when the draft left the input box (accepted),
         ``False`` when it is still there after the full window.
     """
@@ -4030,7 +4038,8 @@ def _verify_submit_accepted(
     warned = False
     while time.monotonic() - start < _SUBMIT_VERIFY_TIMEOUT_S:
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
-        if not _draft_in_input_box(_capture_pane(socket_path, tmux_target), needle):
+        pane = _capture_pane(socket_path, tmux_target)
+        if not _draft_in_input_box(pane, needle):
             if warned:
                 _logger.info(
                     "claude-native: %s accepted after %.1fs of an unresponsive TUI",
@@ -4049,6 +4058,7 @@ def _verify_submit_accepted(
                 _SUBMIT_VERIFY_TIMEOUT_S,
             )
         if now - last_enter >= retry_interval:
+            _raise_if_user_prompt_pending(bridge_dir, pane)
             _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
             last_enter = now
             retry_interval = min(retry_interval * 2, _SUBMIT_RETRY_MAX_INTERVAL_S)
@@ -4266,20 +4276,27 @@ def inject_slash_command(
     draft_seen = False
     deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
     while time.monotonic() < deadline:
-        if _draft_in_input_box(_capture_pane(socket_path, tmux_target), needle):
+        pane = _capture_pane(socket_path, tmux_target)
+        _raise_if_user_prompt_pending(bridge_dir, pane)
+        if _draft_in_input_box(pane, needle):
             draft_seen = True
             break
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
     time.sleep(_PASTE_SETTLE_S)
+    if has_pending_user_prompt(bridge_dir):
+        raise ClaudeUserPromptPending(
+            "Claude is waiting for an explicit answer; settings command not sent."
+        )
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
     if draft_seen:
-        # Re-send only while the command verifiably still sits in the box —
-        # a one-poll-stale retry can at worst hit the empty composer (no-op)
-        # or our own confirm dialog (the intended answer), never a foreign
-        # surface. The command leaving the box is the submit signal; the
-        # dialog replacing the composer counts, since submission pops it.
+        # Retry only while the command remains drafted and no user decision
+        # is pending. A dialog replacing the composer counts as submission.
         if not _verify_submit_accepted(
-            socket_path, tmux_target, needle=needle, what="slash command"
+            socket_path,
+            tmux_target,
+            needle=needle,
+            what="slash command",
+            bridge_dir=bridge_dir,
         ):
             raise RuntimeError(
                 f"Claude Code did not accept the slash command within "
@@ -4287,7 +4304,7 @@ def inject_slash_command(
                 "input box). The command was not delivered."
             )
     if dialog_hint is not None:
-        _confirm_tui_dialog(socket_path, tmux_target, hint=dialog_hint)
+        _confirm_tui_dialog(socket_path, tmux_target, hint=dialog_hint, bridge_dir=bridge_dir)
 
 
 def _confirm_tui_dialog(
@@ -4296,6 +4313,7 @@ def _confirm_tui_dialog(
     *,
     hint: str,
     timeout_s: float = _CONFIRM_DIALOG_TIMEOUT_S,
+    bridge_dir: Path | None = None,
 ) -> bool:
     """
     Accept the TUI confirmation dialog titled *hint*.
@@ -4309,8 +4327,9 @@ def _confirm_tui_dialog(
 
     On timeout the Enter is still sent, so a dialog whose title drifted in a
     Claude Code release does not sit open forever wedging the pane. It is
-    withheld only when the pane shows a :data:`_FOREIGN_DIALOG_HINTS` surface,
-    where taking the default answer would commit something unasked-for.
+    withheld when a question or permission request is pending, or the pane
+    shows a :data:`_FOREIGN_DIALOG_HINTS` surface, whose default answer would
+    commit something unasked-for.
 
     The same load that renders the dialog late can also swallow the confirm
     Enter outright (the TUI drops keystrokes mid-repaint), so a matched-hint
@@ -4324,14 +4343,18 @@ def _confirm_tui_dialog(
     :param hint: Text the dialog renders, e.g.
         :data:`SWITCH_MODEL_DIALOG_HINT`.
     :param timeout_s: Seconds to watch for the dialog, e.g. ``4.0``.
+    :param bridge_dir: Bridge whose live permission hooks protect confirmation.
     :returns: ``True`` when the dialog was seen and confirmed, ``False`` when
         the watch timed out.
     """
     deadline = time.monotonic() + timeout_s
     while True:
         pane = _capture_pane(socket_path, tmux_target)
+        _raise_if_user_prompt_pending(bridge_dir, pane)
         if hint in pane:
-            _confirm_and_verify_dialog_closed(socket_path, tmux_target, hint=hint)
+            _confirm_and_verify_dialog_closed(
+                socket_path, tmux_target, hint=hint, bridge_dir=bridge_dir
+            )
             return True
         if time.monotonic() >= deadline:
             break
@@ -4345,6 +4368,10 @@ def _confirm_tui_dialog(
             foreign,
         )
         return False
+    if bridge_dir is not None and has_pending_user_prompt(bridge_dir):
+        raise ClaudeUserPromptPending(
+            "Claude is waiting for an explicit answer; settings dialog not confirmed."
+        )
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
     return False
 
@@ -4682,7 +4709,9 @@ def confirm_dialog_if_open(bridge_dir: Path, *, hint: str) -> bool:
         pane = _capture_pane(socket_path, tmux_target)
         if hint not in pane:
             return False
-        _confirm_and_verify_dialog_closed(socket_path, tmux_target, hint=hint)
+        _confirm_and_verify_dialog_closed(
+            socket_path, tmux_target, hint=hint, bridge_dir=bridge_dir
+        )
     except (RuntimeError, OSError):
         return False
     return True
@@ -4693,6 +4722,7 @@ def _confirm_and_verify_dialog_closed(
     tmux_target: str,
     *,
     hint: str,
+    bridge_dir: Path | None = None,
 ) -> None:
     """
     Press Enter on the *hint* dialog, re-pressing while it stays on screen.
@@ -4700,17 +4730,21 @@ def _confirm_and_verify_dialog_closed(
     A single Enter is enough in the common case, but under a busy repaint the
     TUI can drop it — leaving the dialog parked, the composer gone, and every
     later delivery failing the readiness gate. Each retry fires only while the
-    dialog is verifiably still up; a one-poll-stale retry can at worst land
-    on the empty composer that replaces it (a no-op), never a foreign
-    surface. A dialog outliving the budget is left on screen; the persisted
+    dialog is verifiably still up and no user decision is pending.
+    A dialog outliving the budget is left on screen; the persisted
     session value remains the authoritative fallback.
 
     :param socket_path: Absolute path to the tmux socket.
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
     :param hint: Text the dialog renders, e.g.
         :data:`SWITCH_MODEL_DIALOG_HINT`.
+    :param bridge_dir: Bridge whose pending questions protect confirmation retries.
     :returns: None.
     """
+    if bridge_dir is not None and has_pending_user_prompt(bridge_dir):
+        raise ClaudeUserPromptPending(
+            "Claude is waiting for an explicit answer; settings dialog not confirmed."
+        )
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
     last_enter = time.monotonic()
     deadline = last_enter + _CONFIRM_DIALOG_ACCEPT_TIMEOUT_S
@@ -4721,7 +4755,8 @@ def _confirm_and_verify_dialog_closed(
         # WITHOUT the hint shows the dialog actually closed.
         if pane.strip() and hint not in pane:
             return
-        if time.monotonic() - last_enter >= _CONFIRM_DIALOG_RETRY_INTERVAL_S:
+        _raise_if_user_prompt_pending(bridge_dir, pane)
+        if hint in pane and time.monotonic() - last_enter >= _CONFIRM_DIALOG_RETRY_INTERVAL_S:
             _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
             last_enter = time.monotonic()
 
@@ -5050,6 +5085,12 @@ def _user_prompt_visible(pane: str) -> bool:
 def _has_approval_wait(bridge_dir: Path) -> bool:
     session_id = read_active_session_id(bridge_dir)
     return session_id is not None and approval_wait_is_fresh(session_id, bridge_dir=bridge_dir)
+
+
+def _raise_if_user_prompt_pending(bridge_dir: Path | None, pane: str) -> None:
+    """Protect live hook waits even when a captured pane is torn or stale."""
+    if (bridge_dir is not None and _has_approval_wait(bridge_dir)) or _user_prompt_visible(pane):
+        raise ClaudeUserPromptPending("Claude is waiting for an explicit answer; input not sent.")
 
 
 def has_pending_user_prompt(bridge_dir: Path) -> bool:

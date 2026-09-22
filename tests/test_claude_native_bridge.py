@@ -9792,17 +9792,24 @@ def test_a_foreign_dialog_rendering_during_the_watch_gets_no_enter(
     (whose Enter rewrites their global default) or Claude asks for a tool
     permission (whose Enter approves it). Both stay untouched.
     """
-    del name
     sends = _fake_tmux(monkeypatch, [_IDLE_PANE, _IDLE_PANE, foreign_pane])
 
-    assert (
-        claude_native_bridge._confirm_tui_dialog(
-            "/tmp/s.sock",
-            "claude:0.0",
-            hint=claude_native_bridge.EFFORT_DIALOG_HINT,
+    if name == "permission prompt":
+        with pytest.raises(claude_native_bridge.ClaudeUserPromptPending):
+            claude_native_bridge._confirm_tui_dialog(
+                "/tmp/s.sock",
+                "claude:0.0",
+                hint=claude_native_bridge.EFFORT_DIALOG_HINT,
+            )
+    else:
+        assert (
+            claude_native_bridge._confirm_tui_dialog(
+                "/tmp/s.sock",
+                "claude:0.0",
+                hint=claude_native_bridge.EFFORT_DIALOG_HINT,
+            )
+            is False
         )
-        is False
-    )
     assert sends == []
 
 
@@ -9873,6 +9880,7 @@ def test_a_torn_capture_does_not_end_the_confirm_retry(
             "",
             _EFFORT_DIALOG_PANE,
             "",
+            _EFFORT_DIALOG_PANE,
             _IDLE_PANE,
         ],
     )
@@ -9949,34 +9957,38 @@ def test_a_slash_command_submit_waits_for_the_command_to_render(
     while the persisted session value claims the switch applied.
     """
     bridge_dir = _picker_bridge_dir(tmp_path)
-    events: list[str] = []
-    frames = ["", _IDLE_PANE, _composer_pane("/effort high"), _IDLE_PANE]
-    served = {"n": 0}
+    clock = _VirtualClock()
+    pasted_at: float | None = None
+    submitted_at: float | None = None
+    draft_seen = False
 
     def _fake_run_tmux(socket_path: str, *args: str) -> None:
+        nonlocal pasted_at, submitted_at
         del socket_path
-        events.append(f"send:{args[-1]}")
+        if args[-1] == "/effort high":
+            pasted_at = clock.monotonic()
+        elif args[-1] == "Enter":
+            assert draft_seen, "Enter arrived before the typed command rendered"
+            submitted_at = clock.monotonic()
 
     def _fake_capture(socket_path: str, tmux_target: str) -> str:
+        nonlocal draft_seen
         del socket_path, tmux_target
-        events.append("capture")
-        frame = frames[min(served["n"], len(frames) - 1)]
-        served["n"] += 1
-        return frame
+        if pasted_at is None or submitted_at is not None:
+            return _IDLE_PANE
+        if clock.monotonic() - pasted_at < 0.3:
+            return ""
+        draft_seen = True
+        return _composer_pane("/effort high")
 
     monkeypatch.setattr(claude_native_bridge, "_run_tmux", _fake_run_tmux)
     monkeypatch.setattr(claude_native_bridge, "_capture_pane", _fake_capture)
-    monkeypatch.setattr(claude_native_bridge, "time", _VirtualClock())
+    monkeypatch.setattr(claude_native_bridge, "time", clock)
 
     claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
 
-    first_enter = events.index("send:Enter")
-    captures_before = sum(1 for event in events[:first_enter] if event == "capture")
-    # Blank (occupied-input check) + idle + draft: three captures before
-    # the Enter may fire.
-    assert captures_before == 3, (
-        f"Enter must wait for the command to render (expected 3 captures first); events: {events}"
-    )
+    assert pasted_at is not None and submitted_at is not None
+    assert submitted_at - pasted_at >= 0.3
 
 
 def test_a_swallowed_slash_submit_enter_is_retried_while_the_draft_persists(
@@ -9991,14 +10003,20 @@ def test_a_swallowed_slash_submit_enter_is_retried_while_the_draft_persists(
     the box, so none can reach the cleared composer or a dialog.
     """
     bridge_dir = _picker_bridge_dir(tmp_path)
-    sends = _fake_tmux(
-        monkeypatch,
-        [_IDLE_PANE] + [_composer_pane("/effort high")] * 9 + [_IDLE_PANE],
-    )
+    tails: list[str] = []
+
+    def _fake_capture(socket_path: str, tmux_target: str) -> str:
+        del socket_path, tmux_target
+        if "/effort high" in tails and tails.count("Enter") < 2:
+            return _composer_pane("/effort high")
+        return _IDLE_PANE
+
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", lambda *args: tails.append(args[-1]))
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", _fake_capture)
+    monkeypatch.setattr(claude_native_bridge, "time", _VirtualClock())
 
     claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
 
-    tails = [args[-1] for args in sends]
     assert tails == ["C-u", "/effort high", "Enter", "Enter"], (
         f"Expected the swallowed submit Enter to be retried once; got {tails}."
     )
