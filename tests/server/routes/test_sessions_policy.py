@@ -885,12 +885,10 @@ class _StubGateEngine:
         :param _policy_name: Deciding policy name (unused).
         :returns: Always ``None``.
         """
-        return None
+        return
 
 
-def _patch_gate_verdict(
-    monkeypatch: pytest.MonkeyPatch, verdict: ElicitationResult
-) -> None:
+def _patch_gate_verdict(monkeypatch: pytest.MonkeyPatch, verdict: ElicitationResult) -> None:
     """Make the real gate resolve instantly with ``verdict``.
 
     Patches the two module globals ``_hold_native_ask_gate_impl``
@@ -908,12 +906,8 @@ def _patch_gate_verdict(
     def _no_popup(*_args: Any, **_kwargs: Any) -> None:
         """Swallow the native popup forward (no runner under test)."""
 
-    monkeypatch.setattr(
-        _orchestration, "_publish_and_wait_for_harness_elicitation", _fake_publish
-    )
-    monkeypatch.setattr(
-        _orchestration, "_spawn_native_approval_popup_forward", _no_popup
-    )
+    monkeypatch.setattr(_orchestration, "_publish_and_wait_for_harness_elicitation", _fake_publish)
+    monkeypatch.setattr(_orchestration, "_spawn_native_approval_popup_forward", _no_popup)
 
 
 def _ask_result(reason: str = "Deleting files requires approval") -> PolicyResult:
@@ -1013,9 +1007,7 @@ async def test_gate_cancel_with_reason_publishes_side_channel(
     )
 
     assert approved is False
-    assert _orchestration._ask_gate_resolver_reason.get() == (
-        "not like that — narrower please"
-    )
+    assert _orchestration._ask_gate_resolver_reason.get() == ("not like that — narrower please")
 
 
 @pytest.mark.asyncio
