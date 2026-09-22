@@ -2,9 +2,14 @@ import { act, renderHook, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { createElement, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
+import {
+  CONNECTED_STREAM_REFETCH_INTERVAL_MS,
+  type Conversation,
+  type ConversationsPage,
+} from "@/hooks/useConversations";
 import * as host from "@/lib/host";
 import * as identity from "@/lib/identity";
+import { sessionUpdatesSocket } from "@/lib/sessionUpdatesSocket";
 import {
   applyLiveRows,
   cachedSessionPreview,
@@ -23,6 +28,10 @@ vi.mock("@/lib/identity", () => ({
 
 vi.mock("@/lib/host", () => ({
   getOmnigentServerIdentity: vi.fn(() => "server-a"),
+}));
+
+vi.mock("@/lib/sessionUpdatesSocket", () => ({
+  sessionUpdatesSocket: { isConnected: vi.fn(() => false) },
 }));
 
 function session(
@@ -71,6 +80,7 @@ beforeEach(() => {
   vi.mocked(identity.authenticatedFetch).mockReset();
   vi.mocked(identity.getCurrentUserId).mockReset().mockReturnValue(null);
   vi.mocked(identity.resolveIdentity).mockReset().mockResolvedValue(null);
+  vi.mocked(sessionUpdatesSocket.isConnected).mockReset().mockReturnValue(false);
   window.sessionStorage.clear();
 });
 
@@ -468,7 +478,7 @@ describe("useCanvasSessions", () => {
     expect(identity.authenticatedFetch).toHaveBeenCalledTimes(1);
   });
 
-  it("polls again after each interval while the page is visible", async () => {
+  it("polls every base interval while disconnected", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     vi.mocked(identity.authenticatedFetch).mockImplementation(async () =>
       jsonResponse(page([], null, false)),
@@ -479,6 +489,7 @@ describe("useCanvasSessions", () => {
     await waitFor(() => expect(result.current.complete).toBe(true));
     expect(identity.authenticatedFetch).toHaveBeenCalledTimes(1);
 
+    // Disconnected: a poll fires on every base tick, unchanged from before.
     await act(async () => {
       await vi.advanceTimersByTimeAsync(SESSION_POLL_INTERVAL_MS + 50);
     });
@@ -487,6 +498,58 @@ describe("useCanvasSessions", () => {
       await vi.advanceTimersByTimeAsync(SESSION_POLL_INTERVAL_MS + 50);
     });
     expect(identity.authenticatedFetch).toHaveBeenCalledTimes(3);
+  });
+
+  it("polls at the slower connected cadence, still reconciling cold cards", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    vi.mocked(sessionUpdatesSocket.isConnected).mockReturnValue(true);
+    vi.mocked(identity.authenticatedFetch).mockImplementation(async () =>
+      jsonResponse(page([], null, false)),
+    );
+    const { result } = renderHook(() => useCanvasSessions(), {
+      wrapper: wrapper(new QueryClient()),
+    });
+    await waitFor(() => expect(result.current.complete).toBe(true));
+    expect(identity.authenticatedFetch).toHaveBeenCalledTimes(1);
+
+    // Connected: the first base tick is skipped, so no poll at 30s.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(SESSION_POLL_INTERVAL_MS + 50);
+    });
+    expect(identity.authenticatedFetch).toHaveBeenCalledTimes(1);
+
+    // The second base tick reaches the connected cadence (60s): the cold-tail
+    // reconciliation poll fires.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(SESSION_POLL_INTERVAL_MS);
+    });
+    expect(identity.authenticatedFetch).toHaveBeenCalledTimes(2);
+  });
+
+  it("reconciles a connected canvas card that the sidebar cache never covers", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    resolveViewer("me");
+    vi.mocked(sessionUpdatesSocket.isConnected).mockReturnValue(true);
+    // The stream never sees this card (it's off the sidebar's watch set), and
+    // its ["conversations"] cache stays empty — so the connected-cadence poll
+    // is the only thing that can bring the card current.
+    vi.mocked(identity.authenticatedFetch)
+      .mockResolvedValueOnce(
+        jsonResponse(page([session("cold", 1, { title: "old" })], null, false)),
+      )
+      .mockResolvedValue(jsonResponse(page([session("cold", 2, { title: "new" })], null, false)));
+    const { result } = renderHook(() => useCanvasSessions(), {
+      wrapper: wrapper(new QueryClient()),
+    });
+    await waitFor(() => expect(result.current.complete).toBe(true));
+    expect(result.current.sessions[0]).toMatchObject({ id: "cold", title: "old" });
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(CONNECTED_STREAM_REFETCH_INTERVAL_MS + 50);
+    });
+    await waitFor(() =>
+      expect(result.current.sessions[0]).toMatchObject({ id: "cold", title: "new" }),
+    );
   });
 
   it("reports an initial failure and keeps cards through a failed refresh on focus", async () => {

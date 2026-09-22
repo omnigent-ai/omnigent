@@ -10,8 +10,9 @@ import json
 import logging
 import os
 import tempfile
+import threading
 import time
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
@@ -44,6 +45,7 @@ from omnigent.harnesses.claude_native.bridge import (
     url_component,
     write_active_session_id,
 )
+from omnigent.harnesses.claude_native.diagnostics import ClaudeDebugLogFollower
 from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
 from omnigent.harnesses.claude_native.status import sync_raw_status_context
 from omnigent.inner.hook_scripts.subagent_router import AGENT_TOOL_NAMES
@@ -53,6 +55,7 @@ from omnigent.native._native_post_delivery import (
     post_external_session_status,
     post_may_have_been_delivered,
 )
+from omnigent.process_logging import harness_stderr_capture_enabled
 from omnigent.session_event_batch import (
     MAX_SESSION_EVENT_BATCH_EVENTS,
     encode_session_event_batch,
@@ -87,13 +90,9 @@ _MAX_PERSISTED_COMPACTION_SEQS = 16
 # prose answer can be hundreds of chunks.
 _MAX_SEEN_DELTA_KEYS = 5000
 
-# Seconds of transcript inactivity after which we publish ``idle`` for
-# a sub-agent. The transcript is the only signal we have for sub-agent
-# completion in Phase A (no SubagentStop hook is subscribed); 5s is the
-# shortest window that comfortably absorbs a stalled tool call without
-# flickering the badge. Phase B will replace this with an authoritative
-# hook signal and drop the heuristic.
-_SUBAGENT_IDLE_QUIESCENCE_S = 5.0
+# Seconds without transcript activity before reporting an idle observation.
+# This heuristic does not establish that the sub-agent has completed.
+_SUBAGENT_IDLE_THRESHOLD_S = 5.0
 
 # Meta-file glob inside ``~/.claude/projects/<encoded>/<session>/subagents/``.
 # One per Claude Task-tool subagent; appears alongside the matching
@@ -561,21 +560,18 @@ class SubagentEntry:
         so a failed later item can leave the cursor behind without
         re-posting earlier accepted items on the next poll.
     :param last_activity_ts: Unix timestamp of the most recent item
-        observed in this sub-agent's transcript. Used by the quiescence
+        observed in this sub-agent's transcript. Used by the inactivity
         heuristic — when ``now - last_activity_ts >
-        _SUBAGENT_IDLE_QUIESCENCE_S`` we publish an
-        ``external_session_status: quiesced`` event (a badge-only
-        signal; the server never forwards it to the runner as a
-        terminal edge). ``None`` when no items have been seen yet (so
-        the heuristic doesn't fire before there's anything to be
-        quiescent about).
-    :param last_status: Last status string POSTed for this
-        sub-agent — used to dedupe so we don't spam ``running`` or
-        ``quiesced`` events on every tick when nothing changed. ``None``
-        means no status has been posted yet.
+        _SUBAGENT_IDLE_THRESHOLD_S`` we publish an
+        ``subagent.status`` event with ``idle: true``. The server publishes
+        idle but never forwards this observation as a terminal edge.
+        ``None`` means no items have been seen, so the heuristic cannot fire.
+    :param last_status: Last observation handled for this sub-agent:
+        ``running``, ``idle``, or ``failed``. An ``idle`` observation is sent
+        through ``subagent.status`` or skipped for an older server. ``None``
+        means no observation has been handled yet.
     :param delivery_error: Durable reason the mirrored transcript is
-        incomplete. Its quiescence edge is ``failed`` instead of
-        ``quiesced``.
+        incomplete. After inactivity it reports ``failed`` instead of idle.
     """
 
     subagent_id: str
@@ -621,6 +617,47 @@ class _SessionEventBatchCapability:
     """Cache whether this server accepts arrays at the session-events route."""
 
     supported: bool | None = None
+
+
+@dataclass
+class _SubagentStatusCapability:
+    """Remember an unsupported idle event for this forwarder's server connection."""
+
+    supported: bool = True
+
+    async def post_idle(self, client: httpx.AsyncClient, *, session_id: str) -> None:
+        """Post an idle observation, or skip it once an old server rejects the type.
+
+        :param client: Omnigent HTTP client.
+        :param session_id: Child session receiving the observation.
+        :raises httpx.HTTPError: For failures other than an unknown event type.
+        """
+        if not self.supported:
+            return
+        resp = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={"type": "subagent.status", "data": {"idle": True}},
+        )
+        if resp.status_code == 400:
+            try:
+                payload = resp.json()
+            except ValueError:
+                payload = None
+            error = payload.get("error") if isinstance(payload, dict) else None
+            if (
+                isinstance(error, dict)
+                and error.get("code") == "invalid_input"
+                and isinstance(error.get("message"), str)
+                and error["message"].startswith("Unknown event type: 'subagent.status'.")
+            ):
+                if self.supported:
+                    _logger.info(
+                        "Omnigent server does not accept subagent.status; "
+                        "skipping idle observations until the forwarder restarts"
+                    )
+                self.supported = False
+                return
+        resp.raise_for_status()
 
 
 class _SubagentStateCheckpoint:
@@ -1031,6 +1068,59 @@ async def _forward_progress_timeout(
         response_hooks.remove(_response_received)
 
 
+@contextlib.asynccontextmanager
+async def _forward_claude_diagnostics(
+    bridge_dir: Path,
+    session_id: str,
+    poll_interval_s: float,
+) -> AsyncIterator[None]:
+    """Follow diagnostics independently of transcript discovery and HTTP progress."""
+    if not harness_stderr_capture_enabled():
+        yield
+        return
+
+    follower = ClaudeDebugLogFollower(bridge_dir)
+
+    def active_session_id() -> str:
+        try:
+            return read_active_session_id(bridge_dir) or session_id
+        except Exception:  # noqa: BLE001 — invalid bridge metadata must not stop diagnostics
+            return session_id
+
+    stop = asyncio.Event()
+    follower_lock = threading.Lock()
+
+    def run_serialized(operation: Callable[[str], None]) -> None:
+        # Cancelling an await cannot stop its worker thread.
+        with follower_lock:
+            operation(active_session_id())
+
+    async def poll() -> None:
+        try:
+            while not stop.is_set():
+                await asyncio.to_thread(run_serialized, follower.poll)
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(stop.wait(), timeout=poll_interval_s)
+        finally:
+            with contextlib.suppress(Exception):
+                await asyncio.shield(asyncio.to_thread(run_serialized, follower.close))
+
+    task = asyncio.create_task(poll(), name=f"claude-diagnostics-{session_id}")
+    try:
+        yield
+    finally:
+        stop.set()
+        # Let an in-flight thread finish before closing its descriptor. A second
+        # caller cancellation may return early, but the shielded task still drains.
+        try:
+            with contextlib.suppress(Exception):
+                await asyncio.shield(task)
+        except asyncio.CancelledError:
+            # A separately cancelled collector must not replace the caller's error.
+            if not task.cancelled():
+                raise
+
+
 async def forward_claude_transcript_to_session(
     *,
     base_url: str,
@@ -1097,6 +1187,7 @@ async def forward_claude_transcript_to_session(
     )
     subagent_status_retries = _PostRetryTracker()
     session_event_batch_capability = _SessionEventBatchCapability()
+    subagent_status_capability = _SubagentStatusCapability()
     # Dedupe: Claude rewrites the same usage block every poll until
     # the next assistant entry; only POST on real change. Mutated in
     # place by ``_forward_available_items`` and carried across polls.
@@ -1126,6 +1217,7 @@ async def forward_claude_transcript_to_session(
     from omnigent.cli_auth import open_server_client
 
     async with (
+        _forward_claude_diagnostics(bridge_dir, session_id, poll_interval_s),
         open_server_client(base_url, headers=headers, auth=auth, timeout=timeout) as client,
         open_server_client(
             base_url, headers=headers, auth=auth, timeout=timeout
@@ -1368,6 +1460,7 @@ async def forward_claude_transcript_to_session(
                                         item_retry_tracker=subagent_item_retries,
                                         status_retry_tracker=subagent_status_retries,
                                         batch_capability=session_event_batch_capability,
+                                        status_capability=subagent_status_capability,
                                     ),
                                     timeout=_FORWARD_LOOP_STALL_DEADLINE_S,
                                 ),
@@ -1954,6 +2047,7 @@ async def _forward_one_subagent(
     item_retry_tracker: _PostRetryTracker,
     status_retry_tracker: _PostRetryTracker,
     batch_capability: _SessionEventBatchCapability,
+    status_capability: _SubagentStatusCapability,
 ) -> None:
     """Drain one child's transcript in ordered, byte-capped batches."""
     jsonl_path = subagents_dir / f"agent-{entry.subagent_id}.jsonl"
@@ -2234,24 +2328,26 @@ async def _forward_one_subagent(
     elif (
         not delivery_pending
         and new_entry.last_activity_ts is not None
-        and now - new_entry.last_activity_ts > _SUBAGENT_IDLE_QUIESCENCE_S
+        and now - new_entry.last_activity_ts > _SUBAGENT_IDLE_THRESHOLD_S
     ):
-        # A bare transcript lull is a badge-only "quiesced", never terminal
-        # "idle": the runner delivers idle/failed as authoritative completions,
-        # and a still-running sub-agent mid tool call must not complete.
-        desired_status = "failed" if new_entry.delivery_error else "quiesced"
+        # A transcript lull is an idle observation, not an authoritative
+        # completion: the child may still be in a long-running tool call.
+        desired_status = "failed" if new_entry.delivery_error else "idle"
     if desired_status is None or desired_status == new_entry.last_status:
         return
     retry_key = f"subagent_status:{entry.child_conversation_id}"
     if status_retry_tracker.retry_delay_s(retry_key) is not None:
         return
     try:
-        await post_external_session_status(
-            client,
-            session_id=entry.child_conversation_id,
-            status=desired_status,
-            output=new_entry.delivery_error if desired_status == "failed" else None,
-        )
+        if desired_status == "idle":
+            await status_capability.post_idle(client, session_id=entry.child_conversation_id)
+        else:
+            await post_external_session_status(
+                client,
+                session_id=entry.child_conversation_id,
+                status=desired_status,
+                output=new_entry.delivery_error if desired_status == "failed" else None,
+            )
     except httpx.HTTPError as exc:
         decision = status_retry_tracker.record_failure(
             retry_key, exc, session_id=entry.child_conversation_id
@@ -2369,11 +2465,12 @@ async def _forward_available_subagents(
     item_retry_tracker: _PostRetryTracker,
     status_retry_tracker: _PostRetryTracker,
     batch_capability: _SessionEventBatchCapability | None = None,
+    status_capability: _SubagentStatusCapability | None = None,
 ) -> SubagentForwardState:
     """
     Discover new Claude Task-tool sub-agents on disk, mint Omnigent child
     conversations for them, tail their transcripts, and publish
-    quiescence-based status.
+    activity observations.
 
     Idempotent across forwarder restarts: ``state`` (persisted to
     ``subagent_forwarder.json``) holds the Omnigent child id and byte
@@ -2399,6 +2496,8 @@ async def _forward_available_subagents(
         ``status:<child_id>``).
     :param batch_capability: Process-local cache of whether the server accepts
         event arrays. A new cache is created for direct callers that omit it.
+    :param status_capability: Process-local cache of whether the server accepts
+        idle observations. A new cache is created for direct callers that omit it.
     :returns: Updated state with new sub-agents registered and
         existing sub-agents' cursors advanced.
     """
@@ -2407,6 +2506,8 @@ async def _forward_available_subagents(
         return state
     if batch_capability is None:
         batch_capability = _SessionEventBatchCapability()
+    if status_capability is None:
+        status_capability = _SubagentStatusCapability()
 
     # ── Register newly-appeared sub-agents ──────────────
     # ``glob`` is sync; offload to a thread so we don't stat the
@@ -2602,6 +2703,7 @@ async def _forward_available_subagents(
                 item_retry_tracker=item_retry_tracker,
                 status_retry_tracker=status_retry_tracker,
                 batch_capability=batch_capability,
+                status_capability=status_capability,
             )
 
     entries = list(updated.subagents.values())

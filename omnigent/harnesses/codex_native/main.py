@@ -1256,6 +1256,7 @@ async def _prepare_codex_terminal(
             _probe.bind(("127.0.0.1", 0))
             codex_ws_url = f"ws://127.0.0.1:{_probe.getsockname()[1]}"
         app_server = build_codex_native_server(
+            session_id=session_id,
             socket_path=socket_path,
             codex_home=codex_home,
             cwd=Path.cwd(),
@@ -1976,6 +1977,12 @@ async def _ensure_local_codex_resume_rollout(
             )
             return existing
         raise
+    from omnigent.inner.native_attachments import resolve_session_item_file_references
+
+    # History stores attachments as raw file_ids; restore the files so the
+    # rebuilt thread can open local cached copies, as on a live turn.
+    items = await resolve_session_item_file_references(client, session_id=session_id, items=items)
+    items = _codex_items_with_attachment_references(items, bridge_dir=codex_home.parent)
     target = _codex_resume_rollout_path(codex_home, external_session_id)
     cli_version = None
     if codex_path is not None:
@@ -2576,6 +2583,40 @@ def _codex_function_call_output_payload_from_session_item(
         "call_id": call_id,
         "output": output,
     }
+
+
+def _codex_items_with_attachment_references(
+    items: list[_JsonObject],
+    *,
+    bridge_dir: Path,
+) -> list[_JsonObject]:
+    """
+    Replace user attachment blocks with the reference lines a live turn sends.
+
+    Rollout history only carries text, so each attachment is written back to
+    the session attachment cache and referenced by path. A
+    block whose bytes never arrived becomes the could-not-load marker.
+
+    :param items: Flat Omnigent item dicts with file_ids already resolved.
+    :param bridge_dir: Session bridge path identifying the attachment cache.
+    :returns: The same items with attachment blocks turned into ``input_text``.
+    """
+    from omnigent.inner.native_attachments import attachment_reference_line
+
+    for item in items:
+        content = item.get("content")
+        if item.get("role") != "user" or not isinstance(content, list):
+            continue
+        item["content"] = [
+            {
+                "type": "input_text",
+                "text": attachment_reference_line(block, bridge_dir),
+            }
+            if isinstance(block, dict) and block.get("type") in ("input_image", "input_file")
+            else block
+            for block in content
+        ]
+    return items
 
 
 def _codex_content_blocks_from_api_content(

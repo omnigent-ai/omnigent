@@ -78,10 +78,16 @@ def test_first_message_survives_slow_terminal_startup(
     original_wait = bridge._wait_for_claude_prompt_ready
     started_at: list[float] = []
 
-    def observe_wait(socket_path: str, tmux_target: str, *, timeout_s: float) -> None:
+    def observe_wait(
+        socket_path: str,
+        tmux_target: str,
+        *,
+        timeout_s: float,
+        bridge_dir: Path | None = None,
+    ) -> None:
         started_at.append(time.monotonic())
         gate_started.touch()
-        original_wait(socket_path, tmux_target, timeout_s=timeout_s)
+        original_wait(socket_path, tmux_target, timeout_s=timeout_s, bridge_dir=bridge_dir)
 
     monkeypatch.setattr(bridge, "_wait_for_claude_prompt_ready", observe_wait)
     with tempfile.TemporaryDirectory(prefix="claude-ready-", dir="/tmp") as socket_dir:

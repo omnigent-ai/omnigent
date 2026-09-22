@@ -1046,6 +1046,62 @@ describe("TerminalSession", () => {
     session.dispose();
   });
 
+  it.each([true, false])(
+    "routes browser selections through consent without a recent-input requirement (bridge enabled: %s)",
+    (clipboardEnabled) => {
+      const onClipboardRequest = vi.fn();
+      const { container, session } = makeSession(
+        undefined,
+        undefined,
+        clipboardEnabled,
+        onClipboardRequest,
+      );
+      const term = (session as unknown as { term: Terminal }).term;
+      vi.spyOn(term, "getSelection").mockReturnValue("selected text");
+      const setData = vi.fn();
+      const copy = new Event("copy", { bubbles: true, cancelable: true });
+      Object.defineProperty(copy, "clipboardData", { value: { setData } });
+      const textarea = container.querySelector("textarea")!;
+      const bypassConsent = vi.fn();
+      textarea.addEventListener("copy", bypassConsent);
+
+      textarea.dispatchEvent(copy);
+
+      expect(copy.defaultPrevented).toBe(true);
+      expect(bypassConsent).not.toHaveBeenCalled();
+      expect(setData).not.toHaveBeenCalled();
+      expect(onClipboardRequest).toHaveBeenCalledWith("selected text", copy);
+      session.dispose();
+    },
+  );
+
+  it("does not copy a browser selection without a consent handler", () => {
+    const { container, session } = makeSession();
+    const term = (session as unknown as { term: Terminal }).term;
+    vi.spyOn(term, "getSelection").mockReturnValue("selected text");
+    const setData = vi.fn();
+    const copy = new Event("copy", { bubbles: true, cancelable: true });
+    Object.defineProperty(copy, "clipboardData", { value: { setData } });
+
+    container.querySelector("textarea")!.dispatchEvent(copy);
+
+    expect(copy.defaultPrevented).toBe(true);
+    expect(setData).not.toHaveBeenCalled();
+    session.dispose();
+  });
+
+  it("leaves copying outside a terminal selection alone", () => {
+    const onClipboardRequest = vi.fn();
+    const { container, session } = makeSession(undefined, undefined, true, onClipboardRequest);
+    const copy = new Event("copy", { bubbles: true, cancelable: true });
+
+    container.dispatchEvent(copy);
+
+    expect(copy.defaultPrevented).toBe(false);
+    expect(onClipboardRequest).not.toHaveBeenCalled();
+    session.dispose();
+  });
+
   it("forwards validated clipboard frames only after recent input", () => {
     vi.spyOn(performance, "now").mockReturnValue(10_000);
     const onClipboardRequest = vi.fn();

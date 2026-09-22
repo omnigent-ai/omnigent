@@ -9,6 +9,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -20,6 +21,7 @@ from omnigent.runner.resource_registry import (
     _TERMINAL_EXIT_OUTPUT_MAX_CHARS,
     CLAUDE_NATIVE_TERMINAL_ROLE,
     CODEX_NATIVE_TERMINAL_ROLE,
+    PI_NATIVE_TERMINAL_ROLE,
     SessionResourceRegistry,
     TerminalExitEvent,
     TerminalLifecycle,
@@ -743,7 +745,7 @@ async def test_required_terminal_exit_while_idle_is_clean_shutdown(
     )
 
     initial_activity = registry.session_activity_epoch("conv_idle")
-    # The agent worked, then its turn completed (pane quiesced → idle).
+    # The agent worked, then its turn completed (pane became quiet → idle).
     on_activity = callbacks["on_activity"]
     on_idle = callbacks["on_idle"]
     assert callable(on_activity) and callable(on_idle)
@@ -1633,3 +1635,225 @@ async def test_cleanup_session_preserves_live_native_bridge_dir(
     assert bridge_dir.exists()
     assert (bridge_dir / "bridge.json").exists()
     assert permission_hook.exists()
+
+
+@pytest.mark.asyncio
+async def test_claude_native_logs_input_ready_once_from_existing_snapshot(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OMNIGENT_RUNNER_PRIMARY_SESSION_ID", "parent")
+    caplog.set_level(logging.INFO, logger="omnigent.runner.resource_registry")
+    callbacks, _, pollers, registry = await _observe_native_with_fake_poller(tmp_path, "child")
+    instance = registry.terminal_registry.get("child", "claude", "main")
+    assert instance is not None
+    on_tick = callbacks["on_tick"]
+    assert callable(on_tick)
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            "omnigent.harnesses.claude_native.bridge.claude_pane_text_ready",
+            Mock(side_effect=RuntimeError("readiness observation failed")),
+        )
+        watcher_continues = instance._fire_watch_callback(on_tick, "tick")
+        assert watcher_continues
+        assert pollers[0].ticks == 1
+    instance._remember_pane_snapshot("Sign in to Claude")
+    on_tick()
+    assert not any(getattr(r, "event_name", None) == "native_input_ready" for r in caplog.records)
+    instance._remember_pane_snapshot("────────────────────\n❯ \n────────────────────")
+    on_tick()
+    on_tick()
+    events = [r for r in caplog.records if getattr(r, "event_name", None) == "native_input_ready"]
+    assert len(events) == 1
+    assert events[0].session_id == "child"
+    assert events[0].attributes["harness"] == "claude-native"
+    assert events[0].attributes["terminal_instance_id"] == instance.diagnostic_id
+
+
+_AUTO_MODE_BILLING_NOTICE_PANE = """────────────────────────────────────────
+  We're changing auto mode to no longer charge for classifier requests in Claude Code.
+  However, this session isn't eligible because your requests go through
+  gateway.example.com, which isn't compatible with this update.
+  Nothing breaks: auto mode keeps working, and its classifier requests are billed as before.
+  To fix it and access the new version of auto mode, ask your gateway to implement:
+  https://code.claude.com/docs/en/auto-mode-classifier-billing
+  Enter to continue · Esc to cancel
+"""
+_CLAUDE_READY_PANE = "────────────────────\n❯ \n────────────────────"
+
+
+@pytest.mark.asyncio
+async def test_claude_native_acknowledges_billing_notice_after_input_was_ready(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import omnigent.harnesses.claude_native.bridge as claude_bridge
+
+    callbacks, _, pollers, registry = await _observe_native_with_fake_poller(tmp_path, "child")
+    instance = registry.terminal_registry.get("child", "claude", "main")
+    assert instance is not None
+    on_tick = callbacks["on_tick"]
+    assert callable(on_tick)
+    bridge_dir = tmp_path / "child-bridge"
+    resolve_bridge = Mock(return_value=bridge_dir)
+    acknowledge = Mock(return_value=False)
+    monkeypatch.setattr(claude_bridge, "bridge_dir_for_conversation_id", resolve_bridge)
+    monkeypatch.setattr(claude_bridge, "acknowledge_auto_mode_billing_notice", acknowledge)
+    send_keys = Mock(side_effect=AssertionError("watcher must delegate guarded input"))
+    monkeypatch.setattr(claude_bridge, "_run_tmux", send_keys)
+
+    instance._remember_pane_snapshot(_CLAUDE_READY_PANE)
+    on_tick()
+    resolve_bridge.assert_not_called()
+    acknowledge.assert_not_called()
+
+    # A mid-turn notice still gets checked after the one-time readiness edge.
+    # Repeated cached matches may already be stale; the bridge rechecks them.
+    instance._remember_pane_snapshot(_AUTO_MODE_BILLING_NOTICE_PANE)
+    on_tick()
+    on_tick()
+
+    assert acknowledge.call_count == 2
+    acknowledge.assert_called_with(
+        bridge_dir,
+        expected_socket_path=str(instance.socket_path),
+        expected_tmux_target=instance.tmux_target,
+    )
+    resolve_bridge.assert_called_with("child")
+    send_keys.assert_not_called()
+    assert pollers[0].ticks == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transfer", [False, True])
+async def test_claude_native_billing_acknowledgement_uses_original_launch_bridge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    transfer: bool,
+) -> None:
+    import omnigent.harnesses.claude_native.bridge as claude_bridge
+
+    callbacks, _, _, registry = await _observe_native_with_fake_poller(tmp_path, "source")
+    instance = registry.terminal_registry.get("source", "claude", "main")
+    assert instance is not None
+    original_bridge = tmp_path / "cli-direct-bridge"
+    instance.args = ["--settings", str(original_bridge / "claude-settings.json")]
+    resolve_conversation_bridge = Mock(side_effect=AssertionError("wrong bridge identity"))
+    acknowledge = Mock(return_value=True)
+    monkeypatch.setattr(
+        claude_bridge, "bridge_dir_for_conversation_id", resolve_conversation_bridge
+    )
+    monkeypatch.setattr(claude_bridge, "acknowledge_auto_mode_billing_notice", acknowledge)
+
+    if transfer:
+        moved = await registry.transfer_terminal("source", "target", "terminal_claude_main")
+        assert moved is not None
+        assert registry.terminal_registry.get("target", "claude", "main") is instance
+    on_tick = callbacks["on_tick"]
+    assert callable(on_tick)
+    instance._remember_pane_snapshot(_AUTO_MODE_BILLING_NOTICE_PANE)
+    on_tick()
+
+    acknowledge.assert_called_once_with(
+        original_bridge,
+        expected_socket_path=str(instance.socket_path),
+        expected_tmux_target=instance.tmux_target,
+    )
+    resolve_conversation_bridge.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "pane",
+    [
+        "",
+        _CLAUDE_READY_PANE,
+        "────────────────────\nDo you want to run this command?\nEnter to select · Esc to cancel",
+        _AUTO_MODE_BILLING_NOTICE_PANE + _CLAUDE_READY_PANE,
+    ],
+)
+async def test_claude_native_ignores_other_panes_without_attempting_acknowledgement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    pane: str,
+) -> None:
+    import omnigent.harnesses.claude_native.bridge as claude_bridge
+
+    callbacks, _, _, registry = await _observe_native_with_fake_poller(tmp_path, "child")
+    instance = registry.terminal_registry.get("child", "claude", "main")
+    assert instance is not None
+    on_tick = callbacks["on_tick"]
+    assert callable(on_tick)
+    resolve_bridge = Mock()
+    acknowledge = Mock()
+    monkeypatch.setattr(claude_bridge, "bridge_dir_for_conversation_id", resolve_bridge)
+    monkeypatch.setattr(claude_bridge, "acknowledge_auto_mode_billing_notice", acknowledge)
+
+    instance._remember_pane_snapshot(pane)
+    on_tick()
+
+    resolve_bridge.assert_not_called()
+    acknowledge.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_claude_native_billing_acknowledgement_error_preserves_watcher(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import omnigent.harnesses.claude_native.bridge as claude_bridge
+
+    callbacks, _, pollers, registry = await _observe_native_with_fake_poller(tmp_path, "child")
+    instance = registry.terminal_registry.get("child", "claude", "main")
+    assert instance is not None
+    on_tick = callbacks["on_tick"]
+    assert callable(on_tick)
+    acknowledge = Mock(side_effect=RuntimeError("capture unavailable"))
+    monkeypatch.setattr(claude_bridge, "acknowledge_auto_mode_billing_notice", acknowledge)
+    caplog.set_level(logging.DEBUG, logger="omnigent.runner.resource_registry")
+
+    instance._remember_pane_snapshot(_AUTO_MODE_BILLING_NOTICE_PANE)
+    assert instance._fire_watch_callback(on_tick, "tick")
+    instance._remember_pane_snapshot(_CLAUDE_READY_PANE)
+    assert instance._fire_watch_callback(on_tick, "tick")
+
+    assert pollers[0].ticks == 2
+    acknowledge.assert_called_once()
+    failure = next(
+        r for r in caplog.records if "billing notice acknowledgement failed" in r.message
+    )
+    assert failure.session_id == "child"
+    assert any(getattr(r, "event_name", None) == "native_input_ready" for r in caplog.records)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role", [None, PI_NATIVE_TERMINAL_ROLE])
+async def test_non_claude_terminal_never_acknowledges_billing_notice(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    role: str | None,
+) -> None:
+    import omnigent.harnesses.claude_native.bridge as claude_bridge
+
+    terminal_registry = TerminalRegistry()
+    registry = SessionResourceRegistry(terminal_registry=terminal_registry)
+    instance = make_test_terminal_instance("shell", "main", tmp_path)
+    instance._remember_pane_snapshot(_AUTO_MODE_BILLING_NOTICE_PANE)
+    start_watcher = Mock()
+    monkeypatch.setattr(instance, "start_idle_watcher_thread", start_watcher)
+    acknowledge = Mock()
+    monkeypatch.setattr(claude_bridge, "acknowledge_auto_mode_billing_notice", acknowledge)
+    registry.set_session_status_publisher(lambda _sid, _status, _reason=None: None)
+    registry.set_terminal_activity_publisher(lambda _sid, _rid: None)
+
+    await registry.observe_required_terminal(
+        "child", "shell", "main", instance, resource_role=role
+    )
+    start_watcher.assert_called_once()
+    on_tick = start_watcher.call_args.kwargs.get("on_tick")
+    if on_tick is not None:
+        on_tick()
+
+    acknowledge.assert_not_called()

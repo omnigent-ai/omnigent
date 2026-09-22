@@ -10,10 +10,11 @@ import { cn } from "@/lib/utils";
 import { childStatus } from "@/shell/subagentStatus";
 
 /**
- * Actionable sub-agent tally for the ComposerWorkspaceBar, sitting beside the
- * background-task tally: a bot icon + count badge toggling a popover listing
- * each active, parked, or errored sub-agent. Mirrors ``BackgroundTaskIndicator`` so the two
- * counts read as one family (background shells + delegated sub-agents).
+ * Direct-child attention tally for the ComposerWorkspaceBar, sitting beside
+ * the background-task tally: a bot icon + count badge toggling a popover
+ * listing each active, parked, disconnected, or errored child. Descendant
+ * hierarchy remains in the Agents rail. Mirrors ``BackgroundTaskIndicator``
+ * so the two counts read as one family (background shells + delegated agents).
  */
 
 type IndicatorState = "active" | "parked" | "quiet" | "error";
@@ -215,12 +216,12 @@ export function SubagentTaskIndicator({ conversationId }: { conversationId: stri
             data-state={triggerState}
             aria-label={countLabel}
             className={cn(
-              "shrink-0 gap-1 px-1 md:px-2",
+              "shrink-0 gap-1 px-1 font-normal tabular-nums md:px-2",
               triggerState === "error" && "text-destructive hover:text-destructive",
               triggerState === "parked" && "text-warning hover:text-warning",
             )}
           >
-            <BotIcon className="size-3.5" aria-hidden="true" />
+            <BotIcon className="size-3.5" strokeWidth={1.5} aria-hidden="true" />
             {count}
           </Button>
         </PopoverTrigger>

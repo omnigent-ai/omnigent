@@ -103,7 +103,7 @@ import { GithubPanel } from "./GithubPanel";
 import { MobilePanelDrawer } from "./MobilePanelDrawer";
 import { isMobileViewport, Sidebar } from "./Sidebar";
 import { SidebarHeaderActions } from "./SidebarHeaderActions";
-import { useSettingsRoute } from "./settingsNav";
+import { HEADERLESS_SECTIONS, useSettingsRoute } from "./settingsNav";
 import { SubagentsPanel } from "./SubagentsPanel";
 import { useRootSessionId, useSession } from "@/hooks/useSession";
 import {
@@ -269,7 +269,11 @@ export function AppShell() {
   // reintroduce the trap: by then the title-bar toggle is back and the Back row
   // is no longer the only way out. Mirrors sidebarOpenBeforeMaximizeRef, which
   // stashes and restores the same state around the maximize flow.
-  const { inSettings } = useSettingsRoute();
+  const { inSettings, section } = useSettingsRoute();
+  // Only hide the header while the sidebar is open — it carries the
+  // sidebar-reopen control, so hiding it with the sidebar closed strands the
+  // user with no way back. Mirrors extensionOwnsHeader above.
+  const hideHeader = inSettings && HEADERLESS_SECTIONS.includes(section) && sidebarOpen;
   const sidebarOpenBeforeSettingsRef = useRef<boolean | null>(null);
   useEffect(() => {
     if (inSettings) {
@@ -2129,7 +2133,7 @@ export function AppShell() {
                   } as CSSProperties
                 }
               >
-                {!extensionOwnsHeader && (
+                {!extensionOwnsHeader && !hideHeader && (
                   <ChatHeader
                     // Real docked state — deliberately NOT `|| sidebarPeek`. Peek
                     // is a transient card floating over the collapsed layout (the

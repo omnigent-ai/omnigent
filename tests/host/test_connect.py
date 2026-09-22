@@ -721,9 +721,11 @@ async def test_handle_launch_spawns_subprocess(
     _cleanup_host(host)
 
 
+@pytest.mark.parametrize("binding_token", ["token_xyz", "", "   "])
 async def test_handle_launch_fails_for_bad_workspace(
     caplog: pytest.LogCaptureFixture,
     capsys: pytest.CaptureFixture[str],
+    binding_token: str,
 ) -> None:
     """
     Verify that _handle_launch returns status='failed' when the
@@ -735,7 +737,7 @@ async def test_handle_launch_fails_for_bad_workspace(
     host = _make_host_process()
     frame = HostLaunchRunnerFrame(
         request_id="req_002",
-        binding_token="token_xyz",
+        binding_token=binding_token,
         workspace="/nonexistent/path/that/does/not/exist",
         session_id="session_missing_workspace",
     )
@@ -750,6 +752,17 @@ async def test_handle_launch_fails_for_bad_workspace(
         f"Error should mention path doesn't exist, got: {result.error!r}"
     )
     assert result.runner_id is None
+    failure = next(
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "runner_launch_failed"
+    )
+    assert failure.session_id == frame.session_id
+    assert failure.attributes["runner_id"] == (
+        token_bound_runner_id(binding_token) if binding_token.strip() else None
+    )
+    assert failure.attributes["host_request_id"] == frame.request_id
+    assert failure.attributes["error_code"] == WORKSPACE_MISSING_ERROR_CODE
     assert "session_missing_workspace" in caplog.text
     assert "/nonexistent/path/that/does/not/exist" in caplog.text
     output = capsys.readouterr().out
@@ -758,9 +771,11 @@ async def test_handle_launch_fails_for_bad_workspace(
     assert "/nonexistent/path/that/does/not/exist" in output
 
 
+@pytest.mark.parametrize("binding_token", ["token_abc", "", "   "])
 async def test_handle_launch_refuses_unconfigured_harness(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    binding_token: str,
 ) -> None:
     """
     Verify _handle_launch refuses to spawn when the frame's harness is
@@ -784,7 +799,7 @@ async def test_handle_launch_refuses_unconfigured_harness(
 
     frame = HostLaunchRunnerFrame(
         request_id="req_unconfigured",
-        binding_token="token_abc",
+        binding_token=binding_token,
         workspace=str(workspace),
         harness="codex",
     )
@@ -3362,6 +3377,43 @@ def test_build_runner_env_passthrough_survives_remote_daemon_hop(
     # The named var reaches the runner; an unnamed one does not.
     assert runner_env["DATABRICKS_LINEAR_API_KEY"] == "lin-secret"
     assert "DATABRICKS_UNNAMED" not in runner_env
+
+
+@pytest.mark.parametrize("server_url", [None, "https://example.databricksapps.com"])
+@pytest.mark.parametrize("setting", [None, "1", "0"])
+async def test_harness_stderr_opt_in_survives_daemon_and_runner_hops(
+    monkeypatch: pytest.MonkeyPatch,
+    server_url: str | None,
+    setting: str | None,
+) -> None:
+    """Forward an explicit capture setting without enabling capture by default."""
+    from omnigent.cli import _build_host_daemon_env
+
+    flag_name = "OMNIGENT_HARNESS_STDERR_ENABLED"
+    sibling_name = "OMNIGENT_HARNESS_STDERR_UNRELATED"
+    monkeypatch.delenv(flag_name, raising=False)
+    monkeypatch.delenv("OMNIGENT_RUNNER_ENV_PASSTHROUGH", raising=False)
+    monkeypatch.setenv(sibling_name, "must-not-forward")
+    monkeypatch.setattr("omnigent.onboarding.provider_config.load_config", dict)
+    if setting is not None:
+        monkeypatch.setenv(flag_name, setting)
+
+    daemon_env = _build_host_daemon_env(server_url=server_url)
+    runner_env = _build_runner_env(
+        daemon_env,
+        server_url=server_url or "http://localhost:8000",
+        runner_id="runner_abc",
+        binding_token="tok",
+        workspace="/ws",
+        parent_pid=42,
+    )
+
+    for env in (daemon_env, runner_env):
+        if setting is None:
+            assert flag_name not in env
+        else:
+            assert env[flag_name] == setting
+    assert sibling_name not in runner_env
 
 
 def test_build_runner_env_preserves_ambient_databricks_profile() -> None:

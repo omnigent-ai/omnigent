@@ -2644,6 +2644,32 @@ def test_truncate_label_empty_string() -> None:
 # ── _persist_session_status_error_labels ─────────────────────────────────────
 
 
+@pytest.mark.parametrize(
+    ("response_id", "names", "expected"),
+    [
+        ("failed_turn", ["claude-native-ui"], "claude-native-ui"),
+        ("failed_turn", ["claude-native-ui", "codex-native-ui"], None),
+        ("other_turn", ["claude-native-ui"], None),
+        (None, ["claude-native-ui"], None),
+    ],
+)
+def test_status_error_identity_requires_an_unambiguous_response(
+    response_id: str | None, names: list[str], expected: str | None
+) -> None:
+    from omnigent.entities import MessageData
+    from omnigent.server.routes._sessions.helpers import _response_agent_name_from_store
+
+    items = [
+        SimpleNamespace(
+            response_id="failed_turn",
+            data=MessageData(role="assistant", agent=name, content=[]),
+        )
+        for name in names
+    ]
+    store = SimpleNamespace(list_items=lambda *args, **kwargs: SimpleNamespace(data=items))
+    assert _response_agent_name_from_store(store, "session", response_id) == expected
+
+
 @pytest.mark.asyncio
 async def test_persist_error_labels_truncates_long_message() -> None:
     """A failure message longer than 256 chars is truncated before the store
@@ -2775,12 +2801,13 @@ async def test_persist_and_project_structured_error_round_trip() -> None:
         remediation="Run the host as a non-root user (uid != 0).",
     )
     await _persist_session_status_error_labels(
-        "aa11bb22cc33dd44ee55ff6677889900", error, _MockStore()
+        "aa11bb22cc33dd44ee55ff6677889900", error, _MockStore(), agent_name="claude-native-ui"
     )  # type: ignore[arg-type]
 
     labels = captured["aa11bb22cc33dd44ee55ff6677889900"]
     projected = _last_task_error_from_labels(labels)
     assert projected == {
+        "agent_name": "claude-native-ui",
         "code": "required_terminal_exited",
         "message": "Claude Code can't run as root\n\n...diagnostics...",
         "title": "Claude Code can't run as root",
@@ -2816,6 +2843,7 @@ async def test_persist_error_labels_clears_stale_structured_fields() -> None:
     assert labels["omnigent.last_task_error_title"] == ""
     assert labels["omnigent.last_task_error_cause"] == ""
     assert labels["omnigent.last_task_error_remediation"] == ""
+    assert labels["omnigent.last_task_error_agent_name"] == ""
     assert _last_task_error_from_labels(labels) == {
         "code": "runner_error",
         "message": "turn setup failed",

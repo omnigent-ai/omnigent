@@ -16,12 +16,14 @@ from omnigent.harnesses.claude_native import bridge as claude_bridge
 from omnigent.harnesses.claude_native.bridge import (
     REQUEST_SESSION_ID_ENV_VAR,
     ClaudePromptTimeout,
+    ClaudeTerminalDialog,
     ClaudeTerminalExited,
     TmuxSessionNotAdvertised,
 )
 from omnigent.inner import claude_native_executor
 from omnigent.inner.claude_native_executor import ClaudeNativeExecutor
 from omnigent.inner.executor import ExecutorConfig, ExecutorError, TurnComplete
+from omnigent.inner.native_attachments import attachment_cache_dir
 
 # Minimal valid 1x1 white PNG used for multimodal attachment tests.
 _TINY_PNG_B64 = (
@@ -599,7 +601,7 @@ async def test_run_turn_materializes_image_to_bridge_dir(
     )
 
     # The file was written to disk with the correct content.
-    uploads = tmp_path / "uploads"
+    uploads = attachment_cache_dir(tmp_path)
     written = list(uploads.iterdir())
     # Exactly 1 file — the materialized PNG.
     assert len(written) == 1, (
@@ -774,7 +776,93 @@ async def test_run_turn_unresolved_file_id_emits_visible_marker(
     # The unresolved image block becomes a visible marker, not a silent drop.
     assert sent[0]["content"] == ("[Attachment file_abc123 could not be loaded]\n\nanalyze this")
     # No uploads directory created — nothing to materialize.
-    assert not (tmp_path / "uploads").exists()
+    assert not (attachment_cache_dir(tmp_path)).exists()
+
+
+@pytest.mark.asyncio
+async def test_run_turn_materializes_zip_outside_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A ZIP reaches Claude by absolute cache path without changing the checkout."""
+    import json
+
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    (tmp_path / "bridge.json").write_text(json.dumps({"workspace": str(workspace)}))
+
+    sent: list[dict[str, Any]] = []
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", _stub_inject(sent))
+
+    zip_bytes = b"PK\x03\x04 fake zip"
+    executor = ClaudeNativeExecutor(tmp_path)
+    events = [
+        event
+        async for event in executor.run_turn(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_file",
+                            "file_data": (
+                                "data:application/zip;base64,"
+                                f"{base64.b64encode(zip_bytes).decode()}"
+                            ),
+                            "filename": "bundle.zip",
+                        },
+                        {"type": "input_text", "text": "what is in here?"},
+                    ],
+                }
+            ],
+            tools=[],
+            system_prompt="ignored",
+        )
+    ]
+
+    assert events == [TurnComplete(response=None)]
+    materialized = attachment_cache_dir(tmp_path) / "bundle.zip"
+    assert materialized.read_bytes() == zip_bytes
+    assert list(workspace.iterdir()) == []
+    assert f"[Attached: {materialized}]" in sent[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_run_turn_materializes_zip_without_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Attachment delivery works before any workspace is recorded at launch."""
+    sent: list[dict[str, Any]] = []
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", _stub_inject(sent))
+
+    executor = ClaudeNativeExecutor(tmp_path)
+    events = [
+        event
+        async for event in executor.run_turn(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_file",
+                            "file_data": "data:application/zip;base64,UEsDBA==",
+                            "filename": "bundle.zip",
+                        },
+                        {"type": "input_text", "text": "unpack this"},
+                    ],
+                }
+            ],
+            tools=[],
+            system_prompt="ignored",
+        )
+    ]
+
+    assert events == [TurnComplete(response=None)]
+    assert (
+        sent[0]["content"]
+        == f"[Attached: {attachment_cache_dir(tmp_path) / 'bundle.zip'}]\n\nunpack this"
+    )
 
 
 @pytest.mark.asyncio
@@ -821,7 +909,7 @@ async def test_run_turn_dedup_same_filename(
     ]
 
     assert events == [TurnComplete(response=None)]
-    uploads = tmp_path / "uploads"
+    uploads = attachment_cache_dir(tmp_path)
     written = sorted(uploads.iterdir())
     # Two distinct files, not one overwritten file.
     assert len(written) == 2, (
@@ -866,7 +954,7 @@ async def test_run_turn_image_without_filename_gets_generated_name(
     ]
 
     assert events == [TurnComplete(response=None)]
-    uploads = tmp_path / "uploads"
+    uploads = attachment_cache_dir(tmp_path)
     written = list(uploads.iterdir())
     assert len(written) == 1
     # Generated name should have .png extension from the data URI MIME.
@@ -918,7 +1006,7 @@ async def test_enqueue_session_message_materializes_image(
     assert "downscaled" not in injected
     assert (tmp_path / CLAUDE_FRAMEWORK_CONTEXT_FILE).read_text() == resize_notice(dimensions)
     # File was written to the bridge directory.
-    written = list((tmp_path / "uploads").iterdir())
+    written = list((attachment_cache_dir(tmp_path)).iterdir())
     assert len(written) == 1
     assert written[0].name == "steering_img.png"
     assert await executor.enqueue_session_message("session-key", "follow-up")
@@ -967,7 +1055,7 @@ async def test_run_turn_malformed_data_uri_emits_visible_marker(
     assert len(sent) == 1
     assert sent[0]["content"] == ("[Attachment attachment could not be loaded]\n\nstill send this")
     # No file written for the malformed URI.
-    assert not (tmp_path / "uploads").exists()
+    assert not (attachment_cache_dir(tmp_path)).exists()
 
 
 @pytest.mark.asyncio
@@ -1007,7 +1095,7 @@ async def test_run_turn_path_traversal_filename_sanitized(
     ]
 
     assert events == [TurnComplete(response=None)]
-    uploads = tmp_path / "uploads"
+    uploads = attachment_cache_dir(tmp_path)
     written = list(uploads.iterdir())
     assert len(written) == 1
     assert written[0].name == ".bashrc"
@@ -1517,6 +1605,51 @@ async def test_run_turn_reaps_tmux_before_reporting_prompt_timeout(
     assert killed == [bridge_dir]
     assert len(events) == 1
     assert isinstance(events[0], ExecutorError)
+
+
+@pytest.mark.asyncio
+async def test_run_turn_keeps_the_pane_when_a_terminal_dialog_blocks_delivery(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    A dialog holding the terminal fails the turn without reaping the pane.
+
+    The person answers the dialog in the embedded terminal and resends, so
+    killing the pane would destroy the very thing they need. Only readiness
+    timeouts reap; the dialog error takes the plain delivery-failure path.
+    """
+    bridge_dir = tmp_path / "bridge"
+    killed: list[Path] = []
+
+    def fail_inject(bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0) -> None:
+        del bridge_dir_arg, content, timeout_s
+        raise ClaudeTerminalDialog(
+            "Claude Code is waiting for an answer in its terminal "
+            "(New MCP server found in this project: e2e-noop), so the message was not delivered."
+        )
+
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", fail_inject)
+    monkeypatch.setattr(
+        claude_native_executor,
+        "kill_session",
+        lambda bridge_dir_arg, *, timeout_s: killed.append(bridge_dir_arg),
+    )
+
+    executor = ClaudeNativeExecutor(bridge_dir)
+    events = [
+        event
+        async for event in executor.run_turn(
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[],
+            system_prompt="",
+        )
+    ]
+
+    assert killed == []
+    assert len(events) == 1
+    assert isinstance(events[0], ExecutorError)
+    assert "waiting for an answer" in events[0].message
 
 
 @pytest.mark.asyncio

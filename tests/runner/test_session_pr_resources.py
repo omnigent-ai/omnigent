@@ -6,6 +6,8 @@ import base64
 import json
 import time
 from pathlib import Path
+from threading import Barrier
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -15,6 +17,7 @@ from filelock import Timeout as FileLockTimeout
 from omnigent.runner import create_runner_app
 from omnigent.runner import github_resource as github
 from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry
+from tests.budgets import budget
 from tests.runner.helpers import NullServerClient
 
 A = "https://github.com/example/one/pull/42"
@@ -193,6 +196,8 @@ def test_branch_inference_reuses_selected_title(
 def test_slow_title_lookups_preserve_metadata_and_leave_queued_prs_for_next_poll(
     tracked: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    clock = 10.0
+    monkeypatch.setattr(github, "time", SimpleNamespace(monotonic=lambda: clock, time=time.time))
     registry = SessionPrRegistry("session")
     registry.record(
         [PullRequestRef.from_url(A.replace("42", str(number))) for number in range(43, 49)],
@@ -201,23 +206,29 @@ def test_slow_title_lookups_preserve_metadata_and_leave_queued_prs_for_next_poll
     )
     monkeypatch.setattr(github, "_PR_TITLE_LOOKUP_SECONDS", 0.2)
     attempted: list[str] = []
+    title_lookups = Barrier(4, timeout=budget(5))
 
     def run(argv: list[str], *, timeout: float, **_kwargs: object) -> tuple[int | None, str, str]:
+        nonlocal clock
         if argv[-1] != "title":
             assert github._pr_title_deadline.get() is None
             assert timeout == github._gh_timeout_seconds()
             return 0, '{"title": "Selected PR"}', ""
         assert 0 < timeout <= 0.2
         attempted.append(argv[3])
-        time.sleep(timeout)
+        deadline = github._pr_title_deadline.get()
+        assert deadline is not None
+        title_lookups.wait()
+        # Concurrent timeouts expire at the same deadline, regardless of scheduling.
+        clock = deadline
         return None, "", "timed out"
 
     monkeypatch.setattr(github, "_run", run)
-    started = time.monotonic()
+    started = clock
     info = github.github_info(tracked, session_id="session", pr_url=B)
-    assert time.monotonic() - started < 1
+    assert clock - started == pytest.approx(0.2)
     assert info["pr"]["title"] == "Selected PR"
-    assert 1 <= len(attempted) <= 4
+    assert len(attempted) == 4
     skipped = {entry.url for entry in registry.list() if entry.title_checked_at == 0}
     assert len(skipped) == 7 - len(attempted)
 

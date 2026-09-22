@@ -29,7 +29,7 @@ import type {
   ToolGroup,
   UserMessageBlock,
 } from "@/lib/blocks";
-import type { ConversationItem } from "@/lib/conversationItems";
+import type { ConversationItem, MessageItem } from "@/lib/conversationItems";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
 import { buildBubbles } from "@/lib/renderItems";
 import { getSessionSlim, INITIAL_WINDOW_ITEMS, SESSION_HISTORY_PAGE_SIZE } from "@/lib/sessionsApi";
@@ -1562,6 +1562,88 @@ describe("chatStore — switchTo", () => {
 
       expect(useChatStore.getState().isNativeTerminalSession).toBe(expectedNative);
       expect(useChatStore.getState().nativeVendorOwnsModel).toBe(expectedVendorOwnsModel);
+    },
+  );
+
+  it.each([
+    ["nessie", undefined, "Nessie ran into an error during this turn."],
+    [
+      "Release Reviewer (fork ag_copy)",
+      undefined,
+      "Release Reviewer ran into an error during this turn.",
+    ],
+    ["claude-native-ui", "Usage limit reached", "Usage limit reached"],
+  ])(
+    "hydrates a failed session headline for agent_name=%s, title=%s",
+    async (agentName, title, expectedTitle) => {
+      seedSession("conv_named_error", []);
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (
+          url.split("?")[0] === "/v1/sessions/conv_named_error" &&
+          (init?.method ?? "GET") === "GET"
+        ) {
+          return mockResponse({
+            id: "conv_named_error",
+            agent_id: "ag_custom",
+            agent_name: agentName,
+            status: "failed",
+            created_at: 0,
+            items: [],
+            last_task_error: {
+              code: "executor_error",
+              message: "The turn failed.",
+              agent_name: agentName,
+              title,
+            },
+          });
+        }
+        return defaultFetchHandler(input, init);
+      });
+
+      await useChatStore.getState().switchTo("conv_named_error");
+
+      expect(useChatStore.getState().boundAgentName).toBe(agentName);
+      expect(useChatStore.getState().blocks.find((block) => block.type === "error")).toMatchObject({
+        title: expectedTitle,
+        code: "executor_error",
+        message: "The turn failed.",
+      });
+    },
+  );
+
+  it.each(["claude-native-ui", undefined])(
+    "does not attribute an old snapshot error to the new binding (saved name=%s)",
+    async (failureAgentName) => {
+      seedSession("conv_switched_error", []);
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input).split("?")[0];
+        if (url === "/v1/sessions/conv_switched_error" && (init?.method ?? "GET") === "GET") {
+          return mockResponse({
+            id: "conv_switched_error",
+            agent_id: "ag_codex",
+            agent_name: "codex-native-ui",
+            status: "failed",
+            created_at: 0,
+            items: [],
+            last_task_error: {
+              code: "native_turn_error",
+              message: "Claude's original diagnostic.",
+              agent_name: failureAgentName,
+            },
+          });
+        }
+        return defaultFetchHandler(input, init);
+      });
+
+      await useChatStore.getState().switchTo("conv_switched_error");
+
+      expect(useChatStore.getState().boundAgentName).toBe("codex-native-ui");
+      const error = useChatStore.getState().blocks.find((block) => block.type === "error");
+      expect(error?.message).toBe("Claude's original diagnostic.");
+      expect(error?.title).toBe(
+        failureAgentName ? "Claude Code ran into an error during this turn." : undefined,
+      );
     },
   );
 
@@ -4837,39 +4919,111 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       expect(useChatStore.getState().sessionStatus).toBe("waiting");
     });
 
-    it("surfaces one terminal error per native response", () => {
-      useChatStore.setState({ blocks: [] });
-      const error = {
-        code: "codex_turn_error",
-        message: "You've hit your usage limit.",
-      };
+    it.each([
+      {
+        agentName: "claude-native-ui (fork ag_old) (switch ag_current)",
+        code: "native_turn_error",
+        displayName: "Claude Code",
+      },
+      { agentName: "codex-native-ui", code: "codex_turn_error", displayName: "Codex" },
+      { agentName: "polly (fork ag_copy)", code: "executor_error", displayName: "Polly" },
+    ])(
+      "surfaces one named turn error per $displayName response",
+      ({ agentName, code, displayName }) => {
+        useChatStore.setState({
+          blocks: itemsToBlocks(
+            ["codex_turn_1", "codex_turn_2"].map(
+              (responseId) =>
+                ({
+                  ...assistantMessage(responseId, "Turn output"),
+                  model: agentName,
+                }) as MessageItem,
+            ),
+          ),
+          boundAgentName: "a-different-current-agent",
+        });
+        const error = {
+          code,
+          message: "You've hit your usage limit.",
+        };
 
-      handleSessionEvent({
-        type: "session_status",
-        conversationId: "conv_abc",
-        status: "failed",
-        responseId: "codex_turn_1",
-        error,
-      });
-      handleSessionEvent({
-        type: "session_status",
-        conversationId: "conv_abc",
-        status: "failed",
-        responseId: "codex_turn_1",
-        error,
-      });
-      handleSessionEvent({
-        type: "session_status",
-        conversationId: "conv_abc",
-        status: "failed",
-        responseId: "codex_turn_2",
-        error,
-      });
+        handleSessionEvent({
+          type: "session_status",
+          conversationId: "conv_abc",
+          status: "failed",
+          responseId: "codex_turn_1",
+          error,
+        });
+        handleSessionEvent({
+          type: "session_status",
+          conversationId: "conv_abc",
+          status: "failed",
+          responseId: "codex_turn_1",
+          error,
+        });
+        handleSessionEvent({
+          type: "session_status",
+          conversationId: "conv_abc",
+          status: "failed",
+          responseId: "codex_turn_2",
+          error,
+        });
 
-      const errors = useChatStore.getState().blocks.filter((block) => block.type === "error");
-      expect(errors).toHaveLength(2);
-      expect(errors.map((block) => block.ctx.responseId)).toEqual(["codex_turn_1", "codex_turn_2"]);
-    });
+        const errors = useChatStore.getState().blocks.filter((block) => block.type === "error");
+        expect(errors).toHaveLength(2);
+        expect(errors.map((block) => block.ctx.responseId)).toEqual([
+          "codex_turn_1",
+          "codex_turn_2",
+        ]);
+        for (const block of errors) {
+          expect(block).toMatchObject({
+            ...error,
+            title: `${displayName} ran into an error during this turn.`,
+          });
+        }
+
+        handleSessionEvent({
+          type: "session_agent_changed",
+          conversationId: "conv_abc",
+          agentId: "ag_new",
+          agentName: "pi-native-ui",
+        });
+        expect(useChatStore.getState().boundAgentName).toBe("pi-native-ui");
+        expect(useChatStore.getState().blocks.filter((block) => block.type === "error")).toEqual(
+          errors,
+        );
+      },
+    );
+
+    it.each([false, true])(
+      "keeps an unowned status error generic (conflicting=%s)",
+      (conflicting) => {
+        const blocks = conflicting
+          ? itemsToBlocks([
+              {
+                ...assistantMessage("old_turn", "Claude output"),
+                model: "claude-native-ui",
+              } as MessageItem,
+              {
+                ...assistantMessage("old_turn", "Codex output"),
+                id: "second_speaker",
+                model: "codex-native-ui",
+              } as MessageItem,
+            ])
+          : [];
+        useChatStore.setState({ blocks, boundAgentName: "codex-native-ui" });
+        handleSessionEvent({
+          type: "session_status",
+          conversationId: "conv_abc",
+          status: "failed",
+          responseId: "old_turn",
+          error: { code: "native_turn_error", message: "Delayed failure." },
+        });
+        const error = useChatStore.getState().blocks.find((block) => block.type === "error");
+        expect(error?.message).toBe("Delayed failure.");
+        expect(error?.title).toBeUndefined();
+      },
+    );
 
     it("idle clears local streaming when no active response will send response_end", () => {
       useChatStore.setState({
@@ -14107,6 +14261,56 @@ describe("chatStore — origin-wide stream slots", () => {
     expect(useChatStore.getState().streamBudgetExceeded).toBe(true);
     expect(useChatStore.getState().streamBudgetBannerDismissed).toBe(false);
   });
+});
+
+it("renders one named error for metadata-less runner failure and status frames", async () => {
+  useChatStore.setState({
+    conversationId: "conv_metadata_less",
+    boundAgentName: "release-reviewer",
+    blocks: [],
+  });
+  const sink = pushableStream();
+  const controller = new AbortController();
+  const setState = useChatStore.setState as unknown as Parameters<typeof pumpStreamEvents>[3];
+  const getState = useChatStore.getState as unknown as Parameters<typeof pumpStreamEvents>[4];
+  const immediate: FrameScheduler = { schedule: (cb) => cb(), cancel: () => {} };
+  void pumpStreamEvents(
+    "conv_metadata_less",
+    sink.stream,
+    controller,
+    setState,
+    getState,
+    immediate,
+  );
+  try {
+    sink.push(
+      sse("response.in_progress", {
+        id: "resp_metadata_less",
+        model: "release-reviewer",
+        status: "in_progress",
+      }),
+    );
+    await tick();
+    const error = { code: "RuntimeError", message: "Harness stopped." };
+    sink.push(sse("response.failed", { source: "harness", response: { status: "failed", error } }));
+    await tick();
+    sink.push(
+      sse("session.status", { conversation_id: "conv_metadata_less", status: "failed", error }),
+    );
+    await tick();
+
+    const state = useChatStore.getState();
+    expect(state.blocks.filter((block) => block.type === "error")).toMatchObject([
+      {
+        ...error,
+        title: "Release-reviewer ran into an error during this turn.",
+        ctx: { responseId: "resp_metadata_less" },
+      },
+    ]);
+    expect(state.activeResponse?.state).toBe("failed");
+  } finally {
+    controller.abort();
+  }
 });
 
 describe("chatStore — interaction_phase analytics", () => {

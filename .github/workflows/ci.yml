@@ -169,6 +169,12 @@ jobs:
         with:
           enable-cache: true
 
+      - name: Set up Node.js for local relay tests
+        if: matrix.group == 'misc'
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+
       - name: Install test system dependencies
         # ripgrep: the Grep tool prefers it. bubblewrap: the linux_bwrap sandbox
         # needs it. tmux: the integration-mock shard spawns harness terminals.
@@ -431,7 +437,11 @@ jobs:
           key: codex-parity-bin-${{ runner.os }}-${{ steps.rustc.outputs.version }}-${{ hashFiles('tests/codex_parity/sidecar/**') }}
 
       - name: Set up pnpm
+        # This job never runs pnpm install, so caching the (empty) pnpm store
+        # makes setup-node's post-step fail on a cache miss.
         uses: ./.github/actions/setup-pnpm
+        with:
+          cache: ""
 
       - name: Install codex CLI
         uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@aa5736c38f5c1258ee29452c6825d75033b952d7

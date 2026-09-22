@@ -415,6 +415,7 @@ export interface Session {
   lastTaskError?: {
     code: string;
     message: string;
+    agent_name?: string;
     title?: string;
     cause?: string;
     remediation?: string;

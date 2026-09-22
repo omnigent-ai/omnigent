@@ -7,9 +7,11 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
+from filelock import FileLock
 
 from omnigent.runner.pr_observer import extract_prs, observe_hook
 from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry
+from tests.budgets import budget
 
 A = "https://github.com/example/one/pull/42"
 B = "https://github.com/example/two/pull/42"
@@ -616,7 +618,15 @@ def test_title_cache_preserves_newer_timeout_marker(
     assert store.list() == latest
 
 
-def test_concurrent_writers_preserve_all_prs(tmp_path: Path) -> None:
+def test_concurrent_writers_preserve_all_prs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Allow serialized durable writes to finish even on a busy CI filesystem.
+    monkeypatch.setattr(
+        "omnigent.runner.session_prs.FileLock",
+        lambda path, **_kwargs: FileLock(path, timeout=budget(10)),
+    )
+
     def write(number: int) -> None:
         store = SessionPrRegistry("conv_a", root=tmp_path)
         store.record(
@@ -627,7 +637,11 @@ def test_concurrent_writers_preserve_all_prs(tmp_path: Path) -> None:
 
     with ThreadPoolExecutor(max_workers=8) as pool:
         list(pool.map(write, range(1, 17)))
-    assert len(SessionPrRegistry("conv_a", root=tmp_path).list()) == 16
+    prs = SessionPrRegistry("conv_a", root=tmp_path).list()
+    assert len(prs) == 16
+    assert {pr.url for pr in prs} == {
+        f"https://github.com/example/one/pull/{number}" for number in range(1, 17)
+    }
 
 
 def test_corruption_is_not_overwritten(tmp_path: Path) -> None:

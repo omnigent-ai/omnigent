@@ -11,7 +11,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import httpx
 import yaml
@@ -40,6 +40,7 @@ from omnigent.spec.types import MCPServerConfig
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.permission_store import PermissionStore
+from omnigent.util.ssrf import host_is_internal
 
 if TYPE_CHECKING:
     from omnigent.runner.routing import RunnerRouter
@@ -54,6 +55,53 @@ class _McpLocation:
     source: Literal["file", "inline"]
     path: Path
     raw: dict[str, Any]
+
+
+# Registration-time SSRF / multi-tenant-RCE guard for MCP-server declarations:
+# reject an http url that targets a non-public host, and stdio transport on a
+# multi-tenant server, before the declaration is persisted. Host classification
+# is shared (omnigent.util.ssrf) with the connect-time redirect guard in
+# omnigent.tools.mcp, so both enforcement points agree on what "internal" means.
+
+
+def assert_mcp_server_request_safe(body: UpsertMCPServerRequest) -> None:
+    """
+    Reject an MCP-server declaration that enables SSRF or multi-tenant RCE.
+
+    - ``http``: the url must not target a non-public address (SSRF to cloud
+      metadata / internal services).
+    - ``stdio``: forbidden on a multi-tenant server, where the command would be
+      spawned on shared runner infrastructure with access to other tenants'
+      runner environment (RCE). A single-user/local server still allows it.
+
+    :param body: The create/update request body.
+    :raises OmnigentError: ``FORBIDDEN`` when the declaration is not permitted.
+    """
+    if body.transport == "stdio":
+        if not local_single_user_enabled():
+            raise OmnigentError(
+                "stdio MCP servers are not permitted on this server; use an http transport.",
+                code=ErrorCode.FORBIDDEN,
+            )
+        return
+    if body.transport == "http" and body.url:
+        # A single-user / local server has no other tenant to protect and is
+        # expected to reach its own loopback services, so it may target internal
+        # endpoints — mirroring the stdio carve-out above.
+        if local_single_user_enabled():
+            return
+        try:
+            host = urlsplit(body.url).hostname
+        except ValueError:
+            # Malformed authority (e.g. an unclosed IPv6 literal `http://[::1`).
+            host = None
+        if not host or host_is_internal(host):
+            raise OmnigentError(
+                "MCP server url must be a public http(s) endpoint; loopback, "
+                "private, shared, link-local and cloud-metadata addresses are "
+                "not allowed.",
+                code=ErrorCode.FORBIDDEN,
+            )
 
 
 def create_session_mcp_servers_router(
@@ -120,6 +168,7 @@ def create_session_mcp_servers_router(
     ) -> MCPServerSummary:
         """Create one MCP server declaration on a session-scoped agent."""
         agent, user_id = await _editable_agent(request, session_id)
+        await asyncio.to_thread(assert_mcp_server_request_safe, body)
         spec = await asyncio.to_thread(
             _mutate_bundle,
             agent,
@@ -142,6 +191,7 @@ def create_session_mcp_servers_router(
     ) -> MCPServerSummary:
         """Replace one MCP server declaration on a session-scoped agent."""
         agent, user_id = await _editable_agent(request, session_id)
+        await asyncio.to_thread(assert_mcp_server_request_safe, body)
         spec = await asyncio.to_thread(
             _mutate_bundle,
             agent,

@@ -22,6 +22,8 @@ describe("ComposerWorkspaceStatus", () => {
     const worktree = screen.getByTestId("composer-git-branch");
     expect(directory).toHaveTextContent("repo");
     expect(worktree).toHaveTextContent("feature/login");
+    expect(directory).toHaveAccessibleName("Working directory: /home/alice/repo");
+    expect(worktree).toHaveAccessibleName("Worktree: feature/login");
     expect(directory.tagName).toBe("SPAN");
     expect(worktree.tagName).toBe("SPAN");
     expect(directory).toHaveClass("text-muted-foreground");
