@@ -10737,6 +10737,64 @@ async def test_claude_model_catalog_marks_the_launch_pin_as_default(
     ]
 
 
+@pytest.mark.parametrize("picker_state", ["listed", "off-list", "disabled", "empty"])
+async def test_custom_provider_catalog_preserves_declared_anthropic_model(
+    monkeypatch: pytest.MonkeyPatch, picker_state: str
+) -> None:
+    """A custom endpoint may explicitly serve canonical Anthropic model IDs."""
+    model = "claude-sonnet-4-20250514"
+
+    async def probe(config: object) -> claude_native.ClaudeModelProbe:
+        return claude_native.ClaudeModelProbe(
+            alias_rows=[
+                {"id": "opus", "model": "claude-opus-5", "displayName": "Opus"},
+                *(
+                    [{"id": "sonnet", "model": model, "displayName": "Sonnet"}]
+                    if picker_state == "listed"
+                    else []
+                ),
+            ],
+            default_model="claude-opus-5",
+            disabled_models=frozenset({model}) if picker_state == "disabled" else frozenset(),
+            empty_picker=picker_state == "empty",
+        )
+
+    monkeypatch.setattr(claude_native, "probe_claude_model_options", probe)
+    config = claude_native.ClaudeNativeUcodeConfig(
+        env={"ANTHROPIC_BASE_URL": "https://proxy.example/anthropic"},
+        model=model,
+        routable_models=(model,),
+    )
+    rows = await claude_native.claude_model_catalog(config)
+    if picker_state in {"disabled", "empty"}:
+        assert rows == []
+    else:
+        assert rows == [
+            {
+                "id": "sonnet" if picker_state == "listed" else model,
+                "model": model,
+                "displayName": "Sonnet" if picker_state == "listed" else model,
+                "isDefault": True,
+            }
+        ]
+
+
+def test_catalog_fingerprint_changes_with_declared_routable_models(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A new provider declaration must not reuse an empty filtered catalog."""
+    _point_claude_at(monkeypatch, tmp_path / "claude")
+    (tmp_path / "claude").write_text("binary")
+    kwargs = {"env": {"ANTHROPIC_BASE_URL": "https://proxy.example/anthropic"}}
+    unknown = claude_native.ClaudeNativeUcodeConfig(**kwargs)
+    declared = claude_native.ClaudeNativeUcodeConfig(
+        **kwargs, routable_models=("claude-sonnet-4-20250514",)
+    )
+    assert claude_native.claude_catalog_fingerprint(unknown) != (
+        claude_native.claude_catalog_fingerprint(declared)
+    )
+
+
 async def test_claude_launch_catalog_reads_the_store_then_probes_once(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

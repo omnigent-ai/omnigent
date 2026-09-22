@@ -1300,10 +1300,11 @@ def claude_catalog_fingerprint(claude_config: ClaudeNativeUcodeConfig | None) ->
     ambient_gateway = os.environ.get(_UCODE_CLAUDE_BASE_URL_ENV) if claude_config is None else None
     return fingerprint_of(
         "claude-native",
-        "control-picker-v2",
+        "control-picker-v3",
         sorted(claude_config.env.items()) if claude_config is not None else None,
         claude_config.api_key_helper if claude_config is not None else None,
         claude_config.model if claude_config is not None else None,
+        sorted(claude_config.routable_models) if claude_config is not None else None,
         binary_identity(command),
         ambient_gateway,
         claude_managed_model_picker() if claude_config is None else None,
@@ -1319,7 +1320,8 @@ async def claude_model_catalog(
     Rows come from the harness's own enumeration alone (no configured/static
     merge). Servability filtering matches the listing composition: on a
     non-canonical endpoint, aliases resolving to bare Anthropic ids are
-    dropped. The default marker is what a Default launch of this config
+    dropped unless the provider explicitly declares them routable. The
+    default marker is what a Default launch of this config
     actually runs: the config's own launch pin when the provider resolves
     one (those launches pass ``--model`` explicitly), else the enumeration
     run's init-event model (a bare subscription launch). It is matched onto
@@ -1335,11 +1337,17 @@ async def claude_model_catalog(
     if probe.empty_picker:
         return []
     rows = list(probe.alias_rows)
+    declared_models = set(claude_config.routable_models) if claude_config is not None else set()
     _non_canonical = (
         claude_config is not None and not _serves_canonical_anthropic_ids(claude_config)
     ) or (claude_config is None and _ambient_env_is_non_anthropic_gateway())
     if _non_canonical:
-        rows = [row for row in rows if not str(row.get("model", "")).startswith("claude-")]
+        rows = [
+            row
+            for row in rows
+            if not str(row.get("model", "")).startswith("claude-")
+            or str(row.get("model", "")) in declared_models
+        ]
 
     configured_pin = claude_config.model if claude_config is not None else None
     default_model = configured_pin or probe.default_model
@@ -1363,7 +1371,11 @@ async def claude_model_catalog(
         _canonical_ids_ok = (
             claude_config is None and not _ambient_env_is_non_anthropic_gateway()
         ) or (claude_config is not None and _serves_canonical_anthropic_ids(claude_config))
-        servable = _canonical_ids_ok or not default_model.startswith("claude-")
+        servable = (
+            _canonical_ids_ok
+            or not default_model.startswith("claude-")
+            or default_model in declared_models
+        )
         if servable:
             # The probe's printed label describes the ENUMERATION run's
             # model; it only names a config-pinned default when the two are
