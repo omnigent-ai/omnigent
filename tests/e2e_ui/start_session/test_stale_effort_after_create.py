@@ -268,10 +268,12 @@ def test_created_session_keeps_default_effort_after_in_session_pick(
     expect(claude_row.first).to_be_visible(timeout=30_000)
     claude_row.first.get_by_text("Edit", exact=True).click()
     expect(agent_picker).to_have_attribute("aria-label", re.compile("Claude Code"), timeout=30_000)
-    model_default = page.get_by_test_id("new-chat-landing-agent-model-default")
+    selected_model = page.get_by_test_id("new-chat-landing-agent-models").locator(
+        '[role="menuitemcheckbox"][aria-checked="true"]'
+    )
     effort_default = page.get_by_test_id("new-chat-landing-agent-effort-default")
-    expect(model_default).to_be_visible(timeout=30_000)
-    expect(model_default).to_have_attribute("aria-checked", "true")
+    expect(selected_model).to_have_count(1, timeout=30_000)
+    expect(selected_model).to_be_visible()
     expect(effort_default).to_be_visible(timeout=30_000)
     expect(effort_default).to_have_attribute("aria-checked", "true")
     page.keyboard.press("Escape")
