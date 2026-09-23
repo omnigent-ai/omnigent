@@ -20,6 +20,7 @@ from omnigent.host.frames import (
     decode_host_frame,
     encode_host_frame,
 )
+from omnigent.runner.transports.ws_tunnel.frames import PingFrame, decode_frame
 from omnigent.server.auth import AuthProvider
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes.host_tunnel import create_host_tunnel_router
@@ -257,6 +258,27 @@ async def test_host_tunnel_ping_loop_persists_heartbeat(
     assert host.status == "online", "heartbeat must not change status"
 
     # Clean up the live tunnel so the loop stops.
+    await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+
+
+async def test_host_tunnel_sends_immediate_ping_as_registration_ack(
+    host_app: tuple[FastAPI, HostRegistry, HostStore],
+) -> None:
+    """A freshly registered host receives its first keepalive ping at once.
+
+    Hosts stamp their daemon record with a confirmed registration on the
+    server's first post-hello frame, so the first ping must not wait a full
+    ``PING_INTERVAL_S`` — the CLI's ``--background`` registration grace is of
+    the same order and would expire first.
+    """
+    app, registry, _store = host_app
+    comm = await _connect_route(app, _TUNNEL_PATH)
+    await _send_hello_and_wait(comm, registry)
+
+    sent = await comm.receive_output(timeout=budget(2.0))
+    assert sent["type"] == "websocket.send"
+    assert isinstance(decode_frame(sent["text"]), PingFrame)
+
     await comm.send_input({"type": "websocket.disconnect", "code": 1000})
 
 

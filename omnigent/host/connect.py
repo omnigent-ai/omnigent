@@ -4258,6 +4258,7 @@ class HostProcess:
             # status``) must not delay ``ws.recv()`` or the inline keepalive pong
             # the server's watchdog counts as liveness, or it closes the tunnel
             # with ``4003 ping timeout``.
+            registration_stamped = False
             while True:
                 raw = await ws.recv()
                 self._conn_frame_received = True
@@ -4267,6 +4268,9 @@ class HostProcess:
                     # request frames run concurrently below; exceptions raised
                     # on those detached tasks are intentionally contained.
                     self._raise_connection_error_from_raw(raw)
+                    if not registration_stamped:
+                        registration_stamped = True
+                        self._stamp_daemon_registered()
                     # Each request frame is handled on its own task so a slow
                     # handler (a model-options CLI exec, a long git walk) can't
                     # head-of-line block the frames behind it — measured
@@ -4351,6 +4355,24 @@ class HostProcess:
             return
         if isinstance(frame, HostConnectionErrorFrame):
             self._raise_connection_error(frame)
+
+    def _stamp_daemon_registered(self) -> None:
+        """Stamp the daemon's registry record with a server-confirmed registration.
+
+        Called on the first frame received after ``host.hello`` that is not a
+        fatal ``host.connection_error``: the server sends nothing else before
+        it completes registration (it starts its send loops — including an
+        immediate keepalive ping — only once the host is persisted and
+        registered), so that frame is the server's acknowledgement. The stamp
+        gives the CLI's background-spawn readiness gate ground truth even when
+        its secondary ``GET /v1/hosts/{id}`` status read diverges from the
+        tunnel (stale, cached, or differently-routed read).
+        """
+        if self._lifecycle_lock is None:
+            return
+        from omnigent.host.daemon_lifecycle import mark_daemon_registered
+
+        mark_daemon_registered(self._lifecycle_lock.record_path)
 
     def _start_frame_task(self, ws: websockets.asyncio.client.ClientConnection, raw: str) -> None:
         """Handle one inbound frame on its own task, off the receive loop.

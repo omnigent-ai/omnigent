@@ -16,6 +16,7 @@ from omnigent.host.daemon_lifecycle import (
     DaemonLifecycleLock,
     HostDaemonRecord,
     daemon_record_path,
+    mark_daemon_registered,
     normalize_daemon_target,
     record_flock_is_held,
 )
@@ -210,6 +211,35 @@ def test_record_flock_is_held_states(tmp_path: Path) -> None:
     assert record_flock_is_held(record) is True
     lock.release()
     assert record_flock_is_held(record) is False
+
+
+def test_mark_daemon_registered_stamps_owner_record_in_place(tmp_path: Path) -> None:
+    """The owner's stamp adds ``registered_at`` without swapping the inode."""
+    record = daemon_record_path("local", base_dir=tmp_path)
+    _write_record(record, os.getpid())
+    inode_before = record.stat().st_ino
+
+    assert mark_daemon_registered(record) is True
+
+    payload = json.loads(record.read_text())
+    assert isinstance(payload["registered_at"], int)
+    # Existing fields survive the rewrite.
+    assert payload["pid"] == os.getpid()
+    assert payload["target"] == "local"
+    # In-place rewrite: an inode swap would strand the daemon's flock.
+    assert record.stat().st_ino == inode_before
+
+
+def test_mark_daemon_registered_refuses_foreign_or_missing_record(tmp_path: Path) -> None:
+    """A record owned by another pid — or absent — is never stamped."""
+    record = daemon_record_path("local", base_dir=tmp_path)
+
+    assert mark_daemon_registered(record) is False
+
+    _write_record(record, os.getpid() + 1)
+
+    assert mark_daemon_registered(record) is False
+    assert "registered_at" not in json.loads(record.read_text())
 
 
 def test_background_daemon_claims_record_before_connecting(

@@ -78,6 +78,7 @@ from omnigent.runner.identity import (
     RUNNER_WORKSPACE_ENV_VAR,
     token_bound_runner_id,
 )
+from omnigent.runner.transports.ws_tunnel.frames import PingFrame, encode_frame
 from omnigent.runtime.harnesses.paths import HARNESS_TMP_PARENT_ENV_VAR
 
 pytestmark = pytest.mark.asyncio
@@ -1083,6 +1084,23 @@ class _ConnectionErrorTunnel:
         return encode_host_frame(self.frame)
 
 
+class _AckThenDisconnectTunnel:
+    """Tunnel that delivers the server's first keepalive ping, then drops."""
+
+    def __init__(self) -> None:
+        self.sent: list[str] = []
+        self._acked = False
+
+    async def send(self, data: str) -> None:
+        self.sent.append(data)
+
+    async def recv(self) -> str:
+        if not self._acked:
+            self._acked = True
+            return encode_frame(PingFrame(ts=1))
+        raise ConnectionError("test disconnect")
+
+
 class _RecordingWS:
     """Fake tunnel that records frames the readiness loop sends.
 
@@ -1627,6 +1645,78 @@ async def test_unreported_exit_flushes_after_reconnect(
     # The queue drained — a retained entry would re-send on every
     # reconnect forever.
     assert host._unreported_exits == {}
+
+
+def _owned_daemon_record(tmp_path: Path) -> tuple[Path, object]:
+    """Write a registry record owned by this process; return (path, lock)."""
+    import os
+
+    from omnigent.host.daemon_lifecycle import DaemonLifecycleLock, daemon_record_path
+
+    target = "https://server.example.com"
+    record_path = daemon_record_path(target, base_dir=tmp_path)
+    record_path.parent.mkdir(parents=True, exist_ok=True)
+    record_path.write_text(json.dumps({"pid": os.getpid(), "target": target, "mode": "server"}))
+    return record_path, DaemonLifecycleLock.for_target(target, base_dir=tmp_path)
+
+
+async def test_serve_frames_stamps_registration_on_first_server_frame(tmp_path: Path) -> None:
+    """The server's first post-hello frame stamps the daemon's registry record.
+
+    The server sends nothing but connection errors before it completes
+    registration, so its first ordinary frame (the immediate keepalive ping)
+    confirms registration. The CLI's background-spawn readiness gate trusts
+    this stamp when its secondary server status read diverges, so a daemon
+    that registered is never torn down as "never registered".
+    """
+    record_path, lock = _owned_daemon_record(tmp_path)
+    host = _make_host_process()
+    host._lifecycle_lock = lock
+    tunnel = _AckThenDisconnectTunnel()
+
+    with pytest.raises(ConnectionError, match="test disconnect"):
+        await host._serve_frames(tunnel)  # type: ignore[arg-type] — duck-typed ws
+    await asyncio.gather(*host._frame_tasks, return_exceptions=True)
+
+    payload = json.loads(record_path.read_text())
+    assert isinstance(payload["registered_at"], int)
+
+
+async def test_serve_frames_does_not_stamp_before_server_ack(tmp_path: Path) -> None:
+    """A hello that was only sent — never answered — is not a registration.
+
+    The send completing proves nothing about the server's post-hello
+    registration work, so a connection that drops before the server's first
+    frame must leave no stamp for the CLI's readiness gate to trust.
+    """
+    record_path, lock = _owned_daemon_record(tmp_path)
+    host = _make_host_process()
+    host._lifecycle_lock = lock
+    tunnel = _FakeTunnel()
+
+    with pytest.raises(ConnectionError, match="test disconnect"):
+        await host._serve_frames(tunnel)  # type: ignore[arg-type] — duck-typed ws
+
+    assert "registered_at" not in json.loads(record_path.read_text())
+
+
+async def test_serve_frames_does_not_stamp_on_connection_error(tmp_path: Path) -> None:
+    """A server that rejects registration post-hello leaves no stamp."""
+    record_path, lock = _owned_daemon_record(tmp_path)
+    host = _make_host_process()
+    host._lifecycle_lock = lock
+    tunnel = _ConnectionErrorTunnel(
+        HostConnectionErrorFrame(
+            stage="registration",
+            error="database unavailable",
+            retryable=False,
+        )
+    )
+
+    with pytest.raises(HostConnectError, match="registration: database unavailable"):
+        await host._serve_frames(tunnel)  # type: ignore[arg-type] — duck-typed ws
+
+    assert "registered_at" not in json.loads(record_path.read_text())
 
 
 async def test_capability_probe_timeout_preserves_unknown_registration_fallback(

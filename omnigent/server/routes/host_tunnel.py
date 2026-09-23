@@ -850,6 +850,13 @@ async def _ping_loop(
     :param host_id: Host id for logging.
     :param host_store: Persistent host store the heartbeat is written to.
     """
+    # The first ping goes out immediately: these loops only start once the
+    # host is persisted and registered, so hosts treat it as the server's
+    # registration acknowledgement and stamp their daemon record on it.
+    try:
+        conn.outbound_queue.put_nowait(encode_frame(PingFrame(ts=int(time.time() * 1000))))
+    except Exception:  # noqa: BLE001
+        return
     while True:
         await asyncio.sleep(PING_INTERVAL_S)
         elapsed = time.time() - conn.last_frame_at
