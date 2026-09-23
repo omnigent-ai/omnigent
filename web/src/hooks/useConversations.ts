@@ -56,7 +56,7 @@ import {
 } from "@/shell/sidebarNav";
 import { apiErrorFromResponse, stopSession } from "@/lib/sessionsApi";
 import { isStaleCursorError, useRestartOnStaleCursor } from "@/lib/staleCursor";
-import { setSessionHost } from "@/lib/sessionHost";
+import { setSessionHost, setSessionParent } from "@/lib/sessionHost";
 import {
   createProject as apiCreateProject,
   deleteProject as apiDeleteProject,
@@ -478,6 +478,7 @@ export async function fetchConversationById(id: string): Promise<Conversation | 
   // requests key their slice off this map — so record the host before returning
   // the row, or those requests fall back to the modal and can miss the replica.
   setSessionHost(wire.id, wire.host_id);
+  setSessionParent(wire.id, wire.parent_session_id);
   return {
     id: wire.id,
     object: "conversation",
@@ -559,7 +560,10 @@ export async function fetchConversationsPage({
   // session's own snapshot loads still keys to the right replica instead of
   // falling back to the modal. host_id is fixed for a session's life, so this
   // can't seed a stale value; a hostless row clears any prior mapping.
-  for (const row of page.data) setSessionHost(row.id, row.host_id);
+  for (const row of page.data) {
+    setSessionHost(row.id, row.host_id);
+    setSessionParent(row.id, row.parent_session_id);
+  }
   return applySessionTombstones(
     withRecentlyCreated(
       page,

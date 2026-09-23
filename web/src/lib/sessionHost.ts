@@ -29,12 +29,43 @@ export function setSessionHost(sessionId: string, hostId: string | null | undefi
   }
 }
 
+// A sub-agent child runs on its parent's runner, whose tunnel lives on the
+// replica keyed by the PARENT's host — the child row carries no host_id of its
+// own. Recording the parent link lets a child key its traffic by the nearest
+// host-bound ancestor instead of going keyless to the default replica.
+const _sessionParents = new Map<string, string>();
+
+// Sub-agent nesting is shallow (the Agents rail renders three levels); the cap
+// only bounds a malformed cycle.
+const MAX_ANCESTOR_HOPS = 4;
+
+/**
+ * Record (or clear) a session's parent so a hostless child resolves its host
+ * through the ancestor chain. Called wherever a session object is parsed.
+ */
+export function setSessionParent(sessionId: string, parentId: string | null | undefined): void {
+  if (parentId && parentId !== sessionId) {
+    _sessionParents.set(sessionId, parentId);
+  } else {
+    _sessionParents.delete(sessionId);
+  }
+}
+
 /**
  * Resolve a session's host_id for slice-key routing, or `null` when unknown
- * (session not loaded yet, or a hostless local session).
+ * (session not loaded yet, or a hostless local session). A session with no
+ * host of its own inherits the nearest host-bound ancestor's.
  */
 export function getSessionHost(sessionId: string): string | null {
-  return _sessionHosts.get(sessionId) ?? null;
+  let id = sessionId;
+  for (let hop = 0; hop <= MAX_ANCESTOR_HOPS; hop++) {
+    const host = _sessionHosts.get(id);
+    if (host) return host;
+    const parent = _sessionParents.get(id);
+    if (!parent) return null;
+    id = parent;
+  }
+  return null;
 }
 
 // ── Keyless-demoted hosts ────────────────────────────────────────────────────

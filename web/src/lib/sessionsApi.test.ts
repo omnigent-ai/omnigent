@@ -844,6 +844,38 @@ describe("getSession", () => {
     expect(fetchMock.mock.calls[0][0]).toBe("/v1/sessions/conv%20with%20space");
   });
 
+  it("routes a hostless sub-agent child by its parent's host", async () => {
+    // A sub-agent child runs on its parent's runner, whose tunnel lives on the
+    // replica keyed by the PARENT's host. The child row carries no host_id of
+    // its own, so its session-scoped requests must key by the parent — else
+    // they land keyless on the default replica and read "runner offline".
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv_routing_parent",
+        agent_id: "agent_xyz",
+        status: "idle",
+        created_at: 0,
+        host_id: "host_devbox",
+      }),
+    );
+    await getSessionSlim("conv_routing_parent");
+
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv_routing_child",
+        agent_id: "agent_xyz",
+        status: "idle",
+        created_at: 0,
+        host_id: null,
+        kind: "sub_agent",
+        parent_session_id: "conv_routing_parent",
+      }),
+    );
+    await getSessionSlim("conv_routing_child");
+
+    expect(getSessionHost("conv_routing_child")).toBe("host_devbox");
+  });
+
   it("getSessionSlim skips items, liveness, and subtree usage", async () => {
     fetchMock.mockResolvedValueOnce(
       mockJsonResponse({

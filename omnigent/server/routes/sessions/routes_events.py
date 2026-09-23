@@ -24,6 +24,7 @@ from starlette.types import Message, Receive, Scope, Send
 from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.debug_logging import add_audit_attrs, mark_request_audit_suppressed
 from omnigent.entities import (
+    Conversation,
     ErrorData,
     NewConversationItem,
 )
@@ -42,7 +43,7 @@ from omnigent.host.frames import (
 )
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runner.launch_failure import classify_native_turn_error
-from omnigent.runner.routing import RunnerRouter
+from omnigent.runner.routing import RunnerRouter, routing_host_id
 from omnigent.runtime import (
     session_stream,
 )
@@ -340,6 +341,43 @@ def _evict_retry_recovery_task(
         completed_task.exception()
 
 
+async def _raise_if_runner_on_another_replica(
+    conv: Conversation,
+    app_state: Any,
+    conversation_store: ConversationStore,
+) -> None:
+    """
+    Re-address a routing miss instead of treating the runner as gone.
+
+    A runner tunnel registers on the replica holding its host, so a bound
+    runner whose tunnel is absent here while that host is live elsewhere means
+    the request landed on the wrong replica. That holds for a sub-agent child
+    too: it is served by its host-bound ancestor's runner (see
+    :func:`routing_host_id`). Raising ``WRONG_REPLICA`` makes the client
+    re-address rather than heal or relaunch against this replica's registry.
+
+    :param conv: Session row whose runner client could not be resolved here.
+    :param app_state: ``request.app.state`` — supplies the host registry and
+        the host store.
+    :param conversation_store: Store used to resolve a sub-agent's ancestors.
+    :raises OmnigentError: ``WRONG_REPLICA`` when the routing host is live on
+        another replica.
+    """
+    host_registry = getattr(app_state, "host_registry", None)
+    host_store = getattr(app_state, "host_store", None)
+    if host_registry is None or host_store is None:
+        return
+    host_id = await asyncio.to_thread(routing_host_id, conv, conversation_store)
+    if host_id is None or host_registry.get(host_id) is not None:
+        return
+    host = await asyncio.to_thread(host_store.get_host, host_id)
+    if host is not None and host_is_live(host):
+        raise OmnigentError(
+            "session runner is on another replica; retry",
+            code=ErrorCode.WRONG_REPLICA,
+        )
+
+
 async def _recover_retry_session(
     *,
     request: Request,
@@ -358,6 +396,7 @@ async def _recover_retry_session(
     runner_relaunched = False
     terminal_ready_from_init = False
     if runner_client is None:
+        await _raise_if_runner_on_another_replica(conv, request.app.state, conversation_store)
         runner_client, conv = await ensure_runner_connected(
             session_id=session_id,
             conv=conv,
@@ -1868,29 +1907,14 @@ def register_events_routes(
                 if conv is None:
                     raise _session_not_found()
                 runner_client = await _get_runner_client(session_id, runner_router)
-        # Check for wrong-replica routing miss before attempting healing or dispatch.
-        # The runner tunnel is registered on the same replica as its host; when the
-        # tunnel is absent here but the host is live elsewhere, the key routed to
-        # the wrong replica. Signal this to the client so it re-addresses without
-        # the key rather than repeatedly trying this replica.
-        # sub-agent heal below: a wrong-replica send must re-address without the
-        # key rather than attempt a heal against this replica's registry.
-        if runner_client is None and conv.host_id is not None:
-            _wrong_pod_host_reg = getattr(request.app.state, "host_registry", None)
-            _wrong_pod_host_store = getattr(request.app.state, "host_store", None)
-            if (
-                _wrong_pod_host_reg is not None
-                and _wrong_pod_host_store is not None
-                and _wrong_pod_host_reg.get(conv.host_id) is None
-            ):
-                _wrong_pod_host = await asyncio.to_thread(
-                    _wrong_pod_host_store.get_host, conv.host_id
-                )
-                if _wrong_pod_host is not None and host_is_live(_wrong_pod_host):
-                    raise OmnigentError(
-                        "session runner is on another replica; retry",
-                        code=ErrorCode.WRONG_REPLICA,
-                    )
+        # Check for a wrong-replica routing miss before attempting healing or
+        # dispatch. The runner tunnel is registered on the same replica as its
+        # host; when the tunnel is absent here but the host is live elsewhere,
+        # the request landed on the wrong replica (a hostless sub-agent child
+        # resolves to its ancestor's host). Signal this to the client so it
+        # re-addresses rather than healing against this replica's registry.
+        if runner_client is None:
+            await _raise_if_runner_on_another_replica(conv, request.app.state, conversation_store)
         if runner_client is None and conv.kind == "sub_agent":
             # A sub-agent copies its parent's runner_id at creation and is
             # never repointed when the parent's runner is relaunched.  If the
