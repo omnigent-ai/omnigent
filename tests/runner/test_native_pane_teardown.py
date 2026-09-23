@@ -22,7 +22,12 @@ from omnigent.runner.app import _session_event_queues_ref
 from omnigent.runner.native import orchestration
 from omnigent.runner.session_status import StatusSource
 from tests.runner.helpers import make_test_terminal_instance
-from tests.terminals.native_pane_rig import PaneRig, build_pane_rig, plant_sidecars
+from tests.terminals.native_pane_rig import (
+    PaneRig,
+    build_pane_rig,
+    plant_sidecars,
+    report_harness_state,
+)
 
 _REAPABLE_KEYS = [p.key for p in _BUILTIN_NATIVE_PROVIDERS if p.key != "kimi"]
 
@@ -208,6 +213,7 @@ async def test_terminal_delete_releases_the_sidecars_of_an_idle_session(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, key: str
 ) -> None:
     rig = await build_pane_rig(tmp_path, monkeypatch, key=key)
+    report_harness_state(rig, monkeypatch, tmp_path, "idle")
     sidecars = plant_sidecars(rig.app, rig.conv_id, tmp_path, harness_key=rig.agent.key)
     rig.drain()
     try:
@@ -221,7 +227,7 @@ async def test_terminal_delete_releases_the_sidecars_of_an_idle_session(
 
 
 @pytest.mark.parametrize(
-    "signal", ["runner_turn", "tool_call", "pending_approval", "running_claim"]
+    "signal", ["runner_turn", "tool_call", "pending_approval", "running_claim", "probe_active"]
 )
 async def test_terminal_delete_keeps_sidecars_that_live_work_still_needs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, signal: str
@@ -229,6 +235,9 @@ async def test_terminal_delete_keeps_sidecars_that_live_work_still_needs(
     from omnigent.runner import pending_approvals
 
     rig = await build_pane_rig(tmp_path, monkeypatch, key="codex")
+    report_harness_state(
+        rig, monkeypatch, tmp_path, "active" if signal == "probe_active" else "idle"
+    )
     sidecars = plant_sidecars(rig.app, rig.conv_id, tmp_path, harness_key=rig.agent.key)
     try:
         if signal == "runner_turn":
@@ -386,6 +395,30 @@ async def test_one_failing_sidecar_release_does_not_leak_the_rest(
     assert released == ("opencode_server", "forwarder")
     assert server.closed
     assert "conv_boom" not in orchestration._AUTO_FORWARDER_TASKS
+
+
+@pytest.mark.parametrize("claude_status", ["idle", "busy"])
+async def test_terminal_delete_judges_claude_by_its_status_file_read_before_the_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, claude_status: str
+) -> None:
+    import json
+
+    rig = await build_pane_rig(tmp_path, monkeypatch, key="claude")
+    status_file = tmp_path / "claude-status.json"
+    status_file.write_text(json.dumps({"status": claude_status}))
+    # The poller, and with it the file path, goes away with the pane.
+    monkeypatch.setattr(
+        rig.resources, "status_poller_path", lambda _sid: status_file if rig.alive() else None
+    )
+    sidecars = plant_sidecars(rig.app, rig.conv_id, tmp_path, harness_key=rig.agent.key)
+    try:
+        assert await _delete_terminal(rig) == 200
+        if claude_status == "idle":
+            assert sidecars.leftovers(rig.app) == []
+        else:
+            assert sidecars.intact(rig.app)
+    finally:
+        sidecars.discard()
 
 
 async def test_a_reap_never_waits_on_a_launch_that_holds_the_lock(

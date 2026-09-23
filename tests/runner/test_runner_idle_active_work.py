@@ -600,6 +600,13 @@ async def test_sdk_session_status_does_not_pin_idle_watchdog() -> None:
 _CEILING_S = 7200.0
 _MAX_TURN_ENV = "OMNIGENT_NATIVE_PANE_MAX_TURN_S"
 _APPROVAL_MAX_ENV = "OMNIGENT_NATIVE_PANE_APPROVAL_MAX_S"
+_CLAIM_POLICY_ENV = "OMNIGENT_NATIVE_PANE_CLAIM_POLICY"
+# Every pane-reaper claim policy, and the default (None: the variable unset).
+_CLAIM_POLICIES = pytest.mark.parametrize(
+    "claim_policy",
+    ["veto", "shadow", "evidence", None],
+    ids=["veto", "shadow", "evidence", "unset"],
+)
 
 
 class _Clock:
@@ -644,12 +651,23 @@ def _agent_output(instance: Any, *, ago_s: float = 0.0) -> None:
     instance._last_agent_output_at = time.monotonic() - ago_s
 
 
+def _set_claim_policy(monkeypatch: pytest.MonkeyPatch, claim_policy: str | None) -> None:
+    """Set OMNIGENT_NATIVE_PANE_CLAIM_POLICY, or unset it for ``None``."""
+    if claim_policy is None:
+        monkeypatch.delenv(_CLAIM_POLICY_ENV, raising=False)
+    else:
+        monkeypatch.setenv(_CLAIM_POLICY_ENV, claim_policy)
+
+
 @pytest.mark.asyncio
+@_CLAIM_POLICIES
 @pytest.mark.parametrize(
     "statuses", [("running",), ("running", "waiting")], ids=["running", "waiting_after_running"]
 )
 async def test_a_lost_closing_edge_holds_the_runner_only_until_the_ceiling(
     statuses: tuple[str, ...],
+    claim_policy: str | None,
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -658,50 +676,67 @@ async def test_a_lost_closing_edge_holds_the_runner_only_until_the_ceiling(
     The forwarder's ``idle`` never arrives, so the book keeps the last
     in-flight status. With no dispatch or pane output since its episode
     began, it holds the watchdog until the ceiling, then the runner shuts
-    down. Each expired episode logs one WARNING.
+    down. Each expired episode logs one WARNING. The session has a live
+    codex pane and the pane reaper is wired, but the rule is the same under
+    every claim policy, which only decides whether the reaper ends a stale
+    claim sooner.
 
     :param statuses: Relayed edges; the last one is never closed.
+    :param claim_policy: OMNIGENT_NATIVE_PANE_CLAIM_POLICY, ``None`` for unset.
     """
-    from tests.runner.conftest import _runner_client
+    from tests.runner.conftest import _runner_client, _spec_resolver_returning
+    from tests.terminals.native_pane_rig import build_pane_rig
 
+    _set_claim_policy(monkeypatch, claim_policy)
     monkeypatch.setenv(_MAX_TURN_ENV, str(_CEILING_S))
     clock = _Clock()
-    conv_id = "conv_native_lost_idle"
-    app = await _native_app_with_session(conv_id, harness="codex-native", status_clock=clock)
-    async with _runner_client(app) as client:
-        await _create_session(client, conv_id)
-        for status in statuses:
-            clock.now += 60.0
-            await _post_status(client, conv_id, status)
-        clock.now += _CEILING_S - 1.0
-        assert app.state.has_active_work() is True
-
-        async def _ceiling_passes() -> None:
-            clock.now += 1.0
-
-        with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
-            await _assert_monitor_blocked_then_shuts_down(
-                has_active_work=app.state.has_active_work,
-                release=_ceiling_passes,
-            )
-            assert app.state.has_active_work() is False
-            assert len(_events(caplog, "runner_in_flight_hold_expired")) == 1
-            # A settled turn and a new one open a new episode, warned once more.
-            await _post_status(client, conv_id, "idle")
-            await _post_status(client, conv_id, statuses[-1])
+    rig = await build_pane_rig(
+        tmp_path,
+        monkeypatch,
+        key="codex",
+        status_clock=clock,
+        spec_resolver=await _spec_resolver_returning(_native_spec("codex-native")),
+    )
+    app, conv_id = rig.app, rig.conv_id
+    assert rig.listed()  # the reaper, built under the policy, would judge this pane
+    try:
+        async with _runner_client(app) as client:
+            await _create_session(client, conv_id)
+            for status in statuses:
+                clock.now += 60.0
+                await _post_status(client, conv_id, status)
+            clock.now += _CEILING_S - 1.0
             assert app.state.has_active_work() is True
-            clock.now += _CEILING_S
-            assert app.state.has_active_work() is False
-            assert app.state.has_active_work() is False
-        expired = _events(caplog, "runner_in_flight_hold_expired")
-        assert len(expired) == 2, [r.getMessage() for r in expired]
-        assert expired[0].session_id == conv_id  # type: ignore[attr-defined]
-        assert expired[0].attributes == {  # type: ignore[attr-defined]
-            "status": statuses[-1],
-            "claim_source": "relay",
-            "evidence_age_s": _CEILING_S,
-            "ceiling_s": _CEILING_S,
-        }
+
+            async def _ceiling_passes() -> None:
+                clock.now += 1.0
+
+            with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+                await _assert_monitor_blocked_then_shuts_down(
+                    has_active_work=app.state.has_active_work,
+                    release=_ceiling_passes,
+                )
+                assert app.state.has_active_work() is False
+                assert len(_events(caplog, "runner_in_flight_hold_expired")) == 1
+                # A settled turn and a new one open a new episode, warned once more.
+                await _post_status(client, conv_id, "idle")
+                await _post_status(client, conv_id, statuses[-1])
+                assert app.state.has_active_work() is True
+                clock.now += _CEILING_S
+                assert app.state.has_active_work() is False
+                assert app.state.has_active_work() is False
+            expired = _events(caplog, "runner_in_flight_hold_expired")
+            assert len(expired) == 2, [r.getMessage() for r in expired]
+            assert expired[0].session_id == conv_id  # type: ignore[attr-defined]
+            assert expired[0].attributes == {  # type: ignore[attr-defined]
+                "status": statuses[-1],
+                "claim_source": "relay",
+                "evidence_age_s": _CEILING_S,
+                "ceiling_s": _CEILING_S,
+            }
+            assert rig.alive()
+    finally:
+        rig.drain()
 
 
 @pytest.mark.asyncio
@@ -1501,15 +1536,15 @@ async def test_deleting_an_idle_tui_releases_its_sidecars_and_the_runner(
     """A DELETE whose sidecars nothing needs releases them and the runner's hold.
 
     The session's ``waiting`` (sub-agents still working when the turn ended)
-    is no claim on the pane, so the sidecars are released, codex's and
-    opencode's vendor servers included, and the release resets the status
-    the close kept for them.
+    is no claim on the pane, and the harness reports its agent idle, so the
+    sidecars are released, codex's and opencode's vendor servers included,
+    and the release resets the status the close kept for them.
 
     :param key: Native harness key, e.g. ``"codex"``.
     """
     from omnigent.entities.session_resources import terminal_resource_id
     from tests.runner.conftest import _runner_client, _spec_resolver_returning
-    from tests.terminals.native_pane_rig import build_pane_rig
+    from tests.terminals.native_pane_rig import build_pane_rig, report_harness_state
 
     rig = await build_pane_rig(
         tmp_path,
@@ -1517,6 +1552,7 @@ async def test_deleting_an_idle_tui_releases_its_sidecars_and_the_runner(
         key=key,
         spec_resolver=await _spec_resolver_returning(_native_spec(f"{key}-native")),
     )
+    report_harness_state(rig, monkeypatch, tmp_path, "idle")
     app, conv_id = rig.app, rig.conv_id
     sidecars = await _plant_pane_sidecars(app, conv_id, tmp_path, key)
     try:
@@ -1640,4 +1676,124 @@ async def test_the_reapers_scan_ends_a_lost_relayed_idles_runner_hold(
             assert sidecars.leftovers(app) == []
     finally:
         sidecars.discard()
+        rig.drain()
+
+
+@pytest.mark.asyncio
+@_CLAIM_POLICIES
+@pytest.mark.parametrize(("key", "refuter"), [("codex", "probe"), ("pi", "server")])
+async def test_a_refutation_ends_the_runner_hold_at_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    key: str,
+    refuter: str,
+    claim_policy: str | None,
+) -> None:
+    """A stale ``running`` the harness or the server refutes stops holding the runner.
+
+    A local channel recorded ``running`` (codex: the runner's dispatch, whose
+    idle the forwarder owns; pi: the pane watcher's own edge) and the closing
+    edge was lost. Two idle windows later the claim still holds the runner,
+    well inside the ceiling. The reaper's deep check asks codex's app-server
+    (``thread/read``) or, for a harness with no probe, the server; either
+    says idle, and the refutation records a RECONCILE ``idle``. That ends the
+    runner's hold at once. Under ``veto`` and ``shadow`` the reaper reconciles
+    the pane the claim alone holds and keeps it; under ``evidence`` the
+    refutation lands before the teardown begins.
+
+    :param key: Native harness key, e.g. ``"codex"``.
+    :param refuter: Who answers idle: the harness's turn probe or the server.
+    :param claim_policy: OMNIGENT_NATIVE_PANE_CLAIM_POLICY, ``None`` for unset.
+    """
+    from omnigent.runner.session_status import StatusSource
+    from omnigent.terminals.pane_reaper import ClaimPolicy, SpareReason, resolve_claim_policy
+    from tests.runner.conftest import (
+        _FakeProcessManager,
+        _runner_client,
+        _ScriptedHarnessClient,
+        _spec_resolver_returning,
+        _sse,
+    )
+    from tests.terminals.native_pane_rig import (
+        FakeServerClient,
+        build_pane_rig,
+        report_harness_state,
+    )
+
+    _set_claim_policy(monkeypatch, claim_policy)
+    monkeypatch.delenv(_MAX_TURN_ENV, raising=False)
+    clock = _Clock()
+    process_manager = _FakeProcessManager(
+        _ScriptedHarnessClient(
+            [
+                _sse({"type": "response.created", "response": {"id": "resp_refuted"}}),
+                _sse({"type": "response.completed", "response": {"id": "resp_refuted"}}),
+            ]
+        )
+    )
+    rig = await build_pane_rig(
+        tmp_path,
+        monkeypatch,
+        key=key,
+        server=FakeServerClient(status="idle" if refuter == "server" else None),
+        process_manager=process_manager,
+        status_clock=clock,
+        spec_resolver=await _spec_resolver_returning(_native_spec(f"{key}-native")),
+    )
+    report_harness_state(rig, monkeypatch, tmp_path, "idle")
+    app, conv_id, book = rig.app, rig.conv_id, rig.book
+    seen_at_reap: list[tuple[bool, Any]] = []
+    reap = rig.reaper._reap
+
+    async def _spy_reap(pane: Any) -> bool | None:
+        # What the runner saw when the teardown (and its status reset) began.
+        seen_at_reap.append((app.state.has_active_work(), book.current(conv_id)))
+        return await reap(pane)
+
+    rig.reaper._reap = _spy_reap
+    try:
+        async with _runner_client(app) as client:
+            await _create_session(client, conv_id)
+            if key == "codex":
+                await _dispatch_turn(client, app, conv_id)
+            else:
+                await rig.fire("on_activity")
+            claim = book.claim(conv_id)
+            assert claim is not None, book.current(conv_id)
+            assert claim.origin is (StatusSource.RUNNER if key == "codex" else StatusSource.PTY)
+            clock.now += 2 * 3600.0  # the closing edge was lost two windows ago
+            assert app.state.has_active_work() is True
+            evidence = resolve_claim_policy() is ClaimPolicy.EVIDENCE
+            if not evidence:
+                assert (await rig.assess()).reasons == {SpareReason.STATUS_CLAIM}
+
+            async def _scan() -> None:
+                rig.reaper._last_busy_at[conv_id] = time.monotonic() - 2 * 3600.0
+                await rig.reaper._scan_once()
+
+            with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+                await _assert_monitor_blocked_then_shuts_down(
+                    has_active_work=app.state.has_active_work,
+                    release=_scan,
+                )
+            refuted = _events(caplog, "native_pane_claim_refuted")
+            assert len(refuted) == 1
+            assert refuted[0].attributes["refuted_by"] == (  # type: ignore[attr-defined]
+                "probe: thread/read: idle" if refuter == "probe" else "server status idle"
+            )
+            if evidence:
+                # The refutation, not the teardown's reset, released the runner.
+                assert not rig.alive()
+                ((held, record),) = seen_at_reap
+                assert held is False
+                assert record is not None and record.status == "idle"
+                assert record.origin is StatusSource.RECONCILE
+            else:
+                assert rig.alive()
+                assert seen_at_reap == []
+                record = book.current(conv_id)
+                assert record is not None and record.status == "idle"
+                assert record.origin is StatusSource.RECONCILE
+    finally:
         rig.drain()

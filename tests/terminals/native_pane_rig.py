@@ -443,3 +443,115 @@ def plant_sidecars(
         prompt_waiter=prompt_waiter,
         relays=relays,
     )
+
+
+def report_harness_state(
+    rig: PaneRig, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, state: str
+) -> None:
+    """Make the harness's own state source report *state*.
+
+    *state* is ``idle``, ``active``, ``parked`` (a prompt owns the input;
+    claude, codex and opencode only) or ``unknown`` (no state source at all;
+    for claude, Claude's status file is gone).
+    """
+    key = rig.agent.key
+    if state == "unknown":
+        _clear_harness_state(rig, monkeypatch)
+        return
+    if key == "claude":
+        if state == "parked":
+            rig.write_claude_status("waiting", waiting_for="permission prompt")
+        else:
+            rig.write_claude_status("idle" if state == "idle" else "busy")
+        if rig.resources.status_poller_path(rig.conv_id) is None:
+            path = rig.claude_status_file
+            monkeypatch.setattr(rig.resources, "status_poller_path", lambda _sid: path)
+    elif key == "codex":
+        from omnigent.harnesses.codex_native import app_server, bridge
+
+        bridge.write_bridge_state(
+            bridge.bridge_dir_for_bridge_id(rig.conv_id),
+            bridge.CodexNativeBridgeState(
+                session_id=rig.conv_id,
+                socket_path="ws://127.0.0.1:1",
+                thread_id="thread_1",
+                codex_home=str(tmp_path),
+            ),
+        )
+        flags = ["waitingOnApproval"] if state == "parked" else []
+        status = {"type": "idle"} if state == "idle" else {"type": "active", "activeFlags": flags}
+        monkeypatch.setattr(app_server, "client_for_transport", lambda *_a, **_k: _Codex(status))
+    elif key == "antigravity":
+        from omnigent.harnesses.antigravity_native import reader, rpc
+
+        run = "CASCADE_RUN_STATUS_IDLE" if state == "idle" else "CASCADE_RUN_STATUS_RUNNING"
+        monkeypatch.setattr(reader, "_resolve_cascade_id", lambda _d: "c1")
+        monkeypatch.setattr(reader, "_resolve_rpc_port", lambda _c: 7)
+        monkeypatch.setattr(
+            rpc,
+            "get_all_cascade_trajectories",
+            lambda _p: {"trajectorySummaries": {"c1": {"status": run}}},
+        )
+    elif key == "opencode":
+        from omnigent.harnesses.opencode_native import bridge
+        from omnigent.harnesses.opencode_native.client import OpenCodeClient
+
+        bridge.write_bridge_state(
+            bridge.bridge_dir_for_bridge_id(rig.conv_id),
+            bridge.OpenCodeNativeBridgeState(
+                session_id=rig.conv_id,
+                server_base_url="http://127.0.0.1:1",
+                opencode_session_id="ses_1",
+                status="idle" if state in ("idle", "parked") else "busy",
+                active_message_id=None if state in ("idle", "parked") else "msg_1",
+            ),
+        )
+
+        pending: list[dict[str, object]] = (
+            [{"id": "per_1", "sessionID": "ses_1"}] if state == "parked" else []
+        )
+
+        async def _permissions(self: OpenCodeClient) -> list[dict[str, object]]:
+            return list(pending)
+
+        monkeypatch.setattr(OpenCodeClient, "list_permissions", _permissions)
+    elif key == "devin":
+        from omnigent.harnesses.devin_native import bridge
+
+        bridge_dir = bridge.prepare_bridge_dir(rig.conv_id)
+        bridge.record_hook_event(bridge_dir, {"hook_event_name": "UserPromptSubmit"})
+        if state == "idle":
+            bridge.record_hook_event(bridge_dir, {"hook_event_name": "Stop"})
+
+
+def _clear_harness_state(rig: PaneRig, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Remove whatever the harness's own state source held: no answer at all."""
+    key = rig.agent.key
+    if key == "claude":
+        rig.claude_status_file.unlink(missing_ok=True)
+    elif key in ("codex", "opencode"):
+        bridge = importlib.import_module(f"omnigent.harnesses.{key}_native.bridge")
+        (bridge.bridge_dir_for_bridge_id(rig.conv_id) / "state.json").unlink(missing_ok=True)
+    elif key == "antigravity":
+        from omnigent.harnesses.antigravity_native import reader
+
+        monkeypatch.setattr(reader, "_resolve_cascade_id", lambda _d: None)
+    elif key == "devin":
+        from omnigent.harnesses.devin_native import bridge
+
+        bridge.hooks_path(bridge.bridge_dir_for_session_id(rig.conv_id)).unlink(missing_ok=True)
+
+
+class _Codex:
+    def __init__(self, status: dict[str, Any]) -> None:
+        self.status = status
+
+    async def connect(self) -> None:
+        return None
+
+    async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        del method, params
+        return {"result": {"thread": {"status": self.status}}}
+
+    async def close(self) -> None:
+        return None

@@ -68,6 +68,7 @@ BOOK_READERS = frozenset(
         "age_s",
         "last_dispatch_at",
         "last_control_idle_at",
+        "last_control_idle_wall",
         "session_ids",
         "status_view",
         "edge_mark",

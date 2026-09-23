@@ -626,6 +626,19 @@ class SessionResourceRegistry:
             self.reset_session_status(session_id, reason)
         return kept
 
+    def vendor_turn_home(self, session_id: str) -> str | None:
+        """The launching session *session_id*'s status is kept for, if any.
+
+        Set when a TUI a ``/clear`` rotation moved to *session_id* was lost
+        while the launching session's vendor server still ran its turn (see
+        :meth:`reset_statuses_kept_for`).
+
+        :param session_id: Session/conversation id, e.g. ``"conv_new"``.
+        :returns: e.g. ``"conv_old"``, or ``None``.
+        """
+        with self._lock:
+            return self._vendor_turn_homes.get(session_id)
+
     def status_poller_path(self, session_id: str) -> Path | None:
         """Claude's resolved ``sessions/<pid>.json`` for *session_id*, if any."""
         with self._lock:

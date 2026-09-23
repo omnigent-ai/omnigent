@@ -8524,6 +8524,7 @@ def create_runner_app(
         facts: dict[str, object],
         *,
         approval_max_s: float,
+        blocked_is_hard: bool = True,
     ) -> set[SpareReason]:
         """Live work or a human wait holding *conv_id*'s native pane.
 
@@ -8533,6 +8534,9 @@ def create_runner_app(
 
         :param facts: Diagnostics the checks add to, e.g. ``park_age_s``.
         :param approval_max_s: Oldest human-wait signal still honored.
+        :param blocked_is_hard: Whether a recorded ``blocked_on`` spares the
+            pane outright. ``False`` for a harness with a turn probe: the
+            record is a claim the probe confirms or refutes before a reap.
         """
         from omnigent.harnesses.claude_native.bridge import approval_wait_is_fresh
         from omnigent.native import prompt_parks
@@ -8557,7 +8561,7 @@ def create_runner_app(
         blocked = _status_book.blocked(conv_id)
         if blocked is not None:
             facts["blocked_on"], facts["blocked_age_s"] = blocked
-            if blocked[1] < approval_max_s:
+            if blocked[1] < approval_max_s and blocked_is_hard:
                 reasons.add(SpareReason.AWAITING_HUMAN)
         if approval_wait_is_fresh(conv_id):
             reasons.add(SpareReason.AWAITING_HUMAN)
@@ -13823,17 +13827,22 @@ def create_runner_app(
         from types import MappingProxyType
 
         from omnigent.native.native_cost_popup import _list_tmux_clients, _tmux_window_activity_at
+        from omnigent.runner.session_status import StatusRecord
         from omnigent.terminals.pane_reaper import (
+            PANE_OUTPUT_BUSY_WINDOW_S,
+            ClaimPolicy,
             ConfirmVerdict,
             NativePaneReaper,
             PaneAssessment,
             PaneRef,
+            resolve_claim_policy,
             resolve_server_check_enabled,
             resolve_server_unreachable_grace_s,
         )
 
         _pane_idle_timeout_s = resolve_native_pane_idle_timeout_s()
         _pane_approval_max_s = resolve_approval_max_s()
+        _pane_claim_policy = resolve_claim_policy()
         _pane_server_check = resolve_server_check_enabled()
         _pane_server_grace_s = resolve_server_unreachable_grace_s(_pane_idle_timeout_s)
         # Pane-reaper bookkeeping: server outage start (and whether it was
@@ -13841,6 +13850,7 @@ def create_runner_app(
         _pane_server_unreachable_since: dict[str, float] = {}
         _pane_server_unreachable_warned: set[str] = set()
         _pane_claim_warned: dict[str, int] = {}
+        _pane_parked_warned: dict[str, int] = {}
 
         def _native_panes_for_reaper() -> list[PaneRef]:
             panes: list[PaneRef] = []
@@ -13853,6 +13863,7 @@ def create_runner_app(
             listed = {pane.conversation_id for pane in panes}
             for bookkeeping in (
                 _pane_claim_warned,
+                _pane_parked_warned,
                 _pane_server_unreachable_since,
                 _native_reap_dispatch_fence,
             ):
@@ -13860,6 +13871,16 @@ def create_runner_app(
                     del bookkeeping[gone]
             _pane_server_unreachable_warned.intersection_update(listed)
             return panes
+
+        def _pane_harness_key(pane: PaneRef) -> str | None:
+            agent = native_coding_agent_for_terminal_name(pane.terminal_name)
+            return agent.key if agent is not None else None
+
+        async def _run_pane_probe(pane: PaneRef, *, cheap_only: bool) -> TurnProbe | None:
+            """Ask the pane's harness for its turn state; ``None`` if it has no probe."""
+            return await _run_native_turn_probe(
+                pane.conversation_id, _pane_harness_key(pane), cheap_only=cheap_only
+            )
 
         async def _pane_output_age(pane: PaneRef) -> float | None:
             """Seconds since the pane last printed; ``None`` if unreadable.
@@ -13873,16 +13894,111 @@ def create_runner_app(
             )
             return None if activity_at is None else max(0.0, time.time() - activity_at)
 
+        def _pane_has_probe(pane: PaneRef) -> bool:
+            from omnigent.native.native_dispatch import resolve_hook_for_key
+
+            key = _pane_harness_key(pane)
+            return key is not None and resolve_hook_for_key(key, "pane_turn_probe") is not None
+
+        def _status_file_dialog(pane: PaneRef) -> tuple[str, float] | None:
+            """A dialog the harness's own status file reported, as ``(reason, age_s)``.
+
+            The harness's probe re-reads that file, so the record is checked
+            against it rather than trusted: a poller that stopped after the
+            dialog opened must not pin the pane once the file moved on. A
+            dialog a forwarder relayed has no such re-read and stays a hold.
+            """
+            if not _pane_has_probe(pane):
+                return None
+            record = _status_book.current(pane.conversation_id)
+            dialog = _status_book.blocked(pane.conversation_id)
+            if (
+                dialog is None
+                or record is None
+                or record.blocked_source is not StatusSource.STATUS_FILE
+            ):
+                return None
+            return dialog
+
+        def _reconcile_claim(conv_id: str, claim: StatusRecord, why: str) -> bool:
+            """Record that a stale ``running`` was refuted by the harness or server.
+
+            :returns: ``False`` when the claim moved on while it was judged (a
+                new turn's edge landed), so nothing was recorded.
+            """
+            if not _status_book.refute(conv_id, claim):
+                _logger.info(
+                    "native pane %s: %s-recorded running changed while it was checked; "
+                    "not refuting it",
+                    conv_id,
+                    claim.origin.value,
+                    extra=debug_event(
+                        "native_pane_claim_moved",
+                        session_id=conv_id,
+                        claim_source=claim.origin.value,
+                        refuted_by=why,
+                    ),
+                )
+                return False
+            _logger.warning(
+                "native pane %s: %s-recorded running (held %.0fs) refuted: %s",
+                conv_id,
+                claim.origin.value,
+                _status_book.age_s(claim.since),
+                why,
+                extra=debug_event(
+                    "native_pane_claim_refuted",
+                    session_id=conv_id,
+                    claim_source=claim.origin.value,
+                    claim_age_s=_status_book.age_s(claim.since),
+                    refuted_by=why,
+                ),
+            )
+            return True
+
+        def _inferred_active_is_stale(conv_id: str, probe: TurnProbe) -> bool:
+            """An inferred ACTIVE left over from before an accepted interrupt.
+
+            A missed ``Stop`` keeps an interrupted turn looking open. The answer
+            is discounted only when nothing shows a turn begun after the
+            interrupt: no runner dispatch since, no ``running`` recorded since
+            (a turn started in the pane is relayed), and, when the probe dates
+            its turn, a turn that started before the interrupt.
+            """
+            if probe.authority != "inferred":
+                return False
+            control_at = _status_book.last_control_idle_at(conv_id)
+            if control_at is None:
+                return False
+            dispatch_at = _status_book.last_dispatch_at(conv_id)
+            if dispatch_at is not None and dispatch_at > control_at:
+                return False
+            control_wall = _status_book.last_control_idle_wall(conv_id)
+            if (
+                probe.started_wall is not None
+                and control_wall is not None
+                and probe.started_wall > control_wall
+            ):
+                return False
+            # The interrupt recorded idle, so any running now began after it.
+            current = _status_book.current(conv_id)
+            return current is None or current.status != "running"
+
         async def _native_pane_assess(pane: PaneRef) -> PaneAssessment:
             """Every liveness signal for one pane (see ``pane_reaper``).
 
-            Status is read only through the book's reader API. A ``running``
-            recorded by a local channel is a hard reason.
+            Status is read only through the book's reader API. A recorded
+            ``running`` is a hard reason under the ``veto`` and ``shadow`` (the
+            default) policies, and aged evidence under ``evidence``.
             """
             conv_id = pane.conversation_id
             facts: dict[str, object] = {"harness": pane.terminal_name}
+            file_dialog = _status_file_dialog(pane)
             reasons = _native_session_hold_reasons(
-                conv_id, facts, approval_max_s=_pane_approval_max_s
+                conv_id,
+                facts,
+                approval_max_s=_pane_approval_max_s,
+                blocked_is_hard=file_dialog is None,
             )
             clients = await asyncio.to_thread(_list_tmux_clients, str(pane.socket_path), "main")
             if clients:
@@ -13896,7 +14012,10 @@ def create_runner_app(
             dispatch_at = _status_book.last_dispatch_at(conv_id)
             if dispatch_at is not None:
                 facts["dispatch_age_s"] = _status_book.age_s(dispatch_at)
-            claim = _status_book.claim(conv_id)
+            claim = _status_book.claim(
+                conv_id, include_relay=_pane_claim_policy is ClaimPolicy.EVIDENCE
+            )
+            claim_age = silent = 0.0
             if claim is not None:
                 # A new runner dispatch restarts the claim's clock even when the
                 # previous turn's ``running`` was never ended.
@@ -13909,7 +14028,66 @@ def create_runner_app(
                     claim_age_s=claim_age,
                     claim_silent_s=silent,
                 )
-                reasons.add(SpareReason.STATUS_CLAIM)
+            live_file_dialog = file_dialog is not None and file_dialog[1] < _pane_approval_max_s
+            probe: TurnProbe | None = None
+            if live_file_dialog or (claim is not None and silent >= PANE_OUTPUT_BUSY_WINDOW_S):
+                probe = await _run_pane_probe(pane, cheap_only=True)
+            if probe is not None:
+                facts["probe"] = f"{probe.state.value}: {probe.detail}"
+                if probe.state is TurnState.ACTIVE:
+                    if not _inferred_active_is_stale(conv_id, probe):
+                        reasons.add(SpareReason.TURN_PROBE)
+                elif probe.state is TurnState.PARKED:
+                    # Bounded like every human wait: from when the dialog was
+                    # recorded, else from the last sign of work.
+                    blocked = _status_book.blocked(conv_id)
+                    parked_for = blocked[1] if blocked is not None else silent
+                    if parked_for < _pane_approval_max_s:
+                        reasons.add(SpareReason.AWAITING_HUMAN)
+                    elif _pane_parked_warned.get(conv_id) != (claim.seq if claim else -1):
+                        _pane_parked_warned[conv_id] = claim.seq if claim else -1
+                        _logger.warning(
+                            "native pane %s: parked on a dialog for %.0fs; "
+                            "no longer holding the pane for it",
+                            conv_id,
+                            parked_for,
+                            extra={"session_id": conv_id},
+                        )
+                elif probe.state is TurnState.INACTIVE:
+                    # Not recorded here: a relay re-asserting running would
+                    # open a fresh episode after every refutation. The pre-reap
+                    # check records the reconciliation.
+                    if claim is not None:
+                        facts["claim_refuted"] = True
+                        claim = None
+                    if file_dialog is not None:
+                        facts["dialog_refuted"] = True
+                elif live_file_dialog:
+                    reasons.add(SpareReason.AWAITING_HUMAN)  # the file could not be re-read
+            elif live_file_dialog:
+                reasons.add(SpareReason.AWAITING_HUMAN)
+            if claim is not None:
+                if _pane_claim_policy is ClaimPolicy.EVIDENCE:
+                    evidence_age = silent
+                else:
+                    reasons.add(SpareReason.STATUS_CLAIM)
+                    if (
+                        _pane_claim_policy is ClaimPolicy.SHADOW
+                        and silent >= _pane_idle_timeout_s
+                        and _pane_claim_warned.get(conv_id) != claim.seq
+                    ):
+                        _logger.info(
+                            "native pane %s: running claim would expire under the "
+                            "evidence policy (silent %.0fs)",
+                            conv_id,
+                            silent,
+                            extra=debug_event(
+                                "native_pane_claim_would_expire",
+                                session_id=conv_id,
+                                claim_source=claim.origin.value,
+                                silent_s=silent,
+                            ),
+                        )
                 if (
                     silent >= _pane_idle_timeout_s
                     and reasons <= {SpareReason.STATUS_CLAIM}
@@ -13984,20 +14162,89 @@ def create_runner_app(
             return None, server_status if isinstance(server_status, str) else None
 
         async def _confirm_native_pane_reap(pane: PaneRef) -> ConfirmVerdict:
-            """Deep check before teardown: the server's pending prompts."""
+            """Deep check before teardown: the harness's own state, then the server."""
             conv_id = pane.conversation_id
             facts: dict[str, object] = {"harness": pane.terminal_name}
             # The teardown checks no turn was dispatched after this point.
             dispatch_before = _status_book.last_dispatch_at(conv_id)
             _native_reap_dispatch_fence[conv_id] = dispatch_before
+            claim = _status_book.claim(
+                conv_id, include_relay=_pane_claim_policy is ClaimPolicy.EVIDENCE
+            )
+            # A recorded dialog (``blocked_on``) holds until its bound. One the
+            # harness's status file reported is checked against the probe,
+            # which re-reads that file; a relayed one is honored as is.
+            recorded_dialog = _status_book.blocked(conv_id)
+            blocked = recorded_dialog
+            if blocked is not None and blocked[1] >= _pane_approval_max_s:
+                blocked = None
+            if blocked is not None and _status_file_dialog(pane) is None:
+                facts["blocked_on"] = blocked[0]
+                return ConfirmVerdict(
+                    False, SpareReason.AWAITING_HUMAN, facts=facts, held_s=blocked[1]
+                )
+            probe = await _run_pane_probe(pane, cheap_only=False)
+            probe_unknown = probe is None
+            if probe is not None:
+                facts["probe"] = f"{probe.state.value}: {probe.detail}"
+                if probe.state is TurnState.ACTIVE:
+                    if _inferred_active_is_stale(conv_id, probe):
+                        facts["probe_discounted"] = "prompt predates an accepted interrupt"
+                    else:
+                        return ConfirmVerdict(False, SpareReason.TURN_PROBE, facts=facts)
+                elif probe.state is TurnState.PARKED:
+                    # The wait's age: since the dialog was recorded, else since
+                    # the pane last printed (it printed the dialog).
+                    held = (
+                        recorded_dialog[1]
+                        if recorded_dialog is not None
+                        else await _pane_output_age(pane)
+                    )
+                    return ConfirmVerdict(
+                        False, SpareReason.AWAITING_HUMAN, facts=facts, held_s=held
+                    )
+                elif probe.state is TurnState.INACTIVE:
+                    if claim is not None:
+                        if not _reconcile_claim(conv_id, claim, f"probe: {probe.detail}"):
+                            return ConfirmVerdict(False, SpareReason.STATUS_CLAIM, facts=facts)
+                        claim = None
+                    blocked = None
+                else:
+                    probe_unknown = True
+            if blocked is not None and probe_unknown:
+                facts["blocked_on"] = blocked[0]
+                return ConfirmVerdict(
+                    False, SpareReason.AWAITING_HUMAN, facts=facts, held_s=blocked[1]
+                )
             if _pane_server_check:
-                spare, _server_status = await _server_pending_check(conv_id, facts)
+                spare, server_status = await _server_pending_check(conv_id, facts)
                 if spare is not None:
                     return spare
+                # Refutation only: the server's ``running`` never keeps a pane.
+                if claim is not None and server_status in ("idle", "failed"):
+                    if not _reconcile_claim(conv_id, claim, f"server status {server_status}"):
+                        return ConfirmVerdict(False, SpareReason.STATUS_CLAIM, facts=facts)
+                    claim = None
             if _status_book.last_dispatch_at(conv_id) != dispatch_before:
-                # A turn was sent while this check awaited the server.
+                # A turn was sent while this check awaited the probe or server.
                 facts["turn_dispatched"] = True
                 return ConfirmVerdict(False, SpareReason.RUNNER_TURN, facts=facts)
+            if claim is not None and probe_unknown and probe is not None:
+                return ConfirmVerdict(False, unknown=True, facts=facts)
+            if claim is not None:
+                _logger.warning(
+                    "native pane %s: reaping with an unverified running claim (%s, %.0fs)",
+                    conv_id,
+                    claim.origin.value,
+                    _status_book.age_s(claim.since),
+                    extra=debug_event(
+                        "native_pane_reap_unverified_claim",
+                        session_id=conv_id,
+                        claim_source=claim.origin.value,
+                        claim_age_s=_status_book.age_s(claim.since),
+                        probe=facts.get("probe"),
+                    ),
+                )
             return ConfirmVerdict(True, facts=facts)
 
         async def _reap_native_pane(pane: PaneRef) -> bool:
@@ -14009,6 +14256,7 @@ def create_runner_app(
                 _pane_server_unreachable_since.pop(conv_id, None)
                 _pane_server_unreachable_warned.discard(conv_id)
                 _pane_claim_warned.pop(conv_id, None)
+                _pane_parked_warned.pop(conv_id, None)
             return reaped
 
         app.state.native_pane_reaper = NativePaneReaper(

@@ -290,3 +290,73 @@ def test_response_id_is_kept_for_diagnostics_only() -> None:
     assert record is not None
     assert record.response_id == "x"
     assert record.since == 1000.0
+
+
+def test_a_refutation_ends_the_claim_it_judged() -> None:
+    book, clock = _book()
+    book.record("conv", "running", source=StatusSource.RUNNER)
+    claim = book.claim("conv")
+    assert claim is not None
+    clock.now += 60
+    assert book.refute("conv", claim) is True
+    record = book.current("conv")
+    assert record is not None and record.status == "idle"
+    assert record.origin is StatusSource.RECONCILE
+    assert book.claim("conv") is None
+
+
+@pytest.mark.parametrize(
+    "meanwhile",
+    [
+        [("running", StatusSource.RUNNER)],  # a new dispatch
+        [("running", StatusSource.PTY)],  # the pane started printing again
+        [("running", StatusSource.STATUS_FILE)],
+        [("idle", StatusSource.RELAY), ("running", StatusSource.RELAY)],  # a new episode
+        [("idle", StatusSource.RELAY)],  # already ended
+    ],
+)
+def test_a_refutation_never_lands_on_a_claim_that_moved(
+    meanwhile: list[tuple[str, StatusSource]],
+) -> None:
+    book, _ = _book()
+    book.record("conv", "running", source=StatusSource.RUNNER)
+    claim = book.claim("conv")
+    assert claim is not None
+    for status, source in meanwhile:
+        book.record("conv", status, source=source)
+    before = book.current("conv")
+    assert book.refute("conv", claim) is False
+    assert book.current("conv") == before
+
+
+def test_a_relayed_reassert_does_not_fence_a_refutation() -> None:
+    book, _ = _book()
+    book.record("conv", "running", source=StatusSource.RUNNER)
+    claim = book.claim("conv")
+    assert claim is not None
+    book.record("conv", "running", source=StatusSource.RELAY)
+    record = book.current("conv")
+    assert record is not None and record.local_asserts == claim.local_asserts
+    assert book.refute("conv", claim) is True
+
+
+def test_local_assertions_are_counted_per_episode() -> None:
+    book, _ = _book()
+    book.record("conv", "running", source=StatusSource.RELAY)
+    assert book.current("conv").local_asserts == 0  # type: ignore[union-attr]
+    book.record("conv", "running", source=StatusSource.PTY)
+    book.record("conv", "running", source=StatusSource.RUNNER)
+    assert book.current("conv").local_asserts == 2  # type: ignore[union-attr]
+    book.record("conv", "idle", source=StatusSource.PTY)
+    assert book.current("conv").local_asserts == 1  # type: ignore[union-attr]
+
+
+def test_the_interrupt_stamp_has_a_wall_clock_twin() -> None:
+    book, _ = _book()
+    assert book.last_control_idle_wall("conv") is None
+    book.record("conv", "idle", source=StatusSource.CONTROL)
+    assert book.last_control_idle_wall("conv") == 1.7e9
+    book.transfer("conv", "conv_new")
+    assert book.last_control_idle_wall("conv_new") == 1.7e9
+    book.forget("conv_new")
+    assert book.last_control_idle_wall("conv_new") is None

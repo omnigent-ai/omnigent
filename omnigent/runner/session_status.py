@@ -74,6 +74,8 @@ class StatusRecord:
     :param blocked_source: The channel that set *blocked_on*.
     :param response_id: Last response id a channel attached (diagnostic only).
     :param seq: Book-global monotonic sequence number of the last change.
+    :param local_asserts: How many times a local channel asserted this value in
+        this episode. A refutation checks it did not move while it waited.
     """
 
     status: str
@@ -87,6 +89,7 @@ class StatusRecord:
     blocked_source: StatusSource | None
     response_id: str | None
     seq: int
+    local_asserts: int = 0
 
 
 class _StatusView(Mapping[str, str]):
@@ -129,6 +132,8 @@ class SessionStatusBook:
     * A ``blocked_on`` change keeps ``since`` and restamps ``blocked_since``.
       A duplicate without a reason clears a reason only when it comes from the
       channel that set it.
+    * A refutation (:meth:`refute`) lands only on the episode it judged, and
+      only if no local channel re-asserted it while the judgement was made.
     * :meth:`current` is the last edge from any channel. It is not liveness:
       only the pane reaper's assessment decides what a ``running`` means. The
       one exception is the runner idle watchdog's native-turn hold: a recorded
@@ -155,6 +160,7 @@ class SessionStatusBook:
         self._records: dict[str, StatusRecord] = {}
         self._dispatch_at: dict[str, float] = {}
         self._control_idle_at: dict[str, float] = {}
+        self._control_idle_wall: dict[str, float] = {}
         self._seq = 0
 
     # ── writers ──────────────────────────────────────────────────────────
@@ -183,6 +189,30 @@ class SessionStatusBook:
         self._log_edge(session_id, status, source, changed, blocked_on)
         return changed
 
+    def refute(self, session_id: str, claim: StatusRecord) -> bool:
+        """End *claim* with a ``RECONCILE`` idle, unless it moved on meanwhile.
+
+        A refutation is decided on a claim read before the probe or server
+        answered. If the status changed since, or a local channel re-asserted
+        it (a new turn's dispatch, the pane's own edge), the refutation would
+        end work it never judged, so nothing is recorded.
+
+        :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
+        :param claim: The record the refutation was decided on.
+        :returns: ``True`` when the idle was recorded.
+        """
+        with self._lock:
+            current = self._records.get(session_id)
+            if (
+                current is None
+                or current.seq != claim.seq
+                or current.local_asserts != claim.local_asserts
+            ):
+                return False
+            changed = self._record_locked(session_id, "idle", StatusSource.RECONCILE, None, None)
+        self._log_edge(session_id, "idle", StatusSource.RECONCILE, changed, None)
+        return True
+
     def _record_locked(
         self,
         session_id: str,
@@ -193,6 +223,7 @@ class SessionStatusBook:
     ) -> bool:
         # Caller holds the lock.
         now = self._clock()
+        local = 1 if source in LOCAL_SOURCES else 0
         previous = self._records.get(session_id)
         if previous is None or previous.status != status:
             self._seq += 1
@@ -208,10 +239,12 @@ class SessionStatusBook:
                 blocked_source=source if blocked_on else None,
                 response_id=response_id,
                 seq=self._seq,
+                local_asserts=local,
             )
             changed = True
         else:
             record, changed = self._merge_duplicate(previous, now, source, blocked_on)
+            record = replace(record, local_asserts=previous.local_asserts + local)
             if response_id is not None:
                 record = replace(record, response_id=response_id)
         self._records[session_id] = record
@@ -281,6 +314,7 @@ class SessionStatusBook:
             self._dispatch_at[session_id] = now
         if source == StatusSource.CONTROL and status == "idle":
             self._control_idle_at[session_id] = now
+            self._control_idle_wall[session_id] = self._wall_clock()
 
     def reset(self, session_id: str, reason: str, *, mark: object = _UNMARKED) -> None:
         """Drop a session's status after its pane was torn down.
@@ -333,6 +367,7 @@ class SessionStatusBook:
             self._records.pop(session_id, None)
             self._dispatch_at.pop(session_id, None)
             self._control_idle_at.pop(session_id, None)
+            self._control_idle_wall.pop(session_id, None)
 
     def transfer(self, source_id: str, target_id: str) -> None:
         """Move a session's status with its pane, never clobbering the target.
@@ -344,7 +379,7 @@ class SessionStatusBook:
             record = self._records.pop(source_id, None)
             if record is not None and target_id not in self._records:
                 self._records[target_id] = record
-            for stamps in (self._dispatch_at, self._control_idle_at):
+            for stamps in (self._dispatch_at, self._control_idle_at, self._control_idle_wall):
                 stamp = stamps.pop(source_id, None)
                 if stamp is not None and target_id not in stamps:
                     stamps[target_id] = stamp
@@ -418,6 +453,15 @@ class SessionStatusBook:
         """Monotonic time of the last accepted native interrupt/stop idle."""
         with self._lock:
             return self._control_idle_at.get(session_id)
+
+    def last_control_idle_wall(self, session_id: str) -> float | None:
+        """Wall-clock twin of :meth:`last_control_idle_at`.
+
+        Only for ordering against a vendor record stamped in wall time, such as
+        a hook log line.
+        """
+        with self._lock:
+            return self._control_idle_wall.get(session_id)
 
     def session_ids(self) -> list[str]:
         """Sessions that currently hold a record."""

@@ -107,7 +107,7 @@ class NativeHarnessProvider:
     stop_handler: str | None = None
     materialize_agent_spec: str | None = None  # built-in agent seeding
     bridge_dir: str | None = None  # cost-popup bridge-dir lookup
-    # Native pane teardown: ``async (NativeProbeContext) -> TurnProbe | None``
+    # Native pane reaper: ``async (NativeProbeContext) -> TurnProbe | None``
     # asking the harness's own state whether its agent is still working (see
     # ``omnigent.runner.native.pane_probe_types``). ``None`` when the harness's
     # running/idle is pane-derived and needs no probe.
@@ -280,6 +280,14 @@ HERMES_NATIVE_CODING_AGENT = NativeCodingAgent(
 # handled as a spawn-env special case rather than a plain label read.
 _BRIDGE_ID_LABEL_HARNESSES: frozenset[str] = frozenset({"codex", "opencode", "antigravity"})
 
+# Built-in harnesses whose turn state the pane reaper can ask for directly:
+# their idle arrives from a forwarder (codex, antigravity), or the runner's own
+# idle is published before the agent finishes (opencode, devin), or the vendor
+# writes a status file (claude). The rest are pane-derived.
+_BUILTIN_PANE_PROBE_HARNESSES: frozenset[str] = frozenset(
+    {"claude", "codex", "antigravity", "opencode", "devin"}
+)
+
 
 def _builtin_native_provider(key: str) -> NativeHarnessProvider:
     """Build a built-in provider row from the ``omnigent.<key>_native`` module.
@@ -305,6 +313,9 @@ def _builtin_native_provider(key: str) -> NativeHarnessProvider:
             f"omnigent.{key}_native.bridge_id" if key in _BRIDGE_ID_LABEL_HARNESSES else None
         ),
         materialize_agent_spec=f"{module}:_materialize_{key}_agent_spec",
+        pane_turn_probe=(
+            f"{pkg}.pane_probe:probe_pane_turn" if key in _BUILTIN_PANE_PROBE_HARNESSES else None
+        ),
     )
 
 

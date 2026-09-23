@@ -60,6 +60,7 @@ _READERS = frozenset(
         "age_s",
         "last_dispatch_at",
         "last_control_idle_at",
+        "last_control_idle_wall",
         "session_ids",
         "status_view",
         "edge_mark",
@@ -68,6 +69,8 @@ _READERS = frozenset(
 # writer -> the (module, function) pairs allowed to call it.
 _WRITER_CALLERS: dict[str, frozenset[tuple[Path, str]]] = {
     "record": frozenset(),  # audited by name in _RECORDERS
+    # RECONCILE: a probe or server refutation, fenced on the claim it judged.
+    "refute": frozenset({(_APP_MODULE, "_reconcile_claim")}),
     "reset": frozenset(
         {
             (_REGISTRY_MODULE, "reset_session_status"),
@@ -113,13 +116,18 @@ _FORBIDDEN_STATUS_SOURCES = frozenset(
 # reference (say, from a merge) reads a store that no longer exists.
 _RETIRED_STATUS_NAMES = frozenset({"_native_pane_status", "_published_session_status"})
 
-# app.py functions that decide from session status: the reaper's assessment,
-# its hold reasons and the teardown re-test, the claude /model mid-turn check,
-# and the runner idle watchdog's native-turn hold. Each must read status only
-# through the book's reader API.
+# app.py functions that decide from session status: the reaper's assessment and
+# deep check, its hold reasons and the teardown re-test, the claude /model
+# mid-turn check, and the runner idle watchdog's native-turn hold. Each must
+# read status only through the book's reader API.
 _STATUS_READING_PATHS: dict[str, frozenset[str]] = {
     "_native_session_hold_reasons": frozenset({"blocked"}),
     "_native_pane_assess": frozenset({"claim", "current"}),
+    "_confirm_native_pane_reap": frozenset({"claim"}),
+    "_inferred_active_is_stale": frozenset(
+        {"last_control_idle_at", "last_control_idle_wall", "last_dispatch_at", "current"}
+    ),
+    "_status_file_dialog": frozenset({"current", "blocked"}),
     "_dispatched_since_reap_decision": frozenset({"last_dispatch_at"}),
     "_native_pane_close_snapshot": frozenset({"claim"}),
     "_native_sidecars_still_needed": frozenset(),
@@ -148,6 +156,7 @@ _BOOK_INTERNALS = frozenset(
         "_records",
         "_dispatch_at",
         "_control_idle_at",
+        "_control_idle_wall",
         "_merge_duplicate",
         "_note_projections",
         "_record_locked",
@@ -566,6 +575,21 @@ def test_the_pane_reaper_never_touches_a_status_store() -> None:
         if path == _REAPER_MODULE
     ]
     assert found == []
+
+
+def test_pane_probes_only_read_the_book() -> None:
+    probes = [
+        (path, tree)
+        for path, tree in _package_sources()
+        if path.name == "pane_probe.py" or path.name == "pane_probe_types.py"
+    ]
+    assert len(probes) >= 6
+    writes = [
+        f"{path}:{line} {method}"
+        for path, method, _owner, line in _book_calls(probes)
+        if method not in _READERS
+    ]
+    assert writes == []
 
 
 def test_production_code_never_reads_the_status_view() -> None:

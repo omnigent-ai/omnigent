@@ -371,6 +371,26 @@ async def test_confirm_exception_spares_and_logs(caplog: pytest.LogCaptureFixtur
     assert any("pre-reap check failed" in rec.getMessage() for rec in caplog.records)
 
 
+async def test_unknown_confirm_spares_one_window_then_reaps(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    f = _Fakes()
+    f.panes = [_pane("conv_a")]
+
+    async def _confirm(pane: PaneRef) -> ConfirmVerdict:
+        return ConfirmVerdict(False, unknown=True)
+
+    r = _assessing(f, {}, confirm=_confirm, timeout=0.01)
+    r._last_busy_at["conv_a"] = time.monotonic() - 1000
+    await r._scan_once()
+    assert f.reaped == []
+    await asyncio.sleep(0.02)
+    with caplog.at_level(logging.WARNING, logger="omnigent.terminals.pane_reaper"):
+        await r._scan_once()
+    assert f.reaped == ["conv_a"]
+    assert any("second idle window" in rec.getMessage() for rec in caplog.records)
+
+
 async def test_confirm_spare_past_its_ceiling_reaps() -> None:
     f = _Fakes()
     f.panes = [_pane("conv_a")]
@@ -616,6 +636,17 @@ async def test_reap_returning_false_rearms_the_clock() -> None:
 def test_reaper_requires_an_assessment() -> None:
     with pytest.raises(TypeError):
         NativePaneReaper(list_native_panes=list, reap=_Fakes().reap)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [("", "shadow"), ("veto", "veto"), ("SHADOW", "shadow"), ("bogus", "shadow")],
+)
+def test_claim_policy_env(monkeypatch: pytest.MonkeyPatch, raw: str, expected: str) -> None:
+    from omnigent.terminals.pane_reaper import resolve_claim_policy
+
+    monkeypatch.setenv("OMNIGENT_NATIVE_PANE_CLAIM_POLICY", raw)
+    assert resolve_claim_policy() == expected
 
 
 # ── Human-wait and live-work signals in the runner's assessment ─────────────
@@ -883,3 +914,34 @@ async def test_a_teardown_that_spares_is_not_logged_or_counted_as_a_reap(
     # The reason history survived the spared attempt.
     assert reaped.attributes["recent_reasons"] == "tool_call"
     assert r._summary["reaped"] == 1
+
+
+@pytest.mark.parametrize(
+    ("held_s", "reaped"), [(None, False), (40.0, False), (50.0, True), (60.0, True)]
+)
+async def test_a_deep_check_hold_counts_from_when_the_wait_began(
+    held_s: float | None, reaped: bool
+) -> None:
+    f = _Fakes()
+    f.panes = [_pane("conv_a")]
+
+    async def _confirm(pane: PaneRef) -> ConfirmVerdict:
+        return ConfirmVerdict(False, SpareReason.AWAITING_HUMAN, held_s=held_s)
+
+    r = NativePaneReaper(
+        list_native_panes=lambda: list(f.panes),
+        assess=lambda _pane: _idle(),
+        confirm_reap=_confirm,
+        reap=f.reap,
+        idle_timeout_s=10.0,
+        approval_max_s=50.0,
+    )
+    r._last_busy_at["conv_a"] = time.monotonic() - 1000
+    await r._scan_once()
+    # A dialog already open for the whole ceiling (known from its record) is
+    # not granted a fresh one from the first deep-check spare.
+    assert f.reaped == (["conv_a"] if reaped else [])
+
+
+async def _idle() -> PaneAssessment:
+    return PaneAssessment()

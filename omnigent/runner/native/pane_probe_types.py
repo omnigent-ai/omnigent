@@ -1,9 +1,9 @@
 """Types for the per-harness native pane turn probes.
 
 A turn probe asks a native harness's own state whether its agent is still
-working, so the runner can check before it releases a deleted pane's
-sidecars. A harness may declare one as
-``NativeHarnessProvider.pane_turn_probe``: an
+working, so the pane reaper can confirm or refute a recorded ``running`` before
+it tears a silent pane down. Each built-in harness that has such a source
+declares it as ``NativeHarnessProvider.pane_turn_probe``: an
 ``async (NativeProbeContext) -> TurnProbe | None`` callable. ``None`` means the
 probe does not answer in this mode (a deep probe asked for a cheap answer).
 """
@@ -41,12 +41,16 @@ class TurnProbe:
         ``"inferred"`` when derived from Omnigent-side bookkeeping.
     :param blocked_on: What a PARKED agent waits for, e.g. ``"approval"``.
     :param detail: Short diagnostic, e.g. ``"thread/read: idle"``.
+    :param started_wall: Wall-clock time the ACTIVE turn began, when the
+        source dates it (a hook log line's record time). Orders an inferred
+        ACTIVE against an accepted interrupt; ``None`` when unknown.
     """
 
     state: TurnState
     authority: ProbeAuthority
     blocked_on: str | None = None
     detail: str = ""
+    started_wall: float | None = None
 
 
 @dataclass(frozen=True)

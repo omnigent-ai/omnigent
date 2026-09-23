@@ -15,22 +15,27 @@ Each scan the runner *assesses* every listed pane (:class:`PaneAssessment`):
 * **Hard reasons** spare the pane outright (:class:`SpareReason`): a live runner
   turn, messages still queued for the pane (for one idle window), a running
   tool call, a human-answerable prompt (runner ASK, open prompt park, a dialog
-  the agent reports, claude's approval marker), running sub-agents, or an
-  attached tmux client. Human waits are bounded by
-  :envvar:`OMNIGENT_NATIVE_PANE_APPROVAL_MAX_S` and sub-agents by
-  :envvar:`OMNIGENT_NATIVE_PANE_MAX_TURN_S`.
-* **Evidence age** is how long the pane has been silent, read from tmux's
-  ``window_activity`` clock. Output within :data:`PANE_OUTPUT_BUSY_WINDOW_S`
-  spares the pane.
+  the agent reports, claude's approval marker), running sub-agents, an attached
+  tmux client, or a probe that says the agent works. Human waits are bounded by
+  :envvar:`OMNIGENT_NATIVE_PANE_APPROVAL_MAX_S`, probe ACTIVE and sub-agents by
+  :envvar:`OMNIGENT_NATIVE_PANE_MAX_TURN_S`; a bound held by the pre-reap check
+  counts from when the wait began, and may run up to one idle window over.
+* **Evidence age** is how long the pane has been silent: tmux's
+  ``window_activity`` clock and, under the ``evidence`` claim policy, how long
+  a recorded ``running`` has gone unrefreshed. Output within
+  :data:`PANE_OUTPUT_BUSY_WINDOW_S` spares the pane.
 
 A recorded ``running`` is a *claim*, not evidence: status channels are lossy
-(a relayed idle can be dropped, a relay can re-assert ``running`` forever). A
-claim a local channel recorded (the runner, the pane watcher or Claude's status
-file) still spares the pane as a hard reason; a relay-only ``running`` does
-not. Before any teardown the reaper asks the server for the session's pending
-prompts (``confirm_reap``). A pane is reapable at ``max(last output, last
-hard-busy scan, first sight) + idle_timeout``; the pane is re-assessed right
-before teardown to close the select→reap race.
+(a relayed idle can be dropped, a relay can re-assert ``running`` forever), so
+the claim is judged against the pane and, before any teardown, against the
+harness's own state (``confirm_reap``: a turn probe and the server's pending
+prompts). A refutation lands only on the claim it judged: if a local channel
+re-asserted it meanwhile (a new turn), nothing is recorded and the pane is
+spared. A dialog recorded from the harness's own status file is re-read by its
+probe the same way; a relayed dialog holds until its bound. A pane is reapable
+at ``max(last output, last claim transition, last hard-busy scan, first sight)
++ idle_timeout``; the pane is re-assessed right before teardown to close the
+select→reap race.
 
 **Teardown** closes the pane and releases its sidecars under the harness's
 per-session ensure lock, after re-testing live work, and that no turn was
@@ -102,7 +107,8 @@ _DEFAULT_IDLE_TIMEOUT_S = 60 * 60
 _DEFAULT_REAPER_INTERVAL_S = 60.0
 _IDLE_TIMEOUT_ENV = "OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S"
 
-# How long an open prompt park may hold a pane: the runner's own ASK wait budget.
+# How long a human-wait signal (open prompt park, dialog reported by the agent,
+# a probe's PARKED) may hold a pane: the runner's own ASK wait budget.
 _DEFAULT_APPROVAL_MAX_S = 86400.0
 _APPROVAL_MAX_ENV = "OMNIGENT_NATIVE_PANE_APPROVAL_MAX_S"
 # How long a probe's ACTIVE (or running sub-agents) may hold a silent pane.
@@ -110,6 +116,8 @@ _APPROVAL_MAX_ENV = "OMNIGENT_NATIVE_PANE_APPROVAL_MAX_S"
 # recorded native turn may keep the runner up after its last evidence of work.
 _DEFAULT_MAX_TURN_S = 86400.0
 _MAX_TURN_ENV = "OMNIGENT_NATIVE_PANE_MAX_TURN_S"
+# How a recorded ``running`` weighs in the assessment (see ClaimPolicy).
+_CLAIM_POLICY_ENV = "OMNIGENT_NATIVE_PANE_CLAIM_POLICY"
 # ``0`` skips asking the server for pending prompts before a reap.
 _SERVER_CHECK_ENV = "OMNIGENT_NATIVE_PANE_REAP_SERVER_CHECK"
 # How long an unreachable server may block reaps before local signals decide.
@@ -139,14 +147,28 @@ class SpareReason(StrEnum):
     BUSY = "busy"
 
 
+class ClaimPolicy(StrEnum):
+    """How a recorded ``running`` counts when nothing else explains it.
+
+    * ``veto`` — it spares the pane outright (the pre-evidence behavior).
+    * ``shadow`` — as ``veto``, but log when it would have expired.
+    * ``evidence`` — it is soft evidence aged from its episode start: a stale
+      claim is confirmed or refuted before teardown and otherwise expires.
+    """
+
+    VETO = "veto"
+    SHADOW = "shadow"
+    EVIDENCE = "evidence"
+
+
 @dataclass(frozen=True)
 class PaneAssessment:
     """One pane's liveness verdict for a scan.
 
     :param reasons: Hard reasons that spare the pane outright.
-    :param evidence_age_s: Seconds since the last soft evidence of work (pane
-        output), or ``None`` when no such evidence could be read. Relative,
-        never an absolute clock.
+    :param evidence_age_s: Seconds since the last soft evidence of work
+        (pane output, or an unexpired claim's episode start), or ``None`` when
+        no such evidence could be read. Relative, never an absolute clock.
     :param facts: Diagnostics for logs, e.g. ``{"output_age_s": 12.0}``.
     """
 
@@ -168,12 +190,19 @@ class ConfirmVerdict:
 
     :param proceed: ``True`` to reap.
     :param reason: Why it spared, e.g. ``SpareReason.TURN_PROBE``, or ``""``.
+    :param unknown: Spared only because a probe could not answer for a stale
+        claim; the reaper proceeds after one more idle window.
     :param facts: Diagnostics for logs.
+    :param held_s: How long the wait behind *reason* has already lasted, when
+        the check knows (a dialog's recorded age), so its ceiling counts from
+        there rather than from the first deep-check spare.
     """
 
     proceed: bool
     reason: str = ""
+    unknown: bool = False
     facts: Mapping[str, object] = field(default_factory=lambda: MappingProxyType({}))
+    held_s: float | None = None
 
 
 class PaneRef(NamedTuple):
@@ -243,6 +272,18 @@ def resolve_max_turn_s() -> float:
     return _resolve_seconds_env(_MAX_TURN_ENV, _DEFAULT_MAX_TURN_S)
 
 
+def resolve_claim_policy() -> ClaimPolicy:
+    """Resolve :envvar:`OMNIGENT_NATIVE_PANE_CLAIM_POLICY` (default ``shadow``)."""
+    raw = (os.environ.get(_CLAIM_POLICY_ENV) or "").strip().lower()
+    if not raw:
+        return ClaimPolicy.SHADOW
+    try:
+        return ClaimPolicy(raw)
+    except ValueError:
+        _logger.warning("%s=%r is not a claim policy; using shadow", _CLAIM_POLICY_ENV, raw)
+        return ClaimPolicy.SHADOW
+
+
 def resolve_server_check_enabled() -> bool:
     """Whether reaps first ask the server for pending prompts (default on)."""
     raw = (os.environ.get(_SERVER_CHECK_ENV) or "").strip().lower()
@@ -283,7 +324,8 @@ class NativePaneReaper:
     :param is_busy: Legacy ``async`` boolean predicate, used when *assess* is
         not given.
     :param confirm_reap: Optional ``async`` deep check run right before
-        teardown (the server's pending prompts).
+        teardown (turn probe, server's pending prompts). Also used to reconcile
+        panes held only by a stale claim under the ``veto``/``shadow`` policies.
     :param idle_timeout_s: Idle window before reaping. ``None`` resolves the env
         knob; ``<= 0`` disables reaping.
     :param reaper_interval_s: Seconds between scans.
@@ -333,6 +375,8 @@ class NativePaneReaper:
         self._reason_history: dict[str, set[SpareReason]] = {}
         # Deep-check spares: (reason, first spared at).
         self._confirm_spare_since: dict[str, tuple[str, float]] = {}
+        self._unknown_since: dict[str, float] = {}
+        self._reconciled_at: dict[str, float] = {}
         self._output_held_since: dict[str, float] = {}
         self._warned: dict[tuple[str, str], float] = {}
         self._summary: Counter[str] = Counter()
@@ -430,13 +474,12 @@ class NativePaneReaper:
     ) -> list[PaneRef]:
         """Pure idle-clock decision: which panes are reapable right now.
 
-        Given the conversation ids observed busy this scan, maintain each
-        pane's idle clock and return the panes idle for at least
-        ``idle_timeout_s``. A busy pane re-arms its clock; a newly-observed idle
-        pane gets one full window of grace before it is eligible. For an armed
-        idle pane, *evidence_age_s* moves the clock forward to its last
-        evidence of work (``now - age``), never back. No I/O, so it is
-        unit-testable with an injected ``now``.
+        Given the conversation ids observed busy this scan, maintain each idle
+        clock and return the panes idle for at least ``idle_timeout_s``. A busy
+        pane re-arms its clock; a newly-observed idle pane gets one full window
+        of grace before it is eligible. For an armed idle pane, *evidence_age_s*
+        moves the clock forward to its last evidence of work (``now - age``),
+        never back. No I/O, so it is unit-testable with an injected ``now``.
         """
         live: set[str] = set()
         reapable: list[PaneRef] = []
@@ -471,6 +514,8 @@ class NativePaneReaper:
             self._last_reasons,
             self._reason_history,
             self._confirm_spare_since,
+            self._unknown_since,
+            self._reconciled_at,
             self._output_held_since,
         ):
             mapping.pop(key, None)
@@ -519,52 +564,80 @@ class NativePaneReaper:
             # Deep-check holds are bounded while they alone hold a pane; any
             # other evidence of work ends that streak.
             self._confirm_spare_since.pop(key, None)
+            self._unknown_since.pop(key, None)
         ages = {
             key: a.evidence_age_s
             for key, a in assessments.items()
             if not a.busy and a.evidence_age_s is not None
         }
+        await self._reconcile_claim_held(panes, assessments, now)
         for pane in self._classify(now, panes, busy_keys, ages):
             await self._consider_reap(pane)
         self._maybe_log_summary(panes)
 
+    async def _reconcile_claim_held(
+        self, panes: list[PaneRef], assessments: Mapping[str, PaneAssessment], now: float
+    ) -> None:
+        """Let the deep check refute claims that alone hold silent panes."""
+        if self._confirm_reap is None:
+            return
+        for pane in panes:
+            key = pane.conversation_id
+            assessment = assessments[key]
+            if assessment.reasons != {SpareReason.STATUS_CLAIM}:
+                continue
+            silent = assessment.facts.get("claim_silent_s")
+            if not isinstance(silent, (int, float)) or silent < self._idle_timeout_s:
+                continue
+            last = self._reconciled_at.get(key)
+            if last is not None and now - last < self._idle_timeout_s:
+                continue
+            self._reconciled_at[key] = now
+            try:
+                await self._confirm_reap(pane)
+            except Exception:
+                _logger.exception(
+                    "native pane reaper: reconcile failed for %s", pane.conversation_id
+                )
+
     async def _consider_reap(self, pane: PaneRef) -> None:
         conv = pane.conversation_id
+        key = pane.conversation_id
         # Re-check immediately before teardown: selection happened with
         # possibly-stale signals, and a turn / client / autonomous run may have
         # started since (the select→reap race). Re-arm and skip if so.
         now = time.monotonic()
         recheck = self._effective(pane, await self._assess_for_scan(pane), now, track=False)
-        if recheck.busy or not self._window_elapsed(conv, now, recheck.evidence_age_s):
+        if recheck.busy or not self._window_elapsed(key, now, recheck.evidence_age_s):
             if recheck.busy:
-                self._last_busy_at[conv] = now
+                self._last_busy_at[key] = now
             return
         if self._confirm_reap is not None:
             try:
                 verdict = await self._confirm_reap(pane)
             except Exception:
                 _logger.exception("native pane reaper: pre-reap check failed for %s", conv)
-                self._last_busy_at[conv] = time.monotonic()
+                self._last_busy_at[key] = time.monotonic()
                 return
             if not verdict.proceed and not self._override_spare(pane, verdict, now):
-                self._last_busy_at[conv] = time.monotonic()
+                self._last_busy_at[key] = time.monotonic()
                 return
             # The deep check awaited I/O; a turn or client may have arrived since.
             final = self._effective(pane, await self._assess_for_scan(pane), now, track=False)
             if final.busy:
-                self._last_busy_at[conv] = time.monotonic()
+                self._last_busy_at[key] = time.monotonic()
                 return
-        history = sorted(self._summary_reasons_for(conv))
+        history = sorted(self._summary_reasons_for(key))
         try:
             reaped = await self._reap(pane)
         except Exception:
             _logger.exception("native pane reaper: reap failed for conversation %s", conv)
             # Drop the clock entry: the grace window re-arms next scan instead
             # of permanently skipping the conversation.
-            self._forget(conv)
+            self._forget(key)
             return
         if reaped is False:
-            self._last_busy_at[conv] = time.monotonic()
+            self._last_busy_at[key] = time.monotonic()
             self._summary["spared:teardown"] += 1
             _logger.info("native pane teardown for %s did not close it; re-arming", conv)
             return
@@ -581,16 +654,32 @@ class NativePaneReaper:
                 recent_reasons=",".join(history),
             ),
         )
-        self._forget(conv)
+        self._forget(key)
         self._summary["reaped"] += 1
 
     def _override_spare(self, pane: PaneRef, verdict: ConfirmVerdict, now: float) -> bool:
         """Whether a deep-check spare has outlived its bound, so the reap proceeds."""
         conv = pane.conversation_id
-        reason, since = self._confirm_spare_since.get(conv, (verdict.reason, now))
+        key = pane.conversation_id
+        if verdict.unknown:
+            first = self._unknown_since.setdefault(key, now)
+            if now - first < self._idle_timeout_s:
+                self._log_confirm_spare(pane, verdict)
+                return False
+            _logger.warning(
+                "native pane %s: probe could not confirm a stale running claim for a "
+                "second idle window; reaping on local evidence",
+                conv,
+                extra=_pane_event("native_pane_reap_unverified", conv, verdict.facts),
+            )
+            return True
+        self._unknown_since.pop(key, None)
+        started = now - verdict.held_s if verdict.held_s is not None else now
+        reason, since = self._confirm_spare_since.get(key, (verdict.reason, started))
         if reason != verdict.reason:
-            since = now
-        self._confirm_spare_since[conv] = (verdict.reason, since)
+            since = started
+        since = min(since, started)
+        self._confirm_spare_since[key] = (verdict.reason, since)
         ceiling = self._ceiling(verdict.reason)
         if ceiling is not None and now - since >= ceiling:
             _logger.warning(
@@ -607,11 +696,11 @@ class NativePaneReaper:
     # ── observability ────────────────────────────────────────────────────
 
     def _log_confirm_spare(self, pane: PaneRef, verdict: ConfirmVerdict) -> None:
-        self._summary[f"confirm:{verdict.reason}"] += 1
+        self._summary[f"confirm:{verdict.reason or 'unknown'}"] += 1
         _logger.info(
             "native pane %s spared at the pre-reap check: %s",
             pane.conversation_id,
-            verdict.reason,
+            verdict.reason or "probe unknown",
             extra=_pane_event(
                 "native_pane_spared",
                 pane.conversation_id,
@@ -619,6 +708,7 @@ class NativePaneReaper:
                 terminal_name=pane.terminal_name,
                 reasons=verdict.reason,
                 stage="confirm",
+                unknown=verdict.unknown,
             ),
         )
 
@@ -628,13 +718,14 @@ class NativePaneReaper:
     def _observe(self, pane: PaneRef, assessment: PaneAssessment, now: float) -> None:
         """Log reason transitions and long holds for one assessed pane."""
         conv = pane.conversation_id
+        key = pane.conversation_id
         reasons = assessment.reasons
         for reason in reasons:
             self._summary[reason.value] += 1
-        self._reason_history.setdefault(conv, set()).update(reasons)
-        previous = self._last_reasons.get(conv)
+        self._reason_history.setdefault(key, set()).update(reasons)
+        previous = self._last_reasons.get(key)
         if previous != reasons:
-            self._last_reasons[conv] = reasons
+            self._last_reasons[key] = reasons
             if reasons or previous:
                 _logger.info(
                     "native pane %s spare reasons: %s",
@@ -658,7 +749,7 @@ class NativePaneReaper:
                 "no longer arrive",
                 conv,
             )
-        since = self._reason_since.get(conv, {})
+        since = self._reason_since.get(key, {})
         if reasons == {SpareReason.CLIENT_ATTACHED}:
             held = now - since.get(SpareReason.CLIENT_ATTACHED, now)
             if held > self._idle_timeout_s:
@@ -689,7 +780,7 @@ class NativePaneReaper:
                 )
         output_only = not reasons and assessment.busy
         if output_only and assessment.facts.get("status") != "running":
-            first = self._output_held_since.setdefault(conv, now)
+            first = self._output_held_since.setdefault(key, now)
             if now - first > _IDLE_REPAINT_WINDOWS * self._idle_timeout_s:
                 self._warn_once(
                     pane,
@@ -700,7 +791,7 @@ class NativePaneReaper:
                     assessment.facts.get("status"),
                 )
         else:
-            self._output_held_since.pop(conv, None)
+            self._output_held_since.pop(key, None)
 
     def _warn_once(self, pane: PaneRef, kind: str, message: str, *args: object) -> None:
         warned = (pane.conversation_id, kind)
