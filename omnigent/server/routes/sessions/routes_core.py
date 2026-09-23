@@ -167,6 +167,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _best_effort_stop,
     _build_session_list_item,
     _build_session_response,
+    _cancel_pending_archive_stop,
     _create_session_from_bundle,
     _create_session_from_existing_agent,
     _ensure_native_terminal_ready,
@@ -2639,18 +2640,27 @@ def register_core_routes(
         # Only on archive→true; unarchiving leaves it pruned (reads as seen).
         if body.archived is True:
             _prune_session_read_state(session_id)
-            # Stop the session now that the flag is committed, so a request
-            # rejected after this point can't leave a stopped-but-unarchived
-            # session. Detached, not awaited: the response must not wait out
-            # the stop's per-runner timeouts (seconds against a wedged or
-            # asleep runner). Archive has no client-side stop, so this also
-            # carries the host-runner teardown.
+            # Defer the stop now that the flag is committed, so a request
+            # rejected after this point can't leave a live runner on a session
+            # that ends up archived. Detached, not awaited: the response must
+            # not wait out the stop's per-runner timeouts (seconds against a
+            # wedged or asleep runner). The teardown sleeps past the Undo
+            # window, then re-reads the archived flag and skips if undone, so
+            # undoing keeps the runner alive. Archive has no client-side stop,
+            # so this also carries the host-runner teardown.
             _spawn_archive_stop(
                 session_id,
                 conversation_store,
                 runner_router,
                 getattr(request.app.state, "host_registry", None),
             )
+        elif body.archived is False:
+            # Unarchive (including Undo, which re-PATCHes archived=false within
+            # the pill's window): cancel a still-pending archive stop so the
+            # runner is kept alive instead of torn down for a session the user
+            # decided to keep. Same-replica fast path; the deferred stop's
+            # archived-flag re-check covers a cross-replica Undo.
+            _cancel_pending_archive_stop(session_id)
         # The runner applies native settings live. Silent startup metadata
         # writes skip both recovery and forwarding to avoid recursive launches.
         live_forward = not body.silent

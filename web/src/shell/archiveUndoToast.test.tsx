@@ -56,7 +56,14 @@ beforeEach(() => {
   toast.dismiss();
 });
 
-afterEach(() => cleanup());
+afterEach(() => {
+  // Clear any pending pill/batch before unmounting so a Sonner timer queued
+  // during a fake-timer test can't fire into a torn-down module (where the
+  // mocked `toast` is gone) and surface as an unhandled error.
+  resetArchiveUndoBatchForTests();
+  toast.dismiss();
+  cleanup();
+});
 
 describe("showArchiveUndoToast", () => {
   it("uses singular copy for a single session", async () => {
@@ -133,5 +140,75 @@ describe("showArchiveUndoToast", () => {
       fireEvent.click(screen.getByRole("button", { name: "View archived" }));
     });
     expect(navigate).toHaveBeenCalledWith("/settings/archived");
+  });
+
+  it("bounds the merged pill by an absolute deadline instead of resetting it", async () => {
+    // Regression: batched sidebar cleanup. Merges must NOT reset a fresh 3s
+    // countdown — the batch's life is bounded from the first archive (5s cap,
+    // below the 8s server grace), so the pill can't linger past the earliest
+    // session's teardown and offer an Undo for an already-stopped runner.
+    // Archive "a", then merge "b"/"c" ~2s apart; the pill must be gone by ~5s
+    // (the deadline), not ~2s after the last merge (a reset would keep it to ~6s).
+    vi.useFakeTimers();
+    try {
+      mountToaster();
+      await show(["a"]);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(2000);
+      });
+      await show(["b"]);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(2000);
+      });
+      await show(["c"]);
+      // t=4s: within the 5s cap, still visible.
+      expect(screen.queryByText(/^Archived/)).toBeInTheDocument();
+      // Past the 5s deadline (total 5.5s) — gone. A reset-on-merge would keep
+      // it until ~7s (last merge at 4s + 3s).
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1500);
+      });
+      expect(screen.queryByText(/^Archived/)).not.toBeInTheDocument();
+    } finally {
+      // Drain any queued Sonner timer WHILE still on fake timers, so nothing
+      // fires later against a torn-down module.
+      resetArchiveUndoBatchForTests();
+      toast.dismiss();
+      await act(async () => {
+        await vi.runOnlyPendingTimersAsync();
+      });
+      vi.useRealTimers();
+    }
+  });
+
+  it("starts a fresh batch for an archive after the deadline", async () => {
+    // An archive arriving past the deadline must not resurrect the old batch's
+    // pill; it begins its own window.
+    vi.useFakeTimers();
+    try {
+      mountToaster();
+      await show(["old"]);
+      // Advance past the 5s deadline so the old batch is finished.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(6000);
+      });
+      await show(["new"]);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(screen.getByText("Archived 1 session")).toBeInTheDocument();
+      act(() => {
+        fireEvent.click(screen.getByRole("button", { name: "Undo" }));
+      });
+      // Only the fresh id, never the expired "old".
+      expect(mocks.undoArchiveConversations).toHaveBeenLastCalledWith(queryClient, convs("new"));
+    } finally {
+      resetArchiveUndoBatchForTests();
+      toast.dismiss();
+      await act(async () => {
+        await vi.runOnlyPendingTimersAsync();
+      });
+      vi.useRealTimers();
+    }
   });
 });
