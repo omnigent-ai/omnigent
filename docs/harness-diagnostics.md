@@ -1,10 +1,16 @@
 # Native harness diagnostics
 
-`OMNIGENT_HARNESS_STDERR_ENABLED=1` enables native diagnostic text in Omnigent
-logs. The flag defaults off. `true`, `yes`, and `on` also enable capture; unset,
-`0`, or other values disable it. Set it in the environment that launches the
-host or CLI; the host forwards it to runners. Existing processes retain their
-launch environment, so start a fresh host and session after changing it.
+`OMNIGENT_HARNESS_STDERR_ENABLED=1` enables the additional native diagnostic text
+exports described here. The flag defaults off. `true`, `yes`, and `on` also
+enable them; unset, `0`, or other values disable them. Set it in the environment
+that launches the host or CLI; the host forwards it to runners. Existing
+processes retain their launch environment, so start a fresh host and session
+after changing it.
+
+The flag gates the additional diagnostic consumers' buffer reads and text
+exports, startup-error excerpts, and Codex's injected app-server logging filter.
+It does not disable in-memory exit-history capture or the existing registered
+Codex exit-screen telemetry.
 
 | Harness | Diagnostic source | When exported |
 | --- | --- | --- |
@@ -23,11 +29,11 @@ remain unchanged.
 ## Content and destinations
 
 Enabled capture retains diagnostic text, including tracebacks and request or
-response context. It applies known credential-pattern redaction, including
-whitespace-delimited values after explicit credential labels, normalizes carriage
-returns to newlines, and removes other terminal control codes. It does not filter
-prompts or payloads by content; configure capture only where this text is
-appropriate for the deployment's log storage and readers.
+response context. It redacts known credential patterns, including explicit
+credential labels, URL userinfo, and `Cookie`/`Set-Cookie` values. It also
+normalizes carriage returns to newlines and removes other terminal control
+codes. It does not filter prompts or payloads by content; configure capture only
+where this text is appropriate for the deployment's log storage and readers.
 
 Redaction is pattern-based, not a general detector of secrets in prose. For
 example, `password hunter2` is redacted, but `The password is hunter2` becomes
@@ -45,9 +51,9 @@ DEBUG path is unchanged. Earlier readiness-error reporting is also unchanged.
 Shared credential-pattern improvements also affect ordinary logs with capture
 disabled: assignment labels can contain spaces, and assigned values can include
 a `Bearer` prefix. For example, `api key: is missing` now becomes
-`api key: [REDACTED] missing` because the colon indicates an assignment. Only
-whitespace-delimited label/value matching without `:` or `=` is confined to
-diagnostic sanitization.
+`api key: [REDACTED] missing` because the colon indicates an assignment.
+Whitespace-delimited label/value matching without `:` or `=`, URL-userinfo
+masking, and cookie-value masking are confined to diagnostic sanitization.
 
 ## Codex continuous diagnostics
 
@@ -120,8 +126,11 @@ waits yield the event loop. A blocked handler cannot hold up the subprocess pipe
 or force app-server teardown to wait indefinitely. Capture is best effort:
 logger failures discard the affected batch, and an exporter that remains stuck
 through shutdown can lose the final diagnostics. With capture disabled, no
-collector thread or queue is created. The existing in-memory startup snapshot remains available in either
-mode, with its text export controlled by the flag.
+collector thread or queue is created. The existing app-server stderr buffer
+still retains completed records in either mode; the startup diagnostic
+collector reads and exports its text only with the flag enabled. Existing DEBUG
+logging and readiness-error reporting can still include stderr with the flag
+disabled.
 
 If capture initialization fails, the reader keeps draining and retaining its
 startup snapshot without falling back to per-line DEBUG logging. It attempts
@@ -161,16 +170,17 @@ before registration also emits `terminal_exit_observed`, with
 metadata; only opted-in Codex launches include a sanitized recent-output tail.
 They do not publish lifecycle changes for a resource that was never observed.
 
-The new startup paths capture up to 100 rows of recent scrollback plus the visible
-screen, so an argument parser's first error line is not lost when usage text
-scrolls it away. A possibly incomplete first joined record is discarded when
-history could have lost its prefix; unknown capture metadata suppresses the new
-tail. Export sanitizes the captured text before trimming to
-the last 40 lines and 4,000 characters, plus an omission notice. Existing
-registered Codex `terminal_exit_observed` records retain their screen-only
-excerpt independently of this flag; the flag is not a master content switch for
-ordinary lifecycle logs. Other terminals still export no pane text in these
-event attributes.
+On exit, the terminal abstraction attempts to retain up to 100 rows of recent
+scrollback plus the visible screen in memory, regardless of the flag. This can
+preserve an argument parser's first error line after usage text scrolls it away.
+The new startup diagnostics read this history only with the flag enabled. A
+possibly incomplete first joined record is discarded when history could have
+lost its prefix; unknown capture metadata suppresses the new tail. Export
+sanitizes the captured text before trimming to the last 40 lines and 4,000
+characters, plus an omission notice. Existing registered Codex
+`terminal_exit_observed` records retain their screen-only excerpt independently
+of this flag; the flag is not a master content switch for ordinary lifecycle
+logs. Other terminals still export no pane text in these event attributes.
 
 ## Codex startup failure snapshot
 
@@ -298,10 +308,11 @@ or deleted.
 ```sh
 uv run --no-sync pytest -q tests/test_codex_native_diagnostics.py tests/runner/test_codex_startup_telemetry.py tests/host/test_connect.py -k 'codex or harness_stderr'
 uv run --no-sync pytest -q tests/test_codex_native_continuous_diagnostics.py tests/test_codex_native_app_server_stderr.py
-uv run --no-sync pytest -q tests/test_codex_native_logging_env.py
+uv run --no-sync pytest -q tests/test_codex_native_logging_env.py tests/test_harness_diagnostics.py
 uv run --no-sync pytest -q tests/inner/test_terminal.py tests/runner/test_terminal_startup_exit.py
 uv run --no-sync pytest -q tests/e2e/test_codex_continuous_diagnostics_e2e.py
 uv run --no-sync pytest -q tests/e2e/test_codex_native_runtime_diagnostics_e2e.py
+uv run --no-sync pytest -q tests/e2e_ui/chat/test_codex_early_tui_startup_error.py
 uv run --no-sync pytest -q tests/test_claude_native_diagnostics.py tests/test_claude_native_diagnostics_integration.py
 ```
 
@@ -321,8 +332,11 @@ The native runtime e2e test additionally uses an installed Codex CLI (or
 `OMNIGENT_CODEX_PATH`): it executes a real shell command, directs a model request
 at an unreachable loopback endpoint, and verifies engine HTTP diagnostics reach
 the structured sink before exit. It needs no credentials or external model
-service and checks the disabled control too. A forced runner-timeout case
-verifies that the native subprocess does not survive test cleanup.
+service and checks the disabled control too. Another loopback provider returns
+HTTP 400 and synthetic response cookies, verifying that real Codex HTTP records
+lose URL credentials and cookie values before export while retaining status,
+request ID, and endpoint context. A forced runner-timeout case verifies that the
+native subprocess does not survive test cleanup.
 
 Claude tests exercise both launch paths, explicit debug-file preservation,
 opt-out without file access, rotation, partial records, bounded shutdown,
@@ -347,7 +361,9 @@ To check early failure, start a fresh opted-in session with
 status `2` and `unexpected argument` in `terminal_last_output`. A discovery
 failure should have `reason=terminal_exited`, not `timeout`. Repeat with capture
 disabled: the discovery snapshot and pre-observation exit record retain metadata
-but omit terminal text. The CLI's separate terminal-readiness wait is unchanged.
+but omit terminal text. The chat startup error should also omit the terminal
+excerpt. Registered Codex exit records still include their existing screen-only
+excerpt in either mode. The CLI's separate terminal-readiness wait is unchanged.
 
 After deploying the runner, filter the debug-log table by the incident time
 window, exact session ID, and `event_name = 'codex_thread_start_failed'`.

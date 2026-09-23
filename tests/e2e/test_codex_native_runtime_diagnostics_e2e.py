@@ -1,7 +1,7 @@
 """Exercise native engine diagnostics through the real Codex process and exporter.
 
-The model endpoint is an unreachable loopback address; no credentials or external
-model call are needed. The installed Codex binary executes a real shell command.
+Model endpoints are loopback-only; no credentials or external model call are
+needed. The installed Codex binary executes a real shell command.
 """
 
 from __future__ import annotations
@@ -17,6 +17,14 @@ from pathlib import Path
 
 import psutil
 import pytest
+
+_HTTP_CANARIES = (
+    "synthetic-url-user",
+    "synthetic-url-pass",
+    "synthetic-cookie-one",
+    "synthetic-cookie-prefix",
+    "synthetic-cookie-suffix",
+)
 
 _RUNNER = r"""
 import asyncio
@@ -34,6 +42,8 @@ from omnigent.process_logging import configure_process_logging
 root = Path(sys.argv[1])
 codex = sys.argv[2]
 enabled = os.environ['OMNIGENT_HARNESS_STDERR_ENABLED'] == '1'
+base_url = os.environ.get('OMNIGENT_DIAGNOSTIC_TEST_BASE_URL', 'http://127.0.0.1:1')
+http_probe = 'OMNIGENT_DIAGNOSTIC_TEST_BASE_URL' in os.environ
 
 def send(batch):
     with (root / 'rows.jsonl').open('a') as stream:
@@ -53,7 +63,7 @@ async def main():
     })
     overrides = [
         'model_provider="diagnostic-probe"',
-        'model_providers.diagnostic-probe={name="Offline",base_url="http://127.0.0.1:1",wire_api="responses",requires_openai_auth=false,request_max_retries=0,stream_max_retries=0}',
+        f'model_providers.diagnostic-probe={{name="Offline",base_url={json.dumps(base_url)},wire_api="responses",requires_openai_auth=false,request_max_retries=0,stream_max_retries=0}}',
         'analytics.enabled=false',
         'feedback.enabled=false',
         'otel.metrics_exporter="none"',
@@ -137,6 +147,9 @@ async def main():
                     has_span = any(all(marker in text for marker in markers) for text in texts)
                     has_error = any('http://127.0.0.1:1/responses' in text
                                     and 'request failed' in text.lower() for text in texts)
+                    if http_probe:
+                        has_error = any('Request completed' in text and 'status=400' in text
+                                        and 'synthetic-request-id' in text for text in texts)
                     if has_span and has_error:
                         break
                     await asyncio.sleep(0.05)
@@ -162,7 +175,7 @@ def _installed_codex() -> str:
 
 
 async def _start_runner(
-    tmp_path: Path, *, enabled: bool, stall: bool = False
+    tmp_path: Path, *, enabled: bool, stall: bool = False, provider_base_url: str | None = None
 ) -> asyncio.subprocess.Process:
     codex = _installed_codex()
     runner = tmp_path / "runner.py"
@@ -177,6 +190,11 @@ async def _start_runner(
             "PATH": os.environ.get("PATH", os.defpath),
             "PYTHONPATH": str(Path(__file__).resolve().parents[2]),
             "OMNIGENT_HARNESS_STDERR_ENABLED": "1" if enabled else "0",
+            **(
+                {"OMNIGENT_DIAGNOSTIC_TEST_BASE_URL": provider_base_url}
+                if provider_base_url is not None
+                else {}
+            ),
         },
         # Codex inherits this private group so a runner timeout reaps both.
         start_new_session=True,
@@ -246,6 +264,71 @@ async def test_real_codex_runtime_diagnostics_are_exported_before_exit(
         assert row["source"] == "runner"
         assert row["attributes"]["source_kind"] == "codex_app_server_stderr"
         assert len(row["attributes"]["text"].encode()) <= 65536
+
+
+@pytest.mark.posix_only
+async def test_real_codex_http_credentials_are_redacted_before_export(tmp_path: Path) -> None:
+    requests: list[str] = []
+
+    async def respond(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            async with asyncio.timeout(10):
+                header = await reader.readuntil(b"\r\n\r\n")
+                lines = header.decode("latin1").split("\r\n")
+                headers = dict(line.split(": ", 1) for line in lines[1:] if ": " in line)
+                normalized = {key.lower(): value for key, value in headers.items()}
+                await reader.readexactly(int(normalized.get("content-length", "0")))
+                requests.append(lines[0])
+                body = b'{"error":{"message":"synthetic failure","type":"invalid_request_error"}}'
+                cookies = (
+                    "diag_session=synthetic-cookie-one; Path=/; HttpOnly",
+                    'diag_quoted="synthetic-cookie-prefix\\"synthetic-cookie-suffix"; Path=/',
+                )
+                response = (
+                    "HTTP/1.1 400 Bad Request\r\n"
+                    "Content-Type: application/json\r\n"
+                    f"Content-Length: {len(body)}\r\n"
+                    "Connection: close\r\n"
+                    + "".join(f"Set-Cookie: {cookie}\r\n" for cookie in cookies)
+                    + "X-Request-Id: synthetic-request-id\r\n\r\n"
+                ).encode() + body
+                writer.write(response)
+                await writer.drain()
+        finally:
+            writer.close()
+            with contextlib.suppress(OSError):
+                await writer.wait_closed()
+
+    provider = await asyncio.start_server(respond, "127.0.0.1", 0)
+    async with provider:
+        port = provider.sockets[0].getsockname()[1]
+        base_url = f"http://synthetic-url-user:synthetic-url-pass@127.0.0.1:{port}/v1"
+        proc = await _start_runner(tmp_path, enabled=True, provider_base_url=base_url)
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), 60)
+            assert proc.returncode == 0, (stdout.decode(), stderr.decode())
+            assert b"native-tool-and-runtime-error-observed" in stdout
+        finally:
+            await _stop_runner(proc)
+
+    assert requests == ["POST /v1/responses HTTP/1.1"]
+    rows = [json.loads(line) for line in (tmp_path / "rows.jsonl").read_text().splitlines()]
+    text = "\n".join(
+        row["attributes"]["text"]
+        for row in rows
+        if row["event_name"] == "harness_diagnostic_output"
+    )
+    for canary in _HTTP_CANARIES:
+        assert canary not in json.dumps(rows)
+    for marker in (
+        "Request completed",
+        "method=POST",
+        f"127.0.0.1:{port}/v1/responses",
+        "status=400",
+        "synthetic-request-id",
+        '"set-cookie": "[REDACTED]"',
+    ):
+        assert marker in text
 
 
 @pytest.mark.posix_only

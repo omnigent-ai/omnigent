@@ -2,7 +2,7 @@
 
 The native Codex TUI is a separate ``--remote`` process from the app-server.
 If it dies before creating a thread, the first chat turn must report the TUI's
-exit status and parser error, not a generic thread-discovery timeout.
+exit status and, when opted in, parser error instead of a discovery timeout.
 
 The rig forces the failure deterministically by injecting an unsupported
 launch arg via ``harness.codex-native.args`` — the real ``codex`` binary then
@@ -11,7 +11,7 @@ and exits 2 before any thread exists. A mock provider routes the codex harness
 so login is not required (the launch is otherwise healthy).
 
 The test requires a visible error and a canonical transcript error containing
-exit status 2, the parser diagnostic, and the injected flag together.
+exit status 2, with parser output included only when diagnostics are enabled.
 """
 
 from __future__ import annotations
@@ -67,25 +67,27 @@ def _no_proxy_env() -> dict[str, str]:
     return env
 
 
-@pytest.fixture
+@pytest.fixture(params=[True, False], ids=["capture-on", "capture-off"])
 def bad_flag_codex_session(
     built_spa: None,
     mock_llm_server_url: str,
     tmp_path_factory: pytest.TempPathFactory,
-) -> Iterator[tuple[str, str]]:
+    request: pytest.FixtureRequest,
+) -> Iterator[tuple[str, str, bool]]:
     """A codex-native session whose TUI exits 2 at startup on a bad launch arg.
 
     Spawns a dedicated server + runner (so the injected config and empty
     ``CODEX_HOME`` cannot leak into other tests), configures a mock provider
     that routes the codex harness, and injects an unsupported launch arg so
-    the real Codex TUI dies immediately. ``OMNIGENT_HARNESS_STDERR_ENABLED``
-    is on to match the reported diagnostics configuration.
+    the real Codex TUI dies immediately. Both values of
+    ``OMNIGENT_HARNESS_STDERR_ENABLED`` exercise the startup-text export gate.
 
-    :returns: ``(base_url, session_id)``.
+    :returns: ``(base_url, session_id, capture_enabled)``.
     """
     if shutil.which("codex") is None:
         pytest.skip("codex CLI is required for the codex-native early-startup rig")
 
+    capture_enabled = bool(request.param)
     work = tmp_path_factory.mktemp("codex_early_startup")
     config_home = work / "config-home"
     codex_home = work / "codex-home"
@@ -125,7 +127,7 @@ def bad_flag_codex_session(
         "PYTHONPATH": f"{_REPO_ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
         "OMNIGENT_CONFIG_HOME": str(config_home),
         "OMNIGENT_CODEX_NATIVE_STATE_DIR": str(state_dir),
-        "OMNIGENT_HARNESS_STDERR_ENABLED": "1",
+        "OMNIGENT_HARNESS_STDERR_ENABLED": "1" if capture_enabled else "0",
         "CODEX_HOME": str(codex_home),
         "HOME": str(home_dir),
     }
@@ -197,7 +199,7 @@ def bad_flag_codex_session(
             )
 
         session_id = _create_native_codex_session(base_url, runner_id)
-        yield (base_url, session_id)
+        yield (base_url, session_id, capture_enabled)
     finally:
         if session_id is not None:
             with contextlib.suppress(httpx.HTTPError):
@@ -219,15 +221,16 @@ def bad_flag_codex_session(
 @pytest.mark.timeout(400)
 def test_codex_early_tui_startup_failure_reports_cause_not_timeout(
     page: Page,
-    bad_flag_codex_session: tuple[str, str],
+    bad_flag_codex_session: tuple[str, str, bool],
 ) -> None:
-    """The first turn must expose the TUI's exit-2 parser error.
+    """The first turn must expose exit 2 and gate the TUI's parser text.
 
     Journey: open a codex-native session whose TUI exits 2 at startup, send
     the first chat message, and require an error with the actual startup
     cause in the transcript rather than a generic thread-discovery timeout.
+    Disabling diagnostic export must omit terminal text from the chat error.
     """
-    base_url, session_id = bad_flag_codex_session
+    base_url, session_id, capture_enabled = bad_flag_codex_session
     page.goto(f"{base_url}/c/{session_id}")
     _ensure_chat_view(page)
 
@@ -248,12 +251,23 @@ def test_codex_early_tui_startup_failure_reports_cause_not_timeout(
         if item.get("type") == "error"
     ]
     assert error_messages, "The visible startup error must be recorded in the transcript."
-    assert any(
-        "Codex terminal exited with status 2 before starting a thread." in message
-        and "unexpected argument" in message
-        and _BAD_FLAG in message
+    startup_errors = [
+        message
         for message in error_messages
-    ), f"Expected the TUI exit status and parser cause in one error: {error_messages!r}"
+        if "Codex terminal exited with status 2 before starting a thread." in message
+    ]
+    assert startup_errors, f"Expected the TUI exit status in the error: {error_messages!r}"
+    if capture_enabled:
+        assert any(
+            "unexpected argument" in message and _BAD_FLAG in message for message in startup_errors
+        ), f"Expected the TUI exit status and parser cause in one error: {error_messages!r}"
+    else:
+        assert all(
+            "Codex startup terminal output:" not in message
+            and "unexpected argument" not in message
+            and _BAD_FLAG not in message
+            for message in error_messages
+        ), f"Disabled diagnostic export leaked terminal text into chat: {error_messages!r}"
 
     timed_out = [m for m in error_messages if _TIMEOUT_MARKER in m]
     assert not timed_out, (
