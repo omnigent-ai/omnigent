@@ -1,5 +1,5 @@
 import { appConfig } from "./appConfig";
-import { SidebarDataProvider } from "./hooks/useSidebarData";
+import { IdentityAwareSidebarDataProvider } from "./hooks/useSidebarData";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { StrictMode, useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
@@ -10,13 +10,14 @@ import { TooltipProvider } from "./components/ui/tooltip";
 import { ImageLightboxProvider } from "./components/ImageLightbox";
 import { RunnerHealthProvider } from "./hooks/RunnerHealthProvider";
 import { QueueFlushProvider } from "./hooks/QueueFlushProvider";
+import { prefetchSessionHostChain } from "./hooks/useSession";
 import { SessionUpdatesProvider } from "./hooks/SessionUpdatesProvider";
 import { getBasePath, withBasePath } from "./lib/basePath";
 import { resolveServerInfo, type ServerInfo } from "./lib/capabilities";
 import { CapabilitiesProvider } from "./lib/CapabilitiesContext";
 import { ExtensionProvider } from "./extensions/ExtensionProvider";
 import { createBootServerInfo, withBootTimeout } from "./lib/bootCapabilities";
-import { isLoginRedirectPending, resolveIdentity } from "./lib/identity";
+import { isLoginRedirectPending, resolveIdentity, setSessionHostResolver } from "./lib/identity";
 import { hideNativeChatTerminalBar } from "./lib/nativeChatTerminalBar";
 import { initNativeInsets } from "./lib/nativeInsets";
 import { initBrowserTelemetry } from "./lib/telemetry";
@@ -54,6 +55,11 @@ const queryClient = new QueryClient({
 // invalidate cached queries (e.g. the conversations list when a new
 // conversation is created server-side).
 initChatStore(queryClient);
+
+// Let a host-scoped request resolve its session's routing host on demand,
+// walking a hostless sub-agent child up to its host-bound ancestor (a cold
+// /c/<child> open) before the request is keyed.
+setSessionHostResolver((sessionId) => prefetchSessionHostChain(queryClient, sessionId));
 
 // Discover the current user identity from the server. Once resolved,
 // all subsequent fetch calls include X-Forwarded-Email so session
@@ -144,7 +150,7 @@ function RootApp({ initialInfo }: { initialInfo: ServerInfo | "loading" }) {
             <TooltipProvider>
               <ImageLightboxProvider>
                 <BrowserRouter basename={getBasePath() || undefined}>
-                  <SidebarDataProvider config={appConfig.sidebar}>
+                  <IdentityAwareSidebarDataProvider config={appConfig.sidebar}>
                     <SessionUpdatesProvider>
                       <RunnerHealthProvider>
                         <QueueFlushProvider>
@@ -152,7 +158,7 @@ function RootApp({ initialInfo }: { initialInfo: ServerInfo | "loading" }) {
                         </QueueFlushProvider>
                       </RunnerHealthProvider>
                     </SessionUpdatesProvider>
-                  </SidebarDataProvider>
+                  </IdentityAwareSidebarDataProvider>
                 </BrowserRouter>
               </ImageLightboxProvider>
             </TooltipProvider>

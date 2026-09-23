@@ -224,9 +224,12 @@ async def _serve_one_launch(
     # Bounded so a routing bug can't hang the test: stat + launch are
     # 2 frames, the rest of the budget absorbs interleaved pings. One deadline
     # for the whole exchange — a per-receive budget would multiply by 40.
-    deadline = Deadline(20.0)
+    deadline = Deadline(30.0)
     for _ in range(40):
-        output = await comm.receive_output(timeout=deadline.next_wait(3.0))
+        # Allow server work between stat and launch under CI load: a
+        # receive_output timeout cancels the mock host tunnel and makes
+        # a slow session create fail with a spurious "host is offline" 409.
+        output = await comm.receive_output(timeout=deadline.next_wait(30.0))
         if output["type"] != "websocket.send":
             continue
         frame = decode_host_frame(output["text"])

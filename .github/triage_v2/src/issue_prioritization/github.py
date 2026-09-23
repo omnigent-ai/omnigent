@@ -9,8 +9,8 @@ from urllib.request import Request, urlopen
 
 from issue_prioritization.bronze import BronzeIssue
 from issue_prioritization.comments import (
-    COMMENT_MARKER,
     build_triage_comment,
+    is_triage_comment,
     preserve_needs_info_deadline,
 )
 from issue_prioritization.labels import LabelManifest
@@ -217,13 +217,17 @@ class GitHubClient:
             page += 1
         return tuple(issues[:limit])
 
-    def open_issue(self, issue_number: int) -> BronzeIssue | None:
+    def open_issue(
+        self, issue_number: int, *, full_author_history: bool = False
+    ) -> BronzeIssue | None:
         value = self.issue_data(issue_number)
         if value.get("state") != "open" or "pull_request" in value:
             return None
         author = value.get("user")
         author_login = str(author.get("login", "")) if isinstance(author, dict) else ""
         comments = self._author_comments(issue_number, author_login)
+        if not full_author_history:
+            comments = tuple(comment[:4000] for comment in comments[-5:])
         if comments:
             original_body = str(value.get("body") or "")
             value = {
@@ -252,10 +256,14 @@ class GitHubClient:
                 user = comment.get("user")
                 login = str(user.get("login", "")) if isinstance(user, dict) else ""
                 body = str(comment.get("body") or "").strip()
-                if login.casefold() == author_login.casefold() and body:
-                    comments.append(body[:4000])
+                if (
+                    login.casefold() == author_login.casefold()
+                    and body
+                    and not is_triage_comment(body)
+                ):
+                    comments.append(body)
             if len(value) < 100:
-                return tuple(comments[-5:])
+                return tuple(comments)
             page += 1
 
     def apply_labels(
@@ -284,8 +292,8 @@ class GitHubClient:
             if not isinstance(value, list):
                 raise ValueError("GitHub issue comments response must be an array")
             for comment in value:
-                if not isinstance(comment, dict) or COMMENT_MARKER not in str(
-                    comment.get("body", "")
+                if not isinstance(comment, dict) or not is_triage_comment(
+                    str(comment.get("body", ""))
                 ):
                     continue
                 comment_id = int(comment["id"])

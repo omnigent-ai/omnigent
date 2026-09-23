@@ -46,7 +46,12 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from omnigent._platform import normalize_interactive_shells
 from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
-from omnigent.debug_logging import debug_event, phase_scope, runner_primary_session_id
+from omnigent.debug_logging import (
+    debug_event,
+    phase_scope,
+    runner_primary_session_id,
+    set_current_session_id,
+)
 from omnigent.entities.session_resources import (
     DEFAULT_ENVIRONMENT_ID,
     SessionResourceView,
@@ -108,6 +113,7 @@ from omnigent.runner.native import (
     _COST_POPUP_REPOP_TASKS,
     _REPL_TERMINAL_NAME,
     _REPL_TERMINAL_SESSION_KEY,
+    _SESSION_METADATA_PARAMS,
     NativeLaunchContext,
     PreLaunchResult,
     ResolvedSpec,
@@ -226,6 +232,9 @@ _CLAUDE_MODEL_LATE_DIALOG_POLL_S = 2.0
 # can tighten the budget.
 _CLAUDE_PANE_READY_TIMEOUT_S = 30.0
 _CLAUDE_PANE_READY_POLL_S = 0.25
+
+# Pending questions outlive prompt delivery; poll outside the turn watchdog.
+_CLAUDE_PENDING_PROMPT_POLL_S = 0.5
 
 # Settle delay between keystrokes when driving Codex TUI popups. The
 # slash-command menu, the /permissions popup, and the Full Access confirm
@@ -2871,6 +2880,10 @@ def create_runner_app(
     import hmac
 
     app = FastAPI(title="omnigent-runner")
+
+    from omnigent.runner.logging_context import RunnerLogContextMiddleware
+
+    app.add_middleware(RunnerLogContextMiddleware)
     mcp_execution_registry = McpExecutionRegistry()
     app.state.mcp_execution_registry = mcp_execution_registry
 
@@ -3058,6 +3071,8 @@ def create_runner_app(
     _model_dialog_watchers: set[asyncio.Task[None]] = set()
     _session_message_buffers: dict[str, list[dict[str, Any]]] = {}
     app.state.session_message_buffers = _session_message_buffers
+    _claude_prompt_waiters: dict[str, asyncio.Task[None]] = {}
+    app.state.claude_prompt_waiters = _claude_prompt_waiters
     _author_attribution_sessions: set[str] = set()
     _ingest_next_seq: dict[str, int] = {}
     _ingest_now_serving: dict[str, int] = {}
@@ -3102,6 +3117,8 @@ def create_runner_app(
 
     def _has_active_work() -> bool:
         if _active_turns:
+            return True
+        if _claude_prompt_waiters:
             return True
         if _has_live_async_tasks(_session_async_tasks):
             return True
@@ -3547,7 +3564,9 @@ def create_runner_app(
             parent_session_id: str | None = None
             agent_name: str | None = None
             try:
-                resp = await server_client.get(f"/v1/sessions/{session_id}")
+                resp = await server_client.get(
+                    f"/v1/sessions/{session_id}", params=_SESSION_METADATA_PARAMS
+                )
                 status_code = resp.status_code
                 if resp.status_code == 200:
                     body = resp.json()
@@ -3607,7 +3626,9 @@ def create_runner_app(
         re-reads it fresh.
         """
         try:
-            resp = await server_client.get(f"/v1/sessions/{session_id}")
+            resp = await server_client.get(
+                f"/v1/sessions/{session_id}", params=_SESSION_METADATA_PARAMS
+            )
             if resp.status_code == 200:
                 raw = resp.json().get("model_override")
                 if isinstance(raw, str) and raw:
@@ -3644,8 +3665,11 @@ def create_runner_app(
         session_id: str,
         agent_id: str,
     ) -> _SessionInitContext:
+        from omnigent.runner.session_init_protocol import validate_runner_inference_config
+
         if envelope.session_id != session_id or envelope.agent_id != agent_id:
             raise ValueError("session initialization envelope identity mismatch")
+        validate_runner_inference_config(envelope.snapshot.inference_config)
 
         global _server_version
         _server_version = envelope.server_version
@@ -3686,6 +3710,10 @@ def create_runner_app(
     ) -> _SessionInitContext:
         envelope = parse_runner_session_init_envelope(body)
         if envelope is None:
+            if os.environ.get("OMNIGENT_INFERENCE_CONFIG"):
+                from omnigent.runner.session_init_protocol import validate_runner_inference_config
+
+                validate_runner_inference_config(None)
             return await _load_legacy_session_init_context()
         body_sub_agent = body.get("sub_agent_name")
         if envelope.sub_agent_name != (
@@ -3895,7 +3923,24 @@ def create_runner_app(
         )
 
     async def _initialize_session(body: _JsonObject) -> JSONResponse:
+        from omnigent.runner.session_init_protocol import RunnerInferenceConfigMismatch
+
+        raw_id = body.get("session_id")
+        set_current_session_id(raw_id if isinstance(raw_id, str) else None)
+        _logger.info(
+            "Runner session initialization started",
+            extra=debug_event("runner_session_init_started", stage="session_init"),
+        )
         if process_manager is None:
+            _logger.error(
+                "Runner session initialization failed",
+                extra=debug_event(
+                    "runner_session_init_failed",
+                    stage="session_init",
+                    status_code=501,
+                    error_code="not_implemented",
+                ),
+            )
             return JSONResponse(
                 status_code=501,
                 content={
@@ -3906,6 +3951,15 @@ def create_runner_app(
         session_id = body.get("session_id")
         agent_id = body.get("agent_id")
         if not session_id or not agent_id:
+            _logger.error(
+                "Runner session initialization failed",
+                extra=debug_event(
+                    "runner_session_init_failed",
+                    stage="session_init",
+                    status_code=400,
+                    error_code="invalid_request",
+                ),
+            )
             return JSONResponse(
                 status_code=400,
                 content={
@@ -3933,7 +3987,27 @@ def create_runner_app(
                 session_id=session_id,
                 agent_id=agent_id,
             )
+        except RunnerInferenceConfigMismatch:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": "inference_config_mismatch",
+                    "detail": (
+                        "This runner has a different saved provider configuration; "
+                        "launch a new runner."
+                    ),
+                },
+            )
         except ValueError:
+            _logger.error(
+                "Runner session initialization failed",
+                extra=debug_event(
+                    "runner_session_init_failed",
+                    stage="session_init",
+                    status_code=400,
+                    error_code="invalid_request",
+                ),
+            )
             return JSONResponse(
                 status_code=400,
                 content={
@@ -3960,6 +4034,15 @@ def create_runner_app(
             try:
                 spec_entry = await spec_resolver(agent_id, session_id)
             except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+                _logger.error(
+                    "Runner session initialization failed",
+                    extra=debug_event(
+                        "runner_session_init_failed",
+                        stage="session_init",
+                        status_code=503,
+                        error_code="spec_resolver_failed",
+                    ),
+                )
                 return JSONResponse(
                     status_code=503,
                     content={
@@ -3998,6 +4081,15 @@ def create_runner_app(
             _start_verdict = await _evaluate_agent_start_gate(spec, harness_name)
             if _start_verdict is not None:
                 if _start_verdict.action in ("deny", "ask"):
+                    _logger.error(
+                        "Runner session initialization failed",
+                        extra=debug_event(
+                            "runner_session_init_failed",
+                            stage="session_init",
+                            status_code=403,
+                            error_code="agent_start_denied",
+                        ),
+                    )
                     return JSONResponse(
                         status_code=403,
                         content={
@@ -4052,6 +4144,15 @@ def create_runner_app(
                 # agent_id. Return a clear 400 rather than silently proceeding
                 # with the test-only harness and leaving the session in a
                 # broken/unrunnable state.
+                _logger.error(
+                    "Runner session initialization failed",
+                    extra=debug_event(
+                        "runner_session_init_failed",
+                        stage="session_init",
+                        status_code=400,
+                        error_code="no_agent_spec",
+                    ),
+                )
                 return JSONResponse(
                     status_code=400,
                     content={
@@ -4072,6 +4173,15 @@ def create_runner_app(
                 env=spawn_env,
             )
         except RuntimeError as exc:
+            _logger.error(
+                "Runner session initialization failed",
+                extra=debug_event(
+                    "runner_session_init_failed",
+                    stage="session_init",
+                    status_code=503,
+                    error_code="harness_spawn_failed",
+                ),
+            )
             return JSONResponse(
                 status_code=503,
                 content={
@@ -4546,6 +4656,15 @@ def create_runner_app(
             _recovery_turn_ids.setdefault(session_id, set()).add(recovery_id)
 
         status = "running" if session_id in _active_turns else "idle"
+        _logger.info(
+            "Runner session initialization finished",
+            extra=debug_event(
+                "runner_session_initialized",
+                stage="session_init",
+                status_code=201,
+                harness=harness_name,
+            ),
+        )
         return JSONResponse(
             status_code=201,
             content={
@@ -4565,6 +4684,12 @@ def create_runner_app(
                     else None
                 ),
                 "terminal_ready": terminal_ready,
+                **(
+                    {"inference_config_verified": True}
+                    if init_context.envelope is not None
+                    and init_context.envelope.snapshot.inference_config is not None
+                    else {}
+                ),
             },
         )
 
@@ -4726,6 +4851,8 @@ def create_runner_app(
 
     @app.delete("/v1/sessions/{session_id}")
     async def delete_session(session_id: str) -> JSONResponse:
+        _cancel_claude_prompt_waiter(session_id)
+        _session_message_buffers.pop(session_id, None)
         # Stop initialization before it can recreate resources during teardown.
         init_tasks = [
             task
@@ -5679,6 +5806,7 @@ def create_runner_app(
             try:
                 resp = await server_client.get(
                     f"/v1/sessions/{urllib.parse.quote(conv_id, safe='')}",
+                    params=_SESSION_METADATA_PARAMS,
                     timeout=10.0,
                 )
                 if resp.status_code == 200:
@@ -6256,6 +6384,11 @@ def create_runner_app(
             stored_claude_catalog_rows,
             stored_claude_picker_values,
         )
+        from omnigent.inference_config import (
+            binding_for_harness,
+            load_runtime_inference_config,
+            resolve_bound_model,
+        )
         from omnigent.models.claude_model_vocabulary import (
             claude_model_command_arg,
             picker_command_values,
@@ -6292,6 +6425,10 @@ def create_runner_app(
                 if not picker_values:
                     picker_values = stored_claude_picker_values(claude_config, stored_rows)
         model_arg = claude_model_command_arg(resolved_model, env, picker_values=picker_values)
+        inference_config = load_runtime_inference_config()
+        if binding_for_harness(inference_config, "claude-native") is not None:
+            resolved_model = resolve_bound_model(inference_config, "claude-native", selected_model)
+            model_arg = resolved_model
         if model_arg is None:
             _logger.warning(
                 "claude-native model change: %r has no spelling session=%s accepts "
@@ -6754,7 +6891,16 @@ def create_runner_app(
             bridge_dir_for_bridge_id,
             update_model_override,
         )
+        from omnigent.inference_config import (
+            binding_for_harness,
+            load_runtime_inference_config,
+            resolve_bound_model,
+        )
 
+        inference_config = load_runtime_inference_config()
+        if binding_for_harness(inference_config, "opencode-native") is not None:
+            selected = resolve_bound_model(inference_config, "opencode-native", model)
+            model = f"omnigent/{selected}" if selected is not None else None
         updated = await asyncio.to_thread(
             update_model_override, bridge_dir_for_bridge_id(conv_id), model
         )
@@ -6768,6 +6914,7 @@ def create_runner_app(
                 await server_client.patch(
                     f"/v1/sessions/{urllib.parse.quote(conv_id, safe='')}",
                     json={"external_session_id": None},
+                    params={"include_usage": "false"},
                     timeout=10.0,
                 )
         try:
@@ -7237,7 +7384,9 @@ def create_runner_app(
         if not attached:
             return
         try:
-            resp = await server_client.get(f"/v1/sessions/{conv_id}", timeout=10.0)
+            resp = await server_client.get(
+                f"/v1/sessions/{conv_id}", params=_SESSION_METADATA_PARAMS, timeout=10.0
+            )
         except httpx.HTTPError:
             return
         if resp.status_code != 200:
@@ -7670,6 +7819,78 @@ def create_runner_app(
     if process_manager is not None and hasattr(process_manager, "set_respawn_hook"):
         process_manager.set_respawn_hook(_resync_turn_state_on_harness_respawn)
 
+    async def _claude_prompt_bridge_dir(session_id: str) -> Path:
+        """Resolve the bridge label before inspecting a native prompt."""
+        from omnigent.harnesses.claude_native.bridge import bridge_dir_for_bridge_id
+
+        bridge_id = await _claude_native_bridge_id_for_session(
+            server_client=server_client, session_id=session_id
+        )
+        return bridge_dir_for_bridge_id(bridge_id)
+
+    async def _pending_claude_prompt_bridge_dir(session_id: str) -> Path | None:
+        """Return the bridge whose question or approval currently owns input."""
+        if _session_harness_name(session_id) != "claude-native":
+            return None
+        from omnigent.harnesses.claude_native.bridge import has_pending_user_prompt
+
+        bridge_dir = await _claude_prompt_bridge_dir(session_id)
+        if await asyncio.to_thread(has_pending_user_prompt, bridge_dir):
+            return bridge_dir
+        return None
+
+    def _cancel_claude_prompt_waiter(session_id: str) -> None:
+        """Discard waiting input before explicit terminal interruption or teardown."""
+        waiter = _claude_prompt_waiters.pop(session_id, None)
+        if waiter is not None or _session_harness_name(session_id) == "claude-native":
+            # Cancel queued work even if the terminal control fails; restoring it
+            # could restart work the user explicitly asked to stop.
+            _session_message_buffers.pop(session_id, None)
+        if waiter is not None:
+            waiter.cancel()
+
+    def _start_claude_prompt_waiter(session_id: str, bridge_dir: Path | None = None) -> None:
+        """Resume the native FIFO after its prompt is answered, without a turn timeout."""
+        existing = _claude_prompt_waiters.get(session_id)
+        if existing is not None and not existing.done():
+            return
+
+        async def _wait_for_prompt() -> None:
+            from omnigent.harnesses.claude_native.bridge import has_pending_user_prompt
+
+            try:
+                resolved_dir = bridge_dir or await _claude_prompt_bridge_dir(session_id)
+                while _session_message_buffers.get(session_id):
+                    if session_id in _active_turns:
+                        return
+                    try:
+                        pending = await asyncio.to_thread(has_pending_user_prompt, resolved_dir)
+                    except (OSError, RuntimeError):
+                        _logger.warning(
+                            "Failed to inspect pending Claude prompt for %s; retrying",
+                            session_id,
+                            exc_info=True,
+                            extra={"session_id": session_id},
+                        )
+                        pending = True
+                    if not pending:
+                        # A cancelled waiter must not abandon an ordered ingest ticket.
+                        drain = asyncio.create_task(_check_and_start_next_turn(session_id))
+                        _background_tasks.add(drain)
+                        drain.add_done_callback(_background_tasks.discard)
+                        await asyncio.shield(drain)
+                        if session_id in _active_turns:
+                            return
+                    await asyncio.sleep(_CLAUDE_PENDING_PROMPT_POLL_S)
+            finally:
+                if _claude_prompt_waiters.get(session_id) is asyncio.current_task():
+                    _claude_prompt_waiters.pop(session_id, None)
+
+        waiter = asyncio.create_task(_wait_for_prompt(), name=f"claude-prompt-{session_id}")
+        _claude_prompt_waiters[session_id] = waiter
+        _background_tasks.add(waiter)
+        waiter.add_done_callback(_background_tasks.discard)
+
     async def _check_and_start_next_turn(
         session_id: str,
     ) -> None:
@@ -7689,6 +7910,15 @@ def create_runner_app(
             buf = _session_message_buffers.get(session_id)
             if not buf:
                 _rewake_parent_if_inbox_stranded(session_id)
+                return
+
+            pending_bridge_dir = await _pending_claude_prompt_bridge_dir(session_id)
+            # Stop/delete can clear the queue while the pane inspection is in flight.
+            buf = _session_message_buffers.get(session_id)
+            if not buf:
+                return
+            if pending_bridge_dir is not None:
+                _start_claude_prompt_waiter(session_id, pending_bridge_dir)
                 return
 
             # A buffered claude-sdk /compact must dispatch as its OWN turn: the
@@ -9635,6 +9865,37 @@ def create_runner_app(
                         },
                     )
 
+                if _session_harness_name(conversation_id) == "claude-native":
+                    pending_bridge_dir = None
+                    has_queued_messages = bool(_session_message_buffers.get(conversation_id))
+                    if not has_queued_messages:
+                        pending_bridge_dir = await _pending_claude_prompt_bridge_dir(
+                            conversation_id
+                        )
+                    if has_queued_messages or pending_bridge_dir is not None:
+                        if conversation_id not in _session_histories:
+                            _session_histories[conversation_id] = await _load_history_as_input(
+                                conversation_id,
+                                drop_item_id=message_body.get("persisted_item_id"),
+                            )
+                        _session_message_buffers.setdefault(conversation_id, []).append(
+                            message_body
+                        )
+                        _start_claude_prompt_waiter(conversation_id, pending_bridge_dir)
+                        _logger.info(
+                            "post_session_events: buffering message for pending Claude prompt "
+                            "conv=%s",
+                            conversation_id,
+                            extra={"session_id": conversation_id},
+                        )
+                        return JSONResponse(
+                            status_code=202,
+                            content={
+                                "status": "buffered",
+                                "detail": "Message buffered until the pending prompt is resolved.",
+                            },
+                        )
+
                 new_item = {
                     "type": "message",
                     "role": message_body.get("role", "user"),
@@ -9692,6 +9953,7 @@ def create_runner_app(
                     _cond.notify_all()
 
         if body_type == "interrupt":
+            _cancel_claude_prompt_waiter(conversation_id)
             _harness = _session_harness_name(conversation_id)
             _interrupt_resp = await _native_interrupt_runner.interrupt(_harness, conversation_id)
             if _interrupt_resp is not None:
@@ -9750,6 +10012,7 @@ def create_runner_app(
             return Response(status_code=204)
 
         if body_type == "stop_session":
+            _cancel_claude_prompt_waiter(conversation_id)
             _harness = _session_harness_name(conversation_id)
             _stop_resp = await _native_interrupt_runner.stop(_harness, conversation_id)
             if _stop_resp is not None:
@@ -13086,19 +13349,34 @@ def _build_spawn_env_from_spec(
     # Namespaced generic-ACP ids (``acp:<slug>``) canonicalize to ``acp`` so the
     # dispatch, model-key lookup, and logging below all key off the base harness;
     # the concrete agent's slug is read from the spec by ``_build_acp_spawn_env``.
+    requested_harness = harness
     harness = canonicalize_harness(harness) or harness
-    acp_default_model: str | None = None
-    if harness == "acp":
-        from omnigent.models.model_catalog import _acp_launch_model, validate_acp_model
-
-        acp_default_model = _acp_launch_model(spec)
-        validate_acp_model(spec, acp_default_model)
-        validate_acp_model(spec, model_override)
     effective_spec = spec
+    from omnigent.inference_config import load_runtime_inference_config, parse_inference_config
+
+    has_inference_bindings = bool(parse_inference_config(load_runtime_inference_config()))
+    if has_inference_bindings and dataclasses.is_dataclass(spec):
+        declared_harness = str(spec.executor.config.get("harness") or "")
+        identity = (
+            requested_harness
+            if requested_harness.startswith("acp:")
+            else declared_harness
+            if harness == "acp" and declared_harness.startswith("acp:")
+            else harness
+        )
+        effective_spec = dataclasses.replace(
+            spec,
+            executor=dataclasses.replace(
+                spec.executor,
+                config={**spec.executor.config, "harness": identity},
+                model=model_override if model_override is not None else spec.executor.model,
+            ),
+        )
     if model_override is not None:
         executor = getattr(spec, "executor", None)
         if (
             harness == "acp"
+            and not has_inference_bindings
             and dataclasses.is_dataclass(spec)
             and dataclasses.is_dataclass(executor)
         ):
@@ -13113,6 +13391,14 @@ def _build_spawn_env_from_spec(
                 AgentSpec,
                 cast(_ModelCopyValue, spec).model_copy(update={"executor": copied_executor}),
             )
+    acp_default_model: str | None = None
+    if harness == "acp":
+        from omnigent.models.model_catalog import _acp_launch_model, validate_acp_model
+
+        policy_spec = effective_spec if has_inference_bindings else spec
+        acp_default_model = _acp_launch_model(policy_spec)
+        validate_acp_model(policy_spec, acp_default_model)
+        validate_acp_model(policy_spec, model_override)
     try:
         from omnigent.runtime.workflow import (
             _build_acp_cli_spawn_env,

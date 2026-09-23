@@ -1,4 +1,5 @@
-import { useQuery } from "@tanstack/react-query";
+import { queryOptions, useQuery } from "@tanstack/react-query";
+import { useRef } from "react";
 
 import { authenticatedFetch } from "@/lib/identity";
 
@@ -26,6 +27,60 @@ export interface HostWorktree {
   is_main: boolean;
   /** ``true`` when the worktree has a detached HEAD (no branch). */
   detached: boolean;
+  /** Unix epoch seconds of the worktree HEAD commit. Missing on older hosts. */
+  updated_at?: number | null;
+}
+
+interface VerifiedGitWorktreeCache {
+  hostId: string;
+  roots: string[];
+  worktrees: HostWorktree[];
+}
+
+function normalizedHostPath(path: string): string {
+  const normalized = path.replace(/\\/g, "/").replace(/\/+$/, "");
+  return /^[A-Za-z]:\//.test(normalized) ? normalized.toLowerCase() : normalized;
+}
+
+export function pathIsWithinWorktree(path: string, root: string): boolean {
+  const candidate = normalizedHostPath(path);
+  const boundary = normalizedHostPath(root);
+  return candidate === boundary || candidate.startsWith(`${boundary}/`);
+}
+
+/**
+ * Keep a verified Git repository visible while a nested path is loading.
+ * An explicit non-Git result clears the cache.
+ */
+export function useVerifiedGitWorktrees({
+  hostId,
+  requestedPath,
+  worktrees,
+  resolved,
+}: {
+  hostId: string | null;
+  requestedPath: string | null;
+  worktrees: HostWorktree[] | undefined;
+  resolved: boolean;
+}): HostWorktree[] {
+  const cacheRef = useRef<VerifiedGitWorktreeCache | null>(null);
+  // The listing includes the main checkout even when no linked worktrees exist.
+  const directlyVerified = resolved && worktrees !== undefined && worktrees.length > 0;
+  if (resolved) {
+    cacheRef.current =
+      directlyVerified && hostId !== null && worktrees !== undefined
+        ? { hostId, roots: worktrees.map((worktree) => worktree.path), worktrees }
+        : null;
+  }
+  const cache = cacheRef.current;
+  const cachedMatch =
+    cache !== null &&
+    cache.hostId === hostId &&
+    requestedPath !== null &&
+    cache.roots.some((root) => pathIsWithinWorktree(requestedPath, root));
+
+  if (resolved) return directlyVerified ? (worktrees ?? []) : [];
+  return cachedMatch ? (cache?.worktrees ?? []) : [];
 }
 
 interface HostWorktreesResponse {
@@ -45,7 +100,10 @@ interface HostWorktreesResponse {
  * @returns The repository's worktrees (main first), or ``[]`` when the
  *   path is not a git repository.
  */
-async function fetchHostWorktrees(hostId: string, repoPath: string): Promise<HostWorktree[]> {
+export async function fetchHostWorktrees(
+  hostId: string,
+  repoPath: string,
+): Promise<HostWorktree[]> {
   const params = new URLSearchParams({ path: repoPath });
   const res = await authenticatedFetch(
     `/v1/hosts/${encodeURIComponent(hostId)}/worktrees?${params.toString()}`,
@@ -61,6 +119,15 @@ async function fetchHostWorktrees(hostId: string, repoPath: string): Promise<Hos
   return body.data;
 }
 
+/** Shared query options for single-path and batched recent-workspace reads. */
+export function hostWorktreesQueryOptions(hostId: string, repoPath: string) {
+  return queryOptions({
+    queryKey: ["host-worktrees", hostId, repoPath] as const,
+    queryFn: () => fetchHostWorktrees(hostId, repoPath),
+    staleTime: 5_000,
+  });
+}
+
 /**
  * React Query hook: list the git worktrees of a repository on a host.
  *
@@ -73,11 +140,9 @@ async function fetchHostWorktrees(hostId: string, repoPath: string): Promise<Hos
  * @returns React Query result with ``data: HostWorktree[]``.
  */
 export function useHostWorktrees(hostId: string | null, repoPath: string | null) {
+  const enabled = hostId !== null && repoPath !== null && repoPath !== "";
   return useQuery({
-    queryKey: ["host-worktrees", hostId, repoPath],
-    queryFn: () => fetchHostWorktrees(hostId as string, repoPath as string),
-    enabled: hostId !== null && repoPath !== null && repoPath !== "",
-    staleTime: 5_000,
-    placeholderData: (prev) => prev,
+    ...hostWorktreesQueryOptions(hostId ?? "", repoPath ?? ""),
+    enabled,
   });
 }

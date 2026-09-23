@@ -111,11 +111,11 @@ _EXTERNAL_ELICITATION_RESOLVED_TYPE: str = "external_elicitation_resolved"
 _EXTERNAL_SESSION_STATUS_TYPE: str = "external_session_status"
 
 
-# "quiesced": the claude-native sub-agent transcript-quiescence badge — a
-# UI signal only, never a terminal edge (the runner must not deliver a
-# parent-inbox completion from it).
+_SUBAGENT_STATUS_TYPE: str = "subagent.status"
+
+
 _EXTERNAL_SESSION_STATUS_VALUES: frozenset[str] = frozenset(
-    {"idle", "running", "waiting", "failed", "quiesced"}
+    {"idle", "running", "waiting", "failed"}
 )
 
 
@@ -288,6 +288,9 @@ _LAST_TASK_ERROR_CODE_LABEL_KEY: str = "omnigent.last_task_error_code"
 
 
 _LAST_TASK_ERROR_MESSAGE_LABEL_KEY: str = "omnigent.last_task_error_message"
+
+
+_LAST_TASK_ERROR_AGENT_NAME_LABEL_KEY: str = "omnigent.last_task_error_agent_name"
 
 
 # Optional structured failure fields (present when the runner classified the
@@ -522,6 +525,7 @@ _ALLOWED_EVENT_TYPES: frozenset[str] = frozenset(ITEM_TYPE_TO_DATA_CLS.keys()) |
     _EXTERNAL_BTW_DISMISS_TYPE,
     _EXTERNAL_ELICITATION_RESOLVED_TYPE,
     _EXTERNAL_SESSION_STATUS_TYPE,
+    _SUBAGENT_STATUS_TYPE,
     _EXTERNAL_SESSION_USAGE_TYPE,
     _EXTERNAL_COMPACTION_STATUS_TYPE,
     _EXTERNAL_MCP_STARTUP_TYPE,
@@ -549,6 +553,33 @@ _WATCHER_TASKS: set[asyncio.Task[None]] = set()
 
 
 _session_status_cache: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
+
+
+@dataclass
+class _RunnerStatusProbeBackoff:
+    """
+    Skip window for a session's runner status probe after slow probes.
+
+    :param skip_until: Monotonic time before which the probe is skipped.
+    :param failures: Consecutive slow or failed probes; sets the next window.
+    :param runner_id: Runner the slow probes were against, e.g.
+        ``"runner_0123456789abcdef"``; a rebind to another runner discards
+        the window.
+    """
+
+    skip_until: float
+    failures: int
+    runner_id: str | None
+
+
+_runner_status_probe_backoff: WorkspaceScopedCache[str, _RunnerStatusProbeBackoff] = (
+    WorkspaceScopedCache()
+)
+
+# The one runner status probe in flight per session; concurrent snapshots await it.
+_runner_status_probe_inflight: WorkspaceScopedCache[str, asyncio.Task[str | None]] = (
+    WorkspaceScopedCache()
+)
 
 
 _session_active_response_cache: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
@@ -1086,6 +1117,7 @@ __all__ = [
     "_STOP_RUNNER_RESULT_TIMEOUT_S",
     "_STOP_SESSION_TYPE",
     "_SUBAGENT_FORWARD_RECONNECT_WAIT_S",
+    "_SUBAGENT_STATUS_TYPE",
     "_TERMINAL_RESPONSE_EVENT_TYPES",
     "_TURN_ACTOR_LABEL",
     "_UI_ADDED_AGENT_TITLE_PREFIX",
@@ -1094,6 +1126,7 @@ __all__ = [
     "_MirroredToolCall",
     "_PendingPolicyAskWrites",
     "_RelayHandle",
+    "_RunnerStatusProbeBackoff",
     "_browser_action_claim_events",
     "_browser_action_claims",
     "_browser_action_owners",
@@ -1116,6 +1149,8 @@ __all__ = [
     "_read_last_seen",
     "_recent_mirrored_tool_calls",
     "_runner_relay_tasks",
+    "_runner_status_probe_backoff",
+    "_runner_status_probe_inflight",
     "_server_host_registry",
     "_server_runner_router",
     "_session_active_response_cache",

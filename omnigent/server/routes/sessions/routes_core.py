@@ -31,8 +31,9 @@ from omnigent.codex_approval_modes import (
     CODEX_NATIVE_PERMISSION_VALUES,
 )
 from omnigent.db.utils import generate_agent_id, generate_file_id
-from omnigent.debug_logging import add_audit_attrs, debug_event
+from omnigent.debug_logging import add_audit_attrs, debug_event, set_current_runner_id
 from omnigent.entities import (
+    Agent,
     CommentsFingerprint,
     Conversation,
     StoredFile,
@@ -73,6 +74,7 @@ from omnigent.server.background_session_titles import (
     BackgroundTitleRequest,
 )
 from omnigent.server.bundles import validate_agent_bundle
+from omnigent.server.creation_logging import creation_metadata, session_created
 from omnigent.server.host_registry import HostRegistry, RunnerExitReports
 from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import (
@@ -125,6 +127,8 @@ from omnigent.server.routes._sessions.helpers import (
     _authorize_bundled_parent_and_inherit_runner,
     _codex_plan_mode_enabled,
     _discovery_key,
+    _enforce_filesystem_attachment_policy,
+    _filesystem_attachment_in_history,
     _forward_session_change_to_runner,
     _get_runner_client,
     _invalidate_runner_backed_snapshot_state,
@@ -226,6 +230,41 @@ from omnigent.util.session_lifecycle import (
     labels_with_closed_status,
 )
 from omnigent.version import VERSION
+
+
+def _require_attachment_compatible_history(
+    session_id: str,
+    target_agent: Agent,
+    conversation_store: ConversationStore,
+    file_store: FileStore | None,
+    *,
+    up_to_response_id: str | None = None,
+) -> str | None:
+    """Reject a target that cannot replay files in the retained transcript.
+
+    :param session_id: Source session whose history will be retained.
+    :param target_agent: Agent selected for the fork or in-place switch.
+    :param conversation_store: Store containing the ordered source history.
+    :param file_store: Store containing authoritative attachment filenames.
+    :param up_to_response_id: Inclusive fork cutoff, or all history when absent.
+    :returns: A retained filesystem attachment's name, or ``None``.
+    :raises OmnigentError: If the target cannot open a referenced attachment.
+    """
+    from omnigent.inner.native_attachments import FILESYSTEM_ATTACHMENT_HARNESSES
+
+    filename = _filesystem_attachment_in_history(
+        session_id, conversation_store, file_store, up_to_response_id=up_to_response_id
+    )
+    if filename is not None:
+        native = _native_coding_agent_for_agent(target_agent)
+        if native is None or native.harness not in FILESYSTEM_ATTACHMENT_HARNESSES:
+            raise OmnigentError(
+                f"This history includes '{filename}', which requires "
+                "Claude Code or Codex. Choose one of those harnesses, "
+                "or fork from before the attachment was sent.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+    return filename
 
 
 async def _reset_runner_and_clear_todos_after_switch(
@@ -472,6 +511,18 @@ def register_core_routes(
                 f"Session {session_id!r} already has a runner bound",
                 code=ErrorCode.CONFLICT,
             )
+        set_current_runner_id(runner_id)
+        add_audit_attrs(runner_id=runner_id)
+        _logger.info(
+            "Session bound to runner",
+            extra=debug_event(
+                "session_runner_bound",
+                session_id=session_id,
+                runner_id=runner_id,
+                operation="create",
+                stage="runner_launch",
+            ),
+        )
         request_id = secrets.token_hex(8)
         future: asyncio.Future[dict[str, str | None]] = asyncio.get_running_loop().create_future()
         conn.pending_launches[request_id] = future
@@ -491,6 +542,11 @@ def register_core_routes(
                 # spawning. None (agent not resolvable) skips the
                 # host-side check.
                 harness=harness,
+                inference_config=(
+                    target.conv.inference_snapshot["runtime_config"]
+                    if target.conv.inference_snapshot
+                    else None
+                ),
             )
         )
         try:
@@ -518,6 +574,9 @@ def register_core_routes(
                 extra=debug_event(
                     "runner_launch_failed",
                     session_id=session_id,
+                    runner_id=runner_id,
+                    stage="runner_launch",
+                    error_code=launch_result.get("error_code") or "host_launch_failed",
                     error_category=ErrorCategory.RUNNER.value,
                     error_impact=ErrorImpact.BLOCKING.value,
                     error_phase=ErrorPhase.RUNNER_LAUNCH.value,
@@ -604,6 +663,7 @@ def register_core_routes(
             # message survives in each entry's `msg`.
             raise HTTPException(status_code=422, detail=exc.errors(include_context=False)) from exc
 
+        creation_metadata(parent_session_id=body.parent_session_id, host_type=body.host_type)
         resp = await _create_session_from_existing_agent(
             conversation_store,
             agent_store,
@@ -790,6 +850,10 @@ def register_core_routes(
         if not isinstance(bundle, StarletteUploadFile):
             raise HTTPException(status_code=422, detail=[_multipart_missing_detail("bundle")])
         parsed_metadata = _parse_session_create_metadata(metadata)
+        creation_metadata(
+            parent_session_id=parsed_metadata.parent_session_id,
+            host_type=parsed_metadata.host_type,
+        )
         from omnigent.server.routes._session_create_validation import (
             resolve_project_session_create,
         )
@@ -800,6 +864,10 @@ def register_core_routes(
             project_store=project_store,
         )
         parsed_metadata = project_resolution.body
+        creation_metadata(
+            parent_session_id=parsed_metadata.parent_session_id,
+            host_type=parsed_metadata.host_type,
+        )
         _reject_reserved_cost_control_label_seed(parsed_metadata.labels)
         _reject_server_reserved_label_seed(parsed_metadata.labels)
 
@@ -844,6 +912,15 @@ def register_core_routes(
             )
             parsed_metadata = parsed_metadata.model_copy(update={"workspace": canonical_workspace})
 
+        from omnigent.server.routes.sandbox_inference import prepare_create_inference
+
+        inference_snapshot, inference_model = await prepare_create_inference(
+            request,
+            parsed_metadata,
+            spec,
+            user_id,
+            conversation_store,
+        )
         result = await asyncio.to_thread(
             _create_session_from_bundle,
             conversation_store,
@@ -852,7 +929,11 @@ def register_core_routes(
             bundle_bytes,
             inherited_runner_id,
             spec,
+            inference_snapshot,
+            inference_model,
+            created_by=user_id,
         )
+        session_created(result.session_id, inherited_runner_id)
         # Top-level creates (no inherited runner) skip the notify —
         # their runner registers itself later.
         if inherited_runner_id is not None:
@@ -1025,6 +1106,7 @@ def register_core_routes(
         include_items: bool = Query(default=True),
         include_liveness: bool = Query(default=True),
         refresh_state: bool = Query(default=False),
+        include_usage: bool = Query(default=True),
     ) -> SessionResponse:
         """
         Return a session snapshot: identity, status, and committed
@@ -1045,6 +1127,11 @@ def register_core_routes(
             as ``None``. The web chat surface passes ``False`` because
             it sources liveness from the ``/health`` poll and the WS
             stream, not the snapshot.
+        :param include_usage: When ``False``, skip the subtree usage read and
+            return null usage fields with ``usage_included=False``. Display
+            clients can independently request this route with
+            ``include_usage=true``, ``include_items=false``,
+            ``include_liveness=false``, and ``refresh_state=false``.
         :param refresh_state: When ``True``, refresh runner-derived
             snapshot overlays from the live session instead of serving
             stale AP-process caches. Browser reload/bind requests use
@@ -1072,11 +1159,13 @@ def register_core_routes(
             conversation=access.conversation,
             liveness_lookup=liveness_lookup if include_liveness else None,
             include_items=include_items,
+            include_usage=include_usage,
             runner_exit_reports=runner_exit_reports,
             refresh_state=refresh_state,
             host_store=getattr(request.app.state, "host_store", None),
             sandbox_config=getattr(request.app.state, "sandbox_config", None),
             viewer_id=user_id,
+            request=request,
         )
 
     @router.get(
@@ -2009,6 +2098,7 @@ def register_core_routes(
         request: Request,
         session_id: str,
         body: UpdateSessionRequest,
+        include_usage: bool = Query(default=True),
     ) -> SessionResponse:
         """
         Update a session's mutable fields. When ``runner_id`` is
@@ -2024,6 +2114,8 @@ def register_core_routes(
         :param session_id: Session/conversation identifier,
             e.g. ``"conv_abc123"``.
         :param body: The validated :class:`UpdateSessionRequest`.
+        :param include_usage: When ``False``, skip usage aggregation in the
+            response. Metadata writes during native launch do not need it.
         :returns: The updated :class:`SessionResponse` snapshot, with
             ``items`` always empty — PATCH callers use only scalar
             fields, and transcripts are served by
@@ -2255,12 +2347,23 @@ def register_core_routes(
             )
             if conv_for_model is None:
                 raise _session_not_found()
-            await asyncio.to_thread(
-                _validate_session_model_selection,
-                conv_for_model,
-                None if clear_model else model_override,
-                agent_store,
+            from omnigent.server.routes.sandbox_inference import (
+                configured_snapshot,
+                validate_saved_selection,
             )
+
+            if configured_snapshot(conv_for_model.inference_snapshot):
+                model_override = await validate_saved_selection(
+                    request, conv_for_model, None if clear_model else model_override
+                )
+                clear_model = False
+            else:
+                await asyncio.to_thread(
+                    _validate_session_model_selection,
+                    conv_for_model,
+                    None if clear_model else model_override,
+                    agent_store,
+                )
 
         # Cost-control switch: ``"off"`` is a real stored value here,
         # so the clear signal is an explicit JSON null (field present,
@@ -2298,6 +2401,10 @@ def register_core_routes(
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
 
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conv is None:
+            raise _session_not_found()
+        previous_runner_id = conv.runner_id
         if body.runner_id is not None:
             # Empty string is the clear sentinel (None = leave unchanged);
             # used by /clear and /switch to move the runner between sessions.
@@ -2306,6 +2413,10 @@ def register_core_routes(
                     await asyncio.to_thread(conversation_store.clear_runner_id, session_id)
                 except ConversationNotFoundError as exc:
                     raise _session_not_found() from exc
+                _logger.info(
+                    "Session unbound from runner",
+                    extra=debug_event("session_runner_unbound", session_id=session_id),
+                )
             else:
                 from omnigent.server.routes import sessions as _sf
 
@@ -2318,6 +2429,17 @@ def register_core_routes(
                     )
                 except ConversationNotFoundError as exc:
                     raise _session_not_found() from exc
+                set_current_runner_id(runner_id)
+                _logger.info(
+                    "Session bound to runner",
+                    extra=debug_event(
+                        "session_runner_bound",
+                        session_id=session_id,
+                        runner_id=runner_id,
+                        operation="bind",
+                        stage="runner_launch",
+                    ),
+                )
                 _runner_client = await _get_runner_client(
                     session_id,
                     runner_router,
@@ -2355,7 +2477,27 @@ def register_core_routes(
                             exc_info=True,
                         )
                     else:
-                        parent_initialized = runner_init_resp.status_code < 400
+                        from omnigent.server.runner_session_init import runner_inference_verified
+
+                        parent_initialized = (
+                            runner_init_resp.status_code < 400
+                            and runner_inference_verified(conv, runner_init_resp)
+                        )
+                if (
+                    conv is not None
+                    and conv.inference_snapshot is not None
+                    and not parent_initialized
+                ):
+                    if previous_runner_id is None:
+                        await asyncio.to_thread(conversation_store.clear_runner_id, session_id)
+                    else:
+                        await asyncio.to_thread(
+                            conversation_store.replace_runner_id, session_id, previous_runner_id
+                        )
+                    raise OmnigentError(
+                        "The runner did not accept this session's saved inference configuration",
+                        code=ErrorCode.RUNNER_UNAVAILABLE,
+                    )
                 if _runner_client is None:
                     # Runner deregistered between validation and
                     # lookup; PATCH still returns 200 but no
@@ -2396,6 +2538,18 @@ def register_core_routes(
                     "Not a session (no agent binding)",
                     code=ErrorCode.NOT_FOUND,
                 )
+
+        from omnigent.server.routes.sandbox_inference import configured_snapshot
+
+        if (
+            conv is not None
+            and configured_snapshot(conv.inference_snapshot)
+            and (cost_control_mode_override == "on" or subagent_routing_override == "on")
+        ):
+            raise OmnigentError(
+                "Automatic provider routing is unavailable for a bound inference profile",
+                code=ErrorCode.INVALID_INPUT,
+            )
 
         updated = await asyncio.to_thread(
             conversation_store.update_conversation,
@@ -2481,11 +2635,27 @@ def register_core_routes(
                 # pane's model, so a forward its runner refused must not pass as
                 # applied. A stopped session reaches no runner and stays quiet —
                 # its relaunch reads the override off the row.
-                _surface_model_change_forward_failure(
+                forward_failed = _surface_model_change_forward_failure(
                     session_id,
                     updated.model_override,
                     _model_forward,
                 )
+                if (
+                    forward_failed
+                    and conv is not None
+                    and configured_snapshot(conv.inference_snapshot)
+                ):
+                    await asyncio.to_thread(
+                        conversation_store.update_conversation,
+                        session_id,
+                        model_override=conv.model_override,
+                        _unset_model_override=conv.model_override is None,
+                    )
+                    raise OmnigentError(
+                        "The terminal did not apply the model change. "
+                        "The previous selection has been restored.",
+                        code=ErrorCode.RUNNER_UNAVAILABLE,
+                    )
             else:
                 await _persist_model_change_note(
                     session_id,
@@ -2673,8 +2843,10 @@ def register_core_routes(
             agent_cache,
             liveness_lookup=liveness_lookup,
             include_items=False,
+            include_usage=include_usage,
             runner_exit_reports=runner_exit_reports,
             viewer_id=user_id,
+            request=request,
         )
 
     # ── POST /sessions/{source_id}/fork ─────────────────────────
@@ -2770,6 +2942,24 @@ def register_core_routes(
                 code=ErrorCode.INVALID_INPUT,
             )
 
+        from omnigent.server.routes.sandbox_inference import (
+            actual_harness,
+            configured_snapshot,
+            validate_saved_selection,
+        )
+
+        source_configured = configured_snapshot(source.inference_snapshot)
+        if source.inference_snapshot is not None:
+            from omnigent.server.auth import RESERVED_USER_LOCAL
+
+            assert source.inference_snapshot is not None
+            if source.inference_snapshot["owner_id"] != (user_id or RESERVED_USER_LOCAL):
+                raise OmnigentError(
+                    "This session's inference configuration belongs to another user. "
+                    "Start a new session to use your own provider connection.",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+
         source_agent = await asyncio.to_thread(agent_store.get, source.agent_id)
         if source_agent is None:
             raise OmnigentError(
@@ -2794,6 +2984,56 @@ def register_core_routes(
                     code=ErrorCode.NOT_FOUND,
                 )
             base_agent = target_agent
+
+        if source.inference_snapshot is not None and switching_agent:
+            from omnigent.harness_aliases import canonicalize_harness
+            from omnigent.inference_config import resolve_bound_provider
+            from omnigent.runtime import get_agent_cache
+
+            assert source.inference_snapshot is not None
+            cache = agent_cache or get_agent_cache()
+            try:
+                target_spec = (
+                    await asyncio.to_thread(cache.load, base_agent.id, base_agent.bundle_location)
+                ).spec
+            except (KeyError, AttributeError, ValueError, ImportError, OSError) as exc:
+                raise OmnigentError(
+                    "Cannot load the target agent to validate its saved inference configuration",
+                    code=ErrorCode.INVALID_INPUT,
+                ) from exc
+            source_harness = source.inference_snapshot["harness"]
+            target_harness = actual_harness(target_spec)
+            same_harness = (
+                source_harness == target_harness
+                if source_harness.startswith("acp:") or target_harness.startswith("acp:")
+                else canonicalize_harness(source_harness) == canonicalize_harness(target_harness)
+            )
+            if not same_harness:
+                raise OmnigentError(
+                    "A configured session can only fork into the same harness. "
+                    "Start a new session to choose another harness and provider.",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            bound_provider = resolve_bound_provider(
+                source.inference_snapshot["runtime_config"],
+                source_harness,
+                target_spec.executor.auth,
+            )
+            if bound_provider is not None and target_spec.executor.profile:
+                raise OmnigentError(
+                    "The target agent's Databricks profile conflicts with the saved provider. "
+                    "Start a new session to use that agent.",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+
+        await asyncio.to_thread(
+            _require_attachment_compatible_history,
+            source_id,
+            base_agent,
+            conversation_store,
+            file_store,
+            up_to_response_id=body.up_to_response_id,
+        )
 
         # Clone params for the fork's session-scoped agent. Created inside
         # fork_conversation's transaction (not agent_store.create): a
@@ -2845,6 +3085,16 @@ def register_core_routes(
                 # Explicit JSON null clears the override (matches the clear
                 # aliases), so the fork falls back to the bound agent default.
                 clear_override_model = True
+
+        if source_configured:
+            selected_model = (
+                (None if clear_override_model else override_model)
+                if model_override_set
+                else source.model_override
+            )
+            override_model = await validate_saved_selection(request, source, selected_model)
+            clear_override_model = False
+            model_override_set = True
 
         override_effort: str | None = None
         clear_override_effort = False
@@ -3038,6 +3288,20 @@ def register_core_routes(
                     break
                 files_after = files_page.last_id
 
+            from omnigent.inner.native_attachments import requires_filesystem
+
+            filesystem_sources = [
+                stored for stored in fork_source_files if requires_filesystem(stored.filename)
+            ]
+            if filesystem_sources:
+                await asyncio.to_thread(
+                    _enforce_filesystem_attachment_policy,
+                    [stored.filename or "" for stored in filesystem_sources],
+                    session_id=None,
+                    file_store=file_store,
+                    sizes=[stored.bytes for stored in filesystem_sources],
+                )
+
         try:
             new_conv = await asyncio.to_thread(
                 conversation_store.fork_conversation,
@@ -3073,6 +3337,7 @@ def register_core_routes(
                 up_to_response_id=body.up_to_response_id,
                 project_id=fork_project_id,
                 file_id_map=fork_file_id_map,
+                created_by=user_id,
             )
         except LookupError as exc:
             raise OmnigentError(
@@ -3259,6 +3524,13 @@ def register_core_routes(
                 code=ErrorCode.INVALID_INPUT,
             )
 
+        if session.inference_snapshot is not None:
+            raise OmnigentError(
+                "This session has a saved harness and provider configuration. "
+                "Start a new session to choose another agent.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+
         # Switching mid-turn would tear the running harness subprocess out
         # from under an active stream. Reject; the caller retries when idle.
         if _session_status_from_cache(session_id) == "running":
@@ -3313,6 +3585,27 @@ def register_core_routes(
                 f"Target agent bundle could not be loaded: {body.agent_id!r}",
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
+
+        retained_attachment = await asyncio.to_thread(
+            _require_attachment_compatible_history,
+            session_id,
+            target_agent,
+            conversation_store,
+            file_store,
+        )
+        if retained_attachment is not None and (session.host_id or session.runner_id):
+            from omnigent.server.routes._sessions.helpers import (
+                require_filesystem_attachment_runtime,
+            )
+
+            await asyncio.to_thread(
+                require_filesystem_attachment_runtime,
+                host_id=session.host_id,
+                runner_id=session.runner_id,
+                host_registry=host_registry,
+                tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
+                runner_router=runner_router,
+            )
 
         # A model id is provider-bound, so model_override / reasoning_effort
         # carry over only within the same provider family. A native target

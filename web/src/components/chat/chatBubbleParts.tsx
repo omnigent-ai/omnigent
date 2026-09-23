@@ -758,7 +758,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
                 non-wrapping strip would sit off-screen in the overflow and
                 look like it never rendered. */}
             {images.length > 0 && (
-              <div className="mb-1.5 flex flex-wrap gap-2">
+              <div className="mb-1.5 flex flex-wrap items-start gap-2">
                 {keyedAttachments(
                   images,
                   (img) => img.file_id ?? img.image_url ?? img.filename,
@@ -774,8 +774,6 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
                             : undefined
                         }
                         alt={preview.alt}
-                        // Sizing lives in SessionImage, which reserves a matching
-                        // box so the bubble's height is settled before bytes land.
                         className="rounded-md object-contain"
                       />
                     );

@@ -14,6 +14,7 @@ import {
   fetchConversationsPage,
   markSessionsDeleting,
   fetchAllArchivedProjectNames,
+  fetchProjectSessionIds,
   renameConversation,
   useArchiveConversation,
   useBulkArchiveConversations,
@@ -208,6 +209,7 @@ describe("useConversations project filter", () => {
     const url = fetchMock.mock.calls[0][0] as string;
     expect(url).toContain("include_archived=true");
     expect(url).toContain("project=Design");
+    expect(url).toContain("visibility=all");
   });
 
   it("url-encodes a project name with spaces", async () => {
@@ -252,6 +254,29 @@ describe("useConversations project filter", () => {
     const url = fetchMock.mock.calls[0][0] as string;
     expect(url).toContain("project=__all__");
   });
+});
+
+describe("fetchConversationsPage visibility", () => {
+  it.each([undefined, "mine", "shared", "archived"] as const)(
+    "sends explicit visibility for %s",
+    async (visibility) => {
+      fetchMock.mockResolvedValueOnce(
+        mockResponse({ data: [], first_id: null, last_id: null, has_more: false }),
+      );
+      const queryClient = new QueryClient();
+
+      await fetchConversationsPage({
+        searchQuery: "",
+        includeArchived: false,
+        visibility,
+        queryClient,
+      });
+
+      const params = new URL(String(fetchMock.mock.calls[0][0]), "http://localhost").searchParams;
+      expect(params.get("visibility")).toBe(visibility ?? "all");
+      queryClient.clear();
+    },
+  );
 });
 
 describe("useConversations search timeout", () => {
@@ -378,7 +403,7 @@ describe("fetchAllArchivedProjectNames", () => {
         mockResponse({
           data: [
             { id: "a", archived: true, labels: { omni_project: "Beta" } },
-            // Active row — include_archived returns it, but it's not filterable here.
+            // Defensively ignore active rows if a server ignores the visibility filter.
             { id: "b", archived: false, labels: { omni_project: "Zeta" } },
             // Archived but unfiled — no project label to collect.
             { id: "c", archived: true, labels: {} },
@@ -391,7 +416,7 @@ describe("fetchAllArchivedProjectNames", () => {
       .mockResolvedValueOnce(
         mockResponse({
           data: [
-            { id: "d", archived: true, labels: { omni_project: "Alpha" } },
+            { id: "d", archived: true, owner: "bob", labels: { omni_project: "Alpha" } },
             // Duplicate project across pages collapses to one entry.
             { id: "e", archived: true, labels: { omni_project: "Beta" } },
           ],
@@ -413,6 +438,11 @@ describe("fetchAllArchivedProjectNames", () => {
     expect(url1).not.toContain("after=");
     // Page 2 follows the previous page's last_id cursor.
     expect(fetchMock.mock.calls[1][0]).toContain("after=c");
+    expect(
+      fetchMock.mock.calls.map(([url]) =>
+        new URL(String(url), "http://localhost").searchParams.get("visibility"),
+      ),
+    ).toEqual(["archived", "archived"]);
   });
 
   it("stops after one request when the first page has no more", async () => {
@@ -2139,7 +2169,7 @@ describe("useProjectSessions", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("fetches the project's non-archived sessions, newest-first, when enabled", async () => {
+  it("fetches the viewer's active project sessions, newest-first, when enabled", async () => {
     fetchMock.mockResolvedValueOnce(
       mockResponse({
         data: [{ id: "conv_a", object: "conversation", title: "A", created_at: 0, updated_at: 9 }],
@@ -2160,9 +2190,28 @@ describe("useProjectSessions", () => {
     expect(url).toContain("order=desc");
     expect(url).toContain("sort_by=updated_at");
     expect(url).toContain("limit=20");
+    expect(url).toContain("visibility=mine");
     // Folders show active sessions only — archived ones leave the sidebar.
     expect(url).not.toContain("include_archived");
     expect(result.current.data?.pages[0]?.data[0]?.id).toBe("conv_a");
+  });
+});
+
+describe("fetchProjectSessionIds", () => {
+  it("checks project membership across all accessible sessions, including archived", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({ data: [{ id: "conv_a" }, { id: "conv_b" }], has_more: false }),
+    );
+
+    await expect(fetchProjectSessionIds("Sprint 42")).resolves.toEqual(["conv_a", "conv_b"]);
+
+    const params = new URL(String(fetchMock.mock.calls[0][0]), "http://localhost").searchParams;
+    expect(Object.fromEntries(params)).toMatchObject({
+      project: "Sprint 42",
+      limit: "2",
+      visibility: "all",
+      include_archived: "true",
+    });
   });
 });
 
@@ -2978,6 +3027,7 @@ describe("useDeleteProject", () => {
     const listUrl = fetchMock.mock.calls[0][0] as string;
     expect(listUrl).toContain("project=Sprint+42");
     expect(listUrl).toContain("include_archived=true");
+    expect(listUrl).toContain("visibility=all");
 
     // Each member is archived AND detached (project_id cleared + label removed)
     // via PATCH — never deleted.

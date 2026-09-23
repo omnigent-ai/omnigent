@@ -124,6 +124,11 @@ def test_session_header_action_visibility(
     expect(filter_sessions).to_have_css("opacity", "1")
     expect(select_wrapper).to_have_css("opacity", "0")
 
+    filter_sessions.hover()
+    expect(page.get_by_role("tooltip")).to_have_text("Filter sessions")
+    page.mouse.move(800, 700)
+    expect(select_wrapper).to_have_css("opacity", "0")
+
     sessions_header.hover()
     expect(select_wrapper).to_have_css("opacity", "1")
 
@@ -238,6 +243,11 @@ def test_archive_action_disabled_until_selection(
     expect(page.get_by_text("1 selected")).to_be_visible()
     expect(archive_btn).to_be_enabled()
     expect(delete_btn).to_be_enabled()
+
+    move_btn = page.get_by_test_id("bulk-move-to-project")
+    expect(move_btn).to_be_enabled()
+    move_btn.hover()
+    expect(page.get_by_role("tooltip")).to_have_text("Move to project")
 
 
 def test_bulk_archive_moves_session_to_archived(

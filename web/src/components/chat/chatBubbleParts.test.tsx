@@ -267,7 +267,7 @@ describe("AssistantBubble error retry", () => {
     );
     render(<BubbleView bubble={errorBubble("required_terminal_exited")} />);
 
-    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    fireEvent.click(screen.getByRole("button", { name: "Resume session" }));
 
     await waitFor(() => expect(screen.queryByTestId("error-pill")).toBeNull());
     expect(fetchMock).toHaveBeenCalledOnce();

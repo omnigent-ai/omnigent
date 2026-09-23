@@ -21,6 +21,14 @@ _P = ParamSpec("_P")
 _T = TypeVar("_T")
 
 
+class HarnessTransportClosedError(RuntimeError):
+    """A native harness channel ended; replay requires explicit safety evidence."""
+
+    def __init__(self, message: str, *, replay_safe: bool = False) -> None:
+        super().__init__(message)
+        self.replay_safe = replay_safe
+
+
 class ErrorCategory(str, Enum):
     """Fault attribution for an error: who must change something to prevent it.
 

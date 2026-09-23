@@ -2306,6 +2306,33 @@ async def test_events_managed_glm_switch_confirms_the_terminal_model(
     assert response.status_code == 204, response.text
 
 
+async def test_bound_claude_switch_preserves_private_model_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.inference_config import inference_config_scope
+
+    selected = "private/model-b[large]"
+    config = {
+        "providers": {"gateway": {"kind": "gateway"}},
+        "inference": {
+            "harnesses": {
+                "claude-native": {
+                    "provider": "gateway",
+                    "default_model": selected,
+                    "model_allowlist": [selected],
+                }
+            }
+        },
+    }
+    with inference_config_scope(config):
+        response = await _post_model_change_with_status_sequence(
+            monkeypatch,
+            ["private/model-a", selected],
+            model=selected,
+        )
+    assert response.status_code == 204, response.text
+
+
 async def test_events_managed_glm_switch_rejects_an_unchanged_terminal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

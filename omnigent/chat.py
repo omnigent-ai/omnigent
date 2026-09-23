@@ -1444,7 +1444,7 @@ def _pick_agent(base_url: str, *, quiet: bool = False) -> str:
         resp = _server_get(
             f"{base_url}/v1/sessions",
             headers=_remote_headers(server_url=base_url, host_id=None),
-            params={"limit": 100},
+            params={"limit": 100, "visibility": "all"},
             timeout=10.0,
         )
     except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ProxyError, httpx.InvalidURL) as exc:
@@ -3028,6 +3028,7 @@ async def _resolve_latest_conversation_id_async(
         limit=1,
         order="desc",
         sort_by="updated_at",
+        visibility="mine",
     )
     if not sessions:
         return None

@@ -1118,6 +1118,34 @@ def load_session_usage(
     return _sum_subtree_usage(tree, conversation_id)
 
 
+def load_session_usage_and_tree(
+    conversation_id: str,
+    conversation_store: ConversationStore,
+    *,
+    root_conversation_id: str | None = None,
+) -> tuple[dict[str, Any], list[Conversation]]:
+    """
+    Load a conversation's subtree usage together with the tree it came from.
+
+    :func:`load_session_usage` discards the tree it summed, so a caller that
+    needs both — the sums *and* the rows, e.g. to roll up which harnesses ran
+    in the tree — would otherwise load it twice. Returning both keeps that to
+    one read, and keeps the sums and the rows from the same snapshot rather
+    than two.
+
+    :param conversation_id: The conversation to sum, e.g. ``"conv_abc123"``.
+    :param conversation_store: Store to read from.
+    :param root_conversation_id: The conversation's tree root, when the
+        caller already holds the row — validated as in
+        :func:`load_session_usage`.
+    :returns: ``(usage, tree)`` — the subtree usage dict
+        :func:`load_session_usage` would return, and every conversation in
+        the tree it was summed from.
+    """
+    tree = load_session_tree(conversation_id, conversation_store, root_conversation_id)
+    return _sum_subtree_usage(tree, conversation_id), tree
+
+
 def load_session_tree(
     conversation_id: str,
     conversation_store: ConversationStore,
@@ -1309,7 +1337,14 @@ def _policy_usage_seed(
     conv = conversation_store.get_conversation(conversation_id)
     if conv is None:
         return {}
-    usage = load_session_usage(conv.root_conversation_id, conversation_store)
+    # A top-level row's ``root_conversation_id`` is its own id, so the root we
+    # are about to sum names itself as its root — pass it and the loader skips
+    # re-reading that row (it still verifies the hint, so a stale one heals).
+    usage = load_session_usage(
+        conv.root_conversation_id,
+        conversation_store,
+        root_conversation_id=conv.root_conversation_id,
+    )
     return _normalize_usage_for_engine(usage)
 
 

@@ -99,7 +99,9 @@ def test_queued_attachments_share_a_compact_row(
         assert layout["sameLine"], layout
     assert layout["noOverlap"], layout
     assert layout["nameWidth"] >= 24, layout
-    assert layout["rowHeight"] <= (48 if width < 768 else 24), layout
+    # Desktop uses 24px compact controls plus 2px vertical padding on each
+    # side; mobile keeps the same padding around its 44px touch targets.
+    assert layout["rowHeight"] <= (48 if width < 768 else 28), layout
     if text:
         assert layout["textWidth"] >= 16, layout
     assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")

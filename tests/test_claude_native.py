@@ -32,6 +32,7 @@ from omnigent._runner_startup import RunnerStartupProgress
 from omnigent._startup_profile import StartupProfiler
 from omnigent._terminal_picker_theme import PICKER_ACCENT, PICKER_MUTED
 from omnigent.harnesses.claude_native import main as claude_native
+from omnigent.inner.native_attachments import attachment_cache_dir
 from omnigent.models.databricks_model_discovery import DatabricksClaudeCatalog
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from omnigent.runtime import tool_result_replay as trc
@@ -3397,10 +3398,169 @@ async def test_ensure_local_claude_resume_transcript_rematerializes_image_blocks
     assert attached_lines, f"image block was silently dropped from the rebuild: {texts}"
     attached_path = Path(attached_lines[0].removeprefix("[Attached: ").removesuffix("]"))
     # The referenced file is live on THIS machine with the fetched bytes.
-    assert attached_path.parent == bridge_dir / "uploads"
+    assert attached_path.parent == attachment_cache_dir(bridge_dir)
     assert attached_path.read_bytes() == b"png-bytes"
     assert "look at this image" in " ".join(texts)
     assert "file_id" not in written.read_text(encoding="utf-8")
+
+
+def test_resume_rebuild_delivers_a_zip_to_the_attachment_cache(tmp_path: Path) -> None:
+    """A resumed ZIP is cached without requiring workspace configuration."""
+    from omnigent.harnesses.claude_native.bridge import _CONFIG_FILE
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    # No bridge config yet, and a stale one would name the previous workspace.
+    assert not (bridge_dir / _CONFIG_FILE).exists()
+    zip_bytes = b"PK\x03\x04 resumed zip"
+    content = [
+        {
+            "type": "input_file",
+            "filename": "bundle.zip",
+            "file_data": "data:application/zip;base64," + base64.b64encode(zip_bytes).decode(),
+        }
+    ]
+
+    blocks = claude_native._claude_attachment_text_blocks_from_api_content(content, bridge_dir)
+
+    expected = attachment_cache_dir(bridge_dir) / "bundle.zip"
+    assert blocks == [{"type": "text", "text": f"[Attached: {expected}]"}]
+    assert expected.read_bytes() == zip_bytes
+    assert list(workspace.iterdir()) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resume_path", ["legacy", "runner", "cli"])
+async def test_resume_restores_attachments_using_the_launch_bridge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    resume_path: str,
+) -> None:
+    """A cold transcript rebuild downloads ZIP files into the attachment cache."""
+    from omnigent.harnesses.claude_native import bridge as claude_native_bridge
+    from omnigent.harnesses.claude_native.bridge import _CONFIG_FILE
+
+    projects = tmp_path / "projects"
+    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
+    legacy_bridge = tmp_path / "legacy-bridge"
+    bridge_dir = legacy_bridge if resume_path == "legacy" else tmp_path / "live-bridge"
+    monkeypatch.setattr(
+        claude_native_bridge, "bridge_dir_for_conversation_id", lambda _conv: legacy_bridge
+    )
+
+    def live_bridge(bridge_id: str) -> Path:
+        assert bridge_id == "rotated-bridge-id"
+        return bridge_dir
+
+    monkeypatch.setattr(claude_native, "bridge_dir_for_bridge_id", live_bridge)
+    workspace = tmp_path / "replacement-repo"
+    workspace.mkdir()
+    monkeypatch.chdir(workspace)
+    zip_bytes = b"PK\x03\x04 resumed zip"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/v1/sessions/conv_abc":
+            return httpx.Response(
+                200,
+                json={
+                    "external_session_id": "sid123",
+                    "labels": {
+                        "omnigent.wrapper": "claude-code-native-ui",
+                        claude_native.BRIDGE_ID_LABEL_KEY: "rotated-bridge-id",
+                    },
+                },
+            )
+        if path.endswith("/resources/files/file_zip/content"):
+            return httpx.Response(200, content=zip_bytes)
+        if path.endswith("/resources/files/file_zip"):
+            return httpx.Response(
+                200,
+                json={
+                    "id": "file_zip",
+                    "name": "bundle.zip",
+                    "content_type": "application/zip",
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_file",
+                                "file_id": "file_zip",
+                                "filename": "bundle.zip",
+                            },
+                            {"type": "input_text", "text": "unpack this"},
+                        ],
+                    }
+                ],
+                "has_more": False,
+            },
+        )
+
+    transport = httpx.MockTransport(handler)
+    expected = attachment_cache_dir(bridge_dir) / "bundle.zip"
+    async with httpx.AsyncClient(transport=transport, base_url="https://example.com") as client:
+        for attempt in range(2):
+            if resume_path == "cli":
+                args = await claude_native._resolve_cold_resume_args(client, "conv_abc")
+                assert args == ("--resume", "sid123")
+                written = claude_native._claude_project_dir_for_cwd(workspace) / "sid123.jsonl"
+            else:
+                written = await claude_native._ensure_local_claude_resume_transcript(
+                    client,
+                    session_id="conv_abc",
+                    external_session_id="sid123",
+                    workspace=workspace,
+                    bridge_dir=bridge_dir if resume_path == "runner" else None,
+                )
+            assert expected.read_bytes() == zip_bytes
+            assert list(workspace.iterdir()) == []
+            if attempt == 0:
+                expected.unlink()
+
+    assert not (bridge_dir / _CONFIG_FILE).exists()
+    expected = attachment_cache_dir(bridge_dir) / "bundle.zip"
+    assert expected.read_bytes() == zip_bytes
+    assert written is not None
+    assert f"[Attached: {expected}]" in written.read_text(encoding="utf-8")
+
+    if resume_path != "legacy":
+        assert not attachment_cache_dir(legacy_bridge).exists()
+
+
+def test_resume_rebuild_ignores_a_stale_bridge_workspace(tmp_path: Path) -> None:
+    """A config left by the previous launch must not redirect the rebuild."""
+    from omnigent.harnesses.claude_native.bridge import _CONFIG_FILE
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    stale = tmp_path / "old-repo"
+    stale.mkdir()
+    (bridge_dir / _CONFIG_FILE).write_text(json.dumps({"workspace": str(stale)}))
+    replacement = tmp_path / "new-repo"
+    replacement.mkdir()
+    content = [
+        {
+            "type": "input_file",
+            "filename": "bundle.zip",
+            "file_data": "data:application/zip;base64," + base64.b64encode(b"PK zip").decode(),
+        }
+    ]
+
+    blocks = claude_native._claude_attachment_text_blocks_from_api_content(content, bridge_dir)
+
+    expected = attachment_cache_dir(bridge_dir) / "bundle.zip"
+    assert blocks == [{"type": "text", "text": f"[Attached: {expected}]"}]
+    assert list(stale.iterdir()) == []
+    assert list(replacement.iterdir()) == []
 
 
 @pytest.mark.asyncio
@@ -10577,6 +10737,64 @@ async def test_claude_model_catalog_marks_the_launch_pin_as_default(
     ]
 
 
+@pytest.mark.parametrize("picker_state", ["listed", "off-list", "disabled", "empty"])
+async def test_custom_provider_catalog_preserves_declared_anthropic_model(
+    monkeypatch: pytest.MonkeyPatch, picker_state: str
+) -> None:
+    """A custom endpoint may explicitly serve canonical Anthropic model IDs."""
+    model = "claude-sonnet-4-20250514"
+
+    async def probe(config: object) -> claude_native.ClaudeModelProbe:
+        return claude_native.ClaudeModelProbe(
+            alias_rows=[
+                {"id": "opus", "model": "claude-opus-5", "displayName": "Opus"},
+                *(
+                    [{"id": "sonnet", "model": model, "displayName": "Sonnet"}]
+                    if picker_state == "listed"
+                    else []
+                ),
+            ],
+            default_model="claude-opus-5",
+            disabled_models=frozenset({model}) if picker_state == "disabled" else frozenset(),
+            empty_picker=picker_state == "empty",
+        )
+
+    monkeypatch.setattr(claude_native, "probe_claude_model_options", probe)
+    config = claude_native.ClaudeNativeUcodeConfig(
+        env={"ANTHROPIC_BASE_URL": "https://proxy.example/anthropic"},
+        model=model,
+        routable_models=(model,),
+    )
+    rows = await claude_native.claude_model_catalog(config)
+    if picker_state in {"disabled", "empty"}:
+        assert rows == []
+    else:
+        assert rows == [
+            {
+                "id": "sonnet" if picker_state == "listed" else model,
+                "model": model,
+                "displayName": "Sonnet" if picker_state == "listed" else model,
+                "isDefault": True,
+            }
+        ]
+
+
+def test_catalog_fingerprint_changes_with_declared_routable_models(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A new provider declaration must not reuse an empty filtered catalog."""
+    _point_claude_at(monkeypatch, tmp_path / "claude")
+    (tmp_path / "claude").write_text("binary")
+    kwargs = {"env": {"ANTHROPIC_BASE_URL": "https://proxy.example/anthropic"}}
+    unknown = claude_native.ClaudeNativeUcodeConfig(**kwargs)
+    declared = claude_native.ClaudeNativeUcodeConfig(
+        **kwargs, routable_models=("claude-sonnet-4-20250514",)
+    )
+    assert claude_native.claude_catalog_fingerprint(unknown) != (
+        claude_native.claude_catalog_fingerprint(declared)
+    )
+
+
 async def test_claude_launch_catalog_reads_the_store_then_probes_once(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -11312,7 +11530,7 @@ def test_configured_provider_wins_over_connect_broker_spec_branch(
     sentinel = claude_native.ClaudeNativeUcodeConfig(env={"MARK": "spec-provider"})
     monkeypatch.setattr(
         "omnigent.runtime.workflow._resolve_provider_for_build",
-        lambda spec, harness_type: object(),  # spec resolves to a provider entry
+        lambda spec, harness_type, actual_harness: object(),  # spec resolves to a provider entry
     )
     monkeypatch.setattr(
         claude_native,
@@ -11387,7 +11605,8 @@ def test_resolve_native_claude_config_spec_path_reaches_connect_broker(
 
     # Spec routes to no provider and carries no ucode profile.
     monkeypatch.setattr(
-        "omnigent.runtime.workflow._resolve_provider_for_build", lambda spec, harness_type: None
+        "omnigent.runtime.workflow._resolve_provider_for_build",
+        lambda spec, harness_type, actual_harness: None,
     )
     monkeypatch.setattr(
         claude_native, "_ucode_config_for_profile", lambda profile, *, refresh_models: None
@@ -11425,7 +11644,8 @@ def test_resolve_native_claude_config_spec_api_key_auth_skips_connect_broker(
     # The shared resolver returns None for an explicit ApiKeyAuth (it leaves bare
     # keys to Claude's own login), which previously fell through to the broker.
     monkeypatch.setattr(
-        "omnigent.runtime.workflow._resolve_provider_for_build", lambda spec, harness_type: None
+        "omnigent.runtime.workflow._resolve_provider_for_build",
+        lambda spec, harness_type, actual_harness: None,
     )
     monkeypatch.setattr(
         claude_native, "_ucode_config_for_profile", lambda profile, *, refresh_models: None

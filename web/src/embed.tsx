@@ -1,5 +1,5 @@
 import { appConfig, type SidebarConfig } from "./appConfig";
-import { SidebarDataProvider } from "./hooks/useSidebarData";
+import { IdentityAwareSidebarDataProvider } from "./hooks/useSidebarData";
 // Embed entry point.
 //
 // Exposes `OmnigentApp` — a plain React component (app-specific providers +
@@ -42,7 +42,8 @@ import {
   setEmbedScopeRoot,
   setOmnigentHostConfig,
 } from "./lib/host";
-import { resolveIdentity } from "./lib/identity";
+import { prefetchSessionHostChain } from "./hooks/useSession";
+import { resolveIdentity, setSessionHostResolver } from "./lib/identity";
 import {
   applyDesktopUiFontSize,
   applyUiFontFamily,
@@ -169,6 +170,9 @@ function OmnigentProviders({
   const hostQueryClient = useQueryClient();
   useState(() => {
     initChatStore(hostQueryClient);
+    // Resolve a session's routing host on demand (a hostless sub-agent child
+    // walks up to its host-bound ancestor) before host-scoped requests key.
+    setSessionHostResolver((sessionId) => prefetchSessionHostChain(hostQueryClient, sessionId));
     void resolveIdentity();
     return null;
   });
@@ -229,7 +233,9 @@ function OmnigentProviders({
               <ImageLightboxProvider>
                 <RoutingProvider value={routing}>
                   <EmbedCapabilitiesProvider>
-                    <SidebarDataProvider config={{ ...appConfig.sidebar, ...sidebarOverrides }}>
+                    <IdentityAwareSidebarDataProvider
+                      config={{ ...appConfig.sidebar, ...sidebarOverrides }}
+                    >
                       <SessionUpdatesProvider>
                         <RunnerHealthProvider>
                           <QueueFlushProvider>
@@ -237,7 +243,7 @@ function OmnigentProviders({
                           </QueueFlushProvider>
                         </RunnerHealthProvider>
                       </SessionUpdatesProvider>
-                    </SidebarDataProvider>
+                    </IdentityAwareSidebarDataProvider>
                   </EmbedCapabilitiesProvider>
                 </RoutingProvider>
               </ImageLightboxProvider>

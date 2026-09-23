@@ -15,6 +15,7 @@ from unittest.mock import patch
 
 import pytest
 
+import omnigent.host.git_worktree as git_worktree_module
 from omnigent.host.git_worktree import (
     CreatedWorktree,
     WorktreeError,
@@ -377,6 +378,27 @@ def test_list_worktrees_returns_main_first(git_repo: Path) -> None:
     assert main.branch == "main"
     assert main.is_main is True
     assert main.detached is False
+    assert isinstance(main.updated_at, int)
+
+
+@pytest.mark.parametrize(
+    "remote_url",
+    [
+        "https://github.com/omnigent-ai/omnigent.git",
+        "https://gitlab.com/acme/repo.git",
+        "git@github-personal:omnigent-ai/omnigent.git",
+        "ssh://git@github.enterprise.example/omnigent-ai/omnigent.git",
+        "https://[invalid/repo",
+    ],
+)
+def test_list_worktrees_does_not_depend_on_remote_url(git_repo: Path, remote_url: str) -> None:
+    """Local worktree support is independent of the configured remote."""
+    _git(git_repo, "remote", "add", "origin", remote_url)
+    result = list_worktrees(repo_path=str(git_repo))
+    assert len(result) == 1
+    assert result[0].path == str(git_repo)
+    assert result[0].branch == "main"
+    assert result[0].is_main is True
 
 
 def test_list_worktrees_includes_linked(git_repo: Path) -> None:
@@ -389,13 +411,41 @@ def test_list_worktrees_includes_linked(git_repo: Path) -> None:
     assert linked.path == created.worktree_path
     assert linked.branch == "feature/login"
     assert linked.detached is False
+    assert isinstance(linked.updated_at, int)
+
+
+def test_list_worktrees_fetches_all_timestamps_with_one_git_command(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Timestamp metadata stays O(1) as the number of worktrees grows."""
+    for index in range(4):
+        create_worktree(repo_path=str(git_repo), branch_name=f"feature/{index}")
+
+    original_run_git = git_worktree_module._run_git
+    show_calls: list[list[str]] = []
+
+    def run_git(args: list[str], *, cwd: str) -> subprocess.CompletedProcess[str]:
+        if args[:3] == ["show", "-s", "--format=%H%x00%ct"]:
+            show_calls.append(args)
+        return original_run_git(args, cwd=cwd)
+
+    monkeypatch.setattr(git_worktree_module, "_run_git", run_git)
+
+    result = list_worktrees(repo_path=str(git_repo))
+
+    assert len(result) == 5
+    assert len(show_calls) == 1
+    assert len(show_calls[0][3:]) == len({_rev_parse(Path(worktree.path)) for worktree in result})
+    assert all(isinstance(worktree.updated_at, int) for worktree in result)
 
 
 def test_list_worktrees_from_linked_resolves_same_list(git_repo: Path) -> None:
     """Listing from inside a linked worktree resolves the main repo's full list."""
     created = create_worktree(repo_path=str(git_repo), branch_name="feature/a")
-    # Query from the linked worktree — should still see BOTH worktrees.
-    result = list_worktrees(repo_path=created.worktree_path)
+    nested = Path(created.worktree_path) / "nested"
+    nested.mkdir()
+    # A subdirectory of the linked worktree resolves both checkouts.
+    result = list_worktrees(repo_path=str(nested))
     paths = {w.path for w in result}
     assert str(git_repo) in paths
     assert created.worktree_path in paths

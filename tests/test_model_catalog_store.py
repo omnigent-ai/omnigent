@@ -136,6 +136,27 @@ async def test_ensure_catalog_stale_refresh_failure_keeps_serving() -> None:
     assert await store.ensure_catalog("claude-native", "abc123", _probe) == _ROWS
 
 
+async def test_shutdown_clears_a_refresh_cancelled_before_it_starts() -> None:
+    """Even a probe cancelled before entering its finally block leaves no task."""
+    store.write_catalog("claude-native", "abc123", _ROWS)
+    _age_entry("claude-native", "abc123", store.CATALOG_STALE_AFTER_S + 60)
+    probes: list[int] = []
+
+    async def _probe() -> list[dict[str, object]]:
+        probes.append(1)
+        return [{"id": "new"}]
+
+    assert await store.ensure_catalog("claude-native", "abc123", _probe) == _ROWS
+    task = store._inflight[("claude-native", "abc123")]
+    await store.shutdown_catalog_probes()
+
+    assert task.cancelled()
+    assert probes == []
+    assert not store._inflight
+    assert store.read_catalog("claude-native", "abc123") == _ROWS
+    assert await store.reprobe_catalog("claude-native", "abc123", _probe) == [{"id": "new"}]
+
+
 @pytest.mark.parametrize("refreshed", [[{"id": "haiku", "model": "claude-haiku-4-5"}], []])
 async def test_reprobe_catalog_joins_the_background_probe_and_persists(
     refreshed: list[dict[str, object]],

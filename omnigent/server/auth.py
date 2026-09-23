@@ -759,6 +759,26 @@ class UnifiedAuthProvider(AuthProvider):
         return None
 
 
+class AccountAuthorityMiddleware:
+    """Select account checks from the app's provider for every ASGI scope.
+
+    Lifespan timers, child tasks, and worker threads inherit the same policy
+    as HTTP and WebSocket handlers without sharing it across applications.
+    """
+
+    def __init__(self, app: ASGIApp, auth_provider: AuthProvider | None) -> None:
+        self._app = app
+        self._checks_enabled = (
+            isinstance(auth_provider, UnifiedAuthProvider) and auth_provider._source == "accounts"
+        )
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        from omnigent.db.account_authority import account_checks_scope
+
+        with account_checks_scope(self._checks_enabled):
+            await self._app(scope, receive, send)
+
+
 class AccountAuthenticationMiddleware:
     """Validate each accounts HTTP request or WebSocket handshake in a worker.
 

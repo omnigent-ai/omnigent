@@ -51,7 +51,7 @@ adds native niceties:
   native `Cmd+,` accelerator on macOS (`Ctrl+,` elsewhere) and routes the
   focused connected window through the SPA without reloading it. On macOS,
   **About Omnigent** opens a shell-owned modal showing the platform app and
-  detected CLI versions; the CLI section points users to `omni upgrade`.
+  detected CLI versions; the CLI section points users to `omni update`.
   **Check for Updates…** in
   the Server menu opens the same modal and starts a check. **Update now** in the
   shell update prompt opens the modal, hides the prompt, and starts the download;
@@ -245,8 +245,9 @@ Omnigent, set its macOS user default, and reopen it:
 defaults write ai.omnigent.desktop DeveloperMode -bool true
 ```
 
-The **Debug → Developer Tools** menu is then available in the packaged app. To
-turn production debugging off again, quit Omnigent and remove the override:
+The packaged app then exposes **Debug → Authentication** session/token
+simulations and **Debug → Developer Tools**. To turn production debugging off
+again, quit Omnigent and remove the override:
 
 ```bash
 defaults delete ai.omnigent.desktop DeveloperMode
@@ -382,6 +383,46 @@ sequenceDiagram
     R-->>S: POST action result + claim token
     S-->>A: result JSON (or clean timeout)
 ```
+
+### Local network permission
+
+Sites in the embedded pane can ask for **local network access**, including
+loopback services such as Okta Verify. A compact, Chrome-style popover beneath
+the browser toolbar names the requesting origin and offers three choices:
+
+- **Allow once** — for this site visit in this browser. Survives reloads and
+  same-origin navigation; expires on leaving the site or closing the pane.
+- **Always allow** — remembers this exact origin across all conversations and
+  app restarts.
+- **Deny** — blocks this permission for the origin across conversation browsers
+  and app restarts.
+
+Closing the popover, pressing Escape, or clicking outside dismisses the request
+without saving a decision. The UI is a bundled, sandboxed child window, not
+part of the visited page or server SPA; only its own main frame can submit a
+choice. Only the visible, active pane can open a new prompt. Existing **Allow
+once** and **Always allow** grants remain effective while the site is
+backgrounded, matching Chrome's permission behavior. HTTPS sites and HTTP
+loopback pages can request access; subframes cannot independently request it.
+
+Electron's permission-check API returns only allowed/denied, not Chrome's
+"prompt" state. For query-first sign-in flows, the popover includes a short
+reload hint and either allow button reloads the page to retry. If a background
+page already stopped its sign-in flow, bring its pane into view and reload.
+
+Saved choices live in `settings.json` under `browser_local_network_permissions`
+(origin → boolean). To reset a saved choice, quit the app, remove that origin's
+entry, and reopen it. These choices do not change cookie/storage isolation or
+the shell's own sign-in window policy. Camera, microphone, notifications, and
+other browser permissions remain denied.
+
+This controls Chromium's local-network permission answers, **not a network
+firewall**: Electron versions may not gate every local-network fetch on this
+permission. Approval does not bypass CORS, TLS certificate validation, or the
+agent navigation policy. A helper that rejects this origin through its own CORS
+policy must be configured to allow it; the pane does not rewrite those headers.
+
+### Browser implementation
 
 The browser runs on the user's machine (a native `WebContentsView`); the agent —
 which may run on a different host — drives it purely by messages: an action

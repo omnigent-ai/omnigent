@@ -40,7 +40,8 @@ export function defaultModelLabel(options: readonly NativeModelLabelFields[]): s
 }
 
 export function compactModelTriggerLabel(value: string): string {
-  return /^Default \((.*)\)$/.exec(value)?.[1] ?? value;
+  const withoutDefault = /^Default \((.*)\)$/.exec(value)?.[1] ?? value;
+  return withoutDefault.replace(/\s*\((\d+(?:\.\d+)?[KMG]) context\)/gi, " $1");
 }
 
 export function formatStatusModelLabel(

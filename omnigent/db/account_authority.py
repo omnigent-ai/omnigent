@@ -30,6 +30,21 @@ class AccountAuthority:
 
 _authority: ContextVar[AccountAuthority | None] = ContextVar("account_authority", default=None)
 _targets: ContextVar[tuple[AccountAuthority, ...]] = ContextVar("account_targets", default=())
+_account_checks_enabled: ContextVar[bool] = ContextVar("account_checks_enabled", default=True)
+
+
+@contextmanager
+def account_checks_scope(enabled: bool) -> Iterator[None]:
+    """Apply the app's auth mode to requests and inherited background work.
+
+    Standalone store calls retain account checks. Saved account generations
+    also retain their checks, even inside an externally authenticated app.
+    """
+    token = _account_checks_enabled.set(enabled)
+    try:
+        yield
+    finally:
+        _account_checks_enabled.reset(token)
 
 
 def bind_account_authority(user_id: str, generation: str) -> None:
@@ -139,6 +154,7 @@ def require_active_account(
     Identities without an accounts row keep the header/OIDC/machine behavior.
     An accounts request cannot create a missing row or cross a re-registration.
     Related resource owners join the same ordered lock set as actor and target.
+    External auth skips account lookups unless a captured generation requires one.
     """
     authority = _authority.get()
     checks: dict[str, list[str | None]] = {}
@@ -155,6 +171,10 @@ def require_active_account(
         checks.setdefault(user_id, [])
         if isinstance(generation, str) or generation is None:
             checks[user_id].append(generation)
+    if not _account_checks_enabled.get() and not any(
+        expected is not None for generations in checks.values() for expected in generations
+    ):
+        return None
     current_generation = None
     revoked: set[str] = set()
     for checked_id in sorted(checks):

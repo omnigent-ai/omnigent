@@ -25,7 +25,7 @@ import {
 import { Link, useLocation } from "@/lib/routing";
 import { Button } from "@/components/ui/button";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { isSingleUserMode } from "@/lib/capabilities";
+import { isFeatureEnabled, isSingleUserMode } from "@/lib/capabilities";
 import { useIsAdmin } from "@/hooks/useIsAdmin";
 import { isElectronShell } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
@@ -33,6 +33,7 @@ import { SIDEBAR_ROW } from "./sidebarStyles";
 
 export type SettingsSectionId =
   | "appearance"
+  | "customize"
   | "general"
   | "git"
   | "integrations"
@@ -46,8 +47,16 @@ export type SettingsSectionId =
   | "cli"
   | "updates";
 
+/** Sub-sections for the Customize section: /settings/customize/<sub>. */
+export type CustomizeSubSectionId = "harnesses" | "skills";
+export const CUSTOMIZE_SUBSECTIONS: readonly CustomizeSubSectionId[] = ["harnesses", "skills"];
+
+/** Sections that render full-height and suppress the shell's ChatHeader. */
+export const HEADERLESS_SECTIONS: readonly SettingsSectionId[] = ["customize"];
+
 const SECTION_IDS: readonly SettingsSectionId[] = [
   "appearance",
+  "customize",
   "general",
   "git",
   "integrations",
@@ -68,6 +77,8 @@ interface SettingsNavItem {
   icon: typeof PaletteIcon;
   /** Hide this item on mobile (e.g. keyboard shortcuts on a touch device). */
   hideOnMobile?: boolean;
+  /** Link target; defaults to /settings/<id>. Set for sections that nest. */
+  to?: string;
 }
 
 interface SettingsNavGroup {
@@ -90,6 +101,7 @@ export function settingsNavGroups(
   isAdmin = false,
   isSingleUser = false,
   integrationsEnabled = false,
+  customizeEnabled = false,
 ): SettingsNavGroup[] {
   const general: SettingsNavItem[] = [
     { id: "general", label: "General", icon: SettingsIcon },
@@ -98,6 +110,15 @@ export function settingsNavGroups(
     { id: "shortcuts", label: "Keyboard shortcuts", icon: KeyboardIcon, hideOnMobile: true },
     { id: "import", label: "Import sessions", icon: DownloadIcon },
   ];
+  // WIP: gated behind the `customize` release feature. Slots after Appearance.
+  if (customizeEnabled) {
+    general.splice(2, 0, {
+      id: "customize",
+      label: "Customize",
+      icon: BlocksIcon,
+      to: `/settings/customize/${CUSTOMIZE_SUBSECTIONS[0]}`,
+    });
+  }
   // Sandbox Integrations appears once any connection provider is wired
   // (enabled_connections non-empty). Slots right after Git.
   if (integrationsEnabled) {
@@ -155,9 +176,14 @@ export function settingsNavGroups(
  * sidebar body swap; `section` drives the content. Bare `/settings` (no
  * section segment) and unknown sections default to General. Basename-agnostic
  * — matches the `settings` segment wherever it lands, same approach as the
- * sidebar's top-level nav detection.
+ * sidebar's top-level nav detection. `subSection` is the third segment for
+ * nested sections (customize), defaulting to the first sub-section.
  */
-export function useSettingsRoute(): { inSettings: boolean; section: SettingsSectionId } {
+export function useSettingsRoute(): {
+  inSettings: boolean;
+  section: SettingsSectionId;
+  subSection?: CustomizeSubSectionId;
+} {
   const info = useServerInfo();
   const defaultSection: SettingsSectionId = "general";
 
@@ -173,9 +199,18 @@ export function useSettingsRoute(): { inSettings: boolean; section: SettingsSect
   const singleUser = isSingleUserMode(info);
   const isValidSection =
     (SECTION_IDS as readonly string[]).includes(next) &&
-    !(singleUser && (next === "members" || next === "sharing"));
+    !(singleUser && (next === "members" || next === "sharing")) &&
+    // Customize is WIP behind the `customize` release feature; a deep link to
+    // it while disabled falls back to the default section rather than an empty
+    // page. Keeps content, nav, and header in agreement on availability.
+    !(next === "customize" && !isFeatureEnabled(info, "customize"));
   const section = isValidSection ? (next as SettingsSectionId) : defaultSection;
-  return { inSettings: true, section };
+  if (section !== "customize") return { inSettings: true, section };
+  const sub = segments[idx + 2];
+  const subSection = (CUSTOMIZE_SUBSECTIONS as readonly string[]).includes(sub)
+    ? (sub as CustomizeSubSectionId)
+    : CUSTOMIZE_SUBSECTIONS[0];
+  return { inSettings: true, section, subSection };
 }
 
 // Last location the user was on before entering /settings — path + search so
@@ -216,6 +251,7 @@ export function SettingsSidebarBody({
   // not just accounts deploys. Non-admins never see it.
   const isAdmin = useIsAdmin();
   const integrationsEnabled = info !== "loading" && (info.enabled_connections ?? []).length > 0;
+  const customizeEnabled = isFeatureEnabled(info, "customize");
   const { section } = useSettingsRoute();
   const groups = settingsNavGroups(
     hasAuthSession,
@@ -223,6 +259,7 @@ export function SettingsSidebarBody({
     isAdmin,
     isSingleUserMode(info),
     integrationsEnabled,
+    customizeEnabled,
   );
 
   return (
@@ -274,7 +311,7 @@ export function SettingsSidebarBody({
                   )}
                 >
                   <Link
-                    to={`/settings/${item.id}`}
+                    to={item.to ?? `/settings/${item.id}`}
                     onClick={onNavClick}
                     data-testid={`settings-nav-${item.id}`}
                     componentId={`settings.nav.${item.id}`}

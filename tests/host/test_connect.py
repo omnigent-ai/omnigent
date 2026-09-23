@@ -13,7 +13,7 @@ import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 from websockets.datastructures import Headers
@@ -415,6 +415,112 @@ async def test_handle_model_options_uses_host_pi_configuration(
     )
 
 
+@pytest.mark.parametrize("harness", ["devin-native", "native-devin", "devin"])
+async def test_handle_model_options_missing_devin_is_quiet(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    harness: str,
+) -> None:
+    """Repeated picker requests for an absent optional CLI must not flood host logs."""
+    from omnigent.harnesses.devin_native import main as devin_native
+
+    monkeypatch.setattr(devin_native, "resolve_cli_binary", lambda *_args, **_kwargs: None)
+    run = Mock(side_effect=AssertionError("a missing CLI must not spawn a subprocess"))
+    monkeypatch.setattr(devin_native, "subprocess", SimpleNamespace(run=run))
+    host = _make_host_process()
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.host.connect"):
+        for i in range(3):
+            result = await host._handle_model_options(
+                HostModelOptionsFrame(request_id=f"missing_{i}", harness=harness),
+            )
+            assert result.status == "failed"
+            assert result.models == []
+            assert result.error is not None
+            assert "requires the 'devin' CLI" in result.error
+            assert "OMNIGENT_DEVIN_PATH" in result.error
+
+    run.assert_not_called()
+    assert not caplog.records
+
+
+async def test_handle_model_options_devin_recovers_after_install(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed preview must not hide a later install or configured executable."""
+    from omnigent.harnesses.devin_native import main as devin_native
+
+    resolve = Mock(return_value=None)
+    monkeypatch.setattr(devin_native, "resolve_cli_binary", resolve)
+    monkeypatch.setenv("OMNIGENT_DEVIN_PATH", "/custom/bin/devin")
+    host = _make_host_process()
+    host._configured_harnesses = {"devin-native": False}
+    first = await host._handle_model_options(
+        HostModelOptionsFrame(request_id="missing", harness="devin-native"),
+    )
+    assert first.status == "failed"
+
+    resolve.return_value = "/custom/bin/devin"
+    run = Mock(
+        return_value=SimpleNamespace(
+            stdout=json.dumps(
+                {
+                    "default_model": "test-family",
+                    "families": [{"slug": "test-family", "family_label": "Test Family"}],
+                }
+            )
+        )
+    )
+    monkeypatch.setattr(devin_native, "subprocess", SimpleNamespace(run=run))
+    result = await host._handle_model_options(
+        HostModelOptionsFrame(request_id="installed", harness="devin-native"),
+    )
+
+    assert result.status == "ok"
+    assert result.models == [
+        {
+            "id": "test-family",
+            "displayName": "Test Family",
+            "isDefault": True,
+            "source": {"kind": "subscription", "label": "Subscription", "name": "devin"},
+        }
+    ]
+    assert resolve.call_args.args == ("/custom/bin/devin",)
+    assert run.call_args.args[0] == ["/custom/bin/devin", "models", "list", "--format", "json"]
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        subprocess.CalledProcessError(1, "devin"),
+        subprocess.TimeoutExpired("devin", 10),
+        ValueError("invalid model catalog"),
+    ],
+)
+async def test_handle_model_options_devin_probe_failure_still_warns(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    failure: Exception,
+) -> None:
+    """Failures from an installed CLI remain diagnosable in the host log."""
+    from omnigent.harnesses.devin_native import main as devin_native
+
+    monkeypatch.setattr(devin_native, "list_devin_cli_model_options", Mock(side_effect=failure))
+    host = _make_host_process()
+    with caplog.at_level(logging.WARNING, logger="omnigent.host.connect"):
+        result = await host._handle_model_options(
+            HostModelOptionsFrame(request_id="failed", harness="devin-native"),
+        )
+
+    assert result.status == "failed"
+    assert result.models == []
+    assert result.error == "failed to resolve Devin model options"
+    record = next(r for r in caplog.records if r.message == "Devin model catalog unavailable")
+    assert record.levelno == logging.WARNING
+    assert record.exc_info is not None
+    assert record.exc_info[1] is failure
+
+
 @pytest.mark.parametrize("failure", ["raises", "resolves_nothing"])
 async def test_handle_model_options_codex_probe_failure_is_failed(
     monkeypatch: pytest.MonkeyPatch, failure: str
@@ -615,9 +721,11 @@ async def test_handle_launch_spawns_subprocess(
     _cleanup_host(host)
 
 
+@pytest.mark.parametrize("binding_token", ["token_xyz", "", "   "])
 async def test_handle_launch_fails_for_bad_workspace(
     caplog: pytest.LogCaptureFixture,
     capsys: pytest.CaptureFixture[str],
+    binding_token: str,
 ) -> None:
     """
     Verify that _handle_launch returns status='failed' when the
@@ -629,7 +737,7 @@ async def test_handle_launch_fails_for_bad_workspace(
     host = _make_host_process()
     frame = HostLaunchRunnerFrame(
         request_id="req_002",
-        binding_token="token_xyz",
+        binding_token=binding_token,
         workspace="/nonexistent/path/that/does/not/exist",
         session_id="session_missing_workspace",
     )
@@ -644,6 +752,17 @@ async def test_handle_launch_fails_for_bad_workspace(
         f"Error should mention path doesn't exist, got: {result.error!r}"
     )
     assert result.runner_id is None
+    failure = next(
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "runner_launch_failed"
+    )
+    assert failure.session_id == frame.session_id
+    assert failure.attributes["runner_id"] == (
+        token_bound_runner_id(binding_token) if binding_token.strip() else None
+    )
+    assert failure.attributes["host_request_id"] == frame.request_id
+    assert failure.attributes["error_code"] == WORKSPACE_MISSING_ERROR_CODE
     assert "session_missing_workspace" in caplog.text
     assert "/nonexistent/path/that/does/not/exist" in caplog.text
     output = capsys.readouterr().out
@@ -652,9 +771,11 @@ async def test_handle_launch_fails_for_bad_workspace(
     assert "/nonexistent/path/that/does/not/exist" in output
 
 
+@pytest.mark.parametrize("binding_token", ["token_abc", "", "   "])
 async def test_handle_launch_refuses_unconfigured_harness(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    binding_token: str,
 ) -> None:
     """
     Verify _handle_launch refuses to spawn when the frame's harness is
@@ -678,7 +799,7 @@ async def test_handle_launch_refuses_unconfigured_harness(
 
     frame = HostLaunchRunnerFrame(
         request_id="req_unconfigured",
-        binding_token="token_abc",
+        binding_token=binding_token,
         workspace=str(workspace),
         harness="codex",
     )
@@ -2187,6 +2308,54 @@ async def test_run_cancels_inflight_capability_discovery_on_shutdown(
     assert host._capability_init_task is None
 
 
+async def test_run_drains_shielded_model_catalog_probe_on_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A shared probe must finish async cleanup before the host's loop closes."""
+    from omnigent.models import model_catalog_store as store
+
+    host = _make_host_process()
+    probe_started = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    cleanup_finished = asyncio.Event()
+
+    async def _probe() -> None:
+        probe_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cleanup_started.set()
+            await release_cleanup.wait()
+            cleanup_finished.set()
+
+    async def _connect_and_serve() -> None:
+        await store.ensure_catalog("claude-native", "shutdown", _probe)
+
+    monkeypatch.setattr(store, "_inflight", {})
+    monkeypatch.setattr(host, "_start_capability_discovery", lambda: None)
+    monkeypatch.setattr(host, "_connect_and_serve", _connect_and_serve)
+    monkeypatch.setattr(host, "_reap_orphans_once", lambda _child_pids=None: 0)
+    run_task = asyncio.create_task(host.run())
+    try:
+        await asyncio.wait_for(probe_started.wait(), timeout=1.0)
+        run_task.cancel()
+        await asyncio.wait_for(cleanup_started.wait(), timeout=1.0)
+        assert not run_task.done(), "host shutdown must await probe cleanup"
+        release_cleanup.set()
+        await asyncio.wait_for(run_task, timeout=1.0)
+
+        assert cleanup_finished.is_set()
+        assert not store._inflight
+    finally:
+        release_cleanup.set()
+        await _cancel(run_task)
+        probes = list(store._inflight.values())
+        for task in probes:
+            task.cancel()
+        await asyncio.gather(*probes, return_exceptions=True)
+
+
 async def test_capability_probe_failure_does_not_block_registration(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -3208,6 +3377,43 @@ def test_build_runner_env_passthrough_survives_remote_daemon_hop(
     # The named var reaches the runner; an unnamed one does not.
     assert runner_env["DATABRICKS_LINEAR_API_KEY"] == "lin-secret"
     assert "DATABRICKS_UNNAMED" not in runner_env
+
+
+@pytest.mark.parametrize("server_url", [None, "https://example.databricksapps.com"])
+@pytest.mark.parametrize("setting", [None, "1", "0"])
+async def test_harness_stderr_opt_in_survives_daemon_and_runner_hops(
+    monkeypatch: pytest.MonkeyPatch,
+    server_url: str | None,
+    setting: str | None,
+) -> None:
+    """Forward an explicit capture setting without enabling capture by default."""
+    from omnigent.cli import _build_host_daemon_env
+
+    flag_name = "OMNIGENT_HARNESS_STDERR_ENABLED"
+    sibling_name = "OMNIGENT_HARNESS_STDERR_UNRELATED"
+    monkeypatch.delenv(flag_name, raising=False)
+    monkeypatch.delenv("OMNIGENT_RUNNER_ENV_PASSTHROUGH", raising=False)
+    monkeypatch.setenv(sibling_name, "must-not-forward")
+    monkeypatch.setattr("omnigent.onboarding.provider_config.load_config", dict)
+    if setting is not None:
+        monkeypatch.setenv(flag_name, setting)
+
+    daemon_env = _build_host_daemon_env(server_url=server_url)
+    runner_env = _build_runner_env(
+        daemon_env,
+        server_url=server_url or "http://localhost:8000",
+        runner_id="runner_abc",
+        binding_token="tok",
+        workspace="/ws",
+        parent_pid=42,
+    )
+
+    for env in (daemon_env, runner_env):
+        if setting is None:
+            assert flag_name not in env
+        else:
+            assert env[flag_name] == setting
+    assert sibling_name not in runner_env
 
 
 def test_build_runner_env_preserves_ambient_databricks_profile() -> None:

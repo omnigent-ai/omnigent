@@ -355,8 +355,7 @@ export function loadWebglRenderer(term: Terminal): WebglAddon | null {
  * Linux/Windows this fires via right-click → Copy (and Edit → Copy); on
  * macOS ⌘C also dispatches a browser ``copy`` event.
  *
- * Pure helper — exported for direct unit testing; production code wires it
- * to a container ``copy`` listener rather than calling it directly.
+ * Called only after the terminal view authorizes the copy gesture.
  *
  * :param event: The browser ``copy`` event.
  * :param selection: The current terminal selection text ("" if none).
@@ -429,8 +428,8 @@ export function hadRecentTerminalInput(lastInputAt: number, now: number): boolea
   );
 }
 
-/** Listener for tmux copy-mode text destined for the user's clipboard. */
-export type TerminalClipboardListener = (text: string) => void;
+/** Browser selection gestures carry their native event; program requests do not. */
+export type TerminalClipboardListener = (text: string, copyEvent?: ClipboardEvent) => void;
 
 /**
  * Ceiling on synthesized wheel reports for a single DOM wheel event, so a
@@ -694,7 +693,7 @@ export class TerminalSession {
    *     job-state oracle.
    * :param onInput: Called when user input is sent to the terminal.
    * :param clipboardEnabled: Whether tmux copies may write the local clipboard.
-   * :param onClipboardRequest: Receives validated tmux copy-mode text.
+   * :param onClipboardRequest: Authorizes browser selections and validated tmux copies.
    * :param focusOnConnect: Whether to grab keyboard focus on WS-open.
    * :param onFileLink: Handles OSC 8 local-file links inside the app.
    */
@@ -767,18 +766,17 @@ export class TerminalSession {
     this.listenerCtl = new AbortController();
     const { signal } = this.listenerCtl;
 
-    // Make the browser copy gesture (right-click → Copy and Edit → Copy on
-    // every platform, ⌘C on macOS) yield the terminal selection as text.
-    // Without this, an xterm selection has no working copy path on
-    // Linux/Windows — Ctrl+C is SIGINT, and xterm's selection layer isn't a
-    // DOM range the browser copies on its own. Capture phase + the shared
-    // abort signal so `dispose()` removes it for free. Ctrl+C is never
-    // remapped (see {@link applyTerminalCopy}).
+    // Capture browser copy gestures before xterm's own listener can write.
+    // Selections and program requests share consent; Ctrl+C stays SIGINT.
     container.addEventListener(
       "copy",
-      // getSelection() returns "" when nothing is selected, which
-      // applyTerminalCopy treats as a no-op — no hasSelection() guard needed.
-      (e) => applyTerminalCopy(e, this.term.getSelection()),
+      (event) => {
+        const selection = this.term.getSelection();
+        if (!selection) return;
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        this.onClipboardRequest?.(selection, event);
+      },
       { capture: true, signal },
     );
 
