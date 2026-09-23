@@ -10,7 +10,7 @@
   inset: 0;
   overflow: hidden;
   pointer-events: none;
-  background: #fff;
+  background: color-mix(in srgb, var(--muted) 48%, var(--card));
 }
 
 .dark .blob-graphic {

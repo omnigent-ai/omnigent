@@ -8,14 +8,14 @@
 // The onboarding flow owns the current step and passes the per-step dimensions;
 // changing width/height/panelHeight animates to the next value.
 
-import type { ReactNode } from "react";
+import type { CSSProperties, ReactNode } from "react";
 import BlobGraphic from "./BlobGraphic";
 import omnigentLogo from "@/assets/omnigent-starfish-icon.png";
 import "./AnimatedOmnigentPanel.css";
 
 // Fixed card width + logo size — the flow only varies height/panelHeight per
 // step, so these never needed to be props.
-const CARD_WIDTH = 440;
+const CARD_WIDTH = 500;
 const LOGO_SIZE = 56;
 
 export interface AnimatedOmnigentPanelProps {
@@ -30,6 +30,9 @@ export interface AnimatedOmnigentPanelProps {
   /** Collapsed flavor: content centered in the band, replacing the logo (e.g. a
    *  harness-icon row). When set, the logo is not rendered. */
   bandContent?: ReactNode;
+  /** Maximally-contracted panel (the server list): fade the panel to transparent
+   *  with a top-anchored gradient mask, matching the design handoff. */
+  contracted?: boolean;
   /** Card body rendered below the panel (the current onboarding step). */
   children?: ReactNode;
 }
@@ -40,15 +43,20 @@ export function AnimatedOmnigentPanel({
   autoHeight = false,
   centeredLogo = false,
   bandContent,
+  contracted = false,
   children,
 }: AnimatedOmnigentPanelProps) {
+  // Top-anchored fade to transparent for the contracted (server-list) panel.
+  const maskStyle: CSSProperties = contracted
+    ? { maskImage: "linear-gradient(black 0px, black 4px, transparent 100%)" }
+    : {};
   return (
     <section
       className={`omnigent-card${autoHeight ? " omnigent-card--auto" : ""}`}
       style={{ width: CARD_WIDTH, ...(autoHeight ? {} : { height }) }}
       aria-label="Omnigent onboarding"
     >
-      <div className="omnigent-animated-panel" style={{ height: panelHeight }}>
+      <div className="omnigent-animated-panel" style={{ height: panelHeight, ...maskStyle }}>
         <BlobGraphic />
 
         {bandContent != null ? (
