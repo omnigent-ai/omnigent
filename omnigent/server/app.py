@@ -52,6 +52,7 @@ from omnigent.errors import (
     ErrorPhase,
     OmnigentError,
     is_cancelled_rpc_error,
+    is_unavailable_rpc_error,
 )
 from omnigent.extensions import ExtensionPluginState
 from omnigent.extensions.assets import (
@@ -140,6 +141,12 @@ from omnigent.stores.project_store import ProjectStore
 from omnigent.stores.scheduled_task_store import ScheduledTaskStore
 
 _logger = logging.getLogger(__name__)
+
+# 5xx codes whose caller already booked the attribution at WARNING with the
+# originating exception type. Re-logging them on the generic 5xx arm would put
+# an "Internal error" plus a stack back into the ERROR stream for a condition
+# that is expected and retryable — the noise that buried the real 500s.
+_ALREADY_ATTRIBUTED_5XX_CODES = frozenset({ErrorCode.UPSTREAM_UNAVAILABLE})
 
 
 class SmartRoutingSourcesInfo(BaseModel):
@@ -2195,7 +2202,7 @@ def create_app(
                     error_phase=exc.phase.value,
                 ),
             )
-        elif exc.http_status >= 500:
+        elif exc.http_status >= 500 and exc.code not in _ALREADY_ATTRIBUTED_5XX_CODES:
             _logger.error(
                 "Internal error: %s",
                 exc.message,
@@ -2400,6 +2407,32 @@ def create_app(
                 ),
             )
             return await _handle_omnigent_error(request, cancelled)
+        if is_unavailable_rpc_error(exc):
+            # A dependency draining for a rolling restart answers in-flight
+            # calls with UNAVAILABLE ("Server is shutting down."). Same shape
+            # as the cancellation above — expected upstream lifecycle, not a
+            # fault — so it logs at WARNING and answers a coded 503 the caller
+            # can retry, instead of an internal_error 500.
+            unavailable = OmnigentError(
+                "The backing service is unavailable; please retry.",
+                code=ErrorCode.UPSTREAM_UNAVAILABLE,
+            )
+            _logger.warning(
+                "Upstream call refused as unavailable: %s",
+                exc,
+                exc_info=exc,
+                extra=_error_audit_extra(
+                    request,
+                    phase="unavailable",
+                    code=str(unavailable.code),
+                    http_status=str(unavailable.http_status),
+                    error_category=unavailable.category.value,
+                    error_impact=unavailable.impact.value,
+                    error_phase=unavailable.phase.value,
+                    error_type=type(exc).__name__,
+                ),
+            )
+            return await _handle_omnigent_error(request, unavailable)
         # UNKNOWN, not SERVER: an uncaught exception has no code that confirms the
         # fault is ours. Booking it as server would inflate our fault rate; the
         # exception type is logged as a signature to rank for promotion to a real

@@ -2091,6 +2091,58 @@ async def test_peer_cancelled_rpc_is_booked_upstream_while_real_faults_stay_unha
     assert unhandled.getMessage().startswith("Unhandled exception:")
 
 
+@pytest.mark.asyncio
+async def test_draining_upstream_rpc_answers_503_not_internal_error(
+    app: FastAPI,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    An UNAVAILABLE backing RPC books a coded WARN 503, not an ERROR 500.
+
+    A dependency draining for a rolling restart answers in-flight calls with
+    ``UNAVAILABLE`` and the detail "Server is shutting down." — an upstream
+    lifecycle event the caller retries. Booking it as ``internal_error`` both
+    tells the client to give up and charges our fault rate for someone else's
+    deploy. Structural stand-in for the same reason as the cancellation test:
+    the deployed build vendors grpc.
+
+    :param app: The real application, for its registered handlers.
+    :param caplog: Pytest log capture fixture.
+    :returns: None.
+    """
+    import json
+
+    class _Status:
+        name = "UNAVAILABLE"
+
+    class RpcError(Exception):
+        def code(self) -> object:
+            return _Status()
+
+    handler = app.exception_handlers[Exception]
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/sessions/conv_abc/events",
+            "raw_path": b"/v1/sessions/conv_abc/events",
+            "query_string": b"",
+            "headers": [],
+        }
+    )
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.server.app"):
+        unavailable = await handler(request, RpcError('detail = "Server is shutting down."'))
+
+    assert unavailable.status_code == 503
+    assert json.loads(unavailable.body)["error"]["code"] == "upstream_unavailable"
+
+    records = [r for r in caplog.records if r.name == "omnigent.server.app"]
+    assert len(records) == 1, f"expected exactly one record, got {records}"
+    assert records[0].levelno == logging.WARNING
+    assert not records[0].getMessage().startswith("Unhandled exception:")
+
+
 async def test_missing_conversation_is_a_404_not_an_unhandled_error(
     app: FastAPI,
     caplog: pytest.LogCaptureFixture,
