@@ -39,6 +39,7 @@ const TASK_WIRE = {
   reasoning_effort: null,
   workspace: null,
   host_id: null,
+  execution_target: "connected_host",
   state: "active",
   last_run_at: null,
   last_run_conversation_id: null,

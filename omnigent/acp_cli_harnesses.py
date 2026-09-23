@@ -54,11 +54,17 @@ class AcpCliHarness:
     :param args: Argv appended after the binary to start the CLI's ACP stdio
         server, e.g. ``("--acp",)`` or ``("agent", "stdio")``.
     :param aliases: Accepted alternate spellings, canonicalized to the row key.
+    :param omnigent_mcp: Whether to offer Omnigent's MCP server in
+        ``session/new``. Some vendor CLIs don't yet support session-scoped
+        MCP and ignore ``mcpServers``, configuring MCP out of band instead
+        (e.g. jcode reads ``~/.jcode/mcp.json``); set ``False`` for those so
+        the server isn't advertised.
     """
 
     install: HarnessInstallSpec
     args: tuple[str, ...]
     aliases: tuple[str, ...] = ()
+    omnigent_mcp: bool = True
 
     @property
     def label(self) -> str:
@@ -81,24 +87,6 @@ class AcpCliHarness:
 # Keyed by canonical harness id. Keep keys sorted; each row's registrations
 # derive from here (see the module docstring for the full list).
 ACP_CLI_HARNESSES: dict[str, AcpCliHarness] = {
-    # Devin (Cognition's ``devin`` CLI) drives ``devin acp`` — its ACP stdio
-    # server. Ships via a curl installer (not npm) and authenticates through its
-    # own ``devin auth login``, which writes a credential file it reads back at
-    # spawn; Omnigent stores nothing. The row runs Devin's account-default model:
-    # a row carries no per-user model, and ``DEVIN_MODEL`` cannot reach the agent
-    # (see the env note above), so pinning a model needs a user-configured
-    # ``acp:<slug>`` agent whose command passes ``--model``.
-    "devin": AcpCliHarness(
-        install=HarnessInstallSpec(
-            "Devin",
-            "devin",
-            None,
-            login_args=("auth", "login"),
-            install_hint="curl -fsSL https://cli.devin.ai/install.sh | bash",
-            auth_hint="run `devin auth login` (Omnigent stores no Devin credential)",
-        ),
-        args=("acp",),
-    ),
     # Grok Build (xAI's ``grok`` CLI) drives ``grok agent stdio``. Ships via a
     # curl installer (not npm) and authenticates through its own ``grok login``
     # (xAI OAuth, device-code capable) or ``XAI_API_KEY``; Omnigent stores no
@@ -114,5 +102,22 @@ ACP_CLI_HARNESSES: dict[str, AcpCliHarness] = {
         ),
         args=("agent", "stdio"),
         aliases=("grok-build",),
+    ),
+    # jcode (https://jcode.sh) drives ``jcode acp``. Ships via a curl
+    # installer (not npm) and owns its provider/model config in
+    # ``~/.jcode/config.toml``; Omnigent stores no credential. Its ACP server
+    # ignores ``mcpServers`` in ``session/new`` (session-scoped MCP isn't
+    # supported; MCP is configured in ``~/.jcode/mcp.json``), so the Omnigent
+    # MCP server is not offered.
+    "jcode": AcpCliHarness(
+        install=HarnessInstallSpec(
+            "Jcode",
+            "jcode",
+            None,
+            install_hint="curl -fsSL https://jcode.sh/install | bash",
+            auth_hint="configure a provider in ~/.jcode/config.toml",
+        ),
+        args=("acp",),
+        omnigent_mcp=False,
     ),
 }

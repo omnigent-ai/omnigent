@@ -1,14 +1,4 @@
-"""E2E: assistant single newlines render as distinct lines in the chat view.
-
-Assistant messages can carry meaningful single newlines (task status and
-handoff output forwarded from CLI harnesses). The stored transcript preserves
-them, but the chat view renders assistant markdown with default CommonMark
-paragraph folding, collapsing each single newline into a space, so a
-three-line status reads as one wrapped paragraph.
-
-The test drives a real turn through the composer against the mock LLM and
-asserts the rendered bubble keeps the reply's line structure.
-"""
+"""Assistant single newlines must render as separate lines in web chat."""
 
 from __future__ import annotations
 

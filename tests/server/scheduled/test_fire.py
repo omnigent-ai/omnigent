@@ -18,9 +18,9 @@ unit-tested without a live host/runner.
 from __future__ import annotations
 
 import asyncio
-import time
 from dataclasses import dataclass, field
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -41,6 +41,7 @@ class _FakeConversation:
     host_id: str | None = None
     git_branch: str | None = None
     labels: dict[str, str] = field(default_factory=dict)
+    runner_id: str | None = None
 
 
 @dataclass
@@ -178,14 +179,26 @@ class FakeConversationStore:
 
 
 class FakePermissionStore:
-    def __init__(self, *, fail_grant: bool = False) -> None:
+    def __init__(self, *, fail_grant: bool = False, users: set[str] | None = None) -> None:
         self.ensured: list[str] = []
         self.grants: list[tuple[str, str, int]] = []
         self.grant_workspace_ids: list[int] = []
         self.fail_grant = fail_grant
+        # ``None`` means every owner exists (the default for most tests).
+        self.users: set[str] | None = set(users) if users is not None else None
 
     def ensure_user(self, user_id: str, *, is_admin: bool = False) -> None:
         self.ensured.append(user_id)
+        if self.users is not None:
+            self.users.add(user_id)
+
+    def user_exists(self, user_id: str) -> bool:
+        return self.users is None or user_id in self.users
+
+    def get_user(self, user_id: str):
+        from omnigent.entities.account import Account
+
+        return Account(user_id, False, None, None, False) if self.user_exists(user_id) else None
 
     def grant(self, user_id: str, conversation_id: str, level: int) -> Any:
         self.grant_workspace_ids.append(current_workspace_id())
@@ -199,6 +212,19 @@ class FakePermissionStore:
 class _FakeHost:
     host_id: str
     user_id: str
+    account_generation: str | None = None
+    # Non-None marks a server-managed sandbox host; the unpinned connected-host
+    # resolver skips these so an automation never reuses an existing sandbox.
+    sandbox_provider: str | None = None
+    # A dormant managed host still has its provider, even without a sandbox id.
+    sandbox_id: str | None = None
+
+
+class _FakeSandboxConfig:
+    """Minimal stand-in for ManagedSandboxDeployment in fire tests."""
+
+    def __init__(self, *, managed_launch_supported: bool = True) -> None:
+        self.managed_launch_supported = managed_launch_supported
 
 
 class FakeHostStore:
@@ -271,6 +297,8 @@ def _deps(sched_store: FakeScheduledTaskStore, **overrides: Any) -> FireDeps:
         tunnel_registry=overrides.get("tunnel_registry"),
         file_store=overrides.get("file_store"),
         artifact_store=overrides.get("artifact_store"),
+        sandbox_config=overrides.get("sandbox_config"),
+        managed_launches=overrides.get("managed_launches"),
     )
 
 
@@ -401,6 +429,7 @@ async def test_active_creates_session_grant_and_run() -> None:
     assert len(conv_store.created) == 1
     assert conv_store.created[0]["agent_id"] == "ag_1"
     # NULL owner resolved to "local" and granted LEVEL_OWNER.
+    assert perm.ensured == [RESERVED_USER_LOCAL]
     assert perm.grants and perm.grants[0][0] == RESERVED_USER_LOCAL
     assert perm.grants[0][2] == LEVEL_OWNER
     # The launch seam was invoked.
@@ -409,6 +438,57 @@ async def test_active_creates_session_grant_and_run() -> None:
     assert len(store.runs) == 1
     assert any("last_run_at" in u for u in store.updates)
     assert any("last_run_conversation_id" in u for u in store.updates)
+
+
+@pytest.mark.asyncio
+async def test_existing_owner_is_granted_without_ensure_user() -> None:
+    """A real owner's row is never (re)created by the fire path."""
+    perm = FakePermissionStore(users={"alice"})
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task(user_id="alice")})
+
+    async def _launch(conv: Any, task: Any) -> None:
+        pass
+
+    on_fire = build_on_fire(
+        _deps(store, permission_store=perm, conversation_store=conv_store),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert len(conv_store.created) == 1
+    assert perm.ensured == []
+    assert [(g[0], g[2]) for g in perm.grants] == [("alice", LEVEL_OWNER)]
+
+
+@pytest.mark.asyncio
+async def test_deleted_owner_disables_task_and_records_failed_run() -> None:
+    """A task whose owner no longer exists is disabled, not resurrected."""
+    perm = FakePermissionStore(users=set())
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task(user_id="alice")})
+    launched: list[Any] = []
+
+    async def _launch(conv: Any, task: Any) -> None:
+        launched.append(conv)
+
+    on_fire = build_on_fire(
+        _deps(store, permission_store=perm, conversation_store=conv_store),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert launched == []
+    assert conv_store.created == []
+    assert perm.ensured == []
+    assert perm.grants == []
+    assert {"id": "task_1", "state": "deleted"} in store.updates
+    assert len(store.runs) == 1
+    assert store.runs[0]["status"] == "failed"
+    assert store.runs[0]["error_code"] == "owner_deleted"
+    assert "alice" in store.runs[0]["error"]
 
 
 def _claude_agent_deps(
@@ -716,8 +796,8 @@ async def test_overlapping_fire_skips_second_launch() -> None:
         _deps(store, conversation_store=conv_store),
         launch_dispatch=_slow_launch,
     )
-    await on_fire(0, "task_1")
-    await on_fire(0, "task_1")
+    assert await on_fire(0, "task_1") is True
+    assert await on_fire(0, "task_1") is True
 
     for _ in range(100):
         if conv_store.created:
@@ -810,20 +890,24 @@ async def test_on_fire_returns_before_launch_completes() -> None:
     """on_fire must return fast so the scheduler timer re-arms immediately."""
     store = FakeScheduledTaskStore(rows={"task_1": _task()})
     release = asyncio.Event()
+    launch_finished = asyncio.Event()
 
     async def _slow_launch(conv: Any, task: Any) -> None:
         await release.wait()
+        launch_finished.set()
 
     on_fire = build_on_fire(_deps(store), launch_dispatch=_slow_launch)
 
-    t0 = time.monotonic()
     await on_fire(0, "task_1")
-    elapsed = time.monotonic() - t0
 
-    # Returned without waiting on the (still-blocked) launch.
-    assert elapsed < 0.5
+    # on_fire returned while the launch is still parked on *release*, which
+    # is the property under test: the launch was handed to a background task
+    # rather than awaited inline. Asserting on the launch's state instead of
+    # a wall-clock budget keeps this honest on a loaded CI runner.
+    assert not launch_finished.is_set()
     release.set()
     await _drain()
+    assert launch_finished.is_set()
 
 
 @pytest.mark.asyncio
@@ -1307,21 +1391,229 @@ async def test_offline_connected_host_records_failed_without_session() -> None:
 
 
 @pytest.mark.asyncio
-async def test_managed_sandbox_is_skipped_and_recorded() -> None:
-    """Managed-sandbox targets are recorded as skipped and do not launch."""
+async def test_managed_sandbox_without_config_records_failed() -> None:
+    """A managed-sandbox task on a server with no sandbox config fails cleanly."""
     store = FakeScheduledTaskStore(rows={"task_1": _task(execution_target="managed_sandbox")})
     launched: list[Any] = []
 
     async def _launch(conv: Any, task: Any) -> None:
         launched.append(conv)
 
+    # No sandbox_config on deps → managed launch is unavailable.
     on_fire = build_on_fire(_deps(store), launch_dispatch=_launch)
     await on_fire(0, "task_1")
     await _drain()
 
     assert launched == []
     assert len(store.runs) == 1
-    assert store.runs[0]["status"] == "skipped"
+    assert store.runs[0]["status"] == "failed"
+    assert store.runs[0]["error_code"] == "managed_sandbox_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_managed_sandbox_fires_hostless_via_managed_dispatch() -> None:
+    """A managed-sandbox task creates a HOSTLESS session and runs the managed seam."""
+    conv_store = FakeConversationStore()
+    perm = FakePermissionStore()
+    # A managed task carries no host/workspace; even a stale pair is dropped.
+    store = FakeScheduledTaskStore(
+        rows={
+            "task_1": _task(
+                execution_target="managed_sandbox", host_id="stale_host", workspace="/stale"
+            )
+        }
+    )
+    launched: list[Any] = []
+
+    async def _launch(conv: Any, task: Any) -> None:
+        launched.append((conv, task))
+
+    on_fire = build_on_fire(
+        _deps(
+            store,
+            conversation_store=conv_store,
+            permission_store=perm,
+            sandbox_config=_FakeSandboxConfig(managed_launch_supported=True),
+        ),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    # Session created hostless (the launch binds a fresh sandbox), not on the
+    # stale pinned host/workspace.
+    assert len(conv_store.created) == 1
+    assert conv_store.created[0]["host_id"] is None
+    assert conv_store.created[0]["workspace"] is None
+    assert len(launched) == 1
+    assert perm.grants and perm.grants[0][2] == LEVEL_OWNER
+    assert store.runs[0]["status"] == "running"
+
+
+@pytest.mark.asyncio
+async def test_managed_sandbox_dispatch_failure_records_one_failed_run() -> None:
+    """A managed dispatch failure records exactly one failed run."""
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task(execution_target="managed_sandbox")})
+
+    async def _boom(conv: Any, task: Any) -> None:
+        raise RuntimeError("launch failed")
+
+    on_fire = build_on_fire(
+        _deps(store, conversation_store=conv_store, sandbox_config=_FakeSandboxConfig()),
+        launch_dispatch=_boom,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert len(conv_store.created) == 1
+    assert len(store.runs) == 1
+    assert store.runs[0]["status"] == "failed"
+    assert store.runs[0]["error_code"] == "launch_failed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dispatch_fails", [False, True])
+async def test_managed_fires_use_regular_launch_with_unchanged_server_config(
+    monkeypatch: pytest.MonkeyPatch, dispatch_fails: bool
+) -> None:
+    """Each fire uses a fresh managed launch with the server's lifecycle settings."""
+    from omnigent.server.managed_hosts import (
+        ManagedLaunchTracker,
+        ManagedSandboxConfig,
+        ManagedSandboxDeployment,
+    )
+    from omnigent.server.routes import sessions
+
+    config = ManagedSandboxDeployment.single(
+        ManagedSandboxConfig(
+            server_url="https://server.example.com",
+            launcher_factory=lambda: pytest.fail("managed launch is stubbed"),
+            token_ttl_s=90000,
+            provider="agent_sandbox",
+            host_config={"runner": {"idle_timeout_s": 7200}},
+        )
+    )
+    conversations = FakeConversationStore()
+    hosts = FakeHostStore()
+    bound: dict[str, _FakeConversation] = {}
+
+    async def launch(**kwargs: Any) -> None:
+        session_id = kwargs["session_id"]
+        host_id = f"sandbox_host_{session_id}"
+        hosts.hosts[host_id] = _FakeHost(
+            host_id,
+            RESERVED_USER_LOCAL,
+            sandbox_provider="agent_sandbox",
+            sandbox_id=f"sandbox_{session_id}",
+        )
+        bound[session_id] = _FakeConversation(
+            id=session_id,
+            agent_id="ag_1",
+            host_id=host_id,
+            workspace="/home/omnigent/workspace",
+            runner_id=f"runner_{session_id}",
+        )
+        kwargs["tracker"].finish(session_id)
+
+    managed_launch = AsyncMock(side_effect=launch)
+    runner_client = object()
+    dispatch = AsyncMock(side_effect=RuntimeError("dispatch failed") if dispatch_fails else None)
+    terminate = AsyncMock()
+    monkeypatch.setattr(conversations, "get_conversation", bound.get)
+    monkeypatch.setattr(sessions, "_run_managed_launch", managed_launch)
+    monkeypatch.setattr(sessions, "_wait_for_runner_client", AsyncMock(return_value=runner_client))
+    monkeypatch.setattr(sessions, "_ensure_runner_session_initialized", AsyncMock())
+    monkeypatch.setattr(sessions, "_dispatch_session_event_to_runner", dispatch)
+    monkeypatch.setattr("omnigent.server.managed_hosts.terminate_managed_host", terminate)
+    store = FakeScheduledTaskStore(rows={"task_1": _task(execution_target="managed_sandbox")})
+    on_fire = build_on_fire(
+        _deps(
+            store,
+            conversation_store=conversations,
+            host_store=hosts,
+            sandbox_config=config,
+            managed_launches=ManagedLaunchTracker(),
+        )
+    )
+
+    for _ in range(2):
+        await on_fire(0, "task_1")
+        await _drain()
+
+    assert managed_launch.await_count == 2
+    assert len(bound) == 2
+    assert len({conv.host_id for conv in bound.values()}) == 2
+    for call in managed_launch.await_args_list:
+        assert call.kwargs["sandbox_config"] is config
+        assert call.kwargs["owner"] == RESERVED_USER_LOCAL
+        assert call.kwargs.get("relaunch_host") is None
+        assert call.kwargs["repos"] == ()
+    assert config.default.host_config == {"runner": {"idle_timeout_s": 7200}}
+    assert dispatch.await_count == 2
+    for call in dispatch.await_args_list:
+        assert call.args[1] is bound[call.args[0]]
+        assert call.args[2].data["content"] == [{"type": "input_text", "text": "do the thing"}]
+        assert call.args[4] is runner_client
+    assert [run["status"] for run in store.runs] == ["failed" if dispatch_fails else "running"] * 2
+    terminate.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("workspace", [None, "/repo"])
+@pytest.mark.parametrize("sandbox_id", [None, "sandbox_1"])
+async def test_legacy_pinned_sandbox_fails_before_host_rpc(
+    monkeypatch: pytest.MonkeyPatch, workspace: str | None, sandbox_id: str | None
+) -> None:
+    """Stored connected-host tasks cannot reuse a live or dormant managed sandbox."""
+    conversations = FakeConversationStore()
+    host = _FakeHost(
+        "host_1",
+        "alice@example.com",
+        sandbox_provider="agent_sandbox",
+        sandbox_id=sandbox_id,
+    )
+    store = FakeScheduledTaskStore(
+        rows={"task_1": _task(user_id=host.user_id, workspace=workspace)}
+    )
+    resolve_workspace = AsyncMock()
+    monkeypatch.setattr(fire_mod, "_resolve_default_workspace", resolve_workspace)
+    on_fire = build_on_fire(
+        _deps(
+            store,
+            conversation_store=conversations,
+            host_store=FakeHostStore({host.host_id: host}),
+            host_registry=FakeHostRegistry(online={host.host_id}),
+        )
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    resolve_workspace.assert_not_awaited()
+    assert conversations.created == []
+    assert len(store.runs) == 1
+    assert store.runs[0]["status"] == "failed"
+    assert store.runs[0]["error_code"] == "existing_sandbox_not_allowed"
+
+
+@pytest.mark.asyncio
+async def test_resolve_owner_host_skips_sandbox_hosts() -> None:
+    """An unpinned connected-host fire never resolves onto an existing sandbox host."""
+    # Owner's most-recently-active online host is a managed sandbox; the next one
+    # is a real connected host. The resolver must skip the sandbox and pick the
+    # connected host rather than reusing the sandbox.
+    hosts = {
+        "sandbox_1": _FakeHost("sandbox_1", "alice@example.com", sandbox_provider="modal"),
+        "host_2": _FakeHost("host_2", "alice@example.com"),
+    }
+    deps = _deps(
+        FakeScheduledTaskStore(rows={}),
+        host_store=FakeHostStore(hosts),
+        host_registry=FakeHostRegistry(online={"sandbox_1", "host_2"}),
+    )
+    task = _task(user_id="alice@example.com", host_id=None)
+    resolved = await fire_mod._resolve_owner_host(deps, task)
+    assert resolved == "host_2"
 
 
 # ── build_run_now (manual "run now" trigger) ─────────────────────────────────
@@ -1378,9 +1670,10 @@ async def test_run_now_fires_paused_task() -> None:
 
 
 @pytest.mark.asyncio
-async def test_run_now_missing_row_is_noop() -> None:
+@pytest.mark.parametrize("row", [None, _task(state="deleted")])
+async def test_run_now_missing_row_is_noop(row) -> None:
     """Run-now on a deleted/missing task starts nothing and records no run."""
-    store = FakeScheduledTaskStore(rows={})
+    store = FakeScheduledTaskStore(rows={"task_1": row} if row else {})
     launched: list[Any] = []
 
     async def _launch(conv: Any, task: Any) -> None:
@@ -1392,6 +1685,21 @@ async def test_run_now_missing_row_is_noop() -> None:
 
     assert started is False
     assert launched == []
+    assert store.runs == []
+
+
+@pytest.mark.asyncio
+async def test_run_now_rechecks_deleted_state_before_session_creation() -> None:
+    store = SequencedScheduledTaskStore([_task(), _task(state="deleted")])
+    conversations = FakeConversationStore()
+
+    async def launch(conv, task):
+        pytest.fail("a deleted task must not launch a runner")
+
+    run_now = build_run_now(_deps(store, conversation_store=conversations), launch_dispatch=launch)
+    assert await run_now(0, "task_1") is True
+    await _drain()
+    assert conversations.created == []
     assert store.runs == []
 
 

@@ -1,12 +1,16 @@
+# OCR needs an explicit file exception for tracked GitHub automation.
+# Keep these before generated-file exclusions so those exclusions still apply.
+.*/
+!.github/
+!.github/**
+.github/**/.*/
+
 .venv/
 build/
 dist/
 !examples/extensions/hello-page/src/omnigent_hello_extension/dist/
 !examples/extensions/hello-page/src/omnigent_hello_extension/dist/extension.js
 !examples/extensions/hello-page/src/omnigent_hello_extension/dist/extension.css
-!extensions/canvas/src/omnigent_canvas/dist/
-!extensions/canvas/src/omnigent_canvas/dist/extension.js
-!extensions/canvas/src/omnigent_canvas/dist/extension.css
 node_modules/
 .pnpm-store/
 .pnpm-debug.log*
@@ -32,10 +36,7 @@ omnigent/_build_info.py
 .worktrees/
 .claude/worktrees/
 .tmp*
-.*/
-
-# Exception: track .github/ (CI workflows) and Storybook configuration.
-!.github/
+# Exception: track Storybook configuration.
 !web/.storybook/
 !web/.storybook/**
 

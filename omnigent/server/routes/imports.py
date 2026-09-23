@@ -17,6 +17,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from omnigent.db.utils import builtin_agent_id
+from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.entities import NewConversationItem, parse_item_data
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import HostImportLocalByIdFrame, HostImportLocalFrame, encode_host_frame
@@ -94,6 +95,10 @@ class ImportSessionRequest(BaseModel):
     title: str | None = Field(default=None, max_length=512)
     force: bool = False
     project_id: str | None = None
+    # The importing CLI's own host, so the session binds back to the machine
+    # the transcript came from and resumes there. Bound only alongside a
+    # workspace (the workspace-required-for-host check constraint).
+    host_id: str | None = None
     items: list[ImportItemInput] = Field(min_length=1, max_length=_MAX_IMPORT_ITEMS)
 
     @field_validator("external_session_id")
@@ -163,6 +168,20 @@ class ImportedSessionRef(BaseModel):
     title: str | None = None
 
 
+class ImportFailureRef(BaseModel):
+    """One session that could not be imported, with a user-facing reason.
+
+    ``external_session_id`` / ``source`` name the source session when known (a
+    host that reports only a count leaves them ``None``); ``reason`` explains the
+    failure so the UI can show it instead of an anonymous "N failed". Also the
+    shape of each ``{"event": "failed", ...}`` line on the stream endpoint.
+    """
+
+    external_session_id: str | None = None
+    source: str | None = None
+    reason: str
+
+
 class LocalImportResponse(BaseModel):
     """Buffered batch result for ``POST /v1/imports/local``.
 
@@ -174,6 +193,8 @@ class LocalImportResponse(BaseModel):
     already_imported: int
     failed: int
     sessions: list[ImportedSessionRef]
+    # One entry per failed session (with a reason); its length equals ``failed``.
+    failures: list[ImportFailureRef] = Field(default_factory=list)
 
 
 @dataclass
@@ -184,7 +205,9 @@ class _ImportLockEntry:
     users: int = 0
 
 
-_IMPORT_LOCKS: dict[tuple[ImportSource, str], _ImportLockEntry] = {}
+_IMPORT_LOCKS: WorkspaceScopedCache[tuple[ImportSource, str], _ImportLockEntry] = (
+    WorkspaceScopedCache()
+)
 _IMPORT_LOCKS_GUARD = threading.Lock()
 
 
@@ -229,7 +252,7 @@ async def _stream_local_sessions_from_host(
     source: str,
     limit: int,
     session_id: str | None = None,
-    stats: dict[str, int] | None = None,
+    stats: dict[str, Any] | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     """Yield requested local sessions one at a time as they stream in.
 
@@ -281,9 +304,17 @@ async def _stream_local_sessions_from_host(
                         code=ErrorCode.INTERNAL_ERROR,
                     )
                 # Sessions the host enumerated but couldn't read send no frame;
-                # surface their count so the caller's tally covers every target.
+                # surface the count (every host) and per-session reasons (newer
+                # hosts) so the caller's tally covers every target and can
+                # explain each failure.
                 if stats is not None:
                     stats["host_failed"] = int(data.get("failed") or 0)
+                    raw_failures = data.get("failures")
+                    stats["host_failures"] = (
+                        [entry for entry in raw_failures if isinstance(entry, dict)]
+                        if isinstance(raw_failures, list)
+                        else []
+                    )
                 return
     finally:
         host_conn.pending_import_local.pop(request_id, None)
@@ -420,8 +451,7 @@ def create_imports_router(
         user_id = require_user(request, auth_provider)
         items = [item.to_item() for item in body.items]
         existing = await asyncio.to_thread(
-            conversation_store.find_imported_conversation,
-            body.source,
+            conversation_store.find_conversation_by_external_session_id,
             body.external_session_id,
         )
         if existing is not None:
@@ -433,8 +463,10 @@ def create_imports_router(
                 conversation_store,
             )
             if not body.force:
+                # Matches a prior import or a native run of the same session
+                # (both record the external id), so "exists", not "imported".
                 raise OmnigentError(
-                    f"This {body.source} session has already been imported as {existing.id}",
+                    f"This {body.source} session already exists as {existing.id}",
                     code=ErrorCode.CONFLICT,
                 )
 
@@ -449,6 +481,7 @@ def create_imports_router(
             user_id=user_id,
             native_title=body.title,
             project_id=body.project_id,
+            host_id=body.host_id,
         )
 
         response.status_code = 201
@@ -489,14 +522,18 @@ def create_imports_router(
         user_id: str | None,
         host_conn: HostConnection,
         counts: dict[str, int],
+        failures: list[ImportFailureRef],
     ) -> AsyncIterator[ImportedSessionRef]:
         """Import the host's requested sessions, one at a time.
 
         Yields one ref per newly imported session and tracks the running tally in
-        ``counts`` (``imported`` / ``already_imported`` / ``failed``). Persists
-        each session as its frame arrives, so a large batch never buffers. Raises
+        ``counts`` (``imported`` / ``already_imported`` / ``failed``); each failed
+        session appends an :class:`ImportFailureRef` (with a reason) to
+        ``failures``, so ``len(failures) == counts["failed"]``. Persists each
+        session as its frame arrives, so a large batch never buffers. Raises
         ``OmnigentError`` if the host read drops mid-stream, after the sessions
-        read so far are already committed (retry is idempotent).
+        read so far are already committed (retry is idempotent, and re-import of a
+        success comes back as already-imported, never a duplicate).
         """
         assert host_registry is not None  # guaranteed by _resolve_import_target
         # Each session carries its own source (an "all" import mixes harnesses),
@@ -505,9 +542,23 @@ def create_imports_router(
         counts["imported"] = 0
         counts["already_imported"] = 0
         counts["failed"] = 0
-        # Set by the stream to the count of sessions the host couldn't read (no
-        # frame arrives for them); folded into ``failed`` after the loop.
-        stats: dict[str, int] = {}
+
+        def _fail(external_session_id: object, source: object, reason: str) -> None:
+            counts["failed"] += 1
+            failures.append(
+                ImportFailureRef(
+                    external_session_id=(
+                        external_session_id if isinstance(external_session_id, str) else None
+                    ),
+                    source=source if isinstance(source, str) else None,
+                    reason=reason,
+                )
+            )
+
+        # Set by the stream to the sessions the host couldn't read (no frame
+        # arrives for them): a count (every host) plus per-session reasons (newer
+        # hosts). Folded into ``failed`` after the loop.
+        stats: dict[str, Any] = {}
         async for session in _stream_local_sessions_from_host(
             host_registry=host_registry,
             host_conn=host_conn,
@@ -532,15 +583,18 @@ def create_imports_router(
                 # balloon a batch import's memory.
                 or len(raw_items) > _MAX_IMPORT_ITEMS
             ):
-                counts["failed"] += 1
+                _fail(
+                    external_session_id,
+                    session_source,
+                    "This session's transcript was malformed or too large to import.",
+                )
                 continue
             # The guard above rejected None and anything outside valid_sources
             # (get_args(ImportSource), which excludes "all"), so this is a
             # concrete harness — narrow off the request's ImportSource | "all".
             source = cast(ImportSource, source)
             existing = await asyncio.to_thread(
-                conversation_store.find_imported_conversation,
-                source,
+                conversation_store.find_conversation_by_external_session_id,
                 external_session_id,
             )
             if existing is not None:
@@ -559,14 +613,34 @@ def create_imports_router(
                     native_title=native_title if isinstance(native_title, str) else None,
                     host_id=body.host_id,
                 )
-            except (OmnigentError, ValueError):
-                counts["failed"] += 1
+            except OmnigentError as exc:
+                # A create that lost the dedup race collides on the deterministic
+                # conversation id (CONFLICT). That's the same source session, so
+                # it's already-imported, never a failure and never a duplicate.
+                if exc.code == ErrorCode.CONFLICT:
+                    counts["already_imported"] += 1
+                    continue
+                _fail(external_session_id, source, exc.message)
+                continue
+            except ValueError:
+                _fail(external_session_id, source, "This session's data could not be imported.")
                 continue
             counts["imported"] += 1
             yield ImportedSessionRef(session_id=session_id, title=title)
-        # Fold in sessions the host enumerated but couldn't read, so the counts
-        # account for every target the user asked to import.
-        counts["failed"] += stats.get("host_failed", 0)
+        # Fold in sessions the host enumerated but couldn't read. Newer hosts send
+        # a per-session reason; older hosts send only a count, so synthesize a
+        # generic reason for each so ``failed`` still equals ``len(failures)``.
+        host_failures = stats.get("host_failures") or []
+        if host_failures:
+            for entry in host_failures:
+                _fail(
+                    entry.get("external_session_id"),
+                    entry.get("source"),
+                    str(entry.get("reason") or "This session could not be read on the host."),
+                )
+        else:
+            for _ in range(int(stats.get("host_failed", 0))):
+                _fail(None, None, "This session could not be read on the host.")
 
     @router.post(
         "/imports/local",
@@ -593,8 +667,9 @@ def create_imports_router(
         user_id, host_conn = _resolve_import_target(request, body)
         counts: dict[str, int] = {}
         sessions: list[ImportedSessionRef] = []
+        failures: list[ImportFailureRef] = []
         try:
-            async for ref in _import_local_core(body, user_id, host_conn, counts):
+            async for ref in _import_local_core(body, user_id, host_conn, counts, failures):
                 sessions.append(ref)
         except OmnigentError as exc:
             error_id, message = _record_local_import_failure()
@@ -613,6 +688,7 @@ def create_imports_router(
             already_imported=counts.get("already_imported", 0),
             failed=counts.get("failed", 0),
             sessions=sessions,
+            failures=failures,
         )
 
     @router.post(
@@ -631,19 +707,23 @@ def create_imports_router(
         Same import as the buffered ``POST /v1/imports/local``, but responds with
         NDJSON: one ``{"event": "session", ...}`` line per newly imported session
         as its frame lands, so the caller lists sessions as they arrive rather
-        than waiting out the whole batch; a terminal ``{"event": "done", ...}``
-        carries the tally. A mid-stream host failure emits ``{"event": "error",
-        ...}`` before ``done`` — the sessions read so far are already committed
-        and a retry is idempotent. Request validation still fails ahead of the
-        stream with the usual HTTP error.
+        than waiting out the whole batch. Each session that could not be imported
+        emits one ``{"event": "failed", "external_session_id", "source",
+        "reason"}`` line (after the successes), and a terminal
+        ``{"event": "done", ...}`` carries the tally plus the full ``failures``
+        list. A mid-stream host read failure emits ``{"event": "error", ...}``
+        before ``done`` (the sessions read so far are already committed and a
+        retry is idempotent). Request validation still fails ahead of the stream
+        with the usual HTTP error.
         """
         user_id, host_conn = _resolve_import_target(request, body)
 
         async def _events() -> AsyncIterator[bytes]:
             counts: dict[str, int] = {}
+            failures: list[ImportFailureRef] = []
             error: tuple[str, str] | None = None
             try:
-                async for ref in _import_local_core(body, user_id, host_conn, counts):
+                async for ref in _import_local_core(body, user_id, host_conn, counts, failures):
                     yield _import_event_line(
                         {"event": "session", "session_id": ref.session_id, "title": ref.title}
                     )
@@ -651,6 +731,10 @@ def create_imports_router(
                 # The read dropped/stalled mid-stream. The 200 + partial body is
                 # already sent, so report the failure inline rather than raising.
                 error = _record_local_import_failure()
+            # Per-session failures (with reasons) after the successes so the
+            # caller can name each one, not just count them.
+            for failure in failures:
+                yield _import_event_line({"event": "failed", **failure.model_dump()})
             if error is not None:
                 error_id, message = error
                 yield _import_event_line(
@@ -666,6 +750,7 @@ def create_imports_router(
                     "imported": counts.get("imported", 0),
                     "already_imported": counts.get("already_imported", 0),
                     "failed": counts.get("failed", 0),
+                    "failures": [failure.model_dump() for failure in failures],
                 }
             )
 

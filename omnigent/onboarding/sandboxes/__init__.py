@@ -14,6 +14,7 @@ from omnigent.onboarding.sandboxes.base import (
     RemoteCommandResult,
     RemoteProcess,
     SandboxCapabilityError,
+    SandboxGoneError,
     SandboxHostLauncher,
     SandboxLauncher,
 )
@@ -42,6 +43,7 @@ from omnigent.onboarding.sandboxes.registry import (
 )
 from omnigent.onboarding.sandboxes.types import (
     HostContext,
+    RepoWorkspace,
     SandboxCapabilities,
     SandboxCommandError,
     SandboxConfigError,
@@ -57,11 +59,13 @@ __all__ = [
     "HostContext",
     "RemoteCommandResult",
     "RemoteProcess",
+    "RepoWorkspace",
     "SandboxCapabilities",
     "SandboxCapabilityError",
     "SandboxCommandError",
     "SandboxConfigError",
     "SandboxError",
+    "SandboxGoneError",
     "SandboxHostLauncher",
     "SandboxInfo",
     "SandboxLauncher",

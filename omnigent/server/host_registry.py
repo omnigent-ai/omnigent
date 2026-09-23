@@ -12,10 +12,9 @@ request/response traffic. No per-request reassembly queues needed.
 
 The registry also holds what connected hosts *report* about themselves and
 nothing persists — today the per-family gateway-inference map (see
-:mod:`omnigent.gateway_inference`). It is delivered on the connect handshake, so
-a replica that has never seen a host simply knows nothing about it, and the
-readers' unknown-is-backed rule covers that window until the host reconnects and
-re-reports.
+:mod:`omnigent.gateway_inference`) and interactive-shell inventory. They are
+delivered on the connect handshake, so a replica that has never seen a host
+simply knows nothing about them until the host reconnects and re-reports.
 """
 
 from __future__ import annotations
@@ -24,16 +23,39 @@ import asyncio
 import logging
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from cachetools import TTLCache
 
+from omnigent._platform import normalize_interactive_shells
+from omnigent.db.account_authority import (
+    AccountAuthority,
+    account_generation,
+    current_account_user,
+)
 from omnigent.db.db_models import InvalidUuidError, current_workspace_id, uuid_to_bytes
-from omnigent.host.frames import HostHelloFrame
+from omnigent.host.frames import CAP_CODEX_SIDE_CHAT, HostHelloFrame, HostSkillsResultFrame
 
 _logger = logging.getLogger(__name__)
+
+_expected_host_owner: ContextVar[AccountAuthority | None] = ContextVar(
+    "expected_host_owner", default=None
+)
+
+
+@contextmanager
+def host_owner_scope(user_id: str | None, generation: str | None) -> Iterator[None]:
+    """Restrict scheduled host RPCs to their saved owner's registration."""
+    owner = AccountAuthority(user_id, generation, current_workspace_id()) if user_id else None
+    token = _expected_host_owner.set(owner)
+    try:
+        yield
+    finally:
+        _expected_host_owner.reset(token)
 
 
 def _canonical_host_id(host_id: str) -> str:
@@ -259,6 +281,7 @@ class HostConnection:
         ``error_code``, and ``error``.
     :param pending_model_options: Per-``request_id`` futures for pre-launch
         model catalogs resolved by the selected host.
+    :param pending_skills: Per-``request_id`` futures for sessionless skill discovery.
     """
 
     workspace_id: int
@@ -269,6 +292,7 @@ class HostConnection:
     outbound_queue: asyncio.Queue[str | None]
     connected_at: float
     last_frame_at: float
+    account_generation: str | None = None
     pending_launches: dict[str, asyncio.Future[dict[str, str | None]]] = field(
         default_factory=dict,
     )
@@ -315,6 +339,9 @@ class HostConnection:
     pending_model_options: dict[str, asyncio.Future[dict[str, Any]]] = field(
         default_factory=dict,
     )
+    pending_skills: dict[str, asyncio.Future[HostSkillsResultFrame]] = field(
+        default_factory=dict,
+    )
     # Import streams one session per frame, so the tunnel pushes each onto a
     # per-request queue the /imports/local handler drains (vs a single future).
     # Each item is a ("session", dict) or ("done", dict) tuple.
@@ -344,6 +371,10 @@ class HostRegistry:
         # answer) and lost with the process, which is the point — a restarted
         # server re-learns it from the reconnect handshake.
         self._gateway_inference: dict[str, dict[str, bool]] = {}
+        self._interactive_shells: dict[str, list[str]] = {}
+        self.launch_authorizer: (
+            Callable[[str, str, str | None, str | None, bool, str | None], None] | None
+        ) = None
 
     def register(
         self,
@@ -387,6 +418,7 @@ class HostRegistry:
             ws=ws,
             hello=hello,
             owner=owner,
+            account_generation=account_generation(owner) if owner else None,
             outbound_queue=asyncio.Queue(),
             connected_at=now,
             last_frame_at=now,
@@ -402,6 +434,12 @@ class HostRegistry:
                 )
                 old.outbound_queue.put_nowait(None)
             self._hosts[key] = conn
+            if hello.interactive_shells is not None:
+                self._interactive_shells[host_id] = normalize_interactive_shells(
+                    hello.interactive_shells
+                )
+            else:
+                self._interactive_shells.pop(host_id, None)
         return conn
 
     def deregister(
@@ -507,6 +545,26 @@ class HostRegistry:
             return None
         return conn.hello.installation_id
 
+    def host_supports_codex_side_chat(self, host_id: str, workspace_id: int | None = None) -> bool:
+        """Whether the connected host's build can fork a codex `/side` chat.
+
+        Reads the capability the host advertised in its hello frame. An older
+        host that predates the feature sends no such token, so it reads as
+        unsupported with no version check. Fails OPEN (``True``) only when the
+        host is offline/unknown — we then can't prove it's too old, and the
+        forward will surface any real connection failure on its own.
+
+        :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
+        :param workspace_id: Tenant partition; defaults to
+            :func:`current_workspace_id`.
+        :returns: ``False`` only for a connected host that did not advertise the
+            codex side-chat capability.
+        """
+        conn = self.get(host_id, workspace_id)
+        if conn is None:
+            return True
+        return CAP_CODEX_SIDE_CHAT in conn.hello.capabilities
+
     def record_gateway_inference(
         self,
         host_id: str,
@@ -543,6 +601,32 @@ class HostRegistry:
             reported = self._gateway_inference.get(_canonical_host_id(host_id))
         return dict(reported) if reported is not None else None
 
+    def interactive_shells(self, host_id: str) -> list[str] | None:
+        """Return the ordered shell inventory last reported by *host_id*."""
+        with self._lock:
+            reported = self._interactive_shells.get(_canonical_host_id(host_id))
+        return list(reported) if reported is not None else None
+
+    async def admit_launch(
+        self,
+        conn: HostConnection,
+        session_id: str,
+        *,
+        allow_unbound: bool = False,
+        transfer_from_host_id: str | None = None,
+    ) -> None:
+        """Reauthorize immediately before a new runner binding is created."""
+        if self.launch_authorizer is not None:
+            await asyncio.to_thread(
+                self.launch_authorizer,
+                conn.host_id,
+                session_id,
+                conn.owner,
+                conn.account_generation,
+                allow_unbound,
+                transfer_from_host_id,
+            )
+
     def send_text(self, conn: HostConnection, data: str) -> None:
         """Enqueue a text frame for sending to the host.
 
@@ -557,8 +641,23 @@ class HostRegistry:
         :param conn: The target host connection.
         :param data: JSON-encoded frame text.
         :raises ConnectionError: If the connection has been
-            replaced (the outbound queue was poisoned).
+            replaced or its owner does not match captured authority.
         """
+        expected = _expected_host_owner.get()
+        if (
+            expected is not None
+            and expected.workspace_id == current_workspace_id()
+            and (conn.workspace_id, conn.owner, conn.account_generation)
+            != (expected.workspace_id, expected.user_id, expected.generation)
+        ):
+            raise ConnectionError(f"host {conn.host_id!r} account ownership changed")
+        actor = current_account_user()
+        if (
+            actor is not None
+            and actor == conn.owner
+            and account_generation(actor) != conn.account_generation
+        ):
+            raise ConnectionError(f"host {conn.host_id!r} account registration changed")
         with self._lock:
             current = self._hosts.get((conn.workspace_id, conn.host_id))
             if current is not conn:

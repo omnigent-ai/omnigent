@@ -4,20 +4,26 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
+import logging
 import threading
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from omnigent.harnesses.claude_native import bridge as claude_bridge
 from omnigent.harnesses.claude_native.bridge import (
     REQUEST_SESSION_ID_ENV_VAR,
     ClaudePromptTimeout,
+    ClaudeTerminalDialog,
+    ClaudeTerminalExited,
     TmuxSessionNotAdvertised,
 )
 from omnigent.inner import claude_native_executor
 from omnigent.inner.claude_native_executor import ClaudeNativeExecutor
 from omnigent.inner.executor import ExecutorConfig, ExecutorError, TurnComplete
+from omnigent.inner.native_attachments import attachment_cache_dir
 
 # Minimal valid 1x1 white PNG used for multimodal attachment tests.
 _TINY_PNG_B64 = (
@@ -204,6 +210,109 @@ async def test_run_turn_rejects_stale_session_after_clear(
     assert len(events) == 1
     assert isinstance(events[0], ExecutorError)
     assert "no longer active after /clear" in events[0].message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", ["/login", "/logout"])
+async def test_run_turn_points_auth_commands_at_omni_setup(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    command: str,
+) -> None:
+    """
+    ``/login`` must not be typed into the pane as a prompt.
+
+    Claude Code's sign-in is an interactive TUI handoff the bridge
+    cannot drive, so the bridge escapes ``/login`` into plain text and
+    the CLI answers it as an ordinary message. On an expired login that
+    answer is "Login expired · Please run /login" — the instruction the
+    user just followed, so the turn is wasted and the session is stuck.
+    Fail the turn with the host command that does re-authenticate.
+    """
+
+    def fail_inject_user_message(
+        bridge_dir_arg: Path,
+        *,
+        content: str,
+        timeout_s: float = 30.0,
+    ) -> None:
+        """
+        Fail if an auth command reaches tmux injection.
+
+        :param bridge_dir_arg: Bridge directory passed by the executor.
+        :param content: Text that would be typed into tmux.
+        :param timeout_s: tmux-target readiness timeout.
+        :returns: Never returns.
+        """
+        del bridge_dir_arg, content, timeout_s
+        raise AssertionError("auth slash command injected into tmux")
+
+    monkeypatch.setattr(
+        claude_native_executor,
+        "inject_user_message",
+        fail_inject_user_message,
+    )
+
+    executor = ClaudeNativeExecutor(tmp_path)
+    events = [
+        event
+        async for event in executor.run_turn(
+            messages=[{"role": "user", "content": command}],
+            tools=[],
+            system_prompt="ignored",
+        )
+    ]
+
+    assert len(events) == 1
+    assert isinstance(events[0], ExecutorError)
+    assert "omni setup" in events[0].message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", ["/login", "/logout"])
+async def test_enqueue_session_message_refuses_auth_commands(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    command: str,
+) -> None:
+    """
+    A live-steered ``/login`` must not be typed into the pane either.
+
+    ``enqueue_session_message`` is the second injection path: a message
+    sent while a turn is active. Refusing it (``False``) leaves the
+    runner's buffered copy undelivered, so the message arrives as the
+    next turn and ``run_turn``'s short-circuit answers it with the
+    ``omni setup`` guidance. The monkeypatched injector raises, so this
+    test fails if anything reaches tmux.
+    """
+
+    def fail_inject_user_message(
+        bridge_dir_arg: Path,
+        *,
+        content: str,
+        timeout_s: float = 30.0,
+    ) -> None:
+        """
+        Fail if an auth command reaches tmux injection.
+
+        :param bridge_dir_arg: Bridge directory passed by the executor.
+        :param content: Text that would be typed into tmux.
+        :param timeout_s: tmux-target readiness timeout.
+        :returns: Never returns.
+        """
+        del bridge_dir_arg, content, timeout_s
+        raise AssertionError("auth slash command injected into tmux")
+
+    monkeypatch.setattr(
+        claude_native_executor,
+        "inject_user_message",
+        fail_inject_user_message,
+    )
+
+    executor = ClaudeNativeExecutor(tmp_path)
+    accepted = await executor.enqueue_session_message("session-key", command)
+
+    assert accepted is False
 
 
 @pytest.mark.asyncio
@@ -492,7 +601,7 @@ async def test_run_turn_materializes_image_to_bridge_dir(
     )
 
     # The file was written to disk with the correct content.
-    uploads = tmp_path / "uploads"
+    uploads = attachment_cache_dir(tmp_path)
     written = list(uploads.iterdir())
     # Exactly 1 file — the materialized PNG.
     assert len(written) == 1, (
@@ -501,6 +610,83 @@ async def test_run_turn_materializes_image_to_bridge_dir(
     assert written[0].name == "screenshot.png"
     # Byte-level check: decoded content matches the original PNG.
     assert written[0].read_bytes() == _TINY_PNG_BYTES
+
+
+@pytest.mark.asyncio
+async def test_resize_notice_uses_hidden_hook_context(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Claude terminal input excludes the framework notice."""
+    from omnigent.inner.native_attachments import framework_notice_block, resize_notice
+
+    dimensions = {"width": 6000, "height": 4000}
+    sent: list[dict[str, Any]] = []
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", _stub_inject(sent))
+    executor = ClaudeNativeExecutor(tmp_path)
+
+    async for _ in executor.run_turn(
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "inspect this"},
+                    framework_notice_block(dimensions),
+                ],
+            },
+            {"role": "developer", "content": "unrelated context"},
+        ],
+        [],
+        "",
+    ):
+        pass
+
+    assert sent[0]["content"] == "inspect this"
+    assert (tmp_path / "pending_framework_context.txt").read_text() == resize_notice(dimensions)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error", [RuntimeError("injection failed"), ClaudePromptTimeout("timeout")]
+)
+async def test_failed_injection_clears_framework_context(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, error: Exception
+) -> None:
+    from omnigent.inner.native_attachments import framework_notice_block
+
+    def fail_inject(*args: Any, **kwargs: Any) -> None:
+        assert (tmp_path / "pending_framework_context.txt").exists()
+        raise error
+
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", fail_inject)
+    monkeypatch.setattr(claude_native_executor, "kill_session", lambda *args, **kwargs: None)
+    executor = ClaudeNativeExecutor(tmp_path)
+    events = [
+        event
+        async for event in executor.run_turn(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "inspect this"},
+                        framework_notice_block({"width": 6000, "height": 4000}),
+                    ],
+                }
+            ],
+            [],
+            "",
+        )
+    ]
+    assert isinstance(events[0], ExecutorError)
+    assert not (tmp_path / "pending_framework_context.txt").exists()
+    assert not await executor.enqueue_session_message(
+        "session-key",
+        [
+            {"type": "input_text", "text": "inspect this"},
+            framework_notice_block({"width": 6000, "height": 4000}),
+        ],
+    )
+    assert not (tmp_path / "pending_framework_context.txt").exists()
 
 
 @pytest.mark.asyncio
@@ -590,7 +776,93 @@ async def test_run_turn_unresolved_file_id_emits_visible_marker(
     # The unresolved image block becomes a visible marker, not a silent drop.
     assert sent[0]["content"] == ("[Attachment file_abc123 could not be loaded]\n\nanalyze this")
     # No uploads directory created — nothing to materialize.
-    assert not (tmp_path / "uploads").exists()
+    assert not (attachment_cache_dir(tmp_path)).exists()
+
+
+@pytest.mark.asyncio
+async def test_run_turn_materializes_zip_outside_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A ZIP reaches Claude by absolute cache path without changing the checkout."""
+    import json
+
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    (tmp_path / "bridge.json").write_text(json.dumps({"workspace": str(workspace)}))
+
+    sent: list[dict[str, Any]] = []
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", _stub_inject(sent))
+
+    zip_bytes = b"PK\x03\x04 fake zip"
+    executor = ClaudeNativeExecutor(tmp_path)
+    events = [
+        event
+        async for event in executor.run_turn(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_file",
+                            "file_data": (
+                                "data:application/zip;base64,"
+                                f"{base64.b64encode(zip_bytes).decode()}"
+                            ),
+                            "filename": "bundle.zip",
+                        },
+                        {"type": "input_text", "text": "what is in here?"},
+                    ],
+                }
+            ],
+            tools=[],
+            system_prompt="ignored",
+        )
+    ]
+
+    assert events == [TurnComplete(response=None)]
+    materialized = attachment_cache_dir(tmp_path) / "bundle.zip"
+    assert materialized.read_bytes() == zip_bytes
+    assert list(workspace.iterdir()) == []
+    assert f"[Attached: {materialized}]" in sent[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_run_turn_materializes_zip_without_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Attachment delivery works before any workspace is recorded at launch."""
+    sent: list[dict[str, Any]] = []
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", _stub_inject(sent))
+
+    executor = ClaudeNativeExecutor(tmp_path)
+    events = [
+        event
+        async for event in executor.run_turn(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_file",
+                            "file_data": "data:application/zip;base64,UEsDBA==",
+                            "filename": "bundle.zip",
+                        },
+                        {"type": "input_text", "text": "unpack this"},
+                    ],
+                }
+            ],
+            tools=[],
+            system_prompt="ignored",
+        )
+    ]
+
+    assert events == [TurnComplete(response=None)]
+    assert (
+        sent[0]["content"]
+        == f"[Attached: {attachment_cache_dir(tmp_path) / 'bundle.zip'}]\n\nunpack this"
+    )
 
 
 @pytest.mark.asyncio
@@ -637,7 +909,7 @@ async def test_run_turn_dedup_same_filename(
     ]
 
     assert events == [TurnComplete(response=None)]
-    uploads = tmp_path / "uploads"
+    uploads = attachment_cache_dir(tmp_path)
     written = sorted(uploads.iterdir())
     # Two distinct files, not one overwritten file.
     assert len(written) == 2, (
@@ -682,7 +954,7 @@ async def test_run_turn_image_without_filename_gets_generated_name(
     ]
 
     assert events == [TurnComplete(response=None)]
-    uploads = tmp_path / "uploads"
+    uploads = attachment_cache_dir(tmp_path)
     written = list(uploads.iterdir())
     assert len(written) == 1
     # Generated name should have .png extension from the data URI MIME.
@@ -701,6 +973,10 @@ async def test_enqueue_session_message_materializes_image(
     Steering messages with multimodal content blocks also materialize
     attachments (same path as ``run_turn``).
     """
+    from omnigent.harnesses.claude_native.bridge import CLAUDE_FRAMEWORK_CONTEXT_FILE
+    from omnigent.inner.native_attachments import framework_notice_block, resize_notice
+
+    dimensions = {"width": 6000, "height": 4000}
     sent: list[dict[str, Any]] = []
     monkeypatch.setattr(
         claude_native_executor,
@@ -717,6 +993,7 @@ async def test_enqueue_session_message_materializes_image(
                 "image_url": _TINY_PNG_DATA_URI,
                 "filename": "steering_img.png",
             },
+            framework_notice_block(dimensions),
             {"type": "input_text", "text": "look at this"},
         ],
     )
@@ -726,10 +1003,14 @@ async def test_enqueue_session_message_materializes_image(
     injected = sent[0]["content"]
     assert "steering_img.png" in injected
     assert "look at this" in injected
+    assert "downscaled" not in injected
+    assert (tmp_path / CLAUDE_FRAMEWORK_CONTEXT_FILE).read_text() == resize_notice(dimensions)
     # File was written to the bridge directory.
-    written = list((tmp_path / "uploads").iterdir())
+    written = list((attachment_cache_dir(tmp_path)).iterdir())
     assert len(written) == 1
     assert written[0].name == "steering_img.png"
+    assert await executor.enqueue_session_message("session-key", "follow-up")
+    assert not (tmp_path / CLAUDE_FRAMEWORK_CONTEXT_FILE).exists()
 
 
 @pytest.mark.asyncio
@@ -774,7 +1055,7 @@ async def test_run_turn_malformed_data_uri_emits_visible_marker(
     assert len(sent) == 1
     assert sent[0]["content"] == ("[Attachment attachment could not be loaded]\n\nstill send this")
     # No file written for the malformed URI.
-    assert not (tmp_path / "uploads").exists()
+    assert not (attachment_cache_dir(tmp_path)).exists()
 
 
 @pytest.mark.asyncio
@@ -814,7 +1095,7 @@ async def test_run_turn_path_traversal_filename_sanitized(
     ]
 
     assert events == [TurnComplete(response=None)]
-    uploads = tmp_path / "uploads"
+    uploads = attachment_cache_dir(tmp_path)
     written = list(uploads.iterdir())
     assert len(written) == 1
     assert written[0].name == ".bashrc"
@@ -945,6 +1226,67 @@ async def test_run_turn_uses_the_custom_model_slot_id_verbatim(
     ]
 
     assert slash_calls == ["/model databricks-claude-sonnet-5"]
+    assert events == [TurnComplete(response=None)]
+
+
+@pytest.mark.asyncio
+async def test_run_turn_types_a_managed_picker_row_verbatim(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A routed model of no Claude family is spelled by the pane's picker.
+
+    A workspace-managed picker lists every served model by its own id, and
+    ``/model`` takes those verbatim — but no alias pin covers them, so the
+    switch was skipped and the turn ran on the launch model.
+    """
+    monkeypatch.delenv(REQUEST_SESSION_ID_ENV_VAR, raising=False)
+    slash_calls: list[str] = []
+
+    def fake_inject_slash_command(
+        bridge_dir_arg: Path,
+        *,
+        command: str,
+        timeout_s: float = 30.0,
+        auto_confirm: bool = False,
+        confirm_hint: str | None = None,
+    ) -> None:
+        del bridge_dir_arg, timeout_s, auto_confirm, confirm_hint
+        slash_calls.append(command)
+
+    monkeypatch.setattr(claude_native_executor, "read_launch_model", lambda _bridge: None)
+    monkeypatch.setattr(
+        claude_native_executor,
+        "read_model_env",
+        lambda _bridge: {
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": "system.ai.claude-opus-4-8[1m]",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL": "system.ai.claude-sonnet-4-6[1m]",
+        },
+    )
+    monkeypatch.setattr(
+        claude_native_executor,
+        "read_model_picker_values",
+        lambda _bridge: ["system.ai.claude-opus-4-8[1m]", "system.ai.glm-5-3"],
+    )
+    monkeypatch.setattr(claude_native_executor, "inject_slash_command", fake_inject_slash_command)
+    monkeypatch.setattr(
+        claude_native_executor,
+        "inject_user_message",
+        lambda bridge_dir_arg, *, content, timeout_s=30.0: None,
+    )
+
+    executor = ClaudeNativeExecutor(tmp_path / "bridge")
+    events = [
+        event
+        async for event in executor.run_turn(
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[],
+            system_prompt="",
+            config=ExecutorConfig(model="system.ai.glm-5-3"),
+        )
+    ]
+
+    assert slash_calls == ["/model system.ai.glm-5-3"]
     assert events == [TurnComplete(response=None)]
 
 
@@ -1263,6 +1605,198 @@ async def test_run_turn_reaps_tmux_before_reporting_prompt_timeout(
     assert killed == [bridge_dir]
     assert len(events) == 1
     assert isinstance(events[0], ExecutorError)
+
+
+@pytest.mark.asyncio
+async def test_run_turn_keeps_the_pane_when_a_terminal_dialog_blocks_delivery(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    A dialog holding the terminal fails the turn without reaping the pane.
+
+    The person answers the dialog in the embedded terminal and resends, so
+    killing the pane would destroy the very thing they need. Only readiness
+    timeouts reap; the dialog error takes the plain delivery-failure path.
+    """
+    bridge_dir = tmp_path / "bridge"
+    killed: list[Path] = []
+
+    def fail_inject(bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0) -> None:
+        del bridge_dir_arg, content, timeout_s
+        raise ClaudeTerminalDialog(
+            "Claude Code is waiting for an answer in its terminal "
+            "(New MCP server found in this project: e2e-noop), so the message was not delivered."
+        )
+
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", fail_inject)
+    monkeypatch.setattr(
+        claude_native_executor,
+        "kill_session",
+        lambda bridge_dir_arg, *, timeout_s: killed.append(bridge_dir_arg),
+    )
+
+    executor = ClaudeNativeExecutor(bridge_dir)
+    events = [
+        event
+        async for event in executor.run_turn(
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[],
+            system_prompt="",
+        )
+    ]
+
+    assert killed == []
+    assert len(events) == 1
+    assert isinstance(events[0], ExecutorError)
+    assert "waiting for an answer" in events[0].message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("exit_status", "expect_error_level"),
+    [("0", False), ("1", True), ("137", True), (None, True)],
+)
+async def test_run_turn_logs_a_closed_terminal_below_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    exit_status: str | None,
+    expect_error_level: bool,
+) -> None:
+    """
+    Closing Claude Code is not an Omnigent defect, so it is not an ERROR.
+
+    Claude Code exits 0 on ``/quit`` or a closed window. Every turn sent
+    afterwards must still fail — the pane is gone — but logging that as an
+    ERROR reports the person's own teardown as a mid-session failure. A
+    pane that died on its own (any other wait-status, or none recorded)
+    keeps the ERROR and its traceback.
+    """
+    bridge_dir = tmp_path / "bridge"
+
+    def fail_inject(bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0) -> None:
+        del bridge_dir_arg, content, timeout_s
+        raise ClaudeTerminalExited(
+            "The Claude Code terminal has exited, so the message was not delivered.",
+            exit_status=exit_status,
+        )
+
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", fail_inject)
+    monkeypatch.setattr(
+        claude_native_executor, "kill_session", lambda bridge_dir_arg, *, timeout_s: None
+    )
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.inner.claude_native_executor"):
+        events = [
+            event
+            async for event in ClaudeNativeExecutor(bridge_dir).run_turn(
+                messages=[{"role": "user", "content": "hi"}],
+                tools=[],
+                system_prompt="",
+            )
+        ]
+
+    # The turn still fails: the pane is gone either way.
+    assert len(events) == 1
+    assert isinstance(events[0], ExecutorError)
+
+    records = [r for r in caplog.records if "terminal exited" in r.getMessage()]
+    assert len(records) == 1
+    assert (records[0].levelno == logging.ERROR) is expect_error_level
+    # A traceback only earns its place when something actually broke.
+    assert bool(records[0].exc_info) is expect_error_level
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("delivery", ["message", "steering", "model"])
+@pytest.mark.parametrize("watchdog", [False, True])
+async def test_cancelled_delivery_drains_worker_before_unlocking(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    delivery: str,
+    watchdog: bool,
+) -> None:
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    commands: list[tuple[str, ...]] = []
+    reaped: list[Path] = []
+
+    def capture(socket_path: str, tmux_target: str) -> str:
+        started.set()
+        assert release.wait(5), "test did not release the in-flight capture"
+        return "────────────────\n❯ \n────────────────\n"
+
+    def inject(*args: Any, **kwargs: Any) -> None:
+        try:
+            claude_bridge._wait_for_claude_prompt_ready("/tmp/sock", "main", timeout_s=30)
+            claude_bridge._run_tmux("/tmp/sock", "send-keys", "late message", "Enter")
+        finally:
+            finished.set()
+
+    def reap(bridge_dir: Path, *, timeout_s: float) -> None:
+        assert finished.is_set()
+        claude_bridge._check_injection_cancelled()
+        reaped.append(bridge_dir)
+
+    def run(cmd: list[str], **kwargs: Any) -> Any:
+        commands.append(tuple(cmd))
+        raise AssertionError("cancelled delivery sent keystrokes")
+
+    monkeypatch.setattr(claude_bridge, "_capture_pane", capture)
+    monkeypatch.setattr("subprocess.run", run)
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", inject)
+    monkeypatch.setattr(claude_native_executor, "inject_slash_command", inject)
+    monkeypatch.setattr(claude_native_executor, "kill_session", reap)
+    executor = ClaudeNativeExecutor(tmp_path / "bridge")
+    monkeypatch.setattr(
+        executor, "_model_command_arg", lambda model: "sonnet" if delivery == "model" else None
+    )
+
+    async def deliver() -> None:
+        async with asyncio.timeout(0.1 if watchdog else 5):
+            if delivery == "steering":
+                await executor.enqueue_session_message("session", "hello")
+            else:
+                async for _event in executor.run_turn(
+                    messages=[{"role": "user", "content": "hello"}],
+                    tools=[],
+                    system_prompt="",
+                ):
+                    raise AssertionError("cancelled turn emitted a completion")
+
+    task = asyncio.create_task(deliver())
+    try:
+        assert await asyncio.to_thread(started.wait, 2)
+        if not watchdog:
+            task.cancel()
+        async with asyncio.timeout(2):
+            while not task.cancelling():
+                await asyncio.sleep(0.005)
+        await asyncio.sleep(0)
+        assert not task.done()
+        assert executor._inject_lock.locked()
+        if not watchdog:
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done()
+        release.set()
+        await asyncio.wait({task}, timeout=2)
+        assert task.done(), "cancelled delivery did not finish after its capture was released"
+        with pytest.raises(TimeoutError if watchdog else asyncio.CancelledError):
+            task.result()
+        assert finished.is_set()
+        assert not executor._inject_lock.locked()
+        assert reaped == [tmp_path / "bridge"]
+        assert commands == []
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.wait({task})
+        with contextlib.suppress(asyncio.CancelledError, TimeoutError):
+            task.result()
 
 
 @pytest.mark.asyncio

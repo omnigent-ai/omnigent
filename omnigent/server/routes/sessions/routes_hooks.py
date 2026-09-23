@@ -18,6 +18,10 @@ from omnigent.debug_logging import add_audit_attrs
 from omnigent.entities import Conversation
 from omnigent.errors import ElicitationDeclinedError, ErrorCode, OmnigentError
 from omnigent.harnesses.codex_native.elicitation import codex_elicitation_id
+from omnigent.native.native_coding_agents import (
+    native_coding_agent_for_harness,
+    native_coding_agent_for_wrapper_label,
+)
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runtime import (
     get_agent_cache,
@@ -69,6 +73,7 @@ from omnigent.server.routes._sessions.common import (
 )
 from omnigent.server.routes._sessions.helpers import (
     _allow_all_edits_eligible,
+    _allow_auto_mode_eligible,
     _allow_remember_eligible,
     _build_actor,
     _build_evaluation_context,
@@ -79,6 +84,7 @@ from omnigent.server.routes._sessions.helpers import (
     _get_runner_client,
     _native_ask_gate_lock,
     _publish_policy_denied,
+    _resolve_harness,
     _structured_ask_user_question,
 )
 from omnigent.server.routes._sessions.orchestration import (
@@ -96,6 +102,11 @@ from omnigent.spec.types import (
 )
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.permission_store import PermissionStore
+
+#: Policy-name vendor for a native agent key, where the two differ. Mirrors
+#: ``POLICY_NAME_VENDORS`` in ``web/src/lib/nativeCodingAgents.ts``, which resolves
+#: a card's glyph and name from the ``<vendor>_native_`` prefix.
+_NATIVE_POLICY_VENDORS: dict[str, str] = {"antigravity": "agy"}
 
 
 def _create_route_decision_id(
@@ -156,7 +167,11 @@ def register_hooks_routes(
         session_id: str,
     ) -> Response:
         """
-        Claude Code ``PermissionRequest`` HTTP hook endpoint.
+        Claude Code ``PermissionRequest`` HTTP hook endpoint, also used by Kimi and Devin.
+
+        Kimi and Devin identify callbacks with namespaced elicitation ids. Reject a
+        callback targeting a different known native harness before publishing
+        a card; legacy sessions without native metadata retain compatibility.
 
         Receives Claude Code's PermissionRequest hook payload (tool
         name + input the user would otherwise see a TUI prompt for),
@@ -185,8 +200,8 @@ def register_hooks_routes(
         :returns: Claude PermissionRequest hookSpecificOutput JSON,
             or ``200`` with empty body on timeout (fail-ask).
         :raises OmnigentError: 404 if the session doesn't exist,
-            400 if the body fails JSON parse or is missing
-            ``tool_name``.
+            400 if the body fails JSON parse or is missing ``tool_name``,
+            409 if the callback targets a different native harness.
         """
         from omnigent.server.routes import sessions as _sf
 
@@ -237,7 +252,36 @@ def register_hooks_routes(
         permission_mode = payload.get("permission_mode")
         if permission_mode is not None and not isinstance(permission_mode, str):
             permission_mode = None
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conv is None:
+            raise OmnigentError("Session not found", code=ErrorCode.NOT_FOUND)
+        harness = await asyncio.to_thread(
+            _resolve_harness, conv, agent_store=agent_store, agent_cache=agent_cache
+        )
+        native_agent = native_coding_agent_for_harness(harness) or (
+            native_coding_agent_for_wrapper_label(conv.labels.get("omnigent.wrapper"))
+        )
+        # Check ownership after the metadata awaits, without yielding before registration.
         elicitation_id = _client_supplied_hook_elicitation_id(payload, session_id)
+        hook_vendor = "claude"
+        if elicitation_id:
+            for vendor in ("kimi", "devin"):
+                if elicitation_id.startswith(f"elicit_{vendor}_"):
+                    hook_vendor = vendor
+                    break
+        elif native_agent is not None and native_agent.key == "devin":
+            # Older Devin hooks send no id; retain their session-derived identity.
+            hook_vendor = "devin"
+        hook_harness = f"{hook_vendor}-native"
+        hook_label = hook_vendor.capitalize()
+        is_claude = hook_vendor == "claude"
+        # Legacy sessions may lack native metadata; a known native session must match.
+        if native_agent is not None and native_agent.harness != hook_harness:
+            raise OmnigentError(
+                f"{hook_label} permission hook does not match the session's "
+                f"{native_agent.display_name} harness.",
+                code=ErrorCode.CONFLICT,
+            )
 
         try:
             preview_str = json.dumps(tool_input or {}, ensure_ascii=False)
@@ -259,15 +303,13 @@ def register_hooks_routes(
             extras["cwd"] = cwd
         if permission_mode is not None:
             extras["permission_mode"] = permission_mode
-        # The card offers ONE persistent-approval affordance, picked by
-        # the gated tool — the two hints below are mutually exclusive
-        # (disjoint eligibility), never two buttons competing on one card.
-        #
+        if is_claude and _allow_auto_mode_eligible(tool_name, permission_mode):
+            extras["allow_auto_mode"] = True
         # Edit tools → "Accept & allow all edits" (switches the session to
         # acceptEdits via setMode). Stamped only for edit-tool prompts
         # under a still-prompting mode — see _allow_all_edits_eligible.
         # The verdict site re-checks the same predicate before honoring it.
-        if _allow_all_edits_eligible(tool_name, permission_mode):
+        if is_claude and _allow_all_edits_eligible(tool_name, permission_mode):
             extras["allow_all_edits"] = True
         # Non-edit eligible tools → "don't ask again" (installs a
         # session-scoped allow rule via addRules). Stamped only when the
@@ -276,7 +318,7 @@ def register_hooks_routes(
         # request host so the UI can label the button ("… for github.com"
         # vs "… for WebFetch"); the verdict site re-derives the same scope
         # before honoring the flag, never trusting a client-supplied rule.
-        if _allow_remember_eligible(tool_name, permission_mode):
+        if is_claude and _allow_remember_eligible(tool_name, permission_mode):
             remember_scope: dict[str, Any] = {"tool": tool_name}
             remember_host = _claude_native_remember_host(tool_name, tool_input)
             if remember_host is not None:
@@ -291,7 +333,7 @@ def register_hooks_routes(
         # ``content_preview`` keeps its 1024-char cap for the
         # binary-card fallback; the structured field is the
         # authoritative source the UI consumes when present.
-        if tool_name == "AskUserQuestion":
+        if is_claude and tool_name == "AskUserQuestion":
             ask_payload = _structured_ask_user_question(tool_input)
             if ask_payload is not None:
                 extras["ask_user_question"] = ask_payload
@@ -304,15 +346,26 @@ def register_hooks_routes(
         # filtering: every field the hook carried natively reaches
         # the UI. An empty/absent input stamps nothing, leaving the
         # binary-card fallback.
-        if tool_name == "ExitPlanMode" and isinstance(tool_input, dict) and tool_input:
+        if (
+            is_claude
+            and tool_name == "ExitPlanMode"
+            and isinstance(tool_input, dict)
+            and tool_input
+        ):
             extras["exit_plan_mode"] = tool_input
+        asking_name = native_agent.display_name if native_agent is not None else hook_label
+        asking_vendor = (
+            _NATIVE_POLICY_VENDORS.get(native_agent.key, native_agent.key)
+            if native_agent is not None
+            else hook_vendor
+        )
         params = ElicitationRequestParams(
             mode="form",
-            message=f"Claude wants to call **{tool_name}**",
+            message=f"{asking_name} wants to call **{tool_name}**",
             requestedSchema=None,
             url=None,
             phase="pre_tool_use",
-            policy_name="claude_native_permission",
+            policy_name=f"{asking_vendor}_native_permission",
             content_preview=f"{tool_name}({preview_str})",
             **extras,
         )
@@ -351,6 +404,12 @@ def register_hooks_routes(
             feedback = result.content.get("feedback")
             if isinstance(feedback, str) and feedback.strip():
                 decision["message"] = feedback
+        if not is_claude:
+            # These bridges consume the verdict without Claude's input/permission updates.
+            return Response(
+                content=json.dumps({"hookSpecificOutput": {"decision": decision}}),
+                media_type="application/json",
+            )
         # When the gated tool is AskUserQuestion AND the user accepted
         # with selections, propagate those selections back to Claude
         # via ``decision.updatedInput``. Claude reads
@@ -381,6 +440,15 @@ def register_hooks_routes(
             and tool_input
         ):
             decision["updatedInput"] = tool_input
+        if (
+            behavior == "allow"
+            and isinstance(result.content, dict)
+            and result.content.get("allow_auto_mode") is True
+            and _allow_auto_mode_eligible(tool_name, permission_mode)
+        ):
+            decision["updatedPermissions"] = [
+                {"type": "setMode", "mode": "auto", "destination": "session"}
+            ]
         # "Accept & allow all edits" — the user approved this edit AND
         # asked to auto-accept future edits. Echo a ``setMode`` permission
         # update so Claude Code switches this session into ``acceptEdits``
@@ -396,7 +464,7 @@ def register_hooks_routes(
         # affordance was offered for. Without this, a client could send
         # the flag on e.g. a Bash prompt and flip the session into
         # ``acceptEdits`` — a mode switch it was never offered.
-        if (
+        elif (
             behavior == "allow"
             and isinstance(result.content, dict)
             and result.content.get("allow_all_edits") is True
@@ -440,10 +508,8 @@ def register_hooks_routes(
         # same ``_allow_remember_eligible`` predicate the button was
         # offered under — so a forged ``remember`` flag on an ineligible
         # tool (e.g. an edit tool, which takes the setMode path) can't
-        # smuggle in an allow rule. Mutually exclusive with the edit-tool
-        # ``allow_all_edits``/ExitPlanMode branches above (disjoint tool
-        # sets), so it never overwrites their ``updatedPermissions``.
-        if (
+        # smuggle in an allow rule.
+        elif (
             behavior == "allow"
             and isinstance(result.content, dict)
             and result.content.get("remember") is True
@@ -910,6 +976,7 @@ def register_hooks_routes(
                                 policy_phase=phase.value,
                                 policy_reason=decline_body["reason"],
                                 policy_gate="declined",
+                                policy_workspace_id=result.deciding_policy_workspace_id,
                             )
                             return Response(
                                 content=json.dumps(decline_body),
@@ -927,6 +994,7 @@ def register_hooks_routes(
                             policy_verdict=approval_body["result"],
                             policy_phase=phase.value,
                             policy_gate="ask",
+                            policy_workspace_id=result.deciding_policy_workspace_id,
                         )
                         if approval_body.get("reason"):
                             add_audit_attrs(policy_reason=approval_body["reason"])
@@ -950,9 +1018,30 @@ def register_hooks_routes(
             resp_body["data"] = result.data
         # Tag the audit envelope with the decision so a DENY/ASK is debuggable
         # (a deny returns HTTP 200, so status alone can't tell you the verdict).
-        add_audit_attrs(policy_verdict=resp_body["result"], policy_phase=phase.value)
+        add_audit_attrs(
+            policy_verdict=resp_body["result"],
+            policy_phase=phase.value,
+            policy_workspace_id=result.deciding_policy_workspace_id,
+        )
         if result.reason:
             add_audit_attrs(policy_reason=result.reason)
+        # Emit a structured log for non-ALLOW verdicts so operators can diagnose
+        # policy evaluation failures without needing audit-log access. The
+        # workspace id is the deciding policy's owning workspace (None for a
+        # YAML / agent-spec policy that is not a workspace-scoped row).
+        if result.action in (PolicyAction.DENY, PolicyAction.ASK):
+            _logger.info(
+                "policy_eval_verdict: session=%s policy_workspace=%s phase=%s "
+                "action=%s policy=%s reason=%r tool=%s",
+                session_id,
+                result.deciding_policy_workspace_id,
+                phase.value,
+                result.action.value,
+                result.deciding_policy,
+                result.reason,
+                (data.get("name") if isinstance(data, dict) else None),
+                extra={"session_id": session_id},
+            )
         _policy_tool = data.get("name") if isinstance(data, dict) else None
         if _policy_tool:
             add_audit_attrs(policy_tool=_policy_tool)

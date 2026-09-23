@@ -29,6 +29,9 @@ from omnigent.server.routes._auth_helpers import (
 from omnigent.server.routes._auth_helpers import (
     require_access_and_level as _require_access_and_level,
 )
+from omnigent.server.routes._errors import (
+    STALE_CURSOR_RESPONSE,
+)
 from omnigent.server.routes._errors import session_not_found as _session_not_found
 from omnigent.server.routes._sessions.common import (
     get_server_runner_router,
@@ -58,7 +61,7 @@ def register_items_routes(
     @router.get(
         "/sessions/{session_id}/items",
         response_model=None,
-        responses={200: {"model": PaginatedList}},
+        responses={200: {"model": PaginatedList}, **STALE_CURSOR_RESPONSE},
     )
     async def list_session_items(
         request: Request,
@@ -116,7 +119,7 @@ def register_items_routes(
     @router.get(
         "/sessions/{session_id}/child_sessions",
         response_model=None,
-        responses={200: {"model": ChildSessionList}},
+        responses={200: {"model": ChildSessionList}, **STALE_CURSOR_RESPONSE},
     )
     async def list_child_sessions(
         request: Request,

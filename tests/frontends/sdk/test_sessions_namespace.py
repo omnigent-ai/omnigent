@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable, Iterable
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 import pytest
@@ -1325,6 +1325,72 @@ async def test_subtree_busy_counts_awaiting_input_as_busy() -> None:
 
 
 # ── list() ───────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("include_archived", [False, True])
+async def test_list_defaults_to_all_visibility(include_archived: bool) -> None:
+    """Default requests preserve access to shared sessions and archive opt-in."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == "/v1/sessions"
+        expected = {
+            "limit": "20",
+            "order": "desc",
+            "sort_by": "created_at",
+            "visibility": "all",
+        }
+        if include_archived:
+            expected["include_archived"] = "true"
+        assert dict(request.url.params) == expected
+        return httpx.Response(200, json={"data": []})
+
+    ns, client = _make_namespace(handler)
+    try:
+        assert await ns.list(include_archived=include_archived) == []
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("visibility", ["all", "mine", "shared", "archived"])
+@pytest.mark.parametrize("cursor", ["after", "before"])
+async def test_list_visibility_preserves_pagination_and_filters(
+    visibility: Literal["all", "mine", "shared", "archived"], cursor: str
+) -> None:
+    """Visibility travels with the existing filters on either pagination direction."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == "/v1/sessions"
+        assert dict(request.url.params) == {
+            "limit": "50",
+            "order": "asc",
+            "sort_by": "updated_at",
+            "visibility": visibility,
+            cursor: "conv_cursor",
+            "agent_id": "ag_abc",
+            "agent_name": "my agent",
+        }
+        return httpx.Response(200, json={"data": []})
+
+    ns, client = _make_namespace(handler)
+    try:
+        rows = await ns.list(
+            visibility=visibility,
+            limit=50,
+            after="conv_cursor" if cursor == "after" else None,
+            before="conv_cursor" if cursor == "before" else None,
+            agent_id="ag_abc",
+            agent_name="my agent",
+            order="asc",
+            sort_by="updated_at",
+        )
+    finally:
+        await client.aclose()
+
+    assert rows == []
 
 
 @pytest.mark.asyncio

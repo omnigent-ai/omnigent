@@ -224,8 +224,10 @@ class FakeSandboxLauncher(SandboxLauncher):
         self.resources: dict[str, object] | None = None
         self.pvc_mounts: list[dict[str, object]] | None = None
         self.secret_mounts: list[dict[str, object]] | None = None
+        self.tolerations: list[dict[str, object]] | None = None
         self.pod_ready_timeout_s: int | None = None
         self.runtime_class: str | None = None
+        self.home_size_limit: str | None = None
         self.prepared = False
         self.provisioned_names: list[str] = []
         self.commands: list[str] = []
@@ -603,7 +605,8 @@ def install_fake_kubernetes_launcher(
     The managed flow constructs ``KubernetesSandboxLauncher(image=…, env=…,
     namespace=…, secret_name=…, service_account=…, node_selector=…,
     kubeconfig=…, in_cluster=…, resources=…, pvc_mounts=…, secret_mounts=…,
-    pod_ready_timeout_s=…, runtime_class=…)``; the shim records those constructor args on the
+    tolerations=…, pod_ready_timeout_s=…, runtime_class=…, home_size_limit=…)``;
+    the shim records those constructor args on the
     fake and hands it back, so production code runs unmodified against it.
 
     :param monkeypatch: The test's ``pytest.MonkeyPatch``.
@@ -624,8 +627,10 @@ def install_fake_kubernetes_launcher(
         resources: dict[str, object] | None = None,
         pvc_mounts: list[dict[str, object]] | None = None,
         secret_mounts: list[dict[str, object]] | None = None,
+        tolerations: list[dict[str, object]] | None = None,
         pod_ready_timeout_s: int | None = None,
         runtime_class: str | None = None,
+        home_size_limit: str | None = None,
     ) -> FakeSandboxLauncher:
         """Stand-in constructor recording the construction wiring."""
         fake.image = image
@@ -639,8 +644,10 @@ def install_fake_kubernetes_launcher(
         fake.resources = resources
         fake.pvc_mounts = pvc_mounts
         fake.secret_mounts = secret_mounts
+        fake.tolerations = tolerations
         fake.pod_ready_timeout_s = pod_ready_timeout_s
         fake.runtime_class = runtime_class
+        fake.home_size_limit = home_size_limit
         return fake
 
     monkeypatch.setattr(kubernetes_mod, "KubernetesSandboxLauncher", _ctor)
@@ -872,6 +879,7 @@ async def create_test_agent(
     skills: list[dict[str, str]] | None = None,
     user: str | None = None,
     guardrails: dict[str, Any] | None = None,
+    terminals: dict[str, Any] | None = None,
     include_llm: bool = True,
     sub_agents: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
@@ -899,6 +907,8 @@ async def create_test_agent(
     :param guardrails: Optional ``guardrails:`` block for the agent
         spec (e.g. a ``cost_budget`` policy). Passed verbatim to
         :func:`build_agent_bundle`. ``None`` omits guardrails.
+    :param terminals: Optional ``terminals:`` block written verbatim
+        into the agent spec.
     :param include_llm: Whether to include the default ``llm:`` block.
         Set ``False`` for model-less harness tests.
     :param sub_agents: Optional sub-agent config dicts declared in the
@@ -917,6 +927,7 @@ async def create_test_agent(
         executor=executor,
         skills=skills,
         guardrails=guardrails,
+        terminals=terminals,
         include_llm=include_llm,
         sub_agents=sub_agents,
     )

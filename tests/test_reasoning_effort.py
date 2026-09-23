@@ -245,6 +245,11 @@ def test_efforts_for_harness_distinguishes_unsupported_from_unknown() -> None:
     # pi declares its own family, so it resolves to a real vocabulary.
     assert efforts_for_harness("pi") == PI_EFFORTS
     assert efforts_for_harness("pi-native") == PI_EFFORTS
+    # codex-native drives the real codex process, which takes Sol's max/ultra;
+    # sharing the SDK codex family (capped at xhigh) dropped a session created
+    # at ultra to Codex's default before its first turn.
+    assert efforts_for_harness("codex-native") == CODEX_NATIVE_EFFORTS
+    assert efforts_for_harness("codex") == CODEX_EFFORTS
     # Known, but declared EffortFamily.NONE.
     assert efforts_for_harness("opencode-native") == frozenset()
     # Not in the registry at all — unclassifiable, not unsupported.

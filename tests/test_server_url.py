@@ -9,6 +9,8 @@ user-facing text or drop the selector from copy-pasteable URLs.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from omnigent.util.server_url import (
@@ -19,6 +21,15 @@ from omnigent.util.server_url import (
 )
 
 _WORKSPACE_API = "https://ws.databricks.com/api/2.0/omnigent"
+
+
+@pytest.fixture(autouse=True)
+def _isolated_auth_store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep remembered synthetic selectors out of other tests and user state."""
+    monkeypatch.setattr(
+        "omnigent.cli_auth._token_file_path",
+        lambda: tmp_path / "auth_tokens.json",
+    )
 
 
 def test_api_base_is_normalized() -> None:

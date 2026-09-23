@@ -30,6 +30,7 @@ from omnigent.runner.transports.ws_tunnel.serve import dispatch_via_asgi
 from omnigent.runner.transports.ws_tunnel.transport import WSTunnelTransport
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.routes.runner_tunnel import create_runner_tunnel_router
+from tests.budgets import budget
 from tests.runner.helpers import NullServerClient
 
 pytestmark = pytest.mark.asyncio
@@ -111,7 +112,7 @@ async def _connect_route(
         _websocket_scope(path, headers=headers, client_host=client_host),
     )
     await communicator.send_input({"type": "websocket.connect"})
-    accepted = await communicator.receive_output(timeout=1.0)
+    accepted = await communicator.receive_output(timeout=budget(1.0))
     assert accepted["type"] == "websocket.accept", (
         f"Expected {path} to accept the WebSocket route; got {accepted!r}. "
         "If this is a websocket.close frame, the route is probably mounted "
@@ -209,7 +210,7 @@ async def _send_hello(
         {"type": "websocket.receive", "text": encode_frame(hello)},
     )
 
-    await asyncio.wait_for(_wait_until_registered(registry, runner_id), timeout=1.0)
+    await asyncio.wait_for(_wait_until_registered(registry, runner_id), timeout=budget(1.0))
 
 
 async def _wait_until_registered(registry: TunnelRegistry, runner_id: str) -> None:
@@ -297,7 +298,7 @@ async def routed_tunnel_client(app: FastAPI) -> AsyncIterator[RoutedTunnelClient
             await route_task
         await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
         with contextlib.suppress(asyncio.TimeoutError):
-            await communicator.wait(timeout=1.0)
+            await communicator.wait(timeout=budget(1.0))
 
 
 async def test_ws_tunnel_route_round_trips_request_to_runner(
@@ -338,7 +339,7 @@ async def test_ws_tunnel_status_reports_registration(app: FastAPI) -> None:
         finally:
             await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
             with contextlib.suppress(asyncio.TimeoutError):
-                await communicator.wait(timeout=1.0)
+                await communicator.wait(timeout=budget(1.0))
 
     assert offline.json() == {"runner_id": _RUNNER_ID, "online": False}
     assert online.json() == {"runner_id": _RUNNER_ID, "online": True}
@@ -366,7 +367,7 @@ async def test_ws_tunnel_list_runners_reports_online_harnesses(app: FastAPI) -> 
         finally:
             await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
             with contextlib.suppress(asyncio.TimeoutError):
-                await communicator.wait(timeout=1.0)
+                await communicator.wait(timeout=budget(1.0))
 
     assert offline.json() == {"data": []}
     assert online.json() == {
@@ -395,8 +396,8 @@ async def test_ws_tunnel_rejects_token_runner_id_mismatch(app: FastAPI) -> None:
     )
 
     await communicator.send_input({"type": "websocket.connect"})
-    accepted = await communicator.receive_output(timeout=1.0)
-    closed = await communicator.receive_output(timeout=1.0)
+    accepted = await communicator.receive_output(timeout=budget(1.0))
+    closed = await communicator.receive_output(timeout=budget(1.0))
 
     assert accepted["type"] == "websocket.accept"
     assert closed == {
@@ -427,7 +428,7 @@ async def test_ws_tunnel_accepts_ipv4_mapped_loopback_client(app: FastAPI) -> No
     finally:
         await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
         with contextlib.suppress(asyncio.TimeoutError):
-            await communicator.wait(timeout=1.0)
+            await communicator.wait(timeout=budget(1.0))
 
 
 @pytest.mark.parametrize("client_host", ["10.1.2.3", "::ffff:10.1.2.3"])
@@ -453,8 +454,8 @@ async def test_ws_tunnel_requires_token_for_non_loopback_client(
     )
 
     await communicator.send_input({"type": "websocket.connect"})
-    accepted = await communicator.receive_output(timeout=1.0)
-    closed = await communicator.receive_output(timeout=1.0)
+    accepted = await communicator.receive_output(timeout=budget(1.0))
+    closed = await communicator.receive_output(timeout=budget(1.0))
 
     assert accepted["type"] == "websocket.accept"
     assert closed == {
@@ -482,8 +483,8 @@ async def test_ws_tunnel_allowlist_requires_token_for_remote_client() -> None:
     )
 
     await communicator.send_input({"type": "websocket.connect"})
-    accepted = await communicator.receive_output(timeout=1.0)
-    closed = await communicator.receive_output(timeout=1.0)
+    accepted = await communicator.receive_output(timeout=budget(1.0))
+    closed = await communicator.receive_output(timeout=budget(1.0))
 
     # Remote client with no token → rejected.
     assert accepted["type"] == "websocket.accept"
@@ -523,8 +524,8 @@ async def test_ws_tunnel_allowlist_rejects_stale_remote_token() -> None:
     )
 
     await communicator.send_input({"type": "websocket.connect"})
-    accepted = await communicator.receive_output(timeout=1.0)
-    closed = await communicator.receive_output(timeout=1.0)
+    accepted = await communicator.receive_output(timeout=budget(1.0))
+    closed = await communicator.receive_output(timeout=budget(1.0))
 
     # Remote client with stale token → rejected.
     assert accepted["type"] == "websocket.accept"
@@ -566,7 +567,7 @@ async def test_ws_tunnel_allowlist_accepts_current_server_token() -> None:
     finally:
         await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
         with contextlib.suppress(asyncio.TimeoutError):
-            await communicator.wait(timeout=1.0)
+            await communicator.wait(timeout=budget(1.0))
 
 
 async def test_ws_tunnel_loopback_bypasses_allowlist() -> None:
@@ -607,7 +608,7 @@ async def test_ws_tunnel_loopback_bypasses_allowlist() -> None:
     finally:
         await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
         with contextlib.suppress(asyncio.TimeoutError):
-            await communicator.wait(timeout=1.0)
+            await communicator.wait(timeout=budget(1.0))
 
 
 async def test_ws_tunnel_accepts_token_bound_runner_id(app: FastAPI) -> None:
@@ -633,7 +634,7 @@ async def test_ws_tunnel_accepts_token_bound_runner_id(app: FastAPI) -> None:
     finally:
         await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
         with contextlib.suppress(asyncio.TimeoutError):
-            await communicator.wait(timeout=1.0)
+            await communicator.wait(timeout=budget(1.0))
 
 
 async def test_ws_tunnel_accepts_multiple_remote_runner_ids(app: FastAPI) -> None:
@@ -676,10 +677,10 @@ async def test_ws_tunnel_accepts_multiple_remote_runner_ids(app: FastAPI) -> Non
     finally:
         await second.send_input({"type": "websocket.disconnect", "code": 1000})
         with contextlib.suppress(asyncio.TimeoutError):
-            await second.wait(timeout=1.0)
+            await second.wait(timeout=budget(1.0))
         await first.send_input({"type": "websocket.disconnect", "code": 1000})
         with contextlib.suppress(asyncio.TimeoutError):
-            await first.wait(timeout=1.0)
+            await first.wait(timeout=budget(1.0))
 
 
 @pytest.mark.parametrize(
@@ -735,7 +736,7 @@ async def test_ws_tunnel_route_survives_malformed_frame(
             await route_task
         await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
         with contextlib.suppress(asyncio.TimeoutError):
-            await communicator.wait(timeout=1.0)
+            await communicator.wait(timeout=budget(1.0))
 
 
 async def test_ws_tunnel_rejects_non_hello_first_frame(app: FastAPI) -> None:
@@ -745,7 +746,7 @@ async def test_ws_tunnel_rejects_non_hello_first_frame(app: FastAPI) -> None:
     await communicator.send_input(
         {"type": "websocket.receive", "text": encode_frame(PingFrame(ts=1))}
     )
-    close = await communicator.receive_output(timeout=1.0)
+    close = await communicator.receive_output(timeout=budget(1.0))
 
     assert close == {
         "type": "websocket.close",
@@ -754,7 +755,7 @@ async def test_ws_tunnel_rejects_non_hello_first_frame(app: FastAPI) -> None:
     }
     assert registry.get(_RUNNER_ID) is None
     with contextlib.suppress(asyncio.TimeoutError):
-        await communicator.wait(timeout=1.0)
+        await communicator.wait(timeout=budget(1.0))
 
 
 async def test_ws_tunnel_route_is_not_double_prefixed(app: FastAPI) -> None:
@@ -769,7 +770,7 @@ async def test_ws_tunnel_route_is_not_double_prefixed(app: FastAPI) -> None:
     communicator = ApplicationCommunicator(app, _websocket_scope(bad_path))
 
     await communicator.send_input({"type": "websocket.connect"})
-    rejected = await communicator.receive_output(timeout=1.0)
+    rejected = await communicator.receive_output(timeout=budget(1.0))
 
     assert rejected["type"] == "websocket.close"
     assert registry.online_runner_ids() == []
@@ -827,7 +828,7 @@ async def test_ws_tunnel_rejects_unauthenticated_non_loopback_peer(
     )
 
     await communicator.send_input({"type": "websocket.connect"})
-    closed = await communicator.receive_output(timeout=1.0)
+    closed = await communicator.receive_output(timeout=budget(1.0))
 
     # Refused before accept (no acceptance oracle): the very first
     # output is the close frame. If the fix is reverted this is a
@@ -877,7 +878,7 @@ async def test_ws_tunnel_registers_authenticated_non_loopback_owner() -> None:
     finally:
         await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
         with contextlib.suppress(asyncio.TimeoutError):
-            await communicator.wait(timeout=1.0)
+            await communicator.wait(timeout=budget(1.0))
 
 
 async def test_ws_tunnel_managed_runner_resolves_owner_from_binding_token() -> None:
@@ -928,7 +929,7 @@ async def test_ws_tunnel_managed_runner_resolves_owner_from_binding_token() -> N
     finally:
         await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
         with contextlib.suppress(asyncio.TimeoutError):
-            await communicator.wait(timeout=1.0)
+            await communicator.wait(timeout=budget(1.0))
 
 
 async def test_ws_tunnel_managed_resolver_none_still_rejects() -> None:
@@ -964,7 +965,7 @@ async def test_ws_tunnel_managed_resolver_none_still_rejects() -> None:
     )
 
     await communicator.send_input({"type": "websocket.connect"})
-    closed = await communicator.receive_output(timeout=1.0)
+    closed = await communicator.receive_output(timeout=budget(1.0))
     assert closed == {
         "type": "websocket.close",
         "code": 4004,
@@ -1001,7 +1002,7 @@ async def test_ws_tunnel_loopback_unauthenticated_registers_as_local() -> None:
     finally:
         await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
         with contextlib.suppress(asyncio.TimeoutError):
-            await communicator.wait(timeout=1.0)
+            await communicator.wait(timeout=budget(1.0))
 
 
 # ── Managed-runner token mint endpoint (POST /v1/runners/{id}/token) ──
@@ -1233,5 +1234,26 @@ async def test_ping_loop_restamps_runner_liveness(
     finally:
         await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
         with contextlib.suppress(asyncio.TimeoutError):
-            await communicator.wait(timeout=1.0)
+            await communicator.wait(timeout=budget(1.0))
         session_live_state.configure(None)
+
+
+async def test_keepalive_loop_fires_faster_than_the_ping_interval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The keepalive loop runs on its own cadence, decoupled from the 30s ping
+    loop, so a short interval yields several refreshes within one ping period."""
+    from omnigent.server.routes import runner_tunnel
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        runner_tunnel.managed_host_keepalive, "touch", lambda rid: calls.append(rid)
+    )
+    monkeypatch.setattr(
+        runner_tunnel.managed_host_keepalive, "keepalive_interval_s", lambda _rid: 0.01
+    )
+    task = asyncio.create_task(runner_tunnel._keepalive_loop("r1"))
+    await asyncio.sleep(0.05)
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    assert len(calls) >= 3 and set(calls) == {"r1"}

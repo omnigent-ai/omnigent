@@ -58,10 +58,18 @@ from collections.abc import Callable
 
 import jwt
 from fastapi import APIRouter, HTTPException, Request
+from starlette.datastructures import FormData
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import UnifiedAuthProvider
 from omnigent.server.device_grant_store import DeviceGrantStore, hash_secret
+from omnigent.server.routes._oauth import (
+    NO_STORE_HEADERS,
+    RATE_LIMITER_MAX_KEYS,
+    SlidingWindowRateLimiter,
+)
+from omnigent.server.routes._oauth import oauth_error as _oauth_error
 from omnigent.server.routes._origin import require_trusted_origin
 
 _logger = logging.getLogger(__name__)
@@ -186,36 +194,46 @@ def mint_delegated_token(
     ttl_seconds: int,
     provider: str,
     *,
-    grant_id: str,
+    grant_id: str | None,
     client_id: str,
     jti: str,
     scope: str | None = DELEGATED_SCOPE,
+    account_generation: str | None = None,
 ) -> str:
-    """Mint a grant-derived access token.
+    """Mint a grant-derived or client-credential access token.
 
     Same HS256 shape as
     :func:`omnigent.server.oidc.mint_session_token` (so
     :meth:`UnifiedAuthProvider._check_cookie` validates it unchanged),
-    plus grant claims:
+    plus the delegated claims:
 
-    - ``scope`` — present ⇒ the auth layer restricts the token to the
-      session APIs and refuses admin endpoints. ``None`` omits the claim,
-      giving the token the SAME authority as the session JWT it renews —
-      used ONLY for first-party login grants, whose bearer is the
-      authenticated user's own CLI/host, not a third-party client.
-    - ``grant_id`` — the grant this token was issued from, checked against
-      the revocation denylist so revoking the grant immediately kills the
-      token. Carried regardless of scope.
+    - ``scope`` — present ⇒ the auth layer confines the token to the
+      fail-closed path allowlist and refuses admin endpoints. ``None``
+      omits the claim, giving the token the SAME authority as the session
+      JWT it renews — used ONLY for first-party login grants, whose bearer
+      is the authenticated user's own CLI/host, not a third-party client.
+    - ``grant_id`` — the store-backed grant this token was issued from,
+      checked against the revocation denylist so revoking the grant
+      immediately kills the token. ``None`` omits the claim, for the
+      client-credentials grant, which has no stored grant to revoke
+      (rotation and expiry are its revocation); the auth layer skips the
+      denylist lookup when it is absent.
     - ``jti`` — unique token id, for audit/log correlation.
     - ``act`` — provenance (RFC 8693 style), ``{"client_id": "<app>"}``,
-      naming the application that obtained the grant so every action is
-      attributable to it.
+      naming the application the token acts on behalf of so every action
+      is attributable to it.
+
+    The two claims are independent: a device grant carries both, a login
+    grant only ``grant_id``, a machine client only ``scope``.
 
     :param user_id: The Omnigent identity the token acts as (``sub``).
     :param cookie_secret: HMAC key for HS256 signing.
     :param ttl_seconds: Token lifetime in seconds (kept short — ≤ 1 h).
     :param provider: Identity provider name (informational claim).
-    :param grant_id: The grant id.
+    :param grant_id: The grant id, or ``None`` for a client-credentials
+        token (no ``grant_id`` claim is emitted). Required keyword with no
+        default: omitting it must be a deliberate statement, since a token
+        that silently loses the claim also skips the revocation lookup.
     :param client_id: The client id (the requesting application,
         e.g. ``"slack"``); recorded in the ``act`` claim for audit.
     :param jti: Unique token id.
@@ -229,18 +247,16 @@ def mint_delegated_token(
         "iat": now,
         "exp": now + ttl_seconds,
         "provider": provider,
-        "grant_id": grant_id,
         "jti": jti,
         "act": {"client_id": client_id},
     }
+    if account_generation is not None:
+        payload["account_generation"] = account_generation
+    if grant_id is not None:
+        payload["grant_id"] = grant_id
     if scope is not None:
         payload["scope"] = scope
     return jwt.encode(payload, cookie_secret, algorithm="HS256")
-
-
-def _oauth_error(error: str, status_code: int = 400) -> JSONResponse:
-    """Return an RFC 6749 / 8628 shaped OAuth error response."""
-    return JSONResponse(status_code=status_code, content={"error": error})
 
 
 def _require_browser_origin(request: Request) -> None:
@@ -270,59 +286,6 @@ _AUTHORIZE_RATE_WINDOW_SECONDS = 60  # …per client per this window.
 # Purge expired/dead grants at most this often (piggybacked on authorize
 # so no scheduler is required — keeps the table bounded under load).
 _PURGE_MIN_INTERVAL_SECONDS = 300
-
-
-# Hard cap on distinct keys the limiter tracks at once. Bounds memory even
-# under a spray from many source IPs (e.g. a whole IPv6 /64) — without it a
-# key hit once and never revisited would live forever. When the cap is hit
-# the whole table is swept of aged-out keys; if still full, the limiter
-# fails OPEN for a new key (availability over a soft throttle — the real
-# anti-abuse control in production is the confidential client secret).
-_RATE_LIMITER_MAX_KEYS = 10_000
-
-
-class _SlidingWindowRateLimiter:
-    """Minimal per-key sliding-window limiter (in-memory, single-process).
-
-    Keyed by client IP. Adequate for a single-process socket-mode
-    deployment; a multi-replica server would want a shared store, but the
-    grant table's own single-use/expiry semantics already bound abuse.
-
-    Memory is bounded by :data:`_RATE_LIMITER_MAX_KEYS`: keys are dropped
-    when they age out (on touch) and, when the cap is reached, a full sweep
-    reclaims every aged-out key before admitting a new one.
-    """
-
-    def __init__(self, max_events: int, window_seconds: int, max_keys: int) -> None:
-        self._max = max_events
-        self._window = window_seconds
-        self._max_keys = max_keys
-        self._hits: dict[str, list[float]] = {}
-
-    def _sweep(self, cutoff: float) -> None:
-        """Drop every key whose hits have all aged out."""
-        dead = [k for k, ts in self._hits.items() if not any(t > cutoff for t in ts)]
-        for k in dead:
-            self._hits.pop(k, None)
-
-    def allow(self, key: str, now: float) -> bool:
-        cutoff = now - self._window
-        # New key while at capacity: sweep aged-out keys first; if the table
-        # is still full of live keys, fail open rather than grow unbounded.
-        if key not in self._hits and len(self._hits) >= self._max_keys:
-            self._sweep(cutoff)
-            if len(self._hits) >= self._max_keys:
-                return True
-        hits = [t for t in self._hits.get(key, ()) if t > cutoff]
-        # Opportunistically bound memory: drop keys that fully aged out.
-        if not hits:
-            self._hits.pop(key, None)
-        if len(hits) >= self._max:
-            self._hits[key] = hits
-            return False
-        hits.append(now)
-        self._hits[key] = hits
-        return True
 
 
 def _resolve_signing_config(auth_provider: UnifiedAuthProvider) -> tuple[bytes, str]:
@@ -404,6 +367,7 @@ def create_oauth_token_router(
     device_grant_store: DeviceGrantStore,
     *,
     handle_device_code: Callable[[str], Response] | None = None,
+    handle_client_credentials: Callable[[Request, FormData], Response] | None = None,
     client_secret_ok: Callable[[Request], bool] | None = None,
 ) -> APIRouter:
     """Build the ``/oauth/token`` + ``/oauth/revoke`` router.
@@ -414,6 +378,11 @@ def create_oauth_token_router(
     RFC 8628 device-code consent flow (which stays accounts-only behind
     ``OMNIGENT_DEVICE_GRANT_ENABLED``).
 
+    This is the app's ONE ``POST /oauth/token``. Every grant type dispatches
+    from the single handler below, and a grant with no handler injected
+    answers ``unsupported_grant_type`` — a second router claiming the same
+    path would be shadowed silently, since FastAPI resolves first-match-wins.
+
     :param auth_provider: The active provider — ``accounts`` or ``oidc``.
     :param device_grant_store: Persistence for grants.
     :param handle_device_code: Optional device-code grant handler.
@@ -421,6 +390,11 @@ def create_oauth_token_router(
         the full flow keeps one token endpoint; standalone mounts leave
         it ``None`` and ``device_code`` exchanges get
         ``unsupported_grant_type``.
+    :param handle_client_credentials: Optional client-credentials grant
+        handler, from
+        :func:`omnigent.server.routes.client_credentials.create_client_credentials_handler`.
+        ``None`` (no machine client configured) leaves that grant type
+        answering ``unsupported_grant_type``.
     :param client_secret_ok: Optional client-secret gate (callable that validates
         the request). When ``None`` (standalone mounts), builds the gate from
         the ``OMNIGENT_DEVICE_CLIENT_SECRET`` env var. When provided
@@ -458,6 +432,12 @@ def create_oauth_token_router(
             _logger.debug("oauth/token: opportunistic grant purge failed", exc_info=True)
 
     def _issue_access_token(grant_id: str, user_id: str, client_id: str) -> str:
+        grant = device_grant_store.authorize_access(grant_id)
+        if grant is None or (
+            auth_provider._source == "accounts"
+            and not auth_provider.accepts_account_generation(user_id, grant.account_generation)
+        ):
+            raise OmnigentError("grant authority has been revoked", code=ErrorCode.UNAUTHORIZED)
         # A first-party login grant renews with the SAME authority as the
         # session JWT it replaces (scope=None); a third-party device grant
         # stays restricted to the delegated allowlist.
@@ -467,6 +447,7 @@ def create_oauth_token_router(
             cookie_secret,
             _ACCESS_TOKEN_TTL_SECONDS,
             provider_name,
+            account_generation=grant.account_generation,
             grant_id=grant_id,
             client_id=client_id or "",
             jti=secrets.token_urlsafe(16),
@@ -475,11 +456,11 @@ def create_oauth_token_router(
 
     @router.post("/oauth/token", dependencies=[])
     async def token(request: Request) -> Response:
-        """Exchange a device_code or refresh_token for an access token.
+        """Exchange a device_code, refresh_token or client credential.
 
         RFC 8628 / 6749 error shapes: ``authorization_pending``,
         ``slow_down``, ``expired_token``, ``access_denied``,
-        ``invalid_grant``, ``unsupported_grant_type``.
+        ``invalid_grant``, ``invalid_client``, ``unsupported_grant_type``.
         """
         form = await request.form()
         grant_type = str(form.get("grant_type") or "")
@@ -494,9 +475,22 @@ def create_oauth_token_router(
                 return _oauth_error("invalid_client", status_code=401)
             if handle_device_code is None:
                 return _oauth_error("unsupported_grant_type")
-            return handle_device_code(str(form.get("device_code") or ""))
+            try:
+                return handle_device_code(str(form.get("device_code") or ""))
+            except OmnigentError:
+                return _oauth_error("invalid_grant")
         if grant_type == "refresh_token":
-            return _handle_refresh_grant(str(form.get("refresh_token") or ""))
+            try:
+                return _handle_refresh_grant(str(form.get("refresh_token") or ""))
+            except OmnigentError:
+                return _oauth_error("invalid_grant")
+        if grant_type == "client_credentials":
+            # RFC 6749 §4.4: the machine client presents its OWN credential,
+            # so it authenticates itself rather than passing the device
+            # client-secret gate. Its handler carries the throttle.
+            if handle_client_credentials is None:
+                return _oauth_error("unsupported_grant_type")
+            return handle_client_credentials(request, form)
         return _oauth_error("unsupported_grant_type")
 
     def _handle_refresh_grant(refresh_token: str) -> Response:
@@ -549,6 +543,7 @@ def create_oauth_token_router(
                     "token_type": "Bearer",
                     "expires_in": _ACCESS_TOKEN_TTL_SECONDS,
                 },
+                headers=NO_STORE_HEADERS,
             )
 
         new_refresh = _mint_refresh_token()
@@ -579,6 +574,7 @@ def create_oauth_token_router(
                 "token_type": "Bearer",
                 "expires_in": _ACCESS_TOKEN_TTL_SECONDS,
             },
+            headers=NO_STORE_HEADERS,
         )
 
     # ── Revocation ────────────────────────────────────────────────
@@ -630,6 +626,8 @@ def create_oauth_token_router(
 def create_device_auth_router(
     auth_provider: UnifiedAuthProvider,
     device_grant_store: DeviceGrantStore,
+    *,
+    handle_client_credentials: Callable[[Request, FormData], Response] | None = None,
 ) -> APIRouter:
     """Build the ``/oauth/*`` device-grant router.
 
@@ -638,6 +636,9 @@ def create_device_auth_router(
         and public base URL. Header mode has no server-mintable identity
         and raises.
     :param device_grant_store: Persistence for device grants.
+    :param handle_client_credentials: Optional client-credentials handler,
+        forwarded to the token router this builds. The device flow and the
+        machine grant share that one ``POST /oauth/token``.
     :returns: APIRouter to mount at the app root.
     """
     cookie_secret, provider_name = _resolve_signing_config(auth_provider)
@@ -665,19 +666,26 @@ def create_device_auth_router(
     _grant_max_lifetime = _grant_max_lifetime_seconds()
 
     router = APIRouter()
-    _rate_limiter = _SlidingWindowRateLimiter(
-        _AUTHORIZE_RATE_MAX, _AUTHORIZE_RATE_WINDOW_SECONDS, _RATE_LIMITER_MAX_KEYS
+    _rate_limiter = SlidingWindowRateLimiter(
+        _AUTHORIZE_RATE_MAX, _AUTHORIZE_RATE_WINDOW_SECONDS, RATE_LIMITER_MAX_KEYS
     )
     # Last time we purged expired grants; gates the opportunistic purge on
     # authorize so the table stays bounded without a separate scheduler.
     _last_purge = {"at": 0.0}
 
     def _issue_access_token(grant_id: str, user_id: str, client_id: str) -> str:
+        grant = device_grant_store.authorize_access(grant_id)
+        if grant is None or (
+            auth_provider._source == "accounts"
+            and not auth_provider.accepts_account_generation(user_id, grant.account_generation)
+        ):
+            raise OmnigentError("grant authority has been revoked", code=ErrorCode.UNAUTHORIZED)
         return mint_delegated_token(
             user_id,
             cookie_secret,
             _ACCESS_TOKEN_TTL_SECONDS,
             provider_name,
+            account_generation=grant.account_generation,
             grant_id=grant_id,
             client_id=client_id or "",
             jti=secrets.token_urlsafe(16),
@@ -744,7 +752,14 @@ def create_device_auth_router(
             created_at=now,
             expires_at=now + _DEVICE_CODE_TTL_SECONDS,
         )
-        verification_uri = f"{base_url}/oauth/device"
+        # Advertise the verification URL under the deployment base path so a
+        # subpath-only proxy can route the user to the consent page. Skip when
+        # base_url already carries it (accounts mode's public base_url may).
+        base_path: str = getattr(request.app.state, "base_path", "")
+        public_base = base_url.rstrip("/")
+        if base_path and not public_base.endswith(base_path):
+            public_base = f"{public_base}{base_path}"
+        verification_uri = f"{public_base}/oauth/device"
         verification_uri_complete = f"{verification_uri}?user_code={user_code}"
         _logger.info("device/authorize: issued grant for client=%s", client_id)
         return JSONResponse(
@@ -757,19 +772,24 @@ def create_device_auth_router(
                 "expires_in": _DEVICE_CODE_TTL_SECONDS,
                 "interval": _POLL_INTERVAL_SECONDS,
             },
+            # RFC 8628 §3.2 carries the bearer device_code and user_code here,
+            # so this body is as sensitive as a token response.
+            headers=NO_STORE_HEADERS,
         )
 
     # ── Browser consent page ──────────────────────────────────────
 
-    def _bounce_to_login(user_code: str, *, reauth: bool) -> RedirectResponse:
+    def _bounce_to_login(request: Request, user_code: str, *, reauth: bool) -> RedirectResponse:
         """302 to the login page, returning to this consent URL afterward.
 
         ``reauth`` adds ``&reauth=1`` so the login page forces a fresh
         password submit instead of auto-bouncing an already-signed-in user
         (which would loop back here with the same stale session).
         """
-        login_url = auth_provider.login_url or "/login"
-        return_to = f"/oauth/device?user_code={user_code}" if user_code else "/oauth/device"
+        base_path: str = getattr(request.app.state, "base_path", "")
+        login_url = base_path + (auth_provider.login_url or "/login")
+        return_to_path = f"/oauth/device?user_code={user_code}" if user_code else "/oauth/device"
+        return_to = base_path + return_to_path
         query = f"return_to={html.escape(return_to, quote=True)}"
         if reauth:
             query += "&reauth=1"
@@ -814,11 +834,14 @@ def create_device_auth_router(
         """
         user_id = auth_provider.get_user_id(request)
         user_code = (request.query_params.get("user_code") or "").strip()
+        base_path: str = getattr(request.app.state, "base_path", "")
         if user_id is None:
-            return _bounce_to_login(user_code, reauth=False)
+            return _bounce_to_login(request, user_code, reauth=False)
 
         if not user_code:
-            return HTMLResponse(_consent_html(prompt_for_code=True), status_code=200)
+            return HTMLResponse(
+                _consent_html(prompt_for_code=True, base_path=base_path), status_code=200
+            )
 
         grant = device_grant_store.get_by_user_code(user_code)
         now = int(time.time())
@@ -834,13 +857,14 @@ def create_device_auth_router(
         # rather than auto-returning the stale session (which would loop).
         session_iat = _session_iat(request)
         if session_iat is None or session_iat < grant.created_at:
-            return _bounce_to_login(user_code, reauth=True)
+            return _bounce_to_login(request, user_code, reauth=True)
 
         return HTMLResponse(
             _consent_html(
                 user_code=user_code,
                 user_id=user_id,
                 client_id=grant.client_id,
+                base_path=base_path,
             ),
             status_code=200,
         )
@@ -967,6 +991,7 @@ def create_device_auth_router(
                 "token_type": "Bearer",
                 "expires_in": _ACCESS_TOKEN_TTL_SECONDS,
             },
+            headers=NO_STORE_HEADERS,
         )
 
     router.include_router(
@@ -974,6 +999,7 @@ def create_device_auth_router(
             auth_provider,
             device_grant_store,
             handle_device_code=_handle_device_code_grant,
+            handle_client_credentials=handle_client_credentials,
             client_secret_ok=_client_secret_ok,
         )
     )
@@ -990,6 +1016,7 @@ def _consent_html(
     error: str = "",
     approved_as: str = "",
     denied: bool = False,
+    base_path: str = "",
 ) -> str:
     """Render the minimal, dependency-free consent page.
 
@@ -997,6 +1024,10 @@ def _consent_html(
     All interpolated values are HTML-escaped. The page is intentionally
     self-contained (no JS framework) so it works regardless of the
     server's front-end build.
+
+    The form actions carry *base_path* (e.g. ``"/proxy/6767"``) so the consent
+    POST/GET reaches the app behind a prefix-stripping proxy; this page is not
+    run through the SPA HTML rewrite. Empty for a root deployment (unchanged).
     """
 
     def esc(value: object) -> str:
@@ -1017,7 +1048,7 @@ def _consent_html(
     elif prompt_for_code:
         body = (
             "<h1>Link your account</h1>"
-            '<form method="get" action="/oauth/device">'
+            f'<form method="get" action="{base_path}/oauth/device">'
             "<label>Enter the code shown by the application:"
             '<input name="user_code" autofocus placeholder="XXXX-XXXX"></label>'
             '<button type="submit">Continue</button></form>'
@@ -1032,10 +1063,10 @@ def _consent_html(
             "login and this code matches the one the application showed you. If "
             "you didn't start it, click Deny — approving lets the application "
             "act as you.</p>"
-            '<form method="post" action="/oauth/device/approve" class="row">'
+            f'<form method="post" action="{base_path}/oauth/device/approve" class="row">'
             f'<input type="hidden" name="user_code" value="{esc(user_code)}">'
             '<button type="submit" class="primary">Approve</button></form>'
-            '<form method="post" action="/oauth/device/deny" class="row">'
+            f'<form method="post" action="{base_path}/oauth/device/deny" class="row">'
             f'<input type="hidden" name="user_code" value="{esc(user_code)}">'
             '<button type="submit">Deny</button></form>'
         )

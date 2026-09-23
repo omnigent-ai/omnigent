@@ -912,7 +912,7 @@ async def _list_sessions_with_retry(
     agent_name: str | None = None,
     order: str = "desc",
 ) -> list[SessionListItem]:
-    """Call ``client.sessions.list`` with bounded retries on 429.
+    """List the caller's own sessions with bounded retries on 429.
 
     A transient rate-limit on the picker's single list call should not
     abort the resume journey: retry on the short
@@ -935,12 +935,16 @@ async def _list_sessions_with_retry(
     for delay_s in _SESSION_LIST_RETRY_DELAYS_S:
         try:
             return await client.sessions.list(
-                limit=limit, agent_id=agent_id, agent_name=agent_name, order=order
+                limit=limit,
+                agent_id=agent_id,
+                agent_name=agent_name,
+                order=order,
+                visibility="mine",
             )
         except RateLimitedError:
             await asyncio.sleep(delay_s)
     return await client.sessions.list(
-        limit=limit, agent_id=agent_id, agent_name=agent_name, order=order
+        limit=limit, agent_id=agent_id, agent_name=agent_name, order=order, visibility="mine"
     )
 
 
@@ -957,7 +961,7 @@ async def pick_conversation_from_sdk(
 
     Sessions API filters by direct ``conversation.agent_id`` (not via
     ``task.agent_id``) so wrapper sessions without task rows still
-    appear; also enforces ``has_agent_id`` and ``accessible_by`` server-side.
+    appear; also enforces ``has_agent_id`` and ownership server-side.
 
     :param agent_id: Scope to this agent; ``None`` lists across agents.
     :param agent_name_filter: Scope to sessions whose bound agent row
@@ -988,8 +992,8 @@ async def pick_conversation_by_wrapper_label_from_sdk(
 
     Wrapper invocations (claude-native today) upload a fresh agent
     bundle per session, so ``agents.get_by_name`` returns no canonical
-    record — agent-id filtering can't be used. List every session the
-    caller can see and filter by the wrapper label client-side.
+    record — agent-id filtering can't be used. List the caller's own
+    sessions and filter by the wrapper label client-side.
 
     Renders workspace metadata so the user can see which cwd each
     session was launched from -- claude --resume requires cwd parity
@@ -1036,19 +1040,15 @@ async def pick_conversation_cross_agent_from_sdk(
     out: TextIO | None = None,
     in_: TextIO | None = None,
 ) -> str | None:
-    """Cross-agent variant: lists every session the caller can see
+    """Cross-agent variant: lists the caller's own sessions
     via ``/v1/sessions`` and renders runtime metadata for
     ``omnigent resume``'s runtime-dispatch UX.
 
-    ``/v1/sessions`` returns every session the caller can *access*,
-    which includes ones merely shared with them. Resume is an
-    owner-only action — the server rejects binding a runner to a
-    session you don't own (``PATCH /v1/sessions/{id}`` → 403) — so a
-    shared row in this picker is a dead end. When ``owner_user_id`` is
-    set, drop the rows this caller does not own so ``omnigent resume``
-    lists only their own sessions. ``None`` leaves the list unfiltered:
-    the caller's identity could not be resolved, or the server runs
-    without permissions (``owner`` unset, no sharing to filter).
+    Resume requires ownership to bind a runner, so request
+    ``visibility="mine"``. When ``owner_user_id`` is set, also filter
+    the returned rows for older servers that ignore visibility.
+    ``None`` skips this fallback when identity could not be resolved
+    or the server runs without permissions.
     """
     convos = await _list_sessions_with_retry(client, limit=200, agent_id=None, order="desc")
     if owner_user_id is not None:

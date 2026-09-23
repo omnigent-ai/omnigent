@@ -1,7 +1,7 @@
 {
   "name": "omnigent-desktop-electron",
   "productName": "Omnigent",
-  "version": "0.12.0",
+  "version": "0.14.0",
   "description": "Omnigent desktop shell (Electron edition) \u2014 a thin native wrapper around the server-served web UI.",
   "private": true,
   "main": "src/main.js",
@@ -35,6 +35,7 @@
   "devDependencies": {
     "electron": "^42.3.2",
     "electron-builder": "^26.0.0",
+    "jsdom": "^29.1.1",
     "playwright": "^1.62.1"
   },
   "build": {
@@ -62,6 +63,8 @@
     "files": [
       "src/**/*",
       "about/**/*",
+      "browser-permission/**/*",
+      "workspace-picker/**/*",
       "setup/**/*",
       "arca-connect/**/*",
       "server-selector-v2/**/*",
@@ -170,6 +173,6 @@
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/xterm": "^6.0.0",
     "electron-updater": "^6.3.9",
-    "js-yaml": "^4.3.1"
+    "js-yaml": "^4.3.2"
   }
 }

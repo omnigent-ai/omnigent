@@ -19,7 +19,7 @@ import logging
 import secrets
 from typing import Any
 
-from omnigent.host.frames import HostFsRequestFrame, encode_host_frame
+from omnigent.host.frames import HostFsRequestFrame, HostFsWriteFrame, encode_host_frame
 from omnigent.server.host_registry import HostConnection, HostRegistry
 
 _logger = logging.getLogger(__name__)
@@ -129,6 +129,81 @@ async def read_workspace_from_host(
     status = result.get("error_status")
     code = result.get("error_code") or "fs_read_failed"
     message = result.get("error") or "host filesystem read failed"
+    if not isinstance(status, int):
+        status = 500
+    raise HostFsError(status, str(code), str(message))
+
+
+async def write_workspace_from_host(
+    *,
+    host_registry: HostRegistry,
+    host_conn: HostConnection,
+    op: str,
+    workspace: str,
+    session_id: str,
+    params: dict[str, Any],
+) -> dict[str, Any]:
+    """Send a ``host.fs_write_request`` frame and await its result.
+
+    The write counterpart of :func:`read_workspace_from_host` — for the small set
+    of host-servable writes (currently ``"github_set_preference"``) so a
+    preference change works when the session's runner is offline. Shares the
+    result frame, the ``pending_fs_requests`` correlation map, and the error
+    mapping with reads.
+
+    :param op: Write op name — currently ``"github_set_preference"``.
+    :param params: Operation-specific arguments, e.g. ``{"account": ...}``.
+    :returns: The refreshed payload on success.
+    :raises HostFsError: When the host reports a failure (reproduces the runner's
+        response).
+    :raises HostFsUnavailableError: On connection loss or timeout.
+    """
+    request_id = secrets.token_hex(8)
+    frame = encode_host_frame(
+        HostFsWriteFrame(
+            request_id=request_id,
+            op=op,
+            workspace=workspace,
+            session_id=session_id,
+            params=params,
+        )
+    )
+    future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
+    host_conn.pending_fs_requests[request_id] = future
+    try:
+        try:
+            host_registry.send_text(host_conn, frame)
+        except ConnectionError as exc:
+            raise HostFsUnavailableError(
+                f"host '{host_conn.host_id}' connection lost during fs write"
+            ) from exc
+        try:
+            result = await asyncio.wait_for(future, timeout=_FS_TIMEOUT_S)
+        except asyncio.TimeoutError as exc:
+            _logger.warning(
+                "host '%s' did not answer fs write op %r within %.0fs",
+                host_conn.host_id,
+                op,
+                _FS_TIMEOUT_S,
+            )
+            raise HostFsUnavailableError(
+                f"host '{host_conn.host_id}' did not respond to fs write within "
+                f"{_FS_TIMEOUT_S:.0f}s (it may be running an older version)"
+            ) from exc
+    finally:
+        host_conn.pending_fs_requests.pop(request_id, None)
+
+    if result.get("status") == "ok":
+        payload = result.get("payload")
+        if not isinstance(payload, dict):
+            raise HostFsUnavailableError(
+                f"host '{host_conn.host_id}' returned an incomplete fs write result"
+            )
+        return payload
+
+    status = result.get("error_status")
+    code = result.get("error_code") or "fs_write_failed"
+    message = result.get("error") or "host filesystem write failed"
     if not isinstance(status, int):
         status = 500
     raise HostFsError(status, str(code), str(message))

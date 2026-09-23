@@ -4,6 +4,7 @@ import asyncio
 import base64
 import contextlib
 import json
+import os
 import stat
 import tempfile
 import unittest
@@ -18,6 +19,7 @@ from omnigent.inner.codex_executor import (
     _TURN_EVENT_WARN_SECONDS,
     CodexExecutor,
     _build_initial_prompt,
+    _clean_codex_env,
     _codex_builtin_tool_completion,
     _codex_cli_version,
     _CodexAppServerSession,
@@ -28,6 +30,10 @@ from omnigent.inner.codex_executor import (
     _prompt_for_turn,
     _provider_codex_config_overrides,
     _to_codex_input_items,
+)
+from omnigent.inner.codex_goal_command import (
+    GOAL_OBJECTIVE_MAX_CHARS,
+    goal_objective_length_error,
 )
 from omnigent.inner.executor import (
     ExecutorError,
@@ -154,6 +160,7 @@ class TestCodexExecutor(unittest.TestCase):
         self.assertFalse(any("/serving-endpoints" in item for item in overrides))
         self.assertTrue(any('auth={command="sh"' in item for item in overrides))
         self.assertTrue(any("databricks auth token --host" in item for item in overrides))
+        self.assertTrue(any("timeout_ms=15000" in item for item in overrides))
         self.assertTrue(any("refresh_interval_ms=900000" in item for item in overrides))
         self.assertFalse(any('env_key="DATABRICKS_TOKEN"' in item for item in overrides))
 
@@ -239,8 +246,14 @@ class TestCodexExecutor(unittest.TestCase):
                 for override in executor._codex_config_overrides
             )
         )
+        # Scope to the CLI mint: it selects by --profile. The sdk fallback
+        # separately passes --host for its own workspace guard (identity is
+        # still pinned by --profile), so assert on the mint, not the overrides.
         self.assertFalse(
-            any("--host" in override for override in executor._codex_config_overrides)
+            any(
+                "databricks auth token --host" in override
+                for override in executor._codex_config_overrides
+            )
         )
         # `--force-refresh` only exists in Databricks CLI >= v0.296.0, so it
         # stays behind a `--help` capability probe — an older CLI rejects the
@@ -379,6 +392,13 @@ class TestCodexExecutor(unittest.TestCase):
                 ]
             )
         )
+
+    def test_goal_objective_length_error_boundary(self):
+        self.assertIsNone(goal_objective_length_error("x" * GOAL_OBJECTIVE_MAX_CHARS))
+        message = goal_objective_length_error("x" * (GOAL_OBJECTIVE_MAX_CHARS + 1))
+        self.assertIsNotNone(message)
+        self.assertIn(str(GOAL_OBJECTIVE_MAX_CHARS + 1), message)
+        self.assertIn(str(GOAL_OBJECTIVE_MAX_CHARS), message)
 
     def test_run_turn_delegates_to_app_server_session(self):
         async def _t():
@@ -677,6 +697,60 @@ class TestCodexExecutor(unittest.TestCase):
                     }
                 ],
             )
+
+        _run(_t())
+
+    def test_app_server_overlong_goal_fails_clearly_without_goal_set(self):
+        """A ``/goal`` past Codex's 4000-char cap never reaches thread/goal/set."""
+
+        async def _t():
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo",
+                cwd="/tmp/workspace",
+                env={},
+                tool_executor=None,
+            )
+            session.start = AsyncMock()
+            session._proc = _FakeProcess()
+            session._request = AsyncMock(
+                side_effect=[
+                    {"result": {"thread": {"id": "thread-1"}}},
+                    {"result": {"goal": {"objective": "x"}}},
+                    {"result": {"turn": {"id": "turn-1"}}},
+                ]
+            )
+
+            async def _inject_turn_completed() -> None:
+                await asyncio.sleep(0.01)
+                session._events.put_nowait(
+                    {"method": "turn/completed", "params": {"turn": {"id": "turn-1"}}}
+                )
+
+            inject_task = asyncio.create_task(_inject_turn_completed())
+            events = []
+            async for event in session.run_turn(
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "/goal " + "x" * 4001}],
+                    }
+                ],
+                tools=[],
+                system_prompt="",
+                model="gpt-5.4-mini",
+                cwd=".",
+                sandbox="workspace-write",
+            ):
+                events.append(event)
+            await inject_task
+
+            self.assertEqual([type(event) for event in events], [ExecutorError])
+            message = events[0].message
+            # A clear client-side limit message, not the raw JSON-RPC payload.
+            self.assertIn("4000", message)
+            self.assertNotIn("-32600", message)
+            methods = [call.args[0] for call in session._request.await_args_list]
+            self.assertNotIn("thread/goal/set", methods)
 
         _run(_t())
 
@@ -1420,12 +1494,285 @@ class TestCodexExecutor(unittest.TestCase):
                     "input_tokens": 100,
                     "output_tokens": 25,
                     "total_tokens": 125,
+                    "context_tokens": 125,
                     "model": "gpt-5.4-mini",
                 },
             )
             # The cached usage must be cleared after consumption so the next
             # turn doesn't inherit stale numbers.
             self.assertIsNone(session._last_turn_usage)
+
+        _run(_t())
+
+    @staticmethod
+    def _usage_update_event(
+        turn_id: str, last: dict[str, int], total: dict[str, int]
+    ) -> dict[str, object]:
+        return {
+            "method": "thread/tokenUsage/updated",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": turn_id,
+                "tokenUsage": {"last": last, "total": total},
+            },
+        }
+
+    def test_app_server_run_turn_accumulates_multi_request_token_usage(self):
+        """A multi-request turn reports the delta of cumulative thread usage.
+
+        ``tokenUsage.last`` covers only the newest model request, so a turn
+        spanning model -> tool -> model would be accounted as just its final
+        request. The turn's billing usage must instead be the growth of the
+        cumulative ``tokenUsage.total`` counters across the whole turn, while
+        ``context_tokens`` (window fill) stays the latest ``last`` snapshot
+        (1350 here) — not the billed total (2450).
+        """
+
+        async def _t():
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo",
+                cwd="/tmp/workspace",
+                env={},
+                tool_executor=None,
+            )
+            session.start = AsyncMock()
+            session._proc = _FakeProcess()
+            session.thread_id = "thread-1"
+            session._request = AsyncMock(return_value={"result": {"turn": {"id": "turn-1"}}})
+
+            async def _inject_events() -> None:
+                await asyncio.sleep(0.01)
+                session._events.put_nowait(
+                    self._usage_update_event(
+                        "turn-1",
+                        last={
+                            "inputTokens": 1000,
+                            "cachedInputTokens": 800,
+                            "outputTokens": 100,
+                            "totalTokens": 1100,
+                        },
+                        total={
+                            "inputTokens": 1000,
+                            "cachedInputTokens": 800,
+                            "outputTokens": 100,
+                            "totalTokens": 1100,
+                        },
+                    )
+                )
+                session._events.put_nowait(
+                    self._usage_update_event(
+                        "turn-1",
+                        last={
+                            "inputTokens": 1200,
+                            "cachedInputTokens": 1000,
+                            "outputTokens": 150,
+                            "totalTokens": 1350,
+                        },
+                        total={
+                            "inputTokens": 2200,
+                            "cachedInputTokens": 1800,
+                            "outputTokens": 250,
+                            "totalTokens": 2450,
+                        },
+                    )
+                )
+                session._events.put_nowait(
+                    {
+                        "method": "turn/completed",
+                        "params": {"turn": {"id": "turn-1"}},
+                    }
+                )
+
+            inject_task = asyncio.create_task(_inject_events())
+            events = [
+                event
+                async for event in session.run_turn(
+                    messages=[{"role": "user", "content": "hi"}],
+                    tools=[],
+                    system_prompt="",
+                    model="gpt-5.4-mini",
+                    cwd=".",
+                    sandbox="workspace-write",
+                )
+            ]
+            await inject_task
+
+            self.assertEqual(len(events), 1)
+            self.assertIsInstance(events[0], TurnComplete)
+            self.assertEqual(
+                events[0].usage,
+                {
+                    "input_tokens": 400,
+                    "output_tokens": 250,
+                    "total_tokens": 2450,
+                    "cache_read_input_tokens": 1800,
+                    "context_tokens": 1350,
+                    "model": "gpt-5.4-mini",
+                },
+            )
+
+        _run(_t())
+
+    def test_app_server_next_turn_usage_excludes_prior_turns(self):
+        """A later turn on the same thread reports only its own token growth.
+
+        ``tokenUsage.total`` is cumulative across the whole thread, so the
+        second turn's billing usage must be diffed against the counters
+        consumed at the first turn's boundary — not reported as the thread
+        total. ``context_tokens`` (window fill) is the opposite: it stays the
+        latest cumulative snapshot (2450), so the two diverge on turn two.
+        """
+
+        async def _t():
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo",
+                cwd="/tmp/workspace",
+                env={},
+                tool_executor=None,
+            )
+            session.start = AsyncMock()
+            session._proc = _FakeProcess()
+            session.thread_id = "thread-1"
+            session._request = AsyncMock(return_value={"result": {"turn": {"id": "turn-1"}}})
+
+            async def _run_one_turn(total: dict[str, int]) -> TurnComplete:
+                async def _inject_events() -> None:
+                    await asyncio.sleep(0.01)
+                    session._events.put_nowait(
+                        self._usage_update_event("turn-1", last=total, total=total)
+                    )
+                    session._events.put_nowait(
+                        {
+                            "method": "turn/completed",
+                            "params": {"turn": {"id": "turn-1"}},
+                        }
+                    )
+
+                inject_task = asyncio.create_task(_inject_events())
+                events = [
+                    event
+                    async for event in session.run_turn(
+                        messages=[{"role": "user", "content": "hi"}],
+                        tools=[],
+                        system_prompt="",
+                        model="gpt-5.4-mini",
+                        cwd=".",
+                        sandbox="workspace-write",
+                    )
+                ]
+                await inject_task
+                self.assertEqual(len(events), 1)
+                self.assertIsInstance(events[0], TurnComplete)
+                return events[0]
+
+            first = await _run_one_turn(
+                {
+                    "inputTokens": 1000,
+                    "cachedInputTokens": 800,
+                    "outputTokens": 100,
+                    "totalTokens": 1100,
+                }
+            )
+            self.assertEqual(
+                first.usage,
+                {
+                    "input_tokens": 200,
+                    "output_tokens": 100,
+                    "total_tokens": 1100,
+                    "cache_read_input_tokens": 800,
+                    "context_tokens": 1100,
+                    "model": "gpt-5.4-mini",
+                },
+            )
+
+            second = await _run_one_turn(
+                {
+                    "inputTokens": 2200,
+                    "cachedInputTokens": 1800,
+                    "outputTokens": 250,
+                    "totalTokens": 2450,
+                }
+            )
+            self.assertEqual(
+                second.usage,
+                {
+                    "input_tokens": 200,
+                    "output_tokens": 150,
+                    "total_tokens": 1350,
+                    "cache_read_input_tokens": 1000,
+                    "context_tokens": 2450,
+                    "model": "gpt-5.4-mini",
+                },
+            )
+
+        _run(_t())
+
+    def test_app_server_run_turn_usage_falls_back_to_last_without_total(self):
+        """Without a ``total`` breakdown, usage falls back to ``last``."""
+
+        async def _t():
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo",
+                cwd="/tmp/workspace",
+                env={},
+                tool_executor=None,
+            )
+            session.start = AsyncMock()
+            session._proc = _FakeProcess()
+            session.thread_id = "thread-1"
+            session._request = AsyncMock(return_value={"result": {"turn": {"id": "turn-1"}}})
+
+            async def _inject_events() -> None:
+                await asyncio.sleep(0.01)
+                session._events.put_nowait(
+                    {
+                        "method": "thread/tokenUsage/updated",
+                        "params": {
+                            "threadId": "thread-1",
+                            "turnId": "turn-1",
+                            "tokenUsage": {
+                                "last": {
+                                    "inputTokens": 100,
+                                    "outputTokens": 25,
+                                    "totalTokens": 125,
+                                }
+                            },
+                        },
+                    }
+                )
+                session._events.put_nowait(
+                    {
+                        "method": "turn/completed",
+                        "params": {"turn": {"id": "turn-1"}},
+                    }
+                )
+
+            inject_task = asyncio.create_task(_inject_events())
+            events = [
+                event
+                async for event in session.run_turn(
+                    messages=[{"role": "user", "content": "hi"}],
+                    tools=[],
+                    system_prompt="",
+                    model="gpt-5.4-mini",
+                    cwd=".",
+                    sandbox="workspace-write",
+                )
+            ]
+            await inject_task
+
+            self.assertEqual(len(events), 1)
+            self.assertIsInstance(events[0], TurnComplete)
+            self.assertEqual(
+                events[0].usage,
+                {
+                    "input_tokens": 100,
+                    "output_tokens": 25,
+                    "total_tokens": 125,
+                    "context_tokens": 125,
+                    "model": "gpt-5.4-mini",
+                },
+            )
 
         _run(_t())
 
@@ -1663,9 +2010,11 @@ class TestCodexExecutor(unittest.TestCase):
                 )
             ]
 
-            self.assertEqual(len(events), 1)
-            self.assertIsInstance(events[0], TurnComplete)
-            self.assertEqual(events[0].response, "done")
+            self.assertEqual(len(events), 2)
+            self.assertIsInstance(events[0], TextChunk)
+            self.assertEqual(events[0].text, "done")
+            self.assertIsInstance(events[1], TurnComplete)
+            self.assertEqual(events[1].response, "done")
 
         _run(_t())
 
@@ -2528,6 +2877,158 @@ def test_extract_codex_last_turn_usage_handles_missing_or_malformed() -> None:
     assert _extract_codex_last_turn_usage({"tokenUsage": {"total": {}}}, "gpt-5.4-mini") is None
 
 
+def test_extract_codex_thread_total_usage_reads_cumulative_counters() -> None:
+    """``tokenUsage.total`` yields the raw cumulative thread counters."""
+    from omnigent.inner.codex_executor import _extract_codex_thread_total_usage
+
+    params = {
+        "tokenUsage": {
+            "last": {"inputTokens": 5, "outputTokens": 2, "totalTokens": 7},
+            "total": {
+                "inputTokens": 100,
+                "cachedInputTokens": 40,
+                "outputTokens": 30,
+                "totalTokens": 130,
+            },
+        }
+    }
+    assert _extract_codex_thread_total_usage(params) == {
+        "inputTokens": 100,
+        "cachedInputTokens": 40,
+        "outputTokens": 30,
+        "totalTokens": 130,
+    }
+
+
+def test_extract_codex_thread_total_usage_rejects_missing_or_malformed() -> None:
+    """Payloads without a usable ``total`` breakdown return None."""
+    from omnigent.inner.codex_executor import _extract_codex_thread_total_usage
+
+    assert _extract_codex_thread_total_usage(None) is None
+    assert _extract_codex_thread_total_usage("not a dict") is None
+    assert _extract_codex_thread_total_usage({}) is None
+    assert _extract_codex_thread_total_usage({"tokenUsage": None}) is None
+    assert _extract_codex_thread_total_usage({"tokenUsage": {"last": {"inputTokens": 5}}}) is None
+    # An empty/counter-free total must fall back to ``last``, not read as zeros.
+    assert _extract_codex_thread_total_usage({"tokenUsage": {"total": {}}}) is None
+    assert (
+        _extract_codex_thread_total_usage({"tokenUsage": {"total": {"contextWindow": 200000}}})
+        is None
+    )
+
+
+def test_codex_turn_usage_from_totals_diffs_against_baseline() -> None:
+    """Turn usage is the growth of cumulative counters, cached split out."""
+    from omnigent.inner.codex_executor import _codex_turn_usage_from_totals
+
+    latest = {
+        "inputTokens": 2200,
+        "cachedInputTokens": 1800,
+        "outputTokens": 250,
+        "totalTokens": 2450,
+    }
+    baseline = {
+        "inputTokens": 1000,
+        "cachedInputTokens": 800,
+        "outputTokens": 100,
+        "totalTokens": 1100,
+    }
+    assert _codex_turn_usage_from_totals(latest, baseline, "gpt-5.4-mini") == {
+        "input_tokens": 200,
+        "output_tokens": 150,
+        "total_tokens": 1350,
+        "cache_read_input_tokens": 1000,
+        "model": "gpt-5.4-mini",
+    }
+    # No baseline (thread's first turn): the totals are the turn's usage.
+    assert _codex_turn_usage_from_totals(latest, None, "gpt-5.4-mini") == {
+        "input_tokens": 400,
+        "output_tokens": 250,
+        "total_tokens": 2450,
+        "cache_read_input_tokens": 1800,
+        "model": "gpt-5.4-mini",
+    }
+    # A falsy/empty resolved model must not synthesize a misleading key.
+    assert _codex_turn_usage_from_totals(latest, baseline, "") == {
+        "input_tokens": 200,
+        "output_tokens": 150,
+        "total_tokens": 1350,
+        "cache_read_input_tokens": 1000,
+    }
+
+
+def test_codex_turn_usage_from_totals_clamps_counter_resets() -> None:
+    """Counters that shrank below the baseline clamp to zero, never negative."""
+    from omnigent.inner.codex_executor import _codex_turn_usage_from_totals
+
+    latest = {
+        "inputTokens": 50,
+        "cachedInputTokens": 0,
+        "outputTokens": 10,
+        "totalTokens": 60,
+    }
+    baseline = {
+        "inputTokens": 1000,
+        "cachedInputTokens": 800,
+        "outputTokens": 100,
+        "totalTokens": 1100,
+    }
+    assert _codex_turn_usage_from_totals(latest, baseline, "gpt-5.4-mini") == {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "model": "gpt-5.4-mini",
+    }
+
+
+def test_extract_codex_context_tokens_reads_last_total() -> None:
+    """context_tokens is the latest ``last`` total (window fill), inclusive
+    of cached tokens, independent of the cumulative ``total`` breakdown."""
+    from omnigent.inner.codex_executor import _extract_codex_context_tokens
+
+    params = {
+        "tokenUsage": {
+            "last": {
+                "inputTokens": 1200,
+                "cachedInputTokens": 1000,
+                "outputTokens": 150,
+                "totalTokens": 1350,
+            },
+            "total": {"inputTokens": 2200, "outputTokens": 250, "totalTokens": 2450},
+        }
+    }
+    # The window-fill snapshot is the last request's raw total, NOT the
+    # cumulative thread total and NOT the non-cached input split.
+    assert _extract_codex_context_tokens(params) == 1350
+
+
+def test_extract_codex_context_tokens_recomputes_when_total_absent() -> None:
+    """With no ``last.totalTokens``, fill recomputes from input + output
+    (input already includes cached, which occupies the window)."""
+    from omnigent.inner.codex_executor import _extract_codex_context_tokens
+
+    params = {"tokenUsage": {"last": {"inputTokens": 100, "outputTokens": 25}}}
+    assert _extract_codex_context_tokens(params) == 125
+
+
+def test_extract_codex_context_tokens_rejects_missing_or_malformed() -> None:
+    """No usable ``last`` breakdown yields None (meter keeps its prior value)."""
+    from omnigent.inner.codex_executor import _extract_codex_context_tokens
+
+    assert _extract_codex_context_tokens(None) is None
+    assert _extract_codex_context_tokens("not a dict") is None
+    assert _extract_codex_context_tokens({}) is None
+    assert _extract_codex_context_tokens({"tokenUsage": None}) is None
+    assert _extract_codex_context_tokens({"tokenUsage": {"total": {"totalTokens": 9}}}) is None
+    # An all-zero ``last`` carries no fill signal.
+    assert (
+        _extract_codex_context_tokens(
+            {"tokenUsage": {"last": {"inputTokens": 0, "outputTokens": 0}}}
+        )
+        is None
+    )
+
+
 def _make_skill_dir(root: Path, name: str) -> Path:
     """Create a minimal valid skill directory for the populator tests."""
     skill_dir = root / name
@@ -2755,6 +3256,7 @@ async def test_embedded_codex_materializes_provider_auth_outside_argv(
             "-c",
             auth_command,
         ]
+        assert config["model_providers"]["omnigent_provider"]["auth"]["timeout_ms"] == 15000
         assert config["model_providers"]["omnigent_provider"]["wire_api"] == "responses"
         assert stat.S_IMODE(codex_home.stat().st_mode) == 0o700
         assert stat.S_IMODE(config_path.stat().st_mode) == 0o600
@@ -3018,6 +3520,29 @@ def test_populate_codex_home_config_keeps_valid_effort(tmp_path: Path) -> None:
     _populate_codex_home_config(target, source)
 
     assert (target / "config.toml").read_text() == original
+
+
+def test_populate_codex_home_config_preserves_native_effort(tmp_path: Path) -> None:
+    """Native Codex sessions preserve max and ultra reasoning effort."""
+    from omnigent.inner.codex_executor import _populate_codex_home_config
+    from omnigent.util.reasoning_effort import CODEX_NATIVE_EFFORTS
+
+    source = tmp_path / "real_codex_home"
+    source.mkdir()
+    original = (
+        'model = "gpt-5.6-luna"\n'
+        'model_reasoning_effort = "max"\n'
+        "[profiles.other]\n"
+        'model_reasoning_effort = "ultra"\n'
+    )
+    (source / "config.toml").write_text(original)
+    target = tmp_path / "temp_codex_home"
+    target.mkdir()
+
+    _populate_codex_home_config(target, source, supported_efforts=CODEX_NATIVE_EFFORTS)
+
+    copied = (target / "config.toml").read_text()
+    assert copied == original
 
 
 def test_populate_codex_home_config_normalizes_effort_after_multiline_array(
@@ -3399,6 +3924,50 @@ def test_clean_codex_env_excludes_openai_api_key(monkeypatch) -> None:
     # Other OPENAI_* vars (retry/timeout knobs) must still pass through.
     assert env.get("OPENAI_MAX_RETRIES") == "3"
     assert env.get("OPENAI_TIMEOUT") == "60"
+
+
+@pytest.mark.parametrize(
+    ("inherited", "expected"),
+    [
+        (None, "launch_mode=omni"),
+        ("", "launch_mode=omni"),
+        (" , ", "launch_mode=omni"),
+        ("deployment=example,user=alice", "deployment=example,user=alice,launch_mode=omni"),
+        ("launch_mode=direct,user=alice", "user=alice,launch_mode=omni"),
+        ("user=alice,launch_mode=omni", "user=alice,launch_mode=omni"),
+        (
+            "launch_mode=direct,user=al%2Cice, launch_mode =other",
+            "user=al%2Cice,launch_mode=omni",
+        ),
+    ],
+)
+def test_clean_codex_env_tags_omni_launch(
+    monkeypatch: pytest.MonkeyPatch, inherited: str | None, expected: str
+) -> None:
+    if inherited is None:
+        monkeypatch.delenv("OTEL_RESOURCE_ATTRIBUTES", raising=False)
+    else:
+        monkeypatch.setenv("OTEL_RESOURCE_ATTRIBUTES", inherited)
+
+    env = _clean_codex_env()
+
+    assert env["OTEL_RESOURCE_ATTRIBUTES"] == expected
+    assert os.environ.get("OTEL_RESOURCE_ATTRIBUTES") == inherited
+
+
+def test_clean_codex_env_keeps_otel_exporter_settings_filtered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OTEL_RESOURCE_ATTRIBUTES", "deployment=example")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_HEADERS", "Authorization=Bearer test-token")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "https://collector.example.com")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_LOGS_HEADERS", "Authorization=Bearer log-token")
+
+    env = _clean_codex_env()
+
+    assert {key: value for key, value in env.items() if key.startswith("OTEL_")} == {
+        "OTEL_RESOURCE_ATTRIBUTES": "deployment=example,launch_mode=omni"
+    }
 
 
 def test_clean_codex_env_includes_databricks_bearer(monkeypatch) -> None:
