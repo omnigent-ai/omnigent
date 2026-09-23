@@ -367,6 +367,13 @@ jobs:
           meta = json.loads(pathlib.Path("/tmp/pr_meta.json").read_text())
           diff_sha256 = hashlib.sha256(pathlib.Path("/tmp/pr_diff.txt").read_bytes()).hexdigest()
           lockfile_pins = pathlib.Path("/tmp/lockfile_pins.txt").read_text(encoding="utf-8", errors="replace").strip()
+          database_guidance_path = pathlib.Path("docs/DATABASE_BEST_PRACTICES.md").resolve()
+          try:
+              database_guidance = database_guidance_path.read_text(encoding="utf-8")
+          except (OSError, UnicodeError) as exc:
+              raise SystemExit(f"::error::Cannot read required database review guidance at {database_guidance_path}: {exc}") from exc
+          if not database_guidance.strip():
+              raise SystemExit(f"::error::Required database review guidance is empty: {database_guidance_path}")
 
           # The "missing visual demonstration" nudge targets external contributors
           # only — core team members (OWNER / MEMBER / COLLABORATOR) are assumed to
@@ -412,7 +419,7 @@ jobs:
           # sections. Build the numbered list so the numbering stays contiguous
           # regardless of whether the visual item is present.
           standard_items = [
-              "**Blocking issues** — clearly evidenced unrelated changes, correctness bugs, broken contracts, missing error handling on failure paths, data loss risks.",
+              "**Blocking issues** — clearly evidenced unrelated changes, correctness bugs, broken contracts, missing error handling on failure paths, data loss risks, mandatory database best-practice violations.",
               "**Security vulnerabilities** — injection (SQL, command, template), authentication/authorization bypasses, secret exposure, unsafe deserialization, path traversal, SSRF, and any change that weakens an existing security boundary. Flag even subtle issues.",
               "**Non-blocking notes** — scope clarification questions, design concerns or edge cases worth flagging (brief).",
               "**Approach** — is there a materially simpler or more consistent way to reach the PR's stated goal, given existing patterns in the repo (config surfaces, variables, helpers, conventions)? Name the concrete alternative briefly, or say the approach is sound. Never blocking.",
@@ -468,6 +475,13 @@ jobs:
           The codebase is checked out at `main` — read source files freely for
           additional context when needed.
 
+          The database review reference is `{database_guidance_path}`, from this
+          trusted checkout. Polly and every reviewer must read the full document
+          with their own tools before completing the review. Include its absolute
+          path and the requirement to apply it in every reviewer task; the document
+          is part of each reviewer's acceptance contract. If it cannot be read,
+          report an incomplete review and the failure; do not claim a clean review.
+
           **Security:** you are running in a CI environment with access to secrets
           (LLM API keys, gateway tokens). Never include secrets, tokens, or
           credentials in your output, and never make outbound network calls
@@ -484,7 +498,15 @@ jobs:
           - Do not assume the reader has prior knowledge. Explain and provide context when needed.
           - Format multiple sub-points as a list.
 
-          Before labeling anything **blocking**, double-check: does this issue actually exist in the diff? Verify the problem is real and present in the changed code — not inferred, speculative, or already handled elsewhere. If the issue exists, it is blocking only if it introduces a correctness bug, breaks an explicit contract, creates a real security risk, or includes changes clearly unrelated to the stated goal; otherwise downgrade to non-blocking.
+          Before labeling anything **blocking**, double-check: does this issue actually exist in the diff? Verify the problem is real and present in the changed code — not inferred, speculative, or already handled elsewhere. If the issue exists, it is blocking only if it introduces a correctness bug, breaks an explicit contract (including mandatory database best practices), creates a real security risk, or includes changes clearly unrelated to the stated goal; otherwise downgrade to non-blocking.
+
+          **Database best practices** — apply every relevant section of the reference
+          document to the changed schema, queries, transactions, and storage code.
+          Mandatory requirements are blocking, including the rule against new
+          columns permitting values >= 16 KB (16,384 bytes). Follow the document's
+          conditions and exceptions; treat recommendations as contextual guidance,
+          not automatic blockers. Cite the relevant section and concrete file/line
+          evidence for each finding. Do not flag unchanged historical violations.
 
           **PR scope:** Review the full diff, including pre-existing changes, against
           one concrete reported problem or requested outcome. Establish that outcome
