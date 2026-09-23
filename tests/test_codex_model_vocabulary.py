@@ -19,6 +19,8 @@ from omnigent.util.reasoning_effort import clamp_effort_for_model
 # codex spells versions with dots, and the extended-catalog row keeps its
 # catalog spelling because that IS codex's id for it.
 _CATALOG: list[dict[str, object]] = [
+    {"id": "gpt-6-luna", "model": "gpt-6-luna"},
+    {"id": "gpt-6-sol", "model": "gpt-6-sol"},
     {"id": "gpt-5.6-sol", "model": "gpt-5.6-sol", "isDefault": True},
     {"id": "gpt-5.6-luna", "model": "gpt-5.6-luna"},
     {"id": "system.ai.glm-5-2", "model": "system.ai.glm-5-2"},
@@ -35,6 +37,9 @@ _CATALOG: list[dict[str, object]] = [
         ("databricks-gpt-5-6-terra", "gpt-5.6-terra"),
         ("databricks-gpt-5-5", "gpt-5.5"),
         ("databricks-gpt-5-2", "gpt-5.2"),
+        # GPT-6 spells its major version without a minor segment.
+        ("databricks-gpt-6-luna", "gpt-6-luna"),
+        ("databricks-gpt-6-sol", "gpt-6-sol"),
         # Already a slug, so translating is a no-op.
         ("gpt-5.6-luna", "gpt-5.6-luna"),
         # A tier hung off a major alone has no minor to dot, so its slug
@@ -45,6 +50,7 @@ _CATALOG: list[dict[str, object]] = [
         ("gpt-6-nova", "gpt-6-nova"),
         # A numeric second segment is still the minor version, not a tier.
         ("system.ai.gpt-6-1", "gpt-6.1"),
+        ("gpt-6-luna", "gpt-6-luna"),
         # GLM is spawnable only under the id the gateway serves it as, which
         # is the slug omnigent writes into the session's catalog.
         ("databricks-glm-5-2", "system.ai.glm-5-2"),
@@ -113,6 +119,8 @@ def test_comparable_model_id_folds_prefix_dots_and_case() -> None:
 
 
 def test_catalog_id_translates_to_the_codex_slug() -> None:
+    assert codex_reachable_model_slug("databricks-gpt-6-luna", _CATALOG) == "gpt-6-luna"
+    assert codex_reachable_model_slug("databricks-gpt-6-sol", _CATALOG) == "gpt-6-sol"
     assert codex_reachable_model_slug("databricks-gpt-5-6-luna", _CATALOG) == "gpt-5.6-luna"
     assert codex_reachable_model_slug("databricks-gpt-5-6-sol", _CATALOG) == "gpt-5.6-sol"
     assert codex_reachable_model_slug("databricks-gpt-5-5", _CATALOG) == "gpt-5.5"

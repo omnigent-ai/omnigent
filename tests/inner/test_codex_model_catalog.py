@@ -28,8 +28,8 @@ _GLM_SLUG = EXTENDED_CATALOG_MODELS["glm-5-2"]
 
 def _catalog(**overrides: Any) -> dict[str, Any]:  # type: ignore[explicit-any]
     luna: dict[str, Any] = {  # type: ignore[explicit-any]
-        "slug": "gpt-5.6-luna",
-        "display_name": "GPT-5.6-Luna",
+        "slug": "gpt-6-luna",
+        "display_name": "GPT-6-Luna",
         "description": "Fast and affordable agentic coding model.",
         "visibility": "list",
         "context_window": 272000,
@@ -41,11 +41,11 @@ def _catalog(**overrides: Any) -> dict[str, Any]:  # type: ignore[explicit-any]
             {"effort": "xhigh"},
         ],
         "availability_nux": {"seen": 3},
-        "upgrade": {"to": "gpt-5.6-sol"},
+        "upgrade": None,
         "base_instructions": "You are Codex...",
         **overrides,
     }
-    return {"models": [{"slug": "gpt-5.6-sol", "visibility": "list"}, luna]}
+    return {"models": [{"slug": "gpt-6-sol", "visibility": "list"}, luna]}
 
 
 def test_the_added_entry_carries_the_clone_sources_fields() -> None:
@@ -87,8 +87,8 @@ def test_the_bundled_arms_survive() -> None:
 
     assert extended is not None
     assert [m["slug"] for m in extended["models"]] == [
-        "gpt-5.6-sol",
-        "gpt-5.6-luna",
+        "gpt-6-sol",
+        "gpt-6-luna",
         _GLM_SLUG,
     ]
 

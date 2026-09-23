@@ -29,9 +29,16 @@ class StaticModelFallback:
 #: sort servable ids. It never invents picker rows: ids absent from the live
 #: listing are simply not ranked by it.
 _CODEX_ARM_PREFERENCE = StaticModelFallback(
-    model_ids=("gpt-5.6-sol", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.5"),
+    model_ids=(
+        "gpt-6-luna",
+        "gpt-6-sol",
+        "gpt-5.6-sol",
+        "gpt-5.6-luna",
+        "gpt-5.6-terra",
+        "gpt-5.5",
+    ),
     owner="Databricks model discovery (omnigent.models.databricks_model_discovery)",
-    provenance="Omnigent's release-curated Codex arm ordering",
+    provenance="Codex 0.156.0 live catalog; Luna leads as the economical default",
     discovery_gap="a workspace listing ranks models by neither recency nor capability",
 )
 
@@ -45,19 +52,17 @@ def static_model_fallback(provider_kind: str, cli: str) -> StaticModelFallback |
     return _STATIC_MODEL_FALLBACKS.get((provider_kind, cli))
 
 
-#: Codex's launch default when nothing else names a model. The bundled
-#: OpenAI catalog's newest row is a bare family alias (``gpt-5.6``) that
-#: codex rejects, so a codex launch defaults to a concrete variant from
-#: codex's own catalog — dotted spelling, since the Databricks hyphenated
-#: form 400s against codex's own backend.
+#: Codex's launch default when nothing else names a model. Use the current
+#: economical concrete slug from Codex's live catalog, not a gateway id.
 _CODEX_LAUNCH_DEFAULT = StaticModelFallback(
-    model_ids=("gpt-5.6-sol",),
-    owner="Codex native launch",
-    provenance="codex's catalog slug for Omnigent's preferred launch arm",
+    model_ids=("gpt-6-luna",),
+    owner="Codex native launch (omnigent.inner.codex_executor)",
+    provenance=(
+        "Codex 0.156.0 live catalog; OpenAI describes Luna for cost-sensitive, high-volume work"
+    ),
     discovery_gap=(
         "the launch default is resolved before any app-server probe can "
-        "answer, and codex rejects the bundled catalog's newest row (a bare "
-        "family alias)"
+        "answer, so it must use a concrete slug that the Codex catalog lists"
     ),
 )
 
@@ -163,9 +168,9 @@ _SMART_ROUTING_FALLBACKS: dict[str, StaticModelFallback] = {
         discovery_gap="a gateway listing advertises these without pi's request-shape limits",
     ),
     "codex_catalog_clone_source": StaticModelFallback(
-        model_ids=("gpt-5.6-luna",),
+        model_ids=("gpt-6-luna",),
         owner="Codex extended catalog (omnigent.inner.codex_executor)",
-        provenance="codex's own bundled catalog slug for the cheapest current arm",
+        provenance="Codex 0.156.0 live catalog's current economical concrete slug",
         discovery_gap="codex's bundled catalog carries no entry for a gateway-only arm to clone",
     ),
 }
@@ -217,12 +222,9 @@ _BACKGROUND_TITLE_FALLBACKS: dict[str, StaticModelFallback] = {
         ),
     ),
     "codex": StaticModelFallback(
-        model_ids=("gpt-5.6-luna",),
+        model_ids=("gpt-6-luna",),
         owner="Background session titles (omnigent.runner.background_titles.service)",
-        provenance=(
-            "codex's own dotted catalog slug for its cheapest current arm — the "
-            "gateway's hyphenated spelling 400s on codex's backend"
-        ),
+        provenance="Codex 0.156.0 live catalog's current economical concrete slug",
         discovery_gap=(
             "a background title never consults the session's live model catalog, "
             "and no discovery API ranks arms by cost"

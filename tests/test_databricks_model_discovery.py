@@ -337,6 +337,8 @@ def test_discover_codex_models_filters_non_codex_and_ranks_curated_first() -> No
     """
     servable = _discover_codex(
         [
+            {"name": "model-services/system.ai.gpt-6-luna"},
+            {"name": "model-services/system.ai.gpt-6-sol"},
             {"name": "model-services/system.ai.gpt-5-5"},
             {"name": "model-services/system.ai.gpt-5-6-luna"},
             {"name": "model-services/system.ai.gpt-5-6-sol"},
@@ -347,7 +349,10 @@ def test_discover_codex_models_filters_non_codex_and_ranks_curated_first() -> No
     )
 
     assert servable == (
-        # Curated (cheapest-safe-first) beats a newer non-curated generation.
+        # The current economical Codex model leads when the workspace serves it.
+        "system.ai.gpt-6-luna",
+        "system.ai.gpt-6-sol",
+        # Existing models remain available as ordered fallbacks.
         "system.ai.gpt-5-6-sol",
         "system.ai.gpt-5-6-luna",
         "system.ai.gpt-5-5",
