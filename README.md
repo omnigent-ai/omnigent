@@ -414,6 +414,41 @@ Server operators can set the same key in the YAML passed to
 
 </details>
 
+<details>
+<summary>Schedule a daily host-daemon restart</summary>
+
+The background host daemon can recycle itself once a day at a configured local
+wall-clock time. This keeps long-running daemons fresh and is entirely opt-in:
+with no `host_daily_restart` key in your config the daemon behaves exactly as
+before.
+
+```bash
+omnigent config set --global host_daily_restart=04:00
+```
+
+The value is a 24-hour `HH:MM` string evaluated in the **system local
+timezone**. The daemon waits until the configured time, then defers the
+restart until no runner subprocesses are live, so no in-flight session work
+is ever interrupted.
+
+To disable, remove the key:
+
+```bash
+omnigent config unset --global host_daily_restart
+```
+
+> [!NOTE]
+> The auto-launched background daemon (`omnigent run` / `omnigent claude` /
+> `omnigent codex`) and a service-installed host (`omnigent host enable`) both
+> come back automatically: the background daemon spawns its own replacement,
+> and the service-managed daemon deliberately exits non-zero so launchd's
+> `KeepAlive` / systemd's `Restart=on-failure` restarts it — a clean exit
+> would look like success to both and leave the service stopped. Running
+> `omnigent host` by hand in a terminal just exits and prints a note; run the
+> same command again to reconnect.
+
+</details>
+
 ### 3. Choose & switch models
 
 ```bash

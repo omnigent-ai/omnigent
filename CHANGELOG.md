@@ -5,6 +5,10 @@ generated at release time from each PR's `## Changelog` section, tagged by the
 PR's `Type of change` (e.g. `[UI]`); the concise, curated highlights live on the
 website under `/releases`.
 
+## [Unreleased]
+
+- [Feature] The background and service-installed host daemons can now recycle themselves daily at a configured local wall-clock time (`host_daily_restart` in `~/.omnigent/config.yaml`). The restart defers until the host is idle so no in-flight session is interrupted, and a fresh daemon takes over automatically afterward.
+
 ## [v0.14.0] — 2026-09-15
 
 - [Bug fix] Host-bound sessions now report deleted workspaces immediately and safely, with useful host diagnostics instead of an empty-log dead end. (#3577)

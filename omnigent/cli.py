@@ -631,6 +631,9 @@ _GLOBAL_CONFIG_KEYS: frozenset[str] = frozenset(
     {
         "default_agent",
         "harness",
+        # Local wall-clock time (HH:MM) at which the background host daemon
+        # recycles itself daily, deferring until idle. Absent/empty = disabled.
+        "host_daily_restart",
         "model",
         # OpenCode-specific default model (``provider/model``) the native
         # ``omni opencode`` TUI launches on; set via `omni setup` → OpenCode.
@@ -9060,6 +9063,7 @@ def host(
     # exit). A connection failure (SystemExit) leaves this False so we don't
     # prompt over an error.
     stopped_cleanly = False
+    restart_requested = False
     try:
         # Sign in first when the remote server is Databricks-fronted and we
         # hold no usable credentials — otherwise the tunnel upgrade is
@@ -9070,7 +9074,7 @@ def host(
         if remote_mode:
             _ensure_databricks_server_auth(server, non_interactive=non_interactive)
         _maybe_open_host_web_ui(server, non_interactive=non_interactive, no_open=no_open, cfg=cfg)
-        run_host_process(server_url=server, daemon_target=target)
+        restart_requested = run_host_process(server_url=server, daemon_target=target)
         stopped_cleanly = True
     except KeyboardInterrupt:
         # Ctrl-C is the normal way to stop the foreground daemon — swallow it
@@ -9086,6 +9090,19 @@ def host(
         # spawned is fair game.
         if stopped_cleanly and spawned_local_server:
             _prompt_stop_local_server()
+    if restart_requested:
+        if non_interactive:
+            # A service-managed host (launchd/systemd) only respawns on a
+            # non-zero exit (see service.py's KeepAlive/Restart config), so a
+            # scheduled restart must exit loud here rather than looking like
+            # a clean stop the supervisor leaves dead. 78 (HOST_FATAL_EXIT_CODE)
+            # and 143 are both excluded from that restart policy, so this
+            # uses a plain 1.
+            raise SystemExit(1)
+        print(
+            f"\nExiting for the scheduled daily restart. Run `{cli_invocation()} host` "
+            "again to reconnect."
+        )
 
 
 def _host_group_option(ctx: click.Context, key: str) -> str | None:
