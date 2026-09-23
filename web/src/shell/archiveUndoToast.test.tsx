@@ -9,15 +9,35 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
+import type * as SonnerModule from "sonner";
 import type { Conversation } from "@/hooks/useConversations";
 
-const mocks = vi.hoisted(() => ({ undoArchiveConversations: vi.fn() }));
+const mocks = vi.hoisted(() => ({
+  undoArchiveConversations: vi.fn(),
+  // Durations passed to `toast()` in call order — lets a test assert the pill's
+  // computed lifetime directly (deterministic) instead of racing sonner's own
+  // close timer in the DOM.
+  toastDurations: [] as number[],
+}));
 
 // archiveUndoToast only pulls undoArchiveConversations from this module; a
 // partial mock keeps the toast logic isolated from cache/network behavior.
 vi.mock("@/hooks/useConversations", () => ({
   undoArchiveConversations: mocks.undoArchiveConversations,
 }));
+
+// Wrap sonner's real module (so the <Toaster> still renders for the DOM-based
+// tests) but record each `toast()` call's duration for the cap assertion. ESM
+// exports can't be spied in place, so a pass-through mock is the clean seam.
+vi.mock("sonner", async (importOriginal) => {
+  const actual = await importOriginal<typeof SonnerModule>();
+  const wrapped = ((message: unknown, opts?: { duration?: number }) => {
+    if (typeof opts?.duration === "number") mocks.toastDurations.push(opts.duration);
+    return (actual.toast as (m: unknown, o?: unknown) => unknown)(message, opts);
+  }) as typeof actual.toast;
+  Object.assign(wrapped, actual.toast); // carry .dismiss/.message/etc.
+  return { ...actual, toast: wrapped };
+});
 
 import { showArchiveUndoToast, resetArchiveUndoBatchForTests } from "./archiveUndoToast";
 import { Toaster } from "@/components/ui/sonner";
@@ -50,7 +70,13 @@ const show = (ids: string[]) =>
   );
 
 beforeEach(() => {
+  // Start every test on REAL timers so a fake clock left installed (or
+  // advanced) by a prior test in this file can't leak into this one — the
+  // pill's lifetime math is Date.now()-based, so a carried-over fake clock
+  // would corrupt the elapsed deltas and close the pill early.
+  vi.useRealTimers();
   mocks.undoArchiveConversations.mockReset().mockResolvedValue(undefined);
+  mocks.toastDurations.length = 0;
   resetArchiveUndoBatchForTests();
   navigate = vi.fn();
   toast.dismiss();
@@ -63,6 +89,8 @@ afterEach(() => {
   resetArchiveUndoBatchForTests();
   toast.dismiss();
   cleanup();
+  // Always leave real timers installed so no fake-timer state escapes the file.
+  vi.useRealTimers();
 });
 
 describe("showArchiveUndoToast", () => {
@@ -147,31 +175,31 @@ describe("showArchiveUndoToast", () => {
     // countdown — the batch's life is bounded from the first archive (5s cap,
     // below the 8s server grace), so the pill can't linger past the earliest
     // session's teardown and offer an Undo for an already-stopped runner.
-    // Archive "a", then merge "b"/"c" ~2s apart; the pill must be gone by ~5s
-    // (the deadline), not ~2s after the last merge (a reset would keep it to ~6s).
+    //
+    // Assert on the `duration` this module passes to sonner, not on the pill's
+    // DOM close time: whether sonner restarts its own timer when a toast is
+    // updated in place is an implementation detail (and races under fake
+    // timers), while the shrinking `duration` is exactly what we control.
     vi.useFakeTimers();
+    vi.setSystemTime(0);
     try {
-      mountToaster();
-      await show(["a"]);
+      await show(["a"]); // t=0
       await act(async () => {
         await vi.advanceTimersByTimeAsync(2000);
       });
-      await show(["b"]);
+      await show(["b"]); // t=2s
       await act(async () => {
         await vi.advanceTimersByTimeAsync(2000);
       });
-      await show(["c"]);
-      // t=4s: within the 5s cap, still visible.
-      expect(screen.queryByText(/^Archived/)).toBeInTheDocument();
-      // Past the 5s deadline (total 5.5s) — gone. A reset-on-merge would keep
-      // it until ~7s (last merge at 4s + 3s).
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(1500);
-      });
-      expect(screen.queryByText(/^Archived/)).not.toBeInTheDocument();
+      await show(["c"]); // t=4s
+
+      // First archive gets the full single-archive duration; merges shrink
+      // toward the 5s absolute deadline and never reset to a fresh 3s:
+      //   t=0 → min(3000, 5000-0)    = 3000
+      //   t=2 → min(3000, 5000-2000) = 3000
+      //   t=4 → min(3000, 5000-4000) = 1000  (closes at t=5s, not t=4+3=7s)
+      expect(mocks.toastDurations).toEqual([3000, 3000, 1000]);
     } finally {
-      // Drain any queued Sonner timer WHILE still on fake timers, so nothing
-      // fires later against a torn-down module.
       resetArchiveUndoBatchForTests();
       toast.dismiss();
       await act(async () => {
@@ -185,6 +213,7 @@ describe("showArchiveUndoToast", () => {
     // An archive arriving past the deadline must not resurrect the old batch's
     // pill; it begins its own window.
     vi.useFakeTimers();
+    vi.setSystemTime(0);
     try {
       mountToaster();
       await show(["old"]);
