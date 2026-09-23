@@ -1516,7 +1516,7 @@ def test_agent_edit_registry_has_no_index_to_consult(
 def test_git_last_changed_files_snapshots_the_paths_still_on_disk(tmp_path: Path) -> None:
     """Search reuses the latest ``git status`` for untracked files. The snapshot
     must exist only after a run, keep modified and new paths, drop deleted ones,
-    and say when the run's limit may have hidden some."""
+    and hold every path git reported regardless of the returned page's limit."""
     env = _git_env()
     subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, env=env)
     (tmp_path / "kept.txt").write_text("a")
@@ -1531,13 +1531,6 @@ def test_git_last_changed_files_snapshots_the_paths_still_on_disk(tmp_path: Path
     reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
     assert reg.last_changed_files() is None
 
-    reg.list_changed_files("conv", limit=10)
-    snapshot = reg.last_changed_files()
-    assert snapshot is not None
-    assert sorted(snapshot.paths) == ["kept.txt", "new.txt"]
-    assert snapshot.complete is True
-
+    # limit=1 caps the page returned, not what the snapshot retains.
     reg.list_changed_files("conv", limit=1)
-    capped = reg.last_changed_files()
-    assert capped is not None
-    assert capped.complete is False
+    assert sorted(reg.last_changed_files() or []) == ["kept.txt", "new.txt"]

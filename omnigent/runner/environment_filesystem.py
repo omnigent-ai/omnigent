@@ -300,7 +300,7 @@ def index_search(
     include: Sequence[str] = (),
     exclude: Sequence[str] = (),
     limit: int = 500,
-) -> tuple[list[FilesystemEntry] | None, bool]:
+) -> list[FilesystemEntry] | None:
     """Match the workspace's index plus its latest change snapshot, if any.
 
     Covers every tracked file in one index read, however large the repo, and
@@ -315,20 +315,17 @@ def index_search(
     :param include: Pre-split include globs.
     :param exclude: Pre-split exclude globs.
     :param limit: Maximum number of entries to return.
-    :returns: ``(entries, complete)``. ``entries`` is ``None`` when the
-        workspace has no index; ``complete`` is ``False`` when the snapshot
-        hit its own limit and so may be missing untracked files.
+    :returns: Matching entries, or ``None`` when the workspace has no index.
     """
     tracked = registry.list_tracked_files(subdir)
     if tracked is None:
-        return None, True
+        return None
     snapshot = registry.last_changed_files()
     if snapshot is not None:
-        tracked += paths_under(snapshot.paths, subdir)
-    entries = search_indexed_paths(
+        tracked += paths_under(snapshot, subdir)
+    return search_indexed_paths(
         root, tracked, query, include=include, exclude=exclude, limit=limit
     )
-    return entries, snapshot is None or snapshot.complete
 
 
 def entry_payload(entry: FilesystemEntry) -> dict[str, object]:
@@ -878,7 +875,8 @@ stop = False
 # a slice of dirpath -- no per-entry relpath(), whose getcwd() calls used to
 # dominate the walk's runtime.
 root = os.path.abspath(start)
-cut = len(root) + 1
+# A root of '/' already ends in the separator the slice skips.
+cut = len(root.rstrip('/')) + 1
 
 
 def rel(dirpath, name):

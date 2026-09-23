@@ -459,20 +459,6 @@ class _FileEvent:
 # ── Abstract base ─────────────────────────────────────────────────────────────
 
 
-@dataclasses.dataclass(frozen=True)
-class ChangedFilesSnapshot:
-    """Paths from one ``list_changed_files`` run, kept for search to reuse.
-
-    :param paths: Workspace-relative paths of files that exist on disk
-        (created or modified; deleted ones are dropped).
-    :param complete: ``False`` when the run hit its ``limit`` and so may
-        have missed paths.
-    """
-
-    paths: list[str]
-    complete: bool
-
-
 class FilesystemRegistry(ABC):
     """Abstract base for per-conversation file-change registries.
 
@@ -574,11 +560,13 @@ class FilesystemRegistry(ABC):
         """
         return None
 
-    def last_changed_files(self) -> ChangedFilesSnapshot | None:
-        """Return the paths reported by the latest :meth:`list_changed_files`.
+    def last_changed_files(self) -> list[str] | None:
+        """Return the on-disk paths the latest :meth:`list_changed_files` found.
 
-        ``None`` until that method has run in this process. Lets search reuse
-        an answer the Changed tab already paid for.
+        Every created or modified path git reported, regardless of the
+        ``limit`` applied to the page that call returned. ``None`` until that
+        method has run in this process. Lets search reuse an answer the
+        Changed tab already paid for.
         """
         return None
 
@@ -868,7 +856,7 @@ class GitFilesystemRegistry(FilesystemRegistry):
         self._git_root = git_root
         self._optimization_start_lock = threading.Lock()
         self._optimization_started = False
-        self._last_changes: ChangedFilesSnapshot | None = None
+        self._last_changes: list[str] | None = None
 
     def start(self) -> None:
         """Start optional Git performance setup without blocking the caller."""
@@ -1019,7 +1007,7 @@ class GitFilesystemRegistry(FilesystemRegistry):
             return None
         return [p for p in result.stdout.decode("utf-8", errors="replace").split("\0") if p]
 
-    def last_changed_files(self) -> ChangedFilesSnapshot | None:
+    def last_changed_files(self) -> list[str] | None:
         return self._last_changes
 
     def list_changed_files(self, conversation_id: str, *, limit: int) -> list[dict[str, Any]]:
@@ -1113,10 +1101,7 @@ class GitFilesystemRegistry(FilesystemRegistry):
 
         # Search reuses this answer for untracked files instead of paying for
         # its own ``git status``, which can take tens of seconds on a big repo.
-        self._last_changes = ChangedFilesSnapshot(
-            paths=[r["path"] for r in records if r["status"] != "deleted"],
-            complete=len(records) <= limit,
-        )
+        self._last_changes = [r["path"] for r in records if r["status"] != "deleted"]
         records.sort(key=lambda r: (r["modified_at"] or 0, r["path"]), reverse=True)
         return records[:limit]
 

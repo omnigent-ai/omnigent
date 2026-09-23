@@ -339,7 +339,7 @@ class WorkspaceReader:
         # until a ``git status`` has run, untracked ones), so it always runs;
         # git's index adds every tracked file however large the repo, and the
         # latest ``git status`` adds untracked files past the budget.
-        indexed, complete = index_search(
+        indexed = index_search(
             self._registry,
             self._root,
             "",
@@ -361,7 +361,8 @@ class WorkspaceReader:
         # os.walk is handed the absolute root, so an entry's path relative to
         # it is a slice of dirpath -- no per-entry relpath(), whose abspath()
         # work used to dominate the walk's runtime.
-        cut = len(str(self._root)) + 1
+        # rstrip: a root of "/" already ends in the separator the slice skips.
+        cut = len(str(self._root).rstrip("/")) + 1
 
         def rel(dirpath: str, name: str) -> str:
             rel_dir = dirpath[cut:]
@@ -462,7 +463,6 @@ class WorkspaceReader:
         results.sort(key=lambda entry: entry.path)
         if indexed is not None:
             results = merge_entries(indexed, results, limit)
-            truncated = truncated or not complete
         return self._search_payload(results, limit, truncated=truncated)
 
     @staticmethod

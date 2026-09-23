@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -598,3 +599,17 @@ def test_search_still_finds_gitignored_files_after_git_status(tmp_path: Path) ->
 
     assert [e["path"] for e in result["data"]] == ["build/out.log"], result
     assert result["truncated"] is False
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX filesystem root")
+def test_search_from_filesystem_root_keeps_paths_intact(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A reader rooted at ``/`` slices result paths off a root that already ends
+    in the separator; slicing one more character used to turn ``etc`` into ``tc``."""
+    monkeypatch.setattr("omnigent.workspace_fs._SEARCH_SCAN_BUDGET", 60)
+    reader = WorkspaceReader(Path("/"))
+
+    result = reader.search("etc")
+
+    paths = [e["path"] for e in result["data"]]
+    assert "etc" in paths, paths
+    assert all((Path("/") / p).exists() for p in paths), paths

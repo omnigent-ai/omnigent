@@ -11227,13 +11227,12 @@ def create_runner_app(
             )
         )
         indexed: list[FilesystemEntry] | None = None
-        complete = True
         try:
             session_registry = (
                 None if fs._absolute(path) else await _resolve_session_fs_registry(session_id)
             )
             if session_registry is not None:
-                indexed, complete = await _asyncio.to_thread(
+                indexed = await _asyncio.to_thread(
                     index_search,
                     session_registry,
                     fs._resolve(path),
@@ -11249,7 +11248,6 @@ def create_runner_app(
         entries, truncated = await walk
         if indexed is not None:
             entries = merge_entries(indexed, entries, limit)
-            truncated = truncated or not complete
         data = [_fs_entry_to_dict(e) for e in entries]
         return JSONResponse(
             status_code=200,

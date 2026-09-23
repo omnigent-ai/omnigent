@@ -2163,3 +2163,29 @@ async def test_search_still_finds_gitignored_files_after_git_status(tmp_path: Pa
         body = resp.json()
         assert [e["path"] for e in body["data"]] == ["build/out.log"], body
         assert body["truncated"] is False
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX filesystem root")
+@pytest.mark.asyncio
+async def test_search_from_filesystem_root_keeps_paths_intact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Browsing ``/`` is allowed for an unconfined environment. The walk builds
+    result paths by slicing off the root, and a root of ``/`` already ends in
+    the separator — slicing one more character used to turn ``etc`` into ``tc``."""
+    monkeypatch.setattr("omnigent.runner.environment_filesystem._SEARCH_SCAN_BUDGET", 60)
+    fs = CallerProcessFilesystem(
+        create_os_environment(
+            OSEnvSpec(
+                type="caller_process",
+                cwd=str(tmp_path),
+                sandbox=OSEnvSandboxSpec(type="none"),
+            )
+        )
+    )
+
+    entries, _truncated = await fs.search_files("etc", path="/")
+
+    paths = [e.path for e in entries]
+    assert "etc" in paths, paths
+    assert all((Path("/") / p).exists() for p in paths), paths

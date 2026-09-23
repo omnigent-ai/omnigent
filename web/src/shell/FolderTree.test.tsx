@@ -544,6 +544,20 @@ describe("FolderTree truncated search", () => {
     );
   });
 
+  it("keeps the truncation note when every match is in a hidden directory", () => {
+    // The hidden-only branch replaces the results list with a "show hidden"
+    // prompt; a truncated scan still has to be distinguishable there.
+    renderTree({
+      searchQuery: "env",
+      searchResults: [file(".env")],
+      searchTruncated: true,
+    });
+
+    expect(screen.getByText(/in hidden directories/)).toHaveTextContent(
+      "Search stopped early — results may be incomplete.",
+    );
+  });
+
   it("footnotes partial results when the scan was truncated", () => {
     renderTree({
       searchQuery: "main",

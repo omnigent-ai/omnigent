@@ -37,6 +37,7 @@ from omnigent.host.frames import (
     HostCreateDirResultFrame,
     HostDetectCredentialsFrame,
     HostDetectCredentialsResultFrame,
+    HostFsRequestFrame,
     HostHarnessReadinessFrame,
     HostHelloFrame,
     HostImportLocalByIdFrame,
@@ -7192,3 +7193,58 @@ async def test_github_pr_update_reports_lock_contention_on_host(
     assert registry.path.read_bytes() == before
     assert host._handle_fs_write(frame).status == "ok"
     assert (target in {entry.url for entry in registry.list()}) == (action == "attach")
+
+
+def test_fs_search_reuses_the_changed_files_snapshot_across_requests(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each fs request arrives as its own frame, so the reader — and the
+    registry snapshot search reuses for untracked files — must survive from a
+    Changed-tab request to a later search. A fresh reader per request never has
+    the snapshot, and an untracked file past the walk budget goes unfound."""
+    ws = tmp_path / "repo"
+    ws.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=ws, check=True)
+    many = ws / "aaa"
+    many.mkdir()
+    for i in range(60):
+        (many / f"f{i:02d}.txt").write_text("x")
+    subprocess.run(["git", "add", "-A"], cwd=ws, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.com",
+            "commit",
+            "-q",
+            "-m",
+            "init",
+        ],
+        cwd=ws,
+        check=True,
+    )
+    (ws / "zzz").mkdir()
+    (ws / "zzz" / "scratch.txt").write_text("untracked")
+    monkeypatch.setattr("omnigent.workspace_fs._SEARCH_SCAN_BUDGET", 10)
+    host = _make_host_process()
+    try:
+        changes = host._handle_fs_request(
+            HostFsRequestFrame(request_id="r1", op="changes", workspace=str(ws), session_id="conv")
+        )
+        assert changes.status == "ok", changes
+        search = host._handle_fs_request(
+            HostFsRequestFrame(
+                request_id="r2",
+                op="search",
+                workspace=str(ws),
+                session_id="conv",
+                params={"q": "scratch"},
+            )
+        )
+    finally:
+        _cleanup_host(host)
+
+    assert search.status == "ok", search
+    assert [e["path"] for e in search.payload["data"]] == ["zzz/scratch.txt"], search.payload

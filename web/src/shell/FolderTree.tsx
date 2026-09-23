@@ -655,6 +655,7 @@ export function FolderTree({
           >
             Show hidden files
           </button>
+          {searchTruncated && " Search stopped early — results may be incomplete."}
         </p>
       );
     }

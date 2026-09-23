@@ -18,11 +18,12 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, SupportsIndex, SupportsInt, TypeVar, cast
+from typing import TYPE_CHECKING, Literal, SupportsIndex, SupportsInt, TypeVar, cast
 
 import click
 import httpx
@@ -175,6 +176,9 @@ from omnigent.util.tunnel_limits import (
     TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
 )
 from omnigent.version import VERSION
+
+if TYPE_CHECKING:
+    from omnigent.workspace_fs import WorkspaceReader
 
 _logger = logging.getLogger(__name__)
 _T = TypeVar("_T")
@@ -1055,6 +1059,10 @@ class HostProcess:
         """
         self._identity = identity
         self._server_url = server_url.rstrip("/")
+        # One reader per workspace: its registry keeps state between requests
+        # (the changed-files snapshot that search reuses for untracked files).
+        self._fs_readers: dict[str, WorkspaceReader] = {}
+        self._fs_readers_lock = threading.Lock()
         self._interactive_shells = normalize_interactive_shells(
             interactive_shells
             if interactive_shells is not None
@@ -2923,7 +2931,10 @@ class HostProcess:
                 error="workspace directory does not exist on host",
             )
 
-        reader = WorkspaceReader(Path(expanded))
+        with self._fs_readers_lock:
+            reader = self._fs_readers.get(expanded)
+            if reader is None:
+                reader = self._fs_readers[expanded] = WorkspaceReader(Path(expanded))
         params = frame.params or {}
         try:
             payload = self._dispatch_fs_op(reader, frame.op, frame.session_id, params)
@@ -3248,8 +3259,6 @@ class HostProcess:
         :raises ValueError: On an unknown op.
         """
         from typing import cast
-
-        from omnigent.workspace_fs import WorkspaceReader
 
         r = cast("WorkspaceReader", reader)
         if op == "list_or_read":
