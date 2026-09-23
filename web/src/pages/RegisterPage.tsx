@@ -170,7 +170,7 @@ export function RegisterPage() {
 
   // v2: a valid invite shows the "Join your team" landing first (Accept →
   // form); a missing invite skips it. One shell across both steps so the panel
-  // isn't remounted (a fresh AnimatedOmnigentPanel re-inits its WebGL context).
+  // isn't remounted and its animation restarts between steps.
   if (loginV2) {
     const showLanding = !missingInvite && !accepted;
     return (

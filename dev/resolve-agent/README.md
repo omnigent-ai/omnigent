@@ -1,6 +1,6 @@
 # resolve-agent
 
-Take a bug that **repro-agent already reproduced** to resolution, and prove that
+Take a bug that **repro-agent reports as reproduced** to resolution, and prove that
 resolution with the reproduction test going fail→pass. It is the step *after*
 [repro-agent](../repro-agent/README.md): it consumes that agent's handoff (the
 reproduction verdict, the per-facet breakdown, the journey, and the authored e2e
@@ -112,18 +112,20 @@ is the review gate after the fact.
    test's content from the `session` or `ci_link`. CI recovery reads the compact
    artifact checkpoint and preserved test files first, using multi-megabyte job
    logs only as a compatibility fallback for older bundles.
-2. **Looks for an open PR already fixing the bug.** This decides the path:
-   - **Existing fix PR** → checks it out, runs the repro test against it (pass =
-     it fixes the bug; fail = it doesn't — the key review finding), reviews the
-     diff for root-cause vs symptom, and comments its findings on that PR.
-   - **No fix PR** → the author path below.
-3. *(author path)* **Audits the e2e test against the unfixed tree first** — it must
-   fail on the real buggy behavior, not because it references something the fix
-   would add. Existence-checks are rewritten into behavioral assertions and
-   flagged. A test that *passes* on the unfixed tree means `main` has since
-   fixed the bug: outcome `nothing_to_fix` with the fixing commit named and a
-   ticket-closure recommendation — stale reproductions are retired, not
-   "fixed" again.
+2. **Audits the recovered repro before either authoring or reviewing.** Artifact
+   delivery is not validation. Inspect the entire patch for unrelated or unsafe
+   changes, check the assertion against the reported behavior, and establish a
+   behavioral failure on the exact unfixed base. Preserve the original evidence
+   when repairing weak tests; reject unreliable repros rather than changing
+   correct product behavior to satisfy them. A green baseline needs an independent
+   journey/history check before concluding `nothing_to_fix`; inconclusive or
+   unsafe evidence yields `needs_more_info`. Both paths record this in `test_audit`.
+3. **Looks for an open PR already fixing the bug.** This decides the path:
+   - **Existing fix PR** → checks it out, runs the same audited assertions,
+     verifies the journey, reviews the diff for root-cause vs symptom, and
+     comments its findings. A green test alone does not prove a fix, and a
+     setup/import failure is a verification blocker, not a product regression.
+   - **No fix PR** → the author path below, using the same baseline proof.
 4. *(author path)* Root-causes, implements the fix, and adds targeted
    unit/integration tests at the layer it changed, each fail→pass on the bug.
 5. *(author path)* Re-runs the whole set to prove every live facet goes fail→pass

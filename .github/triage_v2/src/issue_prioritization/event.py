@@ -340,17 +340,38 @@ def main() -> None:
     areas = AreaCatalog.from_json(args.areas)
     manifest = LabelManifest.from_json(args.label_manifest)
     mode = PipelineMode(args.mode)
-    duplicate_candidates: tuple[dict[str, object], ...] = ()
-    if args.intake:
-        if args.maintainers is None:
-            raise ValueError("--maintainers is required with --intake")
-        duplicate_candidates = tuple(
-            rank_candidates(
-                {"number": issue.number, "title": issue.title, "body": issue.body},
-                list(client.issue_corpus()),
-                repository=args.github_repo,
+    if args.intake and args.maintainers is None:
+        raise ValueError("--maintainers is required with --intake")
+    # Reclassification needs the same related-issue context as initial intake.
+    try:
+        corpus = list(client.issue_corpus())
+    except Exception as error:
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+        (args.output_dir / "event.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "source": "github_actions",
+                    "run_id": args.run_id,
+                    "mode": mode.value,
+                    "status": "failed",
+                    "issue_number": issue.number,
+                    "source_revision": args.source_revision,
+                    "operation": "fetch_related_issues",
+                    "error_type": type(error).__name__,
+                },
+                indent=2,
             )
+            + "\n"
         )
+        raise
+    duplicate_candidates = tuple(
+        rank_candidates(
+            {"number": issue.number, "title": issue.title, "body": issue.body},
+            corpus,
+            repository=args.github_repo,
+        )
+    )
     run, classification, planner, states = prioritize_issue(
         issue,
         serving_endpoint_classifier(

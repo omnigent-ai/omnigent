@@ -216,6 +216,8 @@ _MCP_PROTOCOL_VERSION = "2024-11-05"
 # uses.
 _TOOLS_CHANGED_READY_TIMEOUT_S = 30.0
 _TOOLS_CHANGED_POST_TIMEOUT_S = 10.0
+# The control POST carries an empty JSON object; anything larger is not ours.
+_TOOLS_CHANGED_BODY_MAX_BYTES = 4096
 # Ceiling the relay HTTP handler (``_run_relay_tool``) waits for a single
 # tool dispatch to complete on the harness event loop.
 _TOOL_CALL_TIMEOUT_S = 300.0
@@ -1287,23 +1289,36 @@ def _ensure_secure_dir(target: Path) -> None:
     getuid = getattr(os, "getuid", None)
     my_uid = getuid() if getuid is not None else None
     for ancestor in ancestors:
-        try:
-            os.mkdir(ancestor, mode=0o700)
-            continue
-        except FileExistsError:
-            pass
-        st = os.lstat(ancestor)
-        if stat.S_ISLNK(st.st_mode):
-            raise RuntimeError(f"refusing to use bridge ancestor {ancestor!s}: is a symlink")
-        if not stat.S_ISDIR(st.st_mode):
-            raise RuntimeError(f"refusing to use bridge ancestor {ancestor!s}: not a directory")
-        if my_uid is not None and st.st_uid != my_uid:
-            raise RuntimeError(
-                f"refusing to use bridge ancestor {ancestor!s}: owned by uid "
-                f"{st.st_uid}, not current user ({my_uid})"
-            )
-        if my_uid is not None and (st.st_mode & 0o077) != 0:
-            os.chmod(ancestor, 0o700)
+        _ensure_private_dir(ancestor, my_uid)
+
+
+def _ensure_private_dir(path: Path, my_uid: int | None) -> None:
+    """
+    Create ``path`` as a 0o700 directory, or validate an existing one.
+
+    :param path: Directory that must be owner-only, e.g. one bridge ancestor
+        or the harness socket root.
+    :param my_uid: Current uid, or ``None`` where POSIX ownership does not
+        apply (Windows), which skips the owner and mode checks.
+    :raises RuntimeError: If ``path`` exists as a symlink, a non-directory,
+        or a directory owned by another uid.
+    """
+    try:
+        os.mkdir(path, mode=0o700)
+        return
+    except FileExistsError:
+        pass
+    st = os.lstat(path)
+    if stat.S_ISLNK(st.st_mode):
+        raise RuntimeError(f"refusing to use {path!s}: is a symlink")
+    if not stat.S_ISDIR(st.st_mode):
+        raise RuntimeError(f"refusing to use {path!s}: not a directory")
+    if my_uid is not None and st.st_uid != my_uid:
+        raise RuntimeError(
+            f"refusing to use {path!s}: owned by uid {st.st_uid}, not current user ({my_uid})"
+        )
+    if my_uid is not None and (st.st_mode & 0o077) != 0:
+        os.chmod(path, 0o700)
 
 
 def ensure_secure_dir(target: Path) -> None:
@@ -6100,17 +6115,23 @@ def _start_unix_control_server(
 
     The socket lives directly under the harness socket root — short by
     design, since ``sun_path`` caps at 104 bytes on macOS — as
-    ``mcp-<pid>.sock``. Sockets left behind by ``serve-mcp`` processes that
-    died without cleanup (a killed pane) are reaped first, by owner pid.
+    ``mcp-<pid>.sock``. The root is made absolute (the runner reads the path
+    from its own working directory) and validated as an owner-only directory,
+    since a pre-created root would let another local user swap the socket.
+    Sockets left behind by ``serve-mcp`` processes that died without cleanup
+    (a killed pane) are reaped first, by owner pid.
 
     :param handler_cls: Request handler class.
     :returns: The bound, listening server and its socket path (mode 0600).
     """
     from omnigent.inner._proc import process_alive
-    from omnigent.runtime.harnesses.paths import harness_tmp_parent
+    from omnigent.runtime.harnesses.paths import resolve_harness_tmp_parent
 
-    root = harness_tmp_parent()
-    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    root = resolve_harness_tmp_parent()
+    # A configured root may be nested (``OMNIGENT_HARNESS_TMP_PARENT=.tmp/oa``);
+    # only the leaf must be owner-only.
+    root.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_private_dir(root, os.getuid())
     for stale in root.glob(f"{_MCP_SOCKET_PREFIX}*{_MCP_SOCKET_SUFFIX}"):
         try:
             owner = int(stale.name[len(_MCP_SOCKET_PREFIX) : -len(_MCP_SOCKET_SUFFIX)])
@@ -6183,13 +6204,17 @@ def _handler_factory(
             if self.path != "/tools-changed":
                 self.send_error(HTTPStatus.NOT_FOUND)
                 return
-            # Drain the body before answering: the client writes it after the
-            # headers, and closing first turns that write into EPIPE on a Unix
-            # socket (TCP only surfaced it as a reset after the response).
-            self.rfile.read(int(self.headers.get("Content-Length") or 0))
             if self.headers.get("Authorization") != f"Bearer {token}":
                 self.send_error(HTTPStatus.UNAUTHORIZED)
                 return
+            length = int(self.headers.get("Content-Length") or 0)
+            if not 0 <= length <= _TOOLS_CHANGED_BODY_MAX_BYTES:
+                self.send_error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+                return
+            # Drain the body before answering: the client writes it after the
+            # headers, and closing first turns that write into EPIPE on a Unix
+            # socket (TCP only surfaced it as a reset after the response).
+            self.rfile.read(length)
             notification_queue.put(
                 {
                     "jsonrpc": "2.0",

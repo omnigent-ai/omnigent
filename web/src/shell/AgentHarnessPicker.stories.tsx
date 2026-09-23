@@ -133,8 +133,9 @@ export const NeedsSetupBadges: Story = {
     host: {
       ...readyHost,
       configured_harnesses: {
-        // SDK agents (polly/debby) stay available; the intended badges here are
-        // the native codex/cursor rows below.
+        // SDK agents (polly/debby) stay available; the intended badges are the
+        // native codex/cursor rows, which demote to the "Other..." flyout when
+        // they can't launch on the host.
         "claude-sdk": true,
         "claude-native": true,
         "codex-native": "needs-auth",
@@ -149,7 +150,12 @@ export const NeedsSetupBadges: Story = {
       </CapabilitiesProvider>
     ),
   ],
-  play: async ({ canvasElement }) => openPicker(canvasElement),
+  play: async ({ canvasElement }) => {
+    await openPicker(canvasElement);
+    // The badged rows live behind the harness overflow flyout now.
+    const page = within(canvasElement.ownerDocument.body);
+    await userEvent.click(await page.findByTestId("new-chat-landing-harness-more"));
+  },
 };
 
 export const ClaudeSelected: Story = {

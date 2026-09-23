@@ -11583,6 +11583,112 @@ def test_http_ingress_reaps_sockets_of_dead_owners(
         httpd.server_close()
 
 
+@pytest.mark.usefixtures("_no_ambient_bridge_network")
+def test_http_ingress_refuses_symlinked_socket_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _short_harness_socket_root: Path
+) -> None:
+    """A pre-created root that is a symlink is refused, not silently reused.
+
+    ``mkdir(exist_ok=True)`` would trust whatever another local user planted at
+    the socket root; the ingress validates it like a bridge ancestor instead.
+    """
+    real = _short_harness_socket_root / "real"
+    real.mkdir(mode=0o700)
+    link = _short_harness_socket_root / "link"
+    link.symlink_to(real)
+    monkeypatch.setenv("OMNIGENT_HARNESS_TMP_PARENT", str(link))
+    bridge_dir = prepare_bridge_dir("conv_ingress_symlink", workspace=tmp_path)
+    notifications: queue.Queue[dict[str, object] | None] = queue.Queue()
+    with pytest.raises(RuntimeError, match="is a symlink"):
+        claude_native_bridge._start_http_ingress(bridge_dir, "test-token", notifications)
+
+
+@pytest.mark.usefixtures("_no_ambient_bridge_network")
+def test_http_ingress_advertises_absolute_socket_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _short_harness_socket_root: Path
+) -> None:
+    """A relative, not-yet-created socket root is created and advertised absolute.
+
+    ``OMNIGENT_HARNESS_TMP_PARENT=.tmp/oa`` is a documented shape: nested under a
+    parent that may not exist yet, and relative to whatever directory
+    ``serve-mcp`` starts in. The runner reads ``server.json`` from its own working
+    directory, so the advertised path has to be absolute to resolve there.
+    """
+    relative_root = os.path.relpath(_short_harness_socket_root / "nested" / "oa")
+    assert not os.path.isabs(relative_root)
+    assert not (_short_harness_socket_root / "nested").exists()
+    monkeypatch.setenv("OMNIGENT_HARNESS_TMP_PARENT", relative_root)
+    bridge_dir = prepare_bridge_dir("conv_ingress_abs", workspace=tmp_path)
+    notifications: queue.Queue[dict[str, object] | None] = queue.Queue()
+    httpd = claude_native_bridge._start_http_ingress(bridge_dir, "test-token", notifications)
+    try:
+        info = json.loads(
+            (bridge_dir / claude_native_bridge._SERVER_FILE).read_text(encoding="utf-8")
+        )
+        assert Path(info["socket"]) == Path(os.path.abspath(relative_root)) / (
+            f"mcp-{os.getpid()}.sock"
+        )
+        elsewhere = tmp_path / "a" / "b" / "c" / "d"
+        elsewhere.mkdir(parents=True)
+        monkeypatch.chdir(elsewhere)
+        assert not Path(relative_root).exists()
+        post_tools_changed(bridge_dir, timeout_s=5.0)
+        assert notifications.get(timeout=5.0)["method"] == "notifications/tools/list_changed"
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def _raw_unix_http_status(socket_path: Path, request: bytes) -> bytes:
+    """Send one pre-framed HTTP request over a Unix socket and return the status line."""
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+        sock.settimeout(5)
+        sock.connect(str(socket_path))
+        sock.sendall(request)
+        return sock.recv(4096).split(b"\r\n", 1)[0]
+
+
+@pytest.mark.usefixtures("_no_ambient_bridge_network", "_short_harness_socket_root")
+def test_http_ingress_authenticates_before_draining_a_bounded_body(tmp_path: Path) -> None:
+    """A bad token is refused before any body is read, and an oversized body is refused.
+
+    ``Content-Length`` is caller-controlled, so the drain that keeps the real
+    client off EPIPE must not become a way to occupy the server with bytes.
+    """
+    bridge_dir = prepare_bridge_dir("conv_ingress_auth", workspace=tmp_path)
+    notifications: queue.Queue[dict[str, object] | None] = queue.Queue()
+    httpd = claude_native_bridge._start_http_ingress(bridge_dir, "test-token", notifications)
+    try:
+        socket_path = Path(
+            json.loads(
+                (bridge_dir / claude_native_bridge._SERVER_FILE).read_text(encoding="utf-8")
+            )["socket"]
+        )
+        # Declare a body but withhold it: a handler that drained before
+        # authenticating would block here instead of answering 401.
+        unauthorized_headers_only = (
+            b"POST /tools-changed HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer wrong\r\n"
+            b"Content-Length: 2\r\n\r\n"
+        )
+        assert (
+            _raw_unix_http_status(socket_path, unauthorized_headers_only)
+            == b"HTTP/1.0 401 Unauthorized"
+        )
+        oversized_body = b"x" * (claude_native_bridge._TOOLS_CHANGED_BODY_MAX_BYTES + 1)
+        oversized = (
+            b"POST /tools-changed HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer test-token\r\n"
+            + f"Content-Length: {len(oversized_body)}\r\n\r\n".encode()
+            + oversized_body
+        )
+        assert _raw_unix_http_status(socket_path, oversized) == (
+            b"HTTP/1.0 413 Request Entity Too Large"
+        )
+        assert notifications.empty()
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
 def test_approval_wait_marker_tracks_a_parked_permission_hook(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
