@@ -2933,7 +2933,11 @@ class HostProcess:
 
         with self._fs_readers_lock:
             reader = self._fs_readers.get(expanded)
-            if reader is None:
+            # A reader built before the workspace had a git repository (a
+            # clone landing after the first request) stays walk-only, so
+            # re-detect until one is git-backed. A fresh reader for a non-git
+            # workspace is what every request built before readers were cached.
+            if reader is None or not reader.git_backed:
                 reader = self._fs_readers[expanded] = WorkspaceReader(Path(expanded))
         params = frame.params or {}
         try:

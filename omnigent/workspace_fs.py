@@ -55,6 +55,7 @@ from omnigent.runner.environment_filesystem import (
     split_glob_list,
 )
 from omnigent.runtime.filesystem_registry import (
+    GitFilesystemRegistry,
     GitStatusUnavailable,
     create_filesystem_registry,
 )
@@ -98,6 +99,15 @@ class WorkspaceReader:
         # semantics and everything else degrades to an empty list.
         self._registry = create_filesystem_registry(self._root)
         self._registry.start()
+
+    @property
+    def git_backed(self) -> bool:
+        """Whether the workspace had a git repository when this reader was built.
+
+        Callers caching readers re-detect through this: a workspace that gains
+        a repository later needs a fresh reader to get git-index coverage.
+        """
+        return isinstance(self._registry, GitFilesystemRegistry)
 
     # ── Path confinement ──────────────────────────────────────────
 
@@ -361,11 +371,15 @@ class WorkspaceReader:
         # os.walk is handed the absolute root, so an entry's path relative to
         # it is a slice of dirpath -- no per-entry relpath(), whose abspath()
         # work used to dominate the walk's runtime.
-        # rstrip: a root of "/" already ends in the separator the slice skips.
-        cut = len(str(self._root).rstrip("/")) + 1
+        # rstrip: a bare root ("/", "C:\\") already ends in the separator the
+        # slice skips.
+        cut = len(str(self._root).rstrip(os.sep)) + 1
 
         def rel(dirpath: str, name: str) -> str:
+            # Entries always use '/', like the git-index paths they merge with.
             rel_dir = dirpath[cut:]
+            if os.sep != "/":
+                rel_dir = rel_dir.replace(os.sep, "/")
             return f"{rel_dir}/{name}" if rel_dir else name
 
         def match(dirpath: str, name: str, *, is_dir: bool) -> None:

@@ -322,6 +322,10 @@ def index_search(
         return None
     snapshot = registry.last_changed_files()
     if snapshot is not None:
+        # Snapshot paths come from pathlib and carry native separators;
+        # everything here (and git's index output) speaks '/'.
+        if os.sep != "/":
+            snapshot = [p.replace(os.sep, "/") for p in snapshot]
         tracked += paths_under(snapshot, subdir)
     return search_indexed_paths(
         root, tracked, query, include=include, exclude=exclude, limit=limit
@@ -875,12 +879,15 @@ stop = False
 # a slice of dirpath -- no per-entry relpath(), whose getcwd() calls used to
 # dominate the walk's runtime.
 root = os.path.abspath(start)
-# A root of '/' already ends in the separator the slice skips.
-cut = len(root.rstrip('/')) + 1
+# A bare root ('/', 'C:\') already ends in the separator the slice skips.
+cut = len(root.rstrip(os.sep)) + 1
 
 
 def rel(dirpath, name):
+    # Entries always use '/', like the git-index paths they merge with.
     dp = dirpath[cut:]
+    if os.sep != '/':
+        dp = dp.replace(os.sep, '/')
     return dp + '/' + name if dp else name
 
 
