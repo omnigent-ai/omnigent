@@ -185,10 +185,13 @@ artifacts are created. The composer refreshes choices and retains the draft;
 it requires the user to submit again.
 
 Creation saves the actual harness identity, target/revision, provider settings,
-model policy, credential references, and workspace identity in a dedicated
-text column on Omnigent's conversation metadata. Server-only discovery settings
-are also saved there. An additive database migration creates the nullable column;
-the compact AP-owned session-overrides field is unchanged. Children inherit the full configuration and
+model policy, credential references, and workspace identity as compressed JSON in
+Omnigent's conversation metadata. Server-only discovery settings are also saved
+there. The nullable `inference_snapshot` column uses `BLOB` on MySQL, with a
+65,535-byte limit including compression framing. Reads accept legacy uncompressed
+JSON. New snapshots exceeding the compressed limit are rejected before session
+rows are created; reduce the configured model catalog or allowlist to fit.
+The compact AP-owned session-overrides field is unchanged. Children inherit the full configuration and
 resolve their own harness binding; forks retain it even when resetting model
 settings. Configured sessions cannot switch agents or fork into another harness
 or another owner's credential scope; create a new session for those changes.
@@ -197,6 +200,14 @@ Sessions with saved sandbox profiles can launch only on server-managed sandbox
 hosts, including when forked or restarted. Ordinary hosts keep their own provider
 configuration; start a new session to use one. Admission checks the actual
 destination host, so a fork can still reuse its original managed sandbox.
+
+The compression migration runs online with database readers and writers stopped.
+It compresses existing snapshots in batches and clears only snapshots that still
+exceed the limit. A cleared snapshot loses its saved provider bindings, model
+policy, and catalog; the session retains its other metadata and follows the legacy
+behavior for sessions without snapshots. Deploy the updated code before resuming
+traffic. Downgrade decompresses retained snapshots back to text and cannot recover
+cleared snapshots.
 
 Launch and wake overlay the saved providers and bindings onto current sandbox
 lifecycle settings. Unbound harnesses on a profile-enabled target save that

@@ -31,6 +31,7 @@ from sqlalchemy.sql.selectable import Subquery
 
 from omnigent._wrapper_labels import UI_MODE_LABEL_KEY, WRAPPER_LABEL_KEY
 from omnigent.db.account_authority import AccountAuthority, require_active_account
+from omnigent.db.compression import encode as compress_text
 from omnigent.db.converters import sql_agent_to_entity
 from omnigent.db.db_models import (
     LABEL_VALUE_MAX_LEN,
@@ -84,7 +85,7 @@ from omnigent.entities import (
     PagedList,
     parse_item_data,
 )
-from omnigent.errors import StaleCursorError
+from omnigent.errors import ErrorCode, OmnigentError, StaleCursorError
 from omnigent.native.native_coding_agents import native_coding_agent_for_wrapper_label
 from omnigent.native.session_todos import validate_session_todos
 from omnigent.session_import.models import IMPORT_SOURCE_LABEL_KEY
@@ -356,6 +357,17 @@ def _new_session_conversation_row(
         agent_id=agent_id,
         session_overrides=session_overrides,
     )
+
+
+def _validate_inference_snapshot(value: str | None) -> None:
+    """Reject snapshots that cannot fit a MySQL BLOB before writing either database."""
+    stored = compress_text(value)
+    if stored is not None and len(stored) > 65_535:
+        raise OmnigentError(
+            "Inference snapshot exceeds the 65,535-byte compressed storage limit. "
+            "Reduce the configured model catalog or allowlist.",
+            code=ErrorCode.INVALID_INPUT,
+        )
 
 
 def _new_session_metadata_row(
@@ -1093,6 +1105,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     encoded_inference_snapshot = (
                         parent_meta.inference_snapshot if parent_meta else None
                     )
+            _validate_inference_snapshot(encoded_inference_snapshot)
             if parent_conversation_id is not None and not title:
                 title = f"untitled:{new_id}"
 
@@ -4112,6 +4125,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                     parent_meta.inference_snapshot if parent_meta else None
                 )
 
+        _validate_inference_snapshot(encoded_inference_snapshot)
+
         def insert_ap(ap_sess: Session) -> SqlConversation:
             conversation_row = _new_session_conversation_row(
                 conversation_id,
@@ -4401,6 +4416,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             source_meta_ref: SqlConversationMetadata | None = meta_sess.get(
                 SqlConversationMetadata, (current_workspace_id(), source_conversation_id)
             )
+
+        _validate_inference_snapshot(
+            source_meta_ref.inference_snapshot if source_meta_ref else None
+        )
 
         with self._conv_session("prepare_fork_conversation") as session:
             source = session.get(SqlConversation, (current_workspace_id(), source_conversation_id))
