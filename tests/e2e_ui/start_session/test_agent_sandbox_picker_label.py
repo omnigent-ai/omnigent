@@ -131,11 +131,12 @@ async def _drive_agent_sandbox_label(base_url: str, session_id: str) -> None:
             await expect(row).to_contain_text("Agent Sandbox")
             await expect(row).not_to_contain_text("Sandbox Sandbox")
 
-            # Picking the row labels the chip the same humanized way.
+            # Picking the row labels the chip the same humanized way. The chip
+            # is icon-only, so its label lives in aria-label, not inner text.
             await row.click()
-            await expect(chip).not_to_contain_text("Agent_sandbox")
-            await expect(chip).to_contain_text("Agent Sandbox")
-            await expect(chip).not_to_contain_text("Sandbox Sandbox")
+            await expect(chip).to_have_attribute("aria-label", re.compile("Agent Sandbox"))
+            await expect(chip).not_to_have_attribute("aria-label", re.compile("Agent_sandbox"))
+            await expect(chip).not_to_have_attribute("aria-label", re.compile("Sandbox Sandbox"))
         finally:
             # Close the context before the browser so a recorded video
             # flushes even when an assertion above fails mid-journey.
