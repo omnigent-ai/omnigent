@@ -102,6 +102,7 @@ from omnigent.runner.background_titles import (
 )
 from omnigent.runner.background_titles.service import BACKGROUND_TITLE_MAX_PROMPT_CHARS
 from omnigent.runner.codex.goal import CodexGoalRunner
+from omnigent.runner.ingest_gate import IngestGate
 from omnigent.runner.launch_failure import FailureDiagnosis, classify_terminal_failure
 from omnigent.runner.mcp_execution_registry import (
     McpExecutionConflict,
@@ -3077,9 +3078,7 @@ def create_runner_app(
     _claude_prompt_waiters: dict[str, asyncio.Task[None]] = {}
     app.state.claude_prompt_waiters = _claude_prompt_waiters
     _author_attribution_sessions: set[str] = set()
-    _ingest_next_seq: dict[str, int] = {}
-    _ingest_now_serving: dict[str, int] = {}
-    _ingest_cond: dict[str, asyncio.Condition] = {}
+    _ingest_gate = IngestGate()
     _interrupted_sessions: set[str] = set()
     app.state.interrupted_sessions = _interrupted_sessions
     # Desynced conversations; cleared when a fresh turn binds.
@@ -4912,9 +4911,7 @@ def create_runner_app(
         _desynced_sessions.discard(session_id)
         _required_terminal_exit_errors.pop(session_id, None)
         _native_pane_status.pop(session_id, None)
-        _ingest_next_seq.pop(session_id, None)
-        _ingest_now_serving.pop(session_id, None)
-        _ingest_cond.pop(session_id, None)
+        _ingest_gate.forget(session_id)
         _codex_terminal_ensure_locks.pop(session_id, None)
         _claude_terminal_ensure_locks.pop(session_id, None)
         _pi_terminal_ensure_locks.pop(session_id, None)
@@ -7152,15 +7149,7 @@ def create_runner_app(
         # the slot — the two turns then clobber each other's `_active_turns`
         # entry and race the single live SDK client. Under the gate one reaches
         # its bind before the other's check, so the loser buffers instead.
-        _seq = _ingest_next_seq.get(conv_id, 0)
-        _ingest_next_seq[conv_id] = _seq + 1
-        _cond = _ingest_cond.get(conv_id)
-        if _cond is None:
-            _cond = asyncio.Condition()
-            _ingest_cond[conv_id] = _cond
-        async with _cond:
-            while _ingest_now_serving.get(conv_id, 0) != _seq:
-                await _cond.wait()
+        _ingest_ticket = await _ingest_gate.acquire(conv_id)
         try:
             # A turn is already running: buffer so /compact runs as the next turn
             # rather than racing the live one; the buffer drains via
@@ -7211,9 +7200,7 @@ def create_runner_app(
                 raise
             return Response(status_code=200)
         finally:
-            async with _cond:
-                _ingest_now_serving[conv_id] = _seq + 1
-                _cond.notify_all()
+            await _ingest_gate.release(_ingest_ticket)
 
     async def _handle_claude_native_cost_popup(
         conv_id: str,
@@ -7911,15 +7898,7 @@ def create_runner_app(
     async def _check_and_start_next_turn(
         session_id: str,
     ) -> None:
-        _seq = _ingest_next_seq.get(session_id, 0)
-        _ingest_next_seq[session_id] = _seq + 1
-        _cond = _ingest_cond.get(session_id)
-        if _cond is None:
-            _cond = asyncio.Condition()
-            _ingest_cond[session_id] = _cond
-        async with _cond:
-            while _ingest_now_serving.get(session_id, 0) != _seq:
-                await _cond.wait()
+        _ingest_ticket = await _ingest_gate.acquire(session_id)
         try:
             if session_id in _active_turns:
                 return
@@ -7997,9 +7976,7 @@ def create_runner_app(
             )
             _background_tasks.add(_turn_task)
         finally:
-            async with _cond:
-                _ingest_now_serving[session_id] = _seq + 1
-                _cond.notify_all()
+            await _ingest_gate.release(_ingest_ticket)
 
     app.state.check_and_start_next_turn = _check_and_start_next_turn
 
@@ -9801,15 +9778,7 @@ def create_runner_app(
             if _is_native_harness(conversation_id):
                 resource_registry.note_session_turn_started(conversation_id)
 
-            _seq = _ingest_next_seq.get(conversation_id, 0)
-            _ingest_next_seq[conversation_id] = _seq + 1
-            _cond = _ingest_cond.get(conversation_id)
-            if _cond is None:
-                _cond = asyncio.Condition()
-                _ingest_cond[conversation_id] = _cond
-            async with _cond:
-                while _ingest_now_serving.get(conversation_id, 0) != _seq:
-                    await _cond.wait()
+            _ingest_ticket = await _ingest_gate.acquire(conversation_id)
             try:
                 _raw_content = message_body.get("content")
                 if isinstance(_raw_content, list):
@@ -9965,9 +9934,7 @@ def create_runner_app(
                     },
                 )
             finally:
-                async with _cond:
-                    _ingest_now_serving[conversation_id] = _seq + 1
-                    _cond.notify_all()
+                await _ingest_gate.release(_ingest_ticket)
 
         if body_type == "interrupt":
             _cancel_claude_prompt_waiter(conversation_id)
