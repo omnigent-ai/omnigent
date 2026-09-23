@@ -1411,7 +1411,8 @@ aside[aria-label="Workspace"][data-maximized] {
 @media (prefers-reduced-motion: reduce) {
   .animate-message-highlight {
     animation: none;
-    background-color: var(--message-highlight);
+    /* Override inline contributor tints while the static highlight is active. */
+    background-color: var(--message-highlight) !important;
   }
 
   .animate-user-msg-flash {
