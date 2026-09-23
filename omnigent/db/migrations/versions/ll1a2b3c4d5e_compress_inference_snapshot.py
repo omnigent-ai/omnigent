@@ -109,6 +109,13 @@ def _convert(to_binary: bool) -> None:
                 rows[-1].workspace_id,
                 last_id if isinstance(last_id, str) else bytes(last_id),
             )
+            # Commit full batches; the bounded final partial batch commits with the swap.
+            if len(rows) == _BATCH_SIZE:
+                if bind.dialect.name == "cockroachdb":
+                    _publish(bind)
+                else:
+                    with op.get_context().autocommit_block():
+                        pass
         if cleared:
             _logger.warning(
                 "Cleared %d inference snapshots exceeding 65,535 compressed bytes", cleared

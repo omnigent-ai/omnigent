@@ -202,12 +202,18 @@ configuration; start a new session to use one. Admission checks the actual
 destination host, so a fork can still reuse its original managed sandbox.
 
 The compression migration runs online with database readers and writers stopped.
-It compresses existing snapshots in batches and clears only snapshots that still
-exceed the limit. A cleared snapshot loses its saved provider bindings, model
-policy, and catalog; the session retains its other metadata and follows the legacy
-behavior for sessions without snapshots. Deploy the updated code before resuming
+It commits the backfill in batches of at most 100 metadata rows. Interrupted copies
+restart from the original column; completed column swaps are detected on retry.
+Run it through the normal migration runner without an enclosing transaction.
+It clears only snapshots that still exceed the limit. A cleared snapshot loses its
+saved provider bindings, model policy, and catalog; the session retains its other
+metadata and follows the legacy behavior for sessions without snapshots. Deploy
+the updated code before resuming
 traffic. Downgrade decompresses retained snapshots back to text and cannot recover
-cleared snapshots.
+cleared snapshots. The 65,535-byte cap, irreversible clearing of oversized values,
+and coordinated schema/application cutover are deliberate requirements of this
+existing-column conversion, matching the preferences conversion. They depart from
+the database guide's smaller limit for new columns and staged rollout guidance.
 
 Launch and wake overlay the saved providers and bindings onto current sandbox
 lifecycle settings. Unbound harnesses on a profile-enabled target save that

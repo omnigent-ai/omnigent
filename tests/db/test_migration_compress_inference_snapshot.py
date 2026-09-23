@@ -42,11 +42,12 @@ def _rows(engine: sa.Engine) -> dict[tuple[int, bytes], sa.Row]:
         }
 
 
+@pytest.mark.parametrize("interrupt_copy", [False, True])
 def test_compression_migration_retains_fitting_snapshots_and_all_sessions(
-    db_uri: str, monkeypatch: pytest.MonkeyPatch
+    db_uri: str, interrupt_copy: bool
 ) -> None:
     migration = import_module(_MIGRATION)
-    monkeypatch.setattr(migration, "_BATCH_SIZE", 2)
+    batch_size = migration._BATCH_SIZE
     engine = get_or_create_engine(db_uri)
     _migrate(engine, _PREVIOUS, downgrade=True)
     metadata = sa.Table(_TABLE, sa.MetaData(), autoload_with=engine)
@@ -62,6 +63,8 @@ def test_compression_migration_retains_fitting_snapshots_and_all_sessions(
         (0, bytes([i]) * 16): value
         for i, value in enumerate([None, small, unicode, compressible, oversized], start=1)
     }
+    # Alembic reloads revision modules, so use enough rows to cross real batch boundaries.
+    original.update({(0, bytes([i]) * 16): small for i in range(6, 2 * batch_size + 6)})
     original[(17, bytes([4]) * 16)] = small
     try:
         with engine.begin() as connection:
@@ -90,6 +93,26 @@ def test_compression_migration_retains_fitting_snapshots_and_all_sessions(
         indexes = inspector.get_indexes(_TABLE)
         checks = inspector.get_check_constraints(_TABLE)
         before = _rows(engine)
+        if interrupt_copy:
+            updates = 0
+
+            def fail_second_batch(conn, cursor, statement, parameters, context, executemany):
+                nonlocal updates
+                if statement.startswith(f"UPDATE {_TABLE} SET _inference_snapshot_blob="):
+                    updates += 1
+                    if updates == batch_size + 1:
+                        raise RuntimeError("interrupted second batch")
+
+            sa.event.listen(engine, "before_cursor_execute", fail_second_batch)
+            try:
+                with pytest.raises(RuntimeError, match="interrupted second batch"):
+                    _migrate(engine, _REVISION)
+            finally:
+                sa.event.remove(engine, "before_cursor_execute", fail_second_batch)
+            partial = _rows(engine)
+            assert all(partial[key].inference_snapshot == value for key, value in original.items())
+            assert partial[(0, bytes([2]) * 16)]._inference_snapshot_blob == encode(small)
+            assert partial[(0, bytes([batch_size + 1]) * 16)]._inference_snapshot_blob is None
         _migrate(engine, _REVISION)
         after = _rows(engine)
         assert set(after) == set(before)
@@ -180,7 +203,7 @@ def test_migration_preserves_sqlite_text_and_binary_ids(
     engine = sa.create_engine(f"sqlite:///{tmp_path / 'legacy-ids.db'}")
     original = [(0, "a", '{"saved":1}'), (0, "b", None), (0, b"c" * 16, '{"saved":2}')]
     try:
-        with engine.begin() as connection:
+        with engine.connect() as connection:
             connection.execute(
                 sa.text(
                     f"CREATE TABLE {_TABLE} (workspace_id BIGINT, id BLOB, "
@@ -192,7 +215,9 @@ def test_migration_preserves_sqlite_text_and_binary_ids(
                     sa.text(f"INSERT INTO {_TABLE} VALUES (:workspace, :id, :snapshot)"),
                     {"workspace": workspace_id, "id": row_id, "snapshot": snapshot},
                 )
-            with Operations.context(MigrationContext.configure(connection)):
+            connection.commit()
+            context = MigrationContext.configure(connection, opts={"transactional_ddl": True})
+            with Operations.context(context), context.begin_transaction():
                 migration.upgrade()
                 rows = connection.execute(
                     sa.text(f"SELECT * FROM {_TABLE} ORDER BY workspace_id, id")
