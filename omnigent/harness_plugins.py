@@ -722,6 +722,27 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         streaming=True,
         instruction_delivery=_ID.COMPOSED_PER_TURN,
     ),
+    # Genie streams each turn's reasoning, SQL, and report over the Agent-mode
+    # Responses API — DatabricksGenieExecutor.supports_streaming() returns True
+    # (progressively, as whole output items rather than token deltas).
+    # interrupt_session() closes the live response stream, so a cancelled turn
+    # unblocks immediately instead of waiting out a warehouse query — hence
+    # interrupt True. Continuity lives only in the in-process conversation id
+    # and only the latest user message is forwarded (no transcript replay), so
+    # a restarted harness process starts a fresh, contextless Genie
+    # conversation — hence resume NONE.
+    "databricks-genie": _C(
+        _IM.SDK_IN_PROCESS,
+        _EL.NONE,
+        _RS.NONE,
+        _EF.NONE,
+        _MF.MULTI,
+        _AU.OWN_AUTH,
+        subagents=False,
+        interrupt=True,
+        streaming=True,
+        instruction_delivery=_ID.NOT_DELIVERED,
+    ),
     # open-responses is resolved via an alternate path, but its executor
     # (omnigent/inner/open_responses_sdk.py) is concrete: interrupt_session()
     # closes the active stream and returns True, supports_streaming() is True,
@@ -761,6 +782,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
             "copilot",
             "cursor",
             "cursor-native",
+            "databricks-genie",
             "devin-native",
             "goose",
             "goose-native",
@@ -795,6 +817,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "copilot": "omnigent.inner.copilot_harness",
         "cursor": "omnigent.inner.cursor_harness",
         "cursor-native": "omnigent.inner.cursor_native_harness",
+        "databricks-genie": "omnigent.inner.databricks_genie_harness",
         "goose": "omnigent.inner.goose_harness",
         "goose-native": "omnigent.inner.goose_native_harness",
         "hermes": "omnigent.inner.hermes_harness",
@@ -824,6 +847,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         # ``acp`` and reads the user's own config.
         "devin": "devin-native",
         "devin-acp": "devin-native",
+        "genie": "databricks-genie",
         "github-copilot": "copilot",
         "google-antigravity": "antigravity",
         "kimi-code": "kimi",
@@ -901,6 +925,8 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "codex": "HARNESS_CODEX_MODEL",
         "copilot": "HARNESS_COPILOT_MODEL",
         "cursor": "HARNESS_CURSOR_MODEL",
+        # Genie carries the space id (not a model name) in ``executor.model``.
+        "databricks-genie": "HARNESS_DATABRICKS_GENIE_MODEL",
         "goose": "HARNESS_GOOSE_MODEL",
         "hermes": "HARNESS_HERMES_MODEL",
         "kimi": "HARNESS_KIMI_MODEL",
@@ -934,6 +960,9 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         # openai-agents is intentionally omitted from the picker catalog: it
         # stays a valid harness for YAML specs (and the credential-free
         # integration mock LLM), but is no longer offered as a UI pick.
+        # databricks-genie is deliberately not a picker row either: an agent
+        # needs a Genie space id and a Databricks profile the create dialog
+        # cannot collect, so it stays YAML/CLI-configured.
         "pi": "Pi",
         **{name: row.label for name, row in ACP_CLI_HARNESSES.items()},
     },
