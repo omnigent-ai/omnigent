@@ -2685,6 +2685,9 @@ def register_core_routes(
                     "type": "permission_mode_change",
                     "permission_mode": requested_permission_mode,
                 },
+                # Cycling and reading the TUI footer can outlast the default
+                # 5s forward budget; wait for confirmation before persisting.
+                timeout_s=_TUI_INJECT_FORWARD_TIMEOUT_S,
             )
             # Raises unless the runner confirms the switch, so the label can
             # never claim a mode Claude isn't in. Stores the mode it reached.
