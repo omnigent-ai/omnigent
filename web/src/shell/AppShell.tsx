@@ -103,7 +103,7 @@ import { GithubPanel } from "./GithubPanel";
 import { MobilePanelDrawer } from "./MobilePanelDrawer";
 import { isMobileViewport, Sidebar } from "./Sidebar";
 import { SidebarHeaderActions } from "./SidebarHeaderActions";
-import { useSettingsRoute } from "./settingsNav";
+import { HEADERLESS_SECTIONS, useSettingsRoute } from "./settingsNav";
 import { SubagentsPanel } from "./SubagentsPanel";
 import { useRootSessionId, useSession } from "@/hooks/useSession";
 import {
@@ -269,7 +269,11 @@ export function AppShell() {
   // reintroduce the trap: by then the title-bar toggle is back and the Back row
   // is no longer the only way out. Mirrors sidebarOpenBeforeMaximizeRef, which
   // stashes and restores the same state around the maximize flow.
-  const { inSettings } = useSettingsRoute();
+  const { inSettings, section } = useSettingsRoute();
+  // Only hide the header while the sidebar is open — it carries the
+  // sidebar-reopen control, so hiding it with the sidebar closed strands the
+  // user with no way back. Mirrors extensionOwnsHeader above.
+  const hideHeader = inSettings && HEADERLESS_SECTIONS.includes(section) && sidebarOpen;
   const sidebarOpenBeforeSettingsRef = useRef<boolean | null>(null);
   useEffect(() => {
     if (inSettings) {
@@ -1148,6 +1152,9 @@ export function AppShell() {
   // Validate the latest selection, including a tab queued by session restoration.
   useEffect(() => {
     setRightRailTab((tab) => {
+      // "sidechat" is a dynamic mode (a side-chat tab is selected), not a
+      // gated nav tab — always valid, and never a fallback target.
+      if (tab === "sidechat") return tab;
       if (railTabsAvailable[tab]) return tab;
       return (
         (["files", "changes", "github", "subagents", "browser"] as const).find(
@@ -1593,20 +1600,15 @@ export function AppShell() {
     [selectedFilePath, selectedTerminalKey, clearFileViewerUrl],
   );
 
-  // A `/side` fork the user just opened: reveal it in the Agents rail on the
-  // SIDE CHAT itself, and leave the main chat's rail untouched. `ChatPage`
-  // navigates off `redirectToConversationId`; the rail tab is per-conversation,
-  // so we wait until the router has actually landed on the child
-  // (`conversationId === sideChatRailRequest`) before switching the tab —
-  // otherwise the tab would persist onto the main chat we're leaving.
-  const sideChatRailRequest = useChatStore((s) => s.sideChatRailRequest);
-  const clearSideChatRailRequest = useChatStore((s) => s.clearSideChatRailRequest);
+  // A side chat the user just opened must be visible: reveal the Workspace rail
+  // so its soft tab shows. WorkspacePanel owns opening/selecting the tab and
+  // clearing the one-shot `sideChatToOpen` signal (it holds the side-chat tab
+  // state, like the browser tabs); AppShell only ensures the rail is open.
+  const sideChatToOpen = useChatStore((s) => s.sideChatToOpen);
   useEffect(() => {
-    if (sideChatRailRequest === null) return;
-    if (conversationId !== sideChatRailRequest) return;
-    handleRightRailTabChange("subagents");
-    clearSideChatRailRequest();
-  }, [sideChatRailRequest, clearSideChatRailRequest, handleRightRailTabChange, conversationId]);
+    if (sideChatToOpen === null) return;
+    setRightPanelOpen(true);
+  }, [sideChatToOpen]);
 
   function openTerminalsPanel(key: string) {
     setSelectedFilePath(null); // close file viewer
@@ -2131,7 +2133,7 @@ export function AppShell() {
                   } as CSSProperties
                 }
               >
-                {!extensionOwnsHeader && (
+                {!extensionOwnsHeader && !hideHeader && (
                   <ChatHeader
                     // Real docked state — deliberately NOT `|| sidebarPeek`. Peek
                     // is a transient card floating over the collapsed layout (the
@@ -2364,6 +2366,7 @@ export function AppShell() {
               {serverConversationId && selectedFilePath !== null && (
                 <div className="md:hidden">
                   <FileViewer
+                    viewport="mobile"
                     open
                     conversationId={serverConversationId}
                     path={selectedFilePath}
@@ -2451,7 +2454,7 @@ export function AppShell() {
           {/* Match the previous toast system's effectively unbounded stack so
               security prompts cannot be hidden behind ordinary notifications. */}
           <Toaster
-            position="bottom-right"
+            position="top-center"
             visibleToasts={100}
             offset={{
               right: "1rem",

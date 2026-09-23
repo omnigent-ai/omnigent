@@ -46,7 +46,12 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from omnigent._platform import normalize_interactive_shells
 from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
-from omnigent.debug_logging import debug_event, phase_scope, runner_primary_session_id
+from omnigent.debug_logging import (
+    debug_event,
+    phase_scope,
+    runner_primary_session_id,
+    set_current_session_id,
+)
 from omnigent.entities.session_resources import (
     DEFAULT_ENVIRONMENT_ID,
     SessionResourceView,
@@ -108,6 +113,7 @@ from omnigent.runner.native import (
     _COST_POPUP_REPOP_TASKS,
     _REPL_TERMINAL_NAME,
     _REPL_TERMINAL_SESSION_KEY,
+    _SESSION_METADATA_PARAMS,
     NativeLaunchContext,
     PreLaunchResult,
     ResolvedSpec,
@@ -227,6 +233,9 @@ _CLAUDE_MODEL_LATE_DIALOG_POLL_S = 2.0
 _CLAUDE_PANE_READY_TIMEOUT_S = 30.0
 _CLAUDE_PANE_READY_POLL_S = 0.25
 
+# Pending questions outlive prompt delivery; poll outside the turn watchdog.
+_CLAUDE_PENDING_PROMPT_POLL_S = 0.5
+
 # Settle delay between keystrokes when driving Codex TUI popups. The
 # slash-command menu, the /permissions popup, and the Full Access confirm
 # sub-dialog are each drawn asynchronously; without a pause the next key races
@@ -317,6 +326,9 @@ for _builder_name in (
 # Servers before 0.3.0 cannot serialize the runner's "waiting" status.
 # Unknown versions also downgrade to "running" so old servers never return 500.
 _WAITING_STATUS_MIN_SERVER_VERSION = "0.3.0"
+# Published statuses that mean a session's terminal is still working a turn.
+# ``waiting`` is parked on user input, so it keeps the runner alive too.
+_IN_FLIGHT_SESSION_STATUSES = ("running", "waiting")
 # Cached server version from the /api/version probe; ``None`` until a probe
 # succeeds. A failed probe stays ``None`` and is retried on the next
 # session-create — the GET is cheap and self-heals a transient failure.
@@ -539,6 +551,15 @@ _WAKE_POST_TRANSIENT_4XX = frozenset({408, 409, 425, 429})
 # the Databricks Apps ingress) can drop the long-lived HTTP connection.
 # Matches the AP-side ``_SESSION_STREAM_HEARTBEAT_INTERVAL_S``.
 _SESSION_STREAM_HEARTBEAT_S = 15.0
+
+# How long a required-terminal exit waits for the session's in-flight turn
+# stream to converge before releasing the harness subprocess. The harness
+# usually reports the failure that killed its pane (e.g. a prompt-readiness
+# timeout) on that very stream; releasing at once would close the client the
+# runner is reading and turn the report into a bare transport error. A pane
+# that died on its own leaves the harness parked on a readiness wait, so the
+# wait is bounded and the stream failure is then attributed to the exit.
+_TERMINAL_EXIT_RELEASE_GRACE_S = 2.0
 
 # Lazy singleton LLM client for the runner process. Created on first use so
 # the runner does not import llms at startup (imports are expensive and the
@@ -1367,6 +1388,20 @@ def _is_context_overflow_error(event: _JsonObject) -> tuple[int, int] | None:
     return 128000, 128001
 
 
+def _response_failed_payload(
+    error: Mapping[str, object],
+    source: str = "execution",
+) -> _JsonObject:
+    """Build a failure envelope with required error fields and a legacy mirror."""
+    failure_error = {**_normalize_turn_error(error), **error}
+    return {
+        "type": "response.failed",
+        "source": source,
+        "response": {"status": "failed", "error": failure_error},
+        "error": failure_error,
+    }
+
+
 def _response_failed_event(
     error: Mapping[str, object],
     source: str = "execution",
@@ -1386,10 +1421,7 @@ def _response_failed_event(
         so it can persist the right ``ErrorData.source``.
     :returns: UTF-8 encoded SSE frame bytes.
     """
-    response = {"status": "failed", "error": error}
-    payload = json.dumps(
-        {"type": "response.failed", "source": source, "response": response, "error": error}
-    )
+    payload = json.dumps(_response_failed_payload(error, source=source))
     return f"event: response.failed\ndata: {payload}\n\n".encode()
 
 
@@ -1771,7 +1803,7 @@ def mark_subagent_work_started(child_session_id: str) -> _SubagentWorkEntry | No
     entry = _subagent_work_by_child.get(child_session_id)
     if entry is None:
         return None
-    if entry.status == "launching":
+    if entry.status in {"launching", "waiting"}:
         entry.status = "running"
     return entry
 
@@ -2012,31 +2044,48 @@ async def _recover_subagent_results_from_server(
         status = child.get("current_task_status")
         if not isinstance(child_id, str) or not isinstance(status, str):
             continue
-        if status not in _SUBAGENT_TERMINAL_STATUSES:
+        error = child.get("last_task_error")
+        interrupted = status == "in_progress" or (
+            status == "failed"
+            and isinstance(error, dict)
+            and error.get("code") in {"runner_disconnected", "runner_failed_to_start"}
+        )
+        if status not in _SUBAGENT_TERMINAL_STATUSES and not interrupted:
             continue
-        if (
-            get_subagent_work(child_id) is not None
-            or child_id in _drained_delivered_subagent_children
+        existing = get_subagent_work(child_id)
+        if (existing is not None and existing.status != "waiting") or (
+            child_id in _drained_delivered_subagent_children
         ):
             continue
         labels = child.get("labels")
         dispatch_id = undelivered_subagent_dispatch_id(labels if isinstance(labels, dict) else {})
-        if dispatch_id is None:
+        if dispatch_id is None or (existing is not None and existing.work_id != dispatch_id):
             continue
         output: str | None = None
         if status == "failed":
             error = child.get("last_task_error")
             message = error.get("message") if isinstance(error, dict) else None
             output = message if isinstance(message, str) else None
-        else:
+        elif not interrupted:
             output = await _fetch_latest_assistant_text(server_client, child_id)
-        entry = register_subagent_work(
+        # A forwarded completion or newer dispatch may arrive during the history read.
+        if (
+            get_subagent_work(child_id) is not existing
+            or (existing is not None and existing.status != "waiting")
+            or child_id in _drained_delivered_subagent_children
+        ):
+            continue
+        entry = existing or register_subagent_work(
             parent_session_id=parent_id,
             child_session_id=child_id,
             agent=str(child.get("tool") or child.get("agent_name") or "sub-agent"),
             title=str(child.get("session_name") or ""),
             work_id=dispatch_id,
         )
+        if interrupted:
+            # This dispatch already existed; a local launch timeout cannot judge it.
+            entry.status = "waiting"
+            continue
         ack = mark_subagent_work_terminal(child_id, status=status, output=output)
         if ack.delivered_now:
             schedule_wake(entry)
@@ -2233,6 +2282,7 @@ async def run_subagent_launch_reaper(
     *,
     interval_s: float = SUBAGENT_LAUNCH_REAP_INTERVAL_S,
     mark_terminal: MarkSubagentTerminalAndWake | None = None,
+    reconcile_pending: Callable[[], Awaitable[None]] | None = None,
 ) -> None:
     """
     Periodically sweep for sub-agent dispatches wedged in ``launching``.
@@ -2244,12 +2294,15 @@ async def run_subagent_launch_reaper(
     :param mark_terminal: Terminal-delivery callback forwarded to each sweep;
         the entrypoint passes the app's wake-scheduling seam so a reaped
         failure wakes the parent, not just its inbox.
+    :param reconcile_pending: Refresh recovered work awaiting remote completion.
     :returns: None.
     """
     while True:
         await asyncio.sleep(interval_s)
         try:
             reap_stalled_subagent_launches(mark_terminal=mark_terminal)
+            if reconcile_pending is not None:
+                await reconcile_pending()
         except Exception:  # noqa: BLE001 — the sweep is a backstop; never die.
             _logger.warning("sub-agent launch reaper sweep failed", exc_info=True)
 
@@ -2830,6 +2883,10 @@ def create_runner_app(
     import hmac
 
     app = FastAPI(title="omnigent-runner")
+
+    from omnigent.runner.logging_context import RunnerLogContextMiddleware
+
+    app.add_middleware(RunnerLogContextMiddleware)
     mcp_execution_registry = McpExecutionRegistry()
     app.state.mcp_execution_registry = mcp_execution_registry
 
@@ -2883,7 +2940,10 @@ def create_runner_app(
     _session_snapshot_cache: dict[str, _SessionSnapshot] = {}  # session_id → snapshot
     _session_snapshot_locks: dict[str, asyncio.Lock] = {}  # session_id → snapshot fetch lock
     _session_spec_locks: dict[str, asyncio.Lock] = {}  # session_id → spec resolution lock
-    _session_init_tasks: dict[tuple[str, str, str | None], asyncio.Task[JSONResponse]] = {}
+    _session_init_tasks: dict[
+        tuple[str, str, str | None, str | None], asyncio.Task[JSONResponse]
+    ] = {}
+    _recovery_turn_ids: dict[str, set[str]] = {}
     _session_init_envelopes: dict[str, tuple[float, RunnerSessionInitEnvelope]] = {}
     # session_id → canonical reasoning effort, seeded from the session-init
     # snapshot and updated by ``effort_change``. In-process harnesses learn the
@@ -3014,6 +3074,8 @@ def create_runner_app(
     _model_dialog_watchers: set[asyncio.Task[None]] = set()
     _session_message_buffers: dict[str, list[dict[str, Any]]] = {}
     app.state.session_message_buffers = _session_message_buffers
+    _claude_prompt_waiters: dict[str, asyncio.Task[None]] = {}
+    app.state.claude_prompt_waiters = _claude_prompt_waiters
     _author_attribution_sessions: set[str] = set()
     _ingest_next_seq: dict[str, int] = {}
     _ingest_now_serving: dict[str, int] = {}
@@ -3023,6 +3085,11 @@ def create_runner_app(
     # Desynced conversations; cleared when a fresh turn binds.
     _desynced_sessions: set[str] = set()
     app.state.desynced_sessions = _desynced_sessions
+    # Required-terminal exits whose handler released the session's harness
+    # subprocess. The release closes the httpx client an in-flight
+    # ``proxy_stream`` is reading, which surfaces there as a transport error;
+    # the stream's failure handler consumes the record to report the exit.
+    _required_terminal_exit_errors: dict[str, dict[str, str]] = {}
     # Monotonic epoch stamped at each turn bind; lets recovery detect a replacement that ran
     # and finished during a teardown await (slot empty, but epoch advanced).
     _turn_epoch_seq = itertools.count(1)
@@ -3054,6 +3121,8 @@ def create_runner_app(
     def _has_active_work() -> bool:
         if _active_turns:
             return True
+        if _claude_prompt_waiters:
+            return True
         if _has_live_async_tasks(_session_async_tasks):
             return True
         for timers in _session_timers.values():
@@ -3062,11 +3131,23 @@ def create_runner_app(
                     return True
         if pending_approvals.has_any_pending():
             return True
-        if process_manager is not None:
-            session_ids = set(_session_start_cache) | set(_session_agent_ids)
-            if any(process_manager.has_active_turn(session_id) for session_id in session_ids):
-                return True
-        return False
+        session_ids = set(_session_start_cache) | set(_session_agent_ids)
+        if process_manager is not None and any(
+            process_manager.has_active_turn(session_id) for session_id in session_ids
+        ):
+            return True
+        return any(_native_turn_in_flight(session_id) for session_id in session_ids)
+
+    def _native_turn_in_flight(session_id: str) -> bool:
+        """Whether a native terminal still reports this session's turn as in flight.
+
+        Native delivery returns once the prompt is typed, so the terminal's own
+        status edges decide when the turn settles. SDK turns are already covered
+        by ``_active_turns`` and need not publish a closing edge.
+        """
+        if _native_pane_status.get(session_id) not in _IN_FLIGHT_SESSION_STATUSES:
+            return False
+        return is_native_harness(_session_harness_name(session_id))
 
     app.state.has_active_work = _has_active_work
 
@@ -3364,12 +3445,12 @@ def create_runner_app(
         runner log) and attaches the live pane snapshot as a ``Last captured
         terminal output:`` block, which the web UI renders as diagnostics.
         """
-        cause = str(exc).strip()
-        message = (
-            f"Harness stream connection error: {cause}"
-            if cause
-            else "Harness stream connection error."
-        )
+        # httpx raises several transport errors with no message at all
+        # (``ReadError()``), which left the whole diagnostic as the bare
+        # sentence. Fall back to the exception type so the message always names
+        # which transport failure ended the stream.
+        cause = str(exc).strip() or type(exc).__name__
+        message = f"Harness stream connection error: {cause}"
         pane = _live_terminal_pane_snapshot(conv_id)
         if pane:
             message = f"{message}\n\nLast captured terminal output:\n{pane}"
@@ -3380,6 +3461,12 @@ def create_runner_app(
             return
 
         async def _release() -> None:
+            # Let a live turn stream converge first (bounded): the harness's own
+            # failure event may already be on the wire, and releasing now would
+            # sever the stream carrying it.
+            deadline = time.monotonic() + _TERMINAL_EXIT_RELEASE_GRACE_S
+            while session_id in _live_response_id and time.monotonic() < deadline:
+                await asyncio.sleep(0.05)
             try:
                 await process_manager.release(session_id)
             except Exception:
@@ -3421,6 +3508,14 @@ def create_runner_app(
         _teardown_task.add_done_callback(_background_tasks.discard)
         _background_tasks.add(_teardown_task)
 
+        # Record the exit before releasing the harness: the release severs any
+        # in-flight turn stream, whose failure handler then reports this exit
+        # instead of the transport error the severed socket raises.
+        error = _build_required_terminal_error(event)
+        _required_terminal_exit_errors[event.session_id] = error
+        # A dead required terminal cannot still be working a turn.
+        _native_pane_status.pop(event.session_id, None)
+
         if event.terminal_name in ("qwen", "antigravity") and event.session_key == "main":
             _publish_event(event.session_id, {"type": "session.status", "status": "idle"})
             _release_required_terminal_session(event.session_id)
@@ -3430,7 +3525,6 @@ def create_runner_app(
             _release_required_terminal_session(event.session_id)
             return
 
-        error = _build_required_terminal_error(event)
         _logger.error(
             "required terminal %s exited; failing turn for %s: %s",
             event.terminal_name,
@@ -3487,7 +3581,9 @@ def create_runner_app(
             parent_session_id: str | None = None
             agent_name: str | None = None
             try:
-                resp = await server_client.get(f"/v1/sessions/{session_id}")
+                resp = await server_client.get(
+                    f"/v1/sessions/{session_id}", params=_SESSION_METADATA_PARAMS
+                )
                 status_code = resp.status_code
                 if resp.status_code == 200:
                     body = resp.json()
@@ -3547,7 +3643,9 @@ def create_runner_app(
         re-reads it fresh.
         """
         try:
-            resp = await server_client.get(f"/v1/sessions/{session_id}")
+            resp = await server_client.get(
+                f"/v1/sessions/{session_id}", params=_SESSION_METADATA_PARAMS
+            )
             if resp.status_code == 200:
                 raw = resp.json().get("model_override")
                 if isinstance(raw, str) and raw:
@@ -3584,8 +3682,11 @@ def create_runner_app(
         session_id: str,
         agent_id: str,
     ) -> _SessionInitContext:
+        from omnigent.runner.session_init_protocol import validate_runner_inference_config
+
         if envelope.session_id != session_id or envelope.agent_id != agent_id:
             raise ValueError("session initialization envelope identity mismatch")
+        validate_runner_inference_config(envelope.snapshot.inference_config)
 
         global _server_version
         _server_version = envelope.server_version
@@ -3626,6 +3727,10 @@ def create_runner_app(
     ) -> _SessionInitContext:
         envelope = parse_runner_session_init_envelope(body)
         if envelope is None:
+            if os.environ.get("OMNIGENT_INFERENCE_CONFIG"):
+                from omnigent.runner.session_init_protocol import validate_runner_inference_config
+
+                validate_runner_inference_config(None)
             return await _load_legacy_session_init_context()
         body_sub_agent = body.get("sub_agent_name")
         if envelope.sub_agent_name != (
@@ -3835,7 +3940,24 @@ def create_runner_app(
         )
 
     async def _initialize_session(body: _JsonObject) -> JSONResponse:
+        from omnigent.runner.session_init_protocol import RunnerInferenceConfigMismatch
+
+        raw_id = body.get("session_id")
+        set_current_session_id(raw_id if isinstance(raw_id, str) else None)
+        _logger.info(
+            "Runner session initialization started",
+            extra=debug_event("runner_session_init_started", stage="session_init"),
+        )
         if process_manager is None:
+            _logger.error(
+                "Runner session initialization failed",
+                extra=debug_event(
+                    "runner_session_init_failed",
+                    stage="session_init",
+                    status_code=501,
+                    error_code="not_implemented",
+                ),
+            )
             return JSONResponse(
                 status_code=501,
                 content={
@@ -3846,6 +3968,15 @@ def create_runner_app(
         session_id = body.get("session_id")
         agent_id = body.get("agent_id")
         if not session_id or not agent_id:
+            _logger.error(
+                "Runner session initialization failed",
+                extra=debug_event(
+                    "runner_session_init_failed",
+                    stage="session_init",
+                    status_code=400,
+                    error_code="invalid_request",
+                ),
+            )
             return JSONResponse(
                 status_code=400,
                 content={
@@ -3855,6 +3986,11 @@ def create_runner_app(
             )
         session_id = cast(str, session_id)
         agent_id = cast(str, agent_id)
+        initial_turn_epoch = _turn_bind_epoch.get(session_id)
+        initial_native_activity = resource_registry.session_activity_epoch(session_id)
+        initially_active = session_id in _active_turns or resource_registry.session_turn_is_active(
+            session_id
+        )
 
         # Captured before init's first await: the legacy (no-envelope) context
         # load below probes the server's version over the network, so a reset
@@ -3868,7 +4004,27 @@ def create_runner_app(
                 session_id=session_id,
                 agent_id=agent_id,
             )
+        except RunnerInferenceConfigMismatch:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": "inference_config_mismatch",
+                    "detail": (
+                        "This runner has a different saved provider configuration; "
+                        "launch a new runner."
+                    ),
+                },
+            )
         except ValueError:
+            _logger.error(
+                "Runner session initialization failed",
+                extra=debug_event(
+                    "runner_session_init_failed",
+                    stage="session_init",
+                    status_code=400,
+                    error_code="invalid_request",
+                ),
+            )
             return JSONResponse(
                 status_code=400,
                 content={
@@ -3895,6 +4051,15 @@ def create_runner_app(
             try:
                 spec_entry = await spec_resolver(agent_id, session_id)
             except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+                _logger.error(
+                    "Runner session initialization failed",
+                    extra=debug_event(
+                        "runner_session_init_failed",
+                        stage="session_init",
+                        status_code=503,
+                        error_code="spec_resolver_failed",
+                    ),
+                )
                 return JSONResponse(
                     status_code=503,
                     content={
@@ -3933,6 +4098,15 @@ def create_runner_app(
             _start_verdict = await _evaluate_agent_start_gate(spec, harness_name)
             if _start_verdict is not None:
                 if _start_verdict.action in ("deny", "ask"):
+                    _logger.error(
+                        "Runner session initialization failed",
+                        extra=debug_event(
+                            "runner_session_init_failed",
+                            stage="session_init",
+                            status_code=403,
+                            error_code="agent_start_denied",
+                        ),
+                    )
                     return JSONResponse(
                         status_code=403,
                         content={
@@ -3987,6 +4161,15 @@ def create_runner_app(
                 # agent_id. Return a clear 400 rather than silently proceeding
                 # with the test-only harness and leaving the session in a
                 # broken/unrunnable state.
+                _logger.error(
+                    "Runner session initialization failed",
+                    extra=debug_event(
+                        "runner_session_init_failed",
+                        stage="session_init",
+                        status_code=400,
+                        error_code="no_agent_spec",
+                    ),
+                )
                 return JSONResponse(
                     status_code=400,
                     content={
@@ -4007,6 +4190,15 @@ def create_runner_app(
                 env=spawn_env,
             )
         except RuntimeError as exc:
+            _logger.error(
+                "Runner session initialization failed",
+                extra=debug_event(
+                    "runner_session_init_failed",
+                    stage="session_init",
+                    status_code=503,
+                    error_code="harness_spawn_failed",
+                ),
+            )
             return JSONResponse(
                 status_code=503,
                 content={
@@ -4387,13 +4579,25 @@ def create_runner_app(
         _suppress_recovery = (
             init_context.envelope is not None and init_context.envelope.suppress_recovery_turn
         )
+        recovery_id = (
+            init_context.envelope.recovery_id
+            if init_context.envelope is not None
+            and init_context.envelope.resume_interrupted_turn
+            and not _suppress_recovery
+            else None
+        )
         history: list[_JsonObject]
         if is_native_harness(harness_name):
             await _seed_last_server_item_id(session_id)
             history = []
         else:
             history = await _load_history_as_input(session_id)
-        if history:
+        execution_seen = (
+            initially_active
+            or _turn_bind_epoch.get(session_id) != initial_turn_epoch
+            or resource_registry.session_activity_epoch(session_id) != initial_native_activity
+        )
+        if history and not execution_seen and session_id not in _active_turns:
             _session_histories[session_id] = history
             last = history[-1]
             last_type = last.get("type")
@@ -4403,7 +4607,12 @@ def create_runner_app(
                 or last_type == "function_call"
                 or last_type == "function_call_output"
             )
-            if needs_turn and not _suppress_recovery and session_id not in _active_turns:
+            if (
+                needs_turn
+                and recovery_id is None
+                and not _suppress_recovery
+                and session_id not in _active_turns
+            ):
                 _begin_turn_slot(session_id)
                 _publish_turn_status(session_id, "running")
                 msg_body = {
@@ -4422,7 +4631,57 @@ def create_runner_app(
                 )
                 _background_tasks.add(_turn_task)
 
+        if recovery_id is not None and recovery_id not in _recovery_turn_ids.get(
+            session_id, set()
+        ):
+            # Active execution, including a newer message, takes precedence over
+            # automatic continuation. Initialization alone cannot consume it.
+            if (
+                not execution_seen
+                and session_id not in _active_turns
+                and not resource_registry.session_turn_is_active(session_id)
+            ):
+                if is_native_harness(harness_name):
+                    _session_histories[session_id] = []
+                _begin_turn_slot(session_id)
+                _publish_turn_status(session_id, "running")
+                recovery_body: _JsonObject = {
+                    "agent_id": agent_id,
+                    "model": body.get("model", agent_id),
+                    "browser_renderer_available": False,
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": (
+                                "Your runner was interrupted while this task was active. "
+                                "Continue the existing task from its current state. "
+                                "Check any interrupted operation's outcome before repeating it."
+                            ),
+                        }
+                    ],
+                }
+                if not is_native_harness(harness_name):
+                    _session_histories.setdefault(session_id, []).append(
+                        {"type": "message", "role": "user", "content": recovery_body["content"]}
+                    )
+                recovery_task = asyncio.create_task(
+                    _run_turn_bg(recovery_body, session_id), name=f"turn-recover-{session_id}"
+                )
+                _active_turns[session_id] = recovery_task
+                recovery_task.add_done_callback(_background_tasks.discard)
+                _background_tasks.add(recovery_task)
+            _recovery_turn_ids.setdefault(session_id, set()).add(recovery_id)
+
         status = "running" if session_id in _active_turns else "idle"
+        _logger.info(
+            "Runner session initialization finished",
+            extra=debug_event(
+                "runner_session_initialized",
+                stage="session_init",
+                status_code=201,
+                harness=harness_name,
+            ),
+        )
         return JSONResponse(
             status_code=201,
             content={
@@ -4442,6 +4701,12 @@ def create_runner_app(
                     else None
                 ),
                 "terminal_ready": terminal_ready,
+                **(
+                    {"inference_config_verified": True}
+                    if init_context.envelope is not None
+                    and init_context.envelope.snapshot.inference_config is not None
+                    else {}
+                ),
             },
         )
 
@@ -4461,10 +4726,15 @@ def create_runner_app(
         if not isinstance(session_id, str) or not isinstance(agent_id, str):
             return await _initialize_session(body)
         sub_agent_name = body.get("sub_agent_name")
+        try:
+            envelope = parse_runner_session_init_envelope(body)
+        except ValueError:
+            return await _initialize_session(body)
         key = (
             session_id,
             agent_id,
             sub_agent_name if isinstance(sub_agent_name, str) else None,
+            envelope.recovery_id if envelope is not None else None,
         )
         task = _session_init_tasks.get(key)
         if task is None:
@@ -4598,6 +4868,8 @@ def create_runner_app(
 
     @app.delete("/v1/sessions/{session_id}")
     async def delete_session(session_id: str) -> JSONResponse:
+        _cancel_claude_prompt_waiter(session_id)
+        _session_message_buffers.pop(session_id, None)
         # Stop initialization before it can recreate resources during teardown.
         init_tasks = [
             task
@@ -4635,8 +4907,10 @@ def create_runner_app(
         _live_response_id.pop(session_id, None)
         # Clear all desync/turn state so a recreated same-id session starts clean.
         _turn_bind_epoch.pop(session_id, None)
+        _recovery_turn_ids.pop(session_id, None)
         _desync_terminalized.pop(session_id, None)
         _desynced_sessions.discard(session_id)
+        _required_terminal_exit_errors.pop(session_id, None)
         _native_pane_status.pop(session_id, None)
         _ingest_next_seq.pop(session_id, None)
         _ingest_now_serving.pop(session_id, None)
@@ -5235,10 +5509,11 @@ def create_runner_app(
 
         The parent inbox is a process-local queue, so a result queued before
         a restart but not yet drained would otherwise vanish. Runs once per
-        parent per process; a scan that fails on a server read is retried
-        before the next ``sys_read_inbox`` drain. The inbox is created here
-        when missing: after a reconnect the server can dispatch a pending
-        message before it re-initializes the session, and that turn's drain
+        parent per process; pending recovered work is refreshed by the periodic
+        sweep. A failed server read is retried before the next ``sys_read_inbox``
+        drain. The inbox is created here when missing: after a reconnect the
+        server can dispatch a pending message before it re-initializes the session,
+        and that turn's drain
         must still see the recovered results. Results acknowledged while this
         parent had no inbox here are handed over first, on every call.
 
@@ -5314,6 +5589,21 @@ def create_runner_app(
         await asyncio.shield(_start_subagent_recovery(parent_id))
 
     app.state.recover_undrained_subagent_results = _recover_undrained_subagent_results
+
+    async def _reconcile_pending_subagent_results() -> None:
+        """Refresh only recovered work with no local execution or completion edge."""
+        parents = {
+            entry.parent_session_id
+            for entry in list(_subagent_work_by_child.values())
+            if entry.status == "waiting"
+        }
+        for parent_id in parents:
+            if not any(entry.status == "waiting" for entry in list_subagent_work(parent_id)):
+                continue
+            _subagent_recovery_done.discard(parent_id)
+            await _recover_undrained_subagent_results(parent_id)
+
+    app.state.reconcile_pending_subagent_results = _reconcile_pending_subagent_results
 
     def _note_session_harness_override(conv_id: str, harness_override: str | None) -> None:
         """Record the harness a session was forwarded, so reads match the run.
@@ -5533,6 +5823,7 @@ def create_runner_app(
             try:
                 resp = await server_client.get(
                     f"/v1/sessions/{urllib.parse.quote(conv_id, safe='')}",
+                    params=_SESSION_METADATA_PARAMS,
                     timeout=10.0,
                 )
                 if resp.status_code == 200:
@@ -6103,11 +6394,22 @@ def create_runner_app(
             inject_slash_command,
             read_claude_status_model,
             read_model_env,
+            read_model_picker_values,
         )
         from omnigent.harnesses.claude_native.main import (
             resolve_claude_native_model_selection,
+            stored_claude_catalog_rows,
+            stored_claude_picker_values,
         )
-        from omnigent.models.claude_model_vocabulary import claude_model_command_arg
+        from omnigent.inference_config import (
+            binding_for_harness,
+            load_runtime_inference_config,
+            resolve_bound_model,
+        )
+        from omnigent.models.claude_model_vocabulary import (
+            claude_model_command_arg,
+            picker_command_values,
+        )
 
         if model is None or not model.strip():
             return Response(status_code=204)
@@ -6122,19 +6424,36 @@ def create_runner_app(
         resolved_model = (
             resolve_claude_native_model_selection(selected_model, claude_config) or selected_model
         )
-        # ``/model`` takes only this session's own picker vocabulary — its
-        # family aliases and its one custom slot. Typing a bare catalog id
-        # outside it leaves the pane on its old model while this handler
-        # reports success, so fail loud instead. Same translation the routed
-        # turn path and the executor apply.
+        # Translate through the pane's picker values, aliases, and custom slot.
+        # An unknown spelling must fail before any command reaches the terminal.
         env = read_model_env(bridge_dir) or None
-        model_arg = claude_model_command_arg(resolved_model, env)
+        cached_options = _claude_model_options_rows.get(conv_id)
+        if cached_options is not None:
+            picker_values = picker_command_values(cached_options[1])
+        else:
+            stored_rows = stored_claude_catalog_rows(claude_config)
+            if stored_rows is not None and not stored_rows:
+                # Discovery stored an authoritative empty catalog (every
+                # picker entry disabled): launch-recorded bridge values are
+                # stale vocabulary, so nothing is switchable.
+                picker_values: list[str] = []
+            else:
+                picker_values = read_model_picker_values(bridge_dir)
+                if not picker_values:
+                    picker_values = stored_claude_picker_values(claude_config, stored_rows)
+        model_arg = claude_model_command_arg(resolved_model, env, picker_values=picker_values)
+        inference_config = load_runtime_inference_config()
+        if binding_for_harness(inference_config, "claude-native") is not None:
+            resolved_model = resolve_bound_model(inference_config, "claude-native", selected_model)
+            model_arg = resolved_model
         if model_arg is None:
             _logger.warning(
-                "claude-native model change: %r has no spelling session=%s accepts (pins=%s)",
+                "claude-native model change: %r has no spelling session=%s accepts "
+                "(pins=%s, picker=%s)",
                 resolved_model,
                 conv_id,
                 sorted(env or ()),
+                picker_values,
                 extra={"session_id": conv_id},
             )
             return JSONResponse(
@@ -6589,7 +6908,16 @@ def create_runner_app(
             bridge_dir_for_bridge_id,
             update_model_override,
         )
+        from omnigent.inference_config import (
+            binding_for_harness,
+            load_runtime_inference_config,
+            resolve_bound_model,
+        )
 
+        inference_config = load_runtime_inference_config()
+        if binding_for_harness(inference_config, "opencode-native") is not None:
+            selected = resolve_bound_model(inference_config, "opencode-native", model)
+            model = f"omnigent/{selected}" if selected is not None else None
         updated = await asyncio.to_thread(
             update_model_override, bridge_dir_for_bridge_id(conv_id), model
         )
@@ -6603,6 +6931,7 @@ def create_runner_app(
                 await server_client.patch(
                     f"/v1/sessions/{urllib.parse.quote(conv_id, safe='')}",
                     json={"external_session_id": None},
+                    params={"include_usage": "false"},
                     timeout=10.0,
                 )
         try:
@@ -7072,7 +7401,9 @@ def create_runner_app(
         if not attached:
             return
         try:
-            resp = await server_client.get(f"/v1/sessions/{conv_id}", timeout=10.0)
+            resp = await server_client.get(
+                f"/v1/sessions/{conv_id}", params=_SESSION_METADATA_PARAMS, timeout=10.0
+            )
         except httpx.HTTPError:
             return
         if resp.status_code != 200:
@@ -7505,6 +7836,78 @@ def create_runner_app(
     if process_manager is not None and hasattr(process_manager, "set_respawn_hook"):
         process_manager.set_respawn_hook(_resync_turn_state_on_harness_respawn)
 
+    async def _claude_prompt_bridge_dir(session_id: str) -> Path:
+        """Resolve the bridge label before inspecting a native prompt."""
+        from omnigent.harnesses.claude_native.bridge import bridge_dir_for_bridge_id
+
+        bridge_id = await _claude_native_bridge_id_for_session(
+            server_client=server_client, session_id=session_id
+        )
+        return bridge_dir_for_bridge_id(bridge_id)
+
+    async def _pending_claude_prompt_bridge_dir(session_id: str) -> Path | None:
+        """Return the bridge whose question or approval currently owns input."""
+        if _session_harness_name(session_id) != "claude-native":
+            return None
+        from omnigent.harnesses.claude_native.bridge import has_pending_user_prompt
+
+        bridge_dir = await _claude_prompt_bridge_dir(session_id)
+        if await asyncio.to_thread(has_pending_user_prompt, bridge_dir):
+            return bridge_dir
+        return None
+
+    def _cancel_claude_prompt_waiter(session_id: str) -> None:
+        """Discard waiting input before explicit terminal interruption or teardown."""
+        waiter = _claude_prompt_waiters.pop(session_id, None)
+        if waiter is not None or _session_harness_name(session_id) == "claude-native":
+            # Cancel queued work even if the terminal control fails; restoring it
+            # could restart work the user explicitly asked to stop.
+            _session_message_buffers.pop(session_id, None)
+        if waiter is not None:
+            waiter.cancel()
+
+    def _start_claude_prompt_waiter(session_id: str, bridge_dir: Path | None = None) -> None:
+        """Resume the native FIFO after its prompt is answered, without a turn timeout."""
+        existing = _claude_prompt_waiters.get(session_id)
+        if existing is not None and not existing.done():
+            return
+
+        async def _wait_for_prompt() -> None:
+            from omnigent.harnesses.claude_native.bridge import has_pending_user_prompt
+
+            try:
+                resolved_dir = bridge_dir or await _claude_prompt_bridge_dir(session_id)
+                while _session_message_buffers.get(session_id):
+                    if session_id in _active_turns:
+                        return
+                    try:
+                        pending = await asyncio.to_thread(has_pending_user_prompt, resolved_dir)
+                    except (OSError, RuntimeError):
+                        _logger.warning(
+                            "Failed to inspect pending Claude prompt for %s; retrying",
+                            session_id,
+                            exc_info=True,
+                            extra={"session_id": session_id},
+                        )
+                        pending = True
+                    if not pending:
+                        # A cancelled waiter must not abandon an ordered ingest ticket.
+                        drain = asyncio.create_task(_check_and_start_next_turn(session_id))
+                        _background_tasks.add(drain)
+                        drain.add_done_callback(_background_tasks.discard)
+                        await asyncio.shield(drain)
+                        if session_id in _active_turns:
+                            return
+                    await asyncio.sleep(_CLAUDE_PENDING_PROMPT_POLL_S)
+            finally:
+                if _claude_prompt_waiters.get(session_id) is asyncio.current_task():
+                    _claude_prompt_waiters.pop(session_id, None)
+
+        waiter = asyncio.create_task(_wait_for_prompt(), name=f"claude-prompt-{session_id}")
+        _claude_prompt_waiters[session_id] = waiter
+        _background_tasks.add(waiter)
+        waiter.add_done_callback(_background_tasks.discard)
+
     async def _check_and_start_next_turn(
         session_id: str,
     ) -> None:
@@ -7524,6 +7927,15 @@ def create_runner_app(
             buf = _session_message_buffers.get(session_id)
             if not buf:
                 _rewake_parent_if_inbox_stranded(session_id)
+                return
+
+            pending_bridge_dir = await _pending_claude_prompt_bridge_dir(session_id)
+            # Stop/delete can clear the queue while the pane inspection is in flight.
+            buf = _session_message_buffers.get(session_id)
+            if not buf:
+                return
+            if pending_bridge_dir is not None:
+                _start_claude_prompt_waiter(session_id, pending_bridge_dir)
                 return
 
             # A buffered claude-sdk /compact must dispatch as its OWN turn: the
@@ -8581,6 +8993,9 @@ def create_runner_app(
                     },
                 )
 
+        # A required-terminal exit recorded before this turn belongs to an
+        # earlier stream; only exits observed from here on can end this one.
+        _required_terminal_exit_errors.pop(conv_id, None)
         try:
             client = await manager.get_client(conv_id, harness_name, env=spawn_env)
         except RuntimeError as exc:
@@ -8617,7 +9032,11 @@ def create_runner_app(
                         conv_id,
                         exc,
                         exc_info=True,
-                        extra={"session_id": conv_id},
+                        extra={
+                            "session_id": conv_id,
+                            "event_name": "runner_turn_spec_resolution_failed",
+                            "attributes": {"phase": "eager", "exception_type": type(exc).__name__},
+                        },
                     )
                     _eager_spec_error = (
                         type(exc).__name__,
@@ -8675,7 +9094,11 @@ def create_runner_app(
                     conv_id,
                     exc,
                     exc_info=True,
-                    extra={"session_id": conv_id},
+                    extra={
+                        "session_id": conv_id,
+                        "event_name": "runner_turn_spec_resolution_failed",
+                        "attributes": {"phase": "lazy", "exception_type": type(exc).__name__},
+                    },
                 )
                 return None, (
                     type(exc).__name__,
@@ -8703,13 +9126,7 @@ def create_runner_app(
 
             if _eager_spec_error is not None:
                 _err_type, _err_msg = _eager_spec_error
-                _fail = {
-                    "type": "response.failed",
-                    "error": {
-                        "message": _err_msg,
-                        "type": _err_type,
-                    },
-                }
+                _fail = _response_failed_payload({"message": _err_msg, "type": _err_type})
                 _publish_event(conv_id, _fail)
                 _on_proxy_stream_end(
                     conv_id,
@@ -8793,15 +9210,18 @@ def create_runner_app(
                             "harness rejected turn delivery for %s with status %d",
                             conv_id,
                             harness_resp.status_code,
-                            extra={"session_id": conv_id},
-                        )
-                        _fail_status = {
-                            "type": "response.failed",
-                            "source": "harness",
-                            "error": {
-                                "status": harness_resp.status_code,
+                            extra={
+                                "session_id": conv_id,
+                                "event_name": "harness_turn_rejected",
+                                "attributes": {
+                                    "harness": harness_name,
+                                    "http_status": harness_resp.status_code,
+                                },
                             },
-                        }
+                        )
+                        _fail_status = _response_failed_payload(
+                            {"status": harness_resp.status_code}, source="harness"
+                        )
                         _publish_event(
                             conv_id,
                             _fail_status,
@@ -8992,13 +9412,9 @@ def create_runner_app(
                                         ) = await _resolve_turn_spec_lazy()
                                         if _lazy_err is not None:
                                             _err_type, _err_msg = _lazy_err
-                                            _fail = {
-                                                "type": "response.failed",
-                                                "error": {
-                                                    "message": _err_msg,
-                                                    "type": _err_type,
-                                                },
-                                            }
+                                            _fail = _response_failed_payload(
+                                                {"message": _err_msg, "type": _err_type}
+                                            )
                                             _publish_event(conv_id, _fail)
                                             _on_proxy_stream_end(
                                                 conv_id,
@@ -9206,41 +9622,60 @@ def create_runner_app(
                     ),
                     "type": "_ContextWindowOverflow",
                 }
-                _overflow_fail = {
-                    "type": "response.failed",
-                    "source": "llm",
-                    "response": {"status": "failed", "error": _error},
-                    "error": _error,
-                }
+                _overflow_fail = _response_failed_payload(_error, source="llm")
                 _publish_event(conv_id, _overflow_fail)
                 _on_proxy_stream_end(conv_id, error=_error, owner_response_id=_response_id)
                 yield _response_failed_event(_error, source="llm")
 
             except (httpx.HTTPError, RuntimeError) as exc:
-                _logger.exception(
-                    "proxy stream connection error for %s: %s",
-                    conv_id,
-                    exc,
-                    extra={
-                        "session_id": conv_id,
-                        "event_name": "harness_stream_failed",
-                        "attributes": {
-                            "harness": harness_name,
-                            "response_id": _response_id,
+                _exit_error = _required_terminal_exit_errors.pop(conv_id, None)
+                if _exit_error is not None:
+                    # The runner ended this stream itself: the session's required
+                    # terminal exited and its handler released the harness
+                    # subprocess, closing this client mid-read. Report the exit
+                    # and its pane diagnostics, not the transport symptom.
+                    _logger.warning(
+                        "harness stream for %s ended by required terminal exit: %s: %s",
+                        conv_id,
+                        type(exc).__name__,
+                        exc,
+                        extra={
+                            "session_id": conv_id,
+                            "event_name": "harness_stream_ended_by_terminal_exit",
+                            "attributes": {
+                                "harness": harness_name,
+                                "response_id": _response_id,
+                                "exception_type": type(exc).__name__,
+                            },
                         },
-                    },
-                )
-                _error = {
-                    "code": "connection_error",
-                    "message": _harness_stream_failure_message(conv_id, exc),
-                    "type": type(exc).__name__,
-                }
-                _http_fail = {
-                    "type": "response.failed",
-                    "source": "harness",
-                    "response": {"status": "failed", "error": _error},
-                    "error": _error,
-                }
+                    )
+                    # The status event's code is derived from ``type``.
+                    _error = {**_exit_error, "type": _exit_error["code"]}
+                else:
+                    # Name the type as well as the text: the messageless httpx
+                    # errors otherwise log a trailing colon and nothing, so one
+                    # signature covered every transport cause.
+                    _logger.exception(
+                        "proxy stream connection error for %s: %s: %s",
+                        conv_id,
+                        type(exc).__name__,
+                        exc,
+                        extra={
+                            "session_id": conv_id,
+                            "event_name": "harness_stream_failed",
+                            "attributes": {
+                                "harness": harness_name,
+                                "response_id": _response_id,
+                                "exception_type": type(exc).__name__,
+                            },
+                        },
+                    )
+                    _error = {
+                        "code": "connection_error",
+                        "message": _harness_stream_failure_message(conv_id, exc),
+                        "type": type(exc).__name__,
+                    }
+                _http_fail = _response_failed_payload(_error, source="harness")
                 _publish_event(conv_id, _http_fail)
                 _on_proxy_stream_end(conv_id, error=_error, owner_response_id=_response_id)
                 yield _response_failed_event(_error, source="harness")
@@ -9447,6 +9882,37 @@ def create_runner_app(
                         },
                     )
 
+                if _session_harness_name(conversation_id) == "claude-native":
+                    pending_bridge_dir = None
+                    has_queued_messages = bool(_session_message_buffers.get(conversation_id))
+                    if not has_queued_messages:
+                        pending_bridge_dir = await _pending_claude_prompt_bridge_dir(
+                            conversation_id
+                        )
+                    if has_queued_messages or pending_bridge_dir is not None:
+                        if conversation_id not in _session_histories:
+                            _session_histories[conversation_id] = await _load_history_as_input(
+                                conversation_id,
+                                drop_item_id=message_body.get("persisted_item_id"),
+                            )
+                        _session_message_buffers.setdefault(conversation_id, []).append(
+                            message_body
+                        )
+                        _start_claude_prompt_waiter(conversation_id, pending_bridge_dir)
+                        _logger.info(
+                            "post_session_events: buffering message for pending Claude prompt "
+                            "conv=%s",
+                            conversation_id,
+                            extra={"session_id": conversation_id},
+                        )
+                        return JSONResponse(
+                            status_code=202,
+                            content={
+                                "status": "buffered",
+                                "detail": "Message buffered until the pending prompt is resolved.",
+                            },
+                        )
+
                 new_item = {
                     "type": "message",
                     "role": message_body.get("role", "user"),
@@ -9504,6 +9970,7 @@ def create_runner_app(
                     _cond.notify_all()
 
         if body_type == "interrupt":
+            _cancel_claude_prompt_waiter(conversation_id)
             _harness = _session_harness_name(conversation_id)
             _interrupt_resp = await _native_interrupt_runner.interrupt(_harness, conversation_id)
             if _interrupt_resp is not None:
@@ -9519,6 +9986,9 @@ def create_runner_app(
             delivery_ack: _SubagentDeliveryAck | None = None
             recovered_entry: _SubagentWorkEntry | None = None
             if status in ("running", "waiting", "idle", "failed"):
+                # Forwarders report these edges straight to the server, so record
+                # them here too; the idle watchdog reads them for native turns.
+                _native_pane_status[conversation_id] = status
                 resource_registry.note_external_session_status(conversation_id, status)
                 _fan_out_child_delta_to_parent(
                     conversation_id,
@@ -9562,6 +10032,7 @@ def create_runner_app(
             return Response(status_code=204)
 
         if body_type == "stop_session":
+            _cancel_claude_prompt_waiter(conversation_id)
             _harness = _session_harness_name(conversation_id)
             _stop_resp = await _native_interrupt_runner.stop(_harness, conversation_id)
             if _stop_resp is not None:
@@ -11554,7 +12025,7 @@ def create_runner_app(
                     "detail": "the harness model probe is still resolving",
                 },
             )
-        if not rows:
+        if rows is None:
             return JSONResponse(
                 status_code=503,
                 content={
@@ -11567,6 +12038,37 @@ def create_runner_app(
             time.monotonic() + _CLAUDE_MODEL_OPTIONS_CACHE_TTL_S,
             rows,
         )
+        # Executor parity: a cold launch may have recorded no picker
+        # vocabulary (the store had no catalog yet), while routing decisions
+        # accept picks against THIS listing. Refresh the bridge snapshot so
+        # a routed turn's executor translates exactly the vocabulary served
+        # here — including an authoritative empty catalog, which clears
+        # stale launch values. Best-effort: the terminal may not exist yet.
+        try:
+            from omnigent.harnesses.claude_native.bridge import (
+                bridge_dir_for_bridge_id,
+                record_model_vocabulary,
+            )
+            from omnigent.models.claude_model_vocabulary import picker_command_values
+
+            bridge_id = await _claude_native_bridge_id_for_session(
+                server_client=server_client,
+                session_id=session_id,
+            )
+            await asyncio.to_thread(
+                record_model_vocabulary,
+                bridge_dir_for_bridge_id(bridge_id),
+                launch_env=None,
+                launch_model=None,
+                picker_values=picker_command_values(rows),
+            )
+        except Exception:  # noqa: BLE001 — vocabulary refresh is advisory
+            _logger.debug(
+                "claude-native model options: bridge vocabulary refresh skipped for session=%s",
+                session_id,
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
         return JSONResponse(status_code=200, content={"models": rows})
 
     @app.get("/v1/sessions/{session_id}/model-options")
@@ -11888,6 +12390,7 @@ def create_runner_app(
     async def cleanup_session_resources(
         session_id: str,
     ) -> JSONResponse:
+        _required_terminal_exit_errors.pop(session_id, None)
         _codex_terminal_ensure_locks.pop(session_id, None)
         _claude_terminal_ensure_locks.pop(session_id, None)
         _pi_terminal_ensure_locks.pop(session_id, None)
@@ -11915,6 +12418,7 @@ def create_runner_app(
 
     @app.post("/v1/sessions/{session_id}/reset-state")
     async def reset_session_state(session_id: str) -> JSONResponse:
+        _required_terminal_exit_errors.pop(session_id, None)
         _codex_terminal_ensure_locks.pop(session_id, None)
         _claude_terminal_ensure_locks.pop(session_id, None)
         _pi_terminal_ensure_locks.pop(session_id, None)
@@ -12865,11 +13369,41 @@ def _build_spawn_env_from_spec(
     # Namespaced generic-ACP ids (``acp:<slug>``) canonicalize to ``acp`` so the
     # dispatch, model-key lookup, and logging below all key off the base harness;
     # the concrete agent's slug is read from the spec by ``_build_acp_spawn_env``.
+    requested_harness = harness
     harness = canonicalize_harness(harness) or harness
     effective_spec = spec
+    from omnigent.inference_config import load_runtime_inference_config, parse_inference_config
+
+    has_inference_bindings = bool(parse_inference_config(load_runtime_inference_config()))
+    if has_inference_bindings and dataclasses.is_dataclass(spec):
+        declared_harness = str(spec.executor.config.get("harness") or "")
+        identity = (
+            requested_harness
+            if requested_harness.startswith("acp:")
+            else declared_harness
+            if harness == "acp" and declared_harness.startswith("acp:")
+            else harness
+        )
+        effective_spec = dataclasses.replace(
+            spec,
+            executor=dataclasses.replace(
+                spec.executor,
+                config={**spec.executor.config, "harness": identity},
+                model=model_override if model_override is not None else spec.executor.model,
+            ),
+        )
     if model_override is not None:
         executor = getattr(spec, "executor", None)
-        if hasattr(spec, "model_copy") and hasattr(executor, "model_copy"):
+        if (
+            harness == "acp"
+            and not has_inference_bindings
+            and dataclasses.is_dataclass(spec)
+            and dataclasses.is_dataclass(executor)
+        ):
+            effective_spec = dataclasses.replace(
+                spec, executor=dataclasses.replace(spec.executor, model=model_override)
+            )
+        elif hasattr(spec, "model_copy") and hasattr(executor, "model_copy"):
             copied_executor = cast(_ModelCopyValue, executor).model_copy(
                 update={"model": model_override}
             )
@@ -12877,6 +13411,14 @@ def _build_spawn_env_from_spec(
                 AgentSpec,
                 cast(_ModelCopyValue, spec).model_copy(update={"executor": copied_executor}),
             )
+    acp_default_model: str | None = None
+    if harness == "acp":
+        from omnigent.models.model_catalog import _acp_launch_model, validate_acp_model
+
+        policy_spec = effective_spec if has_inference_bindings else spec
+        acp_default_model = _acp_launch_model(policy_spec)
+        validate_acp_model(policy_spec, acp_default_model)
+        validate_acp_model(policy_spec, model_override)
     try:
         from omnigent.runtime.workflow import (
             _build_acp_cli_spawn_env,
@@ -12916,6 +13458,9 @@ def _build_spawn_env_from_spec(
             env = _build_goose_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
         elif harness == "acp":
             env = _build_acp_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
+            # Reset uses the original default even when the process launched
+            # with a session override. Empty defers to the vendor's first model.
+            env["HARNESS_ACP_DEFAULT_MODEL"] = acp_default_model or ""
         elif harness == "copilot":
             env = _build_copilot_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
         elif harness in ACP_CLI_HARNESSES:

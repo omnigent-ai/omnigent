@@ -72,6 +72,7 @@ describe("session page request", () => {
     expect(query).toContain("sort_by=updated_at");
     expect(query).toContain("order=desc");
     expect(query).toContain("kind=default");
+    expect(query).toContain("visibility=all");
     expect(query).toContain("include_archived=false");
     expect(query).toContain("after=conv+a");
     expect(query).not.toMatch(/search_query|project|pinned|agent_id/);
@@ -248,7 +249,7 @@ describe("listSessionPage", () => {
 
     expect(result.sessions[0].id).toBe("conv_1");
     expect(authenticatedFetch).toHaveBeenCalledWith(
-      expect.stringContaining("include_archived=false"),
+      "/v1/sessions?limit=25&sort_by=updated_at&order=desc&kind=default&visibility=all&include_archived=false",
       { signal: controller.signal },
     );
   });

@@ -318,12 +318,34 @@ describe("CodeViewer markdown preview comment hint", () => {
   });
 });
 
+// Streamdown renders a diagram only once an IntersectionObserver reports it
+// visible; report every observed element visible so diagrams render in jsdom.
+class VisibleIntersectionObserver {
+  private readonly callback: IntersectionObserverCallback;
+  constructor(callback: IntersectionObserverCallback) {
+    this.callback = callback;
+  }
+  observe(target: Element) {
+    this.callback(
+      [{ isIntersecting: true, target } as IntersectionObserverEntry],
+      this as unknown as IntersectionObserver,
+    );
+  }
+  unobserve() {}
+  disconnect() {}
+  takeRecords(): IntersectionObserverEntry[] {
+    return [];
+  }
+}
+
 describe("CodeViewer markdown preview rendering (issue #970)", () => {
   // The read-only markdown preview is now the default surface for .md files, so
   // it must faithfully render the GFM feature set the issue calls out:
   // headings, lists, tables, code blocks, blockquotes, task lists, emoji.
   const renderMd = (content: string) =>
     renderViewer(content, true, "doc.md", { viewMode: "preview" });
+
+  afterEach(() => vi.unstubAllGlobals());
 
   it("renders headings", () => {
     const { container } = renderMd("# Title\n\n## Subtitle");
@@ -354,6 +376,41 @@ describe("CodeViewer markdown preview rendering (issue #970)", () => {
     expect(container.querySelector("pre")?.textContent).toBe("literal raw pre");
     expect(screen.queryByTestId("mermaid-preview")).toBeNull();
   });
+
+  it("explains an invalid Mermaid fence instead of dumping the parser error", async () => {
+    vi.stubGlobal("IntersectionObserver", VisibleIntersectionObserver);
+    renderMd(
+      "```mermaid\nsequenceDiagram\n    A->>B: hi\n    Note over A,B: proceed once; do not call Save\n    A=>B: again\n```",
+    );
+    const card = await screen.findByTestId("mermaid-error", {}, { timeout: 10_000 });
+    expect(card.textContent).toContain("Mermaid couldn't parse line 3");
+    expect(card.querySelector("code")?.textContent).toBe(
+      "Note over A,B: proceed once; do not call Save",
+    );
+    expect(card.textContent).toContain("#59;");
+    // The raw parser dump is still there, folded away.
+    expect(card.querySelector("details pre")?.textContent).toContain("got 'NEWLINE'");
+  }, 15_000);
+
+  it("reports the author's line number past front matter and comments Mermaid strips", async () => {
+    vi.stubGlobal("IntersectionObserver", VisibleIntersectionObserver);
+    renderMd(
+      "```mermaid\n---\ntitle: Flow\n---\n\n%% comment\nsequenceDiagram\n    A->>B: hi\n    Note over A,B once twice\n```",
+    );
+    const card = await screen.findByTestId("mermaid-error", {}, { timeout: 10_000 });
+    expect(card.textContent).toContain("Mermaid couldn't parse line 8");
+    expect(card.querySelector("code")?.textContent).toBe("Note over A,B once twice");
+  }, 15_000);
+
+  it("maps the line by position when front matter repeats the diagram text", async () => {
+    vi.stubGlobal("IntersectionObserver", VisibleIntersectionObserver);
+    renderMd(
+      "```mermaid\n---\ntitle: |\n  sequenceDiagram\n  Note over A,B once twice\n---\nsequenceDiagram\n  Note over A,B once twice\n```",
+    );
+    const card = await screen.findByTestId("mermaid-error", {}, { timeout: 10_000 });
+    expect(card.textContent).toContain("Mermaid couldn't parse line 7");
+    expect(card.querySelector("code")?.textContent).toBe("Note over A,B once twice");
+  }, 15_000);
 
   it("renders Mermaid fences as diagrams instead of plain code", async () => {
     const { container } = renderMd("```mermaid\nflowchart LR\n  A --> B\n```");

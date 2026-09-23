@@ -90,6 +90,7 @@ runs:
       # unprivileged user namespaces, so mirror ci.yml's AppArmor override.
       shell: bash
       run: |
+        sudo apt-get update
         sudo apt-get install -y tmux bubblewrap
         sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
@@ -97,6 +98,20 @@ runs:
       uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@aa5736c38f5c1258ee29452c6825d75033b952d7
       with:
         harness: claude
+
+    - name: Install Claude Code billing-notice regression CLI
+      shell: bash
+      env:
+        NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+      run: |
+        # Keep the newer notice-producing CLI isolated from other harness tests.
+        billing_cli_dir="${RUNNER_TEMP}/omnigent-e2e-claude-billing-notice"
+        mkdir -p "$billing_cli_dir"
+        cp "${GITHUB_ACTION_PATH}/claude-billing-notice/"{package.json,package-lock.json} "$billing_cli_dir/"
+        npm ci --prefix "$billing_cli_dir" --ignore-scripts --no-audit --no-fund
+        node "$billing_cli_dir/node_modules/@anthropic-ai/claude-code/install.cjs"
+        "$billing_cli_dir/node_modules/.bin/claude" --version
+        echo "OMNIGENT_E2E_CLAUDE_BILLING_NOTICE_BIN=$billing_cli_dir/node_modules/.bin/claude" >> "$GITHUB_ENV"
 
     - name: Install Codex CLI
       uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@aa5736c38f5c1258ee29452c6825d75033b952d7

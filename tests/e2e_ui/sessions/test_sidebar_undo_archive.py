@@ -1,14 +1,13 @@
 """Browser e2e for undoing a session archive from the sidebar.
 
-Archiving a session pops a floating Undo pill (a sonner toast, bottom-right
-like the old "View in Settings" pointer). Archiving again while it's still up
-merges into the SAME pill and resets its countdown, so a burst of archives is
-covered by one Undo that restores every session at once. The pill reads
-"Archived N session(s)." — singular for one, plural for more — with a bold,
-underlined **Undo** and a small "View in Settings" link.
+Archiving a session pops a floating Undo toast (a sonner toast, top-center).
+Archiving again while it's still up merges into the SAME toast and resets its
+countdown, so a burst of archives is covered by one Undo that restores every
+session at once. The toast reads "Archived N session(s)" — singular for one,
+plural for more — with an **Undo** action and a "View archived" pointer.
 
 This asserts the headline behaviour: two archives in quick succession collapse
-into one pill whose Undo unarchives BOTH — durably, not just in the client
+into one toast whose Undo unarchives BOTH — durably, not just in the client
 cache. Undo replays ``PATCH /v1/sessions/{id}`` with ``archived: false`` for the
 whole batch, so the store rows flip back and the sidebar rows return.
 
@@ -98,16 +97,16 @@ def test_undo_restores_every_session_archived_in_succession(
     _archive_from_row(page, session_b)
     expect(page.locator(f'a[href="/c/{session_b}"]')).to_have_count(0)
 
-    # One pill, covering both — merged rather than stacked, and pluralised.
-    pill = page.get_by_test_id("archive-undo-toast")
-    expect(pill).to_be_visible()
-    expect(pill).to_contain_text("Archived 2 sessions.")
+    # One toast, covering both — merged rather than stacked, and pluralised.
+    toast = page.get_by_test_id("archive-undo-toast-item")
+    expect(toast).to_be_visible()
+    expect(toast).to_contain_text("Archived 2 sessions")
 
     _wait_for_archived(base_url, session_a, True)
     _wait_for_archived(base_url, session_b, True)
 
     # Undo restores the whole batch.
-    pill.get_by_test_id("archive-undo-button").click()
+    toast.get_by_role("button", name="Undo").click()
 
     # Both rows return to the sidebar...
     expect(page.locator(f'a[href="/c/{session_a}"]')).to_have_count(1)

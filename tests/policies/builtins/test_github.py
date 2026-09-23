@@ -409,6 +409,75 @@ def test_shell_background_operator_does_not_hide_the_push() -> None:
     assert result is not None and result["result"] == "DENY"
 
 
+@pytest.mark.parametrize(
+    "spawned",
+    [
+        "find . -maxdepth 0 -exec git push https://github.com/octo/secret main +",
+        "xargs git push https://github.com/octo/secret main",
+        'perl -e \'exec("git","push","https://github.com/octo/secret","main")\'',
+        "python3 -c \"import os; os.execvp('git',['git','push','https://github.com/octo/secret','main'])\"",
+        "awk 'BEGIN{system(\"git push https://github.com/octo/secret main\")}'",
+    ],
+)
+def test_shell_process_spawning_utility_surfaces_the_push(spawned: str) -> None:
+    """A push spawned as a child of find/xargs/perl/python/awk is surfaced.
+
+    The utility's ``argv[0]`` is not ``git``/``gh`` and the spawned command is
+    buried where the parser does not model it, so the segment produced no op and
+    the policy abstained → ALLOW. It is now treated as an unresolved invocation
+    and, because the segment names a gated keyword, surfaced for approval (ASK)
+    rather than allowed.
+    """
+    policy = github_policy(write_repos=[_REPO])
+    assert _action(policy(_sh(spawned))) == "ASK"
+
+
+@pytest.mark.parametrize("benign", ["find . -name '*.py'", "xargs ls -la", "make build"])
+def test_shell_process_spawning_utility_without_gated_keyword_abstains(benign: str) -> None:
+    """A process-spawning utility that names no gated keyword is not over-blocked.
+
+    The fail-safe is keyword-gated: a bare ``find``/``xargs``/``make`` with no
+    git/gh in the segment still abstains, so benign automation is unaffected.
+    """
+    policy = github_policy(write_repos=[_REPO])
+    assert policy(_sh(benign)) is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "printf %s 'git push https://github.com/octo/secret main' | sh",
+        "echo 'git push https://github.com/octo/secret main' | bash",
+        "sh -s",
+        "sh script.sh",
+        "sh",
+    ],
+)
+def test_shell_stdin_interpreter_is_surfaced(command: str) -> None:
+    """A shell interpreter reading its program from stdin or a script is surfaced.
+
+    Without a ``-c`` string the interpreter's program is opaque to the parser —
+    for ``… | sh`` the gated push even lives in a different segment — so the
+    segment produced no op and the policy abstained → ALLOW. It is now surfaced
+    for approval (ASK) instead of allowed.
+    """
+    policy = github_policy(write_repos=[_REPO])
+    assert _action(policy(_sh(command))) == "ASK"
+
+
+def test_shell_interpreter_with_c_string_still_classified() -> None:
+    """Interpreters with a readable ``-c`` string are unwrapped as before.
+
+    ``sh -c`` / ``bash -lc`` must keep unwrapping to the inner command (so a
+    disallowed push still DENYs and a benign command still abstains) rather than
+    being blanket-surfaced by the new stdin-interpreter path.
+    """
+    policy = github_policy(write_repos=[_REPO])
+    denied = policy(_sh('bash -c "git push https://github.com/octo/secret main"'))
+    assert denied is not None and denied["result"] == "DENY"
+    assert policy(_sh('sh -c "ls -la"')) is None
+
+
 def test_shell_clone_read_allowed_and_denied() -> None:
     """git clone is a read: allowed for an allowlisted repo, denied otherwise."""
     policy = github_policy(read_all=False, read_repos=[_REPO])

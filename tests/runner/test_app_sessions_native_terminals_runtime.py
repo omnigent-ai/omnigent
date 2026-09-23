@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import shlex
 import shutil
 import threading
 import uuid
@@ -325,7 +326,14 @@ async def test_codex_top_level_session_needs_runner_terminal_for_all_session_sha
     from omnigent.runner.app import _codex_session_needs_runner_terminal
 
     class _Client:
-        async def get(self, url: str, *, timeout: float) -> httpx.Response:
+        async def get(
+            self,
+            url: str,
+            *,
+            timeout: float,
+            params: dict[str, str] | None = None,
+        ) -> httpx.Response:
+            del timeout, params
             return httpx.Response(200, json=session_json, request=httpx.Request("GET", url))
 
     assert (
@@ -439,7 +447,13 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
     monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
     monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
+    session_reap_calls: list[Path] = []
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.process_registry.reap_codex_native_processes_for_state_dir",
+        lambda bridge_dir: session_reap_calls.append(bridge_dir),
+    )
     caplog.set_level(logging.INFO, logger="omnigent.runner.app")
+    caplog.set_level(logging.INFO, logger="omnigent.runner.native.orchestration")
     bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(session_id)
     codex_native_bridge.write_bridge_state(
         bridge_dir,
@@ -534,6 +548,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
         :param kwargs: Keyword arguments passed by the runner helper.
         :returns: Fake app-server.
         """
+        assert session_reap_calls == [bridge_dir]
         build_calls.append(kwargs)
         app_server.codex_home = kwargs["codex_home"]
         return app_server
@@ -626,6 +641,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
         *,
         terminal_launch_args: list[str] | None = None,
         retain_client: bool = False,
+        cwd: Path | None = None,
     ) -> Any:
         """
         Record preloading of the known Codex thread.
@@ -639,6 +655,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
             "loaded the resume thread"
         )
         preload_calls.append((transport, loaded_thread_id, terminal_launch_args))
+        assert isinstance(cwd, Path)
         assert retain_client is retain_subscription
         return retained_client if retain_client else None
 
@@ -692,6 +709,9 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
                 )
             assert retained_client.closed is retain_subscription
             assert app_server.closed
+            assert not any(
+                getattr(r, "event_name", None) == "native_input_ready" for r in caplog.records
+            )
             assert not forward_calls
             assert session_id not in runner_app_mod._AUTO_CODEX_APP_SERVERS
             return
@@ -706,6 +726,11 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     finally:
         runner_app_mod._AUTO_CODEX_APP_SERVERS.pop(session_id, None)
 
+    readiness = [
+        r for r in caplog.records if getattr(r, "event_name", None) == "native_input_ready"
+    ]
+    assert len(readiness) == 1
+    assert readiness[0].session_id == session_id
     assert terminal_view.id == "terminal_codex_main"
     assert app_server.started is True
     expected_codex_home = codex_native_bridge.codex_home_for_bridge_dir(
@@ -715,6 +740,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     assert build_calls[0]["model"] == "gpt-5.4-mini"
     assert build_calls[0]["cwd"] == tmp_path / "workspace"
     assert build_calls[0]["trust_project"] is True
+    assert build_calls[0]["reconcile_process_registry"] is False
     assert build_calls[0]["developer_instructions"] == "Be a concise, careful coding assistant."
     assert len(launched_specs) == 1
     launched = launched_specs[0]
@@ -737,6 +763,20 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     assert launched.env["CODEX_HOME"] == str(app_server.codex_home)
     assert launched.tmux_start_on_attach is False
     assert launched.tmux_allow_passthrough is True
+    # A kept pane is what lets the exit event carry Codex's exit status and
+    # final screen; without it an early exit is just "no server running".
+    assert launched.keep_alive_after_exit is True
+    launch_events = [
+        r for r in caplog.records if getattr(r, "event_name", None) == "codex_terminal_launch"
+    ]
+    assert len(launch_events) == 1
+    assert launch_events[0].session_id == session_id
+    assert launch_events[0].attributes["command"] == "codex-wrapper"
+    assert launch_events[0].attributes["resume"] is True
+    assert launch_events[0].attributes["args"] == shlex.join(launched.args)
+    from omnigent.harnesses.codex_native.app_server import _format_codex_version
+
+    assert launch_events[0].attributes["codex_cli_version"] == _format_codex_version(version)
     assert preload_calls == [
         (
             app_server.listen_url,
@@ -849,16 +889,28 @@ async def test_auto_create_codex_terminal_fork_clones_rollout_and_resumes(
     class _ForkSnapshotClient:
         """Server client returning a forked clone snapshot (no thread id)."""
 
-        async def get(self, url: str, *, timeout: float) -> httpx.Response:
+        async def get(
+            self,
+            url: str,
+            *,
+            timeout: float,
+            params: dict[str, str],
+        ) -> httpx.Response:
             """
             Return the clone's snapshot carrying fork labels but no thread id.
 
             :param url: Request path, e.g. ``"/v1/sessions/8aedf63f5e4046ae21b35fec5b35da50"``.
             :param timeout: Request timeout in seconds.
+            :param params: Snapshot metadata projection flags.
             :returns: HTTP 200 response with fork labels.
             """
             del timeout
             assert url == f"/v1/sessions/{session_id}"
+            assert params == {
+                "include_items": "false",
+                "include_liveness": "false",
+                "include_usage": "false",
+            }
             return httpx.Response(
                 200,
                 json={
@@ -871,16 +923,26 @@ async def test_auto_create_codex_terminal_fork_clones_rollout_and_resumes(
                 request=httpx.Request("GET", url),
             )
 
-        async def patch(self, url: str, *, json: dict[str, Any], timeout: float) -> httpx.Response:
+        async def patch(
+            self,
+            url: str,
+            *,
+            json: dict[str, Any],
+            timeout: float,
+            params: dict[str, str],
+        ) -> httpx.Response:
             """
             Record the pre-set external_session_id PATCH.
 
             :param url: Request path.
             :param json: PATCH body, e.g. ``{"external_session_id": "..."}``.
             :param timeout: Request timeout in seconds.
+            :param params: Snapshot response projection flags.
             :returns: HTTP 200 response.
             """
             del timeout
+            assert url == f"/v1/sessions/{session_id}"
+            assert params == {"include_usage": "false"}
             patched_external_ids.append(json["external_session_id"])
             return httpx.Response(200, json={}, request=httpx.Request("PATCH", url))
 
@@ -979,6 +1041,7 @@ async def test_auto_create_codex_terminal_fork_clones_rollout_and_resumes(
         *,
         terminal_launch_args: list[str] | None = None,
         retain_client: bool = False,
+        cwd: Path | None = None,
     ) -> None:
         """
         Record preloading of the cloned Codex thread.
@@ -1119,11 +1182,16 @@ async def test_auto_create_codex_terminal_fork_builds_rollout_from_items_and_res
 
             :param url: Request path — the session snapshot or its items.
             :param timeout: Request timeout (snapshot fetch).
-            :param params: Query params (items fetch pagination).
+            :param params: Snapshot flags or items fetch pagination.
             :returns: HTTP 200 response.
             """
             del timeout
             if url == f"/v1/sessions/{session_id}":
+                assert params == {
+                    "include_items": "false",
+                    "include_liveness": "false",
+                    "include_usage": "false",
+                }
                 labels = {
                     FORK_SOURCE_LABEL_KEY: source_id,
                     FORK_CARRY_HISTORY_LABEL_KEY: "1",
@@ -1155,16 +1223,26 @@ async def test_auto_create_codex_terminal_fork_builds_rollout_from_items_and_res
                 request=httpx.Request("GET", url),
             )
 
-        async def patch(self, url: str, *, json: dict[str, Any], timeout: float) -> httpx.Response:
+        async def patch(
+            self,
+            url: str,
+            *,
+            json: dict[str, Any],
+            timeout: float,
+            params: dict[str, str],
+        ) -> httpx.Response:
             """
             Record the pre-set external_session_id PATCH.
 
             :param url: Request path.
             :param json: PATCH body, e.g. ``{"external_session_id": "..."}``.
             :param timeout: Request timeout in seconds.
+            :param params: Snapshot response projection flags.
             :returns: HTTP 200 response.
             """
             del timeout
+            assert url == f"/v1/sessions/{session_id}"
+            assert params == {"include_usage": "false"}
             patched_external_ids.append(json["external_session_id"])
             return httpx.Response(200, json={}, request=httpx.Request("PATCH", url))
 
@@ -1254,6 +1332,7 @@ async def test_auto_create_codex_terminal_fork_builds_rollout_from_items_and_res
         *,
         terminal_launch_args: list[str] | None = None,
         retain_client: bool = False,
+        cwd: Path | None = None,
     ) -> None:
         """:param transport: App-server URL. :param loaded_thread_id: Resumed thread."""
         assert terminal_launch_args is None
@@ -1382,16 +1461,23 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
     class _WorktreeSnapshotClient:
         """Server client whose session snapshot carries a worktree workspace."""
 
-        async def get(self, url: str, *, timeout: float) -> httpx.Response:
+        async def get(
+            self,
+            url: str,
+            *,
+            timeout: float,
+            params: dict[str, str] | None = None,
+        ) -> httpx.Response:
             """
             Return the session snapshot with a worktree ``workspace``.
 
             :param url: Request path, e.g.
                 ``"/v1/sessions/54e4d4410c43954c11e702f5a8646483"``.
             :param timeout: Request timeout in seconds.
+            :param params: Snapshot metadata projection flags.
             :returns: HTTP 200 response carrying the worktree workspace.
             """
-            del timeout
+            del timeout, params
             assert url == f"/v1/sessions/{session_id}"
             return httpx.Response(
                 200,
@@ -1652,14 +1738,24 @@ async def test_auto_create_codex_terminal_starts_relay_at_session_creation(
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
     monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
     monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.process_registry.reap_codex_native_processes_for_state_dir",
+        lambda _bridge_dir: pytest.fail("fresh Codex launch ran stale-writer recovery"),
+    )
     caplog.set_level(logging.INFO, logger="omnigent.runner.app")
 
     class _SnapshotClient:
         """Fresh-session snapshot (no external thread → discovery path)."""
 
-        async def get(self, url: str, *, timeout: float) -> httpx.Response:
+        async def get(
+            self,
+            url: str,
+            *,
+            timeout: float,
+            params: dict[str, str] | None = None,
+        ) -> httpx.Response:
             """:returns: HTTP 200 fresh-session snapshot."""
-            del timeout, url
+            del timeout, url, params
             return httpx.Response(
                 200,
                 json={
@@ -3190,15 +3286,22 @@ async def test_codex_subagent_always_needs_runner_terminal(
     from omnigent.runner.app import _codex_session_needs_runner_terminal
 
     class _Client:
-        async def get(self, url: str, *, timeout: float) -> httpx.Response:
+        async def get(
+            self,
+            url: str,
+            *,
+            timeout: float,
+            params: dict[str, str] | None = None,
+        ) -> httpx.Response:
             """
             Return child then parent session snapshots.
 
             :param url: Omnigent session snapshot URL.
             :param timeout: HTTP timeout in seconds.
+            :param params: Snapshot metadata projection flags.
             :returns: Fake Omnigent session response.
             """
-            del timeout
+            del timeout, params
             if url.endswith("/ff5cac23d0beb79fad914046049f32ff"):
                 return httpx.Response(
                     200,
@@ -3298,7 +3401,7 @@ async def test_codex_known_thread_forwarder_closes_retained_subscription(
 
 @pytest.mark.asyncio
 async def test_codex_discover_thread_and_forward_cleans_up_on_discovery_failure(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """
     When the fresh TUI never starts a thread, the background task must close
@@ -3312,6 +3415,7 @@ async def test_codex_discover_thread_and_forward_cleans_up_on_discovery_failure(
         _codex_discover_thread_and_forward,
     )
 
+    caplog.set_level("INFO", logger="omnigent.runner.native.orchestration")
     closed = {"client": False, "app_server": False}
 
     class _Client:
@@ -3346,6 +3450,7 @@ async def test_codex_discover_thread_and_forward_cleans_up_on_discovery_failure(
 
     # client closed = no dangling reader task/socket; app_server closed = no
     # orphaned subprocess; dropped from registry = no leaked dict reference.
+    assert not any(getattr(r, "event_name", None) == "native_input_ready" for r in caplog.records)
     assert closed["client"] is True
     assert closed["app_server"] is True
     assert session_id not in _AUTO_CODEX_APP_SERVERS
@@ -3425,6 +3530,7 @@ async def test_codex_discover_thread_and_forward_records_accurate_startup_error(
 async def test_codex_discover_thread_and_forward_persists_workspace_as_bridge_cwd(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
     The fresh-session bridge state must carry the session workspace as ``cwd``.
@@ -3441,9 +3547,19 @@ async def test_codex_discover_thread_and_forward_persists_workspace_as_bridge_cw
         _codex_discover_thread_and_forward,
     )
 
+    caplog.set_level("INFO", logger="omnigent.runner.native.orchestration")
     thread_id = "019e96aa-abcd-7343-8d3b-6f914d60936b"
     workspace = tmp_path / "selected-workspace"
     wait_calls: list[dict[str, object]] = []
+    patch_requests: list[httpx.Request] = []
+    real_async_client = httpx.AsyncClient
+
+    def _handle_patch(request: httpx.Request) -> httpx.Response:
+        patch_requests.append(request)
+        return httpx.Response(200, json={})
+
+    def _mock_client(**kwargs: Any) -> httpx.AsyncClient:
+        return real_async_client(transport=httpx.MockTransport(_handle_patch), **kwargs)
 
     async def _fake_wait(*_args: object, **kwargs: object) -> str:
         wait_calls.append(kwargs)
@@ -3464,6 +3580,7 @@ async def test_codex_discover_thread_and_forward_persists_workspace_as_bridge_cw
     monkeypatch.setattr(codex_native_forwarder, "supervise_forwarder", _fake_supervise)
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
     monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
+    monkeypatch.setattr(httpx, "AsyncClient", _mock_client)
 
     session_id = "9f1f7f7bd7f24f80a621d9a3ba3fbc10"
     codex_native_bridge.write_bridge_startup_timeout(tmp_path, 120.0)
@@ -3482,8 +3599,21 @@ async def test_codex_discover_thread_and_forward_persists_workspace_as_bridge_cw
     finally:
         _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
 
+    assert len(patch_requests) == 1
+    patch_request = patch_requests[0]
+    assert patch_request.method == "PATCH"
+    assert patch_request.url.copy_with(query=None) == httpx.URL(
+        f"http://ap.example/v1/sessions/{session_id}"
+    )
+    assert dict(patch_request.url.params) == {"include_usage": "false"}
+    assert json.loads(patch_request.content) == {"external_session_id": thread_id}
+
     state = codex_native_bridge.read_bridge_state(tmp_path)
     assert state is not None
+    events = [r for r in caplog.records if getattr(r, "event_name", None) == "native_input_ready"]
+    assert len(events) == 1
+    assert events[0].session_id == session_id
+    assert events[0].attributes["harness"] == "codex-native"
     assert state.thread_id == thread_id
     assert state.cwd == str(workspace)
     assert wait_calls == [{"timeout": 120.0}]
@@ -3755,6 +3885,7 @@ async def test_auto_create_codex_terminal_default_pin_requires_a_fresh_catalog(
         *,
         terminal_launch_args: list[str] | None = None,
         retain_client: bool = False,
+        cwd: Path | None = None,
     ) -> None:
         """
         Accept preloading of the known Codex thread.
@@ -3993,6 +4124,7 @@ async def test_auto_create_codex_terminal_accepts_gateway_spelled_override(
         *,
         terminal_launch_args: list[str] | None = None,
         retain_client: bool = False,
+        cwd: Path | None = None,
     ) -> None:
         """Accept preloading of the known Codex thread."""
         del transport, loaded_thread_id, terminal_launch_args

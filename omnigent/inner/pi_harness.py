@@ -87,6 +87,7 @@ _logger = logging.getLogger(__name__)
 # the module docstring for semantics. Centralizing as constants
 # so misconfigurations surface as a single grep target.
 _ENV_MODEL = "HARNESS_PI_MODEL"
+_ENV_PRESERVE_MODEL_IDS = "HARNESS_PI_PRESERVE_MODEL_IDS"
 _ENV_GATEWAY = "HARNESS_PI_GATEWAY"
 _ENV_DATABRICKS_PROFILE = "HARNESS_PI_DATABRICKS_PROFILE"
 _ENV_GATEWAY_HOST = "HARNESS_PI_GATEWAY_HOST"
@@ -221,6 +222,7 @@ def _build_pi_executor() -> Executor:
     agent_name_raw = os.environ.get(_ENV_AGENT_NAME, "").strip()
     agent_name = agent_name_raw or None
     return PiExecutor(
+        preserve_model_ids=os.environ.get(_ENV_PRESERVE_MODEL_IDS) == "true",
         cwd=os.environ.get(_ENV_CWD) or os.environ.get("OMNIGENT_RUNNER_WORKSPACE"),
         os_env=_resolve_os_env(),
         model=os.environ.get(_ENV_MODEL),

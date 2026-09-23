@@ -1,8 +1,10 @@
 import type { QueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 
-import { Link } from "@/lib/routing";
+import type { useNavigate } from "@/lib/routing";
 import { undoArchiveConversations, type Conversation } from "@/hooks/useConversations";
+
+type NavigateFn = ReturnType<typeof useNavigate>;
 
 /**
  * How long the post-archive Undo pill stays on screen, in milliseconds. 3s
@@ -24,10 +26,12 @@ let batched: Conversation[] = [];
 // The most recent caller's QueryClient. Every entry point resolves the same
 // app-level client, so the latest one correctly unarchives the whole batch.
 let activeQueryClient: QueryClient | null = null;
+let activeNavigate: NavigateFn | null = null;
 
 function clearBatch(): void {
   batched = [];
   activeQueryClient = null;
+  activeNavigate = null;
 }
 
 function runUndo(): void {
@@ -40,33 +44,11 @@ function runUndo(): void {
   }
 }
 
-/** The pill body: "Archived N session(s). Undo" plus a small Settings link. */
-function ArchiveUndoToast({ count }: { count: number }) {
-  return (
-    <div
-      data-testid="archive-undo-toast"
-      className="flex items-center gap-3 rounded-full border border-border bg-card px-4 py-2 text-sm text-foreground shadow-composer dark:bg-card-solid"
-    >
-      <span>
-        Archived {count} {count === 1 ? "session" : "sessions"}.{" "}
-        <button
-          type="button"
-          data-testid="archive-undo-button"
-          onClick={runUndo}
-          className="cursor-pointer font-bold underline underline-offset-2 hover:text-primary"
-        >
-          Undo
-        </button>
-      </span>
-      <Link
-        to="/settings/archived"
-        onClick={() => toast.dismiss(ARCHIVE_UNDO_TOAST_ID)}
-        className="border-l border-border pl-3 text-xs text-muted-foreground hover:text-foreground hover:underline"
-      >
-        View in Settings
-      </Link>
-    </div>
-  );
+function runViewArchived(): void {
+  const navigate = activeNavigate;
+  clearBatch();
+  toast.dismiss(ARCHIVE_UNDO_TOAST_ID);
+  navigate?.("/settings/archived");
 }
 
 /**
@@ -83,9 +65,11 @@ function ArchiveUndoToast({ count }: { count: number }) {
 export function showArchiveUndoToast(
   queryClient: QueryClient,
   conversations: readonly Conversation[],
+  navigate: NavigateFn,
 ): void {
   if (conversations.length === 0) return;
   activeQueryClient = queryClient;
+  activeNavigate = navigate;
   const seen = new Set(batched.map((c) => c.id));
   for (const conv of conversations) {
     if (!seen.has(conv.id)) {
@@ -94,10 +78,11 @@ export function showArchiveUndoToast(
     }
   }
   const count = batched.length;
-  toast.custom(() => <ArchiveUndoToast count={count} />, {
+  toast(`Archived ${count} ${count === 1 ? "session" : "sessions"}`, {
     id: ARCHIVE_UNDO_TOAST_ID,
     duration: ARCHIVE_UNDO_DURATION_MS,
-    unstyled: true,
+    action: { label: "Undo", onClick: runUndo },
+    cancel: { label: "View archived", onClick: runViewArchived },
     testId: "archive-undo-toast-item",
     onAutoClose: clearBatch,
     onDismiss: clearBatch,

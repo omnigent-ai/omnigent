@@ -445,16 +445,15 @@ def test_order_preserves_authentication_fields(
             assert user.password_hash == "test-hash"
             assert user.created_at == 123
             assert user.last_login_at == 456
-            assert "project_order" not in user.__dict__
 
 
-def test_order_missing_user_read_and_reset_do_not_create_accounts(
+def test_order_preferences_do_not_create_accounts(
     store: SqlAlchemyProjectStore,
 ) -> None:
-    """Only a custom save needs to create a preference owner."""
+    """Project preferences can be saved without creating authentication rows."""
     from sqlalchemy.orm import Session
 
-    from omnigent.db.db_models import SqlUser
+    from omnigent.db.db_models import SqlPreference, SqlUser
 
     with Session(store._engine) as session:
         user = session.get(SqlUser, (0, "local"))
@@ -465,12 +464,28 @@ def test_order_missing_user_read_and_reset_do_not_create_accounts(
     store.save_order(None, user_id=None)
     with Session(store._engine) as session:
         assert session.get(SqlUser, (0, "local")) is None
+        assert session.get(SqlPreference, (0, "local", "project_order")) is None
     store.save_order([], user_id=None)
     with Session(store._engine) as session:
-        user = session.get(SqlUser, (0, "local"))
-        assert user is not None
-        assert user.is_admin is False
-        assert user.password_hash is None
+        assert session.get(SqlUser, (0, "local")) is None
+        assert session.get(SqlPreference, (0, "local", "project_order")) is not None
+
+
+def test_order_updates_preserve_other_preferences(store: SqlAlchemyProjectStore) -> None:
+    from sqlalchemy.orm import Session
+
+    from omnigent.db.db_models import SqlPreference
+
+    with Session(store._engine) as session:
+        session.add(SqlPreference(workspace_id=0, user_id="local", key="theme", value='"dark"'))
+        session.commit()
+    assert store.get_order(user_id=None) is None
+    for order in (None, [], None, []):
+        store.save_order(order, user_id=None)
+        with Session(store._engine) as session:
+            preference = session.get(SqlPreference, (0, "local", "theme"))
+            assert preference is not None
+            assert preference.value == '"dark"'
 
 
 def test_alphabetical_mode_retains_manual_order(store: SqlAlchemyProjectStore) -> None:
@@ -493,15 +508,19 @@ def test_original_array_format_preserves_manual_order(store: SqlAlchemyProjectSt
     from sqlalchemy import update
     from sqlalchemy.orm import Session
 
-    from omnigent.db.db_models import SqlUser
+    from omnigent.db.db_models import SqlPreference
 
     project = store.create(_uid("original-format"), "A", None)
     store.save_order([], user_id=None)
     with Session(store._engine) as session:
         session.execute(
-            update(SqlUser)
-            .where(SqlUser.workspace_id == 0, SqlUser.id == "local")
-            .values(project_order=json.dumps([project.id]))
+            update(SqlPreference)
+            .where(
+                SqlPreference.workspace_id == 0,
+                SqlPreference.user_id == "local",
+                SqlPreference.key == "project_order",
+            )
+            .values(value=json.dumps([project.id]))
         )
         session.commit()
     assert store.get_order(user_id=None) == [project.id]
@@ -540,7 +559,7 @@ def test_order_at_api_limit_exceeds_small_blob_capacity(store: SqlAlchemyProject
     from sqlalchemy import func, insert, select
     from sqlalchemy.orm import Session
 
-    from omnigent.db.db_models import SqlProject, SqlUser
+    from omnigent.db.db_models import SqlPreference, SqlProject
     from omnigent.server.schemas import ProjectOrderRequest
 
     ids = [_uid(f"large-order-{i}") for i in range(10000)]
@@ -558,8 +577,10 @@ def test_order_at_api_limit_exceeds_small_blob_capacity(store: SqlAlchemyProject
     assert store.get_order(user_id="large") == ids
     with Session(store._engine) as session:
         size = session.scalar(
-            select(func.length(SqlUser.project_order)).where(
-                SqlUser.workspace_id == 0, SqlUser.id == "large"
+            select(func.length(SqlPreference.value)).where(
+                SqlPreference.workspace_id == 0,
+                SqlPreference.user_id == "large",
+                SqlPreference.key == "project_order",
             )
         )
     assert size is not None and size > 65535
@@ -584,14 +605,20 @@ def test_order_at_api_limit_exceeds_small_blob_capacity(store: SqlAlchemyProject
 def test_invalid_order_falls_back_and_can_be_replaced(
     store: SqlAlchemyProjectStore, raw: bytes
 ) -> None:
-    from sqlalchemy import LargeBinary, bindparam, text
+    from sqlalchemy import LargeBinary, bindparam, update
+
+    from omnigent.db.db_models import SqlPreference
 
     store.save_order([], user_id=None)
     with store._engine.begin() as connection:
         connection.execute(
-            text(
-                "UPDATE users SET project_order=:raw WHERE workspace_id=0 AND id='local'"
-            ).bindparams(bindparam("raw", type_=LargeBinary)),
+            update(SqlPreference)
+            .where(
+                SqlPreference.workspace_id == 0,
+                SqlPreference.user_id == "local",
+                SqlPreference.key == "project_order",
+            )
+            .values(value=bindparam("raw", type_=LargeBinary)),
             {"raw": raw},
         )
     default = {"sort_mode": "alphabetical", "ordered_project_ids": None}

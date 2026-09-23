@@ -40,6 +40,7 @@ const TASK: api.ScheduledTask = {
   permissionMode: null,
   workspace: null,
   hostId: null,
+  executionTarget: "connected_host",
   state: "active",
   lastRunAt: null,
   lastRunStatus: null,

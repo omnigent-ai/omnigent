@@ -1,5 +1,7 @@
 import { useQuery, type QueryClient } from "@tanstack/react-query";
 import { authenticatedFetch } from "@/lib/identity";
+import { setSessionParent } from "@/lib/sessionHost";
+import { isTempConvId } from "@/lib/tempConversationId";
 
 /**
  * Maximum depth of sub-agent nesting the Agents rail renders, counted
@@ -179,6 +181,10 @@ export async function fetchChildSessions(sessionId: string): Promise<ChildSessio
   );
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   const json = (await res.json()) as ChildSessionsResponse;
+  // Children run on this session's runner: record the link so their
+  // session-scoped requests key by this session's host before their own
+  // snapshot loads.
+  for (const row of json.data) setSessionParent(row.id, sessionId);
   return json.data.map((row) => ({
     id: row.id,
     title: row.title,
@@ -215,13 +221,14 @@ export function useChildSessions(
   conversationId: string | null,
   pollMs?: number | null,
 ): UseChildSessionsResult {
+  const sessionId = isTempConvId(conversationId) ? null : conversationId;
   const { data, isLoading, error } = useQuery({
     queryKey:
-      conversationId === null
+      sessionId === null
         ? ["conversation", null, "child_sessions"]
-        : childSessionsQueryKey(conversationId),
-    queryFn: () => fetchChildSessions(conversationId as string),
-    enabled: conversationId !== null,
+        : childSessionsQueryKey(sessionId),
+    queryFn: () => fetchChildSessions(sessionId as string),
+    enabled: sessionId !== null,
     staleTime: 60_000,
     retry: false,
     refetchOnMount: false,

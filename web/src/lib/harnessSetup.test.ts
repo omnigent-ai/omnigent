@@ -5,6 +5,7 @@ import {
   harnessCredentialAdoptFamilies,
   harnessCredentialFamily,
   harnessInstallableOnHost,
+  harnessReadinessOnHost,
   harnessUnavailableReasonOnHost,
   harnessUnconfiguredOnHost,
   resolveSetupSteps,
@@ -150,6 +151,73 @@ describe("harnessUnconfiguredOnHost", () => {
   it("is true exactly when there's an unavailable reason", () => {
     expect(harnessUnconfiguredOnHost("codex", hostWith({ codex: false }))).toBe(true);
     expect(harnessUnconfiguredOnHost("codex", hostWith({ codex: true }))).toBe(false);
+  });
+});
+
+describe("harnessReadinessOnHost", () => {
+  it("keeps ready and legacy-unknown harnesses selectable", () => {
+    expect(harnessReadinessOnHost("codex-native", hostWith({ "codex-native": true }))).toEqual({
+      state: "available",
+      reason: "ready",
+      selectable: true,
+      fallbackRelevant: false,
+      explanation: null,
+    });
+    expect(harnessReadinessOnHost("codex-native", hostWith(null))).toMatchObject({
+      state: "available",
+      reason: "readiness-unknown",
+      selectable: true,
+      fallbackRelevant: false,
+    });
+  });
+
+  it("separates setup-required from broken conditions", () => {
+    expect(
+      harnessReadinessOnHost("codex-native", hostWith({ "codex-native": "needs-auth" })),
+    ).toMatchObject({
+      state: "setup-required",
+      reason: "needs-auth",
+      selectable: false,
+      fallbackRelevant: true,
+    });
+    expect(
+      harnessReadinessOnHost("codex-native", hostWith({ "codex-native": "version-too-low" })),
+    ).toMatchObject({
+      state: "broken",
+      reason: "version-too-low",
+      selectable: false,
+      fallbackRelevant: true,
+    });
+    expect(
+      harnessReadinessOnHost("codex-native", hostWith({ "codex-native": "probe-failed" })),
+    ).toMatchObject({
+      state: "broken",
+      reason: "readiness-error",
+    });
+  });
+
+  it("marks host-wide unavailability as irrelevant to harness fallback", () => {
+    expect(
+      harnessReadinessOnHost("codex-native", {
+        ...hostWith({ "codex-native": true }),
+        status: "offline",
+      }),
+    ).toMatchObject({
+      state: "unavailable",
+      reason: "host-unavailable",
+      selectable: false,
+      fallbackRelevant: false,
+    });
+  });
+
+  it("provides explanation copy for disabled selection", () => {
+    expect(
+      harnessReadinessOnHost("codex-native", hostWith({ "codex-native": "binary-missing" }))
+        .explanation,
+    ).toEqual({
+      label: "Harness is not installed",
+      description: "Install this harness on the selected host before using it.",
+    });
   });
 });
 

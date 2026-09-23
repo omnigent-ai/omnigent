@@ -15,8 +15,9 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 from sqlalchemy.sql.dml import Insert
 
+from omnigent.db.account_authority import require_active_account
 from omnigent.db.compression import decode
-from omnigent.db.db_models import SqlProject, SqlUser, current_workspace_id
+from omnigent.db.db_models import SqlPreference, SqlProject, current_workspace_id
 from omnigent.db.utils import (
     get_or_create_engine,
     make_named_managed_session_maker,
@@ -34,6 +35,7 @@ from omnigent.stores.project_store import ProjectOrderPreference, ProjectStore
 # above any realistic set of default-session hints (a few short keys) while
 # still capping abuse.
 _CONFIG_MAX_SERIALIZED_LEN = 64 * 1024
+_PROJECT_ORDER_KEY = "project_order"
 
 
 def _encode_config(config: dict[str, Any] | None) -> str | None:
@@ -206,6 +208,7 @@ class SqlAlchemyProjectStore(ProjectStore):
         encoded_config = _encode_config(config)
 
         def write(session: Session) -> Project:
+            require_active_account(session, user_id)
             if self._name_taken(session, user_id=user_id, name=name, exclude_id=None):
                 raise OmnigentError(
                     f"A project named {name!r} already exists",
@@ -267,6 +270,7 @@ class SqlAlchemyProjectStore(ProjectStore):
         updated_at = now_epoch()
 
         def write(session: Session) -> Project | None:
+            require_active_account(session, user_id)
             row = session.get(SqlProject, (current_workspace_id(), project_id))
             if row is None or row.user_id != user_id:
                 return None
@@ -308,14 +312,15 @@ class SqlAlchemyProjectStore(ProjectStore):
         return preference["ordered_project_ids"] if preference["sort_mode"] == "manual" else None
 
     def get_order_preference(self, *, user_id: str | None) -> ProjectOrderPreference:
-        """Read the preference without loading authentication fields."""
+        """Read project ordering from the user's preferences."""
         preference_user_id = RESERVED_USER_LOCAL if user_id is None else user_id
         with self._session("read_project_order") as session:
             # Decode raw bytes here so malformed values cannot fail in the ORM result processor.
             raw = session.scalar(
-                select(type_coerce(SqlUser.project_order, LargeBinary)).where(
-                    SqlUser.workspace_id == current_workspace_id(),
-                    SqlUser.id == preference_user_id,
+                select(type_coerce(SqlPreference.value, LargeBinary)).where(
+                    SqlPreference.workspace_id == current_workspace_id(),
+                    SqlPreference.user_id == preference_user_id,
+                    SqlPreference.key == _PROJECT_ORDER_KEY,
                 )
             )
             return _decode_order(raw)
@@ -327,11 +332,16 @@ class SqlAlchemyProjectStore(ProjectStore):
         preference_user_id = RESERVED_USER_LOCAL if user_id is None else user_id
 
         def write(session: Session) -> ProjectOrderPreference:
+            require_active_account(session, user_id)
             workspace_id = current_workspace_id()
             if ids is None:
                 raw = session.scalar(
-                    select(type_coerce(SqlUser.project_order, LargeBinary))
-                    .where(SqlUser.workspace_id == workspace_id, SqlUser.id == preference_user_id)
+                    select(type_coerce(SqlPreference.value, LargeBinary))
+                    .where(
+                        SqlPreference.workspace_id == workspace_id,
+                        SqlPreference.user_id == preference_user_id,
+                        SqlPreference.key == _PROJECT_ORDER_KEY,
+                    )
                     .with_for_update()
                 )
                 preference = _decode_order(raw)
@@ -339,12 +349,13 @@ class SqlAlchemyProjectStore(ProjectStore):
                 if raw is None:
                     return preference
                 session.execute(
-                    update(SqlUser)
+                    update(SqlPreference)
                     .where(
-                        SqlUser.workspace_id == workspace_id,
-                        SqlUser.id == preference_user_id,
+                        SqlPreference.workspace_id == workspace_id,
+                        SqlPreference.user_id == preference_user_id,
+                        SqlPreference.key == _PROJECT_ORDER_KEY,
                     )
-                    .values(project_order=json.dumps(preference, separators=(",", ":")))
+                    .values(value=json.dumps(preference, separators=(",", ":")))
                 )
                 return preference
             owned = set(
@@ -364,36 +375,34 @@ class SqlAlchemyProjectStore(ProjectStore):
             encoded = json.dumps(preference, separators=(",", ":"))
             values = {
                 "workspace_id": workspace_id,
-                "id": preference_user_id,
-                "is_admin": False,
-                "project_order": encoded,
+                "user_id": preference_user_id,
+                "key": _PROJECT_ORDER_KEY,
+                "value": encoded,
             }
             dialect = self._engine.dialect.name
             stmt: Insert
             if dialect == "mysql":
                 stmt = (
-                    mysql_insert(SqlUser)
+                    mysql_insert(SqlPreference)
                     .values(**values)
-                    .on_duplicate_key_update(
-                        project_order=encoded,
-                    )
+                    .on_duplicate_key_update(value=encoded)
                 )
             elif dialect == "sqlite":
                 stmt = (
-                    sqlite_insert(SqlUser)
+                    sqlite_insert(SqlPreference)
                     .values(**values)
                     .on_conflict_do_update(
-                        index_elements=["workspace_id", "id"],
-                        set_={"project_order": encoded},
+                        index_elements=["workspace_id", "user_id", "key"],
+                        set_={"value": encoded},
                     )
                 )
             else:
                 stmt = (
-                    pg_insert(SqlUser)
+                    pg_insert(SqlPreference)
                     .values(**values)
                     .on_conflict_do_update(
-                        index_elements=["workspace_id", "id"],
-                        set_={"project_order": encoded},
+                        index_elements=["workspace_id", "user_id", "key"],
+                        set_={"value": encoded},
                     )
                 )
             session.execute(stmt)

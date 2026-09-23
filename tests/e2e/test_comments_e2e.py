@@ -116,7 +116,7 @@ def _ensure_agent(client: httpx.Client) -> str:
         # Agent already exists — look up its id via sessions list.
         list_resp = client.get(
             "/v1/sessions",
-            params={"agent_name": _AGENT_NAME, "limit": 1},
+            params={"visibility": "all", "agent_name": _AGENT_NAME, "limit": 1},
         )
         list_resp.raise_for_status()
         sessions = list_resp.json()["data"]

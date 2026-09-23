@@ -15,6 +15,7 @@ from pathlib import Path
 import httpx
 
 from omnigent.codex_approval_modes import codex_permission_preset_from_thread_settings
+from omnigent.debug_logging import debug_event
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.harnesses.claude_native.bridge import url_component
 from omnigent.harnesses.codex_native import side_chat
@@ -2453,6 +2454,17 @@ async def _create_thread_replacement_session(
             # Carry the workspace across the rotation, or the executor
             # falls back to the harness process's own cwd for new turns.
             cwd=state.cwd if state is not None else None,
+        ),
+    )
+
+    _logger.info(
+        "Codex native input ready after thread switch",
+        extra=debug_event(
+            "native_input_ready",
+            session_id=new_session_id,
+            runner_id=runner_id,
+            harness="codex-native",
+            stage="native_input",
         ),
     )
 

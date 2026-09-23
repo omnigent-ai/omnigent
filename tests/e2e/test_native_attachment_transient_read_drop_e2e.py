@@ -1,46 +1,8 @@
-"""E2E regression: a transient attachment read must not permanently drop an
-attachment from a claude-native turn.
+"""A transient file-store read failure must not drop a native-turn attachment.
 
-The failure mode this guards: a user attaches a file in a ``claude-native``
-session and sends a turn. The out-of-process runner does not
-hold the server's file store, so it fetches the uploaded bytes back through the
-session-scoped resource endpoints and inlines them before handing the message
-to the Claude Code terminal (``resolve_file_id_block`` ->
-``_resolve_forwarded_message_content``). That fetch is two GETs (metadata, then
-content). On ANY ``httpx.HTTPError`` -- a ``ReadTimeout``, or a ``500`` surfaced
-by ``raise_for_status()`` -- the resolver returns ``None`` with no retry, so the
-runner keeps the raw ``file_id`` block. The native executor then renders that
-unresolved block through ``attachment_reference_line`` -> the visible
-``"[Attachment <name> could not be loaded]"`` marker delivered into the pane.
-The attachment is permanently dropped even though the resource is readable again
-on the very next read -- a transient blip, not data loss.
-
-This drives the REAL data path end to end where the bug lives:
-
-* a real ``omnigent server`` subprocess whose file store fails the FIRST read of
-  each file id and succeeds every read after (the real route + exception handler
-  produce the production ``500 {"error":{"code":"internal_error",...}}`` body),
-* the real runner resolver ``_resolve_forwarded_message_content`` fetching the
-  uploaded file back over real HTTP against that transient fault, and
-* the real ``ClaudeNativeExecutor.run_turn`` rendering the resolved content and
-  delivering it into a real ``tmux`` pane running a fake Claude Code TUI, via the
-  production ``inject_user_message`` transport.
-
-Desired behavior (asserted): the attachment is recoverable -- the second read
-succeeds -- so a bounded retry inside the resolver must recover it and the pane
-must show the ``"[Attached: <path>]"`` reference. On the buggy build the single
-transient read drops the attachment and the pane shows
-``"[Attachment protocol.md could not be loaded]"`` instead, so this test FAILS
-with that marker in the pane.
-
-The Claude CLI is replaced by a fake TUI, so no Claude login is needed; the bug
-lives entirely upstream in the runner's resolution, not in the model.
-
-Run::
-
-    .venv/bin/python -m pytest \
-        tests/e2e/test_native_attachment_transient_read_drop_e2e.py -v
-"""
+A real server returns 500 for the first read, then the runner retries and delivers
+the uploaded content through the real executor/bridge to a scripted Claude TUI.
+The TUI is a local stand-in; this test uses no live model."""
 
 from __future__ import annotations
 
@@ -88,12 +50,7 @@ _PYTHONPATH = os.pathsep.join(
     ]
 )
 
-# Bootstrap for the spawned server: make the file store raise on the FIRST read
-# of each file id and succeed on every read after. The first read is the
-# runner's metadata GET during resolution; the REAL route + app-level exception
-# handler turn the raise into the production 500 body. Because the id is
-# readable again immediately, this is a transient blip -- exactly the condition
-# under which a bounded retry recovers but the buggy no-retry resolver drops.
+# Fail each file's first metadata read through the real route's 500 response.
 _SERVER_BOOTSTRAP = """
 import omnigent.stores.file_store.sqlalchemy_store as _fs
 
@@ -113,11 +70,7 @@ from omnigent.cli import main
 main()
 """
 
-# The fake Claude Code TUI. It renders the framed composer -- a box rule, the
-# prompt row, a closing rule -- so the bridge's readiness gate and
-# draft-visibility poll pass and the pasted draft is seen to land, then commits
-# the draft into the transcript on the submit Enter. No stall, no model: this
-# test cares only about WHAT text reaches the pane.
+# Render the composer expected by the bridge and record text submitted to it.
 _FAKE_CLAUDE_TUI = """\
 import os, sys, termios, tty
 
@@ -377,19 +330,7 @@ async def test_transient_attachment_read_does_not_drop_native_attachment(
     fault_injected_server: str,
     claude_pane: Path,
 ) -> None:
-    """A single transient read of an available attachment must not drop it from
-    the claude-native turn.
-
-    Journey (the reporter's): a user attaches a file in a claude-native session
-    and sends a turn; the runner's fetch of the uploaded bytes hits a transient
-    read blip; the attachment must still reach Claude because it is readable
-    again immediately.
-
-    Buggy behavior: the resolver returns ``None`` on the blip with no retry, the
-    runner keeps the raw ``file_id`` block, and the pane shows
-    ``"[Attachment protocol.md could not be loaded]"`` -- the attachment is
-    permanently lost.
-    """
+    """Recover the attachment after one file-store failure and deliver it to the pane."""
     base_url = fault_injected_server
     bridge_dir = claude_pane
 

@@ -116,7 +116,7 @@ def test_hover_reveals_timestamp_on_user_and_assistant_bubbles(
     expect(user_row).to_have_css("opacity", "1")
 
     # Design order: timestamp → Copy at the bubble's right edge.
-    copy_button = user_bubble.get_by_role("button", name="Copy")
+    copy_button = user_bubble.get_by_role("button", name="Copy", exact=True)
     assert user_ts.bounding_box()["x"] < copy_button.bounding_box()["x"]
 
     # --- assistant bubble ---
@@ -137,7 +137,7 @@ def test_hover_reveals_timestamp_on_user_and_assistant_bubbles(
     expect(assistant_row).to_have_css("opacity", "1")
 
     # Design order: Copy/Fork → timestamp at the bubble's left edge.
-    assistant_copy = assistant_bubble.get_by_role("button", name="Copy")
+    assistant_copy = assistant_bubble.get_by_role("button", name="Copy", exact=True)
     assert assistant_copy.bounding_box()["x"] < assistant_ts.bounding_box()["x"]
 
     # --- persistence: reload must show the same server-stamped values ---

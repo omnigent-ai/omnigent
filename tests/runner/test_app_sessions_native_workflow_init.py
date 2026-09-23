@@ -502,6 +502,7 @@ async def test_launch_native_terminal_skip_and_needs_terminal_return_false(
 @pytest.mark.asyncio
 async def test_launch_native_terminal_publishes_start_error_on_failure(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A builder failure returns False and publishes a terminal-start error."""
     from omnigent.runner.native import _launch_native_terminal
@@ -518,6 +519,16 @@ async def test_launch_native_terminal_publishes_start_error_on_failure(
     )
 
     assert result is False
+    failure = next(
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "terminal_start_failed"
+    )
+    assert failure.session_id == "conv_x"
+    assert failure.attributes["stage"] == "terminal_start"
+    assert not any(
+        getattr(record, "event_name", None) == "terminal_started" for record in caplog.records
+    )
     # pending True/False bracket the attempt, and a start-error event is published.
     assert any("error" in name.lower() or "error" in event for name, event in events)
 
