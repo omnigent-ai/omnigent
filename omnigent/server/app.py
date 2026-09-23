@@ -1799,7 +1799,7 @@ def create_app(
             # inside shutdown_all().
             await _mcp_pool.shutdown_all()
 
-    from omnigent.server.auth import UnifiedAuthProvider
+    from omnigent.server.auth import AccountAuthorityMiddleware, UnifiedAuthProvider
 
     runner_account_store = (
         account_store
@@ -3949,6 +3949,7 @@ def create_app(
             """Serve the API-only landing page (no web UI bundle present)."""
             return FileResponse(_API_ONLY_LANDING_HTML, media_type="text/html")
 
+    app.add_middleware(AccountAuthorityMiddleware, auth_provider=auth_provider)
     if resolved_base_path:
         # Added last → outermost ASGI layer, so the prefix is stripped before
         # routing and every other middleware sees canonical `/v1/...` paths.
