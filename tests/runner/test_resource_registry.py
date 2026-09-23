@@ -9,11 +9,12 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import ANY, Mock
 
 import pytest
 
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID
+from omnigent.harnesses.claude_native.status_file import SessionStatus
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 from omnigent.inner.os_env import EditEntry, OpResult, OSEnvironment
 from omnigent.inner.terminal import TerminalInstance
@@ -514,6 +515,8 @@ class _FakeStatusPoller:
         self._on_status = on_status
         self.active = False
         self.blocked_on: str | None = None
+        self.diagnostic_status: SessionStatus | None = None
+        self.read_state = "unresolved"
         self.ticks = 0
         self.retired = False
         self.resyncs = 0
@@ -1753,6 +1756,63 @@ _CLAUDE_READY_PANE = "───────────────────�
 
 
 @pytest.mark.asyncio
+async def test_native_blocker_is_logged_before_recovery_from_cached_pane(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from omnigent.harnesses.claude_native import bridge
+
+    callbacks, _, pollers, registry = await _observe_native_with_fake_poller(tmp_path, "child")
+    instance = registry.terminal_registry.get("child", "claude", "main")
+    assert instance is not None
+    caplog.set_level(logging.INFO, logger="omnigent.harnesses.claude_native.blocked_diagnostics")
+    pollers[0].read_state = "readable"
+    pollers[0].diagnostic_status = SessionStatus("running", "waiting", 123456, "dialog open")
+    capture = Mock(side_effect=AssertionError("diagnostics must reuse the captured pane"))
+    monkeypatch.setattr(bridge, "_capture_pane", capture)
+
+    def acknowledge(*_args: object, **_kwargs: object) -> bool:
+        events = [
+            r for r in caplog.records if getattr(r, "event_name", None) == "native_blocked_state"
+        ]
+        assert len(events) == 1
+        assert events[0].session_id == "child"
+        assert events[0].attributes["phase"] == "entered"
+        assert events[0].attributes["terminal_instance_id"] == instance.diagnostic_id
+        assert events[0].attributes["raw_status"] == "waiting"
+        assert events[0].attributes["status_updated_at"] == 123456
+        return False
+
+    monkeypatch.setattr(bridge, "acknowledge_auto_mode_billing_notice", acknowledge)
+    instance._remember_pane_snapshot(_AUTO_MODE_BILLING_NOTICE_PANE)
+    on_tick = callbacks["on_tick"]
+    assert callable(on_tick)
+    on_tick()
+    on_tick()
+    capture.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_native_diagnostic_failure_does_not_prevent_notice_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.harnesses.claude_native import bridge
+
+    callbacks, _, _, registry = await _observe_native_with_fake_poller(tmp_path, "child")
+    instance = registry.terminal_registry.get("child", "claude", "main")
+    assert instance is not None
+    monkeypatch.setattr(
+        bridge, "native_blocked_diagnostics", Mock(side_effect=RuntimeError("log failure"))
+    )
+    acknowledge = Mock(return_value=False)
+    monkeypatch.setattr(bridge, "acknowledge_auto_mode_billing_notice", acknowledge)
+    instance._remember_pane_snapshot(_AUTO_MODE_BILLING_NOTICE_PANE)
+    on_tick = callbacks["on_tick"]
+    assert callable(on_tick)
+    on_tick()
+    acknowledge.assert_called_once()
+
+
+@pytest.mark.asyncio
 async def test_claude_native_acknowledges_billing_notice_after_input_was_ready(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1774,7 +1834,6 @@ async def test_claude_native_acknowledges_billing_notice_after_input_was_ready(
 
     instance._remember_pane_snapshot(_CLAUDE_READY_PANE)
     on_tick()
-    resolve_bridge.assert_not_called()
     acknowledge.assert_not_called()
 
     # A mid-turn notice still gets checked after the one-time readiness edge.
@@ -1788,6 +1847,7 @@ async def test_claude_native_acknowledges_billing_notice_after_input_was_ready(
         bridge_dir,
         expected_socket_path=str(instance.socket_path),
         expected_tmux_target=instance.tmux_target,
+        diagnostics=ANY,
     )
     resolve_bridge.assert_called_with("child")
     send_keys.assert_not_called()
@@ -1828,6 +1888,7 @@ async def test_claude_native_billing_acknowledgement_uses_original_launch_bridge
         original_bridge,
         expected_socket_path=str(instance.socket_path),
         expected_tmux_target=instance.tmux_target,
+        diagnostics=ANY,
     )
     resolve_conversation_bridge.assert_not_called()
 
@@ -1862,7 +1923,6 @@ async def test_claude_native_ignores_other_panes_without_attempting_acknowledgem
     instance._remember_pane_snapshot(pane)
     on_tick()
 
-    resolve_bridge.assert_not_called()
     acknowledge.assert_not_called()
 
 

@@ -64,7 +64,11 @@ vi.mock("@/hooks/useConversations", async (importActual) => ({
   useConversations: vi.fn(),
 }));
 vi.mock("@/hooks/useCommentInbox", () => ({ useCommentInbox: vi.fn() }));
-vi.mock("@/lib/sessionsApi", () => ({ getSession: vi.fn(), approve: vi.fn() }));
+vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
+  ...(await importOriginal<object>()),
+  getSession: vi.fn(),
+  approve: vi.fn(),
+}));
 
 function conversation(overrides: Partial<Conversation> = {}): Conversation {
   return {

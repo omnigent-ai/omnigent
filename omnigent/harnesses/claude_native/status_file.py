@@ -322,6 +322,7 @@ class SessionStatusPoller:
         self._last_mtime: float | None = None
         self._last_edge: tuple[str, str | None] | None = None
         self._last_status: SessionStatus | None = None
+        self._read_state = "unresolved"
 
     @property
     def active(self) -> bool:
@@ -379,6 +380,7 @@ class SessionStatusPoller:
                 extra={"session_id": self._omnigent_session_id},
             )
             self._exhausted = True
+            self._read_state = "resolution_exhausted"
 
     def retire(self) -> None:
         """Stop reading the file, permanently.
@@ -394,6 +396,7 @@ class SessionStatusPoller:
             extra={"session_id": self._omnigent_session_id},
         )
         self._exhausted = True
+        self._read_state = "retired"
 
     def resync(self) -> None:
         """Forget what was published so the next tick re-asserts the file.
@@ -418,6 +421,16 @@ class SessionStatusPoller:
         self._last_edge = None
 
     @property
+    def diagnostic_status(self) -> SessionStatus | None:
+        """The last readable observation, without treating an old file as expired."""
+        return self._last_status if self._read_state == "readable" else None
+
+    @property
+    def read_state(self) -> str:
+        """Whether a diagnostic observation is readable, missing, or unresolved."""
+        return self._read_state
+
+    @property
     def blocked_on(self) -> str | None:
         """Why Claude is parked, when it is parked on a dialog.
 
@@ -437,12 +450,14 @@ class SessionStatusPoller:
             # File vanished (clean exit unlinks it, or a crash). Exit
             # detection rides the PTY watcher, so just stop polling.
             self._exhausted = True
+            self._read_state = "missing"
             return
         if self._last_mtime is not None and mtime == self._last_mtime:
             return
         self._last_mtime = mtime
         status = read_session_status(self._path)
         if status is None:
+            self._read_state = "unreadable"
             # An unrecognized literal — the file is an undocumented internal
             # detail whose vocabulary can grow. We are now blind to this
             # transition, so drop the dedup baseline: the next readable
@@ -450,6 +465,7 @@ class SessionStatusPoller:
             self._last_status = None
             self._last_edge = None
             return
+        self._read_state = "readable"
         self._last_status = status
         edge = (status.runner_status, status.blocked_on)
         if edge == self._last_edge:

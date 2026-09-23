@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import shlex
 import shutil
@@ -28,6 +29,7 @@ import pytest
 from omnigent.harnesses.claude_native import bridge
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 from omnigent.inner.terminal import TerminalInstance
+from omnigent.runner.native.orchestration import _publish_tmux_target_for_bridge
 from omnigent.runner.resource_registry import (
     CLAUDE_NATIVE_TERMINAL_ROLE,
     SessionResourceRegistry,
@@ -169,10 +171,15 @@ async def _wait_for_pane(
 
 @pytest.mark.parametrize("recovery", ["runner_watcher", "permission_mode"])
 async def test_real_claude_billing_notice_unblocks_pending_tool(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, recovery: str
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    recovery: str,
 ) -> None:
     """A real blocked Bash call must resume without user input to the dialog."""
     config_dir = tmp_path / "claude-config"
+    caplog.set_level(logging.INFO, logger="omnigent.harnesses.claude_native.blocked_diagnostics")
+    caplog.set_level(logging.INFO, logger="omnigent.harnesses.claude_native.bridge")
     workspace = tmp_path / "workspace"
     config_dir.mkdir()
     workspace.mkdir()
@@ -275,8 +282,12 @@ async def test_real_claude_billing_notice_unblocks_pending_tool(
                 check=True,
                 timeout=5,
             )
-            bridge.write_tmux_target(
-                bridge_dir, socket_path=terminal.socket_path, tmux_target=terminal.tmux_target
+            _publish_tmux_target_for_bridge(
+                resource_registry=resources,
+                session_id=session_id,
+                bridge_id=session_id,
+                terminal_name="claude",
+                session_key="main",
             )
             await _wait_for_pane(
                 terminal,
@@ -320,18 +331,49 @@ async def test_real_claude_billing_notice_unblocks_pending_tool(
                     == "auto"
                 )
 
+            def blocker_events() -> list[logging.LogRecord]:
+                return [
+                    record
+                    for record in caplog.records
+                    if getattr(record, "event_name", None) == "native_blocked_state"
+                    and getattr(record, "session_id", None) == session_id
+                ]
+
             await _wait_for_pane(
                 terminal,
                 lambda pane: (
-                    marker.exists() and bool(gateway.tool_results) and _NOTICE not in pane
+                    marker.exists()
+                    and bool(gateway.tool_results)
+                    and _NOTICE not in pane
+                    and any(record.attributes["phase"] == "cleared" for record in blocker_events())
                 ),
                 timeout=20,
-                description="automatic notice acknowledgement and completion of the pending Bash",
+                description="completed Bash plus correlated blocker-clearance telemetry",
             )
             assert marker.read_text() == "confirmed"
             assert gateway.classifier_requests > 0
             assert all(not result.get("is_error") for result in gateway.tool_results)
             assert "billing-notice-tool-completed" in json.dumps(gateway.tool_results)
+            events = blocker_events()
+            entered = next(record for record in events if record.attributes["phase"] == "entered")
+            cleared = next(record for record in events if record.attributes["phase"] == "cleared")
+            assert entered.attributes["dialog_kind"] == "auto_mode_classifier_billing_notice"
+            assert entered.attributes["capture_status"] == "ok"
+            assert entered.attributes["terminal_instance_id"] == terminal.diagnostic_id
+            assert entered.attributes["block_episode_id"] == cleared.attributes["block_episode_id"]
+            assert (
+                entered.attributes["terminal_locator_id"]
+                == cleared.attributes["terminal_locator_id"]
+            )
+            acknowledged = next(
+                record
+                for record in caplog.records
+                if "acknowledged auto-mode classifier-billing notice" in record.getMessage()
+            )
+            assert entered.created <= acknowledged.created <= cleared.created
+            if recovery == "runner_watcher":
+                assert entered.attributes["raw_status"] == "waiting"
+            assert all(not record.attributes.get("dialog_excerpt") for record in events)
             config = json.loads((config_dir / ".claude.json").read_text())
             assert config.get("autoModeClassifierBillingNoticeAcknowledgedAt", 0) > 0
         finally:

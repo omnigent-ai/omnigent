@@ -9,6 +9,7 @@ falls back to the PTY watcher when the file never appears or vanishes.
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
 
@@ -43,6 +44,7 @@ def _write_session_file(
     """
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"{pid}.json"
+    previous_mtime = path.stat().st_mtime_ns if path.exists() else None
     path.write_text(
         json.dumps(
             {
@@ -58,6 +60,9 @@ def _write_session_file(
         ),
         encoding="utf-8",
     )
+    if previous_mtime is not None:
+        # Filesystems can coalesce immediate writes; each test update is a new tick.
+        os.utime(path, ns=(previous_mtime + 1_000_000, previous_mtime + 1_000_000))
     return path
 
 
@@ -459,3 +464,34 @@ def test_parked_session_stays_running_indefinitely(tmp_path: Path) -> None:
     poller.tick()
     assert published == [(RUNNING, "input needed")]
     assert poller.blocked_on == "input needed"
+    assert poller.read_state == "readable"
+    assert poller.diagnostic_status is not None
+    assert poller.diagnostic_status.status_updated_at == int((now - 3600) * 1000)
+
+
+def test_diagnostic_status_distinguishes_unreadable_file_from_cleared_prompt(
+    tmp_path: Path,
+) -> None:
+    path = _write_session_file(
+        tmp_path / "sessions", pid=1, session_id="s", status="waiting", blocked_on="dialog open"
+    )
+    poller = SessionStatusPoller(
+        on_status=lambda *_args: None,
+        pane_pid_getter=lambda: 1,
+        session_id_getter=lambda: "s",
+        config_dir=tmp_path,
+    )
+    assert poller.read_state == "unresolved"
+    poller.tick()
+    assert poller.read_state == "readable"
+    assert poller.diagnostic_status is not None
+    mtime = path.stat().st_mtime_ns
+    path.write_text("{")
+    os.utime(path, ns=(mtime + 1_000_000, mtime + 1_000_000))
+    poller.tick()
+    assert poller.read_state == "unreadable"
+    assert poller.diagnostic_status is None
+    path.unlink()
+    poller.tick()
+    assert poller.read_state == "missing"
+    assert poller.diagnostic_status is None

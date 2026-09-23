@@ -31,6 +31,7 @@ import type {
 } from "@/lib/blocks";
 import type { ConversationItem, MessageItem } from "@/lib/conversationItems";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
+import { recordBrowserDiagnostic } from "@/lib/diagnostics";
 import { buildBubbles } from "@/lib/renderItems";
 import { getSessionSlim, INITIAL_WINDOW_ITEMS, SESSION_HISTORY_PAGE_SIZE } from "@/lib/sessionsApi";
 import { SSE_STALL_TIMEOUT_MS } from "@/lib/sse";
@@ -93,6 +94,11 @@ import {
   type StreamSlotManager,
 } from "./streamSlots";
 import { useTerminalActivityStore } from "./terminalActivity";
+
+vi.mock("@/lib/diagnostics", async (importOriginal) => ({
+  ...(await importOriginal<object>()),
+  recordBrowserDiagnostic: vi.fn(),
+}));
 
 // The real `send` action, captured before any test stubs it via
 // setState({ send: spy }). Zustand's setState permanently overwrites the
@@ -491,6 +497,7 @@ function makeFakeSlotManager(
 }
 
 beforeEach(() => {
+  vi.mocked(recordBrowserDiagnostic).mockClear();
   client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   sessionSnapshots = new Map();
   sessionItems = new Map();
@@ -8450,6 +8457,68 @@ function elicitationBlock(id: string): ElicitationBlock {
 }
 
 describe("chatStore — submitApproval", () => {
+  it("records a failed verdict request without logging its sensitive contents", async () => {
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      blocks: [{ ...elicitationBlock("elic_xyz"), targetSessionId: "conv_child" }],
+    });
+    fetchMock.mockImplementationOnce(() => mockResponse({}, { ok: false, status: 500 }));
+    await useChatStore
+      .getState()
+      .submitApproval("elic_xyz", "accept", { answer: "private answer" });
+    expect(recordBrowserDiagnostic).toHaveBeenCalledWith(
+      "conv_abc",
+      expect.objectContaining({
+        event_name: "browser_approval_verdict_submitted",
+        elicitation_id: "elic_xyz",
+        target_session_id: "conv_child",
+        action: "accept",
+      }),
+    );
+    expect(recordBrowserDiagnostic).toHaveBeenLastCalledWith("conv_abc", {
+      event_name: "browser_approval_verdict_request_completed",
+      elicitation_id: "elic_xyz",
+      target_session_id: "conv_child",
+      action: "accept",
+      outcome: "error",
+      http_status: 500,
+    });
+    expect(JSON.stringify(vi.mocked(recordBrowserDiagnostic).mock.calls)).not.toContain(
+      "private answer",
+    );
+    expect(useChatStore.getState().blocks[0]).toMatchObject({ status: "pending" });
+  });
+
+  it("distinguishes a received status frame from one actually applied to this conversation", () => {
+    useChatStore.setState({ conversationId: "conv_abc", blockedOn: "dialog open" });
+    handleSessionEvent(
+      { type: "session_status", conversationId: "conv_other", status: "idle" },
+      "conv_abc",
+    );
+    expect(recordBrowserDiagnostic).toHaveBeenCalledTimes(1);
+    expect(recordBrowserDiagnostic).toHaveBeenCalledWith(
+      "conv_abc",
+      expect.objectContaining({
+        event_name: "browser_status_received",
+        target_session_id: "conv_other",
+      }),
+    );
+    expect(useChatStore.getState().blockedOn).toBe("dialog open");
+    handleSessionEvent(
+      { type: "session_status", conversationId: "conv_abc", status: "idle" },
+      "conv_abc",
+    );
+    expect(recordBrowserDiagnostic).toHaveBeenLastCalledWith(
+      "conv_abc",
+      expect.objectContaining({
+        event_name: "browser_status_applied",
+        previous_blocked_on: "dialog_open",
+        blocked_on: "none",
+      }),
+    );
+    expect(useChatStore.getState().blockedOn).toBeNull();
+  });
+
   it("posts the verdict to the elicitation resolve URL and optimistically marks responded", async () => {
     useChatStore.setState({
       conversationId: "conv_abc",
@@ -10970,6 +11039,13 @@ describe("chatStore — startStreamPump reconnect loop", () => {
 
     // The reconnect reconciled the committed snapshot: the gap item is in.
     expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toContain(gapItem.id);
+    expect(recordBrowserDiagnostic).toHaveBeenCalledWith(
+      "conv_stall",
+      expect.objectContaining({
+        event_name: "browser_status_reconnect",
+        observation_trigger: "stream_reconnect",
+      }),
+    );
 
     const last = sinks[1]!;
     last.push("data: [DONE]\n\n");
@@ -11184,6 +11260,17 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     expect(snapshotFetches).toBe(1);
     expect(bound.get().sessionStatus).toBe("idle");
     expect(useChatStore.getState().sessionStatus).toBe("idle");
+    expect(recordBrowserDiagnostic).toHaveBeenCalledWith(
+      "conv_heartbeat_gap",
+      expect.objectContaining({
+        event_name: "browser_status_reconnect",
+        observation_trigger: "periodic_reconcile",
+      }),
+    );
+    expect(recordBrowserDiagnostic).not.toHaveBeenCalledWith(
+      "conv_heartbeat_gap",
+      expect.objectContaining({ observation_trigger: "stream_reconnect" }),
+    );
 
     controller.abort();
     await drainAsync(2);
@@ -11607,6 +11694,13 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     // (the pre-gap transcript included) is reachable again by paging up.
     expect(state.oldestItemId).toBe(gap.at(-INITIAL_WINDOW_ITEMS)!.id);
     expect(state.hasMoreHistory).toBe(true);
+    expect(recordBrowserDiagnostic).toHaveBeenCalledWith(
+      "conv_bigap",
+      expect.objectContaining({
+        event_name: "browser_status_reconnect",
+        observation_trigger: "stream_reconnect",
+      }),
+    );
 
     // Scroll-up still pages from the window's top, one page at a time.
     await useChatStore.getState().loadMoreHistory();

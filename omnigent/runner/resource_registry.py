@@ -41,6 +41,7 @@ from omnigent.entities.session_resources import (
 from omnigent.inner.sandbox import contained_realpath, containment_prefix
 
 if TYPE_CHECKING:
+    from omnigent.harnesses.claude_native.blocked_diagnostics import NativeBlockedDiagnostics
     from omnigent.harnesses.claude_native.status_file import SessionStatusPoller
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
     from omnigent.inner.os_env import OSEnvironment
@@ -1280,12 +1281,45 @@ class SessionResourceRegistry:
                 self._status_pollers[session_id] = status_poller
 
         native_input_ready = False
+        blocked_diagnostics: NativeBlockedDiagnostics | None = None
 
         def _on_tick() -> None:
-            nonlocal native_input_ready
+            nonlocal native_input_ready, blocked_diagnostics
             if status_poller is not None:
                 status_poller.tick()
             if resource_role == CLAUDE_NATIVE_TERMINAL_ROLE:
+                # Observe before recovery dismisses the pane; never interrupt recovery.
+                with contextlib.suppress(Exception):
+                    from omnigent.harnesses.claude_native.bridge import (
+                        bridge_dir_for_conversation_id,
+                        bridge_dir_from_launch_args,
+                        native_blocked_diagnostics,
+                    )
+
+                    if blocked_diagnostics is None:
+                        directory = bridge_dir_from_launch_args(instance.args)
+                        blocked_diagnostics = native_blocked_diagnostics(
+                            str(instance.socket_path),
+                            instance.tmux_target,
+                            bridge_dir=directory or bridge_dir_for_conversation_id(session_id),
+                            session_id=session_id,
+                            terminal_instance_id=instance.diagnostic_id,
+                            observation_source="runner_watcher",
+                        )
+                    if blocked_diagnostics is not None:
+                        observation = status_poller.diagnostic_status if status_poller else None
+                        blocked_diagnostics.observe(
+                            instance.last_pane_text(),
+                            raw_status=observation.raw_status if observation else None,
+                            status_updated_at=observation.status_updated_at
+                            if observation
+                            else None,
+                            blocked_on=observation.blocked_on if observation else None,
+                            status_file_state=status_poller.read_state
+                            if status_poller
+                            else "unavailable",
+                            capture_age_ms=instance.last_pane_capture_age_ms(),
+                        )
                 try:
                     from omnigent.harnesses.claude_native.bridge import (
                         acknowledge_auto_mode_billing_notice,
@@ -1303,6 +1337,7 @@ class SessionResourceRegistry:
                             bridge_dir,
                             expected_socket_path=str(instance.socket_path),
                             expected_tmux_target=instance.tmux_target,
+                            diagnostics=blocked_diagnostics,
                         )
                 except Exception:  # noqa: BLE001 - keep lifecycle observation running.
                     _logger.debug(

@@ -1,10 +1,81 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { BlockStream } from "@/lib/blockStream";
+import { recordBrowserDiagnostic } from "@/lib/diagnostics";
 import { buildBubbles } from "@/lib/renderItems";
 import { parseEventLines } from "@/lib/sse";
 import { useChatStore } from "@/store/chatStore";
 import { ApprovalCard, ElicitationCard } from "./ApprovalCard";
+
+vi.mock("@/lib/diagnostics", async (importOriginal) => ({
+  ...(await importOriginal<object>()),
+  recordBrowserDiagnostic: vi.fn(),
+}));
+
+describe("ApprovalCard diagnostic observations", () => {
+  it("records actual rendering separately from viewport visibility and preserves the child target", () => {
+    vi.mocked(recordBrowserDiagnostic).mockClear();
+    let observe!: IntersectionObserverCallback;
+    const disconnect = vi.fn();
+    vi.stubGlobal(
+      "IntersectionObserver",
+      class {
+        constructor(callback: IntersectionObserverCallback) {
+          observe = callback;
+        }
+        observe = vi.fn();
+        disconnect = disconnect;
+      },
+    );
+    const visibility = vi.spyOn(document, "visibilityState", "get").mockReturnValue("hidden");
+    const props = {
+      diagnosticSessionId: "parent-session",
+      targetSessionId: "child-session",
+      elicitationId: "approval-1",
+      message: "Sensitive question must not enter diagnostics",
+      phase: "tool_call",
+      policyName: "policy",
+      contentPreview: "sensitive command",
+      requestedSchema: {},
+    };
+    const { rerender, unmount } = render(
+      <ApprovalCard {...props} status="pending" response={null} />,
+    );
+    expect(recordBrowserDiagnostic).toHaveBeenCalledWith("parent-session", {
+      event_name: "browser_approval_rendered",
+      elicitation_id: "approval-1",
+      card_instance_id: expect.any(String),
+      target_session_id: "child-session",
+      actionable: true,
+      observation_source: "card",
+      tab_visible: false,
+    });
+    observe([{ isIntersecting: true } as IntersectionObserverEntry], {} as IntersectionObserver);
+    expect(recordBrowserDiagnostic).toHaveBeenLastCalledWith(
+      "parent-session",
+      expect.objectContaining({
+        event_name: "browser_approval_visibility",
+        in_view: true,
+        tab_visible: false,
+      }),
+    );
+    rerender(<ApprovalCard {...props} status="responded" response={{ action: "accept" }} />);
+    expect(recordBrowserDiagnostic).toHaveBeenLastCalledWith(
+      "parent-session",
+      expect.objectContaining({
+        event_name: "browser_approval_rendered",
+        actionable: false,
+      }),
+    );
+    expect(JSON.stringify(vi.mocked(recordBrowserDiagnostic).mock.calls)).not.toContain(
+      "sensitive",
+    );
+    unmount();
+    expect(disconnect).toHaveBeenCalled();
+    visibility.mockRestore();
+    vi.unstubAllGlobals();
+  });
+});
 
 afterEach(() => {
   cleanup();

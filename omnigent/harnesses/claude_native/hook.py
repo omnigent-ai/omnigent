@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import logging
 import math
 import os
 import secrets
@@ -38,6 +39,10 @@ from omnigent.harnesses.claude_native.bridge import (
 # helpers that actually speak HTTP.
 if TYPE_CHECKING:
     import httpx
+
+# Hook stdout is a machine-readable verdict, including an intentionally empty one.
+_diagnostic_logger = logging.getLogger("omnigent.harnesses.claude_native.permission_hook")
+_diagnostic_logger.propagate = False
 
 # Client-side budget for the permission-request long-poll to AP. Held
 # at one day so the hook subprocess waits ~indefinitely for a verdict
@@ -673,6 +678,7 @@ def _post_hook_with_reattach(
     hook_label: str,
     reauth: Callable[[], dict[str, str] | None] | None = None,
     wait_marker: Path | None = None,
+    session_id: str | None = None,
 ) -> httpx.Response | None:
     """
     POST one permission-style hook payload, surviving severed long-polls.
@@ -754,6 +760,7 @@ def _post_hook_with_reattach(
         :func:`approval_wait_marker_path`, so the idle pane reaper spares a
         pane parked on this prompt. ``None`` skips the marker (non-approval
         callers).
+    :param session_id: Active Omnigent session for diagnostic attribution.
     :returns: The successful (2xx) response, or ``None`` when rejected
         or out of budget — callers fail-ask as before.
     """
@@ -764,7 +771,21 @@ def _post_hook_with_reattach(
     backoff_s = _PERMISSION_RETRY_INITIAL_BACKOFF_S
     import httpx
 
+    from omnigent.debug_logging import log_debug_event
     from omnigent.native.native_policy_hook import _is_login_redirect_or_unauthorized
+
+    poll_attempt = 0
+
+    def log_attempt(event_name: str, **attributes: object) -> None:
+        """Record transport boundaries without headers or approval content."""
+        log_debug_event(
+            _diagnostic_logger,
+            event_name,
+            session_id=session_id,
+            elicitation_id=body["_omnigent_elicitation_id"],
+            poll_attempt=poll_attempt,
+            **attributes,
+        )
 
     timeout = httpx.Timeout(_PERMISSION_TIMEOUT_S, connect=_PERMISSION_CONNECT_TIMEOUT_S)
     # Absolute backstop: even a run of held-poll severs (which don't count
@@ -780,7 +801,9 @@ def _post_hook_with_reattach(
     )
     with marker_scope:
         while True:
+            poll_attempt += 1
             attempt_started = time.monotonic()
+            log_attempt("approval_hook_attempt")
             try:
                 with httpx.Client(headers=headers, timeout=timeout) as client:
                     resp = client.post(url, json=body)
@@ -797,6 +820,7 @@ def _post_hook_with_reattach(
                         if refreshed:
                             headers = refreshed
                             reauthed = True
+                            log_attempt("approval_hook_retry", reason="auth_refresh")
                             print(
                                 f"omnigent {hook_label} hook: Omnigent auth expired "
                                 "(login redirect/401); re-minted token and retrying",
@@ -804,9 +828,30 @@ def _post_hook_with_reattach(
                             )
                             continue
                     resp.raise_for_status()
+                    response_kind = "empty" if not resp.content else "unknown"
+                    if resp.content:
+                        try:
+                            output = resp.json().get("hookSpecificOutput", {})
+                            decision = output.get("decision", {})
+                            behavior = decision.get("behavior") or output.get("permissionDecision")
+                            if behavior in ("allow", "deny"):
+                                response_kind = behavior
+                        except (ValueError, AttributeError, TypeError):
+                            pass
+                    log_attempt(
+                        "approval_hook_response",
+                        response_kind=response_kind,
+                        http_status=resp.status_code,
+                        duration_ms=round((time.monotonic() - attempt_started) * 1000),
+                    )
                     return resp
             except httpx.HTTPStatusError as exc:
                 if exc.response.status_code < 500:
+                    log_attempt(
+                        "approval_hook_response",
+                        response_kind="rejected",
+                        http_status=exc.response.status_code,
+                    )
                     print(
                         f"omnigent {hook_label} hook: Omnigent request rejected: {exc}",
                         file=sys.stderr,
@@ -818,6 +863,7 @@ def _post_hook_with_reattach(
                 held_s = time.monotonic() - attempt_started
                 is_hard_failure = held_s < _PERMISSION_HELD_POLL_FLOOR_S
                 kind = "sick" if is_hard_failure else "held-poll severed by gateway"
+                retry_reason = "server_error" if is_hard_failure else "gateway_sever"
                 print(
                     f"omnigent {hook_label} hook: Omnigent request failed "
                     f"({kind}); retrying: {exc}",
@@ -836,6 +882,11 @@ def _post_hook_with_reattach(
                     "unreachable"
                     if never_connected
                     else ("flapping" if is_hard_failure else "held-poll severed")
+                )
+                retry_reason = (
+                    "connect_error"
+                    if never_connected
+                    else ("transport_flap" if is_hard_failure else "transport_sever")
                 )
                 print(
                     f"omnigent {hook_label} hook: Omnigent request failed "
@@ -856,6 +907,7 @@ def _post_hook_with_reattach(
                 # lapses once an hour, and each lapse must be re-mintable.
                 reauthed = False
             if consecutive_hard_failures >= _PERMISSION_MAX_CONSECUTIVE_FAILURES:
+                log_attempt("approval_hook_exhausted", reason="consecutive_failures")
                 print(
                     f"omnigent {hook_label} hook: giving up after "
                     f"{consecutive_hard_failures} consecutive hard failures "
@@ -863,10 +915,18 @@ def _post_hook_with_reattach(
                     file=sys.stderr,
                 )
                 return None
+            log_attempt(
+                "approval_hook_retry",
+                reason=retry_reason,
+                duration_ms=round((time.monotonic() - attempt_started) * 1000),
+                backoff_s=backoff_s,
+                consecutive_hard_failures=consecutive_hard_failures,
+            )
             # Two-line backoff; not worth a retry lib in this dependency-light hook.
             time.sleep(backoff_s)
             backoff_s = min(backoff_s * 2, _PERMISSION_RETRY_MAX_BACKOFF_S)
             if time.monotonic() >= deadline:
+                log_attempt("approval_hook_exhausted", reason="wait_budget")
                 print(
                     f"omnigent {hook_label} hook: retry budget exhausted "
                     f"({_PERMISSION_TIMEOUT_S:.0f}s) — failing ask",
@@ -930,6 +990,7 @@ def _main_permission_request(argv: list[str]) -> int:
         "claude permission",
         reauth=policy_hook_reauth(ap_server_url, headers),
         wait_marker=approval_wait_marker_path(session_id, bridge_dir=bridge_dir),
+        session_id=session_id,
     )
     if resp is None:
         return 0
@@ -1361,4 +1422,14 @@ def _route_turn_post(
 
 
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["permission-request"]:
+        from omnigent.process_logging import configure_process_logging
+
+        with contextlib.suppress(Exception):
+            configure_process_logging(
+                "harness",
+                log_to_stderr=False,
+                root=False,
+                logger_names=(_diagnostic_logger.name,),
+            )
     raise SystemExit(main())

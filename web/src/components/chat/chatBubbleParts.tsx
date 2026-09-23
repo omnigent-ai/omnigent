@@ -25,6 +25,7 @@ import {
   XIcon,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
+import { diagnosticBlockedReason, recordBrowserDiagnostic } from "@/lib/diagnostics";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { userColor, userColorTint, userInitials } from "@/lib/userBadge";
@@ -407,10 +408,22 @@ export function workingIndicatorLabel(tick = 0, blockedOn: string | null = null)
 }
 
 export function WorkingIndicator() {
+  const conversationId = useChatStore((s) => s.conversationId);
+  const sessionStatus = useChatStore((s) => s.sessionStatus);
   const bgCount = useChatStore((s) => s.backgroundTaskCount);
   const blockedOn = useChatStore((s) => s.blockedOn);
   const agentWorking = useAgentTurnActive();
   const tick = useWorkingLabelTick();
+  const indicatorVisible = !isBackgroundTasksOnly(bgCount, blockedOn, agentWorking);
+  useEffect(() => {
+    recordBrowserDiagnostic(conversationId, {
+      event_name: "browser_status_displayed",
+      status: sessionStatus ?? "unknown",
+      blocked_on: diagnosticBlockedReason(blockedOn),
+      status_indicator_visible: indicatorVisible,
+      tab_visible: document.visibilityState === "visible",
+    });
+  }, [conversationId, sessionStatus, blockedOn, indicatorVisible]);
   // Once the turn ends but background shells outlive it, BackgroundTaskPill owns
   // the state and the shimmer stays off (it would misread as the agent still
   // thinking). While the turn is active the shimmer shows, with the pill beside it.

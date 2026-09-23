@@ -456,6 +456,20 @@ def debug_event(
     return extra
 
 
+def log_debug_event(
+    logger: logging.Logger,
+    event_name: str,
+    *,
+    session_id: str | None = None,
+    **attributes: object,
+) -> None:
+    """Emit an informational observation without letting logging interrupt work."""
+    with contextlib.suppress(Exception):
+        extra = debug_event(event_name, session_id=session_id)
+        extra["attributes"] = attributes
+        logger.info(event_name, extra=extra)
+
+
 def _stack_trace(record: logging.LogRecord) -> str | None:
     if record.exc_info:
         return "".join(traceback.format_exception(*record.exc_info))

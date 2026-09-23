@@ -2691,6 +2691,7 @@ async def test_auto_create_claude_terminal_honours_cleared_bridge_label(
         running = True
         socket_path = "/tmp/fake-claude.sock"
         tmux_target = "claude:0.0"
+        diagnostic_id = "test-cleared-claude-terminal"
 
     class _FakeTerminalRegistry:
         """Returns the live instance for any (session, terminal, key) lookup."""

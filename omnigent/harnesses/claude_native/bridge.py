@@ -72,6 +72,7 @@ from omnigent.util.json_types import JsonObject as _JsonObject
 if TYPE_CHECKING:
     import httpx
 
+    from omnigent.harnesses.claude_native.blocked_diagnostics import NativeBlockedDiagnostics
     from omnigent.inner.datamodel import OSEnvSandboxSpec
     from omnigent.inner.os_env import OSEnvironment
     from omnigent.llms.context_window import ModelPricing
@@ -88,6 +89,9 @@ CLAUDE_FRAMEWORK_CONTEXT_FILE = "pending_framework_context.txt"
 _logger = logging.getLogger(__name__)
 _INJECTION_CANCEL_EVENT: ContextVar[threading.Event | None] = ContextVar(
     "claude_native_injection_cancel_event", default=None
+)
+_DIAGNOSTIC_BRIDGE_DIR: ContextVar[Path | None] = ContextVar(
+    "claude_native_diagnostic_bridge_dir", default=None
 )
 _INJECTION_LOCKS_GUARD = threading.Lock()
 _INJECTION_LOCKS: dict[str, threading.Lock] = {}
@@ -139,7 +143,11 @@ def _serialize_bridge_injection(function: _InjectionFunction) -> _InjectionFunct
             _cancellable_injection_lock(_bridge_injection_lock(bridge_dir)),
             _cancellable_injection_lock(_bridge_injection_file_lock(bridge_dir)),
         ):
-            return function(bridge_dir, *args, **kwargs)
+            token = _DIAGNOSTIC_BRIDGE_DIR.set(bridge_dir)
+            try:
+                return function(bridge_dir, *args, **kwargs)
+            finally:
+                _DIAGNOSTIC_BRIDGE_DIR.reset(token)
 
     return cast(_InjectionFunction, wrapped)
 
@@ -3823,6 +3831,7 @@ def write_tmux_target(
     socket_path: Path,
     tmux_target: str,
     pid: int | None = None,
+    terminal_instance_id: str | None = None,
 ) -> None:
     """
     Advertise the tmux socket + target for the Claude terminal.
@@ -3837,6 +3846,7 @@ def write_tmux_target(
         socket, e.g. ``Path("/tmp/.../tmux.sock")``.
     :param tmux_target: tmux pane target string, e.g. ``"claude:0.0"``.
     :param pid: Optional Claude process pid, recorded for diagnostics.
+    :param terminal_instance_id: Runner launch identity, shared with diagnostic observations.
     :returns: None.
     """
     _ensure_secure_dir(bridge_dir)
@@ -3847,6 +3857,8 @@ def write_tmux_target(
     }
     if pid is not None:
         payload["pid"] = pid
+    if terminal_instance_id is not None:
+        payload["terminal_instance_id"] = terminal_instance_id
     _write_json_file(bridge_dir / _TMUX_FILE, payload)
 
 
@@ -4696,11 +4708,15 @@ def _read_settled_permission_mode(
         footer never moved off *previous* — before
         :data:`_MODE_FOOTER_SETTLE_TIMEOUT_S`.
     """
+    diagnostics = native_blocked_diagnostics(socket_path, tmux_target)
     deadline = time.monotonic() + _MODE_FOOTER_SETTLE_TIMEOUT_S
     while True:
         pane = _capture_pane(socket_path, tmux_target)
+        _observe_native_blocker(diagnostics, pane)
         if auto_mode_billing_notice_visible(pane):
-            _acknowledge_auto_mode_billing_notice(socket_path, tmux_target)
+            _acknowledge_auto_mode_billing_notice(
+                socket_path, tmux_target, diagnostics=diagnostics
+            )
             pane = _capture_pane(socket_path, tmux_target)
         mode = _permission_mode_from_pane(pane)
         if mode is not None and mode != previous:
@@ -5263,13 +5279,78 @@ def auto_mode_billing_notice_visible(pane: str) -> bool:
     return _AUTO_MODE_BILLING_NOTICE.fullmatch(body) is not None
 
 
-def _acknowledge_auto_mode_billing_notice(socket_path: str, tmux_target: str) -> bool:
+def native_blocked_diagnostics(
+    socket_path: str,
+    tmux_target: str,
+    *,
+    bridge_dir: Path | None = None,
+    session_id: str | None = None,
+    terminal_instance_id: str | None = None,
+    observation_source: str = "bridge_pane",
+) -> NativeBlockedDiagnostics | None:
+    """Build a best-effort observer; bridge reads happen only on diagnostic edges."""
+    with contextlib.suppress(Exception):
+        from omnigent.harnesses.claude_native.blocked_diagnostics import NativeBlockedDiagnostics
+
+        directory = bridge_dir or _DIAGNOSTIC_BRIDGE_DIR.get()
+        if terminal_instance_id is None and directory is not None:
+            info = _read_json_file(directory / _TMUX_FILE)
+            if (
+                isinstance(info, dict)
+                and info.get("socket_path") == socket_path
+                and info.get("tmux_target") == tmux_target
+                and isinstance(info.get("terminal_instance_id"), str)
+            ):
+                terminal_instance_id = str(info["terminal_instance_id"])
+
+        def context() -> dict[str, object]:
+            if directory is None:
+                return {"approval_wait_state": "unknown"}
+            active_session_id = read_active_session_id(directory)
+            return {
+                "native_session_id": read_claude_session_id(directory),
+                "approval_wait_state": (
+                    "unknown"
+                    if active_session_id is None
+                    else "pending"
+                    if _has_approval_wait(directory)
+                    else "absent"
+                ),
+            }
+
+        return NativeBlockedDiagnostics(
+            session_id=session_id or (read_active_session_id(directory) if directory else None),
+            socket_path=socket_path,
+            tmux_target=tmux_target,
+            terminal_instance_id=terminal_instance_id,
+            observation_source=observation_source,
+            context=context,
+        )
+    return None
+
+
+def _observe_native_blocker(diagnostics: NativeBlockedDiagnostics | None, pane: str) -> None:
+    with contextlib.suppress(Exception):
+        if diagnostics is not None:
+            diagnostics.observe(pane)
+
+
+def _acknowledge_auto_mode_billing_notice(
+    socket_path: str,
+    tmux_target: str,
+    *,
+    diagnostics: NativeBlockedDiagnostics | None = None,
+    bridge_dir: Path | None = None,
+) -> bool:
     """Confirm the notice on fresh frames before each bounded Enter attempt."""
+    if diagnostics is None:
+        diagnostics = native_blocked_diagnostics(socket_path, tmux_target, bridge_dir=bridge_dir)
     deadline = time.monotonic() + _CONFIRM_DIALOG_ACCEPT_TIMEOUT_S
     last_enter: float | None = None
     confirmed = False
     while time.monotonic() < deadline:
         pane = _capture_pane(socket_path, tmux_target)
+        _observe_native_blocker(diagnostics, pane)
         if not auto_mode_billing_notice_visible(pane):
             return last_enter is not None
         now = time.monotonic()
@@ -5304,6 +5385,7 @@ def acknowledge_auto_mode_billing_notice(
     *,
     expected_socket_path: str | None = None,
     expected_tmux_target: str | None = None,
+    diagnostics: NativeBlockedDiagnostics | None = None,
 ) -> bool:
     """Acknowledge a live notice without waiting for another pane writer's lock.
 
@@ -5328,7 +5410,9 @@ def acknowledge_auto_mode_billing_notice(
                     return False
                 if _has_approval_wait(bridge_dir):
                     return False
-                return _acknowledge_auto_mode_billing_notice(socket_path, target)
+                return _acknowledge_auto_mode_billing_notice(
+                    socket_path, target, bridge_dir=bridge_dir, diagnostics=diagnostics
+                )
         except FileLockTimeout:
             return False
     finally:
@@ -5374,11 +5458,13 @@ def _restore_occupied_input(
     :param bridge_dir: Bridge whose live permission hooks protect the native prompt.
     :returns: None.
     """
+    diagnostics = native_blocked_diagnostics(socket_path, tmux_target, bridge_dir=bridge_dir)
     deadline = time.monotonic() + _OCCUPIED_INPUT_DISMISS_TIMEOUT_S
     last_escape: float | None = None
     confirmed = False
     while True:
         pane = _capture_pane(socket_path, tmux_target)
+        _observe_native_blocker(diagnostics, pane)
         if (bridge_dir is not None and _has_approval_wait(bridge_dir)) or _user_prompt_visible(
             pane
         ):
@@ -5387,7 +5473,9 @@ def _restore_occupied_input(
                 "before sending a message."
             )
         if auto_mode_billing_notice_visible(pane):
-            _acknowledge_auto_mode_billing_notice(socket_path, tmux_target)
+            _acknowledge_auto_mode_billing_notice(
+                socket_path, tmux_target, diagnostics=diagnostics
+            )
             return
         surface = _occupying_surface(pane)
         if surface is None:
@@ -5765,6 +5853,7 @@ def _wait_for_claude_prompt_ready(
         a startup crash, a torn/empty capture under a mid-turn repaint, or
         a box that never appeared — is diagnosable from the error alone.
     """
+    diagnostics = native_blocked_diagnostics(socket_path, tmux_target, bridge_dir=bridge_dir)
     started = time.monotonic()
     next_liveness_probe = started + timeout_s
     hard_deadline = started + max(timeout_s, _TMUX_READY_SLOW_BOOT_TIMEOUT_S)
@@ -5785,6 +5874,7 @@ def _wait_for_claude_prompt_ready(
     while True:
         _check_injection_cancelled()
         pane = _capture_pane(socket_path, tmux_target)
+        _observe_native_blocker(diagnostics, pane)
         if (bridge_dir is not None and _has_approval_wait(bridge_dir)) or _user_prompt_visible(
             pane
         ):
@@ -5800,7 +5890,9 @@ def _wait_for_claude_prompt_ready(
             return
         billing_notice = auto_mode_billing_notice_visible(pane)
         if billing_notice:
-            _acknowledge_auto_mode_billing_notice(socket_path, tmux_target)
+            _acknowledge_auto_mode_billing_notice(
+                socket_path, tmux_target, diagnostics=diagnostics
+            )
         # A dialog seen on two consecutive polls is real; one frame can be a
         # repaint artifact. Fail now rather than stalling to the cap.
         headline = None if billing_notice else _terminal_dialog_headline(pane)

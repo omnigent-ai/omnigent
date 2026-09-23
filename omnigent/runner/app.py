@@ -48,6 +48,7 @@ from omnigent._platform import normalize_interactive_shells
 from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
 from omnigent.debug_logging import (
     debug_event,
+    log_debug_event,
     phase_scope,
     runner_primary_session_id,
     set_current_session_id,
@@ -10284,6 +10285,16 @@ def create_runner_app(
         if body_type == "approval":
             _data = body.get("data") or body
             _elicit_action = _data.get("action", "")
+            log_debug_event(
+                _logger,
+                "approval_runner_received",
+                session_id=conversation_id,
+                elicitation_id=_data.get("elicitation_id"),
+                action=_elicit_action
+                if isinstance(_elicit_action, str)
+                and _elicit_action in {"accept", "decline", "cancel"}
+                else "invalid",
+            )
             # ``content`` is the person's answer when the prompt asked for
             # more than consent (an MCP ``requestedSchema``). Dropping it here
             # is what used to make the awaiting caller invent one.

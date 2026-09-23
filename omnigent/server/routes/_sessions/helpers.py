@@ -43,7 +43,7 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError, StatementError
 from omnigent.codex_approval_modes import CODEX_NATIVE_PERMISSION_VALUES
 from omnigent.db.utils import generate_task_id
 from omnigent.db.workspace_cache import WorkspaceScopedCache
-from omnigent.debug_logging import debug_event, runner_log_scope
+from omnigent.debug_logging import debug_event, log_debug_event, runner_log_scope
 from omnigent.entities import (
     USER_SESSION_TITLE_MAX_CHARS,
     Agent,
@@ -1013,6 +1013,7 @@ def _signal_terminal_resolved_harness_elicitation_impl(
     mirrored_input = _canonical_tool_input(tool_input)
     for parked in candidates:
         if _canonical_tool_input(parked.tool_input) == mirrored_input:
+            parked.resolution_source = "terminal_result"
             parked.resolved_elsewhere.set()
             return
     # No exact input match. Correlation is exact-only: resolving a
@@ -1192,6 +1193,7 @@ def _signal_harness_elicitation_resolved_by_id(
         )
         _prune_pre_resolved_harness_elicitations()
         return
+    parked.resolution_source = "native_resolution"
     parked.resolved_elsewhere.set()
 
 
@@ -3133,18 +3135,41 @@ async def _forward_approval_to_runner(
     """
     runner_client = await _get_runner_client(session_id, runner_router)
     if runner_client is None:
+        log_debug_event(
+            _logger,
+            "approval_runner_delivery",
+            session_id=session_id,
+            elicitation_id=data.get("elicitation_id"),
+            outcome="no_runner",
+            delivery_role="runner_side_wait",
+        )
         return
     try:
-        await runner_client.post(
+        response = await runner_client.post(
             f"/v1/sessions/{session_id}/events",
             json={"type": _APPROVAL_TYPE, "data": data},
             timeout=10.0,
+        )
+        log_debug_event(
+            _logger,
+            "approval_runner_delivery",
+            session_id=session_id,
+            elicitation_id=data.get("elicitation_id"),
+            outcome="accepted" if response.is_success else "rejected",
+            http_status=response.status_code,
+            delivery_role="runner_side_wait",
         )
     except (httpx.HTTPError, ConnectionError):
         _logger.exception(
             "Approval forward failed for %r",
             session_id,
-            extra={"session_id": session_id},
+            extra=debug_event(
+                "approval_runner_delivery",
+                session_id=session_id,
+                elicitation_id=data.get("elicitation_id"),
+                outcome="transport_error",
+                delivery_role="runner_side_wait",
+            ),
         )
 
 

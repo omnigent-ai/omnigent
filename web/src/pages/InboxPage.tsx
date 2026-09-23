@@ -49,10 +49,11 @@ import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Button } from "@/components/ui/button";
 import { useSidebarData } from "@/hooks/useSidebarData";
 import { collectInboxItems, type InboxItem, type InboxSource } from "@/lib/inbox";
+import { recordBrowserDiagnostic } from "@/lib/diagnostics";
 import { relativeTime } from "@/lib/relativeTime";
 import { Link } from "@/lib/routing";
 import { useOmnigentAnalytics } from "@/lib/analytics";
-import { approve, getSession } from "@/lib/sessionsApi";
+import { ApiError, approve, getSession } from "@/lib/sessionsApi";
 import { userColor, userInitials } from "@/lib/userBadge";
 import { cn } from "@/lib/utils";
 import { conversationDisplayLabel, getConversationAgentType } from "@/shell/sidebarNav";
@@ -150,6 +151,16 @@ export function InboxPage() {
   // count (and the sidebar badge) drop without waiting for the socket.
   const makeSubmit = (item: InboxItem): SubmitApprovalFn => {
     return (elicitationId, action, content, meta) => {
+      const diagnostic = {
+        elicitation_id: elicitationId,
+        target_session_id: item.resolveSessionId,
+        action,
+      };
+      recordBrowserDiagnostic(item.row.id, {
+        event_name: "browser_approval_verdict_submitted",
+        ...diagnostic,
+        tab_visible: document.visibilityState === "visible",
+      });
       setResponded((prev) => ({
         ...prev,
         [elicitationId]: {
@@ -164,9 +175,20 @@ export function InboxPage() {
         ...(meta === undefined ? {} : { _meta: meta }),
       }).then(
         () => {
+          recordBrowserDiagnostic(item.row.id, {
+            event_name: "browser_approval_verdict_request_completed",
+            ...diagnostic,
+            outcome: "success",
+          });
           void queryClient.invalidateQueries({ queryKey: ["conversations"] });
         },
-        () => {
+        (error: unknown) => {
+          recordBrowserDiagnostic(item.row.id, {
+            event_name: "browser_approval_verdict_request_completed",
+            ...diagnostic,
+            outcome: "error",
+            ...(error instanceof ApiError ? { http_status: error.status } : {}),
+          });
           // Roll back to pending so the buttons reappear and the user
           // can retry — same recovery the chat store uses.
           setResponded((prev) => {
@@ -312,6 +334,8 @@ export function InboxPage() {
               </div>
               {expanded && (
                 <ApprovalCard
+                  diagnosticSessionId={item.row.id}
+                  targetSessionId={item.elicitation.targetSessionId}
                   elicitationId={elicitationId}
                   message={item.elicitation.message}
                   phase={item.elicitation.phase}

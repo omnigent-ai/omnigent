@@ -1123,6 +1123,11 @@ class TerminalInstance:
         self._last_pane_snapshot = snapshot
         self._last_capture_at = time.monotonic()
 
+    def last_pane_capture_age_ms(self) -> int | None:
+        """Age of the cached pane observation, without issuing a new tmux query."""
+        captured_at = self._last_capture_at
+        return round((time.monotonic() - captured_at) * 1000) if captured_at is not None else None
+
     def _probe_log_extra(
         self,
         event_name: str,

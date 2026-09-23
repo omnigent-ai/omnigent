@@ -44,6 +44,7 @@
 
 import type { InfiniteData, QueryClient } from "@tanstack/react-query";
 import { create } from "zustand";
+import { diagnosticBlockedReason, recordBrowserDiagnostic } from "@/lib/diagnostics";
 import type {
   AnyBlock,
   ElicitationBlock,
@@ -2747,6 +2748,13 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       scopedState.blocks.find(
         (b): b is ElicitationBlock => b.type === "elicitation" && b.elicitationId === elicitationId,
       )?.targetSessionId ?? sessionId;
+    recordBrowserDiagnostic(sessionId, {
+      event_name: "browser_approval_verdict_submitted",
+      elicitation_id: elicitationId,
+      target_session_id: targetSessionId,
+      action,
+      tab_visible: document.visibilityState === "visible",
+    });
     // Optimistically flip the matching elicitation block to
     // "responded" so the buttons disappear immediately. No server
     // event confirms the approval — the agent just resumes (or
@@ -2782,7 +2790,22 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         ...(content === undefined ? {} : { content }),
         ...(meta === undefined ? {} : { _meta: meta }),
       });
-    } catch {
+      recordBrowserDiagnostic(sessionId, {
+        event_name: "browser_approval_verdict_request_completed",
+        elicitation_id: elicitationId,
+        target_session_id: targetSessionId,
+        action,
+        outcome: "success",
+      });
+    } catch (error) {
+      recordBrowserDiagnostic(sessionId, {
+        event_name: "browser_approval_verdict_request_completed",
+        elicitation_id: elicitationId,
+        target_session_id: targetSessionId,
+        action,
+        outcome: "error",
+        ...(error instanceof ApiError ? { http_status: error.status } : {}),
+      });
       // Roll back to pending so the user can retry. Surfacing the
       // error is a future affordance — for now, the buttons
       // reappear and the user can try again.
@@ -3644,9 +3667,28 @@ function pendingElicitationBlocksFromSnapshot(session: Session): AnyBlock[] {
   const events: StreamEvent[] = [];
   for (const raw of session.pendingElicitations ?? []) {
     const evt = parseEvent("response.elicitation_request", raw);
+    if (evt?.type === "elicitation_request") {
+      recordBrowserDiagnostic(session.id, {
+        event_name: "browser_approval_received",
+        elicitation_id: evt.elicitationId,
+        target_session_id: evt.targetSessionId ?? session.id,
+        observation_source: "snapshot",
+      });
+    }
     if (evt !== null) events.push(evt);
   }
   return events.length > 0 ? new BlockStream().reduceSync(events) : [];
+}
+
+function recordSnapshotApprovalApplied(sessionId: string, block: AnyBlock): void {
+  if (block.type !== "elicitation") return;
+  recordBrowserDiagnostic(sessionId, {
+    event_name: "browser_approval_applied",
+    elicitation_id: block.elicitationId,
+    target_session_id: block.targetSessionId ?? sessionId,
+    actionable: block.status === "pending",
+    observation_source: "snapshot",
+  });
 }
 
 /**
@@ -4033,6 +4075,7 @@ async function bindStream(
       const uniquePendingElicitations = pendingElicitationBlocks.filter(
         (b) => b.type !== "elicitation" || !seenElicitationIds.has(b.elicitationId),
       );
+      uniquePendingElicitations.forEach((block) => recordSnapshotApprovalApplied(id, block));
       // Synthesize a visible error block when the session failed and no error
       // block was already produced by itemsToBlocks. The `response.error` SSE
       // event is transient (published to the in-memory session stream which
@@ -4362,7 +4405,18 @@ function reconnectStatusPatch(
   session: Session,
   s: ChatState,
   launchBeforeFetch: ConversationState["mcpStartupLaunch"] | undefined,
+  observationTrigger: "periodic_reconcile" | "stream_reconnect",
 ): Partial<ChatState> {
+  recordBrowserDiagnostic(session.id, {
+    event_name: "browser_status_reconnect",
+    previous_status: s.sessionStatus ?? "unknown",
+    status: session.status,
+    previous_blocked_on: diagnosticBlockedReason(s.blockedOn),
+    blocked_on: diagnosticBlockedReason(s.blockedOn),
+    snapshot_blocked_on: "unknown",
+    observation_source: "snapshot",
+    observation_trigger: observationTrigger,
+  });
   const patch: Partial<ChatState> = {
     sessionStatus: session.status,
     ...mcpStartupSnapshotPatch(session, s, launchBeforeFetch),
@@ -4485,7 +4539,9 @@ async function reconcileActiveSessionStatus(
   ) {
     return;
   }
-  set((s) => reconnectStatusPatch(session, s, stateBeforeFetch.mcpStartupLaunch));
+  set((s) =>
+    reconnectStatusPatch(session, s, stateBeforeFetch.mcpStartupLaunch, "periodic_reconcile"),
+  );
   if (session.usageIncluded === false) void hydrateSessionUsage(id);
 }
 
@@ -4518,6 +4574,7 @@ async function reconcileActiveSessionStatus(
  * Returns the patched block list, or `null` when nothing changed.
  */
 function reconcileElicitationBlocks(
+  sessionId: string,
   blocks: AnyBlock[],
   snapshotPending: AnyBlock[],
   preGapPendingIds: Set<string>,
@@ -4544,6 +4601,7 @@ function reconcileElicitationBlocks(
         status: "responded",
         response: { action: "auto_resolved" },
       };
+      recordSnapshotApprovalApplied(sessionId, updated);
       return updated;
     }
     if (
@@ -4554,6 +4612,7 @@ function reconcileElicitationBlocks(
     ) {
       changed = true;
       const updated: ElicitationBlock = { ...b, status: "pending", response: null };
+      recordSnapshotApprovalApplied(sessionId, updated);
       return updated;
     }
     return b;
@@ -4563,6 +4622,7 @@ function reconcileElicitationBlocks(
   const missing = snapshotPending.filter(
     (b) => b.type === "elicitation" && !renderedIds.has(b.elicitationId),
   );
+  missing.forEach((block) => recordSnapshotApprovalApplied(sessionId, block));
   if (missing.length === 0 && !changed) return null;
   return [...patched, ...missing];
 }
@@ -4714,9 +4774,10 @@ async function rehydrateWindowOnReconnect(
       withoutRebuiltUserInputCards(tail, windowBlocks),
     );
     return {
-      ...reconnectStatusPatch(session, s, launchBeforeFetch),
+      ...reconnectStatusPatch(session, s, launchBeforeFetch, "stream_reconnect"),
       blocks:
         reconcileElicitationBlocks(
+          id,
           merged,
           snapshotPending,
           preGapElicitations.pending,
@@ -4853,7 +4914,12 @@ async function reconcileOnReconnect(
       currentBlocks.map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
     );
     const unseen = snapshotBlocks.filter((b) => b.ctx.itemId && !seen.has(b.ctx.itemId));
-    const patch: Partial<ChatState> = reconnectStatusPatch(session, s, launchBeforeFetch);
+    const patch: Partial<ChatState> = reconnectStatusPatch(
+      session,
+      s,
+      launchBeforeFetch,
+      "stream_reconnect",
+    );
     // `session.input.consumed` is not replayed, so recovered user blocks are
     // the durable equivalent of its FIFO acknowledgement.
     const recoveredUserInputs = unseen.filter(
@@ -4891,6 +4957,7 @@ async function reconcileOnReconnect(
     // never items), so this is the only path that fixes them short of
     // a full page refresh.
     const reconciled = reconcileElicitationBlocks(
+      id,
       nextBlocks,
       snapshotPending,
       preGapElicitations.pending,
@@ -5689,6 +5756,17 @@ export async function pumpStreamEvents(
         );
       }
       if (fresh.length === 0) return extra ?? {};
+      for (const block of fresh) {
+        if (block.type === "elicitation") {
+          recordBrowserDiagnostic(id, {
+            event_name: "browser_approval_applied",
+            elicitation_id: block.elicitationId,
+            target_session_id: block.targetSessionId ?? id,
+            actionable: block.status === "pending",
+            observation_source: "stream",
+          });
+        }
+      }
       // Only newly accepted text counts, not snapshot hydration or duplicates.
       const hasAssistantText = fresh.some((b) =>
         b.type === "text_chunk"
@@ -5776,6 +5854,15 @@ export async function pumpStreamEvents(
         if (buffer.some((b) => b.type === "elicitation" && b.elicitationId === eid)) continue;
         if (get().blocks.some((b) => b.type === "elicitation" && b.elicitationId === eid)) {
           revivePendingElicitationBlock(set, eid);
+          recordBrowserDiagnostic(id, {
+            event_name: "browser_approval_applied",
+            elicitation_id: eid,
+            target_session_id: block.targetSessionId ?? id,
+            actionable: get().blocks.some(
+              (b) => b.type === "elicitation" && b.elicitationId === eid && b.status === "pending",
+            ),
+            observation_source: "stream",
+          });
           continue;
         }
       }
@@ -6483,6 +6570,13 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       emitBrowserActionRequest(event, sourceConversationId);
       return;
     case "session_status": {
+      recordBrowserDiagnostic(sourceConversationId, {
+        event_name: "browser_status_received",
+        target_session_id: event.conversationId,
+        status: event.status,
+        blocked_on: diagnosticBlockedReason(event.blockedOn ?? null),
+        observation_source: "stream",
+      });
       // Captured BEFORE the patch below adopts event.responseId, so a
       // running/waiting status carrying an unseen id marks a new turn.
       const prevResponseId = useChatStore.getState().activeResponse?.responseId;
@@ -6490,6 +6584,15 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // further down are deliberately NOT (they are keyed by explicit id, so a
       // sub-agent's status still refreshes its parent's rail).
       applyToNamedConversation(event.conversationId, (s) => {
+        recordBrowserDiagnostic(sourceConversationId, {
+          event_name: "browser_status_applied",
+          target_session_id: event.conversationId,
+          previous_status: s.sessionStatus ?? "unknown",
+          status: event.status,
+          previous_blocked_on: diagnosticBlockedReason(s.blockedOn),
+          blocked_on: diagnosticBlockedReason(event.blockedOn ?? null),
+          observation_source: "stream",
+        });
         // `sessionStatus` tracks the server's session-level status 1:1 — a
         // server `idle` means the session is idle, full stop, and the
         // "Working…" indicator (which reads only `sessionStatus`) turns off.
@@ -7221,6 +7324,14 @@ async function* tapSessionEvents(
   onElicitationResolved?: (elicitationId: string) => void,
 ): AsyncIterable<StreamEvent> {
   for await (const event of events) {
+    if (event.type === "elicitation_request") {
+      recordBrowserDiagnostic(conversationId, {
+        event_name: "browser_approval_received",
+        elicitation_id: event.elicitationId,
+        target_session_id: event.targetSessionId ?? conversationId,
+        observation_source: "stream",
+      });
+    }
     if (!isConversationDisposed(conversationId)) {
       streamEventRevisions.set(conversationId, (streamEventRevisions.get(conversationId) ?? 0) + 1);
     }

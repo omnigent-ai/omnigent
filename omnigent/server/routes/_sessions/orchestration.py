@@ -30,7 +30,7 @@ from pydantic import ValidationError
 from omnigent.cli_invocation import cli_invocation
 from omnigent.db.utils import generate_agent_id, generate_task_id
 from omnigent.db.workspace_cache import WorkspaceScopedCache
-from omnigent.debug_logging import debug_event, runner_log_scope
+from omnigent.debug_logging import debug_event, log_debug_event, runner_log_scope
 from omnigent.entities import (
     Agent,
     CommentsFingerprint,
@@ -465,6 +465,34 @@ async def _publish_and_wait_for_harness_elicitation(
     """
     if elicitation_id is None:
         elicitation_id = f"elicit_{secrets.token_hex(16)}"
+    wait_attempt_id = uuid.uuid4().hex
+    wait_started = time.monotonic()
+    wait_outcome = "error"
+    response_kind = "none"
+    adopted_verdict = False
+
+    def log_wait(event_name: str, **attributes: object) -> None:
+        """Record the wait boundary without the prompt or tool arguments."""
+        log_debug_event(
+            _logger,
+            event_name,
+            session_id=session_id,
+            elicitation_id=elicitation_id,
+            wait_attempt_id=wait_attempt_id,
+            **attributes,
+        )
+
+    raw_mode = getattr(params, "permission_mode", None)
+    log_wait(
+        "approval_wait_started",
+        tool_name=tool_name[:128] if tool_name else None,
+        permission_mode=raw_mode
+        if isinstance(raw_mode, str)
+        and raw_mode in {"auto", "default", "acceptEdits", "bypassPermissions", "plan", "dontAsk"}
+        else "unknown",
+        native_reason="not_exposed",
+        timeout_s=timeout_s,
+    )
     future: asyncio.Future[ElicitationResult] = asyncio.get_running_loop().create_future()
     # ``resolved_elsewhere`` is set when a native-side signal proves the
     # prompt was answered outside the web UI: either a mirrored tool
@@ -496,6 +524,10 @@ async def _publish_and_wait_for_harness_elicitation(
         )
         if tombstone is not None:
             # Verdict from the un-parked gap; None = terminal answered (fail-ask).
+            adopted_verdict = True
+            wait_outcome = "web_verdict" if tombstone.result is not None else "native_resolution"
+            response_kind = "verdict" if tombstone.result is not None else "empty"
+            settled_action = tombstone.result.action if tombstone.result is not None else None
             return tombstone.result
         event = ElicitationRequestEvent(
             type="response.elicitation_request",
@@ -505,6 +537,7 @@ async def _publish_and_wait_for_harness_elicitation(
         event_payload = event.model_dump()
         session_stream.publish(session_id, event_payload)
         published_request = True
+        log_wait("approval_published")
         if conversation_store is not None:
             await asyncio.to_thread(
                 _publish_elicitation_request_to_ancestors,
@@ -558,10 +591,32 @@ async def _publish_and_wait_for_harness_elicitation(
             settled = True
             verdict = future.result()
             settled_action = getattr(verdict, "action", None)
+            wait_outcome = "web_verdict"
+            response_kind = "verdict"
             return verdict
         settled = parked.resolved_elsewhere.is_set()
+        if future in done:
+            wait_outcome = "error"
+        elif settled:
+            wait_outcome = parked.resolution_source or "unknown_resolution"
+        elif disconnect_task in done:
+            wait_outcome = "disconnect" if disconnect_task.exception() is None else "error"
+        else:
+            wait_outcome = "timeout"
+        response_kind = "empty"
         return None
+    except asyncio.CancelledError:
+        wait_outcome = "cancelled"
+        raise
     finally:
+        log_wait(
+            "approval_wait_ended",
+            outcome=wait_outcome,
+            response_kind=response_kind,
+            action=settled_action,
+            adopted_verdict=adopted_verdict,
+            duration_ms=round((time.monotonic() - wait_started) * 1000),
+        )
         # Pop only our own entries — a hook retry may have re-parked
         # this id with a new future while this wait was unwinding.
         if _harness_elicitation_registry.get(elicitation_id) is future:
@@ -627,7 +682,19 @@ def _schedule_deferred_elicitation_clear(
         await asyncio.sleep(_facade._HARNESS_ELICITATION_REPARK_GRACE_S)
         if elicitation_id in _harness_elicitation_registry:
             # Re-parked — the new wait owns the eventual clear.
+            log_debug_event(
+                _logger, "approval_reparked", session_id=session_id, elicitation_id=elicitation_id
+            )
             return
+        pending = pending_elicitations.lookup(elicitation_id)
+        still_pending = pending is not None and pending[0] == session_id
+        log_debug_event(
+            _logger,
+            "approval_expired" if still_pending else "approval_deferred_clear",
+            session_id=session_id,
+            elicitation_id=elicitation_id,
+            reason="repark_expiry" if still_pending else "already_settled",
+        )
         _publish_elicitation_resolved(session_id, elicitation_id, reason="unanswered")
         if conversation_store is not None:
             await asyncio.to_thread(
@@ -1975,8 +2042,23 @@ async def _resolve_elicitation(
     # matches, no resolved event published) rather than 500-ing the
     # client — the runner forward still fires so the runner can reject.
     elicitation_id = data.get("elicitation_id", "")
+    raw_action = data.get("action")
+    diagnostic_action = (
+        raw_action
+        if isinstance(raw_action, str) and raw_action in {"accept", "decline", "cancel"}
+        else "invalid"
+    )
+    log_debug_event(
+        _logger,
+        "approval_verdict_received",
+        session_id=session_id,
+        elicitation_id=elicitation_id,
+        action=diagnostic_action,
+    )
+    disposition = "no_pending_wait"
     harness_future = _harness_elicitation_registry.get(elicitation_id)
     if harness_future is not None and not harness_future.done():
+        disposition = "owner_mismatch"
         # Only the session that owns this elicitation
         # may resolve its server-side Future. A mismatch skips
         # resolution (the runner forward still fires below).
@@ -1985,12 +2067,14 @@ async def _resolve_elicitation(
             try:
                 verdict_result = ElicitationResult.model_validate(result_payload)
             except ValidationError:
+                disposition = "invalid_payload"
                 _logger.warning(
                     "Invalid approval payload for %r",
                     elicitation_id,
                     exc_info=True,
                 )
             else:
+                disposition = "applied_to_wait"
                 harness_future.set_result(verdict_result)
                 # The waiter may be a zombie: a proxy can sever the
                 # long-poll client-side while holding the backend
@@ -2027,6 +2111,7 @@ async def _resolve_elicitation(
         except ValidationError:
             pre_resolved = None
         if pre_resolved is not None:
+            disposition = "stored_for_repark"
             # The pending index still holds the answered prompt (the
             # resolved fan-out below drains it), so fingerprint the
             # tombstone with the question's params: a later, different
@@ -2048,6 +2133,17 @@ async def _resolve_elicitation(
                 request_fingerprint=gap_fingerprint,
             )
             _prune_pre_resolved_harness_elicitations()
+        else:
+            disposition = "invalid_payload"
+    log_debug_event(
+        _logger,
+        "approval_verdict_applied",
+        session_id=session_id,
+        elicitation_id=elicitation_id,
+        action=diagnostic_action,
+        disposition=disposition,
+        wait_owner="server" if disposition == "applied_to_wait" else "runner_or_gap",
+    )
     # Wake a currently-parked long-poll via resolved_elsewhere, not only its
     # Future: setting the Future alone races the sever/re-park cycle and the
     # ASK-gated call hangs. Set the event directly; the signal helper's
@@ -2055,6 +2151,11 @@ async def _resolve_elicitation(
     if isinstance(elicitation_id, str) and elicitation_id:
         _parked = _harness_parked_elicitations.get(elicitation_id)
         if _parked is not None and _harness_elicitation_owners.get(elicitation_id) == session_id:
+            _parked.resolution_source = (
+                "web_verdict"
+                if disposition == "applied_to_wait"
+                else "verdict_signal_without_result"
+            )
             _parked.resolved_elsewhere.set()
 
     # Fan-out for every other subscribed client (other tabs, REPL

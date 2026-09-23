@@ -19,20 +19,20 @@ const alertVariants = cva(
   },
 );
 
-function Alert({
-  className,
-  variant,
-  ...props
-}: React.ComponentProps<"div"> & VariantProps<typeof alertVariants>) {
+const Alert = React.forwardRef<
+  HTMLDivElement,
+  React.ComponentPropsWithoutRef<"div"> & VariantProps<typeof alertVariants>
+>(function Alert({ className, variant, ...props }, ref) {
   return (
     <div
+      ref={ref}
       data-slot="alert"
       role="alert"
       className={cn(alertVariants({ variant }), className)}
       {...props}
     />
   );
-}
+});
 
 function AlertTitle({ className, ...props }: React.ComponentProps<"div">) {
   return (

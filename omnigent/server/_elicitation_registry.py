@@ -68,6 +68,7 @@ class _ParkedHarnessElicitation:
     tool_input: dict[str, Any] | None
     resolved_elsewhere: asyncio.Event
     request_fingerprint: str | None = None
+    resolution_source: str | None = None
 
 
 @dataclass(frozen=True)

@@ -32,7 +32,7 @@
 //      on `POST /v1/sessions/{id}/elicitations/{eid}/resolve`,
 //   3. rolls back to "pending" on network error.
 
-import { useContext } from "react";
+import { useContext, useEffect, useRef, useState } from "react";
 import {
   CheckIcon,
   ClipboardListIcon,
@@ -53,6 +53,8 @@ import {
 } from "@/lib/askUserQuestion";
 import { isNativePolicyName, nativeCodingAgentForPolicyName } from "@/lib/nativeCodingAgents";
 import { formatPreview } from "@/lib/previewFormat";
+import { recordBrowserDiagnostic } from "@/lib/diagnostics";
+import { randomUUID } from "@/lib/randomUUID";
 import type { RenderItem } from "@/lib/renderItems";
 import type { CodexPersistMode, RememberScope } from "@/lib/types";
 import { useChatStore } from "@/store/chatStore";
@@ -101,6 +103,8 @@ export type SubmitApprovalFn = (
 ) => void;
 
 interface ApprovalCardProps {
+  diagnosticSessionId?: string;
+  targetSessionId?: string | null;
   elicitationId: string;
   message: string;
   phase: string;
@@ -188,6 +192,8 @@ interface ApprovalCardProps {
 const EMPTY_CODEX_PERSIST_MODES: CodexPersistMode[] = [];
 
 export function ApprovalCard({
+  diagnosticSessionId,
+  targetSessionId,
   elicitationId,
   message,
   phase,
@@ -210,6 +216,49 @@ export function ApprovalCard({
   // the child's elicitation rather than the main conversation's. null (the main
   // transcript) leaves submitApproval on its active-conversation default.
   const scopedConversationId = useContext(ConversationScopeContext);
+  const activeConversationId = useChatStore((s) => s.conversationId);
+  const observedSessionId =
+    diagnosticSessionId ?? scopedConversationId ?? (onSubmit ? null : activeConversationId);
+  const cardRef = useRef<HTMLDivElement>(null);
+  const [cardInstanceId] = useState(randomUUID);
+  useEffect(() => {
+    if (!observedSessionId) return;
+    const fields = {
+      elicitation_id: elicitationId,
+      card_instance_id: cardInstanceId,
+      target_session_id: targetSessionId ?? observedSessionId,
+      actionable: status === "pending",
+      observation_source: "card" as const,
+    };
+    recordBrowserDiagnostic(observedSessionId, {
+      event_name: "browser_approval_rendered",
+      ...fields,
+      tab_visible: document.visibilityState === "visible",
+    });
+    let inView: boolean | undefined;
+    const reportVisibility = () =>
+      recordBrowserDiagnostic(observedSessionId, {
+        event_name: "browser_approval_visibility",
+        ...fields,
+        ...(inView === undefined ? {} : { in_view: inView }),
+        tab_visible: document.visibilityState === "visible",
+      });
+    const element = cardRef.current;
+    const observer =
+      element && typeof IntersectionObserver !== "undefined"
+        ? new IntersectionObserver(([entry]) => {
+            if (!entry) return;
+            inView = entry.isIntersecting;
+            reportVisibility();
+          })
+        : null;
+    if (element) observer?.observe(element);
+    document.addEventListener("visibilitychange", reportVisibility);
+    return () => {
+      observer?.disconnect();
+      document.removeEventListener("visibilitychange", reportVisibility);
+    };
+  }, [observedSessionId, targetSessionId, elicitationId, status, cardInstanceId]);
   const submit: SubmitApprovalFn =
     onSubmit ??
     ((id, action, content, meta) => {
@@ -559,6 +608,7 @@ export function ApprovalCard({
 
     return (
       <Alert
+        ref={cardRef}
         data-testid="approval-card"
         data-state="responded"
         className="flex flex-col gap-1 border-muted"
@@ -619,6 +669,7 @@ export function ApprovalCard({
   // Pending state.
   return (
     <Alert
+      ref={cardRef}
       data-testid="approval-card"
       data-state="pending"
       className="flex flex-col gap-2 py-3 px-4"
@@ -741,6 +792,7 @@ export function ElicitationCard({
 }) {
   return (
     <ApprovalCard
+      targetSessionId={item.targetSessionId}
       elicitationId={item.elicitationId}
       message={item.message}
       phase={item.phase}
