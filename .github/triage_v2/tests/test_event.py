@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
+from pathlib import Path
 
+import pytest
+
+from issue_prioritization import event
 from issue_prioritization.areas import Area, AreaCatalog
 from issue_prioritization.bronze import BronzeIssue
 from issue_prioritization.classification import Classification
@@ -213,3 +218,72 @@ def test_intake_assigns_before_duplicate_closure() -> None:
     _apply_intake(Client(), 7, plan)
 
     assert events == ["labels", "comment", "assign", "close"]
+
+
+@pytest.mark.parametrize("intake", [False, True])
+def test_event_fetches_related_issues_for_intake_and_edits(monkeypatch, tmp_path, intake) -> None:
+    issue = replace(_issue(), body="Cannot start a session; see #3.")
+    captured = []
+
+    class Client:
+        def open_issue(self, number, *, full_author_history):
+            assert number == issue.number
+            assert full_author_history
+            return issue
+
+        def issue_corpus(self):
+            return (
+                {
+                    "number": 3,
+                    "title": "Session fails",
+                    "body": "Cannot start a session",
+                    "state": "closed",
+                    "state_reason": "completed",
+                },
+            )
+
+        def issue_data(self, number):
+            assert intake, "Edits must not run intake actions"
+            return {"state": "open", "labels": [], "assignees": []}
+
+        def assignee_load(self):
+            assert intake
+            return {}
+
+    def classifier(endpoint, areas, *, duplicate_candidates, review_bugs):
+        captured.extend(duplicate_candidates)
+        assert review_bugs
+        return FakeClassifier()
+
+    monkeypatch.setenv("GITHUB_TOKEN", "test-token")
+    monkeypatch.setattr(event, "GitHubClient", lambda *_: Client())
+    monkeypatch.setattr(event, "serving_endpoint_classifier", classifier)
+    github_dir = Path(__file__).resolve().parents[2]
+    argv = [
+        "issue-priority-event",
+        "--issue-number",
+        "7",
+        "--github-repo",
+        "omnigent-ai/omnigent",
+        "--model-endpoint",
+        "test-endpoint",
+        "--areas",
+        str(github_dir / "areas.json"),
+        "--label-manifest",
+        str(github_dir / "issue-prioritization-labels.json"),
+        "--output-dir",
+        str(tmp_path),
+        "--run-id",
+        "test-event",
+        "--close-duplicates",
+        "--post-duplicate-comments",
+    ]
+    if intake:
+        argv.extend(["--intake", "--maintainers", str(github_dir / "MAINTAINER")])
+    monkeypatch.setattr("sys.argv", argv)
+
+    event.main()
+
+    assert [candidate["number"] for candidate in captured] == [3]
+    payload = json.loads((tmp_path / "event.json").read_text())
+    assert (payload["intake"] is not None) == intake
