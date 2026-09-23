@@ -3827,7 +3827,7 @@ async def test_required_terminal_voluntary_exit_publishes_idle_not_failed() -> N
     release the harness, and never render a red required_terminal_exited card.
     """
     from omnigent.runner import app as runner_app
-    from omnigent.runner.app import _CLAUDE_VOLUNTARY_EXIT_MARKER, _session_event_queues_ref
+    from omnigent.runner.app import _session_event_queues_ref
     from omnigent.runner.resource_registry import (
         TerminalExitEvent,
         TerminalLifecycle,
@@ -3858,9 +3858,7 @@ async def test_required_terminal_voluntary_exit_publishes_idle_not_failed() -> N
                 # misclassify this normal quit as a crash.
                 session_was_idle=False,
                 last_output=(
-                    "No changes made.\n\n"
-                    + _CLAUDE_VOLUNTARY_EXIT_MARKER
-                    + "\nclaude --resume abc123"
+                    "No changes made.\n\nResume this session with:\nclaude --resume abc123"
                 ),
             )
         )
@@ -3892,6 +3890,69 @@ async def test_required_terminal_voluntary_exit_publishes_idle_not_failed() -> N
     ] == []
     # The harness subprocess is released.
     assert pm.released == [conv_id]
+
+
+@pytest.mark.asyncio
+async def test_non_claude_terminal_with_resume_banner_still_fails() -> None:
+    """A non-claude terminal exiting with the resume-banner text is still a failure.
+
+    The voluntary-exit banner check is scoped to terminal_name=="claude". Another
+    CLI printing similar text with exit 0 must not bypass the failure path.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.app import _session_event_queues_ref
+    from omnigent.runner.resource_registry import (
+        TerminalExitEvent,
+        TerminalLifecycle,
+    )
+
+    conv_id = uuid.uuid4().hex
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    pm._sessions.add(conv_id)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    resource_registry = app.state.session_resource_registry
+    publish_exit = resource_registry._terminal_exit_publisher
+    assert callable(publish_exit)
+
+    try:
+        publish_exit(
+            TerminalExitEvent(
+                session_id=conv_id,
+                terminal_id="terminal_other_main",
+                terminal_name="other",
+                session_key="main",
+                lifecycle=TerminalLifecycle.REQUIRED,
+                exit_status=0,
+                session_was_idle=False,
+                last_output=("Resume this session with:\nother --resume abc123"),
+            )
+        )
+        queued_events: list[dict[str, Any]] = []
+        for _ in range(1000):
+            queued_events.extend(
+                _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+            )
+            if pm.released:
+                break
+            await asyncio.sleep(0)
+    finally:
+        _session_event_queues_ref.pop(conv_id, None)
+        runner_app.unregister_child_session(conv_id)
+
+    # Non-claude terminal: the banner does not suppress the failure card.
+    assert [
+        event
+        for event in queued_events
+        if event.get("type") == "session.status" and event.get("status") == "failed"
+    ] != []
+    assert [
+        event
+        for event in queued_events
+        if event.get("type") == "session.status" and event.get("status") == "idle"
+    ] == []
 
 
 @pytest.mark.asyncio
