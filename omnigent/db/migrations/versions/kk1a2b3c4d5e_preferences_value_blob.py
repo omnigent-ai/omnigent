@@ -30,6 +30,9 @@ def upgrade() -> None:
         if dialect == "sqlite"
         else sa.func.octet_length(value)
     )
+    # This table has only stored project ordering, so values above the BLOB limit
+    # are not expected in practice. Deleting any outliers is acceptable because
+    # affected users simply return to the default ordering.
     op.execute(_PREFERENCES.delete().where(size > 65_535))
     if dialect == "mysql":
         # An old writer racing the cleanup must fail the ALTER, never truncate a value.
